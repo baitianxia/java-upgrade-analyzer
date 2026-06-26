@@ -1,0 +1,39 @@
+name: Smoke Regression
+
+on:
+  push:
+    paths:
+      - ".github/workflows/smoke-regression.yml"
+      - "README.md"
+      - "RUNBOOK.md"
+      - "SKILL.md"
+      - "runtime_config.example.json"
+      - "scripts/**"
+  pull_request:
+    paths:
+      - ".github/workflows/smoke-regression.yml"
+      - "README.md"
+      - "RUNBOOK.md"
+      - "SKILL.md"
+      - "runtime_config.example.json"
+      - "scripts/**"
+
+jobs:
+  smoke-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Runtime Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install tree-sitter tree-sitter-java
+
+      - name: Run Smoke Regression Suites
+        run: python -m unittest discover -s tests -v

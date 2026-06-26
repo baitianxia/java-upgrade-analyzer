@@ -1,0 +1,417 @@
+{
+  "version": "1.1",
+  "runtime_controls": {
+    "strict_risk_gate": {
+      "type": "boolean",
+      "default": false,
+      "description": "启用后，Step5 门控在存在 uncertain/not_analyzed 时直接阻断，不接受带盲区的影响结论。"
+    }
+  },
+  "steps": [
+    {
+      "id": "step1",
+      "order": 1,
+      "title": "获取真实依赖结果",
+      "script": "s1_dep_diff.py",
+      "gate": "step1_scope",
+      "interaction": {
+        "type": "review",
+        "status": "awaiting_user_input",
+        "question": "请确认真实构建来源和依赖变更范围是否可信；如果用户首轮已明确模块但这里仍是 root 范围，说明前置输入遗漏，应改为携带 primary_module/modules 重跑 Step1，而不是直接继续。",
+        "required_fields": [
+          "action"
+        ],
+        "missing_inputs": [],
+        "fallback_inputs": [],
+        "input_modes": [],
+        "input_normalization": {
+          "enabled": true,
+          "required_fields": [],
+          "allowed_actions": [
+            "continue",
+            "rerun_current_step",
+            "cancel"
+          ]
+        },
+        "response_schema": {
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "continue",
+                "rerun_current_step",
+                "cancel"
+              ]
+            },
+            "primary_module": {
+              "type": "string",
+              "description": "当 action=rerun_current_step 时必填。"
+            },
+            "modules": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "当 action=rerun_current_step 时必填，可包含一个或多个模块。"
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        },
+        "resume_hint": "若用户要求只分析某个模块，或用户首轮其实已明确模块但本次仍跑成 root 范围，请用结构化用户答复选择 rerun_current_step，并同时传入 primary_module/modules 重跑 Step1。",
+        "options": [
+          {
+            "id": "continue",
+            "label": "继续",
+            "description": "真实构建结果和差异范围可信，继续执行 Step2。"
+          },
+          {
+            "id": "rerun_current_step",
+            "label": "按模块重跑",
+            "description": "根据用户指定的模块范围重跑 Step1，重新获取模块级依赖结果；若首轮漏传模块，也应选择该动作。"
+          },
+          {
+            "id": "cancel",
+            "label": "取消",
+            "description": "先人工复核真实构建方式与构建结果，稍后再继续。"
+          }
+        ]
+      },
+      "outputs": [
+        "s1_dep_changes.csv",
+        "s1_deps_current_resolved.csv"
+      ],
+      "notes": [
+        "Step1 默认通过真实构建获取依赖结果。",
+        "自动切换分支执行构建时，必须显式允许。"
+      ]
+    },
+    {
+      "id": "step2",
+      "order": 2,
+      "title": "从依赖树推断上下文",
+      "script": "s2_context_from_deps.py",
+      "gate": "context",
+      "interaction": {
+        "type": "decision",
+        "status": "awaiting_user_input",
+        "question": "请确认升级口径、分支信息、业务源码目录和升级依赖识别结果是否正确；若已知相关依赖源码目录，可直接补充 dependency_source_dirs，让后续 Step4/Step5 自动识别模块与依赖源码映射；继续前应确保 source_dirs 与依赖源码映射已确认。",
+        "required_fields": [
+          "action"
+        ],
+        "missing_inputs": [],
+        "fallback_inputs": [],
+        "input_modes": [],
+        "input_normalization": {
+          "enabled": true,
+          "required_fields": [],
+          "allowed_actions": [
+            "continue",
+            "cancel"
+          ]
+        },
+        "response_schema": {
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "continue",
+                "cancel"
+              ]
+            },
+            "base_branch": {
+              "type": "string"
+            },
+            "current_branch": {
+              "type": "string"
+            },
+            "source_dirs": {
+              "type": "array",
+              "description": "可选但强烈建议确认。业务源码目录，Step3/Step5 会直接消费；若未提供，系统仅尝试自动探测，继续前仍应人工确认。"
+            },
+            "dependency_source_dirs": {
+              "type": "array",
+              "description": "可选。直接提供依赖源码工程目录或多模块仓库根目录，系统会自动推断模块坐标并派生后续所需映射。"
+            },
+            "source_repo_hints": {
+              "type": "array",
+              "description": "可选。提供源码仓库线索，支持 path、repo_path、git_path 或 {coord_hint,path,notes}，系统会只对当前系统引用的升级依赖生成建议映射。"
+            },
+            "accept_suggested_mappings": {
+              "type": "boolean",
+              "description": "可选。设为 true 时，系统会接受自动识别出的依赖源码目录结果并写入配置。默认 false（continue 不会自动覆盖现有配置）。"
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        },
+        "options": [
+          {
+            "id": "continue",
+            "label": "继续",
+            "description": "口径正确；若提供了 dependency_source_dirs 或源码线索，系统会自动识别模块并生成映射建议，但不会在 continue 时覆盖已存在映射。"
+          },
+          {
+            "id": "cancel",
+            "label": "取消",
+            "description": "当前上下文有误，先调整配置后再继续。"
+          }
+        ]
+      },
+      "depends_on": [
+        "step1"
+      ],
+      "inputs": [
+        "s1_dep_changes.csv"
+      ],
+      "outputs": [
+        "s2_context.json",
+        "s2_dep_graph.json"
+      ]
+    },
+    {
+      "id": "step3",
+      "order": 3,
+      "title": "静态扫描",
+      "script": "s3_scan.py",
+      "gate": "scan",
+      "interaction": null,
+      "depends_on": [
+        "step2"
+      ],
+      "inputs": [
+        "s2_context.json",
+        "s1_dep_changes.csv",
+        "s1_deps_current_resolved.csv"
+      ],
+      "outputs": [
+        "s3_jdk_removed_api.csv",
+        "s3_jdk_javax_refs.csv",
+        "s3_jdk_internal_api.csv",
+        "s3_jdk_reflection.csv",
+        "s3_jdk_serialization.txt",
+        "s3_jdk_runtime_flags.csv",
+        "s3_springboot_config.csv",
+        "s3_springboot_autoconfig.txt",
+        "s3_dependency_compat.csv",
+        "s3_dependency_classfile.csv"
+      ],
+      "notes": [
+        "实际输出受 s2_context.json 中的升级标志控制。"
+      ]
+    },
+    {
+      "id": "step4",
+      "order": 4,
+      "title": "jar 包变更对比",
+      "script": "s4_jar_compare.py",
+      "gate": "jar_compare",
+      "interaction": {
+        "type": "review",
+        "status": "awaiting_user_input",
+        "missing_inputs": [],
+        "fallback_inputs": [],
+        "input_modes": [],
+        "input_normalization": {
+          "enabled": true,
+          "required_fields": [],
+          "allowed_actions": [
+            "continue",
+            "rerun_current_step",
+            "cancel"
+          ]
+        },
+        "question": "请复核 jar 对比结果是否完整，尤其确认依赖源码目录是否覆盖相关仓库、自动识别出的模块坐标是否正确，以及 old_version/new_version 命中的 git refs 是否需要人工确认；若源码仓库已识别但 git refs 无法自动确定，应补充 dependency_git_ref_overrides 后重跑 Step4；若映射有误，可补充或修正 dependency_source_dirs；若只想让 Step5 分析部分变更 jar，可直接指定 all_changed_apis.csv 中的 coord 或名称；若 JApiCmp / git diff / dependency:get 出现超时，应补充 Step4 超时参数后重跑，而不是直接继续。",
+        "response_schema": {
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "continue",
+                "rerun_current_step",
+                "cancel"
+              ]
+            },
+            "dependency_source_dirs": {
+              "type": "array",
+              "description": "当 action=rerun_current_step 时可提供依赖源码目录列表；支持单模块工程根目录或多模块仓库根目录，系统会自动推断模块坐标并派生 Step4 所需映射。"
+            },
+            "dependency_git_ref_overrides": {
+              "type": "array",
+              "description": "当源码仓库已识别但 old_version/new_version 无法自动唯一匹配 git refs 时，按依赖显式确认 old_ref/new_ref，例如 [{\"coord\":\"g:a\",\"old_ref\":\"v1\",\"new_ref\":\"v2\"}]。"
+            },
+            "step5_selected_coords": {
+              "type": "array",
+              "description": "可选。继续进入 Step5 时，只分析这些依赖坐标对应的变更 API；坐标必须来自 all_changed_apis.csv 的 coord 列。"
+            },
+            "step5_selected_names": {
+              "type": "array",
+              "description": "可选。继续进入 Step5 时，只分析这些依赖名称对应的变更 API；名称按 coord 的 artifactId 匹配。"
+            },
+            "step4_git_diff_timeout": {
+              "type": "integer",
+              "description": "可选。放宽单个依赖执行 git diff 的超时时间（秒）。"
+            },
+            "step4_japicmp_timeout": {
+              "type": "integer",
+              "description": "可选。放宽单个依赖执行 JApiCmp 的超时时间（秒）。"
+            },
+            "step4_fetch_timeout": {
+              "type": "integer",
+              "description": "可选。放宽 Maven dependency:get 的超时时间（秒）。"
+            },
+            "notes": {
+              "type": "string",
+              "description": "记录用户对源码映射、git refs、缺失 jar、缺失源码映射等复核意见。"
+            }
+          }
+        },
+        "resume_hint": "若用户补充 dependency_source_dirs、dependency_git_ref_overrides 或 Step4 超时参数，请使用 --response-json 传回 action=rerun_current_step 与对应字段，并重跑 Step4；若用户已确认证据池，但只想让 Step5 分析部分变更 jar，可在 continue 时同时传回 step5_selected_coords / step5_selected_names；若用户要求从更早阶段重跑，请传回 action=restart_from_step 与 restart_step_id（如 step2 / step4）。",
+        "options": [
+          {
+            "id": "continue",
+            "label": "继续",
+            "description": "证据池基本可用，继续进入反向调用链分析。"
+          },
+          {
+            "id": "rerun_current_step",
+            "label": "修正映射后重跑",
+            "description": "用户补充依赖源码目录或修正源码映射后，重跑 Step4 重新生成源码 diff 与 git ref 匹配结果。"
+          },
+          {
+            "id": "cancel",
+            "label": "取消",
+            "description": "先补齐 jar 或源码映射，再继续。"
+          }
+        ]
+      },
+      "depends_on": [
+        "step2"
+      ],
+      "inputs": [
+        "s1_dep_changes.csv",
+        "s2_context.json"
+      ],
+      "outputs": [
+        "s4_jar_compare/all_changed_apis.csv",
+        "s4_jar_compare/git_ref_matches.txt",
+        "s4_jar_compare/git_ref_matches.json"
+      ],
+      "notes": [
+        "本步骤输出 all_changed_apis.csv，后续 Step5 默认基于该文件做反向调用链分析，也允许在 checkpoint 中指定只分析其中部分依赖。"
+      ]
+    },
+    {
+      "id": "step5",
+      "order": 5,
+      "title": "调用链影响分析",
+      "script": "s5_call_chain_engine_integrated.py",
+      "gate": "call_chain",
+      "interaction": {
+        "type": "review",
+        "status": "awaiting_user_input",
+        "missing_inputs": [],
+        "fallback_inputs": [],
+        "input_modes": [],
+        "input_normalization": {
+          "enabled": true,
+          "required_fields": [],
+          "allowed_actions": [
+            "continue",
+            "rerun_current_step",
+            "cancel"
+          ]
+        },
+        "question": "请确认本轮 Step5 的四类结论是否可接受：已确认影响、可能影响、当前无法确认、需要补充输入。若存在“需要补充输入”，应优先补 dependency_source_dirs 等关键输入后重跑；若主要是“当前无法确认”，请先抽查高风险项再决定是否继续。",
+        "response_schema": {
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "continue",
+                "rerun_current_step",
+                "cancel"
+              ]
+            },
+            "dependency_source_dirs": {
+              "type": "array",
+              "description": "可选。优先补充依赖源码目录；支持单模块工程或多模块仓库，系统会自动推断依赖源码映射后重跑 Step5。"
+            },
+            "strict_risk_gate": {
+              "type": "boolean",
+              "description": "可选。设为 true 时，Step5 门控会在 uncertain/not_analyzed 非零时直接阻断。"
+            },
+            "notes": {
+              "type": "string",
+              "description": "记录用户对 uncertain 项、依赖源码补充计划或重跑决定。"
+            }
+          }
+        },
+        "options": [
+          {
+            "id": "continue",
+            "label": "继续",
+            "description": "接受当前影响判定，继续生成最终报告。"
+          },
+          {
+            "id": "rerun_current_step",
+            "label": "补源码后重跑",
+            "description": "用户补充依赖源码目录后，重跑 Step5 重新生成 reachable / uncertain 结论。"
+          },
+          {
+            "id": "cancel",
+            "label": "取消",
+            "description": "先补齐调用链证据，再重新执行 Step5。"
+          }
+        ]
+      },
+      "depends_on": [
+        "step4"
+      ],
+      "inputs": [
+        "s4_jar_compare/all_changed_apis.csv"
+      ],
+      "outputs": [
+        "s5_call_chain/summary.json"
+      ],
+      "notes": [
+        "Step5 默认会遍历 all_changed_apis.csv，并对每条变更做反向调用链追踪；若 Step4 checkpoint 指定了坐标/名称，则只分析被选中的依赖。"
+      ]
+    },
+    {
+      "id": "step6",
+      "order": 6,
+      "title": "汇总报告",
+      "script": "s6_report.py",
+      "interaction": null,
+      "depends_on": [
+        "step5"
+      ],
+      "inputs": [
+        "s5_call_chain/summary.json"
+      ],
+      "outputs": [
+        "s6_findings.json",
+        "s6_report.md"
+      ]
+    }
+  ]
+}

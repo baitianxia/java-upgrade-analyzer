@@ -1,0 +1,20 @@
+{
+  "base_branch": "main",
+  "current_branch": "feature/upgrade-test",
+  "base_artifact_path": "/abs/path/to/base-app.jar",
+  "current_artifact_path": "/abs/path/to/current-app.jar",
+  "source_dirs": [
+    "src/main/java",
+    "module-a/src/main/java"
+  ],
+  "dependency_source_dirs": [
+    "/abs/path/to/dependency-a",
+    "/abs/path/to/dependency-b-multi-module"
+  ],
+  "japicmp_jar": "/abs/path/to/japicmp-0.21.2-jar-with-dependencies.jar",
+  "max_depth": 5,
+  "include_test_scope": false,
+  "tool": "maven",
+  "allow_degraded": false,
+  "strict_risk_gate": false
+}

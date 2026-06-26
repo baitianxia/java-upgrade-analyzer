@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+.DS_Store
+
+.idea/
+*.iml
+
+.pytest_cache/
+.mypy_cache/
+
+orchestrator_unittest_full.log
+REMOVED_JAR_PLAN.md

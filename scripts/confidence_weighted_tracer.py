@@ -1,0 +1,2890 @@
+#!/usr/bin/env python3
+"""
+confidence_weighted_tracer.py
+
+置信度加权反向追踪引擎
+
+目标：证明变更 API 是否触达系统代码（不要求最外层入口）。
+
+核心改进：
+  ✓ 置信度加权深度（High:最多5跳, Medium:最多3跳, Low:立即停止）
+  ✓ 系统代码触达识别（Service/Facade/Manager/Handler 等业务层）
+  ✓ 框架边界识别
+  ✓ 精确四态分类（reachable/uncertain/not_analyzed/not_found_in_static_analysis）
+
+替换原有trace_one_api()的固定深度策略
+"""
+
+import json
+import os
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+
+from progress_logging import emit_progress, should_log_progress, suggest_log_interval
+from signature_utils import normalize_signature_for_lookup, split_signature_params
+
+
+NON_BLOCKING_PARSER_FALLBACK_REASONS = {
+    'prefer_tree_sitter_disabled',
+    'unsupported_language_kotlin',
+}
+
+CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
+    'class',
+    'field',
+}
+
+
+def _env_flag_enabled(name):
+    return str(os.environ.get(name, '') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _step5_debug_enabled():
+    return _env_flag_enabled('JUA_STEP5_DEBUG')
+
+
+def _step5_debug_break_enabled():
+    return _env_flag_enabled('JUA_STEP5_DEBUG_BREAK')
+
+
+def _step5_debug(topic, message, **fields):
+    if not _step5_debug_enabled():
+        return
+    payload = {
+        'topic': str(topic or '').strip(),
+        'message': str(message or '').strip(),
+    }
+    for key, value in (fields or {}).items():
+        if value is None:
+            continue
+        payload[key] = value
+    print(f"[step5-debug] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
+
+
+def _step5_debug_break(topic, **fields):
+    if not _step5_debug_break_enabled():
+        return
+    _step5_debug(topic, 'breakpoint triggered', **fields)
+    breakpoint()
+
+
+def _debug_trace_result(topic, result, **fields):
+    _step5_debug(
+        topic,
+        'trace api produced result',
+        api_name=getattr(result, 'api_name', ''),
+        api_signature=getattr(result, 'api_signature', ''),
+        analysis_status=getattr(result, 'analysis_status', ''),
+        reason_code=getattr(result, 'reason_code', ''),
+        match_provenance=getattr(result, 'match_provenance', ''),
+        call_path_count=len(getattr(result, 'call_paths', []) or []),
+        **fields,
+    )
+
+
+@dataclass
+class TraceResult:
+    """追踪结果"""
+    api_name: str
+    api_simple: str
+    api_signature: str
+    symbol_kind: str
+    change_type: str
+    coord: str
+    severity: str
+    confirmed: bool
+    source: str
+    analysis_scope: str
+    analysis_status: str  # reachable / uncertain / not_analyzed
+    direct_callers: int
+    is_reachable: bool
+    reachable_note: str
+    business_reach_depth: int
+    dependency_chain_coords: list
+    call_paths: list
+    evidence_paths: list
+    reason_code: str
+    verification_commands: list
+    hops: list
+    confidence_score: float
+    critical_nodes_hit: list
+    match_provenance: str = ''
+    match_tier: int = -1
+
+
+def critical_parser_fallback_reasons(graph_stats):
+    graph_stats = graph_stats or {}
+    parser_fallback_reasons = graph_stats.get('parser_fallback_reasons') or {}
+    return {
+        key: value
+        for key, value in parser_fallback_reasons.items()
+        if key not in NON_BLOCKING_PARSER_FALLBACK_REASONS
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# 关键节点识别
+# ══════════════════════════════════════════════════════════════════
+
+# 业务入口标记
+BUSINESS_ENTRY_HINTS = [
+    'Controller', 'Service', 'Handler', 'Endpoint', 'Facade',
+    'Job', 'Task', 'Scheduler', 'Listener', 'Consumer',
+    'Presenter', 'Action', 'Application', 'Main', 'App'
+]
+
+# 框架边界注解
+# 注意：不要把 @Service / @Controller / @RestController / @Component 放在这里！
+# 这些注解标注的类是业务层入口，会先命中 is_business_entry_point 而不会进入这里。
+# 如果把它们放在这里，框架追踪会提前停止，导致真正的业务入口被错判。
+# 只放真正表示"框架注入点"的注解（非业务类上的注解）。
+FRAMEWORK_BOUNDARY_ANNOTATIONS = [
+    'Autowired', 'Bean', 'Entity', 'Table',
+    'Configuration', 'Import', 'Inject', 'Named',
+    'Value', 'PropertySource', 'ConfigurationProperties',
+    'Scheduled', 'EventListener'
+]
+
+FRAMEWORK_INTERFACE_ANNOTATIONS = [
+    'Mapper', 'Repository', 'FeignClient', 'RestClient'
+]
+
+# 工具类标记（跳过追踪）
+UTILITY_CLASS_HINTS = [
+    'Utils', 'Helper', 'Constants', 'Config', 'Logger',
+    'Log', 'Exception', 'Error', 'Result', 'Response'
+]
+
+
+def collect_all_annotations(method_def, class_meta):
+    annotations = set(method_def.annotations or [])
+    annotations.update(method_def.class_annotations or [])
+    annotations.update(class_meta.get('annotations', []) or [])
+    return annotations
+
+
+def is_business_framework_interface(method_def, class_meta, all_annotations):
+    if method_def.owner_type != 'business':
+        return False
+    if not (method_def.is_interface or class_meta.get('kind') == 'interface'):
+        return False
+    if any(ann in all_annotations for ann in FRAMEWORK_INTERFACE_ANNOTATIONS):
+        return True
+    # 没有显式注解时，仍然识别常见的框架接口命名模式，避免“类型注入但无注解”漏判。
+    if class_meta.get('kind') == 'interface':
+        interface_name = method_def.class_name or ''
+        if interface_name.endswith(('Mapper', 'Repository', 'Client')):
+            return True
+    return False
+
+
+def is_framework_callback_entry(method_def, class_meta, all_annotations):
+    if method_def.owner_type != 'business':
+        return False
+    if 'public' not in (method_def.modifiers or []):
+        return False
+
+    callback_method_annotations = {
+        'ModelAttribute', 'InitBinder', 'ExceptionHandler',
+    }
+    if any(ann in all_annotations for ann in callback_method_annotations):
+        return True
+
+    callback_interfaces = {
+        'Formatter': {'parse', 'print'},
+        'Parser': {'parse'},
+        'Printer': {'print'},
+        'Converter': {'convert'},
+        'GenericConverter': {'convert'},
+        'Validator': {'validate', 'supports'},
+        'HandlerMethodArgumentResolver': {'supportsParameter', 'resolveArgument'},
+        'HandlerInterceptor': {'preHandle', 'postHandle', 'afterCompletion'},
+        'ApplicationRunner': {'run'},
+        'CommandLineRunner': {'run'},
+    }
+    implements = class_meta.get('implements', []) or []
+    interface_names = {item.rsplit('.', 1)[-1] for item in implements if item}
+    method_name = (getattr(method_def, 'method_name', '') or '').strip()
+    for interface_name, callback_methods in callback_interfaces.items():
+        if interface_name in interface_names and method_name in callback_methods:
+            return True
+
+    stereotype_annotations = {'Component', 'ControllerAdvice', 'RestControllerAdvice'}
+    if any(ann in all_annotations for ann in stereotype_annotations):
+        class_name = method_def.class_name or ''
+        callback_hints = ('Formatter', 'Converter', 'Validator', 'Resolver', 'Interceptor')
+        if any(hint in class_name for hint in callback_hints):
+            return True
+
+    return False
+
+
+def edge_to_evidence(edge, graph=None):
+    method_def = graph.methods_by_id.get(edge.caller_symbol_id) if graph else None
+    caller_key = getattr(edge, 'caller_qualified_key', None)
+    if method_def:
+        caller_key = method_def.qualified_key
+    if not caller_key:
+        caller_key = getattr(edge, 'caller_symbol_id', '?')
+    return {
+        'caller_symbol': caller_key,
+        'callee_key': getattr(edge, 'callee_key', '?'),
+        'confidence': getattr(edge, 'confidence', '?'),
+        'evidence_type': getattr(edge, 'evidence_type', '?'),
+        'file': getattr(edge, 'file', ''),
+        'line': getattr(edge, 'line', 0),
+    }
+
+
+def is_system_code_touched(method_def, _type_metadata):
+    """
+    识别系统代码触达信号
+
+    目标：只要触达系统自有源码中的非测试方法，即为 reachable。
+    不要求到达 HTTP/消息/调度等最外层入口，也不再额外排除配置类/工具类。
+
+    最小排除：
+      1. 非业务源码（owner_type != business）
+      2. 测试代码
+    """
+    if method_def.owner_type != 'business':
+        return False
+
+    if getattr(method_def, 'is_test', False):
+        return False
+
+    return True
+
+
+def is_framework_boundary(method_def, type_metadata):
+    """
+    识别框架边界
+
+    规则：
+      1. 框架注入注解（@Autowired, @Bean等，但排除 @Mapper/@Repository/@FeignClient）
+      2. 接口无实现（动态代理），但排除业务代码中的框架接口（已在 is_system_code_touched 处理）
+
+    注意：
+      MyBatis Mapper/JPA Repository/Feign Client 等接口虽然没有具体实现，
+      但它们是业务代码直接依赖的 API 边界，应在 is_system_code_touched 中识别，
+      而不是在这里标记为框架边界而停止追踪。
+    """
+    class_meta = type_metadata.get(method_def.class_fqcn, {})
+    all_annotations = collect_all_annotations(method_def, class_meta)
+
+    if is_business_framework_interface(method_def, class_meta, all_annotations):
+        return False
+
+    # 规则 1: 框架注入注解（支持类级和方法级）
+    if any(ann in all_annotations for ann in FRAMEWORK_BOUNDARY_ANNOTATIONS):
+        return True
+
+    # 规则 2: 接口无实现（动态代理）- 通用情况
+    if class_meta.get('kind') == 'interface':
+        # 检查是否有实现类
+        implementations = class_meta.get('implementations', [])
+        if not implementations:
+            # 如果是依赖包中的接口（非业务代码），才视为框架边界
+            if method_def.owner_type != 'business':
+                return True  # 依赖包的动态代理接口
+
+    return False
+
+
+def is_utility_class(method_def):
+    """识别工具类（跳过追踪）"""
+    class_name = method_def.class_name
+
+    if any(hint in class_name for hint in UTILITY_CLASS_HINTS):
+        return True
+
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════
+# 置信度加权深度策略
+# ══════════════════════════════════════════════════════════════════
+
+def calculate_depth_cost(confidence):
+    """
+    计算深度代价（置信度加权）
+
+    High confidence: cost = 1（可追踪5跳）
+    Medium confidence: cost = 2（可追踪3跳）
+    Low confidence: cost = 5（立即停止）
+    """
+    if confidence == 'high':
+        return 1
+    elif confidence == 'medium':
+        return 2
+    else:  # low
+        return 5
+
+
+def should_stop_tracing(current_cost, max_cost, confidence_score, critical_node_hit, last_edge_confidence=''):
+    """
+    判断是否应该停止追踪
+
+    停止条件：
+      1. 代价超过限制（max_cost=5）
+      2. 置信度衰减至阈值以下（< 0.3）
+      3. 触达系统代码（已证明变更 API 被系统代码使用）
+      4. 遇到框架边界（无法继续静态分析）
+    """
+    # 代价限制
+    if current_cost >= max_cost:
+        if last_edge_confidence == 'low':
+            return True, 'LOW_CONFIDENCE_EDGE'
+        return True, 'DEPTH_LIMIT_REACHED'
+
+    # 置信度衰减
+    if confidence_score < 0.3:
+        return True, 'CONFIDENCE_DECAYED'
+
+    # 系统代码触达（成功回溯）
+    if critical_node_hit and critical_node_hit.get('type') == 'system_code_touched':
+        return True, 'SYSTEM_CODE_REACHED'
+
+    # 框架边界（无法继续）
+    if critical_node_hit and critical_node_hit.get('type') == 'framework_boundary':
+        return True, 'FRAMEWORK_BOUNDARY'
+
+    return False, None
+
+
+def calculate_confidence_decay(current_score, edge_confidence):
+    """
+    计算置信度衰减
+
+    规则：
+      - High confidence边：衰减5%（×0.95）
+      - Medium confidence边：衰减20%（×0.8）
+      - Low confidence边：衰减50%（×0.5）
+    """
+    if edge_confidence == 'high':
+        return current_score * 0.95
+    elif edge_confidence == 'medium':
+        return current_score * 0.8
+    else:  # low
+        return current_score * 0.5
+
+
+# ══════════════════════════════════════════════════════════════════
+# 核心追踪逻辑
+# ══════════════════════════════════════════════════════════════════
+
+def trace_api_with_confidence_weighting(
+    api_row,
+    graph,
+    type_metadata,
+    max_total_cost=5,
+    needs_bridge=False,
+    has_dependency_source_mapping=True,
+    allow_degraded=False,
+    graph_stats=None,
+    trace_cache=None,
+):
+    """
+    置信度加权反向追踪
+
+    核心改进：
+      1. 置信度加权深度（不再固定3跳）
+      2. 关键节点识别（业务入口/框架边界）
+      3. 精确四态分类：reachable / uncertain / not_analyzed / not_found_in_static_analysis
+
+    Args:
+        api_row: 变更API信息
+        graph: 源码调用图
+        type_metadata: 类型元数据（继承关系）
+        max_total_cost: 最大总代价（默认5）
+        needs_bridge: 该 API 是否需要依赖源码映射才能完整追踪
+        has_dependency_source_mapping: 当前 API 所属依赖是否具备可用源码映射
+        allow_degraded: 如果为 True，缺依赖源码映射时标记为 not_analyzed 而非静态未找到
+
+    Returns:
+        TraceResult
+    """
+    api_name = api_row.get('api_name', '').strip()
+    result = TraceResult(
+        api_name=api_name,
+        api_simple=api_row.get('api_simple', ''),
+        api_signature=api_row.get('api_signature', ''),
+        symbol_kind=get_symbol_kind(api_row),
+        change_type=api_row.get('change_type', ''),
+        coord=api_row.get('coord', ''),
+        severity=api_row.get('severity', ''),
+        confirmed=api_row.get('confirmed') == 'true',
+        source=api_row.get('source', ''),
+        analysis_scope=api_row.get('analysis_scope', 'api'),
+        analysis_status='not_analyzed',
+        direct_callers=0,
+        is_reachable=False,
+        reachable_note='',
+        business_reach_depth=0,
+        dependency_chain_coords=[],
+        call_paths=[],
+        evidence_paths=[],
+        reason_code='',
+        verification_commands=[],
+        hops=[],
+        confidence_score=1.0,
+        critical_nodes_hit=[],
+        match_provenance='',
+        match_tier=-1,
+    )
+    _step5_debug(
+        'trace_api_start',
+        'starting trace for api',
+        api_name=api_name,
+        api_signature=result.api_signature,
+        symbol_kind=result.symbol_kind,
+        change_type=result.change_type,
+        coord=result.coord,
+        max_total_cost=max_total_cost,
+        needs_bridge=needs_bridge,
+        has_dependency_source_mapping=has_dependency_source_mapping,
+        allow_degraded=allow_degraded,
+    )
+
+    # 行为变更：即使找到调用链也需运行时验证
+    if result.change_type == 'BEHAVIOR_CHANGED':
+        # 先尝试追踪看是否存在调用链
+        # 如果找到 reachable 路径，说明存在真实影响（但仍需运行时验证）
+        # 如果未找到，说明"目前代码未使用"或"需要补充依赖源码映射"
+        pass  # 继续追踪，保留后续的路径分析能力
+
+    # 类级fallback：不追踪
+    if result.analysis_scope == 'class_usage':
+        result.analysis_status = 'not_analyzed'
+        result.reason_code = 'CLASS_USAGE_ONLY'
+        result.reachable_note = '类级候选只能证明类型使用，无法确认具体API影响'
+        result.verification_commands = [
+            f"审查 {api_row.get('matched_class')} 的具体使用场景"
+        ]
+        _debug_trace_result('trace_api_result', result)
+        return result
+
+    if not get_symbol_kind(api_row):
+        result.analysis_status = 'not_analyzed'
+        result.reason_code = 'MISSING_SYMBOL_KIND'
+        result.reachable_note = 'Step 5 需要 symbol_kind 才能判断当前变更是方法、字段、类还是构造器'
+        result.verification_commands = [
+            '回到 Step 4 重新生成包含 symbol_kind 的变更 API 清单',
+            '确认 all_changed_apis.csv 每一行都明确标注 symbol_kind',
+        ]
+        _debug_trace_result('trace_api_result', result)
+        return result
+
+    if method_api_requires_signature(api_row) and not has_precise_api_signature(api_row):
+        result.analysis_status = 'not_analyzed'
+        result.reason_code = 'MISSING_API_SIGNATURE'
+        result.reachable_note = '方法级调用链分析要求精确参数签名；当前输入缺少 api_signature，无法区分重载方法'
+        result.verification_commands = [
+            '回到 Step 4 重新生成包含 api_signature 的变更 API 清单',
+            '确认变更方法的参数类型已被精确提取',
+        ]
+        _debug_trace_result('trace_api_result', result)
+        return result
+
+    # 构建目标键
+    target_key_groups = build_api_target_key_groups(api_row, graph=graph, type_metadata=type_metadata)
+    target_keys = flatten_key_groups(target_key_groups)
+    if not target_keys:
+        result.analysis_status = 'not_analyzed'
+        result.reason_code = 'NO_TARGET_KEYS'
+        result.reachable_note = '无法从输入提取可追踪目标'
+        _debug_trace_result('trace_api_result', result)
+        return result
+    _step5_debug(
+        'target_key_groups',
+        'built target key groups for api',
+        api_name=api_name,
+        api_signature=result.api_signature,
+        target_key_groups=target_key_groups,
+        flattened_target_keys=target_keys,
+    )
+
+    # BFS反向追踪（置信度加权）
+    queue = deque()
+    visited = {}  # (symbol_id, provenance_family) -> best(cost, -confidence)
+
+    trace_cache = ensure_trace_cache(trace_cache)
+    reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+
+    target_match_groups = select_matching_key_groups(target_key_groups, reverse_edges)
+    _step5_debug(
+        'target_match_groups',
+        'selected target match groups from reverse edges',
+        api_name=api_name,
+        api_signature=result.api_signature,
+        target_match_groups=target_match_groups,
+    )
+    target_match_groups, target_overload_block = filter_target_match_groups_for_overload_safety(
+        api_row,
+        target_match_groups,
+        graph,
+        type_metadata=type_metadata,
+        trace_cache=trace_cache,
+    )
+    _step5_debug(
+        'target_match_groups_filtered',
+        'applied overload safety filtering to target match groups',
+        api_name=api_name,
+        api_signature=result.api_signature,
+        target_match_groups=target_match_groups,
+        target_overload_block=target_overload_block,
+    )
+    if target_overload_block:
+        _step5_debug(
+            'overload_target_block',
+            'target api blocked because only unsigned matches survived',
+            api_name=api_name,
+            api_signature=result.api_signature,
+            target_match_groups=target_match_groups,
+            overload_info=target_overload_block,
+        )
+        _step5_debug_break(
+            'overload_target_block',
+            api_name=api_name,
+            api_signature=result.api_signature,
+            target_match_groups=target_match_groups,
+            overload_info=target_overload_block,
+        )
+        blocked = build_overload_ambiguous_result(result, target_overload_block)
+        _debug_trace_result('trace_api_result', blocked, overload_info=target_overload_block)
+        return blocked
+
+    for matched_group in target_match_groups:
+        for key in matched_group['matched_keys']:
+            queue.append({
+                'key': key,
+                'path': [],
+                'cost': 0,
+                'confidence': apply_provenance_confidence_modifier(1.0, matched_group['provenance']),
+                'depth': 0,
+                'provenance': matched_group['provenance'],
+                'provenance_family': matched_group['provenance_family'],
+                'match_tier': matched_group['tier_index'],
+            })
+    _step5_debug(
+        'trace_frontier_seed',
+        'seeded bfs frontier from target matches',
+        api_name=api_name,
+        seed_count=len(queue),
+        seed_groups=target_match_groups,
+    )
+    reachable_candidates = []
+    uncertain_candidates = []
+    not_analyzed_candidates = []
+
+    while queue:
+        frontier = queue.popleft()
+        current_key = frontier['key']
+        current_path = frontier['path']
+        current_cost = frontier['cost']
+        current_confidence = frontier['confidence']
+        current_depth = frontier['depth']
+        _step5_debug(
+            'trace_frontier_pop',
+            'processing frontier item',
+            api_name=api_name,
+            current_key=current_key,
+            current_cost=current_cost,
+            current_confidence=current_confidence,
+            current_depth=current_depth,
+            provenance=frontier.get('provenance', ''),
+        )
+
+        # 查询反向索引
+        incoming_edges = sorted(reverse_edges.get(current_key, []), key=stable_edge_sort_key)
+
+        if not incoming_edges:
+            # 链路终点
+            if current_depth > 0:
+                not_analyzed_candidates.append({
+                    'path': current_path,
+                    'reason': 'NO_CALLERS',
+                    'cost': current_cost,
+                    'confidence': current_confidence
+                })
+                _step5_debug(
+                    'trace_no_callers',
+                    'frontier key has no incoming callers',
+                    api_name=api_name,
+                    current_key=current_key,
+                    current_depth=current_depth,
+                )
+            continue
+
+        # 处理每条边
+        for edge in incoming_edges:
+            # 过滤test方法
+            method_def = methods_by_id.get(edge.caller_symbol_id)
+            if not method_def or method_def.is_test:
+                continue
+
+            # 关键修复：加权去重策略
+            # 只保留 cost 更低的路径（cost 越低越好）
+            # 计算新代价和置信度
+            edge_cost = calculate_depth_cost(edge.confidence)
+            new_cost = current_cost + edge_cost
+            new_confidence = calculate_confidence_decay(current_confidence, edge.confidence)
+            new_depth = current_depth + 1
+
+            visited_key = (method_def.symbol_id, frontier.get('provenance_family', 'exact'))
+            path_score = (new_cost, -new_confidence)
+            existing_score = visited.get(visited_key)
+            if existing_score is not None and path_score >= existing_score:
+                _step5_debug(
+                    'trace_pruned',
+                    'skipped path because an equal or better path already exists',
+                    api_name=api_name,
+                    current_key=current_key,
+                    caller=method_def.qualified_key,
+                    existing_score=existing_score,
+                    candidate_score=path_score,
+                )
+                continue  # 已有更优路径，跳过
+            visited[visited_key] = path_score
+
+            # 必须记录“到达该节点后的总代价”，否则后续更优路径会被错误剪枝。
+            # 这里同时保留 provenance_family，避免 exact / polymorphic / fallback 互相误剪枝。
+
+            # 检查关键节点
+            critical_node = None
+            if is_system_code_touched(method_def, type_metadata):
+                critical_node = {
+                    'type': 'system_code_touched',
+                    'method': method_def.qualified_key,
+                    'file': method_def.file,
+                    'line': method_def.line
+                }
+            elif is_framework_boundary(method_def, type_metadata):
+                critical_node = {
+                    'type': 'framework_boundary',
+                    'method': method_def.qualified_key,
+                    'reason': '动态代理或框架注入'
+                }
+
+            # 判断是否停止
+            should_stop, stop_reason = should_stop_tracing(
+                new_cost,
+                max_total_cost,
+                new_confidence,
+                critical_node,
+                edge.confidence,
+            )
+
+            # 构建新路径
+            new_path = current_path + [edge]
+
+            # 分类处理
+            if critical_node and critical_node['type'] == 'system_code_touched':
+                # 成功触达系统代码
+                reachable_candidates.append({
+                    'path': new_path,
+                    'entry_point': critical_node,
+                    'cost': new_cost,
+                    'confidence': new_confidence,
+                    'depth': new_depth,
+                    'provenance': frontier.get('provenance', ''),
+                    'match_tier': frontier.get('match_tier', -1),
+                })
+                _step5_debug(
+                    'trace_reachable_candidate',
+                    'candidate path reached system code',
+                    api_name=api_name,
+                    caller=method_def.qualified_key,
+                    current_key=current_key,
+                    new_cost=new_cost,
+                    new_depth=new_depth,
+                )
+                continue
+
+            if critical_node and critical_node['type'] == 'framework_boundary':
+                # 框架边界，无法继续
+                not_analyzed_candidates.append({
+                    'path': new_path,
+                    'boundary': critical_node,
+                    'reason': 'FRAMEWORK_BOUNDARY',
+                    'cost': new_cost,
+                    'confidence': new_confidence,
+                    'provenance': frontier.get('provenance', ''),
+                    'match_tier': frontier.get('match_tier', -1),
+                })
+                _step5_debug(
+                    'trace_framework_boundary',
+                    'candidate path stopped at framework boundary',
+                    api_name=api_name,
+                    caller=method_def.qualified_key,
+                    current_key=current_key,
+                    new_cost=new_cost,
+                )
+                continue
+
+            if should_stop:
+                # 达到停止条件
+                if stop_reason in {'DEPTH_LIMIT_REACHED', 'LOW_CONFIDENCE_EDGE'}:
+                    uncertain_candidates.append({
+                        'path': new_path,
+                        'reason': stop_reason,
+                        'cost': new_cost,
+                        'confidence': new_confidence,
+                        'depth': new_depth,
+                        'provenance': frontier.get('provenance', ''),
+                        'match_tier': frontier.get('match_tier', -1),
+                    })
+                elif stop_reason == 'CONFIDENCE_DECAYED':
+                    uncertain_candidates.append({
+                        'path': new_path,
+                        'reason': 'CONFIDENCE_DECAYED',
+                        'cost': new_cost,
+                        'confidence': new_confidence,
+                        'depth': new_depth,
+                        'provenance': frontier.get('provenance', ''),
+                        'match_tier': frontier.get('match_tier', -1),
+                    })
+                _step5_debug(
+                    'trace_stop_condition',
+                    'candidate path stopped by tracing policy',
+                    api_name=api_name,
+                    caller=method_def.qualified_key,
+                    current_key=current_key,
+                    stop_reason=stop_reason,
+                    new_cost=new_cost,
+                    new_depth=new_depth,
+                    new_confidence=new_confidence,
+                )
+                continue
+
+            # 继续追踪
+            matched_lookup_groups, method_overload_block = get_cached_method_lookup_resolution(
+                method_def,
+                type_metadata,
+                graph,
+                trace_cache=trace_cache,
+            )
+            if method_overload_block:
+                _step5_debug(
+                    'trace_overload_intermediate',
+                    'trace stopped at intermediate overloaded method',
+                    current_key=current_key,
+                    method=method_def.qualified_key,
+                    overload_info=method_overload_block,
+                    path_length=len(new_path),
+                )
+                _step5_debug_break(
+                    'trace_overload_intermediate',
+                    current_key=current_key,
+                    method=method_def.qualified_key,
+                    overload_info=method_overload_block,
+                    path_length=len(new_path),
+                )
+                not_analyzed_candidates.append({
+                    'path': new_path,
+                    'reason': 'OVERLOAD_AMBIGUOUS_INTERMEDIATE',
+                    'boundary': {
+                        'method': method_def.qualified_key,
+                        'reason': build_intermediate_overload_reason(method_def, method_overload_block),
+                    },
+                    'provenance': frontier.get('provenance', ''),
+                    'match_tier': frontier.get('match_tier', -1),
+                    'verification_commands': [
+                        '补全该中间方法调用点的参数类型推断，确保能命中精确签名',
+                        '若确有多个 overload，请人工复核当前调用链是否串到了 sibling overload',
+                    ],
+                })
+                continue
+            if method_def.owner_type == 'business':
+                # 业务代码：低置信度边不再建图时丢弃，而是在 tracer 中保守停止并归入 uncertain。
+                if edge.confidence in ('high', 'medium'):
+                    for matched_group in matched_lookup_groups:
+                        merged_provenance = merge_match_provenance(
+                            frontier.get('provenance', ''),
+                            matched_group['provenance'],
+                        )
+                        for next_key in matched_group['matched_keys']:
+                            queue.append({
+                                'key': next_key,
+                                'path': new_path,
+                                'cost': new_cost,
+                                'confidence': apply_provenance_confidence_modifier(
+                                    new_confidence,
+                                    matched_group['provenance'],
+                                ),
+                                'depth': new_depth,
+                                'provenance': merged_provenance,
+                                'provenance_family': merged_provenance_family(
+                                    frontier.get('provenance_family', 'exact'),
+                                    matched_group['provenance_family'],
+                                ),
+                                'match_tier': max(frontier.get('match_tier', -1), matched_group['tier_index']),
+                            })
+                    _step5_debug(
+                        'trace_expand',
+                        'expanded frontier through business caller',
+                        api_name=api_name,
+                        caller=method_def.qualified_key,
+                        current_key=current_key,
+                        matched_lookup_groups=matched_lookup_groups,
+                        queue_size=len(queue),
+                    )
+                else:
+                    uncertain_candidates.append({
+                        'path': new_path,
+                        'reason': 'CONFIDENCE_DECAYED',
+                        'cost': new_cost,
+                        'confidence': new_confidence,
+                        'depth': new_depth,
+                        'provenance': frontier.get('provenance', ''),
+                        'match_tier': frontier.get('match_tier', -1),
+                    })
+                    _step5_debug(
+                        'trace_decay_stop',
+                        'business edge downgraded to uncertain because confidence is too low',
+                        api_name=api_name,
+                        caller=method_def.qualified_key,
+                        current_key=current_key,
+                        edge_confidence=edge.confidence,
+                    )
+            else:
+                # 依赖包代码：继续追踪
+                for matched_group in matched_lookup_groups:
+                    merged_provenance = merge_match_provenance(
+                        frontier.get('provenance', ''),
+                        matched_group['provenance'],
+                    )
+                    for next_key in matched_group['matched_keys']:
+                        queue.append({
+                            'key': next_key,
+                            'path': new_path,
+                            'cost': new_cost,
+                            'confidence': apply_provenance_confidence_modifier(
+                                new_confidence,
+                                matched_group['provenance'],
+                            ),
+                            'depth': new_depth,
+                            'provenance': merged_provenance,
+                            'provenance_family': merged_provenance_family(
+                                frontier.get('provenance_family', 'exact'),
+                                matched_group['provenance_family'],
+                            ),
+                            'match_tier': max(frontier.get('match_tier', -1), matched_group['tier_index']),
+                        })
+                _step5_debug(
+                    'trace_expand',
+                    'expanded frontier through dependency caller',
+                    api_name=api_name,
+                    caller=method_def.qualified_key,
+                    current_key=current_key,
+                    matched_lookup_groups=matched_lookup_groups,
+                    queue_size=len(queue),
+                )
+
+    # 选择最优结果
+    if reachable_candidates:
+        best = select_best_candidate(reachable_candidates)
+        # 行为变更：即使找到调用链也需运行时验证
+        if result.change_type == 'BEHAVIOR_CHANGED':
+            safe_best, unsafe_best = select_behavior_changed_candidate(api_row, reachable_candidates)
+            if unsafe_best is not None:
+                built = build_behavior_changed_fallback_simple_result(result, unsafe_best, graph)
+                _debug_trace_result('trace_api_result', built, candidate_counts={
+                    'reachable': len(reachable_candidates),
+                    'uncertain': len(uncertain_candidates),
+                    'not_analyzed': len(not_analyzed_candidates),
+                })
+                return built
+            built = build_behavior_changed_result(result, safe_best or best, graph)
+            _debug_trace_result('trace_api_result', built, candidate_counts={
+                'reachable': len(reachable_candidates),
+                'uncertain': len(uncertain_candidates),
+                'not_analyzed': len(not_analyzed_candidates),
+            })
+            return built
+        safe_best, unsafe_best, unsafe_reason = select_confirmable_reachable_candidate(result, reachable_candidates)
+        if unsafe_best is not None:
+            if unsafe_reason == 'INTERNAL_ONLY_DIRECT_CONSUMER':
+                built = build_internal_only_direct_consumer_result(result, unsafe_best, graph)
+            else:
+                built = build_fallback_simple_unconfirmed_result(result, unsafe_best, graph)
+            _debug_trace_result('trace_api_result', built, candidate_counts={
+                'reachable': len(reachable_candidates),
+                'uncertain': len(uncertain_candidates),
+                'not_analyzed': len(not_analyzed_candidates),
+            })
+            return built
+        built = build_reachable_result(result, safe_best or best, graph)
+        _debug_trace_result('trace_api_result', built, candidate_counts={
+            'reachable': len(reachable_candidates),
+            'uncertain': len(uncertain_candidates),
+            'not_analyzed': len(not_analyzed_candidates),
+        })
+        return built
+
+    if uncertain_candidates:
+        if needs_bridge and (not has_dependency_source_mapping) and allow_degraded:
+            built = build_missing_dependency_source_mapping_result(result)
+            _debug_trace_result('trace_api_result', built, candidate_counts={
+                'reachable': len(reachable_candidates),
+                'uncertain': len(uncertain_candidates),
+                'not_analyzed': len(not_analyzed_candidates),
+            })
+            return built
+        best = select_best_candidate(uncertain_candidates)
+        built = build_uncertain_result(result, best)
+        _debug_trace_result('trace_api_result', built, candidate_counts={
+            'reachable': len(reachable_candidates),
+            'uncertain': len(uncertain_candidates),
+            'not_analyzed': len(not_analyzed_candidates),
+        })
+        return built
+
+    if not_analyzed_candidates:
+        best = select_best_candidate(not_analyzed_candidates)
+        built = build_not_analyzed_result(result, best)
+        _debug_trace_result('trace_api_result', built, candidate_counts={
+            'reachable': len(reachable_candidates),
+            'uncertain': len(uncertain_candidates),
+            'not_analyzed': len(not_analyzed_candidates),
+        })
+        return built
+
+    # 未找到任何路径
+    # 【修复】改进四态分类语义：将 not_reachable 改为更准确的 not_found_in_static_analysis
+    # 原因：静态分析未找到路径不等于"确定未影响"，可能是：
+    # 1. 反射调用/动态代理/配置文件引用
+    # 2. 测试代码或非扫描目录中的引用
+    # 3. 运行时动态加载的代码
+    if needs_bridge and (not has_dependency_source_mapping) and allow_degraded:
+        built = build_missing_dependency_source_mapping_result(result)
+        _debug_trace_result('trace_api_result', built)
+        return built
+
+    if needs_bridge and (not has_dependency_source_mapping) and not allow_degraded:
+        # 需要依赖源码映射但不允许降级 → 不应该走到这里（应该在前面就报错）
+        # 如果走到了这里，说明图搜索空间不足，而非映射问题
+        result.analysis_status = 'not_analyzed'
+        result.reason_code = 'ANALYSIS_INCOMPLETE'
+        result.reachable_note = '分析不完整，可能需要补充依赖源码映射或调整分析参数'
+        result.verification_commands = [
+            '检查是否需要补充依赖源码映射',
+            '或调整 max_depth 参数重新分析'
+        ]
+        _debug_trace_result('trace_api_result', result)
+        return result
+
+    graph_completeness = assess_graph_completeness(graph_stats)
+    if graph_completeness['incomplete']:
+        built = build_analysis_incomplete_result(result, graph_completeness)
+        _debug_trace_result('trace_api_result', built, graph_completeness=graph_completeness)
+        return built
+
+    if result.symbol_kind in CALL_GRAPH_LIMITED_SYMBOL_KINDS:
+        built = build_call_graph_limited_symbol_result(result)
+        _debug_trace_result('trace_api_result', built)
+        return built
+
+    # 只有当不需要依赖源码映射，且搜索空间完整时，才输出 not_found_in_static_analysis
+    # 注意：这不代表"确定未影响"，只表示"静态分析未找到"
+    result.analysis_status = 'not_found_in_static_analysis'
+    result.reason_code = 'NO_STATIC_PATH'
+    result.reachable_note = (
+        '静态分析未找到调用路径。这不代表确定未影响系统。'
+        '可能原因：反射调用、动态代理、配置文件引用、测试代码引用等。'
+    )
+    result.verification_commands = [
+        '搜索项目中是否包含该API名称的字符串引用',
+        '检查是否有反射调用: Class.forName/Method.invoke',
+        '检查配置文件: XML/YAML/Properties',
+        '运行全量测试验证是否有运行时影响'
+    ]
+    _debug_trace_result('trace_api_result', result, candidate_counts={
+        'reachable': len(reachable_candidates),
+        'uncertain': len(uncertain_candidates),
+        'not_analyzed': len(not_analyzed_candidates),
+    })
+    return result
+
+
+def append_unique(keys, value):
+    value = (value or '').strip()
+    if not value or value in keys:
+        return
+    keys.append(value)
+
+
+def extend_unique(keys, values):
+    for value in values or []:
+        append_unique(keys, value)
+
+
+PROVENANCE_RANK = {
+    'exact_signature': 0,
+    'compatible_signature': 0,
+    'exact_name': 1,
+    'polymorphic': 2,
+    'fallback_simple': 3,
+    '': 99,
+}
+
+PROVENANCE_FAMILY_RANK = {
+    'exact': 0,
+    'polymorphic': 1,
+    'fallback_simple': 2,
+    '': 99,
+}
+
+PROVENANCE_FAMILY = {
+    'exact_signature': 'exact',
+    'exact_name': 'exact',
+    'polymorphic': 'polymorphic',
+    'fallback_simple': 'fallback_simple',
+}
+
+
+def provenance_rank(provenance):
+    return PROVENANCE_RANK.get((provenance or '').strip(), 99)
+
+
+def provenance_family_rank(family):
+    return PROVENANCE_FAMILY_RANK.get((family or '').strip(), 99)
+
+
+def merge_match_provenance(current, new_value):
+    current = (current or '').strip()
+    new_value = (new_value or '').strip()
+    if not current:
+        return new_value
+    if not new_value:
+        return current
+    return current if provenance_rank(current) >= provenance_rank(new_value) else new_value
+
+
+def merged_provenance_family(current_family, new_family):
+    current_family = (current_family or '').strip()
+    new_family = (new_family or '').strip()
+    if not current_family:
+        return new_family
+    if not new_family:
+        return current_family
+    return (
+        current_family
+        if provenance_family_rank(current_family) >= provenance_family_rank(new_family)
+        else new_family
+    )
+
+
+def apply_provenance_confidence_modifier(confidence, provenance):
+    modifiers = {
+        'exact_signature': 1.0,
+        'compatible_signature': 1.0,
+        'exact_name': 0.98,
+        'polymorphic': 0.94,
+        'fallback_simple': 0.85,
+    }
+    return confidence * modifiers.get((provenance or '').strip(), 1.0)
+
+
+def append_key_group(groups, provenance, keys):
+    key_list = []
+    extend_unique(key_list, keys)
+    if not key_list:
+        return
+    groups.append({
+        'tier_index': len(groups),
+        'provenance': provenance,
+        'provenance_family': PROVENANCE_FAMILY.get(provenance, ''),
+        'keys': key_list,
+    })
+
+
+def select_matching_key_groups(key_groups, reverse_edges):
+    matched_groups = []
+    for group in key_groups or []:
+        matched_keys = []
+        for key in group.get('keys', []):
+            if reverse_edges.get(key):
+                append_unique(matched_keys, key)
+        if matched_keys:
+            matched_groups.append({
+                'tier_index': group.get('tier_index', -1),
+                'provenance': group.get('provenance', ''),
+                'provenance_family': group.get('provenance_family', ''),
+                'matched_keys': matched_keys,
+            })
+    return matched_groups
+
+
+def ensure_trace_cache(trace_cache=None):
+    trace_cache = trace_cache if trace_cache is not None else {}
+    trace_cache.setdefault('overload_signatures', {})
+    trace_cache.setdefault('method_lookup_resolution', {})
+    trace_cache.setdefault('overload_signature_index', None)
+    trace_cache.setdefault('overload_signature_index_owner', None)
+    return trace_cache
+
+
+def get_cached_overload_signatures(api_name, reverse_edges, trace_cache=None):
+    api_name = (api_name or '').strip()
+    if not api_name:
+        return set()
+    trace_cache = ensure_trace_cache(trace_cache)
+    overload_cache = trace_cache['overload_signatures']
+    reverse_edges_owner = id(reverse_edges)
+    if (
+        trace_cache.get('overload_signature_index') is None
+        or trace_cache.get('overload_signature_index_owner') != reverse_edges_owner
+    ):
+        trace_cache['overload_signature_index'] = build_overload_signature_index(reverse_edges)
+        trace_cache['overload_signature_index_owner'] = reverse_edges_owner
+    if api_name not in overload_cache:
+        overload_cache[api_name] = set(
+            (trace_cache.get('overload_signature_index') or {}).get(api_name, set())
+        )
+    return overload_cache[api_name]
+
+
+def flatten_key_groups(key_groups):
+    keys = []
+    for group in key_groups or []:
+        extend_unique(keys, group.get('keys', []))
+    return keys
+
+
+def stable_edge_sort_key(edge):
+    confidence_rank = {'high': 0, 'medium': 1, 'low': 2}.get(getattr(edge, 'confidence', ''), 9)
+    owner_rank = 0 if getattr(edge, 'owner_type', '') == 'business' else 1
+    return (
+        confidence_rank,
+        owner_rank,
+        str(getattr(edge, 'caller_qualified_key', '') or ''),
+        str(getattr(edge, 'callee_key', '') or ''),
+        str(getattr(edge, 'file', '') or ''),
+        int(getattr(edge, 'line', 0) or 0),
+        str(getattr(edge, 'owner_coord', '') or ''),
+        str(getattr(edge, 'module', '') or ''),
+    )
+
+
+def stable_candidate_tiebreak_key(candidate):
+    path = candidate.get('path') or []
+    path_fingerprint = tuple(
+        (
+            str(getattr(edge, 'caller_qualified_key', '') or ''),
+            str(getattr(edge, 'callee_key', '') or ''),
+            str(getattr(edge, 'file', '') or ''),
+            int(getattr(edge, 'line', 0) or 0),
+        )
+        for edge in path
+    )
+    boundary_reason = str(((candidate.get('boundary') or {}).get('reason')) or '')
+    return (
+        str(candidate.get('reason', '') or ''),
+        str(candidate.get('final_target', '') or ''),
+        str(candidate.get('provenance', '') or ''),
+        str(candidate.get('provenance_family', '') or ''),
+        path_fingerprint,
+        boundary_reason,
+    )
+
+
+def select_best_candidate(candidates):
+    return max(
+        candidates,
+        key=lambda candidate: (
+            candidate.get('confidence', 0.0),
+            -provenance_rank(candidate.get('provenance', '')),
+            -candidate.get('cost', 0),
+            -candidate.get('depth', 0),
+            stable_candidate_tiebreak_key(candidate),
+        ),
+    )
+
+
+def has_external_direct_consumer(target_coord, candidate):
+    path_edges = candidate.get('path') or []
+    if not path_edges:
+        return False
+    direct_edge = path_edges[0]
+    owner_type = getattr(direct_edge, 'owner_type', '')
+    owner_coord = getattr(direct_edge, 'owner_coord', '')
+    if owner_type == 'business' or owner_coord == 'BUSINESS':
+        return True
+    target_coord = (target_coord or '').strip()
+    owner_coord = (owner_coord or '').strip()
+    return bool(owner_coord) and bool(target_coord) and owner_coord != target_coord
+
+
+def select_confirmable_reachable_candidate(result, candidates):
+    safe_candidates = []
+    fallback_only_candidates = []
+    internal_only_candidates = []
+    internal_only_precise_candidates = []
+
+    for candidate in candidates or []:
+        provenance = (candidate.get('provenance') or '').strip()
+        if provenance == 'fallback_simple':
+            fallback_only_candidates.append(candidate)
+            continue
+        if not has_external_direct_consumer(result.coord, candidate):
+            if provenance in {'exact_signature', 'compatible_signature', 'polymorphic'}:
+                internal_only_precise_candidates.append(candidate)
+                continue
+            internal_only_candidates.append(candidate)
+            continue
+        safe_candidates.append(candidate)
+
+    if safe_candidates:
+        return select_best_candidate(safe_candidates), None, ''
+    if internal_only_precise_candidates:
+        return select_best_candidate(internal_only_precise_candidates), None, ''
+    if internal_only_candidates:
+        return None, select_best_candidate(internal_only_candidates), 'INTERNAL_ONLY_DIRECT_CONSUMER'
+    if fallback_only_candidates:
+        return None, select_best_candidate(fallback_only_candidates), 'FALLBACK_SIMPLE_PATH_UNCONFIRMED'
+    return None, None, ''
+
+
+def extract_signature_suffix_from_key(key):
+    key = (key or '').strip()
+    if '(' in key and key.endswith(')'):
+        return key[key.index('('):]
+    return ''
+
+
+PRIMITIVE_TYPES = {
+    'byte', 'short', 'int', 'long', 'float', 'double', 'boolean', 'char',
+}
+
+
+def strip_generic_content(type_name):
+    type_name = (type_name or '').strip()
+    if not type_name:
+        return ''
+
+    chars = []
+    generic_depth = 0
+    for ch in type_name:
+        if ch == '<':
+            generic_depth += 1
+            continue
+        if ch == '>':
+            if generic_depth <= 0:
+                return ''
+            generic_depth -= 1
+            continue
+        if generic_depth == 0:
+            chars.append(ch)
+
+    if generic_depth != 0:
+        return ''
+
+    return ''.join(chars).strip()
+
+
+def normalize_type_reference(type_name, keep_fqcn=True):
+    type_name = (type_name or '').strip()
+    if not type_name:
+        return ''
+    type_name = type_name.replace('...', '[]')
+    type_name = strip_generic_content(type_name)
+    if not type_name or type_name == '?':
+        return ''
+    if not keep_fqcn and '.' in type_name:
+        type_name = type_name.rsplit('.', 1)[-1]
+    return type_name
+
+
+def split_array_suffix(type_name):
+    type_name = (type_name or '').strip()
+    dimensions = 0
+    while type_name.endswith('[]'):
+        dimensions += 1
+        type_name = type_name[:-2].strip()
+    return type_name, dimensions
+
+
+def is_probable_type_reference(type_name):
+    normalized = normalize_type_reference(type_name, keep_fqcn=True)
+    if not normalized:
+        return False
+    base_name, _ = split_array_suffix(normalized)
+    if base_name in PRIMITIVE_TYPES:
+        return True
+    simple_name = base_name.rsplit('.', 1)[-1]
+    return bool(simple_name and (simple_name[0].isupper() or simple_name == '?'))
+
+
+def is_valid_signature_suffix(signature):
+    params = split_signature_params(signature)
+    if params is None:
+        return False
+    return all(is_probable_type_reference(param) for param in params)
+
+
+def collect_overload_signatures(api_name, reverse_edges):
+    return set(build_overload_signature_index(reverse_edges).get((api_name or '').strip(), set()))
+
+
+def build_overload_signature_index(reverse_edges):
+    index = {}
+    for key in (reverse_edges or {}).keys():
+        if not isinstance(key, str):
+            continue
+        if '(' not in key or not key.endswith(')'):
+            continue
+        base_key = key.split('(', 1)[0].strip()
+        if not base_key:
+            continue
+        signature = extract_signature_suffix_from_key(key)
+        if signature and is_valid_signature_suffix(signature):
+            index.setdefault(base_key, set()).add(signature)
+    return index
+
+
+def resolve_type_candidates(type_name, type_metadata):
+    normalized = normalize_type_reference(type_name, keep_fqcn=True)
+    if not normalized:
+        return set()
+
+    base_name, dimensions = split_array_suffix(normalized)
+    suffix = '[]' * dimensions
+    if base_name in PRIMITIVE_TYPES:
+        return {base_name + suffix}
+
+    resolved = set()
+    if base_name in (type_metadata or {}):
+        resolved.add(base_name + suffix)
+
+    simple_name = base_name.rsplit('.', 1)[-1]
+    for known_type in (type_metadata or {}).keys():
+        if known_type.rsplit('.', 1)[-1] == simple_name:
+            resolved.add(known_type + suffix)
+
+    if resolved:
+        return resolved
+    return {base_name + suffix}
+
+
+def collect_all_supertypes(type_name, type_metadata, visited=None):
+    type_name = (type_name or '').strip()
+    if not type_name:
+        return set()
+    if visited is None:
+        visited = set()
+    if type_name in visited:
+        return set()
+
+    visited.add(type_name)
+    supertypes = {type_name}
+    class_meta = (type_metadata or {}).get(type_name, {})
+    for parent in (class_meta.get('extends') or []) + (class_meta.get('implements') or []):
+        if not parent:
+            continue
+        supertypes.update(collect_all_supertypes(parent, type_metadata, visited))
+    return supertypes
+
+
+def is_candidate_param_compatible_with_target(candidate_type, target_type, type_metadata):
+    candidate_normalized = normalize_type_reference(candidate_type, keep_fqcn=True)
+    target_normalized = normalize_type_reference(target_type, keep_fqcn=True)
+    if not candidate_normalized or not target_normalized:
+        return False
+
+    candidate_base, candidate_dims = split_array_suffix(candidate_normalized)
+    target_base, target_dims = split_array_suffix(target_normalized)
+    if candidate_dims != target_dims:
+        return False
+
+    if candidate_base == target_base:
+        return True
+
+    candidate_simple = candidate_base.rsplit('.', 1)[-1]
+    target_simple = target_base.rsplit('.', 1)[-1]
+    if candidate_simple == target_simple:
+        return True
+
+    if target_simple == 'Object' and candidate_base not in PRIMITIVE_TYPES:
+        return True
+
+    if candidate_base in PRIMITIVE_TYPES or target_base in PRIMITIVE_TYPES:
+        return False
+
+    target_candidates = resolve_type_candidates(target_base, type_metadata)
+    candidate_candidates = resolve_type_candidates(candidate_base, type_metadata)
+    for candidate_name in candidate_candidates:
+        candidate_root, _ = split_array_suffix(candidate_name)
+        supertypes = collect_all_supertypes(candidate_root, type_metadata)
+        super_simple_names = {item.rsplit('.', 1)[-1] for item in supertypes}
+        for target_name in target_candidates:
+            target_root, _ = split_array_suffix(target_name)
+            if target_root in supertypes or target_root.rsplit('.', 1)[-1] in super_simple_names:
+                return True
+    return False
+
+
+def select_compatible_overload_signatures(target_signature, overload_signatures, type_metadata):
+    target_params = split_signature_params(target_signature)
+    if target_params is None:
+        return []
+
+    compatible = []
+    for signature in overload_signatures or []:
+        candidate_params = split_signature_params(signature)
+        if candidate_params is None or len(candidate_params) != len(target_params):
+            continue
+        if all(
+            is_candidate_param_compatible_with_target(candidate_type, target_type, type_metadata)
+            for candidate_type, target_type in zip(candidate_params, target_params)
+        ):
+            compatible.append(signature)
+    return compatible
+
+
+def collect_declared_method_signatures(api_name, graph):
+    signatures = set()
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    for method_def in methods_by_id.values():
+        if getattr(method_def, 'qualified_key', '') != api_name:
+            continue
+        for signature in build_method_signature_suffixes(method_def):
+            if signature:
+                signatures.add(signature)
+    return signatures
+
+
+def filter_target_match_groups_for_overload_safety(api_row, matched_groups, graph, type_metadata=None, trace_cache=None):
+    if not method_api_requires_signature(api_row) or not has_precise_api_signature(api_row):
+        return matched_groups, None
+
+    api_name = (api_row.get('api_name') or '').strip()
+    if not api_name:
+        return matched_groups, None
+
+    symbol_kind = get_symbol_kind(api_row)
+    direct_overload_block = None
+    target_signature = api_row.get('api_signature', '')
+    declared_signatures = collect_declared_method_signatures(api_name, graph)
+    has_exact_signature_match = any(
+        group.get('provenance') == 'exact_signature'
+        for group in (matched_groups or [])
+    )
+    allow_multiple_observed_compatible = False
+    if declared_signatures:
+        declared_compatible_signatures = select_compatible_overload_signatures(
+            target_signature,
+            declared_signatures,
+            type_metadata or {},
+        )
+        if len(declared_compatible_signatures) == 1:
+            allow_multiple_observed_compatible = True
+
+    overload_signatures = get_cached_overload_signatures(
+        api_name,
+        getattr(graph, 'reverse_edges', {}) or {},
+        trace_cache=trace_cache,
+    )
+    if (
+        symbol_kind == 'constructor'
+        and len(declared_signatures) > 1
+        and not has_exact_signature_match
+        and not overload_signatures
+    ):
+        return [], {
+            'api_name': api_name,
+            'api_signature': api_row.get('api_signature', ''),
+            'overload_signatures': sorted(declared_signatures),
+        }
+
+    if overload_signatures:
+        safe_groups = [
+            group for group in (matched_groups or [])
+            if group.get('provenance') == 'exact_signature'
+        ]
+        if safe_groups:
+            return safe_groups, None
+
+        compatible_signatures = select_compatible_overload_signatures(
+            target_signature,
+            overload_signatures,
+            type_metadata or {},
+        )
+        if len(compatible_signatures) == 1:
+            compatible_key = f"{api_name}{compatible_signatures[0]}"
+            if (getattr(graph, 'reverse_edges', {}) or {}).get(compatible_key):
+                return [
+                    {
+                        'tier_index': 0,
+                        'provenance': 'compatible_signature',
+                        'provenance_family': 'exact_signature',
+                        'matched_keys': [compatible_key],
+                    }
+                ], None
+
+        # Even if the graph only observed one overload signature, exact_name remains unsafe
+        # when that signature is not the requested target. This commonly happens for
+        # constructors where reverse_edges contains `Type.Type` plus a sibling overload like
+        # `Type.Type(String)`, but the removed target is `Type.Type(String, HttpStatus)`.
+        direct_overload_block = {
+            'api_name': api_name,
+            'api_signature': api_row.get('api_signature', ''),
+            'overload_signatures': sorted(overload_signatures),
+        }
+
+    resolved_groups, descendant_overload_block = resolve_target_matched_groups_for_overload_safety(
+        matched_groups,
+        target_signature,
+        graph,
+        type_metadata=type_metadata,
+        trace_cache=trace_cache,
+        allow_multiple_compatible=allow_multiple_observed_compatible,
+    )
+    if resolved_groups:
+        return resolved_groups, None
+    if descendant_overload_block:
+        return [], descendant_overload_block
+    if direct_overload_block:
+        return [], direct_overload_block
+    return matched_groups, None
+
+
+def build_overload_ambiguous_result(result, overload_info):
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.reason_code = 'OVERLOAD_AMBIGUOUS_TARGET'
+    overload_signatures = overload_info.get('overload_signatures') or []
+    overload_text = ', '.join(overload_signatures[:5])
+    result.reachable_note = (
+        '目标 API 存在重载，当前仅命中了无签名回退键，'
+        f'无法安全确认是否是目标签名 {overload_info.get("api_signature")}'
+        + (f'；已知重载：{overload_text}' if overload_text else '')
+    )
+    result.verification_commands = [
+        '优先补全/保留精确 api_signature，并确认调用点参数类型推断成功',
+        '若仍无法命中精确签名，请人工复核重载方法的真实调用点',
+    ]
+    return result
+
+
+def resolve_target_matched_groups_for_overload_safety(
+    matched_groups,
+    target_signature,
+    graph,
+    type_metadata=None,
+    trace_cache=None,
+    allow_multiple_compatible=False,
+):
+    reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    safe_groups = []
+    ambiguous_keys = []
+
+    for group in matched_groups or []:
+        resolved_keys = []
+        for key in group.get('matched_keys', []) or []:
+            signature = extract_signature_suffix_from_key(key)
+            if signature:
+                append_unique(resolved_keys, key)
+                continue
+
+            overload_signatures = get_cached_overload_signatures(
+                key,
+                reverse_edges,
+                trace_cache=trace_cache,
+            )
+            if not overload_signatures:
+                append_unique(resolved_keys, key)
+                continue
+
+            compatible_signatures = select_compatible_overload_signatures(
+                target_signature,
+                overload_signatures,
+                type_metadata or {},
+            )
+            if allow_multiple_compatible and compatible_signatures:
+                for compatible_signature in compatible_signatures:
+                    compatible_key = f"{key}{compatible_signature}"
+                    if reverse_edges.get(compatible_key):
+                        append_unique(resolved_keys, compatible_key)
+                if resolved_keys:
+                    continue
+            if len(compatible_signatures) == 1:
+                compatible_key = f"{key}{compatible_signatures[0]}"
+                if reverse_edges.get(compatible_key):
+                    append_unique(resolved_keys, compatible_key)
+                    continue
+
+            ambiguous_keys.append(
+                {
+                    'api_name': key,
+                    'overload_signatures': sorted(overload_signatures),
+                }
+            )
+
+        if resolved_keys:
+            safe_groups.append(
+                {
+                    'tier_index': group.get('tier_index', -1),
+                    'provenance': group.get('provenance', ''),
+                    'provenance_family': group.get('provenance_family', ''),
+                    'matched_keys': resolved_keys,
+                }
+            )
+
+    if safe_groups:
+        return safe_groups, None
+    if ambiguous_keys:
+        return [], {
+            'api_name': ambiguous_keys[0].get('api_name', ''),
+            'api_signature': target_signature,
+            'overload_signatures': ambiguous_keys[0].get('overload_signatures', []),
+        }
+    return [], None
+
+
+def signature_suffix_set_from_method(method_def):
+    return {
+        sig for sig in build_method_signature_suffixes(method_def)
+        if (sig or '').strip()
+    }
+
+
+def filter_matched_keys_by_signatures(matched_keys, allowed_signatures):
+    filtered = []
+    for key in matched_keys or []:
+        signature = extract_signature_suffix_from_key(key)
+        if signature and signature in allowed_signatures:
+            append_unique(filtered, key)
+    return filtered
+
+
+def filter_method_lookup_groups_for_overload_safety(method_def, matched_groups, graph, trace_cache=None):
+    allowed_signatures = signature_suffix_set_from_method(method_def)
+    if not allowed_signatures:
+        return matched_groups, None
+
+    reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    overload_signatures = get_cached_overload_signatures(
+        method_def.qualified_key,
+        reverse_edges,
+        trace_cache=trace_cache,
+    )
+    simple_overload_signatures = get_cached_overload_signatures(
+        method_def.simple_key,
+        reverse_edges,
+        trace_cache=trace_cache,
+    )
+    combined_overload_signatures = sorted(
+        set(overload_signatures or []).union(simple_overload_signatures or [])
+    )
+    if len(combined_overload_signatures) <= 1:
+        return matched_groups, None
+
+    safe_groups = []
+    for group in matched_groups or []:
+        filtered_keys = filter_matched_keys_by_signatures(
+            group.get('matched_keys', []),
+            allowed_signatures,
+        )
+        if filtered_keys:
+            safe_groups.append({
+                'tier_index': group.get('tier_index', -1),
+                'provenance': group.get('provenance', ''),
+                'provenance_family': group.get('provenance_family', ''),
+                'matched_keys': filtered_keys,
+            })
+
+    if safe_groups:
+        return safe_groups, None
+
+    overload_block = {
+        'method': method_def.qualified_key,
+        'expected_signatures': sorted(allowed_signatures),
+        'overload_signatures': combined_overload_signatures,
+    }
+    _step5_debug(
+        'overload_intermediate_block',
+        'intermediate method blocked because only unsigned matches survived',
+        method=method_def.qualified_key,
+        expected_signatures=sorted(allowed_signatures),
+        overload_signatures=combined_overload_signatures,
+        matched_groups=matched_groups,
+    )
+    _step5_debug_break(
+        'overload_intermediate_block',
+        method=method_def.qualified_key,
+        expected_signatures=sorted(allowed_signatures),
+        overload_signatures=combined_overload_signatures,
+        matched_groups=matched_groups,
+    )
+    return [], overload_block
+
+
+def build_intermediate_overload_reason(method_def, overload_info):
+    expected_text = ', '.join(overload_info.get('expected_signatures') or [])
+    overload_text = ', '.join(overload_info.get('overload_signatures') or [])
+    return (
+        f"中间方法 {method_def.qualified_key} 存在重载，当前只命中了无签名回退键；"
+        f"期望签名：{expected_text or 'unknown'}；"
+        f"已知重载：{overload_text or 'unknown'}"
+    )
+
+
+def get_cached_method_lookup_resolution(method_def, type_metadata, graph, trace_cache=None):
+    trace_cache = ensure_trace_cache(trace_cache)
+    cache_key = (
+        getattr(method_def, 'symbol_id', ''),
+        getattr(method_def, 'qualified_key', ''),
+        tuple(build_method_signature_suffixes(method_def)),
+    )
+    lookup_cache = trace_cache['method_lookup_resolution']
+    cached = lookup_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    lookup_key_groups = build_method_lookup_key_groups(method_def, type_metadata, graph=graph)
+    matched_lookup_groups = select_matching_key_groups(lookup_key_groups, getattr(graph, 'reverse_edges', {}) or {})
+    if not matched_lookup_groups:
+        _step5_debug(
+            'method_lookup_resolution',
+            'no lookup groups matched reverse edges',
+            method=method_def.qualified_key,
+            lookup_key_groups=lookup_key_groups,
+        )
+    resolved = filter_method_lookup_groups_for_overload_safety(
+        method_def,
+        matched_lookup_groups,
+        graph,
+        trace_cache=trace_cache,
+    )
+    lookup_cache[cache_key] = resolved
+    return resolved
+
+
+def assess_graph_completeness(graph_stats):
+    graph_stats = graph_stats or {}
+    reasons = []
+    verification = []
+
+    if graph_stats.get('truncated'):
+        truncation_reasons = graph_stats.get('truncation_reasons') or []
+        reason_text = '图构建被截断'
+        if truncation_reasons:
+            reason_text = f"{reason_text}（{', '.join(truncation_reasons)}）"
+        reasons.append(reason_text)
+        verification.append('提高 max_methods 或缩小分析范围后重跑 Step 5')
+
+    parser_fallback_reasons = critical_parser_fallback_reasons(graph_stats)
+    if parser_fallback_reasons:
+        parser_items = ', '.join(
+            f"{key}={value}" for key, value in sorted(parser_fallback_reasons.items())
+        )
+        reasons.append(f"部分源码使用降级解析器（{parser_items}）")
+        verification.append('优先修复 tree-sitter/语法兼容问题，减少 regex 降级文件')
+
+    edge_cap_hits = int(graph_stats.get('edge_cap_hits') or 0)
+    if edge_cap_hits > 0:
+        reasons.append(f"反向边索引命中过载保护（edge_cap_hits={edge_cap_hits}）")
+        verification.append('检查热点调用点，必要时提升边上限或拆分分析范围')
+
+    return {
+        'incomplete': bool(reasons),
+        'reasons': reasons,
+        'verification_commands': verification,
+    }
+
+
+def build_analysis_incomplete_result(result, graph_completeness):
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.reason_code = 'ANALYSIS_INCOMPLETE'
+    reasons = graph_completeness.get('reasons') or []
+    if reasons:
+        result.reachable_note = f"分析不完整：{'；'.join(reasons)}"
+    else:
+        result.reachable_note = '分析不完整，当前无法把静态未找到解释为未影响'
+    result.verification_commands = (
+        graph_completeness.get('verification_commands') or []
+    ) + [
+        '重新运行 Step 5 后，再判断是否属于 not_found_in_static_analysis'
+    ]
+    return result
+
+
+def build_call_graph_limited_symbol_result(result):
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.reason_code = 'CALL_GRAPH_LIMITATION_SYMBOL_KIND'
+    symbol_kind = (result.symbol_kind or 'unknown').strip() or 'unknown'
+    result.reachable_note = (
+        '当前 Step5 主要基于方法反向调用图；'
+        f'对 {symbol_kind} 符号的静态证明能力有限，'
+        '当前结果不能解释为静态未找到调用路径'
+    )
+    result.verification_commands = [
+        '结合类型引用、字段访问、构造调用等非方法证据继续复核',
+        '检查配置文件、注解元数据、反射调用或 SPI/回调注册',
+        '必要时补充更适合该符号类型的专项静态分析或人工抽查',
+    ]
+    return result
+
+
+def behavior_changed_requires_precise_match(api_row):
+    return (
+        (api_row.get('change_type') or '').strip() == 'BEHAVIOR_CHANGED'
+        and method_api_requires_signature(api_row)
+        and bool((api_row.get('api_name') or '').strip())
+        and has_precise_api_signature(api_row)
+    )
+
+
+def select_behavior_changed_candidate(api_row, candidates):
+    if not behavior_changed_requires_precise_match(api_row):
+        return select_best_candidate(candidates), None
+
+    strict_candidates = [
+        candidate for candidate in (candidates or [])
+        if candidate.get('provenance') != 'fallback_simple'
+    ]
+    if strict_candidates:
+        return select_best_candidate(strict_candidates), None
+
+    return None, select_best_candidate(candidates)
+
+
+def build_api_target_key_tiers(api_row):
+    tiers = []
+    api_name = api_row.get('api_name', '').strip()
+    matched_class = api_row.get('matched_class', '').strip()
+    api_simple = api_row.get('api_simple', '').strip()
+    api_signature = api_row.get('api_signature', '').strip()
+    symbol_kind = get_symbol_kind(api_row)
+    requires_signature = symbol_kind in {'method', 'constructor'}
+
+    if api_name:
+        if symbol_kind == 'class':
+            append_key_tier(tiers, [f"class:{api_name}"])
+        elif requires_signature:
+            if api_signature:
+                append_key_tier(tiers, [f"{api_name}{api_signature}"])
+                normalized_signature = normalize_signature_for_lookup(api_signature)
+                if normalized_signature and normalized_signature != api_signature:
+                    append_key_tier(tiers, [f"{api_name}{normalized_signature}"])
+            # 方法级追踪在起点上优先保留 FQCN，避免 method:{name} 过早跨类串链。
+            append_key_tier(tiers, [api_name])
+        else:
+            append_key_tier(tiers, [api_name])
+            if '.' in api_name:
+                class_part = api_name.rsplit('.', 1)[0]
+                append_key_tier(tiers, [f"class:{class_part}"])
+
+    if matched_class:
+        append_key_tier(tiers, [f"class:{matched_class}"])
+
+    if api_simple:
+        if requires_signature:
+            # 只有缺少 FQCN 时，才允许退化到 simple key。
+            if not api_name:
+                if api_signature:
+                    append_key_tier(tiers, [f"method:{api_simple}{api_signature}"])
+                    normalized_signature = normalize_signature_for_lookup(api_signature)
+                    if normalized_signature and normalized_signature != api_signature:
+                        append_key_tier(tiers, [f"method:{api_simple}{normalized_signature}"])
+                append_key_tier(tiers, [f"method:{api_simple}"])
+        else:
+            append_key_tier(tiers, [f"method:{api_simple}"])
+
+    return tiers
+
+
+def _extract_api_target_method_info(api_row):
+    api_name = (api_row.get('api_name') or '').strip()
+    if not api_name or '.' not in api_name:
+        return '', '', []
+
+    class_fqcn, method_name = api_name.rsplit('.', 1)
+    api_signature = (api_row.get('api_signature') or '').strip()
+    signature_suffixes = []
+    if api_signature:
+        append_unique(signature_suffixes, api_signature)
+        normalized_signature = normalize_signature_for_lookup(api_signature)
+        if normalized_signature and normalized_signature != api_signature:
+            append_unique(signature_suffixes, normalized_signature)
+    return class_fqcn, method_name, signature_suffixes
+
+
+def _class_declares_matching_method(class_fqcn, method_name, signature_suffixes, graph):
+    if graph is None:
+        return False
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    for method_def in methods_by_id.values():
+        if getattr(method_def, 'class_fqcn', '') != class_fqcn:
+            continue
+        if getattr(method_def, 'method_name', '') != method_name:
+            continue
+        if not signature_suffixes:
+            return True
+        declared_suffixes = build_method_signature_suffixes(method_def)
+        if not declared_suffixes:
+            return True
+        if any(sig in declared_suffixes for sig in signature_suffixes):
+            return True
+    return False
+
+
+def _append_method_lookup_values(keys_with_sig, keys_without_sig, class_fqcn, method_name, signature_suffixes):
+    append_unique(keys_without_sig, f"{class_fqcn}.{method_name}")
+    for sig in signature_suffixes or []:
+        append_unique(keys_with_sig, f"{class_fqcn}.{method_name}{sig}")
+
+
+def _collect_inherited_subclass_tiers(class_fqcn, method_name, signature_suffixes, type_metadata, graph, visited=None):
+    if visited is None:
+        visited = set()
+    if class_fqcn in visited:
+        return []
+    visited.add(class_fqcn)
+
+    class_meta = type_metadata.get(class_fqcn, {}) or {}
+    tiers = []
+    subclass_sig_keys = []
+    subclass_name_keys = []
+
+    for subclass in class_meta.get('subclasses', []) or []:
+        if _class_declares_matching_method(subclass, method_name, signature_suffixes, graph):
+            # 子类自行覆盖后，调用会落到子类实现而不是当前目标方法，停止沿这条分支下钻。
+            continue
+        _append_method_lookup_values(subclass_sig_keys, subclass_name_keys, subclass, method_name, signature_suffixes)
+        extend_tiers(
+            tiers,
+            _collect_inherited_subclass_tiers(
+                subclass,
+                method_name,
+                signature_suffixes,
+                type_metadata,
+                graph,
+                visited=visited,
+            ),
+        )
+
+    prepend = []
+    append_key_tier(prepend, subclass_sig_keys)
+    append_key_tier(prepend, subclass_name_keys)
+    prepend.extend(tiers)
+    return prepend
+
+
+def _collect_unambiguous_interface_dispatch_tiers(class_fqcn, method_name, signature_suffixes, type_metadata):
+    tiers = []
+    sig_keys = []
+    name_keys = []
+
+    interface_candidates = []
+    seen = set()
+
+    def visit_interfaces(target_class):
+        if target_class in seen:
+            return
+        seen.add(target_class)
+        target_meta = type_metadata.get(target_class, {}) or {}
+        for interface in target_meta.get('implements', []) or []:
+            interface_candidates.append(interface)
+            visit_interfaces(interface)
+        for parent in target_meta.get('extends', []) or []:
+            visit_interfaces(parent)
+
+    visit_interfaces(class_fqcn)
+    for interface in interface_candidates:
+        interface_meta = type_metadata.get(interface, {}) or {}
+        implementations = sorted(set(interface_meta.get('implementations', []) or []))
+        if implementations != [class_fqcn]:
+            continue
+        _append_method_lookup_values(sig_keys, name_keys, interface, method_name, signature_suffixes)
+
+    append_key_tier(tiers, sig_keys)
+    append_key_tier(tiers, name_keys)
+    return tiers
+
+
+def _build_api_polymorphic_target_tiers(api_row, graph=None, type_metadata=None):
+    if graph is None or not type_metadata:
+        return []
+
+    symbol_kind = get_symbol_kind(api_row)
+    if symbol_kind not in {'method', 'constructor'}:
+        return []
+
+    class_fqcn, method_name, signature_suffixes = _extract_api_target_method_info(api_row)
+    if not class_fqcn or not method_name:
+        return []
+
+    class_meta = type_metadata.get(class_fqcn, {}) or {}
+    if not class_meta:
+        return []
+
+    tiers = []
+    kind = class_meta.get('kind', 'class')
+    if kind == 'interface':
+        extend_tiers(
+            tiers,
+            collect_inheritance_chain_tiers(
+                class_fqcn,
+                method_name,
+                signature_suffixes,
+                type_metadata,
+                visited=set(),
+                max_depth=20,
+            ),
+        )
+        extend_tiers(
+            tiers,
+            _collect_inherited_subclass_tiers(
+                class_fqcn,
+                method_name,
+                signature_suffixes,
+                type_metadata,
+                graph,
+                visited=set(),
+            ),
+        )
+        return tiers
+
+    extend_tiers(
+        tiers,
+        _collect_inherited_subclass_tiers(
+            class_fqcn,
+            method_name,
+            signature_suffixes,
+            type_metadata,
+            graph,
+            visited=set(),
+        ),
+    )
+    extend_tiers(
+        tiers,
+        _collect_unambiguous_interface_dispatch_tiers(
+            class_fqcn,
+            method_name,
+            signature_suffixes,
+            type_metadata,
+        ),
+    )
+    return tiers
+
+
+def build_api_target_key_groups(api_row, graph=None, type_metadata=None):
+    groups = []
+    api_name = api_row.get('api_name', '').strip()
+    matched_class = api_row.get('matched_class', '').strip()
+    api_simple = api_row.get('api_simple', '').strip()
+    api_signature = api_row.get('api_signature', '').strip()
+    symbol_kind = get_symbol_kind(api_row)
+    requires_signature = symbol_kind in {'method', 'constructor'}
+
+    if api_name:
+        if symbol_kind == 'class':
+            append_key_group(groups, 'exact_name', [f"class:{api_name}"])
+        elif requires_signature:
+            exact_keys = []
+            if api_signature:
+                exact_keys.append(f"{api_name}{api_signature}")
+                normalized_signature = normalize_signature_for_lookup(api_signature)
+                if normalized_signature and normalized_signature != api_signature:
+                    exact_keys.append(f"{api_name}{normalized_signature}")
+            append_key_group(groups, 'exact_signature', exact_keys)
+            append_key_group(groups, 'exact_name', [api_name])
+        else:
+            append_key_group(groups, 'exact_name', [api_name])
+            if '.' in api_name:
+                class_part = api_name.rsplit('.', 1)[0]
+                append_key_group(groups, 'exact_name', [f"class:{class_part}"])
+
+    if matched_class:
+        append_key_group(groups, 'exact_name', [f"class:{matched_class}"])
+
+    if api_simple and not api_name:
+        if requires_signature and api_signature:
+            fallback_keys = [f"method:{api_simple}{api_signature}"]
+            normalized_signature = normalize_signature_for_lookup(api_signature)
+            if normalized_signature and normalized_signature != api_signature:
+                fallback_keys.append(f"method:{api_simple}{normalized_signature}")
+            append_key_group(groups, 'fallback_simple', fallback_keys)
+        append_key_group(groups, 'fallback_simple', [f"method:{api_simple}"])
+
+    for tier in _build_api_polymorphic_target_tiers(api_row, graph=graph, type_metadata=type_metadata):
+        append_key_group(groups, 'polymorphic', tier)
+
+    return groups
+
+
+def build_api_target_keys(api_row, graph=None, type_metadata=None):
+    """
+    Build API target keys (improved version)
+
+    Improvement:
+      - Try to use param types if available in api_row
+      - This helps reduce false positives for overloaded methods
+
+    Note: Current s4_contract does not provide param types,
+    so this is a forward-looking improvement that will become
+    useful when the contract is extended.
+    """
+    tiers = list(build_api_target_key_tiers(api_row))
+    extend_tiers(tiers, _build_api_polymorphic_target_tiers(api_row, graph=graph, type_metadata=type_metadata))
+    return flatten_key_tiers(tiers)
+
+
+def build_api_identity_key(api_row):
+    """为 Step4 -> Step5 串联构建稳定的 API 级唯一键。"""
+    return (
+        (api_row.get('coord') or '').strip(),
+        (api_row.get('api_name') or '').strip(),
+        (api_row.get('api_signature') or '').strip(),
+        (get_symbol_kind(api_row) or '').strip(),
+        (api_row.get('change_type') or '').strip(),
+    )
+
+
+def has_precise_api_signature(api_row):
+    api_signature = (api_row.get('api_signature') or '').strip()
+    return bool(api_signature and api_signature.startswith('(') and api_signature.endswith(')'))
+
+
+def get_symbol_kind(api_row):
+    symbol_kind = (api_row.get('symbol_kind') or '').strip().lower()
+    if symbol_kind in {'method', 'field', 'class', 'constructor'}:
+        return symbol_kind
+    if (api_row.get('analysis_scope', 'api') or 'api') == 'class_usage':
+        return 'class'
+    api_signature = (api_row.get('api_signature') or '').strip()
+    api_name = (api_row.get('api_name') or '').strip()
+    api_simple = (api_row.get('api_simple') or '').strip()
+    if has_precise_api_signature(api_row):
+        if api_simple and api_simple[:1].isupper() and api_name.endswith(f".{api_simple}"):
+            return 'constructor'
+        return 'method'
+    if api_name and not api_signature:
+        tail = api_name.rsplit('.', 1)[-1]
+        if tail and tail[:1].isupper() and not api_simple:
+            return 'class'
+    return ''
+
+
+def method_api_requires_signature(api_row):
+    return get_symbol_kind(api_row) in {'method', 'constructor'}
+
+
+
+def get_lookup_keys(method_def, type_metadata, graph=None):
+    """
+    获取方法查找键（包括完整继承链）
+
+    改进：
+      1. 递归处理多层继承
+      2. 完整处理接口继承链
+      3. 处理接口的父接口
+      4. 添加Object类默认方法
+    """
+    return flatten_key_tiers(get_lookup_key_tiers(method_def, type_metadata, graph=graph))
+
+
+def get_lookup_key_tiers(method_def, type_metadata, graph=None):
+    tiers = []
+    signature_suffixes = build_method_signature_suffixes(method_def)
+    append_key_tier(tiers, build_method_signature_lookup_keys(method_def, signature_suffixes))
+    append_key_tier(tiers, [method_def.qualified_key])
+
+    inheritance_tiers = collect_inheritance_chain_tiers(
+        method_def.class_fqcn,
+        method_def.method_name,
+        signature_suffixes,
+        type_metadata,
+        visited=set(),
+        max_depth=20,
+    )
+    tiers.extend(inheritance_tiers)
+    extend_tiers(
+        tiers,
+        _collect_inherited_subclass_tiers(
+            method_def.class_fqcn,
+            method_def.method_name,
+            signature_suffixes,
+            type_metadata,
+            graph,
+            visited=set(),
+        ),
+    )
+    append_key_tier(tiers, [f"class:{method_def.class_fqcn}"])
+    append_key_tier(tiers, build_simple_signature_lookup_keys(method_def, signature_suffixes))
+    append_key_tier(tiers, [method_def.simple_key])
+    return tiers
+
+
+def build_method_lookup_key_groups(method_def, type_metadata, graph=None):
+    groups = []
+    signature_suffixes = build_method_signature_suffixes(method_def)
+    append_key_group(groups, 'exact_signature', build_method_signature_lookup_keys(method_def, signature_suffixes))
+    append_key_group(groups, 'exact_name', [method_def.qualified_key])
+    for tier in collect_inheritance_chain_tiers(
+        method_def.class_fqcn,
+        method_def.method_name,
+        signature_suffixes,
+        type_metadata,
+        visited=set(),
+        max_depth=20,
+    ):
+        append_key_group(groups, 'polymorphic', tier)
+    for tier in _collect_inherited_subclass_tiers(
+        method_def.class_fqcn,
+        method_def.method_name,
+        signature_suffixes,
+        type_metadata,
+        graph,
+        visited=set(),
+    ):
+        append_key_group(groups, 'polymorphic', tier)
+    append_key_group(groups, 'fallback_simple', build_simple_signature_lookup_keys(method_def, signature_suffixes))
+    append_key_group(groups, 'fallback_simple', [method_def.simple_key])
+    return groups
+
+
+def build_method_signature_suffixes(method_def):
+    suffixes = []
+    param_types = list((getattr(method_def, 'param_types', {}) or {}).values())
+    param_declared_types = list((getattr(method_def, 'param_declared_types', {}) or {}).values())
+
+    def append_signature(type_names):
+        sig = build_signature_suffix(type_names)
+        append_unique(suffixes, sig)
+
+    append_signature(param_declared_types)
+    append_signature(param_types)
+    return suffixes
+
+
+def build_signature_suffix(type_names):
+    normalized = []
+    for type_name in type_names:
+        type_name = normalize_type_name(type_name)
+        if not type_name:
+            return ''
+        normalized.append(type_name)
+    if not normalized and list(type_names or []):
+        return ''
+    return '(' + ', '.join(normalized) + ')'
+
+
+def normalize_type_name(type_name):
+    type_name = (type_name or '').strip()
+    if not type_name:
+        return ''
+    type_name = type_name.replace('...', '[]')
+    if '<' in type_name:
+        type_name = type_name.split('<', 1)[0].strip()
+    if '.' in type_name:
+        type_name = type_name.rsplit('.', 1)[-1]
+    return type_name
+
+
+def build_method_signature_lookup_keys(method_def, signature_suffixes=None):
+    keys = []
+    for sig in signature_suffixes or []:
+        append_unique(keys, f"{method_def.qualified_key}{sig}")
+    return keys
+
+
+def build_simple_signature_lookup_keys(method_def, signature_suffixes=None):
+    keys = []
+    for sig in signature_suffixes or []:
+        append_unique(keys, f"{method_def.simple_key}{sig}")
+    return keys
+
+
+def collect_inheritance_chain(class_fqcn, method_name, signature_suffixes, type_metadata, visited=None, max_depth=20):
+    return flatten_key_tiers(
+        collect_inheritance_chain_tiers(
+            class_fqcn,
+            method_name,
+            signature_suffixes,
+            type_metadata,
+            visited=visited,
+            max_depth=max_depth,
+        )
+    )
+
+
+def collect_inheritance_chain_tiers(class_fqcn, method_name, signature_suffixes, type_metadata, visited=None, max_depth=20):
+    """
+    递归收集完整的继承链
+
+    Args:
+        class_fqcn: 类的完全限定名
+        method_name: 方法名（用于生成完整键）
+        type_metadata: 类型元数据
+        visited: 已访问的类（防止循环继承）
+        max_depth: 最大递归深度
+
+    Returns:
+        List[List[str]]: 分层方法查找键列表
+    """
+    if visited is None:
+        visited = set()
+
+    if max_depth <= 0 or class_fqcn in visited:
+        return []
+
+    visited.add(class_fqcn)
+    method_sig_keys = []
+    method_no_sig_keys = []
+    class_keys = []
+
+    class_meta = type_metadata.get(class_fqcn, {})
+
+    def append_method_keys(target_class):
+        append_unique(method_no_sig_keys, f"{target_class}.{method_name}")
+        for sig in signature_suffixes or []:
+            append_unique(method_sig_keys, f"{target_class}.{method_name}{sig}")
+        append_unique(class_keys, f"class:{target_class}")
+
+    # 处理父类（extends）
+    for parent in class_meta.get('extends', []):
+        append_method_keys(parent)
+
+    # 处理接口（implements）
+    for interface in class_meta.get('implements', []):
+        append_method_keys(interface)
+
+        # 递归处理接口的父接口
+        interface_meta = type_metadata.get(interface, {})
+        for parent_interface in interface_meta.get('extends', []):  # 接口的extends
+            append_method_keys(parent_interface)
+
+    # 接口 -> 实现类 的双向补充，有助于多态/代理场景继续展开。
+    for implementation in class_meta.get('implementations', []):
+        append_method_keys(implementation)
+
+    # 添加Object类（所有类的最终父类）
+    if class_fqcn != 'java.lang.Object':
+        append_method_keys('java.lang.Object')
+
+    tiers = []
+    append_key_tier(tiers, method_sig_keys)
+    append_key_tier(tiers, method_no_sig_keys)
+    append_key_tier(tiers, class_keys)
+
+    for parent in class_meta.get('extends', []):
+        extend_tiers(
+            tiers,
+            collect_inheritance_chain_tiers(parent, method_name, signature_suffixes, type_metadata, visited, max_depth - 1),
+        )
+
+    for interface in class_meta.get('implements', []):
+        extend_tiers(
+            tiers,
+            collect_inheritance_chain_tiers(interface, method_name, signature_suffixes, type_metadata, visited, max_depth - 1),
+        )
+        interface_meta = type_metadata.get(interface, {})
+        for parent_interface in interface_meta.get('extends', []):
+            extend_tiers(
+                tiers,
+                collect_inheritance_chain_tiers(
+                    parent_interface, method_name, signature_suffixes, type_metadata, visited, max_depth - 1
+                ),
+            )
+
+    for implementation in class_meta.get('implementations', []):
+        extend_tiers(
+            tiers,
+            collect_inheritance_chain_tiers(implementation, method_name, signature_suffixes, type_metadata, visited, max_depth - 1),
+        )
+
+    return tiers
+
+
+def append_key_tier(tiers, values):
+    tier = []
+    extend_unique(tier, values)
+    if tier:
+        tiers.append(tier)
+
+
+def extend_tiers(target_tiers, new_tiers):
+    for tier in new_tiers or []:
+        append_key_tier(target_tiers, tier)
+
+
+def flatten_key_tiers(key_tiers):
+    keys = []
+    for tier in key_tiers or []:
+        extend_unique(keys, tier)
+    return keys
+
+
+def select_matching_keys_from_tiers(key_tiers, reverse_edges):
+    for tier in key_tiers or []:
+        matched = []
+        for key in tier:
+            if reverse_edges.get(key):
+                append_unique(matched, key)
+        if matched:
+            return matched
+    return []
+
+
+def build_reachable_result(result, candidate, graph):
+    """构建reachable结果"""
+    result.analysis_status = 'reachable'
+    result.is_reachable = True
+    result.business_reach_depth = candidate['depth']
+    result.confidence_score = candidate['confidence']
+    result.reason_code = 'SYSTEM_CODE_REACHED'
+    result.reachable_note = f"触达系统代码（置信度{candidate['confidence']:.2f}）"
+
+    # 构建调用链
+    path_edges = candidate['path']
+    entry_point = candidate['entry_point']
+
+    result.call_paths = [
+        format_call_chain(path_edges, entry_point['method'])
+    ]
+    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
+
+    # 追踪跨越的依赖边界（dependency_chain_coords）
+    # 检查路径中是否经过dependency-owned源码
+    crossed_coords = set()
+    for edge in path_edges:
+        if edge.owner_coord and edge.owner_coord != 'BUSINESS':
+            crossed_coords.add(edge.owner_coord)
+    if crossed_coords:
+        result.dependency_chain_coords = sorted(crossed_coords)
+
+    result.evidence_paths = [[edge_to_evidence(edge, graph=graph) for edge in path_edges]]
+
+    result.critical_nodes_hit = [entry_point]
+    result.match_provenance = candidate.get('provenance', '')
+    result.match_tier = candidate.get('match_tier', -1)
+
+    return result
+
+
+def build_behavior_changed_result(result, candidate, graph):
+    """
+    构建行为变更结果（需运行时验证）
+
+    行为变更与签名变更不同：即使找到调用链，也不能直接判定为"已触达系统"，
+    因为签名没变不代表运行时行为没变。需要通过运行时测试验证。
+    """
+    # 注意：change_type == 'BEHAVIOR_CHANGED' 的语义是"需要运行时验证"
+    # 即使找到了调用链，analysis_status 应该是 not_analyzed
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.business_reach_depth = candidate['depth']
+    result.confidence_score = candidate['confidence']
+    result.reason_code = 'BEHAVIOR_CHANGED_RUNTIME_VERIFICATION'
+    result.reachable_note = '找到调用链，但签名未变的情况下行为可能变化，需运行时验证'
+
+    # 构建调用链（用于人工审查）
+    path_edges = candidate['path']
+    entry_point = candidate['entry_point']
+
+    result.call_paths = [
+        format_call_chain(path_edges, entry_point['method'])
+    ]
+    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
+
+    # 追踪跨越的依赖边界
+    crossed_coords = set()
+    for edge in path_edges:
+        if getattr(edge, 'owner_coord', None) and edge.owner_coord != 'BUSINESS':
+            crossed_coords.add(edge.owner_coord)
+    if crossed_coords:
+        result.dependency_chain_coords = sorted(crossed_coords)
+
+    result.evidence_paths = [[edge_to_evidence(edge, graph=graph) for edge in path_edges]]
+
+    result.critical_nodes_hit = [entry_point]
+    result.match_provenance = candidate.get('provenance', '')
+    result.match_tier = candidate.get('match_tier', -1)
+
+    result.verification_commands = [
+        '行为变更需运行时测试验证',
+        '建议执行相关单元测试或集成测试',
+        f'调用链已定位，需确认运行时行为是否受影响'
+    ]
+
+    return result
+
+
+def build_behavior_changed_fallback_simple_result(result, candidate, graph):
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.business_reach_depth = candidate['depth']
+    result.confidence_score = candidate['confidence']
+    result.reason_code = 'BEHAVIOR_CHANGED_PRECISE_TARGET_NOT_CONFIRMED'
+    result.reachable_note = (
+        '找到调用链，但当前命中依赖 fallback_simple 回退；'
+        '对于已有完整签名的行为变更，这不足以安全确认目标 API'
+    )
+
+    path_edges = candidate['path']
+    entry_point = candidate['entry_point']
+
+    result.call_paths = [
+        format_call_chain(path_edges, entry_point['method'])
+    ]
+    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
+
+    crossed_coords = set()
+    for edge in path_edges:
+        if getattr(edge, 'owner_coord', None) and edge.owner_coord != 'BUSINESS':
+            crossed_coords.add(edge.owner_coord)
+    if crossed_coords:
+        result.dependency_chain_coords = sorted(crossed_coords)
+
+    result.evidence_paths = [[edge_to_evidence(edge, graph=graph) for edge in path_edges]]
+    result.critical_nodes_hit = [entry_point]
+    result.match_provenance = candidate.get('provenance', '')
+    result.match_tier = candidate.get('match_tier', -1)
+    result.verification_commands = [
+        '补全中间调用点的类型/签名推断，避免命中 fallback_simple 回退键',
+        '人工复核该调用链是否真的落在目标 API，而不是同名 sibling 方法',
+        '确认后再执行相关单元测试或集成测试验证行为变化',
+    ]
+    return result
+
+
+def build_fallback_simple_unconfirmed_result(result, candidate, graph):
+    _ = graph
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.business_reach_depth = candidate['depth']
+    result.confidence_score = candidate['confidence']
+    result.reason_code = 'FALLBACK_SIMPLE_PATH_UNCONFIRMED'
+    result.reachable_note = (
+        '找到候选调用链，但其中依赖 fallback_simple 回退；'
+        '当前证据不足以安全确认命中的就是目标 API'
+    )
+
+    path_edges = candidate['path']
+    entry_point = candidate['entry_point']
+
+    result.call_paths = [
+        format_call_chain(path_edges, entry_point['method'])
+    ]
+    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
+
+    crossed_coords = set()
+    for edge in path_edges:
+        coord = getattr(edge, 'owner_coord', '')
+        if coord and coord != 'BUSINESS':
+            crossed_coords.add(coord)
+    result.dependency_chain_coords = sorted(crossed_coords)
+
+    result.evidence_paths = [[edge_to_evidence(edge) for edge in path_edges]]
+    result.match_provenance = candidate.get('provenance', '')
+    result.match_tier = candidate.get('match_tier', -1)
+    result.verification_commands = [
+        '补全中间调用点的类型/签名推断，避免命中 fallback_simple 回退键',
+        '人工复核该候选链路是否真的落在目标 API，而不是同名 sibling 方法',
+        '若目标属于 SPI/回调接口，请继续确认业务代码是否实现、注册或显式引用了该类型',
+    ]
+    return result
+
+
+def build_internal_only_direct_consumer_result(result, candidate, graph):
+    _ = graph
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.business_reach_depth = candidate['depth']
+    result.confidence_score = candidate['confidence']
+    result.reason_code = 'INTERNAL_ONLY_DIRECT_CONSUMER'
+    result.reachable_note = (
+        '找到候选调用链，但变更 API 的直接调用者仍位于同一依赖内部；'
+        '当前证据不足以证明外部消费者真实依赖了这个变更 API'
+    )
+
+    path_edges = candidate['path']
+    entry_point = candidate['entry_point']
+
+    result.call_paths = [
+        format_call_chain(path_edges, entry_point['method'])
+    ]
+    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
+
+    crossed_coords = set()
+    for edge in path_edges:
+        coord = getattr(edge, 'owner_coord', '')
+        if coord and coord != 'BUSINESS':
+            crossed_coords.add(coord)
+    result.dependency_chain_coords = sorted(crossed_coords)
+
+    result.evidence_paths = [[edge_to_evidence(edge) for edge in path_edges]]
+    result.match_provenance = candidate.get('provenance', '')
+    result.match_tier = candidate.get('match_tier', -1)
+    result.verification_commands = [
+        '优先确认业务代码或其他依赖是否直接调用了该变更 API，而不是只经过目标依赖的内部实现',
+        '若当前路径只证明同坐标依赖内部自调用，请不要直接判定为已确认影响',
+        '若目标属于 SPI/回调接口，还需继续确认业务代码是否实现、注册或显式引用了该类型',
+    ]
+    return result
+
+
+def build_uncertain_result(result, candidate):
+    """构建uncertain结果"""
+    result.analysis_status = 'uncertain'
+    result.is_reachable = None
+    result.confidence_score = candidate['confidence']
+    result.reason_code = candidate['reason']
+    result.reachable_note = f"链路置信度{candidate['confidence']:.2f}，需人工确认"
+
+    path_edges = candidate['path']
+
+    result.call_paths = [
+        format_call_chain(path_edges, "未找到业务入口")
+    ]
+    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
+
+    result.verification_commands = [
+        "审查链路中的低置信度边",
+        f"确认 {getattr(path_edges[-1], 'file', '?')}:{getattr(path_edges[-1], 'line', '?')} 的调用上下文"
+    ]
+
+    # 追踪跨越的依赖边界（dependency_chain_coords）
+    crossed_coords = set()
+    for edge in path_edges:
+        if getattr(edge, 'owner_coord', None) and edge.owner_coord != 'BUSINESS':
+            crossed_coords.add(edge.owner_coord)
+    if crossed_coords:
+        result.dependency_chain_coords = sorted(crossed_coords)
+
+    # 构建证据路径（兼容 s6_report.py）
+    result.evidence_paths = [[edge_to_evidence(edge) for edge in path_edges]]
+    result.match_provenance = candidate.get('provenance', '')
+    result.match_tier = candidate.get('match_tier', -1)
+
+    return result
+
+
+def build_not_analyzed_result(result, candidate):
+    """构建not_analyzed结果"""
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.reason_code = candidate.get('reason', 'UNKNOWN')
+    result.reachable_note = candidate.get('boundary', {}).get('reason', '无法静态分析')
+
+    # 关键修复：填充 call_paths / evidence_paths（s6_report.py 依赖这些字段）
+    path_edges = candidate.get('path', [])
+
+    # 从路径提取方法名构造可读调用链
+    if path_edges:
+        parts = []
+        for edge in reversed(path_edges):
+            caller_key = getattr(edge, 'caller_qualified_key', '') or getattr(edge, 'caller_symbol_id', '?')
+            method_name = caller_key.rsplit('.', 1)[-1] if '.' in caller_key else caller_key
+            parts.append(f"{method_name}()")
+        parts.append('变更API')
+        result.call_paths = [" -> ".join(parts)]
+        result.direct_callers = 1 if getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
+
+        result.evidence_paths = [[edge_to_evidence(e) for e in path_edges]]
+    else:
+        result.call_paths = []
+        result.evidence_paths = []
+
+    result.match_provenance = candidate.get('provenance', '')
+    result.match_tier = candidate.get('match_tier', -1)
+
+    if 'boundary' in candidate:
+        boundary = candidate['boundary']
+        result.verification_commands = [
+            f"框架边界：{boundary['method']}",
+            "审查框架配置（Spring/MyBatis等）"
+        ]
+    elif candidate.get('verification_commands'):
+        result.verification_commands = candidate.get('verification_commands') or []
+
+    return result
+
+
+def build_missing_dependency_source_mapping_result(result):
+    """构建缺少依赖源码映射导致的 not_analyzed 结果"""
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.reason_code = 'DEPENDENCY_SOURCE_MAPPING_MISSING'
+    result.reachable_note = '需要可用的依赖源码映射才能完成分析，当前分析能力受限'
+    result.verification_commands = [
+        '补充 dependency_source_dirs 指向依赖源码工程或仓库根目录',
+        '确认系统能够从依赖源码中解析出目标模块坐标与源码目录',
+        '然后重新运行 Step 5'
+    ]
+    return result
+
+
+def format_call_chain(path_edges, final_target):
+    """格式化调用链为可读格式"""
+    if not path_edges:
+        return final_target
+
+    parts = []
+    for edge in reversed(path_edges):
+        # 简化显示
+        caller_name = edge.caller_qualified_key.rsplit('.', 1)[-1] if '.' in edge.caller_qualified_key else edge.caller_qualified_key
+        parts.append(f"{caller_name}()")
+
+    parts.append(final_target)
+
+    return " → ".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 批量追踪入口
+# ══════════════════════════════════════════════════════════════════
+
+def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max_total_cost=5,
+                                            api_bridge_requirements=None, allow_degraded=False,
+                                            graph_stats=None):
+    """
+    批量追踪所有变更API
+
+    Args:
+        all_apis: List[Dict] 变更API列表
+        graph: 源码调用图
+        type_metadata: 类型元数据
+        max_total_cost: 最大总代价（控制追踪深度）
+        api_bridge_requirements: dict of {api_key: {'needs_bridge': bool, 'reason': str}}
+        allow_degraded: 如果为 True，当 API 需要依赖源码映射但未提供时，标记为 not_analyzed
+
+    Returns:
+        List[TraceResult]
+    """
+    if api_bridge_requirements is None:
+        api_bridge_requirements = {}
+
+    results = []
+    trace_cache = ensure_trace_cache()
+    total = len(all_apis or [])
+    progress_interval = suggest_log_interval(total, target_updates=12, minimum=1)
+    started_at = time.perf_counter()
+    status_counts = {
+        'reachable': 0,
+        'uncertain': 0,
+        'not_analyzed': 0,
+        'not_found_in_static_analysis': 0,
+        'not_reachable': 0,
+    }
+    _step5_debug(
+        'trace_batch_start',
+        'starting batch trace for all apis',
+        total_apis=total,
+        max_total_cost=max_total_cost,
+        allow_degraded=allow_degraded,
+        graph_stats=graph_stats or {},
+    )
+
+    for idx, api_row in enumerate(all_apis, 1):
+        api_name = api_row.get('api_name', '')
+        if not api_name:
+            continue
+
+        # 检查该 API 是否需要依赖源码映射
+        bridge_info = api_bridge_requirements.get(build_api_identity_key(api_row), {})
+        needs_bridge = bridge_info.get('needs_bridge', False)
+        has_dependency_source_mapping = bridge_info.get('has_dependency_source_mapping', True)
+
+        if should_log_progress(idx, total, progress_interval):
+            emit_progress(
+                "step5",
+                "trace",
+                f"正在追踪 {api_name[:80]}",
+                current=idx,
+                total=total,
+                elapsed=time.perf_counter() - started_at,
+                item=api_name[:80],
+            )
+        _step5_debug(
+            'trace_batch_item',
+            'dispatching api trace',
+            index=idx,
+            total=total,
+            api_name=api_name,
+            api_signature=api_row.get('api_signature', ''),
+            bridge_info=bridge_info,
+        )
+
+        result = trace_api_with_confidence_weighting(
+            api_row,
+            graph,
+            type_metadata,
+            max_total_cost=max_total_cost,
+            needs_bridge=needs_bridge,
+            has_dependency_source_mapping=has_dependency_source_mapping,
+            allow_degraded=allow_degraded,
+            graph_stats=graph_stats,
+            trace_cache=trace_cache,
+        )
+
+        results.append(result)
+        status = result.analysis_status or 'unknown'
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if should_log_progress(idx, total, progress_interval):
+            emit_progress(
+                "step5",
+                "trace",
+                (
+                    "追踪进度更新，"
+                    f"reachable={status_counts.get('reachable', 0)}，"
+                    f"uncertain={status_counts.get('uncertain', 0)}，"
+                    f"not_analyzed={status_counts.get('not_analyzed', 0)}，"
+                    f"not_found={status_counts.get('not_found_in_static_analysis', 0) + status_counts.get('not_reachable', 0)}"
+                ),
+                current=idx,
+                total=total,
+                elapsed=time.perf_counter() - started_at,
+            )
+
+    emit_progress(
+        "step5",
+        "trace",
+        (
+            "反向追踪完成，"
+            f"reachable={status_counts.get('reachable', 0)}，"
+            f"uncertain={status_counts.get('uncertain', 0)}，"
+            f"not_analyzed={status_counts.get('not_analyzed', 0)}，"
+            f"not_found={status_counts.get('not_found_in_static_analysis', 0) + status_counts.get('not_reachable', 0)}"
+        ),
+        current=len(results),
+        total=total,
+        elapsed=time.perf_counter() - started_at,
+    )
+    _step5_debug(
+        'trace_batch_done',
+        'finished batch trace for all apis',
+        total_results=len(results),
+        status_counts=status_counts,
+        elapsed_seconds=time.perf_counter() - started_at,
+    )
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════
+# 测试入口
+# ══════════════════════════════════════════════════════════════════
+
+def test_confidence_weighted_tracer():
+    """测试置信度加权追踪"""
+    # 模拟数据
+    # 模拟图结构（简化）
+    # 实际测试需要完整graph
+
+    print("测试置信度加权追踪逻辑")
+    print("  API: com.example.Foo.changedMethod")
+    print("  策略：置信度加权深度")
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(test_confidence_weighted_tracer())
