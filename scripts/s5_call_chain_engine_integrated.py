@@ -224,6 +224,16 @@ def build_missing_dependency_mapping_interaction(
             "allowed_actions": ["rerun_current_step", "restart_from_step", "cancel"],
             "required_fields": ["action"],
         },
+        "action_requirements": {
+            "rerun_current_step": {
+                "at_least_one_of": ["dependency_source_dirs", "allow_degraded"],
+                "description": "重跑 Step5 时，至少要补充 dependency_source_dirs，或显式允许降级执行。",
+            },
+            "restart_from_step": {
+                "required_fields": ["restart_step_id"],
+                "description": "从更早步骤重跑时，必须明确 restart_step_id。",
+            },
+        },
         "missing_mapping_coords": list(missing_mapping_coords or []),
         "resume_hint": (
             "若用户补充 dependency_source_dirs，请使用 --response-json 传回 "

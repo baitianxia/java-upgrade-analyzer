@@ -186,6 +186,9 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - `run_step.py` 退出码 `4` 表示当前命令已进入待用户交互状态，不是普通失败
 - 退出码 `4` 时不要直接重试上一条命令，应先读取 `interaction.json` 并等待用户答复
 - 推荐把用户答复整理成 `intent_patch`，再通过 `--response-json` / `--response-file` 恢复；不要继续沿用旧的顶层业务字段示例
+- 若当前不存在 `pending_interaction`，但用户提出了新的正式业务意图，也可以继续使用 `intent_patch`
+- 这类输入不会伪装成 checkpoint 恢复；调度器会先把它桥接为主状态更新，再从推断出的目标步骤或 `restart_step_id` 重跑
+- 非 checkpoint 场景下，`intent_patch` 必须在 `set` / `clear` 中提供至少一个正式业务字段，或显式使用 `action=restart_from_step`
 
 ### Step4 后按单依赖包进入 Step5
 
@@ -209,6 +212,16 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 这些选择字段必须先归一化写入 `main_state.json`
 - 正式流程中不要把选中依赖直接透传给 `s5_call_chain*.py`
 - Step5 实际消费的是“Step4 API 目标 + Step3 candidate 目标”的选中子集；产物可能是 `selected_all_changed_apis.csv`、`selected_risk_candidates.csv` 以及两者合并后的 `merged_selected_all_changed_apis.csv`
+- 若当前已经不在 Step4 checkpoint，也可以通过结构化新意图继续指定范围，例如：
+
+```bash
+python3 "$SKILL/scripts/run_step.py" --step auto \
+  --project-dir . \
+  --report-dir .upgrade-report \
+  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:legacy-lib"]}}}'
+```
+
+- 调度器会先把 `selected_targets` 归一化为正式 `step5_selected_coords` / `step5_selected_names`，再自动桥接为从 `step5` 重跑，而不是直接卡死在“当前没有 pending interaction”
 - 若某个依赖只在 Step3 candidate 中出现、尚未进入 Step4 API 目标，仍可通过 `step5_selected_coords` / `step5_selected_names` 被选中
 
 若用户答复较长，优先使用：
@@ -330,6 +343,8 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 - `interaction.input_modes`
 - `interaction.response_schema`
 - `interaction.input_normalization`
+- `interaction.action_requirements`
+- `interaction.selection_resolution`
 
 ### 门控
 
@@ -456,7 +471,7 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 ```
 
 若通过 `run_step.py` 执行，建议将 `source_dirs` / `dependency_source_dirs` / `max_depth` 写入 `main_state.json`，命令保持最小参数集。
-- 若 Step4 checkpoint 只想分析部分变更 jar，可在恢复时把 `step5_selected_coords` / `step5_selected_names` 写入 `main_state.json`；调度器会先基于 Step4 API 与 Step3 candidate 的并集生成过滤后的输入文件，再执行 Step5。
+- 若 Step4 checkpoint 只想分析部分变更 jar，优先在恢复时传 `selected_targets`；调度器会先把它归一化为正式的 `step5_selected_coords` / `step5_selected_names`，再基于 Step4 API 与 Step3 candidate 的并集生成过滤后的输入文件执行 Step5。
 正式流程默认不设置 Step5 外层超时；仅在主状态中显式写入 `step5_timeout` 时才启用限制。
 
 规则：
@@ -466,7 +481,8 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 - 只要回溯到系统代码即可记为 `reachable`，不要求必须到达最外层 HTTP 入口
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 的成因；`by_api/*.json` 中的 `evidence_paths` 是逐边证据
 - 若 `all_changed_apis.csv` 为空，直接跳过并说明“Step4 未提取到可追踪的变更 API”
-- 若指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
+- 若指定 `selected_targets`，优先按候选的 `selection_key` 精确匹配；也支持精确填写 `coord` 或 `name`，随后会归一化为正式的 `step5_selected_coords` / `step5_selected_names`
+- 若直接指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
 - 若筛选条件既未在 Step4 API 目标命中，也未在 Step3 candidate 目标命中，Step5 会直接报错，避免静默分析错范围
 - 正式流程会向 `stderr` 输出 `[progress][step5][discovery|graph|bridge-check|trace|report|done]` 日志，展示源码映射发现、图构建、调用链追踪与报告生成的推进情况
 - 当 `reason_code` 为 `DIRECT_CLASS_USAGE`、`DIRECT_FIELD_USAGE`、`DIRECT_STATIC_IMPORT_USAGE` 时，表示 Step5 已直接在业务源码中找到类型/字段引用证据，而不是传统方法调用链

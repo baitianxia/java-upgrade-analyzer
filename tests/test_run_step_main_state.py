@@ -216,7 +216,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 str((project_dir / "base.jar").resolve()),
             )
 
-    def test_apply_structured_user_response_rejects_response_without_pending_interaction(self):
+    def test_apply_structured_user_response_bridges_response_without_pending_interaction(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
@@ -229,6 +229,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 "modules": ["mybatis-example"],
             }
             args = SimpleNamespace(
+                step="auto",
                 response_json=json.dumps(
                     {
                         "intent_patch": {
@@ -251,10 +252,140 @@ class RunStepMainStateTest(unittest.TestCase):
                 "step1",
             )
 
-            self.assertEqual(result["early_exit_code"], 1)
-            self.assertEqual(state["step1"]["input"]["primary_module"], "mybatis-example")
-            self.assertEqual(state["step1"]["input"]["modules"], ["mybatis-example"])
-            self.assertIsNone(state["state"].get("last_user_response"))
+            self.assertIsNone(result["early_exit_code"])
+            self.assertEqual(result["step_id"], "step1")
+            self.assertEqual(state["state"]["current_step"], "step1")
+            self.assertEqual(state["step1"]["input"]["primary_module"], ".")
+            self.assertEqual(state["step1"]["input"]["modules"], ["."])
+            self.assertEqual(state["state"]["last_user_response"]["step_id"], "step1")
+
+    def test_apply_structured_user_response_infers_target_step_when_current_step_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            state["state"]["current_step"] = "done"
+            state["state"]["completed_step"] = "step6"
+            state["step5"]["input"] = {
+                "base_branch": "main",
+                "current_branch": "feature/upgrade",
+            }
+            args = SimpleNamespace(
+                step="auto",
+                response_json=json.dumps(
+                    {
+                        "intent_patch": {
+                            "action": "continue",
+                            "set": {
+                                "step5_selected_coords": ["com.example:demo-lib"],
+                            },
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                response_file="",
+            )
+
+            result = run_step.apply_structured_user_response_if_present(
+                args,
+                project_dir,
+                report_dir,
+                state,
+                "",
+            )
+
+            self.assertIsNone(result["early_exit_code"])
+            self.assertEqual(result["step_id"], "step5")
+            self.assertEqual(state["state"]["current_step"], "step5")
+            self.assertEqual(
+                state["step5"]["input"]["step5_selected_coords"],
+                ["com.example:demo-lib"],
+            )
+
+    def test_apply_structured_user_response_resolves_selected_targets_without_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            (report_dir / "s4_jar_compare").mkdir(parents=True, exist_ok=True)
+            with (report_dir / "s4_jar_compare" / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["coord", "class_name", "member"])
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "coord": "com.example:demo-lib",
+                        "class_name": "com.example.Demo",
+                        "member": "run()",
+                    }
+                )
+            state = run_step.new_main_state(report_dir)
+            state["state"]["current_step"] = "done"
+            args = SimpleNamespace(
+                step="auto",
+                response_json=json.dumps(
+                    {
+                        "intent_patch": {
+                            "action": "continue",
+                            "set": {
+                                "selected_targets": ["coord:com.example:demo-lib"],
+                            },
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                response_file="",
+            )
+
+            result = run_step.apply_structured_user_response_if_present(
+                args,
+                project_dir,
+                report_dir,
+                state,
+                "",
+            )
+
+            self.assertIsNone(result["early_exit_code"])
+            self.assertEqual(result["step_id"], "step5")
+            self.assertEqual(
+                state["step5"]["input"]["step5_selected_coords"],
+                ["com.example:demo-lib"],
+            )
+
+    def test_apply_structured_user_response_rejects_ambiguous_selected_targets_without_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            (report_dir / "s4_jar_compare").mkdir(parents=True, exist_ok=True)
+            with (report_dir / "s4_jar_compare" / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["coord", "class_name", "member"])
+                writer.writeheader()
+                writer.writerow({"coord": "com.example:demo-lib", "class_name": "a.A", "member": "m()"})
+                writer.writerow({"coord": "org.example:demo-lib", "class_name": "b.B", "member": "m()"})
+            state = run_step.new_main_state(report_dir)
+            state["state"]["current_step"] = "done"
+            args = SimpleNamespace(
+                step="auto",
+                response_json=json.dumps(
+                    {
+                        "intent_patch": {
+                            "action": "continue",
+                            "set": {
+                                "selected_targets": ["demo-lib"],
+                            },
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                response_file="",
+            )
+
+            with self.assertRaisesRegex(run_step.StepError, "selected_targets 存在歧义"):
+                run_step.apply_structured_user_response_if_present(
+                    args,
+                    project_dir,
+                    report_dir,
+                    state,
+                    "",
+                )
 
     def test_build_canonical_user_response_supports_intent_patch(self):
         canonical = run_step.build_canonical_user_response(
@@ -573,6 +704,89 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("intent_patch", example)
         self.assertEqual(example["intent_patch"]["action"], "continue")
         self.assertEqual(example["intent_patch"]["set"]["base_branch"], "origin/main")
+
+    def test_apply_interaction_protocol_enhancements_defaults_continue_requirements(self):
+        interaction = run_step.apply_interaction_protocol_enhancements(
+            {
+                "step_id": "step1",
+                "options": [
+                    {"id": "continue", "label": "继续"},
+                    {"id": "cancel", "label": "取消"},
+                ],
+                "required_fields": ["base_branch", "current_branch"],
+                "response_schema": {
+                    "type": "object",
+                    "required": ["action"],
+                    "properties": {
+                        "action": {"type": "string"},
+                        "base_branch": {"type": "string"},
+                        "current_branch": {"type": "string"},
+                    },
+                },
+                "input_normalization": {"enabled": True},
+            },
+            "step1",
+        )
+
+        self.assertEqual(
+            interaction["action_requirements"]["continue"]["required_fields"],
+            ["base_branch", "current_branch"],
+        )
+
+    def test_validate_pending_interaction_response_enforces_action_requirements(self):
+        interaction = {
+            "step_id": "step4",
+            "response_schema": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "dependency_source_dirs": {"type": "array"},
+                    "dependency_git_ref_overrides": {"type": "array"},
+                },
+            },
+            "action_requirements": {
+                "rerun_current_step": {
+                    "at_least_one_of": ["dependency_source_dirs", "dependency_git_ref_overrides"],
+                }
+            },
+        }
+
+        with self.assertRaisesRegex(run_step.StepError, "至少需要提供以下字段之一"):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "rerun_current_step"},
+            )
+
+    def test_validate_pending_interaction_response_rejects_ambiguous_selected_targets(self):
+        selection_options = run_step.build_interaction_selection_options(
+            [
+                {"coord": "com.example:demo-lib", "name": "demo-lib"},
+                {"coord": "org.example:demo-lib", "name": "demo-lib"},
+            ]
+        )
+        interaction = run_step.apply_interaction_protocol_enhancements(
+            {
+                "step_id": "step4",
+                "options": [{"id": "continue", "label": "继续"}],
+                "response_schema": {
+                    "type": "object",
+                    "required": ["action"],
+                    "properties": {
+                        "action": {"type": "string"},
+                    },
+                },
+                "selection_options": selection_options,
+                "input_normalization": {"enabled": True},
+            },
+            "step4",
+        )
+
+        with self.assertRaisesRegex(run_step.StepError, "selected_targets 存在歧义"):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "continue", "selected_targets": ["demo-lib"]},
+            )
 
     def test_build_run_context_keeps_dependency_source_mappings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1202,8 +1416,103 @@ class RunStepMainStateTest(unittest.TestCase):
             properties = payload["response_schema"]["properties"]
             self.assertIn("step5_selected_coords", properties)
             self.assertIn("step5_selected_names", properties)
+            self.assertIn("selected_targets", properties)
+            self.assertTrue(payload["selection_resolution"]["enabled"])
             self.assertEqual(payload["selection_options"][0]["coord"], "com.example:demo-lib")
             self.assertEqual(payload["selection_options"][0]["name"], "demo-lib")
+            self.assertEqual(payload["selection_options"][0]["selection_key"], "coord:com.example:demo-lib")
+
+    def test_apply_user_response_to_main_state_resolves_selected_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            state = run_step.new_main_state(report_dir)
+            pending_interaction = run_step.apply_interaction_protocol_enhancements(
+                {
+                    "step_id": "step4",
+                    "kind": "review",
+                    "options": [{"id": "continue", "label": "继续"}],
+                    "response_schema": {
+                        "type": "object",
+                        "required": ["action"],
+                        "properties": {
+                            "action": {"type": "string"},
+                            "selected_targets": {"type": "array"},
+                        },
+                    },
+                    "selection_options": [
+                        {"coord": "com.example:demo-lib", "name": "demo-lib"},
+                    ],
+                    "input_normalization": {"enabled": True},
+                },
+                "step4",
+                project_dir=project_dir,
+                report_dir=report_dir,
+            )
+
+            updated_state, _ = run_step.apply_user_response_to_main_state(
+                state,
+                pending_interaction,
+                {
+                    "intent_patch": {
+                        "action": "continue",
+                        "set": {"selected_targets": ["coord:com.example:demo-lib"]},
+                    }
+                },
+                project_dir,
+                target_step_id="step4",
+            )
+            run_step.handle_step4_resume_followups(
+                updated_state,
+                report_dir,
+                "step4",
+                "continue",
+            )
+
+        self.assertEqual(
+            updated_state["step4"]["input"]["step5_selected_coords"],
+            ["com.example:demo-lib"],
+        )
+        self.assertEqual(
+            updated_state["step5"]["input"]["step5_selected_coords"],
+            ["com.example:demo-lib"],
+        )
+
+    def test_apply_user_response_to_main_state_accepts_strict_risk_gate_intent_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            state = run_step.new_main_state(report_dir)
+            pending_interaction = {
+                "step_id": "step5",
+                "kind": "review",
+                "response_schema": {
+                    "type": "object",
+                    "required": ["action"],
+                    "properties": {
+                        "action": {"type": "string"},
+                        "strict_risk_gate": {"type": "boolean"},
+                    },
+                },
+            }
+
+            updated_state, updated_context = run_step.apply_user_response_to_main_state(
+                state,
+                pending_interaction,
+                {
+                    "intent_patch": {
+                        "action": "continue",
+                        "set": {"strict_risk_gate": True},
+                    }
+                },
+                project_dir,
+                target_step_id="step5",
+            )
+
+        self.assertTrue(updated_context["strict_risk_gate"])
+        self.assertTrue(updated_state["step5"]["input"]["strict_risk_gate"])
 
     def test_execute_step5_does_not_pass_business_inputs_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1921,6 +2230,77 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(captured["step_id"], "step1")
         self.assertEqual(captured["run_context"]["base_branch"], "base")
         self.assertEqual(captured["run_context"]["current_branch"], "current")
+
+    def test_main_auto_bridges_non_pending_intent_when_current_step_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            project_dir.mkdir(parents=True)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            state = run_step.new_main_state(report_dir)
+            state["state"]["current_step"] = "done"
+            state["state"]["completed_step"] = "step6"
+            state["step5"]["input"] = {
+                "base_branch": "base",
+                "current_branch": "current",
+            }
+            run_step.save_main_state(report_dir, state)
+            (report_dir / "s4_jar_compare").mkdir(parents=True, exist_ok=True)
+            (report_dir / "s4_jar_compare" / "all_changed_apis.csv").write_text(
+                "coord,class_name,member\ncom.example:demo-lib,com.example.Demo,run()\n",
+                encoding="utf-8",
+            )
+            captured = {}
+
+            def fake_execute_step(step_id, _args, _manifest_steps, run_context, **_kwargs):
+                captured["step_id"] = step_id
+                captured["run_context"] = dict(run_context)
+                return None
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_step.py",
+                    "--step",
+                    "auto",
+                    "--project-dir",
+                    str(project_dir),
+                    "--report-dir",
+                    str(report_dir),
+                    "--response-json",
+                    json.dumps(
+                        {
+                            "intent_patch": {
+                                "action": "continue",
+                                "set": {
+                                    "selected_targets": ["coord:com.example:demo-lib"],
+                                },
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                ],
+            ), patch.object(
+                run_step,
+                "load_manifest",
+                return_value=({}, {"step5": {"gate": "call_chain"}}),
+            ), patch.object(
+                run_step,
+                "execute_step",
+                side_effect=fake_execute_step,
+            ):
+                exit_code = run_step.main()
+
+            saved = run_step.load_main_state(report_dir)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(captured["step_id"], "step5")
+            self.assertEqual(
+                captured["run_context"]["step5_selected_coords"],
+                ["com.example:demo-lib"],
+            )
+            self.assertEqual(saved["state"]["current_step"], "step6")
+            self.assertEqual(saved["state"]["completed_step"], "step5")
 
 
 if __name__ == "__main__":

@@ -80,7 +80,16 @@
             "label": "取消",
             "description": "先人工复核真实构建方式与构建结果，稍后再继续。"
           }
-        ]
+        ],
+        "action_requirements": {
+          "rerun_current_step": {
+            "at_least_one_of": [
+              "primary_module",
+              "modules"
+            ],
+            "description": "按模块重跑时，至少要明确 primary_module 或 modules。"
+          }
+        }
       },
       "outputs": [
         "s1_dep_changes.csv",
@@ -166,7 +175,17 @@
             "label": "取消",
             "description": "当前上下文有误，先调整配置后再继续。"
           }
-        ]
+        ],
+        "action_requirements": {
+          "continue": {
+            "recommended_fields": [
+              "source_dirs",
+              "dependency_source_dirs",
+              "source_repo_hints"
+            ],
+            "description": "继续前建议确认业务源码目录与依赖源码线索，避免后续 Step4/Step5 再次中断。"
+          }
+        }
       },
       "depends_on": [
         "step1"
@@ -298,7 +317,27 @@
             "label": "取消",
             "description": "先补齐 jar 或源码映射，再继续。"
           }
-        ]
+        ],
+        "action_requirements": {
+          "continue": {
+            "recommended_fields": [
+              "selected_targets",
+              "step5_selected_coords",
+              "step5_selected_names"
+            ],
+            "description": "若用户只想让 Step5 分析部分变更 jar，应显式选择候选目标。"
+          },
+          "rerun_current_step": {
+            "at_least_one_of": [
+              "dependency_source_dirs",
+              "dependency_git_ref_overrides",
+              "step4_git_diff_timeout",
+              "step4_japicmp_timeout",
+              "step4_fetch_timeout"
+            ],
+            "description": "重跑 Step4 时，至少要提供一个修正项，不能空重跑。"
+          }
+        }
       },
       "depends_on": [
         "step2"
@@ -382,7 +421,21 @@
             "label": "取消",
             "description": "先补齐调用链证据，再重新执行 Step5。"
           }
-        ]
+        ],
+        "action_requirements": {
+          "continue": {
+            "recommended_fields": [
+              "strict_risk_gate"
+            ],
+            "description": "若用户要求无盲区结论，可在继续前显式打开 strict_risk_gate。"
+          },
+          "rerun_current_step": {
+            "at_least_one_of": [
+              "dependency_source_dirs"
+            ],
+            "description": "重跑 Step5 时，应至少补充 dependency_source_dirs。"
+          }
+        }
       },
       "depends_on": [
         "step4"

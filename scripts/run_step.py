@@ -33,6 +33,7 @@ EXIT_AWAITING_USER = 4
 MAIN_STATE_FILE_NAME = "main_state.json"
 STEP1_MAVEN_MODULE_SEP = re.compile(r"\[INFO\]\s*---.*@\s*(\S+)\s*---")
 INTENT_PATCH_ALLOWED_SET_FIELDS = {
+    "allow_degraded",
     "accept_suggested_mappings",
     "analysis_mode",
     "base_artifact_path",
@@ -51,12 +52,14 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "primary_module",
     "source_dirs",
     "source_repo_hints",
+    "selected_targets",
     "step4_fetch_timeout",
     "step4_git_diff_timeout",
     "step4_japicmp_timeout",
     "step5_selected_coords",
     "step5_selected_names",
     "step5_timeout",
+    "strict_risk_gate",
     "tool",
 }
 INTENT_PATCH_RESERVED_TOP_LEVEL_FIELDS = {"action", "intent_patch", "notes", "restart_step_id"}
@@ -655,7 +658,7 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         if timeout_key in response:
             updated[timeout_key] = parse_positive_int_like(response.get(timeout_key), timeout_key)
 
-    for key in ("include_test_scope", "allow_degraded"):
+    for key in ("include_test_scope", "allow_degraded", "strict_risk_gate"):
         if key in response:
             updated[key] = parse_bool_like(response.get(key), key)
     if "strict_risk_gate" in response:
@@ -1456,6 +1459,92 @@ def _artifact_name_from_coord(coord):
     return parts[1]
 
 
+def build_interaction_selection_options(selection_options):
+    normalized = []
+    seen_keys = set()
+    for item in selection_options or []:
+        coord = str((item or {}).get("coord") or "").strip()
+        name = str((item or {}).get("name") or "").strip()
+        selection_key = str((item or {}).get("selection_key") or "").strip()
+        if not selection_key:
+            if coord:
+                selection_key = f"coord:{coord}"
+            elif name:
+                selection_key = f"name:{name}"
+        if not selection_key:
+            continue
+        key_lower = selection_key.lower()
+        if key_lower in seen_keys:
+            continue
+        seen_keys.add(key_lower)
+        aliases = _dedupe_strings(
+            [
+                selection_key,
+                coord,
+                name,
+                str((item or {}).get("label") or "").strip(),
+            ]
+            + list((item or {}).get("aliases") or [])
+        )
+        normalized.append(
+            {
+                "selection_key": selection_key,
+                "coord": coord,
+                "name": name,
+                "label": str((item or {}).get("label") or coord or name or selection_key).strip(),
+                "api_count": (item or {}).get("api_count"),
+                "aliases": aliases,
+            }
+        )
+    return normalized
+
+
+def build_selection_resolution(selection_options):
+    normalized_options = build_interaction_selection_options(selection_options)
+    if not normalized_options:
+        return {}
+    return {
+        "enabled": True,
+        "response_field": "selected_targets",
+        "preferred_identifier": "selection_key",
+        "preferred_write_fields": ["step5_selected_coords", "step5_selected_names"],
+        "rules": [
+            "若用户提到候选依赖，应优先输出 selected_targets，并优先使用 selection_key。",
+            "selected_targets 也允许精确填写 coord 或 name；若 name 命中多个候选，必须先追问，不能猜测。",
+            "selected_targets 只是候选选择输入；系统会自动把它归一化为正式的 step5_selected_coords / step5_selected_names。",
+        ],
+        "options": normalized_options,
+    }
+
+
+NON_PENDING_BRIDGE_ALLOWED_ACTIONS = {
+    "cancel",
+    "continue",
+    "rerun_current_step",
+    "restart_from_step",
+}
+
+
+def build_report_dir_step5_selection_resolution(report_dir):
+    report_dir = Path(report_dir).resolve()
+    available_rows = read_csv_rows(report_dir / "s4_jar_compare" / "all_changed_apis.csv")
+    risk_candidates = read_csv_rows(report_dir / STEP3_RISK_CANDIDATES_FILE)
+    target_summary = build_step5_selection_summary(list(available_rows) + list(risk_candidates))
+    selection_options = build_interaction_selection_options(
+        [
+            {
+                "selection_key": f"coord:{item.get('coord')}",
+                "coord": item.get("coord"),
+                "name": item.get("name"),
+                "api_count": item.get("api_count"),
+                "label": item.get("coord") or item.get("name"),
+            }
+            for item in target_summary.get("available_targets", [])
+        ]
+    )
+    return build_selection_resolution(selection_options)
+
+
 def build_step5_selection_summary(all_rows, selected_coords=None, selected_names=None):
     selected_coords = normalize_step5_target_list(selected_coords, "step5_selected_coords") or []
     selected_names = normalize_step5_target_list(selected_names, "step5_selected_names") or []
@@ -1520,6 +1609,221 @@ def build_step5_selection_summary(all_rows, selected_coords=None, selected_names
         "unmatched_coords": unmatched_coords,
         "unmatched_names": unmatched_names,
     }
+
+
+def _response_value_present(value):
+    return value not in (None, "", [])
+
+
+def has_non_pending_intent_payload(user_response):
+    response = dict(user_response or {})
+    if list(response.get("__clear_fields") or []):
+        return True
+    for key, value in response.items():
+        if key in {"action", "restart_step_id", "notes", "__intent_patch", "__clear_fields"}:
+            continue
+        if _response_value_present(value):
+            return True
+    return False
+
+
+def infer_non_pending_target_step_from_payload(user_response):
+    response = dict(user_response or {})
+    if response.get("selected_targets") is not None:
+        return "step5"
+    step_hints = (
+        (
+            "step1",
+            {
+                "analysis_mode",
+                "base_artifact_path",
+                "base_branch",
+                "base_jdk_home",
+                "base_source_project_dir",
+                "current_artifact_path",
+                "current_branch",
+                "current_jdk_home",
+                "current_source_project_dir",
+                "manual_coord_overrides",
+                "modules",
+                "primary_module",
+                "tool",
+            },
+        ),
+        (
+            "step2",
+            {
+                "source_dirs",
+                "dependency_source_dirs",
+                "source_repo_hints",
+                "accept_suggested_mappings",
+            },
+        ),
+        (
+            "step3",
+            {
+                "include_test_scope",
+            },
+        ),
+        (
+            "step4",
+            {
+                "dependency_git_ref_overrides",
+                "step4_fetch_timeout",
+                "step4_git_diff_timeout",
+                "step4_japicmp_timeout",
+            },
+        ),
+        (
+            "step5",
+            {
+                "allow_degraded",
+                "max_depth",
+                "step5_selected_coords",
+                "step5_selected_names",
+                "step5_timeout",
+                "strict_risk_gate",
+            },
+        ),
+    )
+    for step_id, fields in step_hints:
+        if any(_response_value_present(response.get(field)) for field in fields):
+            return step_id
+    if list(response.get("__clear_fields") or []):
+        cleared = set(response.get("__clear_fields") or [])
+        for step_id, fields in step_hints:
+            if cleared.intersection(fields):
+                return step_id
+    return ""
+
+
+def normalize_action_requirements(action_requirements, options, required_fields=None):
+    normalized = {}
+    known_actions = {
+        str((item or {}).get("id") or "").strip()
+        for item in (options or [])
+        if str((item or {}).get("id") or "").strip()
+    }
+    for action_id, spec in (action_requirements or {}).items():
+        action_key = str(action_id or "").strip()
+        if not action_key:
+            continue
+        if known_actions and action_key not in known_actions:
+            continue
+        item = dict(spec or {})
+        normalized[action_key] = {
+            "required_fields": _dedupe_strings(
+                [
+                    str(field).strip()
+                    for field in (
+                        item.get("required_fields")
+                        or (list(required_fields or []) if action_key == "continue" and required_fields else [])
+                    )
+                    if str(field).strip()
+                ]
+            ),
+            "at_least_one_of": _dedupe_strings(
+                [str(field).strip() for field in (item.get("at_least_one_of") or []) if str(field).strip()]
+            ),
+            "recommended_fields": _dedupe_strings(
+                [str(field).strip() for field in (item.get("recommended_fields") or []) if str(field).strip()]
+            ),
+            "description": str(item.get("description") or "").strip(),
+        }
+    if "continue" in known_actions and required_fields and "continue" not in normalized:
+        normalized["continue"] = {
+            "required_fields": _dedupe_strings([str(field).strip() for field in required_fields if str(field).strip()]),
+            "at_least_one_of": [],
+            "recommended_fields": [],
+            "description": "只有补齐当前检查点要求的关键字段后，才能继续执行。",
+        }
+    if "restart_from_step" in known_actions:
+        restart_spec = normalized.setdefault("restart_from_step", {})
+        restart_spec["required_fields"] = _dedupe_strings(
+            list(restart_spec.get("required_fields") or []) + ["restart_step_id"]
+        )
+        restart_spec.setdefault("at_least_one_of", [])
+        restart_spec.setdefault("recommended_fields", [])
+        restart_spec.setdefault("description", "指定 restart_step_id 后，从当前步骤或更早步骤重新执行。")
+    return normalized
+
+
+def resolve_selected_targets(selection_resolution, raw_value):
+    if raw_value is None:
+        return None
+    values = normalize_step5_target_list(raw_value, "selected_targets") or []
+    resolution = dict(selection_resolution or {})
+    options = list(resolution.get("options") or [])
+    if not options:
+        raise StepError("当前检查点不支持 selected_targets。")
+    alias_map = {}
+    for item in options:
+        aliases = _dedupe_strings(
+            [
+                str(item.get("selection_key") or "").strip(),
+                str(item.get("coord") or "").strip(),
+                str(item.get("name") or "").strip(),
+            ]
+            + list(item.get("aliases") or [])
+        )
+        for alias in aliases:
+            alias_key = alias.lower()
+            if not alias_key:
+                continue
+            alias_map.setdefault(alias_key, []).append(item)
+    selected_coords = []
+    selected_names = []
+    unresolved = []
+    ambiguous = {}
+    seen_coords = set()
+    seen_names = set()
+    for raw_item in values:
+        hits = alias_map.get(raw_item.lower(), [])
+        if not hits:
+            unresolved.append(raw_item)
+            continue
+        unique_hits = []
+        seen_option_keys = set()
+        for hit in hits:
+            option_key = str(hit.get("selection_key") or "").strip().lower()
+            if option_key in seen_option_keys:
+                continue
+            seen_option_keys.add(option_key)
+            unique_hits.append(hit)
+        if len(unique_hits) > 1:
+            ambiguous[raw_item] = [str(item.get("selection_key") or "").strip() for item in unique_hits]
+            continue
+        hit = unique_hits[0]
+        coord = str(hit.get("coord") or "").strip()
+        name = str(hit.get("name") or "").strip()
+        if coord and coord.lower() not in seen_coords:
+            selected_coords.append(coord)
+            seen_coords.add(coord.lower())
+        elif name and name.lower() not in seen_names:
+            selected_names.append(name)
+            seen_names.add(name.lower())
+    return {
+        "selected_targets": values,
+        "step5_selected_coords": selected_coords,
+        "step5_selected_names": selected_names,
+        "unresolved": unresolved,
+        "ambiguous": ambiguous,
+    }
+
+
+def validate_selected_targets_resolution(selection_resolution, raw_value):
+    selection_result = resolve_selected_targets(selection_resolution, raw_value) or {}
+    if selection_result.get("ambiguous"):
+        problems = []
+        for raw_item, candidates in selection_result.get("ambiguous", {}).items():
+            problems.append(f"{raw_item} -> {', '.join(candidates[:5])}")
+        raise StepError("selected_targets 存在歧义，必须先明确唯一候选：" + "；".join(problems))
+    if selection_result.get("unresolved"):
+        raise StepError(
+            "selected_targets 未命中当前候选："
+            + ", ".join(selection_result.get("unresolved")[:10])
+        )
+    return selection_result
 
 
 def write_step5_selected_input(output_path, selection_summary):
@@ -2550,6 +2854,8 @@ def _response_payload_example(action_id, required_fields, properties):
             payload["modules"] = ["<用户指定模块>"]
         if "dependency_source_dirs" in properties:
             payload["dependency_source_dirs"] = ["/abs/path/to/dependency-repo"]
+        if "allow_degraded" in properties:
+            payload["allow_degraded"] = True
     elif action_id == "restart_from_step":
         payload["restart_step_id"] = "<step1|step2|step3|step4|step5>"
         if "dependency_source_dirs" in properties:
@@ -2562,6 +2868,14 @@ def _response_payload_example(action_id, required_fields, properties):
                     payload[field] = [f"<{field} 值>"]
                 elif field not in payload:
                     payload[field] = f"<{field} 值>"
+        if "selected_targets" in properties:
+            payload["selected_targets"] = ["<selection_key 或 coord>"]
+        elif "step5_selected_coords" in properties:
+            payload["step5_selected_coords"] = ["<coord 值>"]
+        elif "step5_selected_names" in properties:
+            payload["step5_selected_names"] = ["<name 值>"]
+        if "strict_risk_gate" in properties:
+            payload["strict_risk_gate"] = True
     if "notes" in properties:
         payload["notes"] = "<可选：用户补充说明>"
     return _wrap_response_payload_as_intent_patch(payload)
@@ -2644,6 +2958,12 @@ def _response_payload_action_example(action_id, properties):
             payload["source_dirs"] = ["src/main/java"]
         if "dependency_source_dirs" in properties:
             payload["dependency_source_dirs"] = ["/abs/path/to/dependency-repo"]
+        if "selected_targets" in properties:
+            payload["selected_targets"] = ["coord:com.example:demo-lib"]
+        elif "step5_selected_coords" in properties:
+            payload["step5_selected_coords"] = ["com.example:demo-lib"]
+        if "strict_risk_gate" in properties:
+            payload["strict_risk_gate"] = True
         if "notes" in properties:
             payload["notes"] = "当前结果可信，继续"
     elif action_id == "cancel":
@@ -2659,6 +2979,8 @@ def _build_user_reply_examples(action_id, properties):
             examples.append("继续，不过基准分支改成 origin/main。")
         elif "source_dirs" in properties:
             examples.append("继续，源码目录补上 module-a/src/main/java。")
+        if "selected_targets" in properties or "step5_selected_coords" in properties:
+            examples.append("继续，但 Step5 只分析 commons-lang:commons-lang 这个依赖。")
         return examples
     if action_id == "rerun_current_step":
         examples = [
@@ -3037,6 +3359,12 @@ def build_step1_preflight_interaction(run_context):
         "fallback_inputs": fallback_inputs,
         "input_modes": build_step1_input_modes(),
         "checklist_lines": checklist_lines,
+        "action_requirements": {
+            "continue": {
+                "required_fields": [item.get("field") for item in missing_inputs if item.get("field")],
+                "description": "只有补齐当前缺失输入后，才能继续执行 Step1。",
+            }
+        },
         "options": [
             {
                 "id": "continue",
@@ -3133,6 +3461,75 @@ def build_input_normalization_contract(options, required_fields, properties):
         "field_hints": field_hints,
         "action_examples": action_examples,
     }
+
+
+def enrich_input_normalization_contract(contract, action_requirements=None, selection_resolution=None):
+    payload = dict(contract or {})
+    rules = list(payload.get("rules") or [])
+    do_not = list(payload.get("do_not") or [])
+    if action_requirements:
+        payload["action_requirements"] = action_requirements
+        requirement_rule = "恢复前必须满足 action_requirements；若 required_fields 或 at_least_one_of 未满足，必须先追问。"
+        if requirement_rule not in rules:
+            rules.append(requirement_rule)
+    if selection_resolution and selection_resolution.get("enabled"):
+        payload["selection_resolution"] = selection_resolution
+        selection_rule = "若用户提到候选对象，优先归一化为 selected_targets；若匹配到多个候选，必须先澄清。"
+        if selection_rule not in rules:
+            rules.append(selection_rule)
+        selection_do_not = "不要把候选展示文案直接当成正式业务字段；先解析为 selected_targets 或正式主键。"
+        if selection_do_not not in do_not:
+            do_not.append(selection_do_not)
+    payload["rules"] = rules
+    if do_not:
+        payload["do_not"] = do_not
+    return payload
+
+
+def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=None, report_dir=None):
+    payload = dict(interaction or {})
+    if not payload:
+        return payload
+    step_id = str(step_id or "").strip()
+    options = [dict(item) for item in (payload.get("options") or [])]
+    response_schema = dict(payload.get("response_schema") or {})
+    properties = dict(response_schema.get("properties") or {})
+    selection_options = build_interaction_selection_options(payload.get("selection_options") or [])
+    selection_resolution = build_selection_resolution(selection_options)
+    if selection_options:
+        payload["selection_options"] = selection_options
+        properties.setdefault(
+            "selected_targets",
+            {
+                "type": "array",
+                "description": "可选。优先填写 selection_key；也支持精确填写候选的 coord 或 name。系统会自动解析为正式的 Step5 目标字段。",
+            },
+        )
+        payload["selection_resolution"] = selection_resolution
+    action_requirements = normalize_action_requirements(
+        payload.get("action_requirements") or {},
+        options,
+        required_fields=payload.get("required_fields") or [],
+    )
+    if action_requirements:
+        payload["action_requirements"] = action_requirements
+    response_schema["properties"] = properties
+    response_schema.setdefault("required", ["action"])
+    payload["response_schema"] = response_schema
+    payload["input_normalization"] = enrich_input_normalization_contract(
+        payload.get("input_normalization") or {},
+        action_requirements=action_requirements,
+        selection_resolution=selection_resolution,
+    )
+    if project_dir is not None and report_dir is not None:
+        payload["resume_command_examples"] = build_resume_command_examples(
+            options,
+            payload.get("required_fields") or [],
+            properties,
+            project_dir,
+            report_dir,
+        )
+    return payload
 
 
 def allowed_restart_step_ids(current_step_id):
@@ -3270,6 +3667,28 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
             if desc:
                 line += f" - {desc}"
             sys.stderr.write(line.rstrip() + "\n")
+    action_requirements = interaction.get("action_requirements") or {}
+    if action_requirements:
+        sys.stderr.write("动作约束：\n")
+        for action_id, spec in action_requirements.items():
+            required_fields = ", ".join(spec.get("required_fields") or []) or "(无)"
+            at_least_one = ", ".join(spec.get("at_least_one_of") or []) or ""
+            recommended = ", ".join(spec.get("recommended_fields") or []) or ""
+            sys.stderr.write(f"  - {action_id}: required={required_fields}\n")
+            if at_least_one:
+                sys.stderr.write(f"    至少其一: {at_least_one}\n")
+            if recommended:
+                sys.stderr.write(f"    推荐: {recommended}\n")
+    selection_options = interaction.get("selection_options", []) or []
+    if selection_options:
+        sys.stderr.write("候选目标：\n")
+        for item in selection_options[:10]:
+            selection_key = item.get("selection_key") or ""
+            coord = item.get("coord") or ""
+            name = item.get("name") or ""
+            sys.stderr.write(
+                f"  - {selection_key} | coord={coord or '(无)'} | name={name or '(无)'}\n"
+            )
     sys.stderr.write("=" * 60 + "\n")
     sys.stderr.flush()
     body = {
@@ -3303,6 +3722,9 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
                 "input_modes": input_modes,
                 "response_schema": interaction.get("response_schema", {}),
                 "input_normalization": interaction.get("input_normalization", {}),
+                "action_requirements": action_requirements,
+                "selection_options": selection_options,
+                "selection_resolution": interaction.get("selection_resolution", {}),
                 "runtime_rules": runtime_rules,
                 "next_action_rule": interaction.get("next_action_rule"),
                 "must_wait_for_user_reply": interaction.get("must_wait_for_user_reply", True),
@@ -3541,14 +3963,18 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         available_rows = read_csv_rows(all_changed_apis)
         risk_candidates = read_csv_rows(report_dir / STEP3_RISK_CANDIDATES_FILE)
         target_summary = build_step5_selection_summary(list(available_rows) + list(risk_candidates))
-        selection_options = [
-            {
-                "coord": item.get("coord"),
-                "name": item.get("name"),
-                "api_count": item.get("api_count"),
-            }
-            for item in target_summary.get("available_targets", [])[:20]
-        ]
+        selection_options = build_interaction_selection_options(
+            [
+                {
+                    "selection_key": f"coord:{item.get('coord')}",
+                    "coord": item.get("coord"),
+                    "name": item.get("name"),
+                    "api_count": item.get("api_count"),
+                    "label": item.get("coord") or item.get("name"),
+                }
+                for item in target_summary.get("available_targets", [])[:20]
+            ]
+        )
         interaction_meta["selection_options"] = selection_options
         checklist_lines.append("Step5 可选调用链分析范围（按依赖汇总自 Step4 API 与 Step3 candidate 输入）：")
         checklist_lines.append(
@@ -3795,12 +4221,14 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         "resume_command_examples": resume_examples,
         "checklist_lines": checklist_lines,
         "created_at": datetime.now().isoformat(),
+        "action_requirements": interaction_meta.get("action_requirements") or {},
     }
     if interaction_meta.get("selection_options"):
         payload["selection_options"] = list(interaction_meta.get("selection_options") or [])
     runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
     runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
     runtime_view.update(run_context or {})
+    payload = apply_interaction_protocol_enhancements(payload, step_id, project_dir=project_dir, report_dir=report_dir)
     return annotate_dependency_source_dirs_interaction(payload, runtime_view, report_dir)
 
 
@@ -3891,6 +4319,21 @@ def validate_pending_interaction_response(pending_interaction, user_response):
     for field in response_schema.get("required", []) or []:
         if user_response.get(field) in (None, "", []):
             raise StepError(f"当前检查点要求字段 {field} 必填，不能为空。")
+    action_requirements = dict(pending_interaction.get("action_requirements") or {})
+    requirement = dict(action_requirements.get(action) or {})
+    for field in requirement.get("required_fields") or []:
+        if not _response_value_present(user_response.get(field)):
+            raise StepError(f"当前动作 {action} 要求字段 {field} 必填，不能为空。")
+    at_least_one_of = [str(field).strip() for field in (requirement.get("at_least_one_of") or []) if str(field).strip()]
+    if at_least_one_of and not any(_response_value_present(user_response.get(field)) for field in at_least_one_of):
+        raise StepError(
+            f"当前动作 {action} 至少需要提供以下字段之一：{', '.join(at_least_one_of)}"
+        )
+    if "selected_targets" in user_response:
+        validate_selected_targets_resolution(
+            pending_interaction.get("selection_resolution") or {},
+            user_response.get("selected_targets"),
+        )
 
     if (
         step_id == "step5"
@@ -3953,6 +4396,15 @@ def validate_pending_interaction_response(pending_interaction, user_response):
 
 def apply_user_response_to_main_state(main_state, pending_interaction, user_response, project_dir, target_step_id=""):
     user_response = build_canonical_user_response(user_response)
+    if user_response.get("selected_targets") is not None:
+        selection_result = resolve_selected_targets(
+            (pending_interaction or {}).get("selection_resolution") or {},
+            user_response.get("selected_targets"),
+        ) or {}
+        if selection_result.get("step5_selected_coords"):
+            user_response["step5_selected_coords"] = selection_result.get("step5_selected_coords")
+        if selection_result.get("step5_selected_names"):
+            user_response["step5_selected_names"] = selection_result.get("step5_selected_names")
     pending_step_id = str((pending_interaction or {}).get("step_id") or "").strip()
     pending_kind = str((pending_interaction or {}).get("kind") or "").strip()
     step_id = str(target_step_id or pending_step_id or "").strip()
@@ -4021,16 +4473,119 @@ def build_restore_context(main_state, step_id):
     return build_step_input_context(main_state, step_id, fallback_existing={})
 
 
-def apply_structured_user_response_if_present(args, project_dir, report_dir, main_state, step_id):
+def resolve_non_pending_structured_response_step(args, main_state, user_response):
+    action = str((user_response or {}).get("action") or "").strip()
+    if action not in NON_PENDING_BRIDGE_ALLOWED_ACTIONS:
+        raise StepError(
+            "当前没有 pending interaction 时，结构化用户意图仅支持以下 action："
+            + ", ".join(sorted(NON_PENDING_BRIDGE_ALLOWED_ACTIONS))
+        )
+    restart_step_id = str((user_response or {}).get("restart_step_id") or "").strip()
+    if action == "restart_from_step":
+        if restart_step_id not in STEP_SEQUENCE:
+            raise StepError("action=restart_from_step 时，必须提供合法的 restart_step_id。")
+        return restart_step_id
+    requested_step = str(getattr(args, "step", "") or "").strip()
+    if requested_step and requested_step != "auto":
+        return requested_step
+    current_step = str(((main_state or {}).get("state") or {}).get("current_step") or "").strip()
+    if current_step in STEP_SEQUENCE:
+        return current_step
+    inferred_step_id = infer_non_pending_target_step_from_payload(user_response)
+    if inferred_step_id:
+        return inferred_step_id
+    raise StepError(
+        "当前没有待恢复的 pending interaction，且无法根据结构化用户意图推断目标步骤。"
+        "请显式指定 --step，或在 intent_patch 中提供 restart_step_id。"
+    )
+
+
+def build_non_pending_structured_response_interaction(target_step_id, report_dir, user_response):
+    interaction = {
+        "step_id": target_step_id,
+        "kind": "non_pending_intent_bridge",
+        "status": "ready",
+    }
+    if user_response.get("selected_targets") is not None:
+        selection_resolution = build_report_dir_step5_selection_resolution(report_dir)
+        if not (selection_resolution.get("options") or []):
+            raise StepError(
+                "当前无法解析 selected_targets：缺少可用的 Step5 候选目标。"
+                "请先执行 Step4 生成候选，或直接提供 step5_selected_coords / step5_selected_names。"
+            )
+        interaction["selection_resolution"] = selection_resolution
+    return interaction
+
+
+def apply_non_pending_structured_response(args, project_dir, report_dir, main_state, user_response):
+    response_action = str((user_response or {}).get("action") or "").strip()
+    if response_action == "cancel":
+        print("⏹ 用户取消非 checkpoint 结构化意图，保持当前主状态不继续执行。", file=sys.stderr)
+        return {
+            "main_state": main_state,
+            "step_id": "",
+            "pending_interaction": None,
+            "resumed_interaction_step_id": "",
+            "response_action": response_action,
+            "user_response": user_response,
+            "early_exit_code": 0,
+        }
+    if not has_non_pending_intent_payload(user_response):
+        raise StepError(
+            "当前没有待恢复的 pending interaction。若要提交新的正式业务意图，"
+            "请在 intent_patch.set / clear 中提供至少一个业务字段，或使用 action=restart_from_step。"
+        )
+    target_step_id = resolve_non_pending_structured_response_step(args, main_state, user_response)
+    synthetic_interaction = build_non_pending_structured_response_interaction(
+        target_step_id,
+        report_dir,
+        user_response,
+    )
+    if user_response.get("selected_targets") is not None:
+        validate_selected_targets_resolution(
+            synthetic_interaction.get("selection_resolution") or {},
+            user_response.get("selected_targets"),
+        )
+    main_state, updated_context = apply_user_response_to_main_state(
+        main_state,
+        synthetic_interaction,
+        user_response,
+        project_dir,
+        target_step_id=target_step_id,
+    )
+    reset_step_state_for_restart(
+        main_state,
+        target_step_id,
+        report_dir,
+        preserve_current_input=dict(updated_context),
+    )
+    save_main_state(report_dir, main_state)
+    print(
+        f"🔁 当前没有 pending interaction；已将结构化用户意图桥接为从 {target_step_id} 重跑。",
+        file=sys.stderr,
+    )
+    return {
+        "main_state": main_state,
+        "step_id": target_step_id,
+        "pending_interaction": None,
+        "resumed_interaction_step_id": "",
+        "response_action": response_action,
+        "user_response": user_response,
+        "early_exit_code": None,
+    }
+
+
+def apply_structured_user_response_if_present(args, project_dir, report_dir, main_state, step_id, user_response=None):
     pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
     has_structured_response = bool(args.response_json or args.response_file)
     resumed_interaction_step_id = ""
     response_action = ""
-    user_response = {}
+    user_response = dict(user_response or {})
     early_exit_code = None
 
     if pending_interaction and has_structured_response:
-        user_response = resolve_user_response(args, project_dir)
+        if not user_response:
+            user_response = resolve_user_response(args, project_dir)
         response_action = str(user_response.get("action") or "").strip()
         resumed_interaction_step_id = str((pending_interaction or {}).get("step_id") or "").strip()
         available_actions = option_ids(pending_interaction)
@@ -4069,13 +4624,15 @@ def apply_structured_user_response_if_present(args, project_dir, report_dir, mai
                 save_main_state(report_dir, main_state)
                 pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
     elif has_structured_response:
-        print(
-            "❌ 当前没有待恢复的 pending interaction，禁止直接使用 --response-json / "
-            "--response-file 写入业务参数。请先通过 --seed-json 初始化主状态，"
-            "或等待实际 checkpoint 后再恢复。",
-            file=sys.stderr,
+        if not user_response:
+            user_response = resolve_user_response(args, project_dir)
+        return apply_non_pending_structured_response(
+            args,
+            project_dir,
+            report_dir,
+            main_state,
+            user_response,
         )
-        early_exit_code = 1
 
     return {
         "main_state": main_state,
@@ -4192,6 +4749,12 @@ def prepare_main_state_for_step_execution(args, main_state, step_id, report_dir)
 def maybe_emit_step1_preflight_interaction(step_id, main_state, report_dir, preflight_interaction):
     if step_id != "step1" or not preflight_interaction:
         return None
+    preflight_interaction = apply_interaction_protocol_enhancements(
+        preflight_interaction,
+        step_id,
+        project_dir=Path(report_dir).resolve().parent,
+        report_dir=report_dir,
+    )
     update_main_state_state(
         main_state,
         current_step=step_id,
@@ -4213,6 +4776,12 @@ def maybe_emit_step1_preflight_interaction(step_id, main_state, report_dir, pref
 def persist_step_interaction(main_state, step_id, report_dir, run_context, interaction):
     store_step_output(main_state, step_id, run_context, report_dir)
     seed_next_step_input(main_state, step_id, run_context)
+    interaction = apply_interaction_protocol_enhancements(
+        interaction,
+        step_id,
+        project_dir=Path(report_dir).resolve().parent,
+        report_dir=report_dir,
+    )
     update_main_state_state(
         main_state,
         current_step=current_step_for_pending_interaction(step_id, interaction),
@@ -4244,6 +4813,12 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
 def persist_interaction_required_error(main_state, step_id, report_dir, interaction):
     runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
     runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
+    interaction = apply_interaction_protocol_enhancements(
+        interaction,
+        step_id,
+        project_dir=Path(report_dir).resolve().parent,
+        report_dir=report_dir,
+    )
     interaction = annotate_dependency_source_dirs_interaction(interaction, runtime_view, report_dir)
     update_main_state_state(
         main_state,
@@ -4619,13 +5194,22 @@ def main():
     main_state = load_main_state(report_dir, manifest_path=args.manifest)
     manifest_data, manifest_steps = load_manifest(args.manifest)
     _ = manifest_data
-    step_id = resolve_requested_step(args.step, main_state)
+    pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
+    structured_user_response = None
+    has_structured_response = bool(args.response_json or args.response_file)
+    if has_structured_response:
+        structured_user_response = resolve_user_response(args, project_dir)
+    if args.step == "auto" and has_structured_response and not pending_interaction:
+        step_id = ""
+    else:
+        step_id = resolve_requested_step(args.step, main_state)
     response_result = apply_structured_user_response_if_present(
         args,
         project_dir,
         report_dir,
         main_state,
         step_id,
+        user_response=structured_user_response,
     )
     main_state = response_result["main_state"]
     step_id = response_result["step_id"]

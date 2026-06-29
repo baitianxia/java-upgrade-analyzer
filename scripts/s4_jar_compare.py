@@ -756,6 +756,16 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
             "allowed_actions": ["rerun_current_step", "restart_from_step", "cancel"],
             "required_fields": ["action"],
         },
+        "action_requirements": {
+            "rerun_current_step": {
+                "at_least_one_of": ["dependency_git_ref_overrides", "dependency_source_dirs"],
+                "description": "重跑 Step4 时，至少要确认 git refs，或修正 dependency_source_dirs。",
+            },
+            "restart_from_step": {
+                "required_fields": ["restart_step_id"],
+                "description": "从更早步骤重跑时，必须明确 restart_step_id。",
+            },
+        },
         "pending_git_ref_items": pending_items,
         "resume_hint": (
             "用户确认 old_ref/new_ref 后，可使用 --response-json 传回 "
@@ -838,6 +848,21 @@ def build_timeout_resolution_interaction(output_dir, timeout_items):
                 "notes": {
                     "type": "string",
                 },
+            },
+        },
+        "action_requirements": {
+            "rerun_current_step": {
+                "at_least_one_of": [
+                    "step4_git_diff_timeout",
+                    "step4_japicmp_timeout",
+                    "step4_fetch_timeout",
+                    "dependency_source_dirs"
+                ],
+                "description": "重跑 Step4 时，至少要调整一个超时参数，或修正 dependency_source_dirs。",
+            },
+            "restart_from_step": {
+                "required_fields": ["restart_step_id"],
+                "description": "从更早步骤重跑时，必须明确 restart_step_id。",
             },
         },
         "input_normalization": {

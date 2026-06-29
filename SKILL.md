@@ -17,7 +17,7 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 
 1. 执行 `scripts/run_step.py`、门控脚本和只读检查命令
 2. 读取 `.upgrade-report/main_state.json`、`.upgrade-report/interaction.json` 与本阶段产物
-3. 向用户原样转述 `interaction.json` 中的 `question`、`options`、`files_to_review`，并优先消费其中的 `missing_inputs`、`fallback_inputs`、`input_modes`、`response_schema`、`input_normalization`
+3. 向用户原样转述 `interaction.json` 中的 `question`、`options`、`files_to_review`，并优先消费其中的 `missing_inputs`、`fallback_inputs`、`input_modes`、`response_schema`、`input_normalization`、`action_requirements`、`selection_resolution`
 4. 把用户的真实答复整理成结构化 `intent_patch`，再通过 `--response-json` 或 `--response-file` 传回下一条恢复命令
 
 首次调用 `step1` 前，必须先读取静态前置协议，而不是先试跑：
@@ -397,8 +397,9 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 必须展示：`all_changed_apis.csv`、`git_ref_matches.txt/json`、`summary.txt`
 - 必须确认：jar diff、源码 diff、依赖源码映射线索与变更集是否足以支撑下一步调用链分析；若只想分析部分变更 jar，应在这里指定 `all_changed_apis.csv` 中的 `coord` 或名称
 - 若证据不足，应先补 `dependency_source_dirs`，而不是直接进入 `step5`
-- 允许在 `continue` 时附带 `step5_selected_coords` / `step5_selected_names`，让 Step5 只分析命中的依赖
-- `selection_options` 需要同时反映 Step4 API 目标与 Step3 candidate 目标，避免只存在于 candidate 的依赖被遗漏
+- 允许在 `continue` 时优先附带 `selected_targets`，让系统自动归一化为 `step5_selected_coords` / `step5_selected_names`
+- `selection_options` 需要同时反映 Step4 API 目标与 Step3 candidate 目标，避免只存在于 candidate 的依赖被遗漏；每个候选都应带稳定 `selection_key`
+- 恢复前必须遵守 `action_requirements`；若当前动作缺少 required / at_least_one_of 字段，必须先追问，不能空恢复
 - 允许动作：`continue`、`cancel`
 - 禁止动作：证据明显不足时仍直接进入 `step5`
 - 恢复命令模板：
@@ -414,7 +415,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 python3 "$SKILL/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"step5_selected_coords":["com.example:demo-lib"],"step5_selected_names":["core-lib"]}}}'
+  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:demo-lib"]}}}'
 
 # 用户补充依赖源码映射后再恢复
 python3 "$SKILL/scripts/run_step.py" --step auto \
@@ -426,7 +427,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### Phase 8 [AUTO] Call Chain Analysis
 
 - 对应步骤：`step5`
-- 输入：`s4_jar_compare/all_changed_apis.csv`（由 Phase 4 产出）与 `s3_risk_candidates.csv`（由 Phase 3 产出）；若在 Phase 7 指定了 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
+- 输入：`s4_jar_compare/all_changed_apis.csv`（由 Phase 4 产出）与 `s3_risk_candidates.csv`（由 Phase 3 产出）；若在 Phase 7 指定了 `selected_targets` 或正式 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
 - 输出：`.upgrade-report/s5_call_chain/`
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
 - 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
@@ -524,13 +525,13 @@ python3 "$SKILL/scripts/context_compress.py" load \
 4. 在 stdout / stderr / `interaction.json` 中输出结构化交互提示
 5. **以退出码 `4` 结束当前脚本**
 
-Agent 在恢复时必须：
+Agent 在恢复或接收新的正式用户意图时必须：
 
 1. 先读取 `main_state.json`
 2. 若 `status` 为 `awaiting_*`，再读取 `interaction.json`
-3. 根据 `pending_interaction.question/options`，并优先结合 `pending_interaction.missing_inputs/fallback_inputs/input_modes/response_schema` 向用户发起对话
-4. 将用户答复整理为结构化 JSON；当前推荐统一整理为 `intent_patch`
-5. 收到用户答复后，再执行：
+3. 若存在 `pending_interaction`，根据 `pending_interaction.question/options`，并优先结合 `pending_interaction.missing_inputs/fallback_inputs/input_modes/response_schema` 向用户发起对话
+4. 将用户答复或新的正式业务意图整理为结构化 JSON；当前推荐统一整理为 `intent_patch`
+5. 收到结构化输入后，再执行：
 
 ```bash
 # 推荐：直接传 `intent_patch` 结构化答复
@@ -550,10 +551,13 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 说明：
 
-- `--response-json` / `--response-file` 是唯一恢复路径
+- `--response-json` / `--response-file` 是统一的结构化交互入口
+- 若当前存在 `pending_interaction`，它表示“恢复当前 checkpoint”
+- 若当前不存在 `pending_interaction`，但用户提出了新的正式业务意图，调度器会把 `intent_patch` 桥接为合法的主状态更新与目标步骤重跑
 - 必须传结构化用户答复；当前推荐形态例如 `--response-json '{"intent_patch":{"action":"continue","set":{}}}'`
 - `cancel` 只表示停止当前续跑，不会清空已有产物
 - 若上一条命令退出码为 `4`，优先读取 `interaction.json`，不要把它当成失败重试
+- 若当前没有 `pending_interaction`，`intent_patch` 必须在 `set` / `clear` 中提供正式业务字段，或显式使用 `action=restart_from_step`
 - 若 `step1` 需要切换到模块级分析，优先使用：
 
 ```bash
@@ -564,12 +568,13 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ```
 
 - 不要只传裸动作；收到用户答复后，必须整理成完整结构化 JSON，再优先包成 `intent_patch` 恢复执行
-- `step_manifest.json` 中的 `interaction` 是脚本级配置；本文件中的 `[CHECKPOINT]` 是 Agent 必须遵守的流程约束
+- `step_manifest.json` 中的 `interaction` 是脚本级配置；本文件中的 `[CHECKPOINT]` 与“非 checkpoint 正式意图桥接”共同构成 Agent 必须遵守的流程约束
 
-唯一合法恢复路径：
+合法交互路径：
 
 ```text
-读取 interaction.json -> 问用户 -> 等用户回复 -> 用用户原话构造 intent_patch 的 response-json/response-file -> 恢复 run_step.py
+存在 pending_interaction -> 读取 interaction.json -> 问用户 -> 等用户回复 -> 用用户原话构造 intent_patch 的 response-json/response-file -> 恢复 run_step.py
+不存在 pending_interaction，但用户提出新的正式业务意图 -> 将意图整理成 intent_patch -> 用 response-json/response-file 写回主状态 -> 从目标步骤重跑
 ```
 
 非法路径示例：
