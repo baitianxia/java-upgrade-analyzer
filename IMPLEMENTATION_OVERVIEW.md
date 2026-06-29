@@ -370,8 +370,10 @@ Step4 的职责是构建 Step5 可稳定消费的变化证据池。
 
 - 生成 JApiCmp 二进制兼容变化
 - 生成依赖源码 `git diff` 变化
+- 对 `removed jar` 场景导出旧版 jar 的 public/protected 符号集合
 - 自动识别依赖源码目录与仓库映射
 - 聚合生成 `all_changed_apis.csv`
+- 按单个 `coord` 落盘 `per_dependency/<coord>/` 目录，作为 Step4/Step5 的桥接视图
 
 #### Step4 的正式语义
 
@@ -382,6 +384,8 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 - `dependency_source_dirs` 是推荐入口
 - `dependency_repo_mappings` 是内部派生结果
 - `s4_contract.py` 固定 `all_changed_apis.csv` 字段契约
+- `removed jar` 不走旁路逻辑；正式语义是把旧版 jar 的 `class / method / constructor` 符号集导出为 Step5 目标池
+- Step4 在报告根目录下为每个依赖写出 `per_dependency/<coord>/removed_jar_symbols.csv`、`resolved_targets.csv`、`summary.json`
 - 依赖源码仓库的 git ref 只从远端分支 `remotes` 中匹配，不直接沿用主项目分支名
 - 版本匹配会先去掉末尾 `-SNAPSHOT`，再按“严格边界命中”筛选候选；像 `3.0.2` 不会命中 `3.0.2.1`
 - `DEV/dev` 分支在同等条件下低于非 `DEV/dev` 分支
@@ -412,6 +416,23 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 - `source`
   - 变更来源，如 `japicmp` / `gitdiff` / `changelog`
 
+#### Step4 的 per-dependency 中间产物
+
+Step4 现在会在报告根目录下为每个依赖额外生成 `per_dependency/<coord>/` 目录，用于承接“单个依赖包为集合”的正式语义。
+
+当前最小闭环中，这个目录包含三类文件：
+
+- `removed_jar_symbols.csv`
+  - 仅在 `change_type=removed` 时有实际内容
+  - 保存旧版 jar 导出的 `class / method / constructor` 符号集合
+- `resolved_targets.csv`
+  - 保存该依赖最终归一化后的 Step5 输入视图
+  - 已按 `coord + api_name + api_signature + symbol_kind + change_type` 去重
+- `summary.json`
+  - 保存该依赖当前阶段的最小摘要
+  - Step4 先写入目标池规模、source 分布和 removed jar 导出元数据
+  - Step5 再补写该依赖是否触达系统源码的结果
+
 #### `jar` 元数据在 Step4 与 Step5 之间的桥接作用
 
 Step4 不仅产出变化 API 池，也为 Step5 提供依赖坐标、版本和桥接线索。Step5 会据此定位依赖 `jar`，进一步抽取 `jar_metadata`，作为依赖源码图的类型补丁层。
@@ -433,14 +454,53 @@ Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系�
 - 自动推断或用户补齐的依赖源码映射
 - 必要时由 Step4 checkpoint 指定的目标 API 子集
 
+当 `Step5` 作为独立 CLI 运行且未显式传 `--report-dir` 时，当前实现会优先从 `all_changed_apis.csv` 的 `s4_jar_compare` 父目录推导报告目录；若该输入也未提供，则再回退到 `output_dir` 的父目录。
+
 当前正式输出：
 
+- `s3_risk_candidates.csv`
+- `per_dependency/<coord>/candidate_hits.csv`
 - `reachable`
 - `uncertain`
 - `not_analyzed`
 - `not_found_in_static_analysis`
+- `per_dependency/<coord>/summary.json` 中的单依赖结果视图
 
 四态属于正式语义，不是展示标签。
+
+#### Step5 的 per-dependency 汇总
+
+Step5 在保留原有 `summary.json`、`by_api/*.json`、`by_module/*.json` 的同时，现在会把 API 级 `TraceResult` 再按 `coord` 汇总回 `per_dependency/<coord>/summary.json`。
+
+同时，Step5 现在会把 Step4 的正式 API 目标与 Step3 的 `s3_risk_candidates.csv` 做并集桥接：
+
+- Step4 负责提供“已确认 API 变化事实”
+- Step3 负责提供 `class_usage / resource / reflection / SPI` 等候选信号
+- 若在 Step4 checkpoint 指定了 `step5_selected_coords` / `step5_selected_names`，筛选会同时作用于这两类输入，而不是只过滤 Step4
+
+#### Step5 的直接证据增强
+
+对于传统方法反向图不擅长的符号，Step5 现在先尝试直接业务证据：
+
+- `class_usage` / `symbol_kind=class`
+  - 直接检查业务方法中的声明类型、导入类型、`new` / `instanceof` / `Type.class` / FQCN body 引用
+  - 若命中，则输出 `DIRECT_CLASS_USAGE`
+- `symbol_kind=field`
+  - 直接检查 `static import` 与限定名字段访问
+  - 若命中，则输出 `DIRECT_STATIC_IMPORT_USAGE` 或 `DIRECT_FIELD_USAGE`
+
+只有在这些直接证据也未命中时，`class_usage` 才继续回落到 `CLASS_USAGE_ONLY`，`field` 才继续回落到 `CALL_GRAPH_LIMITATION_SYMBOL_KIND`。
+
+当前最小输出字段包括：
+
+- `reaches_system_source`
+  - 该依赖是否已有任一目标 API 被证明触达业务源码
+- `blocked_at`
+  - 若未触达系统源码，当前证据链主要止步层级
+- `blocked_reason`
+  - 当前代表性阻塞原因，来自代表性 API 的 `reason_code`
+- `evidence_level`
+  - 当前单依赖结论的最小证据强度摘要
 
 #### Step5 的设计原则
 
@@ -715,7 +775,8 @@ Step5 在正式回溯前执行 `bridge-check`，判断是否必须跨依赖边�
 当前正式语义如下：
 
 - 业务图已直接命中时，不要求额外 bridge source
-- 需要跨依赖继续回溯且缺映射时，默认进入待交互或 `not_analyzed`
+- 需要跨依赖继续回溯时，先尝试依赖源码映射；若缺映射，则继续尝试当前 packaged runtime jar 的字节码稳定符号匹配
+- 只有依赖源码与无源码字节码两条正式路径都不可用时，才进入待交互或 `not_analyzed`
 - 图明显不完整时，不将“未命中”解释为“未影响”
 
 #### 回溯与候选收敛
@@ -774,7 +835,8 @@ Step5 最终收敛到以下四态：
 | 方法或构造器缺少 `api_signature` | 不进入正式回溯 | `not_analyzed` |
 | 目标键无法生成 | 直接终止 | `not_analyzed` |
 | 只有无签名命中且重载无法唯一确认 | overload 安全阻断 | `not_analyzed` |
-| 需要跨依赖回溯但缺 `dependency_source_mappings` | 默认阻塞或待交互 | `not_analyzed` / 阻塞 |
+| 需要跨依赖回溯但缺 `dependency_source_mappings`，但 packaged runtime jar 可扫描 | 走无源码依赖字节码路径 | `uncertain` / `not_found_in_static_analysis` |
+| 需要跨依赖回溯且源码映射、无码字节码路径都不可用 | 默认阻塞或待交互 | `not_analyzed` / 阻塞 |
 | 图明显不完整 | 不把未命中解释为无影响 | 保守语义 |
 | 命中业务代码 | 停止继续扩展 | `reachable` |
 | 命中框架边界且无法再静态证明 | 收敛为不确定候选 | `uncertain` |

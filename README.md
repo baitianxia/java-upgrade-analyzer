@@ -62,6 +62,7 @@ python3 scripts/run_step.py --step step1 \
 python3 scripts/run_step.py --step step1 --project-dir . --report-dir .upgrade-report --base-branch <base-branch> --current-branch <current-branch>
 python3 scripts/run_step.py --step step5 --project-dir . --report-dir .upgrade-report
 ```
+说明：`Step5` 直接执行时，如果未显式传 `--report-dir`，现在会优先从 `--all-changed-apis` 的 `s4_jar_compare/all_changed_apis.csv` 路径推导报告目录；若未提供该参数，则再尝试从 `--output-dir` 的父目录推导。
 如需定位 Step5 的完整分析过程，可仅在调试场景开启：
 ```bash
 JUA_STEP5_DEBUG=1 python3 scripts/s5_call_chain_engine_integrated.py --report-dir .upgrade-report
@@ -214,10 +215,16 @@ python3 scripts/run_step.py --step step1 \
   - `s4_jar_compare/summary.txt`
   - `s4_jar_compare/*_binary.txt`（JApiCmp 原始输出）
   - `s4_jar_compare/*_gitdiff_api_changes.txt`（依赖源码 git diff 原始输出）
+  - `s4_jar_compare/*_removed_symbols.txt`（removed jar 的旧版 public/protected 符号导出摘要）
 - Step5（调用链）
   - `s5_call_chain/summary.json`
   - `s5_call_chain/summary.txt`
   - `s5_call_chain/alerts.csv`
+- per-dependency（按单个依赖坐标沉淀）
+  - `per_dependency/<coord>/candidate_hits.csv`
+  - `per_dependency/<coord>/removed_jar_symbols.csv`
+  - `per_dependency/<coord>/resolved_targets.csv`
+  - `per_dependency/<coord>/summary.json`
 - Step6（汇总报告）
   - `s6_findings.json`
   - `s6_report.md`
@@ -258,6 +265,16 @@ python3 scripts/run_step.py --step step1 \
 | `s3_jdk_removed_api.csv` | JDK 移除/不兼容 API 的静态命中表（文件/行号/命中片段等） | 在 `s2_context.json` 指示存在 JDK 升级场景时生成 | 用于暴露潜在编译期失败点；本文件为背景信号，是否影响当前系统以 Step5 的可达性结论为准 |
 | `s3_jdk_javax_refs.csv` | `javax.*` 引用命中表 | 在 `s2_context.json` 指示存在 javax→jakarta 迁移风险时生成 | 用于评估迁移工作量与风险面；应区分 main/test 以及第三方代码引入的引用 |
 | `s3_jdk_internal_api.csv` | JDK 内部 API（如 `sun.*`）引用命中表 | 在 JDK 升级场景下生成 | 用于暴露运行时兼容性风险；通常需结合替代方案或 JVM 启动参数进行处置 |
+
+### Step4 / per-dependency：removed jar 与单依赖视图
+
+| 文件 | 定义 | 生成来源/条件 | 用途与解读 |
+|---|---|---|---|
+| `s4_jar_compare/*_removed_symbols.txt` | removed 依赖的旧版 jar 符号导出摘要 | 当 Step1 判定依赖为 `移除` 时，由 Step4 对旧版 jar 执行 `javap -public -s` 生成 | 用于确认旧版 jar 是否成功定位、导出了多少 public/protected 类/方法/构造器，以及是否存在导出错误 |
+| `per_dependency/<coord>/candidate_hits.csv` | 某个依赖在 Step3 命中的候选证据明细 | Step3 对系统源码、依赖源码与无源码依赖线索做 per-dependency 扫描后生成 | 用于查看这个依赖在进入 Step5 前有哪些 class-only / resource / reflection / SPI 候选命中，以及分别落在哪一层 |
+| `per_dependency/<coord>/removed_jar_symbols.csv` | 某个依赖的 removed jar 旧版符号明细 | 仅在 `change_type=移除` 时生成 | 这是 removed jar 场景下的正式目标池，后续 Step5 会直接消费这些符号去证明是否触达系统源码 |
+| `per_dependency/<coord>/resolved_targets.csv` | 某个依赖最终归一化后的 Step5 输入视图 | Step4 完成后按单个 `coord` 生成 | 用于查看“这个依赖本轮究竟有哪些目标会进入 Step5”，会做去重和字段归一化 |
+| `per_dependency/<coord>/summary.json` | 某个依赖的阶段性摘要 | Step3 先写候选命中统计，Step4 再写目标池与 removed jar 导出结果，Step5 再补写触达结论 | 这是“单个依赖包为集合”的主视图入口，先看这里，再决定是否继续深入 `candidate_hits.csv`、`resolved_targets.csv` 或 `by_api/*.json` |
 | `s3_jdk_reflection.csv` | 反射/动态调用相关命中表 | 在 JDK 升级场景下生成 | 用于识别可能绕过编译期检查的风险面；建议与回归测试结合复核 |
 | `s3_jdk_serialization.txt` | 序列化兼容性相关扫描输出（文本摘要） | 在 JDK 升级场景下生成 | 用于指导回归验证范围（对外传输对象、落库对象等）；属于风险提示而非影响证明 |
 | `s3_jdk_runtime_flags.csv` | 运行时参数/兼容性开关建议表 | 在 JDK 升级场景下生成 | 用于运行期兼容性处置与问题定位；不构成代码层结论 |
@@ -265,6 +282,7 @@ python3 scripts/run_step.py --step step1 \
 | `s3_springboot_autoconfig.txt` | 自动装配元数据扫描输出（spring.factories/AutoConfiguration.imports） | 在 Spring Boot 升级场景下生成 | 用于识别 starter/内部组件的自动装配元数据迁移工作；属于迁移线索 |
 | `s3_dependency_compat.csv` | 依赖兼容性规则命中表（基于规则库） | 依赖变化存在时生成 | 用于提供依赖兼容性风险提示与排查方向；是否影响当前系统以 Step5 结论为准 |
 | `s3_dependency_classfile.csv` | 依赖 classfile 版本/字节码兼容性线索表 | 依赖变化存在时生成 | 用于定位类加载/启动阶段的强风险信号（版本不匹配等） |
+| `s3_risk_candidates.csv` | Step3 按单依赖归并后的候选输入总表 | 依赖变化存在且 Step3 能提取出类型/资源/反射类候选时生成 | 这是 Step3 进入 Step5 的正式桥接文件；用于把 `system_source / dependency_with_source / dependency_without_source` 三层候选一并纳入后续影响证明 |
 
 ### Step4：jar 对比（依赖变化事实 + 原始证据池）
 
@@ -286,7 +304,7 @@ python3 scripts/run_step.py --step step1 \
 
 | 文件 | 定义 | 生成来源/条件 | 用途与解读 |
 |---|---|---|---|
-| `s5_call_chain/summary.json` | 调用链结论汇总（reachable/not_found_in_static_analysis/uncertain/not_analyzed）、`reason_code` 与关键证据摘要（call_paths） | Step5 对 `s4_jar_compare/all_changed_apis.csv` 逐条执行反向调用链追踪后汇总生成 | 影响判定的核心结论文件；抽样复核时先看 `analysis_status/reason_code`，再沿 call_paths 定位到业务源码的实际调用点 |
+| `s5_call_chain/summary.json` | 调用链结论汇总（reachable/not_found_in_static_analysis/uncertain/not_analyzed）、`reason_code` 与关键证据摘要（call_paths） | Step5 对 Step4 API 目标与 Step3 candidate 桥接输入的并集逐条执行反向追踪后汇总生成 | 影响判定的核心结论文件；抽样复核时先看 `analysis_status/reason_code`，再沿 call_paths 或 direct usage 证据定位到业务源码的实际命中点 |
 | `s5_call_chain/alerts.csv` | 告警清单（扁平化明细，每条风险/变更一行） | Step5 从调用链结果结构化导出生成 | 用于排序、筛选与分发处置（按 severity、模块、依赖坐标等维度） |
 | `s5_call_chain/summary.txt` | Step5 摘要（数量统计、Top 模块/Top 风险、uncertain/not_analyzed 原因分类等） | Step5 汇总生成 | 用于快速掌握总体影响分布；若 uncertain 或 not_analyzed 比例较高，应优先补齐依赖源码映射、检查图截断与框架装配路径 |
 | `s5_call_chain/by_api/*.json` | 单条风险的完整调用链证据（`evidence_paths`、逐跳命中点、reason_code 等） | Step5 对单个候选生成 | 用于复核 reachable/uncertain 结论与定位截断点；属于证据文件 |
@@ -409,12 +427,15 @@ mvn -q dependency:get -Dartifact=<groupId:artifactId>:<version>
 
 若 `all_changed_apis.csv` 为空，不等于“无风险”，应优先查看 `.upgrade-report/s4_jar_compare/summary.txt` 与相关原始证据文件，确认是否存在 jar 缺失、git diff 跳过或提取失败。
 
-调用链跨依赖边界需要依赖源码映射：
-- 优先在 `main_state.json` 中补齐 `dependency_source_dirs`
+调用链跨依赖边界的正式语义：
+- 优先在 `main_state.json` 中补齐 `dependency_source_dirs`，这样 Step5 可以继续做“有源码依赖”回溯
+- 若缺少依赖源码映射，Step5 不会再把“无源码依赖”整体直接跳过，而是先对当前 packaged runtime jar 做字节码级稳定符号匹配
+- 当 `reason_code=PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示已经在无源码依赖 jar 中稳定命中目标符号，但尚未证明是否回到系统源码，因此会收敛为 `uncertain`
 
 建议复核顺序：
 - 先看 `.upgrade-report/s5_call_chain/summary.json` 中的 `uncertain_apis` 与 `not_analyzed_apis`
 - 若存在 `DEPENDENCY_SOURCE_MAPPING_MISSING`，优先补齐 `dependency_source_dirs` 后重跑 Step5
+- 若存在 `PACKAGED_DEPENDENCY_BYTECODE_USAGE`，优先审查命中的无源码依赖及其入口；若要继续证明是否回到系统源码，再补 `dependency_source_dirs`
 - 若存在 `GRAPH_TRUNCATED`，提高 `--max-methods / --max-reverse-edges / --max-incoming-per-key` 后重跑
 - 若存在 `INTERFACE_OR_ABSTRACT_API`、`RESOURCE_OR_REFLECTION`，不要把结果当成“未影响系统”
 
@@ -423,7 +444,7 @@ mvn -q dependency:get -Dartifact=<groupId:artifactId>:<version>
 - `reachable`：已经回溯到业务源码，属于当前系统的真实风险
 - `not_found_in_static_analysis`：当前静态分析未找到路径，不代表确定未影响；仍需结合依赖源码映射、反射/资源配置与分析能力边界判断
 - `uncertain`：发现候选路径但存在低置信歧义，必须人工确认
-- `not_analyzed`：工具已知未覆盖该场景，不能解释为“未影响”；常见原因包括行为变更、缺依赖源码映射、资源/反射命中、接口/抽象 API、图截断
+- `not_analyzed`：工具已知未覆盖该场景，不能解释为“未影响”；常见原因包括行为变更、字节码分析未完成、资源/反射命中、接口/抽象 API、图截断
 - 再打开 `.upgrade-report/s5_call_chain/by_api/*.json`，核对 `evidence_paths` 与 `reason_code`
 
 若通过 `run_step.py` 执行并卡在 Step5 待交互，可直接使用：

@@ -1778,6 +1778,90 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 self.assertEqual(result.reason_code, "CALL_GRAPH_LIMITATION_SYMBOL_KIND")
                 self.assertIn(case["symbol_kind"], result.reachable_note)
 
+    def test_trace_api_marks_class_usage_candidate_reachable_when_business_code_directly_uses_type(self):
+        api_row = {
+            "api_name": "com.lib.TargetType",
+            "api_simple": "TargetType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "coord": "lib:demo",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "class_usage",
+            "matched_class": "com.lib.TargetType",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.Entry.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.Entry",
+            class_name="Entry",
+            method_name="handle",
+            return_type="void",
+            file="Entry.java",
+            line=12,
+            owner_type="business",
+            is_test=False,
+            param_types={},
+            field_types={},
+            local_var_types={},
+            imports={"TargetType": "com.lib.TargetType"},
+            static_imports={},
+            get_body_text=lambda: "return TargetType.class;",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_CLASS_USAGE")
+        self.assertIn("com.biz.Entry.handle", result.call_paths[0])
+        self.assertIn("com.lib.TargetType", result.call_paths[0])
+
+    def test_trace_api_marks_field_static_import_usage_as_reachable(self):
+        api_row = {
+            "api_name": "com.lib.TargetType.FIELD",
+            "api_simple": "FIELD",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "REMOVED",
+            "coord": "lib:demo",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "api",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.Entry.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.Entry",
+            class_name="Entry",
+            method_name="handle",
+            return_type="void",
+            file="Entry.java",
+            line=18,
+            owner_type="business",
+            is_test=False,
+            static_imports={"FIELD": "com.lib.TargetType.FIELD"},
+            get_body_text=lambda: "return FIELD;",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_STATIC_IMPORT_USAGE")
+        self.assertIn("com.lib.TargetType.FIELD", result.call_paths[0])
+
     def test_trace_api_allows_constructor_target_to_reach_business_code(self):
         api_row = {
             "api_name": "com.lib.TargetType.TargetType",
@@ -2276,6 +2360,22 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(symbol_limit_summary["user_conclusion"], "当前无法确认")
         self.assertIn("方法反向调用图", symbol_limit_summary["user_reason"])
 
+    def test_summarize_user_facing_outcome_uses_direct_usage_reason_for_reachable_results(self):
+        direct_field_usage = SimpleNamespace(
+            analysis_status="reachable",
+            reason_code="DIRECT_FIELD_USAGE",
+            change_type="REMOVED",
+            severity="P1",
+            call_paths=["com.biz.Entry.handle -> com.lib.TargetType.FIELD"],
+            evidence_paths=[],
+            dependency_chain_coords=[],
+        )
+
+        summary = formatter.summarize_user_facing_outcome(direct_field_usage)
+
+        self.assertEqual(summary["user_conclusion"], "已确认影响")
+        self.assertIn("目标字段访问", summary["user_reason"])
+
     def test_generate_enhanced_summary_outputs_user_conclusion_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -2364,6 +2464,78 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(summary["user_conclusion_summary"]["可能影响"], 1)
         self.assertEqual(summary["user_conclusion_summary"]["需要补充输入"], 1)
         self.assertEqual(summary["quality_gate"]["needs_input"], 1)
+
+    def test_generate_enhanced_summary_writes_per_dependency_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s5_call_chain"
+            results = [
+                tracer.TraceResult(
+                    coord="a:b",
+                    api_name="com.example.OrderService.run",
+                    api_simple="run",
+                    api_signature="(String)",
+                    symbol_kind="method",
+                    change_type="REMOVED",
+                    severity="P0",
+                    confirmed=True,
+                    source="old_jar",
+                    analysis_scope="method",
+                    analysis_status="reachable",
+                    direct_callers=1,
+                    is_reachable=True,
+                    reachable_note="已证明触达业务代码",
+                    business_reach_depth=2,
+                    dependency_chain_coords=["c:d"],
+                    reason_code="SYSTEM_CODE_REACHED",
+                    call_paths=["Business.run -> Dependency.call"],
+                    evidence_paths=[],
+                    verification_commands=[],
+                    hops=[],
+                    confidence_score=0.96,
+                    critical_nodes_hit=[],
+                    match_provenance="exact_signature",
+                    match_tier=0,
+                ),
+                tracer.TraceResult(
+                    coord="a:b",
+                    api_name="com.example.OrderService.blocked",
+                    api_simple="blocked",
+                    api_signature="()",
+                    symbol_kind="method",
+                    change_type="REMOVED",
+                    severity="P1",
+                    confirmed=True,
+                    source="old_jar",
+                    analysis_scope="method",
+                    analysis_status="not_analyzed",
+                    direct_callers=0,
+                    is_reachable=False,
+                    reachable_note="",
+                    business_reach_depth=0,
+                    dependency_chain_coords=[],
+                    reason_code="DEPENDENCY_SOURCE_MAPPING_MISSING",
+                    call_paths=[],
+                    evidence_paths=[],
+                    verification_commands=[],
+                    hops=[],
+                    confidence_score=0.2,
+                    critical_nodes_hit=[],
+                    match_provenance="fallback_simple",
+                    match_tier=2,
+                ),
+            ]
+
+            formatter.generate_enhanced_summary(results, output_dir)
+            per_dependency_summary = report_dir / "per_dependency" / "a_b" / "summary.json"
+            self.assertTrue(per_dependency_summary.exists())
+            summary = json.loads(per_dependency_summary.read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["coord"], "a:b")
+        self.assertTrue(summary["step5"]["reaches_system_source"])
+        self.assertEqual(summary["step5"]["reachable"], 1)
+        self.assertEqual(summary["step5"]["selected_api"], "com.example.OrderService.run")
+        self.assertEqual(summary["step5"]["evidence_level"], "strong")
 
     def test_trace_result_to_api_entry_includes_match_provenance_metadata(self):
         entry = formatter.trace_result_to_api_entry(
@@ -2781,9 +2953,79 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("## 十一、可能影响（1 项）", report_text)
         self.assertIn("## 十二、需要补充输入（1 项）", report_text)
         self.assertIn("## 十三、未覆盖/未分析（1 项）", report_text)
-        self.assertIn("| a:b | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 0 | 3 |", report_text)
+        self.assertIn("| a:b |  | 否 |  |  | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 0 | 3 |", report_text)
         self.assertIn("| app | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 0 | 3 |", report_text)
         self.assertNotIn("## 十一、未覆盖/未分析（3 项）", report_text)
+
+    def test_s6_report_reads_per_dependency_summary_and_renders_dependency_conclusion_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            s5_dir = report_dir / "s5_call_chain"
+            per_dep_dir = report_dir / "per_dependency" / "a_b"
+            s5_dir.mkdir(parents=True)
+            per_dep_dir.mkdir(parents=True)
+            (report_dir / "s1_dep_changes.csv").write_text(
+                "\n".join(
+                    [
+                        "coord,old_version,new_version,change_type,scope",
+                        "a:b,1.0.0,-,移除,compile",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (s5_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "status": "done",
+                        "reachable": 1,
+                        "uncertain": 0,
+                        "not_analyzed": 0,
+                        "not_found_in_static_analysis": 0,
+                        "user_conclusion_summary": {"已确认影响": 1},
+                        "reachable_apis": [
+                            {
+                                "coord": "a:b",
+                                "api": "com.example.Demo.call",
+                                "api_name": "com.example.Demo.call",
+                                "api_signature": "()",
+                                "symbol_kind": "method",
+                                "change_type": "REMOVED",
+                                "severity": "P0",
+                                "reason_code": "SYSTEM_CODE_REACHED",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (per_dep_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "coord": "a:b",
+                        "change_type": "移除",
+                        "step5": {
+                            "reaches_system_source": True,
+                            "final_status": "reachable",
+                            "blocked_at": "",
+                            "blocked_reason": "",
+                            "evidence_level": "strong",
+                            "selected_api": "com.example.Demo.call",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            findings = s6_report.collect_findings(str(report_dir))
+            report_text = s6_report.generate_report(findings)
+
+        self.assertEqual(findings["per_dependency_results"][0]["coord"], "a:b")
+        self.assertTrue(findings["per_dependency_results"][0]["reaches_system_source"])
+        self.assertEqual(findings["impacted_dependencies"][0]["change_type"], "移除")
+        self.assertIn("### 单依赖包最终结论", report_text)
+        self.assertIn("| a:b | 移除 | 是 | reachable |  |  | strong | com.example.Demo.call |", report_text)
 
     def test_gate_allows_checkpoint_when_inputs_are_missing_without_strict_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2912,6 +3154,56 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("boom", output)
         self.assertIn("Traceback", output)
 
+    def test_infer_step5_report_dir_prefers_all_changed_apis_parent(self):
+        args = SimpleNamespace(
+            report_dir="",
+            all_changed_apis="/tmp/demo/.upgrade-report/s4_jar_compare/all_changed_apis.csv",
+            output_dir="/tmp/other/s5_call_chain",
+        )
+
+        self.assertEqual(
+            step5.infer_step5_report_dir(args),
+            "/tmp/demo/.upgrade-report",
+        )
+
+    def test_infer_step5_report_dir_falls_back_to_output_dir_parent(self):
+        args = SimpleNamespace(
+            report_dir="",
+            all_changed_apis="",
+            output_dir="/tmp/demo/.upgrade-report/s5_call_chain_recheck",
+        )
+
+        self.assertEqual(
+            step5.infer_step5_report_dir(args),
+            "/tmp/demo/.upgrade-report",
+        )
+
+    def test_main_leaves_report_dir_empty_when_cli_omits_flag(self):
+        captured = {}
+
+        def fake_step5_main(args):
+            captured["report_dir"] = args.report_dir
+            return 0
+
+        with patch.object(step5, "step5_integrated_main", side_effect=fake_step5_main):
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "step5",
+                    "--all-changed-apis",
+                    "/tmp/demo/.upgrade-report/s4_jar_compare/all_changed_apis.csv",
+                    "--output-dir",
+                    "/tmp/demo/.upgrade-report/s5_call_chain",
+                    "--source-dirs",
+                    "/tmp/demo/src/main/java",
+                ],
+            ):
+                exit_code = step5.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["report_dir"], "")
+
     def test_step5_requires_interaction_when_dependency_source_mapping_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -2988,6 +3280,105 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 details = json.loads(details_path.read_text(encoding="utf-8"))
                 self.assertEqual(details.get("missing_mapping_count"), 1)
                 self.assertEqual(details.get("missing_mapping_coords"), ["com.example:demo"])
+
+    def test_step5_main_infers_report_dir_from_all_changed_apis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            output_dir = report_dir / "s5_call_chain"
+            source_dir = project_dir / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            (report_dir / "s4_jar_compare").mkdir(parents=True)
+            all_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis.csv"
+            all_changed_apis.write_text("coord,api_name\ncom.example:demo,com.example.Target.call\n", encoding="utf-8")
+            (report_dir / "s1_deps_current_resolved.csv").write_text(
+                "coord,version,scope\nsample:consumer,1.0.0,packaged\n",
+                encoding="utf-8",
+            )
+
+            args = SimpleNamespace(
+                report_dir="",
+                output_dir=str(output_dir),
+                all_changed_apis=str(all_changed_apis),
+                source_dirs=[str(source_dir)],
+                dependency_source_mappings=[],
+                allow_degraded=True,
+                jdk_scan_dir="",
+                max_methods=None,
+                max_depth=1,
+                debug_analysis=False,
+                debug_break=False,
+            )
+
+            graph_result = {
+                "graph": SimpleNamespace(reverse_edges={}, methods_by_id={}),
+                "type_metadata": {},
+                "stats": {
+                    "parser_usage": {},
+                    "parser_fallback_reasons": {},
+                    "truncated": False,
+                    "edge_cap_hits": 0,
+                },
+            }
+            captured_bridge = {}
+
+            def fake_check_bridge(*_args, **kwargs):
+                captured_bridge["runtime_catalog"] = kwargs.get("runtime_dependency_catalog")
+                return {
+                    ("com.example:demo", "com.example.Target.call", "", "method", "REMOVED"): {
+                        "needs_bridge": True,
+                        "coord": "com.example:demo",
+                        "has_dependency_source_mapping": False,
+                        "has_packaged_bytecode_fallback": True,
+                    }
+                }
+
+            fake_result = SimpleNamespace(
+                api_name="com.example.Target.call",
+                api_signature="",
+                coord="com.example:demo",
+                analysis_status="uncertain",
+                reason_code="PACKAGED_DEPENDENCY_BYTECODE_USAGE",
+                call_paths=[],
+                evidence_paths=[],
+                severity="P1",
+                source="validation",
+                change_type="REMOVED",
+                api_simple="call",
+                symbol_kind="method",
+                confirmed=True,
+                direct_callers=0,
+                is_reachable=None,
+                reachable_note="",
+                business_reach_depth=0,
+                dependency_chain_coords=["sample:consumer"],
+                verification_commands=[],
+                hops=[],
+                confidence_score=1.0,
+                critical_nodes_hit=[],
+                match_provenance="",
+                match_tier=-1,
+            )
+
+            with patch.object(step5, "auto_discover_bridge_sources", return_value={"dependency_source_mappings": []}), \
+                 patch.object(step5, "load_changed_apis", return_value=[{
+                     "coord": "com.example:demo",
+                     "api_name": "com.example.Target.call",
+                     "api_signature": "",
+                     "symbol_kind": "method",
+                     "change_type": "REMOVED",
+                 }]), \
+                 patch.object(step5, "build_enhanced_source_graph", return_value=graph_result), \
+                 patch.object(step5, "check_apis_that_need_bridge", side_effect=fake_check_bridge), \
+                 patch.object(step5, "_find_maven_jar", return_value="/tmp/sample-consumer.jar"), \
+                 patch.object(step5, "trace_all_apis_with_confidence_weighting", return_value=[fake_result]), \
+                 patch.object(step5, "generate_enhanced_summary", return_value=None):
+                exit_code = step5.step5_integrated_main(args)
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(captured_bridge["runtime_catalog"]["by_coord"])
+            self.assertIn("sample:consumer", captured_bridge["runtime_catalog"]["by_coord"])
 
     def test_step5_reuses_business_analysis_cache_when_building_full_graph(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6063,6 +6454,226 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertIn('"topic": "trace_batch_summary"', output)
             self.assertIn('"topic": "step5_done"', output)
             self.assertFalse(os.environ.get("JUA_STEP5_DEBUG"))
+
+    def test_trace_api_uses_packaged_bytecode_fallback_when_dependency_source_mapping_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr(
+                    "com/example/consumer/Adapter.class",
+                    b"org/apache/commons/lang/StringUtils isBlank",
+                )
+
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer",
+                            "version": "1.0.0",
+                            "scope": "compile",
+                            "jar_path": str(jar_path),
+                        }
+                    }
+                },
+            )
+            api_row = {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_simple": "isBlank",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P1",
+                "confirmed": "true",
+                "source": "old_jar",
+            }
+
+            javap_output = """
+Compiled from "Adapter.java"
+public class com.example.consumer.Adapter {
+  public void use();
+    descriptor: ()V
+    Code:
+       0: aload_1
+       1: invokestatic  #7 // Method org/apache/commons/lang/StringUtils.isBlank:(Ljava/lang/String;)Z
+       4: pop
+       5: return
+}
+"""
+
+            with patch.object(tracer, "run_cmd", return_value=(javap_output, "", 0)):
+                result = tracer.trace_api_with_confidence_weighting(
+                    api_row,
+                    graph,
+                    {},
+                    max_total_cost=5,
+                    needs_bridge=True,
+                    has_dependency_source_mapping=False,
+                    has_packaged_bytecode_fallback=True,
+                    allow_degraded=True,
+                )
+
+            self.assertEqual(result.analysis_status, "uncertain")
+            self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+            self.assertEqual(result.dependency_chain_coords, ["sample:consumer"])
+            self.assertIn("sample:consumer", result.call_paths[0])
+
+    def test_trace_api_uses_packaged_bytecode_fallback_for_constructor_with_quoted_javap_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr(
+                    "com/example/consumer/Adapter.class",
+                    b"com/example/consumer/Adapter org/apache/commons/lang/NotImplementedException",
+                )
+
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer",
+                            "version": "1.0.0",
+                            "scope": "compile",
+                            "jar_path": str(jar_path),
+                        }
+                    }
+                },
+            )
+            api_row = {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.NotImplementedException.NotImplementedException",
+                "api_simple": "NotImplementedException",
+                "api_signature": "()",
+                "symbol_kind": "constructor",
+                "change_type": "REMOVED",
+                "severity": "P1",
+                "confirmed": "true",
+                "source": "old_jar",
+            }
+
+            javap_output = """
+Compiled from "Adapter.java"
+public class com.example.consumer.Adapter {
+  public void use();
+    descriptor: ()V
+    Code:
+       0: new           #7 // class org/apache/commons/lang/NotImplementedException
+       3: dup
+       4: invokespecial #8 // Method org/apache/commons/lang/NotImplementedException."<init>":()V
+       7: pop
+       8: return
+}
+"""
+
+            with patch.object(tracer, "run_cmd", return_value=(javap_output, "", 0)):
+                result = tracer.trace_api_with_confidence_weighting(
+                    api_row,
+                    graph,
+                    {},
+                    max_total_cost=5,
+                    needs_bridge=True,
+                    has_dependency_source_mapping=False,
+                    has_packaged_bytecode_fallback=True,
+                    allow_degraded=True,
+                )
+
+            self.assertEqual(result.analysis_status, "uncertain")
+            self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+            self.assertEqual(result.dependency_chain_coords, ["sample:consumer"])
+            self.assertIn("org.apache.commons.lang.NotImplementedException.<init>()", result.call_paths[0])
+
+    def test_trace_api_reports_not_found_after_packaged_bytecode_scan_miss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr(
+                    "com/example/consumer/Adapter.class",
+                    b"com/example/consumer/Adapter",
+                )
+
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer",
+                            "version": "1.0.0",
+                            "scope": "compile",
+                            "jar_path": str(jar_path),
+                        }
+                    }
+                },
+            )
+            api_row = {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_simple": "isBlank",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P1",
+                "confirmed": "true",
+                "source": "old_jar",
+            }
+
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                max_total_cost=5,
+                needs_bridge=True,
+                has_dependency_source_mapping=False,
+                has_packaged_bytecode_fallback=True,
+                allow_degraded=True,
+            )
+
+            self.assertEqual(result.analysis_status, "not_found_in_static_analysis")
+            self.assertEqual(result.reason_code, "NO_STATIC_PATH")
+
+    def test_check_apis_that_need_bridge_marks_packaged_bytecode_fallback(self):
+        requirements = step5.check_apis_that_need_bridge(
+            [
+                {
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                    "api_signature": "(String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                }
+            ],
+            str(ROOT_DIR),
+            source_dirs=[],
+            business_graph=None,
+            dependency_source_mappings=[],
+            runtime_dependency_catalog={
+                "by_coord": {
+                    "sample:consumer": {
+                        "coord": "sample:consumer",
+                        "jar_path": "/tmp/consumer.jar",
+                    }
+                }
+            },
+        )
+
+        info = requirements[
+            tracer.build_api_identity_key(
+                {
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                    "api_signature": "(String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                }
+            )
+        ]
+        self.assertTrue(info["needs_bridge"])
+        self.assertFalse(info["has_dependency_source_mapping"])
+        self.assertTrue(info["has_packaged_bytecode_fallback"])
 
 
 if __name__ == "__main__":

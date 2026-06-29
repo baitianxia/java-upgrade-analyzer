@@ -17,11 +17,14 @@ confidence_weighted_tracer.py
 
 import json
 import os
+import re
 import sys
 import time
+import zipfile
 from collections import deque
 from dataclasses import dataclass
 
+from compat import run_cmd
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import normalize_signature_for_lookup, split_signature_params
 
@@ -112,6 +115,520 @@ class TraceResult:
     critical_nodes_hit: list
     match_provenance: str = ''
     match_tier: int = -1
+
+
+def _iter_business_methods(graph):
+    for method_def in (getattr(graph, 'methods_by_id', {}) or {}).values():
+        if getattr(method_def, 'owner_type', '') == 'business' and not getattr(method_def, 'is_test', False):
+            yield method_def
+
+
+def _build_direct_usage_result(result, method_def, reason_code, note, evidence_type, display_target):
+    result.analysis_status = 'reachable'
+    result.is_reachable = True
+    result.reason_code = reason_code
+    result.reachable_note = note
+    result.direct_callers = 1
+    result.business_reach_depth = 1
+    caller_name = getattr(method_def, 'qualified_key', '') or getattr(method_def, 'symbol_id', '')
+    result.call_paths = [f"{caller_name} -> {display_target}"]
+    result.evidence_paths = [[
+        {
+            'caller_symbol': caller_name,
+            'callee_key': display_target,
+            'evidence_type': evidence_type,
+            'confidence': 'high',
+            'file': getattr(method_def, 'file', ''),
+            'line': getattr(method_def, 'line', 0),
+        }
+    ]]
+    return result
+
+
+def _find_direct_business_class_usage(api_row, graph):
+    target_class = str(api_row.get('matched_class') or api_row.get('api_name') or '').strip()
+    if not target_class:
+        return None
+    simple_name = target_class.rsplit('.', 1)[-1]
+    body_patterns = [
+        re.compile(r'\bnew\s+' + re.escape(simple_name) + r'\b'),
+        re.compile(r'\b' + re.escape(simple_name) + r'\s*\.class\b'),
+        re.compile(r'\binstanceof\s+' + re.escape(simple_name) + r'\b'),
+        re.compile(r'\(\s*' + re.escape(simple_name) + r'\s*\)'),
+        re.compile(re.escape(target_class)),
+    ]
+    for method_def in _iter_business_methods(graph):
+        declared_types = (
+            [getattr(method_def, 'return_type', '')]
+            + list((getattr(method_def, 'param_types', {}) or {}).values())
+            + list((getattr(method_def, 'field_types', {}) or {}).values())
+            + list((getattr(method_def, 'local_var_types', {}) or {}).values())
+        )
+        if target_class in declared_types:
+            return method_def, 'declared_type'
+        imports = getattr(method_def, 'imports', {}) or {}
+        body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
+        if imports.get(simple_name) == target_class and any(pattern.search(body_text) for pattern in body_patterns[:-1]):
+            return method_def, 'imported_type'
+        if any(pattern.search(body_text) for pattern in body_patterns):
+            return method_def, 'body_reference'
+    return None
+
+
+def _find_direct_business_field_usage(api_row, graph):
+    api_name = str(api_row.get('api_name') or '').strip()
+    field_name = str(api_row.get('api_simple') or '').strip() or (api_name.rsplit('.', 1)[-1] if '.' in api_name else '')
+    owner_class = api_name.rsplit('.', 1)[0] if '.' in api_name else ''
+    owner_simple = owner_class.rsplit('.', 1)[-1] if owner_class else ''
+    if not field_name:
+        return None
+    body_patterns = []
+    if owner_simple:
+        body_patterns.append(re.compile(r'\b' + re.escape(owner_simple) + r'\s*\.\s*' + re.escape(field_name) + r'\b'))
+    if owner_class:
+        body_patterns.append(re.compile(re.escape(owner_class) + r'\s*\.\s*' + re.escape(field_name) + r'\b'))
+    for method_def in _iter_business_methods(graph):
+        static_imports = getattr(method_def, 'static_imports', {}) or {}
+        if static_imports.get(field_name) == api_name:
+            return method_def, 'static_import'
+        body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
+        if any(pattern.search(body_text) for pattern in body_patterns):
+            return method_def, 'field_access'
+    return None
+
+
+def _try_build_direct_usage_result(api_row, result, graph):
+    if graph is None:
+        return None
+
+    matched = None
+    symbol_kind = str(result.symbol_kind or '').strip()
+    analysis_scope = str(result.analysis_scope or '').strip()
+
+    if analysis_scope == 'class_usage' or symbol_kind == 'class':
+        matched = _find_direct_business_class_usage(api_row, graph)
+        if matched:
+            method_def, evidence_type = matched
+            note = '已在系统源码中找到目标类型的直接使用证据'
+            return _build_direct_usage_result(
+                result,
+                method_def,
+                'DIRECT_CLASS_USAGE',
+                note,
+                evidence_type,
+                str(api_row.get('matched_class') or api_row.get('api_name') or '').strip(),
+            )
+
+    if symbol_kind == 'field':
+        matched = _find_direct_business_field_usage(api_row, graph)
+        if matched:
+            method_def, evidence_type = matched
+            reason_code = 'DIRECT_STATIC_IMPORT_USAGE' if evidence_type == 'static_import' else 'DIRECT_FIELD_USAGE'
+            note = (
+                '已在系统源码中找到目标字段的 static import 直接引用'
+                if evidence_type == 'static_import'
+                else '已在系统源码中找到目标字段的直接访问证据'
+            )
+            return _build_direct_usage_result(
+                result,
+                method_def,
+                reason_code,
+                note,
+                evidence_type,
+                str(api_row.get('api_name') or '').strip(),
+            )
+
+    return None
+
+
+def _get_runtime_dependency_catalog(graph):
+    return getattr(graph, 'runtime_dependency_catalog', {}) or {}
+
+
+def _normalize_descriptor_type(descriptor, preserve_array=False):
+    if not descriptor:
+        return ''
+    array_dims = 0
+    while descriptor.startswith('['):
+        array_dims += 1
+        descriptor = descriptor[1:]
+    primitive_map = {
+        'V': 'void',
+        'Z': 'boolean',
+        'B': 'byte',
+        'C': 'char',
+        'S': 'short',
+        'I': 'int',
+        'J': 'long',
+        'F': 'float',
+        'D': 'double',
+    }
+    if descriptor in primitive_map:
+        base = primitive_map[descriptor]
+    elif descriptor.startswith('L') and descriptor.endswith(';'):
+        base = descriptor[1:-1].replace('/', '.')
+    else:
+        base = descriptor.replace('/', '.')
+    if array_dims:
+        suffix = '[]' * array_dims
+        if preserve_array:
+            return f'{base}{suffix}'
+    return base
+
+
+def _parse_method_descriptor(descriptor):
+    descriptor = str(descriptor or '').strip()
+    if not descriptor.startswith('('):
+        return [], ''
+    idx = 1
+    params = []
+    while idx < len(descriptor) and descriptor[idx] != ')':
+        start = idx
+        while idx < len(descriptor) and descriptor[idx] == '[':
+            idx += 1
+        if idx >= len(descriptor):
+            break
+        if descriptor[idx] == 'L':
+            end = descriptor.find(';', idx)
+            if end < 0:
+                break
+            idx = end + 1
+        else:
+            idx += 1
+        params.append(_normalize_descriptor_type(descriptor[start:idx], preserve_array=True))
+    return_type = ''
+    if idx < len(descriptor) and descriptor[idx] == ')':
+        return_type = _normalize_descriptor_type(descriptor[idx + 1:], preserve_array=True)
+    return params, return_type
+
+
+def _build_signature_from_params(param_types):
+    params = [str(item or '').strip() for item in (param_types or [])]
+    if not params:
+        return '()'
+    normalized = []
+    for item in params:
+        text = item.replace('...', '[]')
+        if '<' in text:
+            text = text.split('<', 1)[0].strip()
+        if '.' in text:
+            text = text.rsplit('.', 1)[-1]
+        normalized.append(text)
+    return '(' + ', '.join(normalized) + ')'
+
+
+def _method_descriptor_to_lookup_signature(descriptor):
+    params, _return_type = _parse_method_descriptor(descriptor)
+    signature = _build_signature_from_params(params)
+    normalized = normalize_signature_for_lookup(signature)
+    return normalized or signature
+
+
+def _field_descriptor_to_lookup_signature(descriptor):
+    normalized = _normalize_descriptor_type(str(descriptor or '').strip(), preserve_array=True)
+    return normalized or ''
+
+
+def _extract_target_owner_and_member(api_row):
+    symbol_kind = get_symbol_kind(api_row)
+    api_name = str(api_row.get('api_name') or '').strip()
+    matched_class = str(api_row.get('matched_class') or '').strip()
+    api_simple = str(api_row.get('api_simple') or '').strip()
+    if symbol_kind == 'class' or str(api_row.get('analysis_scope') or '').strip() == 'class_usage':
+        return matched_class or api_name, '', symbol_kind
+    if not api_name or '.' not in api_name:
+        return '', '', symbol_kind
+    owner, member = api_name.rsplit('.', 1)
+    if symbol_kind == 'constructor':
+        return owner, '<init>', symbol_kind
+    return owner, api_simple or member, symbol_kind
+
+
+def _class_bytes_might_reference_target(data, owner_internal_name, member_name=''):
+    if not data or not owner_internal_name:
+        return False
+    if owner_internal_name.encode('utf-8') not in data:
+        return False
+    if member_name and member_name != '<init>' and member_name.encode('utf-8') not in data:
+        return False
+    return True
+
+
+def _run_javap_bytecode_dump(jar_path, class_binary_name):
+    stdout, _stderr, rc = run_cmd(
+        ['javap', '-classpath', jar_path, '-c', '-s', '-p', class_binary_name],
+        timeout=30,
+    )
+    return stdout if rc == 0 else ''
+
+
+def _parse_javap_bytecode_references(text):
+    references = {
+        'method_refs': [],
+        'field_refs': [],
+        'class_refs': set(),
+    }
+    method_pattern = re.compile(
+        r'//\s+(?:Interface)?Method\s+([A-Za-z0-9_/$]+)\.(?:"([^"]+)"|([A-Za-z0-9_$<>]+)):(\S+)'
+    )
+    field_pattern = re.compile(
+        r'//\s+Field\s+([A-Za-z0-9_/$]+)\.([A-Za-z0-9_$]+):(\S+)'
+    )
+    class_pattern = re.compile(r'//\s+class\s+([A-Za-z0-9_/$]+)')
+    descriptor_pattern = re.compile(r'L([A-Za-z0-9_/$]+);')
+    for raw_line in (text or '').splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        method_match = method_pattern.search(line)
+        if method_match:
+            owner = method_match.group(1).replace('/', '.').replace('$', '.')
+            method_name = method_match.group(2) or method_match.group(3) or ''
+            descriptor = method_match.group(4).strip()
+            references['method_refs'].append({
+                'owner': owner,
+                'name': method_name,
+                'descriptor': descriptor,
+                'signature': _method_descriptor_to_lookup_signature(descriptor),
+            })
+            references['class_refs'].add(owner)
+            continue
+        field_match = field_pattern.search(line)
+        if field_match:
+            owner = field_match.group(1).replace('/', '.').replace('$', '.')
+            descriptor = field_match.group(3).strip()
+            references['field_refs'].append({
+                'owner': owner,
+                'name': field_match.group(2),
+                'descriptor': descriptor,
+                'signature': _field_descriptor_to_lookup_signature(descriptor),
+            })
+            references['class_refs'].add(owner)
+            continue
+        class_match = class_pattern.search(line)
+        if class_match:
+            references['class_refs'].add(class_match.group(1).replace('/', '.').replace('$', '.'))
+        if line.startswith('descriptor:'):
+            descriptor = line.split(':', 1)[1].strip()
+            for match in descriptor_pattern.findall(descriptor):
+                references['class_refs'].add(match.replace('/', '.').replace('$', '.'))
+    references['class_refs'] = sorted(references['class_refs'])
+    return references
+
+
+def _load_runtime_dependency_class_references(catalog, coord, jar_path, class_binary_name):
+    cache = catalog.setdefault('_bytecode_reference_cache', {})
+    cache_key = (coord, class_binary_name)
+    if cache_key in cache:
+        return cache[cache_key]
+    text = _run_javap_bytecode_dump(jar_path, class_binary_name)
+    if not text:
+        cache[cache_key] = None
+        return None
+    parsed = _parse_javap_bytecode_references(text)
+    cache[cache_key] = parsed
+    return parsed
+
+
+def _match_runtime_dependency_reference(api_row, references):
+    references = references or {}
+    owner, member_name, symbol_kind = _extract_target_owner_and_member(api_row)
+    if not owner:
+        return None
+    target_signature = str(api_row.get('api_signature') or '').strip()
+    target_lookup_signature = normalize_signature_for_lookup(target_signature) or target_signature
+
+    if symbol_kind == 'class' or str(api_row.get('analysis_scope') or '').strip() == 'class_usage':
+        if owner in set(references.get('class_refs') or []):
+            return {
+                'evidence_type': 'bytecode_class_reference',
+                'target_display': owner,
+            }
+        return None
+
+    if symbol_kind in {'method', 'constructor'}:
+        for item in references.get('method_refs') or []:
+            if item.get('owner') != owner or item.get('name') != member_name:
+                continue
+            if target_lookup_signature and item.get('signature') and item.get('signature') != target_lookup_signature:
+                continue
+            return {
+                'evidence_type': 'bytecode_method_invocation' if symbol_kind == 'method' else 'bytecode_constructor_invocation',
+                'target_display': f"{owner}.{member_name}{item.get('signature') or ''}",
+            }
+        return None
+
+    if symbol_kind == 'field':
+        for item in references.get('field_refs') or []:
+            if item.get('owner') != owner or item.get('name') != member_name:
+                continue
+            return {
+                'evidence_type': 'bytecode_field_access',
+                'target_display': f"{owner}.{member_name}",
+            }
+        return None
+
+    return None
+
+
+def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
+    catalog = _get_runtime_dependency_catalog(graph)
+    by_coord = catalog.get('by_coord') or {}
+    if not by_coord:
+        return {'status': 'unavailable', 'reason': 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE'}
+
+    owner, member_name, _symbol_kind = _extract_target_owner_and_member(api_row)
+    owner_internal_name = str(owner or '').replace('.', '/')
+    if not owner_internal_name:
+        return {'status': 'unavailable', 'reason': 'BYTECODE_TARGET_UNRESOLVED'}
+
+    hits = []
+    for coord, item in by_coord.items():
+        if coord == str(api_row.get('coord') or '').strip():
+            continue
+        jar_path = str(item.get('jar_path') or '').strip()
+        if not jar_path or not os.path.exists(jar_path):
+            continue
+        try:
+            with zipfile.ZipFile(jar_path) as zf:
+                for entry in sorted(zf.namelist()):
+                    if not entry.endswith('.class') or entry.startswith('META-INF/'):
+                        continue
+                    if entry.endswith('module-info.class') or entry.endswith('package-info.class'):
+                        continue
+                    data = zf.read(entry)
+                    if not _class_bytes_might_reference_target(data, owner_internal_name, member_name):
+                        continue
+                    class_binary_name = entry[:-6].replace('/', '.')
+                    references = _load_runtime_dependency_class_references(catalog, coord, jar_path, class_binary_name)
+                    if references is None:
+                        return {
+                            'status': 'unavailable',
+                            'reason': 'BYTECODE_JAVAP_FAILED',
+                            'coord': coord,
+                            'jar_path': jar_path,
+                            'class_binary_name': class_binary_name,
+                        }
+                    matched = _match_runtime_dependency_reference(api_row, references)
+                    if not matched:
+                        continue
+                    hits.append({
+                        'coord': coord,
+                        'jar_path': jar_path,
+                        'class_fqcn': class_binary_name.replace('$', '.'),
+                        'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
+                        'target_display': matched.get('target_display') or owner,
+                    })
+        except Exception as exc:
+            return {
+                'status': 'unavailable',
+                'reason': 'BYTECODE_SCAN_FAILED',
+                'coord': coord,
+                'jar_path': jar_path,
+                'error': str(exc),
+            }
+    if hits:
+        return {'status': 'hit', 'hits': hits}
+    return {'status': 'miss'}
+
+
+def _build_packaged_dependency_hit_result(result, hits):
+    first_hit = hits[0]
+    dependency_chain = []
+    for item in hits:
+        coord = str(item.get('coord') or '').strip()
+        if coord and coord not in dependency_chain:
+            dependency_chain.append(coord)
+    # Bytecode hits prove that a runtime dependency consumes the changed symbol,
+    # but they still stop one hop short of a confirmed path back into app code.
+    result.analysis_status = 'uncertain'
+    result.is_reachable = None
+    result.reason_code = 'PACKAGED_DEPENDENCY_BYTECODE_USAGE'
+    result.reachable_note = (
+        '已在无源码依赖字节码中找到对目标符号的稳定引用，'
+        '但当前尚未证明这些依赖是否回到系统源码'
+    )
+    result.dependency_chain_coords = dependency_chain
+    consumer_display = f"{first_hit.get('coord')}:{first_hit.get('class_fqcn')}"
+    result.call_paths = [f"{consumer_display} -> {first_hit.get('target_display')}"]
+    result.evidence_paths = [[
+        {
+            'caller_symbol': consumer_display,
+            'callee_key': first_hit.get('target_display'),
+            'evidence_type': first_hit.get('evidence_type'),
+            'confidence': 'high',
+            'file': first_hit.get('jar_path', ''),
+            'line': 0,
+        }
+    ]]
+    result.verification_commands = [
+        '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
+        '优先审查命中的无源码依赖及其对外暴露入口'
+    ]
+    return result
+
+
+def _build_packaged_dependency_not_found_result(result):
+    result.analysis_status = 'not_found_in_static_analysis'
+    result.is_reachable = False
+    result.reason_code = 'NO_STATIC_PATH'
+    result.reachable_note = (
+        '已对无源码依赖 jar 字节码执行静态扫描，未发现目标符号的稳定引用。'
+        '这不代表运行时一定安全。'
+    )
+    result.verification_commands = [
+        '检查是否存在反射、字符串、配置文件或 SPI 间接引用',
+        '必要时结合运行验证确认该依赖变更是否会在实际路径触发'
+    ]
+    return result
+
+
+def _build_packaged_dependency_incomplete_result(result, scan_result):
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.reason_code = str((scan_result or {}).get('reason') or 'ANALYSIS_INCOMPLETE').strip() or 'ANALYSIS_INCOMPLETE'
+    result.reachable_note = '无源码依赖字节码分析未完成，当前无法把未命中解释为安全'
+    result.verification_commands = [
+        '检查当前环境是否可执行 javap，并确认相关依赖 jar 可从本地仓库定位',
+        '必要时补充 dependency_source_dirs 或重新准备依赖产物后重跑 Step 5',
+    ]
+    return result
+
+
+def _try_build_packaged_dependency_result(api_row, result, graph):
+    if graph is None:
+        return None
+    # This fallback is only for dependencies without source checkout coverage.
+    # It reuses runtime jars as a formal analysis input instead of downgrading
+    # the API straight to not_analyzed.
+    scan_result = _scan_packaged_runtime_dependencies_for_api(api_row, graph)
+    if _step5_debug_enabled() and str(api_row.get('api_name') or '').startswith('org.apache.commons.lang'):
+        # #region debug-point B:packaged-scan
+        _step5_debug(
+            'debug_event:B',
+            'packaged dependency scan finished',
+            location='confidence_weighted_tracer.py:_try_build_packaged_dependency_result',
+            run_id='pre-fix',
+            coord=api_row.get('coord', ''),
+            api_name=api_row.get('api_name', ''),
+            status=str((scan_result or {}).get('status') or ''),
+            reason=str((scan_result or {}).get('reason') or ''),
+            hit_count=len((scan_result or {}).get('hits') or []),
+            sample_hit_coords=sorted({
+                str(hit.get('coord') or '')
+                for hit in ((scan_result or {}).get('hits') or [])
+                if str(hit.get('coord') or '').strip()
+            })[:8],
+        )
+        # #endregion
+    status = str((scan_result or {}).get('status') or '').strip()
+    if status == 'hit':
+        return _build_packaged_dependency_hit_result(result, scan_result.get('hits') or [])
+    if status == 'miss':
+        return _build_packaged_dependency_not_found_result(result)
+    if status == 'unavailable':
+        return _build_packaged_dependency_incomplete_result(result, scan_result)
+    return None
 
 
 def critical_parser_fallback_reasons(graph_stats):
@@ -382,6 +899,7 @@ def trace_api_with_confidence_weighting(
     max_total_cost=5,
     needs_bridge=False,
     has_dependency_source_mapping=True,
+    has_packaged_bytecode_fallback=False,
     allow_degraded=False,
     graph_stats=None,
     trace_cache=None,
@@ -401,6 +919,7 @@ def trace_api_with_confidence_weighting(
         max_total_cost: 最大总代价（默认5）
         needs_bridge: 该 API 是否需要依赖源码映射才能完整追踪
         has_dependency_source_mapping: 当前 API 所属依赖是否具备可用源码映射
+        has_packaged_bytecode_fallback: 当前 API 是否可回退到无源码依赖字节码分析
         allow_degraded: 如果为 True，缺依赖源码映射时标记为 not_analyzed 而非静态未找到
 
     Returns:
@@ -445,6 +964,7 @@ def trace_api_with_confidence_weighting(
         max_total_cost=max_total_cost,
         needs_bridge=needs_bridge,
         has_dependency_source_mapping=has_dependency_source_mapping,
+        has_packaged_bytecode_fallback=has_packaged_bytecode_fallback,
         allow_degraded=allow_degraded,
     )
 
@@ -454,6 +974,17 @@ def trace_api_with_confidence_weighting(
         # 如果找到 reachable 路径，说明存在真实影响（但仍需运行时验证）
         # 如果未找到，说明"目前代码未使用"或"需要补充依赖源码映射"
         pass  # 继续追踪，保留后续的路径分析能力
+
+    direct_usage_result = _try_build_direct_usage_result(api_row, result, graph)
+    if direct_usage_result is not None:
+        _debug_trace_result('trace_api_result', direct_usage_result)
+        return direct_usage_result
+
+    if needs_bridge and (not has_dependency_source_mapping) and has_packaged_bytecode_fallback:
+        packaged_dependency_result = _try_build_packaged_dependency_result(api_row, result, graph)
+        if packaged_dependency_result is not None:
+            _debug_trace_result('trace_api_result', packaged_dependency_result)
+            return packaged_dependency_result
 
     # 类级fallback：不追踪
     if result.analysis_scope == 'class_usage':
@@ -2793,6 +3324,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         bridge_info = api_bridge_requirements.get(build_api_identity_key(api_row), {})
         needs_bridge = bridge_info.get('needs_bridge', False)
         has_dependency_source_mapping = bridge_info.get('has_dependency_source_mapping', True)
+        has_packaged_bytecode_fallback = bridge_info.get('has_packaged_bytecode_fallback', False)
 
         if should_log_progress(idx, total, progress_interval):
             emit_progress(
@@ -2821,6 +3353,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
             max_total_cost=max_total_cost,
             needs_bridge=needs_bridge,
             has_dependency_source_mapping=has_dependency_source_mapping,
+            has_packaged_bytecode_fallback=has_packaged_bytecode_fallback,
             allow_degraded=allow_degraded,
             graph_stats=graph_stats,
             trace_cache=trace_cache,

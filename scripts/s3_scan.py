@@ -33,9 +33,18 @@ import json
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text, maven_repo_dir
 from progress_logging import PhaseTimer, emit_progress
+from s4_contract import (
+    PER_DEPENDENCY_CANDIDATE_HITS_FILE,
+    PER_DEPENDENCY_DIRNAME,
+    PER_DEPENDENCY_SUMMARY_FILE,
+    STEP3_RISK_CANDIDATES_FILE,
+    get_per_dependency_dir,
+)
 
 
 MAIN_STATE_FILE_NAME = "main_state.json"
+STEP3_DEPENDENCY_SOURCE_DIRS = []
+STEP3_REPORT_DIR = ""
 
 
 def load_orchestrated_step3_input(report_dir):
@@ -291,6 +300,334 @@ def find_maven_jar(coord, version):
         if matches:
             return str(matches[0])
     return None
+
+
+def _change_type_to_contract(change_type):
+    text = str(change_type or '').strip()
+    if text in {'移除', 'removed'}:
+        return 'REMOVED'
+    if text in {'新增', 'added'}:
+        return 'ADDED'
+    if text in {'大版本升级', '小版本升级', '补丁升级', '版本格式不规则', '已变更', 'upgraded'}:
+        return 'CHANGED'
+    return text or 'CHANGED'
+
+
+def _safe_read_lines(path, limit=500):
+    rows = []
+    try:
+        with open_text(path) as f:
+            for lineno, line in enumerate(f, 1):
+                if len(rows) >= limit:
+                    break
+                text = line.rstrip('\r\n')
+                if text.strip():
+                    rows.append((lineno, text[:300]))
+    except Exception:
+        return []
+    return rows
+
+
+def _iter_candidate_scan_files(source_dirs):
+    exts = {
+        '.java', '.kt', '.xml', '.properties', '.yml', '.yaml',
+        '.txt', '.factories', '.imports'
+    }
+    for source_root in iter_source_roots(source_dirs):
+        for root, dirs, files in os.walk(source_root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in exts or fname in {'spring.factories', 'AutoConfiguration.imports'}:
+                    yield os.path.join(root, fname)
+
+
+def _iter_jar_class_names(jar_path, max_classes=160):
+    classes = []
+    if not jar_path or not os.path.exists(jar_path):
+        return classes
+    try:
+        with zipfile.ZipFile(jar_path) as zf:
+            for entry in sorted(zf.namelist()):
+                if len(classes) >= max_classes:
+                    break
+                if not entry.endswith('.class') or entry.startswith('META-INF/'):
+                    continue
+                if entry.endswith('module-info.class') or entry.endswith('package-info.class'):
+                    continue
+                classes.append(entry[:-6].replace('/', '.'))
+    except Exception:
+        return []
+    return classes
+
+
+def _build_coord_scan_tokens(dep_row):
+    coord = str(dep_row.get('coord') or '').strip()
+    old_version = str(dep_row.get('old_version') or '').strip()
+    new_version = str(dep_row.get('new_version') or '').strip()
+    version = new_version if new_version and new_version != '-' else old_version
+    jar_path = find_maven_jar(coord, version) if version and version != '-' else None
+    class_names = _iter_jar_class_names(jar_path)
+    package_prefixes = []
+    for fqcn in class_names:
+        if '.' not in fqcn:
+            continue
+        package_name = fqcn.rsplit('.', 1)[0]
+        if package_name not in package_prefixes:
+            package_prefixes.append(package_name)
+        if len(package_prefixes) >= 40:
+            break
+    simple_names = []
+    for fqcn in class_names:
+        simple = fqcn.rsplit('.', 1)[-1]
+        if simple not in simple_names:
+            simple_names.append(simple)
+        if len(simple_names) >= 120:
+            break
+    return {
+        'coord': coord,
+        'jar_path': jar_path or '',
+        'class_names': class_names,
+        'package_prefixes': package_prefixes,
+        'simple_names': simple_names,
+    }
+
+
+def _class_usage_match_kind(file_path, line_text, fqcn, simple_name):
+    normalized = file_path.replace('\\', '/').lower()
+    text = str(line_text or '')
+    if normalized.endswith(('.xml', '.properties', '.yml', '.yaml', '.txt', '.factories', '.imports')):
+        return 'resource_reference', 'RESOURCE_OR_REFLECTION', 'weak'
+    if re.search(r'Class\.forName\s*\(\s*"[^"]*' + re.escape(fqcn) + r'[^"]*"', text):
+        return 'reflection_string', 'RESOURCE_OR_REFLECTION', 'weak'
+    if re.search(r'\bimport\s+static\s+' + re.escape(fqcn) + r'\.', text):
+        return 'static_import', 'CLASS_USAGE_ONLY', 'medium'
+    if re.search(r'\bimport\s+' + re.escape(fqcn) + r'\b', text):
+        return 'import_reference', 'CLASS_USAGE_ONLY', 'medium'
+    if re.search(r'\b(?:new|extends|implements|instanceof)\s+' + re.escape(simple_name) + r'\b', text):
+        return 'class_reference', 'CLASS_USAGE_ONLY', 'strong'
+    if re.search(r'\b' + re.escape(simple_name) + r'\s*\.class\b', text):
+        return 'class_literal', 'CLASS_USAGE_ONLY', 'strong'
+    if re.search(r'\b' + re.escape(simple_name) + r'\s*\.', text):
+        return 'qualified_reference', 'CLASS_USAGE_ONLY', 'medium'
+    return 'string_reference', 'RESOURCE_OR_REFLECTION', 'weak'
+
+
+def _candidate_row_from_hit(dep_row, fqcn, file_path, lineno, line_text, bucket):
+    simple_name = fqcn.rsplit('.', 1)[-1]
+    candidate_kind, reason_code, evidence_level = _class_usage_match_kind(file_path, line_text, fqcn, simple_name)
+    return {
+        'coord': str(dep_row.get('coord') or '').strip(),
+        'old_version': str(dep_row.get('old_version') or '').strip(),
+        'new_version': str(dep_row.get('new_version') or '').strip(),
+        'change_type': _change_type_to_contract(dep_row.get('change_type')),
+        'api_name': fqcn,
+        'api_simple': simple_name,
+        'symbol_kind': 'class',
+        'api_signature': '',
+        'confirmed': 'false',
+        'severity': 'P1' if str(dep_row.get('new_version') or '').strip() == '-' else 'P2',
+        'source': 'candidate_scan',
+        'analysis_scope': 'class_usage',
+        'candidate_bucket': bucket,
+        'candidate_kind': candidate_kind,
+        'reason_code': reason_code,
+        'reason': f'{bucket} 命中 {candidate_kind}',
+        'evidence_level': evidence_level,
+        'matched_class': fqcn,
+        'file': file_path,
+        'line': lineno,
+        'content': str(line_text or '')[:240],
+    }
+
+
+def _write_candidate_rows(path, rows):
+    fieldnames = [
+        'coord', 'old_version', 'new_version', 'change_type',
+        'api_name', 'api_simple', 'symbol_kind', 'api_signature',
+        'confirmed', 'severity', 'source', 'analysis_scope',
+        'candidate_bucket', 'candidate_kind', 'reason_code', 'reason',
+        'evidence_level', 'matched_class', 'file', 'line', 'content',
+    ]
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows or [])
+
+
+def cleanup_step3_outputs(report_dir):
+    report_root = Path(report_dir)
+    if not report_root.exists():
+        return
+
+    for _, default_fname in SCAN_FUNCS.values():
+        output_path = report_root / default_fname
+        if output_path.exists():
+            output_path.unlink()
+
+    # Step5 consumes these bridge artifacts directly, so stale Step3 leftovers
+    # must be removed before a rerun narrows the dependency set.
+    aggregate_path = report_root / STEP3_RISK_CANDIDATES_FILE
+    if aggregate_path.exists():
+        aggregate_path.unlink()
+
+    per_dependency_root = report_root / PER_DEPENDENCY_DIRNAME
+    if not per_dependency_root.exists():
+        return
+
+    for dep_dir in per_dependency_root.iterdir():
+        if not dep_dir.is_dir():
+            continue
+        candidate_hits_path = dep_dir / PER_DEPENDENCY_CANDIDATE_HITS_FILE
+        if candidate_hits_path.exists():
+            candidate_hits_path.unlink()
+        summary_path = dep_dir / PER_DEPENDENCY_SUMMARY_FILE
+        if not summary_path.exists():
+            continue
+        try:
+            summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        # Remove only Step3-owned keys and keep the Step4/Step5 summary payload.
+        summary.pop('step3', None)
+        artifacts = dict(summary.get('artifacts') or {})
+        artifacts.pop('candidate_hits_csv', None)
+        if artifacts:
+            summary['artifacts'] = artifacts
+        else:
+            summary.pop('artifacts', None)
+        if summary:
+            write_text(summary_path, json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
+        else:
+            summary_path.unlink()
+
+
+def build_per_dependency_candidate_outputs(source_dirs, dep_changes_path, report_dir, dependency_source_dirs=None):
+    dep_rows = load_dep_changes(dep_changes_path)
+    if not dep_rows or not report_dir:
+        return 0
+
+    source_dirs = list(iter_source_roots(source_dirs))
+    dependency_source_dirs = list(iter_source_roots(dependency_source_dirs))
+    aggregate_rows = []
+
+    for dep_row in dep_rows:
+        coord = str(dep_row.get('coord') or '').strip()
+        if not coord:
+            continue
+        token_bundle = _build_coord_scan_tokens(dep_row)
+        class_names = token_bundle.get('class_names') or []
+        if not class_names:
+            continue
+        interesting_classes = class_names[:80]
+        row_hits = []
+        seen_hits = set()
+
+        def scan_roots(paths, bucket):
+            for file_path in _iter_candidate_scan_files(paths):
+                try:
+                    with open_text(file_path) as f:
+                        for lineno, line in enumerate(f, 1):
+                            text = line.rstrip('\r\n')
+                            if not text.strip():
+                                continue
+                            for fqcn in interesting_classes:
+                                simple = fqcn.rsplit('.', 1)[-1]
+                                if fqcn in text or re.search(r'\b' + re.escape(simple) + r'\b', text):
+                                    key = (fqcn, file_path, lineno, bucket)
+                                    if key in seen_hits:
+                                        continue
+                                    seen_hits.add(key)
+                                    row_hits.append(_candidate_row_from_hit(dep_row, fqcn, file_path, lineno, text, bucket))
+                                    break
+                except Exception:
+                    continue
+
+        scan_roots(source_dirs, 'system_source')
+        if dependency_source_dirs:
+            scan_roots(dependency_source_dirs, 'dependency_with_source')
+
+        dep_compat_path = Path(report_dir) / 's3_dependency_compat.csv'
+        if dep_compat_path.exists():
+            for row in load_csv_rows(str(dep_compat_path)):
+                if str(row.get('坐标') or '').strip() != coord:
+                    continue
+                row_hits.append(
+                    {
+                        'coord': coord,
+                        'old_version': str(dep_row.get('old_version') or '').strip(),
+                        'new_version': str(dep_row.get('new_version') or '').strip(),
+                        'change_type': _change_type_to_contract(dep_row.get('change_type')),
+                        'api_name': '',
+                        'api_simple': '',
+                        'symbol_kind': 'class',
+                        'api_signature': '',
+                        'confirmed': 'false',
+                        'severity': 'P2',
+                        'source': 'candidate_scan',
+                        'analysis_scope': 'class_usage',
+                        'candidate_bucket': 'dependency_without_source',
+                        'candidate_kind': str(row.get('风险类型') or '').strip(),
+                        'reason_code': 'RESOURCE_OR_REFLECTION',
+                        'reason': str(row.get('证据') or '').strip(),
+                        'evidence_level': 'weak',
+                        'matched_class': '',
+                        'file': str(row.get('jar路径') or '').strip(),
+                        'line': '',
+                        'content': str(row.get('证据') or '').strip()[:240],
+                    }
+                )
+
+        per_dependency_dir = get_per_dependency_dir(report_dir, coord)
+        os.makedirs(per_dependency_dir, exist_ok=True)
+        candidate_hits_path = per_dependency_dir / PER_DEPENDENCY_CANDIDATE_HITS_FILE
+        _write_candidate_rows(candidate_hits_path, row_hits)
+
+        summary_path = per_dependency_dir / 'summary.json'
+        summary = {}
+        if summary_path.exists():
+            try:
+                summary = json.loads(summary_path.read_text(encoding='utf-8'))
+            except Exception:
+                summary = {}
+        bucket_counts = {}
+        for item in row_hits:
+            bucket = str(item.get('candidate_bucket') or '').strip()
+            bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        summary['coord'] = coord
+        summary['step3'] = {
+            'status': 'done',
+            'candidate_hit_count': len(row_hits),
+            'bucket_counts': bucket_counts,
+            'class_sample_count': len(interesting_classes),
+            'artifacts': {
+                'candidate_hits_csv': str(candidate_hits_path),
+            },
+        }
+        summary.setdefault('artifacts', {})
+        summary['artifacts']['candidate_hits_csv'] = str(candidate_hits_path)
+        write_text(summary_path, json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
+        aggregate_rows.extend(row_hits)
+
+    aggregate_path = Path(report_dir) / STEP3_RISK_CANDIDATES_FILE
+    _write_candidate_rows(aggregate_path, aggregate_rows)
+    return len(aggregate_rows)
+
+
+def load_csv_rows(path):
+    rows = []
+    if not path or not os.path.exists(path):
+        return rows
+    try:
+        with open_text(path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row:
+                    rows.append({k: (v or '').strip() for k, v in row.items()})
+    except Exception:
+        return []
+    return rows
 
 
 def should_scan_dep_scope(scope):
@@ -1203,6 +1540,10 @@ def main():
             args.source_dirs = list(orchestrated_input.get("source_dirs") or [])
         if not args.include_test_scope and orchestrated_input.get("include_test_scope"):
             args.include_test_scope = True
+    global STEP3_DEPENDENCY_SOURCE_DIRS
+    STEP3_DEPENDENCY_SOURCE_DIRS = list(orchestrated_input.get("dependency_source_dirs") or []) if orchestrated_input else []
+    global STEP3_REPORT_DIR
+    STEP3_REPORT_DIR = report_dir
     if orchestrated_context:
         if not args.jdk_upgraded and orchestrated_context.get("jdk_upgraded"):
             args.jdk_upgraded = True
@@ -1242,6 +1583,7 @@ def main():
             # 没有指定升级类型，运行全部
             to_run = list(SCAN_FUNCS.keys())
 
+        cleanup_step3_outputs(args.output_dir)
         os.makedirs(args.output_dir, exist_ok=True)
         emit_progress(
             "step3",
@@ -1274,6 +1616,22 @@ def main():
                 elapsed=time.perf_counter() - scan_timer,
                 item=default_fname,
             )
+        if dep_list_path:
+            candidate_count = build_per_dependency_candidate_outputs(
+                source_dir,
+                dep_list_path,
+                report_dir=args.output_dir,
+                dependency_source_dirs=STEP3_DEPENDENCY_SOURCE_DIRS,
+            )
+            emit_progress(
+                "step3",
+                "scan",
+                f"完成 per-dependency candidate 产物生成，命中 {candidate_count} 处",
+                current=len(to_run),
+                total=len(to_run),
+                item=STEP3_RISK_CANDIDATES_FILE,
+            )
+            total += candidate_count
         print(f"\nStep 3 完成：共 {total} 处命中", file=sys.stderr)
         emit_progress(
             "step3",

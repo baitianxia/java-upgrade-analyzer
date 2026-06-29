@@ -1146,6 +1146,80 @@ class Step4StabilityTest(unittest.TestCase):
             self.assertFalse(stale_summary.exists())
             self.assertTrue(unrelated.exists())
 
+    def test_main_removed_dependency_exports_old_jar_symbols_and_writes_per_dependency_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            output_dir = report_dir / "s4_jar_compare"
+            dep_changes.write_text(
+                "\n".join(
+                    [
+                        "coord,old_version,new_version,change_type,scope,base_coord",
+                        "com.example:legacy-lib,1.0.0,-,移除,compile,com.example:legacy-lib",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps({"changed_dependencies": [{"coord": "com.example:legacy-lib"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            removed_api = {
+                "coord": "com.example:legacy-lib",
+                "old_version": "1.0.0",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "com.example.LegacyApi.call",
+                "api_simple": "call",
+                "symbol_kind": "method",
+                "api_signature": "()",
+                "confirmed": "true",
+                "severity": "P0",
+                "source": "old_jar",
+            }
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes",
+                    str(dep_changes),
+                    "--context",
+                    str(context_json),
+                    "--output-dir",
+                    str(output_dir),
+                ],
+            ), patch.object(
+                step4,
+                "export_removed_jar_apis",
+                return_value=(
+                    str(output_dir / "legacy_removed_symbols.txt"),
+                    [removed_api],
+                    {"old_jar": str(report_dir / "legacy-1.0.0.jar"), "errors": []},
+                    None,
+                ),
+            ) as export_mock:
+                exit_code = step4.main()
+
+            self.assertEqual(exit_code, 0)
+            export_mock.assert_called_once()
+            per_dependency_dir = step4.get_per_dependency_dir(str(report_dir), "com.example:legacy-lib")
+            removed_symbols_csv = per_dependency_dir / step4.PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE
+            resolved_targets_csv = per_dependency_dir / step4.PER_DEPENDENCY_RESOLVED_TARGETS_FILE
+            summary_json = per_dependency_dir / step4.PER_DEPENDENCY_SUMMARY_FILE
+
+            self.assertTrue(removed_symbols_csv.exists())
+            self.assertTrue(resolved_targets_csv.exists())
+            self.assertTrue(summary_json.exists())
+            self.assertIn("com.example.LegacyApi.call", removed_symbols_csv.read_text(encoding="utf-8"))
+            self.assertIn("com.example.LegacyApi.call", resolved_targets_csv.read_text(encoding="utf-8"))
+            summary = json.loads(summary_json.read_text(encoding="utf-8"))
+            self.assertEqual(summary["coord"], "com.example:legacy-lib")
+            self.assertEqual(summary["step4"]["removed_jar_symbol_count"], 1)
+            self.assertEqual(summary["step4"]["removed_jar"]["old_jar"], str(report_dir / "legacy-1.0.0.jar"))
+
     def test_step4_emits_progress_logs_for_long_running_phases(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

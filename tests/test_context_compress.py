@@ -12,6 +12,18 @@ import context_compress  # noqa: E402
 
 
 class ContextCompressTest(unittest.TestCase):
+    def test_summarize_step3_includes_risk_candidate_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            (report_dir / "s3_risk_candidates.csv").write_text(
+                "coord,api_name\nsample:dep,com.example.Api\nsample:dep,com.example.Other\n",
+                encoding="utf-8",
+            )
+
+            summary = context_compress.summarize_step3(report_dir)
+
+            self.assertEqual(summary["risk_candidate_count"], 2)
+
     def test_summarize_step5_preserves_skipped_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

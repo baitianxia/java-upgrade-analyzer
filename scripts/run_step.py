@@ -16,7 +16,13 @@ from compat import infer_maven_coords, open_text, resolve_repo_input_path, run_c
 from compat import git_cmd
 from auto_discover_bridge_sources import discover_bridge_source_mappings
 from pipeline_constants import INTERACTIVE_STATUS, STEP_SEQUENCE
-from s4_contract import ALL_CHANGED_APIS_FIELDS
+from s4_contract import (
+    ALL_CHANGED_APIS_FIELDS,
+    PER_DEPENDENCY_CANDIDATE_HITS_FILE,
+    PER_DEPENDENCY_DIRNAME,
+    PER_DEPENDENCY_SUMMARY_FILE,
+    STEP3_RISK_CANDIDATES_FILE,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1529,32 +1535,70 @@ def write_step5_selected_input(output_path, selection_summary):
     return output_path
 
 
+def write_csv_rows(output_path, rows, fieldnames):
+    import csv
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows or []:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+    return output_path
+
+
 def materialize_step5_all_changed_apis_input(all_changed_apis_path, report_dir, run_context):
     all_rows = read_csv_rows(all_changed_apis_path)
+    risk_candidates_path = Path(report_dir) / STEP3_RISK_CANDIDATES_FILE
+    candidate_rows = read_csv_rows(risk_candidates_path) if risk_candidates_path.exists() else []
     selected_coords = run_context.get("step5_selected_coords")
     selected_names = run_context.get("step5_selected_names")
     selection_summary = build_step5_selection_summary(
-        all_rows,
+        list(all_rows) + list(candidate_rows),
         selected_coords=selected_coords,
         selected_names=selected_names,
     )
     has_selection = bool(selection_summary.get("selected_coords") or selection_summary.get("selected_names"))
-    if not has_selection:
-        return Path(all_changed_apis_path), selection_summary
-    if selection_summary.get("unmatched_coords") or selection_summary.get("unmatched_names"):
-        problems = []
-        if selection_summary.get("unmatched_coords"):
-            problems.append("未匹配坐标: " + ", ".join(selection_summary.get("unmatched_coords")[:10]))
-        if selection_summary.get("unmatched_names"):
-            problems.append("未匹配名称: " + ", ".join(selection_summary.get("unmatched_names")[:10]))
-        raise StepError(
-            "Step5 选择的变更 jar 未在 all_changed_apis.csv 中匹配到有效目标；"
-            + "；".join(problems)
+    base_path = Path(all_changed_apis_path)
+    if has_selection:
+        if selection_summary.get("unmatched_coords") or selection_summary.get("unmatched_names"):
+            problems = []
+            if selection_summary.get("unmatched_coords"):
+                problems.append("未匹配坐标: " + ", ".join(selection_summary.get("unmatched_coords")[:10]))
+            if selection_summary.get("unmatched_names"):
+                problems.append("未匹配名称: " + ", ".join(selection_summary.get("unmatched_names")[:10]))
+            raise StepError(
+                "Step5 选择的变更 jar 未在 all_changed_apis.csv 中匹配到有效目标；"
+                + "；".join(problems)
+            )
+        if not selection_summary.get("matched_rows"):
+            raise StepError("Step5 选择的变更 jar 过滤后为空，无法执行调用链分析。")
+        filtered_path = Path(report_dir) / "s5_call_chain" / "selected_all_changed_apis.csv"
+        base_selection = build_step5_selection_summary(
+            all_rows,
+            selected_coords=selected_coords,
+            selected_names=selected_names,
         )
-    if not selection_summary.get("matched_rows"):
-        raise StepError("Step5 选择的变更 jar 过滤后为空，无法执行调用链分析。")
-    filtered_path = Path(report_dir) / "s5_call_chain" / "selected_all_changed_apis.csv"
-    return write_step5_selected_input(filtered_path, selection_summary), selection_summary
+        base_path = write_step5_selected_input(filtered_path, base_selection)
+    if not risk_candidates_path.exists():
+        return base_path, selection_summary
+    candidate_path = risk_candidates_path
+    if has_selection:
+        candidate_selection = build_step5_selection_summary(
+            candidate_rows,
+            selected_coords=selected_coords,
+            selected_names=selected_names,
+        )
+        candidate_fields = list(candidate_rows[0].keys()) if candidate_rows else ALL_CHANGED_APIS_FIELDS
+        candidate_path = write_csv_rows(
+            Path(report_dir) / "s5_call_chain" / "selected_risk_candidates.csv",
+            candidate_selection.get("matched_rows") or [],
+            candidate_fields,
+        )
+    merged_name = "merged_selected_all_changed_apis.csv" if has_selection else "merged_all_changed_apis.csv"
+    merged_path = Path(report_dir) / "s5_call_chain" / merged_name
+    return Path(merge_step5_inputs(base_path, candidate_path, merged_path)), selection_summary
 
 
 def flatten_cli_values(raw_values):
@@ -3495,7 +3539,8 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     if step_id == "step4":
         all_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis.csv"
         available_rows = read_csv_rows(all_changed_apis)
-        target_summary = build_step5_selection_summary(available_rows)
+        risk_candidates = read_csv_rows(report_dir / STEP3_RISK_CANDIDATES_FILE)
+        target_summary = build_step5_selection_summary(list(available_rows) + list(risk_candidates))
         selection_options = [
             {
                 "coord": item.get("coord"),
@@ -3505,10 +3550,10 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             for item in target_summary.get("available_targets", [])[:20]
         ]
         interaction_meta["selection_options"] = selection_options
-        checklist_lines.append("Step5 可选调用链分析范围（按依赖汇总自 all_changed_apis.csv）：")
+        checklist_lines.append("Step5 可选调用链分析范围（按依赖汇总自 Step4 API 与 Step3 candidate 输入）：")
         checklist_lines.append(
             f"  - 可选依赖数={target_summary.get('available_target_count', 0)} "
-            f"API 行数={len(available_rows)}"
+            f"Step4 API 行数={len(available_rows)} Step3 candidate 行数={len(risk_candidates)}"
         )
         for item in selection_options[:10]:
             checklist_lines.append(
@@ -3517,7 +3562,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         if target_summary.get("available_target_count", 0) > 10:
             checklist_lines.append("  - 其余候选请直接查看 all_changed_apis.csv 完整内容")
         existing_selection = build_step5_selection_summary(
-            available_rows,
+            list(available_rows) + list(risk_candidates),
             selected_coords=(run_context or {}).get("step5_selected_coords"),
             selected_names=(run_context or {}).get("step5_selected_names"),
         )
@@ -4267,6 +4312,46 @@ def detect_integrity_repair_step(step_id, report_dir):
     return min(missing_restart_steps, key=step_index)
 
 
+def cleanup_step3_candidate_outputs(report_dir):
+    report_dir = Path(report_dir).resolve()
+    # These files bridge Step3 candidate scans into Step5; reruns must not
+    # inherit stale matches from an earlier dependency selection.
+    aggregate_path = report_dir / STEP3_RISK_CANDIDATES_FILE
+    if aggregate_path.exists():
+        aggregate_path.unlink()
+
+    per_dependency_dir = report_dir / PER_DEPENDENCY_DIRNAME
+    if not per_dependency_dir.exists():
+        return
+
+    for dep_dir in per_dependency_dir.iterdir():
+        if not dep_dir.is_dir():
+            continue
+        candidate_hits_path = dep_dir / PER_DEPENDENCY_CANDIDATE_HITS_FILE
+        if candidate_hits_path.exists():
+            candidate_hits_path.unlink()
+        summary_path = dep_dir / PER_DEPENDENCY_SUMMARY_FILE
+        if not summary_path.exists():
+            continue
+        try:
+            summary = read_json(summary_path)
+        except Exception:
+            continue
+        # Preserve the rest of the per-dependency summary and only clear the
+        # Step3-owned candidate section.
+        summary.pop("step3", None)
+        artifacts = dict(summary.get("artifacts") or {})
+        artifacts.pop("candidate_hits_csv", None)
+        if artifacts:
+            summary["artifacts"] = artifacts
+        else:
+            summary.pop("artifacts", None)
+        if summary:
+            summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        else:
+            summary_path.unlink()
+
+
 def step_output_paths_for_cleanup(step_id, report_dir):
     report_dir = Path(report_dir).resolve()
     outputs = {
@@ -4292,6 +4377,7 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             report_dir / "s3_springboot_autoconfig.txt",
             report_dir / "s3_dependency_compat.csv",
             report_dir / "s3_dependency_classfile.csv",
+            report_dir / STEP3_RISK_CANDIDATES_FILE,
         ],
         "step4": [
             report_dir / "s4_jar_compare",
@@ -4313,6 +4399,8 @@ def cleanup_step_outputs(step_id, report_dir):
             shutil.rmtree(path)
         elif path.exists():
             path.unlink()
+    if str(step_id or "").strip() == "step3":
+        cleanup_step3_candidate_outputs(report_dir)
 
 
 def execute_step(step_id, args, manifest_steps, run_context, main_state=None):

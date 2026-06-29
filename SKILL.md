@@ -70,6 +70,9 @@ python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
 3. **结论可追溯**：每条结论都要记录证据来源。
 4. **不猜测**：无法确认时必须区分四态：`reachable` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis`，不要把”未覆盖”误写成”未影响”。
 5. **影响优先**：主报告优先展示已证明触达当前系统的风险。
+6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
+7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
+8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
 
 ## 执行模式
 
@@ -117,6 +120,21 @@ if gate failed or step blocked:
 3. 恢复命令只使用 `--response-json` 或 `--response-file`；不得使用裸动作参数绕过结构化用户答复
 
 优先使用统一调度入口 `scripts/run_step.py`。不要要求自己一次记住所有命令；具体命令、参数、产物清单统一按需查看 `RUNBOOK.md`。
+
+## Removed Jar 语义
+
+在依赖升级分析中，`removed jar` 不是旁路场景，而是统一模型中的一种 `change_type`：
+
+- `upgraded`
+- `removed`
+- `added`
+
+其中 `removed` 的正式语义为：
+
+- `old` 存在，`new` 不存在
+- Step4 必须从旧版 jar 导出最小符号集合
+- 第一批最小闭环至少支持 `class`、`method`、`constructor`
+- Step5/Step6 继续按单个 `coord` 汇总“是否触达系统源码”
 
 ## 会话开场协议
 
@@ -370,7 +388,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 重点：优先识别二进制不兼容，其次补充行为变化
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应超时
 - 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再按依赖的 `old_version/new_version` 只在对应源码仓库远端分支 `remotes` 中匹配 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支；old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；若未匹配到或存在歧义，必须进入人工确认，不得直接套用主项目分支名
-- 规则：若 Step5 确认需要跨依赖分析但缺少可用依赖源码映射，默认阻塞；如确需忽略并继续，需显式启用 `allow_degraded`
+- 规则：若 Step5 确认需要跨依赖分析，系统必须先尝试依赖源码映射；若缺少可用依赖源码映射，仍需继续尝试无源码依赖 jar 的字节码稳定符号分析；只有两条路径都不可用时，才允许阻塞或在显式 `allow_degraded` 下继续
 - 门控：`step4` 完成后执行 `jar_compare`
 
 ### Phase 7 [CHECKPOINT] Confirm Evidence Completeness
@@ -380,6 +398,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 必须确认：jar diff、源码 diff、依赖源码映射线索与变更集是否足以支撑下一步调用链分析；若只想分析部分变更 jar，应在这里指定 `all_changed_apis.csv` 中的 `coord` 或名称
 - 若证据不足，应先补 `dependency_source_dirs`，而不是直接进入 `step5`
 - 允许在 `continue` 时附带 `step5_selected_coords` / `step5_selected_names`，让 Step5 只分析命中的依赖
+- `selection_options` 需要同时反映 Step4 API 目标与 Step3 candidate 目标，避免只存在于 candidate 的依赖被遗漏
 - 允许动作：`continue`、`cancel`
 - 禁止动作：证据明显不足时仍直接进入 `step5`
 - 恢复命令模板：
@@ -407,14 +426,17 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### Phase 8 [AUTO] Call Chain Analysis
 
 - 对应步骤：`step5`
-- 输入：`s4_jar_compare/all_changed_apis.csv`（由 Phase 4 产出）；若在 Phase 7 指定了 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
+- 输入：`s4_jar_compare/all_changed_apis.csv`（由 Phase 4 产出）与 `s3_risk_candidates.csv`（由 Phase 3 产出）；若在 Phase 7 指定了 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
 - 输出：`.upgrade-report/s5_call_chain/`
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
 - 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
 - 规则：名称筛选按 `coord` 的 `artifactId` 精确匹配；坐标筛选按 `coord` 精确匹配
+- 规则：筛选匹配范围是 Step4 API 与 Step3 candidate 的并集；若两边都未命中，则必须直接报错，不能静默缩小分析范围
 - 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
-- 规则：若仍无法推断且需要穿过依赖包边界，默认阻塞；如确需忽略并继续，需显式启用 `allow_degraded`
+- 规则：若仍无法推断依赖源码映射，Step5 仍需继续尝试无源码依赖 jar 的字节码稳定符号分析；只有源码映射与无码字节码两条路径都不可用时，才默认阻塞；如确需忽略并继续，需显式启用 `allow_degraded`
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
+- 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`
+- 规则：当无源码依赖字节码稳定命中目标符号时，Step5 必须输出正式 `reason_code=PACKAGED_DEPENDENCY_BYTECODE_USAGE`，并保守收敛为 `uncertain`；不得再次退化为单纯 `DEPENDENCY_SOURCE_MAPPING_MISSING`
 - 门控：执行 `call_chain`
 
 **置信度加权深度策略**：

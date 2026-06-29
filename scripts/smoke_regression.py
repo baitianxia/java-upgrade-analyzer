@@ -2142,6 +2142,9 @@ return ExtraApi.callLegacy();
         "多模块依赖源码映射自动发现后，Step5 未进入正确的交互确认点",
     )
     multi_bridge_summary = read_json(runtime_full_expand_report / "s5_call_chain" / "summary.json")
+    multi_bridge_per_dependency = read_json(
+        runtime_full_expand_report / "per_dependency" / "com.example_demo-lib" / "summary.json"
+    )
     multi_bridge_api = (multi_bridge_summary.get("not_analyzed_apis") or [{}])[0]
     assert_true(
         multi_bridge_summary.get("not_analyzed") == 1,
@@ -2158,6 +2161,14 @@ return ExtraApi.callLegacy();
     assert_true(
         multi_bridge_api.get("dependency_chain_coords") == ["com.example:demo-lib-extra"],
         "repo 根目录自动展开后，Step5 未正确记录多模块桥接依赖链",
+    )
+    assert_true(
+        multi_bridge_per_dependency.get("step5", {}).get("final_status") == "not_analyzed",
+        "repo 根目录自动展开后，per_dependency summary 未写入 final_status",
+    )
+    assert_true(
+        multi_bridge_per_dependency.get("step5", {}).get("selected_api") == multi_bridge_api.get("api"),
+        "repo 根目录自动展开后，per_dependency summary 未写入代表 API",
     )
     assert_true(
         "自动发现依赖源码映射" in multi_bridge_stderr,
@@ -5256,6 +5267,9 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     orchestrated_all_changed = read_csv(orchestrated_report / "s4_jar_compare" / "all_changed_apis.csv")
     assert_true(orchestrated_all_changed, "orchestrated step5 未产出分析结果")
     orchestrated_summary = read_json(orchestrated_report / "s5_call_chain" / "summary.json")
+    orchestrated_per_dependency = read_json(
+        orchestrated_report / "per_dependency" / "com.example_demo-lib" / "summary.json"
+    )
     orchestrated_total = orchestrated_summary.get("total_apis", 0)
     assert_true(orchestrated_total >= 1, "orchestrated step5 应处理 all_changed_apis.csv 中的全部 API")
     step5_interaction = read_json(orchestrated_report / "interaction.json")
@@ -5265,6 +5279,10 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true("rerun_current_step" in step5_actions, "Step5 交互未提供 rerun_current_step")
     assert_true("dependency_source_dirs" in step5_props, "Step5 交互未暴露 dependency_source_dirs 字段")
     assert_true("dependency_source_mappings" not in step5_props, "Step5 交互不应再暴露 dependency_source_mappings 字段")
+    assert_true(
+        orchestrated_per_dependency.get("step5", {}).get("final_status"),
+        "orchestrated Step5 未写出 per_dependency final_status",
+    )
 
     run_script(
         "run_step.py",
@@ -5286,6 +5304,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     orchestrated_report_text = (orchestrated_report / "s6_report.md").read_text(encoding="utf-8")
     assert_true("依赖包兼容信号" in orchestrated_report_text, "run_step 链路未生成最终报告")
+    assert_true("单依赖包最终结论" in orchestrated_report_text, "run_step 链路未在 Step6 报告中呈现单依赖包结论")
 
 
 

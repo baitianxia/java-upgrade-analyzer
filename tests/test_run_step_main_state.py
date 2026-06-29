@@ -133,6 +133,46 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(updated_state["step1"]["input"]["modules"], ["."])
             self.assertNotIn("source_dirs", updated_state["step1"]["input"])
 
+    def test_materialize_step5_input_keeps_only_selected_candidate_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            all_changed_path = report_dir / "all_changed_apis.csv"
+            risk_candidates_path = report_dir / run_step.STEP3_RISK_CANDIDATES_FILE
+            all_changed_path.write_text(
+                "\n".join(
+                    [
+                        "coord,api_name,api_simple,api_signature,symbol_kind,change_type,confirmed,severity,source,analysis_scope",
+                        "sample:base,com.lib.Base.call,call,(),method,REMOVED,true,P1,japicmp,api",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            risk_candidates_path.write_text(
+                "\n".join(
+                    [
+                        "coord,api_name,api_simple,api_signature,symbol_kind,change_type,confirmed,severity,source,analysis_scope,candidate_bucket",
+                        "sample:base,com.lib.Base,Base,,class,REMOVED,false,P1,candidate_scan,class_usage,system_source",
+                        "sample:candidate,com.lib.Candidate,Candidate,,class,REMOVED,false,P1,candidate_scan,class_usage,system_source",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            materialized_path, selection_summary = run_step.materialize_step5_all_changed_apis_input(
+                all_changed_path,
+                report_dir,
+                {"step5_selected_coords": ["sample:candidate"]},
+            )
+
+            self.assertEqual(selection_summary["matched_coords"], ["sample:candidate"])
+            with materialized_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["coord"], "sample:candidate")
+            self.assertEqual(rows[0]["source"], "candidate_scan")
+
     def test_step1_review_continue_propagates_confirmed_branches_to_step2_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -1619,6 +1659,43 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertFalse(step1_resolved.exists())
             self.assertTrue(main_state.exists())
             self.assertTrue(interaction.exists())
+
+    def test_cleanup_step_outputs_step3_removes_bridge_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            risk_candidates = report_dir / run_step.STEP3_RISK_CANDIDATES_FILE
+            risk_candidates.write_text("coord\n", encoding="utf-8")
+            per_dep_dir = report_dir / "per_dependency" / "sample_demo"
+            per_dep_dir.mkdir(parents=True)
+            candidate_hits = per_dep_dir / "candidate_hits.csv"
+            candidate_hits.write_text("coord\nsample:demo\n", encoding="utf-8")
+            summary_path = per_dep_dir / "summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "coord": "sample:demo",
+                        "step3": {"candidate_hit_count": 1},
+                        "step4": {"target_count": 2},
+                        "artifacts": {
+                            "candidate_hits_csv": str(candidate_hits),
+                            "resolved_targets_csv": "resolved_targets.csv",
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            run_step.cleanup_step_outputs("step3", report_dir)
+
+            self.assertFalse(risk_candidates.exists())
+            self.assertFalse(candidate_hits.exists())
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertNotIn("step3", summary)
+            self.assertEqual(summary["step4"]["target_count"], 2)
+            self.assertNotIn("candidate_hits_csv", summary["artifacts"])
 
     def test_main_explicit_step_run_resets_current_and_downstream_state_and_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:

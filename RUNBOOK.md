@@ -59,6 +59,8 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
   --report-dir .upgrade-report
 ```
 
+- `Step5` 若单独直接执行且未显式传 `--report-dir`，会先尝试从 `--all-changed-apis` 的 `s4_jar_compare/all_changed_apis.csv` 推导报告目录；若仍缺失，再从 `--output-dir` 的父目录推导。
+
 ### tree-sitter 安装
 
 - 不要直接使用裸 `pip install`，否则很容易安装到错误的 Python 环境。
@@ -185,6 +187,30 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 退出码 `4` 时不要直接重试上一条命令，应先读取 `interaction.json` 并等待用户答复
 - 推荐把用户答复整理成 `intent_patch`，再通过 `--response-json` / `--response-file` 恢复；不要继续沿用旧的顶层业务字段示例
 
+### Step4 后按单依赖包进入 Step5
+
+当 Step4 已生成 `s4_jar_compare/all_changed_apis.csv` 后，可在主状态中通过以下字段只让某个或某几个依赖进入 Step5：
+
+- `step5_selected_coords`
+- `step5_selected_names`
+
+推荐优先使用 `step5_selected_coords`，因为 `coord` 是单依赖分析的正式主键。
+
+`seed json` 或恢复输入示例：
+
+```json
+{
+  "step5_selected_coords": ["com.example:legacy-lib"]
+}
+```
+
+说明：
+
+- 这些选择字段必须先归一化写入 `main_state.json`
+- 正式流程中不要把选中依赖直接透传给 `s5_call_chain*.py`
+- Step5 实际消费的是“Step4 API 目标 + Step3 candidate 目标”的选中子集；产物可能是 `selected_all_changed_apis.csv`、`selected_risk_candidates.csv` 以及两者合并后的 `merged_selected_all_changed_apis.csv`
+- 若某个依赖只在 Step3 candidate 中出现、尚未进入 Step4 API 目标，仍可通过 `step5_selected_coords` / `step5_selected_names` 被选中
+
 若用户答复较长，优先使用：
 
 ```bash
@@ -208,16 +234,32 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
   s3_jdk_internal_api.csv
   s3_jdk_reflection.csv
   s3_jdk_serialization.txt
+  s3_jdk_runtime_flags.csv
   s3_springboot_config.csv
   s3_springboot_autoconfig.txt
   s3_dependency_compat.csv
+  s3_dependency_classfile.csv
+  s3_risk_candidates.csv
   s4_jar_compare/
     all_changed_apis.csv
+  per_dependency/
+    <coord>/
+      candidate_hits.csv
+      removed_jar_symbols.csv
+      resolved_targets.csv
+      summary.json
   s5_call_chain/
   s6_findings.json
   s6_report.md
   main_state.json
 ```
+
+补充说明：
+
+- 当某个依赖在 Step1 中被识别为 `移除` 时，Step4 会额外尝试从旧版 jar 导出 `public/protected class/method/constructor` 符号集
+- 这些符号会写入 `per_dependency/<coord>/removed_jar_symbols.csv`
+- Step5 会把单条 API 结果再汇总回 `per_dependency/<coord>/summary.json`
+- Step6 会在最终报告中展示“单依赖包最终结论”表，汇总 `change_type`、`reaches_system_source`、`blocked_at`、`blocked_reason`
 
 ## Step 1：获取真实依赖结果
 
@@ -414,7 +456,7 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 ```
 
 若通过 `run_step.py` 执行，建议将 `source_dirs` / `dependency_source_dirs` / `max_depth` 写入 `main_state.json`，命令保持最小参数集。
-若 Step4 checkpoint 只想分析部分变更 jar，可在恢复时把 `step5_selected_coords` / `step5_selected_names` 写入 `main_state.json`；调度器会先基于 `all_changed_apis.csv` 生成过滤后的输入文件，再执行 Step5。
+- 若 Step4 checkpoint 只想分析部分变更 jar，可在恢复时把 `step5_selected_coords` / `step5_selected_names` 写入 `main_state.json`；调度器会先基于 Step4 API 与 Step3 candidate 的并集生成过滤后的输入文件，再执行 Step5。
 正式流程默认不设置 Step5 外层超时；仅在主状态中显式写入 `step5_timeout` 时才启用限制。
 
 规则：
@@ -425,13 +467,16 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 的成因；`by_api/*.json` 中的 `evidence_paths` 是逐边证据
 - 若 `all_changed_apis.csv` 为空，直接跳过并说明“Step4 未提取到可追踪的变更 API”
 - 若指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
-- 若筛选条件未在 `all_changed_apis.csv` 中命中任何依赖，Step5 会直接报错，避免静默分析错范围
+- 若筛选条件既未在 Step4 API 目标命中，也未在 Step3 candidate 目标命中，Step5 会直接报错，避免静默分析错范围
 - 正式流程会向 `stderr` 输出 `[progress][step5][discovery|graph|bridge-check|trace|report|done]` 日志，展示源码映射发现、图构建、调用链追踪与报告生成的推进情况
+- 当 `reason_code` 为 `DIRECT_CLASS_USAGE`、`DIRECT_FIELD_USAGE`、`DIRECT_STATIC_IMPORT_USAGE` 时，表示 Step5 已直接在业务源码中找到类型/字段引用证据，而不是传统方法调用链
+- 当 `reason_code` 为 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示 Step5 已在无源码依赖 jar 的字节码里稳定命中目标符号；此时不会直接判成 `reachable`，而会保守收敛为 `uncertain`
 
 若 `uncertain` 或 `not_analyzed` 偏多，建议优先按这个顺序排查：
 
 - 查看 `.upgrade-report/s5_call_chain/summary.json` 中的 `uncertain_apis` 与 `not_analyzed_apis`
 - 若出现 `DEPENDENCY_SOURCE_MAPPING_MISSING`，优先补齐 `dependency_source_dirs` 后重跑 Step5
+- 若出现 `PACKAGED_DEPENDENCY_BYTECODE_USAGE`，优先打开命中的无源码依赖条目；如需继续证明是否回到系统源码，再补 `dependency_source_dirs`
 - 若出现 `GRAPH_TRUNCATED`，提高 `--max-methods / --max-reverse-edges / --max-incoming-per-key`
 - 若出现 `INTERFACE_OR_ABSTRACT_API` 或 `RESOURCE_OR_REFLECTION`，不要把结果解释为“未影响”
 - 再打开 `.upgrade-report/s5_call_chain/by_api/*.json`，核对 `reason_code` 与 `evidence_paths`

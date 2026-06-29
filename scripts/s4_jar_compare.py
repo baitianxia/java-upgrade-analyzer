@@ -24,7 +24,7 @@ s4_jar_compare.py — Step 4：jar 包变更全量对比
   "变更 API 数量 = 0 的依赖"仍需特别标出，便于后续交互时人工复核
 """
 
-import argparse, csv, json, os, re, sys, time
+import argparse, csv, json, os, re, shutil, sys, time
 from collections import Counter
 from pathlib import Path
 from datetime import datetime
@@ -38,7 +38,14 @@ from compat import (
 
 sys.path.insert(0, os.path.dirname(__file__))
 from s4_contract import (
-    ALL_CHANGED_APIS_FIELDS, DEFAULT_SEVERITY, validate_row
+    ALL_CHANGED_APIS_FIELDS,
+    DEFAULT_SEVERITY,
+    PER_DEPENDENCY_DIRNAME,
+    PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE,
+    PER_DEPENDENCY_RESOLVED_TARGETS_FILE,
+    PER_DEPENDENCY_SUMMARY_FILE,
+    get_per_dependency_dir,
+    validate_row,
 )
 from progress_logging import PhaseTimer, emit_progress
 
@@ -120,6 +127,9 @@ def cleanup_step4_generated_outputs(output_dir):
         for path in output_path.glob(pattern):
             if path.is_file():
                 path.unlink()
+    per_dependency_dir = output_path.resolve().parent / PER_DEPENDENCY_DIRNAME
+    if per_dependency_dir.exists():
+        shutil.rmtree(per_dependency_dir, ignore_errors=True)
 
 
 def infer_package_from_source_path(source_path):
@@ -935,6 +945,149 @@ def fetch_jar_from_repo(coord, version, timeout=DEFAULT_FETCH_TIMEOUT):
         timeout_label = f"{timeout}s" if timeout not in (None, "") else "unbounded"
         return False, f"timeout({timeout_label})"
     return False, (stderr or 'dependency:get failed')[:160]
+
+
+def _iter_jar_class_entries(jar_path):
+    with zipfile.ZipFile(jar_path) as zf:
+        for entry in sorted(zf.namelist()):
+            if not entry.endswith('.class') or entry.startswith('META-INF/'):
+                continue
+            if entry.endswith('module-info.class') or entry.endswith('package-info.class'):
+                continue
+            yield entry[:-6].replace('/', '.')
+
+
+def _run_javap_public_api_dump(jar_path, class_binary_name):
+    stdout, stderr, rc = run_cmd(
+        ['javap', '-classpath', jar_path, '-public', '-s', class_binary_name],
+        timeout=60,
+    )
+    if rc != 0:
+        raise RuntimeError((stderr or stdout or 'javap failed').strip()[:300] or 'javap failed')
+    return stdout
+
+
+def _build_removed_api_row(coord, old_ver, api_name, api_simple, symbol_kind, api_signature=''):
+    return {
+        'coord': coord,
+        'old_version': old_ver,
+        'new_version': '-',
+        'change_type': 'REMOVED',
+        'api_name': api_name,
+        'api_simple': api_simple,
+        'symbol_kind': symbol_kind,
+        'api_signature': api_signature or '',
+        'confirmed': 'true',
+        'severity': DEFAULT_SEVERITY['REMOVED'],
+        'source': 'old_jar',
+    }
+
+
+def _parse_removed_jar_javap_output(text, coord, old_ver, class_binary_name):
+    class_fqcn = class_binary_name.replace('$', '.')
+    class_simple = class_fqcn.rsplit('.', 1)[-1]
+    lines = [line.strip() for line in str(text or '').splitlines() if line.strip()]
+    header_line = ''
+    for line in lines:
+        if class_binary_name in line or class_fqcn in line:
+            header_line = line
+            break
+    if header_line and not re.search(r'\b(public|protected)\b', header_line):
+        return []
+
+    rows = [
+        _build_removed_api_row(
+            coord=coord,
+            old_ver=old_ver,
+            api_name=class_fqcn,
+            api_simple=class_simple,
+            symbol_kind='class',
+            api_signature='',
+        )
+    ]
+    seen = {(class_fqcn, 'class', '')}
+    for line in lines:
+        if not line.endswith(';'):
+            continue
+        declaration = line[:-1].split(' throws ', 1)[0].strip()
+        if '(' not in declaration or ')' not in declaration:
+            continue
+        if not declaration.startswith(('public ', 'protected ')):
+            continue
+        signature_start = declaration.index('(')
+        signature_end = declaration.rindex(')')
+        params = declaration[signature_start + 1:signature_end].strip()
+        name = declaration[:signature_start].strip().split()[-1]
+        is_constructor = name in {class_simple, class_fqcn, class_binary_name}
+        api_name = f"{class_fqcn}.{class_simple if is_constructor else name}"
+        api_simple = class_simple if is_constructor else name
+        api_signature = f"({params})" if params else "()"
+        symbol_kind = 'constructor' if is_constructor else 'method'
+        dedupe_key = (api_name, symbol_kind, api_signature)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        rows.append(
+            _build_removed_api_row(
+                coord=coord,
+                old_ver=old_ver,
+                api_name=api_name,
+                api_simple=api_simple,
+                symbol_kind=symbol_kind,
+                api_signature=api_signature,
+            )
+        )
+    return rows
+
+
+def export_removed_jar_apis(coord, old_ver, output_dir, old_coord=None, fetch_timeout=DEFAULT_FETCH_TIMEOUT):
+    resolved_old_coord = str(old_coord or coord or '').strip()
+    group_id, artifact_id, classifier = _split_coord(resolved_old_coord)
+    safe_name = (artifact_id or 'unknown').replace('.', '-') + (f"_{classifier}" if classifier else "")
+    out_file = os.path.join(output_dir, f"{safe_name}_{old_ver}_removed_symbols.txt")
+    if not group_id or not artifact_id or not old_ver or old_ver == '-':
+        msg = f"=== 无法导出 removed jar 符号：非法坐标或版本 ===\ncoord={resolved_old_coord}\nold_version={old_ver}\n"
+        write_result(out_file, msg)
+        return out_file, [], {"old_jar": None}, "非法坐标"
+
+    old_jar = find_jar_in_m2(group_id, artifact_id, old_ver, classifier=classifier)
+    fetch_old_error = None
+    if not old_jar:
+        fetched, fetch_old_error = fetch_jar_from_repo(resolved_old_coord, old_ver, timeout=fetch_timeout)
+        if fetched:
+            old_jar = find_jar_in_m2(group_id, artifact_id, old_ver, classifier=classifier)
+    if not old_jar:
+        msg = (
+            f"=== 无法导出 removed jar 符号：旧版 jar 未找到 ===\n"
+            f"coord={resolved_old_coord}\nold_version={old_ver}\n"
+            f"fetch_result={fetch_old_error or '未尝试/成功'}\n"
+        )
+        write_result(out_file, msg)
+        return out_file, [], {"old_jar": None, "fetch_old_error": fetch_old_error}, "jar 未找到"
+
+    apis = []
+    errors = []
+    class_count = 0
+    for class_binary_name in _iter_jar_class_entries(old_jar):
+        class_count += 1
+        try:
+            javap_text = _run_javap_public_api_dump(old_jar, class_binary_name)
+            apis.extend(_parse_removed_jar_javap_output(javap_text, coord, old_ver, class_binary_name))
+        except Exception as exc:
+            if len(errors) < 20:
+                errors.append(f"{class_binary_name}: {str(exc)[:200]}")
+    lines = [
+        f"coord={resolved_old_coord}",
+        f"old_version={old_ver}",
+        f"old_jar={old_jar}",
+        f"class_count={class_count}",
+        f"exported_api_count={len(apis)}",
+    ]
+    if errors:
+        lines.append("errors:")
+        lines.extend(f"  - {item}" for item in errors)
+    write_result(out_file, "\n".join(lines) + "\n")
+    return out_file, apis, {"old_jar": old_jar, "errors": errors}, (None if apis else "未导出到任何 public/protected API")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2352,6 +2505,7 @@ def normalize_step5_input_rows(rows):
     source_rank = {
         'gitdiff': 0,
         'japicmp': 1,
+        'old_jar': 1,
         'changelog': 2,
     }
 
@@ -2401,6 +2555,103 @@ def normalize_step5_input_rows(rows):
         )
     )
     return normalized_rows
+
+
+def _write_contract_csv(path, rows):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows or [])
+
+
+def _load_json_file(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_export=None):
+    """
+    为单个依赖写出 Step4 的 per-dependency 产物。
+
+    约定：
+      - removed_jar_symbols.csv：仅保存 old_jar 导出的原始符号
+      - resolved_targets.csv：保存该 coord 归一化后的 Step5 输入视图
+      - summary.json：保存该 coord 的 Step4 摘要，后续可由 Step5 继续补写
+    """
+    dep_row = dep_row or {}
+    coord = str(dep_row.get('coord') or '').strip()
+    if not coord:
+        return None
+
+    per_dependency_dir = get_per_dependency_dir(report_dir, coord)
+    os.makedirs(per_dependency_dir, exist_ok=True)
+
+    raw_rows = list(raw_rows or [])
+    normalized_rows = normalize_step5_input_rows(raw_rows)
+    removed_rows = [row for row in raw_rows if str(row.get('source') or '').strip() == 'old_jar']
+
+    removed_symbols_path = per_dependency_dir / PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE
+    resolved_targets_path = per_dependency_dir / PER_DEPENDENCY_RESOLVED_TARGETS_FILE
+    summary_path = per_dependency_dir / PER_DEPENDENCY_SUMMARY_FILE
+
+    _write_contract_csv(removed_symbols_path, removed_rows)
+    _write_contract_csv(resolved_targets_path, normalized_rows)
+
+    existing_summary = _load_json_file(summary_path)
+    source_counts = {}
+    for row in raw_rows:
+        source = str(row.get('source') or '').strip() or '(empty)'
+        source_counts[source] = source_counts.get(source, 0) + 1
+
+    step4_summary = {
+        "status": "done",
+        "raw_target_count": len(raw_rows),
+        "resolved_target_count": len(normalized_rows),
+        "removed_jar_symbol_count": len(removed_rows),
+        "sources": sorted(source_counts.keys()),
+        "source_counts": source_counts,
+        "removed_jar": {
+            "enabled": bool(removed_jar_export),
+            "old_coord": str((removed_jar_export or {}).get("old_coord") or "").strip(),
+            "old_jar": str((removed_jar_export or {}).get("old_jar") or "").strip(),
+            "export_error": str((removed_jar_export or {}).get("error") or "").strip(),
+            "class_count": int((removed_jar_export or {}).get("class_count") or 0),
+            "errors": list((removed_jar_export or {}).get("errors") or []),
+        },
+        "artifacts": {
+            "removed_jar_symbols_csv": str(removed_symbols_path),
+            "resolved_targets_csv": str(resolved_targets_path),
+        },
+    }
+
+    summary = dict(existing_summary) if isinstance(existing_summary, dict) else {}
+    summary.update(
+        {
+            "coord": coord,
+            "change_type": str(dep_row.get('change_type') or '').strip(),
+            "old_version": str(dep_row.get('old_version') or '').strip(),
+            "new_version": str(dep_row.get('new_version') or '').strip(),
+            "base_coord": str(dep_row.get('base_coord') or '').strip(),
+            "current_coord": str(dep_row.get('current_coord') or '').strip(),
+            "artifacts": {
+                "summary_json": str(summary_path),
+                "removed_jar_symbols_csv": str(removed_symbols_path),
+                "resolved_targets_csv": str(resolved_targets_path),
+            },
+            "step4": step4_summary,
+        }
+    )
+    write_result(summary_path, json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    return {
+        "coord": coord,
+        "per_dependency_dir": str(per_dependency_dir),
+        "raw_rows": raw_rows,
+        "normalized_rows": normalized_rows,
+        "summary_path": str(summary_path),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2837,6 +3088,8 @@ def main():
     print(f"\nStep 4 开始：处理 {len(dep_rows)} 个依赖", file=sys.stderr)
     emit_progress("step4", "plan", f"开始构建 jar 对比证据池，共 {len(dep_rows)} 个依赖")
 
+    per_dependency_records = {}
+
     for i, row in enumerate(dep_rows, 1):
         dependency_timer = time.perf_counter()
         coord      = row.get('coord', '')
@@ -2845,11 +3098,15 @@ def main():
         change     = row.get('change_type', '')
         scope      = row.get('scope', 'compile')
 
-        if not coord or old_ver == '-' or new_ver == '-':
+        if not coord:
             continue
-        # 新增和移除的依赖也做对比（新增看新版，移除看旧版是否有被调用的 API）
         if change == '未变':
             continue
+
+        is_removed_dependency = (change == '移除') or (new_ver == '-' and old_ver != '-')
+        is_added_dependency = (change == '新增') or (old_ver == '-' and new_ver != '-')
+        dependency_raw_apis = list((per_dependency_records.get(coord) or {}).get("raw_rows") or [])
+        dependency_removed_jar_export = dict((per_dependency_records.get(coord) or {}).get("removed_jar_export") or {})
 
         is_focus_dependency = coord in changed_dependency_coords if changed_dependency_coords else True
         source_mapping = dependency_paths.get(coord) or {}
@@ -2871,7 +3128,7 @@ def main():
                 "new_version": new_ver,
             })
 
-        if has_source_repo:
+        if has_source_repo and not is_removed_dependency and not is_added_dependency:
             # 4b: 有源码依赖做 git diff
             gitdiff_timer = time.perf_counter()
             emit_progress(
@@ -2960,6 +3217,7 @@ def main():
                     )
             else:
                 all_apis.extend(apis)
+                dependency_raw_apis.extend(apis)
                 behavior_changed = sum(1 for a in apis if a.get("change_type") == "BEHAVIOR_CHANGED")
                 print(f"    → {len(apis)} 个源码差异（含 behavior_changed={behavior_changed}）", file=sys.stderr)
                 emit_progress(
@@ -2993,8 +3251,69 @@ def main():
                     }
                 )
 
-        # 4a: 所有升级依赖都做 JApiCmp 二进制对比
-        if old_ver != '-' and new_ver != '-':
+        # 4a: 升级依赖做 JApiCmp；removed 依赖导出旧 jar 符号集作为 Step5 输入
+        if is_removed_dependency:
+            removed_timer = time.perf_counter()
+            emit_progress(
+                "step4",
+                "japicmp",
+                f"开始导出 removed jar 旧版符号：{coord}",
+                current=i,
+                total=len(dep_rows),
+                item=coord,
+            )
+            removed_out_file, apis, jar_info, err = export_removed_jar_apis(
+                coord,
+                old_ver,
+                args.output_dir,
+                old_coord=_resolve_step4_side_coord(row, "base", coord),
+                fetch_timeout=args.fetch_timeout,
+            )
+            dependency_removed_jar_export = {
+                "out_file": os.path.abspath(removed_out_file),
+                "old_coord": _resolve_step4_side_coord(row, "base", coord),
+                "old_jar": (jar_info or {}).get("old_jar"),
+                "class_count": len(list({_normalize_contract_value(item, "api_name") for item in apis if item.get("symbol_kind") == "class"})),
+                "errors": list((jar_info or {}).get("errors") or []),
+                "error": err,
+            }
+            if err:
+                print(f"    ⚠️  removed jar 旧版符号导出失败：{err}", file=sys.stderr)
+                emit_progress(
+                    "step4",
+                    "japicmp",
+                    f"removed jar 旧版符号导出失败：{err}",
+                    current=i,
+                    total=len(dep_rows),
+                    elapsed=time.perf_counter() - removed_timer,
+                    item=coord,
+                )
+                jar_missing_deps.append(coord)
+                if str((jar_info or {}).get("fetch_old_error") or "").startswith("timeout("):
+                    timeout_items.append(
+                        {
+                            "coord": coord,
+                            "stage": "dependency_get",
+                            "timeout_seconds": args.fetch_timeout,
+                            "reason": (jar_info or {}).get("fetch_old_error"),
+                            "old_version": old_ver,
+                            "new_version": new_ver,
+                        }
+                    )
+            else:
+                dependency_raw_apis.extend(apis)
+                all_apis.extend(apis)
+                print(f"    → {len(apis)} 个 removed jar 旧版符号", file=sys.stderr)
+                emit_progress(
+                    "step4",
+                    "japicmp",
+                    f"removed jar 符号导出完成，提取 {len(apis)} 个变化",
+                    current=i,
+                    total=len(dep_rows),
+                    elapsed=time.perf_counter() - removed_timer,
+                    item=coord,
+                )
+        elif old_ver != '-' and new_ver != '-':
             japicmp_timer = time.perf_counter()
             emit_progress(
                 "step4",
@@ -3079,11 +3398,17 @@ def main():
                     elapsed=time.perf_counter() - japicmp_timer,
                     item=coord,
                 )
+            dependency_raw_apis.extend(apis)
             all_apis.extend(apis)
 
         # 4c: changelog 分析任务文件（由 AI agent 后续填写）
         if change in ('大版本升级', '小版本升级') and (not has_source_repo):
             analyze_changelog(coord, old_ver, new_ver, args.output_dir)
+        per_dependency_records[coord] = {
+            "dep_row": dict(row),
+            "raw_rows": dependency_raw_apis,
+            "removed_jar_export": dependency_removed_jar_export,
+        }
         emit_progress(
             "step4",
             "dependency",
@@ -3097,6 +3422,15 @@ def main():
     # 写入汇总文件
     csv_file, valid_count, invalid_count = write_all_changed_apis(
         all_apis, args.output_dir)
+    report_dir = str(Path(args.output_dir).resolve().parent)
+    for coord in sorted(per_dependency_records.keys()):
+        item = per_dependency_records.get(coord) or {}
+        write_per_dependency_outputs(
+            report_dir=report_dir,
+            dep_row=item.get("dep_row") or {},
+            raw_rows=item.get("raw_rows") or [],
+            removed_jar_export=item.get("removed_jar_export") or None,
+        )
 
     changed_classes_path = os.path.join(args.output_dir, "changed_classes.json")
     with open(changed_classes_path, "w", encoding="utf-8") as f:

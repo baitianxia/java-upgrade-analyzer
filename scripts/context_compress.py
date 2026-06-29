@@ -158,6 +158,7 @@ def summarize_step3(report_dir):
         'sb_config_count':         count_csv(f"{report_dir}/s3_springboot_config.csv"),
         'sb_autoconfig_count':     count_txt(f"{report_dir}/s3_springboot_autoconfig.txt"),
         'dep_compat_count':        count_csv(f"{report_dir}/s3_dependency_compat.csv"),
+        'risk_candidate_count':    count_csv(f"{report_dir}/s3_risk_candidates.csv"),
         'note': '详细内容在文件中，需要时读取对应 csv/txt'
     }
 

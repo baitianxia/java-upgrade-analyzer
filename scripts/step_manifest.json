@@ -204,7 +204,8 @@
         "s3_springboot_config.csv",
         "s3_springboot_autoconfig.txt",
         "s3_dependency_compat.csv",
-        "s3_dependency_classfile.csv"
+        "s3_dependency_classfile.csv",
+        "s3_risk_candidates.csv"
       ],
       "notes": [
         "实际输出受 s2_context.json 中的升级标志控制。"

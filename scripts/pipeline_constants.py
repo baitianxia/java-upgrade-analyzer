@@ -21,3 +21,23 @@ GATE_SEQUENCE = [
     "jar_compare",
     "call_chain",
 ]
+
+PER_DEPENDENCY_DIRNAME = "per_dependency"
+PER_DEPENDENCY_SUMMARY_FILE = "summary.json"
+PER_DEPENDENCY_RESOLVED_TARGETS_FILE = "resolved_targets.csv"
+PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE = "removed_jar_symbols.csv"
+PER_DEPENDENCY_CANDIDATE_HITS_FILE = "candidate_hits.csv"
+STEP3_RISK_CANDIDATES_FILE = "s3_risk_candidates.csv"
+
+BLOCKED_AT_VALUES = (
+    "system_source",
+    "dependency_with_source",
+    "dependency_without_source",
+)
+
+BLOCKED_REASON_KEYS = (
+    "NO_STATIC_PATH",
+    "DEPENDENCY_SOURCE_MAPPING_MISSING",
+    "RESOURCE_OR_REFLECTION",
+    "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION",
+)

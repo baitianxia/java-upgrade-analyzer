@@ -57,6 +57,11 @@ class Step1PackagedDepsTest(unittest.TestCase):
             ["org.example:demo-lib"],
         )
 
+    def test_classify_change_marks_removed_dependency(self):
+        change_type, risk = s1_dep_diff.classify_change("1.2.3", "-")
+        self.assertEqual(change_type, "移除")
+        self.assertEqual(risk, "待分析")
+
     def test_build_step1_change_rows_keeps_base_and_current_coords_for_cross_group_upgrade(self):
         rows = s1_dep_diff._build_step1_change_rows(
             [

@@ -6,6 +6,16 @@ all_changed_apis.csv 是 Step 4 的核心输出，Step 5 的核心输入。
 """
 
 import re
+from pathlib import Path
+
+from pipeline_constants import (
+    PER_DEPENDENCY_CANDIDATE_HITS_FILE as _PER_DEPENDENCY_CANDIDATE_HITS_FILE,
+    PER_DEPENDENCY_DIRNAME as _PER_DEPENDENCY_DIRNAME,
+    PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE as _PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE,
+    PER_DEPENDENCY_RESOLVED_TARGETS_FILE as _PER_DEPENDENCY_RESOLVED_TARGETS_FILE,
+    PER_DEPENDENCY_SUMMARY_FILE as _PER_DEPENDENCY_SUMMARY_FILE,
+    STEP3_RISK_CANDIDATES_FILE as _STEP3_RISK_CANDIDATES_FILE,
+)
 
 # CSV 字段定义（顺序固定，不可随意调整）
 ALL_CHANGED_APIS_FIELDS = [
@@ -44,9 +54,16 @@ DEFAULT_SEVERITY = {
 }
 
 # source 枚举
-SOURCES = ["japicmp", "gitdiff", "changelog"]
+SOURCES = ["japicmp", "gitdiff", "changelog", "old_jar"]
 
 SYMBOL_KINDS = {"method", "field", "class", "constructor"}
+
+PER_DEPENDENCY_DIRNAME = _PER_DEPENDENCY_DIRNAME
+PER_DEPENDENCY_SUMMARY_FILE = _PER_DEPENDENCY_SUMMARY_FILE
+PER_DEPENDENCY_RESOLVED_TARGETS_FILE = _PER_DEPENDENCY_RESOLVED_TARGETS_FILE
+PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE = _PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE
+PER_DEPENDENCY_CANDIDATE_HITS_FILE = _PER_DEPENDENCY_CANDIDATE_HITS_FILE
+STEP3_RISK_CANDIDATES_FILE = _STEP3_RISK_CANDIDATES_FILE
 
 
 def validate_row(row: dict) -> list:
@@ -124,3 +141,13 @@ def make_module_filename(module_name: str) -> str:
     """生成 by_module/ 目录下的文件名"""
     safe = _sanitize_filename(module_name or "module", fallback="module", max_len=120)
     return f"{safe}_impacts.json"
+
+
+def make_per_dependency_dirname(coord: str) -> str:
+    """将 Maven 坐标转成稳定目录名。"""
+    safe = _sanitize_filename(str(coord or "").replace(":", "__"), fallback="unknown_coord", max_len=160)
+    return safe
+
+
+def get_per_dependency_dir(report_dir: str, coord: str) -> Path:
+    return Path(report_dir) / PER_DEPENDENCY_DIRNAME / make_per_dependency_dirname(coord)

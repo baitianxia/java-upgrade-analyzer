@@ -33,6 +33,7 @@ import traceback
 import zipfile
 from collections import defaultdict, deque
 from datetime import datetime
+from pathlib import Path
 
 # 引入新模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -254,6 +255,40 @@ def step5_integrated_main(args):
             os.environ['JUA_STEP5_DEBUG_BREAK'] = previous_break
 
 
+def infer_step5_report_dir(args):
+    explicit = str(getattr(args, 'report_dir', '') or '').strip()
+    if explicit:
+        return explicit
+
+    all_changed_apis = str(getattr(args, 'all_changed_apis', '') or '').strip()
+    if all_changed_apis:
+        api_path = Path(all_changed_apis).expanduser()
+        if api_path.name == 'all_changed_apis.csv' and api_path.parent.name == 's4_jar_compare':
+            return str(api_path.parent.parent)
+
+    output_dir = str(getattr(args, 'output_dir', '') or '').strip()
+    if output_dir:
+        output_path = Path(output_dir).expanduser()
+        if output_path.name.startswith('s5_call_chain'):
+            return str(output_path.parent)
+
+    return '.upgrade-report'
+
+
+def _report_step5_debug_event(hypothesis_id, location, msg, data=None, run_id='pre-fix'):
+    if not _step5_debug_enabled():
+        return
+    # #region debug-point A:bridge-check
+    _step5_debug(
+        f"debug_event:{hypothesis_id}",
+        msg,
+        location=location,
+        run_id=run_id,
+        **(data or {}),
+    )
+    # #endregion
+
+
 def _step5_integrated_main_impl(args):
     """
     Step 5集成版主流程
@@ -271,7 +306,7 @@ def _step5_integrated_main_impl(args):
     emit_progress("step5", "plan", "开始调用链影响分析")
 
     # Phase 0: 参数准备
-    report_dir = args.report_dir or '.upgrade-report'
+    report_dir = infer_step5_report_dir(args)
     output_dir = args.output_dir or os.path.join(report_dir, 's5_call_chain')
     os.makedirs(output_dir, exist_ok=True)
     orchestrated_input = load_orchestrated_step5_input(report_dir)
@@ -430,6 +465,26 @@ def _step5_integrated_main_impl(args):
 
     bridge_check_timer = time.perf_counter()
     emit_progress("step5", "bridge-check", "开始判断哪些 API 需要跨依赖继续分析")
+    _report_step5_debug_event(
+        'CATALOG',
+        's5_call_chain_engine_integrated.py:runtime-catalog',
+        'starting runtime dependency catalog build',
+        data={
+            'report_dir': report_dir,
+            'all_api_count': len(all_apis),
+        },
+    )
+    runtime_dependency_catalog = build_runtime_dependency_catalog(report_dir)
+    _report_step5_debug_event(
+        'CATALOG',
+        's5_call_chain_engine_integrated.py:runtime-catalog',
+        'finished runtime dependency catalog build',
+        data={
+            'report_dir': report_dir,
+            'runtime_coord_count': len((runtime_dependency_catalog or {}).get('by_coord') or {}),
+            'sample_runtime_coords': sorted(list(((runtime_dependency_catalog or {}).get('by_coord') or {}).keys()))[:8],
+        },
+    )
     api_bridge_requirements = check_apis_that_need_bridge(
         all_apis,
         report_dir,
@@ -437,6 +492,7 @@ def _step5_integrated_main_impl(args):
         business_graph_result['graph'],
         dependency_source_mappings,
         business_graph_result['stats'],
+        runtime_dependency_catalog=runtime_dependency_catalog,
     )
     emit_progress(
         "step5",
@@ -447,7 +503,11 @@ def _step5_integrated_main_impl(args):
     needs_count = sum(1 for v in api_bridge_requirements.values() if v.get('needs_bridge'))
     missing_mapping_items = [
         item for item in api_bridge_requirements.values()
-        if item.get('needs_bridge') and not item.get('has_dependency_source_mapping')
+        if (
+            item.get('needs_bridge')
+            and not item.get('has_dependency_source_mapping')
+            and not item.get('has_packaged_bytecode_fallback')
+        )
     ]
     missing_mapping_count = len(missing_mapping_items)
     missing_mapping_coords = sorted(
@@ -479,6 +539,7 @@ def _step5_integrated_main_impl(args):
                 'api': key,
                 'needs_bridge': bool(info.get('needs_bridge')),
                 'has_dependency_source_mapping': bool(info.get('has_dependency_source_mapping', True)),
+                'has_packaged_bytecode_fallback': bool(info.get('has_packaged_bytecode_fallback')),
                 'reason': info.get('reason', ''),
             }
             for key, info in list((api_bridge_requirements or {}).items())[:5]
@@ -615,6 +676,7 @@ def _step5_integrated_main_impl(args):
     graph = graph_result['graph']
     type_metadata = graph_result['type_metadata']
     graph_stats = graph_result['stats']
+    graph.runtime_dependency_catalog = runtime_dependency_catalog
 
     print(f"  方法数：{len(graph.methods_by_id)}", file=sys.stderr)
     print(f"  反向边数：{len(graph.reverse_edges)}", file=sys.stderr)
@@ -836,6 +898,39 @@ def _load_coord_versions(report_dir):
             if coord:
                 result[coord] = dict(row)
     return result
+
+
+def build_runtime_dependency_catalog(report_dir):
+    current_resolved_path = os.path.join(report_dir, 's1_deps_current_resolved.csv')
+    catalog = {
+        'by_coord': {},
+        'jar_paths': {},
+    }
+    if not os.path.exists(current_resolved_path):
+        return catalog
+
+    with open(current_resolved_path, 'r', encoding='utf-8', errors='replace') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            coord = str((row or {}).get('coord') or '').strip()
+            version = str((row or {}).get('version') or '').strip()
+            scope = str((row or {}).get('scope') or '').strip()
+            if not coord or not version:
+                continue
+            if scope in {'test', 'provided', 'optional'}:
+                continue
+            jar_path = _find_maven_jar(coord, version)
+            if not jar_path:
+                continue
+            item = {
+                'coord': coord,
+                'version': version,
+                'scope': scope,
+                'jar_path': jar_path,
+            }
+            catalog['by_coord'][coord] = item
+            catalog['jar_paths'][coord] = jar_path
+    return catalog
 
 
 def _normalize_descriptor_type(descriptor, preserve_array=False):
@@ -1950,7 +2045,7 @@ def main():
 
     ap.add_argument(
         '--report-dir',
-        default='.upgrade-report',
+        default='',
         help='报告目录'
     )
 
@@ -2084,6 +2179,7 @@ def check_apis_that_need_bridge(
     business_graph=None,
     dependency_source_mappings=None,
     business_graph_stats=None,
+    runtime_dependency_catalog=None,
 ):
     """
     Check which specific APIs need dependency source mappings (api-level decision)
@@ -2100,6 +2196,7 @@ def check_apis_that_need_bridge(
                 source_dirs = context.get('source_dirs') or []
 
     available_mapping_coords = _valid_dependency_source_mapping_coords(dependency_source_mappings)
+    available_runtime_coords = set((runtime_dependency_catalog or {}).get('by_coord', {}).keys())
     precheck_incomplete = business_graph_precheck_incomplete(business_graph_stats)
 
     result = {}
@@ -2118,9 +2215,26 @@ def check_apis_that_need_bridge(
         coord = row.get('coord', '')
         api_name = row.get('api_name', '')
         key = build_api_identity_key(row)
+        has_packaged_bytecode_fallback = bool(available_runtime_coords)
 
         if not coord or not api_name:
             continue
+
+        if api_name.startswith('org.apache.commons.lang'):
+            _report_step5_debug_event(
+                'A',
+                's5_call_chain_engine_integrated.py:bridge-check',
+                'bridge-check evaluated commons-lang api',
+                data={
+                    'coord': coord,
+                    'api_name': api_name,
+                    'identity_key': key,
+                    'available_runtime_coord_count': len(available_runtime_coords),
+                    'sample_runtime_coords': sorted(list(available_runtime_coords))[:8],
+                    'has_dependency_source_mapping': coord in available_mapping_coords,
+                    'has_packaged_bytecode_fallback': has_packaged_bytecode_fallback,
+                },
+            )
 
         # 【关键修复】只有业务图找到直接的 caller 才算 direct usage
         # 原因：import 只能证明类型可见，不能证明方法被调用
@@ -2133,6 +2247,7 @@ def check_apis_that_need_bridge(
                 'reason': 'direct_business_usage',
                 'coord': coord,
                 'has_dependency_source_mapping': True,
+                'has_packaged_bytecode_fallback': has_packaged_bytecode_fallback,
             }
             continue
 
@@ -2142,6 +2257,7 @@ def check_apis_that_need_bridge(
                 'reason': 'business_graph_precheck_incomplete',
                 'coord': coord,
                 'has_dependency_source_mapping': coord in available_mapping_coords,
+                'has_packaged_bytecode_fallback': has_packaged_bytecode_fallback,
                 'precheck_incomplete': True,
             }
             continue
@@ -2159,6 +2275,7 @@ def check_apis_that_need_bridge(
             'reason': 'no_direct_call_found',
             'coord': coord,
             'has_dependency_source_mapping': coord in available_mapping_coords,
+            'has_packaged_bytecode_fallback': has_packaged_bytecode_fallback,
         }
 
     return result

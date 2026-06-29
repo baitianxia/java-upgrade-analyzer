@@ -19,6 +19,7 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
+from pipeline_constants import PER_DEPENDENCY_DIRNAME, PER_DEPENDENCY_SUMMARY_FILE
 
 
 def load_json(path):
@@ -57,6 +58,20 @@ def count_lines(path):
         return len(lines)
     except Exception:
         return -1
+
+
+def load_per_dependency_summaries(report_dir):
+    per_dependency_root = Path(report_dir) / PER_DEPENDENCY_DIRNAME
+    results = []
+    if not per_dependency_root.is_dir():
+        return results
+    for child in sorted(per_dependency_root.iterdir()):
+        if not child.is_dir():
+            continue
+        payload = load_json(str(child / PER_DEPENDENCY_SUMMARY_FILE))
+        if payload:
+            results.append(payload)
+    return results
 
 
 def build_api_identity_key(payload):
@@ -107,6 +122,7 @@ def collect_findings(d):
         'user_conclusion_summary': {},
         'module_impacts':      {},
         'dep_changes_summary': {},
+        'per_dependency_results': [],
     }
 
     # Step 2 上下文
@@ -122,9 +138,13 @@ def collect_findings(d):
 
     # Step 1 依赖变更统计
     dep_rows = load_csv(f"{d}/s1_dep_changes.csv")
+    dep_change_lookup = {}
     dep_counts = defaultdict(int)
     for row in dep_rows:
         dep_counts[row.get('change_type', '未知')] += 1
+        coord = row.get('coord', '')
+        if coord:
+            dep_change_lookup[coord] = row
     findings['dep_changes_summary'] = dict(dep_counts)
 
     # Step 3 扫描统计
@@ -361,6 +381,32 @@ def collect_findings(d):
                     'impact_count': len(data.get('impacts', [])),
                 }
 
+    per_dependency_summaries = load_per_dependency_summaries(d)
+    per_dependency_lookup = {}
+    per_dependency_results = []
+    for item in per_dependency_summaries:
+        coord = str(item.get('coord', '') or '').strip()
+        if not coord:
+            continue
+        step5 = dict(item.get('step5') or {})
+        dep_row = dep_change_lookup.get(coord) or {}
+        result = {
+            'coord': coord,
+            'change_type': str(item.get('change_type') or dep_row.get('change_type') or '').strip(),
+            'old_version': str(item.get('old_version') or dep_row.get('old_version') or '').strip(),
+            'new_version': str(item.get('new_version') or dep_row.get('new_version') or '').strip(),
+            'reaches_system_source': bool(step5.get('reaches_system_source')),
+            'final_status': str(step5.get('final_status') or step5.get('selected_status') or '').strip(),
+            'blocked_at': str(step5.get('blocked_at') or '').strip(),
+            'blocked_reason': str(step5.get('blocked_reason') or '').strip(),
+            'evidence_level': str(step5.get('evidence_level') or '').strip(),
+            'selected_api': str(step5.get('selected_api') or '').strip(),
+            'step4': dict(item.get('step4') or {}),
+            'step5': step5,
+        }
+        per_dependency_lookup[coord] = result
+        per_dependency_results.append(result)
+
     impacted_dep_map = defaultdict(lambda: {
         'coord': '',
         'p0': 0,
@@ -372,6 +418,13 @@ def collect_findings(d):
         'not_analyzed': 0,
         'not_found': 0,
         'apis': set(),
+        'change_type': '',
+        'reaches_system_source': False,
+        'final_status': '',
+        'blocked_at': '',
+        'blocked_reason': '',
+        'evidence_level': '',
+        'selected_api': '',
     })
     for sev_key, bucket in [('p0', findings['p0']), ('p1', findings['p1']), ('p2', findings['p2'])]:
         for item in bucket:
@@ -413,15 +466,26 @@ def collect_findings(d):
         if item.get('api'):
             impacted_dep_map[coord]['apis'].add(item['api'])
 
-    findings['impacted_dependencies'] = sorted(
-        [
+    impacted_dependencies = []
+    for data in impacted_dep_map.values():
+        per_dep = per_dependency_lookup.get(data['coord']) or {}
+        dep_row = dep_change_lookup.get(data['coord']) or {}
+        impacted_dependencies.append(
             {
                 **data,
                 'api_count': len(data['apis']),
                 'apis': sorted(data['apis'])[:10],
+                'change_type': per_dep.get('change_type') or dep_row.get('change_type', ''),
+                'reaches_system_source': bool(per_dep.get('reaches_system_source')),
+                'final_status': per_dep.get('final_status', ''),
+                'blocked_at': per_dep.get('blocked_at', ''),
+                'blocked_reason': per_dep.get('blocked_reason', ''),
+                'evidence_level': per_dep.get('evidence_level', ''),
+                'selected_api': per_dep.get('selected_api', ''),
             }
-            for data in impacted_dep_map.values()
-        ],
+        )
+    findings['impacted_dependencies'] = sorted(
+        impacted_dependencies,
         key=lambda x: (
             -(x['p0'] * 100 + x['p1'] * 10 + x['p2']),
             -x['uncertain'],
@@ -431,6 +495,14 @@ def collect_findings(d):
             -x.get('not_found', 0),
             x['coord'],
         )
+    )
+    findings['per_dependency_results'] = sorted(
+        per_dependency_results,
+        key=lambda x: (
+            0 if x.get('reaches_system_source') else 1,
+            x.get('blocked_at', ''),
+            x.get('coord', ''),
+        ),
     )
 
     return findings
@@ -573,14 +645,32 @@ def generate_report(findings):
     if impacted_deps:
         L += [
             "## 三、当前系统受影响的依赖", "",
-            "| 依赖坐标 | P0 | P1 | P2 | ❓ | ≈ | … | ⊘ | ✗ | 受影响 API 数 |",
-            "|---|---|---|---|---|---|---|---|---|---|",
+            "| 依赖坐标 | 变更类型 | 回溯到系统源码 | 最终状态 | 止步层 | P0 | P1 | P2 | ❓ | ≈ | … | ⊘ | ✗ | 受影响 API 数 |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for dep in impacted_deps:
             L.append(
-                f"| {dep['coord']} | {dep['p0']} | {dep['p1']} | {dep['p2']} | {dep['uncertain']} | "
+                f"| {dep['coord']} | {dep.get('change_type', '')} | "
+                f"{'是' if dep.get('reaches_system_source') else '否'} | {dep.get('final_status', '')} | "
+                f"{dep.get('blocked_at', '')} | {dep['p0']} | {dep['p1']} | {dep['p2']} | {dep['uncertain']} | "
                 f"{dep.get('probable_impact', 0)} | {dep.get('needs_input', 0)} | {dep.get('not_analyzed', 0)} | "
                 f"{dep.get('not_found', 0)} | {dep['api_count']} |"
+            )
+        L.append("")
+
+    per_dependency_results = findings.get('per_dependency_results', [])
+    if per_dependency_results:
+        L += [
+            "### 单依赖包最终结论", "",
+            "| 依赖坐标 | 变更类型 | 回溯到系统源码 | 最终状态 | 止步层 | 阻塞原因 | 证据等级 | 代表 API |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for item in per_dependency_results:
+            L.append(
+                f"| {item.get('coord', '')} | {item.get('change_type', '')} | "
+                f"{'是' if item.get('reaches_system_source') else '否'} | {item.get('final_status', '')} | "
+                f"{item.get('blocked_at', '')} | {item.get('blocked_reason', '')} | "
+                f"{item.get('evidence_level', '')} | {item.get('selected_api', '')} |"
             )
         L.append("")
 

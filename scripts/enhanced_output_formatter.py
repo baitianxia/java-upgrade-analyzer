@@ -25,6 +25,14 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 
+try:
+    from s4_contract import PER_DEPENDENCY_SUMMARY_FILE, get_per_dependency_dir
+except ImportError:
+    current_dir = os.path.dirname(__file__)
+    if current_dir and current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    from s4_contract import PER_DEPENDENCY_SUMMARY_FILE, get_per_dependency_dir
+
 
 # ══════════════════════════════════════════════════════════════════
 # 可读调用链格式化
@@ -86,6 +94,117 @@ def trace_result_to_api_entry(r):
         'recommended_action':  user_view['recommended_action'],
         'key_evidence':        user_view['key_evidence'],
     }
+
+
+def _load_json_if_exists(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _per_dependency_status_rank(status):
+    return {
+        'reachable': 0,
+        'uncertain': 1,
+        'not_analyzed': 2,
+        'not_found_in_static_analysis': 3,
+        'not_reachable': 3,
+    }.get(str(status or '').strip(), 9)
+
+
+def _pick_per_dependency_representative(entries):
+    def entry_rank(item):
+        severity_rank = {'P0': 0, 'P1': 1, 'P2': 2}.get(str(item.get('severity') or '').strip(), 9)
+        return (
+            _per_dependency_status_rank(item.get('analysis_status')),
+            severity_rank,
+            -int(item.get('business_reach_depth') or 0),
+            item.get('api') or item.get('api_name') or '',
+        )
+
+    return sorted(entries or [], key=entry_rank)[0] if entries else {}
+
+
+def _infer_blocked_at(entry):
+    entry = entry or {}
+    if str(entry.get('analysis_status') or '').strip() == 'reachable':
+        return 'system_source'
+    if str(entry.get('reason_code') or '').strip() in {
+        'DEPENDENCY_SOURCE_MAPPING_MISSING',
+        'PACKAGED_DEPENDENCY_BYTECODE_USAGE',
+    }:
+        return 'dependency_without_source'
+    if entry.get('dependency_chain_coords'):
+        return 'dependency_with_source'
+    return 'system_source'
+
+
+def _infer_evidence_level(entry):
+    entry = entry or {}
+    status = str(entry.get('analysis_status') or '').strip()
+    provenance = str(entry.get('match_provenance') or '').strip()
+    tier = int(entry.get('match_tier', -1) or -1)
+    if status == 'reachable':
+        if provenance.startswith('exact') or tier in (0, 1):
+            return 'strong'
+        return 'medium'
+    if status == 'uncertain':
+        return 'medium' if entry.get('dependency_chain_coords') else 'weak'
+    return 'weak'
+
+
+def write_per_dependency_summaries(all_results, report_dir):
+    grouped = defaultdict(list)
+    for result in all_results or []:
+        coord = str(getattr(result, 'coord', '') or '').strip()
+        if coord:
+            grouped[coord].append(trace_result_to_api_entry(result))
+
+    for coord, entries in grouped.items():
+        per_dependency_dir = get_per_dependency_dir(report_dir, coord)
+        os.makedirs(per_dependency_dir, exist_ok=True)
+        summary_path = per_dependency_dir / PER_DEPENDENCY_SUMMARY_FILE
+        existing_summary = _load_json_if_exists(summary_path)
+
+        reachable_entries = [item for item in entries if item.get('analysis_status') == 'reachable']
+        uncertain_entries = [item for item in entries if item.get('analysis_status') == 'uncertain']
+        not_analyzed_entries = [item for item in entries if item.get('analysis_status') == 'not_analyzed']
+        not_found_entries = [
+            item for item in entries
+            if item.get('analysis_status') in ('not_found_in_static_analysis', 'not_reachable')
+        ]
+        representative = _pick_per_dependency_representative(entries)
+        reaches_system_source = bool(reachable_entries)
+
+        step5_summary = {
+            'status': 'done',
+            'total_targets': len(entries),
+            'reachable': len(reachable_entries),
+            'uncertain': len(uncertain_entries),
+            'not_analyzed': len(not_analyzed_entries),
+            'not_found_in_static_analysis': len(not_found_entries),
+            'reaches_system_source': reaches_system_source,
+            'final_status': str(representative.get('analysis_status') or '').strip(),
+            'blocked_at': '' if reaches_system_source else _infer_blocked_at(representative),
+            'blocked_reason': '' if reaches_system_source else str(representative.get('reason_code') or '').strip(),
+            'evidence_level': _infer_evidence_level(representative),
+            'selected_status': str(representative.get('analysis_status') or '').strip(),
+            'selected_api': str(representative.get('api') or representative.get('api_name') or '').strip(),
+            'selected_reason': str(representative.get('reason') or representative.get('reachable_note') or '').strip(),
+            'sample_results': entries[:20],
+        }
+
+        summary = dict(existing_summary) if isinstance(existing_summary, dict) else {}
+        artifacts = dict(summary.get('artifacts') or {})
+        artifacts['summary_json'] = str(summary_path)
+        summary['coord'] = coord
+        summary['artifacts'] = artifacts
+        summary['step5'] = step5_summary
+
+        with open(summary_path, 'w', encoding='utf-8', newline='\n') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
 
 
 def format_single_path_tree(path_str, trace_result, max_depth):
@@ -213,6 +332,18 @@ REASON_CODE_EXPLANATIONS = {
         'reason': '已找到候选调用链，但变更 API 的直接调用者仍位于同一依赖内部，暂不足以证明外部消费者真实依赖了该 API',
         'action': '优先确认业务代码或其他依赖是否直接调用了该变更 API；若当前只命中目标依赖内部自调用链路，不应直接判定为已确认影响'
     },
+    'DIRECT_CLASS_USAGE': {
+        'reason': '已在系统源码中直接命中目标类型引用',
+        'action': '优先打开命中的业务方法，确认该类型对应的具体受影响成员或行为'
+    },
+    'DIRECT_FIELD_USAGE': {
+        'reason': '已在系统源码中直接命中目标字段访问',
+        'action': '优先核对字段访问点的业务语义，并评估字段删除或行为变化的影响'
+    },
+    'DIRECT_STATIC_IMPORT_USAGE': {
+        'reason': '已在系统源码中通过 static import 直接命中目标字段',
+        'action': '优先核对 static import 对应字段的用途，并评估删除或变更后的影响'
+    },
     'FRAMEWORK_BOUNDARY': {
         'reason': '遇到框架边界（动态代理/接口注入）',
         'action': '审查框架配置（Spring/MyBatis），确认实际注入的实现类'
@@ -236,6 +367,10 @@ REASON_CODE_EXPLANATIONS = {
     'DEPENDENCY_SOURCE_MAPPING_MISSING': {
         'reason': '缺少可用的依赖源码映射',
         'action': '补充 dependency_source_dirs 中的依赖源码路径后重跑 Step5'
+    },
+    'PACKAGED_DEPENDENCY_BYTECODE_USAGE': {
+        'reason': '已在无源码依赖字节码中稳定命中目标符号引用，但尚未证明是否回到系统源码',
+        'action': '优先审查命中的无源码依赖及其入口；若需继续回溯到系统源码，请补充 dependency_source_dirs'
     },
     'MISSING_API_SIGNATURE': {
         'reason': '方法级变更缺少参数签名，无法精确区分重载方法',
@@ -326,8 +461,12 @@ def summarize_user_facing_outcome(trace_like):
     if analysis_status == 'reachable':
         conclusion = '已确认影响'
         decision_bucket = 'confirmed_impact'
-        user_reason = '已找到从系统代码到变更 API 的调用链。'
-        recommended_action = '优先按调用链定位受影响业务，并安排修复或验证。'
+        if reason_code in {'DIRECT_CLASS_USAGE', 'DIRECT_FIELD_USAGE', 'DIRECT_STATIC_IMPORT_USAGE'}:
+            user_reason = explanation.get('reason') or '已在系统源码中直接命中目标引用。'
+            recommended_action = explanation.get('action') or '优先打开命中的业务方法，确认影响范围。'
+        else:
+            user_reason = '已找到从系统代码到变更 API 的调用链。'
+            recommended_action = '优先按调用链定位受影响业务，并安排修复或验证。'
     elif reason_code in INPUT_REQUIRED_REASON_CODES:
         conclusion = '需要补充输入'
         decision_bucket = 'input_required'
@@ -856,6 +995,8 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     summary_json_path = os.path.join(output_dir, 'summary.json')
     with open(summary_json_path, 'w', encoding='utf-8', newline='\n') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    write_per_dependency_summaries(all_results, os.path.dirname(os.path.abspath(output_dir)))
 
     print(f"  汇总 JSON → {summary_json_path}", file=sys.stderr)
     return summary_json_path
