@@ -483,7 +483,8 @@ Step5 在保留原有 `summary.json`、`by_api/*.json`、`by_module/*.json` 的�
 对于传统方法反向图不擅长的符号，Step5 现在先尝试直接业务证据：
 
 - `class_usage` / `symbol_kind=class`
-  - 直接检查业务方法中的声明类型、导入类型、`new` / `instanceof` / `Type.class` / FQCN body 引用
+  - 直接检查业务方法中的声明类型、导入类型与 FQCN body 引用
+  - simple name 形式的 `new` / `instanceof` / `Type.class` 仅在当前 import（含 wildcard import）精确解析到目标 FQCN 时才可升级为 `DIRECT_CLASS_USAGE`
   - 若命中，则输出 `DIRECT_CLASS_USAGE`
 - `symbol_kind=field`
   - 直接检查 `static import` 与限定名字段访问

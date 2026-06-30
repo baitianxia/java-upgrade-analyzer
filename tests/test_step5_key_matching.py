@@ -1823,6 +1823,142 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("com.biz.Entry.handle", result.call_paths[0])
         self.assertIn("com.lib.TargetType", result.call_paths[0])
 
+    def test_trace_api_does_not_upgrade_class_usage_when_import_resolves_simple_name_to_other_type(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang.time.StopWatch",
+            "api_simple": "StopWatch",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "coord": "commons-lang:commons-lang",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "class_usage",
+            "matched_class": "org.apache.commons.lang.time.StopWatch",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.Entry.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.Entry",
+            class_name="Entry",
+            method_name="handle",
+            return_type="void",
+            file="Entry.java",
+            line=12,
+            owner_type="business",
+            is_test=False,
+            param_types={},
+            field_types={},
+            local_var_types={},
+            imports={"StopWatch": "org.springframework.util.StopWatch"},
+            wildcard_imports=[],
+            static_imports={},
+            get_body_text=lambda: "StopWatch sw = new StopWatch(); sw.stop();",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "CLASS_USAGE_ONLY")
+
+    def test_trace_api_keeps_fqcn_class_usage_reachable_even_when_simple_name_import_conflicts(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang.time.StopWatch",
+            "api_simple": "StopWatch",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "coord": "commons-lang:commons-lang",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "class_usage",
+            "matched_class": "org.apache.commons.lang.time.StopWatch",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.Entry.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.Entry",
+            class_name="Entry",
+            method_name="handle",
+            return_type="void",
+            file="Entry.java",
+            line=18,
+            owner_type="business",
+            is_test=False,
+            param_types={},
+            field_types={},
+            local_var_types={},
+            imports={"StopWatch": "org.springframework.util.StopWatch"},
+            wildcard_imports=[],
+            static_imports={},
+            get_body_text=lambda: (
+                "org.apache.commons.lang.time.StopWatch watch = "
+                "new org.apache.commons.lang.time.StopWatch();"
+            ),
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_CLASS_USAGE")
+        self.assertIn("org.apache.commons.lang.time.StopWatch", result.call_paths[0])
+
+    def test_trace_api_keeps_class_usage_reachable_with_wildcard_import(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang.time.StopWatch",
+            "api_simple": "StopWatch",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "coord": "commons-lang:commons-lang",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "class_usage",
+            "matched_class": "org.apache.commons.lang.time.StopWatch",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.Entry.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.Entry",
+            class_name="Entry",
+            method_name="handle",
+            return_type="void",
+            file="Entry.java",
+            line=22,
+            owner_type="business",
+            is_test=False,
+            param_types={},
+            field_types={},
+            local_var_types={},
+            imports={},
+            wildcard_imports=["org.apache.commons.lang.time"],
+            static_imports={},
+            get_body_text=lambda: "StopWatch watch = new StopWatch();",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_CLASS_USAGE")
+
     def test_trace_api_marks_field_static_import_usage_as_reachable(self):
         api_row = {
             "api_name": "com.lib.TargetType.FIELD",

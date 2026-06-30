@@ -219,6 +219,7 @@ class MethodDef:
     param_declared_types: dict = field(default_factory=dict)
     imports: dict = field(default_factory=dict)
     static_imports: dict = field(default_factory=dict)
+    wildcard_imports: list = field(default_factory=list)
     field_types: dict = field(default_factory=dict)
     field_declared_types: dict = field(default_factory=dict)
     annotations: list = field(default_factory=list)
@@ -665,6 +666,7 @@ class EnhancedRegexAnalyzer:
                 param_declared_types=param_declared_types,
                 imports=dict(self.imports),
                 static_imports=dict(self.static_imports),
+                wildcard_imports=list(self.wildcard_imports),
                 field_types=self.field_types,
                 field_declared_types=dict(self.field_declared_types),
                 annotations=annotations,
@@ -1079,6 +1081,7 @@ class TreeSitterAnalyzer:
             param_declared_types=param_declared_types,
             imports=dict(self.helper.imports),
             static_imports=dict(self.helper.static_imports),
+            wildcard_imports=list(self.helper.wildcard_imports),
             field_types=dict(self.helper.field_types),
             field_declared_types=dict(self.helper.field_declared_types),
             annotations=annotations,

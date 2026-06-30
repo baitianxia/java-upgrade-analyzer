@@ -150,13 +150,13 @@ def _find_direct_business_class_usage(api_row, graph):
     if not target_class:
         return None
     simple_name = target_class.rsplit('.', 1)[-1]
-    body_patterns = [
+    simple_name_patterns = [
         re.compile(r'\bnew\s+' + re.escape(simple_name) + r'\b'),
         re.compile(r'\b' + re.escape(simple_name) + r'\s*\.class\b'),
         re.compile(r'\binstanceof\s+' + re.escape(simple_name) + r'\b'),
         re.compile(r'\(\s*' + re.escape(simple_name) + r'\s*\)'),
-        re.compile(re.escape(target_class)),
     ]
+    fqcn_pattern = re.compile(re.escape(target_class))
     for method_def in _iter_business_methods(graph):
         declared_types = (
             [getattr(method_def, 'return_type', '')]
@@ -167,10 +167,15 @@ def _find_direct_business_class_usage(api_row, graph):
         if target_class in declared_types:
             return method_def, 'declared_type'
         imports = getattr(method_def, 'imports', {}) or {}
+        wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
         body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
-        if imports.get(simple_name) == target_class and any(pattern.search(body_text) for pattern in body_patterns[:-1]):
+        import_matches_target = imports.get(simple_name) == target_class
+        wildcard_matches_target = any(f"{pkg}.{simple_name}" == target_class for pkg in wildcard_imports)
+        if (import_matches_target or wildcard_matches_target) and any(
+            pattern.search(body_text) for pattern in simple_name_patterns
+        ):
             return method_def, 'imported_type'
-        if any(pattern.search(body_text) for pattern in body_patterns):
+        if fqcn_pattern.search(body_text):
             return method_def, 'body_reference'
     return None
 
