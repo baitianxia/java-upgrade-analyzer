@@ -399,6 +399,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 若证据不足，应先补 `dependency_source_dirs`，而不是直接进入 `step5`
 - 允许在 `continue` 时优先附带 `selected_targets`，让系统自动归一化为 `step5_selected_coords` / `step5_selected_names`
 - `selection_options` 需要同时反映 Step4 API 目标与 Step3 candidate 目标，避免只存在于 candidate 的依赖被遗漏；每个候选都应带稳定 `selection_key`
+- Step4 checkpoint 若只展示部分 `selection_options` 作为人工阅读摘要，这不应收窄正式选择范围；`selected_targets` 的解析仍必须基于完整候选集，允许用户直接提交未展示但合法的精确 `coord` / `name`
 - 恢复前必须遵守 `action_requirements`；若当前动作缺少 required / at_least_one_of 字段，必须先追问，不能空恢复
 - 允许动作：`continue`、`cancel`
 - 禁止动作：证据明显不足时仍直接进入 `step5`

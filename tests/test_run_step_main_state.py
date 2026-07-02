@@ -1479,6 +1479,114 @@ class RunStepMainStateTest(unittest.TestCase):
             ["com.example:demo-lib"],
         )
 
+    def test_build_interaction_payload_step4_keeps_full_selection_resolution_when_display_truncated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            (report_dir / "s4_jar_compare").mkdir(parents=True)
+            with (report_dir / "s4_jar_compare" / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["coord", "class_name", "member"])
+                writer.writeheader()
+                for idx in range(21):
+                    writer.writerow(
+                        {
+                            "coord": f"com.example:demo-lib-{idx:02d}",
+                            "class_name": f"com.example.Demo{idx}",
+                            "member": "run()",
+                        }
+                    )
+            manifest_steps = {
+                "step4": {
+                    "interaction": {
+                        "title": "请确认",
+                        "question": "请确认",
+                        "options": [{"id": "continue", "label": "继续", "description": "继续"}],
+                    },
+                    "outputs": ["s4_jar_compare/all_changed_apis.csv"],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step4",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={},
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        self.assertEqual(len(payload["selection_options"]), 20)
+        self.assertEqual(len(payload["selection_resolution"]["options"]), 21)
+        self.assertEqual(
+            payload["selection_resolution"]["options"][-1]["selection_key"],
+            "coord:com.example:demo-lib-20",
+        )
+
+    def test_apply_user_response_to_main_state_resolves_selected_targets_outside_display_slice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            state = run_step.new_main_state(report_dir)
+            full_selection_options = run_step.build_interaction_selection_options(
+                [
+                    {
+                        "coord": f"com.example:demo-lib-{idx:02d}",
+                        "name": f"demo-lib-{idx:02d}",
+                    }
+                    for idx in range(21)
+                ]
+            )
+            pending_interaction = run_step.apply_interaction_protocol_enhancements(
+                {
+                    "step_id": "step4",
+                    "kind": "review",
+                    "options": [{"id": "continue", "label": "继续"}],
+                    "response_schema": {
+                        "type": "object",
+                        "required": ["action"],
+                        "properties": {
+                            "action": {"type": "string"},
+                            "selected_targets": {"type": "array"},
+                        },
+                    },
+                    "selection_options": full_selection_options[:20],
+                    "selection_resolution": run_step.build_selection_resolution(full_selection_options),
+                    "input_normalization": {"enabled": True},
+                },
+                "step4",
+                project_dir=project_dir,
+                report_dir=report_dir,
+            )
+
+            updated_state, _ = run_step.apply_user_response_to_main_state(
+                state,
+                pending_interaction,
+                {
+                    "intent_patch": {
+                        "action": "continue",
+                        "set": {"selected_targets": ["coord:com.example:demo-lib-20"]},
+                    }
+                },
+                project_dir,
+                target_step_id="step4",
+            )
+            run_step.handle_step4_resume_followups(
+                updated_state,
+                report_dir,
+                "step4",
+                "continue",
+            )
+
+        self.assertEqual(
+            updated_state["step4"]["input"]["step5_selected_coords"],
+            ["com.example:demo-lib-20"],
+        )
+        self.assertEqual(
+            updated_state["step5"]["input"]["step5_selected_coords"],
+            ["com.example:demo-lib-20"],
+        )
+
     def test_apply_user_response_to_main_state_accepts_strict_risk_gate_intent_patch(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)

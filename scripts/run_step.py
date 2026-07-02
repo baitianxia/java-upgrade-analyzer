@@ -3495,9 +3495,12 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
     response_schema = dict(payload.get("response_schema") or {})
     properties = dict(response_schema.get("properties") or {})
     selection_options = build_interaction_selection_options(payload.get("selection_options") or [])
-    selection_resolution = build_selection_resolution(selection_options)
+    selection_resolution = dict(payload.get("selection_resolution") or {})
+    if not selection_resolution.get("enabled"):
+        selection_resolution = build_selection_resolution(selection_options)
     if selection_options:
         payload["selection_options"] = selection_options
+    if selection_resolution.get("enabled"):
         properties.setdefault(
             "selected_targets",
             {
@@ -3963,7 +3966,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         available_rows = read_csv_rows(all_changed_apis)
         risk_candidates = read_csv_rows(report_dir / STEP3_RISK_CANDIDATES_FILE)
         target_summary = build_step5_selection_summary(list(available_rows) + list(risk_candidates))
-        selection_options = build_interaction_selection_options(
+        full_selection_options = build_interaction_selection_options(
             [
                 {
                     "selection_key": f"coord:{item.get('coord')}",
@@ -3972,10 +3975,12 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                     "api_count": item.get("api_count"),
                     "label": item.get("coord") or item.get("name"),
                 }
-                for item in target_summary.get("available_targets", [])[:20]
+                for item in target_summary.get("available_targets", [])
             ]
         )
+        selection_options = full_selection_options[:20]
         interaction_meta["selection_options"] = selection_options
+        interaction_meta["selection_resolution"] = build_selection_resolution(full_selection_options)
         checklist_lines.append("Step5 可选调用链分析范围（按依赖汇总自 Step4 API 与 Step3 candidate 输入）：")
         checklist_lines.append(
             f"  - 可选依赖数={target_summary.get('available_target_count', 0)} "
@@ -3986,7 +3991,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 f"  - {item.get('coord')} | name={item.get('name')} | api_count={item.get('api_count')}"
             )
         if target_summary.get("available_target_count", 0) > 10:
-            checklist_lines.append("  - 其余候选请直接查看 all_changed_apis.csv 完整内容")
+            checklist_lines.append("  - 其余候选请直接查看 all_changed_apis.csv 完整内容；展示列表之外的目标仍可通过精确 coord/name 正式选择")
         existing_selection = build_step5_selection_summary(
             list(available_rows) + list(risk_candidates),
             selected_coords=(run_context or {}).get("step5_selected_coords"),
@@ -4225,6 +4230,8 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     }
     if interaction_meta.get("selection_options"):
         payload["selection_options"] = list(interaction_meta.get("selection_options") or [])
+    if interaction_meta.get("selection_resolution"):
+        payload["selection_resolution"] = dict(interaction_meta.get("selection_resolution") or {})
     runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
     runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
     runtime_view.update(run_context or {})

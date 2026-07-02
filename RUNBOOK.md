@@ -223,6 +223,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 - 调度器会先把 `selected_targets` 归一化为正式 `step5_selected_coords` / `step5_selected_names`，再自动桥接为从 `step5` 重跑，而不是直接卡死在“当前没有 pending interaction”
 - 若某个依赖只在 Step3 candidate 中出现、尚未进入 Step4 API 目标，仍可通过 `step5_selected_coords` / `step5_selected_names` 被选中
+- Step4 checkpoint 中展示给用户的候选列表可以按数量截断，但 `selected_targets` 的正式解析范围仍是完整候选集；因此即使目标未出现在前端展示片段中，也可以直接提交精确 `coord` 或 `name`
 
 若用户答复较长，优先使用：
 
@@ -482,6 +483,7 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 的成因；`by_api/*.json` 中的 `evidence_paths` 是逐边证据
 - 若 `all_changed_apis.csv` 为空，直接跳过并说明“Step4 未提取到可追踪的变更 API”
 - 若指定 `selected_targets`，优先按候选的 `selection_key` 精确匹配；也支持精确填写 `coord` 或 `name`，随后会归一化为正式的 `step5_selected_coords` / `step5_selected_names`
+- Step4 checkpoint 若只展示前若干个候选，这只影响展示，不影响正式匹配；未展示的合法目标仍会参与 `selected_targets` 解析
 - 若直接指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
 - 若筛选条件既未在 Step4 API 目标命中，也未在 Step3 candidate 目标命中，Step5 会直接报错，避免静默分析错范围
 - 正式流程会向 `stderr` 输出 `[progress][step5][discovery|graph|bridge-check|trace|report|done]` 日志，展示源码映射发现、图构建、调用链追踪与报告生成的推进情况
