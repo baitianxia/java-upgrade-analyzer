@@ -1,0 +1,21 @@
+{
+  "schema": "java-upgrade-analyzer.rule-pack.v1",
+  "id": "jdk-core",
+  "version": "2026.07",
+  "source": "https://docs.oracle.com/en/java/javase/21/migrate/",
+  "last_verified": "2026-07-02",
+  "rules": [
+    {"id":"jdk11-jaxb","kind":"removed_api","pattern":"javax\\.xml\\.bind","name":"JAXB","affected_version":11,"status":"REMOVED"},
+    {"id":"jdk11-jaxws","kind":"removed_api","pattern":"javax\\.xml\\.ws","name":"JAX-WS","affected_version":11,"status":"REMOVED"},
+    {"id":"jdk11-activation","kind":"removed_api","pattern":"javax\\.activation","name":"Activation","affected_version":11,"status":"REMOVED"},
+    {"id":"jdk11-corba","kind":"removed_api","pattern":"org\\.omg\\.|javax\\.rmi\\.","name":"CORBA","affected_version":11,"status":"REMOVED"},
+    {"id":"jdk17-rmi-activation","kind":"removed_api","pattern":"java\\.rmi\\.activation","name":"RMI_Activation","affected_version":17,"status":"REMOVED"},
+    {"id":"jdk17-applet","kind":"removed_api","pattern":"java\\.applet|JApplet","name":"Applet","affected_version":17,"status":"REMOVED"},
+    {"id":"jdk15-nashorn","kind":"removed_api","pattern":"jdk\\.nashorn|NashornScriptEngine","name":"Nashorn","affected_version":15,"status":"REMOVED"},
+    {"id":"jdk11-finalizers-exit","kind":"removed_api","pattern":"runFinalizersOnExit","name":"runFinalizersOnExit","affected_version":11,"status":"REMOVED"},
+    {"id":"jdk9-class-new-instance","kind":"removed_api","pattern":"Class\\.newInstance\\(\\)","name":"Class.newInstance","affected_version":9,"status":"DEPRECATED"},
+    {"id":"jdk18-finalize","kind":"removed_api","pattern":"\\bfinalize\\s*\\(\\s*\\)","name":"finalize","affected_version":18,"status":"DEPRECATED_FOR_REMOVAL"},
+    {"id":"jdk20-url-constructor","kind":"removed_api","pattern":"new\\s+URL\\s*\\(","name":"URL_constructor","affected_version":20,"status":"DEPRECATED"},
+    {"id":"jdk17-security-manager","kind":"removed_api","pattern":"\\b(?:System\\.getSecurityManager|System\\.setSecurityManager)\\b","name":"SecurityManager","affected_version":17,"status":"DEPRECATED_FOR_REMOVAL"}
+  ]
+}

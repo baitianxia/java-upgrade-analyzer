@@ -24,11 +24,32 @@ from pathlib import Path
 # compat 必须第一个 import，它会在 Windows 上修复 stdout/stderr 编码
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, mvn_cmd, git_cmd, IS_WINDOWS, require_human_confirm
+from analysis_contract import sha256_file
 
 
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
+
+
+def retain_artifact_for_analysis(meta, artifact_cache_dir, side):
+    """Copy a build artifact out of temporary/user locations and update its provenance metadata."""
+    artifact_path = str((meta or {}).get('artifact_path') or '').strip()
+    if not artifact_path or not artifact_cache_dir or not Path(artifact_path).is_file():
+        return meta
+    source_artifact = Path(artifact_path).resolve()
+    cache_dir = Path(artifact_cache_dir).resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    suffix = ''.join(source_artifact.suffixes) or '.jar'
+    retained_artifact = cache_dir / f'{side or "artifact"}{suffix}'
+    if source_artifact != retained_artifact:
+        shutil.copy2(source_artifact, retained_artifact)
+    meta['original_artifact_path'] = artifact_path
+    meta['artifact_path'] = str(retained_artifact)
+    meta['archives'] = [str(retained_artifact)]
+    meta['artifact_retained'] = True
+    meta['artifact_sha256'] = sha256_file(retained_artifact)
+    return meta
 
 
 class ArtifactCoordinateInputRequiredError(RuntimeError):
@@ -1900,6 +1921,7 @@ def get_packaged_deps_by_switching_branch(
     manual_coord_overrides=None,
     allow_unresolved=False,
     confirmed_unresolved_items=None,
+    artifact_cache_dir=None,
 ):
     blocked_error = None
     env = None
@@ -1946,6 +1968,12 @@ def get_packaged_deps_by_switching_branch(
             meta['branch'] = branch
             meta['jdk_home'] = resolve_effective_jdk_home(jdk_home)
             meta['worktree_dir'] = str(temp_dir)
+            artifact_path = str(meta.get('artifact_path') or '').strip()
+            meta['artifact_sha256'] = sha256_file(artifact_path) if artifact_path and Path(artifact_path).is_file() else ''
+            revision, _revision_err, revision_rc = run_cmd(git_cmd() + ['rev-parse', 'HEAD'], cwd=str(temp_dir))
+            meta['revision'] = revision.strip() if revision_rc == 0 else ''
+            if artifact_path and artifact_cache_dir:
+                retain_artifact_for_analysis(meta, artifact_cache_dir, side)
             result = (deps, meta)
         except Exception as exc:
             blocked_error = exc if isinstance(exc, Step1CommandExecutionBlockedError) else build_step1_command_blocked_error(
@@ -2163,63 +2191,116 @@ def _resolved_coord(entry):
     return str(entry.get('coord') or '').strip()
 
 
+def _entry_full_compare_key(entry):
+    coord = _resolved_coord(entry)
+    if not coord:
+        return ''
+    classifier = str((entry or {}).get('classifier') or '').strip()
+    return f"{coord}:{classifier}" if classifier else coord
+
+
+def _make_step1_change_row(base_entry, current_entry, comparison_key, pairing_status, pairing_reason_code=''):
+    old_ver = str((base_entry or {}).get('version') or '-').strip() or '-'
+    new_ver = str((current_entry or {}).get('version') or '-').strip() or '-'
+    base_status = str((base_entry or {}).get('resolution_status') or '').strip() or 'resolved'
+    current_status = str((current_entry or {}).get('resolution_status') or '').strip() or 'resolved'
+    forced_unresolved = bool(pairing_reason_code)
+    resolution_status = (
+        'resolved'
+        if not forced_unresolved and base_status == 'resolved' and current_status == 'resolved'
+        else 'unresolved'
+    )
+    if resolution_status == 'resolved':
+        change, risk = classify_change(old_ver, new_ver)
+    else:
+        change, risk = 'unresolved', '需人工确认'
+    scope = str(((current_entry or base_entry or {}).get('scope')) or 'packaged').strip() or 'packaged'
+    if scope in ('test', 'provided', 'optional') and risk == '高':
+        risk = '低(非compile)'
+    remark = str(((current_entry or {}).get('remark')) or ((base_entry or {}).get('remark')) or '').strip()
+    if pairing_reason_code:
+        remark = ';'.join(item for item in (remark, f'pairing:{pairing_reason_code}') if item)
+    return {
+        'coord': _display_coord(current_entry or base_entry),
+        'base_coord': _resolved_coord(base_entry),
+        'current_coord': _resolved_coord(current_entry),
+        'old_version': old_ver,
+        'new_version': new_ver,
+        'change_type': change,
+        'risk': risk,
+        'scope': scope,
+        'remark': remark,
+        'current_packaged': 'true' if current_entry else '',
+        'downgrade_confirmed': '',
+        'resolution_status': resolution_status,
+        'comparison_key': comparison_key,
+        'pairing_status': pairing_status,
+        'pairing_reason_code': pairing_reason_code,
+        'base_lib_entry': str((base_entry or {}).get('lib_entry') or '').strip(),
+        'current_lib_entry': str((current_entry or {}).get('lib_entry') or '').strip(),
+        'base_packaged_match_source': str((base_entry or {}).get('packaged_match_source') or '').strip(),
+        'current_packaged_match_source': str((current_entry or {}).get('packaged_match_source') or '').strip(),
+        'base_resolution_status': base_status,
+        'current_resolution_status': current_status,
+        'base_read_error': str((base_entry or {}).get('read_error') or '').strip(),
+        'current_read_error': str((current_entry or {}).get('read_error') or '').strip(),
+    }
+
+
 def _build_step1_change_rows(base_entries, curr_entries):
+    base_remaining = [dict(item) for item in (base_entries or [])]
+    curr_remaining = [dict(item) for item in (curr_entries or [])]
+    rows = []
+
+    # Stage 1: exact groupId:artifactId(+classifier) matches are authoritative.
+    base_exact = defaultdict(list)
+    curr_exact = defaultdict(list)
+    for item in base_remaining:
+        if _entry_full_compare_key(item):
+            base_exact[_entry_full_compare_key(item)].append(item)
+    for item in curr_remaining:
+        if _entry_full_compare_key(item):
+            curr_exact[_entry_full_compare_key(item)].append(item)
+    paired_base_ids = set()
+    paired_curr_ids = set()
+    for full_key in sorted(set(base_exact) & set(curr_exact)):
+        left = sorted(base_exact[full_key], key=_entry_sort_key)
+        right = sorted(curr_exact[full_key], key=_entry_sort_key)
+        for base_entry, current_entry in zip(left, right):
+            paired_base_ids.add(id(base_entry))
+            paired_curr_ids.add(id(current_entry))
+            rows.append(_make_step1_change_row(
+                base_entry, current_entry, full_key, 'exact_coord',
+            ))
+    base_remaining = [item for item in base_remaining if id(item) not in paired_base_ids]
+    curr_remaining = [item for item in curr_remaining if id(item) not in paired_curr_ids]
+
+    # Stage 2: allow group migration only for a unique artifactId(+classifier) pair.
     base_groups = defaultdict(list)
     curr_groups = defaultdict(list)
-    for item in base_entries or []:
-        base_groups[_entry_compare_key(item)].append(dict(item))
-    for item in curr_entries or []:
-        curr_groups[_entry_compare_key(item)].append(dict(item))
-    for group in base_groups.values():
-        group.sort(key=_entry_sort_key)
-    for group in curr_groups.values():
-        group.sort(key=_entry_sort_key)
-
-    rows = []
-    all_group_keys = sorted(set(base_groups) | set(curr_groups))
-    for group_key in all_group_keys:
-        left_group = base_groups.get(group_key, [])
-        right_group = curr_groups.get(group_key, [])
-        pair_count = max(len(left_group), len(right_group))
-        for idx in range(pair_count):
-            base_entry = left_group[idx] if idx < len(left_group) else None
-            current_entry = right_group[idx] if idx < len(right_group) else None
-            old_ver = str((base_entry or {}).get('version') or '-').strip() or '-'
-            new_ver = str((current_entry or {}).get('version') or '-').strip() or '-'
-            base_status = str((base_entry or {}).get('resolution_status') or '').strip() or 'resolved'
-            current_status = str((current_entry or {}).get('resolution_status') or '').strip() or 'resolved'
-            resolution_status = 'resolved' if base_status == 'resolved' and current_status == 'resolved' else 'unresolved'
-            if resolution_status == 'resolved':
-                change, risk = classify_change(old_ver, new_ver)
-            else:
-                change, risk = 'unresolved', '需人工确认'
-            scope = str(((current_entry or base_entry or {}).get('scope')) or 'packaged').strip() or 'packaged'
-            if scope in ('test', 'provided', 'optional') and risk == '高':
-                risk = '低(非compile)'
-            remark = str(((current_entry or {}).get('remark')) or ((base_entry or {}).get('remark')) or '').strip()
-            rows.append({
-                'coord': _display_coord(current_entry or base_entry),
-                'base_coord': _resolved_coord(base_entry),
-                'current_coord': _resolved_coord(current_entry),
-                'old_version': old_ver,
-                'new_version': new_ver,
-                'change_type': change,
-                'risk': risk,
-                'scope': scope,
-                'remark': remark,
-                'current_packaged': 'true' if current_entry else '',
-                'downgrade_confirmed': '',
-                'resolution_status': resolution_status,
-                'comparison_key': group_key,
-                'base_lib_entry': str((base_entry or {}).get('lib_entry') or '').strip(),
-                'current_lib_entry': str((current_entry or {}).get('lib_entry') or '').strip(),
-                'base_packaged_match_source': str((base_entry or {}).get('packaged_match_source') or '').strip(),
-                'current_packaged_match_source': str((current_entry or {}).get('packaged_match_source') or '').strip(),
-                'base_resolution_status': base_status,
-                'current_resolution_status': current_status,
-                'base_read_error': str((base_entry or {}).get('read_error') or '').strip(),
-                'current_read_error': str((current_entry or {}).get('read_error') or '').strip(),
-            })
+    for item in base_remaining:
+        base_groups[_entry_compare_key(item)].append(item)
+    for item in curr_remaining:
+        curr_groups[_entry_compare_key(item)].append(item)
+    for group_key in sorted(set(base_groups) | set(curr_groups)):
+        left = sorted(base_groups.get(group_key, []), key=_entry_sort_key)
+        right = sorted(curr_groups.get(group_key, []), key=_entry_sort_key)
+        if len(left) == 1 and len(right) == 1:
+            rows.append(_make_step1_change_row(
+                left[0], right[0], group_key, 'unique_artifact_migration',
+            ))
+            continue
+        ambiguous = bool(left and right)
+        reason = 'ambiguous_artifact_migration_candidates' if ambiguous else ''
+        for item in left:
+            rows.append(_make_step1_change_row(
+                item, None, group_key, 'unpaired_ambiguous' if ambiguous else 'base_only', reason,
+            ))
+        for item in right:
+            rows.append(_make_step1_change_row(
+                None, item, group_key, 'unpaired_ambiguous' if ambiguous else 'current_only', reason,
+            ))
+    rows.sort(key=lambda row: (row.get('comparison_key', ''), row.get('base_coord', ''), row.get('current_coord', '')))
     return rows
 
 
@@ -2493,6 +2574,7 @@ def main():
                     manual_coord_overrides=manual_coord_overrides,
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
+                    artifact_cache_dir=Path(args.output).parent / 'artifacts' if args.output else None,
             )
             curr_deps, curr_meta = get_packaged_deps_by_switching_branch(
                     args.current_branch, args.work_dir, args.primary_module, args.modules,
@@ -2500,6 +2582,7 @@ def main():
                     manual_coord_overrides=manual_coord_overrides,
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
+                    artifact_cache_dir=Path(args.output).parent / 'artifacts' if args.output else None,
             )
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
@@ -2617,11 +2700,14 @@ def main():
 
     out_dir = Path(args.output).parent
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.base_artifact_path and args.current_artifact_path:
+        retain_artifact_for_analysis(base_meta, out_dir / 'artifacts', 'base')
+        retain_artifact_for_analysis(curr_meta, out_dir / 'artifacts', 'current')
     # 写 CSV 时明确指定 UTF-8 + newline=''（兼容 Windows 的 csv 模块）
     with open(args.output, 'w', newline='', encoding='utf-8') as f:
         fields = ['coord', 'base_coord', 'current_coord', 'old_version', 'new_version', 'change_type',
                   'risk', 'scope', 'remark', 'current_packaged', 'downgrade_confirmed', 'resolution_status',
-                  'comparison_key', 'base_lib_entry', 'current_lib_entry',
+                  'comparison_key', 'pairing_status', 'pairing_reason_code', 'base_lib_entry', 'current_lib_entry',
                   'base_packaged_match_source', 'current_packaged_match_source',
                   'base_resolution_status', 'current_resolution_status',
                   'base_read_error', 'current_read_error']
@@ -2656,6 +2742,37 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(current_rows)
+
+    provenance_sides = []
+    for side, meta, branch, configured_jdk in (
+        ('base', base_meta, args.base_branch, args.base_jdk_home),
+        ('current', curr_meta, args.current_branch, args.current_jdk_home),
+    ):
+        artifact_path = str((meta or {}).get('artifact_path') or '').strip()
+        artifact_hash = str((meta or {}).get('artifact_sha256') or '').strip()
+        if not artifact_hash and artifact_path and Path(artifact_path).is_file():
+            artifact_hash = sha256_file(artifact_path)
+        provenance_sides.append({
+            'side': side,
+            'source_mode': 'provided_artifact' if (args.base_artifact_path and args.current_artifact_path) else 'checkout_build',
+            'ref': str(branch or ''),
+            'revision': str((meta or {}).get('revision') or ''),
+            'target_module': str(args.primary_module or ''),
+            'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),
+            'build_command': str((meta or {}).get('build_command') or ''),
+            'artifact_path': artifact_path,
+            'artifact_sha256': artifact_hash,
+            'build_succeeded': bool(artifact_path),
+        })
+    provenance_path = out_dir / 'build_provenance.json'
+    provenance_path.write_text(
+        json.dumps({
+            'schema': 'java-upgrade-analyzer.build-provenance.v1',
+            'both_builds_succeeded': all(item.get('build_succeeded') for item in provenance_sides),
+            'sides': provenance_sides,
+        }, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
 
     # 统计
     counts = defaultdict(int)
@@ -2735,6 +2852,7 @@ def main():
     print(f"✅ 输出：{current_out}", file=sys.stderr)
     print(f"✅ 输出：{alerts_out}", file=sys.stderr)
     print(f"✅ 输出：{summary_out}", file=sys.stderr)
+    print(f"✅ 输出：{provenance_path.resolve()}", file=sys.stderr)
     print(f"运行门控：python scripts/gate.py --step step1_scope --report-dir .upgrade-report/",
           file=sys.stderr)
     if not os.environ.get("JUA_ORCHESTRATED"):

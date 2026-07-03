@@ -1,0 +1,17 @@
+{
+  "schema": "java-upgrade-analyzer.rule-pack.v1",
+  "id": "jakarta-namespace",
+  "version": "2026.07",
+  "source": "https://jakarta.ee/specifications/platform/10/jakarta-platform-spec-10.0",
+  "last_verified": "2026-07-02",
+  "rules": [
+    {"id":"jakarta-servlet","kind":"namespace_migration","pattern":"\\bjavax\\.servlet\\.","replacement":"jakarta.servlet","affected_major":3},
+    {"id":"jakarta-persistence","kind":"namespace_migration","pattern":"\\bjavax\\.persistence\\.","replacement":"jakarta.persistence","affected_major":3},
+    {"id":"jakarta-validation","kind":"namespace_migration","pattern":"\\bjavax\\.validation\\.","replacement":"jakarta.validation","affected_major":3},
+    {"id":"jakarta-annotation","kind":"namespace_migration","pattern":"\\bjavax\\.annotation\\.","replacement":"jakarta.annotation","affected_major":3},
+    {"id":"jakarta-inject","kind":"namespace_migration","pattern":"\\bjavax\\.inject\\.","replacement":"jakarta.inject","affected_major":3},
+    {"id":"jakarta-transaction","kind":"namespace_migration","pattern":"\\bjavax\\.transaction\\.","replacement":"jakarta.transaction","affected_major":3},
+    {"id":"jakarta-ws-rs","kind":"namespace_migration","pattern":"\\bjavax\\.ws\\.rs\\.","replacement":"jakarta.ws.rs","affected_major":3},
+    {"id":"jakarta-jaxb","kind":"namespace_migration","pattern":"\\bjavax\\.xml\\.bind\\.","replacement":"jakarta.xml.bind","affected_major":3}
+  ]
+}

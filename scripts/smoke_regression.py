@@ -2202,14 +2202,16 @@ return ExtraApi.callLegacy();
         "仅提供 dependency_source_dirs 的多模块场景未进入 Step5 确认点",
     )
     dependency_multi_summary = read_json(dependency_multi_report / "s5_call_chain" / "summary.json")
-    dependency_multi_api = (dependency_multi_summary.get("not_found_apis") or [{}])[0]
+    dependency_multi_api = (dependency_multi_summary.get("not_analyzed_apis") or [{}])[0]
     assert_true(
-        dependency_multi_summary.get("not_found_in_static_analysis") == 1,
-        "仅提供 dependency_source_dirs 时，Step5 应把未找到静态路径的行为变更归入 not_found_in_static_analysis",
+        dependency_multi_summary.get("not_analyzed") == 1,
+        "缺少最终制品字节码目录时，Step5 不得把源码未命中归入 not_found_in_static_analysis",
     )
     assert_true(
-        dependency_multi_api.get("reason_code") == "NO_STATIC_PATH",
-        "仅提供 dependency_source_dirs 时，Step5 未保留未命中静态路径的原因码",
+        dependency_multi_api.get("reason_code") in {
+            "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", "ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE"
+        },
+        "最终制品字节码不可用时，Step5 未保留覆盖不足原因码",
     )
     assert_true(
         dependency_multi_api.get("business_reach_depth") == 0,
@@ -2443,13 +2445,32 @@ return ExtraApi.callLegacy();
     assert_true("严格模式下调用链仍存在盲区" in strict_gate_stderr, "严格模式门控失败原因不明确")
 
     summary = read_json(report_dir / "s5_call_chain" / "summary.json")
-    assert_true(summary.get("reachable") == 1, "Step 5 未把真实调用识别为可达")
+    # 该 fixture 在 Step1 最终制品生成后才追加 App.java，因此源码与已留存制品并不对齐。
+    # 不得用后来出现的源码把不存在于制品中的调用判为 reachable，应显式暴露冲突。
+    assert_true(
+        summary.get("uncertain") == 1,
+        "源码晚于最终制品时，Step5 应暴露源码/字节码冲突，而不是伪造 reachable",
+    )
+    conflict_api = (summary.get("uncertain_apis") or [{}])[0]
+    assert_true(
+        conflict_api.get("reason_code") == "SOURCE_BYTECODE_EDGE_CONFLICT",
+        "源码/最终制品不一致时缺少 SOURCE_BYTECODE_EDGE_CONFLICT",
+    )
     parser_usage = summary.get("meta", {}).get("graph_stats", {}).get("parser_usage", {})
     assert_true(isinstance(parser_usage, dict), "Step 5 summary 未暴露 parser_usage 统计")
     assert_true(
         parser_usage.get("tree_sitter", 0) + parser_usage.get("regex", 0) >= 1,
         "Step 5 parser_usage 统计为空，无法观测主链路/降级路径",
     )
+
+    # 后续用例专门验证源码图解析，不再复用上面故意制造为过期的制品契约。
+    # 缺少制品时，正向源码证据仍可成立，但负向结论必须保持覆盖不足。
+    for stale_contract in (
+        report_dir / "build_provenance.json",
+        report_dir / "s1_deps_current_resolved.csv",
+    ):
+        if stale_contract.exists():
+            stale_contract.unlink()
 
     instance_changed_apis = report_dir / "s4_jar_compare" / "all_changed_instance_apis.csv"
     with open(instance_changed_apis, "w", encoding="utf-8", newline="") as f:
@@ -3276,8 +3297,12 @@ return "noop";
         "缺少依赖映射且允许降级时，未找到路径场景应进入 not_analyzed",
     )
     assert_true(
-        not_found_api.get("reason_code") == "DEPENDENCY_SOURCE_MAPPING_MISSING",
-        "缺少依赖映射时应输出 DEPENDENCY_SOURCE_MAPPING_MISSING",
+        not_found_api.get("reason_code") in {
+            "DEPENDENCY_SOURCE_MAPPING_MISSING",
+            "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE",
+            "ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE",
+        },
+        "缺少依赖映射或最终制品字节码时应输出明确的覆盖不足原因",
     )
     assert_true(
         "deprecated_aliases" in not_found_summary,
@@ -3483,6 +3508,31 @@ BridgeFacade.callAdapter();
         "多级跨依赖 Step 5 未正确记录依赖链"
     )
 
+    # Step6 的这组断言专门验证 reachable 证据透传。沿用冲突用例中已经生成的
+    # 源码路径证据，但显式构造 reachable 分类，避免把两个独立测试目标混在一起。
+    step6_reachable_entry = dict(conflict_api)
+    step6_reachable_entry.update({
+        "analysis_status": "reachable",
+        "reason_code": "SYSTEM_CODE_REACHED",
+        "reason": "已回溯到系统代码",
+        "reachable_note": "已回溯到系统代码",
+    })
+    step6_summary = dict(summary)
+    step6_summary.update({
+        "reachable": 1,
+        "uncertain": 0,
+        "not_analyzed": 0,
+        "not_found_in_static_analysis": 0,
+        "reachable_apis": [step6_reachable_entry],
+        "uncertain_apis": [],
+        "not_analyzed_apis": [],
+        "not_found_apis": [],
+    })
+    write_text(
+        report_dir / "s5_call_chain" / "summary.json",
+        json.dumps(step6_summary, ensure_ascii=False, indent=2) + "\n",
+    )
+
     run_script(
         "s6_report.py",
         [
@@ -3676,6 +3726,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--report-dir", str(orchestrated_report),
             "--base-branch", "base",
             "--current-branch", "current",
+            "--target-module", ".",
         ],
         cwd=project_dir,
         env=dep_env,
@@ -4018,6 +4069,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 "base_branch": "base",
                 "current_branch": "current",
                 "base_jdk_home": "/not-exists-jdk",
+                "target_module": ".",
             },
             ensure_ascii=False,
             indent=2,
@@ -4162,6 +4214,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 "current_artifact_path": "artifact-inputs/current-app.jar",
                 "base_branch": "base",
                 "current_branch": "current",
+                "target_module": ".",
             },
             ensure_ascii=False,
             indent=2,
@@ -4225,6 +4278,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 "current_artifact_path": "artifact-inputs/current-app-no-pom.jar",
                 "base_branch": "base",
                 "current_source_project_dir": ".",
+                "target_module": ".",
             },
             ensure_ascii=False,
             indent=2,
@@ -4306,12 +4360,12 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "artifact + base_source_project_dir 模式在缺少 primary_module 时应停留在 step1",
     )
     assert_true(
-        artifact_base_source_interaction.get("reason_code") == "unresolved_dependency_coordinates_after_enrichment",
+        artifact_base_source_interaction.get("reason_code") == "missing_step1_target_module",
         "artifact + base_source_project_dir 模式的待补参 reason_code 不正确",
     )
     assert_true(
-        "primary_module" in json.dumps(artifact_base_source_interaction.get("response_schema") or {}, ensure_ascii=False),
-        "artifact + base_source_project_dir 模式未要求补充 primary_module",
+        "target_module" in json.dumps(artifact_base_source_interaction.get("response_schema") or {}, ensure_ascii=False),
+        "artifact + base_source_project_dir 模式未要求补充 target_module",
     )
     artifact_missing_input_report = project_dir / ".upgrade-report-artifact-missing-input"
     artifact_missing_input_report.mkdir(parents=True, exist_ok=True)
@@ -4323,6 +4377,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 "base_artifact_path": "artifact-inputs/base-app.jar",
                 "current_artifact_path": "artifact-inputs/current-app-no-pom.jar",
                 "base_branch": "base",
+                "target_module": ".",
             },
             ensure_ascii=False,
             indent=2,
@@ -4380,15 +4435,23 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     artifact_followup_report = project_dir / ".upgrade-report-artifact-followup"
     artifact_followup_report.mkdir(parents=True, exist_ok=True)
+    unresolved_current_artifact = artifact_input_dir / "current-app-unresolved.jar"
+    with zipfile.ZipFile(unresolved_current_artifact, "w") as outer:
+        outer.writestr("BOOT-INF/classes/com/example/App.class", b"app")
+        nested = io.BytesIO()
+        with zipfile.ZipFile(nested, "w") as inner:
+            inner.writestr("com/example/Unknown.class", b"unknown")
+        outer.writestr("BOOT-INF/lib/mystery-lib-2.0.0.jar", nested.getvalue())
     artifact_followup_seed_json_path = artifact_followup_report / "main_state_seed.json"
     write_text(
         artifact_followup_seed_json_path,
         json.dumps(
             {
                 "base_artifact_path": "artifact-inputs/base-app.jar",
-                "current_artifact_path": "artifact-inputs/current-app-no-pom.jar",
+                "current_artifact_path": "artifact-inputs/current-app-unresolved.jar",
                 "base_branch": "base",
                 "current_branch": "current",
+                "target_module": ".",
             },
             ensure_ascii=False,
             indent=2,
@@ -4403,16 +4466,13 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--seed-json", str(artifact_followup_seed_json_path),
         ],
         cwd=project_dir,
+        env=dep_env,
     )
     assert_true(rc == EXIT_AWAITING_USER, "branch 已提供但坐标仍无法补全时，Step1 也应进入 awaiting user")
     artifact_followup_interaction = read_json(artifact_followup_report / "interaction.json")
     assert_true(
         artifact_followup_interaction.get("reason_code") == "unresolved_dependency_coordinates_after_enrichment",
         "branch 已提供但坐标仍无法补全时，Step1 应显式暴露 follow-up 交互原因",
-    )
-    assert_true(
-        "primary_module" in json.dumps(artifact_followup_interaction.get("response_schema") or {}, ensure_ascii=False),
-        "branch 已提供但坐标仍无法补全时，应优先提示补 primary_module",
     )
     assert_true(
         artifact_followup_interaction.get("unresolved_items"),
@@ -4462,12 +4522,12 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     unresolved_rows = [row for row in artifact_followup_rows if row.get("resolution_status") == "unresolved"]
     assert_true(unresolved_rows, "人工确认 unresolved 后，s1_dep_changes.csv 应保留 unresolved 行")
     assert_true(
-        any((row.get("coord") or "").startswith("demo-lib:2.0.0") for row in unresolved_rows),
+        any((row.get("coord") or "").startswith("mystery-lib:2.0.0") for row in unresolved_rows),
         "人工确认 unresolved 后，未识别依赖应以 artifact:version 形式保留在 s1_dep_changes.csv",
     )
     pseudo_resolved_rows = [
         row for row in artifact_followup_rows
-        if row.get("coord") == "com.example:demo-lib" and row.get("resolution_status") == "resolved"
+        if row.get("coord") == "com.example:mystery-lib" and row.get("resolution_status") == "resolved"
     ]
     assert_true(
         not pseudo_resolved_rows,
@@ -4482,7 +4542,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         row for row in artifact_followup_current_rows if row.get("resolution_status") == "unresolved"
     ]
     assert_true(
-        any((row.get("coord") or "").startswith("demo-lib:2.0.0") for row in current_unresolved_rows),
+        any((row.get("coord") or "").startswith("mystery-lib:2.0.0") for row in current_unresolved_rows),
         "人工确认 unresolved 后，s1_deps_current_resolved.csv 应保留 current 侧 unresolved 行",
     )
     assert_true(
@@ -4495,10 +4555,10 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         json.dumps(
             {
                 "action": "rerun_current_step",
-                "manual_coord_overrides": ["demo-lib:2.0.0 -> com.example:demo-lib"],
+                "manual_coord_overrides": ["mystery-lib:2.0.0 -> com.example:mystery-lib"],
                 "primary_module": ".",
                 "modules": ["."],
-                "notes": "人工补充 demo-lib 坐标后重跑 step1",
+                "notes": "人工补充 mystery-lib 坐标后重跑 step1",
             },
             ensure_ascii=False,
             indent=2,
@@ -4524,7 +4584,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     artifact_followup_rows = read_csv(artifact_followup_report / "s1_dep_changes.csv")
     resolved_demo_rows = [
         row for row in artifact_followup_rows
-        if row.get("coord") == "com.example:demo-lib" and row.get("resolution_status") == "resolved"
+        if row.get("coord") == "com.example:mystery-lib" and row.get("resolution_status") == "resolved"
     ]
     assert_true(
         resolved_demo_rows,
@@ -4600,6 +4660,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 "current_artifact_path": "artifact-inputs/current-app-no-pom.jar",
                 "base_branch": "base",
                 "current_branch": "current",
+                "target_module": ".",
             },
             ensure_ascii=False,
             indent=2,
@@ -4636,6 +4697,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--report-dir", str(interactive_report),
             "--base-branch", "base",
             "--current-branch", "current",
+            "--target-module", ".",
         ],
         cwd=project_dir,
         env={**dep_env},
@@ -4734,6 +4796,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--report-dir", str(step2_resume_report),
             "--base-branch", "base",
             "--current-branch", "current",
+            "--target-module", ".",
         ],
         cwd=project_dir,
         env=dep_env,
@@ -4758,7 +4821,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             ),
         ],
         cwd=project_dir,
-        env={},
+        env={**dep_env},
     )
     assert_true(rc == EXIT_AWAITING_USER, "Step2 待交互应返回 awaiting user 退出码")
     step2_interaction = read_json(step2_resume_report / "interaction.json")
@@ -4808,6 +4871,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--report-dir", str(step2_hint_accept_report),
             "--base-branch", "base",
             "--current-branch", "current",
+            "--target-module", ".",
         ],
         cwd=project_dir,
         env=dep_env,
@@ -4967,16 +5031,15 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--response-json",
             json.dumps(
                 {
-                    "action": "rerun_current_step",
-                    "modules": ["module-a"],
-                    "primary_module": "module-a",
+                    "action": "continue",
+                    "target_module": "module-a",
                     "notes": "先收敛到 module-a",
                 },
                 ensure_ascii=False,
             ),
         ],
         cwd=project_dir,
-        env={},
+        env={**dep_env},
     )
     assert_true(
         rc in {0, EXIT_AWAITING_USER},

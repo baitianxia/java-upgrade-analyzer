@@ -23,6 +23,16 @@ import s6_report  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def test_inlined_constant_miss_remains_uncertain(self):
+        result = SimpleNamespace(
+            analysis_status="not_found_in_static_analysis", is_reachable=False,
+            reason_code="NO_STATIC_PATH", reachable_note="", verification_commands=[],
+        )
+        updated = tracer._build_inlined_constant_result(result)
+        self.assertEqual(updated.analysis_status, "uncertain")
+        self.assertIsNone(updated.is_reachable)
+        self.assertEqual(updated.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
+
     def test_is_system_code_touched_allows_business_service_impl(self):
         method_def = SimpleNamespace(
             owner_type="business",
@@ -6655,6 +6665,182 @@ public class com.example.consumer.Adapter {
             self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
             self.assertEqual(result.dependency_chain_coords, ["sample:consumer"])
             self.assertIn("sample:consumer", result.call_paths[0])
+
+    def test_removed_dependency_scans_runtime_consumers_even_when_target_source_mapping_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr(
+                    "com/example/consumer/Adapter.class",
+                    b"org/apache/commons/lang/StringUtils isBlank",
+                )
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer", "version": "1", "scope": "compile",
+                            "jar_path": str(jar_path),
+                        }
+                    }
+                },
+            )
+            api_row = {
+                "coord": "commons-lang:commons-lang",
+                "old_version": "2.6",
+                "new_version": "-",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_simple": "isBlank",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P0",
+                "confirmed": "true",
+                "source": "old_jar",
+            }
+            javap_output = """
+public class com.example.consumer.Adapter {
+  public void use();
+    descriptor: ()V
+    Code:
+       1: invokestatic #7 // Method org/apache/commons/lang/StringUtils.isBlank:(Ljava/lang/String;)Z
+}
+"""
+            with patch.object(tracer, "run_cmd", return_value=(javap_output, "", 0)):
+                result = tracer.trace_api_with_confidence_weighting(
+                    api_row, graph, {}, max_total_cost=5,
+                    needs_bridge=True,
+                    has_dependency_source_mapping=True,
+                    has_packaged_bytecode_fallback=True,
+                    allow_degraded=False,
+                )
+
+            self.assertEqual(result.analysis_status, "uncertain")
+            self.assertEqual(result.reason_code, "RUNTIME_DEPENDENCY_USES_REMOVED_API")
+            self.assertEqual(result.dependency_chain_coords, ["sample:consumer"])
+            self.assertIn("NoClassDefFoundError", result.reachable_note)
+
+    def test_version_upgrade_scans_runtime_consumers_even_when_target_source_mapping_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr(
+                    "com/example/consumer/Adapter.class",
+                    b"com/vendor/Client removedMethod",
+                )
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer", "version": "1", "scope": "packaged",
+                            "jar_path": str(jar_path),
+                        }
+                    },
+                },
+            )
+            api_row = {
+                "coord": "com.vendor:client",
+                "old_version": "1.0", "new_version": "2.0",
+                "api_name": "com.vendor.Client.removedMethod",
+                "api_simple": "removedMethod", "api_signature": "(String)",
+                "symbol_kind": "method", "change_type": "METHOD_REMOVED",
+                "severity": "P0", "confirmed": "true",
+            }
+            javap_output = """
+public class com.example.consumer.Adapter {
+  public void use();
+    descriptor: ()V
+    Code:
+       1: invokevirtual #7 // Method com/vendor/Client.removedMethod:(Ljava/lang/String;)V
+}
+"""
+            with patch.object(tracer, "run_cmd", return_value=(javap_output, "", 0)):
+                result = tracer.trace_api_with_confidence_weighting(
+                    api_row, graph, {}, max_total_cost=5,
+                    needs_bridge=False,
+                    has_dependency_source_mapping=True,
+                    has_packaged_bytecode_fallback=True,
+                    allow_degraded=False,
+                )
+
+            self.assertEqual(result.analysis_status, "uncertain")
+            self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+            self.assertEqual(result.dependency_chain_coords, ["sample:consumer"])
+
+    def test_packaged_consumer_scan_continues_after_one_javap_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken_jar = Path(tmp) / "broken.jar"
+            hit_jar = Path(tmp) / "hit.jar"
+            for path, entry in (
+                (broken_jar, "com/acme/Broken.class"),
+                (hit_jar, "com/acme/Hit.class"),
+            ):
+                with zipfile.ZipFile(path, "w") as zf:
+                    zf.writestr(entry, b"org/apache/commons/lang/StringUtils isBlank")
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "by_coord": {
+                    "a:broken": {"jar_path": str(broken_jar)},
+                    "b:hit": {"jar_path": str(hit_jar)},
+                }
+            })
+            api_row = {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_simple": "isBlank", "api_signature": "(String)", "symbol_kind": "method",
+            }
+            refs = {
+                "method_refs": [{
+                    "owner": "org.apache.commons.lang.StringUtils", "name": "isBlank",
+                    "signature": "(String)", "descriptor": "(Ljava/lang/String;)Z",
+                }],
+                "field_refs": [], "class_refs": [],
+            }
+            with patch.object(
+                tracer,
+                "_load_runtime_dependency_class_references",
+                side_effect=[None, refs],
+            ):
+                scan = tracer._scan_packaged_runtime_dependencies_for_api(api_row, graph)
+
+            self.assertEqual(scan["status"], "hit")
+            self.assertEqual(scan["hits"][0]["coord"], "b:hit")
+            self.assertEqual(len(scan["scan_failures"]), 1)
+
+    def test_packaged_consumer_scan_does_not_report_miss_when_any_candidate_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken_jar = Path(tmp) / "broken.jar"
+            clean_jar = Path(tmp) / "clean.jar"
+            for path, entry in (
+                (broken_jar, "com/acme/Broken.class"),
+                (clean_jar, "com/acme/Clean.class"),
+            ):
+                with zipfile.ZipFile(path, "w") as zf:
+                    zf.writestr(entry, b"com/vendor/Target call")
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "status": "complete",
+                "by_coord": {
+                    "a:broken": {"jar_path": str(broken_jar)},
+                    "b:clean": {"jar_path": str(clean_jar)},
+                },
+            })
+            api_row = {
+                "coord": "com.vendor:target", "api_name": "com.vendor.Target.call",
+                "api_simple": "call", "api_signature": "()", "symbol_kind": "method",
+            }
+            no_match = {"method_refs": [], "field_refs": [], "class_refs": []}
+            with patch.object(
+                tracer,
+                "_load_runtime_dependency_class_references",
+                side_effect=[None, no_match],
+            ):
+                scan = tracer._scan_packaged_runtime_dependencies_for_api(api_row, graph)
+
+            self.assertEqual(scan["status"], "unavailable")
+            self.assertEqual(scan["reason"], "BYTECODE_JAVAP_FAILED")
 
     def test_trace_api_uses_packaged_bytecode_fallback_for_constructor_with_quoted_javap_init(self):
         with tempfile.TemporaryDirectory() as tmp:

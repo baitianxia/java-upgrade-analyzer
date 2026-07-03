@@ -18,6 +18,48 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_parse_japicmp_xml_preserves_binary_and_source_compatibility(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "diff.xml"
+            xml_path.write_text(
+                """<japicmp><classes>
+                <class name="com.acme.Api" changeStatus="MODIFIED" binaryCompatible="true" sourceCompatible="true">
+                  <methods>
+                    <method name="call" changeStatus="MODIFIED" binaryCompatible="true" sourceCompatible="false">
+                      <parameters><parameter type="java.lang.String"/></parameters>
+                      <compatibilityChanges><compatibilityChange type="METHOD_NEW_DEFAULT"/></compatibilityChanges>
+                    </method>
+                    <method name="gone" changeStatus="REMOVED" binaryCompatible="false" sourceCompatible="false"/>
+                  </methods>
+                </class></classes></japicmp>""",
+                encoding="utf-8",
+            )
+
+            rows = step4.parse_japicmp_xml(xml_path, "com.acme:api", "1", "2")
+
+        by_name = {row["api_name"]: row for row in rows}
+        source_only = by_name["com.acme.Api.call"]
+        self.assertEqual(source_only["change_type"], "SOURCE_INCOMPATIBLE")
+        self.assertEqual(source_only["binary_compatible"], "true")
+        self.assertEqual(source_only["source_compatible"], "false")
+        self.assertEqual(source_only["api_signature"], "(java.lang.String)")
+        self.assertIn("METHOD_NEW_DEFAULT", source_only["compatibility_flags"])
+        self.assertEqual(by_name["com.acme.Api.gone"]["change_type"], "REMOVED")
+
+    def test_parse_japicmp_xml_preserves_constant_value_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "diff.xml"
+            xml_path.write_text(
+                '<japicmp><classes><class name="com.acme.Flags" changeStatus="MODIFIED" '
+                'binaryCompatible="true" sourceCompatible="true"><fields><field name="LIMIT" '
+                'changeStatus="MODIFIED" binaryCompatible="true" sourceCompatible="true" '
+                'oldValue="10" newValue="20"/></fields></class></classes></japicmp>',
+                encoding="utf-8",
+            )
+            rows = step4.parse_japicmp_xml(xml_path, "com.acme:api", "1", "2")
+        self.assertEqual(rows[0]["change_type"], "CONSTANT_VALUE_CHANGED")
+        self.assertEqual((rows[0]["old_value"], rows[0]["new_value"]), ("10", "20"))
+
     def test_step4_default_timeouts_are_unbounded(self):
         self.assertIsNone(step4.DEFAULT_GIT_DIFF_TIMEOUT)
         self.assertIsNone(step4.DEFAULT_JAPICMP_TIMEOUT)

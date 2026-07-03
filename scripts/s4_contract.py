@@ -35,14 +35,29 @@ ALL_CHANGED_APIS_FIELDS = [
                      # "false" = changelog 推断，需人工验证
     "severity",      # P0 / P1 / P2
     "source",        # japicmp / gitdiff / changelog
+    "binary_compatible", # true / false / unknown（JApiCmp XML）
+    "source_compatible", # true / false / unknown（JApiCmp XML）
+    "compatibility_flags", # 以 | 分隔的结构化兼容性原因
+    "reason_code",    # 稳定机器原因码
+    "evidence_path", # 产生该结论的证据文件
+    "old_value",     # 字段/常量旧值（如 JApiCmp XML 可提供）
+    "new_value",     # 字段/常量新值
 ]
+
+OPTIONAL_FIELDS = {
+    "api_signature", "binary_compatible", "source_compatible",
+    "compatibility_flags", "reason_code", "evidence_path",
+    "old_value", "new_value",
+}
 
 # change_type 枚举
 CHANGE_TYPES = {
-    "REMOVED":           "API 被删除，调用方编译必然失败",
-    "SIGNATURE_CHANGED": "方法签名变更（参数/返回类型），编译失败",
+    "REMOVED":           "API 被删除；若当前业务源码实际使用，重新编译将失败",
+    "SIGNATURE_CHANGED": "方法签名变更；若当前业务源码命中不兼容调用，重新编译将失败",
     "BEHAVIOR_CHANGED":  "签名未变但行为变更，编译通过但运行时可能异常",
-    "ACCESS_REDUCED":    "访问权限降低（public→protected），编译失败",
+    "ACCESS_REDUCED":    "访问权限降低；若当前业务源码仍从不可见位置调用，重新编译将失败",
+    "SOURCE_INCOMPATIBLE":"二进制兼容，但调用方重新编译可能失败",
+    "CONSTANT_VALUE_CHANGED":"编译期常量值变化；已有调用方可能继续使用内联旧值",
 }
 
 # severity 与 change_type 的默认映射
@@ -51,6 +66,8 @@ DEFAULT_SEVERITY = {
     "SIGNATURE_CHANGED": "P0",
     "ACCESS_REDUCED":    "P0",
     "BEHAVIOR_CHANGED":  "P2",  # 行为变更需运行时才能确认
+    "SOURCE_INCOMPATIBLE":"P1",
+    "CONSTANT_VALUE_CHANGED":"P1",
 }
 
 # source 枚举
@@ -74,7 +91,7 @@ def validate_row(row: dict) -> list:
     errors = []
     # api_signature 可以为空（签名未知的情况，如 git diff 提取的 BEHAVIOR_CHANGED、
     # 类级变更、字段变更等）
-    required_fields = [f for f in ALL_CHANGED_APIS_FIELDS if f != 'api_signature']
+    required_fields = [f for f in ALL_CHANGED_APIS_FIELDS if f not in OPTIONAL_FIELDS]
     for field in required_fields:
         if field not in row or not str(row[field]).strip():
             errors.append(f"字段 '{field}' 缺失或为空")

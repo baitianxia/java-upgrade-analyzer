@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compat import infer_maven_coords, open_text, resolve_repo_input_path, run_cmd
 from compat import git_cmd
 from auto_discover_bridge_sources import discover_bridge_source_mappings
+from analysis_contract import build_project_scope, discover_maven_modules, write_coverage_report
 from pipeline_constants import INTERACTIVE_STATUS, STEP_SEQUENCE
 from s4_contract import (
     ALL_CHANGED_APIS_FIELDS,
@@ -60,6 +61,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "step5_selected_names",
     "step5_timeout",
     "strict_risk_gate",
+    "target_module",
     "tool",
 }
 INTENT_PATCH_RESERVED_TOP_LEVEL_FIELDS = {"action", "intent_patch", "notes", "restart_step_id"}
@@ -568,12 +570,14 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         updated["analysis_mode"] = normalize_analysis_mode(response.get("analysis_mode"), allow_empty=True)
         updated = apply_explicit_step1_mode_selection(updated)
 
-    for key in ("base_branch", "current_branch", "primary_module", "tool"):
+    for key in ("base_branch", "current_branch", "target_module", "primary_module", "tool"):
         value = response.get(key)
         if isinstance(value, str) and value.strip():
             updated[key] = value.strip()
-            if key == "primary_module":
+            if key in ("target_module", "primary_module"):
                 primary_module_explicit = True
+                updated["target_module"] = value.strip()
+                updated["primary_module"] = value.strip()
             if key in ("base_branch", "current_branch"):
                 updated[f"{key}_explicit"] = True
     for key in ("base_jdk_home", "current_jdk_home"):
@@ -955,12 +959,18 @@ def _collect_focus_dependency_coords(report_dir, ctx=None):
     
 
 
-def _resolve_source_dirs_plan(project_dir, source_dirs=None, modules=None):
+def _resolve_source_dirs_plan(project_dir, source_dirs=None, modules=None, project_scope=None):
     normalized = normalize_source_dirs(source_dirs, project_dir)
     if normalized:
         return {
             "source_dirs": _dedupe_strings(normalized),
             "status": "explicit",
+        }
+    scope_roots = list((project_scope or {}).get("source_roots") or [])
+    if scope_roots:
+        return {
+            "source_dirs": _dedupe_strings(scope_roots),
+            "status": "project_scope",
         }
     detected_by_modules = detect_source_dirs_by_modules(project_dir, modules) if modules else []
     if detected_by_modules:
@@ -1647,6 +1657,7 @@ def infer_non_pending_target_step_from_payload(user_response):
                 "manual_coord_overrides",
                 "modules",
                 "primary_module",
+                "target_module",
                 "tool",
             },
         ),
@@ -2611,6 +2622,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         ),
         "base_jdk_home": resolve_value(cli_scalar(args.base_jdk_home), merged, "base_jdk_home", ""),
         "current_jdk_home": resolve_value(cli_scalar(args.current_jdk_home), merged, "current_jdk_home", ""),
+        "target_module": resolve_value(
+            cli_scalar(getattr(args, "target_module", "")),
+            merged,
+            "target_module",
+            resolve_value(cli_scalar(args.primary_module), merged, "primary_module", ""),
+        ),
         "primary_module": resolve_value(cli_scalar(args.primary_module), merged, "primary_module", ""),
         "manual_coord_overrides": manual_coord_overrides,
         "allow_unresolved": allow_unresolved,
@@ -2672,12 +2689,33 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             result[timeout_key] = None
     modules_value = normalize_modules_value(result.get("modules")) or []
     result["modules"] = modules_value
+    if result.get("target_module"):
+        result["primary_module"] = result["target_module"]
+        result["modules"] = [result["target_module"]]
     if not result.get("primary_module") and len(modules_value) == 1:
         result["primary_module"] = modules_value[0]
+        result["target_module"] = modules_value[0]
+    if result.get("primary_module") and not result.get("target_module"):
+        result["target_module"] = result["primary_module"]
+    if result.get("target_module"):
+        result["project_scope"] = build_project_scope(project_dir, result["target_module"])
+    else:
+        discovery = discover_maven_modules(project_dir)
+        result["project_scope"] = {
+            "schema": "java-upgrade-analyzer.project-scope.v1",
+            "status": "insufficient",
+            "reason_codes": ["target_module_unconfirmed"],
+            "target_module": "",
+            "candidate_modules": [item.get("module") for item in discovery.get("modules") or []],
+            "included_modules": [],
+            "source_roots": [],
+            "resource_roots": [],
+        }
     source_dir_plan = _resolve_source_dirs_plan(
         project_dir,
         source_dirs=result.get("source_dirs"),
-        modules=modules_value,
+        modules=result.get("modules"),
+        project_scope=result.get("project_scope"),
     )
     result["source_dirs"] = list(source_dir_plan.get("source_dirs") or [])
     result["source_dirs_status"] = source_dir_plan.get("status") or "missing"
@@ -3043,9 +3081,13 @@ def build_step1_response_properties():
             "type": "string",
             "description": "可选。当前侧专用 JDK Home；未提供时默认回落主机 JAVA_HOME。",
         },
+        "target_module": {
+            "type": "string",
+            "description": "必填。本次分析唯一的目标部署模块；用户已明确时视为已确认，否则必须在 Step1 前选择。",
+        },
         "primary_module": {
             "type": "string",
-            "description": "推荐。目标模块名；当前 Step1 只支持单模块，建议显式提供。",
+            "description": "兼容字段。等价于 target_module，新交互应优先使用 target_module。",
         },
         "modules": {
             "type": "array",
@@ -3069,7 +3111,8 @@ def build_step1_input_modes():
             "id": "artifact_inputs",
             "label": "直接产物模式",
             "required_fields": ["base_artifact_path", "current_artifact_path"],
-            "recommended_fields": ["base_branch", "current_branch", "primary_module"],
+            "recommended_fields": ["base_branch", "current_branch"],
+            "required_confirmation_fields": ["target_module"],
             "fallback_fields": ["base_source_project_dir", "current_source_project_dir"],
             "notes": [
                 "适合同一系统、同一仓库、不同分支，且用户已经拿到 base/current 编译产物的场景。",
@@ -3080,7 +3123,8 @@ def build_step1_input_modes():
             "id": "checkout_build",
             "label": "自动切分支构建模式",
             "required_fields": ["base_branch", "current_branch"],
-            "recommended_fields": ["primary_module"],
+            "recommended_fields": [],
+            "required_confirmation_fields": ["target_module"],
             "fallback_fields": [],
             "notes": [
                 "适合未提供编译产物，由 Step1 自己切换分支并执行真实 package 的场景。",
@@ -3125,11 +3169,11 @@ def build_step1_static_contract():
                 "current_artifact_path",
                 "base_branch",
                 "current_branch",
-                "primary_module",
+                "target_module",
             ],
             "rules": [
                 "首轮目标不是只让 Step1 能启动，而是尽量一次收齐能完成分析的关键字段。",
-                "若提示词已经明确模块范围，第一次执行 Step1 前必须写入 primary_module/modules。",
+                "若提示词已经明确模块范围，第一次执行 Step1 前必须写入 target_module；否则先展示候选并要求用户确认。",
                 "artifact_inputs 模式下，若用户已给两侧产物，仍应优先继续抽取 base_branch/current_branch，避免运行时反复补参。",
                 "只有在不是同仓库双分支场景时，才把 base_source_project_dir/current_source_project_dir 作为兜底字段。",
                 "checkout_build 模式一旦成立，就天然表示由 Step1 自动 checkout + package，不需要任何额外布尔许可字段。",
@@ -3163,13 +3207,13 @@ def build_step1_static_contract():
                 "current_artifact_path": "/abs/path/current-app.jar",
                 "base_branch": "main",
                 "current_branch": "feature/upgrade",
-                "primary_module": "app-module",
+                "target_module": "app-module",
             },
             "checkout_build_default": {
                 "analysis_mode": "checkout_build",
                 "base_branch": "main",
                 "current_branch": "feature/upgrade",
-                "primary_module": "app-module",
+                "target_module": "app-module",
             },
         },
         "forbidden": [
@@ -3233,6 +3277,7 @@ def build_step1_preflight_interaction(run_context):
     base_branch = str(run_context.get("base_branch") or "").strip()
     current_branch = str(run_context.get("current_branch") or "").strip()
     mode_info = infer_step1_mode_fields(run_context)
+    target_module = str(run_context.get("target_module") or run_context.get("primary_module") or "").strip()
 
     properties = {
         "action": {
@@ -3301,6 +3346,18 @@ def build_step1_preflight_interaction(run_context):
                 }
             )
 
+    if not target_module:
+        missing_inputs.append(
+            {
+                "field": "target_module",
+                "label": "本次分析的目标模块",
+                "required": True,
+                "recommended": True,
+                "reason": "一次分析只对应一个部署模块，必须在 Step1 构建和依赖提取前由用户确认。",
+                "value_type": "module",
+            }
+        )
+
     checklist_lines = [
         "Step1 当前只支持 Maven，且只支持单模块。",
         "执行前请先明确一种输入方式；模式一旦进入执行，不允许因为失败自动切到另一种模式。",
@@ -3339,6 +3396,12 @@ def build_step1_preflight_interaction(run_context):
     elif analysis_mode:
         return None
 
+    missing_fields = {item.get("field") for item in missing_inputs}
+    reason_code = (
+        "missing_step1_target_module"
+        if analysis_mode and missing_fields == {"target_module"}
+        else "missing_step1_entry_inputs"
+    )
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
         "checkpoint": True,
@@ -3346,7 +3409,7 @@ def build_step1_preflight_interaction(run_context):
         "status": "awaiting_user_input",
         "kind": "input_request",
         "step_id": "step1",
-        "reason_code": "missing_step1_entry_inputs",
+        "reason_code": reason_code,
         "summary": "Step1 需要先明确执行入口和关键字段，agent 应先向用户索取这些输入，再启动实际分析。",
         "title": "step1 需要先确认输入方式",
         "analysis_mode": analysis_mode,
@@ -3358,6 +3421,7 @@ def build_step1_preflight_interaction(run_context):
         "missing_inputs": missing_inputs,
         "fallback_inputs": fallback_inputs,
         "input_modes": build_step1_input_modes(),
+        "module_candidates": list((run_context.get("project_scope") or {}).get("candidate_modules") or []),
         "checklist_lines": checklist_lines,
         "action_requirements": {
             "continue": {
@@ -4798,6 +4862,7 @@ def persist_step_interaction(main_state, step_id, report_dir, run_context, inter
         pending_interaction=dict(interaction),
     )
     save_main_state(report_dir, main_state)
+    write_coverage_report(report_dir, project_scope=run_context.get("project_scope"))
     save_interaction_file(report_dir, interaction)
 
 
@@ -4814,6 +4879,7 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
         pending_interaction=None,
     )
     save_main_state(report_dir, main_state)
+    write_coverage_report(report_dir, project_scope=run_context.get("project_scope"))
     clear_interaction_file(report_dir)
 
 
@@ -5169,6 +5235,7 @@ def main():
     ap.add_argument("--allow-degraded", action="store_true")
     ap.add_argument("--strict-risk-gate", action="store_true")
     ap.add_argument("--primary-module", default="")
+    ap.add_argument("--target-module", default="", help="本次分析唯一的目标部署模块；新流程优先使用")
     ap.add_argument("--tool", choices=["maven", "gradle"], default="maven")
     ap.add_argument("--response-json", default="", help="结构化用户答复 JSON，例如 '{\"action\":\"continue\"}'")
     ap.add_argument("--response-file", default="", help="结构化用户答复 JSON 文件路径")

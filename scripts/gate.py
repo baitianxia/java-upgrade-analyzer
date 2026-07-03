@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_constants import GATE_SEQUENCE
+from analysis_contract import sha256_file
 GATES = list(GATE_SEQUENCE)
 
 def python_cmds():
@@ -42,6 +43,7 @@ def has_dep_versions(row):
 def gate_step1_scope(d):
     csv_path = f"{d}/s1_dep_changes.csv"
     current_csv_path = f"{d}/s1_deps_current_resolved.csv"
+    provenance_path = f"{d}/build_provenance.json"
     if not os.path.exists(csv_path):
         fail("s1_dep_changes.csv 不存在，请先执行 Step 1",
              [f"{pc} scripts/run_step.py --step step1 --project-dir . --report-dir .upgrade-report --base-branch <base_branch> --current-branch <current_branch>"
@@ -67,6 +69,21 @@ def gate_step1_scope(d):
     ]
     if not valid_current_rows:
         fail("s1_deps_current_resolved.csv 没有有效当前依赖数据行，请重新执行 Step 1")
+    if not os.path.exists(provenance_path):
+        fail("build_provenance.json 不存在，无法证明 base/current 均来自成功构建或有效产物")
+    with open(provenance_path, encoding="utf-8", errors="replace") as f:
+        provenance = json.load(f)
+    sides = list(provenance.get("sides") or [])
+    if not provenance.get("both_builds_succeeded") or {item.get("side") for item in sides} != {"base", "current"}:
+        fail("仅允许分析 base/current 均成功构建的升级结果")
+    if any(not item.get("artifact_sha256") for item in sides):
+        fail("build_provenance.json 缺少 base/current 产物哈希，无法校验源码与制品对齐")
+    for item in sides:
+        artifact_path = str(item.get("artifact_path") or "").strip()
+        if not artifact_path or not Path(artifact_path).is_file():
+            fail(f"{item.get('side')} 最终制品未留存或已丢失，无法继续执行制品字节码分析")
+        if sha256_file(artifact_path) != item.get("artifact_sha256"):
+            fail(f"{item.get('side')} 最终制品 SHA-256 与 build_provenance.json 不一致")
     ok(f"step1_scope 门控通过：变更清单={len(valid_dep_rows)} 当前依赖={len(valid_current_rows)}")
 
 def gate_context(d):
@@ -196,6 +213,33 @@ def gate_call_chain(d, strict_risk_gate=False):
         fail("s5_call_chain/summary.json 不存在，请先执行 Step 5")
     with open(summary_path, encoding="utf-8", errors="replace") as f:
         summary = json.load(f)
+    coverage_path = Path(d) / 'coverage.json'
+    coverage = {}
+    if coverage_path.is_file():
+        try:
+            coverage = json.loads(coverage_path.read_text(encoding='utf-8'))
+        except json.JSONDecodeError:
+            fail('coverage.json 无效，无法判断分析完整性')
+    critical_incomplete = list(coverage.get('critical_incomplete') or [])
+    components = {item.get('id'): item for item in coverage.get('components') or []}
+    critical_insufficient = [
+        component_id for component_id in critical_incomplete
+        if (components.get(component_id) or {}).get('status') == 'insufficient'
+    ]
+    if critical_insufficient and coverage.get('enforcement') == 'required':
+        # Standard mode may continue to produce a diagnostic report, but the
+        # report must not turn this into a safe/zero-impact conclusion. Strict
+        # mode below remains a hard gate.
+        print(
+            f"\n⚠️ 关键覆盖维度证据不足，标准模式仅允许生成受限结论：{critical_insufficient}",
+            file=sys.stderr,
+        )
+        summary['safe_conclusion_allowed'] = False
+    if strict_risk_gate and critical_incomplete:
+        fail(
+            f"严格模式要求关键覆盖维度全部 complete：{critical_incomplete}",
+            ['根据 coverage.json 补齐 partial/insufficient 维度后重跑'],
+        )
     if summary.get('status') == 'skipped':
         if strict_risk_gate:
             fail("调用链分析被跳过，严格模式下禁止继续", ["补齐 Step4/Step5 所需输入后重新执行分析"])

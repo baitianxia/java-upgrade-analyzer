@@ -2295,6 +2295,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 "current_branch": "current",
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
                 "analysis_mode": "checkout_build",
+                "target_module": ".",
             }
             state["step2"]["output"] = {
                 "base_branch": "base",

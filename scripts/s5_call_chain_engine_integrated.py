@@ -24,6 +24,7 @@ s5_call_chain_engine_integrated.py
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import os
 import re
@@ -49,8 +50,11 @@ from confidence_weighted_tracer import (
     trace_all_apis_with_confidence_weighting,
 )
 from enhanced_output_formatter import generate_enhanced_summary
-from compat import maven_repo_dir
+from compat import maven_repo_dir, run_cmd
 from progress_logging import PhaseTimer, emit_progress
+from business_bytecode_graph import collect_business_bytecode_edges, merge_business_bytecode_edges
+from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
+from analysis_contract import sha256_file
 
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
@@ -686,6 +690,44 @@ def _step5_integrated_main_impl(args):
     graph = graph_result['graph']
     type_metadata = graph_result['type_metadata']
     graph_stats = graph_result['stats']
+    bytecode_evidence, bytecode_stats = collect_business_bytecode_edges(
+        business_roots,
+        artifact_catalog=runtime_dependency_catalog,
+        cache_path=os.path.join(report_dir, 'artifact_bytecode_index.json'),
+    )
+    bytecode_merge = merge_business_bytecode_edges(graph, bytecode_evidence)
+    graph_stats['business_bytecode'] = {
+        **bytecode_stats,
+        **bytecode_merge,
+        'status': (
+            'complete' if (
+                bytecode_stats.get('classes_scanned')
+                and not bytecode_stats.get('failures')
+                and bytecode_stats.get('evidence_source') == 'current_final_artifact'
+            )
+            else ('partial' if bytecode_stats.get('classes_scanned') else 'not_applicable')
+        ),
+    }
+    graph_stats['artifact_bytecode'] = {
+        'status': runtime_dependency_catalog.get('status', 'insufficient'),
+        'reason_codes': list(runtime_dependency_catalog.get('reason_codes') or []),
+        **(runtime_dependency_catalog.get('metrics') or {}),
+    }
+    source_alignment = assess_source_artifact_alignment(report_dir, business_source_dirs)
+    graph.source_artifact_alignment = source_alignment
+    graph_stats['source_artifact_alignment'] = source_alignment
+    framework_output = os.path.join(report_dir, 'framework_adapters.json')
+    framework_evidence = run_framework_adapters(business_roots, framework_output)
+    framework_merge = attach_framework_edges_to_graph(graph, framework_evidence)
+    graph_stats['framework_adapters'] = {
+        item.get('adapter'): {
+            'status': item.get('status'),
+            **(item.get('metrics') or {}),
+            'error_count': len(item.get('errors') or []),
+        }
+        for item in framework_evidence.get('adapters') or []
+    }
+    graph_stats['framework_adapter_merge'] = framework_merge
     graph.runtime_dependency_catalog = runtime_dependency_catalog
 
     print(f"  方法数：{len(graph.methods_by_id)}", file=sys.stderr)
@@ -914,20 +956,127 @@ def build_runtime_dependency_catalog(report_dir):
     current_resolved_path = os.path.join(report_dir, 's1_deps_current_resolved.csv')
     catalog = {
         'by_coord': {},
+        'entries': [],
         'jar_paths': {},
+        'status': 'insufficient',
+        'reason_codes': [],
+        'metrics': {},
     }
     if not os.path.exists(current_resolved_path):
         return catalog
 
     with open(current_resolved_path, 'r', encoding='utf-8', errors='replace') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        rows = list(csv.DictReader(f))
+
+    artifact_path = ''
+    artifact_expected_hash = ''
+    provenance_path = os.path.join(report_dir, 'build_provenance.json')
+    if os.path.exists(provenance_path):
+        try:
+            provenance = json.loads(Path(provenance_path).read_text(encoding='utf-8'))
+            current_side = next(
+                (item for item in provenance.get('sides') or [] if item.get('side') == 'current'),
+                {},
+            )
+            artifact_path = str(current_side.get('artifact_path') or '').strip()
+            artifact_expected_hash = str(current_side.get('artifact_sha256') or '').strip()
+        except (OSError, json.JSONDecodeError):
+            catalog['reason_codes'].append('build_provenance_unreadable')
+
+    artifact_ok = bool(artifact_path and os.path.isfile(artifact_path))
+    if artifact_ok and artifact_expected_hash:
+        artifact_ok = sha256_file(artifact_path) == artifact_expected_hash
+        if not artifact_ok:
+            catalog['reason_codes'].append('current_artifact_hash_mismatch')
+    elif not artifact_ok:
+        catalog['reason_codes'].append('current_artifact_unavailable')
+
+    exact_count = 0
+    fallback_count = 0
+    extraction_failures = []
+    business_class_count = 0
+    cache_dir = Path(report_dir) / 'artifact_bytecode' / 'current'
+    if artifact_ok:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(artifact_path) as outer:
+                names = set(outer.namelist())
+                for row in rows:
+                    coord = str((row or {}).get('coord') or '').strip()
+                    version = str((row or {}).get('version') or '').strip()
+                    scope = str((row or {}).get('scope') or '').strip()
+                    lib_entry = str((row or {}).get('lib_entry') or '').strip()
+                    if scope in {'test', 'provided', 'optional'}:
+                        continue
+                    if not coord or str((row or {}).get('resolution_status') or '').strip() == 'unresolved':
+                        extraction_failures.append({
+                            'coord': coord, 'lib_entry': lib_entry,
+                            'reason': 'dependency_coordinate_unresolved',
+                        })
+                        continue
+                    if not version:
+                        extraction_failures.append({'coord': coord, 'lib_entry': lib_entry, 'reason': 'dependency_version_missing'})
+                        continue
+                    if not lib_entry or lib_entry not in names:
+                        extraction_failures.append({'coord': coord, 'lib_entry': lib_entry, 'reason': 'lib_entry_missing'})
+                        continue
+                    try:
+                        blob = outer.read(lib_entry)
+                        digest = hashlib.sha256(blob).hexdigest()
+                        jar_path = cache_dir / f'{digest[:16]}-{Path(lib_entry).name}'
+                        if not jar_path.exists() or sha256_file(jar_path) != digest:
+                            jar_path.write_bytes(blob)
+                        item = {
+                            'coord': coord, 'version': version, 'scope': scope,
+                            'jar_path': str(jar_path), 'artifact_entry': lib_entry,
+                            'sha256': digest, 'evidence_source': 'current_final_artifact',
+                        }
+                        catalog['by_coord'][coord] = item
+                        catalog['entries'].append(item)
+                        catalog['jar_paths'][coord] = str(jar_path)
+                        exact_count += 1
+                    except Exception as exc:
+                        extraction_failures.append({'coord': coord, 'lib_entry': lib_entry, 'reason': f'extract_failed:{exc}'})
+
+                business_entries = []
+                for name in sorted(names):
+                    if not name.endswith('.class') or name.startswith('META-INF/'):
+                        continue
+                    stripped = name
+                    for prefix in ('BOOT-INF/classes/', 'WEB-INF/classes/'):
+                        if name.startswith(prefix):
+                            stripped = name[len(prefix):]
+                            break
+                    if stripped == name and name.startswith(('BOOT-INF/', 'WEB-INF/', 'lib/')):
+                        continue
+                    if stripped:
+                        business_entries.append((name, stripped))
+                if business_entries:
+                    business_jar = cache_dir / 'business-classes.jar'
+                    with zipfile.ZipFile(business_jar, 'w', compression=zipfile.ZIP_DEFLATED) as target:
+                        for source_name, target_name in business_entries:
+                            target.writestr(target_name, outer.read(source_name))
+                    business_class_count = len(business_entries)
+                    catalog['by_coord']['__business__'] = {
+                        'coord': '__business__', 'version': '', 'scope': 'business',
+                        'jar_path': str(business_jar), 'artifact_entry': '<business-classes>',
+                        'sha256': sha256_file(business_jar),
+                        'evidence_source': 'current_final_artifact',
+                    }
+                    catalog['entries'].append(catalog['by_coord']['__business__'])
+                    catalog['jar_paths']['__business__'] = str(business_jar)
+        except (OSError, zipfile.BadZipFile) as exc:
+            extraction_failures.append({'coord': '', 'lib_entry': '', 'reason': f'artifact_open_failed:{exc}'})
+
+    for row in rows:
             coord = str((row or {}).get('coord') or '').strip()
             version = str((row or {}).get('version') or '').strip()
             scope = str((row or {}).get('scope') or '').strip()
             if not coord or not version:
                 continue
             if scope in {'test', 'provided', 'optional'}:
+                continue
+            if coord in catalog['by_coord']:
                 continue
             jar_path = _find_maven_jar(coord, version)
             if not jar_path:
@@ -937,10 +1086,105 @@ def build_runtime_dependency_catalog(report_dir):
                 'version': version,
                 'scope': scope,
                 'jar_path': jar_path,
+                'artifact_entry': str((row or {}).get('lib_entry') or '').strip(),
+                'sha256': sha256_file(jar_path) if os.path.isfile(jar_path) else '',
+                'evidence_source': 'local_maven_fallback',
             }
             catalog['by_coord'][coord] = item
+            catalog['entries'].append(item)
             catalog['jar_paths'][coord] = jar_path
+            fallback_count += 1
+
+    expected_coords = {
+        str(row.get('coord') or '').strip() for row in rows
+        if str(row.get('coord') or '').strip()
+        and str(row.get('scope') or '').strip() not in {'test', 'provided', 'optional'}
+    }
+    missing_coords = sorted(expected_coords - set(catalog['by_coord']))
+    if missing_coords:
+        catalog['reason_codes'].append('runtime_dependency_jars_missing')
+    if fallback_count:
+        catalog['reason_codes'].append('local_maven_fallback_used')
+    catalog['status'] = (
+        'complete' if artifact_ok and not extraction_failures and not missing_coords and not fallback_count
+        else ('partial' if catalog['by_coord'] else 'insufficient')
+    )
+    catalog['metrics'] = {
+        'expected_runtime_dependencies': len(expected_coords),
+        'exact_artifact_dependencies': exact_count,
+        'local_maven_fallback_dependencies': fallback_count,
+        'missing_dependencies': len(missing_coords),
+        'business_classes': business_class_count,
+        'extraction_failures': len(extraction_failures),
+    }
+    catalog['extraction_failures'] = extraction_failures
+    serializable = {key: value for key, value in catalog.items() if not key.startswith('_')}
+    (Path(report_dir) / 'artifact_bytecode_catalog.json').write_text(
+        json.dumps(serializable, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+    )
     return catalog
+
+
+def assess_source_artifact_alignment(report_dir, business_source_dirs):
+    provenance_path = Path(report_dir) / 'build_provenance.json'
+    current = {}
+    if provenance_path.is_file():
+        try:
+            provenance = json.loads(provenance_path.read_text(encoding='utf-8'))
+            current = next(
+                (item for item in provenance.get('sides') or [] if item.get('side') == 'current'),
+                {},
+            )
+        except (OSError, json.JSONDecodeError):
+            current = {}
+    source_root = str((business_source_dirs or [''])[0] or '')
+    git_root = revision = ''
+    dirty = None
+    if source_root and os.path.isdir(source_root):
+        stdout, _stderr, rc = run_cmd(['git', '-C', source_root, 'rev-parse', '--show-toplevel'])
+        if rc == 0:
+            git_root = stdout.strip()
+            stdout, _stderr, rc = run_cmd(['git', '-C', git_root, 'rev-parse', 'HEAD'])
+            revision = stdout.strip() if rc == 0 else ''
+            stdout, _stderr, rc = run_cmd(['git', '-C', git_root, 'status', '--porcelain'])
+            dirty = bool(stdout.strip()) if rc == 0 else None
+    expected_revision = str(current.get('revision') or '').strip()
+    source_mode = str(current.get('source_mode') or '').strip()
+    reasons = []
+    if not current:
+        status = 'unverified'
+        reasons.append('build_provenance_missing')
+    elif source_mode == 'provided_artifact':
+        status = 'unverified'
+        reasons.append('direct_artifact_source_revision_unverified')
+    elif not expected_revision or not revision:
+        status = 'unverified'
+        reasons.append('source_revision_unavailable')
+    elif expected_revision != revision:
+        status = 'conflict'
+        reasons.append('source_revision_differs_from_build_revision')
+    elif dirty:
+        status = 'conflict'
+        reasons.append('source_worktree_has_unbuilt_changes')
+    else:
+        status = 'aligned'
+    payload = {
+        'schema': 'java-upgrade-analyzer.source-artifact-alignment.v1',
+        'status': status,
+        'reason_codes': reasons,
+        'source_mode': source_mode,
+        'expected_revision': expected_revision,
+        'actual_revision': revision,
+        'git_root': git_root,
+        'worktree_dirty': dirty,
+        'target_module': current.get('target_module', ''),
+        'artifact_path': current.get('artifact_path', ''),
+        'artifact_sha256': current.get('artifact_sha256', ''),
+    }
+    (Path(report_dir) / 'source_artifact_alignment.json').write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+    )
+    return payload
 
 
 def _normalize_descriptor_type(descriptor, preserve_array=False):
@@ -2225,7 +2469,10 @@ def check_apis_that_need_bridge(
         coord = row.get('coord', '')
         api_name = row.get('api_name', '')
         key = build_api_identity_key(row)
-        has_packaged_bytecode_fallback = bool(available_runtime_coords)
+        # Step5 always evaluates the final-artifact bytecode contract. An empty or
+        # incomplete catalog is itself evidence of insufficient coverage, not a
+        # reason to silently fall back to source-only negative conclusions.
+        has_packaged_bytecode_fallback = runtime_dependency_catalog is not None
 
         if not coord or not api_name:
             continue

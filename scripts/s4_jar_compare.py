@@ -29,6 +29,7 @@ from collections import Counter
 from pathlib import Path
 from datetime import datetime
 import hashlib, zipfile
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import (
@@ -1156,6 +1157,8 @@ def run_japicmp(
     safe_name = safe_artifact_id.replace('.', '-') + (f"_{safe_classifier}" if safe_classifier else "")
     out_file = os.path.join(output_dir,
         f"{safe_name}_{old_ver}_vs_{new_ver}_binary.txt")
+    xml_file = os.path.join(output_dir,
+        f"{safe_name}_{old_ver}_vs_{new_ver}_binary.xml")
 
     old_jar = find_jar_in_m2(old_group_id, old_artifact_id, old_ver, classifier=old_classifier)
     new_jar = find_jar_in_m2(new_group_id, new_artifact_id, new_ver, classifier=new_classifier)
@@ -1227,8 +1230,9 @@ def run_japicmp(
         ['java', '-jar', japicmp_jar,
          '--old', old_jar,
          '--new', new_jar,
+         '--only-modified',
          '--ignore-missing-classes',
-         '--only-incompatible'],
+         '--xml-file', xml_file],
         timeout=japicmp_timeout
     )
     if rc == -1 and '超时' in stderr:
@@ -1259,9 +1263,166 @@ def run_japicmp(
     )
     write_result(out_file, header + raw_output)
 
-    # 解析输出，提取变更 API
-    changed_apis = parse_japicmp_output(raw_output, coord, old_ver, new_ver)
-    return out_file, changed_apis, {"old_jar": old_jar, "new_jar": new_jar}, None
+    # XML 是机器解析主证据；仅在工具未生成或 XML 不可解析时回退文本。
+    parser_mode = 'xml'
+    xml_error = ''
+    try:
+        changed_apis = parse_japicmp_xml(xml_file, coord, old_ver, new_ver)
+    except (ET.ParseError, OSError, ValueError) as exc:
+        parser_mode = 'text_fallback'
+        xml_error = f"{type(exc).__name__}:{exc}"
+        changed_apis = parse_japicmp_output(raw_output, coord, old_ver, new_ver)
+        for row in changed_apis:
+            row['reason_code'] = 'JAPICMP_TEXT_FALLBACK_USED'
+            row['evidence_path'] = str(out_file)
+            row['binary_compatible'] = row.get('binary_compatible') or 'unknown'
+            row['source_compatible'] = row.get('source_compatible') or 'unknown'
+    tool_sha256 = ''
+    try:
+        tool_sha256 = hashlib.sha256(Path(japicmp_jar).read_bytes()).hexdigest()
+    except OSError:
+        pass
+    return out_file, changed_apis, {
+        "old_jar": old_jar,
+        "new_jar": new_jar,
+        "xml_file": xml_file if os.path.exists(xml_file) else '',
+        "parser_mode": parser_mode,
+        "xml_error": xml_error,
+        "missing_class_policy": "ignored",
+        "japicmp_version": "0.21.2",
+        "japicmp_sha256": tool_sha256,
+    }, None
+
+
+def _xml_local_name(element):
+    return str(element.tag).rsplit('}', 1)[-1].lower()
+
+
+def _xml_attr(element, *names):
+    lowered = {str(key).lower(): str(value) for key, value in element.attrib.items()}
+    for name in names:
+        value = lowered.get(str(name).lower())
+        if value is not None:
+            return value.strip()
+    return ''
+
+
+def _compat_value(element, *names):
+    value = _xml_attr(element, *names).lower()
+    return value if value in ('true', 'false') else 'unknown'
+
+
+def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
+    """Parse JApiCmp XML while preserving binary and source compatibility separately."""
+    path = Path(xml_file)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise OSError(f"JApiCmp XML 未生成：{path}")
+    root = ET.parse(str(path)).getroot()
+    apis = []
+
+    def add_row(owner, element, symbol_kind):
+        status = _xml_attr(element, 'changeStatus', 'change_status', 'status').upper()
+        binary = _compat_value(element, 'binaryCompatible', 'binary_compatible')
+        source = _compat_value(element, 'sourceCompatible', 'source_compatible')
+        old_value = _xml_attr(element, 'oldValue', 'old_value')
+        new_value = _xml_attr(element, 'newValue', 'new_value')
+        for child in element:
+            local_name = _xml_local_name(child)
+            if local_name in {'oldvalue', 'old-value'} and not old_value:
+                old_value = (child.text or '').strip() or _xml_attr(child, 'value')
+            elif local_name in {'newvalue', 'new-value'} and not new_value:
+                new_value = (child.text or '').strip() or _xml_attr(child, 'value')
+        if status in ('NEW', 'UNCHANGED'):
+            return
+        if symbol_kind == 'field' and old_value and new_value and old_value != new_value:
+            change_type = 'CONSTANT_VALUE_CHANGED'
+            reason_code = 'field_constant_value_changed'
+        elif status == 'REMOVED':
+            change_type = 'REMOVED'
+            reason_code = 'japicmp_removed'
+        elif binary == 'true' and source == 'false':
+            change_type = 'SOURCE_INCOMPATIBLE'
+            reason_code = 'binary_compatible_source_incompatible'
+        elif binary == 'false' or source == 'false' or (
+            status == 'MODIFIED' and binary == 'unknown' and source == 'unknown'
+        ):
+            change_type = 'SIGNATURE_CHANGED'
+            reason_code = 'binary_or_source_incompatible'
+        else:
+            return
+
+        raw_name = _xml_attr(element, 'name')
+        if symbol_kind == 'class':
+            api_name = owner
+            signature = ''
+        elif symbol_kind == 'constructor':
+            simple_owner = owner.rsplit('.', 1)[-1]
+            api_name = f"{owner}.{simple_owner}"
+            signature = _xml_member_signature(element)
+        else:
+            if not raw_name:
+                return
+            api_name = f"{owner}.{raw_name}"
+            signature = _xml_member_signature(element) if symbol_kind == 'method' else ''
+        flags = []
+        for child in element.iter():
+            if _xml_local_name(child) not in ('compatibilitychange', 'compatibility-change'):
+                continue
+            flag = _xml_attr(child, 'type', 'name') or (child.text or '').strip()
+            if flag and flag not in flags:
+                flags.append(flag)
+        row = {
+            'coord': coord,
+            'old_version': old_ver,
+            'new_version': new_ver,
+            'change_type': change_type,
+            'api_name': api_name,
+            'api_simple': api_name.rsplit('.', 1)[-1],
+            'symbol_kind': symbol_kind,
+            'api_signature': signature,
+            'confirmed': 'true',
+            'severity': DEFAULT_SEVERITY[change_type],
+            'source': 'japicmp',
+            'binary_compatible': binary,
+            'source_compatible': source,
+            'compatibility_flags': '|'.join(flags),
+            'reason_code': reason_code,
+            'evidence_path': str(path),
+            'old_value': old_value,
+            'new_value': new_value,
+        }
+        if not validate_row(row):
+            apis.append(row)
+
+    for class_element in root.iter():
+        if _xml_local_name(class_element) not in ('class', 'interface', 'enum', 'annotation', 'record'):
+            continue
+        owner = _xml_attr(class_element, 'fullyQualifiedName', 'fully_qualified_name', 'name')
+        if not owner:
+            continue
+        add_row(owner, class_element, 'class')
+        for member in class_element.iter():
+            if member is class_element:
+                continue
+            tag = _xml_local_name(member)
+            if tag == 'method':
+                add_row(owner, member, 'method')
+            elif tag == 'constructor':
+                add_row(owner, member, 'constructor')
+            elif tag == 'field':
+                add_row(owner, member, 'field')
+    return apis
+
+
+def _xml_member_signature(element):
+    params = []
+    for child in element.iter():
+        if _xml_local_name(child) != 'parameter':
+            continue
+        value = _xml_attr(child, 'type', 'newType', 'oldType', 'name')
+        if value:
+            params.append(value)
+    return build_api_signature_from_types(params)
 
 
 def parse_japicmp_output(output, coord, old_ver, new_ver):
@@ -3109,6 +3270,7 @@ def main():
     gitdiff_skipped = []
     gitdiff_pending = []
     timeout_items = []
+    binary_runs = []
 
     print(f"\nStep 4 开始：处理 {len(dep_rows)} 个依赖", file=sys.stderr)
     emit_progress("step4", "plan", f"开始构建 jar 对比证据池，共 {len(dep_rows)} 个依赖")
@@ -3303,6 +3465,7 @@ def main():
                 "error": err,
             }
             if err:
+                binary_runs.append({'coord': coord, 'status': 'failed', 'mode': 'old_jar_export', 'error': err})
                 print(f"    ⚠️  removed jar 旧版符号导出失败：{err}", file=sys.stderr)
                 emit_progress(
                     "step4",
@@ -3326,6 +3489,7 @@ def main():
                         }
                     )
             else:
+                binary_runs.append({'coord': coord, 'status': 'success', 'mode': 'old_jar_export'})
                 dependency_raw_apis.extend(apis)
                 all_apis.extend(apis)
                 print(f"    → {len(apis)} 个 removed jar 旧版符号", file=sys.stderr)
@@ -3359,6 +3523,17 @@ def main():
                 old_coord=_resolve_step4_side_coord(row, "base", coord),
                 new_coord=_resolve_step4_side_coord(row, "current", coord),
             )
+            binary_runs.append({
+                'coord': coord,
+                'status': 'failed' if err else 'success',
+                'mode': 'japicmp',
+                'parser_mode': str((jar_info or {}).get('parser_mode') or ''),
+                'xml_error': str((jar_info or {}).get('xml_error') or ''),
+                'missing_class_policy': str((jar_info or {}).get('missing_class_policy') or ''),
+                'japicmp_version': str((jar_info or {}).get('japicmp_version') or ''),
+                'japicmp_sha256': str((jar_info or {}).get('japicmp_sha256') or ''),
+                'error': str(err or ''),
+            })
             if compute_changed_classes_enabled and jar_info and jar_info.get("old_jar") and jar_info.get("new_jar"):
                 try:
                     changed_classes_by_coord[coord] = {
@@ -3511,6 +3686,60 @@ def main():
             ensure_ascii=False,
             indent=2,
         )
+
+    binary_failures = [item for item in binary_runs if item.get('status') != 'success']
+    text_fallbacks = [item for item in binary_runs if item.get('parser_mode') == 'text_fallback']
+    missing_classes_ignored = [item for item in binary_runs if item.get('missing_class_policy') == 'ignored']
+    binary_status = (
+        'insufficient' if binary_runs and len(binary_failures) == len(binary_runs)
+        else ('partial' if binary_failures or text_fallbacks or missing_classes_ignored else 'complete')
+    ) if binary_runs else 'not_applicable'
+    behavior_expected = [
+        row for row in dep_rows
+        if row.get('change_type') != '未变'
+        and row.get('old_version') not in ('', '-')
+        and row.get('new_version') not in ('', '-')
+    ]
+    behavior_status = (
+        'not_applicable' if not behavior_expected
+        else ('complete' if len(gitdiff_runs) == len(behavior_expected)
+              else ('partial' if gitdiff_runs else 'insufficient'))
+    )
+    step4_coverage = {
+        'schema': 'java-upgrade-analyzer.step4-coverage.v1',
+        'binary_api_diff': {
+            'status': binary_status,
+            'reason_codes': (
+                (['japicmp_or_old_jar_failed'] if binary_failures else [])
+                + (['JAPICMP_TEXT_FALLBACK_USED'] if text_fallbacks else [])
+                + (['JAPICMP_MISSING_CLASSES_IGNORED'] if missing_classes_ignored else [])
+            ),
+            'metrics': {
+                'planned_dependencies': len(binary_runs),
+                'successful_dependencies': len(binary_runs) - len(binary_failures),
+                'failed_dependencies': len(binary_failures),
+                'text_fallbacks': len(text_fallbacks),
+                'missing_classes_ignored': len(missing_classes_ignored),
+            },
+            'runs': binary_runs,
+        },
+        'behavior_diff': {
+            'status': behavior_status,
+            'reason_codes': [] if behavior_status in {'complete', 'not_applicable'} else [
+                'dependency_source_or_git_ref_coverage_incomplete'
+            ],
+            'metrics': {
+                'planned_dependencies': len(behavior_expected),
+                'successful_dependencies': len(gitdiff_runs),
+                'pending_dependencies': len(gitdiff_pending),
+                'failed_or_skipped_dependencies': len(gitdiff_skipped),
+                'missing_source_dependencies': len(changed_deps_missing_source),
+            },
+        },
+    }
+    Path(args.output_dir, 'coverage.json').write_text(
+        json.dumps(step4_coverage, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+    )
 
     alerts_path, summary_path = write_readable_outputs(
         dep_rows=dep_rows,

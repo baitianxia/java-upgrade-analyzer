@@ -31,7 +31,7 @@ python3 scripts/run_step.py --step auto --project-dir . --report-dir .upgrade-re
 {
   "base_branch": "main",
   "current_branch": "feature/upgrade-test",
-  "source_dirs": ["src/main/java"],
+  "target_module": "app-module",
   "dependency_source_dirs": ["/abs/path/to/dependency-repo"],
   "max_depth": 5,
   "tool": "maven"
@@ -45,7 +45,7 @@ python3 scripts/run_step.py --step auto \
   --seed-json /abs/path/to/seed.json
 ```
 
-如果首轮就已经明确“只分析某个模块”，第一次执行 `Step1` 时必须直接带模块参数，不要先跑 root 范围再在待交互确认点里纠偏：
+一次分析只对应一个目标部署模块。用户已明确时直接传入；未明确时，Step1 会展示 Maven reactor 候选并等待用户确认：
 
 ```bash
 python3 scripts/run_step.py --step step1 \
@@ -53,8 +53,7 @@ python3 scripts/run_step.py --step step1 \
   --report-dir .upgrade-report \
   --base-branch <base-branch> \
   --current-branch <current-branch> \
-  --primary-module module-a \
-  --modules module-a
+  --target-module module-a
 ```
 
 2. **分步运行**（调试场景）
@@ -330,7 +329,8 @@ python3 scripts/run_step.py --step step1 \
 
 最常用字段：
 - `base_branch` / `current_branch`
-- `source_dirs`：业务源码目录列表（多模块必须包含各模块 `src/main/java` / `src/main/kotlin`）
+- `target_module`：本次唯一的目标部署模块；确认后自动生成 `project_scope` 和 reactor 依赖闭包
+- `source_dirs`：旧状态兼容/异常覆盖字段；标准 Maven 工程无需用户填写或确认
 - `dependency_source_dirs`：依赖源码目录列表，支持单模块工程根目录或多模块仓库根目录；系统会自动推断模块坐标，并派生 Step4 git diff 所需源码映射与 Step5 依赖源码映射
 - `max_depth`：调用链最大累计代价（默认 5，高置信度边最多5跳，详见 SKILL.md 置信度加权深度策略）
 - `allow_degraded`：是否允许缺关键输入时继续（不建议，可能漏分析）
@@ -411,6 +411,7 @@ git diff 路径触发条件（同时满足才会执行）：
 
 排查顺序：
 - 查看对应的 `*_binary.txt` 是否写了“jar 未找到 / JApiCmp 未安装”
+- 机器解析以对应的 `*_binary.xml` 为准；文本只用于人读或 XML 失败回退
 - 确认本机 Maven 仓库完整（尤其是私服依赖）
 - 需要时手动拉取：
 
@@ -428,16 +429,27 @@ mvn -q dependency:get -Dartifact=<groupId:artifactId>:<version>
 若 `all_changed_apis.csv` 为空，不等于“无风险”，应优先查看 `.upgrade-report/s4_jar_compare/summary.txt` 与相关原始证据文件，确认是否存在 jar 缺失、git diff 跳过或提取失败。
 
 调用链跨依赖边界的正式语义：
+- 业务源码范围来自统一 `project_scope`；业务字节码以 Step1 留存并校验 SHA-256 的 current 最终制品为主，`target/classes` 只作为降级辅助
+- SPI、Spring、MyBatis 隐式关系写入 `.upgrade-report/framework_adapters.json`
 - 优先在 `main_state.json` 中补齐 `dependency_source_dirs`，这样 Step5 可以继续做“有源码依赖”回溯
-- 若缺少依赖源码映射，Step5 不会再把“无源码依赖”整体直接跳过，而是先对当前 packaged runtime jar 做字节码级稳定符号匹配
-- 当 `reason_code=PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示已经在无源码依赖 jar 中稳定命中目标符号，但尚未证明是否回到系统源码，因此会收敛为 `uncertain`
+- 无论是否存在依赖源码映射，Step5 都会从 current 最终制品按 `lib_entry` 提取实际运行时 JAR，对所有升级、降级、迁移和删除依赖执行字节码级类/方法/字段匹配
+- `.upgrade-report/artifact_bytecode_catalog.json` 记录精确制品提取数量、业务 class 数、fallback、缺失项和覆盖状态；使用本地 Maven 仓库 fallback 时状态不会是 `complete`
+- `.upgrade-report/artifact_bytecode_index.json` 按 current 制品 SHA-256 缓存业务 class 的方法、构造、字段、类型指令、常量池/签名/注解引用和 `invokedynamic` 证据；SHA 变化会自动失效
+- `.upgrade-report/source_artifact_alignment.json` 记录源码 revision/dirty 状态与 Step1 制品溯源是否一致；未对齐时，字节码未命中不得反证源码候选
+- `reason_code=BUSINESS_ARTIFACT_BYTECODE_USAGE` 表示 current 最终制品中的业务 class 已确认引用目标符号；这项事实不依赖源码是否存在
+- 当 `reason_code=PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示已经在最终制品的运行时依赖 JAR 中稳定命中目标符号，但尚未证明是否回到系统源码，因此会收敛为 `uncertain`；是否提供该依赖源码不影响这项命中事实
+- 当 `reason_code=RUNTIME_DEPENDENCY_USES_REMOVED_API` 时，表示某个仍被打入最终制品的依赖 JAR 继续引用已整体删除依赖的类/方法/字段；应优先检查命中的消费类和业务入口，并验证 `NoClassDefFoundError` / `NoSuchMethodError` 风险
+- Step3 的 JDK、Jakarta namespace 与 Spring Boot 迁移规则分别来自 `references/rules/jdk.json`、`jakarta.json` 和 `spring-boot.json`；输出会记录规则 ID 与规则包版本
+- Step3 的 `s3_coverage.json` 同时记录规则包 SHA-256、权威来源、最后核验日期和按升级区间激活的扫描；Step4 的 `coverage.json` 分离二进制 API 与行为差异覆盖
+- 编译期常量值变化输出 `CONSTANT_VALUE_CHANGED`；调用方可能已经内联旧值，因此没有 `getstatic/getfield` 也只能判为 `INLINED_CONSTANT_USAGE_UNDETECTABLE/uncertain`
 
 建议复核顺序：
 - 先看 `.upgrade-report/s5_call_chain/summary.json` 中的 `uncertain_apis` 与 `not_analyzed_apis`
 - 若存在 `DEPENDENCY_SOURCE_MAPPING_MISSING`，优先补齐 `dependency_source_dirs` 后重跑 Step5
-- 若存在 `PACKAGED_DEPENDENCY_BYTECODE_USAGE`，优先审查命中的无源码依赖及其入口；若要继续证明是否回到系统源码，再补 `dependency_source_dirs`
+- 若存在 `PACKAGED_DEPENDENCY_BYTECODE_USAGE`，优先审查命中的运行时依赖及其入口；若要继续证明是否回到系统源码，可补 `dependency_source_dirs`
 - 若存在 `GRAPH_TRUNCATED`，提高 `--max-methods / --max-reverse-edges / --max-incoming-per-key` 后重跑
 - 若存在 `INTERFACE_OR_ABSTRACT_API`、`RESOURCE_OR_REFLECTION`，不要把结果当成“未影响系统”
+- 查看 `.upgrade-report/coverage.json` 判断各证据面是 `complete`、`partial`、`insufficient` 还是 `not_applicable`
 
 ### 7) 如何理解 Step5 四态结论
 

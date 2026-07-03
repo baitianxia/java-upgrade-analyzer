@@ -1,0 +1,11 @@
+{
+  "schema": "java-upgrade-analyzer.rule-pack.v1",
+  "id": "spring-boot-migration",
+  "version": "2026.07",
+  "source": "https://github.com/spring-projects/spring-boot/wiki/Spring-Boot-3.0-Migration-Guide",
+  "last_verified": "2026-07-02",
+  "rules": [
+    {"id":"boot3-autoconfiguration-imports","kind":"resource_migration","pattern":"META-INF/spring.factories","replacement":"META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports","affected_major":3},
+    {"id":"boot3-constructor-binding","kind":"source_migration","pattern":"@ConstructorBinding","affected_major":3}
+  ]
+}

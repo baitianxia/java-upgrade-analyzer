@@ -123,7 +123,10 @@ def collect_findings(d):
         'module_impacts':      {},
         'dep_changes_summary': {},
         'per_dependency_results': [],
+        'coverage': {},
     }
+
+    findings['coverage'] = load_json(f"{d}/coverage.json")
 
     # Step 2 上下文
     ctx = load_json(f"{d}/s2_context.json")
@@ -536,6 +539,11 @@ def generate_report(findings):
         f"> JDK：{ctx.get('jdk','')} | Spring Boot：{ctx.get('springboot','')}  ",
         "> **本报告只描述问题，不提供修复方案**",
         "", "---", "",
+        "## 分析完整度", "",
+        f"- 整体状态：{(findings.get('coverage') or {}).get('overall_status', 'unknown')}",
+        f"- 关键未完成维度：{', '.join((findings.get('coverage') or {}).get('critical_incomplete') or []) or '无'}",
+        "- `complete` 才表示计划范围内无已知覆盖缺口；`partial/insufficient` 均不能解释为没有风险。",
+        "",
         "## 阅读与抽查", "",
         "**建议先看：**", "",
         f"- `{Path('s6_report.md')}`（主报告）",
@@ -579,7 +587,7 @@ def generate_report(findings):
         "## 一、风险总览", "",
         "| 级别 | 数量 | 含义 |",
         "|---|---|---|",
-        f"| P0 编译失败 | {len(p0)} | API 删除或签名变更，编译期必然失败 |",
+        f"| P0 静态编译不兼容候选 | {len(p0)} | 依赖变化与静态引用形成强冲突候选；若 current 构建成功则需核对构建溯源，不得写成已确认编译失败 |",
         f"| P1 运行时崩溃 | {len(p1)} | 编译通过但运行时抛异常 |",
         f"| P2 行为异常 | {len(p2)} | 功能可能不正确，需测试验证 |",
         f"| ❓ 待人工验证 | {len(unk)} | 静态分析发现候选路径，但存在歧义，需人工核实 |",
@@ -616,9 +624,11 @@ def generate_report(findings):
             "",
         ]
     if impacted_total == 0 and call_status != 'skipped':
+        coverage_status = (findings.get('coverage') or {}).get('overall_status', 'unknown')
         L += [
             "**结论：**",
-            "- 当前未识别到已证明影响本系统的依赖/API 变更。",
+            f"- 当前未识别到已证明影响本系统的依赖/API 变更；分析完整度为 `{coverage_status}`。",
+            "- 仅当关键覆盖维度 complete 时，才可表述为“在明确范围内未发现已确认影响”；否则只能表述为当前证据未发现。",
             "- 下文的扫描命中和依赖兼容信号仅作为背景线索，不作为当前系统的重点风险。",
             "",
         ]

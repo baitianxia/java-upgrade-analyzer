@@ -134,6 +134,8 @@ def _infer_blocked_at(entry):
     if str(entry.get('reason_code') or '').strip() in {
         'DEPENDENCY_SOURCE_MAPPING_MISSING',
         'PACKAGED_DEPENDENCY_BYTECODE_USAGE',
+        'RUNTIME_DEPENDENCY_USES_REMOVED_API',
+        'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
     }:
         return 'dependency_without_source'
     if entry.get('dependency_chain_coords'):
@@ -369,8 +371,32 @@ REASON_CODE_EXPLANATIONS = {
         'action': '补充 dependency_source_dirs 中的依赖源码路径后重跑 Step5'
     },
     'PACKAGED_DEPENDENCY_BYTECODE_USAGE': {
-        'reason': '已在无源码依赖字节码中稳定命中目标符号引用，但尚未证明是否回到系统源码',
+        'reason': '已在最终制品的运行时依赖字节码中稳定命中目标符号引用，但尚未证明是否回到系统源码',
         'action': '优先审查命中的无源码依赖及其入口；若需继续回溯到系统源码，请补充 dependency_source_dirs'
+    },
+    'BUSINESS_ARTIFACT_BYTECODE_USAGE': {
+        'reason': '已在当前最终制品的业务 class 中确认目标符号引用',
+        'action': '依据命中的业务 class 和方法定位受影响入口，并执行对应回归测试'
+    },
+    'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE': {
+        'reason': '最终制品业务 class 或运行时依赖 JAR 未被完整扫描',
+        'action': '修复制品留存、嵌套 JAR 提取或 javap 环境后重跑；当前未命中不能解释为无影响'
+    },
+    'SOURCE_BYTECODE_EDGE_CONFLICT': {
+        'reason': '源码调用图与当前最终制品字节码扫描结果冲突',
+        'action': '核对制品 SHA、源码 revision、构建 profile、生成源码和目标模块后重新构建分析'
+    },
+    'SOURCE_ARTIFACT_ALIGNMENT_UNVERIFIED': {
+        'reason': '源码与当前最终制品尚未证明来自同一 revision、模块和构建配置',
+        'action': '使用由 Step1 留存制品对应的源码 revision/profile 重跑；当前字节码未命中不能证明无影响'
+    },
+    'INLINED_CONSTANT_USAGE_UNDETECTABLE': {
+        'reason': '编译期常量可能已内联到调用方，class 中不会保留字段访问指令',
+        'action': '结合源码引用、旧新常量值和业务回归测试确认，不能以字节码字段未命中判定未使用'
+    },
+    'RUNTIME_DEPENDENCY_USES_REMOVED_API': {
+        'reason': '当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号',
+        'action': '优先检查命中的消费依赖及其业务入口，并执行覆盖该路径的启动/集成测试；存在 NoClassDefFoundError/NoSuchMethodError 风险'
     },
     'MISSING_API_SIGNATURE': {
         'reason': '方法级变更缺少参数签名，无法精确区分重载方法',

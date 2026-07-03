@@ -22,6 +22,22 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 nested.writestr(name, content)
         return buffer.getvalue()
 
+    def test_retain_artifact_for_analysis_preserves_exact_bytes_and_updates_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "build/app.jar"
+            artifact.parent.mkdir()
+            artifact.write_bytes(b"exact-artifact")
+            meta = {"artifact_path": str(artifact), "archives": [str(artifact)]}
+
+            s1_dep_diff.retain_artifact_for_analysis(meta, root / "report/artifacts", "current")
+
+            retained = Path(meta["artifact_path"])
+            self.assertEqual(retained.read_bytes(), b"exact-artifact")
+            self.assertEqual(meta["original_artifact_path"], str(artifact))
+            self.assertTrue(meta["artifact_retained"])
+            self.assertEqual(meta["archives"], [str(retained)])
+
     def test_collect_packaged_deps_ignores_spring_boot_jarmode_helper_jar(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_path = Path(tmp) / "app.jar"
@@ -95,6 +111,43 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(rows[0]["old_version"], "2.14.1")
         self.assertEqual(rows[0]["new_version"], "3.0.4")
         self.assertEqual(rows[0]["comparison_key"], "jackson-core")
+        self.assertEqual(rows[0]["pairing_status"], "unique_artifact_migration")
+
+    def test_build_step1_change_rows_matches_exact_coord_before_group_migration(self):
+        rows = s1_dep_diff._build_step1_change_rows(
+            [
+                {"coord": "old.group:shared", "artifact_id": "shared", "version": "1", "resolution_status": "resolved"},
+                {"coord": "stable.group:shared", "artifact_id": "shared", "version": "1", "resolution_status": "resolved"},
+            ],
+            [
+                {"coord": "new.group:shared", "artifact_id": "shared", "version": "2", "resolution_status": "resolved"},
+                {"coord": "stable.group:shared", "artifact_id": "shared", "version": "2", "resolution_status": "resolved"},
+            ],
+        )
+
+        exact = next(row for row in rows if row["base_coord"] == "stable.group:shared")
+        migrated = next(row for row in rows if row["base_coord"] == "old.group:shared")
+        self.assertEqual(exact["current_coord"], "stable.group:shared")
+        self.assertEqual(exact["pairing_status"], "exact_coord")
+        self.assertEqual(migrated["current_coord"], "new.group:shared")
+        self.assertEqual(migrated["pairing_status"], "unique_artifact_migration")
+
+    def test_build_step1_change_rows_refuses_ambiguous_cross_group_pairing(self):
+        rows = s1_dep_diff._build_step1_change_rows(
+            [
+                {"coord": "left.one:shared", "artifact_id": "shared", "version": "1", "resolution_status": "resolved"},
+                {"coord": "left.two:shared", "artifact_id": "shared", "version": "1", "resolution_status": "resolved"},
+            ],
+            [
+                {"coord": "right.one:shared", "artifact_id": "shared", "version": "2", "resolution_status": "resolved"},
+                {"coord": "right.two:shared", "artifact_id": "shared", "version": "2", "resolution_status": "resolved"},
+            ],
+        )
+
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row["resolution_status"] == "unresolved" for row in rows))
+        self.assertTrue(all(row["pairing_reason_code"] == "ambiguous_artifact_migration_candidates" for row in rows))
+        self.assertTrue(all(not (row["base_coord"] and row["current_coord"]) for row in rows))
 
     def test_collect_maven_deps_for_workspace_applies_manual_coord_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:

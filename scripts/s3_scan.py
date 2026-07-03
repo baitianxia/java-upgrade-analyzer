@@ -25,7 +25,7 @@ s3_scan.py — Step 3：静态扫描（替代全部 Shell 脚本，Windows/Linux
   python s3_scan.py --all --source-dir . --output-dir .upgrade-report/
 """
 
-import argparse, csv, os, re, sys, time, zipfile
+import argparse, csv, os, re, sys, time, zipfile, hashlib
 from pathlib import Path
 from datetime import datetime
 import json
@@ -73,6 +73,10 @@ def load_orchestrated_step3_input(report_dir):
 
 DEP_COMPAT_INCLUDE_TEST_SCOPE = False
 TARGET_JDK = None
+BASE_JDK = None
+BASE_SPRING_BOOT_MAJOR = None
+TARGET_SPRING_BOOT_MAJOR = None
+RULE_PACK_DIR = Path(__file__).resolve().parents[1] / 'references' / 'rules'
 
 # ── 跳过的目录（全平台一致）─────────────────────────────────────
 SKIP_DIRS = {'.git', 'target', 'build', '.gradle', 'out', 'bin',
@@ -674,6 +678,61 @@ JDK_REMOVED_RULES = [
     (r'\b(?:System\.getSecurityManager|System\.setSecurityManager)\b', 'SecurityManager', 'JDK17', 'DEPRECATED_FOR_REMOVAL'),
 ]
 
+
+def load_rule_pack(pack_id):
+    path = RULE_PACK_DIR / f'{pack_id}.json'
+    with open(path, 'r', encoding='utf-8') as handle:
+        payload = json.load(handle)
+    if payload.get('schema') != 'java-upgrade-analyzer.rule-pack.v1':
+        raise ValueError(f'不支持的规则包 schema：{payload.get("schema")}')
+    for field in ('id', 'version', 'source', 'last_verified', 'rules'):
+        if not payload.get(field):
+            raise ValueError(f'规则包 {pack_id} 缺少字段：{field}')
+    seen = set()
+    for rule in payload.get('rules') or []:
+        if not rule.get('id') or rule.get('id') in seen or not rule.get('kind') or not rule.get('pattern'):
+            raise ValueError(f'规则包 {pack_id} 存在无效或重复规则：{rule.get("id")}')
+        seen.add(rule['id'])
+        rule.setdefault('source', payload['source'])
+        rule.setdefault('last_verified', payload['last_verified'])
+    payload['_path'] = str(path)
+    payload['_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return payload
+
+
+def rule_applies_to_major_interval(rule, base_major=None, target_major=None):
+    affected = int(rule.get('affected_major') or 0)
+    if not affected or base_major is None or target_major is None:
+        return True
+    return int(base_major) < affected <= int(target_major)
+
+
+def rule_applies_to_jdk_interval(rule, base_jdk=None, target_jdk=None):
+    affected = int(rule.get('affected_version') or 0)
+    if not affected or not base_jdk or not target_jdk:
+        return True
+    return int(base_jdk) < affected <= int(target_jdk)
+
+
+def active_jdk_removed_rules(base_jdk=None, target_jdk=None):
+    try:
+        pack = load_rule_pack('jdk')
+        return [
+            (rule, pack)
+            for rule in pack.get('rules') or []
+            if rule.get('kind') == 'removed_api'
+            and rule_applies_to_jdk_interval(rule, base_jdk, target_jdk)
+        ]
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f'  ⚠️ JDK 规则包不可用，回退内置规则：{exc}', file=sys.stderr)
+        return [
+            ({
+                'id': f'legacy-{idx}', 'pattern': pattern, 'name': api_name,
+                'affected_version': int(re.sub(r'\D', '', affected) or 0), 'status': status,
+            }, {'id': 'legacy-inline', 'version': 'compat', '_path': __file__})
+            for idx, (pattern, api_name, affected, status) in enumerate(JDK_REMOVED_RULES, 1)
+        ]
+
 # JDK 内部 API 扫描规则
 JDK_INTERNAL_RULES = [
     (r'sun\.misc\.',              'sun.misc'),
@@ -721,7 +780,11 @@ JDK_RUNTIME_FLAG_RULES = [
 def scan_jdk_removed(source_dir, output_path, _dep_changes_path=None):
     """扫描 JDK 9~21 已移除 API"""
     rows = []
-    for pattern, api_name, removed_ver, status in JDK_REMOVED_RULES:
+    for rule, pack in active_jdk_removed_rules(BASE_JDK, TARGET_JDK):
+        pattern = rule['pattern']
+        api_name = rule['name']
+        removed_ver = f"JDK{rule['affected_version']}"
+        status = rule['status']
         hits = scan_pattern(source_dir, pattern, extensions=('.java',))
         for fpath, lineno, content in hits:
             rows.append({
@@ -733,11 +796,13 @@ def scan_jdk_removed(source_dir, output_path, _dep_changes_path=None):
                 '状态': status,
                 '置信度': 'CONFIRMED' if status == 'REMOVED' else 'SUSPECT',
                 '证据': f'pattern={pattern};status={status}',
+                '规则ID': rule.get('id', ''),
+                '规则包': f"{pack.get('id')}@{pack.get('version')}",
             })
 
     rows.extend(scan_thread_lifecycle_calls(source_dir))
     count = write_csv_results(rows,
-                               ['文件', '行号', '内容', 'API', '移除版本', '状态', '置信度', '证据'],
+                               ['文件', '行号', '内容', 'API', '移除版本', '状态', '置信度', '证据', '规则ID', '规则包'],
                                output_path)
     print(f"  jdk_removed: {count} 处命中 → {output_path}", file=sys.stderr)
     return count
@@ -925,8 +990,31 @@ def scan_javax(source_dir, output_path, _dep_changes_path=None):
         except Exception:
             pass
 
+    try:
+        jakarta_pack = load_rule_pack('jakarta')
+        jakarta_rules = [
+            rule for rule in jakarta_pack.get('rules') or []
+            if rule.get('kind') == 'namespace_migration'
+            and rule_applies_to_major_interval(rule, BASE_SPRING_BOOT_MAJOR, TARGET_SPRING_BOOT_MAJOR)
+        ]
+    except (OSError, ValueError, json.JSONDecodeError):
+        jakarta_pack, jakarta_rules = {'id': 'jakarta-inline', 'version': 'compat'}, []
+    for row in rows:
+        if row.get('需迁移') != 'Y':
+            row['规则ID'] = 'jdk-javax-no-migration'
+            row['规则包'] = 'jdk-platform'
+            row['建议命名空间'] = ''
+            continue
+        matched = next(
+            (rule for rule in jakarta_rules if re.search(rule.get('pattern') or r'$.', row.get('内容') or '')),
+            None,
+        )
+        row['规则ID'] = (matched or {}).get('id', 'jakarta-generic-review')
+        row['规则包'] = f"{jakarta_pack.get('id')}@{jakarta_pack.get('version')}"
+        row['建议命名空间'] = (matched or {}).get('replacement', 'jakarta.*（人工确认）')
+
     count = write_csv_results(rows,
-                               ['文件', '行号', '内容', '引用类型', '需迁移'],
+                               ['文件', '行号', '内容', '引用类型', '需迁移', '规则ID', '规则包', '建议命名空间'],
                                output_path)
     migrate_count = sum(1 for r in rows if r['需迁移'] == 'Y')
     print(f"  javax: {count} 处命中（需迁移: {migrate_count}）→ {output_path}",
@@ -1149,8 +1237,18 @@ def scan_sb_config(source_dir, output_path, _dep_changes_path=None):
 
 def scan_sb_autoconfig(source_dir, output_path, _dep_changes_path=None):
     """扫描自动装配配置文件迁移情况"""
+    try:
+        spring_pack = load_rule_pack('spring-boot')
+        spring_pack_label = f"{spring_pack.get('id')}@{spring_pack.get('version')}"
+        active_rules = [rule for rule in spring_pack.get('rules') or []
+                        if rule_applies_to_major_interval(rule, BASE_SPRING_BOOT_MAJOR, TARGET_SPRING_BOOT_MAJOR)]
+    except (OSError, ValueError, json.JSONDecodeError):
+        spring_pack_label = 'spring-boot-inline@compat'
+        active_rules = []
     lines = [
         f"# 自动装配配置扫描 | {datetime.now().isoformat()}",
+        f"# 规则包: {spring_pack_label}",
+        f"# 激活规则: {','.join(rule.get('id', '') for rule in active_rules) or 'none'}",
         "# 用途：提示 Spring Boot 2→3 自动装配元数据的迁移线索（spring.factories / AutoConfiguration.imports）。",
         "# 抽查：若发现 spring.factories 仍存在，需确认是否为自研 starter 或自维护依赖；检查是否已迁移到 imports。",
         "",
@@ -1504,6 +1602,67 @@ SCAN_FUNCS = {
 }
 
 
+def write_step3_coverage(output_dir, source_roots, planned_scans, executed_scans):
+    extension_counts = {}
+    read_failures = []
+    scanned_files = 0
+    relevant_extensions = {
+        '.java', '.kt', '.kts', '.xml', '.properties', '.yml', '.yaml',
+        '.factories', '.imports', '.sh', '.bat', '.cmd', '.ps1', '.conf', '.env',
+    }
+    for path in walk_files(source_roots, relevant_extensions):
+        scanned_files += 1
+        extension = Path(path).suffix.lower() or '<none>'
+        extension_counts[extension] = extension_counts.get(extension, 0) + 1
+        try:
+            with open_text(path) as handle:
+                handle.read(1)
+        except Exception as exc:
+            read_failures.append({'file': path, 'reason': type(exc).__name__})
+    planned = list(dict.fromkeys(planned_scans or []))
+    executed = list(dict.fromkeys(executed_scans or []))
+    missing = [item for item in planned if item not in executed]
+    status = 'complete' if not missing and not read_failures else ('partial' if executed else 'insufficient')
+    payload = {
+        'schema': 'java-upgrade-analyzer.step3-coverage.v1',
+        'status': status,
+        'reason_codes': (
+            (['planned_scan_not_executed'] if missing else [])
+            + (['source_file_read_failures'] if read_failures else [])
+        ),
+        'source_roots': list(source_roots or []),
+        'planned_scans': planned,
+        'executed_scans': executed,
+        'not_applicable_scans': [item for item in SCAN_FUNCS if item not in planned],
+        'metrics': {
+            'source_roots': len(source_roots or []),
+            'files_scanned': scanned_files,
+            'extension_counts': extension_counts,
+            'read_failures': len(read_failures),
+        },
+        'failures': read_failures,
+    }
+    packs = []
+    for pack_id in ('jdk', 'jakarta', 'spring-boot'):
+        try:
+            pack = load_rule_pack(pack_id)
+            packs.append({
+                'id': pack['id'], 'version': pack['version'], 'sha256': pack['_sha256'],
+                'source': pack['source'], 'last_verified': pack['last_verified'],
+                'rules': len(pack.get('rules') or []),
+            })
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            packs.append({'id': pack_id, 'status': 'unavailable', 'reason': str(exc)})
+            payload['status'] = 'partial' if executed else 'insufficient'
+            payload['reason_codes'].append('rule_pack_unavailable')
+    payload['rule_packs'] = packs
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(output_dir) / 's3_coverage.json').write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+    )
+    return payload
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Step 3：静态扫描（Windows/Linux/macOS 兼容）'
@@ -1568,6 +1727,14 @@ def main():
     DEP_COMPAT_INCLUDE_TEST_SCOPE = args.include_test_scope
     global TARGET_JDK
     TARGET_JDK = int(args.target_jdk) if str(args.target_jdk).strip().isdigit() else None
+    global BASE_JDK
+    base_jdk_value = str((orchestrated_context or {}).get('jdk_base') or '')
+    BASE_JDK = int(base_jdk_value) if base_jdk_value.isdigit() else None
+    global BASE_SPRING_BOOT_MAJOR, TARGET_SPRING_BOOT_MAJOR
+    base_spring = str((orchestrated_context or {}).get('springboot_base') or '')
+    current_spring = str((orchestrated_context or {}).get('springboot_current') or '')
+    BASE_SPRING_BOOT_MAJOR = int(base_spring.split('.', 1)[0]) if base_spring[:1].isdigit() else None
+    TARGET_SPRING_BOOT_MAJOR = int(current_spring.split('.', 1)[0]) if current_spring[:1].isdigit() else None
     dep_list_path = args.dep_current or args.dep_changes
 
     if args.all:
@@ -1593,6 +1760,7 @@ def main():
             total=len(source_roots),
         )
         total = 0
+        executed_scans = []
         for idx, scan_type in enumerate(to_run, 1):
             func, default_fname = SCAN_FUNCS[scan_type]
             output = os.path.join(args.output_dir, default_fname)
@@ -1606,6 +1774,7 @@ def main():
                 item=default_fname,
             )
             matches = func(source_dir, output, dep_list_path) or 0
+            executed_scans.append(scan_type)
             total += matches
             emit_progress(
                 "step3",
@@ -1632,6 +1801,7 @@ def main():
                 item=STEP3_RISK_CANDIDATES_FILE,
             )
             total += candidate_count
+        write_step3_coverage(args.output_dir, source_roots, to_run, executed_scans)
         print(f"\nStep 3 完成：共 {total} 处命中", file=sys.stderr)
         emit_progress(
             "step3",
@@ -1646,6 +1816,7 @@ def main():
         emit_progress("step3", "scan", f"开始执行 {args.type}", item=default_fname)
         single_timer = time.perf_counter()
         matches = func(source_dir, output, dep_list_path) or 0
+        write_step3_coverage(args.output_dir, source_roots, [args.type], [args.type])
         emit_progress(
             "step3",
             "done",

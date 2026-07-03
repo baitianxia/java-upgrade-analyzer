@@ -250,6 +250,53 @@ def _get_runtime_dependency_catalog(graph):
     return getattr(graph, 'runtime_dependency_catalog', {}) or {}
 
 
+def _apply_source_artifact_miss(result, graph, reachable_note):
+    alignment = getattr(graph, 'source_artifact_alignment', {}) or {}
+    alignment_status = str(alignment.get('status') or '').strip()
+    result.analysis_status = 'uncertain'
+    result.is_reachable = None
+    if alignment_status in {'', 'aligned', 'conflict'}:
+        result.reason_code = 'SOURCE_BYTECODE_EDGE_CONFLICT'
+        result.reachable_note = reachable_note
+    else:
+        result.reason_code = 'SOURCE_ARTIFACT_ALIGNMENT_UNVERIFIED'
+        result.reachable_note = (
+            '源码图存在目标调用，但源码与最终制品未证明来自同一 revision/profile；'
+            '字节码未命中不能用于反证源码候选'
+        )
+    return result
+
+
+def _is_inlined_constant_change(api_row):
+    return (
+        get_symbol_kind(api_row) == 'field'
+        and (
+            str(api_row.get('change_type') or '').strip() == 'CONSTANT_VALUE_CHANGED'
+            or 'CONSTANT' in str(api_row.get('compatibility_flags') or '').upper()
+            or (
+                str(api_row.get('old_value') or '')
+                and str(api_row.get('new_value') or '')
+                and str(api_row.get('old_value')) != str(api_row.get('new_value'))
+            )
+        )
+    )
+
+
+def _build_inlined_constant_result(result):
+    result.analysis_status = 'uncertain'
+    result.is_reachable = None
+    result.reason_code = 'INLINED_CONSTANT_USAGE_UNDETECTABLE'
+    result.reachable_note = (
+        '编译期常量值已变化，但调用方 class 可能只保留内联旧值而没有字段访问指令；'
+        '字节码未发现 getstatic/getfield 不能解释为未使用'
+    )
+    result.verification_commands = [
+        '搜索业务及依赖源码中的常量字段引用，并执行覆盖该常量语义的回归测试',
+        '必要时比较调用方 class 常量池与 old/new 常量值，但不要仅凭字面量命中确认调用关系',
+    ]
+    return result
+
+
 def _normalize_descriptor_type(descriptor, preserve_array=False):
     if not descriptor:
         return ''
@@ -361,7 +408,7 @@ def _class_bytes_might_reference_target(data, owner_internal_name, member_name='
 
 def _run_javap_bytecode_dump(jar_path, class_binary_name):
     stdout, _stderr, rc = run_cmd(
-        ['javap', '-classpath', jar_path, '-c', '-s', '-p', class_binary_name],
+        ['javap', '-classpath', jar_path, '-verbose', '-c', '-s', '-p', class_binary_name],
         timeout=30,
     )
     return stdout if rc == 0 else ''
@@ -423,7 +470,7 @@ def _parse_javap_bytecode_references(text):
 
 def _load_runtime_dependency_class_references(catalog, coord, jar_path, class_binary_name):
     cache = catalog.setdefault('_bytecode_reference_cache', {})
-    cache_key = (coord, class_binary_name)
+    cache_key = (coord, jar_path, class_binary_name)
     if cache_key in cache:
         return cache[cache_key]
     text = _run_javap_bytecode_dump(jar_path, class_binary_name)
@@ -479,7 +526,11 @@ def _match_runtime_dependency_reference(api_row, references):
 def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     catalog = _get_runtime_dependency_catalog(graph)
     by_coord = catalog.get('by_coord') or {}
-    if not by_coord:
+    catalog_entries = list(catalog.get('entries') or [
+        ({'coord': coord, **item} if not item.get('coord') else item)
+        for coord, item in by_coord.items()
+    ])
+    if not catalog_entries:
         return {'status': 'unavailable', 'reason': 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE'}
 
     owner, member_name, _symbol_kind = _extract_target_owner_and_member(api_row)
@@ -488,11 +539,20 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
         return {'status': 'unavailable', 'reason': 'BYTECODE_TARGET_UNRESOLVED'}
 
     hits = []
-    for coord, item in by_coord.items():
+    scan_failures = []
+    scanned_classes = 0
+    visited_classes = 0
+    for item in catalog_entries:
+        coord = str(item.get('coord') or '').strip()
         if coord == str(api_row.get('coord') or '').strip():
             continue
         jar_path = str(item.get('jar_path') or '').strip()
         if not jar_path or not os.path.exists(jar_path):
+            scan_failures.append({
+                'reason': 'RUNTIME_DEPENDENCY_JAR_MISSING',
+                'coord': coord,
+                'jar_path': jar_path,
+            })
             continue
         try:
             with zipfile.ZipFile(jar_path) as zf:
@@ -501,19 +561,19 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                         continue
                     if entry.endswith('module-info.class') or entry.endswith('package-info.class'):
                         continue
+                    visited_classes += 1
                     data = zf.read(entry)
                     if not _class_bytes_might_reference_target(data, owner_internal_name, member_name):
                         continue
                     class_binary_name = entry[:-6].replace('/', '.')
                     references = _load_runtime_dependency_class_references(catalog, coord, jar_path, class_binary_name)
                     if references is None:
-                        return {
-                            'status': 'unavailable',
-                            'reason': 'BYTECODE_JAVAP_FAILED',
-                            'coord': coord,
-                            'jar_path': jar_path,
-                            'class_binary_name': class_binary_name,
-                        }
+                        scan_failures.append({
+                            'reason': 'BYTECODE_JAVAP_FAILED', 'coord': coord,
+                            'jar_path': jar_path, 'class_binary_name': class_binary_name,
+                        })
+                        continue
+                    scanned_classes += 1
                     matched = _match_runtime_dependency_reference(api_row, references)
                     if not matched:
                         continue
@@ -525,47 +585,67 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                         'target_display': matched.get('target_display') or owner,
                     })
         except Exception as exc:
-            return {
-                'status': 'unavailable',
-                'reason': 'BYTECODE_SCAN_FAILED',
-                'coord': coord,
-                'jar_path': jar_path,
-                'error': str(exc),
-            }
+            scan_failures.append({
+                'reason': 'BYTECODE_SCAN_FAILED', 'coord': coord,
+                'jar_path': jar_path, 'error': str(exc),
+            })
+            continue
     if hits:
-        return {'status': 'hit', 'hits': hits}
-    return {'status': 'miss'}
+        return {
+            'status': 'hit', 'hits': hits, 'scan_failures': scan_failures,
+            'scanned_classes': scanned_classes, 'visited_classes': visited_classes,
+        }
+    catalog_status = str(catalog.get('status') or '').strip()
+    if catalog_status and catalog_status != 'complete':
+        return {
+            'status': 'unavailable',
+            'reason': 'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
+            'catalog_status': catalog.get('status'),
+            'catalog_reason_codes': list(catalog.get('reason_codes') or []),
+            'scan_failures': scan_failures,
+            'scanned_classes': scanned_classes,
+            'visited_classes': visited_classes,
+        }
+    if scan_failures:
+        first = scan_failures[0]
+        return {'status': 'unavailable', **first, 'scan_failures': scan_failures}
+    return {
+        'status': 'miss', 'scan_failures': scan_failures,
+        'scanned_classes': scanned_classes, 'visited_classes': visited_classes,
+    }
 
 
 def _build_packaged_dependency_hit_result(result, hits):
-    first_hit = hits[0]
+    business_hits = [item for item in hits if item.get('coord') == '__business__']
     dependency_chain = []
     for item in hits:
         coord = str(item.get('coord') or '').strip()
         if coord and coord not in dependency_chain:
             dependency_chain.append(coord)
-    # Bytecode hits prove that a runtime dependency consumes the changed symbol,
-    # but they still stop one hop short of a confirmed path back into app code.
-    result.analysis_status = 'uncertain'
-    result.is_reachable = None
-    result.reason_code = 'PACKAGED_DEPENDENCY_BYTECODE_USAGE'
+    result.analysis_status = 'reachable' if business_hits else 'uncertain'
+    result.is_reachable = True if business_hits else None
+    result.reason_code = 'BUSINESS_ARTIFACT_BYTECODE_USAGE' if business_hits else 'PACKAGED_DEPENDENCY_BYTECODE_USAGE'
     result.reachable_note = (
-        '已在无源码依赖字节码中找到对目标符号的稳定引用，'
-        '但当前尚未证明这些依赖是否回到系统源码'
+        '已在当前最终制品的业务 class 中确认对目标符号的字节码引用'
+        if business_hits else
+        '已在当前最终制品的运行时依赖字节码中确认对目标符号的稳定引用，'
+        '但当前尚未证明这些依赖是否回到系统业务入口'
     )
     result.dependency_chain_coords = dependency_chain
-    consumer_display = f"{first_hit.get('coord')}:{first_hit.get('class_fqcn')}"
-    result.call_paths = [f"{consumer_display} -> {first_hit.get('target_display')}"]
-    result.evidence_paths = [[
-        {
+    ordered_hits = business_hits + [item for item in hits if item not in business_hits]
+    result.call_paths = []
+    result.evidence_paths = []
+    for hit in ordered_hits:
+        consumer_display = f"{hit.get('coord')}:{hit.get('class_fqcn')}"
+        result.call_paths.append(f"{consumer_display} -> {hit.get('target_display')}")
+        result.evidence_paths.append([{
             'caller_symbol': consumer_display,
-            'callee_key': first_hit.get('target_display'),
-            'evidence_type': first_hit.get('evidence_type'),
+            'callee_key': hit.get('target_display'),
+            'evidence_type': hit.get('evidence_type'),
             'confidence': 'high',
-            'file': first_hit.get('jar_path', ''),
+            'file': hit.get('jar_path', ''),
             'line': 0,
-        }
-    ]]
+        }])
     result.verification_commands = [
         '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
         '优先审查命中的无源码依赖及其对外暴露入口'
@@ -578,7 +658,7 @@ def _build_packaged_dependency_not_found_result(result):
     result.is_reachable = False
     result.reason_code = 'NO_STATIC_PATH'
     result.reachable_note = (
-        '已对无源码依赖 jar 字节码执行静态扫描，未发现目标符号的稳定引用。'
+        '已对当前最终制品的业务 class 和运行时依赖 jar 执行字节码扫描，未发现目标符号引用。'
         '这不代表运行时一定安全。'
     )
     result.verification_commands = [
@@ -592,48 +672,12 @@ def _build_packaged_dependency_incomplete_result(result, scan_result):
     result.analysis_status = 'not_analyzed'
     result.is_reachable = None
     result.reason_code = str((scan_result or {}).get('reason') or 'ANALYSIS_INCOMPLETE').strip() or 'ANALYSIS_INCOMPLETE'
-    result.reachable_note = '无源码依赖字节码分析未完成，当前无法把未命中解释为安全'
+    result.reachable_note = '最终制品字节码分析未完整覆盖，当前无法把未命中解释为安全'
     result.verification_commands = [
-        '检查当前环境是否可执行 javap，并确认相关依赖 jar 可从本地仓库定位',
+        '检查当前环境是否可执行 javap，并确认 Step1 留存制品及其中的嵌套依赖 JAR 完整可读',
         '必要时补充 dependency_source_dirs 或重新准备依赖产物后重跑 Step 5',
     ]
     return result
-
-
-def _try_build_packaged_dependency_result(api_row, result, graph):
-    if graph is None:
-        return None
-    # This fallback is only for dependencies without source checkout coverage.
-    # It reuses runtime jars as a formal analysis input instead of downgrading
-    # the API straight to not_analyzed.
-    scan_result = _scan_packaged_runtime_dependencies_for_api(api_row, graph)
-    if _step5_debug_enabled() and str(api_row.get('api_name') or '').startswith('org.apache.commons.lang'):
-        # #region debug-point B:packaged-scan
-        _step5_debug(
-            'debug_event:B',
-            'packaged dependency scan finished',
-            location='confidence_weighted_tracer.py:_try_build_packaged_dependency_result',
-            run_id='pre-fix',
-            coord=api_row.get('coord', ''),
-            api_name=api_row.get('api_name', ''),
-            status=str((scan_result or {}).get('status') or ''),
-            reason=str((scan_result or {}).get('reason') or ''),
-            hit_count=len((scan_result or {}).get('hits') or []),
-            sample_hit_coords=sorted({
-                str(hit.get('coord') or '')
-                for hit in ((scan_result or {}).get('hits') or [])
-                if str(hit.get('coord') or '').strip()
-            })[:8],
-        )
-        # #endregion
-    status = str((scan_result or {}).get('status') or '').strip()
-    if status == 'hit':
-        return _build_packaged_dependency_hit_result(result, scan_result.get('hits') or [])
-    if status == 'miss':
-        return _build_packaged_dependency_not_found_result(result)
-    if status == 'unavailable':
-        return _build_packaged_dependency_incomplete_result(result, scan_result)
-    return None
 
 
 def critical_parser_fallback_reasons(graph_stats):
@@ -924,7 +968,7 @@ def trace_api_with_confidence_weighting(
         max_total_cost: 最大总代价（默认5）
         needs_bridge: 该 API 是否需要依赖源码映射才能完整追踪
         has_dependency_source_mapping: 当前 API 所属依赖是否具备可用源码映射
-        has_packaged_bytecode_fallback: 当前 API 是否可回退到无源码依赖字节码分析
+        has_packaged_bytecode_fallback: 当前 API 是否具备最终制品字节码分析契约（名称保留用于兼容）
         allow_degraded: 如果为 True，缺依赖源码映射时标记为 not_analyzed 而非静态未找到
 
     Returns:
@@ -980,16 +1024,67 @@ def trace_api_with_confidence_weighting(
         # 如果未找到，说明"目前代码未使用"或"需要补充依赖源码映射"
         pass  # 继续追踪，保留后续的路径分析能力
 
+    dependency_removed = str(api_row.get('new_version') or '').strip() == '-'
+    artifact_scan_incomplete = None
+    artifact_dependency_hits = []
+    artifact_scan_miss = False
+    if has_packaged_bytecode_fallback:
+        scan_result = _scan_packaged_runtime_dependencies_for_api(api_row, graph)
+        scan_status = str((scan_result or {}).get('status') or '').strip()
+        if scan_status == 'hit':
+            scan_hits = scan_result.get('hits') or []
+            if any(item.get('coord') == '__business__' for item in scan_hits):
+                packaged_dependency_result = _build_packaged_dependency_hit_result(result, scan_hits)
+                _debug_trace_result('trace_api_result', packaged_dependency_result)
+                return packaged_dependency_result
+            artifact_dependency_hits = scan_hits
+        if scan_status == 'miss':
+            artifact_scan_miss = True
+        if scan_status == 'unavailable':
+            artifact_scan_incomplete = scan_result
+
     direct_usage_result = _try_build_direct_usage_result(api_row, result, graph)
     if direct_usage_result is not None:
+        if artifact_scan_miss:
+            _apply_source_artifact_miss(direct_usage_result, graph, (
+                '源码图存在目标调用，但与当前最终制品的完整字节码扫描结果冲突；'
+                '可能是源码与制品 revision/profile 不一致，当前不能确认影响'
+            ))
+        if artifact_dependency_hits:
+            for hit in artifact_dependency_hits:
+                consumer_display = f"{hit.get('coord')}:{hit.get('class_fqcn')}"
+                direct_usage_result.call_paths.append(
+                    f"{consumer_display} -> {hit.get('target_display')}"
+                )
+                direct_usage_result.evidence_paths.append([{
+                    'caller_symbol': consumer_display,
+                    'callee_key': hit.get('target_display'),
+                    'evidence_type': hit.get('evidence_type'),
+                    'confidence': 'high',
+                    'file': hit.get('jar_path', ''),
+                    'line': 0,
+                }])
+                coord = str(hit.get('coord') or '').strip()
+                if coord and coord not in direct_usage_result.dependency_chain_coords:
+                    direct_usage_result.dependency_chain_coords.append(coord)
         _debug_trace_result('trace_api_result', direct_usage_result)
         return direct_usage_result
 
-    if needs_bridge and (not has_dependency_source_mapping) and has_packaged_bytecode_fallback:
-        packaged_dependency_result = _try_build_packaged_dependency_result(api_row, result, graph)
-        if packaged_dependency_result is not None:
-            _debug_trace_result('trace_api_result', packaged_dependency_result)
-            return packaged_dependency_result
+    if artifact_dependency_hits:
+        packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits)
+        if dependency_removed:
+            packaged_dependency_result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
+            packaged_dependency_result.reachable_note = (
+                '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
+                '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
+            )
+        _debug_trace_result('trace_api_result', packaged_dependency_result)
+        return packaged_dependency_result
+
+    if artifact_scan_incomplete and needs_bridge and not has_dependency_source_mapping:
+        built = _build_packaged_dependency_incomplete_result(result, artifact_scan_incomplete)
+        _debug_trace_result('trace_api_result', built)
+        return built
 
     # 类级fallback：不追踪
     if result.analysis_scope == 'class_usage':
@@ -1191,7 +1286,20 @@ def trace_api_with_confidence_weighting(
 
             # 检查关键节点
             critical_node = None
-            if is_system_code_touched(method_def, type_metadata):
+            framework_entries = (
+                getattr(graph, 'framework_entry_symbols', {}) or {}
+            ).get(method_def.symbol_id) or []
+            if framework_entries:
+                first_framework_entry = framework_entries[0]
+                critical_node = {
+                    'type': 'system_code_touched',
+                    'method': method_def.qualified_key,
+                    'file': method_def.file,
+                    'line': method_def.line,
+                    'framework_edge_kind': first_framework_entry.get('edge_kind'),
+                    'framework_adapter': first_framework_entry.get('adapter'),
+                }
+            elif is_system_code_touched(method_def, type_metadata):
                 critical_node = {
                     'type': 'system_code_touched',
                     'method': method_def.qualified_key,
@@ -1423,6 +1531,14 @@ def trace_api_with_confidence_weighting(
     # 选择最优结果
     if reachable_candidates:
         best = select_best_candidate(reachable_candidates)
+        if artifact_scan_miss:
+            built = build_reachable_result(result, best, graph)
+            _apply_source_artifact_miss(built, graph, (
+                '源码图存在可达调用链，但当前最终制品的完整字节码扫描未发现对应引用；'
+                '可能是源码与制品 revision/profile 不一致，当前不能确认影响'
+            ))
+            _debug_trace_result('trace_api_result', built)
+            return built
         # 行为变更：即使找到调用链也需运行时验证
         if result.change_type == 'BEHAVIOR_CHANGED':
             safe_best, unsafe_best = select_behavior_changed_candidate(api_row, reachable_candidates)
@@ -1495,6 +1611,15 @@ def trace_api_with_confidence_weighting(
     # 1. 反射调用/动态代理/配置文件引用
     # 2. 测试代码或非扫描目录中的引用
     # 3. 运行时动态加载的代码
+    if artifact_scan_miss:
+        if _is_inlined_constant_change(api_row):
+            built = _build_inlined_constant_result(result)
+            _debug_trace_result('trace_api_result', built)
+            return built
+        built = _build_packaged_dependency_not_found_result(result)
+        _debug_trace_result('trace_api_result', built)
+        return built
+
     if needs_bridge and (not has_dependency_source_mapping) and allow_degraded:
         built = build_missing_dependency_source_mapping_result(result)
         _debug_trace_result('trace_api_result', built)
@@ -1517,6 +1642,11 @@ def trace_api_with_confidence_weighting(
     if graph_completeness['incomplete']:
         built = build_analysis_incomplete_result(result, graph_completeness)
         _debug_trace_result('trace_api_result', built, graph_completeness=graph_completeness)
+        return built
+
+    if artifact_scan_incomplete:
+        built = _build_packaged_dependency_incomplete_result(result, artifact_scan_incomplete)
+        _debug_trace_result('trace_api_result', built)
         return built
 
     if result.symbol_kind in CALL_GRAPH_LIMITED_SYMBOL_KINDS:

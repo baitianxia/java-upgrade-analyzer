@@ -93,7 +93,9 @@
       },
       "outputs": [
         "s1_dep_changes.csv",
-        "s1_deps_current_resolved.csv"
+        "s1_deps_current_resolved.csv",
+        "build_provenance.json",
+        "artifacts/"
       ],
       "notes": [
         "Step1 默认通过真实构建获取依赖结果。",
@@ -109,7 +111,7 @@
       "interaction": {
         "type": "decision",
         "status": "awaiting_user_input",
-        "question": "请确认升级口径、分支信息、业务源码目录和升级依赖识别结果是否正确；若已知相关依赖源码目录，可直接补充 dependency_source_dirs，让后续 Step4/Step5 自动识别模块与依赖源码映射；继续前应确保 source_dirs 与依赖源码映射已确认。",
+        "question": "请确认升级口径、分支信息、target_module 及自动生成的 project_scope 是否正确；标准 Maven 工程无需填写 source_dirs。若已知相关依赖源码目录，可补充 dependency_source_dirs。",
         "required_fields": [
           "action"
         ],
@@ -145,7 +147,7 @@
             },
             "source_dirs": {
               "type": "array",
-              "description": "可选但强烈建议确认。业务源码目录，Step3/Step5 会直接消费；若未提供，系统仅尝试自动探测，继续前仍应人工确认。"
+              "description": "兼容/异常覆盖字段。仅当 Maven project_scope 无法推导非标准源码布局时使用。"
             },
             "dependency_source_dirs": {
               "type": "array",
@@ -179,11 +181,10 @@
         "action_requirements": {
           "continue": {
             "recommended_fields": [
-              "source_dirs",
               "dependency_source_dirs",
               "source_repo_hints"
             ],
-            "description": "继续前建议确认业务源码目录与依赖源码线索，避免后续 Step4/Step5 再次中断。"
+            "description": "继续前建议确认 target_module/project_scope，并按需补充依赖源码线索。"
           }
         }
       },
@@ -444,7 +445,9 @@
         "s4_jar_compare/all_changed_apis.csv"
       ],
       "outputs": [
-        "s5_call_chain/summary.json"
+        "s5_call_chain/summary.json",
+        "artifact_bytecode_catalog.json",
+        "framework_adapters.json"
       ],
       "notes": [
         "Step5 默认会遍历 all_changed_apis.csv，并对每条变更做反向调用链追踪；若 Step4 checkpoint 指定了坐标/名称，则只分析被选中的依赖。"

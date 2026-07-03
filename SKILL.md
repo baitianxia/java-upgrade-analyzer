@@ -154,29 +154,28 @@ python3 -m pip install tree-sitter tree-sitter-java
 
 首次进入任务时，先确认：
 
-1. 项目根目录路径
+1. 当前工作目录是否就是待分析系统的 Maven 工程根目录；通常直接采用，不重复询问路径
 2. `Step1` 选择哪一种输入方式：`artifact_inputs` 或 `checkout_build`
 3. 若是 `artifact_inputs`：`base_artifact_path/current_artifact_path`
 4. 若是 `checkout_build`：`base_branch/current_branch`
-5. 若首轮已明确模块范围：`primary_module/modules`
-6. 业务源码目录列表（默认自动探测，多模块需全部列出）
+5. 本次唯一的 `target_module`；用户未明确时，先展示 reactor 候选并要求确认
 
 如果用户首轮已经明确“只分析某个模块 / 只看某几个模块”，必须把该范围视为 `Step1` 前置输入，而不是等 `Step1` 跑完再纠偏。硬规则：
 
-1. 在第一次执行 `step1` 前，就要通过 `--seed-json` 初始化模块范围，或直接通过 `--primary-module/--modules` 传给 `run_step.py`
+1. 在第一次执行 `step1` 前，就要通过 `--seed-json` 初始化 `target_module`，或直接通过 `--target-module` 传给 `run_step.py`
 2. 禁止先按 root 范围执行 `step1`，再在 `Phase 2 [CHECKPOINT]` 里让用户二次确认模块
-3. 若当前任务要求模块级分析，必须在第一次执行 `step1` 时直接传入 `primary_module/modules`，不得先按 root 范围跑一版再纠偏
+3. 若用户尚未明确模块，先展示 Maven reactor 候选并等待用户确认，不得静默选择 root、第一个模块或最大产物
 
 优先一次性向用户收集执行所需信息，避免多轮追问。最小收集集建议包含：
 
-1. 项目根目录路径
+1. 当前工作目录不是系统工程根目录时，才补充正确根目录
 2. `Step1` 输入方式：`artifact_inputs` 或 `checkout_build`
 3. 若是 `artifact_inputs`：`base_artifact_path/current_artifact_path`
 4. 若是 `checkout_build`：`base_branch/current_branch`
 5. 若 artifact 中某侧嵌套依赖缺少 `pom.properties`：优先补该侧 `branch`，特殊场景才补 `base_source_project_dir/current_source_project_dir`
 6. 若某一侧 Maven 需要特定 JDK：补该侧 `base_jdk_home/current_jdk_home`；未提供时各侧默认回落主机 `JAVA_HOME`
-7. 源码目录列表（默认自动探测 `src/main/java` 与 `src/main/kotlin`；多模块需全部列出）
-8. 依赖源码目录或仓库根目录（可选但强烈推荐；推荐字段 `dependency_source_dirs`）
+7. 本次唯一的 `target_module`；确认后由 Maven reactor 自动推导系统源码范围
+8. 依赖源码目录或仓库根目录（可选但强烈推荐；仅表示依赖源码，字段为 `dependency_source_dirs`）
 9. `max_depth`（默认 5，表示最大累计追踪代价；全高置信度边时最多约 5 跳）
 10. 是否包含 test 作用域（默认 false）
 11. 是否允许降级执行（默认 false；缺少关键源码映射时将阻塞以避免漏分析）
@@ -189,7 +188,7 @@ python3 -m pip install tree-sitter tree-sitter-java
 {
   "base_branch": "main",
   "current_branch": "feature/upgrade-test",
-  "source_dirs": ["src/main/java"],
+  "target_module": "app-module",
   "dependency_source_dirs": ["/abs/path/to/dependency-repo"],
   "max_depth": 5,
   "tool": "maven"
@@ -303,12 +302,12 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 - 对应步骤：`step1`
 - 目标：获取真实依赖结果，产出 `.upgrade-report/s1_dep_changes.csv`
-- 输入：必须二选一
+- 输入：先确认唯一 `target_module`，再从以下方式二选一
   - `artifact_inputs`：`base_artifact_path/current_artifact_path`
   - `checkout_build`：`base_branch/current_branch`
-  必要时再带 `primary_module/modules`
+  `primary_module/modules` 仅作为旧状态兼容名；新交互统一使用 `target_module`
 - 规则：若两种输入方式都不完整，不进入实际 Step1，而是先进入前置输入契约交互（`reason_code=missing_step1_entry_inputs`）
-- 规则：若用户首轮已明确模块范围，第一次执行 `step1` 时必须直接传 `primary_module/modules`；不得先跑 root 范围结果再靠待交互确认点纠偏
+- 规则：若用户首轮已明确模块范围，第一次执行 `step1` 时必须直接传 `target_module`；不得先跑 root 范围结果再靠待交互确认点纠偏
 - 规则：对 direct artifact 模式，若后续要进入 Step2+，必须显式给出 `base_branch/current_branch`；不得依赖系统自动猜测
 - 规则：若 Step1 进入 `unresolved_dependency_coordinates_after_enrichment`，Agent 必须先向用户暴露 `unresolved_items`，允许用户补 `manual_coord_overrides`，或明确选择 `confirm_unresolved`；这条补丁路径同时适用于直接产物模式和 checkout_build 模式
 - 门控：执行 `step1_scope`
@@ -378,6 +377,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 输入：Step 2 上下文 + 依赖变更清单
 - 输出：JDK / Spring Boot / 依赖 jar 兼容性扫描结果
 - 规则：只运行与当前升级场景相关的扫描
+- 规则：JDK/Spring/Jakarta 规则必须来自带版本、来源、校验日期的规则包，并按升级区间过滤；静态命中只能标记为候选证据，不能冒充已发生的编译失败
 - 门控：执行 `scan`
 
 ### Phase 6 [AUTO] Evidence Build
@@ -385,10 +385,10 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 对应步骤：`step4`
 - 输入：依赖变更清单、上下文、分支信息、依赖源码目录（推荐字段：`dependency_source_dirs`）
 - 输出：`.upgrade-report/s4_jar_compare/` 与 `all_changed_apis.csv`
-- 重点：优先识别二进制不兼容，其次补充行为变化
+- 重点：JApiCmp XML 是机器解析主证据，stdout 仅用于人读和 XML 失败回退；分别保留 binary/source compatibility，不能把“二进制兼容但源码重编译不兼容”合并掉
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应超时
 - 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再按依赖的 `old_version/new_version` 只在对应源码仓库远端分支 `remotes` 中匹配 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支；old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；若未匹配到或存在歧义，必须进入人工确认，不得直接套用主项目分支名
-- 规则：若 Step5 确认需要跨依赖分析，系统必须先尝试依赖源码映射；若缺少可用依赖源码映射，仍需继续尝试无源码依赖 jar 的字节码稳定符号分析；只有两条路径都不可用时，才允许阻塞或在显式 `allow_degraded` 下继续
+- 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
 - 门控：`step4` 完成后执行 `jar_compare`
 
 ### Phase 7 [CHECKPOINT] Confirm Evidence Completeness
@@ -430,15 +430,24 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 对应步骤：`step5`
 - 输入：`s4_jar_compare/all_changed_apis.csv`（由 Phase 4 产出）与 `s3_risk_candidates.csv`（由 Phase 3 产出）；若在 Phase 7 指定了 `selected_targets` 或正式 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
 - 输出：`.upgrade-report/s5_call_chain/`
+- 附加证据：Step1 留存的 current 最终制品业务 class、嵌套运行时 JAR 字节码边与 `.upgrade-report/framework_adapters.json`
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
 - 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
 - 规则：名称筛选按 `coord` 的 `artifactId` 精确匹配；坐标筛选按 `coord` 精确匹配
 - 规则：筛选匹配范围是 Step4 API 与 Step3 candidate 的并集；若两边都未命中，则必须直接报错，不能静默缩小分析范围
 - 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
-- 规则：若仍无法推断依赖源码映射，Step5 仍需继续尝试无源码依赖 jar 的字节码稳定符号分析；只有源码映射与无码字节码两条路径都不可用时，才默认阻塞；如确需忽略并继续，需显式启用 `allow_degraded`
+- 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
+- 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step5 必须优先按 `lib_entry` 提取制品中的真实嵌套 JAR，不得用本地 Maven 仓库副本冒充完整制品证据
+- 规则：本地 Maven JAR 只能作为显式 fallback；一旦使用、缺失嵌套 JAR、坐标 unresolved、SHA 不一致或 javap 失败，字节码覆盖必须降级，未命中不得解释为无影响
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
 - 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`
-- 规则：当无源码依赖字节码稳定命中目标符号时，Step5 必须输出正式 `reason_code=PACKAGED_DEPENDENCY_BYTECODE_USAGE`，并保守收敛为 `uncertain`；不得再次退化为单纯 `DEPENDENCY_SOURCE_MAPPING_MISSING`
+- 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中输出 `PACKAGED_DEPENDENCY_BYTECODE_USAGE/uncertain`，删除场景细化为 `RUNTIME_DEPENDENCY_USES_REMOVED_API`
+- 规则：验收测试必须包含真实 `jdeps` 对照；`jdeps` 能发现的静态跨 JAR 类依赖，本 Skill 不得漏报，并继续提供成员级方法/字段匹配
+- 规则：业务源码图与当前业务字节码图使用统一 owner/name/signature 身份；冲突时保留两类 provenance，不得用字节码静默覆盖源码证据
+- 规则：业务字节码索引必须覆盖方法/构造/字段、类型指令、常量池/泛型签名/注解类引用与 `invokedynamic`，并按 current 制品 SHA-256 缓存；制品变化必须失效重建
+- 规则：编译期常量变化不得因 class 中缺少字段访问而判为未使用，必须输出 `INLINED_CONSTANT_USAGE_UNDETECTABLE/uncertain`
+- 规则：SPI、Spring、MyBatis 隐式关系由独立 Adapter 输出；条件未决和多实现必须保留 ambiguity，禁止任意绑定到某个实现
+- 规则：`.upgrade-report/coverage.json` 是从证据派生的覆盖视图，状态仅允许 complete/partial/insufficient/not_applicable；它不是新的事实真相源
 - 门控：执行 `call_chain`
 
 **置信度加权深度策略**：
