@@ -82,6 +82,7 @@ def trace_result_to_api_entry(r):
         'dependency_chain_coords':  r.dependency_chain_coords or [],
         'call_paths':          r.call_paths or [],
         'evidence_paths':      _edges_for_s6(r.evidence_paths),
+        'path_details':        getattr(r, 'path_details', []) or [],
         'verification':        r.verification_commands or [],
         'verification_commands': r.verification_commands or [],
         'confidence_score':    round(r.confidence_score, 3),
@@ -789,7 +790,7 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
 
     输出文件：
       - s5_enhanced_summary.txt：人类可读摘要
-      - s5_enhanced_alerts.csv：高优先级风险列表
+      - alerts.csv：完整逐链路人工台账
       - by_api/*.txt：每个API的详细分析报告
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -923,11 +924,12 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     alerts_path = os.path.join(output_dir, 'alerts.csv')
     generate_alerts_csv(all_results, alerts_path)
 
-    # 也生成增强版（向后兼容）
+    # 旧版重复文件不再生成，避免人工在两个相同清单之间切换。
     enhanced_alerts_path = os.path.join(output_dir, 's5_enhanced_alerts.csv')
-    generate_alerts_csv(all_results, enhanced_alerts_path)
+    if os.path.isfile(enhanced_alerts_path):
+        os.remove(enhanced_alerts_path)
 
-    print(f"  高优先级风险 → {alerts_path}", file=sys.stderr)
+    print(f"  完整链路台账 → {alerts_path}", file=sys.stderr)
 
     # 生成 summary.json（s6_report.py 需要的契约格式）
     summary_json_path = write_summary_json(all_results, output_dir, graph_stats=graph_stats)
@@ -1029,61 +1031,138 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
 
 
 def generate_alerts_csv(all_results, output_path):
-    """
-    生成alerts.csv（高优先级风险）
+    """生成完整、无抽样的人工链路台账；每个 API 至少一行，每条链路独立一行。"""
+    rows = []
+    for result in all_results:
+        rows.extend(_alert_rows_for_result(result))
+    rows.sort(key=lambda row: (
+        {'confirmed': 0, 'candidate': 1, 'incomplete': 2, 'no_static_path': 3}.get(
+            row['conclusion_level'], 9
+        ),
+        severity_rank(row['severity']), row['target_coord'], row['changed_symbol'], row['path_id'],
+    ))
 
-    包含：
-      - P0/P1 reachable
-      - 所有 uncertain
-      - 所有 not_analyzed
-    """
-    alerts = []
-
-    for r in all_results:
-        # 筛选条件
-        if r.analysis_status == 'reachable' and r.severity in ('P0', 'P1'):
-            alerts.append(r)
-        elif r.analysis_status in ('uncertain', 'not_analyzed'):
-            alerts.append(r)
-
-    # 排序
-    alerts_sorted = sorted(
-        alerts,
-        key=lambda r: (
-            0 if r.analysis_status == 'reachable' else 1,
-            severity_rank(r.severity),
-            r.coord,
-            r.api_name
-        )
-    )
-
-    # CSV格式
     import csv
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            'coord', 'api', 'severity', 'change_type',
-            'status', 'confidence', 'depth',
-            'reason', 'action', 'example_path'
-        ])
+        fieldnames = [
+            'api_id', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
+            'symbol_kind', 'change_type', 'severity', 'api_status', 'path_status',
+            'conclusion_level', 'action_type', 'business_reachable', 'business_entry',
+            'consumer_coord', 'consumer_class', 'consumer_method', 'consumer_signature',
+            'path_text', 'stop_reason', 'reason', 'action', 'confidence', 'depth',
+            'evidence_types', 'evidence_files', 'detail_file',
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
-        for r in alerts_sorted:
-            explanation = explain_reason_code(r.reason_code, r)
 
-            path_example = r.call_paths[0] if r.call_paths else ''
+def _alert_rows_for_result(result):
+    identity = '|'.join([
+        result.coord or '', result.api_name or '',
+        getattr(result, 'api_signature', '') or '', getattr(result, 'symbol_kind', '') or '',
+    ])
+    api_id = 'API-' + hashlib.sha1(identity.encode('utf-8')).hexdigest()[:12]
+    details = list(getattr(result, 'path_details', []) or [])
+    if not details:
+        call_paths = list(getattr(result, 'call_paths', []) or [])
+        evidence_paths = list(getattr(result, 'evidence_paths', []) or [])
+        count = max(len(call_paths), len(evidence_paths), 1)
+        for index in range(count):
+            evidence = list(evidence_paths[index] or []) if index < len(evidence_paths) else []
+            first = evidence[0] if evidence else {}
+            consumer_class, consumer_method = _split_alert_consumer(first.get('caller_symbol', ''))
+            details.append({
+                'path_status': result.analysis_status,
+                'stop_reason': result.reason_code,
+                'business_entry': _result_business_entry(result),
+                'business_reachable': True if result.analysis_status == 'reachable' else None,
+                'consumer_coord': first.get('owner_coord') or (
+                    (result.dependency_chain_coords or [''])[0] if result.dependency_chain_coords else ''
+                ),
+                'consumer_class': first.get('consumer_class') or consumer_class,
+                'consumer_method': first.get('consumer_method') or consumer_method,
+                'consumer_signature': first.get('consumer_signature') or '',
+                'path_text': call_paths[index] if index < len(call_paths) else '',
+                'confidence': result.confidence_score,
+                'depth': result.business_reach_depth,
+                'evidence': evidence,
+            })
 
-            writer.writerow([
-                r.coord,
-                r.api_name,
-                r.severity,
-                r.change_type,
-                r.analysis_status,
-                f"{r.confidence_score:.2f}",
-                r.business_reach_depth,
-                explanation['reason'],
-                explanation['action'] or '',
-                path_example[:200]
-            ])
+    rows = []
+    explanation = explain_reason_code(result.reason_code, result)
+    detail_file = f"by_api/{build_by_api_safe_filename(result)}.txt"
+    for detail in details:
+        evidence = list(detail.get('evidence') or [])
+        path_status = str(detail.get('path_status') or result.analysis_status)
+        stop_reason = str(detail.get('stop_reason') or result.reason_code)
+        path_identity = json.dumps({
+            'api_id': api_id, 'status': path_status, 'stop_reason': stop_reason,
+            'path_text': detail.get('path_text') or '', 'evidence': evidence,
+        }, ensure_ascii=False, sort_keys=True)
+        path_id = 'PATH-' + hashlib.sha1(path_identity.encode('utf-8')).hexdigest()[:12]
+        conclusion_level, action_type = _path_conclusion(path_status)
+        reachable = detail.get('business_reachable')
+        rows.append({
+            'api_id': api_id,
+            'path_id': path_id,
+            'target_coord': result.coord,
+            'changed_symbol': result.api_name,
+            'api_signature': getattr(result, 'api_signature', '') or '',
+            'symbol_kind': getattr(result, 'symbol_kind', '') or '',
+            'change_type': result.change_type,
+            'severity': result.severity,
+            'api_status': result.analysis_status,
+            'path_status': path_status,
+            'conclusion_level': conclusion_level,
+            'action_type': action_type,
+            'business_reachable': 'true' if reachable is True else ('false' if reachable is False else 'unknown'),
+            'business_entry': detail.get('business_entry') or '',
+            'consumer_coord': detail.get('consumer_coord') or '',
+            'consumer_class': detail.get('consumer_class') or '',
+            'consumer_method': detail.get('consumer_method') or '',
+            'consumer_signature': detail.get('consumer_signature') or '',
+            'path_text': detail.get('path_text') or '',
+            'stop_reason': stop_reason,
+            'reason': explanation['reason'],
+            'action': explanation['action'] or '',
+            'confidence': f"{float(detail.get('confidence') or 0.0):.2f}",
+            'depth': int(detail.get('depth') or 0),
+            'evidence_types': '|'.join(sorted({str(item.get('evidence_type') or '') for item in evidence if item.get('evidence_type')})),
+            'evidence_files': '|'.join(sorted({str(item.get('file') or '') for item in evidence if item.get('file')})),
+            'detail_file': detail_file,
+        })
+    return rows
+
+
+def _split_alert_consumer(symbol):
+    value = str(symbol or '').strip()
+    if not value:
+        return '', ''
+    # Runtime bytecode evidence prefixes the Java symbol with group:artifact:.
+    if value.count(':') >= 2:
+        value = value.split(':', 2)[-1]
+    head = value.split('(', 1)[0]
+    if '.' not in head:
+        return head, ''
+    return tuple(head.rsplit('.', 1))
+
+
+def _result_business_entry(result):
+    for node in getattr(result, 'critical_nodes_hit', []) or []:
+        if node.get('type') == 'system_code_touched' and node.get('method'):
+            return node['method']
+    return ''
+
+
+def _path_conclusion(path_status):
+    return {
+        'reachable': ('confirmed', 'fix'),
+        'uncertain': ('candidate', 'review'),
+        'not_analyzed': ('incomplete', 'rerun_analysis'),
+        'not_found_in_static_analysis': ('no_static_path', 'review'),
+        'not_reachable': ('no_static_path', 'review'),
+    }.get(path_status, ('incomplete', 'review'))
 
 
 def severity_rank(sev):

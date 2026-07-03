@@ -444,6 +444,9 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中输出 `PACKAGED_DEPENDENCY_BYTECODE_USAGE/uncertain`，删除场景细化为 `RUNTIME_DEPENDENCY_USES_REMOVED_API`
 - 规则：验收测试必须包含真实 `jdeps` 对照；`jdeps` 能发现的静态跨 JAR 类依赖，本 Skill 不得漏报，并继续提供成员级方法/字段匹配
 - 规则：业务源码图与当前业务字节码图使用统一 owner/name/signature 身份；冲突时保留两类 provenance，不得用字节码静默覆盖源码证据
+- 规则：`s5_call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条终止链路独立一行，禁止只保留第一条路径或静默截断
+- 规则：链路台账必须显式给出 target/consumer 坐标、消费类和方法、业务入口、逐链路状态、中断原因、证据文件及稳定 api_id/path_id；API 汇总状态不得覆盖或删除其他候选链路
+- 人工排查入口固定为 Step4 `all_changed_apis.csv`、Step5 `alerts.csv`、Step6 `s6_report.md`；其他 JSON/catalog 默认作为机器或深度排障证据
 - 规则：业务字节码索引必须覆盖方法/构造/字段、类型指令、常量池/泛型签名/注解类引用与 `invokedynamic`，并按 current 制品 SHA-256 缓存；制品变化必须失效重建
 - 规则：编译期常量变化不得因 class 中缺少字段访问而判为未使用，必须输出 `INLINED_CONSTANT_USAGE_UNDETECTABLE/uncertain`
 - 规则：SPI、Spring、MyBatis 隐式关系由独立 Adapter 输出；条件未决和多实现必须保留 ambiguity，禁止任意绑定到某个实现

@@ -22,7 +22,7 @@ import sys
 import time
 import zipfile
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from compat import run_cmd
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
@@ -115,6 +115,8 @@ class TraceResult:
     critical_nodes_hit: list
     match_provenance: str = ''
     match_tier: int = -1
+    # 全部终止链路的人工复核视图；call_paths/evidence_paths 保留兼容语义。
+    path_details: list = field(default_factory=list)
 
 
 def _iter_business_methods(graph):
@@ -264,7 +266,17 @@ def _apply_source_artifact_miss(result, graph, reachable_note):
             '源码图存在目标调用，但源码与最终制品未证明来自同一 revision/profile；'
             '字节码未命中不能用于反证源码候选'
         )
+    _downgrade_reachable_path_details(result, 'uncertain', result.reason_code)
     return result
+
+
+def _downgrade_reachable_path_details(result, path_status, stop_reason):
+    for detail in getattr(result, 'path_details', []) or []:
+        if detail.get('path_status') != 'reachable':
+            continue
+        detail['path_status'] = path_status
+        detail['stop_reason'] = stop_reason
+        detail['business_reachable'] = None
 
 
 def _is_inlined_constant_change(api_row):
@@ -414,7 +426,7 @@ def _run_javap_bytecode_dump(jar_path, class_binary_name):
     return stdout if rc == 0 else ''
 
 
-def _parse_javap_bytecode_references(text):
+def _parse_javap_bytecode_references(text, class_binary_name=''):
     references = {
         'method_refs': [],
         'field_refs': [],
@@ -428,12 +440,34 @@ def _parse_javap_bytecode_references(text):
     )
     class_pattern = re.compile(r'//\s+class\s+([A-Za-z0-9_/$]+)')
     descriptor_pattern = re.compile(r'L([A-Za-z0-9_/$]+);')
+    method_header_pattern = re.compile(
+        r'^\s*(?:[\w.$<>\[\],?]+\s+)+([\w$<>]+)\([^;]*\);\s*$'
+    )
+    current_member = ''
+    current_signature = ''
+    class_simple = str(class_binary_name or '').rsplit('.', 1)[-1].split('$', 1)[0]
     for raw_line in (text or '').splitlines():
         line = raw_line.strip()
         if not line:
             continue
+        header = method_header_pattern.match(raw_line)
+        if header:
+            current_member = header.group(1)
+            if current_member == class_simple:
+                current_member = '<init>'
+            current_signature = ''
+            continue
+        if line.startswith('descriptor:') and current_member:
+            current_signature = _method_descriptor_to_lookup_signature(line.split(':', 1)[1].strip())
+            for match in descriptor_pattern.findall(line):
+                references['class_refs'].add(match.replace('/', '.').replace('$', '.'))
+            continue
+        # Constant-pool declarations also contain "// Method/Field" comments,
+        # but they do not identify the consuming method. Only instruction lines
+        # are valid member-level usage evidence.
+        instruction_line = bool(re.match(r'^\d+:', line))
         method_match = method_pattern.search(line)
-        if method_match:
+        if method_match and instruction_line:
             owner = method_match.group(1).replace('/', '.').replace('$', '.')
             method_name = method_match.group(2) or method_match.group(3) or ''
             descriptor = method_match.group(4).strip()
@@ -442,11 +476,13 @@ def _parse_javap_bytecode_references(text):
                 'name': method_name,
                 'descriptor': descriptor,
                 'signature': _method_descriptor_to_lookup_signature(descriptor),
+                'consumer_method': current_member,
+                'consumer_signature': current_signature,
             })
             references['class_refs'].add(owner)
             continue
         field_match = field_pattern.search(line)
-        if field_match:
+        if field_match and instruction_line:
             owner = field_match.group(1).replace('/', '.').replace('$', '.')
             descriptor = field_match.group(3).strip()
             references['field_refs'].append({
@@ -454,6 +490,8 @@ def _parse_javap_bytecode_references(text):
                 'name': field_match.group(2),
                 'descriptor': descriptor,
                 'signature': _field_descriptor_to_lookup_signature(descriptor),
+                'consumer_method': current_member,
+                'consumer_signature': current_signature,
             })
             references['class_refs'].add(owner)
             continue
@@ -477,50 +515,79 @@ def _load_runtime_dependency_class_references(catalog, coord, jar_path, class_bi
     if not text:
         cache[cache_key] = None
         return None
-    parsed = _parse_javap_bytecode_references(text)
+    parsed = _parse_javap_bytecode_references(text, class_binary_name)
     cache[cache_key] = parsed
     return parsed
 
 
-def _match_runtime_dependency_reference(api_row, references):
+def _match_runtime_dependency_references(api_row, references):
     references = references or {}
     owner, member_name, symbol_kind = _extract_target_owner_and_member(api_row)
     if not owner:
-        return None
+        return []
     target_signature = str(api_row.get('api_signature') or '').strip()
     target_lookup_signature = normalize_signature_for_lookup(target_signature) or target_signature
 
     if symbol_kind == 'class' or str(api_row.get('analysis_scope') or '').strip() == 'class_usage':
         if owner in set(references.get('class_refs') or []):
-            return {
+            return [{
                 'evidence_type': 'bytecode_class_reference',
                 'target_display': owner,
-            }
-        return None
+                'consumer_method': '<class>',
+                'consumer_signature': '',
+            }]
+        return []
 
     if symbol_kind in {'method', 'constructor'}:
+        matches = []
         for item in references.get('method_refs') or []:
             if item.get('owner') != owner or item.get('name') != member_name:
                 continue
             if target_lookup_signature and item.get('signature') and item.get('signature') != target_lookup_signature:
                 continue
-            return {
+            matches.append({
                 'evidence_type': 'bytecode_method_invocation' if symbol_kind == 'method' else 'bytecode_constructor_invocation',
                 'target_display': f"{owner}.{member_name}{item.get('signature') or ''}",
-            }
-        return None
+                'consumer_method': item.get('consumer_method') or '<unknown>',
+                'consumer_signature': item.get('consumer_signature') or '',
+            })
+        return _dedupe_runtime_matches(matches)
 
     if symbol_kind == 'field':
+        matches = []
         for item in references.get('field_refs') or []:
             if item.get('owner') != owner or item.get('name') != member_name:
                 continue
-            return {
+            matches.append({
                 'evidence_type': 'bytecode_field_access',
                 'target_display': f"{owner}.{member_name}",
-            }
-        return None
+                'consumer_method': item.get('consumer_method') or '<unknown>',
+                'consumer_signature': item.get('consumer_signature') or '',
+            })
+        return _dedupe_runtime_matches(matches)
 
-    return None
+    return []
+
+
+def _dedupe_runtime_matches(matches):
+    unique = []
+    seen = set()
+    for item in matches or []:
+        identity = (
+            item.get('evidence_type'), item.get('target_display'),
+            item.get('consumer_method'), item.get('consumer_signature'),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    return unique
+
+
+def _match_runtime_dependency_reference(api_row, references):
+    """Compatibility wrapper for callers that only need the first match."""
+    matches = _match_runtime_dependency_references(api_row, references)
+    return matches[0] if matches else None
 
 
 def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
@@ -574,16 +641,19 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                         })
                         continue
                     scanned_classes += 1
-                    matched = _match_runtime_dependency_reference(api_row, references)
-                    if not matched:
+                    matches = _match_runtime_dependency_references(api_row, references)
+                    if not matches:
                         continue
-                    hits.append({
-                        'coord': coord,
-                        'jar_path': jar_path,
-                        'class_fqcn': class_binary_name.replace('$', '.'),
-                        'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
-                        'target_display': matched.get('target_display') or owner,
-                    })
+                    for matched in matches:
+                        hits.append({
+                            'coord': coord,
+                            'jar_path': jar_path,
+                            'class_fqcn': class_binary_name.replace('$', '.'),
+                            'consumer_method': matched.get('consumer_method') or '<unknown>',
+                            'consumer_signature': matched.get('consumer_signature') or '',
+                            'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
+                            'target_display': matched.get('target_display') or owner,
+                        })
         except Exception as exc:
             scan_failures.append({
                 'reason': 'BYTECODE_SCAN_FAILED', 'coord': coord,
@@ -635,17 +705,41 @@ def _build_packaged_dependency_hit_result(result, hits):
     ordered_hits = business_hits + [item for item in hits if item not in business_hits]
     result.call_paths = []
     result.evidence_paths = []
+    result.path_details = []
     for hit in ordered_hits:
-        consumer_display = f"{hit.get('coord')}:{hit.get('class_fqcn')}"
+        consumer_member = str(hit.get('consumer_method') or '<unknown>')
+        consumer_signature = str(hit.get('consumer_signature') or '')
+        consumer_symbol = f"{hit.get('class_fqcn')}.{consumer_member}{consumer_signature}"
+        consumer_display = f"{hit.get('coord')}:{consumer_symbol}"
+        path_text = f"{consumer_display} -> {hit.get('target_display')}"
         result.call_paths.append(f"{consumer_display} -> {hit.get('target_display')}")
-        result.evidence_paths.append([{
+        evidence = [{
             'caller_symbol': consumer_display,
             'callee_key': hit.get('target_display'),
             'evidence_type': hit.get('evidence_type'),
             'confidence': 'high',
             'file': hit.get('jar_path', ''),
             'line': 0,
-        }])
+            'owner_coord': hit.get('coord', ''),
+            'consumer_class': hit.get('class_fqcn', ''),
+            'consumer_method': consumer_member,
+            'consumer_signature': consumer_signature,
+        }]
+        result.evidence_paths.append(evidence)
+        result.path_details.append({
+            'path_status': 'reachable' if hit.get('coord') == '__business__' else 'uncertain',
+            'stop_reason': '' if hit.get('coord') == '__business__' else 'BUSINESS_ENTRY_NOT_CONFIRMED',
+            'business_entry': consumer_symbol if hit.get('coord') == '__business__' else '',
+            'business_reachable': hit.get('coord') == '__business__',
+            'consumer_coord': hit.get('coord', ''),
+            'consumer_class': hit.get('class_fqcn', ''),
+            'consumer_method': consumer_member,
+            'consumer_signature': consumer_signature,
+            'path_text': path_text,
+            'confidence': 1.0,
+            'depth': 1,
+            'evidence': evidence,
+        })
     result.verification_commands = [
         '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
         '优先审查命中的无源码依赖及其对外暴露入口'
@@ -801,6 +895,8 @@ def edge_to_evidence(edge, graph=None):
         'evidence_type': getattr(edge, 'evidence_type', '?'),
         'file': getattr(edge, 'file', ''),
         'line': getattr(edge, 'line', 0),
+        'owner_coord': getattr(edge, 'owner_coord', ''),
+        'module': getattr(edge, 'module', ''),
     }
 
 
@@ -1528,6 +1624,14 @@ def trace_api_with_confidence_weighting(
                     queue_size=len(queue),
                 )
 
+    # 保存全部终止链路供人工复核；API 级状态仍由下面的最优证据规则求值。
+    result.path_details = build_all_candidate_path_details(
+        reachable_candidates,
+        uncertain_candidates,
+        not_analyzed_candidates,
+        graph,
+    )
+
     # 选择最优结果
     if reachable_candidates:
         best = select_best_candidate(reachable_candidates)
@@ -1869,6 +1973,70 @@ def select_best_candidate(candidates):
             stable_candidate_tiebreak_key(candidate),
         ),
     )
+
+
+def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph):
+    details = []
+    groups = (
+        ('reachable', 'SYSTEM_CODE_REACHED', reachable or []),
+        ('uncertain', '', uncertain or []),
+        ('not_analyzed', '', not_analyzed or []),
+    )
+    seen = set()
+    for path_status, default_reason, candidates in groups:
+        for candidate in candidates:
+            path_edges = list(candidate.get('path') or [])
+            evidence = [edge_to_evidence(edge, graph=graph) for edge in path_edges]
+            entry = dict(candidate.get('entry_point') or candidate.get('boundary') or {})
+            stop_reason = str(candidate.get('reason') or default_reason)
+            final_target = entry.get('method') or stop_reason or '未找到业务入口'
+            path_text = format_call_chain(path_edges, final_target) if path_edges else final_target
+            identity = (
+                path_status,
+                stop_reason,
+                tuple(
+                    (item.get('caller_symbol'), item.get('callee_key'), item.get('evidence_type'))
+                    for item in evidence
+                ),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            first = evidence[0] if evidence else {}
+            last = evidence[-1] if evidence else {}
+            consumer_symbol = str(first.get('caller_symbol') or '')
+            consumer_class, consumer_method = split_consumer_symbol(consumer_symbol)
+            business_entry = str(entry.get('method') or '') if path_status == 'reachable' else ''
+            details.append({
+                'path_status': path_status,
+                'stop_reason': stop_reason,
+                'business_entry': business_entry,
+                'business_reachable': path_status == 'reachable',
+                'consumer_coord': str(first.get('owner_coord') or ''),
+                'consumer_class': consumer_class,
+                'consumer_method': consumer_method,
+                'consumer_signature': '',
+                'path_text': path_text,
+                'confidence': float(candidate.get('confidence') or 0.0),
+                'depth': int(candidate.get('depth') or len(path_edges)),
+                'evidence': evidence,
+                'terminal_symbol': last.get('caller_symbol') or business_entry,
+            })
+    return sorted(details, key=lambda item: (
+        {'reachable': 0, 'uncertain': 1, 'not_analyzed': 2}.get(item.get('path_status'), 9),
+        item.get('path_text') or '',
+    ))
+
+
+def split_consumer_symbol(symbol):
+    value = str(symbol or '').strip()
+    if not value:
+        return '', ''
+    head = value.split('(', 1)[0]
+    if '.' not in head:
+        return head, ''
+    owner, member = head.rsplit('.', 1)
+    return owner, member
 
 
 def has_external_direct_consumer(target_coord, candidate):
@@ -3180,6 +3348,7 @@ def build_behavior_changed_result(result, candidate, graph):
         '建议执行相关单元测试或集成测试',
         f'调用链已定位，需确认运行时行为是否受影响'
     ]
+    _downgrade_reachable_path_details(result, 'not_analyzed', result.reason_code)
 
     return result
 
@@ -3219,6 +3388,7 @@ def build_behavior_changed_fallback_simple_result(result, candidate, graph):
         '人工复核该调用链是否真的落在目标 API，而不是同名 sibling 方法',
         '确认后再执行相关单元测试或集成测试验证行为变化',
     ]
+    _downgrade_reachable_path_details(result, 'not_analyzed', result.reason_code)
     return result
 
 
@@ -3257,6 +3427,7 @@ def build_fallback_simple_unconfirmed_result(result, candidate, graph):
         '人工复核该候选链路是否真的落在目标 API，而不是同名 sibling 方法',
         '若目标属于 SPI/回调接口，请继续确认业务代码是否实现、注册或显式引用了该类型',
     ]
+    _downgrade_reachable_path_details(result, 'not_analyzed', result.reason_code)
     return result
 
 
@@ -3295,6 +3466,7 @@ def build_internal_only_direct_consumer_result(result, candidate, graph):
         '若当前路径只证明同坐标依赖内部自调用，请不要直接判定为已确认影响',
         '若目标属于 SPI/回调接口，还需继续确认业务代码是否实现、注册或显式引用了该类型',
     ]
+    _downgrade_reachable_path_details(result, 'not_analyzed', result.reason_code)
     return result
 
 
@@ -3390,17 +3562,17 @@ def build_missing_dependency_source_mapping_result(result):
 
 
 def format_call_chain(path_edges, final_target):
-    """格式化调用链为可读格式"""
+    """把反向追踪边还原为“业务调用方 → ... → 变更符号”的完整正向链路。"""
     if not path_edges:
         return final_target
 
-    parts = []
-    for edge in reversed(path_edges):
-        # 简化显示
-        caller_name = edge.caller_qualified_key.rsplit('.', 1)[-1] if '.' in edge.caller_qualified_key else edge.caller_qualified_key
-        parts.append(f"{caller_name}()")
-
-    parts.append(final_target)
+    parts = [
+        str(getattr(edge, 'caller_qualified_key', '') or getattr(edge, 'caller_symbol_id', '?'))
+        for edge in reversed(path_edges)
+    ]
+    # path_edges[0] 是变更符号的直接消费边，其 callee 才是链路终点。
+    changed_target = str(getattr(path_edges[0], 'callee_key', '') or final_target)
+    parts.append(changed_target)
 
     return " → ".join(parts)
 

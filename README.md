@@ -228,6 +228,11 @@ python3 scripts/run_step.py --step step1 \
   - `s6_findings.json`
   - `s6_report.md`
 
+人工排查默认只需要三个入口：Step4 `all_changed_apis.csv` 查看变化事实，Step5
+`alerts.csv` 查看完整逐链路追踪过程，Step6 `s6_report.md` 查看最终汇总结论。
+`alerts.csv` 不是样例子集：每个进入 Step5 的 API 至少一行，每条终止链路独立一行，
+并明确消费依赖、消费类/方法、业务入口、链路状态、中断原因和原始证据位置。
+
 ## 产物字典（让使用者知道每个文件是什么）
 
 说明：本节对 `.upgrade-report/` 目录下的产物给出**定义**、**生成来源/条件**与**用途/解读要点**。产物分为两类：
@@ -304,7 +309,7 @@ python3 scripts/run_step.py --step step1 \
 | 文件 | 定义 | 生成来源/条件 | 用途与解读 |
 |---|---|---|---|
 | `s5_call_chain/summary.json` | 调用链结论汇总（reachable/not_found_in_static_analysis/uncertain/not_analyzed）、`reason_code` 与关键证据摘要（call_paths） | Step5 对 Step4 API 目标与 Step3 candidate 桥接输入的并集逐条执行反向追踪后汇总生成 | 影响判定的核心结论文件；抽样复核时先看 `analysis_status/reason_code`，再沿 call_paths 或 direct usage 证据定位到业务源码的实际命中点 |
-| `s5_call_chain/alerts.csv` | 告警清单（扁平化明细，每条风险/变更一行） | Step5 从调用链结果结构化导出生成 | 用于排序、筛选与分发处置（按 severity、模块、依赖坐标等维度） |
+| `s5_call_chain/alerts.csv` | 完整链路台账（每个 API 至少一行、每条终止链路一行） | Step5 从全部终止路径结构化导出，不抽样 | 人工核对消费依赖/类/方法、业务触达、中断原因和证据位置 |
 | `s5_call_chain/summary.txt` | Step5 摘要（数量统计、Top 模块/Top 风险、uncertain/not_analyzed 原因分类等） | Step5 汇总生成 | 用于快速掌握总体影响分布；若 uncertain 或 not_analyzed 比例较高，应优先补齐依赖源码映射、检查图截断与框架装配路径 |
 | `s5_call_chain/by_api/*.json` | 单条风险的完整调用链证据（`evidence_paths`、逐跳命中点、reason_code 等） | Step5 对单个候选生成 | 用于复核 reachable/uncertain 结论与定位截断点；属于证据文件 |
 | `s5_call_chain/by_module/*_impacts.json` | 按模块聚合的影响摘要 | Step5 对调用链结果进行模块聚合后生成 | 用于按业务域拆解责任与处置优先级；属于视图文件 |

@@ -1,3 +1,4 @@
+import csv
 import json
 import io
 import os
@@ -23,6 +24,20 @@ import s6_report  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def test_format_call_chain_outputs_every_hop_in_forward_order(self):
+        direct = SimpleNamespace(
+            caller_qualified_key="com.dep.B.callC", caller_symbol_id="b",
+            callee_key="com.changed.C.removed",
+        )
+        upstream = SimpleNamespace(
+            caller_qualified_key="com.app.A.callB", caller_symbol_id="a",
+            callee_key="com.dep.B.callC",
+        )
+        self.assertEqual(
+            tracer.format_call_chain([direct, upstream], "com.app.A.callB"),
+            "com.app.A.callB → com.dep.B.callC → com.changed.C.removed",
+        )
+
     def test_inlined_constant_miss_remains_uncertain(self):
         result = SimpleNamespace(
             analysis_status="not_found_in_static_analysis", is_reachable=False,
@@ -2610,6 +2625,71 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(summary["user_conclusion_summary"]["可能影响"], 1)
         self.assertEqual(summary["user_conclusion_summary"]["需要补充输入"], 1)
         self.assertEqual(summary["quality_gate"]["needs_input"], 1)
+
+    def test_alerts_csv_is_complete_path_ledger_with_explicit_consumers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "alerts.csv"
+            result = tracer.TraceResult(
+                coord="commons-lang:commons-lang",
+                api_name="org.apache.commons.lang.StringUtils.isBlank",
+                api_simple="isBlank", api_signature="(String)", symbol_kind="method",
+                change_type="REMOVED", severity="P0", confirmed=True, source="old_jar",
+                analysis_scope="method", analysis_status="uncertain", direct_callers=0,
+                is_reachable=None, reachable_note="依赖字节码命中", business_reach_depth=0,
+                dependency_chain_coords=["a:consumer", "b:consumer"], call_paths=[],
+                evidence_paths=[], reason_code="RUNTIME_DEPENDENCY_USES_REMOVED_API",
+                verification_commands=[], hops=[], confidence_score=1.0, critical_nodes_hit=[],
+                path_details=[
+                    {
+                        "path_status": "uncertain", "stop_reason": "BUSINESS_ENTRY_NOT_CONFIRMED",
+                        "business_reachable": None, "consumer_coord": "a:consumer",
+                        "consumer_class": "com.acme.Adapter", "consumer_method": "validate",
+                        "consumer_signature": "(String)",
+                        "path_text": "a:consumer:Adapter.validate -> StringUtils.isBlank",
+                        "confidence": 1.0, "depth": 1,
+                        "evidence": [{"evidence_type": "bytecode_method_invocation", "file": "/a.jar"}],
+                    },
+                    {
+                        "path_status": "uncertain", "stop_reason": "BUSINESS_ENTRY_NOT_CONFIRMED",
+                        "business_reachable": None, "consumer_coord": "b:consumer",
+                        "consumer_class": "com.acme.Helper", "consumer_method": "convert",
+                        "consumer_signature": "()",
+                        "path_text": "b:consumer:Helper.convert -> StringUtils.isBlank",
+                        "confidence": 1.0, "depth": 1,
+                        "evidence": [{"evidence_type": "bytecode_method_invocation", "file": "/b.jar"}],
+                    },
+                ],
+            )
+
+            formatter.generate_alerts_csv([result], output)
+            with output.open(encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["consumer_coord"] for row in rows}, {"a:consumer", "b:consumer"})
+        self.assertEqual({row["consumer_method"] for row in rows}, {"validate", "convert"})
+        self.assertTrue(all(row["conclusion_level"] == "candidate" for row in rows))
+        self.assertTrue(all(row["business_reachable"] == "unknown" for row in rows))
+        self.assertTrue(all(row["api_id"] and row["path_id"] for row in rows))
+
+    def test_alerts_csv_keeps_api_without_any_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "alerts.csv"
+            result = tracer.TraceResult(
+                coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+                api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+                confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="not_found_in_static_analysis", direct_callers=0,
+                is_reachable=False, reachable_note="未找到", business_reach_depth=0,
+                dependency_chain_coords=[], call_paths=[], evidence_paths=[], reason_code="NO_STATIC_PATH",
+                verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[],
+            )
+            formatter.generate_alerts_csv([result], output)
+            with output.open(encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["conclusion_level"], "no_static_path")
+        self.assertEqual(rows[0]["path_text"], "")
 
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6665,6 +6745,8 @@ public class com.example.consumer.Adapter {
             self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
             self.assertEqual(result.dependency_chain_coords, ["sample:consumer"])
             self.assertIn("sample:consumer", result.call_paths[0])
+            self.assertEqual(result.path_details[0]["consumer_method"], "use")
+            self.assertEqual(result.path_details[0]["consumer_signature"], "()")
 
     def test_removed_dependency_scans_runtime_consumers_even_when_target_source_mapping_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6720,6 +6802,42 @@ public class com.example.consumer.Adapter {
             self.assertEqual(result.reason_code, "RUNTIME_DEPENDENCY_USES_REMOVED_API")
             self.assertEqual(result.dependency_chain_coords, ["sample:consumer"])
             self.assertIn("NoClassDefFoundError", result.reachable_note)
+
+    def test_packaged_bytecode_keeps_every_consuming_method_for_manual_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr(
+                    "com/example/consumer/Adapter.class",
+                    b"org/apache/commons/lang/StringUtils isBlank",
+                )
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "status": "complete",
+                "by_coord": {"sample:consumer": {"coord": "sample:consumer", "jar_path": str(jar_path)}},
+            })
+            api_row = {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_simple": "isBlank", "api_signature": "(String)",
+                "symbol_kind": "method", "change_type": "REMOVED",
+            }
+            javap_output = """
+public class com.example.consumer.Adapter {
+  public void validate();
+    descriptor: ()V
+    Code:
+       1: invokestatic #7 // Method org/apache/commons/lang/StringUtils.isBlank:(Ljava/lang/String;)Z
+  public boolean convert(java.lang.String);
+    descriptor: (Ljava/lang/String;)Z
+    Code:
+       1: invokestatic #7 // Method org/apache/commons/lang/StringUtils.isBlank:(Ljava/lang/String;)Z
+}
+"""
+            with patch.object(tracer, "run_cmd", return_value=(javap_output, "", 0)):
+                scan = tracer._scan_packaged_runtime_dependencies_for_api(api_row, graph)
+
+        self.assertEqual(scan["status"], "hit")
+        self.assertEqual({item["consumer_method"] for item in scan["hits"]}, {"validate", "convert"})
 
     def test_version_upgrade_scans_runtime_consumers_even_when_target_source_mapping_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
