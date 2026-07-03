@@ -315,6 +315,22 @@ REASON_CODE_EXPLANATIONS = {
         'reason': '候选链路在低置信度边处停止，当前证据不足以继续安全追踪',
         'action': '优先审查最后一跳低置信度边的类型推断、接收者解析和调用点上下文'
     },
+    'BUSINESS_ENTRY_NOT_CONFIRMED': {
+        'reason': '已确认运行时依赖使用了变更 API，但尚未证明该依赖链路触达系统业务入口',
+        'action': '按 consumer_coord、consumer_class 和 consumer_method 定位直接消费者，再核对业务代码或框架入口是否调用它'
+    },
+    'REFLECTION_OVERLOAD_UNRESOLVED': {
+        'reason': '已关联到变更类型和反射成员，但参数类型不足以唯一确定重载目标',
+        'action': '核对 getMethod/getDeclaredMethod 的参数类型来源，确认实际目标重载'
+    },
+    'REFLECTION_TARGET_DYNAMIC': {
+        'reason': '已发现与变更范围相关的反射调用，但类名或成员名由运行时动态决定',
+        'action': '检查配置、字符串拼接和运行时入参，并通过相关业务测试确认真实反射目标'
+    },
+    'RESOURCE_TARGET_REFERENCE': {
+        'reason': '资源或配置文件同时引用了变更类型及成员，当前尚不能证明它会形成可执行调用',
+        'action': '核对读取该资源的框架或业务代码，确认该配置是否会解析并调用目标 API'
+    },
     'CONFIDENCE_DECAYED': {
         'reason': '链路置信度衰减至阈值以下',
         'action': '审查链路中的低置信度边，确认类型推断是否正确'
@@ -1050,7 +1066,7 @@ def generate_alerts_csv(all_results, output_path):
             'conclusion_level', 'action_type', 'business_reachable', 'business_entry',
             'consumer_coord', 'consumer_class', 'consumer_method', 'consumer_signature',
             'path_text', 'stop_reason', 'reason', 'action', 'confidence', 'depth',
-            'evidence_types', 'evidence_files', 'detail_file',
+            'coverage_status', 'coverage_details', 'evidence_types', 'evidence_files', 'detail_file',
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -1090,19 +1106,27 @@ def _alert_rows_for_result(result):
             })
 
     rows = []
-    explanation = explain_reason_code(result.reason_code, result)
     detail_file = f"by_api/{build_by_api_safe_filename(result)}.txt"
     for detail in details:
         evidence = list(detail.get('evidence') or [])
         path_status = str(detail.get('path_status') or result.analysis_status)
         stop_reason = str(detail.get('stop_reason') or result.reason_code)
+        explanation = explain_reason_code(stop_reason, result)
+        semantic_evidence = [
+            {
+                key: item.get(key) or ''
+                for key in ('caller_symbol', 'callee_key', 'evidence_type', 'owner_coord')
+            }
+            for item in evidence
+        ]
         path_identity = json.dumps({
             'api_id': api_id, 'status': path_status, 'stop_reason': stop_reason,
-            'path_text': detail.get('path_text') or '', 'evidence': evidence,
+            'path_text': detail.get('path_text') or '', 'evidence': semantic_evidence,
         }, ensure_ascii=False, sort_keys=True)
         path_id = 'PATH-' + hashlib.sha1(path_identity.encode('utf-8')).hexdigest()[:12]
         conclusion_level, action_type = _path_conclusion(path_status)
         reachable = detail.get('business_reachable')
+        capability_coverage = dict(getattr(result, 'capability_coverage', {}) or {})
         rows.append({
             'api_id': api_id,
             'path_id': path_id,
@@ -1128,6 +1152,15 @@ def _alert_rows_for_result(result):
             'action': explanation['action'] or '',
             'confidence': f"{float(detail.get('confidence') or 0.0):.2f}",
             'depth': int(detail.get('depth') or 0),
+            'coverage_status': capability_coverage.get('status') or '',
+            'coverage_details': json.dumps(
+                {
+                    'analyzers': capability_coverage.get('analyzers') or {},
+                    'matrix': capability_coverage.get('matrix') or {},
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
             'evidence_types': '|'.join(sorted({str(item.get('evidence_type') or '') for item in evidence if item.get('evidence_type')})),
             'evidence_files': '|'.join(sorted({str(item.get('file') or '') for item in evidence if item.get('file')})),
             'detail_file': detail_file,

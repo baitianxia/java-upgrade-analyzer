@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent evidence adapters for Java SPI, Spring, and MyBatis implicit edges."""
+"""Independent evidence adapters for Java SPI, Spring, MyBatis and proxy edges."""
 
 from __future__ import annotations
 
@@ -190,6 +190,13 @@ def run_spring_adapter(source_roots):
     bean_candidates = []
     listener_pattern = re.compile(r'@EventListener(?:\([^)]*\))?[\s\S]{0,500}?\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{')
     bean_pattern = re.compile(r'@(Component|Service|Repository|Controller|Configuration|Bean)\b')
+    bean_method_pattern = re.compile(
+        r'@Bean(?:\s*\([^)]*\))?\s*'
+        r'(?P<post_annotations>(?:@[A-Za-z_$][\w.$]*(?:\s*\([^)]*\))?\s*)*)'
+        r'(?:(?:public|protected|private|static|final|synchronized)\s+)*'
+        r'(?P<return_type>[A-Za-z_$][\w.$]*(?:\s*<[^>{}]+>)?(?:\[\])?)\s+'
+        r'(?P<method_name>[A-Za-z_$]\w*)\s*\([^)]*\)\s*\{(?P<body>[\s\S]*?)\}',
+    )
     condition_pattern = re.compile(r'@(ConditionalOn\w+)(?:\(([^)]*)\))?')
     callback_methods = {
         'ApplicationRunner': {'run'},
@@ -212,6 +219,8 @@ def run_spring_adapter(source_roots):
                 continue
             applicable = True
             owner = _java_package_and_class(text, path.stem)
+            owner_simple = owner.rsplit('.', 1)[-1]
+            package_name = owner.rsplit('.', 1)[0] if '.' in owner else ''
             imports = {
                 item.rsplit('.', 1)[-1]: item
                 for item in re.findall(r'\bimport\s+([\w.]+)\s*;', text)
@@ -221,12 +230,13 @@ def run_spring_adapter(source_roots):
                 for match in condition_pattern.finditer(text)
             ]
             class_match = re.search(
-                r'\bclass\s+(\w+)(?:\s+extends\s+[\w.<>]+)?\s+implements\s+([^\{]+)',
+                rf'\bclass\s+{re.escape(owner_simple)}'
+                r'(?:\s+extends\s+[\w.<>]+)?\s+implements\s+([^\{]+)',
                 text,
             )
             if class_match and bean_pattern.search(text):
                 implemented = []
-                for raw_interface in class_match.group(2).split(','):
+                for raw_interface in class_match.group(1).split(','):
                     simple = re.sub(r'<.*>', '', raw_interface).strip()
                     interface = imports.get(simple, simple)
                     implemented.append((simple, interface))
@@ -256,6 +266,45 @@ def run_spring_adapter(source_roots):
                             'conditions': conditions, 'ambiguity': False,
                             'provenance': {'file': str(path), 'interface': interface},
                         })
+            bean_methods_found = 0
+            for bean_match in bean_method_pattern.finditer(text):
+                bean_methods_found += 1
+                return_type = re.sub(r'<.*>', '', bean_match.group('return_type')).replace('[]', '').strip()
+                return_simple = return_type.rsplit('.', 1)[-1]
+                interface = imports.get(return_simple, return_type)
+                if '.' not in interface and package_name:
+                    interface = f'{package_name}.{interface}'
+                implementation_match = re.search(r'\bnew\s+([A-Za-z_$][\w.$]*)\s*\(', bean_match.group('body'))
+                if not implementation_match:
+                    findings.append({
+                        'reason_code': 'spring_bean_method_unresolved',
+                        'subject': f"{owner}.{bean_match.group('method_name')}",
+                        'return_type': interface,
+                        'file': str(path),
+                    })
+                    continue
+                implementation_type = implementation_match.group(1)
+                implementation_simple = implementation_type.rsplit('.', 1)[-1]
+                implementation = imports.get(implementation_simple, implementation_type)
+                if '.' not in implementation and package_name:
+                    implementation = f'{package_name}.{implementation}'
+                annotation_prefix = text[max(0, bean_match.start() - 200):bean_match.start()]
+                annotation_prefix = re.split(r'[;}\{]', annotation_prefix)[-1]
+                method_annotations = annotation_prefix + bean_match.group('post_annotations')
+                bean_candidates.append({
+                    'interface': interface,
+                    'implementation': implementation,
+                    'primary': bool(re.search(r'@Primary\b', method_annotations)),
+                    'qualifiers': re.findall(r'@Qualifier\s*\(\s*"([^"]+)"\s*\)', method_annotations),
+                    'file': str(path),
+                    'source_method': bean_match.group('method_name'),
+                })
+            if '@Bean' in text and not bean_methods_found:
+                findings.append({
+                    'reason_code': 'spring_bean_method_unresolved',
+                    'subject': owner,
+                    'file': str(path),
+                })
             for match in listener_pattern.finditer(text):
                 target = f'{owner}.{match.group(1)}'
                 nodes.append({'id': target, 'kind': 'spring_event_listener'})
@@ -298,7 +347,8 @@ def run_spring_adapter(source_roots):
             })
     unresolved = any(
         finding.get('reason_code') in {
-            'spring_conditions_require_runtime_evaluation', 'AMBIGUOUS_FRAMEWORK_DISPATCH'
+            'spring_conditions_require_runtime_evaluation', 'AMBIGUOUS_FRAMEWORK_DISPATCH',
+            'spring_bean_method_unresolved',
         }
         for finding in findings
     )
@@ -436,11 +486,293 @@ def run_mybatis_adapter(source_roots):
     }
 
 
+def run_dynamic_proxy_adapter(source_roots):
+    edges, nodes, findings, errors = [], [], [], []
+    scanned = 0
+    registrations = 0
+    callback_methods = {
+        'InvocationHandler': ('framework:jdk-dynamic-proxy', {'invoke'}),
+        'MethodInterceptor': ('framework:dynamic-proxy-advice', {'invoke', 'intercept'}),
+    }
+    source_files = []
+    handlers = {}
+    for root in _source_paths(source_roots):
+        for path in sorted(root.rglob('*.java')):
+            scanned += 1
+            try:
+                text = path.read_text(encoding='utf-8', errors='replace')
+            except OSError as exc:
+                errors.append(f'{path}:{type(exc).__name__}')
+                continue
+            source_files.append((path, text))
+            if not any(marker in text for marker in (
+                'InvocationHandler', 'MethodInterceptor', 'Proxy.newProxyInstance', 'Enhancer.create',
+            )):
+                continue
+            owner = _java_package_and_class(text, path.stem)
+            imports = {
+                item.rsplit('.', 1)[-1]: item
+                for item in re.findall(r'\bimport\s+([\w.]+)\s*;', text)
+            }
+            class_match = re.search(
+                rf'\bclass\s+{re.escape(owner.rsplit(".", 1)[-1])}'
+                r'(?:\s+extends\s+[\w.<>]+)?(?:\s+implements\s+([^\{]+))?',
+                text,
+            )
+            implemented = []
+            if class_match and class_match.group(1):
+                for raw_interface in class_match.group(1).split(','):
+                    simple = re.sub(r'<.*>', '', raw_interface).strip()
+                    implemented.append(imports.get(simple, simple))
+            method_names = set(re.findall(
+                r'\b(?:public|protected)\s+(?:[\w.$<>\[\],?]+\s+)+([A-Za-z_]\w*)\s*\(',
+                text,
+            ))
+            for raw_interface in implemented:
+                simple = raw_interface.rsplit('.', 1)[-1]
+                if simple not in callback_methods:
+                    continue
+                source, allowed = callback_methods[simple]
+                callbacks = []
+                for method_name in sorted(method_names):
+                    if method_name not in allowed:
+                        continue
+                    callbacks.append(method_name)
+                if callbacks:
+                    handlers[owner] = {
+                        'source': source,
+                        'interface': raw_interface,
+                        'methods': callbacks,
+                        'file': str(path),
+                    }
+
+    registration_pattern = re.compile(
+        r'Proxy\s*\.\s*newProxyInstance\s*\([\s\S]{0,800}?'
+        r'new\s+Class(?:<[^>]+>)?\s*\[\s*\]\s*\{(?P<interfaces>[^}]*)\}'
+        r'\s*,\s*(?P<handler>new\s+[A-Za-z_$][\w.$]*|[A-Za-z_$]\w*)',
+        re.S,
+    )
+    for path, text in source_files:
+        owner = _java_package_and_class(text, path.stem)
+        imports = {
+            item.rsplit('.', 1)[-1]: item
+            for item in re.findall(r'\bimport\s+([\w.]+)\s*;', text)
+        }
+        matched_registrations = 0
+        for match in registration_pattern.finditer(text):
+            matched_registrations += 1
+            registrations += 1
+            interfaces = []
+            for item in match.group('interfaces').split(','):
+                class_match = re.search(r'([A-Za-z_$][\w.$]*)\s*\.\s*class\b', item.strip())
+                if class_match:
+                    value = class_match.group(1)
+                    interfaces.append(imports.get(value.rsplit('.', 1)[-1], value))
+            handler_expr = match.group('handler').strip()
+            if handler_expr.startswith('new '):
+                handler_type = handler_expr[4:].strip()
+            else:
+                declaration = re.search(
+                    rf'\b([A-Za-z_$][\w.$<>]*)\s+{re.escape(handler_expr)}\b', text
+                )
+                handler_type = re.sub(r'<.*>', '', declaration.group(1)) if declaration else ''
+            handler_type = imports.get(handler_type.rsplit('.', 1)[-1], handler_type)
+            if handler_type and '.' not in handler_type:
+                package_name = owner.rsplit('.', 1)[0] if '.' in owner else ''
+                handler_type = f'{package_name}.{handler_type}' if package_name else handler_type
+            handler = handlers.get(handler_type)
+            findings.append({
+                'reason_code': 'dynamic_proxy_registration',
+                'subject': owner,
+                'handler': handler_type,
+                'interfaces': interfaces,
+                'file': str(path),
+            })
+            if not handler:
+                findings.append({
+                    'reason_code': 'dynamic_proxy_handler_unresolved',
+                    'subject': owner,
+                    'handler': handler_type,
+                    'file': str(path),
+                })
+                continue
+            for method_name in handler['methods']:
+                target = f'{handler_type}.{method_name}'
+                nodes.append({'id': target, 'kind': 'dynamic_proxy_callback'})
+                edges.append({
+                    'source': handler['source'],
+                    'target': target,
+                    'edge_kind': 'dynamic_proxy_callback',
+                    'confidence': 'high',
+                    'conditions': [],
+                    'ambiguity': False,
+                    'provenance': {
+                        'file': str(path),
+                        'handler_file': handler['file'],
+                        'interface': handler['interface'],
+                    },
+                })
+        unmatched_registrations = max(0, text.count('Proxy.newProxyInstance') - matched_registrations)
+        if unmatched_registrations:
+            registrations += unmatched_registrations
+            findings.append({
+                'reason_code': 'dynamic_proxy_handler_unresolved',
+                'subject': owner,
+                'file': str(path),
+                'count': unmatched_registrations,
+            })
+        if 'Enhancer.create' in text:
+            registrations += text.count('Enhancer.create')
+            findings.append({
+                'reason_code': 'dynamic_proxy_handler_unresolved',
+                'subject': owner,
+                'file': str(path),
+            })
+    unresolved = any(
+        item.get('reason_code') == 'dynamic_proxy_handler_unresolved'
+        for item in findings
+    )
+    applicable = registrations > 0
+    status = 'partial' if applicable and (errors or unresolved) else _status(applicable, errors)
+    return {
+        'adapter': 'dynamic_proxy_basic',
+        'version': '1',
+        'status': status,
+        'nodes': nodes,
+        'edges': edges,
+        'findings': findings,
+        'errors': errors,
+        'metrics': {
+            'source_files_scanned': scanned,
+            'proxy_registrations': registrations,
+            'edges': len(edges),
+        },
+    }
+
+
+def run_declarative_http_client_adapter(source_roots):
+    edges, nodes, findings, errors = [], [], [], []
+    scanned = 0
+    applicable = False
+    client_annotations = ('FeignClient', 'HttpExchange')
+    request_annotations = (
+        'HttpExchange', 'GetExchange', 'PostExchange', 'PutExchange',
+        'DeleteExchange', 'PatchExchange', 'RequestMapping', 'GetMapping',
+        'PostMapping', 'PutMapping', 'DeleteMapping', 'PatchMapping', 'RequestLine',
+    )
+    request_pattern = re.compile(
+        r'@(HttpExchange|GetExchange|PostExchange|PutExchange|DeleteExchange|PatchExchange|'
+        r'RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestLine)'
+        r'\s*(?:\(([^)]*)\))?'
+    )
+    interface_method_pattern = re.compile(
+        r'(?P<annotations>(?:@[A-Za-z_$][\w.$]*(?:\s*\([^)]*\))?\s*)*)'
+        r'(?:(?:public|default|static)\s+)?'
+        r'(?P<return_type>[\w.$<>\[\],?]+)\s+'
+        r'(?P<method_name>[A-Za-z_$]\w*)\s*\([^;{}]*\)\s*;',
+        re.S,
+    )
+    for root in _source_paths(source_roots):
+        for path in sorted(root.rglob('*.java')):
+            scanned += 1
+            try:
+                text = path.read_text(encoding='utf-8', errors='replace')
+            except OSError as exc:
+                errors.append(f'{path}:{type(exc).__name__}')
+                continue
+            if not any(f'@{marker}' in text for marker in client_annotations):
+                continue
+            owner = _java_package_and_class(text, path.stem)
+            if ' interface ' not in f' {text} ':
+                continue
+            class_annotations = text[:text.find('{')] if '{' in text else text
+            if not any(f'@{marker}' in class_annotations for marker in client_annotations):
+                continue
+            applicable = True
+            dynamic_endpoint = bool(re.search(r'[@$]\{[^}]+\}', class_annotations))
+            client_kind = (
+                'feign'
+                if '@FeignClient' in class_annotations
+                else 'http_exchange'
+            )
+            client_edges = 0
+            for match in interface_method_pattern.finditer(text):
+                annotations = match.group('annotations') or ''
+                if not any(f'@{marker}' in annotations for marker in request_annotations):
+                    continue
+                method_name = match.group('method_name')
+                target = f'{owner}.{method_name}'
+                request_match = request_pattern.search(annotations) or request_pattern.search(class_annotations)
+                request_annotation = request_match.group(1) if request_match else ('FeignClient' if client_kind == 'feign' else 'HttpExchange')
+                request_expr = (request_match.group(2) or '').strip() if request_match else ''
+                if request_expr and re.search(r'[@$]\{[^}]+\}', request_expr):
+                    dynamic_endpoint = True
+                nodes.append({'id': target, 'kind': 'declarative_http_client_method'})
+                edges.append({
+                    'source': target,
+                    'target': f'framework:declarative-http-client:{client_kind}:{owner}',
+                    'edge_kind': 'declarative_http_client_outbound',
+                    'confidence': 'high',
+                    'conditions': [],
+                    'ambiguity': False,
+                    'provenance': {
+                        'file': str(path),
+                        'client_kind': client_kind,
+                        'request_annotation': request_annotation,
+                        'request_mapping': request_expr,
+                    },
+                })
+                client_edges += 1
+            findings.append({
+                'reason_code': 'declarative_http_client_registration',
+                'subject': owner,
+                'client_kind': client_kind,
+                'file': str(path),
+            })
+            if dynamic_endpoint:
+                findings.append({
+                    'reason_code': 'declarative_http_client_runtime_endpoint',
+                    'subject': owner,
+                    'client_kind': client_kind,
+                    'file': str(path),
+                })
+            if client_edges == 0:
+                findings.append({
+                    'reason_code': 'declarative_http_client_method_mapping_unresolved',
+                    'subject': owner,
+                    'client_kind': client_kind,
+                    'file': str(path),
+                })
+    unresolved = any(
+        item.get('reason_code') in {
+            'declarative_http_client_runtime_endpoint',
+            'declarative_http_client_method_mapping_unresolved',
+        }
+        for item in findings
+    )
+    return {
+        'adapter': 'declarative_http_client_basic',
+        'version': '1',
+        'status': 'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
+        'nodes': nodes,
+        'edges': edges,
+        'findings': findings,
+        'errors': errors,
+        'metrics': {
+            'source_files_scanned': scanned,
+            'clients': len({item['subject'] for item in findings if item.get('reason_code') == 'declarative_http_client_registration'}),
+            'edges': len(edges),
+        },
+    }
+
+
 def run_framework_adapters(source_roots, output_path=''):
     adapters = [
         run_spi_adapter(source_roots),
         run_spring_adapter(source_roots),
         run_mybatis_adapter(source_roots),
+        run_dynamic_proxy_adapter(source_roots),
+        run_declarative_http_client_adapter(source_roots),
     ]
     for adapter in adapters:
         normalized = []

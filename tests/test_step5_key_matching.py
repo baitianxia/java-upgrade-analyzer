@@ -2664,6 +2664,12 @@ class Step5KeyMatchingTest(unittest.TestCase):
             formatter.generate_alerts_csv([result], output)
             with output.open(encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
+            original_path_ids = [row["path_id"] for row in rows]
+            result.path_details[0]["evidence"][0]["file"] = "/different/run/a.jar"
+            result.path_details[1]["evidence"][0]["file"] = "/different/run/b.jar"
+            formatter.generate_alerts_csv([result], output)
+            with output.open(encoding="utf-8") as handle:
+                relocated_rows = list(csv.DictReader(handle))
 
         self.assertEqual(len(rows), 2)
         self.assertEqual({row["consumer_coord"] for row in rows}, {"a:consumer", "b:consumer"})
@@ -2671,6 +2677,29 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertTrue(all(row["conclusion_level"] == "candidate" for row in rows))
         self.assertTrue(all(row["business_reachable"] == "unknown" for row in rows))
         self.assertTrue(all(row["api_id"] and row["path_id"] for row in rows))
+        self.assertTrue(all("尚未证明" in row["reason"] for row in rows))
+        self.assertEqual(original_path_ids, [row["path_id"] for row in relocated_rows])
+
+    def test_alert_row_uses_path_stop_reason_instead_of_api_reason(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.changed", api_simple="changed",
+            api_signature="()", symbol_kind="method", change_type="METHOD_CHANGED",
+            severity="P1", confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="reachable", direct_callers=1, is_reachable=True,
+            reachable_note="部分链路触达", business_reach_depth=2,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[],
+            reason_code="SYSTEM_CODE_REACHED", verification_commands=[], hops=[],
+            confidence_score=0.9, critical_nodes_hit=[], path_details=[{
+                "path_status": "uncertain", "stop_reason": "LOW_CONFIDENCE_EDGE",
+                "business_reachable": None, "path_text": "A.call -> B.call",
+                "confidence": 0.4, "depth": 1, "evidence": [],
+            }],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertIn("低置信度边", row["reason"])
+        self.assertNotIn("已证明变更 API 触达系统代码", row["reason"])
 
     def test_alerts_csv_keeps_api_without_any_path(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -211,7 +211,10 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 - 这些选择字段必须先归一化写入 `main_state.json`
 - 正式流程中不要把选中依赖直接透传给 `s5_call_chain*.py`
-- Step5 实际消费的是“Step4 API 目标 + Step3 candidate 目标”的选中子集；产物可能是 `selected_all_changed_apis.csv`、`selected_risk_candidates.csv` 以及两者合并后的 `merged_selected_all_changed_apis.csv`
+- Step5 只消费 Step4 API 目标的选中子集；Step3 candidate 保留为独立风险线索，不再生成合并后的 Step5 目标文件
+- Step5 的 `summary.json -> graph_stats.indirect_usage` 会输出按 API、symbol kind 和调用机制拆分的覆盖矩阵；目标相关能力为 `partial/insufficient` 时，该 API 不得输出 `not_found_in_static_analysis`，对应总视图会派生到 `.upgrade-report/coverage.json` 的 `indirect_usage_matrix`
+- Step5 的 `.upgrade-report/framework_adapters.json` 当前基线包含 `java_spi`、`spring_basic`、`mybatis`、`dynamic_proxy_basic` 和 `declarative_http_client_basic`
+- `dynamic_proxy_basic` 只为能够从注册点绑定到具体 handler 的回调输出证据，但仅注册不会把 handler 提升为业务入口；`declarative_http_client_basic` 生成的是业务向远端发起调用的出站证据；两者都不直接进入 `framework_entry_symbols`
 - 若当前已经不在 Step4 checkpoint，也可以通过结构化新意图继续指定范围，例如：
 
 ```bash
@@ -222,7 +225,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ```
 
 - 调度器会先把 `selected_targets` 归一化为正式 `step5_selected_coords` / `step5_selected_names`，再自动桥接为从 `step5` 重跑，而不是直接卡死在“当前没有 pending interaction”
-- 若某个依赖只在 Step3 candidate 中出现、尚未进入 Step4 API 目标，仍可通过 `step5_selected_coords` / `step5_selected_names` 被选中
+- 只有已进入 Step4 API 目标集的依赖才能通过 `step5_selected_coords` / `step5_selected_names` 被选中
 - Step4 checkpoint 中展示给用户的候选列表可以按数量截断，但 `selected_targets` 的正式解析范围仍是完整候选集；因此即使目标未出现在前端展示片段中，也可以直接提交精确 `coord` 或 `name`
 
 若用户答复较长，优先使用：
@@ -253,12 +256,10 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
   s3_springboot_autoconfig.txt
   s3_dependency_compat.csv
   s3_dependency_classfile.csv
-  s3_risk_candidates.csv
   s4_jar_compare/
     all_changed_apis.csv
   per_dependency/
     <coord>/
-      candidate_hits.csv
       removed_jar_symbols.csv
       resolved_targets.csv
       summary.json
@@ -472,7 +473,7 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 ```
 
 若通过 `run_step.py` 执行，建议将 `source_dirs` / `dependency_source_dirs` / `max_depth` 写入 `main_state.json`，命令保持最小参数集。
-- 若 Step4 checkpoint 只想分析部分变更 jar，优先在恢复时传 `selected_targets`；调度器会先把它归一化为正式的 `step5_selected_coords` / `step5_selected_names`，再基于 Step4 API 与 Step3 candidate 的并集生成过滤后的输入文件执行 Step5。
+- 若 Step4 checkpoint 只想分析部分变更 jar，优先在恢复时传 `selected_targets`；调度器会先把它归一化为正式的 `step5_selected_coords` / `step5_selected_names`，再基于 Step4 API 生成过滤后的输入文件执行 Step5。
 正式流程默认不设置 Step5 外层超时；仅在主状态中显式写入 `step5_timeout` 时才启用限制。
 
 规则：
@@ -485,7 +486,7 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 - 若指定 `selected_targets`，优先按候选的 `selection_key` 精确匹配；也支持精确填写 `coord` 或 `name`，随后会归一化为正式的 `step5_selected_coords` / `step5_selected_names`
 - Step4 checkpoint 若只展示前若干个候选，这只影响展示，不影响正式匹配；未展示的合法目标仍会参与 `selected_targets` 解析
 - 若直接指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
-- 若筛选条件既未在 Step4 API 目标命中，也未在 Step3 candidate 目标命中，Step5 会直接报错，避免静默分析错范围
+- 若筛选条件未在 Step4 API 目标中命中，Step5 会直接报错，避免静默分析错范围
 - 正式流程会向 `stderr` 输出 `[progress][step5][discovery|graph|bridge-check|trace|report|done]` 日志，展示源码映射发现、图构建、调用链追踪与报告生成的推进情况
 - 当 `reason_code` 为 `DIRECT_CLASS_USAGE`、`DIRECT_FIELD_USAGE`、`DIRECT_STATIC_IMPORT_USAGE` 时，表示 Step5 已直接在业务源码中找到类型/字段引用证据，而不是传统方法调用链
 - `DIRECT_CLASS_USAGE` 仅接受声明类型、import（含 wildcard import）精确命中或 FQCN 直写等正式类型证据；若 simple name 已被 import 解析到其他 FQCN，不会再升级为直接类型命中

@@ -398,7 +398,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 必须确认：jar diff、源码 diff、依赖源码映射线索与变更集是否足以支撑下一步调用链分析；若只想分析部分变更 jar，应在这里指定 `all_changed_apis.csv` 中的 `coord` 或名称
 - 若证据不足，应先补 `dependency_source_dirs`，而不是直接进入 `step5`
 - 允许在 `continue` 时优先附带 `selected_targets`，让系统自动归一化为 `step5_selected_coords` / `step5_selected_names`
-- `selection_options` 需要同时反映 Step4 API 目标与 Step3 candidate 目标，避免只存在于 candidate 的依赖被遗漏；每个候选都应带稳定 `selection_key`
+- `selection_options` 只反映 Step4 API 目标；每个候选都应带稳定 `selection_key`
 - Step4 checkpoint 若只展示部分 `selection_options` 作为人工阅读摘要，这不应收窄正式选择范围；`selected_targets` 的解析仍必须基于完整候选集，允许用户直接提交未展示但合法的精确 `coord` / `name`
 - 恢复前必须遵守 `action_requirements`；若当前动作缺少 required / at_least_one_of 字段，必须先追问，不能空恢复
 - 允许动作：`continue`、`cancel`
@@ -428,13 +428,13 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### Phase 8 [AUTO] Call Chain Analysis
 
 - 对应步骤：`step5`
-- 输入：`s4_jar_compare/all_changed_apis.csv`（由 Phase 4 产出）与 `s3_risk_candidates.csv`（由 Phase 3 产出）；若在 Phase 7 指定了 `selected_targets` 或正式 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
+- 输入：仅使用 `s4_jar_compare/all_changed_apis.csv`（由 Phase 4 产出）作为变更 API 目标集；若在 Phase 7 指定了 `selected_targets` 或正式 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
 - 输出：`.upgrade-report/s5_call_chain/`
 - 附加证据：Step1 留存的 current 最终制品业务 class、嵌套运行时 JAR 字节码边与 `.upgrade-report/framework_adapters.json`
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
 - 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
 - 规则：名称筛选按 `coord` 的 `artifactId` 精确匹配；坐标筛选按 `coord` 精确匹配
-- 规则：筛选匹配范围是 Step4 API 与 Step3 candidate 的并集；若两边都未命中，则必须直接报错，不能静默缩小分析范围
+- 规则：筛选匹配范围只允许来自 Step4 API；Step3 平台/框架风险和类级 candidate 不得追加为 Step5 变更 API
 - 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
 - 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
 - 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step5 必须优先按 `lib_entry` 提取制品中的真实嵌套 JAR，不得用本地 Maven 仓库副本冒充完整制品证据
@@ -448,8 +448,14 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：链路台账必须显式给出 target/consumer 坐标、消费类和方法、业务入口、逐链路状态、中断原因、证据文件及稳定 api_id/path_id；API 汇总状态不得覆盖或删除其他候选链路
 - 人工排查入口固定为 Step4 `all_changed_apis.csv`、Step5 `alerts.csv`、Step6 `s6_report.md`；其他 JSON/catalog 默认作为机器或深度排障证据
 - 规则：业务字节码索引必须覆盖方法/构造/字段、类型指令、常量池/泛型签名/注解类引用与 `invokedynamic`，并按 current 制品 SHA-256 缓存；制品变化必须失效重建
+- 规则：运行时依赖字节码必须解析 lambda/方法引用的 bootstrap method handle；Multi-Release JAR 必须按 `jdk_current` 选择生效 class，目标 JDK 未知时未命中不得解释为无影响
+- 规则：Step5 必须独立解析与 Step4 目标相关的反射、可静态求值 MethodHandle 和资源间接引用；精确证据合并到统一图，动态或不唯一目标输出 `uncertain`，不得伪装为静态未找到
+- 规则：`alerts.csv` 必须输出间接引用的证据类型、位置及能力覆盖状态；完全动态且无法关联到目标范围的线索不得污染所有 API
+- 规则：间接调用覆盖必须按 Step4 API 独立求值；目标相关能力为 `partial/insufficient` 时禁止输出 `not_found_in_static_analysis`，严格模式必须将该覆盖缺口作为关键门控
 - 规则：编译期常量变化不得因 class 中缺少字段访问而判为未使用，必须输出 `INLINED_CONSTANT_USAGE_UNDETECTABLE/uncertain`
 - 规则：SPI、Spring、MyBatis 隐式关系由独立 Adapter 输出；条件未决和多实现必须保留 ambiguity，禁止任意绑定到某个实现
+- 规则：Spring `@Bean` 必须绑定方法返回类型与实际构造实现；无法解析工厂返回实现时 Adapter 状态必须为 `partial`，禁止绑定到配置类并报告完整覆盖
+- 规则：动态代理只有在注册点能够绑定具体 handler 时才能输出具体回调证据，但仅注册不能把 handler 提升为业务入口；声明式 HTTP Client 属于出站边，也不得作为业务代码入站入口
 - 规则：`.upgrade-report/coverage.json` 是从证据派生的覆盖视图，状态仅允许 complete/partial/insufficient/not_applicable；它不是新的事实真相源
 - 门控：执行 `call_chain`
 

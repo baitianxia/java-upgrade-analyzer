@@ -53,6 +53,7 @@ from enhanced_output_formatter import generate_enhanced_summary
 from compat import maven_repo_dir, run_cmd
 from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_edges, merge_business_bytecode_edges
+from indirect_usage_analyzer import analyze_and_merge_indirect_usages
 from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
 from analysis_contract import sha256_file
 
@@ -728,6 +729,9 @@ def _step5_integrated_main_impl(args):
         for item in framework_evidence.get('adapters') or []
     }
     graph_stats['framework_adapter_merge'] = framework_merge
+    graph_stats['indirect_usage'] = analyze_and_merge_indirect_usages(
+        graph, all_apis, source_roots
+    )
     graph.runtime_dependency_catalog = runtime_dependency_catalog
 
     print(f"  方法数：{len(graph.methods_by_id)}", file=sys.stderr)
@@ -961,7 +965,17 @@ def build_runtime_dependency_catalog(report_dir):
         'status': 'insufficient',
         'reason_codes': [],
         'metrics': {},
+        'target_jdk': '',
     }
+    context_path = os.path.join(report_dir, 's2_context.json')
+    if os.path.exists(context_path):
+        try:
+            context = json.loads(Path(context_path).read_text(encoding='utf-8'))
+            target_jdk = str(context.get('jdk_current') or '').strip()
+            if target_jdk.lower() != 'unknown':
+                catalog['target_jdk'] = target_jdk
+        except (OSError, json.JSONDecodeError):
+            catalog['reason_codes'].append('s2_context_unreadable')
     if not os.path.exists(current_resolved_path):
         return catalog
 
@@ -1504,28 +1518,10 @@ def load_changed_apis(csv_path, jdk_scan_dir=""):
     """加载变更API列表"""
     rows = []
 
-    # JDK removed API 过滤（来自Step3）
-    excluded = set()
-    if jdk_scan_dir:
-        jdk_removed_path = os.path.join(jdk_scan_dir, 's3_jdk_removed_api.csv')
-        if os.path.exists(jdk_removed_path):
-            with open(jdk_removed_path, 'r', encoding='utf-8', errors='replace') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    key = f"{row.get('package', '')}.{row.get('name', '')}"
-                    excluded.add(key)
-
     with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            api = dict(row)
-            # 过滤 JDK removed API
-            coord = api.get('coord', '')
-            api_name = api.get('api_name', '')
-            key = f"{coord}:{api_name}"
-            if key in excluded or api_name in excluded:
-                continue
-            rows.append(api)
+            rows.append(dict(row))
 
     _step5_debug(
         'input_changed_apis',
@@ -1533,7 +1529,7 @@ def load_changed_apis(csv_path, jdk_scan_dir=""):
         csv_path=os.path.abspath(csv_path),
         jdk_scan_dir=os.path.abspath(jdk_scan_dir) if jdk_scan_dir else '',
         total_rows=len(rows),
-        excluded_count=len(excluded),
+        excluded_count=0,
         sample_api_names=[item.get('api_name', '') for item in rows[:5]],
     )
 

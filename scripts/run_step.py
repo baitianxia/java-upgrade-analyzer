@@ -1538,8 +1538,7 @@ NON_PENDING_BRIDGE_ALLOWED_ACTIONS = {
 def build_report_dir_step5_selection_resolution(report_dir):
     report_dir = Path(report_dir).resolve()
     available_rows = read_csv_rows(report_dir / "s4_jar_compare" / "all_changed_apis.csv")
-    risk_candidates = read_csv_rows(report_dir / STEP3_RISK_CANDIDATES_FILE)
-    target_summary = build_step5_selection_summary(list(available_rows) + list(risk_candidates))
+    target_summary = build_step5_selection_summary(available_rows)
     selection_options = build_interaction_selection_options(
         [
             {
@@ -1865,12 +1864,10 @@ def write_csv_rows(output_path, rows, fieldnames):
 
 def materialize_step5_all_changed_apis_input(all_changed_apis_path, report_dir, run_context):
     all_rows = read_csv_rows(all_changed_apis_path)
-    risk_candidates_path = Path(report_dir) / STEP3_RISK_CANDIDATES_FILE
-    candidate_rows = read_csv_rows(risk_candidates_path) if risk_candidates_path.exists() else []
     selected_coords = run_context.get("step5_selected_coords")
     selected_names = run_context.get("step5_selected_names")
     selection_summary = build_step5_selection_summary(
-        list(all_rows) + list(candidate_rows),
+        all_rows,
         selected_coords=selected_coords,
         selected_names=selected_names,
     )
@@ -1896,24 +1893,7 @@ def materialize_step5_all_changed_apis_input(all_changed_apis_path, report_dir, 
             selected_names=selected_names,
         )
         base_path = write_step5_selected_input(filtered_path, base_selection)
-    if not risk_candidates_path.exists():
-        return base_path, selection_summary
-    candidate_path = risk_candidates_path
-    if has_selection:
-        candidate_selection = build_step5_selection_summary(
-            candidate_rows,
-            selected_coords=selected_coords,
-            selected_names=selected_names,
-        )
-        candidate_fields = list(candidate_rows[0].keys()) if candidate_rows else ALL_CHANGED_APIS_FIELDS
-        candidate_path = write_csv_rows(
-            Path(report_dir) / "s5_call_chain" / "selected_risk_candidates.csv",
-            candidate_selection.get("matched_rows") or [],
-            candidate_fields,
-        )
-    merged_name = "merged_selected_all_changed_apis.csv" if has_selection else "merged_all_changed_apis.csv"
-    merged_path = Path(report_dir) / "s5_call_chain" / merged_name
-    return Path(merge_step5_inputs(base_path, candidate_path, merged_path)), selection_summary
+    return base_path, selection_summary
 
 
 def flatten_cli_values(raw_values):
@@ -2403,78 +2383,6 @@ def _matching_repo_mappings_from_source_plan(coord_hint, repo_path, derived_repo
                 continue
         matches.append(f"{candidate_coord}={candidate_repo_path}")
     return _dedupe_strings(matches)
-
-
-def merge_step5_inputs(all_changed_apis_path, risk_candidates_path, merged_output_path):
-    import csv
-
-    def read_rows(path):
-        if not Path(path).exists():
-            return [], []
-        with open_text(path) as f:
-            reader = csv.DictReader(f)
-            fieldnames = list(reader.fieldnames or [])
-            rows = [{k: (v or "").strip() for k, v in row.items()} for row in reader if row]
-        return fieldnames, rows
-
-    base_fields, base_rows = read_rows(all_changed_apis_path)
-    candidate_fields, candidate_rows = read_rows(risk_candidates_path)
-
-    merged_fields = list(base_fields)
-    for field in candidate_fields:
-        if field not in merged_fields:
-            merged_fields.append(field)
-
-    candidate_index = {}
-    for row in candidate_rows:
-        key = (
-            row.get("coord", ""),
-            row.get("api_name", ""),
-            row.get("change_type", ""),
-            row.get("source", ""),
-        )
-        candidate_index[key] = row
-
-    merged_rows = []
-    seen = set()
-    for row in base_rows:
-        key = (
-            row.get("coord", ""),
-            row.get("api_name", ""),
-            row.get("change_type", ""),
-            row.get("source", ""),
-        )
-        merged = dict(row)
-        candidate = candidate_index.get(key)
-        if candidate:
-            for field in candidate_fields:
-                if candidate.get(field):
-                    merged[field] = candidate[field]
-        if not merged.get("analysis_scope"):
-            merged["analysis_scope"] = "api"
-        merged_rows.append(merged)
-        seen.add(key)
-
-    for row in candidate_rows:
-        key = (
-            row.get("coord", ""),
-            row.get("api_name", ""),
-            row.get("change_type", ""),
-            row.get("source", ""),
-        )
-        if key in seen:
-            continue
-        merged = dict(row)
-        if not merged.get("analysis_scope"):
-            merged["analysis_scope"] = "api"
-        merged_rows.append(merged)
-
-    Path(merged_output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(merged_output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=merged_fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(merged_rows)
-    return merged_output_path
 
 
 def load_seed_json_arg(raw_value, project_dir):
@@ -4028,8 +3936,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     if step_id == "step4":
         all_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis.csv"
         available_rows = read_csv_rows(all_changed_apis)
-        risk_candidates = read_csv_rows(report_dir / STEP3_RISK_CANDIDATES_FILE)
-        target_summary = build_step5_selection_summary(list(available_rows) + list(risk_candidates))
+        target_summary = build_step5_selection_summary(available_rows)
         full_selection_options = build_interaction_selection_options(
             [
                 {
@@ -4045,10 +3952,10 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         selection_options = full_selection_options[:20]
         interaction_meta["selection_options"] = selection_options
         interaction_meta["selection_resolution"] = build_selection_resolution(full_selection_options)
-        checklist_lines.append("Step5 可选调用链分析范围（按依赖汇总自 Step4 API 与 Step3 candidate 输入）：")
+        checklist_lines.append("Step5 可选调用链分析范围（按依赖汇总自 Step4 API 输入）：")
         checklist_lines.append(
             f"  - 可选依赖数={target_summary.get('available_target_count', 0)} "
-            f"Step4 API 行数={len(available_rows)} Step3 candidate 行数={len(risk_candidates)}"
+            f"Step4 API 行数={len(available_rows)}"
         )
         for item in selection_options[:10]:
             checklist_lines.append(
@@ -4057,7 +3964,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         if target_summary.get("available_target_count", 0) > 10:
             checklist_lines.append("  - 其余候选请直接查看 all_changed_apis.csv 完整内容；展示列表之外的目标仍可通过精确 coord/name 正式选择")
         existing_selection = build_step5_selection_summary(
-            list(available_rows) + list(risk_candidates),
+            available_rows,
             selected_coords=(run_context or {}).get("step5_selected_coords"),
             selected_names=(run_context or {}).get("step5_selected_names"),
         )
@@ -4962,8 +4869,8 @@ def detect_integrity_repair_step(step_id, report_dir):
 
 def cleanup_step3_candidate_outputs(report_dir):
     report_dir = Path(report_dir).resolve()
-    # These files bridge Step3 candidate scans into Step5; reruns must not
-    # inherit stale matches from an earlier dependency selection.
+    # Step3 candidate artifacts are independent diagnostic evidence; reruns must
+    # not inherit stale matches from an earlier dependency selection.
     aggregate_path = report_dir / STEP3_RISK_CANDIDATES_FILE
     if aggregate_path.exists():
         aggregate_path.unlink()

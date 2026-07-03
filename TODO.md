@@ -1,7 +1,7 @@
 # 待优化项
 
-> 实施状态（2026-07-03）：本文件中的 9 项优化均已落地并通过自动化回归。
-> 下文保留了讨论时的背景、候选方案和“待处理问题”作为设计记录；这些文字不再表示当前代码仍未实现。
+> 实施状态（2026-07-03）：前 10 项优化已落地并通过自动化回归；第 11 项为待办。
+> 已完成章节保留讨论背景作为设计记录；明确标记“待办”的章节仍表示当前能力缺口。
 
 | 项目 | 状态 | 主要落点 |
 |---|---|---|
@@ -12,9 +12,10 @@
 | 5. 构建溯源 | 已完成 | base/current 成功构建、制品 SHA、源码 revision/profile 对齐与冲突降级 |
 | 6. 版本化规则包 | 已完成 | JDK/Jakarta/Spring Boot 规则区间、来源、核验日期和 SHA |
 | 7. JApiCmp XML | 已完成 | XML 主解析、source/binary 分离、常量值、文本降级和缺失类覆盖降级 |
-| 8. 源码+字节码混合图 | 已完成 | 方法/构造/字段/类型/常量池/签名/注解/`invokedynamic`，制品哈希缓存与 jdeps 对照测试 |
-| 9. Framework Adapter | 已完成 | SPI、Spring、MyBatis 独立证据、歧义/条件保留及统一图合并 |
-| 10. 人工复核链路台账 | 已完成 | `alerts.csv` 每 API 至少一行、每条终止链路一行，显式消费方/业务入口/中断原因且不抽样 |
+| 8. 源码+字节码混合图 | 已完成 | 方法/构造/字段/类型/常量池/签名/注解/`invokedynamic` method handle、MR-JAR 目标 JDK 选择，制品哈希缓存与 jdeps 对照测试 |
+| 9. Framework Adapter | 已完成 | SPI、Spring、MyBatis 独立证据、歧义/条件保留、`@Bean` 实现解析及统一图合并 |
+| 10. 人工复核链路台账 | 已完成 | `alerts.csv` 每 API 至少一行、每条终止链路一行，逐路径原因、稳定语义 ID、显式消费方/业务入口且不抽样 |
+| 11. Step5 分析能力补全 | 已完成当前清单的可交付基线 | Step4 唯一目标集；已落地精确反射、常见反射字节码、静态 MethodHandle、资源/表达式引用、动态代理与声明式 HTTP Client Adapter、覆盖矩阵与正式产物接线 |
 
 ## 1. 简化系统源码相关内部参数模型
 
@@ -1328,3 +1329,78 @@ Spring Event Dispatch
 - SPI 和 Spring 基础场景能够补充普通调用图无法发现的业务入口和实现绑定。
 - Adapter 的缺失或失败会降低覆盖状态，不会被解释为没有框架影响。
 - 新增框架能力可以通过独立 Adapter 扩展，而不破坏通用 AST/字节码图。
+
+## 11. Step5 变更 API 分析能力补全（当前清单的可交付基线已完成）
+
+### 当前落地状态
+
+当前已落地：Step5 不再合并 Step3 candidate；已增加链式/局部变量反射解析、常见 javac 反射字节码还原、静态 MethodHandle（含 `findConstructor/findGetter/findSetter/findSpecial`）、目标相关资源/表达式引用、`dynamic_proxy_basic` 与 `declarative_http_client_basic` 框架 Adapter，以及按 API 求值的 `summary.json -> graph_stats.indirect_usage` / `coverage.json -> indirect_usage_matrix` 覆盖矩阵。目标相关能力为 partial/insufficient 时会阻止 `not_found_in_static_analysis`；动态代理必须从注册点绑定 handler 才输出具体证据，但不会仅凭注册提升为业务入口；声明式 HTTP Client 仅输出出站证据。复杂跨方法数据流、更广泛表达式方言和更多框架 Adapter 继续保留为后续增强，不属于当前清单的交付基线。
+
+### 问题
+
+当前 Step5 已覆盖普通源码调用、制品字节码引用、部分 `invokedynamic` 和框架隐式边，
+但仍存在已知调用机制和间接引用语义未被统一图识别的问题。任何未覆盖机制都可能让
+真实引用被错误归入 `not_found_in_static_analysis`。
+
+反射是当前已经确认的一个具体缺口。例如：
+
+```java
+Class.forName("org.apache.commons.lang.StringUtils")
+    .getMethod("isBlank", String.class)
+    .invoke(null, value);
+```
+
+即使 Step4 已确认 `org.apache.commons.lang.StringUtils.isBlank(String)` 发生变化，
+当前 Step5 仍可能因为缺少反射数据流解析而输出 `not_found_in_static_analysis`。
+同类缺口还可能出现在显式 `MethodHandle` 查找/调用、可解析的配置或资源成员引用、
+尚未覆盖的代理/框架派发等机制中。
+
+### 职责边界
+
+- Step3：分析 JDK、Spring/Jakarta 等平台和框架升级规则导致的风险，不参与 Step5 的变更 API 反射调用分析。
+- Step4：输出类、方法、构造器和字段的具体变化及精确签名。
+- Step5：仅以 Step4 变更 API 为目标，独立解析业务源码、依赖源码、资源配置和制品字节码中的直接及间接引用，并继续回溯业务入口。
+
+### 优化方案
+
+- 停止把 `s3_risk_candidates.csv` 追加到 Step5 的变更 API 集合；Step5 目标清单只来自 Step4 `all_changed_apis.csv`。
+- 建立 Step5 能力矩阵，按 symbol kind 与调用机制记录 `complete/partial/insufficient/not_applicable`，明确普通调用、反射、MethodHandle、资源配置和框架 Adapter 的覆盖状态。
+- 将不同机制统一输出为 owner/name/signature 身份和标准证据边，再与 Step4 变更 API 做目标驱动匹配。
+- 优先补齐已确认缺口，但不得用不断增加的孤立正则代替可扩展的语义分析器或 Adapter。
+
+#### 反射与动态调用
+
+- 在 Step5 构建反射调用索引，并只与 Step4 变更 API 做目标匹配，避免把所有反射风险扩散到全部 API。
+- 在源码 AST 中跟踪 `Class`、`Method`、`Constructor` 和 `Field` 的局部变量及链式表达式。
+- 关联 `Class.forName`/类字面量、`getMethod/getDeclaredMethod`、参数类型列表与最终 `invoke`。
+- 在业务和依赖字节码中识别对应的 `ldc`、反射 API 调用与局部数据流，补充源码缺失场景。
+- 识别可静态求值的 `MethodHandles.Lookup.findVirtual/findStatic/findConstructor/findGetter/findSetter` 与后续 `invoke/invokeExact`。
+- 目标类、成员名和参数类型均可确定时，生成 `reflection_method_invocation` 等精确证据边，并沿 Step5 统一反向图追踪业务入口。
+- 精确反射边触达业务代码时输出 `reachable`；只在运行时依赖中确认、但未回溯到业务入口时输出 `uncertain` 并展示具体消费依赖。
+- 只能确定部分信息或字符串来自参数、配置、拼接，但仍能关联到目标依赖、类或变更 API 时，输出 `REFLECTION_OVERLOAD_UNRESOLVED` 或 `REFLECTION_TARGET_DYNAMIC`；不得降为普通静态未找到。
+- 完全动态且无法关联到任何目标范围的反射只保留为独立风险，不得让全部变更 API 变成 `uncertain`。
+
+#### 其他缺失语义
+
+- 对 XML、properties、YAML、SPI 元数据等资源中的类名或成员名建立目标相关索引；能够唯一解析时生成资源引用边，不能唯一解析时保留候选和停止原因。
+- 通过能力矩阵持续盘点动态代理、表达式语言、序列化、代码生成和新增框架 Adapter 等缺口；每项必须定义适用条件、证据强度和失败语义。
+- 对 JNI、任意字符串拼接、外部配置注入等静态不可求值场景明确标记能力边界，不承诺虚假的完整解析。
+
+#### 结论约束
+
+- 只有与目标 API 相关的所有适用分析器都完整执行且未命中，才允许输出 `not_found_in_static_analysis`。
+- 相关分析器部分执行、解析失败或发现无法唯一解析的目标线索时，输出 `uncertain` 或 `not_analyzed` 并记录具体原因；禁止把能力缺口解释为无引用。
+- 将所有新增证据边纳入 `alerts.csv` 的完整路径、证据位置、置信度和覆盖状态。
+
+### 验收标准
+
+- Step5 输入目标与 Step4 `all_changed_apis.csv` 一致，不再由 Step3 类级候选扩展。
+- 每个 Step4 API 都输出按 symbol kind 和调用机制划分的覆盖状态，`not_found_in_static_analysis` 可追溯到完整覆盖依据。
+- 能识别链式写法和拆分到局部变量的 `Class.forName -> getMethod -> invoke`。
+- 能区分重载方法，并按参数类型生成统一 owner/name/signature 身份。
+- 覆盖 `getDeclaredMethod`、构造器和字段反射的等价场景。
+- 能识别目标可静态求值的 MethodHandle 调用和配置/资源间接引用。
+- Step5 能将精确反射边与源码、字节码及框架边合并，并完整回溯到业务入口。
+- 只在依赖中命中时，`alerts.csv` 明确给出消费依赖、消费类、方法及反射证据链。
+- 能关联到目标范围的动态类名或方法名不会产生武断绑定，而是稳定输出 `uncertain`；无法关联目标范围时不污染其他 API 结论。
+- 增加源码、真实编译字节码、资源配置、MethodHandle 和反射回归测试，确保已知能力缺口不会被报告为安全未命中。

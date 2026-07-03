@@ -21,6 +21,181 @@ import confidence_weighted_tracer as tracer
 
 
 class ArtifactBytecodeCatalogTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
+    def test_reflection_bytecode_is_visible_to_upgrade_scanner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            consumer_src = root / "src/com/acme/Consumer.java"
+            consumer_src.parent.mkdir(parents=True)
+            consumer_src.write_text(
+                "package com.acme; public class Consumer { public Object check(String value) throws Exception { "
+                "return Class.forName(\"org.apache.commons.lang.StringUtils\")"
+                ".getMethod(\"isBlank\", String.class).invoke(null, value); } }",
+                encoding="utf-8",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            subprocess.run(["javac", "-d", str(classes), str(consumer_src)], check=True)
+            consumer_jar = root / "consumer.jar"
+            with zipfile.ZipFile(consumer_jar, "w") as zf:
+                zf.write(classes / "com/acme/Consumer.class", "com/acme/Consumer.class")
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "status": "complete", "target_jdk": "17",
+                "by_coord": {"com.acme:consumer": {"jar_path": str(consumer_jar)}},
+            })
+
+            scan = tracer._scan_packaged_runtime_dependencies_for_api({
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_simple": "isBlank", "api_signature": "(String)",
+                "symbol_kind": "method",
+            }, graph)
+
+        self.assertEqual(scan["status"], "hit")
+        self.assertEqual(scan["hits"][0]["consumer_method"], "check")
+        self.assertEqual(scan["hits"][0]["evidence_type"], "bytecode_reflection_method_invocation")
+
+    @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
+    def test_method_reference_bytecode_is_visible_to_upgrade_scanner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_src = root / "target-src/org/apache/commons/lang/StringUtils.java"
+            target_src.parent.mkdir(parents=True)
+            target_src.write_text(
+                "package org.apache.commons.lang; public class StringUtils { "
+                "public static boolean isBlank(String value) { return value == null; } }",
+                encoding="utf-8",
+            )
+            target_classes = root / "target-classes"
+            target_classes.mkdir()
+            subprocess.run(["javac", "-d", str(target_classes), str(target_src)], check=True)
+            target_jar = root / "commons-lang.jar"
+            with zipfile.ZipFile(target_jar, "w") as zf:
+                zf.write(
+                    target_classes / "org/apache/commons/lang/StringUtils.class",
+                    "org/apache/commons/lang/StringUtils.class",
+                )
+
+            consumer_src = root / "consumer-src/com/acme/Consumer.java"
+            consumer_src.parent.mkdir(parents=True)
+            consumer_src.write_text(
+                "package com.acme; import java.util.function.Predicate; "
+                "import org.apache.commons.lang.StringUtils; public class Consumer { "
+                "public boolean check(String value) { Predicate<String> p = StringUtils::isBlank; "
+                "return p.test(value); } }",
+                encoding="utf-8",
+            )
+            consumer_classes = root / "consumer-classes"
+            consumer_classes.mkdir()
+            subprocess.run([
+                "javac", "-cp", str(target_jar), "-d", str(consumer_classes), str(consumer_src)
+            ], check=True)
+            consumer_jar = root / "consumer.jar"
+            with zipfile.ZipFile(consumer_jar, "w") as zf:
+                zf.write(consumer_classes / "com/acme/Consumer.class", "com/acme/Consumer.class")
+
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "status": "complete", "target_jdk": "17",
+                "by_coord": {"com.acme:consumer": {"jar_path": str(consumer_jar)}},
+            })
+            scan = tracer._scan_packaged_runtime_dependencies_for_api({
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_simple": "isBlank", "api_signature": "(String)",
+                "symbol_kind": "method",
+            }, graph)
+
+        self.assertEqual(scan["status"], "hit")
+        self.assertEqual(scan["hits"][0]["consumer_method"], "check")
+        self.assertEqual(scan["hits"][0]["evidence_type"], "bytecode_invokedynamic_method_reference")
+
+    def test_javap_parser_attributes_throws_and_static_initializer_correctly(self):
+        parsed = tracer._parse_javap_bytecode_references("""
+public class com.acme.Consumer {
+  public boolean check(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Z
+    Code:
+       0: invokestatic #7 // Method com/vendor/Client.check:(Ljava/lang/String;)Z
+  static {};
+    descriptor: ()V
+    Code:
+       0: invokestatic #8 // Method com/vendor/Client.bootstrap:()V
+}
+""", "com.acme.Consumer")
+
+        consumers = {(item["name"], item["consumer_method"]) for item in parsed["method_refs"]}
+        self.assertIn(("check", "check"), consumers)
+        self.assertIn(("bootstrap", "<clinit>"), consumers)
+
+    def test_javap_parser_resolves_lambda_method_handle_target(self):
+        parsed = tracer._parse_javap_bytecode_references("""
+public class com.acme.Consumer {
+  public boolean check(java.lang.String);
+    descriptor: (Ljava/lang/String;)Z
+    Code:
+       0: invokedynamic #7,  0 // InvokeDynamic #0:test:()Ljava/util/function/Predicate;
+}
+BootstrapMethods:
+  0: #33 REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/CallSite;
+    Method arguments:
+      #26 REF_invokeStatic org/apache/commons/lang/StringUtils.isBlank:(Ljava/lang/String;)Z
+""", "com.acme.Consumer")
+
+        target = next(item for item in parsed["method_refs"] if item["name"] == "isBlank")
+        self.assertEqual(target["owner"], "org.apache.commons.lang.StringUtils")
+        self.assertEqual(target["consumer_method"], "check")
+        self.assertEqual(target["reference_kind"], "invokedynamic_method_handle")
+
+    def test_multi_release_jar_uses_effective_target_jdk_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\nMulti-Release: true\n")
+                zf.writestr("com/acme/Consumer.class", b"clean")
+                zf.writestr(
+                    "META-INF/versions/11/com/acme/Consumer.class",
+                    b"com/vendor/Client removedMethod",
+                )
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "status": "complete", "target_jdk": "17",
+                "by_coord": {"com.acme:consumer": {"jar_path": str(jar_path)}},
+            })
+            api_row = {
+                "coord": "com.vendor:client", "api_name": "com.vendor.Client.removedMethod",
+                "api_simple": "removedMethod", "api_signature": "()", "symbol_kind": "method",
+            }
+            refs = {"method_refs": [{
+                "owner": "com.vendor.Client", "name": "removedMethod", "signature": "()",
+                "consumer_method": "use", "consumer_signature": "()",
+            }], "field_refs": [], "class_refs": []}
+            with patch.object(
+                tracer, "_load_runtime_dependency_class_references", return_value=refs
+            ) as loader:
+                scan = tracer._scan_packaged_runtime_dependencies_for_api(api_row, graph)
+
+        self.assertEqual(scan["status"], "hit")
+        self.assertEqual(scan["hits"][0]["multi_release_version"], 11)
+        self.assertEqual(loader.call_args.kwargs["multi_release_version"], 11)
+
+    def test_multi_release_miss_is_unavailable_when_target_jdk_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\nMulti-Release: true\n")
+                zf.writestr("com/acme/Consumer.class", b"clean")
+                zf.writestr("META-INF/versions/11/com/acme/Consumer.class", b"clean")
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "status": "complete",
+                "by_coord": {"com.acme:consumer": {"jar_path": str(jar_path)}},
+            })
+            scan = tracer._scan_packaged_runtime_dependencies_for_api({
+                "coord": "com.vendor:client", "api_name": "com.vendor.Client.removedMethod",
+                "api_simple": "removedMethod", "api_signature": "()", "symbol_kind": "method",
+            }, graph)
+
+        self.assertEqual(scan["status"], "unavailable")
+        self.assertEqual(scan["reason"], "MULTI_RELEASE_TARGET_JDK_UNKNOWN")
+
     @unittest.skipUnless(shutil.which("javac") and shutil.which("jdeps") and shutil.which("javap"), "JDK tools required")
     def test_every_reference_found_by_jdeps_is_visible_to_upgrade_scanner(self):
         with tempfile.TemporaryDirectory() as tmp:

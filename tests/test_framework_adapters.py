@@ -90,6 +90,43 @@ class FrameworkAdaptersTest(unittest.TestCase):
         spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
         self.assertTrue(any(edge["edge_kind"] == "spring_framework_callback" for edge in spring["edges"]))
 
+    def test_spring_bean_method_binds_return_type_to_created_implementation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "Config.java").write_text(
+                "package com.acme; import org.springframework.context.annotation.Bean; "
+                "import org.springframework.context.annotation.Configuration; "
+                "@Configuration class Config { @Bean PaymentService paymentService() { "
+                "return new PaymentServiceImpl(); } "
+                "static class PaymentServiceImpl implements PaymentService {} }",
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        bean_edge = next(edge for edge in spring["edges"] if edge["edge_kind"] == "spring_bean_dispatch")
+        self.assertEqual(bean_edge["source"], "com.acme.PaymentService")
+        self.assertEqual(bean_edge["target"], "com.acme.PaymentServiceImpl")
+        self.assertNotEqual(bean_edge["target"], "com.acme.Config")
+
+    def test_unresolved_spring_bean_factory_is_partial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "Config.java").write_text(
+                "package com.acme; import org.springframework.context.annotation.Bean; "
+                "class Config { @Bean PaymentService paymentService() { return createService(); } }",
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertEqual(spring["status"], "partial")
+        self.assertTrue(any(
+            item["reason_code"] == "spring_bean_method_unresolved" for item in spring["findings"]
+        ))
+
     def test_spring_autoconfiguration_resource_registrations_are_discovered(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = Path(tmp)
@@ -129,6 +166,83 @@ class FrameworkAdaptersTest(unittest.TestCase):
         spi = next(item for item in payload["adapters"] if item["adapter"] == "java_spi")
         for edge in spi["edges"]:
             self.assertTrue({"adapter", "adapter_version", "evidence", "activation_conditions", "candidate_count", "ambiguity_reason"} <= set(edge))
+
+    def test_dynamic_proxy_adapter_emits_callback_edge_and_registration_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "Handler.java").write_text(
+                "package com.acme; "
+                "import java.lang.reflect.InvocationHandler; "
+                "import java.lang.reflect.Method; "
+                "class Handler implements InvocationHandler { "
+                "public Object invoke(Object proxy, Method method, Object[] args) { return null; } }",
+                encoding="utf-8",
+            )
+            (root / "Factory.java").write_text(
+                "package com.acme; "
+                "import java.lang.reflect.Proxy; "
+                "class Factory { Object build(Handler handler) { return Proxy.newProxyInstance("
+                "Factory.class.getClassLoader(), new Class[]{Plugin.class}, handler); } }",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        adapter = next(item for item in payload["adapters"] if item["adapter"] == "dynamic_proxy_basic")
+        self.assertEqual(adapter["status"], "complete")
+        self.assertTrue(any(edge["edge_kind"] == "dynamic_proxy_callback" for edge in adapter["edges"]))
+        self.assertTrue(any(item["reason_code"] == "dynamic_proxy_registration" for item in adapter["findings"]))
+
+        graph = SimpleNamespace(
+            methods_by_id={"m1": SimpleNamespace(symbol_id="m1", qualified_key="com.acme.Handler.invoke")}
+        )
+        attach_framework_edges_to_graph(graph, payload)
+        self.assertEqual(graph.framework_entry_symbols, {})
+
+    def test_unregistered_dynamic_proxy_handler_is_not_a_framework_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "DeadHandler.java").write_text(
+                "package com.acme; import java.lang.reflect.*; "
+                "class DeadHandler implements InvocationHandler { "
+                "public Object invoke(Object proxy, Method method, Object[] args) { return null; } }",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        adapter = next(item for item in payload["adapters"] if item["adapter"] == "dynamic_proxy_basic")
+        self.assertEqual(adapter["status"], "not_applicable")
+        self.assertEqual(adapter["edges"], [])
+
+    def test_declarative_http_client_adapter_emits_outbound_edge_for_feign_get_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "RemoteApi.java").write_text(
+                "package com.acme; "
+                "import org.springframework.cloud.openfeign.FeignClient; "
+                "import org.springframework.web.bind.annotation.GetMapping; "
+                "@FeignClient(name = \"demo\") "
+                "interface RemoteApi { @GetMapping(\"/orders\") Order fetch(); }",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        adapter = next(item for item in payload["adapters"] if item["adapter"] == "declarative_http_client_basic")
+        self.assertEqual(adapter["status"], "complete")
+        self.assertTrue(any(edge["edge_kind"] == "declarative_http_client_outbound" for edge in adapter["edges"]))
+        self.assertEqual(adapter["edges"][0]["source"], "com.acme.RemoteApi.fetch")
+        self.assertTrue(any(item["reason_code"] == "declarative_http_client_registration" for item in adapter["findings"]))
+
+        graph = SimpleNamespace(
+            methods_by_id={"m1": SimpleNamespace(symbol_id="m1", qualified_key="com.acme.RemoteApi.fetch")}
+        )
+        attach_framework_edges_to_graph(graph, payload)
+        self.assertEqual(graph.framework_entry_symbols, {})
 
 
 if __name__ == '__main__':

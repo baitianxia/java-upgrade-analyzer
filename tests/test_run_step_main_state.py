@@ -133,7 +133,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(updated_state["step1"]["input"]["modules"], ["."])
             self.assertNotIn("source_dirs", updated_state["step1"]["input"])
 
-    def test_materialize_step5_input_keeps_only_selected_candidate_rows(self):
+    def test_materialize_step5_input_does_not_promote_step3_candidates_to_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
             all_changed_path = report_dir / "all_changed_apis.csv"
@@ -160,18 +160,19 @@ class RunStepMainStateTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            materialized_path, selection_summary = run_step.materialize_step5_all_changed_apis_input(
-                all_changed_path,
-                report_dir,
-                {"step5_selected_coords": ["sample:candidate"]},
-            )
+            with self.assertRaises(run_step.StepError):
+                run_step.materialize_step5_all_changed_apis_input(
+                    all_changed_path,
+                    report_dir,
+                    {"step5_selected_coords": ["sample:candidate"]},
+                )
 
-            self.assertEqual(selection_summary["matched_coords"], ["sample:candidate"])
-            with materialized_path.open(encoding="utf-8", newline="") as f:
-                rows = list(csv.DictReader(f))
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["coord"], "sample:candidate")
-            self.assertEqual(rows[0]["source"], "candidate_scan")
+            materialized_path, selection_summary = run_step.materialize_step5_all_changed_apis_input(
+                all_changed_path, report_dir, {}
+            )
+            self.assertEqual(materialized_path, all_changed_path)
+            self.assertEqual(len(selection_summary["matched_rows"]), 1)
+            self.assertEqual(selection_summary["matched_rows"][0]["source"], "japicmp")
 
     def test_step1_review_continue_propagates_confirmed_branches_to_step2_input(self):
         with tempfile.TemporaryDirectory() as tmp:

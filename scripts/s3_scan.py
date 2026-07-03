@@ -1785,22 +1785,6 @@ def main():
                 elapsed=time.perf_counter() - scan_timer,
                 item=default_fname,
             )
-        if dep_list_path:
-            candidate_count = build_per_dependency_candidate_outputs(
-                source_dir,
-                dep_list_path,
-                report_dir=args.output_dir,
-                dependency_source_dirs=STEP3_DEPENDENCY_SOURCE_DIRS,
-            )
-            emit_progress(
-                "step3",
-                "scan",
-                f"完成 per-dependency candidate 产物生成，命中 {candidate_count} 处",
-                current=len(to_run),
-                total=len(to_run),
-                item=STEP3_RISK_CANDIDATES_FILE,
-            )
-            total += candidate_count
         write_step3_coverage(args.output_dir, source_roots, to_run, executed_scans)
         print(f"\nStep 3 完成：共 {total} 处命中", file=sys.stderr)
         emit_progress(

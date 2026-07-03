@@ -118,6 +118,31 @@ class AnalysisContractTest(unittest.TestCase):
             self.assertEqual(dependency["status"], "partial")
             self.assertIn("dependency_pairing_ambiguous", dependency["reason_codes"])
 
+    def test_indirect_usage_partial_is_a_critical_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp)
+            summary = report / "s5_call_chain/summary.json"
+            summary.parent.mkdir(parents=True)
+            summary.write_text(json.dumps({
+                "total_apis": 1,
+                "not_analyzed": 1,
+                "graph_stats": {
+                    "indirect_usage": {
+                        "status": "partial",
+                        "reason_codes": ["reflection_source_partial"],
+                    }
+                },
+            }), encoding="utf-8")
+
+            coverage = derive_coverage_report(
+                report,
+                project_scope={"status": "complete", "reason_codes": []},
+            )
+
+        self.assertIn("indirect_usage_matrix", coverage["critical_incomplete"])
+        indirect = next(item for item in coverage["components"] if item["id"] == "indirect_usage_matrix")
+        self.assertEqual(indirect["reason_codes"], ["reflection_source_partial"])
+
 
 if __name__ == "__main__":
     unittest.main()

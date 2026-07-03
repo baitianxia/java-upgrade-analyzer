@@ -138,9 +138,6 @@ def gate_scan(d):
         dep_classfile = f"{d}/s3_dependency_classfile.csv"
         if not os.path.exists(dep_classfile):
             issues.append('s3_dependency_classfile.csv')
-        risk_candidates = f"{d}/s3_risk_candidates.csv"
-        if not os.path.exists(risk_candidates):
-            issues.append('s3_risk_candidates.csv')
     if issues:
         fail(f"以下扫描文件缺失：{issues}",
              [f"{pc} scripts/s3_scan.py --all --source-dir . --output-dir .upgrade-report --dep-current .upgrade-report/s1_deps_current_resolved.csv"

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from compat import run_cmd
 from enhanced_source_analyzer import CallEdge
+from indirect_usage_analyzer import parse_javap_indirect_references
 
 
 METHOD_REF_RE = re.compile(
@@ -152,6 +153,37 @@ def parse_javap_calls(text, class_name):
                 'line': index + 1,
                 'content': raw.strip(),
             })
+    for item in parse_javap_indirect_references(text, class_name):
+        owner = item.get('owner') or ''
+        kind = item.get('kind') or ''
+        member = item.get('name') or ''
+        signature = item.get('signature') or ''
+        if kind in {'method', 'constructor'} and not item.get('signature_resolved'):
+            continue
+        if kind == 'class':
+            callee_key = f'class:{owner}'
+            simple_key = f'class:{owner.rsplit(".", 1)[-1]}'
+            evidence_type = 'bytecode_reflection_class_lookup'
+        elif kind == 'field':
+            callee_key = f'{owner}.{member}'
+            simple_key = f'field:{member}'
+            evidence_type = 'bytecode_reflection_field_access'
+        else:
+            display_member = owner.rsplit('.', 1)[-1] if kind == 'constructor' else member
+            callee_key = f'{owner}.{display_member}{signature}'
+            simple_key = f'method:{display_member}{signature}'
+            evidence_type = 'bytecode_reflection_constructor_invocation' if kind == 'constructor' else 'bytecode_reflection_method_invocation'
+        edges.append({
+            'caller_owner': class_name,
+            'caller_name': class_name.rsplit('.', 1)[-1] if item.get('consumer_method') == '<init>' else item.get('consumer_method'),
+            'caller_signature': item.get('consumer_signature') or '',
+            'callee_key': callee_key,
+            'callee_simple_key': simple_key,
+            'evidence_type': evidence_type,
+            'line': item.get('line') or 0,
+            'content': 'javap reflection data-flow',
+        })
+
     # Verbose javap exposes generic signatures, annotations and bootstrap arguments
     # through constant-pool Class entries. Keep these as class-level evidence even
     # when no executable instruction references the type directly.

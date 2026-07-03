@@ -533,6 +533,27 @@ def derive_coverage_report(report_dir, project_scope=None):
         "metrics": artifact_bytecode,
     })
 
+    indirect_usage = dict(graph_stats.get("indirect_usage") or {})
+    indirect_status = indirect_usage.get("status") or (
+        "partial" if step5_summary.is_file() else "not_applicable"
+    )
+    components.append({
+        "id": "indirect_usage_matrix",
+        "status": indirect_status,
+        "reason_codes": list(indirect_usage.get("reason_codes") or (
+            [] if indirect_status in {"complete", "not_applicable"}
+            else (["indirect_usage_coverage_missing"] if step5_summary.is_file() else ["step5_not_executed"])
+        )),
+        "evidence": ["s5_call_chain/summary.json"] if step5_summary.is_file() else [],
+        "metrics": {
+            "analyzers": indirect_usage.get("analyzers") or {},
+            "matrix": indirect_usage.get("matrix") or {},
+            "source_methods_scanned": int(indirect_usage.get("source_methods_scanned") or 0),
+            "resource_files_scanned": int(indirect_usage.get("resource_files_scanned") or 0),
+            "merged_edges": int(indirect_usage.get("merged_edges") or 0),
+        },
+    })
+
     adapter_path = report / "framework_adapters.json"
     if adapter_path.is_file():
         try:
@@ -552,6 +573,7 @@ def derive_coverage_report(report_dir, project_scope=None):
     critical_ids = {
         'project_scope', 'dependency_diff', 'build_provenance', 'binary_api_diff',
         'artifact_bytecode_dependencies', 'source_artifact_alignment',
+        'indirect_usage_matrix',
     }
     critical_incomplete = [
         item['id'] for item in components

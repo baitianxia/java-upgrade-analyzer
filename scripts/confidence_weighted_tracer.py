@@ -27,6 +27,10 @@ from dataclasses import dataclass, field
 from compat import run_cmd
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import normalize_signature_for_lookup, split_signature_params
+from indirect_usage_analyzer import (
+    api_key as indirect_api_key,
+    parse_javap_indirect_references,
+)
 
 
 NON_BLOCKING_PARSER_FALLBACK_REASONS = {
@@ -117,6 +121,7 @@ class TraceResult:
     match_tier: int = -1
     # 全部终止链路的人工复核视图；call_paths/evidence_paths 保留兼容语义。
     path_details: list = field(default_factory=list)
+    capability_coverage: dict = field(default_factory=dict)
 
 
 def _iter_business_methods(graph):
@@ -411,16 +416,22 @@ def _extract_target_owner_and_member(api_row):
 def _class_bytes_might_reference_target(data, owner_internal_name, member_name=''):
     if not data or not owner_internal_name:
         return False
-    if owner_internal_name.encode('utf-8') not in data:
+    owner_bytes = owner_internal_name.encode('utf-8')
+    dotted_owner_bytes = owner_internal_name.replace('/', '.').encode('utf-8')
+    if owner_bytes not in data and dotted_owner_bytes not in data:
         return False
     if member_name and member_name != '<init>' and member_name.encode('utf-8') not in data:
         return False
     return True
 
 
-def _run_javap_bytecode_dump(jar_path, class_binary_name):
+def _run_javap_bytecode_dump(jar_path, class_binary_name, multi_release_version=None):
+    command = ['javap', '-classpath', jar_path, '-verbose', '-c', '-s', '-p']
+    if multi_release_version is not None:
+        command.extend(['--multi-release', str(multi_release_version)])
+    command.append(class_binary_name)
     stdout, _stderr, rc = run_cmd(
-        ['javap', '-classpath', jar_path, '-verbose', '-c', '-s', '-p', class_binary_name],
+        command,
         timeout=30,
     )
     return stdout if rc == 0 else ''
@@ -441,20 +452,57 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
     class_pattern = re.compile(r'//\s+class\s+([A-Za-z0-9_/$]+)')
     descriptor_pattern = re.compile(r'L([A-Za-z0-9_/$]+);')
     method_header_pattern = re.compile(
-        r'^\s*(?:[\w.$<>\[\],?]+\s+)+([\w$<>]+)\([^;]*\);\s*$'
+        r'^\s*(?:[\w.$<>\[\],?]+\s+)+([\w$<>.]+)\([^;]*\)'
+        r'(?:\s+throws\s+[^;]+)?;\s*$'
     )
+    bootstrap_start_pattern = re.compile(r'^\s*(\d+):\s+#\d+\s+REF_\w+')
+    method_handle_pattern = re.compile(
+        r'(?:#\d+\s+)?REF_\w+\s+([A-Za-z0-9_/$]+)\.(?:"([^"]+)"|([A-Za-z0-9_$<>]+)):(\S+)'
+    )
+    bootstrap_targets = {}
+    current_bootstrap = None
+    in_bootstrap_section = False
+    for raw_line in (text or '').splitlines():
+        line = raw_line.strip()
+        if line == 'BootstrapMethods:':
+            in_bootstrap_section = True
+            current_bootstrap = None
+            continue
+        if not in_bootstrap_section:
+            continue
+        start = bootstrap_start_pattern.match(raw_line)
+        if start:
+            current_bootstrap = int(start.group(1))
+            bootstrap_targets.setdefault(current_bootstrap, [])
+        handle = method_handle_pattern.search(line)
+        if handle and current_bootstrap is not None:
+            owner = handle.group(1).replace('/', '.').replace('$', '.')
+            if owner in {
+                'java.lang.invoke.LambdaMetafactory',
+                'java.lang.invoke.StringConcatFactory',
+            }:
+                continue
+            bootstrap_targets[current_bootstrap].append({
+                'owner': owner,
+                'name': handle.group(2) or handle.group(3) or '',
+                'descriptor': handle.group(4),
+            })
     current_member = ''
     current_signature = ''
-    class_simple = str(class_binary_name or '').rsplit('.', 1)[-1].split('$', 1)[0]
+    class_simple = str(class_binary_name or '').rsplit('.', 1)[-1]
     for raw_line in (text or '').splitlines():
         line = raw_line.strip()
         if not line:
             continue
         header = method_header_pattern.match(raw_line)
         if header:
-            current_member = header.group(1)
+            current_member = header.group(1).rsplit('.', 1)[-1]
             if current_member == class_simple:
                 current_member = '<init>'
+            current_signature = ''
+            continue
+        if re.match(r'^\s*static\s+\{\};\s*$', raw_line):
+            current_member = '<clinit>'
             current_signature = ''
             continue
         if line.startswith('descriptor:') and current_member:
@@ -466,6 +514,20 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
         # but they do not identify the consuming method. Only instruction lines
         # are valid member-level usage evidence.
         instruction_line = bool(re.match(r'^\d+:', line))
+        dynamic_match = re.search(r'\binvokedynamic\b.*//\s+InvokeDynamic\s+#(\d+):', line)
+        if dynamic_match and instruction_line:
+            for target in bootstrap_targets.get(int(dynamic_match.group(1)), []):
+                descriptor = target.get('descriptor') or ''
+                references['method_refs'].append({
+                    'owner': target.get('owner') or '',
+                    'name': target.get('name') or '',
+                    'descriptor': descriptor,
+                    'signature': _method_descriptor_to_lookup_signature(descriptor),
+                    'consumer_method': current_member,
+                    'consumer_signature': current_signature,
+                    'reference_kind': 'invokedynamic_method_handle',
+                })
+                references['class_refs'].add(target.get('owner') or '')
         method_match = method_pattern.search(line)
         if method_match and instruction_line:
             owner = method_match.group(1).replace('/', '.').replace('$', '.')
@@ -502,16 +564,43 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
             descriptor = line.split(':', 1)[1].strip()
             for match in descriptor_pattern.findall(descriptor):
                 references['class_refs'].add(match.replace('/', '.').replace('$', '.'))
+    for item in parse_javap_indirect_references(text, class_binary_name):
+        kind = item.get('kind')
+        owner = item.get('owner') or ''
+        references['class_refs'].add(owner)
+        if kind == 'class':
+            continue
+        if kind == 'field':
+            references['field_refs'].append({
+                'owner': owner, 'name': item.get('name') or '', 'descriptor': '',
+                'signature': '', 'consumer_method': item.get('consumer_method') or '',
+                'consumer_signature': item.get('consumer_signature') or '',
+                'reference_kind': item.get('reference_kind'),
+            })
+            continue
+        references['method_refs'].append({
+            'owner': owner,
+            'name': '<init>' if kind == 'constructor' else (item.get('name') or ''),
+            'descriptor': '', 'signature': item.get('signature') or '',
+            'signature_resolved': bool(item.get('signature_resolved')),
+            'consumer_method': item.get('consumer_method') or '',
+            'consumer_signature': item.get('consumer_signature') or '',
+            'reference_kind': item.get('reference_kind'),
+        })
     references['class_refs'] = sorted(references['class_refs'])
     return references
 
 
-def _load_runtime_dependency_class_references(catalog, coord, jar_path, class_binary_name):
+def _load_runtime_dependency_class_references(
+    catalog, coord, jar_path, class_binary_name, multi_release_version=None
+):
     cache = catalog.setdefault('_bytecode_reference_cache', {})
-    cache_key = (coord, jar_path, class_binary_name)
+    cache_key = (coord, jar_path, class_binary_name, multi_release_version)
     if cache_key in cache:
         return cache[cache_key]
-    text = _run_javap_bytecode_dump(jar_path, class_binary_name)
+    text = _run_javap_bytecode_dump(
+        jar_path, class_binary_name, multi_release_version=multi_release_version
+    )
     if not text:
         cache[cache_key] = None
         return None
@@ -543,10 +632,19 @@ def _match_runtime_dependency_references(api_row, references):
         for item in references.get('method_refs') or []:
             if item.get('owner') != owner or item.get('name') != member_name:
                 continue
-            if target_lookup_signature and item.get('signature') and item.get('signature') != target_lookup_signature:
-                continue
+            if target_lookup_signature:
+                if item.get('reference_kind', '').startswith('reflection_') and not item.get('signature_resolved'):
+                    continue
+                if item.get('signature') and item.get('signature') != target_lookup_signature:
+                    continue
             matches.append({
-                'evidence_type': 'bytecode_method_invocation' if symbol_kind == 'method' else 'bytecode_constructor_invocation',
+                'evidence_type': (
+                    'bytecode_invokedynamic_method_reference'
+                    if item.get('reference_kind') == 'invokedynamic_method_handle'
+                    else 'bytecode_reflection_method_invocation'
+                    if item.get('reference_kind') in {'reflection_method', 'reflection_constructor'}
+                    else ('bytecode_method_invocation' if symbol_kind == 'method' else 'bytecode_constructor_invocation')
+                ),
                 'target_display': f"{owner}.{member_name}{item.get('signature') or ''}",
                 'consumer_method': item.get('consumer_method') or '<unknown>',
                 'consumer_signature': item.get('consumer_signature') or '',
@@ -559,7 +657,11 @@ def _match_runtime_dependency_references(api_row, references):
             if item.get('owner') != owner or item.get('name') != member_name:
                 continue
             matches.append({
-                'evidence_type': 'bytecode_field_access',
+                'evidence_type': (
+                    'bytecode_reflection_field_access'
+                    if item.get('reference_kind') == 'reflection_field'
+                    else 'bytecode_field_access'
+                ),
                 'target_display': f"{owner}.{member_name}",
                 'consumer_method': item.get('consumer_method') or '<unknown>',
                 'consumer_signature': item.get('consumer_signature') or '',
@@ -590,6 +692,46 @@ def _match_runtime_dependency_reference(api_row, references):
     return matches[0] if matches else None
 
 
+def _runtime_class_variants(entries, target_jdk=None, multi_release_enabled=True):
+    """Return effective class entries from a normal or Multi-Release JAR."""
+    base = {}
+    versioned = {}
+    for entry in entries or []:
+        if not str(entry).endswith('.class'):
+            continue
+        match = re.match(r'^META-INF/versions/(\d+)/(.*\.class)$', str(entry))
+        if match:
+            if multi_release_enabled:
+                versioned.setdefault(match.group(2), []).append((int(match.group(1)), str(entry)))
+        elif not str(entry).startswith('META-INF/'):
+            base[str(entry)] = str(entry)
+
+    try:
+        raw_target = str(target_jdk or '').strip()
+        target = int(raw_target.split('.', 1)[1]) if raw_target.startswith('1.') else int(raw_target.split('.', 1)[0])
+    except ValueError:
+        target = None
+
+    variants = []
+    logical_names = sorted(set(base) | set(versioned))
+    for logical_name in logical_names:
+        if target is None:
+            if logical_name in base:
+                variants.append((base[logical_name], logical_name, 'base'))
+            for version, entry in sorted(versioned.get(logical_name, [])):
+                variants.append((entry, logical_name, version))
+            continue
+        selected_entry = base.get(logical_name)
+        selected_version = 'base'
+        for version, entry in sorted(versioned.get(logical_name, [])):
+            if version <= target:
+                selected_entry = entry
+                selected_version = version
+        if selected_entry:
+            variants.append((selected_entry, logical_name, selected_version))
+    return variants, bool(versioned), target
+
+
 def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     catalog = _get_runtime_dependency_catalog(graph)
     by_coord = catalog.get('by_coord') or {}
@@ -609,6 +751,9 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     scan_failures = []
     scanned_classes = 0
     visited_classes = 0
+    multi_release_seen = False
+    multi_release_target_resolved = False
+    target_jdk = catalog.get('target_jdk')
     for item in catalog_entries:
         coord = str(item.get('coord') or '').strip()
         if coord == str(api_row.get('coord') or '').strip():
@@ -623,21 +768,36 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
             continue
         try:
             with zipfile.ZipFile(jar_path) as zf:
-                for entry in sorted(zf.namelist()):
-                    if not entry.endswith('.class') or entry.startswith('META-INF/'):
-                        continue
-                    if entry.endswith('module-info.class') or entry.endswith('package-info.class'):
+                try:
+                    manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
+                except KeyError:
+                    manifest = ''
+                multi_release_enabled = bool(re.search(
+                    r'(?im)^Multi-Release\s*:\s*true\s*$', manifest
+                ))
+                variants, is_multi_release, parsed_target = _runtime_class_variants(
+                    zf.namelist(), target_jdk, multi_release_enabled=multi_release_enabled
+                )
+                multi_release_seen = multi_release_seen or is_multi_release
+                if is_multi_release and parsed_target is not None:
+                    multi_release_target_resolved = True
+                for entry, logical_name, selected_version in variants:
+                    if logical_name.endswith('module-info.class') or logical_name.endswith('package-info.class'):
                         continue
                     visited_classes += 1
                     data = zf.read(entry)
                     if not _class_bytes_might_reference_target(data, owner_internal_name, member_name):
                         continue
-                    class_binary_name = entry[:-6].replace('/', '.')
-                    references = _load_runtime_dependency_class_references(catalog, coord, jar_path, class_binary_name)
+                    class_binary_name = logical_name[:-6].replace('/', '.')
+                    references = _load_runtime_dependency_class_references(
+                        catalog, coord, jar_path, class_binary_name,
+                        multi_release_version=selected_version,
+                    )
                     if references is None:
                         scan_failures.append({
                             'reason': 'BYTECODE_JAVAP_FAILED', 'coord': coord,
                             'jar_path': jar_path, 'class_binary_name': class_binary_name,
+                            'multi_release_version': selected_version,
                         })
                         continue
                     scanned_classes += 1
@@ -653,6 +813,8 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                             'consumer_signature': matched.get('consumer_signature') or '',
                             'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
                             'target_display': matched.get('target_display') or owner,
+                            'class_entry': entry,
+                            'multi_release_version': selected_version,
                         })
         except Exception as exc:
             scan_failures.append({
@@ -661,9 +823,25 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
             })
             continue
     if hits:
+        unique_hits = []
+        seen_hits = set()
+        for hit in hits:
+            identity = tuple(hit.get(key) for key in (
+                'coord', 'class_fqcn', 'consumer_method', 'consumer_signature',
+                'evidence_type', 'target_display', 'multi_release_version',
+            ))
+            if identity not in seen_hits:
+                seen_hits.add(identity)
+                unique_hits.append(hit)
         return {
-            'status': 'hit', 'hits': hits, 'scan_failures': scan_failures,
+            'status': 'hit', 'hits': unique_hits, 'scan_failures': scan_failures,
             'scanned_classes': scanned_classes, 'visited_classes': visited_classes,
+        }
+    if multi_release_seen and not multi_release_target_resolved:
+        return {
+            'status': 'unavailable', 'reason': 'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
+            'scan_failures': scan_failures, 'scanned_classes': scanned_classes,
+            'visited_classes': visited_classes,
         }
     catalog_status = str(catalog.get('status') or '').strip()
     if catalog_status and catalog_status != 'complete':
@@ -770,6 +948,84 @@ def _build_packaged_dependency_incomplete_result(result, scan_result):
     result.verification_commands = [
         '检查当前环境是否可执行 javap，并确认 Step1 留存制品及其中的嵌套依赖 JAR 完整可读',
         '必要时补充 dependency_source_dirs 或重新准备依赖产物后重跑 Step 5',
+    ]
+    return result
+
+
+def _build_indirect_usage_result(result, api_row, graph):
+    key = indirect_api_key(api_row)
+    exact_findings = list((getattr(graph, 'indirect_usage_findings', {}) or {}).get(key) or [])
+    unresolved = list((getattr(graph, 'indirect_usage_unresolved', {}) or {}).get(key) or [])
+    findings = exact_findings + unresolved
+    if not findings:
+        return None
+    result.analysis_status = 'uncertain'
+    result.is_reachable = None
+    result.reason_code = str(findings[0].get('reason_code') or 'INDIRECT_TARGET_REFERENCE')
+    result.reachable_note = (
+        '已发现与变更 API 相关的间接引用证据，但当前证据不能唯一证明该路径触达并执行目标 API'
+    )
+    result.call_paths = []
+    result.evidence_paths = []
+    result.path_details = []
+    for finding in findings:
+        caller = str(finding.get('caller_symbol') or 'indirect-reference')
+        path_text = f"{caller} -> {result.api_name}{result.api_signature or ''}"
+        evidence = [{
+            'caller_symbol': caller,
+            'callee_key': f"{result.api_name}{result.api_signature or ''}",
+            'evidence_type': finding.get('evidence_type') or 'indirect_reference',
+            'confidence': 'medium',
+            'file': finding.get('file') or '',
+            'line': int(finding.get('line') or 0),
+            'owner_coord': finding.get('owner_coord') or '',
+        }]
+        result.call_paths.append(path_text)
+        result.evidence_paths.append(evidence)
+        result.path_details.append({
+            'path_status': 'uncertain',
+            'stop_reason': finding.get('reason_code') or result.reason_code,
+            'business_reachable': None,
+            'consumer_coord': finding.get('owner_coord') or '',
+            'consumer_class': '', 'consumer_method': caller,
+            'consumer_signature': '', 'path_text': path_text,
+            'confidence': 0.6, 'depth': 1, 'evidence': evidence,
+        })
+    result.verification_commands = [
+        '核对间接引用中的动态类名、成员名和参数类型',
+        '结合实际配置或运行测试确认目标 API 是否会被调用',
+    ]
+    return result
+
+
+def _capability_coverage_for_api(api_row, graph):
+    coverage = dict(getattr(graph, 'indirect_analysis_coverage', {}) or {})
+    per_api = dict(coverage.get('by_api') or {})
+    item = dict(per_api.get(indirect_api_key(api_row)) or {})
+    if not item:
+        return coverage
+    symbol_kind = get_symbol_kind(api_row)
+    return {
+        'status': item.get('status') or 'not_applicable',
+        'reason_codes': list(item.get('reason_codes') or []),
+        'analyzers': dict(item.get('matrix') or {}),
+        'matrix': {symbol_kind: dict(item.get('matrix') or {})},
+    }
+
+
+def _build_indirect_coverage_incomplete_result(result):
+    coverage = dict(result.capability_coverage or {})
+    reasons = list(coverage.get('reason_codes') or [])
+    result.analysis_status = 'not_analyzed'
+    result.is_reachable = None
+    result.reason_code = 'INDIRECT_ANALYSIS_INCOMPLETE'
+    result.reachable_note = (
+        '目标 API 存在适用但未完整覆盖的间接调用机制，不能把静态未命中解释为未发现引用。'
+        + (f"未完整能力：{', '.join(reasons)}" if reasons else '')
+    )
+    result.verification_commands = [
+        '查看 alerts.csv 的 coverage_details，定位 partial/insufficient 的间接分析能力',
+        '补充对应源码、制品或框架证据后重新运行 Step 5',
     ]
     return result
 
@@ -1097,6 +1353,7 @@ def trace_api_with_confidence_weighting(
         critical_nodes_hit=[],
         match_provenance='',
         match_tier=-1,
+        capability_coverage=_capability_coverage_for_api(api_row, graph),
     )
     _step5_debug(
         'trace_api_start',
@@ -1715,6 +1972,16 @@ def trace_api_with_confidence_weighting(
     # 1. 反射调用/动态代理/配置文件引用
     # 2. 测试代码或非扫描目录中的引用
     # 3. 运行时动态加载的代码
+    indirect_result = _build_indirect_usage_result(result, api_row, graph)
+    if indirect_result is not None:
+        _debug_trace_result('trace_api_result', indirect_result)
+        return indirect_result
+
+    if (result.capability_coverage or {}).get('status') in {'partial', 'insufficient'}:
+        built = _build_indirect_coverage_incomplete_result(result)
+        _debug_trace_result('trace_api_result', built)
+        return built
+
     if artifact_scan_miss:
         if _is_inlined_constant_change(api_row):
             built = _build_inlined_constant_result(result)
