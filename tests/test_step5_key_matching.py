@@ -24,6 +24,73 @@ import s6_report  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def test_analyze_file_ignores_fully_block_commented_java_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            java_file = Path(tmp) / "Demo.java"
+            java_file.write_text(
+                "\n".join(
+                    [
+                        "/*",
+                        "package com.example;",
+                        "public class Demo {",
+                        "    public String foo() {",
+                        '        return "x";',
+                        "    }",
+                        "}",
+                        "*/",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            methods, parser_info = source_analyzer.analyze_file(
+                str(java_file),
+                {"root": tmp, "owner_type": "business", "owner_coord": "BUSINESS", "module": "app"},
+                return_diagnostics=True,
+            )
+
+            self.assertEqual(methods, [])
+            self.assertEqual(parser_info["actual_parser"], "regex")
+            self.assertTrue(parser_info["fallback_reason"].startswith("tree_sitter_runtime_error:"))
+
+    def test_analyze_file_ignores_block_commented_structure_but_keeps_real_method(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            java_file = Path(tmp) / "Demo.java"
+            java_file.write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "/*",
+                        "public class OldDemo {",
+                        "    public String removed() {",
+                        '        return "old";',
+                        "    }",
+                        "}",
+                        "*/",
+                        "public class Demo {",
+                        "    public String live() {",
+                        '        return "new";',
+                        "    }",
+                        "}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            methods, parser_info = source_analyzer.analyze_file(
+                str(java_file),
+                {"root": tmp, "owner_type": "business", "owner_coord": "BUSINESS", "module": "app"},
+                return_diagnostics=True,
+            )
+
+            self.assertEqual(parser_info["actual_parser"], "tree_sitter")
+            self.assertEqual(
+                [(method.class_fqcn, method.method_name) for method in methods],
+                [("com.example.Demo", "live")],
+            )
+
     def test_format_call_chain_outputs_every_hop_in_forward_order(self):
         direct = SimpleNamespace(
             caller_qualified_key="com.dep.B.callC", caller_symbol_id="b",

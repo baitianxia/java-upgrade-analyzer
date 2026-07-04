@@ -383,20 +383,94 @@ class EnhancedRegexAnalyzer:
         """分析单个源码文件"""
         try:
             with open(self.file_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = list(f)
+                original_lines = list(f)
         except Exception:
             return []
 
+        sanitized_lines = self._sanitize_structure_lines(original_lines)
+
         # Phase 1: 提取包名、imports、类结构、字段
-        self.package_name = self._detect_package(lines)
-        self.imports, self.static_imports, self.wildcard_imports = self._detect_imports(lines)
-        self._scan_class_structure(lines)
-        self._scan_fields(lines)
+        self.package_name = self._detect_package(sanitized_lines)
+        self.imports, self.static_imports, self.wildcard_imports = self._detect_imports(sanitized_lines)
+        self._scan_class_structure(sanitized_lines)
+        self._scan_fields(sanitized_lines)
 
         # Phase 2: 提取方法定义
-        methods = self._extract_methods(lines)
+        methods = self._extract_methods(sanitized_lines, original_lines=original_lines)
 
         return methods
+
+    def _sanitize_structure_lines(self, lines):
+        """
+        结构扫描前统一屏蔽注释内容，同时保留行数与非注释代码布局。
+
+        这样 tree-sitter 降级到 regex 后，不会把整段块注释中的类/字段/方法
+        误识别为真实源码结构。
+        """
+        sanitized = []
+        in_block_comment = False
+        for raw_line in lines:
+            line = []
+            i = 0
+            n = len(raw_line)
+            in_string = False
+            in_char = False
+            while i < n:
+                ch = raw_line[i]
+                nxt = raw_line[i + 1] if i + 1 < n else ""
+                if in_block_comment:
+                    if ch == '*' and nxt == '/':
+                        line.extend([' ', ' '])
+                        in_block_comment = False
+                        i += 2
+                    else:
+                        line.append('\n' if ch == '\n' else ' ')
+                        i += 1
+                    continue
+                if in_string:
+                    line.append(ch)
+                    if ch == '\\' and i + 1 < n:
+                        line.append(raw_line[i + 1])
+                        i += 2
+                        continue
+                    if ch == '"':
+                        in_string = False
+                    i += 1
+                    continue
+                if in_char:
+                    line.append(ch)
+                    if ch == '\\' and i + 1 < n:
+                        line.append(raw_line[i + 1])
+                        i += 2
+                        continue
+                    if ch == "'":
+                        in_char = False
+                    i += 1
+                    continue
+                if ch == '"':
+                    in_string = True
+                    line.append(ch)
+                    i += 1
+                    continue
+                if ch == "'":
+                    in_char = True
+                    line.append(ch)
+                    i += 1
+                    continue
+                if ch == '/' and nxt == '/':
+                    line.extend(' ' for _ in raw_line[i:] if _ != '\n')
+                    if raw_line.endswith('\n'):
+                        line.append('\n')
+                    break
+                if ch == '/' and nxt == '*':
+                    line.extend([' ', ' '])
+                    in_block_comment = True
+                    i += 2
+                    continue
+                line.append(ch)
+                i += 1
+            sanitized.append(''.join(line))
+        return sanitized
 
     def _detect_package(self, lines):
         """提取包名"""
@@ -524,10 +598,11 @@ class EnhancedRegexAnalyzer:
                                     self.field_types[param_name] = resolved_type
                                     self.field_declared_types[param_name] = type_expr
 
-    def _extract_methods(self, lines):
+    def _extract_methods(self, lines, original_lines=None):
         """提取方法定义（含方法体内容用于调用边提取）"""
         methods = []
         n = len(lines)
+        original_lines = list(original_lines or lines)
 
         # 内联维护类栈：在每行方法定义时 class_stack 处于正确状态
         class_stack = []
@@ -621,7 +696,7 @@ class EnhancedRegexAnalyzer:
                     body_brace_depth -= 1  # 单行方法体：同一行的 } 抵消
 
             if capture:
-                body_lines.append(line)
+                body_lines.append(original_lines[idx])
 
             # 继续处理后续行
             j = idx + 1
@@ -636,7 +711,7 @@ class EnhancedRegexAnalyzer:
                     elif ch == '}':
                         body_brace_depth -= 1
 
-                body_lines.append(l)
+                body_lines.append(original_lines[j])
                 j += 1
 
             end_line = idx if not capture else min(j, n - 1)
