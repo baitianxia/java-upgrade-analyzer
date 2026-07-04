@@ -174,6 +174,36 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(len(selection_summary["matched_rows"]), 1)
             self.assertEqual(selection_summary["matched_rows"][0]["source"], "japicmp")
 
+    def test_materialize_step5_input_name_filter_keeps_all_matching_coords(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            all_changed_path = report_dir / "all_changed_apis.csv"
+            all_changed_path.write_text(
+                "\n".join(
+                    [
+                        "coord,api_name,api_simple,api_signature,symbol_kind,change_type,confirmed,severity,source,analysis_scope",
+                        "com.example:demo-lib,com.example.Demo.call,call,(),method,REMOVED,true,P1,japicmp,api",
+                        "org.example:demo-lib,org.example.Demo.call,call,(),method,REMOVED,true,P1,japicmp,api",
+                        "com.example:core-lib,com.example.Core.call,call,(),method,REMOVED,true,P1,japicmp,api",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            materialized_path, selection_summary = run_step.materialize_step5_all_changed_apis_input(
+                all_changed_path,
+                report_dir,
+                {"step5_selected_names": ["demo-lib"]},
+            )
+
+            self.assertEqual(materialized_path.name, "selected_all_changed_apis.csv")
+            self.assertEqual(selection_summary["matched_names"], ["demo-lib"])
+            self.assertEqual(
+                {row["coord"] for row in selection_summary["matched_rows"]},
+                {"com.example:demo-lib", "org.example:demo-lib"},
+            )
+
     def test_step1_review_continue_propagates_confirmed_branches_to_step2_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -351,7 +381,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 ["com.example:demo-lib"],
             )
 
-    def test_apply_structured_user_response_rejects_ambiguous_selected_targets_without_pending(self):
+    def test_apply_structured_user_response_resolves_name_selected_targets_without_pending(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
@@ -379,14 +409,20 @@ class RunStepMainStateTest(unittest.TestCase):
                 response_file="",
             )
 
-            with self.assertRaisesRegex(run_step.StepError, "selected_targets 存在歧义"):
-                run_step.apply_structured_user_response_if_present(
-                    args,
-                    project_dir,
-                    report_dir,
-                    state,
-                    "",
-                )
+            result = run_step.apply_structured_user_response_if_present(
+                args,
+                project_dir,
+                report_dir,
+                state,
+                "",
+            )
+
+            self.assertIsNone(result["early_exit_code"])
+            self.assertEqual(result["step_id"], "step5")
+            self.assertEqual(
+                state["step5"]["input"]["step5_selected_names"],
+                ["demo-lib"],
+            )
 
     def test_build_canonical_user_response_supports_intent_patch(self):
         canonical = run_step.build_canonical_user_response(
@@ -759,7 +795,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 {"action": "rerun_current_step"},
             )
 
-    def test_validate_pending_interaction_response_rejects_ambiguous_selected_targets(self):
+    def test_validate_pending_interaction_response_allows_name_selected_targets(self):
         selection_options = run_step.build_interaction_selection_options(
             [
                 {"coord": "com.example:demo-lib", "name": "demo-lib"},
@@ -783,11 +819,18 @@ class RunStepMainStateTest(unittest.TestCase):
             "step4",
         )
 
-        with self.assertRaisesRegex(run_step.StepError, "selected_targets 存在歧义"):
-            run_step.validate_pending_interaction_response(
-                interaction,
-                {"action": "continue", "selected_targets": ["demo-lib"]},
-            )
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {"action": "continue", "selected_targets": ["demo-lib"]},
+        )
+        normalized = run_step.resolve_selected_targets(
+            interaction.get("selection_resolution") or {},
+            ["demo-lib"],
+        )
+
+        self.assertEqual(normalized["selected_targets"], ["demo-lib"])
+        self.assertEqual(normalized["step5_selected_coords"], [])
+        self.assertEqual(normalized["step5_selected_names"], ["demo-lib"])
 
     def test_build_run_context_keeps_dependency_source_mappings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2060,12 +2103,17 @@ class RunStepMainStateTest(unittest.TestCase):
             step1_changes = report_dir / "s1_dep_changes.csv"
             step1_summary = report_dir / "s1_dep_summary.txt"
             step1_resolved = report_dir / "s1_deps_current_resolved.csv"
+            build_provenance = report_dir / "build_provenance.json"
+            artifacts_dir = report_dir / "artifacts"
             main_state = report_dir / "main_state.json"
             interaction = report_dir / "interaction.json"
             step1_alerts.write_text("coord\n", encoding="utf-8")
             step1_changes.write_text("coord\n", encoding="utf-8")
             step1_summary.write_text("summary\n", encoding="utf-8")
             step1_resolved.write_text("coord\n", encoding="utf-8")
+            build_provenance.write_text("{}", encoding="utf-8")
+            artifacts_dir.mkdir(parents=True)
+            (artifacts_dir / "current.jar").write_text("jar\n", encoding="utf-8")
             main_state.write_text("{}", encoding="utf-8")
             interaction.write_text("{}", encoding="utf-8")
 
@@ -2075,6 +2123,37 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertFalse(step1_changes.exists())
             self.assertFalse(step1_summary.exists())
             self.assertFalse(step1_resolved.exists())
+            self.assertFalse(build_provenance.exists())
+            self.assertFalse(artifacts_dir.exists())
+            self.assertTrue(main_state.exists())
+            self.assertTrue(interaction.exists())
+
+    def test_cleanup_step_outputs_removes_all_step5_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            step5_dir = report_dir / "s5_call_chain"
+            artifact_catalog = report_dir / "artifact_bytecode_catalog.json"
+            artifact_index = report_dir / "artifact_bytecode_index.json"
+            framework_adapters = report_dir / "framework_adapters.json"
+            source_alignment = report_dir / "source_artifact_alignment.json"
+            main_state = report_dir / "main_state.json"
+            interaction = report_dir / "interaction.json"
+            step5_dir.mkdir(parents=True)
+            (step5_dir / "summary.json").write_text("{}", encoding="utf-8")
+            artifact_catalog.write_text("{}", encoding="utf-8")
+            artifact_index.write_text("{}", encoding="utf-8")
+            framework_adapters.write_text("{}", encoding="utf-8")
+            source_alignment.write_text("{}", encoding="utf-8")
+            main_state.write_text("{}", encoding="utf-8")
+            interaction.write_text("{}", encoding="utf-8")
+
+            run_step.cleanup_step_outputs("step5", report_dir)
+
+            self.assertFalse(step5_dir.exists())
+            self.assertFalse(artifact_catalog.exists())
+            self.assertFalse(artifact_index.exists())
+            self.assertFalse(framework_adapters.exists())
+            self.assertFalse(source_alignment.exists())
             self.assertTrue(main_state.exists())
             self.assertTrue(interaction.exists())
 

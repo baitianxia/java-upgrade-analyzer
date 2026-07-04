@@ -1520,7 +1520,7 @@ def build_selection_resolution(selection_options):
         "preferred_write_fields": ["step5_selected_coords", "step5_selected_names"],
         "rules": [
             "若用户提到候选依赖，应优先输出 selected_targets，并优先使用 selection_key。",
-            "selected_targets 也允许精确填写 coord 或 name；若 name 命中多个候选，必须先追问，不能猜测。",
+            "selected_targets 若填写 selection_key 或 coord，必须严格按该唯一目标执行；若只填写 name，则按 artifactId 名称筛选命中的全部候选。",
             "selected_targets 只是候选选择输入；系统会自动把它归一化为正式的 step5_selected_coords / step5_selected_names。",
         ],
         "options": normalized_options,
@@ -1766,13 +1766,25 @@ def resolve_selected_targets(selection_resolution, raw_value):
     options = list(resolution.get("options") or [])
     if not options:
         raise StepError("当前检查点不支持 selected_targets。")
+    selection_key_map = {}
+    coord_map = {}
+    name_map = {}
     alias_map = {}
     for item in options:
+        selection_key = str(item.get("selection_key") or "").strip()
+        coord = str(item.get("coord") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if selection_key:
+            selection_key_map.setdefault(selection_key.lower(), []).append(item)
+        if coord:
+            coord_map.setdefault(coord.lower(), []).append(item)
+        if name:
+            name_map.setdefault(name.lower(), []).append(item)
         aliases = _dedupe_strings(
             [
-                str(item.get("selection_key") or "").strip(),
-                str(item.get("coord") or "").strip(),
-                str(item.get("name") or "").strip(),
+                selection_key,
+                coord,
+                name,
             ]
             + list(item.get("aliases") or [])
         )
@@ -1780,7 +1792,42 @@ def resolve_selected_targets(selection_resolution, raw_value):
             alias_key = alias.lower()
             if not alias_key:
                 continue
+            if alias_key in {selection_key.lower(), coord.lower(), name.lower()}:
+                continue
             alias_map.setdefault(alias_key, []).append(item)
+
+    def unique_hits(raw_hits):
+        resolved = []
+        seen_option_keys = set()
+        for hit in raw_hits:
+            option_key = str(hit.get("selection_key") or "").strip().lower()
+            if option_key in seen_option_keys:
+                continue
+            seen_option_keys.add(option_key)
+            resolved.append(hit)
+        return resolved
+
+    def append_selected_hit(hit):
+        coord = str(hit.get("coord") or "").strip()
+        name = str(hit.get("name") or "").strip()
+        if coord and coord.lower() not in seen_coords:
+            selected_coords.append(coord)
+            seen_coords.add(coord.lower())
+            return
+        if name and name.lower() not in seen_names:
+            selected_names.append(name)
+            seen_names.add(name.lower())
+
+    def append_selected_name(name_value, raw_hits):
+        hits = unique_hits(raw_hits)
+        if not hits:
+            return False
+        canonical_name = str(hits[0].get("name") or name_value or "").strip() or str(name_value or "").strip()
+        if canonical_name and canonical_name.lower() not in seen_names:
+            selected_names.append(canonical_name)
+            seen_names.add(canonical_name.lower())
+        return True
+
     selected_coords = []
     selected_names = []
     unresolved = []
@@ -1788,30 +1835,31 @@ def resolve_selected_targets(selection_resolution, raw_value):
     seen_coords = set()
     seen_names = set()
     for raw_item in values:
-        hits = alias_map.get(raw_item.lower(), [])
-        if not hits:
+        raw_key = raw_item.lower()
+        if raw_key.startswith("name:"):
+            name_value = raw_item.split(":", 1)[1].strip()
+            if not name_value or not append_selected_name(name_value, name_map.get(name_value.lower(), [])):
+                unresolved.append(raw_item)
+            continue
+        direct_hits = unique_hits(selection_key_map.get(raw_key, []))
+        if not direct_hits:
+            direct_hits = unique_hits(coord_map.get(raw_key, []))
+        if direct_hits:
+            if len(direct_hits) > 1:
+                ambiguous[raw_item] = [str(item.get("selection_key") or "").strip() for item in direct_hits]
+                continue
+            append_selected_hit(direct_hits[0])
+            continue
+        if append_selected_name(raw_item, name_map.get(raw_key, [])):
+            continue
+        alias_hits = unique_hits(alias_map.get(raw_key, []))
+        if not alias_hits:
             unresolved.append(raw_item)
             continue
-        unique_hits = []
-        seen_option_keys = set()
-        for hit in hits:
-            option_key = str(hit.get("selection_key") or "").strip().lower()
-            if option_key in seen_option_keys:
-                continue
-            seen_option_keys.add(option_key)
-            unique_hits.append(hit)
-        if len(unique_hits) > 1:
-            ambiguous[raw_item] = [str(item.get("selection_key") or "").strip() for item in unique_hits]
+        if len(alias_hits) > 1:
+            ambiguous[raw_item] = [str(item.get("selection_key") or "").strip() for item in alias_hits]
             continue
-        hit = unique_hits[0]
-        coord = str(hit.get("coord") or "").strip()
-        name = str(hit.get("name") or "").strip()
-        if coord and coord.lower() not in seen_coords:
-            selected_coords.append(coord)
-            seen_coords.add(coord.lower())
-        elif name and name.lower() not in seen_names:
-            selected_names.append(name)
-            seen_names.add(name.lower())
+        append_selected_hit(alias_hits[0])
     return {
         "selected_targets": values,
         "step5_selected_coords": selected_coords,
@@ -4911,10 +4959,12 @@ def step_output_paths_for_cleanup(step_id, report_dir):
     report_dir = Path(report_dir).resolve()
     outputs = {
         "step1": [
-                report_dir / "s1_dep_alerts.csv",
+            report_dir / "s1_dep_alerts.csv",
             report_dir / "s1_dep_changes.csv",
-                report_dir / "s1_dep_summary.txt",
+            report_dir / "s1_dep_summary.txt",
             report_dir / "s1_deps_current_resolved.csv",
+            report_dir / "build_provenance.json",
+            report_dir / "artifacts",
         ],
         "step2": [
             report_dir / "s2_context.json",
@@ -4939,6 +4989,10 @@ def step_output_paths_for_cleanup(step_id, report_dir):
         ],
         "step5": [
             report_dir / "s5_call_chain",
+            report_dir / "artifact_bytecode_catalog.json",
+            report_dir / "artifact_bytecode_index.json",
+            report_dir / "framework_adapters.json",
+            report_dir / "source_artifact_alignment.json",
         ],
         "step6": [
             report_dir / "s6_findings.json",

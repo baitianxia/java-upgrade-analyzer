@@ -92,7 +92,9 @@
         }
       },
       "outputs": [
+        "s1_dep_alerts.csv",
         "s1_dep_changes.csv",
+        "s1_dep_summary.txt",
         "s1_deps_current_resolved.csv",
         "build_provenance.json",
         "artifacts/"
@@ -444,9 +446,11 @@
         "s4_jar_compare/all_changed_apis.csv"
       ],
       "outputs": [
-        "s5_call_chain/summary.json",
+        "s5_call_chain/",
         "artifact_bytecode_catalog.json",
-        "framework_adapters.json"
+        "artifact_bytecode_index.json",
+        "framework_adapters.json",
+        "source_artifact_alignment.json"
       ],
       "notes": [
         "Step5 默认会遍历 all_changed_apis.csv，并对每条变更做反向调用链追踪；若 Step4 checkpoint 指定了坐标/名称，则只分析被选中的依赖。"

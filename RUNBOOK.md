@@ -474,6 +474,7 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 
 若通过 `run_step.py` 执行，建议将 `source_dirs` / `dependency_source_dirs` / `max_depth` 写入 `main_state.json`，命令保持最小参数集。
 - 若 Step4 checkpoint 只想分析部分变更 jar，优先在恢复时传 `selected_targets`；调度器会先把它归一化为正式的 `step5_selected_coords` / `step5_selected_names`，再基于 Step4 API 生成过滤后的输入文件执行 Step5。
+- 若 `selected_targets` 提供的是 `selection_key` 或完整 `coord`，调度器必须严格按该唯一目标执行；只有当用户只给出 `name` 时，才允许按 `artifactId` 名称筛选命中的全部候选。
 正式流程默认不设置 Step5 外层超时；仅在主状态中显式写入 `step5_timeout` 时才启用限制。
 
 规则：
@@ -485,6 +486,7 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 - 若 `all_changed_apis.csv` 为空，直接跳过并说明“Step4 未提取到可追踪的变更 API”
 - 若指定 `selected_targets`，优先按候选的 `selection_key` 精确匹配；也支持精确填写 `coord` 或 `name`，随后会归一化为正式的 `step5_selected_coords` / `step5_selected_names`
 - Step4 checkpoint 若只展示前若干个候选，这只影响展示，不影响正式匹配；未展示的合法目标仍会参与 `selected_targets` 解析
+- 显式重跑 Step1 或 Step5 前，调度层会先清空该步骤全部正式输出，避免旧的制品、catalog、framework adapter 或对齐文件污染新一轮结果
 - 若直接指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
 - 若筛选条件未在 Step4 API 目标中命中，Step5 会直接报错，避免静默分析错范围
 - 正式流程会向 `stderr` 输出 `[progress][step5][discovery|graph|bridge-check|trace|report|done]` 日志，展示源码映射发现、图构建、调用链追踪与报告生成的推进情况

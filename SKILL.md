@@ -399,7 +399,8 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 若证据不足，应先补 `dependency_source_dirs`，而不是直接进入 `step5`
 - 允许在 `continue` 时优先附带 `selected_targets`，让系统自动归一化为 `step5_selected_coords` / `step5_selected_names`
 - `selection_options` 只反映 Step4 API 目标；每个候选都应带稳定 `selection_key`
-- Step4 checkpoint 若只展示部分 `selection_options` 作为人工阅读摘要，这不应收窄正式选择范围；`selected_targets` 的解析仍必须基于完整候选集，允许用户直接提交未展示但合法的精确 `coord` / `name`
+- Step4 checkpoint 若只展示部分 `selection_options` 作为人工阅读摘要，这不应收窄正式选择范围；`selected_targets` 的解析仍必须基于完整候选集，允许用户直接提交未展示但合法的 `selection_key` / `coord` / `name`
+- `selected_targets` 若填写 `selection_key` 或 `coord`，调度层必须严格按该唯一目标执行；若只填写 `name`，则按 `artifactId` 名称筛选命中的全部候选
 - 恢复前必须遵守 `action_requirements`；若当前动作缺少 required / at_least_one_of 字段，必须先追问，不能空恢复
 - 允许动作：`continue`、`cancel`
 - 禁止动作：证据明显不足时仍直接进入 `step5`
@@ -434,7 +435,9 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
 - 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
 - 规则：名称筛选按 `coord` 的 `artifactId` 精确匹配；坐标筛选按 `coord` 精确匹配
+- 规则：若用户通过 `selected_targets` 明确提交 `selection_key` 或 `coord`，Step5 只能分析对应唯一依赖；只有当用户只给出 `name` 时，才允许按名称批量筛选
 - 规则：筛选匹配范围只允许来自 Step4 API；Step3 平台/框架风险和类级 candidate 不得追加为 Step5 变更 API
+- 规则：显式重跑某一步前，调度层必须先清空该步骤全部正式输出，避免旧轮次的制品、目录或字节码证据混入本轮结果
 - 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
 - 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
 - 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step5 必须优先按 `lib_entry` 提取制品中的真实嵌套 JAR，不得用本地 Maven 仓库副本冒充完整制品证据

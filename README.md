@@ -205,6 +205,8 @@ python3 scripts/run_step.py --step step1 \
   - `s1_dep_changes.csv`
   - `s1_dep_summary.txt`
   - `s1_dep_alerts.csv`
+  - `build_provenance.json`
+  - `artifacts/`
 - Step2（上下文）
   - `s2_context.json`
   - `s2_dep_graph.json`
@@ -248,6 +250,8 @@ python3 scripts/run_step.py --step step1 \
 | `s1_deps_current_resolved.csv` | current 侧解析后的依赖清单（坐标、版本、scope、备注） | Step1 对 current 侧最终产物或 runtime 依赖结果做结构化提取生成 | 用于确认“当前构建实际生效的依赖集合”；用于定位 BOM/版本仲裁和打包插件导致的差异 |
 | `s1_dep_alerts.csv` | 需人工复核的依赖变更子集（如降级、版本不确定、风险标记） | 从 `s1_dep_changes.csv` 按规则筛选生成 | Step1 的人工复核入口；该文件未确认前，后续分析结果可能出现范围偏差 |
 | `s1_dep_summary.txt` | Step1 摘要（统计信息、关键告警 Top 列表） | Step1 依据解析结果汇总生成 | 用于快速确认输入是否正确（尤其是多模块/primary_module 场景）与变更规模分布 |
+| `build_provenance.json` | base/current 最终制品的来源、构建状态、SHA-256 与留存路径 | Step1 在自动构建或直接产物模式下统一写入 | 是 Step5 校验“业务源码与制品是否对齐”的正式依据；重跑 Step1 时必须一起刷新 |
+| `artifacts/` | Step1 留存的 base/current 最终制品及必要附属文件 | Step1 对自动构建结果或用户提供产物做归档后生成 | 供 Step5 提取业务 class 和运行时嵌套 JAR；旧目录不得跨轮复用 |
 
 补充说明：
 - 当部分嵌套依赖无法安全补齐坐标时，Step1 会先进入待交互；无论当前走的是直接产物模式还是自动切分支构建模式，用户都可补 `manual_coord_overrides`，或显式选择 `confirm_unresolved`
@@ -310,6 +314,10 @@ python3 scripts/run_step.py --step step1 \
 | `s5_call_chain/summary.txt` | Step5 摘要（数量统计、Top 模块/Top 风险、uncertain/not_analyzed 原因分类等） | Step5 汇总生成 | 用于快速掌握总体影响分布；若 uncertain 或 not_analyzed 比例较高，应优先补齐依赖源码映射、检查图截断与框架装配路径 |
 | `s5_call_chain/by_api/*.json` | 单条风险的完整调用链证据（`evidence_paths`、逐跳命中点、reason_code 等） | Step5 对单个候选生成 | 用于复核 reachable/uncertain 结论与定位截断点；属于证据文件 |
 | `s5_call_chain/by_module/*_impacts.json` | 按模块聚合的影响摘要 | Step5 对调用链结果进行模块聚合后生成 | 用于按业务域拆解责任与处置优先级；属于视图文件 |
+| `artifact_bytecode_catalog.json` | Step5 对 current 最终制品、业务 class 与运行时依赖 JAR 的提取清单与覆盖状态 | Step5 读取 Step1 留存制品并完成字节码入口扫描后生成 | 用于判断字节码证据是否完整；重跑 Step5 时必须与调用链结果一起刷新 |
+| `artifact_bytecode_index.json` | 按 current 制品 SHA-256 缓存的业务 class 字节码索引 | Step5 在构建字节码事实库时生成 | 用于复用方法/字段/类型/`invokedynamic` 证据；制品变化或重跑 Step5 时必须失效重建 |
+| `framework_adapters.json` | SPI、Spring、MyBatis、动态代理等框架隐式边适配结果 | Step5 的框架适配器阶段生成 | 用于解释部分非显式源码边来源；旧轮次 adapter 结果不得污染本轮 |
+| `source_artifact_alignment.json` | 源码 revision/dirty 状态与 Step1 制品溯源的一致性检查结果 | Step5 对源码目录与 Step1 留存制品做对齐校验后生成 | 用于决定字节码未命中能否反证源码候选；重跑 Step5 时必须同步刷新 |
 
 ### Step6：汇总报告（给使用者交付）
 
