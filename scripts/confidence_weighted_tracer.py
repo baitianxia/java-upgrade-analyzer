@@ -1157,24 +1157,122 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     return existing
 
 
-def _build_packaged_dependency_hit_result(result, hits):
+_JAVA_LANG_SIMPLE_TYPES = {
+    'Boolean', 'Byte', 'Character', 'CharSequence', 'Class', 'Double', 'Enum',
+    'Float', 'Integer', 'Long', 'Number', 'Object', 'Short', 'String', 'Void',
+}
+
+
+def _expand_java_lang_signature(signature):
+    text = str(signature or '').strip()
+    if not (text.startswith('(') and text.endswith(')')):
+        return ''
+    body = text[1:-1].strip()
+    if not body:
+        return text
+    parts = [part.strip() for part in body.split(',')]
+    expanded = []
+    changed = False
+    for part in parts:
+        array_suffix = ''
+        base = part
+        while base.endswith('[]'):
+            array_suffix += '[]'
+            base = base[:-2].strip()
+        if base in _JAVA_LANG_SIMPLE_TYPES:
+            expanded.append(f"java.lang.{base}{array_suffix}")
+            changed = True
+        else:
+            expanded.append(part)
+    return '(' + ', '.join(expanded) + ')' if changed else ''
+
+
+def _packaged_hit_consumer_lookup_keys(hit):
+    class_fqcn = str(hit.get('class_fqcn') or '').strip()
+    consumer_method = str(hit.get('consumer_method') or '').strip()
+    consumer_signature = str(hit.get('consumer_signature') or '').strip()
+    if not class_fqcn or not consumer_method or consumer_method == '<class>':
+        return []
+    method_display = consumer_method
+    if consumer_method == '<init>':
+        method_display = class_fqcn.rsplit('.', 1)[-1]
+    keys = []
+    signatures = [consumer_signature] if consumer_signature else []
+    expanded_signature = _expand_java_lang_signature(consumer_signature)
+    if expanded_signature:
+        signatures.append(expanded_signature)
+    for signature in signatures:
+        keys.append(f"{class_fqcn}.{consumer_method}{signature}")
+        if method_display != consumer_method:
+            keys.append(f"{class_fqcn}.{method_display}{signature}")
+    keys.append(f"{class_fqcn}.{consumer_method}")
+    if method_display != consumer_method:
+        keys.append(f"{class_fqcn}.{method_display}")
+    return list(dict.fromkeys(keys))
+
+
+def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
+    if not graph:
+        return []
+    reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    queue = []
+    for key in _packaged_hit_consumer_lookup_keys(hit):
+        queue.append((key, []))
+    visited = set()
+    paths = []
+    while queue:
+        current_key, path = queue.pop(0)
+        if current_key in visited or len(path) >= max_depth:
+            continue
+        visited.add(current_key)
+        for edge in sorted(reverse_edges.get(current_key, []) or [], key=stable_edge_sort_key):
+            method_def = methods_by_id.get(getattr(edge, 'caller_symbol_id', ''))
+            if method_def is None:
+                continue
+            next_path = path + [edge]
+            if getattr(method_def, 'owner_type', '') == 'business' and not getattr(method_def, 'is_test', False):
+                paths.append((method_def, next_path))
+                continue
+            caller_key = getattr(method_def, 'qualified_key', '') or getattr(edge, 'caller_qualified_key', '')
+            if caller_key:
+                queue.append((caller_key, next_path))
+    return paths
+
+
+def _build_packaged_dependency_hit_result(result, hits, graph=None):
     business_hits = [item for item in hits if item.get('coord') == '__business__']
+    bridged_hits = []
+    for item in hits:
+        if item.get('coord') == '__business__':
+            continue
+        for business_entry, bridge_edges in _find_business_callers_for_packaged_hit(item, graph):
+            bridged_hits.append({
+                'hit': item,
+                'business_entry': business_entry,
+                'bridge_edges': bridge_edges,
+            })
     dependency_chain = []
     for item in hits:
         coord = str(item.get('coord') or '').strip()
         if coord and coord not in dependency_chain:
             dependency_chain.append(coord)
-    result.analysis_status = 'reachable' if business_hits else 'uncertain'
-    result.is_reachable = True if business_hits else None
-    result.reason_code = 'BUSINESS_ARTIFACT_BYTECODE_USAGE' if business_hits else 'PACKAGED_DEPENDENCY_BYTECODE_USAGE'
+    has_business_path = bool(business_hits or bridged_hits)
+    result.analysis_status = 'reachable' if has_business_path else 'uncertain'
+    result.is_reachable = True if has_business_path else None
+    result.reason_code = 'BUSINESS_ARTIFACT_BYTECODE_USAGE' if has_business_path else 'PACKAGED_DEPENDENCY_BYTECODE_USAGE'
     result.reachable_note = (
-        '已在当前最终制品的业务 class 中确认对目标符号的字节码引用'
-        if business_hits else
+        '已在当前最终制品中确认业务 class 可到达目标符号引用'
+        if has_business_path else
         '已在当前最终制品的运行时依赖字节码中确认对目标符号的稳定引用，'
         '但当前尚未证明这些依赖是否回到系统业务入口'
     )
     result.dependency_chain_coords = dependency_chain
-    ordered_hits = business_hits + [item for item in hits if item not in business_hits]
+    bridged_hit_ids = {id(item.get('hit')) for item in bridged_hits}
+    ordered_hits = business_hits + [
+        item for item in hits
+        if item not in business_hits and id(item) not in bridged_hit_ids
+    ]
     result.call_paths = []
     result.evidence_paths = []
     result.path_details = []
@@ -1212,6 +1310,65 @@ def _build_packaged_dependency_hit_result(result, hits):
             'depth': 1,
             'evidence': evidence,
         })
+    for bridged in bridged_hits:
+        hit = bridged['hit']
+        bridge_edges = bridged.get('bridge_edges') or []
+        business_entry = bridged.get('business_entry')
+        consumer_member = str(hit.get('consumer_method') or '<unknown>')
+        consumer_signature = str(hit.get('consumer_signature') or '')
+        consumer_symbol = f"{hit.get('class_fqcn')}.{consumer_member}{consumer_signature}"
+        consumer_display = f"{hit.get('coord')}:{consumer_symbol}"
+        target_display = hit.get('target_display')
+        path_nodes = [
+            getattr(edge, 'caller_qualified_key', '') or getattr(edge, 'caller_symbol_id', '?')
+            for edge in reversed(bridge_edges)
+        ]
+        path_nodes.append(consumer_display)
+        path_nodes.append(target_display)
+        path_text = " -> ".join(str(item) for item in path_nodes if item)
+        result.call_paths.append(path_text)
+        evidence = []
+        for edge in reversed(bridge_edges):
+            evidence.append({
+                'caller_symbol': getattr(edge, 'caller_qualified_key', '') or getattr(edge, 'caller_symbol_id', '?'),
+                'callee_key': getattr(edge, 'callee_key', ''),
+                'evidence_type': getattr(edge, 'evidence_type', ''),
+                'confidence': getattr(edge, 'confidence', 'high'),
+                'file': getattr(edge, 'file', ''),
+                'line': getattr(edge, 'line', 0),
+                'owner_coord': getattr(edge, 'owner_coord', ''),
+            })
+        evidence.append({
+            'caller_symbol': consumer_display,
+            'callee_key': target_display,
+            'evidence_type': hit.get('evidence_type'),
+            'confidence': 'high',
+            'file': hit.get('jar_path', ''),
+            'line': 0,
+            'owner_coord': hit.get('coord', ''),
+            'consumer_class': hit.get('class_fqcn', ''),
+            'consumer_method': consumer_member,
+            'consumer_signature': consumer_signature,
+        })
+        result.evidence_paths.append(evidence)
+        result.path_details.append({
+            'path_status': 'reachable',
+            'stop_reason': '',
+            'business_entry': getattr(business_entry, 'qualified_key', '') or path_nodes[0],
+            'business_reachable': True,
+            'consumer_coord': hit.get('coord', ''),
+            'consumer_class': hit.get('class_fqcn', ''),
+            'consumer_method': consumer_member,
+            'consumer_signature': consumer_signature,
+            'path_text': path_text,
+            'confidence': 1.0,
+            'depth': len(evidence),
+            'evidence': evidence,
+        })
+    reachable_details = [item for item in result.path_details if item.get('path_status') == 'reachable']
+    if reachable_details:
+        result.direct_callers = len(reachable_details)
+        result.business_reach_depth = min(int(item.get('depth') or 1) for item in reachable_details)
     result.verification_commands = [
         '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
         '优先审查命中的无源码依赖及其对外暴露入口'
@@ -1681,7 +1838,7 @@ def trace_api_with_confidence_weighting(
         if scan_status == 'hit':
             scan_hits = scan_result.get('hits') or []
             if any(item.get('coord') == '__business__' for item in scan_hits):
-                packaged_dependency_result = _build_packaged_dependency_hit_result(result, scan_hits)
+                packaged_dependency_result = _build_packaged_dependency_hit_result(result, scan_hits, graph)
                 _debug_trace_result('trace_api_result', packaged_dependency_result)
                 return packaged_dependency_result
             artifact_dependency_hits = scan_hits
@@ -1720,7 +1877,7 @@ def trace_api_with_confidence_weighting(
     # 类级目标没有正式的方法级反向追踪主路径；若最终制品已稳定命中字节码引用，
     # 仍应沿用打包依赖命中结论，而不是被后续 CLASS_USAGE_ONLY 覆盖。
     if artifact_dependency_hits and (result.analysis_scope == 'class_usage' or result.symbol_kind == 'class'):
-        packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits)
+        packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits, graph)
         _debug_trace_result('trace_api_result', packaged_dependency_result)
         return packaged_dependency_result
 
@@ -2232,7 +2389,7 @@ def trace_api_with_confidence_weighting(
     # 对有依赖源码映射的多模块系统，应先允许 tracer 继续证明是否最终回到 BUSINESS。
     # 只有在源码图没有产出更强结论时，才回退为打包依赖字节码命中结论。
     if artifact_dependency_hits:
-        packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits)
+        packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits, graph)
         if dependency_removed:
             packaged_dependency_result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
             packaged_dependency_result.reachable_note = (

@@ -7066,6 +7066,78 @@ public class com.example.consumer.Adapter {
                 "miss",
             )
 
+    def test_packaged_dependency_hit_is_reachable_when_business_bytecode_calls_consumer(self):
+        result = tracer.TraceResult(
+            api_name="com.acme.target.LegacyApi.removed",
+            api_simple="removed",
+            api_signature="(String)",
+            symbol_kind="method",
+            change_type="METHOD_REMOVED",
+            coord="com.acme:target-lib",
+            severity="P1",
+            confirmed=True,
+            source="japicmp",
+            analysis_scope="method",
+            analysis_status="unknown",
+            direct_callers=0,
+            is_reachable=False,
+            reachable_note="",
+            business_reach_depth=0,
+            dependency_chain_coords=[],
+            call_paths=[],
+            evidence_paths=[],
+            reason_code="",
+            verification_commands=[],
+            hops=[],
+            confidence_score=1.0,
+            critical_nodes_hit=[],
+        )
+        business_method = SimpleNamespace(
+            symbol_id="app_entry",
+            qualified_key="com.acme.app.App.entry",
+            owner_type="business",
+            is_test=False,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="app_entry",
+            caller_qualified_key="com.acme.app.App.entry",
+            callee_key="com.acme.consumer.ConsumerFacade.use(java.lang.String)",
+            evidence_type="bytecode_method_invocation",
+            confidence="high",
+            file="/tmp/business-classes.jar",
+            line=0,
+            owner_type="business",
+            owner_coord="__business__",
+            module="app",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"app_entry": business_method},
+            reverse_edges={
+                "com.acme.consumer.ConsumerFacade.use(java.lang.String)": [edge],
+            },
+        )
+        hit = {
+            "coord": "com.acme:consumer-lib",
+            "class_fqcn": "com.acme.consumer.ConsumerFacade",
+            "consumer_method": "use",
+            "consumer_signature": "(String)",
+            "target_display": "com.acme.target.LegacyApi.removed(String)",
+            "evidence_type": "bytecode_method_invocation",
+            "jar_path": "/tmp/consumer-lib.jar",
+        }
+
+        built = tracer._build_packaged_dependency_hit_result(result, [hit], graph)
+
+        self.assertEqual(built.analysis_status, "reachable")
+        self.assertEqual(built.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
+        self.assertTrue(any(
+            "com.acme.app.App.entry -> com.acme:consumer-lib:com.acme.consumer.ConsumerFacade.use(String)"
+            in path
+            for path in built.call_paths
+        ))
+        self.assertTrue(any(detail.get("business_reachable") for detail in built.path_details))
+        self.assertFalse(any(detail.get("path_status") == "uncertain" for detail in built.path_details))
+
     def test_version_upgrade_scans_runtime_consumers_even_when_target_source_mapping_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "consumer.jar"
