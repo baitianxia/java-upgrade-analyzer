@@ -920,6 +920,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     ])
 
     scan_failures = []
+    candidate_failures_by_key = defaultdict(list)
     hits_by_key = defaultdict(list)
     scanned_classes = 0
     visited_classes = 0
@@ -947,9 +948,20 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         f"开始批量扫描运行时依赖字节码，依赖数={len(catalog_entries)}，API数={len(missing_rows)}",
     )
 
-    owner_bytes = [
-        (owner, internal.encode('utf-8'), owner.encode('utf-8'))
-        for owner, internal in owner_internal_names.items()
+    owner_packages = defaultdict(list)
+    for owner, internal in owner_internal_names.items():
+        internal_package = internal.rsplit('/', 1)[0] if '/' in internal else ''
+        dotted_package = owner.rsplit('.', 1)[0] if '.' in owner else ''
+        owner_packages[(internal_package, dotted_package)].append(
+            (owner, internal.encode('utf-8'), owner.encode('utf-8'))
+        )
+    package_bytes = [
+        (
+            internal_package.encode('utf-8') if internal_package else b'',
+            dotted_package.encode('utf-8') if dotted_package else b'',
+            grouped_owners,
+        )
+        for (internal_package, dotted_package), grouped_owners in owner_packages.items()
     ]
 
     for idx, item in enumerate(catalog_entries, 1):
@@ -992,8 +1004,18 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         continue
                     visited_classes += 1
                     data = zf.read(entry)
+                    owner_candidates = []
+                    for internal_package_bytes, dotted_package_bytes, grouped_owners in package_bytes:
+                        if (
+                            internal_package_bytes
+                            and internal_package_bytes not in data
+                            and dotted_package_bytes
+                            and dotted_package_bytes not in data
+                        ):
+                            continue
+                        owner_candidates.extend(grouped_owners)
                     candidate_owners = [
-                        owner for owner, internal_bytes, dotted_bytes in owner_bytes
+                        owner for owner, internal_bytes, dotted_bytes in owner_candidates
                         if internal_bytes in data or dotted_bytes in data
                     ]
                     if not candidate_owners:
@@ -1004,13 +1026,16 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         multi_release_version=selected_version,
                     )
                     if references is None:
-                        scan_failures.append({
+                        failure = {
                             'reason': 'BYTECODE_JAVAP_FAILED',
                             'coord': coord,
                             'jar_path': jar_path,
                             'class_binary_name': class_binary_name,
                             'multi_release_version': selected_version,
-                        })
+                        }
+                        for owner in set(candidate_owners):
+                            for api_row in target_rows_by_owner.get(owner, []):
+                                candidate_failures_by_key[build_api_identity_key(api_row)].append(failure)
                         continue
                     scanned_classes += 1
                     referenced_owners = set(references.get('class_refs') or [])
@@ -1054,6 +1079,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         if key in existing and existing[key].get('status') == 'unavailable':
             continue
         hits = hits_by_key.get(key) or []
+        api_scan_failures = scan_failures + list(candidate_failures_by_key.get(key) or [])
         if hits:
             unique_hits = []
             seen_hits = set()
@@ -1069,7 +1095,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             existing[key] = {
                 'status': 'hit',
                 'hits': unique_hits,
-                'scan_failures': scan_failures,
+                'scan_failures': api_scan_failures,
                 'scanned_classes': scanned_classes,
                 'visited_classes': visited_classes,
                 'scan_mode': 'batch',
@@ -1079,7 +1105,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             existing[key] = {
                 'status': 'unavailable',
                 'reason': 'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
-                'scan_failures': scan_failures,
+                'scan_failures': api_scan_failures,
                 'scanned_classes': scanned_classes,
                 'visited_classes': visited_classes,
                 'scan_mode': 'batch',
@@ -1091,18 +1117,18 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 'reason': 'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
                 'catalog_status': catalog.get('status'),
                 'catalog_reason_codes': list(catalog.get('reason_codes') or []),
-                'scan_failures': scan_failures,
+                'scan_failures': api_scan_failures,
                 'scanned_classes': scanned_classes,
                 'visited_classes': visited_classes,
                 'scan_mode': 'batch',
             }
             continue
-        if scan_failures:
-            first = dict(scan_failures[0])
+        if api_scan_failures:
+            first = dict(api_scan_failures[0])
             existing[key] = {
                 'status': 'unavailable',
                 **first,
-                'scan_failures': scan_failures,
+                'scan_failures': api_scan_failures,
                 'scanned_classes': scanned_classes,
                 'visited_classes': visited_classes,
                 'scan_mode': 'batch',
@@ -1110,7 +1136,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             continue
         existing[key] = {
             'status': 'miss',
-            'scan_failures': scan_failures,
+            'scan_failures': api_scan_failures,
             'scanned_classes': scanned_classes,
             'visited_classes': visited_classes,
             'scan_mode': 'batch',
