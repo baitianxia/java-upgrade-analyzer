@@ -18,6 +18,7 @@ confidence_weighted_tracer.py
 import json
 import os
 import re
+import struct
 import sys
 import time
 import zipfile
@@ -425,6 +426,206 @@ def _class_bytes_might_reference_target(data, owner_internal_name, member_name='
     return True
 
 
+def _parse_classfile_constant_pool_summary(data):
+    """Return a small constant-pool summary without invoking javap.
+
+    This is intentionally conservative: parse failures return None so callers can
+    fall back to the old javap path rather than miss evidence. For valid class
+    files, it lets Step5 distinguish real symbolic references from plain string
+    constants that merely mention a target owner name.
+    """
+    try:
+        if not data or len(data) < 10 or data[:4] != b'\xca\xfe\xba\xbe':
+            return None
+        cp_count = struct.unpack_from('>H', data, 8)[0]
+        utf8 = {}
+        class_name_indexes = []
+        ref_class_indexes = []
+        name_and_type_name_indexes = {}
+        ref_name_and_type_indexes = []
+        idx = 10
+        cp_index = 1
+        while cp_index < cp_count:
+            if idx >= len(data):
+                return None
+            tag = data[idx]
+            idx += 1
+            if tag == 1:  # Utf8
+                if idx + 2 > len(data):
+                    return None
+                length = struct.unpack_from('>H', data, idx)[0]
+                idx += 2
+                if idx + length > len(data):
+                    return None
+                utf8[cp_index] = data[idx:idx + length].decode('utf-8', errors='replace')
+                idx += length
+            elif tag == 7:  # Class
+                if idx + 2 > len(data):
+                    return None
+                class_name_indexes.append(struct.unpack_from('>H', data, idx)[0])
+                idx += 2
+            elif tag in (9, 10, 11):  # Fieldref / Methodref / InterfaceMethodref
+                if idx + 4 > len(data):
+                    return None
+                ref_class_indexes.append(struct.unpack_from('>H', data, idx)[0])
+                ref_name_and_type_indexes.append(struct.unpack_from('>H', data, idx + 2)[0])
+                idx += 4
+            elif tag == 12:  # NameAndType
+                if idx + 4 > len(data):
+                    return None
+                name_and_type_name_indexes[cp_index] = struct.unpack_from('>H', data, idx)[0]
+                idx += 4
+            elif tag in (3, 4):  # Integer / Float
+                idx += 4
+            elif tag in (5, 6):  # Long / Double, takes two entries
+                idx += 8
+                cp_index += 1
+            elif tag == 8:  # String
+                idx += 2
+            elif tag == 15:  # MethodHandle
+                idx += 3
+            elif tag == 16:  # MethodType
+                idx += 2
+            elif tag in (17, 18):  # Dynamic / InvokeDynamic
+                idx += 4
+            elif tag in (19, 20):  # Module / Package
+                idx += 2
+            else:
+                return None
+            if idx > len(data):
+                return None
+            cp_index += 1
+        class_internal = {utf8.get(name_index, '') for name_index in class_name_indexes}
+        ref_class_internal = {
+            utf8.get(name_index, '')
+            for name_index in class_name_indexes
+            if name_index
+        }
+        # Ref class indexes point to CONSTANT_Class entries; class_name_indexes
+        # above does not preserve the original cp index, so build a second pass
+        # mapping while keeping the parser simple.
+        class_by_cp_index = {}
+        idx = 10
+        cp_index = 1
+        while cp_index < cp_count:
+            tag = data[idx]
+            idx += 1
+            if tag == 1:
+                length = struct.unpack_from('>H', data, idx)[0]
+                idx += 2 + length
+            elif tag == 7:
+                class_by_cp_index[cp_index] = utf8.get(struct.unpack_from('>H', data, idx)[0], '')
+                idx += 2
+            elif tag in (9, 10, 11):
+                idx += 4
+            elif tag == 12:
+                idx += 4
+            elif tag in (3, 4):
+                idx += 4
+            elif tag in (5, 6):
+                idx += 8
+                cp_index += 1
+            elif tag == 8:
+                idx += 2
+            elif tag == 15:
+                idx += 3
+            elif tag == 16:
+                idx += 2
+            elif tag in (17, 18):
+                idx += 4
+            elif tag in (19, 20):
+                idx += 2
+            else:
+                return None
+            cp_index += 1
+        ref_class_internal = {
+            class_by_cp_index.get(class_index, '')
+            for class_index in ref_class_indexes
+        }
+        ref_member_names = {
+            utf8.get(name_and_type_name_indexes.get(name_and_type_index, ''), '')
+            for name_and_type_index in ref_name_and_type_indexes
+        }
+        utf8_values = set(utf8.values())
+        return {
+            'class_internal_names': {item for item in class_internal if item},
+            'ref_internal_names': {item for item in ref_class_internal if item},
+            'ref_member_names': {item for item in ref_member_names if item},
+            'utf8_values': utf8_values,
+        }
+    except Exception:
+        return None
+
+
+def _runtime_prefilter_owner_candidates(owner_candidates, data, target_rows_by_owner):
+    if not owner_candidates:
+        return []
+    summary = _parse_classfile_constant_pool_summary(data)
+    if summary is None:
+        return [owner for owner, _internal_bytes, _dotted_bytes in owner_candidates]
+    class_names = summary.get('class_internal_names') or set()
+    ref_names = summary.get('ref_internal_names') or set()
+    utf8_values = summary.get('utf8_values') or set()
+    ref_member_names = summary.get('ref_member_names') or set()
+    filtered = []
+    for owner, _internal_bytes, _dotted_bytes in owner_candidates:
+        internal = owner.replace('.', '/')
+        if internal in class_names or internal in ref_names:
+            filtered.append(owner)
+            continue
+        owner_as_string = internal in utf8_values or owner in utf8_values
+        if not owner_as_string:
+            continue
+        for api_row in target_rows_by_owner.get(owner, []):
+            _api_owner, member_name, symbol_kind = _extract_target_owner_and_member(api_row)
+            if symbol_kind == 'class' or str(api_row.get('analysis_scope') or '').strip() == 'class_usage':
+                filtered.append(owner)
+                break
+            if symbol_kind == 'constructor':
+                constructor_reflection_names = {
+                    'getConstructor',
+                    'getDeclaredConstructor',
+                    'newInstance',
+                }
+                if constructor_reflection_names & (utf8_values | ref_member_names):
+                    filtered.append(owner)
+                    break
+            if symbol_kind == 'field':
+                field_reflection_names = {
+                    'getField',
+                    'getDeclaredField',
+                    'findGetter',
+                    'findSetter',
+                    'findStaticGetter',
+                    'findStaticSetter',
+                }
+                if (
+                    member_name
+                    and (member_name in utf8_values or member_name in ref_member_names)
+                    and field_reflection_names & (utf8_values | ref_member_names)
+                ):
+                    filtered.append(owner)
+                    break
+            if symbol_kind == 'method':
+                method_reflection_names = {
+                    'getMethod',
+                    'getDeclaredMethod',
+                    'findStatic',
+                    'findVirtual',
+                    'findSpecial',
+                    'unreflect',
+                    'unreflectSpecial',
+                }
+                if (
+                    member_name
+                    and (member_name in utf8_values or member_name in ref_member_names)
+                    and method_reflection_names & (utf8_values | ref_member_names)
+                ):
+                    filtered.append(owner)
+                    break
+    return list(dict.fromkeys(filtered))
+
+
 def _run_javap_bytecode_dump(jar_path, class_binary_name, multi_release_version=None):
     command = ['javap', '-classpath', jar_path, '-verbose', '-c', '-s', '-p']
     if multi_release_version is not None:
@@ -797,6 +998,12 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                     data = zf.read(entry)
                     if not _class_bytes_might_reference_target(data, owner_internal_name, member_name):
                         continue
+                    if not _runtime_prefilter_owner_candidates(
+                        [(owner, owner_internal_name.encode('utf-8'), owner.encode('utf-8'))],
+                        data,
+                        {owner: [api_row]},
+                    ):
+                        continue
                     class_binary_name = logical_name[:-6].replace('/', '.')
                     references = _load_runtime_dependency_class_references(
                         catalog, coord, jar_path, class_binary_name,
@@ -1018,6 +1225,17 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         owner for owner, internal_bytes, dotted_bytes in owner_candidates
                         if internal_bytes in data or dotted_bytes in data
                     ]
+                    if candidate_owners:
+                        candidate_owner_set = set(candidate_owners)
+                        candidate_owners = _runtime_prefilter_owner_candidates(
+                            [
+                                (owner, internal_bytes, dotted_bytes)
+                                for owner, internal_bytes, dotted_bytes in owner_candidates
+                                if owner in candidate_owner_set
+                            ],
+                            data,
+                            target_rows_by_owner,
+                        )
                     if not candidate_owners:
                         continue
                     class_binary_name = logical_name[:-6].replace('/', '.')

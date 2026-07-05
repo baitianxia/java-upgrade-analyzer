@@ -2,6 +2,8 @@ import csv
 import json
 import io
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -25,6 +27,31 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def _compile_java_fixture(self, tmp, relative_path, source):
+        if not shutil.which("javac"):
+            self.skipTest("javac is required for this bytecode fixture")
+        src_root = Path(tmp) / "src"
+        classes_root = Path(tmp) / "classes"
+        java_file = src_root / relative_path
+        java_file.parent.mkdir(parents=True, exist_ok=True)
+        classes_root.mkdir(parents=True, exist_ok=True)
+        java_file.write_text(source, encoding="utf-8")
+        result = subprocess.run(
+            ["javac", "-d", str(classes_root), str(java_file)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            self.fail(f"javac failed: {result.stderr}")
+        return classes_root
+
+    def _jar_compiled_classes(self, jar_path, classes_root):
+        with zipfile.ZipFile(jar_path, "w") as zf:
+            for class_file in Path(classes_root).rglob("*.class"):
+                zf.write(class_file, class_file.relative_to(classes_root).as_posix())
+
     def test_analyze_file_ignores_fully_block_commented_java_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"
@@ -7188,6 +7215,128 @@ public class com.example.consumer.Adapter {
             self.assertEqual(mocked_run.call_count, 1)
             self.assertEqual([item.analysis_status for item in results], ["uncertain", "not_found_in_static_analysis"])
             self.assertEqual(results[0].reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+
+    def test_batch_packaged_bytecode_skips_owner_and_member_string_constants_without_reflection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes_root = self._compile_java_fixture(
+                tmp,
+                "com/example/consumer/StringOnly.java",
+                """
+package com.example.consumer;
+
+public class StringOnly {
+    private static final String OWNER_INTERNAL = "com/vendor/Target";
+    private static final String OWNER_DOTTED = "com.vendor.Target";
+    private static final String METHOD = "removed";
+
+    public String describe() {
+        return OWNER_INTERNAL + OWNER_DOTTED + METHOD;
+    }
+}
+""",
+            )
+            jar_path = Path(tmp) / "consumer.jar"
+            self._jar_compiled_classes(jar_path, classes_root)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer",
+                            "version": "1",
+                            "scope": "compile",
+                            "jar_path": str(jar_path),
+                        }
+                    },
+                },
+            )
+            apis = [{
+                "coord": "com.vendor:api",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }]
+
+            with patch.object(tracer, "run_cmd", side_effect=AssertionError("javap should be skipped")):
+                tracer._build_packaged_runtime_dependency_scan_cache(apis, graph)
+
+            cached = graph.runtime_dependency_catalog["_packaged_api_scan_results"]
+            self.assertEqual(cached[tracer.build_api_identity_key(apis[0])]["status"], "miss")
+
+    def test_batch_packaged_bytecode_keeps_reflection_string_candidates_for_javap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes_root = self._compile_java_fixture(
+                tmp,
+                "com/example/consumer/ReflectiveCall.java",
+                """
+package com.example.consumer;
+
+public class ReflectiveCall {
+    public Object invoke(String value) throws Exception {
+        return Class.forName("com.vendor.Target")
+            .getMethod("removed", String.class)
+            .invoke(null, value);
+    }
+}
+""",
+            )
+            jar_path = Path(tmp) / "consumer.jar"
+            self._jar_compiled_classes(jar_path, classes_root)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer",
+                            "version": "1",
+                            "scope": "compile",
+                            "jar_path": str(jar_path),
+                        }
+                    },
+                },
+            )
+            apis = [{
+                "coord": "com.vendor:api",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }]
+            javap_output = """
+public class com.example.consumer.ReflectiveCall {
+  public java.lang.Object invoke(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/Object;
+    Code:
+       0: ldc           #7                  // String com.vendor.Target
+       2: invokestatic  #9                  // Method java/lang/Class.forName:(Ljava/lang/String;)Ljava/lang/Class;
+       5: ldc           #15                 // String removed
+       7: iconst_1
+       8: anewarray     #10                 // class java/lang/Class
+      11: dup
+      12: iconst_0
+      13: ldc           #17                 // class java/lang/String
+      15: aastore
+      16: invokevirtual #19                 // Method java/lang/Class.getMethod:(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
+      19: aconst_null
+      20: iconst_1
+      21: anewarray     #2                  // class java/lang/Object
+      24: invokevirtual #23                 // Method java/lang/reflect/Method.invoke:(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
+}
+"""
+
+            with patch.object(tracer, "run_cmd", return_value=(javap_output, "", 0)) as mocked_run:
+                tracer._build_packaged_runtime_dependency_scan_cache(apis, graph)
+
+            cached = graph.runtime_dependency_catalog["_packaged_api_scan_results"]
+            self.assertEqual(mocked_run.call_count, 1)
+            self.assertEqual(cached[tracer.build_api_identity_key(apis[0])]["status"], "hit")
 
     def test_batch_packaged_bytecode_javap_failure_does_not_poison_unrelated_api(self):
         with tempfile.TemporaryDirectory() as tmp:
