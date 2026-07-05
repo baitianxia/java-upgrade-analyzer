@@ -1424,9 +1424,10 @@ def _packaged_hit_consumer_lookup_keys(hit):
         keys.append(f"{class_fqcn}.{consumer_method}{signature}")
         if method_display != consumer_method:
             keys.append(f"{class_fqcn}.{method_display}{signature}")
-    keys.append(f"{class_fqcn}.{consumer_method}")
-    if method_display != consumer_method:
-        keys.append(f"{class_fqcn}.{method_display}")
+    if not consumer_signature:
+        keys.append(f"{class_fqcn}.{consumer_method}")
+        if method_display != consumer_method:
+            keys.append(f"{class_fqcn}.{method_display}")
     return list(dict.fromkeys(keys))
 
 

@@ -73,6 +73,61 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.fail(f"javac failed: {result.stderr}")
         return output_dir
 
+    def _runtime_catalog(self, entries):
+        return {
+            "status": "complete",
+            "by_coord": {
+                coord: {
+                    "coord": coord,
+                    "version": "1",
+                    "scope": "compile",
+                    "jar_path": str(jar_path),
+                }
+                for coord, jar_path in entries
+            },
+        }
+
+    def _graph_with_business_edge(self, catalog, callee_key, root):
+        business_method = SimpleNamespace(
+            symbol_id="app_run",
+            qualified_key="com.app.App.run",
+            owner_type="business",
+            owner_coord="__business__",
+            is_test=False,
+        )
+        business_edge = source_analyzer.CallEdge(
+            caller_symbol_id="app_run",
+            caller_qualified_key="com.app.App.run",
+            callee_key=callee_key,
+            callee_simple_key=f"method:{callee_key.rsplit('.', 1)[-1]}",
+            evidence_type="bytecode_method_invocation",
+            confidence="high",
+            file=str(Path(root) / "app.jar"),
+            line=0,
+            content="business bytecode calls runtime dependency",
+            owner_type="business",
+            owner_coord="__business__",
+            module="app",
+            is_test=False,
+        )
+        return SimpleNamespace(
+            methods_by_id={"app_run": business_method},
+            reverse_edges={callee_key: [business_edge]},
+            runtime_dependency_catalog=catalog,
+        )
+
+    def _trace_packaged_fixture(self, api_row, graph):
+        return tracer.trace_api_with_confidence_weighting(
+            api_row,
+            graph,
+            {},
+            max_total_cost=5,
+            needs_bridge=True,
+            has_dependency_source_mapping=False,
+            has_packaged_bytecode_fallback=True,
+            allow_degraded=True,
+        )
+
     def test_analyze_file_ignores_fully_block_commented_java_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"
@@ -7618,6 +7673,279 @@ public class com.example.consumer.ReflectiveCall {
         self.assertTrue(any(
             "com.app.App.run -> com.depa.FacadeA.entry(String) -> "
             "com.example:dep-b:com.depb.BridgeB.use(String) -> com.vendor.Target.removed(String)"
+            in path
+            for path in reachable.call_paths
+        ))
+
+    def test_runtime_dependency_bytecode_graph_connects_three_hop_packaged_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_src = root / "target-src" / "com" / "vendor" / "Target.java"
+            target_src.parent.mkdir(parents=True)
+            target_src.write_text(
+                "package com.vendor; public class Target { "
+                "public static boolean removed(String s) { return s == null; } }",
+                encoding="utf-8",
+            )
+            target_classes = self._compile_java_files(root / "target-classes", [target_src])
+            target_jar = root / "target.jar"
+            self._jar_compiled_classes(target_jar, target_classes)
+
+            dep_c_src = root / "dep-c-src" / "com" / "depc" / "LeafC.java"
+            dep_c_src.parent.mkdir(parents=True)
+            dep_c_src.write_text(
+                "package com.depc; public class LeafC { "
+                "public boolean use(String s) { return com.vendor.Target.removed(s); } }",
+                encoding="utf-8",
+            )
+            dep_c_classes = self._compile_java_files(root / "dep-c-classes", [dep_c_src], classpath=target_jar)
+            dep_c_jar = root / "dep-c.jar"
+            self._jar_compiled_classes(dep_c_jar, dep_c_classes)
+
+            dep_b_src = root / "dep-b-src" / "com" / "depb" / "MiddleB.java"
+            dep_b_src.parent.mkdir(parents=True)
+            dep_b_src.write_text(
+                "package com.depb; public class MiddleB { "
+                "public boolean call(String s) { return new com.depc.LeafC().use(s); } }",
+                encoding="utf-8",
+            )
+            dep_b_cp = os.pathsep.join([str(dep_c_jar), str(target_jar)])
+            dep_b_classes = self._compile_java_files(root / "dep-b-classes", [dep_b_src], classpath=dep_b_cp)
+            dep_b_jar = root / "dep-b.jar"
+            self._jar_compiled_classes(dep_b_jar, dep_b_classes)
+
+            dep_a_src = root / "dep-a-src" / "com" / "depa" / "FacadeA.java"
+            dep_a_src.parent.mkdir(parents=True)
+            dep_a_src.write_text(
+                "package com.depa; public class FacadeA { "
+                "public boolean entry(String s) { return new com.depb.MiddleB().call(s); } }",
+                encoding="utf-8",
+            )
+            dep_a_cp = os.pathsep.join([str(dep_b_jar), str(dep_c_jar), str(target_jar)])
+            dep_a_classes = self._compile_java_files(root / "dep-a-classes", [dep_a_src], classpath=dep_a_cp)
+            dep_a_jar = root / "dep-a.jar"
+            self._jar_compiled_classes(dep_a_jar, dep_a_classes)
+
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            catalog = self._runtime_catalog([
+                ("com.example:dep-a", dep_a_jar),
+                ("com.example:dep-b", dep_b_jar),
+                ("com.example:dep-c", dep_c_jar),
+            ])
+            graph = self._graph_with_business_edge(
+                catalog,
+                "com.depa.FacadeA.entry(java.lang.String)",
+                root,
+            )
+
+            reachable = self._trace_packaged_fixture(api_row, graph)
+
+        self.assertEqual(reachable.analysis_status, "reachable")
+        self.assertEqual(reachable.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
+        self.assertEqual(
+            reachable.dependency_chain_coords,
+            ["com.example:dep-c", "com.example:dep-b", "com.example:dep-a"],
+        )
+        self.assertTrue(any(
+            "com.app.App.run -> com.depa.FacadeA.entry(String) -> "
+            "com.depb.MiddleB.call(String) -> com.example:dep-c:com.depc.LeafC.use(String) -> "
+            "com.vendor.Target.removed(String)"
+            in path
+            for path in reachable.call_paths
+        ))
+
+    def test_runtime_dependency_bytecode_graph_does_not_infer_unconnected_packaged_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_src = root / "target-src" / "com" / "vendor" / "Target.java"
+            target_src.parent.mkdir(parents=True)
+            target_src.write_text(
+                "package com.vendor; public class Target { "
+                "public static boolean removed(String s) { return s == null; } }",
+                encoding="utf-8",
+            )
+            target_classes = self._compile_java_files(root / "target-classes", [target_src])
+            target_jar = root / "target.jar"
+            self._jar_compiled_classes(target_jar, target_classes)
+
+            dep_b_src = root / "dep-b-src" / "com" / "depb" / "BridgeB.java"
+            dep_b_src.parent.mkdir(parents=True)
+            dep_b_src.write_text(
+                "package com.depb; public class BridgeB { "
+                "public boolean use(String s) { return com.vendor.Target.removed(s); } }",
+                encoding="utf-8",
+            )
+            dep_b_classes = self._compile_java_files(root / "dep-b-classes", [dep_b_src], classpath=target_jar)
+            dep_b_jar = root / "dep-b.jar"
+            self._jar_compiled_classes(dep_b_jar, dep_b_classes)
+
+            dep_a_src = root / "dep-a-src" / "com" / "depa" / "FacadeA.java"
+            dep_a_src.parent.mkdir(parents=True)
+            dep_a_src.write_text(
+                "package com.depa; public class FacadeA { "
+                "public boolean entry(String s) { return s != null; } }",
+                encoding="utf-8",
+            )
+            dep_a_classes = self._compile_java_files(root / "dep-a-classes", [dep_a_src])
+            dep_a_jar = root / "dep-a.jar"
+            self._jar_compiled_classes(dep_a_jar, dep_a_classes)
+
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            catalog = self._runtime_catalog([
+                ("com.example:dep-a", dep_a_jar),
+                ("com.example:dep-b", dep_b_jar),
+            ])
+            graph = self._graph_with_business_edge(
+                catalog,
+                "com.depa.FacadeA.entry(java.lang.String)",
+                root,
+            )
+
+            result = self._trace_packaged_fixture(api_row, graph)
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+        self.assertEqual(result.dependency_chain_coords, ["com.example:dep-b"])
+        self.assertFalse(any(detail.get("business_reachable") for detail in result.path_details))
+
+    def test_runtime_dependency_bytecode_graph_does_not_cross_wrong_overload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_src = root / "target-src" / "com" / "vendor" / "Target.java"
+            target_src.parent.mkdir(parents=True)
+            target_src.write_text(
+                "package com.vendor; public class Target { "
+                "public static boolean removed(String s) { return s == null; } }",
+                encoding="utf-8",
+            )
+            target_classes = self._compile_java_files(root / "target-classes", [target_src])
+            target_jar = root / "target.jar"
+            self._jar_compiled_classes(target_jar, target_classes)
+
+            dep_b_src = root / "dep-b-src" / "com" / "depb" / "BridgeB.java"
+            dep_b_src.parent.mkdir(parents=True)
+            dep_b_src.write_text(
+                "package com.depb; public class BridgeB { "
+                "public boolean use(String s) { return com.vendor.Target.removed(s); } "
+                "public boolean use(Integer value) { return value != null; } }",
+                encoding="utf-8",
+            )
+            dep_b_classes = self._compile_java_files(root / "dep-b-classes", [dep_b_src], classpath=target_jar)
+            dep_b_jar = root / "dep-b.jar"
+            self._jar_compiled_classes(dep_b_jar, dep_b_classes)
+
+            dep_a_src = root / "dep-a-src" / "com" / "depa" / "FacadeA.java"
+            dep_a_src.parent.mkdir(parents=True)
+            dep_a_src.write_text(
+                "package com.depa; public class FacadeA { "
+                "public boolean entry() { return new com.depb.BridgeB().use(Integer.valueOf(1)); } }",
+                encoding="utf-8",
+            )
+            dep_a_cp = os.pathsep.join([str(dep_b_jar), str(target_jar)])
+            dep_a_classes = self._compile_java_files(root / "dep-a-classes", [dep_a_src], classpath=dep_a_cp)
+            dep_a_jar = root / "dep-a.jar"
+            self._jar_compiled_classes(dep_a_jar, dep_a_classes)
+
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            catalog = self._runtime_catalog([
+                ("com.example:dep-a", dep_a_jar),
+                ("com.example:dep-b", dep_b_jar),
+            ])
+            graph = self._graph_with_business_edge(catalog, "com.depa.FacadeA.entry()", root)
+
+            result = self._trace_packaged_fixture(api_row, graph)
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+        self.assertEqual(result.dependency_chain_coords, ["com.example:dep-b"])
+        self.assertFalse(any(
+            "com.app.App.run" in path and "BridgeB.use(String)" in path
+            for path in result.call_paths
+        ))
+
+    def test_runtime_dependency_bytecode_graph_connects_business_to_changed_field_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_src = root / "target-src" / "com" / "vendor" / "Target.java"
+            target_src.parent.mkdir(parents=True)
+            target_src.write_text(
+                "package com.vendor; public class Target { "
+                "public static String REMOVED_FIELD = \"legacy\"; }",
+                encoding="utf-8",
+            )
+            target_classes = self._compile_java_files(root / "target-classes", [target_src])
+            target_jar = root / "target.jar"
+            self._jar_compiled_classes(target_jar, target_classes)
+
+            dep_b_src = root / "dep-b-src" / "com" / "depb" / "BridgeB.java"
+            dep_b_src.parent.mkdir(parents=True)
+            dep_b_src.write_text(
+                "package com.depb; public class BridgeB { "
+                "public String use() { return com.vendor.Target.REMOVED_FIELD; } }",
+                encoding="utf-8",
+            )
+            dep_b_classes = self._compile_java_files(root / "dep-b-classes", [dep_b_src], classpath=target_jar)
+            dep_b_jar = root / "dep-b.jar"
+            self._jar_compiled_classes(dep_b_jar, dep_b_classes)
+
+            dep_a_src = root / "dep-a-src" / "com" / "depa" / "FacadeA.java"
+            dep_a_src.parent.mkdir(parents=True)
+            dep_a_src.write_text(
+                "package com.depa; public class FacadeA { "
+                "public String entry() { return new com.depb.BridgeB().use(); } }",
+                encoding="utf-8",
+            )
+            dep_a_cp = os.pathsep.join([str(dep_b_jar), str(target_jar)])
+            dep_a_classes = self._compile_java_files(root / "dep-a-classes", [dep_a_src], classpath=dep_a_cp)
+            dep_a_jar = root / "dep-a.jar"
+            self._jar_compiled_classes(dep_a_jar, dep_a_classes)
+
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.REMOVED_FIELD",
+                "api_simple": "REMOVED_FIELD",
+                "api_signature": "java.lang.String",
+                "symbol_kind": "field",
+                "change_type": "REMOVED",
+            }
+            catalog = self._runtime_catalog([
+                ("com.example:dep-a", dep_a_jar),
+                ("com.example:dep-b", dep_b_jar),
+            ])
+            graph = self._graph_with_business_edge(catalog, "com.depa.FacadeA.entry()", root)
+
+            reachable = self._trace_packaged_fixture(api_row, graph)
+
+        self.assertEqual(reachable.analysis_status, "reachable")
+        self.assertEqual(reachable.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
+        self.assertEqual(
+            reachable.dependency_chain_coords,
+            ["com.example:dep-b", "com.example:dep-a"],
+        )
+        self.assertTrue(any(
+            "com.app.App.run -> com.depa.FacadeA.entry() -> "
+            "com.example:dep-b:com.depb.BridgeB.use() -> com.vendor.Target.REMOVED_FIELD"
             in path
             for path in reachable.call_paths
         ))
