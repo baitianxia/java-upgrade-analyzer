@@ -233,6 +233,11 @@ python3 scripts/run_step.py --step step1 \
 `alerts.csv` 查看完整逐链路追踪过程，Step6 `s6_report.md` 查看最终汇总结论。
 `alerts.csv` 不是样例子集：每个进入 Step5 的 API 至少一行，每条终止链路独立一行，
 并明确消费依赖、消费类/方法、业务入口、链路状态、中断原因和原始证据位置。
+当 `alerts.csv` 过大影响人工或表格工具打开时，Step5 会同时输出非空的阅读拆分文件：
+`alerts_reachable.csv`、`alerts_uncertain.csv`、`alerts_not_found_in_static_analysis.csv`、
+`alerts_not_analyzed.csv`；若单个分类仍过大，则输出
+`alerts_<status>_001.csv`、`alerts_<status>_002.csv` 等分片。`alerts.csv` 仍是完整主文件，
+拆分文件只是按链路状态生成的人工阅读视图，不是索引、抽样或替代结论。
 
 ## 产物字典（让使用者知道每个文件是什么）
 
@@ -310,7 +315,8 @@ python3 scripts/run_step.py --step step1 \
 | 文件 | 定义 | 生成来源/条件 | 用途与解读 |
 |---|---|---|---|
 | `s5_call_chain/summary.json` | 调用链结论汇总（reachable/not_found_in_static_analysis/uncertain/not_analyzed）、`reason_code`、按 API 的能力覆盖与关键证据摘要 | Step5 仅对 Step4 API 目标执行普通调用、字节码、反射、MethodHandle、资源、表达式语言及框架边分析后生成 | 影响判定的核心结论文件；目标相关能力为 partial/insufficient 时不会输出 not_found；抽样复核时先看 `analysis_status/reason_code`，再沿 call_paths 定位证据 |
-| `s5_call_chain/alerts.csv` | 完整链路台账（每个 API 至少一行、每条终止链路一行） | Step5 从全部终止路径结构化导出，不抽样 | 人工核对消费依赖/类/方法、业务触达、中断原因和证据位置 |
+| `s5_call_chain/alerts.csv` | 完整链路台账（每个 API 至少一行、每条终止链路一行） | Step5 从全部终止路径结构化导出，不抽样 | 完整主文件；自动化和完整审计优先读取这里 |
+| `s5_call_chain/alerts_<status>.csv` / `alerts_<status>_NNN.csv` | `alerts.csv` 的人工阅读拆分文件 | Step5 按 `path_status` 从完整台账派生；仅非空分类生成，超过阈值时按序号分片 | 人工复核大文件时优先打开；内容仍来自完整台账，不是轻量索引或样例 |
 | `s5_call_chain/summary.txt` | Step5 摘要（数量统计、Top 模块/Top 风险、uncertain/not_analyzed 原因分类等） | Step5 汇总生成 | 用于快速掌握总体影响分布；若 uncertain 或 not_analyzed 比例较高，应优先补齐依赖源码映射、检查图截断与框架装配路径 |
 | `s5_call_chain/by_api/*.json` | 单条风险的完整调用链证据（`evidence_paths`、逐跳命中点、reason_code 等） | Step5 对单个候选生成 | 用于复核 reachable/uncertain 结论与定位截断点；属于证据文件 |
 | `s5_call_chain/by_module/*_impacts.json` | 按模块聚合的影响摘要 | Step5 对调用链结果进行模块聚合后生成 | 用于按业务域拆解责任与处置优先级；属于视图文件 |

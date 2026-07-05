@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import csv
 from collections import defaultdict
 from datetime import datetime
 
@@ -37,6 +38,24 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════
 # 可读调用链格式化
 # ══════════════════════════════════════════════════════════════════
+
+ALERTS_CSV_FIELDNAMES = [
+    'api_id', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
+    'symbol_kind', 'change_type', 'severity', 'api_status', 'path_status',
+    'conclusion_level', 'action_type', 'business_reachable', 'business_entry',
+    'consumer_coord', 'consumer_class', 'consumer_method', 'consumer_signature',
+    'path_text', 'stop_reason', 'reason', 'action', 'confidence', 'depth',
+    'coverage_status', 'coverage_details', 'evidence_types', 'evidence_files', 'detail_file',
+]
+
+ALERTS_SPLIT_MAX_ROWS = 50000
+
+ALERTS_REVIEW_BUCKETS = [
+    ('reachable', {'reachable'}),
+    ('uncertain', {'uncertain'}),
+    ('not_found_in_static_analysis', {'not_found_in_static_analysis', 'not_reachable'}),
+    ('not_analyzed', {'not_analyzed'}),
+]
 
 
 def trace_result_to_api_entry(r):
@@ -939,6 +958,10 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     # 生成alerts.csv（文档承诺的合约）
     alerts_path = os.path.join(output_dir, 'alerts.csv')
     generate_alerts_csv(all_results, alerts_path)
+    alert_split_files = sorted(
+        name for name in os.listdir(output_dir)
+        if name.startswith('alerts_') and name.endswith('.csv')
+    )
 
     # 旧版重复文件不再生成，避免人工在两个相同清单之间切换。
     enhanced_alerts_path = os.path.join(output_dir, 's5_enhanced_alerts.csv')
@@ -946,6 +969,12 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
         os.remove(enhanced_alerts_path)
 
     print(f"  完整链路台账 → {alerts_path}", file=sys.stderr)
+    if alert_split_files:
+        print(
+            "  人工阅读拆分 → "
+            + ", ".join(os.path.join(output_dir, name) for name in alert_split_files),
+            file=sys.stderr,
+        )
 
     # 生成 summary.json（s6_report.py 需要的契约格式）
     summary_json_path = write_summary_json(all_results, output_dir, graph_stats=graph_stats)
@@ -1058,17 +1087,84 @@ def generate_alerts_csv(all_results, output_path):
         severity_rank(row['severity']), row['target_coord'], row['changed_symbol'], row['path_id'],
     ))
 
-    import csv
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = [
-            'api_id', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
-            'symbol_kind', 'change_type', 'severity', 'api_status', 'path_status',
-            'conclusion_level', 'action_type', 'business_reachable', 'business_entry',
-            'consumer_coord', 'consumer_class', 'consumer_method', 'consumer_signature',
-            'path_text', 'stop_reason', 'reason', 'action', 'confidence', 'depth',
-            'coverage_status', 'coverage_details', 'evidence_types', 'evidence_files', 'detail_file',
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    write_alerts_review_splits(rows, os.path.dirname(os.path.abspath(output_path)))
+
+
+def write_alerts_review_splits(rows, output_dir, max_rows=None):
+    """Write non-authoritative review-oriented alert CSV splits next to alerts.csv."""
+    cleanup_alerts_review_splits(output_dir)
+    if max_rows is None:
+        max_rows = _alerts_split_max_rows()
+    buckets = {name: [] for name, _statuses in ALERTS_REVIEW_BUCKETS}
+    other_rows = []
+    status_to_bucket = {
+        status: name
+        for name, statuses in ALERTS_REVIEW_BUCKETS
+        for status in statuses
+    }
+    for row in rows or []:
+        bucket = status_to_bucket.get(str(row.get('path_status') or ''))
+        if bucket:
+            buckets[bucket].append(row)
+        else:
+            other_rows.append(row)
+    for name, bucket_rows in buckets.items():
+        _write_alerts_review_bucket(output_dir, name, bucket_rows, max_rows)
+    _write_alerts_review_bucket(output_dir, 'other', other_rows, max_rows)
+
+
+def cleanup_alerts_review_splits(output_dir):
+    if not output_dir or not os.path.isdir(output_dir):
+        return
+    prefixes = [name for name, _statuses in ALERTS_REVIEW_BUCKETS] + ['other']
+    for filename in os.listdir(output_dir):
+        if not filename.startswith('alerts_') or not filename.endswith('.csv'):
+            continue
+        if any(
+            filename == f'alerts_{prefix}.csv'
+            or re.match(rf'^alerts_{re.escape(prefix)}_\d{{3}}\.csv$', filename)
+            for prefix in prefixes
+        ):
+            try:
+                os.remove(os.path.join(output_dir, filename))
+            except OSError:
+                pass
+
+
+def _alerts_split_max_rows():
+    raw = str(os.environ.get('JUA_ALERTS_SPLIT_MAX_ROWS') or '').strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return ALERTS_SPLIT_MAX_ROWS
+
+
+def _write_alerts_review_bucket(output_dir, bucket_name, rows, max_rows):
+    if not rows:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    max_rows = max(1, int(max_rows or ALERTS_SPLIT_MAX_ROWS))
+    if len(rows) <= max_rows:
+        _write_alert_rows_csv(os.path.join(output_dir, f'alerts_{bucket_name}.csv'), rows)
+        return
+    for index, start in enumerate(range(0, len(rows), max_rows), 1):
+        _write_alert_rows_csv(
+            os.path.join(output_dir, f'alerts_{bucket_name}_{index:03d}.csv'),
+            rows[start:start + max_rows],
+        )
+
+
+def _write_alert_rows_csv(path, rows):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 

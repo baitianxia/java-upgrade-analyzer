@@ -2834,6 +2834,102 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
         self.assertNotIn("B.call -> C.removed", path_texts)
 
+    def test_alerts_csv_writes_review_split_files_without_replacing_main_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "alerts.csv"
+            results = []
+            for status, api_name in [
+                ("reachable", "com.acme.Api.reachable"),
+                ("uncertain", "com.acme.Api.uncertain"),
+                ("not_found_in_static_analysis", "com.acme.Api.notFound"),
+                ("not_analyzed", "com.acme.Api.notAnalyzed"),
+            ]:
+                results.append(tracer.TraceResult(
+                    coord="a:b",
+                    api_name=api_name,
+                    api_simple=api_name.rsplit(".", 1)[-1],
+                    api_signature="()",
+                    symbol_kind="method",
+                    change_type="METHOD_CHANGED",
+                    severity="P1",
+                    confirmed=True,
+                    source="japicmp",
+                    analysis_scope="method",
+                    analysis_status=status,
+                    direct_callers=1 if status == "reachable" else 0,
+                    is_reachable=True if status == "reachable" else None,
+                    reachable_note=status,
+                    business_reach_depth=1,
+                    dependency_chain_coords=[],
+                    call_paths=[f"{api_name}.caller -> {api_name}"],
+                    evidence_paths=[],
+                    reason_code="SYSTEM_CODE_REACHED" if status == "reachable" else "NO_STATIC_PATH",
+                    verification_commands=[],
+                    hops=[],
+                    confidence_score=1.0,
+                    critical_nodes_hit=[],
+                ))
+
+            formatter.generate_alerts_csv(results, output)
+
+            with output.open(encoding="utf-8") as handle:
+                main_rows = list(csv.DictReader(handle))
+            split_files = {path.name for path in Path(tmp).glob("alerts_*.csv")}
+
+        self.assertEqual(len(main_rows), 4)
+        self.assertEqual(
+            split_files,
+            {
+                "alerts_reachable.csv",
+                "alerts_uncertain.csv",
+                "alerts_not_found_in_static_analysis.csv",
+                "alerts_not_analyzed.csv",
+            },
+        )
+
+    def test_alerts_review_split_files_are_chunked_and_stale_files_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            stale = output_dir / "alerts_reachable_003.csv"
+            stale.write_text("stale\n", encoding="utf-8")
+            stale_uncertain = output_dir / "alerts_uncertain.csv"
+            stale_uncertain.write_text("stale\n", encoding="utf-8")
+            rows = [
+                {
+                    field: ""
+                    for field in formatter.ALERTS_CSV_FIELDNAMES
+                }
+                for _ in range(5)
+            ]
+            for index, row in enumerate(rows):
+                row.update({
+                    "api_id": f"API-{index}",
+                    "path_id": f"PATH-{index}",
+                    "path_status": "reachable",
+                    "conclusion_level": "confirmed",
+                    "severity": "P1",
+                })
+
+            formatter.write_alerts_review_splits(rows, str(output_dir), max_rows=2)
+
+            split_files = sorted(path.name for path in output_dir.glob("alerts_*.csv"))
+            counts = {}
+            for name in split_files:
+                with (output_dir / name).open(encoding="utf-8") as handle:
+                    counts[name] = len(list(csv.DictReader(handle)))
+            stale_uncertain_exists = stale_uncertain.exists()
+
+        self.assertEqual(
+            split_files,
+            ["alerts_reachable_001.csv", "alerts_reachable_002.csv", "alerts_reachable_003.csv"],
+        )
+        self.assertEqual(counts, {
+            "alerts_reachable_001.csv": 2,
+            "alerts_reachable_002.csv": 2,
+            "alerts_reachable_003.csv": 1,
+        })
+        self.assertFalse(stale_uncertain_exists)
+
     def test_alert_row_uses_path_stop_reason_instead_of_api_reason(self):
         result = tracer.TraceResult(
             coord="a:b", api_name="com.acme.Api.changed", api_simple="changed",
