@@ -1268,11 +1268,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         '但当前尚未证明这些依赖是否回到系统业务入口'
     )
     result.dependency_chain_coords = dependency_chain
-    bridged_hit_ids = {id(item.get('hit')) for item in bridged_hits}
-    ordered_hits = business_hits + [
-        item for item in hits
-        if item not in business_hits and id(item) not in bridged_hit_ids
-    ]
+    ordered_hits = business_hits + [item for item in hits if item not in business_hits]
     result.call_paths = []
     result.evidence_paths = []
     result.path_details = []

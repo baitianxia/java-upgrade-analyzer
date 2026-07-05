@@ -1105,6 +1105,8 @@ def _alert_rows_for_result(result):
                 'evidence': evidence,
             })
 
+    details = _suppress_suffix_covered_path_details(details)
+
     rows = []
     detail_file = f"by_api/{build_by_api_safe_filename(result)}.txt"
     for detail in details:
@@ -1166,6 +1168,56 @@ def _alert_rows_for_result(result):
             'detail_file': detail_file,
         })
     return rows
+
+
+def _suppress_suffix_covered_path_details(details):
+    indexed = []
+    for index, detail in enumerate(details or []):
+        nodes = _alert_path_nodes(detail)
+        indexed.append((index, detail, nodes, _alert_path_status_rank(detail.get('path_status'))))
+    suppressed = set()
+    for index, _detail, nodes, status_rank in indexed:
+        if len(nodes) < 2:
+            continue
+        for other_index, _other_detail, other_nodes, other_rank in indexed:
+            if index == other_index:
+                continue
+            if len(other_nodes) <= len(nodes):
+                continue
+            if other_rank > status_rank:
+                continue
+            if other_nodes[-len(nodes):] == nodes:
+                suppressed.add(index)
+                break
+    return [detail for index, detail, _nodes, _rank in indexed if index not in suppressed]
+
+
+def _alert_path_status_rank(path_status):
+    return {
+        'reachable': 0,
+        'uncertain': 1,
+        'not_analyzed': 2,
+        'not_found_in_static_analysis': 3,
+        'not_reachable': 3,
+    }.get(str(path_status or ''), 9)
+
+
+def _alert_path_nodes(detail):
+    path_text = str((detail or {}).get('path_text') or '').strip()
+    if path_text:
+        separator = ' -> ' if ' -> ' in path_text else (' → ' if ' → ' in path_text else '')
+        if separator:
+            return [part.strip() for part in path_text.split(separator) if part.strip()]
+    evidence = list((detail or {}).get('evidence') or [])
+    nodes = []
+    for item in evidence:
+        caller = str((item or {}).get('caller_symbol') or '').strip()
+        callee = str((item or {}).get('callee_key') or '').strip()
+        if caller and (not nodes or nodes[-1] != caller):
+            nodes.append(caller)
+        if callee:
+            nodes.append(callee)
+    return nodes
 
 
 def _split_alert_consumer(symbol):

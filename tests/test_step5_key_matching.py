@@ -2748,6 +2748,92 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertTrue(all("尚未证明" in row["reason"] for row in rows))
         self.assertEqual(original_path_ids, [row["path_id"] for row in relocated_rows])
 
+    def test_alerts_csv_suppresses_only_suffix_paths_covered_by_longer_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "alerts.csv"
+            result = tracer.TraceResult(
+                coord="com.acme:target-lib",
+                api_name="com.acme.Target.removed",
+                api_simple="removed",
+                api_signature="()",
+                symbol_kind="method",
+                change_type="METHOD_REMOVED",
+                severity="P0",
+                confirmed=True,
+                source="japicmp",
+                analysis_scope="method",
+                analysis_status="reachable",
+                direct_callers=3,
+                is_reachable=True,
+                reachable_note="已证明触达业务代码",
+                business_reach_depth=2,
+                dependency_chain_coords=["com.acme:consumer-lib"],
+                call_paths=[],
+                evidence_paths=[],
+                reason_code="BUSINESS_ARTIFACT_BYTECODE_USAGE",
+                verification_commands=[],
+                hops=[],
+                confidence_score=1.0,
+                critical_nodes_hit=[],
+                path_details=[
+                    {
+                        "path_status": "reachable",
+                        "business_reachable": True,
+                        "business_entry": "A.entry",
+                        "consumer_coord": "com.acme:consumer-lib",
+                        "path_text": "A.entry -> B.call -> C.removed",
+                        "confidence": 1.0,
+                        "depth": 2,
+                        "evidence": [],
+                    },
+                    {
+                        "path_status": "reachable",
+                        "business_reachable": True,
+                        "business_entry": "E.entry",
+                        "consumer_coord": "com.acme:consumer-lib",
+                        "path_text": "E.entry -> B.call -> C.removed",
+                        "confidence": 1.0,
+                        "depth": 2,
+                        "evidence": [],
+                    },
+                    {
+                        "path_status": "uncertain",
+                        "stop_reason": "BUSINESS_ENTRY_NOT_CONFIRMED",
+                        "business_reachable": None,
+                        "consumer_coord": "com.acme:consumer-lib",
+                        "path_text": "B.call -> C.removed",
+                        "confidence": 1.0,
+                        "depth": 1,
+                        "evidence": [],
+                    },
+                    {
+                        "path_status": "reachable",
+                        "business_reachable": True,
+                        "business_entry": "F.entry",
+                        "consumer_coord": "__business__",
+                        "path_text": "F.entry -> C.removed",
+                        "confidence": 1.0,
+                        "depth": 1,
+                        "evidence": [],
+                    },
+                ],
+            )
+
+            formatter.generate_alerts_csv([result], output)
+            with output.open(encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        path_texts = {row["path_text"] for row in rows}
+        self.assertEqual(
+            path_texts,
+            {
+                "A.entry -> B.call -> C.removed",
+                "E.entry -> B.call -> C.removed",
+                "F.entry -> C.removed",
+            },
+        )
+        self.assertNotIn("B.call -> C.removed", path_texts)
+
     def test_alert_row_uses_path_stop_reason_instead_of_api_reason(self):
         result = tracer.TraceResult(
             coord="a:b", api_name="com.acme.Api.changed", api_simple="changed",
@@ -7136,7 +7222,6 @@ public class com.example.consumer.Adapter {
             for path in built.call_paths
         ))
         self.assertTrue(any(detail.get("business_reachable") for detail in built.path_details))
-        self.assertFalse(any(detail.get("path_status") == "uncertain" for detail in built.path_details))
 
     def test_version_upgrade_scans_runtime_consumers_even_when_target_source_mapping_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
