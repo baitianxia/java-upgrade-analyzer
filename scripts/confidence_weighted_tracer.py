@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from compat import run_cmd
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import normalize_signature_for_lookup, split_signature_params
+from enhanced_source_analyzer import CallEdge, MethodDef
 from indirect_usage_analyzer import (
     api_key as indirect_api_key,
     parse_javap_indirect_references,
@@ -1429,11 +1430,210 @@ def _packaged_hit_consumer_lookup_keys(hit):
     return list(dict.fromkeys(keys))
 
 
+def _parse_runtime_method_lookup_key(key):
+    value = str(key or '').strip()
+    if not value or value.startswith(('class:', 'method:', 'field:', 'invokedynamic:')):
+        return None
+    signature = ''
+    owner_member = value
+    if '(' in value:
+        owner_member, tail = value.split('(', 1)
+        signature = '(' + tail
+    if '.' not in owner_member:
+        return None
+    owner, member = owner_member.rsplit('.', 1)
+    if not owner or not member:
+        return None
+    return owner, member, signature
+
+
+def _runtime_method_def_for_packaged_caller(coord, jar_path, class_fqcn, method_name, signature):
+    normalized_class = str(class_fqcn or '').replace('$', '.')
+    method_name = str(method_name or '').strip() or '<unknown>'
+    signature = str(signature or '').strip()
+    display_method = normalized_class.rsplit('.', 1)[-1] if method_name == '<init>' else method_name
+    qualified_key = f'{normalized_class}.{display_method}{signature}'
+    return MethodDef(
+        symbol_id=f'runtime:{coord}:{qualified_key}',
+        qualified_key=qualified_key,
+        simple_key=f'{display_method}{signature}',
+        class_fqcn=normalized_class,
+        class_name=normalized_class.rsplit('.', 1)[-1],
+        method_name=display_method,
+        return_type='',
+        file=str(jar_path or ''),
+        line=0,
+        end_line=0,
+        package_name=normalized_class.rsplit('.', 1)[0] if '.' in normalized_class else '',
+        owner_type='dependency',
+        owner_coord=str(coord or ''),
+        module='',
+        source_root='',
+        language='bytecode',
+        is_test=False,
+    )
+
+
+def _add_runtime_dependency_caller_edge(graph, lookup_key, coord, jar_path, class_fqcn, matched):
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    consumer_method = matched.get('consumer_method') or '<unknown>'
+    consumer_signature = matched.get('consumer_signature') or ''
+    caller = _runtime_method_def_for_packaged_caller(
+        coord, jar_path, class_fqcn, consumer_method, consumer_signature
+    )
+    methods_by_id.setdefault(caller.symbol_id, caller)
+    parsed_lookup = _parse_runtime_method_lookup_key(lookup_key)
+    lookup_member = parsed_lookup[1] if parsed_lookup else ''
+    lookup_signature = parsed_lookup[2] if parsed_lookup else ''
+    lookup_simple_signature = normalize_signature_for_lookup(lookup_signature) or lookup_signature
+    edge = CallEdge(
+        caller_symbol_id=caller.symbol_id,
+        caller_qualified_key=caller.qualified_key,
+        callee_key=lookup_key,
+        callee_simple_key=f'method:{lookup_member}{lookup_simple_signature}',
+        evidence_type=matched.get('evidence_type') or 'runtime_dependency_bytecode_invocation',
+        confidence='high',
+        file=str(jar_path or ''),
+        line=0,
+        content='runtime dependency bytecode caller',
+        owner_type='dependency',
+        owner_coord=str(coord or ''),
+        module='',
+        is_test=False,
+        callee_param_types=[],
+    )
+    for key in (lookup_key, edge.callee_simple_key):
+        bucket = reverse_edges.setdefault(key, [])
+        identity = (edge.caller_symbol_id, edge.callee_key, edge.evidence_type)
+        if any((old.caller_symbol_id, old.callee_key, old.evidence_type) == identity for old in bucket):
+            continue
+        bucket.append(edge)
+    graph.methods_by_id = methods_by_id
+    graph.reverse_edges = reverse_edges
+    return edge
+
+
+def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
+    if not graph:
+        return {'expanded': False, 'edges_added': 0, 'javap_classes': 0, 'visited_classes': 0}
+    parsed = _parse_runtime_method_lookup_key(lookup_key)
+    if not parsed:
+        return {'expanded': False, 'edges_added': 0, 'javap_classes': 0, 'visited_classes': 0}
+    expanded = getattr(graph, '_runtime_dependency_caller_expanded', None)
+    if expanded is None:
+        expanded = set()
+        setattr(graph, '_runtime_dependency_caller_expanded', expanded)
+    if lookup_key in expanded:
+        return {'expanded': False, 'edges_added': 0, 'javap_classes': 0, 'visited_classes': 0}
+    expanded.add(lookup_key)
+
+    owner, member, signature = parsed
+    normalized_signature = normalize_signature_for_lookup(signature) or signature
+    api_row = {
+        'api_name': f'{owner}.{member}',
+        'api_simple': member,
+        'api_signature': normalized_signature,
+        'symbol_kind': 'method',
+    }
+    catalog = _get_runtime_dependency_catalog(graph)
+    by_coord = catalog.get('by_coord') or {}
+    catalog_entries = list(catalog.get('entries') or [
+        ({'coord': coord, **item} if not item.get('coord') else item)
+        for coord, item in by_coord.items()
+    ])
+    owner_internal = owner.replace('.', '/')
+    target_rows_by_owner = {owner: [api_row]}
+    visited_classes = 0
+    javap_classes = 0
+    edges_added = 0
+    target_jdk = catalog.get('target_jdk')
+    for item in catalog_entries:
+        coord = str(item.get('coord') or '').strip()
+        if not coord or coord == '__business__':
+            continue
+        jar_path = str(item.get('jar_path') or '').strip()
+        if not jar_path or not os.path.exists(jar_path):
+            continue
+        try:
+            with zipfile.ZipFile(jar_path) as zf:
+                try:
+                    manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
+                except KeyError:
+                    manifest = ''
+                multi_release_enabled = bool(re.search(
+                    r'(?im)^Multi-Release\s*:\s*true\s*$', manifest
+                ))
+                variants, _is_multi_release, _parsed_target = _runtime_class_variants(
+                    zf.namelist(), target_jdk, multi_release_enabled=multi_release_enabled
+                )
+                for entry, logical_name, selected_version in variants:
+                    if logical_name.endswith(('module-info.class', 'package-info.class')):
+                        continue
+                    visited_classes += 1
+                    data = zf.read(entry)
+                    if not _class_bytes_might_reference_target(data, owner_internal, member):
+                        continue
+                    if not _runtime_prefilter_owner_candidates(
+                        [(owner, owner_internal.encode('utf-8'), owner.encode('utf-8'))],
+                        data,
+                        target_rows_by_owner,
+                    ):
+                        continue
+                    class_binary_name = logical_name[:-6].replace('/', '.')
+                    references = _load_runtime_dependency_class_references(
+                        catalog, coord, jar_path, class_binary_name,
+                        multi_release_version=selected_version,
+                    )
+                    javap_classes += 1
+                    if references is None:
+                        continue
+                    matches = _match_runtime_dependency_references(api_row, references)
+                    for matched in matches:
+                        _add_runtime_dependency_caller_edge(
+                            graph, lookup_key, coord, jar_path,
+                            class_binary_name.replace('$', '.'),
+                            matched,
+                        )
+                        edges_added += 1
+        except Exception:
+            continue
+    return {
+        'expanded': True,
+        'edges_added': edges_added,
+        'javap_classes': javap_classes,
+        'visited_classes': visited_classes,
+    }
+
+
+def _method_lookup_key_variants(key):
+    value = str(key or '').strip()
+    if not value or '(' not in value:
+        return [value] if value else []
+    prefix, tail = value.split('(', 1)
+    signature = '(' + tail
+    variants = [value]
+    normalized = normalize_signature_for_lookup(signature)
+    if normalized and normalized != signature:
+        variants.append(prefix + normalized)
+    expanded = _expand_java_lang_signature(signature)
+    if expanded and expanded != signature:
+        variants.append(prefix + expanded)
+    return list(dict.fromkeys(item for item in variants if item))
+
+
 def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
     if not graph:
         return []
     reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
     methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    if not reverse_edges:
+        return []
+    if not any(
+        getattr(method_def, 'owner_type', '') == 'business' and not getattr(method_def, 'is_test', False)
+        for method_def in methods_by_id.values()
+    ):
+        return []
     queue = []
     for key in _packaged_hit_consumer_lookup_keys(hit):
         queue.append((key, []))
@@ -1444,6 +1644,7 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
         if current_key in visited or len(path) >= max_depth:
             continue
         visited.add(current_key)
+        _ensure_runtime_dependency_callers_for_key(graph, current_key)
         for edge in sorted(reverse_edges.get(current_key, []) or [], key=stable_edge_sort_key):
             method_def = methods_by_id.get(getattr(edge, 'caller_symbol_id', ''))
             if method_def is None:
@@ -1454,7 +1655,8 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
                 continue
             caller_key = getattr(method_def, 'qualified_key', '') or getattr(edge, 'caller_qualified_key', '')
             if caller_key:
-                queue.append((caller_key, next_path))
+                for variant in _method_lookup_key_variants(caller_key):
+                    queue.append((variant, next_path))
     return paths
 
 
@@ -1475,6 +1677,11 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         coord = str(item.get('coord') or '').strip()
         if coord and coord not in dependency_chain:
             dependency_chain.append(coord)
+    for bridged in bridged_hits:
+        for edge in bridged.get('bridge_edges') or []:
+            coord = str(getattr(edge, 'owner_coord', '') or '').strip()
+            if coord and coord != '__business__' and coord not in dependency_chain:
+                dependency_chain.append(coord)
     has_business_path = bool(business_hits or bridged_hits)
     result.analysis_status = 'reachable' if has_business_path else 'uncertain'
     result.is_reachable = True if has_business_path else None

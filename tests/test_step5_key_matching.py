@@ -52,6 +52,27 @@ class Step5KeyMatchingTest(unittest.TestCase):
             for class_file in Path(classes_root).rglob("*.class"):
                 zf.write(class_file, class_file.relative_to(classes_root).as_posix())
 
+    def _compile_java_files(self, output_dir, java_files, classpath=None):
+        if not shutil.which("javac"):
+            self.skipTest("javac is required for this bytecode fixture")
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        command = ["javac"]
+        if classpath:
+            command.extend(["-cp", str(classpath)])
+        command.extend(["-d", str(output_dir)])
+        command.extend(str(item) for item in java_files)
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            self.fail(f"javac failed: {result.stderr}")
+        return output_dir
+
     def test_analyze_file_ignores_fully_block_commented_java_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"
@@ -7467,6 +7488,139 @@ public class com.example.consumer.ReflectiveCall {
             for path in built.call_paths
         ))
         self.assertTrue(any(detail.get("business_reachable") for detail in built.path_details))
+
+    def test_runtime_dependency_bytecode_graph_connects_business_to_transitive_packaged_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_src = root / "target-src" / "com" / "vendor" / "Target.java"
+            target_src.parent.mkdir(parents=True)
+            target_src.write_text(
+                "package com.vendor; public class Target { "
+                "public static boolean removed(String s) { return s == null; } }",
+                encoding="utf-8",
+            )
+            target_classes = self._compile_java_files(root / "target-classes", [target_src])
+            target_jar = root / "target.jar"
+            self._jar_compiled_classes(target_jar, target_classes)
+
+            dep_b_src = root / "dep-b-src" / "com" / "depb" / "BridgeB.java"
+            dep_b_src.parent.mkdir(parents=True)
+            dep_b_src.write_text(
+                "package com.depb; public class BridgeB { "
+                "public boolean use(String s) { return com.vendor.Target.removed(s); } }",
+                encoding="utf-8",
+            )
+            dep_b_classes = self._compile_java_files(root / "dep-b-classes", [dep_b_src], classpath=target_jar)
+            dep_b_jar = root / "dep-b.jar"
+            self._jar_compiled_classes(dep_b_jar, dep_b_classes)
+
+            dep_a_src = root / "dep-a-src" / "com" / "depa" / "FacadeA.java"
+            dep_a_src.parent.mkdir(parents=True)
+            dep_a_src.write_text(
+                "package com.depa; public class FacadeA { "
+                "public boolean entry(String s) { return new com.depb.BridgeB().use(s); } }",
+                encoding="utf-8",
+            )
+            classpath = os.pathsep.join([str(dep_b_jar), str(target_jar)])
+            dep_a_classes = self._compile_java_files(root / "dep-a-classes", [dep_a_src], classpath=classpath)
+            dep_a_jar = root / "dep-a.jar"
+            self._jar_compiled_classes(dep_a_jar, dep_a_classes)
+
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            catalog = {
+                "status": "complete",
+                "by_coord": {
+                    "com.example:dep-a": {
+                        "coord": "com.example:dep-a",
+                        "version": "1",
+                        "scope": "compile",
+                        "jar_path": str(dep_a_jar),
+                    },
+                    "com.example:dep-b": {
+                        "coord": "com.example:dep-b",
+                        "version": "1",
+                        "scope": "compile",
+                        "jar_path": str(dep_b_jar),
+                    },
+                },
+            }
+            business_method = SimpleNamespace(
+                symbol_id="app_run",
+                qualified_key="com.app.App.run",
+                owner_type="business",
+                owner_coord="__business__",
+                is_test=False,
+            )
+            business_to_a = source_analyzer.CallEdge(
+                caller_symbol_id="app_run",
+                caller_qualified_key="com.app.App.run",
+                callee_key="com.depa.FacadeA.entry(java.lang.String)",
+                callee_simple_key="method:entry(java.lang.String)",
+                evidence_type="bytecode_method_invocation",
+                confidence="high",
+                file=str(root / "app.jar"),
+                line=0,
+                content="business bytecode calls dep-a",
+                owner_type="business",
+                owner_coord="__business__",
+                module="app",
+                is_test=False,
+            )
+            graph_with_business_edge = SimpleNamespace(
+                methods_by_id={"app_run": business_method},
+                reverse_edges={
+                    "com.depa.FacadeA.entry(java.lang.String)": [business_to_a],
+                },
+                runtime_dependency_catalog=catalog,
+            )
+            reachable = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph_with_business_edge,
+                {},
+                max_total_cost=5,
+                needs_bridge=True,
+                has_dependency_source_mapping=False,
+                has_packaged_bytecode_fallback=True,
+                allow_degraded=True,
+            )
+            self.assertEqual(reachable.analysis_status, "reachable")
+
+            graph_with_runtime_edges_only = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=catalog,
+            )
+            still_uncertain = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph_with_runtime_edges_only,
+                {},
+                max_total_cost=5,
+                needs_bridge=True,
+                has_dependency_source_mapping=False,
+                has_packaged_bytecode_fallback=True,
+                allow_degraded=True,
+            )
+            self.assertEqual(still_uncertain.analysis_status, "uncertain")
+
+        self.assertEqual(reachable.analysis_status, "reachable")
+        self.assertEqual(reachable.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
+        self.assertEqual(
+            reachable.dependency_chain_coords,
+            ["com.example:dep-b", "com.example:dep-a"],
+        )
+        self.assertTrue(any(
+            "com.app.App.run -> com.depa.FacadeA.entry(String) -> "
+            "com.example:dep-b:com.depb.BridgeB.use(String) -> com.vendor.Target.removed(String)"
+            in path
+            for path in reachable.call_paths
+        ))
 
     def test_version_upgrade_scans_runtime_consumers_even_when_target_source_mapping_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
