@@ -9,6 +9,7 @@
 """
 
 import argparse
+import base64
 import csv
 from dataclasses import dataclass
 import io
@@ -151,7 +152,19 @@ def main_state_step_output(main_state, step_id):
 
 def write_text(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8", newline="\n")
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(content)
+
+
+def minimal_valid_app_class_bytes():
+    # 由 `public class App {}` 编译得到的最小合法 class，用于让 smoke 的
+    # 最终制品能被 javap 正常读取，避免把 fake 字节串误当成业务字节码回归。
+    return base64.b64decode(
+        "yv66vgAAAEQADQoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClW"
+        "BwAIAQADQXBwAQAEQ29kZQEAD0xpbmVOdW1iZXJUYWJsZQEAClNvdXJjZUZpbGUBAAhBcHAuamF2"
+        "YQAhAAcAAgAAAAAAAQABAAUABgABAAkAAAAdAAEAAQAAAAUqtwABsQAAAAEACgAAAAYAAQAAAAEA"
+        "AQALAAAAAgAM"
+    )
 
 
 def create_fake_jar(path, marker=b""):
@@ -184,7 +197,7 @@ def build_embedded_maven_jar_bytes(group_id, artifact_id, version, marker=b""):
 def create_fake_boot_jar(path, embedded_deps):
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("BOOT-INF/classes/com/example/App.class", b"app")
+        zf.writestr("BOOT-INF/classes/com/example/App.class", minimal_valid_app_class_bytes())
         for dep in embedded_deps:
             group_id, artifact_id, version = dep
             zf.writestr(
@@ -196,7 +209,7 @@ def create_fake_boot_jar(path, embedded_deps):
 def create_plain_jar(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("com/example/App.class", b"plain")
+        zf.writestr("com/example/App.class", minimal_valid_app_class_bytes())
 
 
 def run_external_cmd(cmd, cwd):
@@ -525,6 +538,7 @@ def create_smoke_workspace(base_tmp):
 
 def fake_maven_script_text():
     return """#!/usr/bin/env python3
+import base64
 import io
 import os
 import sys
@@ -581,13 +595,22 @@ def select_module(args):
 def create_plain_jar(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("com/example/App.class", b"plain")
+        zf.writestr("com/example/App.class", minimal_valid_app_class_bytes())
+
+
+def minimal_valid_app_class_bytes():
+    return base64.b64decode(
+        "yv66vgAAAEQADQoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClW"
+        "BwAIAQADQXBwAQAEQ29kZQEAD0xpbmVOdW1iZXJUYWJsZQEAClNvdXJjZUZpbGUBAAhBcHAuamF2"
+        "YQAhAAcAAgAAAAAAAQABAAUABgABAAkAAAAdAAEAAQAAAAUqtwABsQAAAAEACgAAAAYAAQAAAAEA"
+        "AQALAAAAAgAM"
+    )
 
 
 def create_boot_jar(path, deps):
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as outer:
-        outer.writestr("BOOT-INF/classes/com/example/App.class", b"app")
+        outer.writestr("BOOT-INF/classes/com/example/App.class", minimal_valid_app_class_bytes())
         for group_id, artifact_id, version in deps:
             nested = io.BytesIO()
             with zipfile.ZipFile(nested, "w") as inner:
@@ -2461,6 +2484,11 @@ return ExtraApi.callLegacy();
     assert_true(
         parser_usage.get("tree_sitter", 0) + parser_usage.get("regex", 0) >= 1,
         "Step 5 parser_usage 统计为空，无法观测主链路/降级路径",
+    )
+    business_bytecode = summary.get("meta", {}).get("graph_stats", {}).get("business_bytecode", {})
+    assert_true(
+        not any("Bad magic number" in str(item) for item in (business_bytecode.get("failures") or [])),
+        "Step 5 smoke 的业务字节码补边不应再因 fake class 触发 Bad magic number",
     )
 
     # 后续用例专门验证源码图解析，不再复用上面故意制造为过期的制品契约。

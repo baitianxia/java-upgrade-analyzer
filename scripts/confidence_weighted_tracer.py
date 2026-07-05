@@ -1423,14 +1423,10 @@ def trace_api_with_confidence_weighting(
         _debug_trace_result('trace_api_result', direct_usage_result)
         return direct_usage_result
 
-    if artifact_dependency_hits:
+    # 类级目标没有正式的方法级反向追踪主路径；若最终制品已稳定命中字节码引用，
+    # 仍应沿用打包依赖命中结论，而不是被后续 CLASS_USAGE_ONLY 覆盖。
+    if artifact_dependency_hits and (result.analysis_scope == 'class_usage' or result.symbol_kind == 'class'):
         packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits)
-        if dependency_removed:
-            packaged_dependency_result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
-            packaged_dependency_result.reachable_note = (
-                '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
-                '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
-            )
         _debug_trace_result('trace_api_result', packaged_dependency_result)
         return packaged_dependency_result
 
@@ -1937,6 +1933,24 @@ def trace_api_with_confidence_weighting(
             'not_analyzed': len(not_analyzed_candidates),
         })
         return built
+
+    # 运行时依赖字节码命中是强证据，但不应抢在源码反向追踪之前提前终止方法级分析。
+    # 对有依赖源码映射的多模块系统，应先允许 tracer 继续证明是否最终回到 BUSINESS。
+    # 只有在源码图没有产出更强结论时，才回退为打包依赖字节码命中结论。
+    if artifact_dependency_hits:
+        packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits)
+        if dependency_removed:
+            packaged_dependency_result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
+            packaged_dependency_result.reachable_note = (
+                '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
+                '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
+            )
+        _debug_trace_result('trace_api_result', packaged_dependency_result, candidate_counts={
+            'reachable': len(reachable_candidates),
+            'uncertain': len(uncertain_candidates),
+            'not_analyzed': len(not_analyzed_candidates),
+        })
+        return packaged_dependency_result
 
     if uncertain_candidates:
         if needs_bridge and (not has_dependency_source_mapping) and allow_degraded:

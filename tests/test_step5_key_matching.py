@@ -6985,6 +6985,169 @@ public class com.example.consumer.Adapter {
             self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
             self.assertEqual(result.dependency_chain_coords, ["sample:consumer"])
 
+    def test_trace_api_keeps_following_source_path_after_packaged_dependency_hit(self):
+        api_row = {
+            "coord": "com.example:repository",
+            "api_name": "com.example.multimodule.repository.UserRepository.findByEmail",
+            "api_simple": "findByEmail",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+            "analysis_scope": "method",
+        }
+        service_method = SimpleNamespace(
+            symbol_id="service_method",
+            qualified_key="com.example.multimodule.services.impl.UserServiceImpl.getUserByEmail",
+            simple_key="method:getUserByEmail",
+            class_fqcn="com.example.multimodule.services.impl.UserServiceImpl",
+            class_name="UserServiceImpl",
+            method_name="getUserByEmail",
+            param_types={"email": "java.lang.String"},
+            param_declared_types={"email": "String"},
+            owner_type="dependency",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/UserServiceImpl.java",
+            line=38,
+        )
+        controller_method = SimpleNamespace(
+            symbol_id="controller_method",
+            qualified_key="com.example.multimodule.controller.UserController.getUserByEmail",
+            simple_key="method:getUserByEmail",
+            class_fqcn="com.example.multimodule.controller.UserController",
+            class_name="UserController",
+            method_name="getUserByEmail",
+            param_types={"email": "java.lang.String"},
+            param_declared_types={"email": "String"},
+            owner_type="business",
+            is_test=False,
+            annotations=["GetMapping"],
+            class_annotations=["RestController"],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/UserController.java",
+            line=26,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={
+                "service_method": service_method,
+                "controller_method": controller_method,
+            },
+            reverse_edges={
+                "com.example.multimodule.repository.UserRepository.findByEmail(String)": [
+                    SimpleNamespace(
+                        caller_symbol_id="service_method",
+                        caller_qualified_key=service_method.qualified_key,
+                        callee_key="com.example.multimodule.repository.UserRepository.findByEmail(String)",
+                        callee_simple_key="method:findByEmail(String)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=service_method.file,
+                        line=service_method.line,
+                        owner_type="dependency",
+                        owner_coord="com.example:services",
+                        module="services",
+                        is_test=False,
+                    ),
+                ],
+                "com.example.multimodule.services.impl.UserServiceImpl.getUserByEmail(String)": [
+                    SimpleNamespace(
+                        caller_symbol_id="controller_method",
+                        caller_qualified_key=controller_method.qualified_key,
+                        callee_key="com.example.multimodule.services.impl.UserServiceImpl.getUserByEmail(String)",
+                        callee_simple_key="method:getUserByEmail(String)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=controller_method.file,
+                        line=controller_method.line,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="controller",
+                        is_test=False,
+                    ),
+                ],
+            },
+        )
+
+        packaged_scan_hit = {
+            "status": "hit",
+            "hits": [{
+                "coord": "com.example:services",
+                "class_fqcn": "com.example.multimodule.services.impl.UserServiceImpl",
+                "consumer_method": "getUserByEmail",
+                "consumer_signature": "(String)",
+                "target_display": "com.example.multimodule.repository.UserRepository.findByEmail(String)",
+                "jar_path": "/tmp/services.jar",
+                "evidence_type": "bytecode_method_invocation",
+            }],
+        }
+
+        with patch.object(tracer, "_scan_packaged_runtime_dependencies_for_api", return_value=packaged_scan_hit):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                max_total_cost=5,
+                needs_bridge=True,
+                has_dependency_source_mapping=True,
+                has_packaged_bytecode_fallback=True,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertIn("UserController.getUserByEmail", result.call_paths[0])
+        self.assertIn("UserServiceImpl.getUserByEmail", result.call_paths[0])
+        self.assertEqual(result.dependency_chain_coords, ["com.example:services"])
+
+    def test_trace_api_keeps_packaged_bytecode_result_for_class_usage(self):
+        api_row = {
+            "coord": "sample:consumer",
+            "api_name": "com.vendor.TargetType",
+            "api_simple": "TargetType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "CLASS_REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+            "analysis_scope": "class_usage",
+            "matched_class": "com.vendor.TargetType",
+        }
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+        packaged_scan_hit = {
+            "status": "hit",
+            "hits": [{
+                "coord": "sample:consumer",
+                "class_fqcn": "com.example.consumer.Adapter",
+                "consumer_method": "use",
+                "consumer_signature": "()",
+                "target_display": "com.vendor.TargetType",
+                "jar_path": "/tmp/consumer.jar",
+                "evidence_type": "bytecode_class_reference",
+            }],
+        }
+
+        with patch.object(tracer, "_scan_packaged_runtime_dependencies_for_api", return_value=packaged_scan_hit):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                max_total_cost=5,
+                needs_bridge=False,
+                has_dependency_source_mapping=False,
+                has_packaged_bytecode_fallback=True,
+                allow_degraded=False,
+            )
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+        self.assertNotEqual(result.reason_code, "CLASS_USAGE_ONLY")
+
     def test_packaged_consumer_scan_continues_after_one_javap_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             broken_jar = Path(tmp) / "broken.jar"

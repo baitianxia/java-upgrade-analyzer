@@ -313,7 +313,16 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
 
 def _source_method_for_edge(graph, item):
     qualified = f"{item['caller_owner']}.{item['caller_name']}"
-    candidates = list((getattr(graph, 'methods_by_qualified', {}) or {}).get(qualified) or [])
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    raw_candidates = list((getattr(graph, 'methods_by_qualified', {}) or {}).get(qualified) or [])
+    candidates = []
+    for raw_candidate in raw_candidates:
+        if hasattr(raw_candidate, 'symbol_id'):
+            candidates.append(raw_candidate)
+            continue
+        method_def = methods_by_id.get(raw_candidate)
+        if method_def is not None:
+            candidates.append(method_def)
     if len(candidates) == 1:
         return candidates[0]
     signature = item.get('caller_signature') or ''

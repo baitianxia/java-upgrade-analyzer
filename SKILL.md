@@ -444,7 +444,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：本地 Maven JAR 只能作为显式 fallback；一旦使用、缺失嵌套 JAR、坐标 unresolved、SHA 不一致或 javap 失败，字节码覆盖必须降级，未命中不得解释为无影响
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
 - 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`
-- 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中输出 `PACKAGED_DEPENDENCY_BYTECODE_USAGE/uncertain`，删除场景细化为 `RUNTIME_DEPENDENCY_USES_REMOVED_API`
+- 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中保留 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` / `RUNTIME_DEPENDENCY_USES_REMOVED_API` 事实，但若该依赖存在源码映射，Step5 必须先继续尝试回溯到业务代码，只有未能证明业务入口时才收敛为 `uncertain`
 - 规则：验收测试必须包含真实 `jdeps` 对照；`jdeps` 能发现的静态跨 JAR 类依赖，本 Skill 不得漏报，并继续提供成员级方法/字段匹配
 - 规则：业务源码图与当前业务字节码图使用统一 owner/name/signature 身份；冲突时保留两类 provenance，不得用字节码静默覆盖源码证据
 - 规则：`s5_call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条终止链路独立一行，禁止只保留第一条路径或静默截断

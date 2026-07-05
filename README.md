@@ -449,7 +449,7 @@ mvn -q dependency:get -Dartifact=<groupId:artifactId>:<version>
 - `.upgrade-report/source_artifact_alignment.json` 记录源码 revision/dirty 状态与 Step1 制品溯源是否一致；未对齐时，字节码未命中不得反证源码候选
 - `alerts.csv` 的 `reason/action` 按每条终止路径的 `stop_reason` 生成；`path_id` 基于符号与证据类型等语义字段，不受工作目录或证据绝对路径变化影响
 - `reason_code=BUSINESS_ARTIFACT_BYTECODE_USAGE` 表示 current 最终制品中的业务 class 已确认引用目标符号；这项事实不依赖源码是否存在
-- 当 `reason_code=PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示已经在最终制品的运行时依赖 JAR 中稳定命中目标符号，但尚未证明是否回到系统源码，因此会收敛为 `uncertain`；是否提供该依赖源码不影响这项命中事实
+- 当 `reason_code=PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示已经在最终制品的运行时依赖 JAR 中稳定命中目标符号，但当前源码追踪仍未证明是否回到系统源码，因此会收敛为 `uncertain`；若依赖源码可用，Step5 会先继续尝试把链路回溯到业务代码，再决定是否回退到这项结论
 - 当 `reason_code=RUNTIME_DEPENDENCY_USES_REMOVED_API` 时，表示某个仍被打入最终制品的依赖 JAR 继续引用已整体删除依赖的类/方法/字段；应优先检查命中的消费类和业务入口，并验证 `NoClassDefFoundError` / `NoSuchMethodError` 风险
 - Step3 的 JDK、Jakarta namespace 与 Spring Boot 迁移规则分别来自 `references/rules/jdk.json`、`jakarta.json` 和 `spring-boot.json`；输出会记录规则 ID 与规则包版本
 - Step3 的 `s3_coverage.json` 同时记录规则包 SHA-256、权威来源、最后核验日期和按升级区间激活的扫描；Step4 的 `coverage.json` 分离二进制 API 与行为差异覆盖

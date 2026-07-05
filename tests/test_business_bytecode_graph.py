@@ -1,13 +1,18 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from business_bytecode_graph import method_descriptor_signature, parse_javap_calls
+from business_bytecode_graph import (
+    merge_business_bytecode_edges,
+    method_descriptor_signature,
+    parse_javap_calls,
+)
 
 
 class BusinessBytecodeGraphTest(unittest.TestCase):
@@ -47,6 +52,39 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         self.assertIn("bytecode_type_reference", kinds)
         self.assertIn("bytecode_invokedynamic", kinds)
         self.assertIn("bytecode_class_reference", kinds)
+
+    def test_merge_business_bytecode_edges_resolves_symbol_ids_to_method_defs(self):
+        method = SimpleNamespace(
+            symbol_id="m1",
+            qualified_key="com.acme.Service.execute()",
+            owner_coord="BUSINESS",
+            module="app",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"m1": method},
+            methods_by_qualified={"com.acme.Service.execute": ["m1"]},
+            lookup_keys_by_symbol={"m1": ["com.acme.Service.execute()"]},
+            reverse_edges={},
+        )
+        evidence = [{
+            "caller_owner": "com.acme.Service",
+            "caller_name": "execute",
+            "caller_signature": "()",
+            "callee_key": "com.acme.Client.call(java.lang.String)",
+            "callee_simple_key": "method:call(java.lang.String)",
+            "evidence_type": "bytecode_method_invocation",
+            "class_file": "/tmp/Service.class",
+            "line": 12,
+            "content": "invokevirtual Client.call",
+        }]
+
+        metrics = merge_business_bytecode_edges(graph, evidence)
+
+        self.assertEqual(metrics, {"merged_edges": 1, "skipped_unresolved_callers": 0})
+        edges = graph.reverse_edges["com.acme.Client.call(java.lang.String)"]
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0].caller_symbol_id, "m1")
+        self.assertEqual(edges[0].caller_qualified_key, "com.acme.Service.execute()")
 
 
 if __name__ == "__main__":
