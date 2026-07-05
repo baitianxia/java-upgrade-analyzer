@@ -9,5 +9,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
+.upgrade-report/
+
 orchestrator_unittest_full.log
 REMOVED_JAR_PLAN.md

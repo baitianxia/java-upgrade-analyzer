@@ -1821,6 +1821,66 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
         self.assertEqual(result.match_provenance, "compatible_signature")
 
+    def test_trace_api_uses_builtin_java_assignable_signature_for_target_overload(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang3.StringUtils.isBlank",
+            "api_simple": "isBlank",
+            "api_signature": "(CharSequence)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.apache.commons:commons-lang3",
+            "severity": "HIGH",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_scope": "method",
+        }
+        business_entry = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="org.example.Controller.handle",
+            simple_key="method:handle",
+            class_fqcn="org.example.Controller",
+            class_name="Controller",
+            method_name="handle",
+            param_types={},
+            param_declared_types={},
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/Controller.java",
+            line=18,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="business_entry",
+            caller_qualified_key=business_entry.qualified_key,
+            callee_key="org.apache.commons.lang3.StringUtils.isBlank(String)",
+            callee_simple_key="method:isBlank(String)",
+            confidence="high",
+            evidence_type="ast_method_invocation",
+            file=business_entry.file,
+            line=18,
+            owner_type="business",
+            owner_coord="BUSINESS",
+            module="app",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_entry},
+            reverse_edges={
+                "org.apache.commons.lang3.StringUtils.isBlank": [edge],
+                "org.apache.commons.lang3.StringUtils.isBlank(String)": [edge],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertEqual(result.match_provenance, "compatible_signature")
+
     def test_trace_api_does_not_start_from_unrelated_simple_signature_target(self):
         api_row = {
             "api_name": "com.lib.Target.parse",

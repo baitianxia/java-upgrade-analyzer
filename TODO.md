@@ -1,6 +1,6 @@
 # 待优化项
 
-> 实施状态（2026-07-03）：前 10 项优化已落地并通过自动化回归；第 11 项为待办。
+> 实施状态（2026-07-05）：前 11 项优化已落地并通过自动化回归；第 12 项为真实项目回归暴露的新待办。
 > 已完成章节保留讨论背景作为设计记录；明确标记“待办”的章节仍表示当前能力缺口。
 
 | 项目 | 状态 | 主要落点 |
@@ -16,6 +16,33 @@
 | 9. Framework Adapter | 已完成 | SPI、Spring、MyBatis 独立证据、歧义/条件保留、`@Bean` 实现解析及统一图合并 |
 | 10. 人工复核链路台账 | 已完成 | `alerts.csv` 每 API 至少一行、每条终止链路一行，逐路径原因、稳定语义 ID、显式消费方/业务入口且不抽样 |
 | 11. Step5 分析能力补全 | 已完成当前清单的可交付基线 | Step4 唯一目标集；已落地精确反射、常见反射字节码、静态 MethodHandle、资源/表达式引用、动态代理与声明式 HTTP Client Adapter、覆盖矩阵与正式产物接线 |
+| 12. Step5 boolean/varargs 重载推断 | 待办 | 真实 Commons Text 回归暴露：`Validate.isTrue(boolean, String, Object...)` 仍因 boolean 表达式与 varargs 签名推断不足被保守归为 `not_analyzed` |
+
+## 12. Step5 boolean 表达式与 varargs 重载推断补强
+
+### 背景
+
+使用真实 Git 项目 Apache Commons Text（commit `87ace21`）作为被分析系统，模拟
+`commons-lang3` API 删除并运行 Step5：
+
+- `StringUtils.isBlank(CharSequence)` 曾因源码调用被推断为 `isBlank(String)`，被重载安全过滤阻断；已通过 Java 内置类型 assignability 修复。
+- `Validate.isTrue(boolean, String, Object...)` 仍被归为 `not_analyzed / OVERLOAD_AMBIGUOUS_TARGET`。
+
+当前 `Validate.isTrue` 问题的直接原因是源码调用图里只稳定产生了无签名 key，且部分调用的参数推断出现
+`(StringUtils, String)` 一类错误签名；在目标 API 存在重载时，Step5 不能安全地把无签名命中升级为 reachable。
+
+### 优化方向
+
+- 补强布尔表达式类型推断：比较表达式、逻辑表达式、取反、括号表达式应推断为 `boolean`。
+- 补强 varargs 兼容：目标形如 `(boolean, String, Object...)` 时，应能安全匹配 `(boolean, String)` 以及后续额外引用类型参数。
+- 继续保持重载安全：不得因为存在无签名 `Validate.isTrue` 命中就直接判定 reachable。
+- 将 Commons Text `Validate.isTrue` 场景固化为真实项目或精简 fixture 回归，防止后续再次被误判为“未分析”。
+
+### 验收口径
+
+- Commons Text 真实项目回归中，`StringUtils.isBlank(CharSequence)`、`StringUtils.isEmpty(CharSequence)`、`StringUtils.defaultString(String)`、`StringUtils.EMPTY`、`ArrayUtils.isEmpty(char[])` 均为 reachable。
+- 在补强 boolean/varargs 后，`Validate.isTrue(boolean, String, Object...)` 能在真实源码调用中安全识别为 reachable。
+- 现有错误重载防护测试仍通过，不能引入同名重载误报。
 
 ## 1. 简化系统源码相关内部参数模型
 

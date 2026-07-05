@@ -3248,6 +3248,39 @@ PRIMITIVE_TYPES = {
     'byte', 'short', 'int', 'long', 'float', 'double', 'boolean', 'char',
 }
 
+JAVA_BUILTIN_SUPERTYPES = {
+    'java.lang.String': {
+        'java.lang.CharSequence',
+        'java.lang.Comparable',
+        'java.io.Serializable',
+        'java.lang.Object',
+    },
+    'java.lang.StringBuilder': {
+        'java.lang.CharSequence',
+        'java.lang.Appendable',
+        'java.io.Serializable',
+        'java.lang.Object',
+    },
+    'java.lang.StringBuffer': {
+        'java.lang.CharSequence',
+        'java.lang.Appendable',
+        'java.io.Serializable',
+        'java.lang.Object',
+    },
+}
+
+JAVA_BUILTIN_SIMPLE_TO_FQCN = {
+    fqcn.rsplit('.', 1)[-1]: fqcn
+    for fqcn in JAVA_BUILTIN_SUPERTYPES
+}
+JAVA_BUILTIN_SIMPLE_TO_FQCN.update({
+    'Object': 'java.lang.Object',
+    'CharSequence': 'java.lang.CharSequence',
+    'Comparable': 'java.lang.Comparable',
+    'Appendable': 'java.lang.Appendable',
+    'Serializable': 'java.io.Serializable',
+})
+
 
 def strip_generic_content(type_name):
     type_name = (type_name or '').strip()
@@ -3294,6 +3327,27 @@ def split_array_suffix(type_name):
         dimensions += 1
         type_name = type_name[:-2].strip()
     return type_name, dimensions
+
+
+def canonical_builtin_type_name(type_name):
+    type_name = (type_name or '').strip()
+    if not type_name:
+        return ''
+    if type_name in JAVA_BUILTIN_SIMPLE_TO_FQCN:
+        return JAVA_BUILTIN_SIMPLE_TO_FQCN[type_name]
+    return type_name
+
+
+def builtin_supertypes_for(type_name):
+    canonical = canonical_builtin_type_name(type_name)
+    if not canonical:
+        return set()
+    simple = canonical.rsplit('.', 1)[-1]
+    supertypes = {canonical, simple}
+    for parent in JAVA_BUILTIN_SUPERTYPES.get(canonical, set()):
+        supertypes.add(parent)
+        supertypes.add(parent.rsplit('.', 1)[-1])
+    return supertypes
 
 
 def is_probable_type_reference(type_name):
@@ -3401,6 +3455,10 @@ def is_candidate_param_compatible_with_target(candidate_type, target_type, type_
 
     if candidate_base in PRIMITIVE_TYPES or target_base in PRIMITIVE_TYPES:
         return False
+
+    builtin_candidate_supertypes = builtin_supertypes_for(candidate_base)
+    if target_base in builtin_candidate_supertypes or target_simple in builtin_candidate_supertypes:
+        return True
 
     target_candidates = resolve_type_candidates(target_base, type_metadata)
     candidate_candidates = resolve_type_candidates(candidate_base, type_metadata)
