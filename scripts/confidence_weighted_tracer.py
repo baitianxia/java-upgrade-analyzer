@@ -21,7 +21,7 @@ import re
 import sys
 import time
 import zipfile
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 from compat import run_cmd
@@ -734,6 +734,15 @@ def _runtime_class_variants(entries, target_jdk=None, multi_release_enabled=True
 
 def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     catalog = _get_runtime_dependency_catalog(graph)
+    cached_results = catalog.get('_packaged_api_scan_results') or {}
+    identity_key = build_api_identity_key(api_row)
+    if identity_key in cached_results:
+        return cached_results[identity_key]
+    _build_packaged_runtime_dependency_scan_cache([api_row], graph)
+    cached_results = catalog.get('_packaged_api_scan_results') or {}
+    if identity_key in cached_results:
+        return cached_results[identity_key]
+
     by_coord = catalog.get('by_coord') or {}
     catalog_entries = list(catalog.get('entries') or [
         ({'coord': coord, **item} if not item.get('coord') else item)
@@ -861,6 +870,265 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
         'status': 'miss', 'scan_failures': scan_failures,
         'scanned_classes': scanned_classes, 'visited_classes': visited_classes,
     }
+
+
+def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
+    """Batch scan final-artifact runtime dependency bytecode once for all Step5 APIs.
+
+    The previous per-API path repeatedly opened every runtime JAR and repeatedly
+    ran javap for the same class. Removed JAR analysis can expand to thousands of
+    changed APIs, so the naive complexity becomes APIs × runtime-jars × classes.
+    This cache scans each candidate runtime class at most once and then fans the
+    parsed bytecode references back out to all matching APIs.
+    """
+    catalog = _get_runtime_dependency_catalog(graph)
+    if not catalog:
+        return {}
+    existing = catalog.setdefault('_packaged_api_scan_results', {})
+    api_rows = [dict(row or {}) for row in (api_rows or []) if (row or {}).get('api_name')]
+    missing_rows = [
+        row for row in api_rows
+        if build_api_identity_key(row) not in existing
+    ]
+    if not missing_rows:
+        return existing
+
+    target_rows_by_owner = defaultdict(list)
+    owner_internal_names = {}
+    for row in missing_rows:
+        key = build_api_identity_key(row)
+        owner, _member_name, _symbol_kind = _extract_target_owner_and_member(row)
+        if not owner:
+            existing[key] = {
+                'status': 'unavailable',
+                'reason': 'BYTECODE_TARGET_UNRESOLVED',
+                'scan_failures': [],
+                'scanned_classes': 0,
+                'visited_classes': 0,
+            }
+            continue
+        target_rows_by_owner[owner].append(row)
+        owner_internal_names[owner] = owner.replace('.', '/')
+
+    if not target_rows_by_owner:
+        return existing
+
+    by_coord = catalog.get('by_coord') or {}
+    catalog_entries = list(catalog.get('entries') or [
+        ({'coord': coord, **item} if not item.get('coord') else item)
+        for coord, item in by_coord.items()
+    ])
+
+    scan_failures = []
+    hits_by_key = defaultdict(list)
+    scanned_classes = 0
+    visited_classes = 0
+    multi_release_seen = False
+    multi_release_target_resolved = False
+    target_jdk = catalog.get('target_jdk')
+    started_at = time.perf_counter()
+    progress_interval = suggest_log_interval(len(catalog_entries), target_updates=8, minimum=1)
+
+    if not catalog_entries:
+        for row in missing_rows:
+            key = build_api_identity_key(row)
+            existing.setdefault(key, {
+                'status': 'unavailable',
+                'reason': 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE',
+                'scan_failures': [],
+                'scanned_classes': 0,
+                'visited_classes': 0,
+            })
+        return existing
+
+    emit_progress(
+        "step5",
+        "bytecode-scan",
+        f"开始批量扫描运行时依赖字节码，依赖数={len(catalog_entries)}，API数={len(missing_rows)}",
+    )
+
+    owner_bytes = [
+        (owner, internal.encode('utf-8'), owner.encode('utf-8'))
+        for owner, internal in owner_internal_names.items()
+    ]
+
+    for idx, item in enumerate(catalog_entries, 1):
+        coord = str(item.get('coord') or '').strip()
+        jar_path = str(item.get('jar_path') or '').strip()
+        if should_log_progress(idx, len(catalog_entries), progress_interval):
+            emit_progress(
+                "step5",
+                "bytecode-scan",
+                f"正在扫描运行时依赖字节码 {coord or '<unknown>'}",
+                current=idx,
+                total=len(catalog_entries),
+                elapsed=time.perf_counter() - started_at,
+                item=coord or jar_path,
+            )
+        if not jar_path or not os.path.exists(jar_path):
+            scan_failures.append({
+                'reason': 'RUNTIME_DEPENDENCY_JAR_MISSING',
+                'coord': coord,
+                'jar_path': jar_path,
+            })
+            continue
+        try:
+            with zipfile.ZipFile(jar_path) as zf:
+                try:
+                    manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
+                except KeyError:
+                    manifest = ''
+                multi_release_enabled = bool(re.search(
+                    r'(?im)^Multi-Release\s*:\s*true\s*$', manifest
+                ))
+                variants, is_multi_release, parsed_target = _runtime_class_variants(
+                    zf.namelist(), target_jdk, multi_release_enabled=multi_release_enabled
+                )
+                multi_release_seen = multi_release_seen or is_multi_release
+                if is_multi_release and parsed_target is not None:
+                    multi_release_target_resolved = True
+                for entry, logical_name, selected_version in variants:
+                    if logical_name.endswith('module-info.class') or logical_name.endswith('package-info.class'):
+                        continue
+                    visited_classes += 1
+                    data = zf.read(entry)
+                    candidate_owners = [
+                        owner for owner, internal_bytes, dotted_bytes in owner_bytes
+                        if internal_bytes in data or dotted_bytes in data
+                    ]
+                    if not candidate_owners:
+                        continue
+                    class_binary_name = logical_name[:-6].replace('/', '.')
+                    references = _load_runtime_dependency_class_references(
+                        catalog, coord, jar_path, class_binary_name,
+                        multi_release_version=selected_version,
+                    )
+                    if references is None:
+                        scan_failures.append({
+                            'reason': 'BYTECODE_JAVAP_FAILED',
+                            'coord': coord,
+                            'jar_path': jar_path,
+                            'class_binary_name': class_binary_name,
+                            'multi_release_version': selected_version,
+                        })
+                        continue
+                    scanned_classes += 1
+                    referenced_owners = set(references.get('class_refs') or [])
+                    referenced_owners.update(
+                        item.get('owner') for item in references.get('method_refs') or []
+                    )
+                    referenced_owners.update(
+                        item.get('owner') for item in references.get('field_refs') or []
+                    )
+                    for owner in set(candidate_owners) & {item for item in referenced_owners if item}:
+                        for api_row in target_rows_by_owner.get(owner, []):
+                            if coord == str(api_row.get('coord') or '').strip():
+                                continue
+                            matches = _match_runtime_dependency_references(api_row, references)
+                            if not matches:
+                                continue
+                            key = build_api_identity_key(api_row)
+                            for matched in matches:
+                                hits_by_key[key].append({
+                                    'coord': coord,
+                                    'jar_path': jar_path,
+                                    'class_fqcn': class_binary_name.replace('$', '.'),
+                                    'consumer_method': matched.get('consumer_method') or '<unknown>',
+                                    'consumer_signature': matched.get('consumer_signature') or '',
+                                    'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
+                                    'target_display': matched.get('target_display') or owner,
+                                    'class_entry': entry,
+                                    'multi_release_version': selected_version,
+                                })
+        except Exception as exc:
+            scan_failures.append({
+                'reason': 'BYTECODE_SCAN_FAILED',
+                'coord': coord,
+                'jar_path': jar_path,
+                'error': str(exc),
+            })
+
+    catalog_status = str(catalog.get('status') or '').strip()
+    for row in missing_rows:
+        key = build_api_identity_key(row)
+        if key in existing and existing[key].get('status') == 'unavailable':
+            continue
+        hits = hits_by_key.get(key) or []
+        if hits:
+            unique_hits = []
+            seen_hits = set()
+            for hit in hits:
+                identity = tuple(hit.get(field) for field in (
+                    'coord', 'class_fqcn', 'consumer_method', 'consumer_signature',
+                    'evidence_type', 'target_display', 'multi_release_version',
+                ))
+                if identity in seen_hits:
+                    continue
+                seen_hits.add(identity)
+                unique_hits.append(hit)
+            existing[key] = {
+                'status': 'hit',
+                'hits': unique_hits,
+                'scan_failures': scan_failures,
+                'scanned_classes': scanned_classes,
+                'visited_classes': visited_classes,
+                'scan_mode': 'batch',
+            }
+            continue
+        if multi_release_seen and not multi_release_target_resolved:
+            existing[key] = {
+                'status': 'unavailable',
+                'reason': 'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
+                'scan_failures': scan_failures,
+                'scanned_classes': scanned_classes,
+                'visited_classes': visited_classes,
+                'scan_mode': 'batch',
+            }
+            continue
+        if catalog_status and catalog_status != 'complete':
+            existing[key] = {
+                'status': 'unavailable',
+                'reason': 'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
+                'catalog_status': catalog.get('status'),
+                'catalog_reason_codes': list(catalog.get('reason_codes') or []),
+                'scan_failures': scan_failures,
+                'scanned_classes': scanned_classes,
+                'visited_classes': visited_classes,
+                'scan_mode': 'batch',
+            }
+            continue
+        if scan_failures:
+            first = dict(scan_failures[0])
+            existing[key] = {
+                'status': 'unavailable',
+                **first,
+                'scan_failures': scan_failures,
+                'scanned_classes': scanned_classes,
+                'visited_classes': visited_classes,
+                'scan_mode': 'batch',
+            }
+            continue
+        existing[key] = {
+            'status': 'miss',
+            'scan_failures': scan_failures,
+            'scanned_classes': scanned_classes,
+            'visited_classes': visited_classes,
+            'scan_mode': 'batch',
+        }
+
+    emit_progress(
+        "step5",
+        "bytecode-scan",
+        (
+            "运行时依赖字节码批量扫描完成，"
+            f"visited_classes={visited_classes}，javap_classes={scanned_classes}，"
+            f"hit_apis={sum(1 for key in hits_by_key if hits_by_key.get(key))}"
+        ),
+        current=len(catalog_entries),
+        total=len(catalog_entries),
+        elapsed=time.perf_counter() - started_at,
+    )
+    return existing
 
 
 def _build_packaged_dependency_hit_result(result, hits):
@@ -3902,6 +4170,8 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         allow_degraded=allow_degraded,
         graph_stats=graph_stats or {},
     )
+    if graph is not None and all_apis:
+        _build_packaged_runtime_dependency_scan_cache(all_apis, graph)
 
     for idx, api_row in enumerate(all_apis, 1):
         api_name = api_row.get('api_name', '')

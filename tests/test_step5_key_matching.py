@@ -6936,6 +6936,77 @@ public class com.example.consumer.Adapter {
         self.assertEqual(scan["status"], "hit")
         self.assertEqual({item["consumer_method"] for item in scan["hits"]}, {"validate", "convert"})
 
+    def test_batch_packaged_bytecode_scan_reuses_javap_across_apis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr(
+                    "com/example/consumer/Adapter.class",
+                    b"org/apache/commons/lang/StringUtils isBlank isEmpty",
+                )
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer",
+                            "version": "1",
+                            "scope": "compile",
+                            "jar_path": str(jar_path),
+                        }
+                    },
+                },
+            )
+            apis = [
+                {
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                    "api_simple": "isBlank",
+                    "api_signature": "(String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                },
+                {
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.isEmpty",
+                    "api_simple": "isEmpty",
+                    "api_signature": "(String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                },
+            ]
+            javap_output = """
+public class com.example.consumer.Adapter {
+  public void validate();
+    descriptor: ()V
+    Code:
+       1: invokestatic #7 // Method org/apache/commons/lang/StringUtils.isBlank:(Ljava/lang/String;)Z
+}
+"""
+            with patch.object(tracer, "run_cmd", return_value=(javap_output, "", 0)) as mocked_run:
+                results = tracer.trace_all_apis_with_confidence_weighting(
+                    apis,
+                    graph,
+                    {},
+                    max_total_cost=5,
+                    api_bridge_requirements={
+                        tracer.build_api_identity_key(item): {
+                            "needs_bridge": True,
+                            "has_dependency_source_mapping": False,
+                            "has_packaged_bytecode_fallback": True,
+                        }
+                        for item in apis
+                    },
+                    allow_degraded=True,
+                    graph_stats={"truncated": False, "parser_fallback_reasons": {}},
+                )
+
+            self.assertEqual(mocked_run.call_count, 1)
+            self.assertEqual([item.analysis_status for item in results], ["uncertain", "not_found_in_static_analysis"])
+            self.assertEqual(results[0].reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+
     def test_version_upgrade_scans_runtime_consumers_even_when_target_source_mapping_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "consumer.jar"
