@@ -97,7 +97,7 @@
         "s1_dep_summary.txt",
         "s1_deps_current_resolved.csv",
         "build_provenance.json",
-        "artifacts/"
+        "s1_artifacts/"
       ],
       "notes": [
         "Step1 默认通过真实构建获取依赖结果。",
@@ -447,8 +447,9 @@
       ],
       "outputs": [
         "s5_call_chain/",
-        "artifact_bytecode_catalog.json",
-        "artifact_bytecode_index.json",
+        "s5_artifact_bytecode/",
+        "s5_artifact_bytecode_catalog.json",
+        "s5_artifact_bytecode_index.json",
         "framework_adapters.json",
         "source_artifact_alignment.json"
       ],

@@ -206,7 +206,7 @@ python3 scripts/run_step.py --step step1 \
   - `s1_dep_summary.txt`
   - `s1_dep_alerts.csv`
   - `build_provenance.json`
-  - `artifacts/`
+  - `s1_artifacts/`
 - Step2（上下文）
   - `s2_context.json`
   - `s2_dep_graph.json`
@@ -221,10 +221,10 @@ python3 scripts/run_step.py --step step1 \
   - `s5_call_chain/summary.json`
   - `s5_call_chain/summary.txt`
   - `s5_call_chain/alerts.csv`
-- per-dependency（按单个依赖坐标沉淀）
-  - `per_dependency/<coord>/removed_jar_symbols.csv`
-  - `per_dependency/<coord>/resolved_targets.csv`
-  - `per_dependency/<coord>/summary.json`
+- Step4 per-dependency（按单个依赖坐标沉淀）
+  - `s4_per_dependency/<coord>/removed_jar_symbols.csv`
+  - `s4_per_dependency/<coord>/resolved_targets.csv`
+  - `s4_per_dependency/<coord>/summary.json`
 - Step6（汇总报告）
   - `s6_findings.json`
   - `s6_report.md`
@@ -251,7 +251,7 @@ python3 scripts/run_step.py --step step1 \
 | `s1_dep_alerts.csv` | 需人工复核的依赖变更子集（如降级、版本不确定、风险标记） | 从 `s1_dep_changes.csv` 按规则筛选生成 | Step1 的人工复核入口；该文件未确认前，后续分析结果可能出现范围偏差 |
 | `s1_dep_summary.txt` | Step1 摘要（统计信息、关键告警 Top 列表） | Step1 依据解析结果汇总生成 | 用于快速确认输入是否正确（尤其是多模块/primary_module 场景）与变更规模分布 |
 | `build_provenance.json` | base/current 最终制品的来源、构建状态、SHA-256 与留存路径 | Step1 在自动构建或直接产物模式下统一写入 | 是 Step5 校验“业务源码与制品是否对齐”的正式依据；重跑 Step1 时必须一起刷新 |
-| `artifacts/` | Step1 留存的 base/current 最终制品及必要附属文件 | Step1 对自动构建结果或用户提供产物做归档后生成 | 供 Step5 提取业务 class 和运行时嵌套 JAR；旧目录不得跨轮复用 |
+| `s1_artifacts/` | Step1 留存的 base/current 最终制品及必要附属文件 | Step1 对自动构建结果或用户提供产物做归档后生成 | 供 Step5 提取业务 class 和运行时嵌套 JAR；旧目录不得跨轮复用 |
 
 补充说明：
 - 当部分嵌套依赖无法安全补齐坐标时，Step1 会先进入待交互；无论当前走的是直接产物模式还是自动切分支构建模式，用户都可补 `manual_coord_overrides`，或显式选择 `confirm_unresolved`
@@ -278,9 +278,9 @@ python3 scripts/run_step.py --step step1 \
 | 文件 | 定义 | 生成来源/条件 | 用途与解读 |
 |---|---|---|---|
 | `s4_jar_compare/*_removed_symbols.txt` | removed 依赖的旧版 jar 符号导出摘要 | 当 Step1 判定依赖为 `移除` 时，由 Step4 对旧版 jar 执行 `javap -public -s` 生成 | 用于确认旧版 jar 是否成功定位、导出了多少 public/protected 类/方法/构造器，以及是否存在导出错误 |
-| `per_dependency/<coord>/removed_jar_symbols.csv` | 某个依赖的 removed jar 旧版符号明细 | 仅在 `change_type=移除` 时生成 | 这是 removed jar 场景下的正式目标池，后续 Step5 会直接消费这些符号去证明是否触达系统源码 |
-| `per_dependency/<coord>/resolved_targets.csv` | 某个依赖最终归一化后的 Step5 输入视图 | Step4 完成后按单个 `coord` 生成 | 用于查看“这个依赖本轮究竟有哪些目标会进入 Step5”，会做去重和字段归一化 |
-| `per_dependency/<coord>/summary.json` | 某个依赖的阶段性摘要 | Step4 写入目标池与 removed jar 导出结果，Step5 再补写触达结论 | 这是“单个依赖包为集合”的主视图入口，可继续深入 `resolved_targets.csv` 或 `by_api/*.json` |
+| `s4_per_dependency/<coord>/removed_jar_symbols.csv` | 某个依赖的 removed jar 旧版符号明细 | 仅在 `change_type=移除` 时生成 | 这是 removed jar 场景下的正式目标池，后续 Step5 会直接消费这些符号去证明是否触达系统源码 |
+| `s4_per_dependency/<coord>/resolved_targets.csv` | 某个依赖最终归一化后的 Step5 输入视图 | Step4 完成后按单个 `coord` 生成 | 用于查看“这个依赖本轮究竟有哪些目标会进入 Step5”，会做去重和字段归一化 |
+| `s4_per_dependency/<coord>/summary.json` | 某个依赖的阶段性摘要 | Step4 写入目标池与 removed jar 导出结果，Step5 再补写触达结论 | 这是“单个依赖包为集合”的主视图入口，可继续深入 `resolved_targets.csv` 或 `by_api/*.json` |
 | `s3_jdk_reflection.csv` | 反射/动态调用相关命中表 | 在 JDK 升级场景下生成 | 用于识别可能绕过编译期检查的风险面；建议与回归测试结合复核 |
 | `s3_jdk_serialization.txt` | 序列化兼容性相关扫描输出（文本摘要） | 在 JDK 升级场景下生成 | 用于指导回归验证范围（对外传输对象、落库对象等）；属于风险提示而非影响证明 |
 | `s3_jdk_runtime_flags.csv` | 运行时参数/兼容性开关建议表 | 在 JDK 升级场景下生成 | 用于运行期兼容性处置与问题定位；不构成代码层结论 |
@@ -314,8 +314,9 @@ python3 scripts/run_step.py --step step1 \
 | `s5_call_chain/summary.txt` | Step5 摘要（数量统计、Top 模块/Top 风险、uncertain/not_analyzed 原因分类等） | Step5 汇总生成 | 用于快速掌握总体影响分布；若 uncertain 或 not_analyzed 比例较高，应优先补齐依赖源码映射、检查图截断与框架装配路径 |
 | `s5_call_chain/by_api/*.json` | 单条风险的完整调用链证据（`evidence_paths`、逐跳命中点、reason_code 等） | Step5 对单个候选生成 | 用于复核 reachable/uncertain 结论与定位截断点；属于证据文件 |
 | `s5_call_chain/by_module/*_impacts.json` | 按模块聚合的影响摘要 | Step5 对调用链结果进行模块聚合后生成 | 用于按业务域拆解责任与处置优先级；属于视图文件 |
-| `artifact_bytecode_catalog.json` | Step5 对 current 最终制品、业务 class 与运行时依赖 JAR 的提取清单与覆盖状态 | Step5 读取 Step1 留存制品并完成字节码入口扫描后生成 | 用于判断字节码证据是否完整；重跑 Step5 时必须与调用链结果一起刷新 |
-| `artifact_bytecode_index.json` | 按 current 制品 SHA-256 缓存的业务 class 字节码索引 | Step5 在构建字节码事实库时生成 | 用于复用方法/字段/类型/`invokedynamic` 证据；制品变化或重跑 Step5 时必须失效重建 |
+| `s5_artifact_bytecode/` | Step5 从 current 最终制品解出的运行时依赖 JAR 与业务 class 缓存 | Step5 读取 Step1 留存制品并完成字节码入口扫描后生成 | 用于保存字节码扫描的实际输入；重跑 Step5 时必须与调用链结果一起刷新 |
+| `s5_artifact_bytecode_catalog.json` | Step5 对 current 最终制品、业务 class 与运行时依赖 JAR 的提取清单与覆盖状态 | Step5 读取 Step1 留存制品并完成字节码入口扫描后生成 | 用于判断字节码证据是否完整；重跑 Step5 时必须与调用链结果一起刷新 |
+| `s5_artifact_bytecode_index.json` | 按 current 制品 SHA-256 缓存的业务 class 字节码索引 | Step5 在构建字节码事实库时生成 | 用于复用方法/字段/类型/`invokedynamic` 证据；制品变化或重跑 Step5 时必须失效重建 |
 | `framework_adapters.json` | SPI、Spring、MyBatis、动态代理等框架隐式边适配结果 | Step5 的框架适配器阶段生成 | 用于解释部分非显式源码边来源；旧轮次 adapter 结果不得污染本轮 |
 | `source_artifact_alignment.json` | 源码 revision/dirty 状态与 Step1 制品溯源的一致性检查结果 | Step5 对源码目录与 Step1 留存制品做对齐校验后生成 | 用于决定字节码未命中能否反证源码候选；重跑 Step5 时必须同步刷新 |
 
@@ -444,8 +445,8 @@ mvn -q dependency:get -Dartifact=<groupId:artifactId>:<version>
 - 优先在 `main_state.json` 中补齐 `dependency_source_dirs`，这样 Step5 可以继续做“有源码依赖”回溯
 - 无论是否存在依赖源码映射，Step5 都会从 current 最终制品按 `lib_entry` 提取实际运行时 JAR，对所有升级、降级、迁移和删除依赖执行字节码级类/方法/字段匹配
 - 运行时 JAR 扫描会解析 lambda/方法引用的 `invokedynamic` bootstrap method handle；Multi-Release JAR 按 Step2 `jdk_current` 选择实际生效版本，目标 JDK 未知时不会用未命中反证无影响
-- `.upgrade-report/artifact_bytecode_catalog.json` 记录精确制品提取数量、业务 class 数、fallback、缺失项和覆盖状态；使用本地 Maven 仓库 fallback 时状态不会是 `complete`
-- `.upgrade-report/artifact_bytecode_index.json` 按 current 制品 SHA-256 缓存业务 class 的方法、构造、字段、类型指令、常量池/签名/注解引用和 `invokedynamic` 证据；SHA 变化会自动失效
+- `.upgrade-report/s5_artifact_bytecode_catalog.json` 记录精确制品提取数量、业务 class 数、fallback、缺失项和覆盖状态；使用本地 Maven 仓库 fallback 时状态不会是 `complete`
+- `.upgrade-report/s5_artifact_bytecode_index.json` 按 current 制品 SHA-256 缓存业务 class 的方法、构造、字段、类型指令、常量池/签名/注解引用和 `invokedynamic` 证据；SHA 变化会自动失效
 - `.upgrade-report/source_artifact_alignment.json` 记录源码 revision/dirty 状态与 Step1 制品溯源是否一致；未对齐时，字节码未命中不得反证源码候选
 - `alerts.csv` 的 `reason/action` 按每条终止路径的 `stop_reason` 生成；`path_id` 基于符号与证据类型等语义字段，不受工作目录或证据绝对路径变化影响
 - `reason_code=BUSINESS_ARTIFACT_BYTECODE_USAGE` 表示 current 最终制品中的业务 class 已确认引用目标符号；这项事实不依赖源码是否存在

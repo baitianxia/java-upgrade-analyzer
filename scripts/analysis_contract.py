@@ -12,6 +12,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pipeline_constants import STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+
 
 COVERAGE_STATUSES = ("complete", "partial", "insufficient", "not_applicable")
 _STATUS_RANK = {"complete": 0, "not_applicable": 0, "partial": 1, "insufficient": 2}
@@ -524,10 +526,10 @@ def derive_coverage_report(report_dir, project_scope=None):
         "status": artifact_status,
         "reason_codes": list(artifact_bytecode.get("reason_codes") or (
             [] if artifact_status == "complete"
-            else (["artifact_bytecode_catalog_missing"] if step5_summary.is_file() else ["step5_not_executed"])
+            else (["s5_artifact_bytecode_catalog_missing"] if step5_summary.is_file() else ["step5_not_executed"])
         )),
         "evidence": [
-            item for item in ("artifact_bytecode_catalog.json", "s5_call_chain/summary.json")
+            item for item in (STEP5_ARTIFACT_BYTECODE_CATALOG_FILE, "s5_call_chain/summary.json")
             if (report / item).is_file()
         ],
         "metrics": artifact_bytecode,

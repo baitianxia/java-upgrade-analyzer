@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, mvn_cmd, git_cmd, IS_WINDOWS, require_human_confirm
 from analysis_contract import sha256_file
+from pipeline_constants import STEP1_ARTIFACTS_DIRNAME
 
 
 EXIT_AWAITING_USER = 4
@@ -2574,7 +2575,7 @@ def main():
                     manual_coord_overrides=manual_coord_overrides,
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
-                    artifact_cache_dir=Path(args.output).parent / 'artifacts' if args.output else None,
+                    artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
             )
             curr_deps, curr_meta = get_packaged_deps_by_switching_branch(
                     args.current_branch, args.work_dir, args.primary_module, args.modules,
@@ -2582,7 +2583,7 @@ def main():
                     manual_coord_overrides=manual_coord_overrides,
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
-                    artifact_cache_dir=Path(args.output).parent / 'artifacts' if args.output else None,
+                    artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
             )
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
@@ -2701,8 +2702,8 @@ def main():
     out_dir = Path(args.output).parent
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.base_artifact_path and args.current_artifact_path:
-        retain_artifact_for_analysis(base_meta, out_dir / 'artifacts', 'base')
-        retain_artifact_for_analysis(curr_meta, out_dir / 'artifacts', 'current')
+        retain_artifact_for_analysis(base_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'base')
+        retain_artifact_for_analysis(curr_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'current')
     # 写 CSV 时明确指定 UTF-8 + newline=''（兼容 Windows 的 csv 模块）
     with open(args.output, 'w', newline='', encoding='utf-8') as f:
         fields = ['coord', 'base_coord', 'current_coord', 'old_version', 'new_version', 'change_type',

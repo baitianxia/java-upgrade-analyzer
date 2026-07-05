@@ -56,6 +56,11 @@ from business_bytecode_graph import collect_business_bytecode_edges, merge_busin
 from indirect_usage_analyzer import analyze_and_merge_indirect_usages
 from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
 from analysis_contract import sha256_file
+from pipeline_constants import (
+    STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
+    STEP5_ARTIFACT_BYTECODE_DIRNAME,
+    STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
+)
 
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
@@ -694,7 +699,7 @@ def _step5_integrated_main_impl(args):
     bytecode_evidence, bytecode_stats = collect_business_bytecode_edges(
         business_roots,
         artifact_catalog=runtime_dependency_catalog,
-        cache_path=os.path.join(report_dir, 'artifact_bytecode_index.json'),
+        cache_path=os.path.join(report_dir, STEP5_ARTIFACT_BYTECODE_INDEX_FILE),
     )
     bytecode_merge = merge_business_bytecode_edges(graph, bytecode_evidence)
     graph_stats['business_bytecode'] = {
@@ -1009,7 +1014,7 @@ def build_runtime_dependency_catalog(report_dir):
     fallback_count = 0
     extraction_failures = []
     business_class_count = 0
-    cache_dir = Path(report_dir) / 'artifact_bytecode' / 'current'
+    cache_dir = Path(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME / 'current'
     if artifact_ok:
         cache_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -1133,7 +1138,7 @@ def build_runtime_dependency_catalog(report_dir):
     }
     catalog['extraction_failures'] = extraction_failures
     serializable = {key: value for key, value in catalog.items() if not key.startswith('_')}
-    (Path(report_dir) / 'artifact_bytecode_catalog.json').write_text(
+    (Path(report_dir) / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE).write_text(
         json.dumps(serializable, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
     return catalog

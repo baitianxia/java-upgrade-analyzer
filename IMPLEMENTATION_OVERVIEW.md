@@ -374,7 +374,7 @@ Step4 的职责是构建 Step5 可稳定消费的变化证据池。
 - 对 `removed jar` 场景导出旧版 jar 的 public/protected 符号集合
 - 自动识别依赖源码目录与仓库映射
 - 聚合生成 `all_changed_apis.csv`
-- 按单个 `coord` 落盘 `per_dependency/<coord>/` 目录，作为 Step4/Step5 的桥接视图
+- 按单个 `coord` 落盘 `s4_per_dependency/<coord>/` 目录，作为 Step4/Step5 的桥接视图
 
 #### Step4 的正式语义
 
@@ -386,7 +386,7 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 - `dependency_repo_mappings` 是内部派生结果
 - `s4_contract.py` 固定 `all_changed_apis.csv` 字段契约
 - `removed jar` 不走旁路逻辑；正式语义是把旧版 jar 的 `class / method / constructor` 符号集导出为 Step5 目标池
-- Step4 在报告根目录下为每个依赖写出 `per_dependency/<coord>/removed_jar_symbols.csv`、`resolved_targets.csv`、`summary.json`
+- Step4 在报告根目录下为每个依赖写出 `s4_per_dependency/<coord>/removed_jar_symbols.csv`、`resolved_targets.csv`、`summary.json`
 - 依赖源码仓库的 git ref 只从远端分支 `remotes` 中匹配，不直接沿用主项目分支名
 - 版本匹配会先去掉末尾 `-SNAPSHOT`，再按“严格边界命中”筛选候选；像 `3.0.2` 不会命中 `3.0.2.1`
 - `DEV/dev` 分支在同等条件下低于非 `DEV/dev` 分支
@@ -419,7 +419,7 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 
 #### Step4 的 per-dependency 中间产物
 
-Step4 现在会在报告根目录下为每个依赖额外生成 `per_dependency/<coord>/` 目录，用于承接“单个依赖包为集合”的正式语义。
+Step4 现在会在报告根目录下为每个依赖额外生成 `s4_per_dependency/<coord>/` 目录，用于承接“单个依赖包为集合”的正式语义。
 
 当前最小闭环中，这个目录包含三类文件：
 
@@ -460,18 +460,18 @@ Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系�
 当前正式输出：
 
 - `s3_risk_candidates.csv`
-- `per_dependency/<coord>/candidate_hits.csv`
+- `s4_per_dependency/<coord>/candidate_hits.csv`
 - `reachable`
 - `uncertain`
 - `not_analyzed`
 - `not_found_in_static_analysis`
-- `per_dependency/<coord>/summary.json` 中的单依赖结果视图
+- `s4_per_dependency/<coord>/summary.json` 中的单依赖结果视图
 
 四态属于正式语义，不是展示标签。
 
 #### Step5 的 per-dependency 汇总
 
-Step5 在保留原有 `summary.json`、`by_api/*.json`、`by_module/*.json` 的同时，现在会把 API 级 `TraceResult` 再按 `coord` 汇总回 `per_dependency/<coord>/summary.json`。
+Step5 在保留原有 `summary.json`、`by_api/*.json`、`by_module/*.json` 的同时，现在会把 API 级 `TraceResult` 再按 `coord` 汇总回 `s4_per_dependency/<coord>/summary.json`。
 
 同时，Step5 现在会把 Step4 的正式 API 目标与 Step3 的 `s3_risk_candidates.csv` 做并集桥接：
 

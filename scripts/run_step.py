@@ -16,7 +16,14 @@ from compat import infer_maven_coords, open_text, resolve_repo_input_path, run_c
 from compat import git_cmd
 from auto_discover_bridge_sources import discover_bridge_source_mappings
 from analysis_contract import build_project_scope, discover_maven_modules, write_coverage_report
-from pipeline_constants import INTERACTIVE_STATUS, STEP_SEQUENCE
+from pipeline_constants import (
+    INTERACTIVE_STATUS,
+    STEP1_ARTIFACTS_DIRNAME,
+    STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
+    STEP5_ARTIFACT_BYTECODE_DIRNAME,
+    STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
+    STEP_SEQUENCE,
+)
 from s4_contract import (
     ALL_CHANGED_APIS_FIELDS,
     PER_DEPENDENCY_CANDIDATE_HITS_FILE,
@@ -4964,7 +4971,7 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             report_dir / "s1_dep_summary.txt",
             report_dir / "s1_deps_current_resolved.csv",
             report_dir / "build_provenance.json",
-            report_dir / "artifacts",
+            report_dir / STEP1_ARTIFACTS_DIRNAME,
         ],
         "step2": [
             report_dir / "s2_context.json",
@@ -4989,8 +4996,9 @@ def step_output_paths_for_cleanup(step_id, report_dir):
         ],
         "step5": [
             report_dir / "s5_call_chain",
-            report_dir / "artifact_bytecode_catalog.json",
-            report_dir / "artifact_bytecode_index.json",
+            report_dir / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
+            report_dir / STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
+            report_dir / STEP5_ARTIFACT_BYTECODE_DIRNAME,
             report_dir / "framework_adapters.json",
             report_dir / "source_artifact_alignment.json",
         ],

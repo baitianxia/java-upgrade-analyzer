@@ -2104,7 +2104,7 @@ class RunStepMainStateTest(unittest.TestCase):
             step1_summary = report_dir / "s1_dep_summary.txt"
             step1_resolved = report_dir / "s1_deps_current_resolved.csv"
             build_provenance = report_dir / "build_provenance.json"
-            artifacts_dir = report_dir / "artifacts"
+            artifacts_dir = report_dir / run_step.STEP1_ARTIFACTS_DIRNAME
             main_state = report_dir / "main_state.json"
             interaction = report_dir / "interaction.json"
             step1_alerts.write_text("coord\n", encoding="utf-8")
@@ -2132,14 +2132,17 @@ class RunStepMainStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
             step5_dir = report_dir / "s5_call_chain"
-            artifact_catalog = report_dir / "artifact_bytecode_catalog.json"
-            artifact_index = report_dir / "artifact_bytecode_index.json"
+            artifact_catalog = report_dir / run_step.STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+            artifact_index = report_dir / run_step.STEP5_ARTIFACT_BYTECODE_INDEX_FILE
+            artifact_bytecode_dir = report_dir / run_step.STEP5_ARTIFACT_BYTECODE_DIRNAME
             framework_adapters = report_dir / "framework_adapters.json"
             source_alignment = report_dir / "source_artifact_alignment.json"
             main_state = report_dir / "main_state.json"
             interaction = report_dir / "interaction.json"
             step5_dir.mkdir(parents=True)
             (step5_dir / "summary.json").write_text("{}", encoding="utf-8")
+            artifact_bytecode_dir.mkdir(parents=True)
+            (artifact_bytecode_dir / "current.jar").write_text("jar\n", encoding="utf-8")
             artifact_catalog.write_text("{}", encoding="utf-8")
             artifact_index.write_text("{}", encoding="utf-8")
             framework_adapters.write_text("{}", encoding="utf-8")
@@ -2150,6 +2153,7 @@ class RunStepMainStateTest(unittest.TestCase):
             run_step.cleanup_step_outputs("step5", report_dir)
 
             self.assertFalse(step5_dir.exists())
+            self.assertFalse(artifact_bytecode_dir.exists())
             self.assertFalse(artifact_catalog.exists())
             self.assertFalse(artifact_index.exists())
             self.assertFalse(framework_adapters.exists())
@@ -2162,7 +2166,7 @@ class RunStepMainStateTest(unittest.TestCase):
             report_dir = Path(tmp)
             risk_candidates = report_dir / run_step.STEP3_RISK_CANDIDATES_FILE
             risk_candidates.write_text("coord\n", encoding="utf-8")
-            per_dep_dir = report_dir / "per_dependency" / "sample_demo"
+            per_dep_dir = report_dir / run_step.PER_DEPENDENCY_DIRNAME / "sample_demo"
             per_dep_dir.mkdir(parents=True)
             candidate_hits = per_dep_dir / "candidate_hits.csv"
             candidate_hits.write_text("coord\nsample:demo\n", encoding="utf-8")

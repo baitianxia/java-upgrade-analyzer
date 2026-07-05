@@ -258,7 +258,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
   s3_dependency_classfile.csv
   s4_jar_compare/
     all_changed_apis.csv
-  per_dependency/
+  s4_per_dependency/
     <coord>/
       removed_jar_symbols.csv
       resolved_targets.csv
@@ -272,8 +272,8 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 补充说明：
 
 - 当某个依赖在 Step1 中被识别为 `移除` 时，Step4 会额外尝试从旧版 jar 导出 `public/protected class/method/constructor` 符号集
-- 这些符号会写入 `per_dependency/<coord>/removed_jar_symbols.csv`
-- Step5 会把单条 API 结果再汇总回 `per_dependency/<coord>/summary.json`
+- 这些符号会写入 `s4_per_dependency/<coord>/removed_jar_symbols.csv`
+- Step5 会把单条 API 结果再汇总回 `s4_per_dependency/<coord>/summary.json`
 - Step6 会在最终报告中展示“单依赖包最终结论”表，汇总 `change_type`、`reaches_system_source`、`blocked_at`、`blocked_reason`
 
 ## Step 1：获取真实依赖结果

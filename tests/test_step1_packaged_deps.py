@@ -12,6 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import s1_dep_diff  # noqa: E402
+from pipeline_constants import STEP1_ARTIFACTS_DIRNAME  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
@@ -30,7 +31,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
             artifact.write_bytes(b"exact-artifact")
             meta = {"artifact_path": str(artifact), "archives": [str(artifact)]}
 
-            s1_dep_diff.retain_artifact_for_analysis(meta, root / "report/artifacts", "current")
+            s1_dep_diff.retain_artifact_for_analysis(meta, root / "report" / STEP1_ARTIFACTS_DIRNAME, "current")
 
             retained = Path(meta["artifact_path"])
             self.assertEqual(retained.read_bytes(), b"exact-artifact")

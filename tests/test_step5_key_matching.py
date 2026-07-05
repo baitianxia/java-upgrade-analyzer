@@ -21,6 +21,7 @@ import enhanced_output_formatter as formatter  # noqa: E402
 import gate  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
 import s6_report  # noqa: E402
+from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
@@ -2849,7 +2850,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
             ]
 
             formatter.generate_enhanced_summary(results, output_dir)
-            per_dependency_summary = report_dir / "per_dependency" / "a_b" / "summary.json"
+            per_dependency_summary = report_dir / PER_DEPENDENCY_DIRNAME / "a_b" / "summary.json"
             self.assertTrue(per_dependency_summary.exists())
             summary = json.loads(per_dependency_summary.read_text(encoding="utf-8"))
 
@@ -3283,7 +3284,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
             s5_dir = report_dir / "s5_call_chain"
-            per_dep_dir = report_dir / "per_dependency" / "a_b"
+            per_dep_dir = report_dir / PER_DEPENDENCY_DIRNAME / "a_b"
             s5_dir.mkdir(parents=True)
             per_dep_dir.mkdir(parents=True)
             (report_dir / "s1_dep_changes.csv").write_text(

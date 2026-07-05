@@ -2166,7 +2166,7 @@ return ExtraApi.callLegacy();
     )
     multi_bridge_summary = read_json(runtime_full_expand_report / "s5_call_chain" / "summary.json")
     multi_bridge_per_dependency = read_json(
-        runtime_full_expand_report / "per_dependency" / "com.example_demo-lib" / "summary.json"
+        runtime_full_expand_report / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
     )
     multi_bridge_api = (multi_bridge_summary.get("not_analyzed_apis") or [{}])[0]
     assert_true(
@@ -5359,7 +5359,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true(orchestrated_all_changed, "orchestrated step5 未产出分析结果")
     orchestrated_summary = read_json(orchestrated_report / "s5_call_chain" / "summary.json")
     orchestrated_per_dependency = read_json(
-        orchestrated_report / "per_dependency" / "com.example_demo-lib" / "summary.json"
+        orchestrated_report / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
     )
     orchestrated_total = orchestrated_summary.get("total_apis", 0)
     assert_true(orchestrated_total >= 1, "orchestrated step5 应处理 all_changed_apis.csv 中的全部 API")
