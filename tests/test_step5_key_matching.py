@@ -2001,6 +2001,175 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
         self.assertEqual(result.match_provenance, "compatible_signature")
 
+    def test_select_compatible_overload_signatures_supports_varargs_target(self):
+        compatible = tracer.select_compatible_overload_signatures(
+            "(boolean, String, Object...)",
+            {
+                "(boolean, String)",
+                "(boolean, String, int)",
+                "(boolean, String, Object[])",
+                "(boolean)",
+                "(String, String)",
+            },
+            {},
+        )
+
+        self.assertEqual(
+            set(compatible),
+            {"(boolean, String)", "(boolean, String, int)", "(boolean, String, Object[])"},
+        )
+
+    def test_trace_api_uses_all_compatible_varargs_observed_signatures(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang3.Validate.isTrue",
+            "api_simple": "isTrue",
+            "api_signature": "(boolean, String, Object...)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.apache.commons:commons-lang3",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "varargs_fixture",
+            "analysis_scope": "api",
+        }
+        two_arg_method = SimpleNamespace(
+            symbol_id="two_arg",
+            qualified_key="com.biz.TwoArg.call",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            file="TwoArg.java",
+            line=10,
+        )
+        three_arg_method = SimpleNamespace(
+            symbol_id="three_arg",
+            qualified_key="com.biz.ThreeArg.call",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            file="ThreeArg.java",
+            line=20,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"two_arg": two_arg_method, "three_arg": three_arg_method},
+            reverse_edges={
+                "org.apache.commons.lang3.Validate.isTrue(boolean, String)": [
+                    SimpleNamespace(
+                        caller_symbol_id="two_arg",
+                        caller_qualified_key=two_arg_method.qualified_key,
+                        callee_key="org.apache.commons.lang3.Validate.isTrue(boolean, String)",
+                        callee_simple_key="method:isTrue(boolean, String)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=two_arg_method.file,
+                        line=10,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+                "org.apache.commons.lang3.Validate.isTrue(boolean, String, int)": [
+                    SimpleNamespace(
+                        caller_symbol_id="three_arg",
+                        caller_qualified_key=three_arg_method.qualified_key,
+                        callee_key="org.apache.commons.lang3.Validate.isTrue(boolean, String, int)",
+                        callee_simple_key="method:isTrue(boolean, String, int)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=three_arg_method.file,
+                        line=20,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.match_provenance, "compatible_signature")
+        path_texts = [item.get("path_text", "") for item in result.path_details]
+        self.assertTrue(any("com.biz.TwoArg.call" in path for path in path_texts))
+        self.assertTrue(any("com.biz.ThreeArg.call" in path for path in path_texts))
+
+    def test_build_graph_infers_boolean_expression_for_varargs_validation_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.commons.lang3.Validate;",
+                        "",
+                        "public class Demo {",
+                        "    public void check(int upper, int lower) {",
+                        "        Validate.isTrue(upper >= lower, \"upper must be >= lower\");",
+                        "        Validate.isTrue(upper >= 0, \"upper %d is negative\", upper);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.commons.lang3.Validate.isTrue(boolean, String)", graph.reverse_edges)
+            self.assertIn("org.apache.commons.lang3.Validate.isTrue(boolean, String, int)", graph.reverse_edges)
+
+    def test_build_graph_infers_stringutils_boolean_return_for_validation_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.commons.lang3.StringUtils;",
+                        "import org.apache.commons.lang3.Validate;",
+                        "",
+                        "public class Demo {",
+                        "    public void check(CharSequence text) {",
+                        "        Validate.isTrue(StringUtils.isNotBlank(text), \"Invalid text\");",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.commons.lang3.Validate.isTrue(boolean, String)", graph.reverse_edges)
+            self.assertNotIn("org.apache.commons.lang3.Validate.isTrue(StringUtils, String)", graph.reverse_edges)
+
     def test_trace_api_does_not_start_from_unrelated_simple_signature_target(self):
         api_row = {
             "api_name": "com.lib.Target.parse",

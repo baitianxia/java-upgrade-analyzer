@@ -2515,6 +2515,18 @@ def infer_known_library_method_return_type(receiver_type, method_name):
     if method_name == 'toString':
         return 'java.lang.String'
 
+    if simple_receiver == 'StringUtils' and method_name in {
+        'isBlank',
+        'isNotBlank',
+        'isEmpty',
+        'isNotEmpty',
+        'isAnyBlank',
+        'isNoneBlank',
+        'isAnyEmpty',
+        'isNoneEmpty',
+    }:
+        return 'boolean'
+
     if receiver_candidates & {'java.lang.Class', 'Class'}:
         if method_name in {'getCanonicalName', 'getName', 'getSimpleName', 'getTypeName'}:
             return 'java.lang.String'
@@ -2559,6 +2571,19 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
 
     # Boolean literal
     if expr in ('true', 'false'):
+        return 'boolean'
+
+    # Boolean expressions such as `value != null`, `count >= 0`, `a && b`,
+    # or `item instanceof String` are common guard arguments for validation
+    # helpers. Treating them as boolean lets Step5 keep precise signatures for
+    # varargs APIs such as Validate.isTrue(boolean, String, Object...).
+    if re.search(r'(?<![=!<>])(?:==|!=|<=|>=|<|>)(?![=])', expr):
+        return 'boolean'
+    if re.search(r'\binstanceof\b', expr):
+        return 'boolean'
+    if '&&' in expr or '||' in expr:
+        return 'boolean'
+    if expr.startswith('!') and not expr.startswith('!='):
         return 'boolean'
 
     # Null literal

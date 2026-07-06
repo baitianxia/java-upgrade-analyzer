@@ -3598,7 +3598,7 @@ def is_candidate_param_compatible_with_target(candidate_type, target_type, type_
     if candidate_simple == target_simple:
         return True
 
-    if target_simple == 'Object' and candidate_base not in PRIMITIVE_TYPES:
+    if target_simple == 'Object':
         return True
 
     if candidate_base in PRIMITIVE_TYPES or target_base in PRIMITIVE_TYPES:
@@ -3621,6 +3621,60 @@ def is_candidate_param_compatible_with_target(candidate_type, target_type, type_
     return False
 
 
+def is_varargs_type_reference(type_name):
+    return str(type_name or '').strip().endswith('...')
+
+
+def varargs_element_type(type_name):
+    normalized = str(type_name or '').strip()
+    if normalized.endswith('...'):
+        return normalized[:-3].strip()
+    if normalized.endswith('[]'):
+        return normalized[:-2].strip()
+    return normalized
+
+
+def is_candidate_signature_compatible_with_target(candidate_params, target_params, type_metadata):
+    if candidate_params is None or target_params is None:
+        return False
+    if target_params and is_varargs_type_reference(target_params[-1]):
+        fixed_target_params = target_params[:-1]
+        if len(candidate_params) < len(fixed_target_params):
+            return False
+        fixed_candidate_params = candidate_params[:len(fixed_target_params)]
+        if not all(
+            is_candidate_param_compatible_with_target(candidate_type, target_type, type_metadata)
+            for candidate_type, target_type in zip(fixed_candidate_params, fixed_target_params)
+        ):
+            return False
+
+        remaining_candidate_params = candidate_params[len(fixed_target_params):]
+        if not remaining_candidate_params:
+            return True
+
+        target_vararg = target_params[-1]
+        target_array = target_vararg.replace('...', '[]')
+        target_element = varargs_element_type(target_vararg)
+        if len(remaining_candidate_params) == 1 and is_candidate_param_compatible_with_target(
+            remaining_candidate_params[0],
+            target_array,
+            type_metadata,
+        ):
+            return True
+
+        return all(
+            is_candidate_param_compatible_with_target(candidate_type, target_element, type_metadata)
+            for candidate_type in remaining_candidate_params
+        )
+
+    if len(candidate_params) == len(target_params):
+        return all(
+            is_candidate_param_compatible_with_target(candidate_type, target_type, type_metadata)
+            for candidate_type, target_type in zip(candidate_params, target_params)
+        )
+    return False
+
+
 def select_compatible_overload_signatures(target_signature, overload_signatures, type_metadata):
     target_params = split_signature_params(target_signature)
     if target_params is None:
@@ -3629,12 +3683,9 @@ def select_compatible_overload_signatures(target_signature, overload_signatures,
     compatible = []
     for signature in overload_signatures or []:
         candidate_params = split_signature_params(signature)
-        if candidate_params is None or len(candidate_params) != len(target_params):
+        if candidate_params is None:
             continue
-        if all(
-            is_candidate_param_compatible_with_target(candidate_type, target_type, type_metadata)
-            for candidate_type, target_type in zip(candidate_params, target_params)
-        ):
+        if is_candidate_signature_compatible_with_target(candidate_params, target_params, type_metadata):
             compatible.append(signature)
     return compatible
 
@@ -3662,6 +3713,8 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
     symbol_kind = get_symbol_kind(api_row)
     direct_overload_block = None
     target_signature = api_row.get('api_signature', '')
+    target_params = split_signature_params(target_signature)
+    target_is_varargs = bool(target_params and is_varargs_type_reference(target_params[-1]))
     declared_signatures = collect_declared_method_signatures(api_name, graph)
     has_exact_signature_match = any(
         group.get('provenance') == 'exact_signature'
@@ -3732,6 +3785,21 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
             overload_signatures,
             type_metadata or {},
         )
+        if target_is_varargs and compatible_signatures:
+            compatible_keys = [
+                f"{api_name}{compatible_signature}"
+                for compatible_signature in compatible_signatures
+                if (getattr(graph, 'reverse_edges', {}) or {}).get(f"{api_name}{compatible_signature}")
+            ]
+            if compatible_keys:
+                return [
+                    {
+                        'tier_index': 0,
+                        'provenance': 'compatible_signature',
+                        'provenance_family': 'exact_signature',
+                        'matched_keys': compatible_keys,
+                    }
+                ], None
         if len(compatible_signatures) == 1:
             compatible_key = f"{api_name}{compatible_signatures[0]}"
             if (getattr(graph, 'reverse_edges', {}) or {}).get(compatible_key):

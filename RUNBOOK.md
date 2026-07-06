@@ -572,5 +572,6 @@ python3 "$SKILL/scripts/error_handler.py" summary --report-dir .upgrade-report
 - 最小回归：`python3 "$SKILL/scripts/smoke_regression.py"`
 - 按主题回归：`python3 "$SKILL/scripts/smoke_regression.py" --group core|step5|orchestrator`
 - 标准测试入口：`python3 -m unittest discover -s "$SKILL/tests" -v`
+- 真实项目回归（本地存在探针项目时）：`python3 "$SKILL/scripts/real_project_regression.py" --case all`
 - 若需要保留临时目录便于排查：`python3 "$SKILL/scripts/smoke_regression.py" --keep-tmp`
 - CI 工作流：`.github/workflows/smoke-regression.yml`

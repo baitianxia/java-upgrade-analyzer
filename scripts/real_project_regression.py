@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+Real-project regression runner for java-upgrade-analyzer.
+
+This script is intentionally not part of the default CI smoke suite: it expects
+real project checkouts under /private/tmp (or explicit paths passed by CLI) and
+therefore validates ecosystem-shaped source code rather than synthetic fixtures.
+
+The checks are deliberately conservative:
+  * Step5 must complete.
+  * Production-source baseline references for selected APIs must not be missing
+    from alerts.csv.
+  * Test-source references are reported separately and do not fail the run.
+  * Extra alert files are reported but not treated as failures because a full
+    call chain can legitimately include helper methods or target declarations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class BaselineSpec:
+    symbol: str
+    pattern: str
+    import_pattern: str
+    require_zero_production_missing: bool = True
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class RealProjectCase:
+    name: str
+    default_project: Path
+    default_changed_apis: Path
+    baseline_specs: tuple[BaselineSpec, ...]
+    source_dirs: tuple[Path, ...] = field(default_factory=tuple)
+
+
+CASES = {
+    "commons-text": RealProjectCase(
+        name="commons-text",
+        default_project=Path("/private/tmp/jua-real-system-commons-text"),
+        default_changed_apis=Path("/private/tmp/jua-real-system-run/s4_jar_compare/all_changed_apis.csv"),
+        baseline_specs=(
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.StringUtils.isBlank",
+                pattern=r"\bStringUtils\s*\.\s*isBlank\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.commons\.lang3\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.commons\.lang3\.\*\s*;"
+                ),
+                notes="commons-lang3 removal probe; direct production utility calls must be represented",
+            ),
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.StringUtils.EMPTY",
+                pattern=r"\bStringUtils\s*\.\s*EMPTY\b",
+                import_pattern=(
+                    r"import\s+org\.apache\.commons\.lang3\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.commons\.lang3\.\*\s*;"
+                ),
+                notes="field owner resolution for commons-lang3 StringUtils.EMPTY",
+            ),
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.ArrayUtils.isEmpty",
+                pattern=r"\bArrayUtils\s*\.\s*isEmpty\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.commons\.lang3\.ArrayUtils\s*;"
+                    r"|import\s+org\.apache\.commons\.lang3\.\*\s*;"
+                ),
+                require_zero_production_missing=False,
+                notes=(
+                    "reported only: current probe target is char[], while grep cannot distinguish "
+                    "Object[]/CharSequence[]/custom-array overloads"
+                ),
+            ),
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.Validate.isTrue",
+                pattern=r"\bValidate\s*\.\s*isTrue\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.commons\.lang3\.Validate\s*;"
+                    r"|import\s+org\.apache\.commons\.lang3\.\*\s*;"
+                ),
+                notes="varargs method probe",
+            ),
+        ),
+    ),
+    "seata": RealProjectCase(
+        name="seata",
+        default_project=Path("/private/tmp/jua-real-project-seata"),
+        default_changed_apis=Path("/private/tmp/jua-seata-real-matrix/report/s4_jar_compare/all_changed_apis.csv"),
+        baseline_specs=(
+            BaselineSpec(
+                symbol="org.apache.seata.common.util.StringUtils.isBlank",
+                pattern=r"\bStringUtils\s*\.\s*isBlank\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.seata\.common\.util\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.seata\.common\.util\.\*\s*;"
+                ),
+                notes="single-signature target; production direct calls should all be represented",
+            ),
+            BaselineSpec(
+                symbol="org.apache.seata.common.util.StringUtils.isEmpty",
+                pattern=r"\bStringUtils\s*\.\s*isEmpty\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.seata\.common\.util\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.seata\.common\.util\.\*\s*;"
+                ),
+                notes="CharSequence-compatible target; direct production calls should be represented",
+            ),
+            BaselineSpec(
+                symbol="org.apache.seata.common.util.StringUtils.EMPTY",
+                pattern=r"\bStringUtils\s*\.\s*EMPTY\b",
+                import_pattern=(
+                    r"import\s+org\.apache\.seata\.common\.util\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.seata\.common\.util\.\*\s*;"
+                ),
+                notes="field owner resolution baseline",
+            ),
+        ),
+    ),
+    "dubbo": RealProjectCase(
+        name="dubbo",
+        default_project=Path("/private/tmp/jua-real-project-dubbo"),
+        default_changed_apis=Path("/private/tmp/jua-dubbo-mixed-probe/report/s4_jar_compare/all_changed_apis.csv"),
+        baseline_specs=(
+            BaselineSpec(
+                symbol="org.apache.dubbo.common.utils.StringUtils.isEquals",
+                pattern=r"\bStringUtils\s*\.\s*isEquals\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.dubbo\.common\.utils\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.dubbo\.common\.utils\.\*\s*;"
+                ),
+                notes="static utility method with String/String signature",
+            ),
+            BaselineSpec(
+                symbol="org.apache.dubbo.common.utils.StringUtils.parseQueryString",
+                pattern=r"\bStringUtils\s*\.\s*parseQueryString\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.dubbo\.common\.utils\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.dubbo\.common\.utils\.\*\s*;"
+                ),
+                notes="single-argument String utility method",
+            ),
+            BaselineSpec(
+                symbol="org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap",
+                pattern=r"\bCollectionUtils\s*\.\s*isEmptyMap\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.dubbo\.common\.utils\.CollectionUtils\s*;"
+                    r"|import\s+org\.apache\.dubbo\.common\.utils\.\*\s*;"
+                ),
+                notes="Map-specific utility method; source calls should not be confused with Collection overloads",
+            ),
+        ),
+    ),
+}
+
+
+def is_test_source(path: Path) -> bool:
+    normalized = path.as_posix()
+    return "/src/test/" in normalized or "/test/" in normalized
+
+
+def iter_java_files(project_root: Path) -> Iterable[Path]:
+    for path in project_root.rglob("*.java"):
+        if path.is_file():
+            yield path
+
+
+def collect_baseline_files(project_root: Path, spec: BaselineSpec) -> tuple[set[str], set[str], int]:
+    production_files: set[str] = set()
+    test_files: set[str] = set()
+    occurrence_count = 0
+    import_re = re.compile(spec.import_pattern)
+    call_re = re.compile(spec.pattern)
+    for java_file in iter_java_files(project_root):
+        try:
+            text = java_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if not import_re.search(text):
+            continue
+        matches = list(call_re.finditer(text))
+        if not matches:
+            continue
+        occurrence_count += len(matches)
+        resolved = str(java_file.resolve())
+        if is_test_source(java_file):
+            test_files.add(resolved)
+        else:
+            production_files.add(resolved)
+    return production_files, test_files, occurrence_count
+
+
+def collect_alert_files(alerts_csv: Path, symbol: str) -> set[str]:
+    if not alerts_csv.exists():
+        return set()
+    files: set[str] = set()
+    with alerts_csv.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            if (row.get("changed_symbol") or "").strip() != symbol:
+                continue
+            for item in (row.get("evidence_files") or "").split(";"):
+                item = item.strip()
+                if item:
+                    files.add(str(Path(item).resolve()))
+    return files
+
+
+def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, report_dir: Path) -> tuple[int, float]:
+    output_dir = report_dir / "s5_call_chain"
+    cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "s5_call_chain.py"),
+        "--all-changed-apis",
+        str(changed_apis),
+        "--source-dirs",
+        str(project_root),
+        "--report-dir",
+        str(report_dir),
+        "--output-dir",
+        str(output_dir),
+        "--max-depth",
+        "5",
+        "--allow-degraded",
+    ]
+    start = time.time()
+    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True)
+    return proc.returncode, time.time() - start
+
+
+def load_summary(report_dir: Path) -> dict:
+    summary_path = report_dir / "s5_call_chain" / "summary.json"
+    if not summary_path.exists():
+        return {}
+    return json.loads(summary_path.read_text(encoding="utf-8"))
+
+
+def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, report_root: Path) -> dict:
+    if not project_root.exists():
+        return {"case": case.name, "status": "skipped", "reason": f"project root missing: {project_root}"}
+    if not changed_apis.exists():
+        return {"case": case.name, "status": "skipped", "reason": f"changed APIs missing: {changed_apis}"}
+
+    report_dir = report_root / case.name
+    report_dir.mkdir(parents=True, exist_ok=True)
+    returncode, elapsed = run_step5(case, project_root, changed_apis, report_dir)
+    summary = load_summary(report_dir)
+    alerts_csv = report_dir / "s5_call_chain" / "alerts.csv"
+    checks = []
+    failures = []
+
+    for spec in case.baseline_specs:
+        production_baseline, test_baseline, occurrences = collect_baseline_files(project_root, spec)
+        alert_files = collect_alert_files(alerts_csv, spec.symbol)
+        production_missing = sorted(production_baseline - alert_files)
+        test_missing = sorted(test_baseline - alert_files)
+        extra = sorted(alert_files - production_baseline - test_baseline)
+        check = {
+            "symbol": spec.symbol,
+            "gating": spec.require_zero_production_missing,
+            "occurrences": occurrences,
+            "baseline_production_files": len(production_baseline),
+            "baseline_test_files": len(test_baseline),
+            "alert_files": len(alert_files),
+            "production_missing": len(production_missing),
+            "test_missing": len(test_missing),
+            "extra_alert_files": len(extra),
+            "notes": spec.notes,
+            "production_missing_files": [str(Path(item).relative_to(project_root)) for item in production_missing[:20]],
+            "test_missing_files": [str(Path(item).relative_to(project_root)) for item in test_missing[:20]],
+        }
+        checks.append(check)
+        if spec.require_zero_production_missing and production_missing:
+            failures.append(f"{spec.symbol}: production_missing={len(production_missing)}")
+
+    status = "passed" if returncode == 0 and not failures else "failed"
+    if returncode != 0:
+        failures.append(f"step5_returncode={returncode}")
+
+    return {
+        "case": case.name,
+        "status": status,
+        "project_root": str(project_root),
+        "changed_apis": str(changed_apis),
+        "report_dir": str(report_dir),
+        "elapsed_seconds": round(elapsed, 2),
+        "step5_returncode": returncode,
+        "summary": {
+            "total_apis": summary.get("total_apis"),
+            "reachable": summary.get("reachable"),
+            "uncertain": summary.get("uncertain"),
+            "not_analyzed": summary.get("not_analyzed"),
+            "not_found_in_static_analysis": summary.get("not_found_in_static_analysis"),
+        },
+        "checks": checks,
+        "failures": failures,
+    }
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run real-project regression probes for Step5.")
+    parser.add_argument("--case", choices=sorted(CASES.keys()) + ["all"], default="all")
+    parser.add_argument("--project-root", help="Override project root for a single --case run.")
+    parser.add_argument("--changed-apis", help="Override all_changed_apis.csv for a single --case run.")
+    parser.add_argument(
+        "--report-root",
+        default="/private/tmp/java-upgrade-real-project-regression",
+        help="Directory where per-case reports are written.",
+    )
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON only.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    case_names = sorted(CASES.keys()) if args.case == "all" else [args.case]
+    report_root = Path(args.report_root)
+    results = []
+    for name in case_names:
+        case = CASES[name]
+        if args.case == "all" and (args.project_root or args.changed_apis):
+            raise SystemExit("--project-root/--changed-apis can only be used with a single --case")
+        project_root = Path(args.project_root) if args.project_root else case.default_project
+        changed_apis = Path(args.changed_apis) if args.changed_apis else case.default_changed_apis
+        results.append(run_case(case, project_root, changed_apis, report_root))
+
+    failed = any(item.get("status") == "failed" for item in results)
+    if args.json:
+        print(json.dumps({"status": "failed" if failed else "passed", "results": results}, ensure_ascii=False, indent=2))
+    else:
+        for item in results:
+            print(f"\nREAL PROJECT {item['case']}: {item['status']}")
+            if item.get("reason"):
+                print(f"  reason: {item['reason']}")
+                continue
+            print(f"  elapsed: {item['elapsed_seconds']}s")
+            print(f"  report: {item['report_dir']}")
+            print(f"  summary: {item['summary']}")
+            for check in item.get("checks", []):
+                print(
+                    "  check: {symbol} production={baseline_production_files} "
+                    "test={baseline_test_files} alerts={alert_files} "
+                    "prod_missing={production_missing} test_missing={test_missing} extra={extra_alert_files} "
+                    "gating={gating}".format(**check)
+                )
+                for missing in check.get("production_missing_files", []):
+                    label = "PROD_MISSING" if check.get("gating") else "NON_GATING_PROD_MISSING"
+                    print(f"    {label} {missing}")
+            for failure in item.get("failures", []):
+                print(f"  FAILURE {failure}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

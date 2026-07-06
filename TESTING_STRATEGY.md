@@ -58,9 +58,27 @@ python3 -m unittest tests.test_step5_key_matching tests.test_business_bytecode_g
 - 运行 Step5，检查 `summary.txt`、`summary.json`、`alerts.csv`、`alerts_<status>.csv`。
 - 将发现的问题固化为最小 fixture 回归，而不是只保留一次性运行记录。
 
+本仓库提供一个非 CI 的真实项目回归入口，用于本地已有真实项目源码时执行：
+
+```bash
+python3 scripts/real_project_regression.py --case all
+python3 scripts/real_project_regression.py --case commons-text
+python3 scripts/real_project_regression.py --case dubbo
+python3 scripts/real_project_regression.py --case seata
+```
+
+该脚本会：
+
+- 复用真实项目源码运行 Step5，并记录耗时、summary 和报告目录。
+- 对选定 API 做 production/test baseline 对照，production 缺失才作为门控失败。
+- 将无法由简单 grep 区分重载的检查标记为非门控，只用于人工观察，不能据此宣称实现漏报。
+- 在本地缺少真实项目或探针 CSV 时输出 `skipped`，不替代单元测试和 smoke。
+
 已使用过的真实项目探针：
 
 - Apache Commons Text：验证 `commons-lang3` 方法/字段引用、assignable 签名和字段 import owner。
+- Apache Dubbo：验证大型多模块项目中的 `StringUtils`、`CollectionUtils`、`URL`、`NetUtils` 调用链和重载安全。
+- Apache Seata：验证 `StringUtils` 字段/方法、单签名 raw 调用保留、生产源码与测试源码区分。
 
 ## 结论口径
 
