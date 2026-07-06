@@ -40,6 +40,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from auto_discover_bridge_sources import auto_discover_bridge_sources
 from enhanced_source_analyzer import (
+    CallEdge,
+    MethodDef,
     analyze_file,
     extract_call_edges_enhanced,
 )
@@ -1984,6 +1986,132 @@ def build_enhanced_source_graph(
             return 'java.lang.Object'
         return package_candidate
 
+    def infer_initializer_arg_signature(arg_text):
+        text = (arg_text or '').strip()
+        if not text:
+            return '()'
+        args = [item.strip() for item in text.split(',')]
+        inferred = []
+        for arg in args:
+            if not arg:
+                continue
+            if '.class' in arg or arg.endswith('getClass()') or arg == 'getClass()':
+                inferred.append('Class')
+            elif (arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'")):
+                inferred.append('String')
+            elif re.fullmatch(r'[-+]?\d+[lL]?', arg):
+                inferred.append('long' if arg.lower().endswith('l') else 'int')
+            elif arg in {'true', 'false'}:
+                inferred.append('boolean')
+            else:
+                inferred.append('')
+        if not inferred or any(not item for item in inferred):
+            return ''
+        return '(' + ', '.join(inferred) + ')'
+
+    def collect_initializer_edges():
+        synthetic_methods = []
+        synthetic_edges = []
+        invocation_pattern = re.compile(
+            r'\b((?:[a-z_]\w*\.)*[A-Z]\w*)\s*\.\s*([a-zA-Z_]\w*)\s*\(([^;\n]*)\)'
+        )
+        for entry in file_entries:
+            file_path = str(entry.get('file_path') or '')
+            if not file_path:
+                continue
+            methods = list(entry.get('methods') or [])
+            method_ranges = [
+                (
+                    int(getattr(method_def, 'line', 0) or 0),
+                    int(getattr(method_def, 'end_line', 0) or getattr(method_def, 'line', 0) or 0),
+                )
+                for method_def in methods
+            ]
+            package_name = entry.get('package_name') or ''
+            imports = dict(entry.get('imports') or {})
+            declared_types = dict(entry.get('declared_types') or {})
+            if not declared_types:
+                continue
+            declared_name = next(iter(declared_types.keys()))
+            class_fqcn = f"{package_name}.{declared_name}" if package_name else declared_name
+            root_info = dict(entry.get('root') or {})
+            owner_type = root_info.get('owner_type', 'business')
+            owner_coord = root_info.get('coord') or ('BUSINESS' if owner_type == 'business' else '')
+            source_root = root_info.get('root') or ''
+            module = root_info.get('module') or Path(file_path).parent.name
+            try:
+                lines = Path(file_path).read_text(encoding='utf-8', errors='replace').splitlines()
+            except Exception:
+                continue
+
+            for line_no, line in enumerate(lines, 1):
+                if any(start <= line_no <= end for start, end in method_ranges if start and end):
+                    continue
+                if '(' not in line or '.' not in line:
+                    continue
+                stripped = line.strip()
+                if not stripped or stripped.startswith(('*', '//', '/*')):
+                    continue
+                for match in invocation_pattern.finditer(line):
+                    receiver = match.group(1)
+                    method_name = match.group(2)
+                    args_text = match.group(3)
+                    if not receiver or not method_name:
+                        continue
+                    if '.' in receiver:
+                        receiver_fqcn = receiver
+                    else:
+                        receiver_fqcn = imports.get(receiver) or (
+                            f"{package_name}.{receiver}" if package_name else receiver
+                        )
+                    if not receiver_fqcn or receiver_fqcn.startswith(package_name + '.new '):
+                        continue
+                    signature = infer_initializer_arg_signature(args_text)
+                    base_callee = f"{receiver_fqcn}.{method_name}"
+                    callee_key = f"{base_callee}{signature}" if signature else base_callee
+                    simple_key = f"method:{method_name}{signature}" if signature else f"method:{method_name}"
+                    synthetic_id = f"{class_fqcn}#<class-init>@{file_path}:{line_no}:{match.start()}"
+                    qualified_key = f"{class_fqcn}.<class-init>"
+                    method_def = MethodDef(
+                        symbol_id=synthetic_id,
+                        qualified_key=qualified_key,
+                        simple_key='method:<class-init>',
+                        class_fqcn=class_fqcn,
+                        class_name=class_fqcn.rsplit('.', 1)[-1],
+                        method_name='<class-init>',
+                        return_type='void',
+                        file=file_path,
+                        line=line_no,
+                        end_line=line_no,
+                        package_name=package_name,
+                        owner_type=owner_type,
+                        owner_coord=owner_coord,
+                        module=module,
+                        source_root=source_root,
+                        language='java',
+                        is_test='/src/test/' in file_path,
+                        imports=imports,
+                        body_text=line,
+                        is_static=True,
+                    )
+                    synthetic_methods.append(method_def)
+                    synthetic_edges.append(CallEdge(
+                        caller_symbol_id=synthetic_id,
+                        caller_qualified_key=qualified_key,
+                        callee_key=callee_key,
+                        callee_simple_key=simple_key,
+                        evidence_type='initializer_invocation',
+                        confidence='high',
+                        file=file_path,
+                        line=line_no,
+                        content=stripped,
+                        owner_type=owner_type,
+                        owner_coord=owner_coord,
+                        module=module,
+                        is_test='/src/test/' in file_path,
+                    ))
+        return synthetic_methods, synthetic_edges
+
     jar_class_candidates = _collect_external_class_candidates(
         class_info,
         all_methods,
@@ -2113,6 +2241,25 @@ def build_enhanced_source_graph(
         if meta.get('kind') == 'interface':
             meta['implementations'] = sorted(collect_interface_implementations(class_fqcn))
 
+    initializer_methods, initializer_edges = collect_initializer_edges()
+    for method_def in initializer_methods:
+        if max_methods is not None and len(methods_by_id) >= max_methods:
+            stats['truncated'] = True
+            if 'max_methods' not in stats['truncation_reasons']:
+                stats['truncation_reasons'].append('max_methods')
+            break
+        methods_by_id[method_def.symbol_id] = method_def
+        methods_by_qualified[method_def.qualified_key].append(method_def.symbol_id)
+        methods_by_simple[method_def.simple_key].append(method_def.symbol_id)
+        lookup_keys_by_symbol[method_def.symbol_id] = [
+            method_def.qualified_key,
+            method_def.simple_key,
+            f"class:{method_def.class_fqcn}",
+        ]
+        all_methods.append(method_def)
+    stats['initializer_methods_indexed'] = len(initializer_methods)
+    stats['initializer_edges_discovered'] = len(initializer_edges)
+
     global_method_return_types = defaultdict(dict)
     global_method_return_types_by_signature = defaultdict(lambda: defaultdict(dict))
     for method_def in all_methods:
@@ -2173,6 +2320,8 @@ def build_enhanced_source_graph(
         method_def.known_type_metadata = type_metadata
 
     for method_def in all_methods:
+        if getattr(method_def, 'method_name', '') == '<class-init>':
+            continue
         edges = extract_call_edges_enhanced(method_def, include_low_confidence=False)
         for edge in edges:
             edge_keys = build_reverse_edge_keys(edge)
@@ -2198,6 +2347,19 @@ def build_enhanced_source_graph(
                     worst_idx = max(range(len(existing)), key=lambda idx: edge_rank(existing[idx]))
                     if edge_rank(edge) < edge_rank(existing[worst_idx]):
                         existing[worst_idx] = edge
+
+    for edge in initializer_edges:
+        edge_keys = build_reverse_edge_keys(edge)
+        for edge_key in edge_keys:
+            existing = reverse_edges[edge_key]
+            if len(existing) < 10000:
+                existing.append(edge)
+                stats['reverse_edges_indexed'] += 1
+                stats['initializer_edges_indexed'] = stats.get('initializer_edges_indexed', 0) + 1
+            else:
+                stats['edge_cap_hits'] += 1
+                if len(stats['edge_cap_keys']) < 20 and edge_key not in stats['edge_cap_keys']:
+                    stats['edge_cap_keys'].append(edge_key)
 
     for edge_key, edges in reverse_edges.items():
         edges.sort(key=edge_sort_key)

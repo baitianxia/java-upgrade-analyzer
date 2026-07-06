@@ -2385,6 +2385,64 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertTrue(any("com.biz.First.handle" in path for path in result.call_paths))
         self.assertTrue(any("com.biz.Second.handle" in path for path in result.call_paths))
 
+    def test_build_graph_indexes_field_initializer_method_invocations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.slf4j.Logger;",
+                        "import org.slf4j.LoggerFactory;",
+                        "",
+                        "public class Demo {",
+                        "    private static final Logger LOGGER = LoggerFactory.getLogger(Demo.class);",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.slf4j.LoggerFactory.getLogger(Class)", graph.reverse_edges)
+            edge = graph.reverse_edges["org.slf4j.LoggerFactory.getLogger(Class)"][0]
+            self.assertEqual(edge.evidence_type, "initializer_invocation")
+            self.assertEqual(edge.caller_qualified_key, "com.example.Demo.<class-init>")
+
+            result = tracer.trace_api_with_confidence_weighting(
+                {
+                    "api_name": "org.slf4j.LoggerFactory.getLogger",
+                    "api_simple": "getLogger",
+                    "api_signature": "(Class)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "coord": "org.slf4j:slf4j-api",
+                    "severity": "P1",
+                    "confirmed": "false",
+                    "source": "initializer_fixture",
+                    "analysis_scope": "api",
+                },
+                graph,
+                {},
+                max_total_cost=5,
+            )
+
+            self.assertEqual(result.analysis_status, "reachable")
+            self.assertTrue(any("com.example.Demo.<class-init>" in path for path in result.call_paths))
+
     def test_trace_api_respects_wildcard_import_owner_for_simple_static_field_access(self):
         api_row = {
             "api_name": "io.seata.common.StringUtils.EMPTY",
