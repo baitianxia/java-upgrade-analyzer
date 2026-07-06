@@ -109,6 +109,60 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
         self.assertEqual(scan["hits"][0]["consumer_method"], "check")
         self.assertEqual(scan["hits"][0]["evidence_type"], "bytecode_invokedynamic_method_reference")
 
+    @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
+    def test_direct_method_bytecode_uses_constant_pool_fast_path_without_javap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_src = root / "target-src/org/apache/commons/lang/StringUtils.java"
+            target_src.parent.mkdir(parents=True)
+            target_src.write_text(
+                "package org.apache.commons.lang; public class StringUtils { "
+                "public static boolean isBlank(String value) { return value == null; } }",
+                encoding="utf-8",
+            )
+            target_classes = root / "target-classes"
+            target_classes.mkdir()
+            subprocess.run(["javac", "-d", str(target_classes), str(target_src)], check=True)
+            target_jar = root / "commons-lang.jar"
+            with zipfile.ZipFile(target_jar, "w") as zf:
+                zf.write(
+                    target_classes / "org/apache/commons/lang/StringUtils.class",
+                    "org/apache/commons/lang/StringUtils.class",
+                )
+
+            consumer_src = root / "consumer-src/com/acme/Consumer.java"
+            consumer_src.parent.mkdir(parents=True)
+            consumer_src.write_text(
+                "package com.acme; import org.apache.commons.lang.StringUtils; "
+                "public class Consumer { public boolean check(String value) { "
+                "return StringUtils.isBlank(value); } }",
+                encoding="utf-8",
+            )
+            consumer_classes = root / "consumer-classes"
+            consumer_classes.mkdir()
+            subprocess.run([
+                "javac", "-cp", str(target_jar), "-d", str(consumer_classes), str(consumer_src)
+            ], check=True)
+            consumer_jar = root / "consumer.jar"
+            with zipfile.ZipFile(consumer_jar, "w") as zf:
+                zf.write(consumer_classes / "com/acme/Consumer.class", "com/acme/Consumer.class")
+
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "status": "complete", "target_jdk": "17",
+                "by_coord": {"com.acme:consumer": {"jar_path": str(consumer_jar)}},
+            })
+            with patch.object(tracer, "run_cmd", side_effect=AssertionError("javap should not be called")):
+                scan = tracer._scan_packaged_runtime_dependencies_for_api({
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                    "api_simple": "isBlank", "api_signature": "(String)",
+                    "symbol_kind": "method",
+                }, graph)
+
+        self.assertEqual(scan["status"], "hit")
+        self.assertEqual(scan["hits"][0]["consumer_method"], "<unknown>")
+        self.assertEqual(scan["hits"][0]["evidence_type"], "bytecode_constant_pool_method_reference")
+
     def test_javap_parser_attributes_throws_and_static_initializer_correctly(self):
         parsed = tracer._parse_javap_bytecode_references("""
 public class com.acme.Consumer {

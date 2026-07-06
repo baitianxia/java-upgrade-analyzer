@@ -523,9 +523,9 @@ def _parse_classfile_constant_pool_summary(data):
         cp_count = struct.unpack_from('>H', data, 8)[0]
         utf8 = {}
         class_name_indexes = []
-        ref_class_indexes = []
-        name_and_type_name_indexes = {}
-        ref_name_and_type_indexes = []
+        ref_entries = []
+        name_and_type_indexes = {}
+        has_dynamic_reference = False
         idx = 10
         cp_index = 1
         while cp_index < cp_count:
@@ -550,13 +550,19 @@ def _parse_classfile_constant_pool_summary(data):
             elif tag in (9, 10, 11):  # Fieldref / Methodref / InterfaceMethodref
                 if idx + 4 > len(data):
                     return None
-                ref_class_indexes.append(struct.unpack_from('>H', data, idx)[0])
-                ref_name_and_type_indexes.append(struct.unpack_from('>H', data, idx + 2)[0])
+                ref_entries.append({
+                    'tag': tag,
+                    'class_index': struct.unpack_from('>H', data, idx)[0],
+                    'name_and_type_index': struct.unpack_from('>H', data, idx + 2)[0],
+                })
                 idx += 4
             elif tag == 12:  # NameAndType
                 if idx + 4 > len(data):
                     return None
-                name_and_type_name_indexes[cp_index] = struct.unpack_from('>H', data, idx)[0]
+                name_and_type_indexes[cp_index] = {
+                    'name_index': struct.unpack_from('>H', data, idx)[0],
+                    'descriptor_index': struct.unpack_from('>H', data, idx + 2)[0],
+                }
                 idx += 4
             elif tag in (3, 4):  # Integer / Float
                 idx += 4
@@ -570,6 +576,7 @@ def _parse_classfile_constant_pool_summary(data):
             elif tag == 16:  # MethodType
                 idx += 2
             elif tag in (17, 18):  # Dynamic / InvokeDynamic
+                has_dynamic_reference = True
                 idx += 4
             elif tag in (19, 20):  # Module / Package
                 idx += 2
@@ -615,6 +622,7 @@ def _parse_classfile_constant_pool_summary(data):
             elif tag == 16:
                 idx += 2
             elif tag in (17, 18):
+                has_dynamic_reference = True
                 idx += 4
             elif tag in (19, 20):
                 idx += 2
@@ -623,17 +631,34 @@ def _parse_classfile_constant_pool_summary(data):
             cp_index += 1
         ref_class_internal = {
             class_by_cp_index.get(class_index, '')
-            for class_index in ref_class_indexes
+            for class_index in [item.get('class_index') for item in ref_entries]
         }
         ref_member_names = {
-            utf8.get(name_and_type_name_indexes.get(name_and_type_index, ''), '')
-            for name_and_type_index in ref_name_and_type_indexes
+            utf8.get((name_and_type_indexes.get(name_and_type_index, {}) or {}).get('name_index', ''), '')
+            for name_and_type_index in [item.get('name_and_type_index') for item in ref_entries]
         }
+        ref_members = []
+        for item in ref_entries:
+            nt = name_and_type_indexes.get(item.get('name_and_type_index'), {}) or {}
+            owner = class_by_cp_index.get(item.get('class_index'), '')
+            name = utf8.get(nt.get('name_index'), '')
+            descriptor = utf8.get(nt.get('descriptor_index'), '')
+            if owner and name:
+                ref_members.append({
+                    'tag': item.get('tag'),
+                    'owner': owner,
+                    'name': name,
+                    'descriptor': descriptor,
+                })
+        ref_member_descriptors = {item.get('descriptor') or '' for item in ref_members if item.get('descriptor')}
         utf8_values = set(utf8.values())
         return {
             'class_internal_names': {item for item in class_internal if item},
             'ref_internal_names': {item for item in ref_class_internal if item},
             'ref_member_names': {item for item in ref_member_names if item},
+            'ref_member_descriptors': ref_member_descriptors,
+            'ref_members': ref_members,
+            'has_dynamic_reference': has_dynamic_reference,
             'utf8_values': utf8_values,
         }
     except Exception:
@@ -707,6 +732,66 @@ def _runtime_prefilter_owner_candidates(owner_candidates, data, target_rows_by_o
                     filtered.append(owner)
                     break
     return list(dict.fromkeys(filtered))
+
+
+def _references_from_constant_pool_summary(summary, class_binary_name=''):
+    references = {
+        'class_refs': set(),
+        'method_refs': [],
+        'field_refs': [],
+    }
+    if not summary:
+        return references
+    for internal in summary.get('class_internal_names') or set():
+        references['class_refs'].add(str(internal).replace('/', '.').replace('$', '.'))
+    for internal in summary.get('ref_internal_names') or set():
+        references['class_refs'].add(str(internal).replace('/', '.').replace('$', '.'))
+    for item in summary.get('ref_members') or []:
+        owner = str(item.get('owner') or '').replace('/', '.').replace('$', '.')
+        name = str(item.get('name') or '')
+        descriptor = str(item.get('descriptor') or '')
+        tag = item.get('tag')
+        if not owner or not name:
+            continue
+        references['class_refs'].add(owner)
+        if tag == 9:
+            references['field_refs'].append({
+                'owner': owner,
+                'name': name,
+                'descriptor': descriptor,
+                'signature': _field_descriptor_to_lookup_signature(descriptor),
+                'consumer_method': '<unknown>',
+                'consumer_signature': '',
+                'reference_kind': 'constant_pool_fieldref',
+            })
+        elif tag in (10, 11):
+            references['method_refs'].append({
+                'owner': owner,
+                'name': name,
+                'descriptor': descriptor,
+                'signature': _method_descriptor_to_lookup_signature(descriptor),
+                'consumer_method': '<unknown>',
+                'consumer_signature': '',
+                'reference_kind': 'constant_pool_methodref',
+            })
+    references['class_refs'] = sorted(references['class_refs'])
+    return references
+
+
+def _match_runtime_dependency_references_from_constant_pool(api_row, summary, class_binary_name=''):
+    _owner, _member_name, symbol_kind = _extract_target_owner_and_member(api_row)
+    if symbol_kind == 'method' and (summary or {}).get('has_dynamic_reference'):
+        return []
+    references = _references_from_constant_pool_summary(summary, class_binary_name)
+    matches = _match_runtime_dependency_references(api_row, references)
+    for item in matches:
+        if item.get('evidence_type') == 'bytecode_method_invocation':
+            item['evidence_type'] = 'bytecode_constant_pool_method_reference'
+        elif item.get('evidence_type') == 'bytecode_field_access':
+            item['evidence_type'] = 'bytecode_constant_pool_field_reference'
+        elif item.get('evidence_type') == 'bytecode_class_reference':
+            item['evidence_type'] = 'bytecode_constant_pool_class_reference'
+    return matches
 
 
 def _run_javap_bytecode_dump(jar_path, class_binary_name, multi_release_version=None):
@@ -1047,6 +1132,7 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     multi_release_seen = False
     multi_release_target_resolved = False
     target_jdk = catalog.get('target_jdk')
+    allow_constant_pool_fast_path = not bool(getattr(graph, 'reverse_edges', {}) or {})
     for item in catalog_entries:
         coord = str(item.get('coord') or '').strip()
         if coord == str(api_row.get('coord') or '').strip():
@@ -1088,6 +1174,25 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                     ):
                         continue
                     class_binary_name = logical_name[:-6].replace('/', '.')
+                    if allow_constant_pool_fast_path:
+                        summary = _parse_classfile_constant_pool_summary(data)
+                        constant_pool_matches = _match_runtime_dependency_references_from_constant_pool(
+                            api_row, summary, class_binary_name
+                        )
+                        if constant_pool_matches:
+                            for matched in constant_pool_matches:
+                                hits.append({
+                                    'coord': coord,
+                                    'jar_path': jar_path,
+                                    'class_fqcn': class_binary_name.replace('$', '.'),
+                                    'consumer_method': matched.get('consumer_method') or '<unknown>',
+                                    'consumer_signature': matched.get('consumer_signature') or '',
+                                    'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
+                                    'target_display': matched.get('target_display') or owner,
+                                    'class_entry': entry,
+                                    'multi_release_version': selected_version,
+                                })
+                            continue
                     references = _load_runtime_dependency_class_references(
                         catalog, coord, jar_path, class_binary_name,
                         multi_release_version=selected_version,
@@ -1219,6 +1324,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     target_jdk = catalog.get('target_jdk')
     started_at = time.perf_counter()
     progress_interval = suggest_log_interval(len(catalog_entries), target_updates=8, minimum=1)
+    allow_constant_pool_fast_path = not bool(getattr(graph, 'reverse_edges', {}) or {})
 
     if not catalog_entries:
         for row in missing_rows:
@@ -1322,6 +1428,34 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     if not candidate_owners:
                         continue
                     class_binary_name = logical_name[:-6].replace('/', '.')
+                    if allow_constant_pool_fast_path:
+                        summary = _parse_classfile_constant_pool_summary(data)
+                        constant_pool_matched_any = False
+                        for owner in set(candidate_owners):
+                            for api_row in target_rows_by_owner.get(owner, []):
+                                if coord == str(api_row.get('coord') or '').strip():
+                                    continue
+                                matches = _match_runtime_dependency_references_from_constant_pool(
+                                    api_row, summary, class_binary_name
+                                )
+                                if not matches:
+                                    continue
+                                constant_pool_matched_any = True
+                                key = build_api_identity_key(api_row)
+                                for matched in matches:
+                                    hits_by_key[key].append({
+                                        'coord': coord,
+                                        'jar_path': jar_path,
+                                        'class_fqcn': class_binary_name.replace('$', '.'),
+                                        'consumer_method': matched.get('consumer_method') or '<unknown>',
+                                        'consumer_signature': matched.get('consumer_signature') or '',
+                                        'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
+                                        'target_display': matched.get('target_display') or owner,
+                                        'class_entry': entry,
+                                        'multi_release_version': selected_version,
+                                    })
+                        if constant_pool_matched_any:
+                            continue
                     references = _load_runtime_dependency_class_references(
                         catalog, coord, jar_path, class_binary_name,
                         multi_release_version=selected_version,
