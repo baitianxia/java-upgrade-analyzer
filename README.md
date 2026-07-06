@@ -85,6 +85,7 @@ JUA_STEP5_DEBUG=1 JUA_STEP5_DEBUG_BREAK=1 python3 scripts/s5_call_chain_engine_i
 - 当调用点签名不完整时，Step5 不再只依赖“所有参数都成功推断”这一条路径；若已知参数位足以在声明签名集合中唯一确定一个 overload，系统会恢复该唯一签名并写入带签名调用边，减少无签名回退造成的 `OVERLOAD_AMBIGUOUS_*`
 - Step5 的纯性能优化只允许减少重复扫描、降低内存峰值与释放无用中间对象；不得改变四态语义、目标键规则、bridge-check 阻塞语义或正式输入输出契约
 - 当前大输入场景下，Step5 会复用业务源码预分析结果、复用 overload 签名索引，并在进入完整图构建前释放预判阶段不再需要的大对象，以降低 CPU 与内存峰值
+- Step5 对最终制品运行时依赖 JAR 做字节码扫描时，会先用常量池快路径过滤/命中不需要回溯业务链路的直接引用；需要 `consumer_method` 回溯业务链路的候选 class 仍使用 `javap` 精确解析，并默认以 4 个 worker 并行执行。可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS=1` 关闭并行，或设置为 `1..16` 调整并行度。
 - 若本机缺少依赖，不要直接用裸 `pip install`；请始终用**执行本 Skill 的同一个 Python**安装：
 
 ```bash

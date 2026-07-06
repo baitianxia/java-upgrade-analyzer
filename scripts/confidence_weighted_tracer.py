@@ -22,6 +22,7 @@ import struct
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
@@ -77,6 +78,16 @@ def _step5_debug_break(topic, **fields):
         return
     _step5_debug(topic, 'breakpoint triggered', **fields)
     breakpoint()
+
+
+def _step5_bytecode_javap_workers():
+    value = str(os.environ.get('JUA_STEP5_BYTECODE_JAVAP_WORKERS') or '').strip()
+    if value:
+        try:
+            return max(1, min(16, int(value)))
+        except ValueError:
+            return 4
+    return 4
 
 
 def _debug_trace_result(topic, result, **fields):
@@ -978,6 +989,17 @@ def _load_runtime_dependency_class_references(
     return parsed
 
 
+def _load_runtime_dependency_class_references_for_task(task):
+    references = _load_runtime_dependency_class_references(
+        task['catalog'],
+        task['coord'],
+        task['jar_path'],
+        task['class_binary_name'],
+        multi_release_version=task.get('multi_release_version'),
+    )
+    return task, references
+
+
 def _match_runtime_dependency_references(api_row, references):
     references = references or {}
     owner, member_name, symbol_kind = _extract_target_owner_and_member(api_row)
@@ -1317,6 +1339,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     scan_failures = []
     candidate_failures_by_key = defaultdict(list)
     hits_by_key = defaultdict(list)
+    javap_tasks = []
     scanned_classes = 0
     visited_classes = 0
     multi_release_seen = False
@@ -1456,50 +1479,16 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                                     })
                         if constant_pool_matched_any:
                             continue
-                    references = _load_runtime_dependency_class_references(
-                        catalog, coord, jar_path, class_binary_name,
-                        multi_release_version=selected_version,
-                    )
-                    if references is None:
-                        failure = {
-                            'reason': 'BYTECODE_JAVAP_FAILED',
-                            'coord': coord,
-                            'jar_path': jar_path,
-                            'class_binary_name': class_binary_name,
-                            'multi_release_version': selected_version,
-                        }
-                        for owner in set(candidate_owners):
-                            for api_row in target_rows_by_owner.get(owner, []):
-                                candidate_failures_by_key[build_api_identity_key(api_row)].append(failure)
-                        continue
-                    scanned_classes += 1
-                    referenced_owners = set(references.get('class_refs') or [])
-                    referenced_owners.update(
-                        item.get('owner') for item in references.get('method_refs') or []
-                    )
-                    referenced_owners.update(
-                        item.get('owner') for item in references.get('field_refs') or []
-                    )
-                    for owner in set(candidate_owners) & {item for item in referenced_owners if item}:
-                        for api_row in target_rows_by_owner.get(owner, []):
-                            if coord == str(api_row.get('coord') or '').strip():
-                                continue
-                            matches = _match_runtime_dependency_references(api_row, references)
-                            if not matches:
-                                continue
-                            key = build_api_identity_key(api_row)
-                            for matched in matches:
-                                hits_by_key[key].append({
-                                    'coord': coord,
-                                    'jar_path': jar_path,
-                                    'class_fqcn': class_binary_name.replace('$', '.'),
-                                    'consumer_method': matched.get('consumer_method') or '<unknown>',
-                                    'consumer_signature': matched.get('consumer_signature') or '',
-                                    'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
-                                    'target_display': matched.get('target_display') or owner,
-                                    'class_entry': entry,
-                                    'multi_release_version': selected_version,
-                                })
+                    javap_tasks.append({
+                        'catalog': catalog,
+                        'coord': coord,
+                        'jar_path': jar_path,
+                        'class_binary_name': class_binary_name,
+                        'class_fqcn': class_binary_name.replace('$', '.'),
+                        'class_entry': entry,
+                        'multi_release_version': selected_version,
+                        'candidate_owners': sorted(set(candidate_owners)),
+                    })
         except Exception as exc:
             scan_failures.append({
                 'reason': 'BYTECODE_SCAN_FAILED',
@@ -1507,6 +1496,83 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 'jar_path': jar_path,
                 'error': str(exc),
             })
+
+    if javap_tasks:
+        workers = min(_step5_bytecode_javap_workers(), len(javap_tasks))
+        emit_progress(
+            "step5",
+            "bytecode-scan",
+            f"解析候选运行时依赖字节码，候选class={len(javap_tasks)}，并行度={workers}",
+            elapsed=time.perf_counter() - started_at,
+        )
+
+        def handle_javap_result(task, references):
+            nonlocal scanned_classes
+            coord = task.get('coord') or ''
+            jar_path = task.get('jar_path') or ''
+            class_binary_name = task.get('class_binary_name') or ''
+            selected_version = task.get('multi_release_version')
+            candidate_owners = task.get('candidate_owners') or []
+            cache = catalog.setdefault('_bytecode_reference_cache', {})
+            cache[(coord, jar_path, class_binary_name, selected_version)] = references
+            if references is None:
+                failure = {
+                    'reason': 'BYTECODE_JAVAP_FAILED',
+                    'coord': coord,
+                    'jar_path': jar_path,
+                    'class_binary_name': class_binary_name,
+                    'multi_release_version': selected_version,
+                }
+                for owner in set(candidate_owners):
+                    for api_row in target_rows_by_owner.get(owner, []):
+                        candidate_failures_by_key[build_api_identity_key(api_row)].append(failure)
+                return
+            scanned_classes += 1
+            referenced_owners = set(references.get('class_refs') or [])
+            referenced_owners.update(
+                item.get('owner') for item in references.get('method_refs') or []
+            )
+            referenced_owners.update(
+                item.get('owner') for item in references.get('field_refs') or []
+            )
+            for owner in set(candidate_owners) & {item for item in referenced_owners if item}:
+                for api_row in target_rows_by_owner.get(owner, []):
+                    if coord == str(api_row.get('coord') or '').strip():
+                        continue
+                    matches = _match_runtime_dependency_references(api_row, references)
+                    if not matches:
+                        continue
+                    key = build_api_identity_key(api_row)
+                    for matched in matches:
+                        hits_by_key[key].append({
+                            'coord': coord,
+                            'jar_path': jar_path,
+                            'class_fqcn': task.get('class_fqcn') or class_binary_name.replace('$', '.'),
+                            'consumer_method': matched.get('consumer_method') or '<unknown>',
+                            'consumer_signature': matched.get('consumer_signature') or '',
+                            'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
+                            'target_display': matched.get('target_display') or owner,
+                            'class_entry': task.get('class_entry') or '',
+                            'multi_release_version': selected_version,
+                        })
+
+        if workers <= 1:
+            for task in javap_tasks:
+                _task, references = _load_runtime_dependency_class_references_for_task(task)
+                handle_javap_result(_task, references)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(_load_runtime_dependency_class_references_for_task, task): task
+                    for task in javap_tasks
+                }
+                for future in as_completed(future_map):
+                    task = future_map[future]
+                    try:
+                        _task, references = future.result()
+                    except Exception:
+                        _task, references = task, None
+                    handle_javap_result(_task, references)
 
     catalog_status = str(catalog.get('status') or '').strip()
     for row in missing_rows:
