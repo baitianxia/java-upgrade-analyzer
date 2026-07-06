@@ -2335,6 +2335,56 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(result.reason_code, "DIRECT_FIELD_USAGE")
         self.assertIn("org.apache.commons.lang3.StringUtils.EMPTY", result.call_paths[0])
 
+    def test_trace_api_keeps_all_imported_static_field_access_paths(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang3.StringUtils.EMPTY",
+            "api_simple": "EMPTY",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "REMOVED",
+            "coord": "org.apache.commons:commons-lang3",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "api",
+        }
+
+        def method(symbol_id, qualified_key, line):
+            return SimpleNamespace(
+                symbol_id=symbol_id,
+                qualified_key=qualified_key,
+                simple_key=f"method:{qualified_key.rsplit('.', 1)[-1]}",
+                class_fqcn=qualified_key.rsplit('.', 1)[0],
+                class_name=qualified_key.rsplit('.', 2)[-2],
+                method_name=qualified_key.rsplit('.', 1)[-1],
+                return_type="void",
+                file=f"{qualified_key.rsplit('.', 2)[-2]}.java",
+                line=line,
+                owner_type="business",
+                is_test=False,
+                imports={"StringUtils": "org.apache.commons.lang3.StringUtils"},
+                wildcard_imports=[],
+                static_imports={},
+                get_body_text=lambda: "return StringUtils.EMPTY;",
+            )
+
+        first = method("first", "com.biz.First.handle", 10)
+        second = method("second", "com.biz.Second.handle", 20)
+        graph = SimpleNamespace(
+            methods_by_id={"first": first, "second": second},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_FIELD_USAGE")
+        self.assertEqual(result.direct_callers, 2)
+        self.assertEqual(len(result.call_paths), 2)
+        self.assertEqual(len(result.path_details), 2)
+        self.assertTrue(any("com.biz.First.handle" in path for path in result.call_paths))
+        self.assertTrue(any("com.biz.Second.handle" in path for path in result.call_paths))
+
     def test_trace_api_respects_wildcard_import_owner_for_simple_static_field_access(self):
         api_row = {
             "api_name": "io.seata.common.StringUtils.EMPTY",

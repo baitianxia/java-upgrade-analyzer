@@ -154,6 +154,67 @@ def _build_direct_usage_result(result, method_def, reason_code, note, evidence_t
     return result
 
 
+def _build_direct_usage_results(result, matches, reason_code, note, display_target):
+    unique_matches = []
+    seen = set()
+    for method_def, evidence_type in matches or []:
+        caller_name = getattr(method_def, 'qualified_key', '') or getattr(method_def, 'symbol_id', '')
+        identity = (
+            caller_name,
+            evidence_type,
+            getattr(method_def, 'file', ''),
+            getattr(method_def, 'line', 0),
+        )
+        if not caller_name or identity in seen:
+            continue
+        seen.add(identity)
+        unique_matches.append((method_def, evidence_type, caller_name))
+
+    if not unique_matches:
+        return result
+
+    result.analysis_status = 'reachable'
+    result.is_reachable = True
+    result.reason_code = reason_code
+    result.reachable_note = note
+    result.direct_callers = len(unique_matches)
+    result.business_reach_depth = 1
+    result.call_paths = []
+    result.evidence_paths = []
+    result.path_details = []
+
+    for method_def, evidence_type, caller_name in unique_matches:
+        path_text = f"{caller_name} -> {display_target}"
+        evidence = [{
+            'caller_symbol': caller_name,
+            'callee_key': display_target,
+            'evidence_type': evidence_type,
+            'confidence': 'high',
+            'file': getattr(method_def, 'file', ''),
+            'line': getattr(method_def, 'line', 0),
+        }]
+        result.call_paths.append(path_text)
+        result.evidence_paths.append(evidence)
+        consumer_class = getattr(method_def, 'class_fqcn', '') or caller_name.rsplit('.', 1)[0]
+        consumer_method = getattr(method_def, 'method_name', '') or caller_name.rsplit('.', 1)[-1]
+        result.path_details.append({
+            'path_status': 'reachable',
+            'stop_reason': reason_code,
+            'business_entry': caller_name,
+            'business_reachable': True,
+            'consumer_coord': 'BUSINESS',
+            'consumer_class': consumer_class,
+            'consumer_method': consumer_method,
+            'consumer_signature': '',
+            'path_text': path_text,
+            'confidence': 1.0,
+            'depth': 1,
+            'evidence': evidence,
+            'terminal_symbol': caller_name,
+        })
+    return result
+
+
 def _find_direct_business_class_usage(api_row, graph):
     target_class = str(api_row.get('matched_class') or api_row.get('api_name') or '').strip()
     if not target_class:
@@ -189,13 +250,13 @@ def _find_direct_business_class_usage(api_row, graph):
     return None
 
 
-def _find_direct_business_field_usage(api_row, graph):
+def _find_direct_business_field_usages(api_row, graph):
     api_name = str(api_row.get('api_name') or '').strip()
     field_name = str(api_row.get('api_simple') or '').strip() or (api_name.rsplit('.', 1)[-1] if '.' in api_name else '')
     owner_class = api_name.rsplit('.', 1)[0] if '.' in api_name else ''
     owner_simple = owner_class.rsplit('.', 1)[-1] if owner_class else ''
     if not field_name:
-        return None
+        return []
     simple_access_pattern = (
         re.compile(r'\b' + re.escape(owner_simple) + r'\s*\.\s*' + re.escape(field_name) + r'\b')
         if owner_simple else None
@@ -204,21 +265,29 @@ def _find_direct_business_field_usage(api_row, graph):
         re.compile(re.escape(owner_class) + r'\s*\.\s*' + re.escape(field_name) + r'\b')
         if owner_class else None
     )
+    matches = []
     for method_def in _iter_business_methods(graph):
         static_imports = getattr(method_def, 'static_imports', {}) or {}
         if static_imports.get(field_name) == api_name:
-            return method_def, 'static_import'
+            matches.append((method_def, 'static_import'))
+            continue
         body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
         if fqcn_access_pattern and fqcn_access_pattern.search(body_text):
-            return method_def, 'field_access'
+            matches.append((method_def, 'field_access'))
+            continue
         if simple_access_pattern and simple_access_pattern.search(body_text):
             imports = getattr(method_def, 'imports', {}) or {}
             wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
             if imports.get(owner_simple) == owner_class or any(
                 f"{pkg}.{owner_simple}" == owner_class for pkg in wildcard_imports
             ):
-                return method_def, 'field_access'
-    return None
+                matches.append((method_def, 'field_access'))
+    return matches
+
+
+def _find_direct_business_field_usage(api_row, graph):
+    usages = _find_direct_business_field_usages(api_row, graph)
+    return usages[0] if usages else None
 
 
 def _try_build_direct_usage_result(api_row, result, graph):
@@ -244,21 +313,23 @@ def _try_build_direct_usage_result(api_row, result, graph):
             )
 
     if symbol_kind == 'field':
-        matched = _find_direct_business_field_usage(api_row, graph)
-        if matched:
-            method_def, evidence_type = matched
-            reason_code = 'DIRECT_STATIC_IMPORT_USAGE' if evidence_type == 'static_import' else 'DIRECT_FIELD_USAGE'
+        matches = _find_direct_business_field_usages(api_row, graph)
+        if matches:
+            reason_code = (
+                'DIRECT_STATIC_IMPORT_USAGE'
+                if all(evidence_type == 'static_import' for _method_def, evidence_type in matches)
+                else 'DIRECT_FIELD_USAGE'
+            )
             note = (
                 '已在系统源码中找到目标字段的 static import 直接引用'
-                if evidence_type == 'static_import'
+                if reason_code == 'DIRECT_STATIC_IMPORT_USAGE'
                 else '已在系统源码中找到目标字段的直接访问证据'
             )
-            return _build_direct_usage_result(
+            return _build_direct_usage_results(
                 result,
-                method_def,
+                matches,
                 reason_code,
                 note,
-                evidence_type,
                 str(api_row.get('api_name') or '').strip(),
             )
 
