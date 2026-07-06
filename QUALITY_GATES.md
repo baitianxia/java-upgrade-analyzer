@@ -23,13 +23,24 @@ python3 scripts/quality_gate.py --profile step5
 python3 scripts/quality_gate.py --profile release
 ```
 
+其中准确性基准矩阵也可以单独执行：
+
+```bash
+python3 scripts/accuracy_benchmark.py --profile core
+python3 scripts/accuracy_benchmark.py --profile step5
+python3 scripts/accuracy_benchmark.py --profile all
+python3 scripts/accuracy_benchmark.py --profile step5 --dry-run
+```
+
+`accuracy_benchmark.py` 不是新的分析逻辑，而是把高风险准确性契约显式分组：`jdeps` 对照、运行时依赖字节码链路、反射/MethodHandle、owner/import/signature 精度、`alerts.csv` 完整台账、Step6 汇总结论等。它用于防止“修了一个真实项目，却忘了保护同类问题”。
+
 各 profile 含义：
 
 | Profile | 适用场景 | 覆盖范围 |
 |---|---|---|
-| `quick` | 小范围文档/脚本调整后的快速检查 | Python 编译、核心语义单测、smoke core |
-| `step5` | 修改 Step5、字节码、反射、alerts 或调用链时 | Python 编译、Step5 相关单测、smoke core/step5、可选真实项目矩阵 |
-| `release` | 打包给真实工程测试或提交重要变更前 | Python 编译、完整单测、smoke all、真实项目矩阵、`git diff --check` |
+| `quick` | 小范围文档/脚本调整后的快速检查 | Python 编译、核心准确性矩阵、核心语义单测、smoke core |
+| `step5` | 修改 Step5、字节码、反射、alerts 或调用链时 | Python 编译、Step5 准确性矩阵、Step5 相关单测、smoke core/step5、可选真实项目矩阵 |
+| `release` | 打包给真实工程测试或提交重要变更前 | Python 编译、完整准确性矩阵、完整单测、smoke all、真实项目矩阵、`git diff --check` |
 
 如果本地没有真实项目缓存，可临时使用：
 

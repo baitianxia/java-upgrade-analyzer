@@ -23,9 +23,20 @@ python3 scripts/quality_gate.py --profile release
 python3 scripts/quality_gate.py --profile release --dry-run
 ```
 
+高风险准确性契约也可以单独按矩阵执行：
+
+```bash
+python3 scripts/accuracy_benchmark.py --profile core
+python3 scripts/accuracy_benchmark.py --profile step5
+python3 scripts/accuracy_benchmark.py --profile all
+```
+
+`accuracy_benchmark.py` 把历史上反复出问题的能力点显式分组，包括 `jdeps` 对照、运行时依赖字节码链路、反射/MethodHandle、owner/import/signature 精度、`alerts.csv` 完整台账和 Step6 汇总结论。它不是替代真实项目测试，而是防止已知准确性合同在后续修改中退化。
+
 每次修改分析逻辑后至少执行 quick 或等价命令：
 
 ```bash
+python3 scripts/accuracy_benchmark.py --profile core
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/smoke_regression.py --group core
 python3 scripts/smoke_regression.py --group step5
@@ -65,12 +76,13 @@ python3 -m unittest tests.test_step5_key_matching tests.test_business_bytecode_g
 | 层级 | 执行时机 | 命令/方式 | 目标 |
 |---|---|---|---|
 | L0 精准回归 | 每次局部修改后立即执行 | 相关 `unittest` 单例或单文件 | 快速验证刚修的正反例 |
-| L1 Step 相关回归 | 修改 Step4/Step5 逻辑后执行 | `tests.test_step5_key_matching`、`test_business_bytecode_graph`、`test_artifact_bytecode_catalog`、`test_indirect_usage_analyzer` | 覆盖签名、owner、字节码、间接调用 |
-| L2 Smoke | 修改分析主流程后执行 | `smoke_regression.py --group core` 和 `--group step5` | 防止主流程和输出合同破坏 |
-| L3 全量单测 | 较大逻辑调整或提交前执行 | `python3 -m unittest discover -s tests -p 'test_*.py'` | 防止跨步骤回归 |
-| L4 真实项目矩阵 | Step5 准确性/输出语义/性能相关修改后执行 | `python3 scripts/real_project_regression.py --case all` | 用真实项目发现解析边界和误报/漏报 |
+| L1 准确性基准矩阵 | 修改 Step4/Step5 逻辑后执行 | `python3 scripts/accuracy_benchmark.py --profile step5` | 按风险类别验证已知高危准确性契约 |
+| L2 Step 相关回归 | 修改 Step4/Step5 逻辑后执行 | `tests.test_step5_key_matching`、`test_business_bytecode_graph`、`test_artifact_bytecode_catalog`、`test_indirect_usage_analyzer` | 覆盖签名、owner、字节码、间接调用 |
+| L3 Smoke | 修改分析主流程后执行 | `smoke_regression.py --group core` 和 `--group step5` | 防止主流程和输出合同破坏 |
+| L4 全量单测 | 较大逻辑调整或提交前执行 | `python3 -m unittest discover -s tests -p 'test_*.py'` | 防止跨步骤回归 |
+| L5 真实项目矩阵 | Step5 准确性/输出语义/性能相关修改后执行 | `python3 scripts/real_project_regression.py --case all` | 用真实项目发现解析边界和误报/漏报 |
 
-如果 L4 每次都发现新问题，说明当前测试矩阵仍不充分，应优先扩充真实项目探针和最小 fixture，而不是继续局部修补。
+如果 L5 每次都发现新问题，说明当前测试矩阵仍不充分，应优先扩充真实项目探针和最小 fixture，而不是继续局部修补。
 
 ## 正例和负例必须成对
 

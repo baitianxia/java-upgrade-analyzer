@@ -443,6 +443,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step5 必须优先按 `lib_entry` 提取制品中的真实嵌套 JAR，不得用本地 Maven 仓库副本冒充完整制品证据
 - 规则：本地 Maven JAR 只能作为显式 fallback；一旦使用、缺失嵌套 JAR、坐标 unresolved、SHA 不一致或 javap 失败，字节码覆盖必须降级，未命中不得解释为无影响
 - 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4
+- 规则：准确性相关变更必须运行显式基准矩阵 `python3 scripts/accuracy_benchmark.py --profile core|step5|all`，覆盖 `jdeps` 对照、运行时依赖字节码链路、间接引用、owner/signature 精度、alerts 完整台账和汇总结论
 - 规则：打包给真实工程测试前必须优先执行 `python3 scripts/quality_gate.py --profile release`；若因本地缺少真实项目矩阵而使用 `--skip-real`，交付说明必须明确标记真实项目矩阵未执行
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
 - 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`

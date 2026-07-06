@@ -106,6 +106,15 @@ def _real_project_task(python_exe, case, report_root):
     )
 
 
+def _accuracy_benchmark_task(python_exe, profile):
+    return GateTask(
+        name=f"accuracy_benchmark_{profile}",
+        command=[python_exe, "scripts/accuracy_benchmark.py", "--profile", profile],
+        purpose=f"准确性基准矩阵：{profile}",
+        heavy=profile in {"step5", "all"},
+    )
+
+
 def _diff_check_task():
     return GateTask(
         name="git_diff_check",
@@ -119,6 +128,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="all", repor
     tasks = [_py_compile_task(python_exe)]
 
     if profile == "quick":
+        tasks.append(_accuracy_benchmark_task(python_exe, "core"))
         tasks.append(_unittest_task(
             python_exe,
             "unit_core_semantics",
@@ -127,6 +137,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="all", repor
         ))
         tasks.append(_smoke_task(python_exe, "core"))
     elif profile == "step5":
+        tasks.append(_accuracy_benchmark_task(python_exe, "step5"))
         tasks.append(_unittest_task(
             python_exe,
             "unit_step5_semantics",
@@ -139,6 +150,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="all", repor
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root))
     elif profile == "release":
+        tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all"))
         if not skip_real:

@@ -17,6 +17,7 @@ class QualityGateTest(unittest.TestCase):
         names = [task.name for task in tasks]
 
         self.assertEqual(names[0], "py_compile_scripts")
+        self.assertIn("accuracy_benchmark_core", names)
         self.assertIn("unit_core_semantics", names)
         self.assertIn("smoke_core", names)
         self.assertNotIn("real_project_all", names)
@@ -25,6 +26,7 @@ class QualityGateTest(unittest.TestCase):
         tasks = quality_gate.build_plan("step5", python_exe="pythonX", skip_real=True)
         names = [task.name for task in tasks]
 
+        self.assertIn("accuracy_benchmark_step5", names)
         self.assertIn("unit_step5_semantics", names)
         self.assertIn("smoke_step5", names)
         self.assertFalse(any(task.real_project for task in tasks))
@@ -37,6 +39,7 @@ class QualityGateTest(unittest.TestCase):
         )
         names = [task.name for task in tasks]
 
+        self.assertIn("accuracy_benchmark_all", names)
         self.assertIn("unit_all", names)
         self.assertIn("smoke_all", names)
         self.assertIn("real_project_all", names)
@@ -64,6 +67,7 @@ class QualityGateTest(unittest.TestCase):
         self.assertTrue(payload["dry_run"])
         self.assertEqual(payload["profile"], "step5")
         task_names = [task["name"] for task in payload["tasks"]]
+        self.assertIn("accuracy_benchmark_step5", task_names)
         self.assertIn("unit_step5_semantics", task_names)
         self.assertNotIn("real_project_all", task_names)
 
