@@ -2335,6 +2335,166 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(result.reason_code, "DIRECT_FIELD_USAGE")
         self.assertIn("org.apache.commons.lang3.StringUtils.EMPTY", result.call_paths[0])
 
+    def test_trace_api_respects_wildcard_import_owner_for_simple_static_field_access(self):
+        api_row = {
+            "api_name": "io.seata.common.StringUtils.EMPTY",
+            "api_simple": "EMPTY",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "REMOVED",
+            "coord": "io.seata:seata-common",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "api",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.RppAssignFacility.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.RppAssignFacility",
+            class_name="RppAssignFacility",
+            method_name="handle",
+            return_type="void",
+            file="RppAssignFacility.java",
+            line=913,
+            owner_type="business",
+            is_test=False,
+            imports={},
+            wildcard_imports=["org.apache.commons.lang3"],
+            static_imports={},
+            get_body_text=lambda: "return StringUtils.EMPTY;",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertNotEqual(result.reason_code, "DIRECT_FIELD_USAGE")
+
+    def test_trace_api_marks_wildcard_imported_simple_static_field_access_as_reachable(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang3.StringUtils.EMPTY",
+            "api_simple": "EMPTY",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "REMOVED",
+            "coord": "org.apache.commons:commons-lang3",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "api",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.RppAssignFacility.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.RppAssignFacility",
+            class_name="RppAssignFacility",
+            method_name="handle",
+            return_type="void",
+            file="RppAssignFacility.java",
+            line=913,
+            owner_type="business",
+            is_test=False,
+            imports={},
+            wildcard_imports=["org.apache.commons.lang3"],
+            static_imports={},
+            get_body_text=lambda: "return StringUtils.EMPTY;",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_FIELD_USAGE")
+
+    def test_trace_api_keeps_fqcn_static_field_access_reachable_despite_import_conflict(self):
+        api_row = {
+            "api_name": "io.seata.common.StringUtils.EMPTY",
+            "api_simple": "EMPTY",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "REMOVED",
+            "coord": "io.seata:seata-common",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "api",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.RppAssignFacility.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.RppAssignFacility",
+            class_name="RppAssignFacility",
+            method_name="handle",
+            return_type="void",
+            file="RppAssignFacility.java",
+            line=913,
+            owner_type="business",
+            is_test=False,
+            imports={"StringUtils": "org.apache.commons.lang3.StringUtils"},
+            wildcard_imports=[],
+            static_imports={},
+            get_body_text=lambda: "return io.seata.common.StringUtils.EMPTY;",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_FIELD_USAGE")
+
+    def test_trace_api_respects_static_import_owner_for_field_access(self):
+        api_row = {
+            "api_name": "io.seata.common.StringUtils.EMPTY",
+            "api_simple": "EMPTY",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "REMOVED",
+            "coord": "io.seata:seata-common",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "api",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.RppAssignFacility.handle",
+            simple_key="method:handle",
+            class_fqcn="com.biz.RppAssignFacility",
+            class_name="RppAssignFacility",
+            method_name="handle",
+            return_type="void",
+            file="RppAssignFacility.java",
+            line=913,
+            owner_type="business",
+            is_test=False,
+            imports={},
+            wildcard_imports=[],
+            static_imports={"EMPTY": "org.apache.commons.lang3.StringUtils.EMPTY"},
+            get_body_text=lambda: "return EMPTY;",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertNotEqual(result.reason_code, "DIRECT_STATIC_IMPORT_USAGE")
+
     def test_trace_api_allows_constructor_target_to_reach_business_code(self):
         api_row = {
             "api_name": "com.lib.TargetType.TargetType",

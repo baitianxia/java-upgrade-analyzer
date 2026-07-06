@@ -72,6 +72,8 @@ class Step4StabilityTest(unittest.TestCase):
                                binaryCompatible="false" sourceCompatible="false"/>
                     <interface name="java.lang.Comparable" changeStatus="REMOVED"
                                binaryCompatible="false" sourceCompatible="false"/>
+                    <interface name="org.external.Marker" changeStatus="REMOVED"
+                               binaryCompatible="false" sourceCompatible="false"/>
                   </interfaces>
                   <methods>
                     <method name="call" changeStatus="REMOVED"
@@ -92,6 +94,7 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertNotIn("java.io.Serializable", api_names)
         self.assertNotIn("java.lang.Comparable", api_names)
         self.assertNotIn("java.lang.annotation.Annotation", api_names)
+        self.assertNotIn("org.external.Marker", api_names)
 
     def test_step4_default_timeouts_are_unbounded(self):
         self.assertIsNone(step4.DEFAULT_GIT_DIFF_TIMEOUT)
