@@ -1463,6 +1463,72 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertTrue(completeness["incomplete"])
         self.assertIn("tree_sitter_unavailable=2", completeness["reasons"][0])
 
+    def test_assess_graph_completeness_ignores_unrelated_parser_fallback_files_for_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unrelated = Path(tmp) / "generated" / "MySqlParser.java"
+            unrelated.parent.mkdir(parents=True)
+            unrelated.write_text(
+                "package org.apache.seata.sqlparser.antlr.mysql.parser; class MySqlParser {}",
+                encoding="utf-8",
+            )
+
+            completeness = tracer.assess_graph_completeness(
+                {
+                    "truncated": False,
+                    "parser_fallback_reasons": {"tree_sitter_runtime_error:RecursionError": 1},
+                    "parser_fallback_files": [
+                        {
+                            "file": str(unrelated),
+                            "reason": "tree_sitter_runtime_error:RecursionError",
+                        }
+                    ],
+                    "edge_cap_hits": 0,
+                },
+                api_row={
+                    "api_name": "io.seata.common.util.StringUtils.isBlank",
+                    "symbol_kind": "method",
+                },
+            )
+
+        self.assertFalse(completeness["incomplete"])
+        self.assertEqual(completeness["reasons"], [])
+
+    def test_assess_graph_completeness_keeps_related_parser_fallback_files_for_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            related = Path(tmp) / "src" / "main" / "java" / "demo" / "Compat.java"
+            related.parent.mkdir(parents=True)
+            related.write_text(
+                "\n".join(
+                    [
+                        "package demo;",
+                        "import io.seata.common.util.StringUtils;",
+                        "class Compat { boolean x(String v) { return StringUtils.isBlank(v); } }",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            completeness = tracer.assess_graph_completeness(
+                {
+                    "truncated": False,
+                    "parser_fallback_reasons": {"tree_sitter_runtime_error:RecursionError": 1},
+                    "parser_fallback_files": [
+                        {
+                            "file": str(related),
+                            "reason": "tree_sitter_runtime_error:RecursionError",
+                        }
+                    ],
+                    "edge_cap_hits": 0,
+                },
+                api_row={
+                    "api_name": "io.seata.common.util.StringUtils.isBlank",
+                    "symbol_kind": "method",
+                },
+            )
+
+        self.assertTrue(completeness["incomplete"])
+        self.assertIn("tree_sitter_runtime_error:RecursionError=1", completeness["reasons"][0])
+
     def test_trace_api_accepts_precise_internal_dependency_consumer_when_path_reaches_business(self):
         api_row = {
             "api_name": "org.example.InternalConfig.message",

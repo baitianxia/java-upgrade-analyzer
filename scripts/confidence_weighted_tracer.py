@@ -2230,6 +2230,66 @@ def critical_parser_fallback_reasons(graph_stats):
     }
 
 
+def _api_owner_and_member(api_row):
+    api_name = str((api_row or {}).get('api_name') or (api_row or {}).get('api') or '').strip()
+    if not api_name or '.' not in api_name:
+        return '', ''
+    owner, member = api_name.rsplit('.', 1)
+    return owner.strip(), member.strip()
+
+
+def _fallback_file_may_reference_api(file_path, api_row):
+    owner, member = _api_owner_and_member(api_row)
+    if not owner:
+        return True
+    owner_path = owner.replace('.', '/')
+    normalized_path = str(file_path or '').replace('\\', '/')
+    if owner_path and owner_path in normalized_path:
+        return True
+    try:
+        with open(str(file_path), 'r', encoding='utf-8', errors='ignore') as handle:
+            text = handle.read()
+    except OSError:
+        return True
+    owner_simple = owner.rsplit('.', 1)[-1]
+    owner_package = owner.rsplit('.', 1)[0] if '.' in owner else ''
+    if owner in text:
+        return True
+    if member and f"{owner_simple}.{member}" in text:
+        return True
+    if owner_package and re.search(rf"\bimport\s+{re.escape(owner_package)}\.\*\s*;", text):
+        if owner_simple in text or (member and member in text):
+            return True
+    return False
+
+
+def parser_fallback_reasons_relevant_to_api(graph_stats, api_row):
+    critical_reasons = critical_parser_fallback_reasons(graph_stats)
+    if not critical_reasons:
+        return {}
+    if not api_row:
+        return critical_reasons
+    fallback_files = [
+        dict(item or {})
+        for item in ((graph_stats or {}).get('parser_fallback_files') or [])
+        if str((item or {}).get('reason') or '') in critical_reasons
+    ]
+    total_critical_files = sum(int(value or 0) for value in critical_reasons.values())
+    if not fallback_files:
+        return critical_reasons
+    # parser_fallback_files is capped in graph stats. If it does not cover all critical
+    # fallbacks, keep the conservative global incomplete signal for unknown files.
+    if len(fallback_files) < total_critical_files:
+        return critical_reasons
+    relevant = defaultdict(int)
+    for item in fallback_files:
+        reason = str(item.get('reason') or '').strip()
+        file_path = str(item.get('file') or '').strip()
+        if reason and _fallback_file_may_reference_api(file_path, api_row):
+            relevant[reason] += 1
+    return dict(relevant)
+
+
 # ══════════════════════════════════════════════════════════════════
 # 关键节点识别
 # ══════════════════════════════════════════════════════════════════
@@ -3213,7 +3273,7 @@ def trace_api_with_confidence_weighting(
         _debug_trace_result('trace_api_result', result)
         return result
 
-    graph_completeness = assess_graph_completeness(graph_stats)
+    graph_completeness = assess_graph_completeness(graph_stats, api_row=api_row)
     if graph_completeness['incomplete']:
         built = build_analysis_incomplete_result(result, graph_completeness)
         _debug_trace_result('trace_api_result', built, graph_completeness=graph_completeness)
@@ -4287,7 +4347,7 @@ def get_cached_method_lookup_resolution(method_def, type_metadata, graph, trace_
     return resolved
 
 
-def assess_graph_completeness(graph_stats):
+def assess_graph_completeness(graph_stats, api_row=None):
     graph_stats = graph_stats or {}
     reasons = []
     verification = []
@@ -4300,7 +4360,7 @@ def assess_graph_completeness(graph_stats):
         reasons.append(reason_text)
         verification.append('提高 max_methods 或缩小分析范围后重跑 Step 5')
 
-    parser_fallback_reasons = critical_parser_fallback_reasons(graph_stats)
+    parser_fallback_reasons = parser_fallback_reasons_relevant_to_api(graph_stats, api_row)
     if parser_fallback_reasons:
         parser_items = ', '.join(
             f"{key}={value}" for key, value in sorted(parser_fallback_reasons.items())

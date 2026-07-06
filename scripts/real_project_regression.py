@@ -39,6 +39,7 @@ class BaselineSpec:
     import_pattern: str
     require_zero_production_missing: bool = True
     notes: str = ""
+    file_path_pattern: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class RealProjectCase:
     baseline_specs: tuple[BaselineSpec, ...]
     source_dirs: tuple[Path, ...] = field(default_factory=tuple)
     changed_api_rows: tuple[dict[str, str], ...] = field(default_factory=tuple)
+    prefer_embedded_changed_api_rows: bool = False
     source_shape_patterns: dict[str, str] = field(default_factory=dict)
     min_source_shape_files: dict[str, int] = field(default_factory=dict)
     min_methods_indexed: int = 0
@@ -100,16 +102,13 @@ CASES = {
             ),
             BaselineSpec(
                 symbol="org.apache.commons.lang3.ArrayUtils.isEmpty",
-                pattern=r"\bArrayUtils\s*\.\s*isEmpty\s*\(",
+                pattern=r"\bArrayUtils\s*\.\s*isEmpty\s*\(\s*(?:chars|delimiters)\s*\)",
                 import_pattern=(
                     r"import\s+org\.apache\.commons\.lang3\.ArrayUtils\s*;"
                     r"|import\s+org\.apache\.commons\.lang3\.\*\s*;"
                 ),
-                require_zero_production_missing=False,
-                notes=(
-                    "reported only: current probe target is char[], while grep cannot distinguish "
-                    "Object[]/CharSequence[]/custom-array overloads"
-                ),
+                file_path_pattern=r"(?:StrMatcher|CaseUtils)\.java$",
+                notes="char[] overload probe; variable-name filter intentionally excludes other array overloads",
             ),
             BaselineSpec(
                 symbol="org.apache.commons.lang3.Validate.isTrue",
@@ -126,6 +125,48 @@ CASES = {
         name="seata",
         default_project=Path("/private/tmp/jua-real-project-seata"),
         default_changed_apis=Path("/private/tmp/jua-seata-real-matrix/report/s4_jar_compare/all_changed_apis.csv"),
+        changed_api_rows=(
+            {
+                "coord": "org.apache.seata:seata-common",
+                "old_version": "probe",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.seata.common.util.StringUtils.isBlank",
+                "api_simple": "isBlank",
+                "symbol_kind": "method",
+                "api_signature": "(String)",
+                "confirmed": "false",
+                "severity": "P1",
+                "source": "real_project_seata_probe",
+            },
+            {
+                "coord": "org.apache.seata:seata-common",
+                "old_version": "probe",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.seata.common.util.StringUtils.isEmpty",
+                "api_simple": "isEmpty",
+                "symbol_kind": "method",
+                "api_signature": "(CharSequence)",
+                "confirmed": "false",
+                "severity": "P1",
+                "source": "real_project_seata_probe",
+            },
+            {
+                "coord": "org.apache.seata:seata-common",
+                "old_version": "probe",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.seata.common.util.StringUtils.EMPTY",
+                "api_simple": "EMPTY",
+                "symbol_kind": "field",
+                "api_signature": "",
+                "confirmed": "false",
+                "severity": "P1",
+                "source": "real_project_seata_probe",
+            },
+        ),
+        prefer_embedded_changed_api_rows=True,
         baseline_specs=(
             BaselineSpec(
                 symbol="org.apache.seata.common.util.StringUtils.isBlank",
@@ -227,6 +268,7 @@ CASES = {
                 "source": "real_project_dubbo_probe",
             },
         ),
+        prefer_embedded_changed_api_rows=True,
         baseline_specs=(
             BaselineSpec(
                 symbol="org.apache.dubbo.common.utils.StringUtils.isEquals",
@@ -257,13 +299,9 @@ CASES = {
             ),
             BaselineSpec(
                 symbol="org.apache.dubbo.common.URL.valueOf",
-                pattern=r"\bURL\s*\.\s*valueOf\s*\(",
+                pattern=r"\bURL\s*\.\s*valueOf\s*\(\s*[^,()]+?\s*\)",
                 import_pattern=r"import\s+org\.apache\.dubbo\.common\.URL\s*;",
-                require_zero_production_missing=False,
-                notes=(
-                    "reported only: URL.valueOf is heavily overloaded; simple grep cannot distinguish "
-                    "String, ScopeModel and filtering overloads"
-                ),
+                notes="single-argument String URL.valueOf overload; broader overloads are intentionally excluded",
             ),
             BaselineSpec(
                 symbol="org.apache.dubbo.common.utils.NetUtils.getLocalHost",
@@ -353,6 +391,7 @@ CASES = {
                 "source": "manual_real_project_probe",
             },
         ),
+        prefer_embedded_changed_api_rows=True,
         baseline_specs=(
             BaselineSpec(
                 symbol="org.apache.commons.lang3.StringUtils.isBlank",
@@ -374,13 +413,12 @@ CASES = {
             ),
             BaselineSpec(
                 symbol="org.apache.commons.lang3.Validate.isTrue",
-                pattern=r"\bValidate\s*\.\s*isTrue\s*\(",
+                pattern=r"\bValidate\s*\.\s*isTrue\s*\([^)]*,",
                 import_pattern=(
                     r"import\s+org\.apache\.commons\.lang3\.Validate\s*;"
                     r"|package\s+org\.apache\.commons\.lang3\s*;"
                 ),
-                require_zero_production_missing=False,
-                notes="reported only: grep includes boolean-only overload and comments; varargs hits are still checked manually",
+                notes="varargs/message overload probe; boolean-only overload is intentionally excluded",
             ),
         ),
     ),
@@ -408,7 +446,11 @@ def collect_baseline_files(project_root: Path, spec: BaselineSpec) -> tuple[set[
     occurrence_count = 0
     import_re = re.compile(spec.import_pattern)
     call_re = re.compile(spec.pattern)
+    file_re = re.compile(spec.file_path_pattern) if spec.file_path_pattern else None
     for java_file in iter_java_files(project_root):
+        rel_path = java_file.relative_to(project_root).as_posix()
+        if file_re and not file_re.search(rel_path):
+            continue
         try:
             text = java_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -481,8 +523,10 @@ def extract_graph_stats(summary: dict) -> dict:
     }
 
 
-def ensure_changed_apis(case: RealProjectCase, changed_apis: Path) -> Path:
-    if changed_apis.exists() or not case.changed_api_rows:
+def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_path: Path | None = None) -> Path:
+    if case.prefer_embedded_changed_api_rows and case.changed_api_rows:
+        changed_apis = materialized_path or changed_apis
+    elif changed_apis.exists() or not case.changed_api_rows:
         return changed_apis
     changed_apis.parent.mkdir(parents=True, exist_ok=True)
     fields = [
@@ -528,12 +572,12 @@ def load_summary(report_dir: Path) -> dict:
 def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, report_root: Path) -> dict:
     if not project_root.exists():
         return {"case": case.name, "status": "skipped", "reason": f"project root missing: {project_root}"}
-    changed_apis = ensure_changed_apis(case, changed_apis)
+    report_dir = report_root / case.name
+    report_dir.mkdir(parents=True, exist_ok=True)
+    changed_apis = ensure_changed_apis(case, changed_apis, report_dir / "input_all_changed_apis.csv")
     if not changed_apis.exists():
         return {"case": case.name, "status": "skipped", "reason": f"changed APIs missing: {changed_apis}"}
 
-    report_dir = report_root / case.name
-    report_dir.mkdir(parents=True, exist_ok=True)
     returncode, elapsed = run_step5(case, project_root, changed_apis, report_dir)
     summary = load_summary(report_dir)
     graph_stats = extract_graph_stats(summary)
