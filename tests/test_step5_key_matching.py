@@ -4726,6 +4726,149 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(summary["user_conclusion_summary"]["需要补充输入"], 1)
         self.assertEqual(summary["quality_gate"]["needs_input"], 1)
 
+    def test_generate_enhanced_summary_persists_step5_perf_report_stats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            graph_stats = {
+                "step5_perf": {
+                    "main": {
+                        "business_graph_elapsed_sec": 0.123,
+                    }
+                }
+            }
+            result = tracer.TraceResult(
+                coord="a:b",
+                api_name="com.example.OrderService.run",
+                api_simple="run",
+                api_signature="()",
+                symbol_kind="method",
+                change_type="method_changed",
+                severity="P1",
+                confirmed=True,
+                source="gitdiff",
+                analysis_scope="method",
+                analysis_status="reachable",
+                direct_callers=1,
+                is_reachable=True,
+                reachable_note="已找到调用链",
+                business_reach_depth=1,
+                dependency_chain_coords=[],
+                reason_code="SYSTEM_CODE_REACHABLE",
+                call_paths=["OrderService.run -> DemoApi.call"],
+                evidence_paths=[],
+                verification_commands=[],
+                hops=[],
+                confidence_score=0.95,
+                critical_nodes_hit=[],
+            )
+
+            _, summary_json_path = formatter.generate_enhanced_summary([result], output_dir, graph_stats=graph_stats)
+            summary = json.loads(Path(summary_json_path).read_text(encoding="utf-8"))
+
+        perf = summary["meta"]["graph_stats"]["step5_perf"]
+        self.assertEqual(perf["main"]["business_graph_elapsed_sec"], 0.123)
+        self.assertIn("summary_text_elapsed_sec", perf["report"])
+        self.assertIn("alerts_elapsed_sec", perf["report"])
+        self.assertIn("summary_json_elapsed_sec", perf["report"])
+        self.assertIn("by_module_elapsed_sec", perf["report"])
+        self.assertIn("elapsed_sec", perf["report"])
+        self.assertEqual(perf["report"]["by_api_count"], 1)
+
+    def test_trace_all_apis_merges_step5_perf_without_dropping_main_stats(self):
+        graph = SimpleNamespace()
+        graph_stats = {
+            "step5_perf": {
+                "main": {
+                    "business_graph_elapsed_sec": 12.345,
+                }
+            }
+        }
+
+        results = tracer.trace_all_apis_with_confidence_weighting(
+            [],
+            graph,
+            {},
+            graph_stats=graph_stats,
+        )
+
+        self.assertEqual(results, [])
+        perf = graph_stats["step5_perf"]
+        self.assertEqual(perf["main"]["business_graph_elapsed_sec"], 12.345)
+        self.assertIn("trace", perf)
+        self.assertEqual(perf["trace"]["total_apis"], 0.0)
+        self.assertEqual(perf["trace"]["calls"], 1.0)
+
+    def test_step5_perf_records_top_slow_items_sorted_and_rounded(self):
+        graph = SimpleNamespace()
+
+        tracer._perf_record_top(graph, "trace", "slow_api_traces", {
+            "api_name": "fast",
+            "elapsed_sec": 0.0014,
+        })
+        tracer._perf_record_top(graph, "trace", "slow_api_traces", {
+            "api_name": "slow",
+            "elapsed_sec": 1.23456,
+        })
+        tracer._perf_record_top(graph, "trace", "slow_api_traces", {
+            "api_name": "middle",
+            "elapsed_sec": 0.5,
+        })
+
+        perf = tracer._finalize_step5_perf_stats(graph)
+
+        self.assertEqual(
+            [item["api_name"] for item in perf["trace"]["slow_api_traces"]],
+            ["slow", "middle", "fast"],
+        )
+        self.assertEqual(perf["trace"]["slow_api_traces"][0]["elapsed_sec"], 1.235)
+
+    def test_trace_all_apis_records_slow_api_trace_details(self):
+        graph = SimpleNamespace()
+        graph_stats = {}
+        api_row = {
+            "coord": "a:b",
+            "api_name": "com.example.OrderService.run",
+            "api_simple": "run",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "method_changed",
+            "severity": "P1",
+        }
+        trace_result = tracer.TraceResult(
+            coord="a:b",
+            api_name="com.example.OrderService.run",
+            api_simple="run",
+            api_signature="()",
+            symbol_kind="method",
+            change_type="method_changed",
+            severity="P1",
+            confirmed=True,
+            source="gitdiff",
+            analysis_scope="method",
+            analysis_status="reachable",
+            direct_callers=1,
+            is_reachable=True,
+            reachable_note="已找到调用链",
+            business_reach_depth=1,
+            dependency_chain_coords=[],
+            reason_code="SYSTEM_CODE_REACHABLE",
+            call_paths=["OrderService.run -> DemoApi.call"],
+            evidence_paths=[],
+            verification_commands=[],
+            hops=[],
+            confidence_score=0.95,
+            critical_nodes_hit=[],
+        )
+
+        with patch.object(tracer, "trace_api_with_confidence_weighting", return_value=trace_result):
+            tracer.trace_all_apis_with_confidence_weighting([api_row], graph, {}, graph_stats=graph_stats)
+
+        slow_apis = graph_stats["step5_perf"]["trace"]["slow_api_traces"]
+        self.assertEqual(len(slow_apis), 1)
+        self.assertEqual(slow_apis[0]["api_name"], "com.example.OrderService.run")
+        self.assertEqual(slow_apis[0]["analysis_status"], "reachable")
+        self.assertEqual(slow_apis[0]["reason_code"], "SYSTEM_CODE_REACHABLE")
+
     def test_alerts_csv_is_complete_path_ledger_with_explicit_consumers(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "alerts.csv"

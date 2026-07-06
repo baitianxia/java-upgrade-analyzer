@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import csv
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -829,6 +830,10 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
       - alerts.csv：完整逐链路人工台账
       - by_api/*.txt：每个API的详细分析报告
     """
+    report_started_at = time.perf_counter()
+    report_perf = None
+    if graph_stats is not None:
+        report_perf = graph_stats.setdefault('step5_perf', {}).setdefault('report', {})
     os.makedirs(output_dir, exist_ok=True)
 
     # 分类统计（支持新状态名）
@@ -922,6 +927,7 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     # 保存摘要
     # 关键修复：同时生成 summary.txt（文档承诺的合约）和 s5_enhanced_summary.txt
     summary_path = os.path.join(output_dir, 'summary.txt')
+    summary_text_timer = time.perf_counter()
     with open(summary_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write('\n'.join(summary_lines))
 
@@ -929,10 +935,13 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     enhanced_summary_path = os.path.join(output_dir, 's5_enhanced_summary.txt')
     with open(enhanced_summary_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write('\n'.join(summary_lines))
+    if report_perf is not None:
+        report_perf['summary_text_elapsed_sec'] = round(time.perf_counter() - summary_text_timer, 3)
 
     print(f"  摘要报告 → {summary_path}", file=sys.stderr)
 
     # 生成每个API的详细报告
+    by_api_timer = time.perf_counter()
     api_dir = os.path.join(output_dir, 'by_api')
     os.makedirs(api_dir, exist_ok=True)
     cleanup_generated_output_dir(api_dir, allowed_suffixes=('.json', '.txt'))
@@ -953,12 +962,18 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
         json_payload = trace_result_to_api_entry(result)
         with open(json_path, 'w', encoding='utf-8', newline='\n') as f:
             json.dump(json_payload, f, ensure_ascii=False, indent=2)
+    if report_perf is not None:
+        report_perf['by_api_elapsed_sec'] = round(time.perf_counter() - by_api_timer, 3)
+        report_perf['by_api_count'] = len(all_results)
 
     print(f"  API详细报告 → {api_dir}/", file=sys.stderr)
 
     # 生成alerts.csv（文档承诺的合约）
+    alerts_timer = time.perf_counter()
     alerts_path = os.path.join(output_dir, 'alerts.csv')
     generate_alerts_csv(all_results, alerts_path)
+    if report_perf is not None:
+        report_perf['alerts_elapsed_sec'] = round(time.perf_counter() - alerts_timer, 3)
     alert_split_files = sorted(
         name for name in os.listdir(output_dir)
         if name.startswith('alerts_') and name.endswith('.csv')
@@ -978,13 +993,28 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
         )
 
     # 生成 summary.json（s6_report.py 需要的契约格式）
+    summary_json_timer = time.perf_counter()
     summary_json_path = write_summary_json(all_results, output_dir, graph_stats=graph_stats)
+    if report_perf is not None:
+        report_perf['summary_json_elapsed_sec'] = round(time.perf_counter() - summary_json_timer, 3)
 
     # Key fix: generate by_module aggregation (document promise)
+    by_module_timer = time.perf_counter()
     module_dir = os.path.join(output_dir, "by_module")
     os.makedirs(module_dir, exist_ok=True)
     cleanup_generated_output_dir(module_dir, allowed_suffixes=('.json',))
     aggregate_by_module(all_results, output_dir)
+    if report_perf is not None:
+        report_perf['by_module_elapsed_sec'] = round(time.perf_counter() - by_module_timer, 3)
+        report_perf['elapsed_sec'] = round(time.perf_counter() - report_started_at, 3)
+        try:
+            with open(summary_json_path, 'r', encoding='utf-8') as f:
+                summary_payload = json.load(f)
+            summary_payload.setdefault('meta', {})['graph_stats'] = graph_stats or {}
+            with open(summary_json_path, 'w', encoding='utf-8', newline='\n') as f:
+                json.dump(summary_payload, f, ensure_ascii=False, indent=2)
+        except (OSError, json.JSONDecodeError):
+            pass
 
     return summary_path, summary_json_path
 

@@ -90,6 +90,127 @@ def _step5_bytecode_javap_workers():
     return 4
 
 
+def _step5_perf_stats(graph):
+    if graph is None:
+        return None
+    stats = getattr(graph, '_step5_perf_stats', None)
+    if stats is None:
+        stats = {
+            'bytecode_scan': defaultdict(float),
+            'bytecode_expand': defaultdict(float),
+            'trace': defaultdict(float),
+        }
+        setattr(graph, '_step5_perf_stats', stats)
+    return stats
+
+
+def _perf_add(graph, section, key, value=1):
+    stats = _step5_perf_stats(graph)
+    if stats is None:
+        return
+    stats.setdefault(section, defaultdict(float))[key] += value
+
+
+def _perf_max(graph, section, key, value):
+    stats = _step5_perf_stats(graph)
+    if stats is None:
+        return
+    bucket = stats.setdefault(section, defaultdict(float))
+    bucket[key] = max(bucket.get(key, 0), value)
+
+
+def _perf_record_top(graph, section, key, item, elapsed_key='elapsed_sec', limit=20):
+    stats = _step5_perf_stats(graph)
+    if stats is None or not isinstance(item, dict):
+        return
+    bucket = stats.setdefault(section, defaultdict(float))
+    values = bucket.get(key)
+    if not isinstance(values, list):
+        values = []
+        bucket[key] = values
+    values.append(dict(item))
+    values.sort(key=lambda row: float(row.get(elapsed_key) or 0), reverse=True)
+    del values[limit:]
+
+
+def _round_perf_value(value):
+    if isinstance(value, float):
+        return round(value, 3)
+    if isinstance(value, list):
+        return [_round_perf_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _round_perf_value(item) for key, item in value.items()}
+    return value
+
+
+def _finalize_step5_perf_stats(graph):
+    stats = _step5_perf_stats(graph)
+    if not stats:
+        return {}
+    finalized = {}
+    for section, values in stats.items():
+        bucket = {}
+        for key, value in dict(values or {}).items():
+            bucket[key] = _round_perf_value(value)
+        finalized[section] = bucket
+    return finalized
+
+
+def _merge_step5_perf_stats(target, updates):
+    if not isinstance(target, dict) or not isinstance(updates, dict):
+        return
+    for section, values in updates.items():
+        if isinstance(values, dict) and isinstance(target.get(section), dict):
+            target[section].update(values)
+        else:
+            target[section] = values
+
+
+def _emit_step5_perf_summary(graph):
+    perf = _finalize_step5_perf_stats(graph)
+    if not perf:
+        return
+    scan = perf.get('bytecode_scan') or {}
+    expand = perf.get('bytecode_expand') or {}
+    trace = perf.get('trace') or {}
+    emit_progress(
+        "step5",
+        "perf",
+        (
+            "性能统计："
+            f"scan_elapsed={scan.get('elapsed_sec', 0)}s，"
+            f"scan_visited_classes={int(scan.get('visited_classes', 0))}，"
+            f"scan_javap_tasks={int(scan.get('javap_tasks', 0))}，"
+            f"expand_elapsed={expand.get('elapsed_sec', 0)}s，"
+            f"expand_calls={int(expand.get('calls', 0))}，"
+            f"expand_cache_hits={int(expand.get('candidate_cache_hits', 0))}，"
+            f"member_index_builds={int(expand.get('member_index_builds', 0))}，"
+            f"trace_elapsed={trace.get('elapsed_sec', 0)}s"
+        ),
+    )
+    slow_apis = (trace.get('slow_api_traces') or [])[:5]
+    slow_jars = (scan.get('slow_jar_scans') or [])[:5]
+    slow_lookups = (expand.get('slow_runtime_lookups') or [])[:5]
+    if slow_apis or slow_jars or slow_lookups:
+        def _fmt(items, label_key):
+            parts = []
+            for item in items:
+                label = str(item.get(label_key) or item.get('api_name') or item.get('lookup') or item.get('coord') or '<unknown>')
+                parts.append(f"{label[:80]}={item.get('elapsed_sec', 0)}s")
+            return "; ".join(parts)
+
+        emit_progress(
+            "step5",
+            "perf",
+            (
+                "慢项Top："
+                f"apis=[{_fmt(slow_apis, 'api_name')}]，"
+                f"jars=[{_fmt(slow_jars, 'coord')}]，"
+                f"lookups=[{_fmt(slow_lookups, 'lookup')}]"
+            ),
+        )
+
+
 def _debug_trace_result(topic, result, **fields):
     _step5_debug(
         topic,
@@ -1301,13 +1422,19 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     catalog = _get_runtime_dependency_catalog(graph)
     if not catalog:
         return {}
+    scan_started_at = time.perf_counter()
+    _perf_add(graph, 'bytecode_scan', 'calls', 1)
     existing = catalog.setdefault('_packaged_api_scan_results', {})
     api_rows = [dict(row or {}) for row in (api_rows or []) if (row or {}).get('api_name')]
     missing_rows = [
         row for row in api_rows
         if build_api_identity_key(row) not in existing
     ]
+    _perf_add(graph, 'bytecode_scan', 'api_rows', len(api_rows))
+    _perf_add(graph, 'bytecode_scan', 'missing_api_rows', len(missing_rows))
+    _perf_add(graph, 'bytecode_scan', 'cache_hit_api_rows', max(0, len(api_rows) - len(missing_rows)))
     if not missing_rows:
+        _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
         return existing
 
     target_rows_by_owner = defaultdict(list)
@@ -1328,6 +1455,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         owner_internal_names[owner] = owner.replace('.', '/')
 
     if not target_rows_by_owner:
+        _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
         return existing
 
     by_coord = catalog.get('by_coord') or {}
@@ -1359,8 +1487,11 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 'scanned_classes': 0,
                 'visited_classes': 0,
             })
+        _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
         return existing
 
+    _perf_add(graph, 'bytecode_scan', 'catalog_entries', len(catalog_entries))
+    _perf_max(graph, 'bytecode_scan', 'max_catalog_entries', len(catalog_entries))
     emit_progress(
         "step5",
         "bytecode-scan",
@@ -1386,6 +1517,11 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     for idx, item in enumerate(catalog_entries, 1):
         coord = str(item.get('coord') or '').strip()
         jar_path = str(item.get('jar_path') or '').strip()
+        jar_started_at = time.perf_counter()
+        jar_visited_classes = 0
+        jar_candidate_classes = 0
+        jar_constant_pool_hits = 0
+        jar_failed = False
         if should_log_progress(idx, len(catalog_entries), progress_interval):
             emit_progress(
                 "step5",
@@ -1397,10 +1533,21 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 item=coord or jar_path,
             )
         if not jar_path or not os.path.exists(jar_path):
+            _perf_add(graph, 'bytecode_scan', 'missing_jars', 1)
+            jar_failed = True
             scan_failures.append({
                 'reason': 'RUNTIME_DEPENDENCY_JAR_MISSING',
                 'coord': coord,
                 'jar_path': jar_path,
+            })
+            _perf_record_top(graph, 'bytecode_scan', 'slow_jar_scans', {
+                'coord': coord,
+                'jar_path': jar_path,
+                'elapsed_sec': time.perf_counter() - jar_started_at,
+                'visited_classes': jar_visited_classes,
+                'candidate_classes': jar_candidate_classes,
+                'constant_pool_hits': jar_constant_pool_hits,
+                'failed': jar_failed,
             })
             continue
         try:
@@ -1422,6 +1569,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     if logical_name.endswith('module-info.class') or logical_name.endswith('package-info.class'):
                         continue
                     visited_classes += 1
+                    jar_visited_classes += 1
                     data = zf.read(entry)
                     owner_candidates = []
                     for internal_package_bytes, dotted_package_bytes, grouped_owners in package_bytes:
@@ -1466,6 +1614,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                                 constant_pool_matched_any = True
                                 key = build_api_identity_key(api_row)
                                 for matched in matches:
+                                    _perf_add(graph, 'bytecode_scan', 'constant_pool_hits', 1)
+                                    jar_constant_pool_hits += 1
                                     hits_by_key[key].append({
                                         'coord': coord,
                                         'jar_path': jar_path,
@@ -1489,16 +1639,30 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         'multi_release_version': selected_version,
                         'candidate_owners': sorted(set(candidate_owners)),
                     })
+                    jar_candidate_classes += 1
         except Exception as exc:
+            _perf_add(graph, 'bytecode_scan', 'jar_scan_failures', 1)
+            jar_failed = True
             scan_failures.append({
                 'reason': 'BYTECODE_SCAN_FAILED',
                 'coord': coord,
                 'jar_path': jar_path,
                 'error': str(exc),
             })
+        finally:
+            _perf_record_top(graph, 'bytecode_scan', 'slow_jar_scans', {
+                'coord': coord,
+                'jar_path': jar_path,
+                'elapsed_sec': time.perf_counter() - jar_started_at,
+                'visited_classes': jar_visited_classes,
+                'candidate_classes': jar_candidate_classes,
+                'constant_pool_hits': jar_constant_pool_hits,
+                'failed': jar_failed,
+            })
 
     if javap_tasks:
         workers = min(_step5_bytecode_javap_workers(), len(javap_tasks))
+        javap_started_at = time.perf_counter()
         emit_progress(
             "step5",
             "bytecode-scan",
@@ -1573,6 +1737,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     except Exception:
                         _task, references = task, None
                     handle_javap_result(_task, references)
+        _perf_add(graph, 'bytecode_scan', 'javap_elapsed_sec', time.perf_counter() - javap_started_at)
 
     catalog_status = str(catalog.get('status') or '').strip()
     for row in missing_rows:
@@ -1655,6 +1820,12 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         total=len(catalog_entries),
         elapsed=time.perf_counter() - started_at,
     )
+    _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
+    _perf_add(graph, 'bytecode_scan', 'visited_classes', visited_classes)
+    _perf_add(graph, 'bytecode_scan', 'javap_tasks', len(javap_tasks))
+    _perf_add(graph, 'bytecode_scan', 'javap_classes', scanned_classes)
+    _perf_add(graph, 'bytecode_scan', 'hit_apis', sum(1 for key in hits_by_key if hits_by_key.get(key)))
+    _perf_add(graph, 'bytecode_scan', 'scan_failures', len(scan_failures))
     return existing
 
 
@@ -1809,6 +1980,8 @@ _BYTECODE_REFLECTION_MEMBER_LOOKUP_NAMES = {
 
 
 def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk):
+    index_started_at = time.perf_counter()
+    _perf_add(graph, 'bytecode_expand', 'member_index_builds', 1)
     tasks = []
     unparsed_tasks = []
     direct_by_owner_member = defaultdict(set)
@@ -1893,6 +2066,11 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
         except Exception:
             parse_failures += 1
             continue
+    _perf_add(graph, 'bytecode_expand', 'member_index_elapsed_sec', time.perf_counter() - index_started_at)
+    _perf_add(graph, 'bytecode_expand', 'member_index_visited_classes', visited_classes)
+    _perf_add(graph, 'bytecode_expand', 'member_index_tasks', len(tasks))
+    _perf_add(graph, 'bytecode_expand', 'member_index_unparsed_tasks', len(unparsed_tasks))
+    _perf_add(graph, 'bytecode_expand', 'member_index_parse_failures', parse_failures)
     return {
         'tasks': tasks,
         'unparsed_tasks': unparsed_tasks,
@@ -1937,8 +2115,11 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
     task_ids.update(owner_ids & member_ids & reflection_ids)
     tasks = list(index.get('tasks') or [])
     candidates = [tasks[item] for item in sorted(task_ids) if 0 <= item < len(tasks)]
+    unparsed_checked = 0
+    unparsed_selected = 0
     owner_internal = owner.replace('.', '/')
     for task in index.get('unparsed_tasks') or []:
+        unparsed_checked += 1
         jar_path = str(task.get('jar_path') or '')
         class_entry = str(task.get('class_entry') or '')
         if not jar_path or not class_entry or not os.path.exists(jar_path):
@@ -1949,11 +2130,16 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
         except Exception:
             continue
         if _class_bytes_might_reference_target(data, owner_internal, member):
+            unparsed_selected += 1
             candidates.append(task)
+    index['last_unparsed_checked'] = unparsed_checked
+    index['last_unparsed_selected'] = unparsed_selected
     return candidates
 
 
 def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
+    expand_started_at = time.perf_counter()
+    _perf_add(graph, 'bytecode_expand', 'calls', 1)
     if not graph:
         return {'expanded': False, 'edges_added': 0, 'javap_classes': 0, 'visited_classes': 0}
     parsed = _parse_runtime_method_lookup_key(lookup_key)
@@ -1964,6 +2150,22 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
         expanded = set()
         setattr(graph, '_runtime_dependency_caller_expanded', expanded)
     if lookup_key in expanded:
+        _perf_add(graph, 'bytecode_expand', 'already_expanded_hits', 1)
+        _perf_add(graph, 'bytecode_expand', 'elapsed_sec', time.perf_counter() - expand_started_at)
+        owner, member, signature = parsed
+        _perf_record_top(graph, 'bytecode_expand', 'slow_runtime_lookups', {
+            'lookup': lookup_key,
+            'owner': owner,
+            'member': member,
+            'signature': signature,
+            'elapsed_sec': time.perf_counter() - expand_started_at,
+            'candidate_source': 'already_expanded',
+            'candidate_cache_hit': True,
+            'candidate_classes': 0,
+            'javap_classes': 0,
+            'edges_added': 0,
+            'visited_classes': 0,
+        })
         return {'expanded': False, 'edges_added': 0, 'javap_classes': 0, 'visited_classes': 0}
     expanded.add(lookup_key)
 
@@ -1991,27 +2193,44 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
     if candidate_cache is None:
         candidate_cache = {}
         setattr(graph, '_runtime_dependency_caller_candidate_cache', candidate_cache)
+    candidate_source = 'unknown'
+    candidate_cache_hit = False
+    member_index_unparsed_checked = 0
+    member_index_unparsed_selected = 0
     # Candidate discovery depends only on owner/member, not on the specific
     # spelling of the signature.  Cache it so String/java.lang.String variants
     # and repeated paths do not rescan every runtime JAR.
     candidate_cache_key = (owner, member)
     cached_candidates = candidate_cache.get(candidate_cache_key)
     if cached_candidates is not None:
+        _perf_add(graph, 'bytecode_expand', 'candidate_cache_hits', 1)
+        candidate_cache_hit = True
+        candidate_source = 'cache'
         javap_tasks = list(cached_candidates.get('javap_tasks') or [])
         visited_classes = int(cached_candidates.get('visited_classes') or 0)
     else:
+        _perf_add(graph, 'bytecode_expand', 'candidate_cache_misses', 1)
         prior_light_scans = int(getattr(graph, '_runtime_dependency_caller_candidate_light_scans', 0) or 0)
         prefer_member_index = bool(getattr(graph, '_prefer_runtime_dependency_member_candidate_index', False))
         use_member_index = prefer_member_index or prior_light_scans >= 3
         indexed_tasks = None
         member_index = None
         if use_member_index:
+            _perf_add(graph, 'bytecode_expand', 'member_index_uses', 1)
             member_index = _get_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk)
             indexed_tasks = _candidate_tasks_from_runtime_member_index(member_index, owner, member)
         if indexed_tasks is not None:
+            candidate_source = 'member_index'
+            _perf_add(graph, 'bytecode_expand', 'member_index_candidate_queries', 1)
+            member_index_unparsed_checked = int((member_index or {}).get('last_unparsed_checked') or 0)
+            member_index_unparsed_selected = int((member_index or {}).get('last_unparsed_selected') or 0)
+            _perf_add(graph, 'bytecode_expand', 'member_index_unparsed_checked', member_index_unparsed_checked)
+            _perf_add(graph, 'bytecode_expand', 'member_index_unparsed_selected', member_index_unparsed_selected)
             javap_tasks = list(indexed_tasks)
             visited_classes = int((member_index or {}).get('visited_classes') or 0)
         else:
+            candidate_source = 'light_scan'
+            _perf_add(graph, 'bytecode_expand', 'light_scans', 1)
             setattr(graph, '_runtime_dependency_caller_candidate_light_scans', prior_light_scans + 1)
             javap_tasks = []
             scan_started_at = time.perf_counter()
@@ -2068,7 +2287,9 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                                 'multi_release_version': selected_version,
                             })
                 except Exception:
+                    _perf_add(graph, 'bytecode_expand', 'light_scan_failures', 1)
                     continue
+            _perf_add(graph, 'bytecode_expand', 'light_scan_elapsed_sec', time.perf_counter() - scan_started_at)
         candidate_cache[candidate_cache_key] = {
             'javap_tasks': list(javap_tasks),
             'visited_classes': visited_classes,
@@ -2125,6 +2346,27 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                             total=len(future_map),
                             elapsed=time.perf_counter() - javap_started_at,
                         )
+        _perf_add(graph, 'bytecode_expand', 'javap_elapsed_sec', time.perf_counter() - javap_started_at)
+    _perf_add(graph, 'bytecode_expand', 'elapsed_sec', time.perf_counter() - expand_started_at)
+    _perf_add(graph, 'bytecode_expand', 'candidate_classes', len(javap_tasks))
+    _perf_add(graph, 'bytecode_expand', 'javap_classes', javap_classes)
+    _perf_add(graph, 'bytecode_expand', 'edges_added', edges_added)
+    _perf_add(graph, 'bytecode_expand', 'visited_classes', visited_classes)
+    _perf_record_top(graph, 'bytecode_expand', 'slow_runtime_lookups', {
+        'lookup': lookup_key,
+        'owner': owner,
+        'member': member,
+        'signature': signature,
+        'elapsed_sec': time.perf_counter() - expand_started_at,
+        'candidate_source': candidate_source,
+        'candidate_cache_hit': candidate_cache_hit,
+        'candidate_classes': len(javap_tasks),
+        'javap_classes': javap_classes,
+        'edges_added': edges_added,
+        'visited_classes': visited_classes,
+        'member_index_unparsed_checked': member_index_unparsed_checked,
+        'member_index_unparsed_selected': member_index_unparsed_selected,
+    })
     return {
         'expanded': True,
         'edges_added': edges_added,
@@ -5572,6 +5814,8 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
     if api_bridge_requirements is None:
         api_bridge_requirements = {}
 
+    trace_started_at = time.perf_counter()
+    _perf_add(graph, 'trace', 'calls', 1)
     results = []
     trace_cache = ensure_trace_cache()
     total = len(all_apis or [])
@@ -5596,6 +5840,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         _build_packaged_runtime_dependency_scan_cache(all_apis, graph)
 
     for idx, api_row in enumerate(all_apis, 1):
+        api_started_at = time.perf_counter()
         api_name = api_row.get('api_name', '')
         if not api_name:
             continue
@@ -5640,7 +5885,23 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         )
 
         results.append(result)
+        api_elapsed_sec = time.perf_counter() - api_started_at
+        _perf_add(graph, 'trace', 'api_elapsed_sec', api_elapsed_sec)
+        _perf_add(graph, 'trace', 'apis_traced', 1)
         status = result.analysis_status or 'unknown'
+        _perf_record_top(graph, 'trace', 'slow_api_traces', {
+            'api_name': api_name,
+            'api_signature': api_row.get('api_signature', ''),
+            'symbol_kind': api_row.get('symbol_kind', ''),
+            'change_type': api_row.get('change_type', ''),
+            'severity': api_row.get('severity', ''),
+            'elapsed_sec': api_elapsed_sec,
+            'analysis_status': status,
+            'direct_callers': result.direct_callers,
+            'business_reach_depth': result.business_reach_depth,
+            'confidence_score': result.confidence_score,
+            'reason_code': result.reason_code,
+        })
         status_counts[status] = status_counts.get(status, 0) + 1
         if should_log_progress(idx, total, progress_interval):
             emit_progress(
@@ -5679,6 +5940,14 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         status_counts=status_counts,
         elapsed_seconds=time.perf_counter() - started_at,
     )
+    _perf_add(graph, 'trace', 'elapsed_sec', time.perf_counter() - trace_started_at)
+    _perf_add(graph, 'trace', 'total_apis', total)
+    if graph_stats is not None:
+        _merge_step5_perf_stats(
+            graph_stats.setdefault('step5_perf', {}),
+            _finalize_step5_perf_stats(graph),
+        )
+    _emit_step5_perf_summary(graph)
     return results
 
 

@@ -478,11 +478,12 @@ def _step5_integrated_main_impl(args):
         max_methods=getattr(args, 'max_methods', None),
         retain_analysis_cache=bool(dependency_source_mappings),
     )
+    business_graph_elapsed = time.perf_counter() - business_graph_timer
     emit_progress(
         "step5",
         "graph",
         "业务源码基础图构建完成",
-        elapsed=time.perf_counter() - business_graph_timer,
+        elapsed=business_graph_elapsed,
     )
 
     bridge_check_timer = time.perf_counter()
@@ -682,15 +683,17 @@ def _step5_integrated_main_impl(args):
             reused_analysis=reused_analysis,
             retain_analysis_cache=False,
         )
+        full_graph_elapsed = time.perf_counter() - full_graph_timer
         business_graph_result = None
         reused_analysis = None
         emit_progress(
             "step5",
             "graph",
             f"依赖源码图构建完成，依赖源码根 {len(dependency_only_roots)} 个",
-            elapsed=time.perf_counter() - full_graph_timer,
+            elapsed=full_graph_elapsed,
         )
     else:
+        full_graph_elapsed = 0.0
         print("\n复用业务源码图进行调用链分析...", file=sys.stderr)
         emit_progress("step5", "graph", "未提供依赖源码映射，复用业务源码图")
         graph_result = business_graph_result
@@ -698,6 +701,16 @@ def _step5_integrated_main_impl(args):
     graph = graph_result['graph']
     type_metadata = graph_result['type_metadata']
     graph_stats = graph_result['stats']
+    graph_stats.setdefault('step5_perf', {})
+    graph_stats['step5_perf'].setdefault('main', {})
+    graph_stats['step5_perf']['main'].update({
+        'business_graph_elapsed_sec': round(business_graph_elapsed, 3),
+        'dependency_graph_elapsed_sec': round(full_graph_elapsed, 3),
+        'source_root_count': len(source_roots or []),
+        'business_source_root_count': len(business_roots or []),
+        'dependency_source_mapping_count': len(dependency_source_mappings or []),
+    })
+    bytecode_timer = time.perf_counter()
     bytecode_evidence, bytecode_stats = collect_business_bytecode_edges(
         business_roots,
         artifact_catalog=runtime_dependency_catalog,
@@ -716,6 +729,7 @@ def _step5_integrated_main_impl(args):
             else ('partial' if bytecode_stats.get('classes_scanned') else 'not_applicable')
         ),
     }
+    graph_stats['step5_perf']['main']['business_bytecode_elapsed_sec'] = round(time.perf_counter() - bytecode_timer, 3)
     graph_stats['artifact_bytecode'] = {
         'status': runtime_dependency_catalog.get('status', 'insufficient'),
         'reason_codes': list(runtime_dependency_catalog.get('reason_codes') or []),
