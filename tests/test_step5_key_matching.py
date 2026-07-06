@@ -4869,6 +4869,45 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(slow_apis[0]["analysis_status"], "reachable")
         self.assertEqual(slow_apis[0]["reason_code"], "SYSTEM_CODE_REACHABLE")
 
+    def test_large_runtime_catalog_prefers_member_index_without_light_scan(self):
+        entries = [
+            {
+                "coord": f"com.example:dep-{idx}",
+                "jar_path": f"/missing/dep-{idx}.jar",
+            }
+            for idx in range(50)
+        ]
+        graph = SimpleNamespace(
+            runtime_dependency_catalog={
+                "status": "complete",
+                "entries": entries,
+            }
+        )
+        fake_index = {
+            "tasks": [],
+            "unparsed_tasks": [],
+            "direct_by_owner_member": {},
+            "owner_string_ids": {},
+            "member_string_ids": {},
+            "reflection_ids": set(),
+            "visited_classes": 1234,
+            "parse_failures": 0,
+        }
+
+        with patch.object(tracer, "_get_runtime_dependency_member_candidate_index", return_value=fake_index) as mocked_index:
+            result = tracer._ensure_runtime_dependency_callers_for_key(
+                graph,
+                "com.example.Target.run()",
+            )
+
+        self.assertTrue(result["expanded"])
+        mocked_index.assert_called_once()
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_expand"]
+        self.assertEqual(perf["member_index_auto_large_catalog"], 1.0)
+        self.assertEqual(perf["member_index_candidate_queries"], 1.0)
+        self.assertNotIn("light_scans", perf)
+        self.assertEqual(perf["slow_runtime_lookups"][0]["candidate_source"], "member_index")
+
     def test_alerts_csv_is_complete_path_ledger_with_explicit_consumers(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "alerts.csv"

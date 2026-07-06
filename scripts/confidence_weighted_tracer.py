@@ -90,6 +90,26 @@ def _step5_bytecode_javap_workers():
     return 4
 
 
+def _step5_runtime_member_index_min_jars():
+    value = str(os.environ.get('JUA_STEP5_RUNTIME_MEMBER_INDEX_MIN_JARS') or '').strip()
+    if value:
+        try:
+            return max(1, int(value))
+        except ValueError:
+            return 50
+    return 50
+
+
+def _should_prefer_runtime_member_candidate_index(graph, catalog_entries):
+    if bool(getattr(graph, '_prefer_runtime_dependency_member_candidate_index', False)):
+        return True, 'explicit'
+    entry_count = len(catalog_entries or [])
+    threshold = _step5_runtime_member_index_min_jars()
+    if entry_count >= threshold:
+        return True, f'large_runtime_catalog:{entry_count}>={threshold}'
+    return False, ''
+
+
 def _step5_perf_stats(graph):
     if graph is None:
         return None
@@ -2211,12 +2231,26 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
     else:
         _perf_add(graph, 'bytecode_expand', 'candidate_cache_misses', 1)
         prior_light_scans = int(getattr(graph, '_runtime_dependency_caller_candidate_light_scans', 0) or 0)
-        prefer_member_index = bool(getattr(graph, '_prefer_runtime_dependency_member_candidate_index', False))
+        prefer_member_index, prefer_member_index_reason = _should_prefer_runtime_member_candidate_index(
+            graph,
+            catalog_entries,
+        )
         use_member_index = prefer_member_index or prior_light_scans >= 3
         indexed_tasks = None
         member_index = None
         if use_member_index:
             _perf_add(graph, 'bytecode_expand', 'member_index_uses', 1)
+            if prefer_member_index_reason:
+                _perf_add(graph, 'bytecode_expand', 'member_index_preferred', 1)
+                if prefer_member_index_reason.startswith('large_runtime_catalog:'):
+                    _perf_add(graph, 'bytecode_expand', 'member_index_auto_large_catalog', 1)
+                    if not bool(getattr(graph, '_runtime_member_index_large_catalog_logged', False)):
+                        setattr(graph, '_runtime_member_index_large_catalog_logged', True)
+                        emit_progress(
+                            "step5",
+                            "bytecode-expand",
+                            f"运行时依赖数量较大，直接启用 member 候选索引：{prefer_member_index_reason}",
+                        )
             member_index = _get_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk)
             indexed_tasks = _candidate_tasks_from_runtime_member_index(member_index, owner, member)
         if indexed_tasks is not None:
