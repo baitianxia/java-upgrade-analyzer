@@ -26,6 +26,37 @@ python3 -m unittest tests.test_step4_stability
 python3 -m unittest tests.test_step5_key_matching tests.test_business_bytecode_graph tests.test_artifact_bytecode_catalog tests.test_indirect_usage_analyzer
 ```
 
+## 修复准入：先分析，再改代码
+
+每个修复都必须先写清楚“为什么这个修复是合理的”，不能为了某个真实项目或某个单点样例临时放宽规则。修复前至少确认：
+
+- Java 语义是否成立：例如 varargs、装箱、继承、重载、静态 import、字段访问是否符合编译期规则。
+- 适用边界是否明确：该规则适用于哪些 owner、签名、表达式形态；哪些情况必须继续保持 `uncertain` / `not_analyzed`。
+- 是否会引入误报：特别是同名不同 owner、同名不同重载、raw key fallback、简单名 import 冲突。
+- 是否有正反成对回归：新增命中能力时，必须同时覆盖“应该命中”和“不应该命中”。
+- 是否经过真实项目验证：Step5/字节码/输出语义相关修复，至少跑一个真实项目；高风险修复应跑 `--case all`。
+
+禁止把以下做法作为修复：
+
+- 为了让某个 API reachable，直接把 raw key 全部归入目标签名。
+- 在有多个重载时，因为名字相同就判定命中。
+- 因为真实项目 grep 有结果，就忽略签名、owner 或 test/prod 区分。
+- 把能力不足伪装成 `not_found_in_static_analysis`。
+
+## 测试分层：不要只跑几个场景
+
+测试按风险分层执行，不能用少量单测替代大范围验证：
+
+| 层级 | 执行时机 | 命令/方式 | 目标 |
+|---|---|---|---|
+| L0 精准回归 | 每次局部修改后立即执行 | 相关 `unittest` 单例或单文件 | 快速验证刚修的正反例 |
+| L1 Step 相关回归 | 修改 Step4/Step5 逻辑后执行 | `tests.test_step5_key_matching`、`test_business_bytecode_graph`、`test_artifact_bytecode_catalog`、`test_indirect_usage_analyzer` | 覆盖签名、owner、字节码、间接调用 |
+| L2 Smoke | 修改分析主流程后执行 | `smoke_regression.py --group core` 和 `--group step5` | 防止主流程和输出合同破坏 |
+| L3 全量单测 | 较大逻辑调整或提交前执行 | `python3 -m unittest discover -s tests -p 'test_*.py'` | 防止跨步骤回归 |
+| L4 真实项目矩阵 | Step5 准确性/输出语义/性能相关修改后执行 | `python3 scripts/real_project_regression.py --case all` | 用真实项目发现解析边界和误报/漏报 |
+
+如果 L4 每次都发现新问题，说明当前测试矩阵仍不充分，应优先扩充真实项目探针和最小 fixture，而不是继续局部修补。
+
 ## 正例和负例必须成对
 
 新增一种命中能力时，必须同时增加“应该命中”和“不应误报”的测试。

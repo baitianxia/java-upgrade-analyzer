@@ -2548,6 +2548,52 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     expr = _strip_balanced_outer_parens(expr.strip())
     local_var_types = local_var_types or getattr(method_def, 'local_var_types', {}) or {}
 
+    def split_top_level_ternary(text):
+        paren_depth = bracket_depth = brace_depth = 0
+        question_index = -1
+        nested_ternary_depth = 0
+        for idx, ch in enumerate(text or ''):
+            if ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                paren_depth = max(0, paren_depth - 1)
+            elif ch == '[':
+                bracket_depth += 1
+            elif ch == ']':
+                bracket_depth = max(0, bracket_depth - 1)
+            elif ch == '{':
+                brace_depth += 1
+            elif ch == '}':
+                brace_depth = max(0, brace_depth - 1)
+            elif paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
+                if ch == '?':
+                    if question_index < 0:
+                        question_index = idx
+                    else:
+                        nested_ternary_depth += 1
+                elif ch == ':' and question_index >= 0:
+                    if nested_ternary_depth > 0:
+                        nested_ternary_depth -= 1
+                        continue
+                    return (
+                        text[:question_index].strip(),
+                        text[question_index + 1:idx].strip(),
+                        text[idx + 1:].strip(),
+                    )
+        return None
+
+    ternary_parts = split_top_level_ternary(expr)
+    if ternary_parts:
+        _condition_expr, true_expr, false_expr = ternary_parts
+        true_type = infer_param_type_from_expression(true_expr, method_def, local_var_types)
+        false_type = infer_param_type_from_expression(false_expr, method_def, local_var_types)
+        if true_type and false_type and true_type == false_type:
+            return true_type
+        if true_type in {'Object', 'null', None} and false_type:
+            return false_type
+        if false_type in {'Object', 'null', None} and true_type:
+            return true_type
+
     cast_match = re.match(r'^\(\s*([A-Za-z_][\w.]*)\s*\)\s*(.+)$', expr)
     if cast_match:
         cast_type = cast_match.group(1).strip()
