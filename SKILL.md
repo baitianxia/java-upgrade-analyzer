@@ -447,7 +447,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中保留 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` / `RUNTIME_DEPENDENCY_USES_REMOVED_API` 事实，但若该依赖存在源码映射，Step5 必须先继续尝试回溯到业务代码，只有未能证明业务入口时才收敛为 `uncertain`
 - 规则：验收测试必须包含真实 `jdeps` 对照；`jdeps` 能发现的静态跨 JAR 类依赖，本 Skill 不得漏报，并继续提供成员级方法/字段匹配
 - 规则：业务源码图与当前业务字节码图使用统一 owner/name/signature 身份；冲突时保留两类 provenance，不得用字节码静默覆盖源码证据
-- 规则：`s5_call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条终止链路独立一行，禁止只保留第一条路径或静默截断
+- 规则：`s5_call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条唯一终止链路独立一行，禁止只保留第一条路径或静默截断；同一终止链路重复命中时合并为一行并用 `path_occurrence_count` 表示次数
 - 规则：`alerts.csv` 必须作为完整主文件保留；当台账较大时，Step5 可额外输出 `alerts_reachable.csv`、`alerts_uncertain.csv`、`alerts_not_found_in_static_analysis.csv`、`alerts_not_analyzed.csv` 及 `alerts_<status>_NNN.csv` 分片作为人工阅读视图。拆分文件不得替代完整主文件，也不得做成轻量索引或样例子集
 - 规则：链路台账必须显式给出 target/consumer 坐标、消费类和方法、业务入口、逐链路状态、中断原因、证据文件及稳定 api_id/path_id；API 汇总状态不得覆盖或删除其他候选链路
 - 人工排查入口固定为 Step4 `all_changed_apis.csv`、Step5 `alerts.csv`、Step6 `s6_report.md`；其他 JSON/catalog 默认作为机器或深度排障证据

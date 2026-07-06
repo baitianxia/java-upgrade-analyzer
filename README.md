@@ -233,6 +233,8 @@ python3 scripts/run_step.py --step step1 \
 `alerts.csv` 查看完整逐链路追踪过程，Step6 `s6_report.md` 查看最终汇总结论。
 `alerts.csv` 不是样例子集：每个进入 Step5 的 API 至少一行，每条终止链路独立一行，
 并明确消费依赖、消费类/方法、业务入口、链路状态、中断原因和原始证据位置。
+如果同一终止链路在同一消费方法内重复命中，`alerts.csv` 会合并为一行，并通过
+`path_occurrence_count` 标明重复命中次数；不同业务入口、不同消费方或不同完整链路不会合并。
 当 `alerts.csv` 过大影响人工或表格工具打开时，Step5 会同时输出非空的阅读拆分文件：
 `alerts_reachable.csv`、`alerts_uncertain.csv`、`alerts_not_found_in_static_analysis.csv`、
 `alerts_not_analyzed.csv`；若单个分类仍过大，则输出

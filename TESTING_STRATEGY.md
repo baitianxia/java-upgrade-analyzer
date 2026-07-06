@@ -68,7 +68,7 @@ python3 -m unittest tests.test_step5_key_matching tests.test_business_bytecode_g
 | Step5 字段访问 | import/static import/FQCN 指向目标 owner | 简单名相同但 import 指向其他 owner |
 | Step5 跨依赖字节码 | 业务可回溯到命中依赖 | 依赖命中但没有业务入口，或业务只连到无关分支 |
 | Step1 依赖配对 | 完整坐标或唯一迁移可确认 | 同 artifactId 不同 group 的歧义配对 |
-| 输出台账 | 每条有效链路有完整 path/evidence | 只输出抽样、轻量索引或缺少消费方 |
+| 输出台账 | 每条唯一有效链路有完整 path/evidence，重复命中通过 occurrence count 表达 | 只输出抽样、轻量索引、缺少消费方，或把不同入口链路错误合并 |
 
 ## 高风险回归池
 

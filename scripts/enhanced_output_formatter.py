@@ -45,7 +45,8 @@ ALERTS_CSV_FIELDNAMES = [
     'conclusion_level', 'action_type', 'business_reachable', 'business_entry',
     'consumer_coord', 'consumer_class', 'consumer_method', 'consumer_signature',
     'path_text', 'stop_reason', 'reason', 'action', 'confidence', 'depth',
-    'coverage_status', 'coverage_details', 'evidence_types', 'evidence_files', 'detail_file',
+    'path_occurrence_count', 'coverage_status', 'coverage_details',
+    'evidence_types', 'evidence_files', 'detail_file',
 ]
 
 ALERTS_SPLIT_MAX_ROWS = 50000
@@ -1201,7 +1202,7 @@ def _alert_rows_for_result(result):
                 'evidence': evidence,
             })
 
-    details = _suppress_suffix_covered_path_details(details)
+    details = _deduplicate_equivalent_path_details(_suppress_suffix_covered_path_details(details))
 
     rows = []
     detail_file = f"by_api/{build_by_api_safe_filename(result)}.txt"
@@ -1250,6 +1251,7 @@ def _alert_rows_for_result(result):
             'action': explanation['action'] or '',
             'confidence': f"{float(detail.get('confidence') or 0.0):.2f}",
             'depth': int(detail.get('depth') or 0),
+            'path_occurrence_count': int(detail.get('_path_occurrence_count') or 1),
             'coverage_status': capability_coverage.get('status') or '',
             'coverage_details': json.dumps(
                 {
@@ -1264,6 +1266,47 @@ def _alert_rows_for_result(result):
             'detail_file': detail_file,
         })
     return rows
+
+
+def _deduplicate_equivalent_path_details(details):
+    deduped = []
+    seen = {}
+    for detail in details or []:
+        key = _alert_path_detail_identity(detail)
+        if key in seen:
+            existing = seen[key]
+            existing['_path_occurrence_count'] = int(existing.get('_path_occurrence_count') or 1) + 1
+            existing_evidence = list(existing.get('evidence') or [])
+            existing_evidence.extend(list(detail.get('evidence') or []))
+            existing['evidence'] = existing_evidence
+            continue
+        copied = dict(detail)
+        copied['_path_occurrence_count'] = int(copied.get('_path_occurrence_count') or 1)
+        seen[key] = copied
+        deduped.append(copied)
+    return deduped
+
+
+def _alert_path_detail_identity(detail):
+    semantic_evidence = [
+        {
+            key: item.get(key) or ''
+            for key in ('caller_symbol', 'callee_key', 'evidence_type', 'owner_coord')
+        }
+        for item in list((detail or {}).get('evidence') or [])
+    ]
+    return json.dumps({
+        'path_status': (detail or {}).get('path_status') or '',
+        'stop_reason': (detail or {}).get('stop_reason') or '',
+        'business_reachable': (detail or {}).get('business_reachable'),
+        'business_entry': (detail or {}).get('business_entry') or '',
+        'consumer_coord': (detail or {}).get('consumer_coord') or '',
+        'consumer_class': (detail or {}).get('consumer_class') or '',
+        'consumer_method': (detail or {}).get('consumer_method') or '',
+        'consumer_signature': (detail or {}).get('consumer_signature') or '',
+        'path_text': (detail or {}).get('path_text') or '',
+        'evidence': semantic_evidence,
+    }, ensure_ascii=False, sort_keys=True)
 
 
 def _suppress_suffix_covered_path_details(details):

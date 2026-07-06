@@ -4532,6 +4532,92 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
         self.assertNotIn("B.call -> C.removed", path_texts)
 
+    def test_alerts_csv_deduplicates_equivalent_paths_but_keeps_distinct_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "alerts.csv"
+            result = tracer.TraceResult(
+                coord="com.acme:target-lib",
+                api_name="com.acme.Target.removed",
+                api_simple="removed",
+                api_signature="()",
+                symbol_kind="method",
+                change_type="METHOD_REMOVED",
+                severity="P0",
+                confirmed=True,
+                source="japicmp",
+                analysis_scope="method",
+                analysis_status="reachable",
+                direct_callers=3,
+                is_reachable=True,
+                reachable_note="已证明触达业务代码",
+                business_reach_depth=1,
+                dependency_chain_coords=["com.acme:consumer-lib"],
+                call_paths=[],
+                evidence_paths=[],
+                reason_code="BUSINESS_ARTIFACT_BYTECODE_USAGE",
+                verification_commands=[],
+                hops=[],
+                confidence_score=1.0,
+                critical_nodes_hit=[],
+                path_details=[
+                    {
+                        "path_status": "reachable",
+                        "business_reachable": True,
+                        "business_entry": "A.entry",
+                        "consumer_coord": "com.acme:consumer-lib",
+                        "path_text": "A.entry -> C.removed",
+                        "confidence": 1.0,
+                        "depth": 1,
+                        "evidence": [
+                            {
+                                "caller_symbol": "A.entry",
+                                "callee_key": "C.removed",
+                                "evidence_type": "method_invocation",
+                                "owner_coord": "com.acme:consumer-lib",
+                                "file": "/src/A.java",
+                            }
+                        ],
+                    },
+                    {
+                        "path_status": "reachable",
+                        "business_reachable": True,
+                        "business_entry": "A.entry",
+                        "consumer_coord": "com.acme:consumer-lib",
+                        "path_text": "A.entry -> C.removed",
+                        "confidence": 1.0,
+                        "depth": 1,
+                        "evidence": [
+                            {
+                                "caller_symbol": "A.entry",
+                                "callee_key": "C.removed",
+                                "evidence_type": "method_invocation",
+                                "owner_coord": "com.acme:consumer-lib",
+                                "file": "/relocated/A.java",
+                            }
+                        ],
+                    },
+                    {
+                        "path_status": "reachable",
+                        "business_reachable": True,
+                        "business_entry": "E.entry",
+                        "consumer_coord": "com.acme:consumer-lib",
+                        "path_text": "E.entry -> C.removed",
+                        "confidence": 1.0,
+                        "depth": 1,
+                        "evidence": [],
+                    },
+                ],
+            )
+
+            formatter.generate_alerts_csv([result], output)
+            with output.open(encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(len(rows), 2)
+        counts = {row["path_text"]: row["path_occurrence_count"] for row in rows}
+        self.assertEqual(counts["A.entry -> C.removed"], "2")
+        self.assertEqual(counts["E.entry -> C.removed"], "1")
+
     def test_alerts_csv_writes_review_split_files_without_replacing_main_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "alerts.csv"
