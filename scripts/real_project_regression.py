@@ -49,6 +49,11 @@ class RealProjectCase:
     baseline_specs: tuple[BaselineSpec, ...]
     source_dirs: tuple[Path, ...] = field(default_factory=tuple)
     changed_api_rows: tuple[dict[str, str], ...] = field(default_factory=tuple)
+    source_shape_patterns: dict[str, str] = field(default_factory=dict)
+    min_source_shape_files: dict[str, int] = field(default_factory=dict)
+    min_methods_indexed: int = 0
+    min_reverse_edges_indexed: int = 0
+    max_elapsed_seconds: float = 0.0
 
 
 CASES = {
@@ -155,6 +160,73 @@ CASES = {
         name="dubbo",
         default_project=Path("/private/tmp/jua-real-project-dubbo"),
         default_changed_apis=Path("/private/tmp/jua-dubbo-mixed-probe/report/s4_jar_compare/all_changed_apis.csv"),
+        changed_api_rows=(
+            {
+                "coord": "org.apache.dubbo:dubbo-common",
+                "old_version": "probe",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.dubbo.common.utils.StringUtils.isEquals",
+                "api_simple": "isEquals",
+                "symbol_kind": "method",
+                "api_signature": "(String, String)",
+                "confirmed": "true",
+                "severity": "P1",
+                "source": "real_project_dubbo_probe",
+            },
+            {
+                "coord": "org.apache.dubbo:dubbo-common",
+                "old_version": "probe",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.dubbo.common.utils.StringUtils.parseQueryString",
+                "api_simple": "parseQueryString",
+                "symbol_kind": "method",
+                "api_signature": "(String)",
+                "confirmed": "true",
+                "severity": "P1",
+                "source": "real_project_dubbo_probe",
+            },
+            {
+                "coord": "org.apache.dubbo:dubbo-common",
+                "old_version": "probe",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap",
+                "api_simple": "isEmptyMap",
+                "symbol_kind": "method",
+                "api_signature": "(Map<?, ?>)",
+                "confirmed": "true",
+                "severity": "P1",
+                "source": "real_project_dubbo_probe",
+            },
+            {
+                "coord": "org.apache.dubbo:dubbo-common",
+                "old_version": "probe",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.dubbo.common.URL.valueOf",
+                "api_simple": "valueOf",
+                "symbol_kind": "method",
+                "api_signature": "(String)",
+                "confirmed": "true",
+                "severity": "P1",
+                "source": "real_project_dubbo_probe",
+            },
+            {
+                "coord": "org.apache.dubbo:dubbo-common",
+                "old_version": "probe",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.dubbo.common.utils.NetUtils.getLocalHost",
+                "api_simple": "getLocalHost",
+                "symbol_kind": "method",
+                "api_signature": "()",
+                "confirmed": "true",
+                "severity": "P1",
+                "source": "real_project_dubbo_probe",
+            },
+        ),
         baseline_specs=(
             BaselineSpec(
                 symbol="org.apache.dubbo.common.utils.StringUtils.isEquals",
@@ -203,6 +275,25 @@ CASES = {
                 notes="zero-argument utility method",
             ),
         ),
+        source_shape_patterns={
+            "static_stringutils_import": r"import\s+static\s+org\.apache\.dubbo\.common\.utils\.StringUtils\.",
+            "static_collectionutils_import": r"import\s+static\s+org\.apache\.dubbo\.common\.utils\.CollectionUtils\.",
+            "lambda_expression": r"->",
+            "method_reference": r"::",
+            "class_for_name": r"\bClass\.forName\s*\(",
+            "reflection_get_method": r"\.getMethod\s*\(",
+        },
+        min_source_shape_files={
+            "static_stringutils_import": 20,
+            "static_collectionutils_import": 5,
+            "lambda_expression": 300,
+            "method_reference": 100,
+            "class_for_name": 10,
+            "reflection_get_method": 30,
+        },
+        min_methods_indexed=15000,
+        min_reverse_edges_indexed=100000,
+        max_elapsed_seconds=60.0,
     ),
     "commons-lang": RealProjectCase(
         name="commons-lang",
@@ -352,6 +443,44 @@ def collect_alert_files(alerts_csv: Path, symbol: str) -> set[str]:
     return files
 
 
+def collect_source_shape_metrics(project_root: Path, patterns: dict[str, str]) -> dict[str, dict[str, int]]:
+    compiled = {name: re.compile(pattern) for name, pattern in (patterns or {}).items()}
+    metrics = {
+        name: {"files": 0, "occurrences": 0}
+        for name in compiled.keys()
+    }
+    if not compiled:
+        return metrics
+    for java_file in iter_java_files(project_root):
+        try:
+            text = java_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for name, regex in compiled.items():
+            matches = list(regex.finditer(text))
+            if not matches:
+                continue
+            metrics[name]["files"] += 1
+            metrics[name]["occurrences"] += len(matches)
+    return metrics
+
+
+def extract_graph_stats(summary: dict) -> dict:
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    graph_stats = meta.get("graph_stats") if isinstance(meta.get("graph_stats"), dict) else {}
+    parser_usage = graph_stats.get("parser_usage") if isinstance(graph_stats.get("parser_usage"), dict) else {}
+    return {
+        "methods_indexed": int(graph_stats.get("methods_indexed") or 0),
+        "reverse_edges_indexed": int(graph_stats.get("reverse_edges_indexed") or 0),
+        "initializer_methods_indexed": int(graph_stats.get("initializer_methods_indexed") or 0),
+        "initializer_edges_indexed": int(graph_stats.get("initializer_edges_indexed") or 0),
+        "tree_sitter_files": int(parser_usage.get("tree_sitter") or 0),
+        "regex_files": int(parser_usage.get("regex") or 0),
+        "truncated": bool(graph_stats.get("truncated")),
+        "edge_cap_hits": int(graph_stats.get("edge_cap_hits") or 0),
+    }
+
+
 def ensure_changed_apis(case: RealProjectCase, changed_apis: Path) -> Path:
     if changed_apis.exists() or not case.changed_api_rows:
         return changed_apis
@@ -407,9 +536,39 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
     report_dir.mkdir(parents=True, exist_ok=True)
     returncode, elapsed = run_step5(case, project_root, changed_apis, report_dir)
     summary = load_summary(report_dir)
+    graph_stats = extract_graph_stats(summary)
+    source_shape_metrics = collect_source_shape_metrics(project_root, case.source_shape_patterns)
     alerts_csv = report_dir / "s5_call_chain" / "alerts.csv"
     checks = []
     failures = []
+    warnings = []
+
+    for name, minimum_files in (case.min_source_shape_files or {}).items():
+        actual_files = int((source_shape_metrics.get(name) or {}).get("files") or 0)
+        if actual_files < int(minimum_files or 0):
+            failures.append(f"source_shape:{name}: files={actual_files} below_min={minimum_files}")
+
+    if case.min_methods_indexed and graph_stats["methods_indexed"] < case.min_methods_indexed:
+        failures.append(
+            f"graph_stats: methods_indexed={graph_stats['methods_indexed']} below_min={case.min_methods_indexed}"
+        )
+    if case.min_reverse_edges_indexed and graph_stats["reverse_edges_indexed"] < case.min_reverse_edges_indexed:
+        failures.append(
+            "graph_stats: reverse_edges_indexed="
+            f"{graph_stats['reverse_edges_indexed']} below_min={case.min_reverse_edges_indexed}"
+        )
+    if graph_stats["truncated"] or graph_stats["edge_cap_hits"]:
+        failures.append(
+            f"graph_stats: truncated={graph_stats['truncated']} edge_cap_hits={graph_stats['edge_cap_hits']}"
+        )
+    if case.max_elapsed_seconds and elapsed > case.max_elapsed_seconds:
+        failures.append(f"performance: elapsed={elapsed:.2f}s over_budget={case.max_elapsed_seconds:.2f}s")
+    if not alerts_csv.exists():
+        failures.append("alerts.csv missing")
+    elif alerts_csv.stat().st_size == 0:
+        failures.append("alerts.csv empty")
+    if (report_dir / "s5_call_chain" / "alerts_reachable.csv").exists() is False:
+        warnings.append("alerts_reachable.csv missing")
 
     for spec in case.baseline_specs:
         production_baseline, test_baseline, occurrences = collect_baseline_files(project_root, spec)
@@ -434,6 +593,8 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         checks.append(check)
         if spec.require_zero_production_missing and production_missing:
             failures.append(f"{spec.symbol}: production_missing={len(production_missing)}")
+        if spec.require_zero_production_missing and not production_baseline:
+            failures.append(f"{spec.symbol}: production_baseline_empty")
 
     status = "passed" if returncode == 0 and not failures else "failed"
     if returncode != 0:
@@ -446,6 +607,7 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         "changed_apis": str(changed_apis),
         "report_dir": str(report_dir),
         "elapsed_seconds": round(elapsed, 2),
+        "performance_budget_seconds": case.max_elapsed_seconds,
         "step5_returncode": returncode,
         "summary": {
             "total_apis": summary.get("total_apis"),
@@ -454,8 +616,11 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
             "not_analyzed": summary.get("not_analyzed"),
             "not_found_in_static_analysis": summary.get("not_found_in_static_analysis"),
         },
+        "graph_stats": graph_stats,
+        "source_shape_metrics": source_shape_metrics,
         "checks": checks,
         "failures": failures,
+        "warnings": warnings,
     }
 
 
@@ -502,8 +667,17 @@ def main(argv=None):
                 print(f"  reason: {item['reason']}")
                 continue
             print(f"  elapsed: {item['elapsed_seconds']}s")
+            if item.get("performance_budget_seconds"):
+                print(f"  performance budget: {item['performance_budget_seconds']}s")
             print(f"  report: {item['report_dir']}")
             print(f"  summary: {item['summary']}")
+            if item.get("graph_stats"):
+                print(f"  graph_stats: {item['graph_stats']}")
+            for name, metric in sorted((item.get("source_shape_metrics") or {}).items()):
+                print(
+                    f"  source_shape: {name} files={metric.get('files', 0)} "
+                    f"occurrences={metric.get('occurrences', 0)}"
+                )
             for check in item.get("checks", []):
                 print(
                     "  check: {symbol} production={baseline_production_files} "
@@ -516,6 +690,8 @@ def main(argv=None):
                     print(f"    {label} {missing}")
             for failure in item.get("failures", []):
                 print(f"  FAILURE {failure}")
+            for warning in item.get("warnings", []):
+                print(f"  WARNING {warning}")
     return 1 if failed else 0
 
 

@@ -576,5 +576,8 @@ python3 "$SKILL/scripts/error_handler.py" summary --report-dir .upgrade-report
 - 按主题回归：`python3 "$SKILL/scripts/smoke_regression.py" --group core|step5|orchestrator`
 - 标准测试入口：`python3 -m unittest discover -s "$SKILL/tests" -v`
 - 真实项目回归（本地存在探针项目时）：`python3 "$SKILL/scripts/real_project_regression.py" --case all`
+- Dubbo 大型项目探针：`python3 "$SKILL/scripts/real_project_regression.py" --case dubbo --report-root /private/tmp/jua-real-dubbo-regression --json-out /private/tmp/jua-real-dubbo-regression/result.json`
+  - 该探针会校验静态导入、lambda、method reference、反射源码形态、Step5 图规模、alerts 输出完整性和 60 秒性能预算
+  - `org.apache.dubbo.common.URL.valueOf` 是重载较多的 non-gating 观测项；若质量审计报告 medium signal，需要人工确认是探针过宽还是分析漏报
 - 若需要保留临时目录便于排查：`python3 "$SKILL/scripts/smoke_regression.py" --keep-tmp`
 - CI 工作流：`.github/workflows/smoke-regression.yml`
