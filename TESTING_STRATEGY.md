@@ -33,6 +33,13 @@ python3 scripts/accuracy_benchmark.py --profile all
 
 `accuracy_benchmark.py` 把历史上反复出问题的能力点显式分组，包括 `jdeps` 对照、运行时依赖字节码链路、反射/MethodHandle、owner/import/signature 精度、`alerts.csv` 完整台账和 Step6 汇总结论。它不是替代真实项目测试，而是防止已知准确性合同在后续修改中退化。
 
+质量风险矩阵见 `QUALITY_RISK_MATRIX.md`。真实项目矩阵即使 `passed`，也必须关注 `non_gating_production_missing`、`not_analyzed`、`uncertain` 和 skipped 等质量信号：
+
+```bash
+python3 scripts/real_project_regression.py --case all --json-out /private/tmp/jua-real/result.json
+python3 scripts/quality_signal_audit.py /private/tmp/jua-real/result.json
+```
+
 每次修改分析逻辑后至少执行 quick 或等价命令：
 
 ```bash
@@ -81,8 +88,9 @@ python3 -m unittest tests.test_step5_key_matching tests.test_business_bytecode_g
 | L3 Smoke | 修改分析主流程后执行 | `smoke_regression.py --group core` 和 `--group step5` | 防止主流程和输出合同破坏 |
 | L4 全量单测 | 较大逻辑调整或提交前执行 | `python3 -m unittest discover -s tests -p 'test_*.py'` | 防止跨步骤回归 |
 | L5 真实项目矩阵 | Step5 准确性/输出语义/性能相关修改后执行 | `python3 scripts/real_project_regression.py --case all` | 用真实项目发现解析边界和误报/漏报 |
+| L6 质量信号审计 | 真实项目矩阵执行后 | `python3 scripts/quality_signal_audit.py result.json` | 防止 passed 掩盖 non-gating miss、not_analyzed、skipped |
 
-如果 L5 每次都发现新问题，说明当前测试矩阵仍不充分，应优先扩充真实项目探针和最小 fixture，而不是继续局部修补。
+如果 L5/L6 每次都发现新问题，说明当前测试矩阵仍不充分，应优先扩充真实项目探针和最小 fixture，而不是继续局部修补。
 
 ## 正例和负例必须成对
 

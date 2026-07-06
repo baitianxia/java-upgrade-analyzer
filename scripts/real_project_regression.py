@@ -470,6 +470,7 @@ def parse_args(argv=None):
         help="Directory where per-case reports are written.",
     )
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON only.")
+    parser.add_argument("--json-out", default="", help="Write machine-readable JSON result to this file.")
     return parser.parse_args(argv)
 
 
@@ -487,8 +488,13 @@ def main(argv=None):
         results.append(run_case(case, project_root, changed_apis, report_root))
 
     failed = any(item.get("status") == "failed" for item in results)
+    payload = {"status": "failed" if failed else "passed", "results": results}
+    if args.json_out:
+        output = Path(args.json_out)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if args.json:
-        print(json.dumps({"status": "failed" if failed else "passed", "results": results}, ensure_ascii=False, indent=2))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         for item in results:
             print(f"\nREAL PROJECT {item['case']}: {item['status']}")

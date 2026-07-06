@@ -50,6 +50,16 @@ python3 scripts/quality_gate.py --profile step5 --skip-real
 
 但这只能说明“真实项目矩阵未覆盖”，不能宣称真实场景安全。
 
+真实项目矩阵执行后，还应审计“通过但可疑”的质量信号：
+
+```bash
+python3 scripts/real_project_regression.py --case all \
+  --json-out /private/tmp/jua-real/result.json
+python3 scripts/quality_signal_audit.py /private/tmp/jua-real/result.json
+```
+
+`quality_signal_audit.py` 会显式列出 skipped、`not_analyzed`、`uncertain`、`not_found_in_static_analysis` 与 non-gating production missing。需要把这些信号作为失败处理时，可使用 `--strict` 或 `--fail-on-high`。
+
 ## 3. 真实项目矩阵基线
 
 真实项目矩阵至少记录：
@@ -62,6 +72,8 @@ python3 scripts/quality_gate.py --profile step5 --skip-real
 - bytecode scan / bytecode expand 的候选 class 数与并行度
 
 一旦这些指标发生漂移，必须解释是合理能力变化、输入变化，还是回归。
+
+真实项目 `passed` 不能直接等价于健康：non-gating production missing、`not_analyzed` 和 skipped 必须进入质量信号审计，并按 `QUALITY_RISK_MATRIX.md` 解释或升级为准确性基准。
 
 ## 4. 修复准入
 

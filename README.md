@@ -502,6 +502,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
   - 打包或重要提交前：`python3 scripts/quality_gate.py --profile release`
   - 只查看计划不执行：`python3 scripts/quality_gate.py --profile release --dry-run`
 - 单独运行准确性基准矩阵：`python3 scripts/accuracy_benchmark.py --profile core|step5|all`
+- 审计真实项目“通过但可疑”的质量信号：`python3 scripts/quality_signal_audit.py /path/to/real_project_result.json`
 - 运行完整最小回归：`python3 scripts/smoke_regression.py`
 - 按主题运行回归：`python3 scripts/smoke_regression.py --group core|step5|orchestrator`
 - 通过标准测试入口运行：`python3 -m unittest discover -s tests -v`
