@@ -2443,6 +2443,548 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertEqual(result.analysis_status, "reachable")
             self.assertTrue(any("com.example.Demo.<class-init>" in path for path in result.call_paths))
 
+    def test_build_graph_resolves_static_imported_method_invocation_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import static org.apache.dubbo.common.utils.StringUtils.isEmpty;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(String value) {",
+                        "        return isEmpty(value);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isEmpty(String)", graph.reverse_edges)
+            edge = graph.reverse_edges["org.apache.dubbo.common.utils.StringUtils.isEmpty(String)"][0]
+            self.assertEqual(edge.evidence_type, "ast_method_invocation")
+            self.assertEqual(edge.caller_qualified_key, "com.example.Demo.check")
+
+            result = tracer.trace_api_with_confidence_weighting(
+                {
+                    "api_name": "org.apache.dubbo.common.utils.StringUtils.isEmpty",
+                    "api_simple": "isEmpty",
+                    "api_signature": "(String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "coord": "org.apache.dubbo:dubbo-common",
+                    "severity": "P1",
+                    "confirmed": "false",
+                    "source": "dubbo_static_import_fixture",
+                    "analysis_scope": "api",
+                },
+                graph,
+                {},
+                max_total_cost=5,
+            )
+
+            self.assertEqual(result.analysis_status, "reachable")
+            self.assertTrue(any("com.example.Demo.check" in path for path in result.call_paths))
+
+    def test_build_graph_infers_argument_type_from_inherited_getter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Base.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "public class Base {",
+                        "    public String getPath() {",
+                        "        return \"\";",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.dubbo.common.utils.StringUtils;",
+                        "",
+                        "public class Demo extends Base {",
+                        "    public boolean check() {",
+                        "        return StringUtils.isEmpty(getPath());",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isEmpty(String)", graph.reverse_edges)
+
+    def test_build_graph_infers_argument_type_from_explicit_cast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.dubbo.common.utils.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(Object value) {",
+                        "        return value instanceof String && StringUtils.isBlank((String) value);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isBlank(String)", graph.reverse_edges)
+
+    def test_build_graph_infers_argument_type_from_generic_map_get(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import java.util.Map;",
+                        "import static org.apache.dubbo.common.utils.StringUtils.isEmpty;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(Map<String, String> parameters) {",
+                        "        return isEmpty(parameters.get(\"protocol\"));",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isEmpty(String)", graph.reverse_edges)
+
+    def test_build_graph_parses_varargs_parameter_type_for_static_import_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import static org.apache.dubbo.common.utils.StringUtils.isBlank;",
+                        "",
+                        "public class Demo {",
+                        "    public String build(String one, String... others) {",
+                        "        for (String other : others) {",
+                        "            return isBlank(other) ? one : other;",
+                        "        }",
+                        "        return one;",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isBlank(String)", graph.reverse_edges)
+
+    def test_build_graph_infers_dubbo_url_get_parameter_string_return(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "URL.java").write_text(
+                "\n".join(
+                    [
+                        "package org.apache.dubbo.common;",
+                        "",
+                        "public class URL {",
+                        "    public String getParameter(String key) {",
+                        "        return \"\";",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.dubbo.common.URL;",
+                        "import org.apache.dubbo.common.utils.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(URL url) {",
+                        "        return StringUtils.isEmpty(url.getParameter(\"k\"));",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isEmpty(String)", graph.reverse_edges)
+
+    def test_build_graph_infers_single_arg_get_parameter_string_return_in_lambda(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import java.util.Collection;",
+                        "import org.apache.dubbo.common.utils.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(Collection<ServiceInfo> services) {",
+                        "        return services.stream().anyMatch(serviceInfo -> StringUtils.isEmpty(serviceInfo.getParameter(\"extra\")));",
+                        "    }",
+                        "    static class ServiceInfo {",
+                        "        String getParameter(String key) { return \"\"; }",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isEmpty(String)", graph.reverse_edges)
+
+    def test_trace_api_does_not_mix_in_raw_edges_from_other_overloads(self):
+        api_row = {
+            "api_name": "org.slf4j.LoggerFactory.getLogger",
+            "api_simple": "getLogger",
+            "api_signature": "(Class)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.slf4j:slf4j-api",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "overload_safety_fixture",
+            "analysis_scope": "api",
+        }
+
+        class_method = SimpleNamespace(
+            symbol_id="class_hit",
+            qualified_key="com.biz.ClassHit.<class-init>",
+            simple_key="method:<class-init>",
+            class_fqcn="com.biz.ClassHit",
+            class_name="ClassHit",
+            method_name="<class-init>",
+            return_type="void",
+            file="ClassHit.java",
+            line=10,
+            owner_type="business",
+            is_test=False,
+            imports={},
+            wildcard_imports=[],
+            static_imports={},
+            get_body_text=lambda: "",
+        )
+        string_method = SimpleNamespace(
+            symbol_id="string_hit",
+            qualified_key="com.biz.StringHit.call",
+            simple_key="method:call",
+            class_fqcn="com.biz.StringHit",
+            class_name="StringHit",
+            method_name="call",
+            return_type="void",
+            file="StringHit.java",
+            line=20,
+            owner_type="business",
+            is_test=False,
+            imports={},
+            wildcard_imports=[],
+            static_imports={},
+            get_body_text=lambda: "",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"class_hit": class_method, "string_hit": string_method},
+            reverse_edges={
+                "org.slf4j.LoggerFactory.getLogger(Class)": [
+                    SimpleNamespace(
+                        caller_symbol_id="class_hit",
+                        caller_qualified_key=class_method.qualified_key,
+                        callee_key="org.slf4j.LoggerFactory.getLogger(Class)",
+                        callee_simple_key="method:getLogger(Class)",
+                        confidence="high",
+                        evidence_type="initializer_invocation",
+                        file=class_method.file,
+                        line=10,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+                "org.slf4j.LoggerFactory.getLogger(String)": [
+                    SimpleNamespace(
+                        caller_symbol_id="string_hit",
+                        caller_qualified_key=string_method.qualified_key,
+                        callee_key="org.slf4j.LoggerFactory.getLogger(String)",
+                        callee_simple_key="method:getLogger(String)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=string_method.file,
+                        line=20,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+                "org.slf4j.LoggerFactory.getLogger": [
+                    SimpleNamespace(
+                        caller_symbol_id="string_hit",
+                        caller_qualified_key=string_method.qualified_key,
+                        callee_key="org.slf4j.LoggerFactory.getLogger(String)",
+                        callee_simple_key="method:getLogger(String)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=string_method.file,
+                        line=20,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        path_texts = [item.get("path_text", "") for item in result.path_details]
+        self.assertTrue(any("com.biz.ClassHit.<class-init>" in path for path in path_texts))
+        self.assertFalse(any("com.biz.StringHit.call" in path for path in path_texts))
+
+    def test_build_graph_exposes_field_initializer_field_usage_to_tracer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.dubbo.common.utils.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    private String value = StringUtils.EMPTY_STRING;",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            result = tracer.trace_api_with_confidence_weighting(
+                {
+                    "api_name": "org.apache.dubbo.common.utils.StringUtils.EMPTY_STRING",
+                    "api_simple": "EMPTY_STRING",
+                    "api_signature": "",
+                    "symbol_kind": "field",
+                    "change_type": "REMOVED",
+                    "coord": "org.apache.dubbo:dubbo-common",
+                    "severity": "P1",
+                    "confirmed": "false",
+                    "source": "field_initializer_fixture",
+                    "analysis_scope": "api",
+                },
+                graph,
+                {},
+                max_total_cost=5,
+            )
+
+            self.assertEqual(result.analysis_status, "reachable")
+            self.assertTrue(any("com.example.Demo.<class-init>" in path for path in result.call_paths))
+
+    def test_build_graph_infers_initializer_lambda_local_string_argument(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import java.util.function.Function;",
+                        "import org.apache.dubbo.common.utils.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    public static final Function<Object, String> KEY = value -> {",
+                        "        String iName = value.toString();",
+                        "        if (StringUtils.isBlank(iName)) {",
+                        "            return \"\";",
+                        "        }",
+                        "        return iName;",
+                        "    };",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isBlank(String)", graph.reverse_edges)
+
+    def test_build_graph_does_not_skip_main_package_named_test(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "org" / "apache" / "dubbo" / "test" / "check"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package org.apache.dubbo.test.check;",
+                        "",
+                        "import org.apache.dubbo.common.utils.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(String directory) {",
+                        "        return StringUtils.isEmpty(directory);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isEmpty(String)", graph.reverse_edges)
+
     def test_trace_api_respects_wildcard_import_owner_for_simple_static_field_access(self):
         api_row = {
             "api_name": "io.seata.common.StringUtils.EMPTY",

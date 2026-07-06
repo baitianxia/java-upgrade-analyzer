@@ -1681,7 +1681,7 @@ def _analyze_source_file_entry(file_path, root):
 def _collect_source_file_entries(source_roots, reused_analysis=None):
     skip_dirs = {
         '.git', 'target', 'build', '.gradle', 'out', 'bin',
-        'node_modules', '.idea', '.upgrade-report', 'test'
+        'node_modules', '.idea', '.upgrade-report'
     }
     entries = []
     seen_files = set()
@@ -1717,7 +1717,12 @@ def _collect_source_file_entries(source_roots, reused_analysis=None):
         if not root_path or not os.path.isdir(root_path):
             continue
         for current_root, dirs, files in os.walk(root_path):
-            dirs[:] = sorted(d for d in dirs if d not in skip_dirs)
+            normalized_current = current_root.replace(os.sep, '/')
+            dirs[:] = sorted(
+                d for d in dirs
+                if d not in skip_dirs
+                and not (d == 'test' and normalized_current.endswith('/src'))
+            )
             for filename in sorted(files):
                 if not (filename.endswith('.java') or filename.endswith('.kt')):
                     continue
@@ -1986,13 +1991,15 @@ def build_enhanced_source_graph(
             return 'java.lang.Object'
         return package_candidate
 
-    def infer_initializer_arg_signature(arg_text):
+    def infer_initializer_arg_signature(arg_text, context_text=''):
         text = (arg_text or '').strip()
         if not text:
             return '()'
         args = [item.strip() for item in text.split(',')]
         inferred = []
         for arg in args:
+            while arg.endswith(')') and arg.count(')') > arg.count('('):
+                arg = arg[:-1].strip()
             if not arg:
                 continue
             if '.class' in arg or arg.endswith('getClass()') or arg == 'getClass()':
@@ -2003,6 +2010,8 @@ def build_enhanced_source_graph(
                 inferred.append('long' if arg.lower().endswith('l') else 'int')
             elif arg in {'true', 'false'}:
                 inferred.append('boolean')
+            elif re.search(rf'\bString\s+{re.escape(arg)}\b', context_text or ''):
+                inferred.append('String')
             else:
                 inferred.append('')
         if not inferred or any(not item for item in inferred):
@@ -2012,9 +2021,56 @@ def build_enhanced_source_graph(
     def collect_initializer_edges():
         synthetic_methods = []
         synthetic_edges = []
+        synthetic_method_keys = set()
         invocation_pattern = re.compile(
             r'\b((?:[a-z_]\w*\.)*[A-Z]\w*)\s*\.\s*([a-zA-Z_]\w*)\s*\(([^;\n]*)\)'
         )
+        field_access_pattern = re.compile(
+            r'\b((?:[a-z_]\w*\.)*[A-Z]\w*)\s*\.\s*([A-Za-z_]\w*)\b'
+        )
+
+        def build_synthetic_method(
+            class_fqcn,
+            file_path,
+            line_no,
+            column,
+            line,
+            package_name,
+            imports,
+            static_imports,
+            owner_type,
+            owner_coord,
+            source_root,
+            module,
+        ):
+            synthetic_id = f"{class_fqcn}#<class-init>@{file_path}:{line_no}:{column}"
+            if synthetic_id in synthetic_method_keys:
+                return None
+            synthetic_method_keys.add(synthetic_id)
+            return MethodDef(
+                symbol_id=synthetic_id,
+                qualified_key=f"{class_fqcn}.<class-init>",
+                simple_key='method:<class-init>',
+                class_fqcn=class_fqcn,
+                class_name=class_fqcn.rsplit('.', 1)[-1],
+                method_name='<class-init>',
+                return_type='void',
+                file=file_path,
+                line=line_no,
+                end_line=line_no,
+                package_name=package_name,
+                owner_type=owner_type,
+                owner_coord=owner_coord,
+                module=module,
+                source_root=source_root,
+                language='java',
+                is_test='/src/test/' in file_path,
+                imports=imports,
+                static_imports=static_imports,
+                body_text=line,
+                is_static=True,
+            )
+
         for entry in file_entries:
             file_path = str(entry.get('file_path') or '')
             if not file_path:
@@ -2043,14 +2099,42 @@ def build_enhanced_source_graph(
                 lines = Path(file_path).read_text(encoding='utf-8', errors='replace').splitlines()
             except Exception:
                 continue
+            static_imports = {}
+            for raw_line in lines[:200]:
+                static_match = re.match(r'^\s*import\s+static\s+([A-Za-z_][\w.]*)\s*;', raw_line)
+                if not static_match:
+                    continue
+                fq_member = static_match.group(1)
+                static_imports[fq_member.rsplit('.', 1)[-1]] = fq_member
 
             for line_no, line in enumerate(lines, 1):
                 if any(start <= line_no <= end for start, end in method_ranges if start and end):
                     continue
-                if '(' not in line or '.' not in line:
+                if '.' not in line and not any(re.search(rf'\b{re.escape(simple)}\b', line) for simple in static_imports):
                     continue
                 stripped = line.strip()
                 if not stripped or stripped.startswith(('*', '//', '/*')):
+                    continue
+                if field_access_pattern.search(line) or any(
+                    re.search(rf'\b{re.escape(simple)}\b', line) for simple in static_imports
+                ):
+                    method_def = build_synthetic_method(
+                        class_fqcn,
+                        file_path,
+                        line_no,
+                        0,
+                        line,
+                        package_name,
+                        imports,
+                        static_imports,
+                        owner_type,
+                        owner_coord,
+                        source_root,
+                        module,
+                    )
+                    if method_def is not None:
+                        synthetic_methods.append(method_def)
+                if '(' not in line:
                     continue
                 for match in invocation_pattern.finditer(line):
                     receiver = match.group(1)
@@ -2066,37 +2150,30 @@ def build_enhanced_source_graph(
                         )
                     if not receiver_fqcn or receiver_fqcn.startswith(package_name + '.new '):
                         continue
-                    signature = infer_initializer_arg_signature(args_text)
+                    context_text = '\n'.join(lines[max(0, line_no - 6):line_no])
+                    signature = infer_initializer_arg_signature(args_text, context_text=context_text)
                     base_callee = f"{receiver_fqcn}.{method_name}"
                     callee_key = f"{base_callee}{signature}" if signature else base_callee
                     simple_key = f"method:{method_name}{signature}" if signature else f"method:{method_name}"
-                    synthetic_id = f"{class_fqcn}#<class-init>@{file_path}:{line_no}:{match.start()}"
                     qualified_key = f"{class_fqcn}.<class-init>"
-                    method_def = MethodDef(
-                        symbol_id=synthetic_id,
-                        qualified_key=qualified_key,
-                        simple_key='method:<class-init>',
-                        class_fqcn=class_fqcn,
-                        class_name=class_fqcn.rsplit('.', 1)[-1],
-                        method_name='<class-init>',
-                        return_type='void',
-                        file=file_path,
-                        line=line_no,
-                        end_line=line_no,
-                        package_name=package_name,
-                        owner_type=owner_type,
-                        owner_coord=owner_coord,
-                        module=module,
-                        source_root=source_root,
-                        language='java',
-                        is_test='/src/test/' in file_path,
-                        imports=imports,
-                        body_text=line,
-                        is_static=True,
+                    method_def = build_synthetic_method(
+                        class_fqcn,
+                        file_path,
+                        line_no,
+                        match.start(),
+                        line,
+                        package_name,
+                        imports,
+                        static_imports,
+                        owner_type,
+                        owner_coord,
+                        source_root,
+                        module,
                     )
-                    synthetic_methods.append(method_def)
+                    if method_def is not None:
+                        synthetic_methods.append(method_def)
                     synthetic_edges.append(CallEdge(
-                        caller_symbol_id=synthetic_id,
+                        caller_symbol_id=method_def.symbol_id if method_def is not None else f"{class_fqcn}#<class-init>@{file_path}:{line_no}:{match.start()}",
                         caller_qualified_key=qualified_key,
                         callee_key=callee_key,
                         callee_simple_key=simple_key,

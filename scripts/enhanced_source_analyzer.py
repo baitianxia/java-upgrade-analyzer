@@ -1242,6 +1242,17 @@ class TreeSitterAnalyzer:
                     param_name = source_code[name_node.start_byte:name_node.end_byte].decode('utf-8')
                     param_types[param_name] = self.helper._resolve_type(raw_type)
                     param_declared_types[param_name] = raw_type.strip()
+                elif child.type == 'spread_parameter':
+                    raw_param = self._node_text(child, source_code).strip()
+                    spread_match = re.match(
+                        r'(?:@\w+(?:\([^)]*\))?\s+)*(?P<type>[A-Za-z_][\w.<>, ?\[\]]*)\s*\.\.\.\s*(?P<name>[A-Za-z_]\w*)$',
+                        raw_param,
+                    )
+                    if spread_match:
+                        raw_type = spread_match.group('type').strip() + '...'
+                        param_name = spread_match.group('name').strip()
+                        param_types[param_name] = self.helper._resolve_type(raw_type.replace('...', '[]'))
+                        param_declared_types[param_name] = raw_type
             elif child.type == 'receiver_parameter':
                 type_node = child.child_by_field_name('type')
                 name_node = child.child_by_field_name('name')
@@ -1811,7 +1822,12 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
             evidence_type = 'method_reference'
         else:
             if not receiver_expr:
-                receiver_type = method_def.class_fqcn
+                static_imports = getattr(method_def, 'static_imports', {}) or {}
+                imported_member = static_imports.get(method_name)
+                if imported_member and imported_member.rsplit('.', 1)[-1] == method_name:
+                    receiver_type = imported_member.rsplit('.', 1)[0]
+                else:
+                    receiver_type = method_def.class_fqcn
                 resolved_receiver_type = receiver_type
                 confidence = 'high'
                 callee_key = f"{receiver_type}.{method_name}"
@@ -2349,6 +2365,13 @@ def infer_invocation_return_type(receiver_type, method_name, method_def, invocat
             return bucket.get(normalized_signature)
         if len(bucket) == 1:
             return next(iter(bucket.values()))
+        unique_return_types = {
+            str(return_type or '').strip()
+            for return_type in bucket.values()
+            if str(return_type or '').strip()
+        }
+        if len(unique_return_types) == 1:
+            return next(iter(unique_return_types))
         return None
 
     if receiver_type == method_def.class_fqcn:
@@ -2371,6 +2394,42 @@ def infer_invocation_return_type(receiver_type, method_name, method_def, invocat
                 matched = _match_from_bucket(direct)
                 if matched:
                     return matched
+
+    type_metadata = getattr(method_def, 'known_type_metadata', {}) or {}
+    visited = set()
+
+    def _lookup_in_supertypes(type_name):
+        if not type_name or type_name in visited:
+            return None
+        visited.add(type_name)
+        meta = type_metadata.get(type_name, {}) or {}
+        for parent in (meta.get('extends') or []) + (meta.get('implements') or []):
+            if not parent or parent in visited:
+                continue
+            if parent in known_method_return_types_by_signature:
+                matched = _match_from_bucket(
+                    known_method_return_types_by_signature.get(parent, {}).get(method_name)
+                )
+                if matched:
+                    return matched
+            if parent in known_method_return_types:
+                bucket = known_method_return_types.get(parent, {})
+                if isinstance(bucket, dict):
+                    direct = bucket.get(method_name)
+                    if isinstance(direct, str):
+                        return direct
+                    if isinstance(direct, dict):
+                        matched = _match_from_bucket(direct)
+                        if matched:
+                            return matched
+            inherited = _lookup_in_supertypes(parent)
+            if inherited:
+                return inherited
+        return None
+
+    inherited_return = _lookup_in_supertypes(receiver_type)
+    if inherited_return:
+        return inherited_return
     return None
 
 
@@ -2451,6 +2510,9 @@ def infer_known_library_method_return_type(receiver_type, method_name):
     simple_receiver = normalized_receiver.rsplit('.', 1)[-1]
     receiver_candidates = {normalized_receiver, simple_receiver}
 
+    if method_name == 'getParameter' and simple_receiver == 'URL':
+        return 'java.lang.String'
+
     if method_name == 'toString':
         return 'java.lang.String'
 
@@ -2474,6 +2536,12 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     """
     expr = _strip_balanced_outer_parens(expr.strip())
     local_var_types = local_var_types or getattr(method_def, 'local_var_types', {}) or {}
+
+    cast_match = re.match(r'^\(\s*([A-Za-z_][\w.]*)\s*\)\s*(.+)$', expr)
+    if cast_match:
+        cast_type = cast_match.group(1).strip()
+        resolved = resolve_type_fqn(cast_type, method_def)
+        return resolved.rsplit('.', 1)[-1] if resolved else cast_type.rsplit('.', 1)[-1]
 
     # String literal
     if expr.startswith('"') and expr.endswith('"'):
@@ -2509,6 +2577,28 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
             fqn = method_def.field_types[field_name]
             return fqn.rsplit('.', 1)[-1] if '.' in fqn else fqn
 
+    def infer_map_get_value_type(receiver_expr):
+        receiver_expr = (receiver_expr or '').strip()
+        if not receiver_expr:
+            return None
+        declared_type = ''
+        if receiver_expr in (getattr(method_def, 'param_declared_types', {}) or {}):
+            declared_type = (method_def.param_declared_types or {}).get(receiver_expr, '')
+        if not declared_type:
+            for site in getattr(method_def, 'ast_local_var_sites', []) or []:
+                if site.get('name') == receiver_expr:
+                    declared_type = site.get('declared_type') or ''
+                    break
+        if not declared_type or 'Map' not in declared_type or '<' not in declared_type or '>' not in declared_type:
+            return None
+        generic_text = declared_type[declared_type.find('<') + 1: declared_type.rfind('>')]
+        parts = [item.strip() for item in generic_text.split(',')]
+        if len(parts) < 2:
+            return None
+        value_type = parts[1]
+        resolved = resolve_type_fqn(value_type, method_def)
+        return resolved.rsplit('.', 1)[-1] if resolved else value_type.rsplit('.', 1)[-1]
+
     # Parameter reference
     if expr in method_def.param_types:
         fqn = method_def.param_types[expr]
@@ -2518,6 +2608,15 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     if expr in local_var_types:
         fqn = local_var_types[expr]
         return fqn.rsplit('.', 1)[-1] if '.' in fqn else fqn
+
+    body_text = method_def.get_body_text() if hasattr(method_def, 'get_body_text') else getattr(method_def, 'body_text', '')
+    enhanced_for_match = re.search(
+        rf'for\s*\(\s*([A-Za-z_][\w.<>, ?\[\]]*)\s+{re.escape(expr)}\s*:',
+        body_text or '',
+    )
+    if enhanced_for_match:
+        resolved = resolve_type_fqn(enhanced_for_match.group(1).strip(), method_def)
+        return resolved.rsplit('.', 1)[-1] if resolved else enhanced_for_match.group(1).strip().rsplit('.', 1)[-1]
 
     # Field reference
     if expr in method_def.field_types:
@@ -2530,6 +2629,10 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         receiver_expr = method_call_match.group('receiver').strip()
         method_name = method_call_match.group('method').strip()
         args_text = method_call_match.group('args').strip()
+        if method_name == 'get':
+            map_value_type = infer_map_get_value_type(receiver_expr)
+            if map_value_type:
+                return map_value_type
         arg_exprs = []
         if args_text:
             arg_exprs = [part.strip() for part in args_text.split(',') if part.strip()]
@@ -2540,6 +2643,13 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
                 inferred_param_types.append(inferred_type)
         invocation_signature = build_invocation_signature(arg_exprs, inferred_param_types)
         receiver_type = infer_expression_type_from_text(receiver_expr, method_def, local_var_types)
+        if method_name == 'getParameter' and len(arg_exprs) == 1:
+            return 'String'
+        if method_name == 'getParameter' and (receiver_type or '').rsplit('.', 1)[-1] == 'URL':
+            if len(arg_exprs) >= 2:
+                second_arg_type = infer_param_type_from_expression(arg_exprs[1], method_def, local_var_types)
+                if second_arg_type == 'String':
+                    return 'String'
         return_type = infer_invocation_return_type(
             receiver_type,
             method_name,
@@ -2557,6 +2667,27 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
             method_name=method_name,
             invocation_signature=invocation_signature,
             return_type=return_type,
+        )
+        simple_name = _to_simple_type_name(return_type)
+        if simple_name:
+            return simple_name
+
+    bare_method_call_match = re.match(r'^(?P<method>[A-Za-z_]\w*)\s*\((?P<args>.*)\)$', expr)
+    if bare_method_call_match:
+        method_name = bare_method_call_match.group('method').strip()
+        args_text = bare_method_call_match.group('args').strip()
+        arg_exprs = [part.strip() for part in args_text.split(',') if part.strip()] if args_text else []
+        inferred_param_types = []
+        for arg_expr in arg_exprs:
+            inferred_type = infer_param_type_from_expression(arg_expr, method_def, local_var_types)
+            if inferred_type:
+                inferred_param_types.append(inferred_type)
+        invocation_signature = build_invocation_signature(arg_exprs, inferred_param_types)
+        return_type = infer_invocation_return_type(
+            method_def.class_fqcn,
+            method_name,
+            method_def,
+            invocation_signature=invocation_signature,
         )
         simple_name = _to_simple_type_name(return_type)
         if simple_name:
