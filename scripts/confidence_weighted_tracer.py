@@ -948,7 +948,7 @@ def _match_runtime_dependency_references_from_constant_pool(api_row, summary, cl
 
 def _run_javap_bytecode_dump(jar_path, class_binary_name, multi_release_version=None):
     command = ['javap', '-classpath', jar_path, '-verbose', '-c', '-s', '-p']
-    if multi_release_version is not None:
+    if multi_release_version not in (None, '', 'base'):
         command.extend(['--multi-release', str(multi_release_version)])
     command.append(class_binary_name)
     stdout, _stderr, rc = run_cmd(

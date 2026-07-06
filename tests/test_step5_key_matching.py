@@ -10047,6 +10047,58 @@ public class com.example.consumer.ReflectiveCall {
             for item in perf.get("slow_runtime_lookups", [])
         ))
 
+    def test_packaged_runtime_scan_javap_handles_base_classes_without_multi_release_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_src = root / "target-src" / "com" / "vendor" / "Target.java"
+            target_src.parent.mkdir(parents=True)
+            target_src.write_text(
+                "package com.vendor; public class Target { "
+                "public static String removed(String s) { return s == null ? \"\" : s; } }",
+                encoding="utf-8",
+            )
+            target_classes = self._compile_java_files(root / "target-classes", [target_src])
+            target_jar = root / "target.jar"
+            self._jar_compiled_classes(target_jar, target_classes)
+
+            consumer_src = root / "consumer-src" / "com" / "consumer" / "UsesTarget.java"
+            consumer_src.parent.mkdir(parents=True)
+            consumer_src.write_text(
+                "package com.consumer; public class UsesTarget { "
+                "public String call(String s) { return com.vendor.Target.removed(s); } }",
+                encoding="utf-8",
+            )
+            consumer_classes = self._compile_java_files(root / "consumer-classes", [consumer_src], classpath=target_jar)
+            consumer_jar = root / "consumer.jar"
+            self._jar_compiled_classes(consumer_jar, consumer_classes)
+
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            catalog = self._runtime_catalog([
+                ("com.vendor:target", target_jar),
+                ("com.example:consumer", consumer_jar),
+            ])
+            graph = SimpleNamespace(
+                runtime_dependency_catalog=catalog,
+                reverse_edges={"force_javap_path": []},
+            )
+
+            result = tracer._scan_packaged_runtime_dependencies_for_api(api_row, graph)
+
+        self.assertEqual(result["status"], "hit")
+        self.assertEqual(result["hits"][0]["coord"], "com.example:consumer")
+        self.assertEqual(result["hits"][0]["consumer_method"], "call")
+        self.assertEqual(
+            result["hits"][0]["target_display"],
+            "com.vendor.Target.removed(String)",
+        )
+
     def test_runtime_dependency_bytecode_graph_does_not_infer_unconnected_packaged_hit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
