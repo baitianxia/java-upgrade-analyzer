@@ -2104,7 +2104,10 @@ public class OverloadFactoryAstApp {
 
         run_orchestrator_smoke_cases(workspace, dep_env)
 
-        print("SMOKE PASS [orchestrator]")
+        if cli_args.group == "orchestrator":
+            print("SMOKE PASS [orchestrator]")
+        else:
+            print("SMOKE PASS [all]")
         print(f"workspace={project_dir}")
         print(f"report={report_dir}")
         return 0
