@@ -1830,6 +1830,7 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
     visited_classes = 0
     javap_classes = 0
     edges_added = 0
+    javap_tasks = []
     target_jdk = catalog.get('target_jdk')
     for item in catalog_entries:
         coord = str(item.get('coord') or '').strip()
@@ -1864,23 +1865,52 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                     ):
                         continue
                     class_binary_name = logical_name[:-6].replace('/', '.')
-                    references = _load_runtime_dependency_class_references(
-                        catalog, coord, jar_path, class_binary_name,
-                        multi_release_version=selected_version,
-                    )
-                    javap_classes += 1
-                    if references is None:
-                        continue
-                    matches = _match_runtime_dependency_references(api_row, references)
-                    for matched in matches:
-                        _add_runtime_dependency_caller_edge(
-                            graph, lookup_key, coord, jar_path,
-                            class_binary_name.replace('$', '.'),
-                            matched,
-                        )
-                        edges_added += 1
+                    javap_tasks.append({
+                        'catalog': catalog,
+                        'coord': coord,
+                        'jar_path': jar_path,
+                        'class_binary_name': class_binary_name,
+                        'class_fqcn': class_binary_name.replace('$', '.'),
+                        'multi_release_version': selected_version,
+                    })
         except Exception:
             continue
+
+    def handle_javap_result(task, references):
+        nonlocal javap_classes, edges_added
+        if references is None:
+            return
+        javap_classes += 1
+        matches = _match_runtime_dependency_references(api_row, references)
+        for matched in matches:
+            _add_runtime_dependency_caller_edge(
+                graph, lookup_key,
+                task.get('coord') or '',
+                task.get('jar_path') or '',
+                task.get('class_fqcn') or (task.get('class_binary_name') or '').replace('$', '.'),
+                matched,
+            )
+            edges_added += 1
+
+    if javap_tasks:
+        workers = min(_step5_bytecode_javap_workers(), len(javap_tasks))
+        if workers <= 1:
+            for task in javap_tasks:
+                _task, references = _load_runtime_dependency_class_references_for_task(task)
+                handle_javap_result(_task, references)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(_load_runtime_dependency_class_references_for_task, task): task
+                    for task in javap_tasks
+                }
+                for future in as_completed(future_map):
+                    task = future_map[future]
+                    try:
+                        _task, references = future.result()
+                    except Exception:
+                        _task, references = task, None
+                    handle_javap_result(_task, references)
     return {
         'expanded': True,
         'edges_added': edges_added,
