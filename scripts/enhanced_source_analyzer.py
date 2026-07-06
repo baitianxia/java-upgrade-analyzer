@@ -886,22 +886,32 @@ class EnhancedRegexAnalyzer:
           - 嵌套类：Outer.Inner → 从class_stack查找
           - 导入类：Foo → 从imports查找FQN
         """
-        type_expr = type_expr.strip()
+        type_expr = (type_expr or '').strip()
+        if not type_expr:
+            return ''
+        type_expr = type_expr.replace('...', '[]')
+        type_expr = re.sub(
+            r'\b(?:final|volatile|transient|public|protected|private|static|abstract|strictfp)\b',
+            '',
+            type_expr,
+        ).strip()
+        array_suffix = ''
+        while type_expr.endswith('[]'):
+            array_suffix += '[]'
+            type_expr = type_expr[:-2].strip()
+        if not type_expr:
+            return ''
 
         # 基础类型
         if type_expr in {'int', 'long', 'double', 'float', 'boolean', 'char', 'byte', 'short', 'void'}:
-            return type_expr
+            return type_expr + array_suffix
 
         # 去除泛型参数（保留FQN）
         if '<' in type_expr:
             base_type = type_expr.split('<')[0].strip()
             # 解析base_type
-            return self._resolve_simple_type(base_type)
-
-        # 数组类型
-        if type_expr.endswith('[]'):
-            base_type = type_expr[:-2].strip()
-            return self._resolve_simple_type(base_type)
+            resolved = self._resolve_simple_type(base_type)
+            return (resolved + array_suffix) if resolved else ''
 
         # 嵌套类
         if '.' in type_expr:
@@ -915,13 +925,14 @@ class EnhancedRegexAnalyzer:
                 # 检查是否是当前文件的内部类
                 for class_info in self.class_stack:
                     if class_info['name'] == outer:
-                        return f"{class_info['fqcn']}.{inner}"
+                        return f"{class_info['fqcn']}.{inner}{array_suffix}"
 
             # FQN类型
-            return type_expr
+            return type_expr + array_suffix
 
         # 简单类型名
-        return self._resolve_simple_type(type_expr)
+        resolved = self._resolve_simple_type(type_expr)
+        return (resolved + array_suffix) if resolved else ''
 
     def _resolve_simple_type(self, simple_name):
         """解析简单类型名"""

@@ -68,6 +68,7 @@ BENCHMARK_CATEGORIES = (
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_trace_api_uses_builtin_java_assignable_signature_for_target_overload",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_select_compatible_overload_signatures_supports_varargs_target",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_build_graph_infers_chained_string_return_for_url_valueof",
+            "tests.test_step5_key_matching.Step5KeyMatchingTest.test_trace_api_reaches_primitive_array_parameter_without_losing_array_suffix",
         ),
     ),
     BenchmarkCategory(

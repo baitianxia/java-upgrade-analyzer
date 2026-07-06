@@ -3096,6 +3096,58 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
             self.assertIn("org.apache.seata.common.util.StringUtils.isBlank(String)", graph.reverse_edges)
 
+    def test_trace_api_reaches_primitive_array_parameter_without_losing_array_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.commons.lang3.ArrayUtils;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(final char[] delimiters) {",
+                        "        return ArrayUtils.isEmpty(delimiters);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+            api_row = {
+                "api_name": "org.apache.commons.lang3.ArrayUtils.isEmpty",
+                "api_simple": "isEmpty",
+                "api_signature": "(char[])",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "coord": "org.apache.commons:commons-lang3",
+                "severity": "P0",
+                "confirmed": "true",
+                "source": "unit",
+            }
+
+            self.assertIn("org.apache.commons.lang3.ArrayUtils.isEmpty(char[])", graph.reverse_edges)
+            self.assertNotIn("org.apache.commons.lang3.ArrayUtils.isEmpty(char)", graph.reverse_edges)
+
+            result = tracer.trace_api_with_confidence_weighting(api_row, graph, graph.type_metadata)
+
+            self.assertEqual(result.analysis_status, "reachable")
+            self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+
     def test_build_graph_parses_volatile_field_type(self):
         with tempfile.TemporaryDirectory() as tmp:
             src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
