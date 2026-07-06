@@ -3098,6 +3098,206 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertTrue(any("com.biz.ClassHit.<class-init>" in path for path in path_texts))
         self.assertFalse(any("com.biz.StringHit.call" in path for path in path_texts))
 
+    def test_trace_api_keeps_raw_edge_when_declared_target_has_single_signature(self):
+        api_row = {
+            "api_name": "org.example.Strings.isBlank",
+            "api_simple": "isBlank",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.example:lib",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "single_signature_raw_fixture",
+            "analysis_scope": "api",
+        }
+        declared_method = SimpleNamespace(
+            symbol_id="declared",
+            qualified_key="org.example.Strings.isBlank",
+            simple_key="method:isBlank",
+            class_fqcn="org.example.Strings",
+            method_name="isBlank",
+            param_types={"value": "String"},
+            param_declared_types={"value": "String"},
+            owner_type="dependency",
+            is_test=False,
+            file="Strings.java",
+            line=1,
+        )
+        exact_method = SimpleNamespace(
+            symbol_id="exact_hit",
+            qualified_key="com.biz.ExactHit.call",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            file="ExactHit.java",
+            line=10,
+        )
+        raw_method = SimpleNamespace(
+            symbol_id="raw_hit",
+            qualified_key="com.biz.RawHit.call",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            file="RawHit.java",
+            line=20,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={
+                "declared": declared_method,
+                "exact_hit": exact_method,
+                "raw_hit": raw_method,
+            },
+            reverse_edges={
+                "org.example.Strings.isBlank(String)": [
+                    SimpleNamespace(
+                        caller_symbol_id="exact_hit",
+                        caller_qualified_key=exact_method.qualified_key,
+                        callee_key="org.example.Strings.isBlank(String)",
+                        callee_simple_key="method:isBlank(String)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file="ExactHit.java",
+                        line=10,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+                "org.example.Strings.isBlank": [
+                    SimpleNamespace(
+                        caller_symbol_id="raw_hit",
+                        caller_qualified_key=raw_method.qualified_key,
+                        callee_key="org.example.Strings.isBlank",
+                        callee_simple_key="method:isBlank",
+                        confidence="medium",
+                        evidence_type="ast_method_invocation",
+                        file="RawHit.java",
+                        line=20,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        path_texts = [item.get("path_text", "") for item in result.path_details]
+        self.assertTrue(any("com.biz.ExactHit.call" in path for path in path_texts))
+        self.assertTrue(any("com.biz.RawHit.call" in path for path in path_texts))
+
+    def test_trace_api_still_blocks_raw_edge_when_target_has_multiple_declared_overloads(self):
+        api_row = {
+            "api_name": "org.example.Collections.isEmpty",
+            "api_simple": "isEmpty",
+            "api_signature": "(Map)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.example:lib",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "multi_signature_raw_fixture",
+            "analysis_scope": "api",
+        }
+        map_declared = SimpleNamespace(
+            symbol_id="declared_map",
+            qualified_key="org.example.Collections.isEmpty",
+            simple_key="method:isEmpty",
+            class_fqcn="org.example.Collections",
+            method_name="isEmpty",
+            param_types={"value": "Map"},
+            param_declared_types={"value": "Map"},
+            owner_type="dependency",
+            is_test=False,
+            file="Collections.java",
+            line=1,
+        )
+        list_declared = SimpleNamespace(
+            symbol_id="declared_list",
+            qualified_key="org.example.Collections.isEmpty",
+            simple_key="method:isEmpty",
+            class_fqcn="org.example.Collections",
+            method_name="isEmpty",
+            param_types={"value": "List"},
+            param_declared_types={"value": "List"},
+            owner_type="dependency",
+            is_test=False,
+            file="Collections.java",
+            line=2,
+        )
+        map_method = SimpleNamespace(
+            symbol_id="map_hit",
+            qualified_key="com.biz.MapHit.call",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            file="MapHit.java",
+            line=10,
+        )
+        raw_method = SimpleNamespace(
+            symbol_id="raw_hit",
+            qualified_key="com.biz.RawHit.call",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            file="RawHit.java",
+            line=20,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={
+                "declared_map": map_declared,
+                "declared_list": list_declared,
+                "map_hit": map_method,
+                "raw_hit": raw_method,
+            },
+            reverse_edges={
+                "org.example.Collections.isEmpty(Map)": [
+                    SimpleNamespace(
+                        caller_symbol_id="map_hit",
+                        caller_qualified_key=map_method.qualified_key,
+                        callee_key="org.example.Collections.isEmpty(Map)",
+                        callee_simple_key="method:isEmpty(Map)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file="MapHit.java",
+                        line=10,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+                "org.example.Collections.isEmpty": [
+                    SimpleNamespace(
+                        caller_symbol_id="raw_hit",
+                        caller_qualified_key=raw_method.qualified_key,
+                        callee_key="org.example.Collections.isEmpty",
+                        callee_simple_key="method:isEmpty",
+                        confidence="medium",
+                        evidence_type="ast_method_invocation",
+                        file="RawHit.java",
+                        line=20,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    )
+                ],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        path_texts = [item.get("path_text", "") for item in result.path_details]
+        self.assertTrue(any("com.biz.MapHit.call" in path for path in path_texts))
+        self.assertFalse(any("com.biz.RawHit.call" in path for path in path_texts))
+
     def test_build_graph_exposes_field_initializer_field_usage_to_tracer(self):
         with tempfile.TemporaryDirectory() as tmp:
             src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"

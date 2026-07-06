@@ -3668,6 +3668,7 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
         for group in (matched_groups or [])
     )
     allow_multiple_observed_compatible = False
+    declared_compatible_signatures = []
     if declared_signatures:
         declared_compatible_signatures = select_compatible_overload_signatures(
             target_signature,
@@ -3706,6 +3707,14 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
             if group.get('provenance') == 'exact_signature'
         ]
         if safe_groups:
+            if len(declared_signatures) == 1 and len(declared_compatible_signatures) == 1:
+                for group in matched_groups or []:
+                    if group.get('provenance') != 'exact_name':
+                        continue
+                    for matched_key in group.get('matched_keys', []) or []:
+                        if matched_key == api_name and (getattr(graph, 'reverse_edges', {}) or {}).get(matched_key):
+                            for safe_group in safe_groups:
+                                append_unique(safe_group['matched_keys'], matched_key)
             compatible_signatures = select_compatible_overload_signatures(
                 target_signature,
                 overload_signatures,
