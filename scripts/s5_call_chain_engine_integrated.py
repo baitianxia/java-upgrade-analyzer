@@ -2381,6 +2381,51 @@ def build_enhanced_source_graph(
         }
         for class_fqcn, method_map in local_method_return_types_by_class.items()
     }
+    global_field_types = defaultdict(dict)
+    for candidate in all_methods:
+        class_fqcn = getattr(candidate, 'class_fqcn', '')
+        if not class_fqcn:
+            continue
+        for field_name, field_type in (getattr(candidate, 'field_types', {}) or {}).items():
+            if field_name and field_type and field_name not in global_field_types[class_fqcn]:
+                global_field_types[class_fqcn][field_name] = field_type
+    field_decl_pattern = re.compile(
+        r'^\s*(?:public|protected|private|static|final|volatile|transient|\s)*'
+        r'(?P<type>[A-Za-z_][\w.$]*(?:\s*<[^;=(){}]+>)?(?:\[\]|\.\.\.)?)\s+'
+        r'(?P<name>[A-Za-z_]\w*)\s*(?:=|;)'
+    )
+    for entry in file_entries:
+        file_path = str(entry.get('file_path') or '')
+        declared_types = dict(entry.get('declared_types') or {})
+        if not file_path or not declared_types:
+            continue
+        package_name = entry.get('package_name') or ''
+        imports = dict(entry.get('imports') or {})
+        owner_info = {
+            'imports': imports,
+            'package_name': package_name,
+        }
+        try:
+            lines = Path(file_path).read_text(encoding='utf-8', errors='replace').splitlines()
+        except Exception:
+            continue
+        class_name = next(iter(declared_types.keys()))
+        class_fqcn = f"{package_name}.{class_name}" if package_name else class_name
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith(('*', '//', '/*', 'import ', 'package ')):
+                continue
+            match = field_decl_pattern.match(raw_line)
+            if not match:
+                continue
+            raw_type = match.group('type').strip()
+            field_name = match.group('name').strip()
+            if field_name and raw_type and field_name not in global_field_types[class_fqcn]:
+                global_field_types[class_fqcn][field_name] = resolve_type_name(raw_type, owner_info)
+    global_field_types = {
+        class_fqcn: dict(fields)
+        for class_fqcn, fields in global_field_types.items()
+    }
     all_methods = sorted(all_methods, key=method_sort_key)
 
     for method_def in all_methods:
@@ -2395,6 +2440,7 @@ def build_enhanced_source_graph(
         method_def.known_method_return_types = global_method_return_types
         method_def.known_method_return_types_by_signature = global_method_return_types_by_signature
         method_def.known_type_metadata = type_metadata
+        method_def.known_field_types = global_field_types
 
     for method_def in all_methods:
         if getattr(method_def, 'method_name', '') == '<class-init>':

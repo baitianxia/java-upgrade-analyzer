@@ -3348,6 +3348,72 @@ JAVA_BUILTIN_SUPERTYPES = {
         'java.io.Serializable',
         'java.lang.Object',
     },
+    'java.util.Map': {
+        'java.lang.Object',
+    },
+    'java.util.concurrent.ConcurrentMap': {
+        'java.util.Map',
+        'java.lang.Object',
+    },
+    'java.util.SortedMap': {
+        'java.util.Map',
+        'java.lang.Object',
+    },
+    'java.util.NavigableMap': {
+        'java.util.SortedMap',
+        'java.util.Map',
+        'java.lang.Object',
+    },
+    'java.util.concurrent.ConcurrentNavigableMap': {
+        'java.util.concurrent.ConcurrentMap',
+        'java.util.NavigableMap',
+        'java.util.SortedMap',
+        'java.util.Map',
+        'java.lang.Object',
+    },
+    'java.util.concurrent.ConcurrentHashMap': {
+        'java.util.concurrent.ConcurrentMap',
+        'java.util.Map',
+        'java.lang.Object',
+    },
+    'java.util.HashMap': {
+        'java.util.Map',
+        'java.lang.Object',
+    },
+    'java.util.LinkedHashMap': {
+        'java.util.HashMap',
+        'java.util.Map',
+        'java.lang.Object',
+    },
+    'java.util.TreeMap': {
+        'java.util.Map',
+        'java.lang.Object',
+    },
+    'java.util.Collection': {
+        'java.lang.Object',
+    },
+    'java.util.List': {
+        'java.util.Collection',
+        'java.lang.Iterable',
+        'java.lang.Object',
+    },
+    'java.util.Set': {
+        'java.util.Collection',
+        'java.lang.Iterable',
+        'java.lang.Object',
+    },
+    'java.util.ArrayList': {
+        'java.util.List',
+        'java.util.Collection',
+        'java.lang.Iterable',
+        'java.lang.Object',
+    },
+    'java.util.HashSet': {
+        'java.util.Set',
+        'java.util.Collection',
+        'java.lang.Iterable',
+        'java.lang.Object',
+    },
 }
 
 JAVA_BUILTIN_SIMPLE_TO_FQCN = {
@@ -3360,6 +3426,7 @@ JAVA_BUILTIN_SIMPLE_TO_FQCN.update({
     'Comparable': 'java.lang.Comparable',
     'Appendable': 'java.lang.Appendable',
     'Serializable': 'java.io.Serializable',
+    'Iterable': 'java.lang.Iterable',
 })
 
 
@@ -3629,10 +3696,26 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
 
     if overload_signatures:
         safe_groups = [
-            group for group in (matched_groups or [])
+            {
+                'tier_index': group.get('tier_index', -1),
+                'provenance': group.get('provenance', ''),
+                'provenance_family': group.get('provenance_family', ''),
+                'matched_keys': list(group.get('matched_keys', []) or []),
+            }
+            for group in (matched_groups or [])
             if group.get('provenance') == 'exact_signature'
         ]
         if safe_groups:
+            compatible_signatures = select_compatible_overload_signatures(
+                target_signature,
+                overload_signatures,
+                type_metadata or {},
+            )
+            for compatible_signature in compatible_signatures:
+                compatible_key = f"{api_name}{compatible_signature}"
+                if (getattr(graph, 'reverse_edges', {}) or {}).get(compatible_key):
+                    for group in safe_groups:
+                        append_unique(group['matched_keys'], compatible_key)
             return safe_groups, None
 
         compatible_signatures = select_compatible_overload_signatures(

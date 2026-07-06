@@ -2623,6 +2623,16 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         fqn = method_def.field_types[expr]
         return fqn.rsplit('.', 1)[-1] if '.' in fqn else fqn
 
+    static_field_match = re.match(r'^(?P<owner>[A-Z][A-Za-z0-9_$.]*)\.(?P<field>[A-Za-z_][A-Za-z0-9_]*)$', expr)
+    if static_field_match:
+        owner_expr = static_field_match.group('owner').strip()
+        field_name = static_field_match.group('field').strip()
+        owner_type = resolve_type_fqn(owner_expr, method_def)
+        known_field_types = getattr(method_def, 'known_field_types', {}) or {}
+        field_type = (known_field_types.get(owner_type, {}) or {}).get(field_name)
+        if field_type:
+            return field_type.rsplit('.', 1)[-1] if '.' in field_type else field_type
+
     # Method invocation (receiver.method(...))
     method_call_match = re.match(r'^(?P<receiver>.+)\.(?P<method>[A-Za-z_]\w*)\s*\((?P<args>.*)\)$', expr)
     if method_call_match:

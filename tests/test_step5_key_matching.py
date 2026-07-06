@@ -1881,6 +1881,126 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
         self.assertEqual(result.match_provenance, "compatible_signature")
 
+    def test_trace_api_uses_builtin_map_assignable_signature_for_target_overload(self):
+        api_row = {
+            "api_name": "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap",
+            "api_simple": "isEmptyMap",
+            "api_signature": "(Map)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.apache.dubbo:dubbo-common",
+            "severity": "HIGH",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_scope": "method",
+        }
+        business_entry = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="org.example.Controller.handle",
+            simple_key="method:handle",
+            class_fqcn="org.example.Controller",
+            class_name="Controller",
+            method_name="handle",
+            param_types={},
+            param_declared_types={},
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/Controller.java",
+            line=18,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="business_entry",
+            caller_qualified_key=business_entry.qualified_key,
+            callee_key="org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap(ConcurrentMap<Class<?>, Merger<?>>)",
+            callee_simple_key="method:isEmptyMap(ConcurrentMap<Class<?>, Merger<?>>)",
+            confidence="high",
+            evidence_type="ast_method_invocation",
+            file=business_entry.file,
+            line=18,
+            owner_type="business",
+            owner_coord="BUSINESS",
+            module="app",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_entry},
+            reverse_edges={
+                "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap": [edge],
+                "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap(ConcurrentMap<Class<?>, Merger<?>>)": [edge],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertEqual(result.match_provenance, "compatible_signature")
+
+    def test_trace_api_uses_builtin_concurrent_hash_map_assignable_signature(self):
+        api_row = {
+            "api_name": "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap",
+            "api_simple": "isEmptyMap",
+            "api_signature": "(Map)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.apache.dubbo:dubbo-common",
+            "severity": "HIGH",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_scope": "method",
+        }
+        business_entry = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="org.example.Controller.handle",
+            simple_key="method:handle",
+            class_fqcn="org.example.Controller",
+            class_name="Controller",
+            method_name="handle",
+            param_types={},
+            param_declared_types={},
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/Controller.java",
+            line=18,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="business_entry",
+            caller_qualified_key=business_entry.qualified_key,
+            callee_key="org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap(ConcurrentHashMap<?, ConcurrentHashMap<T, AtomicLong>>)",
+            callee_simple_key="method:isEmptyMap(ConcurrentHashMap<?, ConcurrentHashMap<T, AtomicLong>>)",
+            confidence="high",
+            evidence_type="ast_method_invocation",
+            file=business_entry.file,
+            line=18,
+            owner_type="business",
+            owner_coord="BUSINESS",
+            module="app",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_entry},
+            reverse_edges={
+                "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap": [edge],
+                "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap(ConcurrentHashMap<?, ConcurrentHashMap<T, AtomicLong>>)": [edge],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertEqual(result.match_provenance, "compatible_signature")
+
     def test_trace_api_does_not_start_from_unrelated_simple_signature_target(self):
         api_row = {
             "api_name": "com.lib.Target.parse",
@@ -2748,6 +2868,53 @@ class Step5KeyMatchingTest(unittest.TestCase):
             graph = graph_result["graph"]
 
             self.assertIn("org.apache.dubbo.common.utils.StringUtils.isEmpty(String)", graph.reverse_edges)
+
+    def test_build_graph_infers_imported_static_field_argument_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Constants.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "public interface Constants {",
+                        "    String CLOSE = \"close!\";",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.dubbo.common.utils.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(String result) {",
+                        "        return StringUtils.isEquals(Constants.CLOSE, result);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.utils.StringUtils.isEquals(String, String)", graph.reverse_edges)
 
     def test_trace_api_does_not_mix_in_raw_edges_from_other_overloads(self):
         api_row = {
