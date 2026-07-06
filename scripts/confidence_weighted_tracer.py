@@ -1894,6 +1894,11 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
 
     if javap_tasks:
         workers = min(_step5_bytecode_javap_workers(), len(javap_tasks))
+        emit_progress(
+            "step5",
+            "bytecode-expand",
+            f"扩展运行时依赖调用者字节码，lookup={lookup_key[:120]}，候选class={len(javap_tasks)}，并行度={workers}",
+        )
         if workers <= 1:
             for task in javap_tasks:
                 _task, references = _load_runtime_dependency_class_references_for_task(task)
