@@ -60,6 +60,39 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertEqual(rows[0]["change_type"], "CONSTANT_VALUE_CHANGED")
         self.assertEqual((rows[0]["old_value"], rows[0]["new_value"]), ("10", "20"))
 
+    def test_parse_japicmp_xml_ignores_nested_and_top_level_jdk_type_noise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "diff.xml"
+            xml_path.write_text(
+                """<japicmp><classes>
+                <class name="io.seata.common.Foo" changeStatus="MODIFIED"
+                       binaryCompatible="false" sourceCompatible="false">
+                  <interfaces>
+                    <interface name="java.io.Serializable" changeStatus="REMOVED"
+                               binaryCompatible="false" sourceCompatible="false"/>
+                    <interface name="java.lang.Comparable" changeStatus="REMOVED"
+                               binaryCompatible="false" sourceCompatible="false"/>
+                  </interfaces>
+                  <methods>
+                    <method name="call" changeStatus="REMOVED"
+                            binaryCompatible="false" sourceCompatible="false"/>
+                  </methods>
+                </class>
+                <annotation name="java.lang.annotation.Annotation" changeStatus="REMOVED"
+                            binaryCompatible="false" sourceCompatible="false"/>
+                </classes></japicmp>""",
+                encoding="utf-8",
+            )
+
+            rows = step4.parse_japicmp_xml(xml_path, "io.seata:seata-common", "1", "2")
+
+        api_names = {row["api_name"] for row in rows}
+        self.assertIn("io.seata.common.Foo", api_names)
+        self.assertIn("io.seata.common.Foo.call", api_names)
+        self.assertNotIn("java.io.Serializable", api_names)
+        self.assertNotIn("java.lang.Comparable", api_names)
+        self.assertNotIn("java.lang.annotation.Annotation", api_names)
+
     def test_step4_default_timeouts_are_unbounded(self):
         self.assertIsNone(step4.DEFAULT_GIT_DIFF_TIMEOUT)
         self.assertIsNone(step4.DEFAULT_JAPICMP_TIMEOUT)

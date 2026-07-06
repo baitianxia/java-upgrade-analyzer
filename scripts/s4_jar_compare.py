@@ -1320,7 +1320,35 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
     root = ET.parse(str(path)).getroot()
     apis = []
 
+    def is_jdk_standard_owner(owner):
+        owner = str(owner or '').strip()
+        return owner.startswith(('java.', 'jdk.', 'sun.', 'com.sun.'))
+
+    def iter_top_level_class_elements():
+        class_tags = {'class', 'interface', 'enum', 'annotation', 'record'}
+        if _xml_local_name(root) in class_tags:
+            yield root
+            return
+        class_containers = [
+            element for element in root.iter()
+            if _xml_local_name(element) in {'classes', 'class-list', 'classlist'}
+        ]
+        if not class_containers:
+            class_containers = [root]
+        seen = set()
+        for container in class_containers:
+            for child in list(container):
+                if _xml_local_name(child) not in class_tags:
+                    continue
+                identity = id(child)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                yield child
+
     def add_row(owner, element, symbol_kind):
+        if is_jdk_standard_owner(owner):
+            return
         status = _xml_attr(element, 'changeStatus', 'change_status', 'status').upper()
         binary = _compat_value(element, 'binaryCompatible', 'binary_compatible')
         source = _compat_value(element, 'sourceCompatible', 'source_compatible')
@@ -1394,11 +1422,9 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
         if not validate_row(row):
             apis.append(row)
 
-    for class_element in root.iter():
-        if _xml_local_name(class_element) not in ('class', 'interface', 'enum', 'annotation', 'record'):
-            continue
+    for class_element in iter_top_level_class_elements():
         owner = _xml_attr(class_element, 'fullyQualifiedName', 'fully_qualified_name', 'name')
-        if not owner:
+        if not owner or is_jdk_standard_owner(owner):
             continue
         add_row(owner, class_element, 'class')
         for member in class_element.iter():
