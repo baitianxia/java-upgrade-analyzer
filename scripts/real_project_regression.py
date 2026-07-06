@@ -48,6 +48,7 @@ class RealProjectCase:
     default_changed_apis: Path
     baseline_specs: tuple[BaselineSpec, ...]
     source_dirs: tuple[Path, ...] = field(default_factory=tuple)
+    changed_api_rows: tuple[dict[str, str], ...] = field(default_factory=tuple)
 
 
 CASES = {
@@ -203,6 +204,95 @@ CASES = {
             ),
         ),
     ),
+    "commons-lang": RealProjectCase(
+        name="commons-lang",
+        default_project=Path("/private/tmp/jua-real-git-commons-lang"),
+        default_changed_apis=Path("/private/tmp/jua-real-git-commons-lang-probe/s4_jar_compare/all_changed_apis.csv"),
+        changed_api_rows=(
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.StringUtils.isBlank",
+                "api_simple": "isBlank",
+                "symbol_kind": "method",
+                "api_signature": "(CharSequence)",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.StringUtils.isEmpty",
+                "api_simple": "isEmpty",
+                "symbol_kind": "method",
+                "api_signature": "(CharSequence)",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.StringUtils.EMPTY",
+                "api_simple": "EMPTY",
+                "symbol_kind": "field",
+                "api_signature": "",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.Validate.isTrue",
+                "api_simple": "isTrue",
+                "symbol_kind": "method",
+                "api_signature": "(boolean, String, Object...)",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+        ),
+        baseline_specs=(
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.StringUtils.isBlank",
+                pattern=r"\bStringUtils\s*\.\s*isBlank\s*\(",
+                import_pattern=r"package\s+org\.apache\.commons\.lang3\s*;",
+                notes="same-package method references inside commons-lang itself",
+            ),
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.StringUtils.isEmpty",
+                pattern=r"\bStringUtils\s*\.\s*isEmpty\s*\(",
+                import_pattern=r"package\s+org\.apache\.commons\.lang3\s*;",
+                notes="same-package method references and internal helper usage",
+            ),
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.StringUtils.EMPTY",
+                pattern=r"\bStringUtils\s*\.\s*EMPTY\b",
+                import_pattern=r"package\s+org\.apache\.commons\.lang3\s*;",
+                notes="same-package static field owner resolution without import",
+            ),
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.Validate.isTrue",
+                pattern=r"\bValidate\s*\.\s*isTrue\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.commons\.lang3\.Validate\s*;"
+                    r"|package\s+org\.apache\.commons\.lang3\s*;"
+                ),
+                require_zero_production_missing=False,
+                notes="reported only: grep includes boolean-only overload and comments; varargs hits are still checked manually",
+            ),
+        ),
+    ),
 }
 
 
@@ -217,6 +307,10 @@ def iter_java_files(project_root: Path) -> Iterable[Path]:
             yield path
 
 
+def strip_java_comments(text: str) -> str:
+    return re.sub(r"/\*.*?\*/|//[^\n\r]*", "", text, flags=re.DOTALL)
+
+
 def collect_baseline_files(project_root: Path, spec: BaselineSpec) -> tuple[set[str], set[str], int]:
     production_files: set[str] = set()
     test_files: set[str] = set()
@@ -228,6 +322,7 @@ def collect_baseline_files(project_root: Path, spec: BaselineSpec) -> tuple[set[
             text = java_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        text = strip_java_comments(text)
         if not import_re.search(text):
             continue
         matches = list(call_re.finditer(text))
@@ -250,11 +345,26 @@ def collect_alert_files(alerts_csv: Path, symbol: str) -> set[str]:
         for row in csv.DictReader(fh):
             if (row.get("changed_symbol") or "").strip() != symbol:
                 continue
-            for item in (row.get("evidence_files") or "").split(";"):
+            for item in re.split(r"[|;]", row.get("evidence_files") or ""):
                 item = item.strip()
                 if item:
                     files.add(str(Path(item).resolve()))
     return files
+
+
+def ensure_changed_apis(case: RealProjectCase, changed_apis: Path) -> Path:
+    if changed_apis.exists() or not case.changed_api_rows:
+        return changed_apis
+    changed_apis.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "coord", "old_version", "new_version", "change_type", "api_name",
+        "api_simple", "symbol_kind", "api_signature", "confirmed", "severity", "source",
+    ]
+    with changed_apis.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(case.changed_api_rows)
+    return changed_apis
 
 
 def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, report_dir: Path) -> tuple[int, float]:
@@ -289,6 +399,7 @@ def load_summary(report_dir: Path) -> dict:
 def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, report_root: Path) -> dict:
     if not project_root.exists():
         return {"case": case.name, "status": "skipped", "reason": f"project root missing: {project_root}"}
+    changed_apis = ensure_changed_apis(case, changed_apis)
     if not changed_apis.exists():
         return {"case": case.name, "status": "skipped", "reason": f"changed APIs missing: {changed_apis}"}
 

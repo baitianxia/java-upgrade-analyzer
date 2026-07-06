@@ -2205,6 +2205,41 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
             self.assertIn("org.apache.dubbo.common.URL.valueOf(String)", graph.reverse_edges)
 
+    def test_build_graph_infers_class_boolean_and_string_returns_for_varargs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.commons.lang3.Validate;",
+                        "",
+                        "public class Demo {",
+                        "    public Demo(Class<?> listenerInterface) {",
+                        "        Validate.isTrue(listenerInterface.isInterface(), \"Class %s is not an interface\", listenerInterface.getName());",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.commons.lang3.Validate.isTrue(boolean, String, String)", graph.reverse_edges)
+
     def test_trace_api_does_not_start_from_unrelated_simple_signature_target(self):
         api_row = {
             "api_name": "com.lib.Target.parse",
@@ -2647,6 +2682,48 @@ class Step5KeyMatchingTest(unittest.TestCase):
             wildcard_imports=[],
             static_imports={},
             get_body_text=lambda: "return StringUtils.EMPTY;",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_FIELD_USAGE")
+        self.assertIn("org.apache.commons.lang3.StringUtils.EMPTY", result.call_paths[0])
+
+    def test_trace_api_marks_same_package_simple_static_field_access_as_reachable(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang3.StringUtils.EMPTY",
+            "api_simple": "EMPTY",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "REMOVED",
+            "coord": "org.apache.commons:commons-lang3",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "api",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="org.apache.commons.lang3.AnnotationUtils.toString",
+            simple_key="method:toString",
+            class_fqcn="org.apache.commons.lang3.AnnotationUtils",
+            class_name="AnnotationUtils",
+            method_name="toString",
+            return_type="String",
+            file="AnnotationUtils.java",
+            line=87,
+            owner_type="business",
+            is_test=False,
+            package_name="org.apache.commons.lang3",
+            imports={},
+            wildcard_imports=[],
+            static_imports={},
+            get_body_text=lambda: "return value.orElse(StringUtils.EMPTY);",
         )
         graph = SimpleNamespace(
             methods_by_id={"business_entry": business_method},

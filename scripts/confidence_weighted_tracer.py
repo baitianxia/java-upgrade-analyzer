@@ -278,9 +278,10 @@ def _find_direct_business_field_usages(api_row, graph):
         if simple_access_pattern and simple_access_pattern.search(body_text):
             imports = getattr(method_def, 'imports', {}) or {}
             wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
+            package_name = getattr(method_def, 'package_name', '') or ''
             if imports.get(owner_simple) == owner_class or any(
                 f"{pkg}.{owner_simple}" == owner_class for pkg in wildcard_imports
-            ):
+            ) or (package_name and f"{package_name}.{owner_simple}" == owner_class):
                 matches.append((method_def, 'field_access'))
     return matches
 

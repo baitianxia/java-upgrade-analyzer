@@ -2615,6 +2615,37 @@ def infer_known_library_method_return_type(receiver_type, method_name):
         }:
             return 'java.lang.String'
 
+    if receiver_candidates & {'java.lang.Class', 'Class'}:
+        if method_name in {
+            'desiredAssertionStatus',
+            'isAnnotation',
+            'isAnonymousClass',
+            'isArray',
+            'isAssignableFrom',
+            'isEnum',
+            'isHidden',
+            'isInstance',
+            'isInterface',
+            'isLocalClass',
+            'isMemberClass',
+            'isPrimitive',
+            'isRecord',
+            'isSealed',
+            'isSynthetic',
+        }:
+            return 'boolean'
+        if method_name in {
+            'descriptorString',
+            'getCanonicalName',
+            'getName',
+            'getPackageName',
+            'getSimpleName',
+            'getTypeName',
+            'toGenericString',
+            'toString',
+        }:
+            return 'java.lang.String'
+
     if simple_receiver == 'StringUtils' and method_name in {
         'isBlank',
         'isNotBlank',
