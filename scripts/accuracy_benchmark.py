@@ -81,6 +81,7 @@ BENCHMARK_CATEGORIES = (
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_packaged_dependency_hit_is_reachable_when_business_bytecode_calls_consumer",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_business_to_transitive_packaged_hit",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_three_hop_packaged_hit",
+            "tests.test_step5_key_matching.Step5KeyMatchingTest.test_deleted_commons_lang_many_runtime_jars_reaches_business_via_dependency_chain",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_does_not_infer_unconnected_packaged_hit",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_does_not_cross_wrong_overload",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_business_to_changed_field_hit",

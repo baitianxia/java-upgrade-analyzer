@@ -9958,6 +9958,95 @@ public class com.example.consumer.ReflectiveCall {
             for path in reachable.call_paths
         ))
 
+    def test_deleted_commons_lang_many_runtime_jars_reaches_business_via_dependency_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            commons_src = root / "commons-src" / "org" / "apache" / "commons" / "lang" / "StringUtils.java"
+            commons_src.parent.mkdir(parents=True)
+            commons_src.write_text(
+                "package org.apache.commons.lang; public class StringUtils { "
+                "public static boolean isBlank(String s) { return s == null || s.trim().isEmpty(); } "
+                "public static final String EMPTY = \"\"; }",
+                encoding="utf-8",
+            )
+            commons_classes = self._compile_java_files(root / "commons-classes", [commons_src])
+            commons_jar = root / "commons-lang.jar"
+            self._jar_compiled_classes(commons_jar, commons_classes)
+
+            dep_b_src = root / "dep-b-src" / "com" / "consumer" / "BridgeB.java"
+            dep_b_src.parent.mkdir(parents=True)
+            dep_b_src.write_text(
+                "package com.consumer; public class BridgeB { "
+                "public boolean use(String s) { return org.apache.commons.lang.StringUtils.isBlank(s); } }",
+                encoding="utf-8",
+            )
+            dep_b_classes = self._compile_java_files(root / "dep-b-classes", [dep_b_src], classpath=commons_jar)
+            dep_b_jar = root / "dep-b.jar"
+            self._jar_compiled_classes(dep_b_jar, dep_b_classes)
+
+            dep_a_src = root / "dep-a-src" / "com" / "consumer" / "FacadeA.java"
+            dep_a_src.parent.mkdir(parents=True)
+            dep_a_src.write_text(
+                "package com.consumer; public class FacadeA { "
+                "public boolean entry(String s) { return new com.consumer.BridgeB().use(s); } }",
+                encoding="utf-8",
+            )
+            dep_a_cp = os.pathsep.join([str(dep_b_jar), str(commons_jar)])
+            dep_a_classes = self._compile_java_files(root / "dep-a-classes", [dep_a_src], classpath=dep_a_cp)
+            dep_a_jar = root / "dep-a.jar"
+            self._jar_compiled_classes(dep_a_jar, dep_a_classes)
+
+            dummy_entries = []
+            for idx in range(60):
+                dummy_jar = root / f"dummy-{idx}.jar"
+                with zipfile.ZipFile(dummy_jar, "w") as zf:
+                    zf.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+                dummy_entries.append((f"com.example:dummy-{idx}", dummy_jar))
+
+            api_row = {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_simple": "isBlank",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            catalog = self._runtime_catalog([
+                ("com.example:dep-a", dep_a_jar),
+                ("com.example:dep-b", dep_b_jar),
+                *dummy_entries,
+            ])
+            graph = self._graph_with_business_edge(
+                catalog,
+                "com.consumer.FacadeA.entry(java.lang.String)",
+                root,
+            )
+
+            reachable = self._trace_packaged_fixture(api_row, graph)
+            perf = tracer._finalize_step5_perf_stats(graph)["bytecode_expand"]
+
+        self.assertEqual(reachable.analysis_status, "reachable")
+        self.assertEqual(reachable.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
+        self.assertEqual(
+            reachable.dependency_chain_coords,
+            ["com.example:dep-b", "com.example:dep-a"],
+        )
+        self.assertTrue(any(
+            "com.app.App.run -> com.consumer.FacadeA.entry(String) -> "
+            "com.example:dep-b:com.consumer.BridgeB.use(String) -> "
+            "org.apache.commons.lang.StringUtils.isBlank(String)"
+            in path
+            for path in reachable.call_paths
+        ))
+        self.assertGreaterEqual(perf["member_index_auto_large_catalog"], 1.0)
+        self.assertGreaterEqual(perf["member_index_builds"], 1.0)
+        self.assertGreaterEqual(perf["member_index_candidate_queries"], 1.0)
+        self.assertNotIn("light_scans", perf)
+        self.assertTrue(any(
+            item.get("candidate_source") == "member_index"
+            for item in perf.get("slow_runtime_lookups", [])
+        ))
+
     def test_runtime_dependency_bytecode_graph_does_not_infer_unconnected_packaged_hit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
