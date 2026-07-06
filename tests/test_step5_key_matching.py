@@ -2170,6 +2170,41 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertIn("org.apache.commons.lang3.Validate.isTrue(boolean, String)", graph.reverse_edges)
             self.assertNotIn("org.apache.commons.lang3.Validate.isTrue(StringUtils, String)", graph.reverse_edges)
 
+    def test_build_graph_infers_chained_string_return_for_url_valueof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.dubbo.common.URL;",
+                        "",
+                        "public class Demo {",
+                        "    public void handle(String msg) {",
+                        "        URL.valueOf(msg.substring(\"REGISTER\".length()).trim());",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.dubbo.common.URL.valueOf(String)", graph.reverse_edges)
+
     def test_trace_api_does_not_start_from_unrelated_simple_signature_target(self):
         api_row = {
             "api_name": "com.lib.Target.parse",

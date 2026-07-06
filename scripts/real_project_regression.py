@@ -66,6 +66,24 @@ CASES = {
                 notes="commons-lang3 removal probe; direct production utility calls must be represented",
             ),
             BaselineSpec(
+                symbol="org.apache.commons.lang3.StringUtils.isEmpty",
+                pattern=r"\bStringUtils\s*\.\s*isEmpty\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.commons\.lang3\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.commons\.lang3\.\*\s*;"
+                ),
+                notes="commons-lang3 CharSequence-compatible utility method",
+            ),
+            BaselineSpec(
+                symbol="org.apache.commons.lang3.StringUtils.defaultString",
+                pattern=r"\bStringUtils\s*\.\s*defaultString\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.commons\.lang3\.StringUtils\s*;"
+                    r"|import\s+org\.apache\.commons\.lang3\.\*\s*;"
+                ),
+                notes="commons-lang3 single-argument String utility method",
+            ),
+            BaselineSpec(
                 symbol="org.apache.commons.lang3.StringUtils.EMPTY",
                 pattern=r"\bStringUtils\s*\.\s*EMPTY\b",
                 import_pattern=(
@@ -163,6 +181,25 @@ CASES = {
                     r"|import\s+org\.apache\.dubbo\.common\.utils\.\*\s*;"
                 ),
                 notes="Map-specific utility method; source calls should not be confused with Collection overloads",
+            ),
+            BaselineSpec(
+                symbol="org.apache.dubbo.common.URL.valueOf",
+                pattern=r"\bURL\s*\.\s*valueOf\s*\(",
+                import_pattern=r"import\s+org\.apache\.dubbo\.common\.URL\s*;",
+                require_zero_production_missing=False,
+                notes=(
+                    "reported only: URL.valueOf is heavily overloaded; simple grep cannot distinguish "
+                    "String, ScopeModel and filtering overloads"
+                ),
+            ),
+            BaselineSpec(
+                symbol="org.apache.dubbo.common.utils.NetUtils.getLocalHost",
+                pattern=r"\bNetUtils\s*\.\s*getLocalHost\s*\(",
+                import_pattern=(
+                    r"import\s+org\.apache\.dubbo\.common\.utils\.NetUtils\s*;"
+                    r"|import\s+org\.apache\.dubbo\.common\.utils\.\*\s*;"
+                ),
+                notes="zero-argument utility method",
             ),
         ),
     ),

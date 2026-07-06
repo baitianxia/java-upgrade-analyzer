@@ -97,6 +97,48 @@ def _strip_balanced_outer_parens(expr):
     return text
 
 
+def split_trailing_method_call(expr):
+    text = (expr or '').strip()
+    if not text.endswith(')'):
+        return None
+    depth = 0
+    open_index = -1
+    for idx in range(len(text) - 1, -1, -1):
+        ch = text[idx]
+        if ch == ')':
+            depth += 1
+        elif ch == '(':
+            depth -= 1
+            if depth == 0:
+                open_index = idx
+                break
+    if open_index <= 0:
+        return None
+
+    method_end = open_index
+    method_start = method_end
+    while method_start > 0 and (text[method_start - 1].isalnum() or text[method_start - 1] == '_'):
+        method_start -= 1
+    method_name = text[method_start:method_end].strip()
+    if not method_name:
+        return None
+
+    dot_index = method_start - 1
+    while dot_index >= 0 and text[dot_index].isspace():
+        dot_index -= 1
+    if dot_index < 0 or text[dot_index] != '.':
+        return None
+
+    receiver_expr = text[:dot_index].strip()
+    if not receiver_expr:
+        return None
+    return {
+        'receiver': receiver_expr,
+        'method': method_name,
+        'args': text[open_index + 1:-1].strip(),
+    }
+
+
 def _normalize_type_hint(type_name):
     text = re.sub(r'<.*?>', '', str(type_name or '').strip())
     if not text:
@@ -2455,6 +2497,9 @@ def infer_expression_type_from_text(expr, method_def, local_var_types=None):
         return None
     local_var_types = local_var_types or getattr(method_def, 'local_var_types', {}) or {}
 
+    if expr.startswith('"') and expr.endswith('"'):
+        return 'java.lang.String'
+
     if expr.startswith('new '):
         match = re.match(r'new\s+([A-Za-z_][\w.]*)', expr)
         if match:
@@ -2481,6 +2526,30 @@ def infer_expression_type_from_text(expr, method_def, local_var_types=None):
             method_def,
             invocation_signature=invocation_signature,
         )
+
+    method_call = split_trailing_method_call(expr)
+    if method_call:
+        receiver_expr = method_call['receiver']
+        method_name = method_call['method']
+        args_text = method_call['args']
+        arg_exprs = [part.strip() for part in args_text.split(',') if part.strip()] if args_text else []
+        inferred_param_types = []
+        for arg_expr in arg_exprs:
+            inferred_type = infer_param_type_from_expression(arg_expr, method_def, local_var_types)
+            if inferred_type:
+                inferred_param_types.append(inferred_type)
+        invocation_signature = build_invocation_signature(arg_exprs, inferred_param_types)
+        receiver_type = infer_expression_type_from_text(receiver_expr, method_def, local_var_types)
+        return_type = infer_invocation_return_type(
+            receiver_type,
+            method_name,
+            method_def,
+            invocation_signature=invocation_signature,
+        )
+        if not return_type:
+            return_type = infer_known_library_method_return_type(receiver_type, method_name)
+        if return_type:
+            return return_type
 
     if expr[0].isupper():
         return resolve_type_fqn(expr, method_def)
@@ -2514,6 +2583,37 @@ def infer_known_library_method_return_type(receiver_type, method_name):
 
     if method_name == 'toString':
         return 'java.lang.String'
+
+    if receiver_candidates & {'java.lang.String', 'String'}:
+        if method_name in {
+            'codePointAt',
+            'codePointBefore',
+            'codePointCount',
+            'compareTo',
+            'compareToIgnoreCase',
+            'indexOf',
+            'lastIndexOf',
+            'length',
+            'offsetByCodePoints',
+        }:
+            return 'int'
+        if method_name in {
+            'concat',
+            'indent',
+            'repeat',
+            'replace',
+            'replaceAll',
+            'replaceFirst',
+            'strip',
+            'stripIndent',
+            'stripLeading',
+            'stripTrailing',
+            'substring',
+            'toLowerCase',
+            'toUpperCase',
+            'trim',
+        }:
+            return 'java.lang.String'
 
     if simple_receiver == 'StringUtils' and method_name in {
         'isBlank',
@@ -2722,11 +2822,11 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
             return field_type.rsplit('.', 1)[-1] if '.' in field_type else field_type
 
     # Method invocation (receiver.method(...))
-    method_call_match = re.match(r'^(?P<receiver>.+)\.(?P<method>[A-Za-z_]\w*)\s*\((?P<args>.*)\)$', expr)
-    if method_call_match:
-        receiver_expr = method_call_match.group('receiver').strip()
-        method_name = method_call_match.group('method').strip()
-        args_text = method_call_match.group('args').strip()
+    method_call = split_trailing_method_call(expr)
+    if method_call:
+        receiver_expr = method_call['receiver']
+        method_name = method_call['method']
+        args_text = method_call['args']
         if method_name == 'get':
             map_value_type = infer_map_get_value_type(receiver_expr)
             if map_value_type:
