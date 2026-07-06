@@ -346,8 +346,7 @@ INTERFACE_DECL_RE = re.compile(
 # 字段声明识别（增强版 - 支持无初始化字段）
 FIELD_DECL_RE = re.compile(
     r"^\s*(?:@\w+(?:\([^)]*\))?\s*)*"  # 支持多行注解
-    r"(?:private|protected|public)?\s*"  # 访问修饰符
-    r"(?:static)?\s*(?:final)?\s*"  # 其他修饰符
+    r"(?:(?:private|protected|public|static|final|volatile|transient)\s+)*"  # 修饰符
     r"([A-Za-z_]\w*(?:<[^;=]+>)?(?:\[\])*)\s+"  # 类型（含泛型和数组）
     r"([a-zA-Z_]\w*)\s*"  # 字段名
     r"((?:\s*\[\s*\])*)\s*"  # 支持 String field[] 写法
@@ -2608,6 +2607,24 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     if expr in local_var_types:
         fqn = local_var_types[expr]
         return fqn.rsplit('.', 1)[-1] if '.' in fqn else fqn
+
+    array_access_match = re.match(r'^(?P<base>[A-Za-z_]\w*)\s*\[[^\]]+\]$', expr)
+    if array_access_match:
+        base = array_access_match.group('base')
+        base_type = (
+            local_var_types.get(base)
+            or (getattr(method_def, 'param_declared_types', {}) or {}).get(base)
+            or (getattr(method_def, 'param_types', {}) or {}).get(base)
+            or (getattr(method_def, 'field_declared_types', {}) or {}).get(base)
+            or (getattr(method_def, 'field_types', {}) or {}).get(base)
+        )
+        if base_type:
+            element_type = str(base_type).strip()
+            element_type = element_type.replace('...', '[]')
+            if element_type.endswith('[]'):
+                element_type = element_type[:-2].strip()
+            resolved = resolve_type_fqn(element_type, method_def)
+            return resolved.rsplit('.', 1)[-1] if resolved else element_type.rsplit('.', 1)[-1]
 
     body_text = method_def.get_body_text() if hasattr(method_def, 'get_body_text') else getattr(method_def, 'body_text', '')
     enhanced_for_match = re.search(

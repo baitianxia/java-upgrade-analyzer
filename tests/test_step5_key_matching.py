@@ -2780,6 +2780,79 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
             self.assertIn("org.apache.dubbo.common.utils.StringUtils.isBlank(String)", graph.reverse_edges)
 
+    def test_build_graph_infers_varargs_array_element_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.seata.common.util.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(String... authInfo) {",
+                        "        return StringUtils.isBlank(authInfo[0]);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.seata.common.util.StringUtils.isBlank(String)", graph.reverse_edges)
+
+    def test_build_graph_parses_volatile_field_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import org.apache.seata.common.util.StringUtils;",
+                        "",
+                        "public class Demo {",
+                        "    private volatile String distributedLockTable;",
+                        "    public Demo() {",
+                        "        if (StringUtils.isBlank(distributedLockTable)) {",
+                        "            throw new IllegalStateException();",
+                        "        }",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("org.apache.seata.common.util.StringUtils.isBlank(String)", graph.reverse_edges)
+
     def test_build_graph_infers_dubbo_url_get_parameter_string_return(self):
         with tempfile.TemporaryDirectory() as tmp:
             src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
