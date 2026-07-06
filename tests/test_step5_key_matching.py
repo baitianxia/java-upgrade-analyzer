@@ -128,6 +128,102 @@ class Step5KeyMatchingTest(unittest.TestCase):
             allow_degraded=True,
         )
 
+    def test_runtime_dependency_caller_candidate_scan_is_reused_for_signature_variants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            src.mkdir()
+            bridge = src / "BridgeB.java"
+            caller = src / "CallerA.java"
+            bridge.write_text(
+                "package com.depb; public class BridgeB { public static void use(String v) {} }",
+                encoding="utf-8",
+            )
+            caller.write_text(
+                "package com.depa; public class CallerA { public void entry(String v) { com.depb.BridgeB.use(v); } }",
+                encoding="utf-8",
+            )
+            classes = self._compile_java_files(Path(tmp) / "classes", [bridge, caller])
+            jar_path = Path(tmp) / "dep-a.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=self._runtime_catalog((("com.example:dep-a", jar_path),)),
+            )
+
+            zip_open_count = 0
+            original_zip_file = tracer.zipfile.ZipFile
+
+            def counting_zip_file(*args, **kwargs):
+                nonlocal zip_open_count
+                zip_open_count += 1
+                return original_zip_file(*args, **kwargs)
+
+            with patch.object(tracer.zipfile, "ZipFile", side_effect=counting_zip_file):
+                tracer._ensure_runtime_dependency_callers_for_key(
+                    graph,
+                    "com.depb.BridgeB.use(String)",
+                )
+                tracer._ensure_runtime_dependency_callers_for_key(
+                    graph,
+                    "com.depb.BridgeB.use(java.lang.String)",
+                )
+
+        self.assertEqual(zip_open_count, 1)
+        self.assertIn(("com.depb.BridgeB", "use"), graph._runtime_dependency_caller_candidate_cache)
+
+    def test_packaged_hit_business_path_lookup_is_cached_for_repeated_consumer_hits(self):
+        hit = {
+            "coord": "com.example:dep-b",
+            "jar_path": "/tmp/dep-b.jar",
+            "class_fqcn": "com.depb.BridgeB",
+            "consumer_method": "use",
+            "consumer_signature": "(String)",
+            "target_display": "org.apache.commons.lang.StringUtils.isBlank(String)",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="app_run",
+            qualified_key="com.app.App.run",
+            owner_type="business",
+            owner_coord="__business__",
+            is_test=False,
+        )
+        edge = source_analyzer.CallEdge(
+            caller_symbol_id="app_run",
+            caller_qualified_key="com.app.App.run",
+            callee_key="com.depb.BridgeB.use(String)",
+            callee_simple_key="method:use",
+            evidence_type="bytecode_method_invocation",
+            confidence="high",
+            file="/tmp/app.jar",
+            line=0,
+            content="business bytecode calls dep",
+            owner_type="business",
+            owner_coord="__business__",
+            module="app",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"app_run": business_method},
+            reverse_edges={"com.depb.BridgeB.use(String)": [edge]},
+            runtime_dependency_catalog={},
+        )
+        calls = 0
+
+        def fake_expand(_graph, _lookup_key):
+            nonlocal calls
+            calls += 1
+            return {"expanded": True, "edges_added": 0, "javap_classes": 0, "visited_classes": 0}
+
+        with patch.object(tracer, "_ensure_runtime_dependency_callers_for_key", side_effect=fake_expand):
+            first = tracer._find_business_callers_for_packaged_hit(hit, graph)
+            calls_after_first = calls
+            second = tracer._find_business_callers_for_packaged_hit(hit, graph)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(calls, calls_after_first)
+
     def test_analyze_file_ignores_fully_block_commented_java_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"

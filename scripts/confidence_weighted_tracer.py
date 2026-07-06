@@ -1830,51 +1830,80 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
     visited_classes = 0
     javap_classes = 0
     edges_added = 0
-    javap_tasks = []
     target_jdk = catalog.get('target_jdk')
-    for item in catalog_entries:
-        coord = str(item.get('coord') or '').strip()
-        if not coord or coord == '__business__':
-            continue
-        jar_path = str(item.get('jar_path') or '').strip()
-        if not jar_path or not os.path.exists(jar_path):
-            continue
-        try:
-            with zipfile.ZipFile(jar_path) as zf:
-                try:
-                    manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
-                except KeyError:
-                    manifest = ''
-                multi_release_enabled = bool(re.search(
-                    r'(?im)^Multi-Release\s*:\s*true\s*$', manifest
-                ))
-                variants, _is_multi_release, _parsed_target = _runtime_class_variants(
-                    zf.namelist(), target_jdk, multi_release_enabled=multi_release_enabled
+    candidate_cache = getattr(graph, '_runtime_dependency_caller_candidate_cache', None)
+    if candidate_cache is None:
+        candidate_cache = {}
+        setattr(graph, '_runtime_dependency_caller_candidate_cache', candidate_cache)
+    # Candidate discovery depends only on owner/member, not on the specific
+    # spelling of the signature.  Cache it so String/java.lang.String variants
+    # and repeated paths do not rescan every runtime JAR.
+    candidate_cache_key = (owner, member)
+    cached_candidates = candidate_cache.get(candidate_cache_key)
+    if cached_candidates is not None:
+        javap_tasks = list(cached_candidates.get('javap_tasks') or [])
+        visited_classes = int(cached_candidates.get('visited_classes') or 0)
+    else:
+        javap_tasks = []
+        scan_started_at = time.perf_counter()
+        progress_interval = suggest_log_interval(len(catalog_entries), target_updates=6, minimum=1)
+        for idx, item in enumerate(catalog_entries, 1):
+            coord = str(item.get('coord') or '').strip()
+            if should_log_progress(idx, len(catalog_entries), progress_interval):
+                emit_progress(
+                    "step5",
+                    "bytecode-expand",
+                    f"查找运行时依赖调用者候选 owner={owner[:100]} member={member}",
+                    current=idx,
+                    total=len(catalog_entries),
+                    elapsed=time.perf_counter() - scan_started_at,
+                    item=coord or str(item.get('jar_path') or '')[:120],
                 )
-                for entry, logical_name, selected_version in variants:
-                    if logical_name.endswith(('module-info.class', 'package-info.class')):
-                        continue
-                    visited_classes += 1
-                    data = zf.read(entry)
-                    if not _class_bytes_might_reference_target(data, owner_internal, member):
-                        continue
-                    if not _runtime_prefilter_owner_candidates(
-                        [(owner, owner_internal.encode('utf-8'), owner.encode('utf-8'))],
-                        data,
-                        target_rows_by_owner,
-                    ):
-                        continue
-                    class_binary_name = logical_name[:-6].replace('/', '.')
-                    javap_tasks.append({
-                        'catalog': catalog,
-                        'coord': coord,
-                        'jar_path': jar_path,
-                        'class_binary_name': class_binary_name,
-                        'class_fqcn': class_binary_name.replace('$', '.'),
-                        'multi_release_version': selected_version,
-                    })
-        except Exception:
-            continue
+            if not coord or coord == '__business__':
+                continue
+            jar_path = str(item.get('jar_path') or '').strip()
+            if not jar_path or not os.path.exists(jar_path):
+                continue
+            try:
+                with zipfile.ZipFile(jar_path) as zf:
+                    try:
+                        manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
+                    except KeyError:
+                        manifest = ''
+                    multi_release_enabled = bool(re.search(
+                        r'(?im)^Multi-Release\s*:\s*true\s*$', manifest
+                    ))
+                    variants, _is_multi_release, _parsed_target = _runtime_class_variants(
+                        zf.namelist(), target_jdk, multi_release_enabled=multi_release_enabled
+                    )
+                    for entry, logical_name, selected_version in variants:
+                        if logical_name.endswith(('module-info.class', 'package-info.class')):
+                            continue
+                        visited_classes += 1
+                        data = zf.read(entry)
+                        if not _class_bytes_might_reference_target(data, owner_internal, member):
+                            continue
+                        if not _runtime_prefilter_owner_candidates(
+                            [(owner, owner_internal.encode('utf-8'), owner.encode('utf-8'))],
+                            data,
+                            target_rows_by_owner,
+                        ):
+                            continue
+                        class_binary_name = logical_name[:-6].replace('/', '.')
+                        javap_tasks.append({
+                            'catalog': catalog,
+                            'coord': coord,
+                            'jar_path': jar_path,
+                            'class_binary_name': class_binary_name,
+                            'class_fqcn': class_binary_name.replace('$', '.'),
+                            'multi_release_version': selected_version,
+                        })
+            except Exception:
+                continue
+        candidate_cache[candidate_cache_key] = {
+            'javap_tasks': list(javap_tasks),
+            'visited_classes': visited_classes,
+        }
 
     def handle_javap_result(task, references):
         nonlocal javap_classes, edges_added
@@ -1894,6 +1923,7 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
 
     if javap_tasks:
         workers = min(_step5_bytecode_javap_workers(), len(javap_tasks))
+        javap_started_at = time.perf_counter()
         emit_progress(
             "step5",
             "bytecode-expand",
@@ -1909,13 +1939,23 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                     executor.submit(_load_runtime_dependency_class_references_for_task, task): task
                     for task in javap_tasks
                 }
-                for future in as_completed(future_map):
+                progress_interval = suggest_log_interval(len(future_map), target_updates=8, minimum=1)
+                for done_count, future in enumerate(as_completed(future_map), 1):
                     task = future_map[future]
                     try:
                         _task, references = future.result()
                     except Exception:
                         _task, references = task, None
                     handle_javap_result(_task, references)
+                    if should_log_progress(done_count, len(future_map), progress_interval):
+                        emit_progress(
+                            "step5",
+                            "bytecode-expand",
+                            f"运行时依赖调用者字节码扩展进度 lookup={lookup_key[:100]}",
+                            current=done_count,
+                            total=len(future_map),
+                            elapsed=time.perf_counter() - javap_started_at,
+                        )
     return {
         'expanded': True,
         'edges_added': edges_added,
@@ -1952,8 +1992,18 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
         for method_def in methods_by_id.values()
     ):
         return []
+    lookup_keys = tuple(_packaged_hit_consumer_lookup_keys(hit))
+    if not lookup_keys:
+        return []
+    path_cache = getattr(graph, '_packaged_hit_business_path_cache', None)
+    if path_cache is None:
+        path_cache = {}
+        setattr(graph, '_packaged_hit_business_path_cache', path_cache)
+    cache_key = (lookup_keys, int(max_depth or 0))
+    if cache_key in path_cache:
+        return list(path_cache.get(cache_key) or [])
     queue = []
-    for key in _packaged_hit_consumer_lookup_keys(hit):
+    for key in lookup_keys:
         queue.append((key, []))
     visited = set()
     paths = []
@@ -1975,6 +2025,7 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
             if caller_key:
                 for variant in _method_lookup_key_variants(caller_key):
                     queue.append((variant, next_path))
+    path_cache[cache_key] = list(paths)
     return paths
 
 
