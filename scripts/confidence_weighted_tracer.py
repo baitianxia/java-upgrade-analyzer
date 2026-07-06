@@ -196,18 +196,28 @@ def _find_direct_business_field_usage(api_row, graph):
     owner_simple = owner_class.rsplit('.', 1)[-1] if owner_class else ''
     if not field_name:
         return None
-    body_patterns = []
-    if owner_simple:
-        body_patterns.append(re.compile(r'\b' + re.escape(owner_simple) + r'\s*\.\s*' + re.escape(field_name) + r'\b'))
-    if owner_class:
-        body_patterns.append(re.compile(re.escape(owner_class) + r'\s*\.\s*' + re.escape(field_name) + r'\b'))
+    simple_access_pattern = (
+        re.compile(r'\b' + re.escape(owner_simple) + r'\s*\.\s*' + re.escape(field_name) + r'\b')
+        if owner_simple else None
+    )
+    fqcn_access_pattern = (
+        re.compile(re.escape(owner_class) + r'\s*\.\s*' + re.escape(field_name) + r'\b')
+        if owner_class else None
+    )
     for method_def in _iter_business_methods(graph):
         static_imports = getattr(method_def, 'static_imports', {}) or {}
         if static_imports.get(field_name) == api_name:
             return method_def, 'static_import'
         body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
-        if any(pattern.search(body_text) for pattern in body_patterns):
+        if fqcn_access_pattern and fqcn_access_pattern.search(body_text):
             return method_def, 'field_access'
+        if simple_access_pattern and simple_access_pattern.search(body_text):
+            imports = getattr(method_def, 'imports', {}) or {}
+            wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
+            if imports.get(owner_simple) == owner_class or any(
+                f"{pkg}.{owner_simple}" == owner_class for pkg in wildcard_imports
+            ):
+                return method_def, 'field_access'
     return None
 
 
