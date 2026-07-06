@@ -224,6 +224,49 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(len(second), 1)
         self.assertEqual(calls, calls_after_first)
 
+    def test_many_packaged_hits_enable_runtime_member_index_preference(self):
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={}, runtime_dependency_catalog={})
+        result = tracer.TraceResult(
+            api_name="org.apache.commons.lang.StringUtils.isBlank",
+            api_simple="isBlank",
+            api_signature="(String)",
+            symbol_kind="method",
+            change_type="REMOVED",
+            coord="org.apache.commons:commons-lang",
+            severity="P1",
+            confirmed=True,
+            source="unit",
+            analysis_scope="method",
+            analysis_status="",
+            direct_callers=0,
+            is_reachable=None,
+            reachable_note="",
+            business_reach_depth=0,
+            dependency_chain_coords=[],
+            call_paths=[],
+            evidence_paths=[],
+            reason_code="",
+            verification_commands=[],
+            hops=[],
+            confidence_score=0.0,
+            critical_nodes_hit=[],
+        )
+        hits = [
+            {
+                "coord": f"com.example:dep-{idx}",
+                "jar_path": f"/tmp/dep-{idx}.jar",
+                "class_fqcn": f"com.dep{idx}.Bridge",
+                "consumer_method": "use",
+                "consumer_signature": "(String)",
+                "target_display": "org.apache.commons.lang.StringUtils.isBlank(String)",
+            }
+            for idx in range(8)
+        ]
+
+        tracer._build_packaged_dependency_hit_result(result, hits, graph)
+
+        self.assertTrue(graph._prefer_runtime_dependency_member_candidate_index)
+
     def test_analyze_file_ignores_fully_block_commented_java_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"
