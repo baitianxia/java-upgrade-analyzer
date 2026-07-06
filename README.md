@@ -496,6 +496,11 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ## 开发者
 
+- 推荐统一质量门入口：
+  - 快速检查：`python3 scripts/quality_gate.py --profile quick`
+  - Step5/字节码/输出语义相关修改：`python3 scripts/quality_gate.py --profile step5`
+  - 打包或重要提交前：`python3 scripts/quality_gate.py --profile release`
+  - 只查看计划不执行：`python3 scripts/quality_gate.py --profile release --dry-run`
 - 运行完整最小回归：`python3 scripts/smoke_regression.py`
 - 按主题运行回归：`python3 scripts/smoke_regression.py --group core|step5|orchestrator`
 - 通过标准测试入口运行：`python3 -m unittest discover -s tests -v`

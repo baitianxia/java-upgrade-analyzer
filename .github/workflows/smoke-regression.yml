@@ -7,16 +7,22 @@ on:
       - "README.md"
       - "RUNBOOK.md"
       - "SKILL.md"
+      - "QUALITY_GATES.md"
+      - "TESTING_STRATEGY.md"
       - "runtime_config.example.json"
       - "scripts/**"
+      - "tests/**"
   pull_request:
     paths:
       - ".github/workflows/smoke-regression.yml"
       - "README.md"
       - "RUNBOOK.md"
       - "SKILL.md"
+      - "QUALITY_GATES.md"
+      - "TESTING_STRATEGY.md"
       - "runtime_config.example.json"
       - "scripts/**"
+      - "tests/**"
 
 jobs:
   smoke-regression:
@@ -35,5 +41,5 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install tree-sitter tree-sitter-java
 
-      - name: Run Smoke Regression Suites
-        run: python -m unittest discover -s tests -v
+      - name: Run Quick Quality Gate
+        run: python scripts/quality_gate.py --profile quick

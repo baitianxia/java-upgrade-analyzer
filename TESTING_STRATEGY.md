@@ -9,7 +9,21 @@
 
 ## 必跑质量门禁
 
-每次修改分析逻辑后至少执行：
+推荐优先使用统一质量门入口：
+
+```bash
+python3 scripts/quality_gate.py --profile quick
+python3 scripts/quality_gate.py --profile step5
+python3 scripts/quality_gate.py --profile release
+```
+
+只想查看会执行哪些命令时使用：
+
+```bash
+python3 scripts/quality_gate.py --profile release --dry-run
+```
+
+每次修改分析逻辑后至少执行 quick 或等价命令：
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
@@ -22,6 +36,7 @@ git diff --check
 涉及 Step4 或 Step5 时，应额外执行对应局部测试：
 
 ```bash
+python3 scripts/quality_gate.py --profile step5
 python3 -m unittest tests.test_step4_stability
 python3 -m unittest tests.test_step5_key_matching tests.test_business_bytecode_graph tests.test_artifact_bytecode_catalog tests.test_indirect_usage_analyzer
 ```
