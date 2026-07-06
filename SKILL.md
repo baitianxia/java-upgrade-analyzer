@@ -386,6 +386,8 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 输入：依赖变更清单、上下文、分支信息、依赖源码目录（推荐字段：`dependency_source_dirs`）
 - 输出：`.upgrade-report/s4_jar_compare/` 与 `all_changed_apis.csv`
 - 重点：JApiCmp XML 是机器解析主证据，stdout 仅用于人读和 XML 失败回退；分别保留 binary/source compatibility，不能把“二进制兼容但源码重编译不兼容”合并掉
+- 规则：Step4 必须优先复用 Step1 `build_provenance.json` 指向的 base/current 最终构建产物，并按 `s1_dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 jar；只有最终制品中无法定位时，才回退到本地 Maven 仓库或 Maven 拉取
+- 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `s1_dep_changes.csv` 原始顺序稳定合并
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应超时
 - 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再按依赖的 `old_version/new_version` 只在对应源码仓库远端分支 `remotes` 中匹配 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支；old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；若未匹配到或存在歧义，必须进入人工确认，不得直接套用主项目分支名
 - 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释

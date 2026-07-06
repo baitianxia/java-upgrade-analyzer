@@ -64,6 +64,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "step4_fetch_timeout",
     "step4_git_diff_timeout",
     "step4_japicmp_timeout",
+    "step4_workers",
     "step5_selected_coords",
     "step5_selected_names",
     "step5_timeout",
@@ -664,6 +665,7 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         "step4_git_diff_timeout",
         "step4_japicmp_timeout",
         "step4_fetch_timeout",
+        "step4_workers",
         "step5_timeout",
     ):
         if timeout_key in response:
@@ -1689,6 +1691,7 @@ def infer_non_pending_target_step_from_payload(user_response):
                 "step4_fetch_timeout",
                 "step4_git_diff_timeout",
                 "step4_japicmp_timeout",
+                "step4_workers",
             },
         ),
         (
@@ -2567,6 +2570,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             "step4_fetch_timeout",
             None,
         ),
+        "step4_workers": resolve_value(
+            cli_scalar(getattr(args, "step4_workers", None)),
+            merged,
+            "step4_workers",
+            None,
+        ),
         "step5_timeout": resolve_value(
             cli_scalar(getattr(args, "step5_timeout", None)),
             merged,
@@ -2643,6 +2652,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "step4_git_diff_timeout",
         "step4_japicmp_timeout",
         "step4_fetch_timeout",
+        "step4_workers",
         "step5_timeout",
     ):
         value = result.get(timeout_key)
@@ -5192,6 +5202,7 @@ def main():
     ap.add_argument("--step4-git-diff-timeout", type=int, default=None)
     ap.add_argument("--step4-japicmp-timeout", type=int, default=None)
     ap.add_argument("--step4-fetch-timeout", type=int, default=None)
+    ap.add_argument("--step4-workers", type=int, default=None)
     ap.add_argument("--step5-timeout", type=int, default=None)
     ap.add_argument("--base-artifact-path", default="")
     ap.add_argument("--current-artifact-path", default="")

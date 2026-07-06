@@ -426,6 +426,7 @@ python3 "$SKILL/scripts/s4_jar_compare.py" \
   --dep-changes .upgrade-report/s1_dep_changes.csv \
   --context .upgrade-report/s2_context.json \
   --output-dir .upgrade-report/s4_jar_compare \
+  --workers 4 \
   --source-branches <基准分支> <当前分支>
 ```
 
@@ -457,6 +458,8 @@ mvn dependency:get \
 - `jar 未找到`
 - `JApiCmp 未安装`
 - 其他执行失败项
+- Step4 会优先复用 Step1 成功构建产物中的 `base_lib_entry/current_lib_entry` jar，并将提取缓存写入 `.upgrade-report/s4_jar_compare/step4_artifact_jars/`；只有无法从最终制品定位时才回退本地 Maven 仓库或 Maven 拉取
+- Step4 默认 `step4_workers=4` 进行依赖级并行；如果本机 CPU/磁盘压力过高，可在主状态或命令行设为 1/2
 - 正式流程默认不设置 Step4 超时；仅在主状态中显式写入 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应限制
 - 正式流程会向 `stderr` 输出 `[progress][step4][dependency|gitdiff|japicmp|done]` 日志，展示当前处理到哪个依赖、子阶段和耗时
 

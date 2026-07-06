@@ -24,7 +24,8 @@ s4_jar_compare.py — Step 4：jar 包变更全量对比
   "变更 API 数量 = 0 的依赖"仍需特别标出，便于后续交互时人工复核
 """
 
-import argparse, csv, json, os, re, shutil, sys, time
+import argparse, csv, json, os, re, shutil, sys, time, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from pathlib import Path
 from datetime import datetime
@@ -55,6 +56,7 @@ MAIN_STATE_FILE_NAME = "main_state.json"
 DEFAULT_FETCH_TIMEOUT = None
 DEFAULT_JAPICMP_TIMEOUT = None
 DEFAULT_GIT_DIFF_TIMEOUT = None
+_WRITE_RESULT_LOCK = threading.RLock()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -102,7 +104,8 @@ def load_csv(path):
 
 def write_result(path, content):
     """写文件，使用 compat.write_text 确保跨平台 UTF-8 和目录创建"""
-    write_text(path, content)
+    with _WRITE_RESULT_LOCK:
+        write_text(path, content)
 
 
 def cleanup_step4_generated_outputs(output_dir):
@@ -131,6 +134,9 @@ def cleanup_step4_generated_outputs(output_dir):
     per_dependency_dir = output_path.resolve().parent / PER_DEPENDENCY_DIRNAME
     if per_dependency_dir.exists():
         shutil.rmtree(per_dependency_dir, ignore_errors=True)
+    artifact_cache_dir = output_path / "step4_artifact_jars"
+    if artifact_cache_dir.exists():
+        shutil.rmtree(artifact_cache_dir, ignore_errors=True)
 
 
 def infer_package_from_source_path(source_path):
@@ -171,6 +177,99 @@ def _resolve_step4_side_coord(row, side, fallback_coord=""):
     else:
         side_coord = ""
     return side_coord or str(fallback_coord or row.get("coord") or "").strip()
+
+
+def _safe_artifact_entry_filename(entry_name):
+    raw = str(entry_name or "").replace("\\", "/").strip("/")
+    safe = re.sub(r"[^A-Za-z0-9._/-]+", "_", raw).replace("/", "__")
+    return safe or "unknown.jar"
+
+
+class Step1ArtifactJarResolver:
+    """Resolve dependency jars from Step1 final build artifacts before falling back to Maven.
+
+    Step1 records the final deployable artifact and each packaged lib entry.  Reusing those
+    nested jars keeps Step4 aligned with the exact artifacts that successfully built, and avoids
+    repeatedly resolving/downloading jars that are already present in the packaged output.
+    """
+
+    def __init__(self, report_dir, output_dir):
+        self.report_dir = Path(report_dir or ".").resolve()
+        self.output_dir = Path(output_dir or ".").resolve()
+        self.cache_dir = self.output_dir / "step4_artifact_jars"
+        self.sides = self._load_sides()
+        self._entry_cache = {}
+
+    def _load_sides(self):
+        provenance_path = self.report_dir / "build_provenance.json"
+        if not provenance_path.is_file():
+            return {}
+        try:
+            data = json.loads(provenance_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        sides = {}
+        for item in data.get("sides") or []:
+            side = str(item.get("side") or "").strip()
+            artifact_path = str(item.get("artifact_path") or "").strip()
+            if not side or not artifact_path:
+                continue
+            artifact = Path(artifact_path)
+            if not artifact.is_file():
+                retained_name = Path(artifact_path).name
+                retained = self.report_dir / "s1_artifacts" / retained_name
+                if retained.is_file():
+                    artifact = retained
+            if artifact.is_file():
+                record = dict(item)
+                record["artifact_path"] = str(artifact)
+                sides[side] = record
+        return sides
+
+    def resolve_for_row(self, row, side):
+        row = row or {}
+        entry_field = "base_lib_entry" if side == "base" else "current_lib_entry"
+        lib_entry = str(row.get(entry_field) or "").replace("\\", "/").strip()
+        if not lib_entry:
+            return None
+        return self.resolve_entry(side, lib_entry)
+
+    def resolve_entry(self, side, lib_entry):
+        side_meta = self.sides.get(side) or {}
+        artifact_path = side_meta.get("artifact_path")
+        if not artifact_path or not lib_entry:
+            return None
+        key = (side, artifact_path, lib_entry)
+        if key in self._entry_cache:
+            cached = self._entry_cache[key]
+            return dict(cached) if cached else None
+        artifact = Path(artifact_path)
+        target = self.cache_dir / side / _safe_artifact_entry_filename(lib_entry)
+        try:
+            with zipfile.ZipFile(artifact) as zf:
+                names = set(zf.namelist())
+                if lib_entry not in names:
+                    self._entry_cache[key] = None
+                    return None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                info = zf.getinfo(lib_entry)
+                if not target.exists() or target.stat().st_size != info.file_size:
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        except Exception as exc:
+            _ = exc
+            self._entry_cache[key] = None
+            return None
+        evidence = {
+            "path": str(target),
+            "source": "step1_final_artifact",
+            "side": side,
+            "artifact_path": str(artifact),
+            "artifact_sha256": str(side_meta.get("artifact_sha256") or ""),
+            "lib_entry": lib_entry,
+        }
+        self._entry_cache[key] = dict(evidence)
+        return evidence
 
 
 _REPO_REFS_CACHE = {}
@@ -1066,7 +1165,15 @@ def _parse_removed_jar_javap_output(text, coord, old_ver, class_binary_name):
     return rows
 
 
-def export_removed_jar_apis(coord, old_ver, output_dir, old_coord=None, fetch_timeout=DEFAULT_FETCH_TIMEOUT):
+def export_removed_jar_apis(
+    coord,
+    old_ver,
+    output_dir,
+    old_coord=None,
+    fetch_timeout=DEFAULT_FETCH_TIMEOUT,
+    old_jar_path=None,
+    old_jar_evidence=None,
+):
     resolved_old_coord = str(old_coord or coord or '').strip()
     group_id, artifact_id, classifier = _split_coord(resolved_old_coord)
     safe_name = (artifact_id or 'unknown').replace('.', '-') + (f"_{classifier}" if classifier else "")
@@ -1076,12 +1183,20 @@ def export_removed_jar_apis(coord, old_ver, output_dir, old_coord=None, fetch_ti
         write_result(out_file, msg)
         return out_file, [], {"old_jar": None}, "非法坐标"
 
-    old_jar = find_jar_in_m2(group_id, artifact_id, old_ver, classifier=classifier)
+    old_jar = str(old_jar_path or "").strip() or None
+    old_jar_source = (old_jar_evidence or {}).get("source") if old_jar else ""
+    if old_jar and not os.path.exists(old_jar):
+        old_jar = None
+        old_jar_source = ""
+    if not old_jar:
+        old_jar = find_jar_in_m2(group_id, artifact_id, old_ver, classifier=classifier)
+        old_jar_source = "m2_repository" if old_jar else ""
     fetch_old_error = None
     if not old_jar:
         fetched, fetch_old_error = fetch_jar_from_repo(resolved_old_coord, old_ver, timeout=fetch_timeout)
         if fetched:
             old_jar = find_jar_in_m2(group_id, artifact_id, old_ver, classifier=classifier)
+            old_jar_source = "m2_repository" if old_jar else ""
     if not old_jar:
         msg = (
             f"=== 无法导出 removed jar 符号：旧版 jar 未找到 ===\n"
@@ -1106,6 +1221,7 @@ def export_removed_jar_apis(coord, old_ver, output_dir, old_coord=None, fetch_ti
         f"coord={resolved_old_coord}",
         f"old_version={old_ver}",
         f"old_jar={old_jar}",
+        f"old_jar_source={old_jar_source or 'unknown'}",
         f"class_count={class_count}",
         f"exported_api_count={len(apis)}",
     ]
@@ -1113,7 +1229,12 @@ def export_removed_jar_apis(coord, old_ver, output_dir, old_coord=None, fetch_ti
         lines.append("errors:")
         lines.extend(f"  - {item}" for item in errors)
     write_result(out_file, "\n".join(lines) + "\n")
-    return out_file, apis, {"old_jar": old_jar, "errors": errors}, (None if apis else "未导出到任何 public/protected API")
+    return out_file, apis, {
+        "old_jar": old_jar,
+        "old_jar_source": old_jar_source,
+        "old_jar_evidence": old_jar_evidence or {},
+        "errors": errors,
+    }, (None if apis else "未导出到任何 public/protected API")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1130,6 +1251,10 @@ def run_japicmp(
     fetch_timeout=DEFAULT_FETCH_TIMEOUT,
     old_coord=None,
     new_coord=None,
+    old_jar_path=None,
+    new_jar_path=None,
+    old_jar_evidence=None,
+    new_jar_evidence=None,
 ):
     """
     对单个依赖运行 JApiCmp，返回 (output_file, changed_apis, error_msg)
@@ -1160,8 +1285,22 @@ def run_japicmp(
     xml_file = os.path.join(output_dir,
         f"{safe_name}_{old_ver}_vs_{new_ver}_binary.xml")
 
-    old_jar = find_jar_in_m2(old_group_id, old_artifact_id, old_ver, classifier=old_classifier)
-    new_jar = find_jar_in_m2(new_group_id, new_artifact_id, new_ver, classifier=new_classifier)
+    old_jar = str(old_jar_path or "").strip() or None
+    new_jar = str(new_jar_path or "").strip() or None
+    old_jar_source = (old_jar_evidence or {}).get("source") if old_jar else ""
+    new_jar_source = (new_jar_evidence or {}).get("source") if new_jar else ""
+    if old_jar and not os.path.exists(old_jar):
+        old_jar = None
+        old_jar_source = ""
+    if new_jar and not os.path.exists(new_jar):
+        new_jar = None
+        new_jar_source = ""
+    if not old_jar:
+        old_jar = find_jar_in_m2(old_group_id, old_artifact_id, old_ver, classifier=old_classifier)
+        old_jar_source = "m2_repository" if old_jar else ""
+    if not new_jar:
+        new_jar = find_jar_in_m2(new_group_id, new_artifact_id, new_ver, classifier=new_classifier)
+        new_jar_source = "m2_repository" if new_jar else ""
 
     fetch_old_error = None
     fetch_new_error = None
@@ -1170,11 +1309,13 @@ def run_japicmp(
         fetched, fetch_old_error = fetch_jar_from_repo(resolved_old_coord, old_ver, timeout=fetch_timeout)
         if fetched:
             old_jar = find_jar_in_m2(old_group_id, old_artifact_id, old_ver, classifier=old_classifier)
+            old_jar_source = "m2_repository" if old_jar else ""
     if not new_jar:
         print(f"  本地无 {resolved_new_coord}:{new_ver}，尝试下载...", file=sys.stderr)
         fetched, fetch_new_error = fetch_jar_from_repo(resolved_new_coord, new_ver, timeout=fetch_timeout)
         if fetched:
             new_jar = find_jar_in_m2(new_group_id, new_artifact_id, new_ver, classifier=new_classifier)
+            new_jar_source = "m2_repository" if new_jar else ""
 
     # 仍然找不到：明确记录，不跳过
     if not old_jar or not new_jar:
@@ -1211,6 +1352,10 @@ def run_japicmp(
         return out_file, [], {
             "old_jar": old_jar,
             "new_jar": new_jar,
+            "old_jar_source": old_jar_source,
+            "new_jar_source": new_jar_source,
+            "old_jar_evidence": old_jar_evidence or {},
+            "new_jar_evidence": new_jar_evidence or {},
             "fetch_old_error": fetch_old_error,
             "fetch_new_error": fetch_new_error,
         }, f"jar 未找到：{display_coord}（旧:{old_jar or '缺失'} 新:{new_jar or '缺失'}）"
@@ -1223,7 +1368,14 @@ def run_japicmp(
             f"下载后重新运行。\n"
         )
         write_result(out_file, msg)
-        return out_file, [], {"old_jar": old_jar, "new_jar": new_jar}, "JApiCmp 未安装"
+        return out_file, [], {
+            "old_jar": old_jar,
+            "new_jar": new_jar,
+            "old_jar_source": old_jar_source,
+            "new_jar_source": new_jar_source,
+            "old_jar_evidence": old_jar_evidence or {},
+            "new_jar_evidence": new_jar_evidence or {},
+        }, "JApiCmp 未安装"
 
     # 执行 JApiCmp
     stdout, stderr, rc = run_cmd(
@@ -1238,7 +1390,14 @@ def run_japicmp(
     if rc == -1 and '超时' in stderr:
         timeout_label = f"{japicmp_timeout}秒" if japicmp_timeout not in (None, "") else "未设置超时"
         write_result(out_file, f"❌ JApiCmp 执行超时（{timeout_label}）\n{stderr}")
-        return out_file, [], {"old_jar": old_jar, "new_jar": new_jar}, "超时"
+        return out_file, [], {
+            "old_jar": old_jar,
+            "new_jar": new_jar,
+            "old_jar_source": old_jar_source,
+            "new_jar_source": new_jar_source,
+            "old_jar_evidence": old_jar_evidence or {},
+            "new_jar_evidence": new_jar_evidence or {},
+        }, "超时"
     if rc != 0:
         error_lines = [f"❌ JApiCmp 执行失败（退出码 {rc}）"]
         if stderr:
@@ -1247,7 +1406,14 @@ def run_japicmp(
             error_lines.append(f"stdout:\n{stdout}")
         write_result(out_file, "\n".join(error_lines) + "\n")
         failure_msg = (stderr or stdout or f"JApiCmp 失败，退出码 {rc}").strip()
-        return out_file, [], {"old_jar": old_jar, "new_jar": new_jar}, failure_msg[:100]
+        return out_file, [], {
+            "old_jar": old_jar,
+            "new_jar": new_jar,
+            "old_jar_source": old_jar_source,
+            "new_jar_source": new_jar_source,
+            "old_jar_evidence": old_jar_evidence or {},
+            "new_jar_evidence": new_jar_evidence or {},
+        }, failure_msg[:100]
     raw_output = stdout or stderr or "(无输出)"
 
     # 完整保留原始输出
@@ -1258,6 +1424,8 @@ def run_japicmp(
         f"新坐标：{resolved_new_coord}\n"
         f"旧版本：{old_ver}  ({old_jar})\n"
         f"新版本：{new_ver}  ({new_jar})\n"
+        f"旧 jar 来源：{old_jar_source or 'unknown'}\n"
+        f"新 jar 来源：{new_jar_source or 'unknown'}\n"
         f"执行时间：{datetime.now().isoformat()}\n"
         f"{'='*60}\n\n"
     )
@@ -1285,6 +1453,10 @@ def run_japicmp(
     return out_file, changed_apis, {
         "old_jar": old_jar,
         "new_jar": new_jar,
+        "old_jar_source": old_jar_source,
+        "new_jar_source": new_jar_source,
+        "old_jar_evidence": old_jar_evidence or {},
+        "new_jar_evidence": new_jar_evidence or {},
         "xml_file": xml_file if os.path.exists(xml_file) else '',
         "parser_mode": parser_mode,
         "xml_error": xml_error,
@@ -3141,6 +3313,8 @@ def main():
                     help='单个依赖执行 JApiCmp 的超时时间（秒）')
     ap.add_argument('--fetch-timeout', type=int, default=DEFAULT_FETCH_TIMEOUT,
                     help='单个依赖通过 Maven 拉取 jar 的超时时间（秒）')
+    ap.add_argument('--workers', type=int, default=int(os.environ.get("JUA_STEP4_WORKERS", "4") or "4"),
+                    help='Step4 依赖级并行 worker 数；设为 1 可恢复串行执行')
     ap.add_argument('--skip-changed-classes', action='store_true',
                     help='跳过 changed_classes.json 的 class hash 计算，减少大批量依赖时的 I/O 开销')
     ap.add_argument('--source-branches', nargs=2,
@@ -3165,6 +3339,8 @@ def main():
             args.japicmp_timeout = int(orchestrated_input.get("step4_japicmp_timeout"))
         if args.fetch_timeout in (None, "") and orchestrated_input.get("step4_fetch_timeout"):
             args.fetch_timeout = int(orchestrated_input.get("step4_fetch_timeout"))
+        if orchestrated_input.get("step4_workers"):
+            args.workers = int(orchestrated_input.get("step4_workers"))
         if not args.source_branches:
             base_branch = str(orchestrated_input.get("base_branch") or "").strip()
             current_branch = str(orchestrated_input.get("current_branch") or "").strip()
@@ -3298,12 +3474,47 @@ def main():
     timeout_items = []
     binary_runs = []
 
-    print(f"\nStep 4 开始：处理 {len(dep_rows)} 个依赖", file=sys.stderr)
-    emit_progress("step4", "plan", f"开始构建 jar 对比证据池，共 {len(dep_rows)} 个依赖")
+    report_dir = str(Path(args.output_dir).resolve().parent)
+    artifact_resolver = Step1ArtifactJarResolver(report_dir, args.output_dir)
+    prepared_dep_rows = []
+    artifact_jar_hits = 0
+    for row in dep_rows:
+        prepared = dict(row)
+        base_evidence = artifact_resolver.resolve_for_row(row, "base")
+        current_evidence = artifact_resolver.resolve_for_row(row, "current")
+        if base_evidence:
+            artifact_jar_hits += 1
+            prepared["_step4_base_jar_path"] = base_evidence.get("path") or ""
+            prepared["_step4_base_jar_evidence"] = base_evidence
+        if current_evidence:
+            artifact_jar_hits += 1
+            prepared["_step4_current_jar_path"] = current_evidence.get("path") or ""
+            prepared["_step4_current_jar_evidence"] = current_evidence
+        prepared_dep_rows.append(prepared)
 
-    per_dependency_records = {}
+    workers = max(1, int(args.workers or 1))
+    if len(dep_rows) <= 1:
+        workers = 1
+    print(f"\nStep 4 开始：处理 {len(dep_rows)} 个依赖（workers={workers}，Step1 产物 jar 命中={artifact_jar_hits}）", file=sys.stderr)
+    emit_progress("step4", "plan", f"开始构建 jar 对比证据池，共 {len(dep_rows)} 个依赖，workers={workers}")
 
-    for i, row in enumerate(dep_rows, 1):
+    def process_dependency(i, row):
+        result = {
+            "index": i,
+            "all_apis": [],
+            "jar_missing_deps": [],
+            "japicmp_missing_deps": [],
+            "other_failed_deps": [],
+            "changed_classes_by_coord": {},
+            "changed_classes_errors": [],
+            "changed_deps_missing_source": [],
+            "gitdiff_runs": [],
+            "gitdiff_skipped": [],
+            "gitdiff_pending": [],
+            "timeout_items": [],
+            "binary_runs": [],
+            "per_dependency_record": None,
+        }
         dependency_timer = time.perf_counter()
         coord      = row.get('coord', '')
         old_ver    = row.get('old_version', '-')
@@ -3312,14 +3523,14 @@ def main():
         scope      = row.get('scope', 'compile')
 
         if not coord:
-            continue
+            return result
         if change == '未变':
-            continue
+            return result
 
         is_removed_dependency = (change == '移除') or (new_ver == '-' and old_ver != '-')
         is_added_dependency = (change == '新增') or (old_ver == '-' and new_ver != '-')
-        dependency_raw_apis = list((per_dependency_records.get(coord) or {}).get("raw_rows") or [])
-        dependency_removed_jar_export = dict((per_dependency_records.get(coord) or {}).get("removed_jar_export") or {})
+        dependency_raw_apis = []
+        dependency_removed_jar_export = {}
 
         is_focus_dependency = coord in changed_dependency_coords if changed_dependency_coords else True
         source_mapping = dependency_paths.get(coord) or {}
@@ -3335,7 +3546,7 @@ def main():
             item=coord,
         )
         if is_focus_dependency and (not has_source_repo):
-            changed_deps_missing_source.append({
+            result["changed_deps_missing_source"].append({
                 "coord": coord,
                 "old_version": old_ver,
                 "new_version": new_ver,
@@ -3377,7 +3588,7 @@ def main():
                     elapsed=time.perf_counter() - gitdiff_timer,
                     item=coord,
                 )
-                gitdiff_pending.append(
+                result["gitdiff_pending"].append(
                     {
                         "coord": coord,
                         "old_version": old_ver,
@@ -3404,7 +3615,7 @@ def main():
                     elapsed=time.perf_counter() - gitdiff_timer,
                     item=coord,
                 )
-                gitdiff_skipped.append(
+                result["gitdiff_skipped"].append(
                     {
                         "coord": coord,
                         "old_version": old_ver,
@@ -3418,7 +3629,7 @@ def main():
                     }
                 )
                 if meta.get("timed_out"):
-                    timeout_items.append(
+                    result["timeout_items"].append(
                         {
                             "coord": coord,
                             "stage": "gitdiff",
@@ -3442,7 +3653,7 @@ def main():
                     elapsed=time.perf_counter() - gitdiff_timer,
                     item=coord,
                 )
-                gitdiff_runs.append(
+                result["gitdiff_runs"].append(
                     {
                         "coord": coord,
                         "old_version": old_ver,
@@ -3481,17 +3692,21 @@ def main():
                 args.output_dir,
                 old_coord=_resolve_step4_side_coord(row, "base", coord),
                 fetch_timeout=args.fetch_timeout,
+                old_jar_path=row.get("_step4_base_jar_path") or "",
+                old_jar_evidence=row.get("_step4_base_jar_evidence") or {},
             )
             dependency_removed_jar_export = {
                 "out_file": os.path.abspath(removed_out_file),
                 "old_coord": _resolve_step4_side_coord(row, "base", coord),
                 "old_jar": (jar_info or {}).get("old_jar"),
+                "old_jar_source": (jar_info or {}).get("old_jar_source") or "",
+                "old_jar_evidence": (jar_info or {}).get("old_jar_evidence") or {},
                 "class_count": len(list({_normalize_contract_value(item, "api_name") for item in apis if item.get("symbol_kind") == "class"})),
                 "errors": list((jar_info or {}).get("errors") or []),
                 "error": err,
             }
             if err:
-                binary_runs.append({'coord': coord, 'status': 'failed', 'mode': 'old_jar_export', 'error': err})
+                result["binary_runs"].append({'coord': coord, 'status': 'failed', 'mode': 'old_jar_export', 'error': err})
                 print(f"    ⚠️  removed jar 旧版符号导出失败：{err}", file=sys.stderr)
                 emit_progress(
                     "step4",
@@ -3502,9 +3717,9 @@ def main():
                     elapsed=time.perf_counter() - removed_timer,
                     item=coord,
                 )
-                jar_missing_deps.append(coord)
+                result["jar_missing_deps"].append(coord)
                 if str((jar_info or {}).get("fetch_old_error") or "").startswith("timeout("):
-                    timeout_items.append(
+                    result["timeout_items"].append(
                         {
                             "coord": coord,
                             "stage": "dependency_get",
@@ -3515,9 +3730,14 @@ def main():
                         }
                     )
             else:
-                binary_runs.append({'coord': coord, 'status': 'success', 'mode': 'old_jar_export'})
+                result["binary_runs"].append({
+                    'coord': coord,
+                    'status': 'success',
+                    'mode': 'old_jar_export',
+                    'old_jar_source': str((jar_info or {}).get('old_jar_source') or ''),
+                })
                 dependency_raw_apis.extend(apis)
-                all_apis.extend(apis)
+                result["all_apis"].extend(apis)
                 print(f"    → {len(apis)} 个 removed jar 旧版符号", file=sys.stderr)
                 emit_progress(
                     "step4",
@@ -3548,11 +3768,17 @@ def main():
                 fetch_timeout=args.fetch_timeout,
                 old_coord=_resolve_step4_side_coord(row, "base", coord),
                 new_coord=_resolve_step4_side_coord(row, "current", coord),
+                old_jar_path=row.get("_step4_base_jar_path") or "",
+                new_jar_path=row.get("_step4_current_jar_path") or "",
+                old_jar_evidence=row.get("_step4_base_jar_evidence") or {},
+                new_jar_evidence=row.get("_step4_current_jar_evidence") or {},
             )
-            binary_runs.append({
+            result["binary_runs"].append({
                 'coord': coord,
                 'status': 'failed' if err else 'success',
                 'mode': 'japicmp',
+                'old_jar_source': str((jar_info or {}).get('old_jar_source') or ''),
+                'new_jar_source': str((jar_info or {}).get('new_jar_source') or ''),
                 'parser_mode': str((jar_info or {}).get('parser_mode') or ''),
                 'xml_error': str((jar_info or {}).get('xml_error') or ''),
                 'missing_class_policy': str((jar_info or {}).get('missing_class_policy') or ''),
@@ -3562,7 +3788,7 @@ def main():
             })
             if compute_changed_classes_enabled and jar_info and jar_info.get("old_jar") and jar_info.get("new_jar"):
                 try:
-                    changed_classes_by_coord[coord] = {
+                    result["changed_classes_by_coord"][coord] = {
                         "coord": coord,
                         "old_version": old_ver,
                         "new_version": new_ver,
@@ -3571,7 +3797,7 @@ def main():
                         **compute_changed_classes(jar_info["old_jar"], jar_info["new_jar"]),
                     }
                 except Exception as e:
-                    changed_classes_errors.append(f"{coord}: {str(e)[:120]}")
+                    result["changed_classes_errors"].append(f"{coord}: {str(e)[:120]}")
             if err:
                 print(f"    ⚠️  JApiCmp 失败：{err}", file=sys.stderr)
                 emit_progress(
@@ -3584,11 +3810,11 @@ def main():
                     item=coord,
                 )
                 if 'jar 未找到' in err:
-                    jar_missing_deps.append(coord)
+                    result["jar_missing_deps"].append(coord)
                     if str(jar_info.get("fetch_old_error") or "").startswith("timeout(") or str(
                         jar_info.get("fetch_new_error") or ""
                     ).startswith("timeout("):
-                        timeout_items.append(
+                        result["timeout_items"].append(
                             {
                                 "coord": coord,
                                 "stage": "dependency_get",
@@ -3599,11 +3825,11 @@ def main():
                             }
                         )
                 elif 'JApiCmp 未安装' in err:
-                    japicmp_missing_deps.append(coord)
+                    result["japicmp_missing_deps"].append(coord)
                 else:
-                    other_failed_deps.append(coord)
+                    result["other_failed_deps"].append(coord)
                     if '超时' in err:
-                        timeout_items.append(
+                        result["timeout_items"].append(
                             {
                                 "coord": coord,
                                 "stage": "japicmp",
@@ -3625,13 +3851,14 @@ def main():
                     item=coord,
                 )
             dependency_raw_apis.extend(apis)
-            all_apis.extend(apis)
+            result["all_apis"].extend(apis)
 
         # 4c: changelog 分析任务文件（由 AI agent 后续填写）
         if change in ('大版本升级', '小版本升级') and (not has_source_repo):
             analyze_changelog(coord, old_ver, new_ver, args.output_dir)
-        per_dependency_records[coord] = {
-            "dep_row": dict(row),
+        result["per_dependency_record"] = {
+            "coord": coord,
+            "dep_row": {k: v for k, v in dict(row).items() if not str(k).startswith("_step4_")},
             "raw_rows": dependency_raw_apis,
             "removed_jar_export": dependency_removed_jar_export,
         }
@@ -3644,11 +3871,42 @@ def main():
             elapsed=time.perf_counter() - dependency_timer,
             item=coord,
         )
+        return result
+
+    per_dependency_records = {}
+    task_results = []
+    if workers == 1:
+        for i, row in enumerate(prepared_dep_rows, 1):
+            task_results.append(process_dependency(i, row))
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="step4-dep") as executor:
+            futures = [
+                executor.submit(process_dependency, i, row)
+                for i, row in enumerate(prepared_dep_rows, 1)
+            ]
+            for future in as_completed(futures):
+                task_results.append(future.result())
+
+    for item in sorted(task_results, key=lambda value: value.get("index") or 0):
+        all_apis.extend(item.get("all_apis") or [])
+        jar_missing_deps.extend(item.get("jar_missing_deps") or [])
+        japicmp_missing_deps.extend(item.get("japicmp_missing_deps") or [])
+        other_failed_deps.extend(item.get("other_failed_deps") or [])
+        changed_classes_by_coord.update(item.get("changed_classes_by_coord") or {})
+        changed_classes_errors.extend(item.get("changed_classes_errors") or [])
+        changed_deps_missing_source.extend(item.get("changed_deps_missing_source") or [])
+        gitdiff_runs.extend(item.get("gitdiff_runs") or [])
+        gitdiff_skipped.extend(item.get("gitdiff_skipped") or [])
+        gitdiff_pending.extend(item.get("gitdiff_pending") or [])
+        timeout_items.extend(item.get("timeout_items") or [])
+        binary_runs.extend(item.get("binary_runs") or [])
+        per_record = item.get("per_dependency_record")
+        if per_record and per_record.get("coord"):
+            per_dependency_records[per_record.get("coord")] = per_record
 
     # 写入汇总文件
     csv_file, valid_count, invalid_count = write_all_changed_apis(
         all_apis, args.output_dir)
-    report_dir = str(Path(args.output_dir).resolve().parent)
     for coord in sorted(per_dependency_records.keys()):
         item = per_dependency_records.get(coord) or {}
         write_per_dependency_outputs(

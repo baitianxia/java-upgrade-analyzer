@@ -2,6 +2,8 @@ import json
 import io
 import sys
 import tempfile
+import threading
+import zipfile
 from pathlib import Path
 import unittest
 from contextlib import redirect_stderr
@@ -1223,6 +1225,138 @@ class Step4StabilityTest(unittest.TestCase):
             self.assertFalse(stale_gitdiff.exists())
             self.assertFalse(stale_summary.exists())
             self.assertTrue(unrelated.exists())
+
+    def test_main_prefers_step1_packaged_jars_for_japicmp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s4_jar_compare"
+            base_artifact = report_dir / "base-app.jar"
+            current_artifact = report_dir / "current-app.jar"
+            base_entry = "BOOT-INF/lib/demo-1.0.0.jar"
+            current_entry = "BOOT-INF/lib/demo-2.0.0.jar"
+            with zipfile.ZipFile(base_artifact, "w") as zf:
+                zf.writestr(base_entry, b"base demo jar")
+            with zipfile.ZipFile(current_artifact, "w") as zf:
+                zf.writestr(current_entry, b"current demo jar")
+            (report_dir / "build_provenance.json").write_text(
+                json.dumps(
+                    {
+                        "sides": [
+                            {"side": "base", "artifact_path": str(base_artifact), "artifact_sha256": "base-sha"},
+                            {"side": "current", "artifact_path": str(current_artifact), "artifact_sha256": "current-sha"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            dep_changes.write_text(
+                "\n".join(
+                    [
+                        "coord,old_version,new_version,change_type,scope,base_coord,current_coord,base_lib_entry,current_lib_entry",
+                        f"com.example:demo,1.0.0,2.0.0,小版本升级,compile,com.example:demo,com.example:demo,{base_entry},{current_entry}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps({"changed_dependencies": [{"coord": "com.example:demo"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes",
+                    str(dep_changes),
+                    "--context",
+                    str(context_json),
+                    "--output-dir",
+                    str(output_dir),
+                    "--workers",
+                    "2",
+                ],
+            ), patch.object(
+                step4,
+                "run_japicmp",
+                return_value=(str(output_dir / "demo_binary.txt"), [], {"old_jar": "", "new_jar": ""}, None),
+            ) as japicmp_mock, patch.object(
+                step4,
+                "fetch_jar_from_repo",
+                side_effect=AssertionError("Step1 packaged jars should avoid Maven fetch"),
+            ):
+                exit_code = step4.main()
+
+            self.assertEqual(exit_code, 0)
+            japicmp_mock.assert_called_once()
+            kwargs = japicmp_mock.call_args.kwargs
+            self.assertEqual(kwargs["old_jar_evidence"]["source"], "step1_final_artifact")
+            self.assertEqual(kwargs["new_jar_evidence"]["source"], "step1_final_artifact")
+            self.assertTrue(Path(kwargs["old_jar_path"]).exists())
+            self.assertTrue(Path(kwargs["new_jar_path"]).exists())
+            self.assertEqual(Path(kwargs["old_jar_path"]).read_bytes(), b"base demo jar")
+            self.assertEqual(Path(kwargs["new_jar_path"]).read_bytes(), b"current demo jar")
+
+    def test_main_processes_dependencies_in_parallel_when_workers_gt_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s4_jar_compare"
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            dep_changes.write_text(
+                "\n".join(
+                    [
+                        "coord,old_version,new_version,change_type,scope",
+                        "com.example:demo-a,1.0.0,2.0.0,小版本升级,compile",
+                        "com.example:demo-b,1.0.0,2.0.0,小版本升级,compile",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps(
+                    {
+                        "changed_dependencies": [
+                            {"coord": "com.example:demo-a"},
+                            {"coord": "com.example:demo-b"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            barrier = threading.Barrier(2)
+            seen_threads = set()
+
+            def fake_run_japicmp(coord, *_args, **_kwargs):
+                seen_threads.add(threading.current_thread().name)
+                barrier.wait(timeout=2)
+                return str(output_dir / f"{coord.rsplit(':', 1)[-1]}_binary.txt"), [], {"old_jar": "", "new_jar": ""}, None
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes",
+                    str(dep_changes),
+                    "--context",
+                    str(context_json),
+                    "--output-dir",
+                    str(output_dir),
+                    "--workers",
+                    "2",
+                ],
+            ), patch.object(step4, "run_japicmp", side_effect=fake_run_japicmp) as japicmp_mock:
+                exit_code = step4.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(japicmp_mock.call_count, 2)
+            self.assertGreaterEqual(len(seen_threads), 2)
 
     def test_main_removed_dependency_exports_old_jar_symbols_and_writes_per_dependency_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
