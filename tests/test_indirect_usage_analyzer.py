@@ -11,6 +11,7 @@ if str(SCRIPTS) not in sys.path:
 
 import confidence_weighted_tracer as tracer
 import enhanced_output_formatter as formatter
+import indirect_usage_analyzer as indirect_module
 from enhanced_source_analyzer import MethodDef
 from indirect_usage_analyzer import analyze_and_merge_indirect_usages, parse_javap_indirect_references
 
@@ -22,6 +23,21 @@ def api_row():
         "api_simple": "isBlank", "api_signature": "(String)",
         "symbol_kind": "method", "change_type": "REMOVED",
         "severity": "P0", "confirmed": "true", "source": "old_jar",
+        "analysis_scope": "method",
+    }
+
+
+def api_row_for(owner, member="removed", signature="()"):
+    return {
+        "coord": "com.example:large-lib",
+        "api_name": f"{owner}.{member}",
+        "api_simple": member,
+        "api_signature": signature,
+        "symbol_kind": "method",
+        "change_type": "REMOVED",
+        "severity": "P1",
+        "confirmed": "true",
+        "source": "old_jar",
         "analysis_scope": "method",
     }
 
@@ -38,6 +54,14 @@ def business_method(body):
         param_declared_types={"value": "String"}, imports={}, static_imports={},
         body_text=body,
     )
+
+
+def business_method_with_id(symbol_id, body, imports=None):
+    method = business_method(body)
+    method.symbol_id = symbol_id
+    method.qualified_key = f"com.acme.OrderService.{symbol_id}()"
+    method.imports = imports or {}
+    return method
 
 
 def graph_for(method):
@@ -69,6 +93,86 @@ class IndirectUsageAnalyzerTest(unittest.TestCase):
             evidence["evidence_type"] == "reflection_method_invocation"
             for path in result.evidence_paths for evidence in path
         ))
+
+    def test_large_step4_api_set_without_indirect_markers_skips_owner_scan(self):
+        methods = {
+            f"m{i}": business_method_with_id(
+                f"m{i}",
+                "int value = input.length(); return value > 0;"
+            )
+            for i in range(250)
+        }
+        graph = SimpleNamespace(
+            methods_by_id=methods,
+            reverse_edges={},
+            lookup_keys_by_symbol={},
+            type_metadata={},
+            runtime_dependency_catalog={},
+        )
+        rows = [
+            api_row_for(f"com.example.removed.Type{i // 4}", f"method{i}")
+            for i in range(1200)
+        ]
+        original = indirect_module._owners_present_in_source_body
+        calls = {"count": 0}
+
+        def counted(*args, **kwargs):
+            calls["count"] += 1
+            return original(*args, **kwargs)
+
+        indirect_module._owners_present_in_source_body = counted
+        try:
+            stats = analyze_and_merge_indirect_usages(graph, rows, [])
+        finally:
+            indirect_module._owners_present_in_source_body = original
+
+        self.assertEqual(calls["count"], 0)
+        self.assertEqual(stats["merged_edges"], 0)
+        self.assertEqual(stats["source_methods_scanned"], 250)
+        self.assertEqual(stats["target_count"], 1200)
+        self.assertEqual(stats["potential_legacy_method_target_pairs"], 250 * 1200)
+        self.assertEqual(stats["owner_presence_scans"], 0)
+        self.assertIn("elapsed_sec", stats)
+
+    def test_large_step4_api_set_with_reflection_scans_owners_once_per_method(self):
+        methods = {
+            "m1": business_method_with_id(
+                "m1",
+                '''
+                Class<?> type = Class.forName("com.example.removed.Type7");
+                Method target = type.getMethod("method28");
+                return target.invoke(null);
+                '''
+            )
+        }
+        graph = SimpleNamespace(
+            methods_by_id=methods,
+            reverse_edges={},
+            lookup_keys_by_symbol={},
+            type_metadata={},
+            runtime_dependency_catalog={},
+        )
+        rows = [
+            api_row_for(f"com.example.removed.Type{i // 4}", f"method{i}")
+            for i in range(1200)
+        ]
+        original = indirect_module._owners_present_in_source_body
+        calls = {"count": 0}
+
+        def counted(*args, **kwargs):
+            calls["count"] += 1
+            return original(*args, **kwargs)
+
+        indirect_module._owners_present_in_source_body = counted
+        try:
+            stats = analyze_and_merge_indirect_usages(graph, rows, [])
+        finally:
+            indirect_module._owners_present_in_source_body = original
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(stats["merged_edges"], 1)
+        self.assertEqual(stats["owner_presence_scans"], 1)
+        self.assertEqual(stats["source_methods_with_indirect_markers"], 1)
 
     def test_local_variables_are_correlated_for_reflection(self):
         method = business_method('''

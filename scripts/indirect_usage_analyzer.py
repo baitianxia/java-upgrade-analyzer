@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 
 from enhanced_source_analyzer import CallEdge
@@ -11,6 +12,19 @@ from signature_utils import normalize_signature_for_lookup, split_signature_para
 
 
 RESOURCE_SUFFIXES = {'.xml', '.properties', '.yml', '.yaml', '.json', '.conf', '.txt'}
+REFLECTION_MEMBER_PATTERN = re.compile(r'\.get(?:Declared)?(?:Method|Field|Constructor)\s*\(')
+OWNER_SIMPLE_TOKEN_PATTERN_CACHE = {}
+SOURCE_INDIRECT_MARKERS = (
+    'Class.forName',
+    'getMethod',
+    'getDeclaredMethod',
+    'getField',
+    'getDeclaredField',
+    'getConstructor',
+    'getDeclaredConstructor',
+    'MethodHandles',
+)
+EXPRESSION_MARKERS = ('T(', '#{', '${', '@')
 
 
 def _descriptor_signature(descriptor):
@@ -369,6 +383,8 @@ def _expression_matches_target(text, target):
 
 def _source_candidates(method):
     body = method.get_body_text()
+    if not any(marker in body for marker in SOURCE_INDIRECT_MARKERS):
+        return body, [], []
     string_vars = {
         match.group(1): match.group(2)
         for match in re.finditer(
@@ -596,11 +612,57 @@ def _resource_roots(source_roots):
                 yield candidate.resolve()
 
 
+def _owner_simple_token_pattern(owner_simple):
+    cached = OWNER_SIMPLE_TOKEN_PATTERN_CACHE.get(owner_simple)
+    if cached is None:
+        cached = re.compile(r'(?<![\w$])' + re.escape(owner_simple) + r'(?![\w$])')
+        OWNER_SIMPLE_TOKEN_PATTERN_CACHE[owner_simple] = cached
+    return cached
+
+
+def _owners_present_in_source_body(body, method, owners, owners_by_simple):
+    """Return target owners whose names are plausibly present in one source method body.
+
+    This intentionally preserves the old matching semantics but applies them at owner
+    granularity instead of target/API granularity. A removed jar can easily export
+    thousands of APIs that belong to a much smaller set of classes, so scanning by
+    owner prevents Step5 indirect analysis from degenerating into methods × APIs.
+    """
+    if not body or not owners:
+        return []
+    present = set()
+    for owner in owners:
+        if owner in body or owner.replace('.', '/') in body:
+            present.add(owner)
+    imports = getattr(method, 'imports', {}) or {}
+    if imports:
+        for simple, imported in imports.items():
+            imported_owner = str(imported or '').replace('$', '.')
+            if imported_owner not in owners:
+                continue
+            if _owner_simple_token_pattern(simple).search(body):
+                present.add(imported_owner)
+    else:
+        for simple, simple_owners in owners_by_simple.items():
+            if len(simple_owners) != 1:
+                continue
+            if _owner_simple_token_pattern(simple).search(body):
+                owner = simple_owners[0]
+                if owner in body or owner.replace('.', '/') in body:
+                    present.add(owner)
+    return [owner for owner in owners if owner in present]
+
+
 def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
+    started_at = time.perf_counter()
     targets = [item for item in (_target(row) for row in api_rows or []) if item]
     by_owner = {}
     for target in targets:
         by_owner.setdefault(target['owner'], []).append(target)
+    owners = list(by_owner.keys())
+    owners_by_simple = {}
+    for owner in owners:
+        owners_by_simple.setdefault(owner.rsplit('.', 1)[-1], []).append(owner)
     findings = {target['api_key']: [] for target in targets}
     unresolved_by_api = {target['api_key']: [] for target in targets}
     coverage_by_api = {
@@ -615,23 +677,28 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
     }
     merged_edges = 0
     source_methods = 0
+    owner_presence_scans = 0
+    source_methods_with_indirect_markers = 0
 
     for method in (getattr(graph, 'methods_by_id', {}) or {}).values():
         source_methods += 1
         body, candidates, unresolved = _source_candidates(method)
-        for target in targets:
-            owner = target['owner']
-            owner_simple = owner.rsplit('.', 1)[-1]
-            imports = getattr(method, 'imports', {}) or {}
-            imported_owner_present = (
-                str(imports.get(owner_simple) or '').replace('$', '.') == owner
-                and bool(re.search(r'(?<![\w$])' + re.escape(owner_simple) + r'(?![\w$])', body))
-            )
-            owner_present = owner in body or owner.replace('.', '/') in body or imported_owner_present
-            if owner_present and ('Class.forName' in body or re.search(r'\.get(?:Declared)?(?:Method|Field|Constructor)\s*\(', body)):
-                coverage_by_api[target['api_key']]['reflection_source'] = 'partial'
-            if owner_present and 'MethodHandles' in body:
-                coverage_by_api[target['api_key']]['method_handle_source'] = 'partial'
+        has_reflection_source = 'Class.forName' in body or bool(REFLECTION_MEMBER_PATTERN.search(body))
+        has_method_handle_source = 'MethodHandles' in body
+        has_expression_markers = any(marker in body for marker in EXPRESSION_MARKERS)
+        present_owners = []
+        if has_reflection_source or has_method_handle_source:
+            source_methods_with_indirect_markers += 1
+        if has_reflection_source or has_method_handle_source or has_expression_markers:
+            owner_presence_scans += 1
+            present_owners = _owners_present_in_source_body(body, method, owners, owners_by_simple)
+        if has_reflection_source or has_method_handle_source:
+            for owner in present_owners:
+                for target in by_owner.get(owner, []):
+                    if has_reflection_source:
+                        coverage_by_api[target['api_key']]['reflection_source'] = 'partial'
+                    if has_method_handle_source:
+                        coverage_by_api[target['api_key']]['method_handle_source'] = 'partial'
         for kind, owner, member, params, offset, content, evidence_type in candidates:
             for target in by_owner.get(owner.replace('$', '.'), []):
                 if not _matches_target(target, owner, member, params, kind=kind):
@@ -658,7 +725,10 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
                     'caller_symbol': method.qualified_key,
                     'owner_coord': method.owner_coord,
                 })
-        for owner, owner_targets in by_owner.items():
+        if not has_expression_markers:
+            continue
+        for owner in present_owners:
+            owner_targets = by_owner.get(owner, [])
             for target in owner_targets:
                 if not _expression_matches_target(body, target):
                     continue
@@ -785,6 +855,12 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
         'resource_findings': sum(len(items) for items in findings.values()),
         'expression_findings': expression_findings,
         'unresolved_findings': sum(len(items) for items in unresolved_by_api.values()),
+        'elapsed_sec': round(time.perf_counter() - started_at, 3),
+        'target_count': len(targets),
+        'owner_count': len(owners),
+        'potential_legacy_method_target_pairs': source_methods * len(targets),
+        'owner_presence_scans': owner_presence_scans,
+        'source_methods_with_indirect_markers': source_methods_with_indirect_markers,
         'analyzers': analyzer_statuses,
         'matrix': matrix,
         'by_api': per_api_coverage,

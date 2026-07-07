@@ -367,10 +367,18 @@ def _build_direct_usage_results(result, matches, reason_code, note, display_targ
     return result
 
 
-def _find_direct_business_class_usage(api_row, graph):
+def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
     target_class = str(api_row.get('matched_class') or api_row.get('api_name') or '').strip()
     if not target_class:
         return None
+    trace_cache = ensure_trace_cache(trace_cache)
+    cache = trace_cache['direct_business_class_usage']
+    if target_class in cache:
+        _perf_add(graph, 'trace', 'direct_class_usage_cache_hits', 1)
+        return cache[target_class]
+    _perf_add(graph, 'trace', 'direct_class_usage_cache_misses', 1)
+    started_at = time.perf_counter()
+    scanned_methods = 0
     simple_name = target_class.rsplit('.', 1)[-1]
     simple_name_patterns = [
         re.compile(r'\bnew\s+' + re.escape(simple_name) + r'\b'),
@@ -380,6 +388,7 @@ def _find_direct_business_class_usage(api_row, graph):
     ]
     fqcn_pattern = re.compile(re.escape(target_class))
     for method_def in _iter_business_methods(graph):
+        scanned_methods += 1
         declared_types = (
             [getattr(method_def, 'return_type', '')]
             + list((getattr(method_def, 'param_types', {}) or {}).values())
@@ -387,7 +396,11 @@ def _find_direct_business_class_usage(api_row, graph):
             + list((getattr(method_def, 'local_var_types', {}) or {}).values())
         )
         if target_class in declared_types:
-            return method_def, 'declared_type'
+            cache[target_class] = (method_def, 'declared_type')
+            _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
+            _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
+            _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
+            return cache[target_class]
         imports = getattr(method_def, 'imports', {}) or {}
         wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
         body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
@@ -396,19 +409,40 @@ def _find_direct_business_class_usage(api_row, graph):
         if (import_matches_target or wildcard_matches_target) and any(
             pattern.search(body_text) for pattern in simple_name_patterns
         ):
-            return method_def, 'imported_type'
+            cache[target_class] = (method_def, 'imported_type')
+            _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
+            _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
+            _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
+            return cache[target_class]
         if fqcn_pattern.search(body_text):
-            return method_def, 'body_reference'
+            cache[target_class] = (method_def, 'body_reference')
+            _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
+            _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
+            _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
+            return cache[target_class]
+    cache[target_class] = None
+    _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
+    _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
+    _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
     return None
 
 
-def _find_direct_business_field_usages(api_row, graph):
+def _find_direct_business_field_usages(api_row, graph, trace_cache=None):
     api_name = str(api_row.get('api_name') or '').strip()
     field_name = str(api_row.get('api_simple') or '').strip() or (api_name.rsplit('.', 1)[-1] if '.' in api_name else '')
     owner_class = api_name.rsplit('.', 1)[0] if '.' in api_name else ''
     owner_simple = owner_class.rsplit('.', 1)[-1] if owner_class else ''
     if not field_name:
         return []
+    cache_key = api_name or f"{owner_class}.{field_name}"
+    trace_cache = ensure_trace_cache(trace_cache)
+    cache = trace_cache['direct_business_field_usages']
+    if cache_key in cache:
+        _perf_add(graph, 'trace', 'direct_field_usage_cache_hits', 1)
+        return list(cache[cache_key] or [])
+    _perf_add(graph, 'trace', 'direct_field_usage_cache_misses', 1)
+    started_at = time.perf_counter()
+    scanned_methods = 0
     simple_access_pattern = (
         re.compile(r'\b' + re.escape(owner_simple) + r'\s*\.\s*' + re.escape(field_name) + r'\b')
         if owner_simple else None
@@ -419,6 +453,7 @@ def _find_direct_business_field_usages(api_row, graph):
     )
     matches = []
     for method_def in _iter_business_methods(graph):
+        scanned_methods += 1
         static_imports = getattr(method_def, 'static_imports', {}) or {}
         if static_imports.get(field_name) == api_name:
             matches.append((method_def, 'static_import'))
@@ -435,24 +470,29 @@ def _find_direct_business_field_usages(api_row, graph):
                 f"{pkg}.{owner_simple}" == owner_class for pkg in wildcard_imports
             ) or (package_name and f"{package_name}.{owner_simple}" == owner_class):
                 matches.append((method_def, 'field_access'))
+    cache[cache_key] = tuple(matches)
+    _perf_add(graph, 'trace', 'direct_field_usage_scanned_methods', scanned_methods)
+    _perf_add(graph, 'trace', 'direct_field_usage_elapsed_sec', time.perf_counter() - started_at)
+    _perf_max(graph, 'trace', 'direct_field_usage_cache_size', len(cache))
     return matches
 
 
-def _find_direct_business_field_usage(api_row, graph):
-    usages = _find_direct_business_field_usages(api_row, graph)
+def _find_direct_business_field_usage(api_row, graph, trace_cache=None):
+    usages = _find_direct_business_field_usages(api_row, graph, trace_cache=trace_cache)
     return usages[0] if usages else None
 
 
-def _try_build_direct_usage_result(api_row, result, graph):
+def _try_build_direct_usage_result(api_row, result, graph, trace_cache=None):
     if graph is None:
         return None
 
+    trace_cache = ensure_trace_cache(trace_cache)
     matched = None
     symbol_kind = str(result.symbol_kind or '').strip()
     analysis_scope = str(result.analysis_scope or '').strip()
 
     if analysis_scope == 'class_usage' or symbol_kind == 'class':
-        matched = _find_direct_business_class_usage(api_row, graph)
+        matched = _find_direct_business_class_usage(api_row, graph, trace_cache=trace_cache)
         if matched:
             method_def, evidence_type = matched
             note = '已在系统源码中找到目标类型的直接使用证据'
@@ -466,7 +506,7 @@ def _try_build_direct_usage_result(api_row, result, graph):
             )
 
     if symbol_kind == 'field':
-        matches = _find_direct_business_field_usages(api_row, graph)
+        matches = _find_direct_business_field_usages(api_row, graph, trace_cache=trace_cache)
         if matches:
             reason_code = (
                 'DIRECT_STATIC_IMPORT_USAGE'
@@ -3144,7 +3184,7 @@ def trace_api_with_confidence_weighting(
         if scan_status == 'unavailable':
             artifact_scan_incomplete = scan_result
 
-    direct_usage_result = _try_build_direct_usage_result(api_row, result, graph)
+    direct_usage_result = _try_build_direct_usage_result(api_row, result, graph, trace_cache=trace_cache)
     if direct_usage_result is not None:
         if artifact_scan_miss:
             _apply_source_artifact_miss(direct_usage_result, graph, (
@@ -3310,6 +3350,7 @@ def trace_api_with_confidence_weighting(
 
     while queue:
         frontier = queue.popleft()
+        _perf_add(graph, 'trace', 'frontier_pops', 1)
         current_key = frontier['key']
         current_path = frontier['path']
         current_cost = frontier['cost']
@@ -3327,7 +3368,13 @@ def trace_api_with_confidence_weighting(
         )
 
         # 查询反向索引
-        incoming_edges = sorted(reverse_edges.get(current_key, []), key=stable_edge_sort_key)
+        incoming_edges = get_cached_sorted_incoming_edges(
+            reverse_edges,
+            current_key,
+            trace_cache=trace_cache,
+            graph=graph,
+        )
+        _perf_add(graph, 'trace', 'incoming_edges_scanned', len(incoming_edges))
 
         if not incoming_edges:
             # 链路终点
@@ -3382,33 +3429,12 @@ def trace_api_with_confidence_weighting(
             # 这里同时保留 provenance_family，避免 exact / polymorphic / fallback 互相误剪枝。
 
             # 检查关键节点
-            critical_node = None
-            framework_entries = (
-                getattr(graph, 'framework_entry_symbols', {}) or {}
-            ).get(method_def.symbol_id) or []
-            if framework_entries:
-                first_framework_entry = framework_entries[0]
-                critical_node = {
-                    'type': 'system_code_touched',
-                    'method': method_def.qualified_key,
-                    'file': method_def.file,
-                    'line': method_def.line,
-                    'framework_edge_kind': first_framework_entry.get('edge_kind'),
-                    'framework_adapter': first_framework_entry.get('adapter'),
-                }
-            elif is_system_code_touched(method_def, type_metadata):
-                critical_node = {
-                    'type': 'system_code_touched',
-                    'method': method_def.qualified_key,
-                    'file': method_def.file,
-                    'line': method_def.line
-                }
-            elif is_framework_boundary(method_def, type_metadata):
-                critical_node = {
-                    'type': 'framework_boundary',
-                    'method': method_def.qualified_key,
-                    'reason': '动态代理或框架注入'
-                }
+            critical_node = get_cached_critical_node(
+                method_def,
+                graph,
+                type_metadata,
+                trace_cache=trace_cache,
+            )
 
             # 判断是否停止
             should_stop, stop_reason = should_stop_tracing(
@@ -3564,6 +3590,7 @@ def trace_api_with_confidence_weighting(
                                 ),
                                 'match_tier': max(frontier.get('match_tier', -1), matched_group['tier_index']),
                             })
+                            _perf_add(graph, 'trace', 'frontier_pushes', 1)
                     _step5_debug(
                         'trace_expand',
                         'expanded frontier through business caller',
@@ -3615,6 +3642,7 @@ def trace_api_with_confidence_weighting(
                             ),
                             'match_tier': max(frontier.get('match_tier', -1), matched_group['tier_index']),
                         })
+                        _perf_add(graph, 'trace', 'frontier_pushes', 1)
                 _step5_debug(
                     'trace_expand',
                     'expanded frontier through dependency caller',
@@ -3922,9 +3950,80 @@ def ensure_trace_cache(trace_cache=None):
     trace_cache = trace_cache if trace_cache is not None else {}
     trace_cache.setdefault('overload_signatures', {})
     trace_cache.setdefault('method_lookup_resolution', {})
+    trace_cache.setdefault('sorted_incoming_edges_by_key', {})
+    trace_cache.setdefault('critical_node_by_symbol_id', {})
+    trace_cache.setdefault('direct_business_class_usage', {})
+    trace_cache.setdefault('direct_business_field_usages', {})
+    trace_cache.setdefault('declared_method_signature_index', None)
+    trace_cache.setdefault('declared_method_signature_index_owner', None)
     trace_cache.setdefault('overload_signature_index', None)
     trace_cache.setdefault('overload_signature_index_owner', None)
     return trace_cache
+
+
+def get_cached_sorted_incoming_edges(reverse_edges, current_key, trace_cache=None, graph=None):
+    trace_cache = ensure_trace_cache(trace_cache)
+    cache = trace_cache['sorted_incoming_edges_by_key']
+    if current_key in cache:
+        _perf_add(graph, 'trace', 'incoming_edges_cache_hits', 1)
+        return cache[current_key]
+    _perf_add(graph, 'trace', 'incoming_edges_cache_misses', 1)
+    incoming_edges = tuple(sorted(reverse_edges.get(current_key, []) or [], key=stable_edge_sort_key))
+    cache[current_key] = incoming_edges
+    _perf_max(graph, 'trace', 'incoming_edges_cache_size', len(cache))
+    return incoming_edges
+
+
+def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None):
+    trace_cache = ensure_trace_cache(trace_cache)
+    cache = trace_cache['critical_node_by_symbol_id']
+    symbol_id = getattr(method_def, 'symbol_id', '')
+    if symbol_id in cache:
+        _perf_add(graph, 'trace', 'critical_node_cache_hits', 1)
+        return cache[symbol_id]
+    _perf_add(graph, 'trace', 'critical_node_cache_misses', 1)
+    critical_node = None
+    framework_entries = (
+        getattr(graph, 'framework_entry_symbols', {}) or {}
+    ).get(symbol_id) or []
+    if framework_entries:
+        first_framework_entry = framework_entries[0]
+        critical_node = {
+            'type': 'system_code_touched',
+            'method': method_def.qualified_key,
+            'file': method_def.file,
+            'line': method_def.line,
+            'framework_edge_kind': first_framework_entry.get('edge_kind'),
+            'framework_adapter': first_framework_entry.get('adapter'),
+        }
+    elif is_system_code_touched(method_def, type_metadata):
+        critical_node = {
+            'type': 'system_code_touched',
+            'method': method_def.qualified_key,
+            'file': method_def.file,
+            'line': method_def.line
+        }
+    elif (
+        getattr(method_def, 'owner_type', '') != 'business'
+        and not getattr(method_def, 'annotations', None)
+        and not getattr(method_def, 'class_annotations', None)
+        and not (type_metadata or {}).get(getattr(method_def, 'class_fqcn', '') or '')
+    ):
+        # Most runtime dependency methods have no source/type metadata in the analysis graph.
+        # In that case the framework-boundary rules below cannot produce a positive result:
+        # they only inspect annotations and class metadata. Returning None here preserves
+        # semantics while avoiding hundreds of thousands of empty metadata checks.
+        critical_node = None
+        _perf_add(graph, 'trace', 'critical_node_fast_none', 1)
+    elif is_framework_boundary(method_def, type_metadata):
+        critical_node = {
+            'type': 'framework_boundary',
+            'method': method_def.qualified_key,
+            'reason': '动态代理或框架注入'
+        }
+    cache[symbol_id] = critical_node
+    _perf_max(graph, 'trace', 'critical_node_cache_size', len(cache))
+    return critical_node
 
 
 def get_cached_overload_signatures(api_name, reverse_edges, trace_cache=None):
@@ -4484,16 +4583,43 @@ def select_compatible_overload_signatures(target_signature, overload_signatures,
     return compatible
 
 
-def collect_declared_method_signatures(api_name, graph):
-    signatures = set()
+def build_declared_method_signature_index(graph):
+    index = defaultdict(set)
     methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
     for method_def in methods_by_id.values():
-        if getattr(method_def, 'qualified_key', '') != api_name:
+        qualified_key = getattr(method_def, 'qualified_key', '')
+        if not qualified_key:
             continue
         for signature in build_method_signature_suffixes(method_def):
             if signature:
-                signatures.add(signature)
-    return signatures
+                index[qualified_key].add(signature)
+    return index
+
+
+def collect_declared_method_signatures(api_name, graph, trace_cache=None):
+    api_name = (api_name or '').strip()
+    if not api_name:
+        return set()
+    trace_cache = ensure_trace_cache(trace_cache)
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    owner = id(methods_by_id)
+    if (
+        trace_cache.get('declared_method_signature_index') is None
+        or trace_cache.get('declared_method_signature_index_owner') != owner
+    ):
+        started_at = time.perf_counter()
+        trace_cache['declared_method_signature_index'] = build_declared_method_signature_index(graph)
+        trace_cache['declared_method_signature_index_owner'] = owner
+        _perf_add(graph, 'trace', 'declared_signature_index_builds', 1)
+        _perf_add(graph, 'trace', 'declared_signature_index_elapsed_sec', time.perf_counter() - started_at)
+        _perf_max(
+            graph,
+            'trace',
+            'declared_signature_index_size',
+            len(trace_cache.get('declared_method_signature_index') or {}),
+        )
+    index = trace_cache.get('declared_method_signature_index') or {}
+    return set(index.get(api_name) or set())
 
 
 def filter_target_match_groups_for_overload_safety(api_row, matched_groups, graph, type_metadata=None, trace_cache=None):
@@ -4509,7 +4635,7 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
     target_signature = api_row.get('api_signature', '')
     target_params = split_signature_params(target_signature)
     target_is_varargs = bool(target_params and is_varargs_type_reference(target_params[-1]))
-    declared_signatures = collect_declared_method_signatures(api_name, graph)
+    declared_signatures = collect_declared_method_signatures(api_name, graph, trace_cache=trace_cache)
     has_exact_signature_match = any(
         group.get('provenance') == 'exact_signature'
         for group in (matched_groups or [])

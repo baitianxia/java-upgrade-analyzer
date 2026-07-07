@@ -21,6 +21,49 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
 from pipeline_constants import PER_DEPENDENCY_DIRNAME, PER_DEPENDENCY_SUMMARY_FILE
 
+S6_INLINE_LIMIT = 20
+S6_NOT_FOUND_INLINE_LIMIT = S6_INLINE_LIMIT
+S6_DETAIL_MD_FULL_LIMIT = 200
+S6_DETAIL_MD_SAMPLE_LIMIT = 50
+S6_DETAIL_MD_DEP_SUMMARY_LIMIT = 50
+S6_DETAIL_BUCKETS = {
+    "uncertain": {
+        "title": "待人工验证完整清单",
+        "csv": "s6_uncertain_apis.csv",
+        "md": "s6_uncertain_apis.md",
+        "summary_key": "uncertain_reason_summary",
+        "note": "静态分析发现候选路径但存在歧义，需要人工核实。",
+    },
+    "probable_impact": {
+        "title": "可能影响完整清单",
+        "csv": "s6_probable_impact_apis.csv",
+        "md": "s6_probable_impact_apis.md",
+        "summary_key": "not_analyzed_reason_summary",
+        "note": "已找到强相关证据，但仍需测试或运行时验证。",
+    },
+    "needs_input": {
+        "title": "需要补充输入完整清单",
+        "csv": "s6_needs_input_apis.csv",
+        "md": "s6_needs_input_apis.md",
+        "summary_key": "not_analyzed_reason_summary",
+        "note": "关键输入缺失，当前结论不完整。",
+    },
+    "not_analyzed": {
+        "title": "未覆盖/未分析完整清单",
+        "csv": "s6_not_analyzed_apis.csv",
+        "md": "s6_not_analyzed_apis.md",
+        "summary_key": "not_analyzed_reason_summary",
+        "note": "工具已知未覆盖该场景，不能按未影响解释。",
+    },
+    "not_found": {
+        "title": "静态未找到路径完整清单",
+        "csv": "s6_not_found_apis.csv",
+        "md": "s6_not_found_apis.md",
+        "summary_key": "not_found_reason_summary",
+        "note": "静态未找到不等于确定不影响；仅表示当前源码图未找到引用路径。",
+    },
+}
+
 
 def load_json(path):
     if not os.path.exists(path):
@@ -58,6 +101,176 @@ def count_lines(path):
         return len(lines)
     except Exception:
         return -1
+
+
+def relpath_for_report(path, report_dir):
+    try:
+        return Path(path).resolve().relative_to(Path(report_dir).resolve()).as_posix()
+    except Exception:
+        return Path(path).name
+
+
+def _csv_cell(value):
+    if isinstance(value, (list, tuple)):
+        return " | ".join(str(item) for item in value)
+    return str(value or "")
+
+
+def summarize_item_reason_codes(items):
+    counts = defaultdict(int)
+    for item in items or []:
+        counts[item.get("reason_code") or "UNKNOWN"] += 1
+    return dict(sorted(counts.items(), key=lambda x: (-x[1], x[0])))
+
+
+def summarize_item_coords(items):
+    counts = defaultdict(int)
+    for item in items or []:
+        counts[item.get("coord") or "UNKNOWN"] += 1
+    return dict(sorted(counts.items(), key=lambda x: (-x[1], x[0])))
+
+
+def _md_cell(value, limit=240):
+    text = str(value or "").replace("|", "\\|").replace("\n", " ")
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _detail_row(idx, item):
+    reason = item.get("user_reason") or item.get("reason") or item.get("recommended_action") or ""
+    return (
+        f"| {idx} | `{_md_cell(item.get('coord'))}` | `{_md_cell(item.get('api'))}` | "
+        f"`{_md_cell(item.get('api_signature'), 160)}` | `{_md_cell(item.get('symbol_kind'))}` | "
+        f"`{_md_cell(item.get('reason_code'))}` | {_md_cell(reason)} |"
+    )
+
+
+def build_bucket_detail_markdown(config, items, csv_name):
+    reason_summary = summarize_item_reason_codes(items)
+    coord_summary = summarize_item_coords(items)
+    lines = [
+        f"# {config.get('title') or 'S6 明细'}",
+        "",
+        f"- 总数：{len(items)}",
+        f"- 说明：{config.get('note') or ''}",
+        f"- 完整可筛选清单：`{csv_name}`",
+        "",
+        "## 如何阅读",
+        "",
+        "- 先看“原因分类”和“依赖坐标分布”，判断风险是否集中在少数原因或少数依赖。",
+        "- 再看“优先抽查样例”，确认分类与说明是否符合预期。",
+        "- 若需要逐条复核，请使用 CSV 按 `coord`、`reason_code`、`api` 过滤；CSV 是完整全集。",
+        "",
+    ]
+    if reason_summary:
+        lines += [
+            "## 原因分类",
+            "",
+            "| 原因码 | 数量 |",
+            "|---|---:|",
+        ]
+        for reason_code, count in reason_summary.items():
+            lines.append(f"| `{_md_cell(reason_code)}` | {count} |")
+        lines.append("")
+    if coord_summary:
+        lines += [
+            f"## 依赖坐标分布（Top {min(S6_DETAIL_MD_DEP_SUMMARY_LIMIT, len(coord_summary))}）",
+            "",
+            "| 依赖坐标 | 数量 |",
+            "|---|---:|",
+        ]
+        for coord, count in list(coord_summary.items())[:S6_DETAIL_MD_DEP_SUMMARY_LIMIT]:
+            lines.append(f"| `{_md_cell(coord)}` | {count} |")
+        if len(coord_summary) > S6_DETAIL_MD_DEP_SUMMARY_LIMIT:
+            lines.append(
+                f"| 其他 {len(coord_summary) - S6_DETAIL_MD_DEP_SUMMARY_LIMIT} 个依赖 | "
+                f"{sum(list(coord_summary.values())[S6_DETAIL_MD_DEP_SUMMARY_LIMIT:])} |"
+            )
+        lines.append("")
+
+    if len(items) <= S6_DETAIL_MD_FULL_LIMIT:
+        lines += [
+            "## API 明细（完整）",
+            "",
+            "| # | 依赖坐标 | API | 签名 | 符号 | 原因码 | 说明 |",
+            "|---:|---|---|---|---|---|---|",
+        ]
+        for idx, item in enumerate(items, 1):
+            lines.append(_detail_row(idx, item))
+        lines.append("")
+    else:
+        lines += [
+            f"## 优先抽查样例（前 {S6_DETAIL_MD_SAMPLE_LIMIT} 条）",
+            "",
+            f"> 本桶共有 {len(items)} 条，Markdown 只展示样例，避免明细文件自身难以阅读或预览失败；完整全集请看 `{csv_name}`。",
+            "",
+            "| # | 依赖坐标 | API | 签名 | 符号 | 原因码 | 说明 |",
+            "|---:|---|---|---|---|---|---|",
+        ]
+        for idx, item in enumerate(items[:S6_DETAIL_MD_SAMPLE_LIMIT], 1):
+            lines.append(_detail_row(idx, item))
+        lines += [
+            "",
+            f"> 其余 {len(items) - S6_DETAIL_MD_SAMPLE_LIMIT} 条未在 Markdown 展开，请在 CSV 中筛选查看。",
+            "",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
+    """Write full bucket details outside the main Markdown report."""
+    config = S6_DETAIL_BUCKETS.get(bucket_name) or {}
+    items = list((findings or {}).get(bucket_name) or [])
+    if bucket_name == "not_analyzed":
+        items = [
+            item for item in items
+            if item.get("user_conclusion") not in {"可能影响", "需要补充输入"}
+        ]
+    artifacts = {}
+    if not items:
+        return artifacts
+    report_path = Path(report_dir)
+    report_path.mkdir(parents=True, exist_ok=True)
+    csv_path = report_path / config.get("csv", f"s6_{bucket_name}_apis.csv")
+    md_path = report_path / config.get("md", f"s6_{bucket_name}_apis.md")
+    fieldnames = [
+        "coord",
+        "api",
+        "api_signature",
+        "symbol_kind",
+        "change_type",
+        "severity",
+        "reason_code",
+        "reason",
+        "user_reason",
+        "recommended_action",
+        "verification",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in items:
+            writer.writerow({key: _csv_cell(item.get(key)) for key in fieldnames})
+
+    write_text(
+        str(md_path),
+        build_bucket_detail_markdown(config, items, relpath_for_report(csv_path, report_dir)),
+    )
+    artifacts[f"{bucket_name}_csv"] = relpath_for_report(csv_path, report_dir)
+    artifacts[f"{bucket_name}_md"] = relpath_for_report(md_path, report_dir)
+    return artifacts
+
+
+def write_not_found_detail_artifacts(report_dir, findings):
+    return write_bucket_detail_artifacts(report_dir, findings, "not_found")
+
+
+def write_s6_detail_artifacts(report_dir, findings):
+    artifacts = {}
+    for bucket_name in S6_DETAIL_BUCKETS:
+        artifacts.update(write_bucket_detail_artifacts(report_dir, findings, bucket_name))
+    return artifacts
 
 
 def load_per_dependency_summaries(report_dir):
@@ -739,103 +952,94 @@ def generate_report(findings):
     section("八、P1 运行时崩溃", p1, "P1")
     section("九、P2 行为异常", p2, "P2")
 
-    L += [f"## 十、待人工验证（{len(unk)} 项）", ""]
-    if unk:
-        reason_summary = findings.get('uncertain_reason_summary', {})
-        if reason_summary:
-            L += ["**原因分类**", ""]
-            for reason_code, cnt in reason_summary.items():
-                L.append(f"- `{reason_code}`：{cnt}")
-            L.append("")
-        for item in unk:
-            L.append(f"### `{item.get('api','')}`")
-            if item.get('reason_code'):
-                L.append(f"- **原因码**：`{item.get('reason_code')}`")
-            L.append(f"- **原因**：{item.get('reason','')}")
-            for cmd in item.get('verification', []):
-                L.append(f"- **验证**：`{cmd}`")
-            evidence_paths = item.get('evidence_paths', []) or []
-            if evidence_paths:
-                first_path = evidence_paths[0]
-                if first_path:
-                    L.append("- **已知证据路径（摘要）**：")
-                    for edge in first_path[:5]:
-                        L.append(
-                            f"  - `{edge.get('caller_symbol','?')}` -> `{edge.get('callee_key','?')}` "
-                            f"({edge.get('evidence_type','')}, {edge.get('confidence','')}) "
-                            f"`{Path(edge.get('file','?')).name}:{edge.get('line','?')}`"
-                        )
-            L.append("")
-    else:
-        L += ["✅ 无待验证项", ""]
-    L += ["---", ""]
+    def render_reason_summary(reason_summary):
+        if not reason_summary:
+            return
+        L.extend(["**原因分类**", ""])
+        for reason_code, cnt in reason_summary.items():
+            L.append(f"- `{reason_code}`：{cnt}")
+        L.append("")
 
-    L += [f"## 十一、可能影响（{len(probable_impact)} 项）", ""]
-    if probable_impact:
-        for item in probable_impact:
-            L.extend(_fmt_issue(item))
-    else:
-        L += ["✅ 无可能影响项", ""]
-    L += ["---", ""]
+    def artifact_links(bucket_name):
+        artifacts = findings.get('artifacts') or {}
+        links = []
+        if artifacts.get(f'{bucket_name}_csv'):
+            links.append(f"`{artifacts.get(f'{bucket_name}_csv')}`")
+        if artifacts.get(f'{bucket_name}_md'):
+            links.append(f"`{artifacts.get(f'{bucket_name}_md')}`")
+        return links
 
-    L += [f"## 十二、需要补充输入（{len(needs_input)} 项）", ""]
-    if needs_input:
-        for item in needs_input:
-            L.append(f"### `{item.get('api','')}`")
-            if item.get('reason_code'):
-                L.append(f"- **原因码**：`{item.get('reason_code')}`")
-            if item.get('user_reason') or item.get('reason'):
-                L.append(f"- **说明**：{item.get('user_reason') or item.get('reason')}")
-            if item.get('recommended_action'):
-                L.append(f"- **推荐动作**：{item.get('recommended_action')}")
-            for cmd in item.get('verification', []):
-                L.append(f"- **建议动作**：`{cmd}`")
-            L.append("")
-    else:
-        L += ["✅ 无待补输入项", ""]
-    L += ["---", ""]
+    def render_compact_bucket(title, items, empty_text, bucket_name, reason_summary=None, limit=S6_INLINE_LIMIT):
+        L.extend([f"## {title}（{len(items)} 项）", ""])
+        if not items:
+            L.extend([empty_text, "", "---", ""])
+            return
+        render_reason_summary(reason_summary)
+        links = artifact_links(bucket_name)
+        if links:
+            L.extend([
+                f"完整清单见：{', '.join(links)}。",
+                f"主报告仅展示前 {min(limit, len(items))} 条，避免 Markdown 预览器因大量明细渲染失败。",
+                "",
+            ])
+        else:
+            L.extend([f"主报告仅展示前 {min(limit, len(items))} 条。", ""])
+        L.extend([
+            "| # | 依赖坐标 | API | 签名 | 符号 | 原因码 | 说明/动作 |",
+            "|---:|---|---|---|---|---|---|",
+        ])
+        for idx, item in enumerate(items[:limit], 1):
+            reason = (
+                item.get('user_reason')
+                or item.get('reason')
+                or item.get('recommended_action')
+                or ''
+            ).replace('|', '\\|').replace('\n', ' ')
+            L.append(
+                f"| {idx} | `{item.get('coord','')}` | `{item.get('api','')}` | "
+                f"`{item.get('api_signature','')}` | `{item.get('symbol_kind','')}` | "
+                f"`{item.get('reason_code','')}` | {reason[:180]} |"
+            )
+        if len(items) > limit:
+            L.extend(["", f"> 其余 {len(items) - limit} 条请查看完整清单文件。"])
+        L.extend(["", "---", ""])
 
-    L += [f"## 十三、未覆盖/未分析（{len(na)} 项）", ""]
-    if na:
-        reason_summary = summarize_reason_codes(na)
-        if reason_summary:
-            L += ["**原因分类**", ""]
-            for reason_code, cnt in reason_summary.items():
-                L.append(f"- `{reason_code}`：{cnt}")
-            L.append("")
-        for item in na:
-            L.append(f"### `{item.get('api','')}`")
-            if item.get('reason_code'):
-                L.append(f"- **原因码**：`{item.get('reason_code')}`")
-            if item.get('impact_mode'):
-                L.append(f"- **影响类型**：`{item.get('impact_mode')}`")
-            L.append(f"- **说明**：{item.get('reason','')}")
-            for cmd in item.get('verification', []):
-                L.append(f"- **建议动作**：`{cmd}`")
-            L.append("")
-    else:
-        L += ["✅ 无未覆盖项", ""]
-    L += ["---", ""]
-
-    L += [f"## 十四、静态未找到路径（{len(nf)} 项）", ""]
-    if nf:
-        reason_summary = findings.get('not_found_reason_summary', {})
-        if reason_summary:
-            L += ["**原因分类**", ""]
-            for reason_code, cnt in reason_summary.items():
-                L.append(f"- `{reason_code}`：{cnt}")
-            L.append("")
-        for item in nf:
-            L.append(f"### `{item.get('api','')}`")
-            if item.get('reason_code'):
-                L.append(f"- **原因码**：`{item.get('reason_code')}`")
-            L.append(f"- **说明**：{item.get('reason','')}")
-            for cmd in item.get('verification', []):
-                L.append(f"- **建议动作**：`{cmd}`")
-            L.append("")
-    else:
-        L += ["✅ 无静态未找到项", ""]
-    L += ["---", ""]
+    render_compact_bucket(
+        "十、待人工验证",
+        unk,
+        "✅ 无待验证项",
+        "uncertain",
+        findings.get('uncertain_reason_summary', {}),
+    )
+    render_compact_bucket(
+        "十一、可能影响",
+        probable_impact,
+        "✅ 无可能影响项",
+        "probable_impact",
+        summarize_reason_codes(probable_impact),
+    )
+    render_compact_bucket(
+        "十二、需要补充输入",
+        needs_input,
+        "✅ 无待补输入项",
+        "needs_input",
+        summarize_reason_codes(needs_input),
+    )
+    render_compact_bucket(
+        "十三、未覆盖/未分析",
+        na,
+        "✅ 无未覆盖项",
+        "not_analyzed",
+        summarize_reason_codes(na),
+    )
+    render_compact_bucket(
+        "十四、静态未找到路径",
+        nf,
+        "✅ 无静态未找到项",
+        "not_found",
+        findings.get('not_found_reason_summary', {}),
+        S6_NOT_FOUND_INLINE_LIMIT,
+    )
 
     mod_impacts = findings.get('module_impacts', {})
     L += ["## 十五、受影响的系统模块", ""]
@@ -920,6 +1124,8 @@ def main():
 
     print("\nStep 6：生成报告...", file=sys.stderr)
     findings = collect_findings(args.report_dir)
+    findings.setdefault('artifacts', {})
+    findings['artifacts'].update(write_s6_detail_artifacts(args.report_dir, findings))
 
     Path(args.output_findings).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output_findings, 'w', encoding='utf-8', newline='\n') as f:
@@ -931,6 +1137,9 @@ def main():
     print(f"  P0={p0} P1={p1} P2={p2} ❓={unk} ⊘={na} ✗={nf}", file=sys.stderr)
     print(f"  findings → {args.output_findings}", file=sys.stderr)
     print(f"  report   → {args.output_report}",   file=sys.stderr)
+    for key in sorted(findings.get('artifacts', {})):
+        if key.endswith('_csv'):
+            print(f"  {key} → {Path(args.report_dir) / findings['artifacts'][key]}", file=sys.stderr)
 
 
 if __name__ == '__main__':

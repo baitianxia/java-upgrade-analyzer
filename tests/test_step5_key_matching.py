@@ -4774,6 +4774,256 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("elapsed_sec", perf["report"])
         self.assertEqual(perf["report"]["by_api_count"], 1)
 
+    def test_step5_timing_csv_includes_hotspot_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            graph_stats = {
+                "step5_perf": {
+                    "main": {
+                        "business_graph_elapsed_sec": 0.123,
+                        "indirect_usage_elapsed_sec": 24.0,
+                        "indirect_usage_potential_legacy_method_target_pairs": 10205100,
+                        "indirect_usage_owner_presence_scans": 17,
+                    },
+                    "trace": {
+                        "elapsed_sec": 42.0,
+                        "total_apis": 1972,
+                        "frontier_pops": 12345,
+                        "incoming_edges_scanned": 631208,
+                        "incoming_edges_cache_hits": 100,
+                        "incoming_edges_cache_misses": 25,
+                        "critical_node_cache_hits": 200,
+                        "critical_node_cache_misses": 30,
+                        "critical_node_fast_none": 29,
+                        "direct_class_usage_elapsed_sec": 1.5,
+                        "direct_class_usage_scanned_methods": 26331,
+                        "direct_class_usage_cache_hits": 10,
+                        "direct_class_usage_cache_misses": 2,
+                        "direct_field_usage_elapsed_sec": 2.5,
+                        "direct_field_usage_scanned_methods": 52662,
+                        "direct_field_usage_cache_hits": 20,
+                        "direct_field_usage_cache_misses": 4,
+                        "declared_signature_index_builds": 1,
+                        "declared_signature_index_size": 1234,
+                    },
+                }
+            }
+
+            timing_path = step5._write_step5_timing_csv(output_dir, graph_stats)
+            with Path(timing_path).open(encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+
+        values = {(row["section"], row["metric"]): row["value"] for row in rows}
+        self.assertEqual(values[("main", "indirect_usage_elapsed_sec")], "24.0")
+        self.assertEqual(
+            values[("main", "indirect_usage_potential_legacy_method_target_pairs")],
+            "10205100",
+        )
+        self.assertEqual(values[("main", "indirect_usage_owner_presence_scans")], "17")
+        self.assertEqual(values[("trace", "elapsed_sec")], "42.0")
+        self.assertEqual(values[("trace", "frontier_pops")], "12345")
+        self.assertEqual(values[("trace", "incoming_edges_scanned")], "631208")
+        self.assertEqual(values[("trace", "incoming_edges_cache_hits")], "100")
+        self.assertEqual(values[("trace", "critical_node_cache_misses")], "30")
+        self.assertEqual(values[("trace", "critical_node_fast_none")], "29")
+        self.assertEqual(values[("trace", "direct_class_usage_cache_hits")], "10")
+        self.assertEqual(values[("trace", "direct_field_usage_scanned_methods")], "52662")
+        self.assertEqual(values[("trace", "declared_signature_index_builds")], "1")
+        self.assertEqual(values[("trace", "declared_signature_index_size")], "1234")
+
+    def test_trace_cache_reuses_sorted_incoming_edges_and_critical_node_checks(self):
+        trace_cache = tracer.ensure_trace_cache()
+        edge_a = source_analyzer.CallEdge(
+            caller_symbol_id="b",
+            caller_qualified_key="B.call",
+            callee_key="Target.call()",
+            callee_simple_key="method:call()",
+            evidence_type="source",
+            confidence="medium",
+            file="B.java",
+            line=20,
+            content="",
+            owner_type="dependency",
+            owner_coord="g:b",
+            module="",
+            is_test=False,
+        )
+        edge_b = source_analyzer.CallEdge(
+            caller_symbol_id="a",
+            caller_qualified_key="A.call",
+            callee_key="Target.call()",
+            callee_simple_key="method:call()",
+            evidence_type="source",
+            confidence="high",
+            file="A.java",
+            line=10,
+            content="",
+            owner_type="business",
+            owner_coord="__business__",
+            module="",
+            is_test=False,
+        )
+        graph = SimpleNamespace(reverse_edges={"Target.call()": [edge_a, edge_b]})
+
+        first_edges = tracer.get_cached_sorted_incoming_edges(
+            graph.reverse_edges,
+            "Target.call()",
+            trace_cache=trace_cache,
+            graph=graph,
+        )
+        second_edges = tracer.get_cached_sorted_incoming_edges(
+            graph.reverse_edges,
+            "Target.call()",
+            trace_cache=trace_cache,
+            graph=graph,
+        )
+
+        self.assertIs(first_edges, second_edges)
+        self.assertEqual([edge.caller_symbol_id for edge in first_edges], ["a", "b"])
+        perf = tracer._finalize_step5_perf_stats(graph)["trace"]
+        self.assertEqual(perf["incoming_edges_cache_misses"], 1)
+        self.assertEqual(perf["incoming_edges_cache_hits"], 1)
+
+        method_def = SimpleNamespace(
+            symbol_id="app_run",
+            qualified_key="com.app.App.run",
+            owner_type="business",
+            is_test=False,
+            file="App.java",
+            line=7,
+            class_fqcn="com.app.App",
+            annotations=[],
+        )
+        first_node = tracer.get_cached_critical_node(method_def, graph, {}, trace_cache=trace_cache)
+        second_node = tracer.get_cached_critical_node(method_def, graph, {}, trace_cache=trace_cache)
+
+        self.assertIs(first_node, second_node)
+        self.assertEqual(first_node["type"], "system_code_touched")
+        perf = tracer._finalize_step5_perf_stats(graph)["trace"]
+        self.assertEqual(perf["critical_node_cache_misses"], 1)
+        self.assertEqual(perf["critical_node_cache_hits"], 1)
+
+        dependency_method = SimpleNamespace(
+            symbol_id="dep_call",
+            qualified_key="com.dep.Lib.call",
+            owner_type="dependency",
+            is_test=False,
+            file="Lib.java",
+            line=1,
+            class_fqcn="com.dep.Lib",
+            class_name="Lib",
+            annotations=[],
+            class_annotations=[],
+            is_interface=False,
+        )
+        self.assertIsNone(
+            tracer.get_cached_critical_node(dependency_method, graph, {}, trace_cache=trace_cache)
+        )
+        perf = tracer._finalize_step5_perf_stats(graph)["trace"]
+        self.assertEqual(perf["critical_node_fast_none"], 1)
+
+    def test_declared_method_signature_index_is_built_once_for_many_api_filters(self):
+        graph = SimpleNamespace(
+            methods_by_id={
+                f"m{i}": SimpleNamespace(
+                    qualified_key=f"com.example.Api{i}.call",
+                    method_name="call",
+                    signature="()",
+                    param_types=[],
+                )
+                for i in range(100)
+            }
+        )
+        trace_cache = tracer.ensure_trace_cache()
+
+        for i in range(20):
+            signatures = tracer.collect_declared_method_signatures(
+                f"com.example.Api{i}.call",
+                graph,
+                trace_cache=trace_cache,
+            )
+            self.assertIn("()", signatures)
+
+        perf = tracer._finalize_step5_perf_stats(graph)["trace"]
+        self.assertEqual(perf["declared_signature_index_builds"], 1)
+        self.assertEqual(perf["declared_signature_index_size"], 100)
+
+    def test_direct_business_usage_scans_are_cached_per_target(self):
+        methods = {
+            "first": SimpleNamespace(
+                symbol_id="first",
+                owner_type="business",
+                return_type="",
+                param_types={},
+                field_types={},
+                local_var_types={},
+                imports={},
+                wildcard_imports=[],
+                static_imports={},
+                package_name="com.app",
+                get_body_text=lambda: "",
+            ),
+            "second": SimpleNamespace(
+                symbol_id="second",
+                owner_type="business",
+                return_type="",
+                param_types={},
+                field_types={},
+                local_var_types={"value": "com.changed.Target"},
+                imports={"Flags": "com.changed.Flags"},
+                wildcard_imports=[],
+                static_imports={},
+                package_name="com.app",
+                get_body_text=lambda: "return Flags.ENABLED;",
+            ),
+        }
+        graph = SimpleNamespace(methods_by_id=methods)
+        trace_cache = tracer.ensure_trace_cache()
+
+        class_api = {
+            "api_name": "com.changed.Target",
+            "matched_class": "com.changed.Target",
+        }
+        first_class_match = tracer._find_direct_business_class_usage(
+            class_api,
+            graph,
+            trace_cache=trace_cache,
+        )
+        second_class_match = tracer._find_direct_business_class_usage(
+            class_api,
+            graph,
+            trace_cache=trace_cache,
+        )
+
+        self.assertEqual(first_class_match[0].symbol_id, "second")
+        self.assertIs(first_class_match, second_class_match)
+
+        field_api = {
+            "api_name": "com.changed.Flags.ENABLED",
+            "api_simple": "ENABLED",
+        }
+        first_field_matches = tracer._find_direct_business_field_usages(
+            field_api,
+            graph,
+            trace_cache=trace_cache,
+        )
+        second_field_matches = tracer._find_direct_business_field_usages(
+            field_api,
+            graph,
+            trace_cache=trace_cache,
+        )
+
+        self.assertEqual([item[0].symbol_id for item in first_field_matches], ["second"])
+        self.assertEqual([item[0].symbol_id for item in second_field_matches], ["second"])
+
+        perf = tracer._finalize_step5_perf_stats(graph)["trace"]
+        self.assertEqual(perf["direct_class_usage_cache_misses"], 1)
+        self.assertEqual(perf["direct_class_usage_cache_hits"], 1)
+        self.assertEqual(perf["direct_class_usage_scanned_methods"], 2)
+        self.assertEqual(perf["direct_field_usage_cache_misses"], 1)
+        self.assertEqual(perf["direct_field_usage_cache_hits"], 1)
+        self.assertEqual(perf["direct_field_usage_scanned_methods"], 2)
+
     def test_trace_all_apis_merges_step5_perf_without_dropping_main_stats(self):
         graph = SimpleNamespace()
         graph_stats = {
@@ -5648,6 +5898,192 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(findings["not_found_reason_summary"]["NO_STATIC_PATH"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["not_found"], 1)
         self.assertIn("| app | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 1 |", report_text)
+
+    def test_s6_report_summarizes_large_not_found_list_outside_main_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            s5_dir = report_dir / "s5_call_chain"
+            s5_dir.mkdir(parents=True)
+            not_found_apis = [
+                {
+                    "coord": "a:b",
+                    "api": f"com.example.Api{i}.removed",
+                    "api_name": f"com.example.Api{i}.removed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "severity": "P1",
+                    "reason_code": "NO_STATIC_PATH",
+                    "reason": "静态分析未找到调用路径",
+                    "user_conclusion": "当前无法确认",
+                }
+                for i in range(100)
+            ]
+            summary = {
+                "status": "done",
+                "reachable": 0,
+                "uncertain": 0,
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": len(not_found_apis),
+                "user_conclusion_summary": {"当前无法确认": len(not_found_apis)},
+                "not_found_apis": not_found_apis,
+            }
+            (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+
+            findings = s6_report.collect_findings(str(report_dir))
+            findings.setdefault("artifacts", {}).update(
+                s6_report.write_s6_detail_artifacts(str(report_dir), findings)
+            )
+            report_text = s6_report.generate_report(findings)
+
+            not_found_csv = report_dir / findings["artifacts"]["not_found_csv"]
+            not_found_md = report_dir / findings["artifacts"]["not_found_md"]
+            self.assertTrue(not_found_csv.exists())
+            self.assertTrue(not_found_md.exists())
+            with not_found_csv.open(encoding="utf-8") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 100)
+            self.assertIn("完整清单见", report_text)
+            self.assertIn("其余 80 条请查看完整清单文件", report_text)
+            self.assertIn("com.example.Api0.removed", report_text)
+            self.assertNotIn("com.example.Api99.removed", report_text)
+            self.assertEqual(report_text.count("### `com.example.Api"), 0)
+            self.assertIn("com.example.Api99.removed", not_found_md.read_text(encoding="utf-8"))
+
+    def test_s6_report_summarizes_large_review_buckets_outside_main_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            s5_dir = report_dir / "s5_call_chain"
+            s5_dir.mkdir(parents=True)
+
+            uncertain_apis = [
+                {
+                    "coord": "a:b",
+                    "api": f"com.example.Uncertain{i}.changed",
+                    "api_name": f"com.example.Uncertain{i}.changed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "severity": "P1",
+                    "reason_code": "BYTECODE_HIT_BUSINESS_ENTRY_NOT_CONFIRMED",
+                    "reason": "字节码命中但未确认回业务入口",
+                    "user_conclusion": "当前无法确认",
+                }
+                for i in range(30)
+            ]
+            not_analyzed_apis = []
+            for prefix, conclusion, reason_code in [
+                ("Probable", "可能影响", "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION"),
+                ("NeedsInput", "需要补充输入", "DEPENDENCY_SOURCE_MAPPING_MISSING"),
+                ("NotAnalyzed", "当前无法确认", "RESOURCE_OR_REFLECTION"),
+            ]:
+                for i in range(30):
+                    not_analyzed_apis.append(
+                        {
+                            "coord": "a:b",
+                            "api": f"com.example.{prefix}{i}.changed",
+                            "api_name": f"com.example.{prefix}{i}.changed",
+                            "api_signature": "()",
+                            "symbol_kind": "method",
+                            "change_type": "REMOVED",
+                            "severity": "P1",
+                            "reason_code": reason_code,
+                            "reason": f"{prefix} reason",
+                            "user_conclusion": conclusion,
+                            "recommended_action": f"{prefix} action",
+                        }
+                    )
+            summary = {
+                "status": "done",
+                "reachable": 0,
+                "uncertain": len(uncertain_apis),
+                "not_analyzed": len(not_analyzed_apis),
+                "not_found_in_static_analysis": 0,
+                "user_conclusion_summary": {
+                    "可能影响": 30,
+                    "需要补充输入": 30,
+                    "当前无法确认": 60,
+                },
+                "uncertain_apis": uncertain_apis,
+                "not_analyzed_apis": not_analyzed_apis,
+            }
+            (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+
+            findings = s6_report.collect_findings(str(report_dir))
+            findings.setdefault("artifacts", {}).update(
+                s6_report.write_s6_detail_artifacts(str(report_dir), findings)
+            )
+            report_text = s6_report.generate_report(findings)
+
+            for key in [
+                "uncertain_csv",
+                "probable_impact_csv",
+                "needs_input_csv",
+                "not_analyzed_csv",
+            ]:
+                self.assertTrue((report_dir / findings["artifacts"][key]).exists())
+
+            with (report_dir / findings["artifacts"]["not_analyzed_csv"]).open(encoding="utf-8") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 30)
+            self.assertIn("## 十、待人工验证（30 项）", report_text)
+            self.assertIn("## 十一、可能影响（30 项）", report_text)
+            self.assertIn("## 十二、需要补充输入（30 项）", report_text)
+            self.assertIn("## 十三、未覆盖/未分析（30 项）", report_text)
+            self.assertIn("其余 10 条请查看完整清单文件", report_text)
+            self.assertIn("com.example.Uncertain0.changed", report_text)
+            self.assertNotIn("com.example.Uncertain29.changed", report_text)
+            self.assertEqual(report_text.count("### `com.example.Uncertain"), 0)
+            self.assertIn(
+                "com.example.Uncertain29.changed",
+                (report_dir / findings["artifacts"]["uncertain_md"]).read_text(encoding="utf-8"),
+            )
+
+    def test_s6_detail_markdown_stays_readable_for_very_large_bucket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            s5_dir = report_dir / "s5_call_chain"
+            s5_dir.mkdir(parents=True)
+            not_found_apis = [
+                {
+                    "coord": f"g:dep-{i % 5}",
+                    "api": f"com.example.Huge{i}.removed",
+                    "api_name": f"com.example.Huge{i}.removed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "severity": "P1",
+                    "reason_code": "NO_STATIC_PATH" if i % 2 == 0 else "NO_CLASS_REFERENCE",
+                    "reason": "静态分析未找到调用路径",
+                    "user_conclusion": "当前无法确认",
+                }
+                for i in range(260)
+            ]
+            summary = {
+                "status": "done",
+                "reachable": 0,
+                "uncertain": 0,
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": len(not_found_apis),
+                "user_conclusion_summary": {"当前无法确认": len(not_found_apis)},
+                "not_found_apis": not_found_apis,
+            }
+            (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+
+            findings = s6_report.collect_findings(str(report_dir))
+            findings.setdefault("artifacts", {}).update(
+                s6_report.write_s6_detail_artifacts(str(report_dir), findings)
+            )
+
+            not_found_csv = report_dir / findings["artifacts"]["not_found_csv"]
+            not_found_md = report_dir / findings["artifacts"]["not_found_md"]
+            with not_found_csv.open(encoding="utf-8") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 260)
+            md_text = not_found_md.read_text(encoding="utf-8")
+            self.assertIn("## 原因分类", md_text)
+            self.assertIn("## 依赖坐标分布", md_text)
+            self.assertIn("## 优先抽查样例（前 50 条）", md_text)
+            self.assertIn("完整全集请看 `s6_not_found_apis.csv`", md_text)
+            self.assertIn("com.example.Huge0.removed", md_text)
+            self.assertNotIn("com.example.Huge259.removed", md_text)
 
     def test_s6_report_keeps_probable_impact_and_needs_input_out_of_uncovered_section(self):
         with tempfile.TemporaryDirectory() as tmp:

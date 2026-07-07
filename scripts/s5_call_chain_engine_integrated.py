@@ -91,6 +91,106 @@ def _step5_debug(topic, message, **fields):
     print(f"[step5-debug] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
 
 
+def _write_step5_timing_csv(output_dir, graph_stats):
+    """Persist Step5 timing metrics in a small human-readable CSV."""
+    perf = ((graph_stats or {}).get('step5_perf') or {})
+    rows = []
+    preferred_keys = {
+        'main': [
+            'business_graph_elapsed_sec',
+            'dependency_graph_elapsed_sec',
+            'business_bytecode_elapsed_sec',
+            'source_artifact_alignment_elapsed_sec',
+            'framework_adapters_elapsed_sec',
+            'framework_adapter_merge_elapsed_sec',
+            'indirect_usage_elapsed_sec',
+            'indirect_usage_target_count',
+            'indirect_usage_owner_count',
+            'indirect_usage_source_methods_scanned',
+            'indirect_usage_source_methods_with_indirect_markers',
+            'indirect_usage_owner_presence_scans',
+            'indirect_usage_potential_legacy_method_target_pairs',
+        ],
+        'bytecode_scan': [
+            'elapsed_sec',
+            'javap_elapsed_sec',
+            'visited_classes',
+            'javap_tasks',
+            'javap_classes',
+            'hit_apis',
+            'scan_failures',
+        ],
+        'bytecode_expand': [
+            'elapsed_sec',
+            'member_index_elapsed_sec',
+            'calls',
+            'candidate_cache_hits',
+            'member_index_builds',
+            'member_index_uses',
+            'candidate_classes',
+            'javap_classes',
+            'edges_added',
+        ],
+        'trace': [
+            'elapsed_sec',
+            'api_elapsed_sec',
+            'apis_traced',
+            'total_apis',
+            'frontier_pops',
+            'frontier_pushes',
+            'incoming_edges_scanned',
+            'incoming_edges_cache_hits',
+            'incoming_edges_cache_misses',
+            'incoming_edges_cache_size',
+            'critical_node_cache_hits',
+            'critical_node_cache_misses',
+            'critical_node_cache_size',
+            'critical_node_fast_none',
+            'direct_class_usage_elapsed_sec',
+            'direct_class_usage_scanned_methods',
+            'direct_class_usage_cache_hits',
+            'direct_class_usage_cache_misses',
+            'direct_class_usage_cache_size',
+            'direct_field_usage_elapsed_sec',
+            'direct_field_usage_scanned_methods',
+            'direct_field_usage_cache_hits',
+            'direct_field_usage_cache_misses',
+            'direct_field_usage_cache_size',
+            'declared_signature_index_builds',
+            'declared_signature_index_elapsed_sec',
+            'declared_signature_index_size',
+        ],
+        'report': [
+            'elapsed_sec',
+            'summary_text_elapsed_sec',
+            'by_api_elapsed_sec',
+            'alerts_elapsed_sec',
+            'summary_json_elapsed_sec',
+            'by_module_elapsed_sec',
+            'by_api_count',
+        ],
+    }
+    for section, keys in preferred_keys.items():
+        bucket = perf.get(section) or {}
+        if not isinstance(bucket, dict):
+            continue
+        for key in keys:
+            if key in bucket:
+                rows.append({'section': section, 'metric': key, 'value': bucket.get(key)})
+        for key in sorted(bucket):
+            if key in keys or isinstance(bucket.get(key), (dict, list)):
+                continue
+            rows.append({'section': section, 'metric': key, 'value': bucket.get(key)})
+    if not rows:
+        return ''
+    path = Path(output_dir) / 'step5_timing.csv'
+    with path.open('w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['section', 'metric', 'value'])
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(path)
+
+
 # ══════════════════════════════════════════════════════════════════
 # Step 5集成版：完整流程
 # ══════════════════════════════════════════════════════════════════
@@ -735,12 +835,24 @@ def _step5_integrated_main_impl(args):
         'reason_codes': list(runtime_dependency_catalog.get('reason_codes') or []),
         **(runtime_dependency_catalog.get('metrics') or {}),
     }
+    source_alignment_timer = time.perf_counter()
     source_alignment = assess_source_artifact_alignment(report_dir, business_source_dirs)
     graph.source_artifact_alignment = source_alignment
     graph_stats['source_artifact_alignment'] = source_alignment
+    graph_stats['step5_perf']['main']['source_artifact_alignment_elapsed_sec'] = round(
+        time.perf_counter() - source_alignment_timer, 3
+    )
     framework_output = os.path.join(report_dir, 'framework_adapters.json')
+    framework_timer = time.perf_counter()
     framework_evidence = run_framework_adapters(business_roots, framework_output)
+    graph_stats['step5_perf']['main']['framework_adapters_elapsed_sec'] = round(
+        time.perf_counter() - framework_timer, 3
+    )
+    framework_merge_timer = time.perf_counter()
     framework_merge = attach_framework_edges_to_graph(graph, framework_evidence)
+    graph_stats['step5_perf']['main']['framework_adapter_merge_elapsed_sec'] = round(
+        time.perf_counter() - framework_merge_timer, 3
+    )
     graph_stats['framework_adapters'] = {
         item.get('adapter'): {
             'status': item.get('status'),
@@ -750,8 +862,37 @@ def _step5_integrated_main_impl(args):
         for item in framework_evidence.get('adapters') or []
     }
     graph_stats['framework_adapter_merge'] = framework_merge
+    indirect_timer = time.perf_counter()
     graph_stats['indirect_usage'] = analyze_and_merge_indirect_usages(
         graph, all_apis, source_roots
+    )
+    indirect_elapsed = time.perf_counter() - indirect_timer
+    indirect_stats = graph_stats.get('indirect_usage') or {}
+    graph_stats['step5_perf']['main'].update({
+        'indirect_usage_elapsed_sec': round(indirect_elapsed, 3),
+        'indirect_usage_target_count': int(indirect_stats.get('target_count') or 0),
+        'indirect_usage_owner_count': int(indirect_stats.get('owner_count') or 0),
+        'indirect_usage_source_methods_scanned': int(indirect_stats.get('source_methods_scanned') or 0),
+        'indirect_usage_source_methods_with_indirect_markers': int(
+            indirect_stats.get('source_methods_with_indirect_markers') or 0
+        ),
+        'indirect_usage_owner_presence_scans': int(indirect_stats.get('owner_presence_scans') or 0),
+        'indirect_usage_potential_legacy_method_target_pairs': int(
+            indirect_stats.get('potential_legacy_method_target_pairs') or 0
+        ),
+    })
+    emit_progress(
+        "step5",
+        "perf",
+        (
+            "图增强耗时："
+            f"source_alignment={graph_stats['step5_perf']['main']['source_artifact_alignment_elapsed_sec']}s，"
+            f"framework={graph_stats['step5_perf']['main']['framework_adapters_elapsed_sec']}s，"
+            f"framework_merge={graph_stats['step5_perf']['main']['framework_adapter_merge_elapsed_sec']}s，"
+            f"indirect_usage={graph_stats['step5_perf']['main']['indirect_usage_elapsed_sec']}s，"
+            f"potential_method_target_pairs={graph_stats['step5_perf']['main']['indirect_usage_potential_legacy_method_target_pairs']}，"
+            f"owner_presence_scans={graph_stats['step5_perf']['main']['indirect_usage_owner_presence_scans']}"
+        ),
     )
     graph.runtime_dependency_catalog = runtime_dependency_catalog
 
@@ -841,6 +982,9 @@ def _step5_integrated_main_impl(args):
         "汇总报告生成完成",
         elapsed=time.perf_counter() - summary_timer,
     )
+    timing_csv = _write_step5_timing_csv(output_dir, graph_stats)
+    if timing_csv:
+        print(f"  耗时明细 → {timing_csv}", file=sys.stderr)
 
     # 统计
     reachable_count = sum(1 for r in all_results if r.analysis_status == 'reachable')
