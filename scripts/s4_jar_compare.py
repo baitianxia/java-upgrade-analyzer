@@ -12,7 +12,7 @@ s4_jar_compare.py — Step 4：jar 包变更全量对比
   s2_context.json           — 项目上下文（含升级依赖清单）
   <japicmp-jar>             — JApiCmp 工具 jar
 
-输出（全部写入 .upgrade-report/s4_jar_compare/ 目录）：
+输出（全部写入 .upgrade-report/evidence/api_changes/ 目录）：
   [artifact]_[旧版]_vs_[新版]_binary.txt   — JApiCmp 完整原始输出（不裁剪）
   [artifact]_[旧版]_vs_[新版]_behavior.txt — changelog 行为变更记录
   [lib]_gitdiff_api_changes.txt            — 依赖源码 git diff 结果
@@ -50,12 +50,19 @@ from s4_contract import (
     validate_row,
 )
 from progress_logging import PhaseTimer, emit_progress
+from pipeline_constants import (
+    EVIDENCE_API_CHANGES_DIRNAME,
+    EVIDENCE_DIRNAME,
+    RUNTIME_DIRNAME,
+    RUNTIME_STATE_DIRNAME,
+)
 
 INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
 DEFAULT_FETCH_TIMEOUT = None
 DEFAULT_JAPICMP_TIMEOUT = None
 DEFAULT_GIT_DIFF_TIMEOUT = None
+DEFAULT_JAPICMP_COORD = "com.github.siom79.japicmp:japicmp:0.21.2:jar:jar-with-dependencies"
 _WRITE_RESULT_LOCK = threading.RLock()
 
 
@@ -70,10 +77,10 @@ def load_orchestrated_step4_input(output_dir):
         return {}
     report_dir = os.environ.get("UPGRADE_REPORT_DIR", "").strip()
     if not report_dir and output_dir:
-        report_dir = str(Path(output_dir).resolve().parent)
+        report_dir = str(infer_report_dir_from_output_dir(output_dir))
     if not report_dir:
         return {}
-    state_path = Path(report_dir) / MAIN_STATE_FILE_NAME
+    state_path = Path(report_dir) / RUNTIME_DIRNAME / RUNTIME_STATE_DIRNAME / MAIN_STATE_FILE_NAME
     if not state_path.exists():
         return {}
     try:
@@ -82,6 +89,18 @@ def load_orchestrated_step4_input(output_dir):
     except Exception:
         return {}
     return dict((((main_state or {}).get("step4") or {}).get("input")) or {})
+
+
+def infer_report_dir_from_output_dir(output_dir):
+    output_path = Path(output_dir).resolve()
+    if output_path.name == EVIDENCE_API_CHANGES_DIRNAME and output_path.parent.name == EVIDENCE_DIRNAME:
+        return output_path.parent.parent
+    return output_path.parent
+
+
+def default_coverage_output_path(output_dir):
+    report_dir = infer_report_dir_from_output_dir(output_dir)
+    return report_dir / RUNTIME_DIRNAME / "coverage" / "s4_coverage.json"
 
 def load_json(path):
     if not os.path.exists(path): return {}
@@ -983,6 +1002,168 @@ def build_timeout_resolution_interaction(output_dir, timeout_items):
 
 def emit_interaction(interaction):
     print(f"{INTERACTION_PREFIX}{json.dumps(interaction, ensure_ascii=False)}")
+
+
+def _env_flag_disabled(name):
+    return str(os.environ.get(name, "") or "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def japicmp_default_jar_path():
+    return str(
+        maven_repo_dir()
+        / 'com' / 'github' / 'siom79' / 'japicmp' / 'japicmp' / '0.21.2'
+        / 'japicmp-0.21.2-jar-with-dependencies.jar'
+    )
+
+
+def should_auto_install_japicmp():
+    return not _env_flag_disabled("JUA_JAPICMP_AUTO_INSTALL")
+
+
+def auto_install_japicmp(japicmp_jar, timeout=DEFAULT_FETCH_TIMEOUT):
+    """Try to install JApiCmp once into the current Maven local repository."""
+    target = str(japicmp_jar or "").strip() or japicmp_default_jar_path()
+    if os.path.exists(target):
+        return True, target, ""
+    if not should_auto_install_japicmp():
+        return False, target, "auto_install_disabled"
+    cmd = mvn_cmd() + [
+        "dependency:get",
+        f"-Dartifact={DEFAULT_JAPICMP_COORD}",
+        "--no-transfer-progress",
+        "-q",
+    ]
+    print(
+        "⚙️  JApiCmp 未安装，正在尝试自动安装："
+        + " ".join(cmd),
+        file=sys.stderr,
+    )
+    _stdout, stderr, rc = run_cmd(cmd, timeout=timeout)
+    if rc == 0 and os.path.exists(target):
+        print(f"✅ JApiCmp 自动安装成功：{target}", file=sys.stderr)
+        return True, target, ""
+    reason = (stderr or f"mvn dependency:get failed rc={rc}").strip()
+    if rc == -1 and "超时" in reason:
+        timeout_label = f"{timeout}s" if timeout not in (None, "") else "unbounded"
+        reason = f"timeout({timeout_label})"
+    return False, target, reason[:500]
+
+
+def dependency_needs_japicmp(row):
+    change = str((row or {}).get("change_type") or "").strip()
+    old_ver = str((row or {}).get("old_version") or "").strip()
+    new_ver = str((row or {}).get("new_version") or "").strip()
+    if not (row or {}).get("coord"):
+        return False
+    if change == "未变":
+        return False
+    is_removed_dependency = (change == '移除') or (new_ver == '-' and old_ver != '-')
+    is_added_dependency = (change == '新增') or (old_ver == '-' and new_ver != '-')
+    return (not is_removed_dependency) and (not is_added_dependency) and old_ver not in ("", "-") and new_ver not in ("", "-")
+
+
+def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, planned_dependencies):
+    preflight_path = os.path.join(output_dir, "japicmp_preflight.json")
+    payload = {
+        "generated_at": datetime.now().isoformat(),
+        "japicmp_jar": str(japicmp_jar or ""),
+        "install_error": str(install_error or ""),
+        "planned_dependencies": planned_dependencies,
+        "impact": [
+            "Step4 无法执行 JApiCmp 二进制 API 对比。",
+            "这会漏掉仅通过 jar 二进制对比才能发现的删除、签名变化、字段变化、源码重编译不兼容等 API 变化。",
+            "如果确认降级继续，后续 Step5/Step6 的结论必须视为二进制 API 证据不完整。",
+        ],
+        "manual_install": [
+            f"mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}",
+            "或提供 japicmp_jar 的绝对路径。",
+        ],
+    }
+    Path(preflight_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "schema": "java-upgrade-analyzer.interaction.v2",
+        "checkpoint": True,
+        "hard_stop": True,
+        "status": "awaiting_user_input",
+        "kind": "review",
+        "step_id": "step4",
+        "title": "step4 缺少 JApiCmp，二进制 API 对比不可用",
+        "question": (
+            "Step4 需要 JApiCmp 执行依赖 jar 的二进制 API 对比。系统已尝试自动安装但失败。"
+            "请优先安装 JApiCmp 或提供 japicmp_jar 后重跑 Step4；"
+            "只有在你明确接受二进制 API 证据缺失的风险时，才允许 allow_degraded=true 降级继续。"
+        ),
+        "summary": f"共有 {len(planned_dependencies)} 个升级依赖需要 JApiCmp；当前工具不可用。",
+        "reason_code": "step4_japicmp_missing_need_resolution",
+        "files_to_review": [os.path.abspath(preflight_path)],
+        "required_fields": ["action"],
+        "options": [
+            {
+                "id": "rerun_current_step",
+                "label": "处理 JApiCmp 后重跑",
+                "description": "安装/提供 japicmp_jar 后重跑；或显式 allow_degraded=true 接受二进制 API 证据缺失后重跑。",
+            },
+            {
+                "id": "restart_from_step",
+                "label": "从更早步骤重跑",
+                "description": "如输入或环境需要调整，可从 step1/step2/step4 重新处理。",
+            },
+            {
+                "id": "cancel",
+                "label": "取消",
+                "description": "先人工安装 JApiCmp 或确认风险后再继续。",
+            },
+        ],
+        "response_schema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["rerun_current_step", "restart_from_step", "cancel"],
+                },
+                "japicmp_jar": {
+                    "type": "string",
+                    "description": "可选。JApiCmp jar-with-dependencies 的绝对路径。",
+                },
+                "allow_degraded": {
+                    "type": "boolean",
+                    "description": "可选。若设为 true，表示用户明确接受缺少 JApiCmp 二进制 API 对比证据后降级继续。",
+                },
+                "restart_step_id": {
+                    "type": "string",
+                    "enum": ["step1", "step2", "step4"],
+                },
+                "notes": {"type": "string"},
+            },
+        },
+        "action_requirements": {
+            "rerun_current_step": {
+                "at_least_one_of": ["japicmp_jar", "allow_degraded"],
+                "description": "重跑 Step4 时，要么提供 japicmp_jar，要么明确 allow_degraded=true。",
+            },
+            "restart_from_step": {
+                "required_fields": ["restart_step_id"],
+                "description": "从更早步骤重跑时，必须明确 restart_step_id。",
+            },
+        },
+        "input_normalization": {
+            "enabled": True,
+            "allowed_actions": ["rerun_current_step", "restart_from_step", "cancel"],
+            "required_fields": ["action"],
+        },
+        "japicmp": {
+            "expected_jar": str(japicmp_jar or ""),
+            "install_error": str(install_error or ""),
+            "manual_install": f"mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}",
+        },
+        "resume_hint": (
+            "优先安装 JApiCmp 或提供 japicmp_jar 后 action=rerun_current_step；"
+            "若用户确认风险，也可 action=rerun_current_step 且 allow_degraded=true。"
+        ),
+        "next_action_rule": "只能先处理 JApiCmp 缺失并等待用户回复，不得直接继续进入 Step5。",
+        "must_wait_for_user_reply": True,
+    }
 
 def _jar_class_hash_map(jar_path: str) -> dict:
     m = {}
@@ -3297,7 +3478,9 @@ def main():
     ap.add_argument('--context',       required=True,
                     help='s2_context.json')
     ap.add_argument('--output-dir',    required=True,
-                    help='输出目录（.upgrade-report/s4_jar_compare/）')
+                    help='输出目录（.upgrade-report/evidence/api_changes/）')
+    ap.add_argument('--coverage-output', default='',
+                    help='Step4 覆盖率 JSON 输出路径；编排模式下写入 .runtime/coverage')
     ap.add_argument('--allow-degraded', action='store_true',
                     help='允许在缺少依赖源码映射等情况下继续执行（可能漏掉行为变更或截断调用链）')
     ap.add_argument('--japicmp-jar',
@@ -3348,11 +3531,7 @@ def main():
                 args.source_branches = [base_branch, current_branch]
 
     if not args.japicmp_jar:
-        args.japicmp_jar = str(
-            maven_repo_dir()
-            / 'com' / 'github' / 'siom79' / 'japicmp' / 'japicmp' / '0.21.2'
-            / 'japicmp-0.21.2-jar-with-dependencies.jar'
-        )
+        args.japicmp_jar = japicmp_default_jar_path()
 
     os.makedirs(args.output_dir, exist_ok=True)
     cleanup_step4_generated_outputs(args.output_dir)
@@ -3365,6 +3544,43 @@ def main():
     step_timer = PhaseTimer("step4", "total")
     dep_rows = load_csv(args.dep_changes)
     ctx      = load_json(args.context)
+    japicmp_planned_rows = [row for row in dep_rows if dependency_needs_japicmp(row)]
+    if japicmp_planned_rows and not os.path.exists(args.japicmp_jar):
+        installed, resolved_japicmp_jar, install_error = auto_install_japicmp(
+            args.japicmp_jar,
+            timeout=args.fetch_timeout,
+        )
+        args.japicmp_jar = resolved_japicmp_jar
+        if (not installed) and (not args.allow_degraded):
+            planned_dependencies = [
+                {
+                    "coord": row.get("coord", ""),
+                    "old_version": row.get("old_version", ""),
+                    "new_version": row.get("new_version", ""),
+                    "change_type": row.get("change_type", ""),
+                }
+                for row in japicmp_planned_rows
+            ]
+            interaction = build_japicmp_missing_interaction(
+                args.output_dir,
+                args.japicmp_jar,
+                install_error,
+                planned_dependencies,
+            )
+            if os.environ.get("JUA_ORCHESTRATED") == "1":
+                emit_interaction(interaction)
+                return 0
+            print("\n❌ JApiCmp 不可用，且未确认 allow_degraded=true。", file=sys.stderr)
+            print(f"   自动安装失败原因：{install_error}", file=sys.stderr)
+            print(f"   请执行：mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}", file=sys.stderr)
+            print("   或提供 --japicmp-jar 后重跑 Step4；若确认降级，请显式设置 --allow-degraded。", file=sys.stderr)
+            return 2
+        if (not installed) and args.allow_degraded:
+            print(
+                "⚠️  JApiCmp 自动安装失败，但已显式 allow_degraded=true；"
+                "Step4 将缺少二进制 API 对比证据。",
+                file=sys.stderr,
+            )
     compute_changed_classes_enabled = (not args.skip_changed_classes) and len(dep_rows) <= 200
     if not compute_changed_classes_enabled:
         print("  ℹ️  changed_classes.json 已降级为轻量模式，跳过 class hash 计算以提升大批量依赖稳定性。", file=sys.stderr)
@@ -4021,7 +4237,9 @@ def main():
             },
         },
     }
-    Path(args.output_dir, 'coverage.json').write_text(
+    coverage_output = Path(args.coverage_output) if args.coverage_output else default_coverage_output_path(args.output_dir)
+    coverage_output.parent.mkdir(parents=True, exist_ok=True)
+    coverage_output.write_text(
         json.dumps(step4_coverage, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
 
@@ -4076,7 +4294,7 @@ def main():
         print("  只要给到 repo 根目录，调度层会自动扫描 pom.xml 并展开多模块坐标。", file=sys.stderr)
         print("  方式1：命令行参数 --dependency-repo-mappings /abs/path/to/repo", file=sys.stderr)
         print("        标准格式：--dependency-repo-mappings groupId:artifactId=/abs/path/to/repo", file=sys.stderr)
-        print("  方式2：先将 dependency_repo_mappings 写入 .upgrade-report/main_state.json 的当前步骤输入", file=sys.stderr)
+        print("  方式2：先将 dependency_repo_mappings 写入 .upgrade-report/.runtime/state/main_state.json 的当前步骤输入", file=sys.stderr)
         print("示例：", file=sys.stderr)
         print('  {"dependency_repo_mappings":["/abs/path/internal-repo"]}', file=sys.stderr)
         print('  {"dependency_repo_mappings":[{"coord":"com.myco:lib-a","path":"/abs/path/internal-repo"}]}', file=sys.stderr)

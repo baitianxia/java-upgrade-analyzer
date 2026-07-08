@@ -36,7 +36,7 @@ STEP_IDS = ("step1", "step2", "step3", "step4", "step5", "step6")
 
 
 def main_state_path(report_dir, explicit_path=None):
-    return Path(explicit_path or (Path(report_dir) / MAIN_STATE_FILE_NAME)).resolve()
+    return Path(explicit_path or (Path(report_dir) / ".runtime" / "state" / MAIN_STATE_FILE_NAME)).resolve()
 
 
 def load_main_state_payload(report_dir, explicit_path=None):

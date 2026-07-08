@@ -1735,11 +1735,22 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             coord = task.get('coord') or ''
             jar_path = task.get('jar_path') or ''
             class_binary_name = task.get('class_binary_name') or ''
+            task_started_at = float(task.get('_javap_started_at') or time.perf_counter())
+            task_elapsed = time.perf_counter() - task_started_at
             selected_version = task.get('multi_release_version')
             candidate_owners = task.get('candidate_owners') or []
             cache = catalog.setdefault('_bytecode_reference_cache', {})
             cache[(coord, jar_path, class_binary_name, selected_version)] = references
             if references is None:
+                _perf_add(graph, 'bytecode_scan', 'javap_failures', 1)
+                _perf_record_top(graph, 'bytecode_scan', 'slow_javap_tasks', {
+                    'coord': coord,
+                    'jar_path': jar_path,
+                    'class_binary_name': class_binary_name,
+                    'multi_release_version': selected_version,
+                    'elapsed_sec': task_elapsed,
+                    'failed': True,
+                })
                 failure = {
                     'reason': 'BYTECODE_JAVAP_FAILED',
                     'coord': coord,
@@ -1752,6 +1763,14 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         candidate_failures_by_key[build_api_identity_key(api_row)].append(failure)
                 return
             scanned_classes += 1
+            _perf_record_top(graph, 'bytecode_scan', 'slow_javap_tasks', {
+                'coord': coord,
+                'jar_path': jar_path,
+                'class_binary_name': class_binary_name,
+                'multi_release_version': selected_version,
+                'elapsed_sec': task_elapsed,
+                'failed': False,
+            })
             referenced_owners = set(references.get('class_refs') or [])
             referenced_owners.update(
                 item.get('owner') for item in references.get('method_refs') or []
@@ -1781,22 +1800,48 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         })
 
         if workers <= 1:
-            for task in javap_tasks:
+            progress_interval = suggest_log_interval(len(javap_tasks), target_updates=12, minimum=1)
+            for done_count, task in enumerate(javap_tasks, 1):
+                task['_javap_started_at'] = time.perf_counter()
                 _task, references = _load_runtime_dependency_class_references_for_task(task)
                 handle_javap_result(_task, references)
+                if should_log_progress(done_count, len(javap_tasks), progress_interval):
+                    emit_progress(
+                        "step5",
+                        "bytecode-scan",
+                        "运行时依赖候选 class javap 解析进度",
+                        current=done_count,
+                        total=len(javap_tasks),
+                        elapsed=time.perf_counter() - javap_started_at,
+                        item=(task.get('class_binary_name') or '')[:100],
+                    )
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_map = {
-                    executor.submit(_load_runtime_dependency_class_references_for_task, task): task
+                    executor.submit(
+                        _load_runtime_dependency_class_references_for_task,
+                        {**task, '_javap_started_at': time.perf_counter()},
+                    ): task
                     for task in javap_tasks
                 }
-                for future in as_completed(future_map):
+                progress_interval = suggest_log_interval(len(future_map), target_updates=12, minimum=1)
+                for done_count, future in enumerate(as_completed(future_map), 1):
                     task = future_map[future]
                     try:
                         _task, references = future.result()
                     except Exception:
                         _task, references = task, None
                     handle_javap_result(_task, references)
+                    if should_log_progress(done_count, len(future_map), progress_interval):
+                        emit_progress(
+                            "step5",
+                            "bytecode-scan",
+                            "运行时依赖候选 class javap 解析进度",
+                            current=done_count,
+                            total=len(future_map),
+                            elapsed=time.perf_counter() - javap_started_at,
+                            item=(task.get('class_binary_name') or '')[:100],
+                        )
         _perf_add(graph, 'bytecode_scan', 'javap_elapsed_sec', time.perf_counter() - javap_started_at)
 
     catalog_status = str(catalog.get('status') or '').strip()
@@ -2597,7 +2642,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         consumer_display = f"{hit.get('coord')}:{consumer_symbol}"
         target_display = hit.get('target_display')
         path_nodes = [
-            getattr(edge, 'caller_qualified_key', '') or getattr(edge, 'caller_symbol_id', '?')
+            _format_bridge_edge_caller(edge)
             for edge in reversed(bridge_edges)
         ]
         path_nodes.append(consumer_display)
@@ -2651,6 +2696,15 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         '优先审查命中的无源码依赖及其对外暴露入口'
     ]
     return result
+
+
+def _format_bridge_edge_caller(edge):
+    """Format an intermediate bridge caller for human-readable packaged dependency paths."""
+    caller = str(getattr(edge, 'caller_qualified_key', '') or getattr(edge, 'caller_symbol_id', '?'))
+    coord = str(getattr(edge, 'owner_coord', '') or '').strip()
+    if coord and coord not in {'BUSINESS', '__business__'} and not caller.startswith(f"{coord}:"):
+        return f"{coord}:{caller}"
+    return caller
 
 
 def _build_packaged_dependency_not_found_result(result):
@@ -3469,6 +3523,68 @@ def trace_api_with_confidence_weighting(
                     new_cost=new_cost,
                     new_depth=new_depth,
                 )
+                # 触达系统代码已经足以证明 reachable，但报告复核时还需要尽量看到
+                # A -> B -> C -> D 这类完整上游链路。过去这里直接停止，导致
+                # alerts.csv 通常只展示第一个业务调用点 C -> D。现在在不改变
+                # reachable 判定的前提下，若仍在 cost/confidence 边界内，继续
+                # 沿高/中置信业务边向上游扩展，直到 max_total_cost 或图边界。
+                if new_cost < max_total_cost and new_confidence >= 0.3 and edge.confidence in ('high', 'medium'):
+                    matched_lookup_groups, method_overload_block = get_cached_method_lookup_resolution(
+                        method_def,
+                        type_metadata,
+                        graph,
+                        trace_cache=trace_cache,
+                    )
+                    # 上游补全只走精确签名。这里的目标是让报告展示更完整的
+                    # A -> B -> C -> D 证据链，而不是扩大召回。若沿用
+                    # fallback_simple / polymorphic，真实大项目里容易因为 init/close
+                    # 等同名方法串出大量不可靠长链路，违背准确性优先原则。
+                    matched_lookup_groups = [
+                        group for group in matched_lookup_groups
+                        if group.get('provenance') == 'exact_signature'
+                    ]
+                    if method_overload_block:
+                        _step5_debug(
+                            'trace_reachable_overload_boundary',
+                            'reachable path recorded but upstream expansion stopped at overloaded business method',
+                            current_key=current_key,
+                            method=method_def.qualified_key,
+                            overload_info=method_overload_block,
+                            path_length=len(new_path),
+                        )
+                    else:
+                        for matched_group in matched_lookup_groups:
+                            merged_provenance = merge_match_provenance(
+                                frontier.get('provenance', ''),
+                                matched_group['provenance'],
+                            )
+                            for next_key in matched_group['matched_keys']:
+                                queue.append({
+                                    'key': next_key,
+                                    'path': new_path,
+                                    'cost': new_cost,
+                                    'confidence': apply_provenance_confidence_modifier(
+                                        new_confidence,
+                                        matched_group['provenance'],
+                                    ),
+                                    'depth': new_depth,
+                                    'provenance': merged_provenance,
+                                    'provenance_family': merged_provenance_family(
+                                        frontier.get('provenance_family', 'exact'),
+                                        matched_group['provenance_family'],
+                                    ),
+                                    'match_tier': max(frontier.get('match_tier', -1), matched_group['tier_index']),
+                                })
+                                _perf_add(graph, 'trace', 'frontier_pushes', 1)
+                        _step5_debug(
+                            'trace_expand_after_system_reached',
+                            'continued tracing upstream after recording reachable system-code candidate',
+                            api_name=api_name,
+                            caller=method_def.qualified_key,
+                            current_key=current_key,
+                            matched_lookup_groups=matched_lookup_groups,
+                            queue_size=len(queue),
+                        )
                 continue
 
             if critical_node and critical_node['type'] == 'framework_boundary':
@@ -5430,7 +5546,19 @@ def get_lookup_key_tiers(method_def, type_metadata, graph=None):
     return tiers
 
 
+def ensure_method_identity_fields(method_def):
+    qualified_key = str(getattr(method_def, 'qualified_key', '') or '').strip()
+    if qualified_key and not getattr(method_def, 'class_fqcn', None) and '.' in qualified_key:
+        setattr(method_def, 'class_fqcn', qualified_key.rsplit('.', 1)[0])
+    if qualified_key and not getattr(method_def, 'method_name', None):
+        setattr(method_def, 'method_name', qualified_key.rsplit('.', 1)[-1])
+    if not getattr(method_def, 'simple_key', None) and getattr(method_def, 'method_name', None):
+        setattr(method_def, 'simple_key', f"method:{getattr(method_def, 'method_name')}")
+    return method_def
+
+
 def build_method_lookup_key_groups(method_def, type_metadata, graph=None):
+    method_def = ensure_method_identity_fields(method_def)
     groups = []
     signature_suffixes = build_method_signature_suffixes(method_def)
     append_key_group(groups, 'exact_signature', build_method_signature_lookup_keys(method_def, signature_suffixes))

@@ -67,7 +67,7 @@ def next_step_id(step_id):
 
 def summarize_step1(report_dir):
     """Step 1：只保留依赖数量和关键变更，丢弃所有中间细节"""
-    csv_path = f"{report_dir}/s1_dep_changes.csv"
+    csv_path = f"{report_dir}/evidence/dependencies/dep_changes.csv"
     if not os.path.exists(csv_path):
         return {'status': 'missing'}
 
@@ -108,7 +108,7 @@ def summarize_step1(report_dir):
 
 def summarize_step2(report_dir):
     """Step 2：只保留关键上下文字段"""
-    ctx_path = f"{report_dir}/s2_context.json"
+    ctx_path = f"{report_dir}/evidence/context/context.json"
     if not os.path.exists(ctx_path):
         return {'status': 'missing'}
 
@@ -150,28 +150,28 @@ def summarize_step3(report_dir):
 
     return {
         'status': 'done',
-        'jdk_removed_api_count':   count_csv(f"{report_dir}/s3_jdk_removed_api.csv"),
-        'jdk_javax_refs_count':    count_csv(f"{report_dir}/s3_jdk_javax_refs.csv"),
-        'jdk_internal_api_count':  count_csv(f"{report_dir}/s3_jdk_internal_api.csv"),
-        'jdk_reflection_count':    count_csv(f"{report_dir}/s3_jdk_reflection.csv"),
-        'jdk_serialization_count': count_txt(f"{report_dir}/s3_jdk_serialization.txt"),
-        'sb_config_count':         count_csv(f"{report_dir}/s3_springboot_config.csv"),
-        'sb_autoconfig_count':     count_txt(f"{report_dir}/s3_springboot_autoconfig.txt"),
-        'dep_compat_count':        count_csv(f"{report_dir}/s3_dependency_compat.csv"),
-        'risk_candidate_count':    count_csv(f"{report_dir}/s3_risk_candidates.csv"),
+        'jdk_removed_api_count':   count_csv(f"{report_dir}/evidence/static_scan/s3_jdk_removed_api.csv"),
+        'jdk_javax_refs_count':    count_csv(f"{report_dir}/evidence/static_scan/s3_jdk_javax_refs.csv"),
+        'jdk_internal_api_count':  count_csv(f"{report_dir}/evidence/static_scan/s3_jdk_internal_api.csv"),
+        'jdk_reflection_count':    count_csv(f"{report_dir}/evidence/static_scan/s3_jdk_reflection.csv"),
+        'jdk_serialization_count': count_txt(f"{report_dir}/evidence/static_scan/s3_jdk_serialization.txt"),
+        'sb_config_count':         count_csv(f"{report_dir}/evidence/static_scan/s3_springboot_config.csv"),
+        'sb_autoconfig_count':     count_txt(f"{report_dir}/evidence/static_scan/s3_springboot_autoconfig.txt"),
+        'dep_compat_count':        count_csv(f"{report_dir}/evidence/static_scan/s3_dependency_compat.csv"),
+        'risk_candidate_count':    count_csv(f"{report_dir}/evidence/static_scan/s3_risk_candidates.csv"),
         'note': '详细内容在文件中，需要时读取对应 csv/txt'
     }
 
 
 def summarize_step4(report_dir):
     """Step 4：只保留变更 API 的数量和关键清单"""
-    csv_path = f"{report_dir}/s4_jar_compare/all_changed_apis.csv"
+    csv_path = f"{report_dir}/evidence/api_changes/all_changed_apis.csv"
     if not os.path.exists(csv_path):
         return {'status': 'missing'}
 
     p0, p1, p2 = [], [], []
     unconfirmed = []
-    jar_dir = f"{report_dir}/s4_jar_compare"
+    jar_dir = f"{report_dir}/evidence/api_changes"
     jar_missing = []
 
     with open_text(csv_path) as f:
@@ -206,7 +206,7 @@ def summarize_step4(report_dir):
 
     # 从 main_state.json 读取派生出的依赖仓库映射（用于 Step5 自动发现）
     dependency_repo_mappings = []
-    main_state_path = os.path.join(report_dir, 'main_state.json')
+    main_state_path = os.path.join(report_dir, '.runtime', 'state', 'main_state.json')
     if os.path.exists(main_state_path):
         try:
             with open(main_state_path, 'r', encoding='utf-8') as f:
@@ -243,7 +243,7 @@ def summarize_step4(report_dir):
 
 
 def _count_step5_affected_modules(report_dir):
-    module_dir = Path(report_dir) / 's5_call_chain' / 'by_module'
+    module_dir = Path(report_dir) / 'evidence' / 'call_chain' / 'by_module'
     if not module_dir.exists():
         return 0
     affected = 0
@@ -270,7 +270,7 @@ def _build_step5_severity_breakdown(summary):
 
 def summarize_step5(report_dir):
     """Step 5：只保留影响摘要，丢弃每条调用链详情"""
-    summary_path = f"{report_dir}/s5_call_chain/summary.json"
+    summary_path = f"{report_dir}/evidence/call_chain/summary.json"
     if not os.path.exists(summary_path):
         return {'status': 'missing'}
 
@@ -295,7 +295,7 @@ def summarize_step5(report_dir):
         'top_reachable': summary.get('reachable_apis', [])[:10],
         # 保留所有 uncertain（需人工验证，不能丢）
         'all_uncertain': summary.get('uncertain_apis', []),
-        'note': f'完整调用链在 {report_dir}/s5_call_chain/by_api/ 和 by_module/'
+        'note': f'完整调用链在 {report_dir}/evidence/call_chain/by_api/ 和 by_module/'
     }
 
 
@@ -386,11 +386,11 @@ def _get_next_action(next_step):
     actions = {
         'step1': '先切到 base/current 执行真实构建，再生成 Step1 依赖差异。',
         'step2': '运行 s2_context_from_deps.py 推断项目上下文，并同步产出依赖关系图。',
-        'step3': '根据 s2_context.json 的标志位运行对应的 Step 3 扫描脚本。',
+        'step3': '根据 evidence/context/context.json 的标志位运行对应的 Step 3 扫描脚本。',
         'step4': '运行 s4_jar_compare.py 做 jar 包变更对比。',
-        'step5': '对 s4_jar_compare/all_changed_apis.csv 逐条执行反向调用链追踪（默认 max_depth=5，高/中/低置信度边分别消耗 1/2/5 单位代价，详见 SKILL.md）。',
+        'step5': '对 evidence/api_changes/all_changed_apis.csv 逐条执行反向调用链追踪（默认 max_depth=5，高/中/低置信度边分别消耗 1/2/5 单位代价，详见 SKILL.md）。',
         'step6': '运行 s6_report.py 生成最终报告。',
-        None: '分析已完成，查看 s6_report.md。'
+        None: '分析已完成，查看 deliverables/report.md。'
     }
     return actions.get(next_step, f'继续 {next_step}')
 
@@ -399,14 +399,14 @@ def _get_files_to_read(next_step):
     """新对话开始时应该读取的最小文件集"""
     files = {
         'step1': ['项目根目录', '基准分支', '当前分支'],
-        'step2': ['main_state.json', 's1_dep_changes.csv（前 20 行即可）'],
-        'step3': ['main_state.json', 's2_context.json'],
-        'step4': ['main_state.json', 's2_context.json', 's1_dep_changes.csv'],
-        'step5': ['main_state.json', 's4_jar_compare/all_changed_apis.csv', 's2_context.json'],
-        'step6': ['main_state.json', 's5_call_chain/summary.json', 's4_jar_compare/all_changed_apis.csv'],
-        None: ['s6_report.md'],
+        'step2': ['.runtime/state/main_state.json', 'evidence/dependencies/dep_changes.csv（前 20 行即可）'],
+        'step3': ['.runtime/state/main_state.json', 'evidence/context/context.json'],
+        'step4': ['.runtime/state/main_state.json', 'evidence/context/context.json', 'evidence/dependencies/dep_changes.csv'],
+        'step5': ['.runtime/state/main_state.json', 'evidence/api_changes/all_changed_apis.csv', 'evidence/context/context.json'],
+        'step6': ['.runtime/state/main_state.json', 'evidence/call_chain/summary.json', 'evidence/api_changes/all_changed_apis.csv'],
+        None: ['deliverables/report.md'],
     }
-    return files.get(next_step, ['main_state.json'])
+    return files.get(next_step, ['.runtime/state/main_state.json'])
 
 
 # ── 上下文感知压缩（运行时主动调用）────────────────────────────

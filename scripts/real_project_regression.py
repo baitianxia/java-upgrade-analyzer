@@ -62,7 +62,88 @@ CASES = {
     "commons-text": RealProjectCase(
         name="commons-text",
         default_project=Path("/private/tmp/jua-real-system-commons-text"),
-        default_changed_apis=Path("/private/tmp/jua-real-system-run/s4_jar_compare/all_changed_apis.csv"),
+        default_changed_apis=Path(""),
+        changed_api_rows=(
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.StringUtils.isBlank",
+                "api_simple": "isBlank",
+                "symbol_kind": "method",
+                "api_signature": "(CharSequence)",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.StringUtils.isEmpty",
+                "api_simple": "isEmpty",
+                "symbol_kind": "method",
+                "api_signature": "(CharSequence)",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.StringUtils.defaultString",
+                "api_simple": "defaultString",
+                "symbol_kind": "method",
+                "api_signature": "(String)",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.StringUtils.EMPTY",
+                "api_simple": "EMPTY",
+                "symbol_kind": "field",
+                "api_signature": "",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.ArrayUtils.isEmpty",
+                "api_simple": "isEmpty",
+                "symbol_kind": "method",
+                "api_signature": "(char[])",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "old_version": "3.x",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "org.apache.commons.lang3.Validate.isTrue",
+                "api_simple": "isTrue",
+                "symbol_kind": "method",
+                "api_signature": "(boolean, String, Object...)",
+                "confirmed": "true",
+                "severity": "HIGH",
+                "source": "manual_real_project_probe",
+            },
+        ),
+        prefer_embedded_changed_api_rows=True,
         baseline_specs=(
             BaselineSpec(
                 symbol="org.apache.commons.lang3.StringUtils.isBlank",
@@ -124,7 +205,7 @@ CASES = {
     "seata": RealProjectCase(
         name="seata",
         default_project=Path("/private/tmp/jua-real-project-seata"),
-        default_changed_apis=Path("/private/tmp/jua-seata-real-matrix/report/s4_jar_compare/all_changed_apis.csv"),
+        default_changed_apis=Path(""),
         changed_api_rows=(
             {
                 "coord": "org.apache.seata:seata-common",
@@ -200,7 +281,7 @@ CASES = {
     "dubbo": RealProjectCase(
         name="dubbo",
         default_project=Path("/private/tmp/jua-real-project-dubbo"),
-        default_changed_apis=Path("/private/tmp/jua-dubbo-mixed-probe/report/s4_jar_compare/all_changed_apis.csv"),
+        default_changed_apis=Path(""),
         changed_api_rows=(
             {
                 "coord": "org.apache.dubbo:dubbo-common",
@@ -336,7 +417,7 @@ CASES = {
     "commons-lang": RealProjectCase(
         name="commons-lang",
         default_project=Path("/private/tmp/jua-real-git-commons-lang"),
-        default_changed_apis=Path("/private/tmp/jua-real-git-commons-lang-probe/s4_jar_compare/all_changed_apis.csv"),
+        default_changed_apis=Path(""),
         changed_api_rows=(
             {
                 "coord": "org.apache.commons:commons-lang3",
@@ -541,7 +622,7 @@ def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_
 
 
 def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, report_dir: Path) -> tuple[int, float]:
-    output_dir = report_dir / "s5_call_chain"
+    output_dir = report_dir / "evidence" / "call_chain"
     cmd = [
         sys.executable,
         str(ROOT_DIR / "scripts" / "s5_call_chain.py"),
@@ -563,7 +644,7 @@ def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, rep
 
 
 def load_summary(report_dir: Path) -> dict:
-    summary_path = report_dir / "s5_call_chain" / "summary.json"
+    summary_path = report_dir / "evidence" / "call_chain" / "summary.json"
     if not summary_path.exists():
         return {}
     return json.loads(summary_path.read_text(encoding="utf-8"))
@@ -574,7 +655,11 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         return {"case": case.name, "status": "skipped", "reason": f"project root missing: {project_root}"}
     report_dir = report_root / case.name
     report_dir.mkdir(parents=True, exist_ok=True)
-    changed_apis = ensure_changed_apis(case, changed_apis, report_dir / "input_all_changed_apis.csv")
+    changed_apis = ensure_changed_apis(
+        case,
+        changed_apis,
+        report_dir / "evidence" / "api_changes" / "all_changed_apis.csv",
+    )
     if not changed_apis.exists():
         return {"case": case.name, "status": "skipped", "reason": f"changed APIs missing: {changed_apis}"}
 
@@ -582,7 +667,7 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
     summary = load_summary(report_dir)
     graph_stats = extract_graph_stats(summary)
     source_shape_metrics = collect_source_shape_metrics(project_root, case.source_shape_patterns)
-    alerts_csv = report_dir / "s5_call_chain" / "alerts.csv"
+    alerts_csv = report_dir / "evidence" / "call_chain" / "alerts.csv"
     checks = []
     failures = []
     warnings = []
@@ -611,7 +696,7 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         failures.append("alerts.csv missing")
     elif alerts_csv.stat().st_size == 0:
         failures.append("alerts.csv empty")
-    if (report_dir / "s5_call_chain" / "alerts_reachable.csv").exists() is False:
+    if (report_dir / "evidence" / "call_chain" / "alerts_reachable.csv").exists() is False:
         warnings.append("alerts_reachable.csv missing")
 
     for spec in case.baseline_specs:

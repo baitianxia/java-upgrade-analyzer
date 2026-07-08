@@ -33,6 +33,12 @@ import json
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text, maven_repo_dir
 from progress_logging import PhaseTimer, emit_progress
+from pipeline_constants import (
+    EVIDENCE_CONTEXT_DIRNAME,
+    EVIDENCE_DIRNAME,
+    RUNTIME_DIRNAME,
+    RUNTIME_STATE_DIRNAME,
+)
 from s4_contract import (
     PER_DEPENDENCY_CANDIDATE_HITS_FILE,
     PER_DEPENDENCY_DIRNAME,
@@ -47,12 +53,20 @@ STEP3_DEPENDENCY_SOURCE_DIRS = []
 STEP3_REPORT_DIR = ""
 
 
+def runtime_state_path(report_dir):
+    return Path(report_dir) / RUNTIME_DIRNAME / RUNTIME_STATE_DIRNAME / MAIN_STATE_FILE_NAME
+
+
+def context_path(report_dir):
+    return Path(report_dir) / EVIDENCE_DIRNAME / EVIDENCE_CONTEXT_DIRNAME / "context.json"
+
+
 def load_orchestrated_step3_input(report_dir):
     """正式流程下从 main_state 和 s2_context 读取 Step3 输入，单脚本 CLI 仅用于调试。"""
     if not os.environ.get("JUA_ORCHESTRATED"):
         return {}, {}
-    state_path = Path(report_dir) / MAIN_STATE_FILE_NAME
-    context_path = Path(report_dir) / "s2_context.json"
+    state_path = runtime_state_path(report_dir)
+    context_file = context_path(report_dir)
     main_state = {}
     context = {}
     if state_path.exists():
@@ -61,9 +75,9 @@ def load_orchestrated_step3_input(report_dir):
                 main_state = json.load(f)
         except Exception:
             main_state = {}
-    if context_path.exists():
+    if context_file.exists():
         try:
-            with open(context_path, "r", encoding="utf-8") as f:
+            with open(context_file, "r", encoding="utf-8") as f:
                 context = json.load(f)
         except Exception:
             context = {}
@@ -1602,7 +1616,7 @@ SCAN_FUNCS = {
 }
 
 
-def write_step3_coverage(output_dir, source_roots, planned_scans, executed_scans):
+def write_step3_coverage(output_dir, source_roots, planned_scans, executed_scans, coverage_output=''):
     extension_counts = {}
     read_failures = []
     scanned_files = 0
@@ -1656,8 +1670,9 @@ def write_step3_coverage(output_dir, source_roots, planned_scans, executed_scans
             payload['status'] = 'partial' if executed else 'insufficient'
             payload['reason_codes'].append('rule_pack_unavailable')
     payload['rule_packs'] = packs
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    (Path(output_dir) / 's3_coverage.json').write_text(
+    output_path = Path(coverage_output) if coverage_output else Path(output_dir) / 's3_coverage.json'
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
     return payload
@@ -1679,6 +1694,10 @@ def main():
                     help='输出文件路径（单项扫描时使用）')
     ap.add_argument('--output-dir', default='.upgrade-report',
                     help='输出目录（--all 时使用）')
+    ap.add_argument('--report-dir', default='',
+                    help='升级报告根目录；编排模式下用于读取 .runtime/state 与 evidence/context')
+    ap.add_argument('--coverage-output', default='',
+                    help='Step3 覆盖率 JSON 输出路径；编排模式下写入 .runtime/coverage')
     ap.add_argument('--dep-changes',
                     help='s1_dep_changes.csv 路径（依赖 jar 扫描时使用）')
     ap.add_argument('--dep-current',
@@ -1692,7 +1711,7 @@ def main():
     ap.add_argument('--target-jdk', default='',
                     help='目标运行 JDK 版本（用于依赖 classfile 兼容性判断，如 17/21）')
     args = ap.parse_args()
-    report_dir = args.output_dir
+    report_dir = args.report_dir or args.output_dir
     orchestrated_input, orchestrated_context = load_orchestrated_step3_input(report_dir)
     if orchestrated_input:
         if not args.source_dirs and not args.source_dir:
@@ -1785,7 +1804,7 @@ def main():
                 elapsed=time.perf_counter() - scan_timer,
                 item=default_fname,
             )
-        write_step3_coverage(args.output_dir, source_roots, to_run, executed_scans)
+        write_step3_coverage(args.output_dir, source_roots, to_run, executed_scans, args.coverage_output)
         print(f"\nStep 3 完成：共 {total} 处命中", file=sys.stderr)
         emit_progress(
             "step3",
@@ -1800,7 +1819,7 @@ def main():
         emit_progress("step3", "scan", f"开始执行 {args.type}", item=default_fname)
         single_timer = time.perf_counter()
         matches = func(source_dir, output, dep_list_path) or 0
-        write_step3_coverage(args.output_dir, source_roots, [args.type], [args.type])
+        write_step3_coverage(args.output_dir, source_roots, [args.type], [args.type], args.coverage_output)
         emit_progress(
             "step3",
             "done",

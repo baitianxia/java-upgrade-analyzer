@@ -25,9 +25,11 @@ enhanced_source_analyzer.py
 """
 
 import argparse
+import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -44,6 +46,10 @@ def _current_python_pip_install_cmd():
 
 def _env_flag_enabled(name):
     return str(os.environ.get(name, '') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _env_flag_disabled(name):
+    return str(os.environ.get(name, '') or '').strip().lower() in {'0', 'false', 'no', 'off'}
 
 
 def _step5_debug_enabled():
@@ -216,7 +222,9 @@ def resolve_invocation_signature_from_partial_hints(receiver_type, method_name, 
             )
     return ''
 
-# 降级方案：如果tree-sitter未安装，使用增强正则
+# 降级方案：如果 tree-sitter 未安装，Step5 首次需要 Java AST 时会先尝试自动安装；
+# 正式流程应在 Step5 入口处先做 preflight，安装失败时由 checkpoint 要求用户确认后才降级。
+# analyze_file() 仍保留兜底降级能力，避免调试脚本或单文件分析直接崩溃。
 try:
     import tree_sitter_java as tsjava
     from tree_sitter import Language, Parser
@@ -224,11 +232,119 @@ try:
     TREE_SITTER_AVAILABLE = True
 except ImportError:
     TREE_SITTER_AVAILABLE = False
-    print("⚠️  tree-sitter未安装，降级使用增强正则方案", file=sys.stderr)
+
+TREE_SITTER_AUTO_INSTALL_ATTEMPTED = False
+TREE_SITTER_AUTO_INSTALL_ERROR = ""
+
+
+def _tree_sitter_auto_install_enabled():
+    # 默认启用；离线 CI / 严格无网络环境可显式关闭。
+    return not _env_flag_disabled('JUA_TREE_SITTER_AUTO_INSTALL')
+
+
+def _tree_sitter_auto_install_timeout():
+    raw = str(os.environ.get('JUA_TREE_SITTER_AUTO_INSTALL_TIMEOUT') or '').strip()
+    if not raw:
+        return 120
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 120
+
+
+def _reload_tree_sitter_modules():
+    global TREE_SITTER_AVAILABLE, tsjava, Language, Parser
+    tsjava = importlib.import_module('tree_sitter_java')
+    tree_sitter_module = importlib.import_module('tree_sitter')
+    Language = tree_sitter_module.Language
+    Parser = tree_sitter_module.Parser
+    TREE_SITTER_AVAILABLE = True
+    return True
+
+
+def _ensure_tree_sitter_available():
+    """Ensure tree-sitter is available; by default try installing once before regex fallback."""
+    global TREE_SITTER_AUTO_INSTALL_ATTEMPTED, TREE_SITTER_AUTO_INSTALL_ERROR
+    if TREE_SITTER_AVAILABLE:
+        return True
+    if not _tree_sitter_auto_install_enabled():
+        TREE_SITTER_AUTO_INSTALL_ERROR = "auto_install_disabled"
+        return False
+    if TREE_SITTER_AUTO_INSTALL_ATTEMPTED:
+        return TREE_SITTER_AVAILABLE
+    TREE_SITTER_AUTO_INSTALL_ATTEMPTED = True
+
+    cmd = [
+        sys.executable or "python",
+        "-m",
+        "pip",
+        "install",
+        "tree-sitter",
+        "tree-sitter-java",
+    ]
     print(
-        f"   请使用当前执行解释器安装：{_current_python_pip_install_cmd()}",
+        "⚙️  tree-sitter 未安装，正在尝试使用当前 Python 自动安装："
+        + " ".join(cmd),
         file=sys.stderr,
     )
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=_tree_sitter_auto_install_timeout(),
+        )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or '').strip().splitlines()
+            TREE_SITTER_AUTO_INSTALL_ERROR = details[-1] if details else f"pip_returncode={result.returncode}"
+            print(
+                "⚠️  tree-sitter 自动安装失败，将降级使用增强正则方案；"
+                f"如需手动处理，请使用当前解释器安装：{_current_python_pip_install_cmd()}",
+                file=sys.stderr,
+            )
+            if TREE_SITTER_AUTO_INSTALL_ERROR:
+                print(f"   安装失败原因：{TREE_SITTER_AUTO_INSTALL_ERROR}", file=sys.stderr)
+            return False
+        try:
+            _reload_tree_sitter_modules()
+        except Exception as exc:
+            TREE_SITTER_AUTO_INSTALL_ERROR = f"reload_failed:{exc.__class__.__name__}"
+            print(
+                "⚠️  tree-sitter 已安装但当前进程加载失败，将降级使用增强正则方案；"
+                f"原因：{TREE_SITTER_AUTO_INSTALL_ERROR}",
+                file=sys.stderr,
+            )
+            return False
+        print("✅ tree-sitter 自动安装成功，Java 源码将优先使用 AST 主链路分析", file=sys.stderr)
+        TREE_SITTER_AUTO_INSTALL_ERROR = ""
+        return True
+    except Exception as exc:
+        TREE_SITTER_AUTO_INSTALL_ERROR = f"{exc.__class__.__name__}: {exc}"
+        print(
+            "⚠️  tree-sitter 自动安装失败，将降级使用增强正则方案；"
+            f"如需手动处理，请使用当前解释器安装：{_current_python_pip_install_cmd()}",
+            file=sys.stderr,
+        )
+        print(f"   安装失败原因：{TREE_SITTER_AUTO_INSTALL_ERROR}", file=sys.stderr)
+        return False
+
+
+def ensure_tree_sitter_available():
+    """Public Step5 preflight hook. Returns True only when tree-sitter can be imported/loaded."""
+    return _ensure_tree_sitter_available()
+
+
+def tree_sitter_status():
+    return {
+        "available": bool(TREE_SITTER_AVAILABLE),
+        "auto_install_attempted": bool(TREE_SITTER_AUTO_INSTALL_ATTEMPTED),
+        "auto_install_error": TREE_SITTER_AUTO_INSTALL_ERROR,
+        "auto_install_enabled": bool(_tree_sitter_auto_install_enabled()),
+        "install_command": _current_python_pip_install_cmd(),
+        "python_executable": sys.executable or "python",
+    }
 
 
 @dataclass
@@ -1702,11 +1818,18 @@ def analyze_file(file_path, source_root, prefer_tree_sitter=True, return_diagnos
         'actual_parser': 'regex',
         'fallback_reason': '',
         'tree_sitter_available': TREE_SITTER_AVAILABLE,
+        'tree_sitter_auto_install_attempted': TREE_SITTER_AUTO_INSTALL_ATTEMPTED,
+        'tree_sitter_auto_install_error': TREE_SITTER_AUTO_INSTALL_ERROR,
         'language': 'kotlin' if is_kotlin else 'java',
         'error_nodes': 0,
     }
 
     methods = []
+    if prefer_tree_sitter and not is_kotlin and not TREE_SITTER_AVAILABLE:
+        _ensure_tree_sitter_available()
+        parser_info['tree_sitter_available'] = TREE_SITTER_AVAILABLE
+        parser_info['tree_sitter_auto_install_attempted'] = TREE_SITTER_AUTO_INSTALL_ATTEMPTED
+        parser_info['tree_sitter_auto_install_error'] = TREE_SITTER_AUTO_INSTALL_ERROR
     if TREE_SITTER_AVAILABLE and prefer_tree_sitter and not is_kotlin:
         try:
             analyzer = TreeSitterAnalyzer(file_path, source_root)

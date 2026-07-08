@@ -92,12 +92,12 @@
         }
       },
       "outputs": [
-        "s1_dep_alerts.csv",
-        "s1_dep_changes.csv",
-        "s1_dep_summary.txt",
-        "s1_deps_current_resolved.csv",
-        "build_provenance.json",
-        "s1_artifacts/"
+        "evidence/dependencies/dep_alerts.csv",
+        "evidence/dependencies/dep_changes.csv",
+        "evidence/dependencies/dep_summary.txt",
+        "evidence/dependencies/deps_current_resolved.csv",
+        "evidence/dependencies/build_provenance.json",
+        "evidence/dependencies/s1_artifacts/"
       ],
       "notes": [
         "Step1 默认通过真实构建获取依赖结果。",
@@ -194,11 +194,11 @@
         "step1"
       ],
       "inputs": [
-        "s1_dep_changes.csv"
+        "evidence/dependencies/dep_changes.csv"
       ],
       "outputs": [
-        "s2_context.json",
-        "s2_dep_graph.json"
+        "evidence/context/context.json",
+        "evidence/context/dep_graph.json"
       ]
     },
     {
@@ -212,24 +212,24 @@
         "step2"
       ],
       "inputs": [
-        "s2_context.json",
-        "s1_dep_changes.csv",
-        "s1_deps_current_resolved.csv"
+        "evidence/context/context.json",
+        "evidence/dependencies/dep_changes.csv",
+        "evidence/dependencies/deps_current_resolved.csv"
       ],
       "outputs": [
-        "s3_jdk_removed_api.csv",
-        "s3_jdk_javax_refs.csv",
-        "s3_jdk_internal_api.csv",
-        "s3_jdk_reflection.csv",
-        "s3_jdk_serialization.txt",
-        "s3_jdk_runtime_flags.csv",
-        "s3_springboot_config.csv",
-        "s3_springboot_autoconfig.txt",
-        "s3_dependency_compat.csv",
-        "s3_dependency_classfile.csv"
+        "evidence/static_scan/s3_jdk_removed_api.csv",
+        "evidence/static_scan/s3_jdk_javax_refs.csv",
+        "evidence/static_scan/s3_jdk_internal_api.csv",
+        "evidence/static_scan/s3_jdk_reflection.csv",
+        "evidence/static_scan/s3_jdk_serialization.txt",
+        "evidence/static_scan/s3_jdk_runtime_flags.csv",
+        "evidence/static_scan/s3_springboot_config.csv",
+        "evidence/static_scan/s3_springboot_autoconfig.txt",
+        "evidence/static_scan/s3_dependency_compat.csv",
+        "evidence/static_scan/s3_dependency_classfile.csv"
       ],
       "notes": [
-        "实际输出受 s2_context.json 中的升级标志控制。"
+        "实际输出受 evidence/context/context.json 中的升级标志控制。"
       ]
     },
     {
@@ -345,13 +345,13 @@
         "step2"
       ],
       "inputs": [
-        "s1_dep_changes.csv",
-        "s2_context.json"
+        "evidence/dependencies/dep_changes.csv",
+        "evidence/context/context.json"
       ],
       "outputs": [
-        "s4_jar_compare/all_changed_apis.csv",
-        "s4_jar_compare/git_ref_matches.txt",
-        "s4_jar_compare/git_ref_matches.json"
+        "evidence/api_changes/all_changed_apis.csv",
+        "evidence/api_changes/git_ref_matches.txt",
+        "evidence/api_changes/git_ref_matches.json"
       ],
       "notes": [
         "本步骤输出 all_changed_apis.csv，后续 Step5 默认基于该文件做反向调用链分析，也允许在 checkpoint 中指定只分析其中部分依赖。"
@@ -443,15 +443,16 @@
         "step4"
       ],
       "inputs": [
-        "s4_jar_compare/all_changed_apis.csv"
+        "evidence/api_changes/all_changed_apis.csv"
       ],
       "outputs": [
-        "s5_call_chain/",
-        "s5_artifact_bytecode/",
-        "s5_artifact_bytecode_catalog.json",
-        "s5_artifact_bytecode_index.json",
-        "framework_adapters.json",
-        "source_artifact_alignment.json"
+        "evidence/call_chain/",
+        ".runtime/indexes/s5_query_index.json",
+        ".runtime/cache/s5_artifact_bytecode/",
+        ".runtime/cache/s5_artifact_bytecode_catalog.json",
+        ".runtime/cache/s5_artifact_bytecode_index.json",
+        "evidence/call_chain/framework_adapters.json",
+        "evidence/call_chain/source_artifact_alignment.json"
       ],
       "notes": [
         "Step5 默认会遍历 all_changed_apis.csv，并对每条变更做反向调用链追踪；若 Step4 checkpoint 指定了坐标/名称，则只分析被选中的依赖。"
@@ -467,11 +468,11 @@
         "step5"
       ],
       "inputs": [
-        "s5_call_chain/summary.json"
+        "evidence/call_chain/summary.json"
       ],
       "outputs": [
-        "s6_findings.json",
-        "s6_report.md"
+        ".runtime/findings/s6_findings.json",
+        "deliverables/report.md"
       ]
     }
   ]

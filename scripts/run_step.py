@@ -17,11 +17,25 @@ from compat import git_cmd
 from auto_discover_bridge_sources import discover_bridge_source_mappings
 from analysis_contract import build_project_scope, discover_maven_modules, write_coverage_report
 from pipeline_constants import (
+    DELIVERABLES_DIRNAME,
+    EVIDENCE_API_CHANGES_DIRNAME,
+    EVIDENCE_CALL_CHAIN_DIRNAME,
+    EVIDENCE_CONTEXT_DIRNAME,
+    EVIDENCE_DEPENDENCIES_DIRNAME,
+    EVIDENCE_DIRNAME,
+    EVIDENCE_STATIC_SCAN_DIRNAME,
     INTERACTIVE_STATUS,
+    RUNTIME_COVERAGE_DIRNAME,
+    RUNTIME_CACHE_DIRNAME,
+    RUNTIME_DIRNAME,
+    RUNTIME_FINDINGS_DIRNAME,
+    RUNTIME_INDEXES_DIRNAME,
+    RUNTIME_STATE_DIRNAME,
     STEP1_ARTIFACTS_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
     STEP5_ARTIFACT_BYTECODE_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
+    STEP5_QUERY_INDEX_FILE,
     STEP_SEQUENCE,
 )
 from s4_contract import (
@@ -68,6 +82,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "step5_selected_coords",
     "step5_selected_names",
     "step5_timeout",
+    "tree_sitter_installed",
     "strict_risk_gate",
     "target_module",
     "tool",
@@ -83,6 +98,125 @@ class StepInteractionRequired(StepError):
     def __init__(self, interaction):
         self.interaction = interaction
         super().__init__(str((interaction or {}).get("question") or (interaction or {}).get("title") or "需要用户补充信息"))
+
+
+def deliverables_dir(report_dir):
+    return Path(report_dir) / DELIVERABLES_DIRNAME
+
+
+def evidence_dir(report_dir):
+    return Path(report_dir) / EVIDENCE_DIRNAME
+
+
+def runtime_dir(report_dir):
+    return Path(report_dir) / RUNTIME_DIRNAME
+
+
+def evidence_dependencies_dir(report_dir):
+    return evidence_dir(report_dir) / EVIDENCE_DEPENDENCIES_DIRNAME
+
+
+def evidence_context_dir(report_dir):
+    return evidence_dir(report_dir) / EVIDENCE_CONTEXT_DIRNAME
+
+
+def evidence_static_scan_dir(report_dir):
+    return evidence_dir(report_dir) / EVIDENCE_STATIC_SCAN_DIRNAME
+
+
+def evidence_api_changes_dir(report_dir):
+    return evidence_dir(report_dir) / EVIDENCE_API_CHANGES_DIRNAME
+
+
+def evidence_call_chain_dir(report_dir):
+    return evidence_dir(report_dir) / EVIDENCE_CALL_CHAIN_DIRNAME
+
+
+def runtime_state_dir(report_dir):
+    return runtime_dir(report_dir) / RUNTIME_STATE_DIRNAME
+
+
+def runtime_coverage_dir(report_dir):
+    return runtime_dir(report_dir) / RUNTIME_COVERAGE_DIRNAME
+
+
+def runtime_indexes_dir(report_dir):
+    return runtime_dir(report_dir) / RUNTIME_INDEXES_DIRNAME
+
+
+def runtime_findings_dir(report_dir):
+    return runtime_dir(report_dir) / RUNTIME_FINDINGS_DIRNAME
+
+
+def runtime_cache_dir(report_dir):
+    return runtime_dir(report_dir) / RUNTIME_CACHE_DIRNAME
+
+
+def step1_dep_changes_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / "dep_changes.csv"
+
+
+def step1_dep_alerts_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / "dep_alerts.csv"
+
+
+def step1_dep_summary_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / "dep_summary.txt"
+
+
+def step1_current_resolved_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / "deps_current_resolved.csv"
+
+
+def build_provenance_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / "build_provenance.json"
+
+
+def step1_artifacts_dir(report_dir):
+    return evidence_dependencies_dir(report_dir) / STEP1_ARTIFACTS_DIRNAME
+
+
+def step2_context_path(report_dir):
+    return evidence_context_dir(report_dir) / "context.json"
+
+
+def step2_dep_graph_path(report_dir):
+    return evidence_context_dir(report_dir) / "dep_graph.json"
+
+
+def step2_source_mapping_summary_path(report_dir):
+    return evidence_context_dir(report_dir) / "source_mapping_summary.json"
+
+
+def step4_api_changes_dir(report_dir):
+    return evidence_api_changes_dir(report_dir)
+
+
+def step5_call_chain_dir(report_dir):
+    return evidence_call_chain_dir(report_dir)
+
+
+def step5_query_index_path(report_dir):
+    return runtime_indexes_dir(report_dir) / STEP5_QUERY_INDEX_FILE
+
+
+def s6_findings_path(report_dir):
+    return runtime_findings_dir(report_dir) / "s6_findings.json"
+
+
+def s6_report_path(report_dir):
+    return deliverables_dir(report_dir) / "report.md"
+
+
+def artifact_path(report_dir, rel_path):
+    report_dir = Path(report_dir)
+    text = str(rel_path or "").strip()
+    trailing_slash = text.endswith("/")
+    text = text.rstrip("/")
+    if Path(text).is_absolute():
+        return Path(text)
+    path = report_dir / text
+    return path if not trailing_slash else Path(str(path))
 
 
 def read_json(path):
@@ -124,7 +258,7 @@ CHECKPOINT_RULES = load_checkpoint_rules()
 
 
 def main_state_path(report_dir):
-    return Path(report_dir) / MAIN_STATE_FILE_NAME
+    return runtime_state_dir(report_dir) / MAIN_STATE_FILE_NAME
 
 
 def empty_step_state():
@@ -327,7 +461,7 @@ def build_step_derived_snapshot(step_id, run_context, report_dir):
             if key in ctx
         }
     if step_id == "step3":
-        context_json = Path(report_dir) / "s2_context.json"
+        context_json = step2_context_path(report_dir)
         if context_json.exists():
             s2_ctx = read_json(context_json)
             return {
@@ -388,11 +522,11 @@ def save_interaction_file(report_dir, interaction):
     payload = dict(interaction)
     payload["status"] = normalize_interaction_status(payload.get("status"))
     payload.setdefault("exit_code", EXIT_AWAITING_USER)
-    write_json(Path(report_dir) / "interaction.json", payload)
+    write_json(runtime_state_dir(report_dir) / "interaction.json", payload)
 
 
 def clear_interaction_file(report_dir):
-    interaction_file = Path(report_dir) / "interaction.json"
+    interaction_file = runtime_state_dir(report_dir) / "interaction.json"
     if interaction_file.exists():
         interaction_file.unlink()
 
@@ -671,7 +805,7 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         if timeout_key in response:
             updated[timeout_key] = parse_positive_int_like(response.get(timeout_key), timeout_key)
 
-    for key in ("include_test_scope", "allow_degraded", "strict_risk_gate"):
+    for key in ("include_test_scope", "allow_degraded", "strict_risk_gate", "tree_sitter_installed"):
         if key in response:
             updated[key] = parse_bool_like(response.get(key), key)
     if "strict_risk_gate" in response:
@@ -920,7 +1054,7 @@ def _collect_relevant_dependency_coords(report_dir, ctx=None):
     coords = []
     seen = set()
 
-    dep_changes_path = report_dir / "s1_dep_changes.csv"
+    dep_changes_path = step1_dep_changes_path(report_dir)
     for row in read_csv_rows(dep_changes_path):
         coord = str(row.get("coord") or "").strip()
         change_type = str(row.get("change_type") or "").strip()
@@ -939,7 +1073,7 @@ def _collect_relevant_dependency_coords(report_dir, ctx=None):
         return coords
 
     if ctx is None:
-        context_path = report_dir / "s2_context.json"
+        context_path = step2_context_path(report_dir)
         ctx = read_json(context_path) if context_path.exists() else {}
     for dep in (ctx or {}).get("changed_dependencies") or []:
         coord = str((dep or {}).get("coord") or "").strip()
@@ -953,7 +1087,7 @@ def _collect_relevant_dependency_coords(report_dir, ctx=None):
 def _collect_focus_dependency_coords(report_dir, ctx=None):
     report_dir = Path(report_dir)
     if ctx is None:
-        context_path = report_dir / "s2_context.json"
+        context_path = step2_context_path(report_dir)
         ctx = read_json(context_path) if context_path.exists() else {}
     coords = []
     seen = set()
@@ -1546,7 +1680,7 @@ NON_PENDING_BRIDGE_ALLOWED_ACTIONS = {
 
 def build_report_dir_step5_selection_resolution(report_dir):
     report_dir = Path(report_dir).resolve()
-    available_rows = read_csv_rows(report_dir / "s4_jar_compare" / "all_changed_apis.csv")
+    available_rows = read_csv_rows(step4_api_changes_dir(report_dir) / "all_changed_apis.csv")
     target_summary = build_step5_selection_summary(available_rows)
     selection_options = build_interaction_selection_options(
         [
@@ -1944,7 +2078,7 @@ def materialize_step5_all_changed_apis_input(all_changed_apis_path, report_dir, 
             )
         if not selection_summary.get("matched_rows"):
             raise StepError("Step5 选择的变更 jar 过滤后为空，无法执行调用链分析。")
-        filtered_path = Path(report_dir) / "s5_call_chain" / "selected_all_changed_apis.csv"
+        filtered_path = runtime_cache_dir(report_dir) / "selected_all_changed_apis.csv"
         base_selection = build_step5_selection_summary(
             all_rows,
             selected_coords=selected_coords,
@@ -2312,7 +2446,7 @@ def build_step2_source_mapping_summary(run_context, ctx):
 
 def write_step2_source_mapping_summary(report_dir, run_context, ctx):
     summary = build_step2_source_mapping_summary(run_context, ctx)
-    output_path = Path(report_dir) / "s2_source_mapping_summary.json"
+    output_path = step2_source_mapping_summary_path(report_dir)
     write_json(output_path, summary)
     return output_path, summary
 
@@ -3535,8 +3669,29 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
     selection_resolution = dict(payload.get("selection_resolution") or {})
     if not selection_resolution.get("enabled"):
         selection_resolution = build_selection_resolution(selection_options)
+    if step_id == "step5" and not selection_resolution.get("enabled") and report_dir:
+        selection_resolution = build_report_dir_step5_selection_resolution(report_dir)
     if selection_options:
         payload["selection_options"] = selection_options
+    elif step_id == "step5" and selection_resolution.get("enabled"):
+        payload["selection_options"] = build_interaction_selection_options(
+            selection_resolution.get("options") or []
+        )
+    if step_id == "step5":
+        properties.setdefault(
+            "step5_selected_coords",
+            {
+                "type": "array",
+                "description": "可选。重跑 Step5 时，只分析这些依赖坐标对应的变更 API；坐标必须来自 Step4 all_changed_apis.csv 的 coord 列。",
+            },
+        )
+        properties.setdefault(
+            "step5_selected_names",
+            {
+                "type": "array",
+                "description": "可选。重跑 Step5 时，只分析这些依赖名称对应的变更 API；名称按 coord 的 artifactId 匹配。",
+            },
+        )
     if selection_resolution.get("enabled"):
         properties.setdefault(
             "selected_targets",
@@ -3741,7 +3896,7 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
         "resume_command_examples": resume_examples,
         "interaction": interaction,
         "report_dir": str(Path(report_dir).resolve()),
-        "interaction_file": str((Path(report_dir) / "interaction.json").resolve()),
+        "interaction_file": str((runtime_state_dir(report_dir) / "interaction.json").resolve()),
     }
     _print_confirmation_json(event, body)
     sys.stdout.write(
@@ -3874,7 +4029,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     interaction_meta = augment_interaction_meta_with_restart_option(step_id, interaction_meta)
     title = f"{step_id} {step_meta.get('title') or ''}（进入下一步前请确认）".strip()
     outputs = step_meta.get("outputs", []) or []
-    files_to_review = [str((report_dir / rel).resolve()) for rel in outputs]
+    files_to_review = [str(artifact_path(report_dir, rel).resolve()) for rel in outputs]
     checklist_lines = []
     if outputs:
         checklist_lines.append("需要打开并复核的产物：")
@@ -3886,8 +4041,8 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         for note in notes:
             checklist_lines.append(f"  - {note}")
     if step_id == "step2":
-        context_json = report_dir / "s2_context.json"
-        dep_graph_json = report_dir / "s2_dep_graph.json"
+        context_json = step2_context_path(report_dir)
+        dep_graph_json = step2_dep_graph_path(report_dir)
         ctx = read_json(context_json) if context_json.exists() else {}
         runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
         runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
@@ -3999,7 +4154,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 checklist_lines.append("注意：选择 continue 不会自动接受建议映射。")
                 checklist_lines.append("若要接受建议，请提供 accept_suggested_mappings=true 参数。")
     if step_id == "step4":
-        all_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis.csv"
+        all_changed_apis = step4_api_changes_dir(report_dir) / "all_changed_apis.csv"
         available_rows = read_csv_rows(all_changed_apis)
         target_summary = build_step5_selection_summary(available_rows)
         full_selection_options = build_interaction_selection_options(
@@ -4056,7 +4211,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                     "  - 未匹配名称: " + ", ".join(existing_selection.get("unmatched_names")[:10])
                 )
     if step_id == "step5":
-        summary_json = report_dir / "s5_call_chain" / "summary.json"
+        summary_json = step5_call_chain_dir(report_dir) / "summary.json"
         call_summary = read_json(summary_json) if summary_json.exists() else {}
         runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
         runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
@@ -4219,6 +4374,20 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 "description": "可选。直接补充依赖源码目录；系统会自动推断依赖源码映射并重跑分析。",
             },
         )
+        properties.setdefault(
+            "step5_selected_coords",
+            {
+                "type": "array",
+                "description": "可选。重跑 Step5 时，只分析这些依赖坐标对应的变更 API；坐标必须来自 Step4 all_changed_apis.csv 的 coord 列。",
+            },
+        )
+        properties.setdefault(
+            "step5_selected_names",
+            {
+                "type": "array",
+                "description": "可选。重跑 Step5 时，只分析这些依赖名称对应的变更 API；名称按 coord 的 artifactId 匹配。",
+            },
+        )
     for field in interaction_meta.get("required_fields", []) or []:
         properties.setdefault(
             field,
@@ -4268,6 +4437,13 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         payload["selection_options"] = list(interaction_meta.get("selection_options") or [])
     if interaction_meta.get("selection_resolution"):
         payload["selection_resolution"] = dict(interaction_meta.get("selection_resolution") or {})
+    if step_id == "step5" and not payload.get("selection_resolution"):
+        selection_resolution = build_report_dir_step5_selection_resolution(report_dir)
+        if selection_resolution.get("enabled"):
+            payload["selection_resolution"] = selection_resolution
+            payload["selection_options"] = build_interaction_selection_options(
+                selection_resolution.get("options") or []
+            )
     runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
     runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
     runtime_view.update(run_context or {})
@@ -4389,10 +4565,15 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             if str(item).strip()
         ]
         allow_degraded = bool(user_response.get("allow_degraded"))
-        if not dependency_source_dirs and not allow_degraded:
+        has_selection_override = any(
+            _response_value_present(user_response.get(field))
+            for field in ("selected_targets", "step5_selected_coords", "step5_selected_names")
+        )
+        if not dependency_source_dirs and not allow_degraded and not has_selection_override:
             raise StepError(
                 "Step5 当前检查点要求先补充 dependency_source_dirs，或显式设置 "
-                "allow_degraded=true 后，再使用 action=rerun_current_step 重跑。"
+                "allow_degraded=true，或选择需要分析的目标 jar 后，再使用 "
+                "action=rerun_current_step 重跑。"
             )
 
     if (
@@ -4434,6 +4615,31 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             raise StepError(
                 "Step4 当前检查点要求先调整至少一个 Step4 超时参数，或修正 "
                 "dependency_source_dirs 后，再使用 action=rerun_current_step 重跑。"
+            )
+    if (
+        step_id == "step4"
+        and reason_code == "step4_japicmp_missing_need_resolution"
+        and action == "rerun_current_step"
+    ):
+        japicmp_jar = str(user_response.get("japicmp_jar") or "").strip()
+        allow_degraded = bool(user_response.get("allow_degraded"))
+        if not japicmp_jar and not allow_degraded:
+            raise StepError(
+                "Step4 当前检查点要求先安装/提供 japicmp_jar，或显式设置 "
+                "allow_degraded=true 确认降级后，再使用 action=rerun_current_step 重跑。"
+            )
+    if (
+        step_id == "step5"
+        and reason_code == "step5_tree_sitter_missing_need_resolution"
+        and action == "rerun_current_step"
+    ):
+        allow_degraded = bool(user_response.get("allow_degraded"))
+        tree_sitter_installed = bool(user_response.get("tree_sitter_installed"))
+        if not tree_sitter_installed and not allow_degraded:
+            raise StepError(
+                "Step5 当前检查点要求先安装 tree-sitter/tree-sitter-java，"
+                "并设置 tree_sitter_installed=true；或显式设置 allow_degraded=true 确认源码 AST 降级后，再使用 "
+                "action=rerun_current_step 重跑。"
             )
 
 
@@ -4573,7 +4779,7 @@ def apply_non_pending_structured_response(args, project_dir, report_dir, main_st
             "user_response": user_response,
             "early_exit_code": 0,
         }
-    if not has_non_pending_intent_payload(user_response):
+    if response_action != "restart_from_step" and not has_non_pending_intent_payload(user_response):
         raise StepError(
             "当前没有待恢复的 pending interaction。若要提交新的正式业务意图，"
             "请在 intent_patch.set / clear 中提供至少一个业务字段，或使用 action=restart_from_step。"
@@ -4715,7 +4921,7 @@ def handle_step2_resume_followups(
     # 建议映射需要用户显式确认，避免“继续流程”和“接受推断值”绑定。
     # 当前用户主入口是 dependency_source_dirs；accept_suggested_mappings 用于确认是否固化自动推断结果。
     if user_response.get("accept_suggested_mappings"):
-        ctx = read_json(report_dir / "s2_context.json") if (report_dir / "s2_context.json").exists() else {}
+        ctx = read_json(step2_context_path(report_dir)) if step2_context_path(report_dir).exists() else {}
         step2_input = dict((main_state.get("step2") or {}).get("input") or {})
         suggestions = build_dependency_repo_mapping_suggestions(step2_input, ctx)
         relevant_coords = _collect_relevant_dependency_coords(report_dir)
@@ -4834,8 +5040,9 @@ def persist_step_interaction(main_state, step_id, report_dir, run_context, inter
         pending_interaction=dict(interaction),
     )
     save_main_state(report_dir, main_state)
-    write_coverage_report(report_dir, project_scope=run_context.get("project_scope"))
+    write_coverage_report(runtime_coverage_dir(report_dir), project_scope=run_context.get("project_scope"))
     save_interaction_file(report_dir, interaction)
+    return interaction
 
 
 def persist_completed_step(main_state, step_id, report_dir, run_context):
@@ -4851,7 +5058,7 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
         pending_interaction=None,
     )
     save_main_state(report_dir, main_state)
-    write_coverage_report(report_dir, project_scope=run_context.get("project_scope"))
+    write_coverage_report(runtime_coverage_dir(report_dir), project_scope=run_context.get("project_scope"))
     clear_interaction_file(report_dir)
 
 
@@ -4875,6 +5082,7 @@ def persist_interaction_required_error(main_state, step_id, report_dir, interact
     )
     save_main_state(report_dir, main_state)
     save_interaction_file(report_dir, interaction)
+    return interaction
 
 
 def persist_step_error(main_state, step_id, report_dir, exc):
@@ -4893,11 +5101,11 @@ def persist_step_error(main_state, step_id, report_dir, exc):
 def refresh_step2_outputs(report_dir, project_dir, run_context):
     report_dir = Path(report_dir).resolve()
     project_dir = Path(project_dir).resolve()
-    dep_changes = report_dir / "s1_dep_changes.csv"
-    context_json = report_dir / "s2_context.json"
-    dep_graph_json = report_dir / "s2_dep_graph.json"
+    dep_changes = step1_dep_changes_path(report_dir)
+    context_json = step2_context_path(report_dir)
+    dep_graph_json = step2_dep_graph_path(report_dir)
 
-    ensure_exists(dep_changes, "重建 Step2 产物时缺少 s1_dep_changes.csv，请先执行 Step1")
+    ensure_exists(dep_changes, "重建 Step2 产物时缺少 evidence/dependencies/dep_changes.csv，请先执行 Step1")
     if not (run_context.get("base_branch") and run_context.get("current_branch")):
         raise StepError("重建 Step2 产物需要 base_branch 和 current_branch")
     cmd = [
@@ -4917,15 +5125,18 @@ def refresh_step2_outputs(report_dir, project_dir, run_context):
 def detect_integrity_repair_step(step_id, report_dir):
     report_dir = Path(report_dir).resolve()
     required_outputs = {
-        "step2": [("step1", "s1_dep_changes.csv")],
-        "step3": [("step2", "s2_context.json")],
-        "step4": [("step1", "s1_dep_changes.csv"), ("step2", "s2_context.json")],
-        "step5": [("step4", "s4_jar_compare/all_changed_apis.csv")],
-        "step6": [("step5", "s5_call_chain/summary.json")],
+        "step2": [("step1", "evidence/dependencies/dep_changes.csv")],
+        "step3": [("step2", "evidence/context/context.json")],
+        "step4": [
+            ("step1", "evidence/dependencies/dep_changes.csv"),
+            ("step2", "evidence/context/context.json"),
+        ],
+        "step5": [("step4", "evidence/api_changes/all_changed_apis.csv")],
+        "step6": [("step5", "evidence/call_chain/summary.json")],
     }
     missing_restart_steps = []
     for restart_step_id, rel_path in required_outputs.get(str(step_id or "").strip(), []):
-        if not (report_dir / rel_path).exists():
+        if not artifact_path(report_dir, rel_path).exists():
             missing_restart_steps.append(restart_step_id)
     if not missing_restart_steps:
         return ""
@@ -4936,11 +5147,11 @@ def cleanup_step3_candidate_outputs(report_dir):
     report_dir = Path(report_dir).resolve()
     # Step3 candidate artifacts are independent diagnostic evidence; reruns must
     # not inherit stale matches from an earlier dependency selection.
-    aggregate_path = report_dir / STEP3_RISK_CANDIDATES_FILE
+    aggregate_path = evidence_static_scan_dir(report_dir) / STEP3_RISK_CANDIDATES_FILE
     if aggregate_path.exists():
         aggregate_path.unlink()
 
-    per_dependency_dir = report_dir / PER_DEPENDENCY_DIRNAME
+    per_dependency_dir = step4_api_changes_dir(report_dir) / PER_DEPENDENCY_DIRNAME
     if not per_dependency_dir.exists():
         return
 
@@ -4976,45 +5187,47 @@ def step_output_paths_for_cleanup(step_id, report_dir):
     report_dir = Path(report_dir).resolve()
     outputs = {
         "step1": [
-            report_dir / "s1_dep_alerts.csv",
-            report_dir / "s1_dep_changes.csv",
-            report_dir / "s1_dep_summary.txt",
-            report_dir / "s1_deps_current_resolved.csv",
-            report_dir / "build_provenance.json",
-            report_dir / STEP1_ARTIFACTS_DIRNAME,
+            step1_dep_alerts_path(report_dir),
+            step1_dep_changes_path(report_dir),
+            step1_dep_summary_path(report_dir),
+            step1_current_resolved_path(report_dir),
+            build_provenance_path(report_dir),
+            step1_artifacts_dir(report_dir),
         ],
         "step2": [
-            report_dir / "s2_context.json",
-            report_dir / "s2_dep_graph.json",
-            report_dir / "s2_source_mapping_summary.json",
+            step2_context_path(report_dir),
+            step2_dep_graph_path(report_dir),
+            step2_source_mapping_summary_path(report_dir),
         ],
         "step3": [
-            report_dir / "s3_jdk_removed_api.csv",
-            report_dir / "s3_jdk_javax_refs.csv",
-            report_dir / "s3_jdk_internal_api.csv",
-            report_dir / "s3_jdk_reflection.csv",
-            report_dir / "s3_jdk_serialization.txt",
-            report_dir / "s3_jdk_runtime_flags.csv",
-            report_dir / "s3_springboot_config.csv",
-            report_dir / "s3_springboot_autoconfig.txt",
-            report_dir / "s3_dependency_compat.csv",
-            report_dir / "s3_dependency_classfile.csv",
-            report_dir / STEP3_RISK_CANDIDATES_FILE,
+            evidence_static_scan_dir(report_dir) / "s3_jdk_removed_api.csv",
+            evidence_static_scan_dir(report_dir) / "s3_jdk_javax_refs.csv",
+            evidence_static_scan_dir(report_dir) / "s3_jdk_internal_api.csv",
+            evidence_static_scan_dir(report_dir) / "s3_jdk_reflection.csv",
+            evidence_static_scan_dir(report_dir) / "s3_jdk_serialization.txt",
+            evidence_static_scan_dir(report_dir) / "s3_jdk_runtime_flags.csv",
+            evidence_static_scan_dir(report_dir) / "s3_springboot_config.csv",
+            evidence_static_scan_dir(report_dir) / "s3_springboot_autoconfig.txt",
+            evidence_static_scan_dir(report_dir) / "s3_dependency_compat.csv",
+            evidence_static_scan_dir(report_dir) / "s3_dependency_classfile.csv",
+            evidence_static_scan_dir(report_dir) / STEP3_RISK_CANDIDATES_FILE,
         ],
         "step4": [
-            report_dir / "s4_jar_compare",
+            step4_api_changes_dir(report_dir),
         ],
         "step5": [
-            report_dir / "s5_call_chain",
-            report_dir / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
-            report_dir / STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
-            report_dir / STEP5_ARTIFACT_BYTECODE_DIRNAME,
-            report_dir / "framework_adapters.json",
-            report_dir / "source_artifact_alignment.json",
+            step5_call_chain_dir(report_dir),
+            runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
+            runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
+            runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME,
+            step5_query_index_path(report_dir),
+            evidence_call_chain_dir(report_dir) / "framework_adapters.json",
+            evidence_call_chain_dir(report_dir) / "source_artifact_alignment.json",
         ],
         "step6": [
-            report_dir / "s6_findings.json",
-            report_dir / "s6_report.md",
+            s6_findings_path(report_dir),
+            s6_report_path(report_dir),
+            deliverables_dir(report_dir),
         ],
     }
     return list(outputs.get(str(step_id or "").strip(), []))
@@ -5036,13 +5249,13 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     report_dir.mkdir(parents=True, exist_ok=True)
     cleanup_step_outputs(step_id, report_dir)
 
-    dep_changes = report_dir / "s1_dep_changes.csv"
-    dep_current = report_dir / "s1_deps_current_resolved.csv"
-    context_json = report_dir / "s2_context.json"
-    s4_dir = report_dir / "s4_jar_compare"
+    dep_changes = step1_dep_changes_path(report_dir)
+    dep_current = step1_current_resolved_path(report_dir)
+    context_json = step2_context_path(report_dir)
+    s4_dir = step4_api_changes_dir(report_dir)
 
     if step_id == "step1":
-        output = report_dir / "s1_dep_changes.csv"
+        output = step1_dep_changes_path(report_dir)
         if run_context.get("tool", "maven") != "maven":
             raise StepError("Step1 当前只支持 Maven，并且只比较单模块的最终打包依赖。")
         base_artifact_path = run_context.get("base_artifact_path", "")
@@ -5071,30 +5284,30 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
             )
 
     elif step_id == "step2":
-        ensure_exists(dep_changes, "Step2 缺少 s1_dep_changes.csv，请先执行 Step1")
+        ensure_exists(dep_changes, "Step2 缺少 evidence/dependencies/dep_changes.csv，请先执行 Step1")
         base_branch = run_context.get("base_branch")
         current_branch = run_context.get("current_branch")
         if not (base_branch and current_branch):
             if run_context.get("artifact_input_mode"):
                 raise StepError(
                     "Step2 检测到当前流程来自用户提供的编译产物路径，但尚未明确提供 base_branch/current_branch。"
-                    "请回到最近的 checkpoint，通过结构化用户答复把这两个分支写回 main_state.json 后再继续，"
+                "请回到最近的 checkpoint，通过结构化用户答复把这两个分支写回 .runtime/state/main_state.json 后再继续，"
                     "避免把产物差异和自动探测到的工作区分支混用。"
                 )
             raise StepError(
-                "Step2 需要基准分支和当前分支。请检查 main_state.json 中的 step2.input / step1.output，"
+                "Step2 需要基准分支和当前分支。请检查 .runtime/state/main_state.json 中的 step2.input / step1.output，"
                 "或回到最近的 checkpoint 通过 --response-json / --response-file 把分支写回主状态后再继续。"
             )
         if is_git_repo(project_dir) and base_branch == current_branch:
             raise StepError(
                 f"Step2 检测到 base_branch 与 current_branch 相同（{base_branch}），无法进行 git diff/推断。"
-                "请回到最近的 checkpoint 或修正 main_state.json，明确写入两个不同分支后再继续。"
+                "请回到最近的 checkpoint 或修正 .runtime/state/main_state.json，明确写入两个不同分支后再继续。"
             )
         cmd = [
             "--dep-changes", str(dep_changes),
             "--work-dir", str(project_dir),
             "--output", str(context_json),
-            "--output-dep-graph", str(report_dir / "s2_dep_graph.json"),
+            "--output-dep-graph", str(step2_dep_graph_path(report_dir)),
         ]
         run_python(
             "s2_context_from_deps.py",
@@ -5104,10 +5317,12 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
         )
     elif step_id == "step3":
         validate_run_context_for_step(step_id, run_context)
-        ensure_exists(context_json, "Step3 缺少 s2_context.json，请先执行 Step2")
+        ensure_exists(context_json, "Step3 缺少 evidence/context/context.json，请先执行 Step2")
         cmd = [
             "--all",
-            "--output-dir", str(report_dir),
+            "--output-dir", str(evidence_static_scan_dir(report_dir)),
+            "--report-dir", str(report_dir),
+            "--coverage-output", str(runtime_coverage_dir(report_dir) / "s3_coverage.json"),
         ]
         if dep_current.exists():
             cmd.extend(["--dep-current", str(dep_current)])
@@ -5117,12 +5332,13 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
 
     elif step_id == "step4":
         validate_run_context_for_step(step_id, run_context)
-        ensure_exists(dep_changes, "Step4 缺少 s1_dep_changes.csv，请先执行 Step1")
-        ensure_exists(context_json, "Step4 缺少 s2_context.json，请先执行 Step2")
+        ensure_exists(dep_changes, "Step4 缺少 evidence/dependencies/dep_changes.csv，请先执行 Step1")
+        ensure_exists(context_json, "Step4 缺少 evidence/context/context.json，请先执行 Step2")
         cmd = [
             "--dep-changes", str(dep_changes),
             "--context", str(context_json),
             "--output-dir", str(s4_dir),
+            "--coverage-output", str(runtime_coverage_dir(report_dir) / "s4_coverage.json"),
         ]
         run_python("s4_jar_compare.py", cmd, project_dir, report_dir=report_dir)
 
@@ -5137,9 +5353,10 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
         )
         cmd = [
             "--all-changed-apis", str(step5_all_changed_apis),
-            "--jdk-scan-dir", str(report_dir),
+            "--jdk-scan-dir", str(evidence_static_scan_dir(report_dir)),
             "--report-dir", str(report_dir),
-            "--output-dir", str(report_dir / "s5_call_chain"),
+            "--output-dir", str(step5_call_chain_dir(report_dir)),
+            "--query-index", str(step5_query_index_path(report_dir)),
         ]
         step5_timeout = run_context.get("step5_timeout")
         if step5_timeout not in (None, ""):
@@ -5155,13 +5372,13 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
         )
 
     elif step_id == "step6":
-        ensure_exists(report_dir / "s5_call_chain" / "summary.json", "Step6 缺少 Step5 的 summary.json，请先执行 Step5")
+        ensure_exists(step5_call_chain_dir(report_dir) / "summary.json", "Step6 缺少 Step5 的 summary.json，请先执行 Step5")
         run_python(
             "s6_report.py",
             [
                 "--report-dir", str(report_dir),
-                "--output-findings", str(report_dir / "s6_findings.json"),
-                "--output-report", str(report_dir / "s6_report.md"),
+                "--output-findings", str(s6_findings_path(report_dir)),
+                "--output-report", str(s6_report_path(report_dir)),
             ],
             project_dir,
             report_dir=report_dir,
@@ -5325,7 +5542,7 @@ def main():
         # Always save main_state after interaction to maintain protocol integrity.
         # Per CHECKPOINT_RULES.md: must_wait_for_user_reply.
         if interaction:
-            persist_step_interaction(main_state, step_id, report_dir, run_context, interaction)
+            interaction = persist_step_interaction(main_state, step_id, report_dir, run_context, interaction)
             print_interaction_to_streams(interaction, report_dir)
             print(
                 f"⏸ {step_id} 已执行完成，进入待用户交互状态。用户答复后执行："
@@ -5341,7 +5558,7 @@ def main():
         return 0
     except StepInteractionRequired as exc:
         interaction = exc.interaction or {}
-        persist_interaction_required_error(main_state, step_id, report_dir, interaction)
+        interaction = persist_interaction_required_error(main_state, step_id, report_dir, interaction)
         print_interaction_to_streams(interaction, report_dir)
         print(
             f"⏸ {step_id} 需要补充业务信息后才能继续；当前退出码={EXIT_AWAITING_USER}",

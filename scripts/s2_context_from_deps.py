@@ -38,7 +38,7 @@ def load_orchestrated_step2_input(output_path=""):
         report_dir = str(Path(output_path).resolve().parent)
     if not report_dir:
         return {}
-    state_path = Path(report_dir) / MAIN_STATE_FILE_NAME
+    state_path = Path(report_dir) / ".runtime" / "state" / MAIN_STATE_FILE_NAME
     if not state_path.exists():
         return {}
     try:

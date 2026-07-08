@@ -6,7 +6,7 @@ import threading
 import zipfile
 from pathlib import Path
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 
@@ -20,6 +20,56 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_main_emits_japicmp_missing_checkpoint_before_degraded_step4(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            output_dir = report_dir / "s4_jar_compare"
+            output_dir.mkdir(parents=True)
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,scope\n"
+                "com.acme:api,1.0.0,2.0.0,小版本升级,compile\n",
+                encoding="utf-8",
+            )
+            context = report_dir / "s2_context.json"
+            context.write_text(
+                json.dumps({"changed_dependencies": [{"coord": "com.acme:api"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with patch.dict("os.environ", {"JUA_ORCHESTRATED": "1"}), patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes",
+                    str(dep_changes),
+                    "--context",
+                    str(context),
+                    "--output-dir",
+                    str(output_dir),
+                    "--japicmp-jar",
+                    str(Path(tmp) / "missing-japicmp.jar"),
+                ],
+            ), patch.object(
+                step4,
+                "auto_install_japicmp",
+                return_value=(False, str(Path(tmp) / "missing-japicmp.jar"), "network unavailable"),
+            ) as install_mock, redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = step4.main()
+
+            self.assertEqual(rc, 0)
+            install_mock.assert_called_once()
+            output = stdout.getvalue()
+            self.assertIn(step4.INTERACTION_PREFIX, output)
+            payload = json.loads(output.split(step4.INTERACTION_PREFIX, 1)[1].strip())
+            self.assertEqual(payload["reason_code"], "step4_japicmp_missing_need_resolution")
+            self.assertIn("allow_degraded", payload["response_schema"]["properties"])
+            self.assertIn("japicmp_jar", payload["response_schema"]["properties"])
+            self.assertTrue((output_dir / "japicmp_preflight.json").exists())
+
     def test_parse_japicmp_xml_preserves_binary_and_source_compatibility(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml_path = Path(tmp) / "diff.xml"

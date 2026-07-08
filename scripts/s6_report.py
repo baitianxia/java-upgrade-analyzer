@@ -8,8 +8,8 @@ s6_report.py — Step 6：汇总报告
 用法：
   python s6_report.py \
     --report-dir .upgrade-report \
-    --output-findings .upgrade-report/s6_findings.json \
-    --output-report   .upgrade-report/s6_report.md
+    --output-findings .upgrade-report/.runtime/findings/s6_findings.json \
+    --output-report   .upgrade-report/deliverables/report.md
 """
 
 import argparse, csv, json, os, sys
@@ -19,16 +19,69 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
-from pipeline_constants import PER_DEPENDENCY_DIRNAME, PER_DEPENDENCY_SUMMARY_FILE
+from pipeline_constants import (
+    DELIVERABLES_DIRNAME,
+    EVIDENCE_API_CHANGES_DIRNAME,
+    EVIDENCE_CALL_CHAIN_DIRNAME,
+    EVIDENCE_CONTEXT_DIRNAME,
+    EVIDENCE_DEPENDENCIES_DIRNAME,
+    EVIDENCE_DIRNAME,
+    EVIDENCE_STATIC_SCAN_DIRNAME,
+    PER_DEPENDENCY_DIRNAME,
+    PER_DEPENDENCY_SUMMARY_FILE,
+    RUNTIME_COVERAGE_DIRNAME,
+    RUNTIME_DIRNAME,
+)
 
 S6_INLINE_LIMIT = 20
+S6_IMPACT_INLINE_LIMIT = 15
+S6_ENTRY_INLINE_LIMIT = 20
 S6_NOT_FOUND_INLINE_LIMIT = S6_INLINE_LIMIT
 S6_DETAIL_MD_FULL_LIMIT = 200
 S6_DETAIL_MD_SAMPLE_LIMIT = 50
 S6_DETAIL_MD_DEP_SUMMARY_LIMIT = 50
+S6_CHANGED_API_SPLIT_ROWS = 500
+
+
+def _evidence_dir(report_dir, name):
+    return Path(report_dir) / EVIDENCE_DIRNAME / name
+
+
+def _deliverables_dir(report_dir):
+    return Path(report_dir) / DELIVERABLES_DIRNAME
+
+
+def _runtime_dir(report_dir, name):
+    return Path(report_dir) / RUNTIME_DIRNAME / name
+
+
+def _dep_changes_path(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_DEPENDENCIES_DIRNAME) / "dep_changes.csv"
+
+
+def _context_path(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_CONTEXT_DIRNAME) / "context.json"
+
+
+def _static_scan_dir(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_STATIC_SCAN_DIRNAME)
+
+
+def _api_changes_dir(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_API_CHANGES_DIRNAME)
+
+
+def _call_chain_dir(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_CALL_CHAIN_DIRNAME)
+
+
+def _coverage_path(report_dir):
+    return _runtime_dir(report_dir, RUNTIME_COVERAGE_DIRNAME) / "coverage.json"
+
+
 S6_DETAIL_BUCKETS = {
     "uncertain": {
-        "title": "待人工验证完整清单",
+        "title": "需人工复核清单",
         "csv": "s6_uncertain_apis.csv",
         "md": "s6_uncertain_apis.md",
         "summary_key": "uncertain_reason_summary",
@@ -42,25 +95,25 @@ S6_DETAIL_BUCKETS = {
         "note": "已找到强相关证据，但仍需测试或运行时验证。",
     },
     "needs_input": {
-        "title": "需要补充输入完整清单",
+        "title": "缺少依赖源码/构建产物，无法回溯调用链清单",
         "csv": "s6_needs_input_apis.csv",
         "md": "s6_needs_input_apis.md",
         "summary_key": "not_analyzed_reason_summary",
-        "note": "关键输入缺失，当前结论不完整。",
+        "note": "缺少依赖源码、目标模块或构建产物，当前无法完整回溯调用链。",
     },
     "not_analyzed": {
-        "title": "未覆盖/未分析完整清单",
+        "title": "本次未完成分析清单",
         "csv": "s6_not_analyzed_apis.csv",
         "md": "s6_not_analyzed_apis.md",
         "summary_key": "not_analyzed_reason_summary",
         "note": "工具已知未覆盖该场景，不能按未影响解释。",
     },
     "not_found": {
-        "title": "静态未找到路径完整清单",
+        "title": "未发现调用路径清单",
         "csv": "s6_not_found_apis.csv",
         "md": "s6_not_found_apis.md",
         "summary_key": "not_found_reason_summary",
-        "note": "静态未找到不等于确定不影响；仅表示当前源码图未找到引用路径。",
+        "note": "未发现调用路径不等于确定不影响；仅表示当前源码图未找到引用路径。",
     },
 }
 
@@ -156,11 +209,11 @@ def build_bucket_detail_markdown(config, items, csv_name):
         f"- 说明：{config.get('note') or ''}",
         f"- 完整可筛选清单：`{csv_name}`",
         "",
-        "## 如何阅读",
+        "## 文件说明",
         "",
-        "- 先看“原因分类”和“依赖坐标分布”，判断风险是否集中在少数原因或少数依赖。",
-        "- 再看“优先抽查样例”，确认分类与说明是否符合预期。",
-        "- 若需要逐条复核，请使用 CSV 按 `coord`、`reason_code`、`api` 过滤；CSV 是完整全集。",
+        "- “原因分类”和“依赖坐标分布”用于展示该桶内条目的聚集情况。",
+        "- Markdown 展示样例或完整明细；CSV 是该桶的完整全集。",
+        "- CSV 字段可按 `coord`、`reason_code`、`api` 过滤。",
         "",
     ]
     if reason_summary:
@@ -201,7 +254,7 @@ def build_bucket_detail_markdown(config, items, csv_name):
         lines.append("")
     else:
         lines += [
-            f"## 优先抽查样例（前 {S6_DETAIL_MD_SAMPLE_LIMIT} 条）",
+            f"## 明细样例（前 {S6_DETAIL_MD_SAMPLE_LIMIT} 条）",
             "",
             f"> 本桶共有 {len(items)} 条，Markdown 只展示样例，避免明细文件自身难以阅读或预览失败；完整全集请看 `{csv_name}`。",
             "",
@@ -230,7 +283,7 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
     artifacts = {}
     if not items:
         return artifacts
-    report_path = Path(report_dir)
+    report_path = _deliverables_dir(report_dir)
     report_path.mkdir(parents=True, exist_ok=True)
     csv_path = report_path / config.get("csv", f"s6_{bucket_name}_apis.csv")
     md_path = report_path / config.get("md", f"s6_{bucket_name}_apis.md")
@@ -270,11 +323,50 @@ def write_s6_detail_artifacts(report_dir, findings):
     artifacts = {}
     for bucket_name in S6_DETAIL_BUCKETS:
         artifacts.update(write_bucket_detail_artifacts(report_dir, findings, bucket_name))
+    artifacts.update(write_changed_api_split_artifacts(report_dir))
+    return artifacts
+
+
+def write_changed_api_split_artifacts(report_dir):
+    artifacts = {}
+    source_path = _api_changes_dir(report_dir) / "all_changed_apis.csv"
+    if not source_path.is_file():
+        return artifacts
+
+    split_dir = source_path.parent
+    for stale_path in split_dir.glob("all_changed_apis_part_*.csv"):
+        try:
+            stale_path.unlink()
+        except OSError:
+            pass
+
+    try:
+        with source_path.open(encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+    except OSError:
+        return artifacts
+
+    if not fieldnames or not rows:
+        return artifacts
+
+    part_count = 0
+    for start in range(0, len(rows), S6_CHANGED_API_SPLIT_ROWS):
+        part_count += 1
+        part_path = split_dir / f"all_changed_apis_part_{part_count:03d}.csv"
+        with part_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows[start:start + S6_CHANGED_API_SPLIT_ROWS])
+
+    artifacts["changed_apis_split_pattern"] = "evidence/api_changes/all_changed_apis_part_*.csv"
+    artifacts["changed_apis_split_count"] = part_count
     return artifacts
 
 
 def load_per_dependency_summaries(report_dir):
-    per_dependency_root = Path(report_dir) / PER_DEPENDENCY_DIRNAME
+    per_dependency_root = _api_changes_dir(report_dir) / PER_DEPENDENCY_DIRNAME
     results = []
     if not per_dependency_root.is_dir():
         return results
@@ -298,19 +390,207 @@ def build_api_identity_key(payload):
     )
 
 
+def _short_path(value, parts=4):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    items = Path(text).parts[-parts:]
+    return "/".join(items) if items else text
+
+
+def _module_from_evidence_file(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parts = list(Path(text).parts)
+    for marker in (("src", "main", "java"), ("src", "test", "java")):
+        marker_len = len(marker)
+        for idx in range(0, max(len(parts) - marker_len + 1, 0)):
+            if tuple(parts[idx:idx + marker_len]) == marker:
+                before = [part for part in parts[:idx] if part not in {"/", ""}]
+                if before:
+                    if len(before) >= 2 and before[-2].startswith("jua-real-project"):
+                        return before[-1]
+                    return "/".join(before[-2:]) if len(before) >= 2 else before[-1]
+    return _short_path(text, parts=2)
+
+
+def _impact_bucket(row):
+    status = str(row.get("path_status") or row.get("api_status") or "").strip()
+    conclusion = str(row.get("conclusion_level") or "").strip()
+    business_reachable = str(row.get("business_reachable") or "").strip().lower()
+    if status == "reachable" or conclusion == "confirmed" or business_reachable == "true":
+        return "confirmed"
+    if status in {"uncertain", "not_analyzed"} or conclusion in {"candidate", "incomplete"}:
+        return "review"
+    if status == "not_found_in_static_analysis":
+        return "not_found"
+    return status or "unknown"
+
+
+def _bucket_rank(bucket):
+    return {"confirmed": 0, "review": 1, "not_found": 2, "unknown": 3}.get(bucket or "unknown", 9)
+
+
+def _impact_sort_key(item):
+    status_counts = item.get("status_counts") or {}
+    return (
+        _bucket_rank(item.get("bucket")),
+        -int(status_counts.get("reachable") or 0),
+        -int(item.get("path_count") or 0),
+        item.get("coord", ""),
+        item.get("api", ""),
+    )
+
+
+def build_impact_overview(alert_rows):
+    """Convert Step5 alerts.csv into a human-first "what is affected" view."""
+    api_map = {}
+    entry_map = {}
+    for row in alert_rows or []:
+        api = str(row.get("changed_symbol") or "").strip()
+        coord = str(row.get("target_coord") or "").strip()
+        if not api:
+            continue
+        bucket = _impact_bucket(row)
+        key = (
+            coord,
+            api,
+            str(row.get("api_signature") or "").strip(),
+            str(row.get("symbol_kind") or "").strip(),
+            str(row.get("change_type") or "").strip(),
+        )
+        item = api_map.setdefault(key, {
+            "coord": coord,
+            "api": api,
+            "api_signature": key[2],
+            "symbol_kind": key[3],
+            "change_type": key[4],
+            "bucket": bucket,
+            "status_counts": defaultdict(int),
+            "path_count": 0,
+            "entries": set(),
+            "paths": [],
+            "files": set(),
+            "modules": set(),
+            "actions": set(),
+            "reasons": set(),
+        })
+        if _bucket_rank(bucket) < _bucket_rank(item["bucket"]):
+            item["bucket"] = bucket
+        status = str(row.get("path_status") or row.get("api_status") or "unknown").strip() or "unknown"
+        item["status_counts"][status] += 1
+        try:
+            occurrence_count = max(int(str(row.get("path_occurrence_count") or "1")), 1)
+        except ValueError:
+            occurrence_count = 1
+        item["path_count"] += occurrence_count
+
+        entry = str(row.get("business_entry") or "").strip()
+        if not entry:
+            consumer_class = str(row.get("consumer_class") or "").strip()
+            consumer_method = str(row.get("consumer_method") or "").strip()
+            entry = ".".join(part for part in (consumer_class, consumer_method) if part)
+        if entry:
+            item["entries"].add(entry)
+
+        path_text = str(row.get("path_text") or "").strip()
+        if path_text and path_text not in item["paths"]:
+            item["paths"].append(path_text)
+        for raw_file in str(row.get("evidence_files") or "").split("|"):
+            raw_file = raw_file.strip()
+            if raw_file:
+                item["files"].add(raw_file)
+                module = _module_from_evidence_file(raw_file)
+                if module:
+                    item["modules"].add(module)
+        action = str(row.get("action") or "").strip()
+        if action:
+            item["actions"].add(action)
+        reason = str(row.get("reason") or row.get("stop_reason") or "").strip()
+        if reason:
+            item["reasons"].add(reason)
+
+        if bucket == "confirmed" and entry:
+            entry_item = entry_map.setdefault(entry, {
+                "entry": entry,
+                "apis": set(),
+                "paths": [],
+                "files": set(),
+                "modules": set(),
+                "path_count": 0,
+            })
+            entry_item["apis"].add(api)
+            entry_item["path_count"] += occurrence_count
+            if path_text and path_text not in entry_item["paths"]:
+                entry_item["paths"].append(path_text)
+            for raw_file in str(row.get("evidence_files") or "").split("|"):
+                raw_file = raw_file.strip()
+                if raw_file:
+                    entry_item["files"].add(raw_file)
+                    module = _module_from_evidence_file(raw_file)
+                    if module:
+                        entry_item["modules"].add(module)
+
+    api_items = []
+    for item in api_map.values():
+        status_counts = dict(sorted(item["status_counts"].items(), key=lambda x: (-x[1], x[0])))
+        api_items.append({
+            "coord": item["coord"],
+            "api": item["api"],
+            "api_signature": item["api_signature"],
+            "symbol_kind": item["symbol_kind"],
+            "change_type": item["change_type"],
+            "bucket": item["bucket"],
+            "status_counts": status_counts,
+            "path_count": item["path_count"],
+            "entry_count": len(item["entries"]),
+            "module_count": len(item["modules"]),
+            "sample_modules": sorted(item["modules"])[:5],
+            "sample_entries": sorted(item["entries"])[:3],
+            "sample_paths": item["paths"][:2],
+            "paths": item["paths"][:10],
+            "sample_files": [_short_path(path) for path in sorted(item["files"])[:3]],
+            "sample_actions": sorted(item["actions"])[:2],
+            "sample_reasons": sorted(item["reasons"])[:2],
+        })
+
+    entry_items = []
+    for item in entry_map.values():
+        entry_items.append({
+            "entry": item["entry"],
+            "api_count": len(item["apis"]),
+            "path_count": item["path_count"],
+            "sample_modules": sorted(item["modules"])[:3],
+            "sample_apis": sorted(item["apis"])[:3],
+            "sample_paths": item["paths"][:2],
+            "sample_files": [_short_path(path) for path in sorted(item["files"])[:2]],
+        })
+
+    api_items = sorted(api_items, key=_impact_sort_key)
+    entry_items = sorted(entry_items, key=lambda x: (-x["api_count"], -x["path_count"], x["entry"]))
+    return {
+        "apis": api_items,
+        "confirmed_apis": [item for item in api_items if item.get("bucket") == "confirmed"],
+        "review_apis": [item for item in api_items if item.get("bucket") == "review"],
+        "not_found_apis": [item for item in api_items if item.get("bucket") == "not_found"],
+        "business_entries": entry_items,
+    }
+
+
 def collect_findings(d):
     findings = {
         'meta': {
             'read_order': [
-                's6_report.md（主报告，先看 P0/P1/❓）',
-                's5_call_chain/summary.json（reachable / uncertain 证据）',
-                's5_call_chain/by_api/*.json（真实 evidence_paths 与 reason_code）',
-                's4_jar_compare/all_changed_apis.csv（反向调用链输入变更集）',
-                's3_*.csv/.txt（背景信号，用于补充排查方向）',
+                'deliverables/report.md（主报告）',
+                's6_*_apis.csv/md（按结论拆分的完整 API 明细）',
+                'evidence/call_chain/alerts.csv（完整逐链路台账）',
+                'evidence/api_changes/all_changed_apis.csv（反向调用链输入变更集）',
+                'evidence/static_scan/s3_*.csv/.txt（背景信号，用于补充排查方向）',
             ],
             'sampling_guide': [
                 '从 P0/P1 各抽 3 条：沿 call_paths 打开源码核对调用关系',
-                '对 uncertain 至少抽 3 条：先看 reason_code，再看 verification 与 by_api/*.json 的 evidence_paths',
+                '对 uncertain 至少抽 3 条：先看 s6_uncertain_apis.csv/md，再到 alerts.csv 核对链路状态和证据文件',
                 '从 all_changed_apis.csv 抽 3 条：核对 change_type / source 与原始证据是否一致',
                 '从 s3_jdk_removed_api.csv / s3_jdk_javax_refs.csv 各抽 2 条：核对 文件:行号 是否为真实命中',
             ],
@@ -336,13 +616,20 @@ def collect_findings(d):
         'module_impacts':      {},
         'dep_changes_summary': {},
         'per_dependency_results': [],
+        'impact_overview': {
+            'apis': [],
+            'confirmed_apis': [],
+            'review_apis': [],
+            'not_found_apis': [],
+            'business_entries': [],
+        },
         'coverage': {},
     }
 
-    findings['coverage'] = load_json(f"{d}/coverage.json")
+    findings['coverage'] = load_json(_coverage_path(d))
 
     # Step 2 上下文
-    ctx = load_json(f"{d}/s2_context.json")
+    ctx = load_json(_context_path(d))
     findings['context'] = {
         'jdk':        f"{ctx.get('jdk_base','?')} → {ctx.get('jdk_current','?')}",
         'springboot': f"{ctx.get('springboot_base','?')} → {ctx.get('springboot_current','?')}",
@@ -353,7 +640,7 @@ def collect_findings(d):
     }
 
     # Step 1 依赖变更统计
-    dep_rows = load_csv(f"{d}/s1_dep_changes.csv")
+    dep_rows = load_csv(_dep_changes_path(d))
     dep_change_lookup = {}
     dep_counts = defaultdict(int)
     for row in dep_rows:
@@ -364,18 +651,19 @@ def collect_findings(d):
     findings['dep_changes_summary'] = dict(dep_counts)
 
     # Step 3 扫描统计
+    static_dir = _static_scan_dir(d)
     for name, path in [
-        ('jdk_removed_api',   f"{d}/s3_jdk_removed_api.csv"),
-        ('jdk_javax_refs',    f"{d}/s3_jdk_javax_refs.csv"),
-        ('jdk_internal_api',  f"{d}/s3_jdk_internal_api.csv"),
-        ('jdk_reflection',    f"{d}/s3_jdk_reflection.csv"),
-        ('jdk_serialization', f"{d}/s3_jdk_serialization.txt"),
-        ('sb_config',         f"{d}/s3_springboot_config.csv"),
-        ('sb_autoconfig',     f"{d}/s3_springboot_autoconfig.txt"),
+        ('jdk_removed_api',   static_dir / "s3_jdk_removed_api.csv"),
+        ('jdk_javax_refs',    static_dir / "s3_jdk_javax_refs.csv"),
+        ('jdk_internal_api',  static_dir / "s3_jdk_internal_api.csv"),
+        ('jdk_reflection',    static_dir / "s3_jdk_reflection.csv"),
+        ('jdk_serialization', static_dir / "s3_jdk_serialization.txt"),
+        ('sb_config',         static_dir / "s3_springboot_config.csv"),
+        ('sb_autoconfig',     static_dir / "s3_springboot_autoconfig.txt"),
     ]:
         findings['scan_stats'][name] = count_lines(path)
 
-    dep_compat_rows = load_csv(f"{d}/s3_dependency_compat.csv")
+    dep_compat_rows = load_csv(static_dir / "s3_dependency_compat.csv")
     findings['scan_stats']['dep_compat'] = len(dep_compat_rows)
     if dep_compat_rows:
         by_type = defaultdict(int)
@@ -395,13 +683,16 @@ def collect_findings(d):
         }
 
     # Step 4 jar 变更
-    changed_apis = load_csv(f"{d}/s4_jar_compare/all_changed_apis.csv")
+    changed_apis = load_csv(_api_changes_dir(d) / "all_changed_apis.csv")
     findings['scan_stats']['changed_apis_total'] = len(changed_apis)
     findings['scan_stats']['changed_apis_p0'] = sum(
         1 for r in changed_apis if r.get('severity') == 'P0')
+    findings['impact_overview'] = build_impact_overview(
+        load_csv(_call_chain_dir(d) / "alerts.csv")
+    )
 
     # Step 5 调用链
-    call_summary = load_json(f"{d}/s5_call_chain/summary.json")
+    call_summary = load_json(_call_chain_dir(d) / "summary.json")
     impacted_coords = set()
     if call_summary:
         findings['user_conclusion_summary'] = dict(call_summary.get('user_conclusion_summary') or {})
@@ -436,7 +727,7 @@ def collect_findings(d):
                 'dependency_chain_coords': api_info.get('dependency_chain_coords', []),
                 'evidence_paths': [],
             }
-            by_api_path = os.path.join(d, 's5_call_chain', 'by_api')
+            by_api_path = str(_call_chain_dir(d) / 'by_api')
             if os.path.isdir(by_api_path):
                 pass
             if entry['coord']:
@@ -532,7 +823,7 @@ def collect_findings(d):
             })
         findings['not_found_reason_summary'] = dict(sorted(not_found_reason_counts.items(), key=lambda x: (-x[1], x[0])))
 
-    by_api_dir = os.path.join(d, 's5_call_chain', 'by_api')
+    by_api_dir = str(_call_chain_dir(d) / 'by_api')
     by_api_lookup = {}
     if os.path.isdir(by_api_dir):
         for fname in os.listdir(by_api_dir):
@@ -577,7 +868,7 @@ def collect_findings(d):
             )[:10]
 
     # 按模块汇总
-    module_dir = f"{d}/s5_call_chain/by_module"
+    module_dir = str(_call_chain_dir(d) / "by_module")
     if os.path.isdir(module_dir):
         for fname in sorted(os.listdir(module_dir)):
             if not fname.endswith('_impacts.json'):
@@ -724,27 +1015,745 @@ def collect_findings(d):
     return findings
 
 
-def generate_report(findings):
-    ctx  = findings['context']
-    stat = findings['scan_stats']
-    p0 = findings['p0']
-    p1 = findings['p1']
-    p2 = findings['p2']
-    unk = findings['uncertain']
-    probable_impact = findings.get('probable_impact', [])
-    needs_input = findings.get('needs_input', [])
-    na = [
-        item for item in findings['not_analyzed']
+def _join_inline(values, limit=3, empty="-"):
+    cleaned = [str(value or "").strip() for value in values or [] if str(value or "").strip()]
+    if not cleaned:
+        return empty
+    text = "<br>".join(_md_cell(value, 180) for value in cleaned[:limit])
+    if len(cleaned) > limit:
+        text += f"<br>…另 {len(cleaned) - limit} 项"
+    return text
+
+
+def _status_counts_cell(counts):
+    if not counts:
+        return "-"
+    labels = {
+        "reachable": "已确认",
+        "uncertain": "待确认",
+        "not_analyzed": "未分析",
+        "not_found_in_static_analysis": "未发现调用路径",
+    }
+    return "<br>".join(
+        f"{labels.get(status, status)}: {count}"
+        for status, count in counts.items()
+    )
+
+
+def _status_counts_text(counts):
+    if not counts:
+        return "-"
+    labels = {
+        "reachable": "已确认",
+        "uncertain": "待确认",
+        "not_analyzed": "未分析",
+        "not_found_in_static_analysis": "未发现调用路径",
+    }
+    return "，".join(
+        f"{labels.get(status, status)} {count}"
+        for status, count in counts.items()
+    )
+
+
+def _render_inline_list(title, values, limit=3):
+    cleaned = [str(value or "").strip() for value in values or [] if str(value or "").strip()]
+    if not cleaned:
+        return f"- **{title}**：-"
+    rendered = "；".join(f"`{_md_cell(value, 220)}`" for value in cleaned[:limit])
+    if len(cleaned) > limit:
+        rendered += f"；…另 {len(cleaned) - limit} 项"
+    return f"- **{title}**：{rendered}"
+
+
+def _top_modules_from_items(items, limit=5):
+    counts = defaultdict(int)
+    for item in items or []:
+        for module in item.get("sample_modules") or []:
+            counts[module] += 1
+    return [module for module, _count in sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:limit]]
+
+
+def _render_api_cards(title, items, limit, empty_text, review=False):
+    lines = [title, ""]
+    if not items:
+        lines += [empty_text, ""]
+        return lines
+    for idx, item in enumerate(items[:limit], 1):
+        lines += [
+            f"#### {idx}. `{_md_cell(item.get('api'), 220)}`",
+            "",
+            f"- **变化**：`{_md_cell(item.get('change_type'))}` / `{_md_cell(item.get('symbol_kind'))}`"
+            + (f" / `{_md_cell(item.get('api_signature'))}`" if item.get("api_signature") else ""),
+            f"- **影响范围**：{item.get('entry_count', 0)} 个业务入口，{item.get('module_count', 0)} 个模块/组件；链路状态：{_status_counts_text(item.get('status_counts'))}",
+            _render_inline_list("涉及模块", item.get("sample_modules"), limit=5),
+            _render_inline_list("代表业务入口", item.get("sample_entries"), limit=3),
+        ]
+        if review:
+            reasons = item.get("sample_reasons") or item.get("sample_actions") or []
+            lines.append(_render_inline_list("中断原因/建议", reasons, limit=2))
+            lines.append(_render_inline_list("证据文件", item.get("sample_files"), limit=2))
+        lines.append("")
+    if len(items) > limit:
+        lines += [f"> 还有 {len(items) - limit} 个未在主报告展开，请查看 Step5 的 `alerts.csv` 及按状态拆分文件。", ""]
+    return lines
+
+
+def render_impact_overview_section(findings):
+    overview = findings.get("impact_overview") or {}
+    confirmed = overview.get("confirmed_apis") or []
+    review = overview.get("review_apis") or []
+    entries = overview.get("business_entries") or []
+    stat = findings.get("scan_stats") or {}
+    p0 = findings.get("p0") or []
+    p1 = findings.get("p1") or []
+    p2 = findings.get("p2") or []
+    probable_impact = findings.get("probable_impact") or []
+    needs_input = findings.get("needs_input") or []
+    not_analyzed = [
+        item for item in findings.get("not_analyzed") or []
+        if item.get("user_conclusion") not in {"可能影响", "需要补充输入"}
+    ]
+    not_found = findings.get("not_found") or []
+    call_status = stat.get("call_chain_status", "done")
+    lines = [
+        "## 一、核心结论",
+        "",
+        "这一节只回答三个问题：是否确认影响、影响面有多大、下一步先做什么。",
+        "",
+    ]
+    if not confirmed and not review and not entries:
+        lines += [
+            "- 当前没有从 Step5 链路台账中提取到具体影响链路。",
+            "- 若 Step5 被跳过或 alerts.csv 缺失，请先检查 Step4/Step5 产物是否完整。",
+            "",
+        ]
+        return lines
+
+    total_entries = len(entries)
+    top_modules = _top_modules_from_items(confirmed + review)
+    lines += [
+        "### 1.1 结论卡片",
+        "",
+        "| 项目 | 结果 |",
+        "|---|---|",
+        f"| 调用链分析状态 | `{call_status}` |",
+        f"| 已确认影响 | {len(confirmed)} 个变更 API，约 {total_entries} 个业务入口 |",
+        f"| 需要人工复核 | {len(review)} 个变更 API |",
+        f"| 主要影响模块 | {', '.join(f'`{item}`' for item in top_modules) if top_modules else '暂未识别'} |",
+        "",
+        "### 1.2 风险分布",
+        "",
+        "| 类别 | 数量 |",
+        "|---|---:|",
+        f"| P0 静态编译不兼容候选 | {len(p0)} |",
+        f"| P1 运行时崩溃 | {len(p1)} |",
+        f"| P2 行为异常 | {len(p2)} |",
+        f"| 待人工验证 | {len(review)} |",
+        f"| 可能影响 | {len(probable_impact)} |",
+        f"| 缺少依赖源码/构建产物，无法回溯调用链 | {len(needs_input)} |",
+        f"| 本次未完成分析 | {len(not_analyzed)} |",
+        f"| 未发现调用路径 | {len(not_found)} |",
+        "",
+        "### 1.3 建议处理顺序",
+        "",
+    ]
+    if confirmed:
+        lines += [
+            "1. 先处理“已确认触达业务代码”的 API：这些已经有调用链证据，不需要再争论是否可能影响。",
+            "2. 按第 3 节的依赖和模块分派负责人，再到 `evidence/call_chain/alerts.csv` 定位具体链路。",
+        ]
+    else:
+        lines += [
+            "1. 当前没有确认触达业务代码的 API；不要直接表述为“无影响”，应先看第 5 节的未确认原因。",
+        ]
+    if review:
+        lines.append("3. 对“需要人工复核”的 API，优先核对 stop_reason、consumer 信息和 evidence_files。")
+    if findings.get("needs_input"):
+        lines.append("4. 如果存在“缺少依赖源码/构建产物，无法回溯调用链”，先补齐依赖源码、目标模块或构建产物后重跑相关 Step。")
+    if findings.get("not_found"):
+        lines.append("5. “未发现调用路径”只表示当前静态证据未发现路径，建议按附录C抽样复核。")
+    lines.append("")
+
+    if confirmed:
+        lines += _render_api_cards(
+            f"## 二、已确认影响清单（{len(confirmed)} 个变更 API）",
+            confirmed,
+            S6_IMPACT_INLINE_LIMIT,
+            "✅ 暂无已确认触达业务代码的变更 API。",
+        )
+
+    if review:
+        lines += _render_api_cards(
+            f"### 2.1 需要人工复核但已有候选线索（{len(review)} 个变更 API）",
+            review,
+            S6_IMPACT_INLINE_LIMIT,
+            "✅ 暂无需要人工复核的候选线索。",
+            review=True,
+        )
+
+    lines += [
+        "> 本节只回答“影响了什么、影响面多大”；逐链路证据在第 4 节和 `evidence/call_chain/alerts.csv`。",
+        "",
+    ]
+    return lines
+
+
+def render_business_entries_section(findings, section_no="3.3"):
+    overview = findings.get("impact_overview") or {}
+    entries = overview.get("business_entries") or []
+    if not entries:
+        return []
+    lines = [
+        f"### {section_no} 受影响业务入口 Top {min(S6_ENTRY_INLINE_LIMIT, len(entries))}",
+        "",
+        "| 业务入口 | 关联变更 API 数 | 链路命中数 | 示例变更 API | 示例证据文件 |",
+        "|---|---:|---:|---|---|",
+    ]
+    for item in entries[:S6_ENTRY_INLINE_LIMIT]:
+        lines.append(
+            f"| `{_md_cell(item.get('entry'), 180)}` | {item.get('api_count', 0)} | "
+            f"{item.get('path_count', 0)} | {_join_inline(item.get('sample_apis'))} | "
+            f"{_join_inline(item.get('sample_files'), limit=2)} |"
+        )
+    lines += [
+        "",
+        "> 这里只展示入口聚合视图；完整链路仍以 `evidence/call_chain/alerts.csv` 为准。",
+        "",
+    ]
+    return lines
+
+
+def render_report_toc():
+    return [
+        "## 报告目录",
+        "",
+        "本报告主表按变更 API 展示分析结果。",
+        "",
+        "1. [核心结论](#一核心结论)",
+        "2. [结论限制](#二结论限制)",
+        "3. [分析结果总表](#三分析结果总表)",
+        "4. [附录](#四附录)",
+        "",
+        "> 关键证据在主表中展示；完整逐链路台账以 `evidence/call_chain/alerts.csv` 为准。",
+        "",
+    ]
+
+
+def _item_action_reason(item):
+    return (
+        item.get('user_reason')
+        or item.get('reason')
+        or item.get('reason_code')
+        or ''
+    )
+
+
+def _render_result_bucket(title, items, meaning, evidence, limit=S6_INLINE_LIMIT):
+    lines = [f"### {title}（{len(items)} 项）", ""]
+    if not items:
+        lines += ["✅ 暂无", ""]
+        return lines
+    lines += [
+        f"- **分类含义**：{meaning}",
+        f"- **证据入口**：{evidence}",
+        "",
+        "| # | 依赖坐标 | 变更 API | 变化 | 分析依据 |",
+        "|---:|---|---|---|---|",
+    ]
+    for idx, item in enumerate(items[:limit], 1):
+        lines.append(
+            f"| {idx} | `{_md_cell(item.get('coord'))}` | `{_md_cell(item.get('api'), 220)}` | "
+            f"`{_md_cell(item.get('change_type'))}` / `{_md_cell(item.get('symbol_kind'))}`"
+            f"{('<br>`' + _md_cell(item.get('api_signature'), 160) + '`') if item.get('api_signature') else ''} | "
+            f"{_md_cell(_item_action_reason(item), 220)} |"
+        )
+    if len(items) > limit:
+        lines += ["", f"> 其余 {len(items) - limit} 项不在主报告展开，完整集合见对应明细文件或 `evidence/call_chain/alerts.csv`。"]
+    lines.append("")
+    return lines
+
+
+def _status_label_from_item(item):
+    conclusion = str(item.get('user_conclusion') or '').strip()
+    if conclusion:
+        return conclusion
+    bucket = str(item.get('bucket') or '').strip()
+    if bucket == 'confirmed':
+        return '已确认影响'
+    if bucket == 'review':
+        return '需要人工复核'
+    if bucket == 'not_found':
+        return '未发现调用路径'
+    return '待确认'
+
+
+DISPLAY_LABELS = {
+    '当前无法确认': '需人工复核',
+    '需要人工复核': '需人工复核',
+    '需要补充输入': '缺少依赖源码/构建产物，无法回溯调用链',
+    '未覆盖/未分析': '本次未完成分析',
+    '静态未找到': '未发现调用路径',
+}
+
+
+def _display_label(text):
+    value = str(text or '').strip()
+    if not value:
+        return value
+    parts = [part.strip() for part in value.split('；')]
+    mapped = []
+    for part in parts:
+        if not part:
+            continue
+        label = DISPLAY_LABELS.get(part, part)
+        if label not in mapped:
+            mapped.append(label)
+    return '；'.join(mapped)
+
+
+def _coverage_status_label(status):
+    labels = {
+        'complete': '完整',
+        'partial': '部分完整',
+        'insufficient': '不足',
+        'not_applicable': '不适用',
+        'unknown': '未知',
+    }
+    return labels.get(str(status or 'unknown'), str(status or 'unknown'))
+
+
+def _coverage_item_label(component_id):
+    component_id = str(component_id or '').strip()
+    labels = {
+        'project_scope': '分析范围',
+        'dependency_diff': '依赖变更识别',
+        'build_provenance': '构建产物来源',
+        'binary_api_diff': '二进制 API 对比',
+        'artifact_bytecode_dependencies': '制品内依赖字节码',
+        'source_artifact_alignment': '源码与制品一致性',
+        'indirect_usage_matrix': '动态调用可能漏报',
+        'business_reachability': '业务调用链回溯',
+        'business_bytecode_graph': '业务字节码调用图',
+        'static_scan': '静态扫描',
+    }
+    if component_id.startswith('framework_adapter:'):
+        return '框架适配器'
+    return labels.get(component_id, component_id.replace('_', ' ') or '未知检查项')
+
+
+def _coverage_impact_text(component_id, reason_codes):
+    component_id = str(component_id or '').strip()
+    reasons = set(reason_codes or [])
+    reason_texts = {
+        'dependency_pairing_ambiguous': '依赖升级前后坐标匹配存在歧义。',
+        'dependency_coordinates_unresolved': '部分依赖坐标未解析。',
+        'artifact_hash_missing': '构建产物缺少哈希，无法确认输入制品是否稳定。',
+        'base_or_current_build_not_succeeded': '升级前或升级后构建产物不完整。',
+        'step4_coverage_missing': '缺少 API 对比覆盖记录。',
+        'dependency_source_diff_not_available': '缺少依赖源码 diff，行为变化可能不完整。',
+        'compiled_business_classes_not_available': '缺少业务编译产物，字节码调用补充分析不完整。',
+        'step5_not_analyzed_targets': '部分变更 API 没有完成调用链分析。',
+        'step5_target_count_mismatch': 'Step5 目标 API 数和结果数不一致。',
+        'source_alignment_invalid': '源码与实际制品不一致，调用链需要复核。',
+        's5_artifact_bytecode_catalog_missing': '缺少制品内依赖字节码清单。',
+        'indirect_usage_coverage_missing': '反射、配置或间接调用可能漏报。',
+        'reflection_source_partial': '反射调用可能漏报。',
+    }
+    known = [reason_texts[item] for item in sorted(reasons) if item in reason_texts]
+    if known:
+        return ' '.join(known)
+    fallback = {
+        'project_scope': '分析范围不完整，报告可能漏掉部分模块。',
+        'dependency_diff': '依赖变更识别不完整，报告可能漏掉部分依赖变化。',
+        'build_provenance': '构建产物来源不完整，结果可复现性不足。',
+        'binary_api_diff': 'API 对比不完整，报告可能漏掉部分破坏性 API 变化。',
+        'artifact_bytecode_dependencies': '制品内依赖分析不完整，运行时依赖链路可能不完整。',
+        'source_artifact_alignment': '源码与实际制品不一致，调用链需要复核。',
+        'indirect_usage_matrix': '动态调用可能漏报。',
+        'business_reachability': '业务调用链回溯不完整，部分 API 影响无法确认。',
+        'business_bytecode_graph': '业务字节码调用图不完整，补充调用证据可能缺失。',
+        'static_scan': '静态扫描不完整，背景风险线索可能缺失。',
+    }
+    return fallback.get(component_id, '该检查项不完整，相关结论需要复核。')
+
+
+def _coverage_component_lookup(coverage):
+    return {
+        str(item.get('id') or ''): item
+        for item in (coverage.get('components') or [])
+        if item.get('id')
+    }
+
+
+def _coverage_gap_rows(coverage):
+    component_lookup = _coverage_component_lookup(coverage)
+    rows = []
+    for component_id in coverage.get('critical_incomplete') or []:
+        component = component_lookup.get(str(component_id)) or {
+            'id': component_id,
+            'status': coverage.get('overall_status') or 'unknown',
+            'reason_codes': [],
+            'evidence': [],
+        }
+        rows.append({
+            'label': _coverage_item_label(component.get('id')),
+            'status': _coverage_status_label(component.get('status')),
+            'impact': _coverage_impact_text(component.get('id'), component.get('reason_codes') or []),
+            'evidence': component.get('evidence') or [],
+        })
+    return rows
+
+
+def render_core_conclusion(findings):
+    stat = findings.get('scan_stats') or {}
+    coverage = findings.get('coverage') or {}
+    p0 = findings.get('p0') or []
+    p1 = findings.get('p1') or []
+    p2 = findings.get('p2') or []
+    uncertain = findings.get('uncertain') or []
+    probable = findings.get('probable_impact') or []
+    needs_input = findings.get('needs_input') or []
+    not_analyzed = [
+        item for item in findings.get('not_analyzed') or []
         if item.get('user_conclusion') not in {'可能影响', '需要补充输入'}
     ]
-    nf = findings['not_found']
-    conclusion_summary = findings.get('user_conclusion_summary', {})
+    not_found = findings.get('not_found') or []
+    confirmed_count = len(p0) + len(p1) + len(p2)
+    if confirmed_count:
+        verdict = f"发现 {confirmed_count} 个已确认/高风险影响项。"
+    elif probable or uncertain or needs_input or not_analyzed:
+        verdict = "本次报告未确认任何已影响当前系统的变更 API。仍有条目需要复核或补齐依赖源码/构建产物。"
+    elif not_found:
+        verdict = "未发现业务调用路径。"
+    else:
+        verdict = "当前报告范围内未发现影响项。"
+    lines = [
+        "## 一、核心结论",
+        "",
+        f"**一句话结论：{verdict}**",
+        "",
+        "| 项目 | 结果 |",
+        "|---|---|",
+        f"| 调用链分析状态 | `{stat.get('call_chain_status', 'unknown')}` |",
+        f"| 已确认/高风险影响项 | {confirmed_count} |",
+        f"| 可能影响 | {len(probable)} |",
+        f"| 需人工复核 | {len(uncertain)} |",
+        f"| 缺少依赖源码/构建产物，无法回溯调用链 | {len(needs_input)} |",
+        f"| 本次未完成分析 | {len(not_analyzed)} |",
+        f"| 未发现调用路径 | {len(not_found)} |",
+        f"| 分析完整度 | {_coverage_status_label(coverage.get('overall_status'))} |",
+        "",
+    ]
+    return lines
 
-    def summarize_reason_codes(items):
-        counts = defaultdict(int)
+
+def render_result_layers_section(findings):
+    p0 = findings.get('p0') or []
+    p1 = findings.get('p1') or []
+    p2 = findings.get('p2') or []
+    probable = findings.get('probable_impact') or []
+    uncertain = findings.get('uncertain') or []
+    needs_input = findings.get('needs_input') or []
+    not_analyzed = [
+        item for item in findings.get('not_analyzed') or []
+        if item.get('user_conclusion') not in {'可能影响', '需要补充输入'}
+    ]
+    not_found = findings.get('not_found') or []
+    high_risk = p0 + p1 + p2
+    lines = [
+        "## 二、分析结果分层",
+        "",
+        "这一节按结果确定性分层展示，不包含处置建议。",
+        "",
+    ]
+    if not (high_risk or probable or uncertain or needs_input or not_analyzed or not_found):
+        lines += ["✅ 没有可展示的影响、未确认或覆盖缺口条目。", ""]
+        return lines
+    lines += _render_result_bucket(
+        "2.1 已确认/高风险影响项",
+        high_risk,
+        "存在系统代码触达证据，或变更类型被归入编译/运行/行为高风险。",
+        "`evidence/call_chain/alerts.csv` 为完整链路台账；`evidence/api_changes/all_changed_apis.csv` 为变更事实集合。",
+    )
+    lines += _render_result_bucket(
+        "2.2 可能影响",
+        probable,
+        "已有强相关证据，但还没有证明当前系统代码一定会调用到该 API。",
+        "`deliverables/s6_probable_impact_apis.csv/md` 与 `evidence/call_chain/alerts.csv`。",
+    )
+    lines += _render_result_bucket(
+        "2.3 需人工复核",
+        uncertain,
+        "存在候选线索，但证据链存在冲突、歧义或无法完全回溯。",
+        "`deliverables/s6_uncertain_apis.csv/md`、`evidence/call_chain/alerts.csv`。",
+    )
+    lines += _render_result_bucket(
+        "2.4 缺少依赖源码/构建产物，无法回溯调用链",
+        needs_input,
+        "缺少依赖源码、目标模块或构建产物，当前无法完整回溯调用链。",
+        "`s6_needs_input_apis.csv/md`。",
+    )
+    lines += _render_result_bucket(
+        "2.5 本次未完成分析",
+        not_analyzed,
+        "工具已知未完成有效分析，不能解释为不影响。",
+        "`s6_not_analyzed_apis.csv/md`。",
+    )
+    lines += _render_result_bucket(
+        "2.6 未发现调用路径",
+        not_found,
+        "当前源码中未找到调用路径；不等于确定不影响。",
+        "`deliverables/s6_not_found_apis.csv/md`；完整链路台账见 `evidence/call_chain/alerts.csv`。",
+    )
+    return lines
+
+
+def _identity_without_severity(item):
+    return (
+        str(item.get('coord', '') or '').strip(),
+        str(item.get('api', '') or item.get('api_name', '') or '').strip(),
+        str(item.get('api_signature', '') or '').strip(),
+        str(item.get('symbol_kind', '') or '').strip(),
+        str(item.get('change_type', '') or '').strip(),
+    )
+
+
+def _change_cell(item, severity=''):
+    parts = [
+        str(item.get('change_type') or '').strip(),
+        str(item.get('symbol_kind') or '').strip(),
+        str(item.get('api_signature') or '').strip(),
+        str(severity or item.get('severity') or '').strip(),
+    ]
+    return " / ".join(f"`{_md_cell(part, 120)}`" for part in parts if part)
+
+
+def _conclusion_for_report(item, fallback):
+    conclusion = str(item.get('user_conclusion') or '').strip()
+    if conclusion and fallback and fallback != conclusion:
+        return _display_label(f"{fallback}；{conclusion}")
+    if conclusion:
+        return _display_label(conclusion)
+    return _display_label(fallback)
+
+
+def _paths_for_report(item, overview_lookup):
+    paths = []
+    overview = overview_lookup.get(_identity_without_severity(item)) or {}
+    for path in overview.get('paths') or overview.get('sample_paths') or []:
+        text = str(path or '').strip()
+        if text and text not in paths:
+            paths.append(text)
+    for path in item.get('call_paths') or []:
+        text = str(path or '').strip()
+        if text and text not in paths:
+            paths.append(text)
+    if not paths:
+        for evidence_path in item.get('evidence_paths') or []:
+            edge_texts = []
+            for edge in evidence_path or []:
+                caller = str(edge.get('caller_symbol') or '').strip()
+                callee = str(edge.get('callee_key') or '').strip()
+                if caller and callee:
+                    edge_texts.append(f"{caller} → {callee}")
+            if edge_texts:
+                candidate = " → ".join(edge_texts)
+                if candidate not in paths:
+                    paths.append(candidate)
+    return paths[:5]
+
+
+def _human_reason(value):
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    labels = {
+        'NO_STATIC_PATH': '当前源码中未找到调用路径。',
+        'NOT_FOUND_IN_STATIC_ANALYSIS': '当前源码中未找到调用路径。',
+        'NO_CLASS_REFERENCE': '当前源码中未找到目标类引用。',
+        'DEPENDENCY_SOURCE_MAPPING_MISSING': '缺少依赖源码，跨依赖调用链未完整回溯。',
+        'MISSING_DEPENDENCY_SOURCE_MAPPING': '缺少依赖源码，跨依赖调用链未完整回溯。',
+        'RESOURCE_OR_REFLECTION': '涉及资源配置或反射调用，静态分析无法确认实际调用目标。',
+        'UNCERTAIN_DYNAMIC_PROXY_CALL': '存在动态代理调用，静态分析无法确认实际实现。',
+        'BYTECODE_HIT_BUSINESS_ENTRY_NOT_CONFIRMED': '字节码发现候选入口，但还没有证明当前系统代码会调用到该 API。',
+        'BEHAVIOR_CHANGED_RUNTIME_VERIFICATION': '行为变化需要运行时验证。',
+        'BEHAVIOR_CHANGED_PRECISE_TARGET_NOT_CONFIRMED': '行为变化目标未精确确认。',
+        'OVERLOAD_AMBIGUOUS_TARGET': '重载方法目标存在歧义。',
+        'OVERLOAD_AMBIGUOUS_INTERMEDIATE': '中间调用存在重载歧义。',
+        'LOW_CONFIDENCE_EDGE': '调用边置信度较低，需要复核。',
+        'CALL_GRAPH_LIMITATION_SYMBOL_KIND': '当前符号类型的调用图识别不完整。',
+        'ANALYSIS_INCOMPLETE': '分析未完整完成。',
+        'RUNTIME_DEPENDENCY_USES_REMOVED_API': '运行时依赖可能使用已移除 API。',
+        'PACKAGED_DEPENDENCY_BYTECODE_USAGE': '制品内依赖字节码命中该 API。',
+        'BUSINESS_ARTIFACT_BYTECODE_USAGE': '业务制品字节码命中该 API。',
+    }
+    return labels.get(text, text.replace('_', ' ').strip().capitalize() if text.isupper() else text)
+
+
+def _result_evidence_reason(row):
+    paths = row.get('paths') or []
+    if paths:
+        evidence = "<br>".join(f"`{_md_cell(path, 260)}`" for path in paths)
+        return evidence, "-"
+    reason = _human_reason(row.get('reason'))
+    return "-", _md_cell(reason, 260) if reason else "-"
+
+
+def build_api_result_rows(findings):
+    overview_lookup = {
+        _identity_without_severity(item): item
+        for item in ((findings.get('impact_overview') or {}).get('apis') or [])
+    }
+    source_buckets = [
+        ('已确认/高风险影响', 'P0', findings.get('p0') or []),
+        ('已确认/高风险影响', 'P1', findings.get('p1') or []),
+        ('已确认/高风险影响', 'P2', findings.get('p2') or []),
+        ('可能影响', '', findings.get('probable_impact') or []),
+        ('需人工复核', '', findings.get('uncertain') or []),
+        ('缺少依赖源码/构建产物，无法回溯调用链', '', findings.get('needs_input') or []),
+        (
+            '本次未完成分析',
+            '',
+            [
+                item for item in (findings.get('not_analyzed') or [])
+                if item.get('user_conclusion') not in {'可能影响', '需要补充输入'}
+            ],
+        ),
+        ('未发现调用路径', '', findings.get('not_found') or []),
+    ]
+    rows = []
+    seen = set()
+    for fallback_conclusion, severity, items in source_buckets:
         for item in items:
-            counts[item.get('reason_code') or 'UNKNOWN'] += 1
-        return dict(sorted(counts.items(), key=lambda x: (-x[1], x[0])))
+            key = (_identity_without_severity(item), fallback_conclusion, severity)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                'coord': item.get('coord', ''),
+                'api': item.get('api', '') or item.get('api_name', ''),
+                'change': _change_cell(item, severity),
+                'conclusion': _conclusion_for_report(item, fallback_conclusion),
+                'paths': _paths_for_report(item, overview_lookup),
+                'reason': item.get('user_reason') or item.get('reason') or item.get('reason_code') or '',
+            })
+    return rows
+
+
+def render_api_result_table(findings):
+    rows = build_api_result_rows(findings)
+    lines = [
+        "## 三、分析结果总表",
+        "",
+    ]
+    if not rows:
+        lines += ["✅ 当前没有可展示的变更 API 分析结果。", ""]
+        return lines
+    displayed = []
+    skipped_by_conclusion = {}
+    shown_by_conclusion = {}
+    for row in rows:
+        conclusion = str(row.get('conclusion') or '未分类')
+        shown = shown_by_conclusion.get(conclusion, 0)
+        if shown >= S6_INLINE_LIMIT:
+            skipped_by_conclusion[conclusion] = skipped_by_conclusion.get(conclusion, 0) + 1
+            continue
+        shown_by_conclusion[conclusion] = shown + 1
+        displayed.append(row)
+
+    omitted_count = len(rows) - len(displayed)
+    lines += [
+        f"> 本表共有 {len(rows)} 条 API 分析结果，当前展示 {len(displayed)} 条，省略 {omitted_count} 条；"
+        "完整逐链路台账见 `evidence/call_chain/alerts.csv`。",
+        "> 按结论拆分的完整明细见 `deliverables/s6_probable_impact_apis.csv/md`、`deliverables/s6_uncertain_apis.csv/md`、"
+        "`deliverables/s6_needs_input_apis.csv/md`、`deliverables/s6_not_analyzed_apis.csv/md`、`deliverables/s6_not_found_apis.csv/md`。",
+        "> 排序：已确认/高风险、可能影响、需人工复核、缺少依赖源码/构建产物，无法回溯调用链、本次未完成分析、未发现调用路径。",
+        "",
+        "| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |",
+        "|---|---|---|---|---|---|",
+    ]
+
+    for row in displayed:
+        evidence_cell, reason_cell = _result_evidence_reason(row)
+        lines.append(
+            f"| `{_md_cell(row.get('coord'), 180)}` | `{_md_cell(row.get('api'), 220)}` | "
+            f"{row.get('change') or '-'} | {_md_cell(row.get('conclusion'), 160)} | "
+            f"{evidence_cell} | {reason_cell} |"
+        )
+    if skipped_by_conclusion:
+        skipped = "；".join(f"{name} 省略 {count} 条" for name, count in skipped_by_conclusion.items())
+        lines += [
+            "",
+            f"> 主报告按结论类型各展示前 {S6_INLINE_LIMIT} 条，{skipped}。",
+        ]
+    lines.append("")
+    return lines
+
+
+def render_limitations_section(findings):
+    coverage = findings.get('coverage') or {}
+    gap_rows = _coverage_gap_rows(coverage)
+    lines = [
+        "## 二、结论限制", "",
+    ]
+    if gap_rows:
+        lines += [
+            "| 限制项 | 对结论的影响 | 证据文件 |",
+            "|---|---|---|",
+        ]
+        for row in gap_rows:
+            evidence = _join_inline(row.get('evidence'), limit=3) or "-"
+            lines.append(
+                f"| {_md_cell(row.get('label'), 120)} | {_md_cell(row.get('impact'), 260)} | {evidence} |"
+            )
+        lines.append("")
+    else:
+        lines += ["- 未发现影响结论的关键限制。", ""]
+    return lines
+
+
+def render_report_appendix(findings):
+    lines = [
+        "## 四、附录", "",
+    ]
+    lines += [
+        "### 运行产物阅读分层", "",
+        "#### 给用户看的产物", "",
+        "| 文件 | 承载的信息 |",
+        "|---|---|",
+        "| `deliverables/report.md` | 最终报告；优先阅读这一份 |",
+        "| `deliverables/s6_probable_impact_apis.csv/md` | 可能影响清单 |",
+        "| `deliverables/s6_uncertain_apis.csv/md` | 需人工复核清单 |",
+        "| `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物，无法回溯调用链清单 |",
+        "| `deliverables/s6_not_analyzed_apis.csv/md` | 本次未完成分析清单 |",
+        "| `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |",
+        "",
+        "#### 用户深入排查时看的产物", "",
+        "| 文件 | 承载的信息 |",
+        "|---|---|",
+        "| `evidence/dependencies/dep_changes.csv` | 依赖包变更列表 |",
+        "| `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化全集 |",
+        f"| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 {S6_CHANGED_API_SPLIT_ROWS} 条一份） |",
+        "| `evidence/call_chain/alerts.csv` | 完整逐链路台账 |",
+        "| `evidence/call_chain/alerts_<status>.csv` / `alerts_<status>_NNN.csv` | 按链路状态拆分的台账 |",
+        "| `evidence/static_scan/s3_*.csv/.txt` | JDK、Spring Boot、反射等静态扫描命中 |",
+        "",
+        "#### 程序使用的产物", "",
+        "| 文件 | 承载的信息 |",
+        "|---|---|",
+        "| `.runtime/state/main_state.json` | 流程状态；用于恢复、重跑和 checkpoint 判断 |",
+        "| `.runtime/state/interaction.json` | 当前等待用户确认的问题和选项 |",
+        "| `.runtime/coverage/coverage.json` / `.runtime/coverage/s*_coverage.json` | 各步骤覆盖情况；用于判断结论限制 |",
+        "| `.runtime/findings/s6_findings.json` | Step6 结构化结果；供程序读取，不作为人工优先阅读文件 |",
+        "| `.runtime/indexes/s5_query_index.json` | 调用链查询索引；供只读查询命令使用 |",
+        "| `evidence/call_chain/by_api/*.json` | 单 API 原始链路证据；排查时按需读取 |",
+        "",
+    ]
+    return lines
+
+
+def generate_report(findings):
+    ctx  = findings['context']
 
     L = [
         "# Java 升级兼容性分析报告", "",
@@ -752,331 +1761,23 @@ def generate_report(findings):
         f"> JDK：{ctx.get('jdk','')} | Spring Boot：{ctx.get('springboot','')}  ",
         "> **本报告只描述问题，不提供修复方案**",
         "", "---", "",
-        "## 分析完整度", "",
-        f"- 整体状态：{(findings.get('coverage') or {}).get('overall_status', 'unknown')}",
-        f"- 关键未完成维度：{', '.join((findings.get('coverage') or {}).get('critical_incomplete') or []) or '无'}",
-        "- `complete` 才表示计划范围内无已知覆盖缺口；`partial/insufficient` 均不能解释为没有风险。",
-        "",
-        "## 阅读与抽查", "",
-        "**建议先看：**", "",
-        f"- `{Path('s6_report.md')}`（主报告）",
-        f"- `{Path('s4_jar_compare/all_changed_apis.csv')}`（进入反向调用链的变更集）",
-        f"- `{Path('s5_call_chain/alerts.csv')}`（全部 API、全部唯一终止链路及中断原因；重复命中看 path_occurrence_count）",
-        f"- `{Path('s5_call_chain/alerts_<status>.csv')}` / `{Path('s5_call_chain/alerts_<status>_NNN.csv')}`（当 alerts.csv 较大时的分类阅读拆分；完整审计仍以 alerts.csv 为准）",
-        "", 
-        "**建议固定抽查 10 条：**", "",
-        "- 从 alerts.csv 的 confirmed/candidate 各抽 3 条：沿 path_text 与 evidence_files 核对调用关系",
-        "- 从 incomplete/no_static_path 抽 3 条：核对 stop_reason 与覆盖状态是否自洽",
-        "- 从 all_changed_apis.csv 抽 3 条：核对 change_type / source 与原始证据是否一致",
-        "- 从 s3_jdk_removed_api.csv / s3_jdk_javax_refs.csv 各抽 2 条：核对 文件:行号 是否为真实命中",
-        "",
-        "## 产物索引（每个文件是什么）", "",
-        "说明：普通人工复核只需主报告、Step4 变更列表和 Step5 链路台账；其余文件是深度排障或机器证据。", "",
-        "- `s1_dep_changes.csv`：依赖变更范围（后续分析范围依据）",
-        "- `s1_dep_alerts.csv`：需人工确认的依赖变更子集（降级/❓）",
-        "- `s1_dep_summary.txt`：Step1 摘要（输入是否拿对、统计与 Top 风险）",
-        "- `s2_context.json`：升级场景上下文（决定 Step3 扫描项与 Step4/5 策略）",
-        "- `s2_dep_graph.json`：升级依赖关系图（叶→根顺序，用于辅助安排分析顺序）",
-        "- `s3_*.csv/.txt`：静态扫描背景信号（线索，不直接等于影响系统）",
-        "- `s4_jar_compare/`：依赖变化事实与证据池：", 
-        "  - `all_changed_apis.csv`：聚合后的 API 变化清单（事实集合）",
-        "  - `all_changed_apis_alerts.csv`：高风险子集（优先抽查）",
-        "  - `summary.txt`：Step4 总控面板（缺 jar/JApiCmp/gitdiff 情况）",
-        "  - `changed_classes.json`：类级变更索引（辅助定位变更类集合）",
-        "  - `*_binary.txt`：JApiCmp 原始输出证据",
-        "  - `*_gitdiff_api_changes.txt`：依赖源码 git diff 证据",
-        "  - `*_behavior.txt`：changelog 行为变更任务（需人工确认）",
-        "- `s5_call_chain/`：影响证明：",
-        "  - `summary.json`：reachable/uncertain 结论、reason_code 与 call_paths（核心）",
-        "  - `alerts.csv`：完整链路台账；每个 API 至少一行、每条唯一终止链路独立一行，不抽样；重复命中通过 path_occurrence_count 表达",
-        "  - `alerts_<status>.csv` / `alerts_<status>_NNN.csv`：按 path_status 派生的人工阅读拆分文件；非索引、非抽样、非主结论替代品",
-        "  - `summary.txt`：Step5 摘要（Top 模块/Top 触达/Top 不确定）",
-        "  - `by_api/*.json`：内部深度证据（通常无需人工打开）",
-        "  - `by_module/*_impacts.json`：按模块聚合影响摘要",
-        "- `s6_findings.json`：结构化最终结果（机器可消费）",
-        "- `s6_report.md`：最终人类报告（你正在读）",
-        "- `main_state.json`：唯一主状态文件（业务参数、步骤输入输出、待交互状态）",
-        "- `interaction.json`：待交互展示文件（只展示问题、选项与恢复提示）",
-        "", "---", "",
-        "## 一、风险总览", "",
-        "| 级别 | 数量 | 含义 |",
-        "|---|---|---|",
-        f"| P0 静态编译不兼容候选 | {len(p0)} | 依赖变化与静态引用形成强冲突候选；若 current 构建成功则需核对构建溯源，不得写成已确认编译失败 |",
-        f"| P1 运行时崩溃 | {len(p1)} | 编译通过但运行时抛异常 |",
-        f"| P2 行为异常 | {len(p2)} | 功能可能不正确，需测试验证 |",
-        f"| ❓ 待人工验证 | {len(unk)} | 静态分析发现候选路径，但存在歧义，需人工核实 |",
-        f"| ≈ 可能影响 | {len(probable_impact)} | 已找到强相关证据，但仍需测试或运行时验证 |",
-        f"| … 需要补充输入 | {len(needs_input)} | 关键输入缺失，当前结论不完整 |",
-        f"| ⊘ 未覆盖/未分析 | {len(na)} | 工具已知未覆盖该场景，不能按“未影响”解释 |",
-        f"| ✗ 静态未找到 | {len(nf)} | 当前源码图未找到路径，不等于确定未影响 |",
-        "",
     ]
 
-    total_apis = stat.get('changed_apis_total', 0)
-    call_status = stat.get('call_chain_status', 'done')
-    impacted_total = (
-        len(p0) + len(p1) + len(p2) + len(unk)
-        + len(probable_impact) + len(needs_input) + len(na) + len(nf)
-    )
-    if call_status == 'skipped':
-        L += [
-            "**调用链分析状态：**",
-            f"- 状态：skipped（{stat.get('call_chain_skip_reason', '') or 'no_reason'}）",
-            f"- Step4 变更 API 总数：{total_apis}",
-            "- 请先检查 all_changed_apis.csv、Step4 summary.txt 与原始证据文件是否为空或提取失败。",
-            "",
-        ]
-    elif total_apis > 0:
-        L += [
-            "**调用链分析：**",
-            f"- 变更 API 总数：{total_apis}",
-            f"- 已确认影响：{conclusion_summary.get('已确认影响', stat.get('call_chain_reachable', 0))}",
-            f"- 可能影响：{conclusion_summary.get('可能影响', 0)}",
-            f"- 当前无法确认：{conclusion_summary.get('当前无法确认', 0)}",
-            f"- 需要补充输入：{conclusion_summary.get('需要补充输入', 0)}",
-            f"- 静态未找到：{stat.get('call_chain_not_found_in_static_analysis', 0)}",
-            "",
-        ]
-    if impacted_total == 0 and call_status != 'skipped':
-        coverage_status = (findings.get('coverage') or {}).get('overall_status', 'unknown')
-        L += [
-            "**结论：**",
-            f"- 当前未识别到已证明影响本系统的依赖/API 变更；分析完整度为 `{coverage_status}`。",
-            "- 仅当关键覆盖维度 complete 时，才可表述为“在明确范围内未发现已确认影响”；否则只能表述为当前证据未发现。",
-            "- 下文的扫描命中和依赖兼容信号仅作为背景线索，不作为当前系统的重点风险。",
-            "",
-        ]
-    if impacted_total == 0 and call_status == 'skipped' and total_apis > 0:
-        L += [
-            "**结论：**",
-            "- 调用链分析被跳过，无法基于静态分析证明“是否影响本系统”。",
-            "- 请优先检查 Step4 产物是否完整，并重新执行 Step5。",
-            "",
-        ]
-
-    L += [
-        "## 二、当前系统受影响摘要", "",
-        "| 项目 | 数量 | 说明 |",
-        "|---|---|---|",
-        f"| 已确认影响 | {conclusion_summary.get('已确认影响', stat.get('call_chain_reachable', 0))} | 已找到从系统代码到变更 API 的调用链 |",
-        f"| 可能影响 | {conclusion_summary.get('可能影响', 0)} | 已找到强相关证据，但仍需测试或运行时验证 |",
-        f"| 当前无法确认 | {conclusion_summary.get('当前无法确认', 0)} | 当前证据不足，需人工复核或补证据 |",
-        f"| 需要补充输入 | {conclusion_summary.get('需要补充输入', 0)} | 关键输入缺失，当前结论不完整 |",
-        "",
-    ]
-
-    impacted_deps = findings.get('impacted_dependencies', [])
-    if impacted_deps:
-        L += [
-            "## 三、当前系统受影响的依赖", "",
-            "| 依赖坐标 | 变更类型 | 回溯到系统源码 | 最终状态 | 止步层 | P0 | P1 | P2 | ❓ | ≈ | … | ⊘ | ✗ | 受影响 API 数 |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
-        ]
-        for dep in impacted_deps:
-            L.append(
-                f"| {dep['coord']} | {dep.get('change_type', '')} | "
-                f"{'是' if dep.get('reaches_system_source') else '否'} | {dep.get('final_status', '')} | "
-                f"{dep.get('blocked_at', '')} | {dep['p0']} | {dep['p1']} | {dep['p2']} | {dep['uncertain']} | "
-                f"{dep.get('probable_impact', 0)} | {dep.get('needs_input', 0)} | {dep.get('not_analyzed', 0)} | "
-                f"{dep.get('not_found', 0)} | {dep['api_count']} |"
-            )
-        L.append("")
-
-    per_dependency_results = findings.get('per_dependency_results', [])
-    if per_dependency_results:
-        L += [
-            "### 单依赖包最终结论", "",
-            "| 依赖坐标 | 变更类型 | 回溯到系统源码 | 最终状态 | 止步层 | 阻塞原因 | 证据等级 | 代表 API |",
-            "|---|---|---|---|---|---|---|---|",
-        ]
-        for item in per_dependency_results:
-            L.append(
-                f"| {item.get('coord', '')} | {item.get('change_type', '')} | "
-                f"{'是' if item.get('reaches_system_source') else '否'} | {item.get('final_status', '')} | "
-                f"{item.get('blocked_at', '')} | {item.get('blocked_reason', '')} | "
-                f"{item.get('evidence_level', '')} | {item.get('selected_api', '')} |"
-            )
-        L.append("")
-
-    L += [
-        "## 四、扫描统计", "",
-        "| 扫描项 | 命中数 |", "|---|---|",
-    ]
-    for key, label in [
-        ('jdk_removed_api',  'JDK 已移除 API'),
-        ('jdk_javax_refs',   'javax.* 引用'),
-        ('jdk_internal_api', 'JDK 内部 API'),
-        ('jdk_reflection',   '反射操作'),
-        ('sb_config',        'Spring Boot 配置键'),
-        ('dep_compat',       '依赖包兼容信号'),
-    ]:
-        v = stat.get(key, -1)
-        L.append(f"| {label} | {v if v >= 0 else '未扫描'} |")
-    L.append("")
-
-    dep_compat = findings.get('dep_compat_summary', {})
-    if dep_compat and dep_compat.get('impacted_total', 0) > 0:
-        L += [
-            "## 五、与当前系统相关的依赖包兼容信号", "",
-            f"- 已命中且影响到系统调用链的依赖信号：{dep_compat.get('impacted_total', 0)}",
-        ]
-        for risk_type, cnt in dep_compat.get('impacted_by_type', {}).items():
-            L.append(f"- {risk_type}: {cnt}")
-        L.append("")
-        top_coords = dep_compat.get('impacted_coords', [])
-        if top_coords:
-            L += ["**命中最多的依赖（Top 10）**", "", "| 依赖坐标 | 命中数 |", "|---|---|"]
-            for coord, cnt in top_coords:
-                L.append(f"| {coord} | {cnt} |")
-            L.append("")
-
-    dep_sum = findings.get('dep_changes_summary', {})
-    if dep_sum:
-        L += ["## 六、依赖变更概览", "", "| 变更类型 | 数量 |", "|---|---|"]
-        for ct, cnt in sorted(dep_sum.items()):
-            L.append(f"| {ct} | {cnt} |")
-        L.append("")
-
+    L += render_report_toc()
     L += ["---", ""]
-
-    def section(title, items, emoji):
-        if items:
-            L.extend([f"## {title}（{len(items)} 个）", ""])
-            for item in items:
-                L.extend(_fmt_issue(item))
-        else:
-            L.extend([f"## {title}", "", f"✅ 无{emoji}问题", ""])
-        L.extend(["---", ""])
-
-    section("七、P0 编译失败", p0, "P0")
-    section("八、P1 运行时崩溃", p1, "P1")
-    section("九、P2 行为异常", p2, "P2")
-
-    def render_reason_summary(reason_summary):
-        if not reason_summary:
-            return
-        L.extend(["**原因分类**", ""])
-        for reason_code, cnt in reason_summary.items():
-            L.append(f"- `{reason_code}`：{cnt}")
-        L.append("")
-
-    def artifact_links(bucket_name):
-        artifacts = findings.get('artifacts') or {}
-        links = []
-        if artifacts.get(f'{bucket_name}_csv'):
-            links.append(f"`{artifacts.get(f'{bucket_name}_csv')}`")
-        if artifacts.get(f'{bucket_name}_md'):
-            links.append(f"`{artifacts.get(f'{bucket_name}_md')}`")
-        return links
-
-    def render_compact_bucket(title, items, empty_text, bucket_name, reason_summary=None, limit=S6_INLINE_LIMIT):
-        L.extend([f"## {title}（{len(items)} 项）", ""])
-        if not items:
-            L.extend([empty_text, "", "---", ""])
-            return
-        render_reason_summary(reason_summary)
-        links = artifact_links(bucket_name)
-        if links:
-            L.extend([
-                f"完整清单见：{', '.join(links)}。",
-                f"主报告仅展示前 {min(limit, len(items))} 条，避免 Markdown 预览器因大量明细渲染失败。",
-                "",
-            ])
-        else:
-            L.extend([f"主报告仅展示前 {min(limit, len(items))} 条。", ""])
-        L.extend([
-            "| # | 依赖坐标 | API | 签名 | 符号 | 原因码 | 说明/动作 |",
-            "|---:|---|---|---|---|---|---|",
-        ])
-        for idx, item in enumerate(items[:limit], 1):
-            reason = (
-                item.get('user_reason')
-                or item.get('reason')
-                or item.get('recommended_action')
-                or ''
-            ).replace('|', '\\|').replace('\n', ' ')
-            L.append(
-                f"| {idx} | `{item.get('coord','')}` | `{item.get('api','')}` | "
-                f"`{item.get('api_signature','')}` | `{item.get('symbol_kind','')}` | "
-                f"`{item.get('reason_code','')}` | {reason[:180]} |"
-            )
-        if len(items) > limit:
-            L.extend(["", f"> 其余 {len(items) - limit} 条请查看完整清单文件。"])
-        L.extend(["", "---", ""])
-
-    render_compact_bucket(
-        "十、待人工验证",
-        unk,
-        "✅ 无待验证项",
-        "uncertain",
-        findings.get('uncertain_reason_summary', {}),
-    )
-    render_compact_bucket(
-        "十一、可能影响",
-        probable_impact,
-        "✅ 无可能影响项",
-        "probable_impact",
-        summarize_reason_codes(probable_impact),
-    )
-    render_compact_bucket(
-        "十二、需要补充输入",
-        needs_input,
-        "✅ 无待补输入项",
-        "needs_input",
-        summarize_reason_codes(needs_input),
-    )
-    render_compact_bucket(
-        "十三、未覆盖/未分析",
-        na,
-        "✅ 无未覆盖项",
-        "not_analyzed",
-        summarize_reason_codes(na),
-    )
-    render_compact_bucket(
-        "十四、静态未找到路径",
-        nf,
-        "✅ 无静态未找到项",
-        "not_found",
-        findings.get('not_found_reason_summary', {}),
-        S6_NOT_FOUND_INLINE_LIMIT,
-    )
-
-    mod_impacts = findings.get('module_impacts', {})
-    L += ["## 十五、受影响的系统模块", ""]
-    if mod_impacts:
-        L += ["| 模块 | P0 | P1 | P2 | ❓ | ≈ | … | ⊘ | ✗ | 影响点数 |",
-              "|---|---|---|---|---|---|---|---|---|---|"]
-        for mod, data in sorted(mod_impacts.items(),
-                                 key=lambda x: -(x[1]['p0']*100+x[1]['p1']*10+x[1]['p2'])):
-            L.append(f"| {mod} | {data['p0']} | {data['p1']} | {data['p2']} "
-                     f"| {data['uncertain']} | {data.get('probable_impact', 0)} | {data.get('needs_input', 0)} "
-                     f"| {data.get('not_analyzed', 0)} | {data.get('not_found', 0)} | {data['impact_count']} |")
-        L.append("")
-    else:
-        L += ["✅ 当前未识别到受影响模块", ""]
-
-    background = findings.get('background_signals', {})
-    if background:
-        L += ["## 附录A、背景信号（未证明影响当前系统）", ""]
-        dep_compat_total = background.get('dep_compat_total', 0)
-        if dep_compat_total:
-            L += [
-                f"- 依赖包兼容信号命中 {dep_compat_total} 项，但当前未证明影响系统调用链。",
-                "- 这些结果适合作为排查线索，不作为主报告重点风险。",
-                "",
-            ]
-            top_coords = background.get('dep_compat_top_coords', [])
-            if top_coords:
-                L += ["| 依赖坐标 | 背景命中数 |", "|---|---|"]
-                for coord, cnt in top_coords:
-                    L.append(f"| {coord} | {cnt} |")
-                L.append("")
+    L += render_core_conclusion(findings)
+    L += ["---", ""]
+    L += render_limitations_section(findings)
+    L += ["---", ""]
+    L += render_api_result_table(findings)
+    L += ["---", ""]
+    L += render_report_appendix(findings)
 
     return '\n'.join(L)
 
 
 def _fmt_issue(item):
-    lines = [f"### `{item.get('api','')}`", "",
+    lines = [f"#### `{item.get('api','')}`", "",
              f"- **依赖坐标**：`{item.get('coord','?')}`",
              f"- **变更类型**：{item.get('change_type','')}",
              f"- **业务直接命中**：{item.get('direct_callers',0)} 处"]
@@ -1090,8 +1791,6 @@ def _fmt_issue(item):
         lines.append(f"- **结论**：{item.get('user_conclusion')}")
     if item.get('user_reason') or item.get('reason'):
         lines.append(f"- **说明**：{item.get('user_reason') or item.get('reason')}")
-    if item.get('recommended_action'):
-        lines.append(f"- **推荐动作**：{item.get('recommended_action')}")
     if item.get('key_evidence'):
         lines.append(f"- **关键证据**：`{item.get('key_evidence')}`")
     if item.get('business_reach_depth'):

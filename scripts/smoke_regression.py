@@ -754,6 +754,18 @@ def seed_fake_local_m2(workspace):
     create_fake_jar(
         workspace.fake_home / ".m2" / "repository" / "com" / "example" / "deep-lib" / "1.0.0" / "deep-lib-1.0.0.jar"
     )
+    create_fake_jar(
+        workspace.fake_home
+        / ".m2"
+        / "repository"
+        / "com"
+        / "github"
+        / "siom79"
+        / "japicmp"
+        / "japicmp"
+        / "0.21.2"
+        / "japicmp-0.21.2-jar-with-dependencies.jar"
+    )
 
 
 def initialize_support_repositories(workspace):
@@ -1811,7 +1823,11 @@ public interface com.example.service.DemoService extends java.lang.Object {
             assert_true(parser_info.get("actual_parser") == "regex", "tree-sitter 不可用时应自动降级到增强正则")
             assert_true(parser_info.get("fallback_reason") == "tree_sitter_unavailable", "tree-sitter 缺失时应记录明确降级原因")
 
-        with mock.patch.object(source_analyzer_module, "TREE_SITTER_AVAILABLE", False):
+        with mock.patch.object(source_analyzer_module, "TREE_SITTER_AVAILABLE", False), mock.patch.object(
+            source_analyzer_module,
+            "_tree_sitter_auto_install_enabled",
+            return_value=False,
+        ):
             _, forced_regex_info = analyze_file(
                 str(source_dir / "AstMainlineApp.java"),
                 analyzer_root,
@@ -3576,13 +3592,13 @@ BridgeFacade.callAdapter();
     findings = read_json(report_dir / "s6_findings.json")
     report_text = (report_dir / "s6_report.md").read_text(encoding="utf-8")
     assert_true(findings.get("scan_stats", {}).get("dep_compat", 0) > 0, "Step 6 未汇总依赖 jar 扫描结果")
-    assert_true("依赖包兼容信号" in report_text, "Step 6 报告未展示依赖包兼容信号章节")
+    assert_true("分析结果总表" in report_text, "Step 6 报告未展示新主表")
     assert_true(findings.get("p0", [])[0].get("reason_code") == "SYSTEM_CODE_REACHED", "Step 6 未透传 reachable 风险的 reason_code")
     assert_true(findings.get("p0", [])[0].get("evidence_paths"), "Step 6 未透传 reachable 风险的 evidence_paths")
-    assert_true("未覆盖/未分析" in report_text, "Step 6 报告未展示 not_analyzed 章节")
+    assert_true("未覆盖/未分析" in report_text, "Step 6 报告未展示 not_analyzed 结论")
     assert_true(
-        "静态未找到路径" in report_text and "not_reachable" not in report_text,
-        "Step 6 报告未改用静态未找到路径章节承载 not_found_in_static_analysis 语义",
+        "静态未找到" in report_text and "not_reachable" not in report_text,
+        "Step 6 报告未在核心结论/API 总表中保留 not_found_in_static_analysis 语义",
     )
     assert_true(
         "call_chain_not_found_in_static_analysis" in findings.get("scan_stats", {}),
@@ -3662,16 +3678,23 @@ BridgeFacade.callAdapter();
     synthetic_findings = read_json(user_conclusion_findings)
     synthetic_report_text = user_conclusion_report.read_text(encoding="utf-8")
     assert_true(
-        "## 十一、可能影响（1 项）" in synthetic_report_text,
-        "Step 6 报告未单列可能影响章节",
+        "## 三、分析结果总表" in synthetic_report_text,
+        "Step 6 报告未呈现分析结果总表",
     )
     assert_true(
-        "## 十二、需要补充输入（1 项）" in synthetic_report_text,
-        "Step 6 报告未单列需要补充输入章节",
+        "com.example.lib.LegacyApi.behaviorChanged" in synthetic_report_text
+        and "可能影响" in synthetic_report_text,
+        "Step 6 报告未在主表中呈现可能影响 API",
     )
     assert_true(
-        "## 十三、未覆盖/未分析（1 项）" in synthetic_report_text,
-        "Step 6 报告未将剩余 not_analyzed 条目单独保留在未覆盖章节",
+        "com.example.lib.LegacyApi.bridgeMissing" in synthetic_report_text
+        and "需要补充输入" in synthetic_report_text,
+        "Step 6 报告未在主表中呈现需要补充输入 API",
+    )
+    assert_true(
+        "com.example.lib.LegacyApi.reflective" in synthetic_report_text
+        and "当前无法确认" in synthetic_report_text,
+        "Step 6 报告未在主表中呈现当前无法确认 API",
     )
     impacted_dep = (synthetic_findings.get("impacted_dependencies") or [{}])[0]
     assert_true(
@@ -5397,8 +5420,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "run_step 主状态未保留 step5 的输出结果"
     )
     orchestrated_report_text = (orchestrated_report / "s6_report.md").read_text(encoding="utf-8")
-    assert_true("依赖包兼容信号" in orchestrated_report_text, "run_step 链路未生成最终报告")
-    assert_true("单依赖包最终结论" in orchestrated_report_text, "run_step 链路未在 Step6 报告中呈现单依赖包结论")
+    assert_true("# Java 升级兼容性分析报告" in orchestrated_report_text, "run_step 链路未生成最终报告")
+    assert_true("## 三、分析结果总表" in orchestrated_report_text, "run_step 链路未在 Step6 报告中呈现分析结果总表")
 
 
 

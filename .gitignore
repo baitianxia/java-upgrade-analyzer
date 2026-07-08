@@ -13,3 +13,5 @@ __pycache__/
 
 orchestrator_unittest_full.log
 REMOVED_JAR_PLAN.md
+
+dist/*.zip

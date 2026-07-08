@@ -26,6 +26,7 @@ import csv
 import time
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 try:
     from s4_contract import PER_DEPENDENCY_SUMMARY_FILE, get_per_dependency_dir
@@ -229,6 +230,13 @@ def write_per_dependency_summaries(all_results, report_dir):
 
         with open(summary_path, 'w', encoding='utf-8', newline='\n') as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
+
+
+def api_changes_dir_for_step5_output(output_dir):
+    output_path = Path(output_dir).resolve()
+    if output_path.name == 'call_chain' and output_path.parent.name == 'evidence':
+        return output_path.parent / 'api_changes'
+    return output_path.parent
 
 
 def format_single_path_tree(path_str, trace_result, max_depth):
@@ -735,7 +743,7 @@ def aggregate_by_module(all_results, output_dir):
     """
     Aggregate impacts by module (restored from old engine)
 
-    Generates: s5_call_chain/by_module/*_impacts.json
+    Generates: evidence/call_chain/by_module/*_impacts.json
     """
     from collections import defaultdict
     module_data = defaultdict(
@@ -1021,7 +1029,7 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
 
 def write_summary_json(all_results, output_dir, graph_stats=None):
     """
-    生成 s5_call_chain/summary.json（s6_report.py 契约格式）
+    生成 evidence/call_chain/summary.json（s6_report.py 契约格式）
 
     契约字段（当前主语义）：
       status, skip_reason, reachable/not_found_in_static_analysis/uncertain/not_analyzed,
@@ -1100,7 +1108,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     with open(summary_json_path, 'w', encoding='utf-8', newline='\n') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    write_per_dependency_summaries(all_results, os.path.dirname(os.path.abspath(output_dir)))
+    write_per_dependency_summaries(all_results, str(api_changes_dir_for_step5_output(output_dir)))
 
     print(f"  汇总 JSON → {summary_json_path}", file=sys.stderr)
     return summary_json_path

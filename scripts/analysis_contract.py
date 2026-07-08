@@ -341,10 +341,10 @@ def derive_coverage_report(report_dir, project_scope=None):
         "id": "project_scope",
         "status": scope.get("status") or "insufficient",
         "reason_codes": list(scope.get("reason_codes") or ["project_scope_missing"]),
-        "evidence": ["main_state.json#project_scope"],
+        "evidence": [".runtime/state/main_state.json#project_scope"],
     })
 
-    dep_path = report / "s1_dep_changes.csv"
+    dep_path = report / "evidence" / "dependencies" / "dep_changes.csv"
     dep_rows = _csv_rows(dep_path)
     if dep_path.is_file():
         ambiguous = [row for row in dep_rows if row.get("pairing_reason_code")]
@@ -359,11 +359,11 @@ def derive_coverage_report(report_dir, project_scope=None):
         status, reasons = "not_applicable", ["step1_not_executed"]
     components.append({
         "id": "dependency_diff", "status": status, "reason_codes": reasons,
-        "evidence": ["s1_dep_changes.csv"] if dep_path.is_file() else [],
+        "evidence": ["evidence/dependencies/dep_changes.csv"] if dep_path.is_file() else [],
         "metrics": {"rows": len(dep_rows)},
     })
 
-    provenance_path = report / "build_provenance.json"
+    provenance_path = report / "evidence" / "dependencies" / "build_provenance.json"
     if provenance_path.is_file():
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         both_ok = bool(provenance.get("both_builds_succeeded"))
@@ -377,10 +377,11 @@ def derive_coverage_report(report_dir, project_scope=None):
     components.append({
         "id": "build_provenance", "status": provenance_status,
         "reason_codes": provenance_reasons,
-        "evidence": ["build_provenance.json"] if provenance_path.is_file() else [],
+        "evidence": ["evidence/dependencies/build_provenance.json"] if provenance_path.is_file() else [],
     })
 
-    step3_coverage_path = report / 's3_coverage.json'
+    static_scan_dir = report / "evidence" / "static_scan"
+    step3_coverage_path = report / ".runtime" / "coverage" / "s3_coverage.json"
     if step3_coverage_path.is_file():
         try:
             step3_coverage = json.loads(step3_coverage_path.read_text(encoding='utf-8'))
@@ -388,20 +389,21 @@ def derive_coverage_report(report_dir, project_scope=None):
             step3_coverage = {'status': 'insufficient', 'reason_codes': ['step3_coverage_invalid']}
     else:
         step3_coverage = {
-            'status': 'not_applicable' if not any(report.glob('s3_*')) else 'partial',
-            'reason_codes': ['step3_not_executed'] if not any(report.glob('s3_*')) else ['step3_coverage_missing'],
+            'status': 'not_applicable' if not any(static_scan_dir.glob('s3_*')) else 'partial',
+            'reason_codes': ['step3_not_executed'] if not any(static_scan_dir.glob('s3_*')) else ['step3_coverage_missing'],
         }
     components.append({
         'id': 'static_scan',
         'status': step3_coverage.get('status') or 'insufficient',
         'reason_codes': list(step3_coverage.get('reason_codes') or []),
-        'evidence': ['s3_coverage.json'] if step3_coverage_path.is_file() else [],
+        'evidence': ['.runtime/coverage/s3_coverage.json'] if step3_coverage_path.is_file() else [],
         'metrics': step3_coverage.get('metrics') or {},
     })
 
-    api_path = report / "s4_jar_compare" / "all_changed_apis.csv"
+    api_changes_dir = report / "evidence" / "api_changes"
+    api_path = api_changes_dir / "all_changed_apis.csv"
     api_rows = _csv_rows(api_path)
-    step4_coverage_path = report / 's4_jar_compare' / 'coverage.json'
+    step4_coverage_path = report / ".runtime" / "coverage" / "s4_coverage.json"
     step4_coverage = {}
     if step4_coverage_path.is_file():
         try:
@@ -418,11 +420,11 @@ def derive_coverage_report(report_dir, project_scope=None):
         binary_status, binary_reasons = "not_applicable", ["step4_not_executed"]
     components.append({
         "id": "binary_api_diff", "status": binary_status, "reason_codes": binary_reasons,
-        "evidence": ["s4_jar_compare/all_changed_apis.csv"] if api_path.is_file() else [],
+        "evidence": ["evidence/api_changes/all_changed_apis.csv"] if api_path.is_file() else [],
         "metrics": {"changed_apis": len(api_rows), **(binary_component.get('metrics') or {})},
     })
 
-    behavior_files = sorted((report / "s4_jar_compare").glob("*_gitdiff_api_changes.txt"))
+    behavior_files = sorted(api_changes_dir.glob("*_gitdiff_api_changes.txt"))
     behavior_component = dict(step4_coverage.get('behavior_diff') or {})
     if behavior_component:
         behavior_status = behavior_component.get('status') or 'insufficient'
@@ -441,7 +443,8 @@ def derive_coverage_report(report_dir, project_scope=None):
         "metrics": behavior_component.get('metrics') or {},
     })
 
-    step5_summary = report / "s5_call_chain" / "summary.json"
+    call_chain_dir = report / "evidence" / "call_chain"
+    step5_summary = call_chain_dir / "summary.json"
     graph_stats = {}
     if step5_summary.is_file():
         try:
@@ -463,7 +466,7 @@ def derive_coverage_report(report_dir, project_scope=None):
             [] if bytecode.get("status") == "complete"
             else (["compiled_business_classes_not_available"] if step5_summary.is_file() else ["step5_not_executed"])
         ),
-        "evidence": ["s5_call_chain/summary.json"] if step5_summary.is_file() else [],
+        "evidence": ["evidence/call_chain/summary.json"] if step5_summary.is_file() else [],
         "metrics": bytecode,
     })
 
@@ -487,7 +490,7 @@ def derive_coverage_report(report_dir, project_scope=None):
         'id': 'business_reachability',
         'status': reachability_status,
         'reason_codes': reachability_reasons,
-        'evidence': ['s5_call_chain/summary.json'] if step5_summary.is_file() else [],
+        'evidence': ['evidence/call_chain/summary.json'] if step5_summary.is_file() else [],
         'metrics': {
             'target_apis': total,
             'completed_results': completed,
@@ -498,7 +501,7 @@ def derive_coverage_report(report_dir, project_scope=None):
         },
     })
 
-    alignment_path = report / 'source_artifact_alignment.json'
+    alignment_path = call_chain_dir / 'source_artifact_alignment.json'
     if alignment_path.is_file():
         try:
             alignment = json.loads(alignment_path.read_text(encoding='utf-8'))
@@ -513,7 +516,7 @@ def derive_coverage_report(report_dir, project_scope=None):
         'id': 'source_artifact_alignment',
         'status': alignment_status,
         'reason_codes': alignment_reasons,
-        'evidence': ['source_artifact_alignment.json'] if alignment_path.is_file() else [],
+        'evidence': ['evidence/call_chain/source_artifact_alignment.json'] if alignment_path.is_file() else [],
         'metrics': alignment,
     })
 
@@ -529,7 +532,10 @@ def derive_coverage_report(report_dir, project_scope=None):
             else (["s5_artifact_bytecode_catalog_missing"] if step5_summary.is_file() else ["step5_not_executed"])
         )),
         "evidence": [
-            item for item in (STEP5_ARTIFACT_BYTECODE_CATALOG_FILE, "s5_call_chain/summary.json")
+            item for item in (
+                f".runtime/cache/{STEP5_ARTIFACT_BYTECODE_CATALOG_FILE}",
+                "evidence/call_chain/summary.json",
+            )
             if (report / item).is_file()
         ],
         "metrics": artifact_bytecode,
@@ -546,7 +552,7 @@ def derive_coverage_report(report_dir, project_scope=None):
             [] if indirect_status in {"complete", "not_applicable"}
             else (["indirect_usage_coverage_missing"] if step5_summary.is_file() else ["step5_not_executed"])
         )),
-        "evidence": ["s5_call_chain/summary.json"] if step5_summary.is_file() else [],
+        "evidence": ["evidence/call_chain/summary.json"] if step5_summary.is_file() else [],
         "metrics": {
             "analyzers": indirect_usage.get("analyzers") or {},
             "matrix": indirect_usage.get("matrix") or {},
@@ -556,7 +562,7 @@ def derive_coverage_report(report_dir, project_scope=None):
         },
     })
 
-    adapter_path = report / "framework_adapters.json"
+    adapter_path = call_chain_dir / "framework_adapters.json"
     if adapter_path.is_file():
         try:
             adapters = json.loads(adapter_path.read_text(encoding="utf-8")).get("adapters") or []
@@ -567,7 +573,7 @@ def derive_coverage_report(report_dir, project_scope=None):
                 "id": f"framework_adapter:{adapter.get('adapter')}",
                 "status": adapter.get("status") or "insufficient",
                 "reason_codes": ["adapter_execution_errors"] if adapter.get("errors") else [],
-                "evidence": ["framework_adapters.json"],
+                "evidence": ["evidence/call_chain/framework_adapters.json"],
                 "metrics": adapter.get("metrics") or {},
             })
 
@@ -600,7 +606,7 @@ def write_coverage_report(report_dir, project_scope=None):
         'required' if project_scope and project_scope.get('status') in {'complete', 'partial'}
         else 'advisory'
     )
-    path = Path(report_dir) / "coverage.json"
+    path = Path(report_dir) / ".runtime" / "coverage" / "coverage.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return payload

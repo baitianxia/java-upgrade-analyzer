@@ -4,7 +4,17 @@ import argparse, csv, json, os, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pipeline_constants import GATE_SEQUENCE
+from pipeline_constants import (
+    EVIDENCE_API_CHANGES_DIRNAME,
+    EVIDENCE_CALL_CHAIN_DIRNAME,
+    EVIDENCE_CONTEXT_DIRNAME,
+    EVIDENCE_DEPENDENCIES_DIRNAME,
+    EVIDENCE_DIRNAME,
+    EVIDENCE_STATIC_SCAN_DIRNAME,
+    GATE_SEQUENCE,
+    RUNTIME_COVERAGE_DIRNAME,
+    RUNTIME_DIRNAME,
+)
 from analysis_contract import sha256_file
 GATES = list(GATE_SEQUENCE)
 
@@ -20,6 +30,50 @@ def fail(msg, instructions=None):
     sys.exit(1)
 
 def ok(msg): print(f"✅ {msg}", file=sys.stderr)
+
+
+def evidence_dependencies_dir(report_dir):
+    return Path(report_dir) / EVIDENCE_DIRNAME / EVIDENCE_DEPENDENCIES_DIRNAME
+
+
+def evidence_context_dir(report_dir):
+    return Path(report_dir) / EVIDENCE_DIRNAME / EVIDENCE_CONTEXT_DIRNAME
+
+
+def evidence_static_scan_dir(report_dir):
+    return Path(report_dir) / EVIDENCE_DIRNAME / EVIDENCE_STATIC_SCAN_DIRNAME
+
+
+def evidence_api_changes_dir(report_dir):
+    return Path(report_dir) / EVIDENCE_DIRNAME / EVIDENCE_API_CHANGES_DIRNAME
+
+
+def evidence_call_chain_dir(report_dir):
+    return Path(report_dir) / EVIDENCE_DIRNAME / EVIDENCE_CALL_CHAIN_DIRNAME
+
+
+def runtime_coverage_dir(report_dir):
+    return Path(report_dir) / RUNTIME_DIRNAME / RUNTIME_COVERAGE_DIRNAME
+
+
+def dep_changes_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / "dep_changes.csv"
+
+
+def current_resolved_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / "deps_current_resolved.csv"
+
+
+def provenance_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / "build_provenance.json"
+
+
+def context_path(report_dir):
+    return evidence_context_dir(report_dir) / "context.json"
+
+
+def coverage_path(report_dir):
+    return runtime_coverage_dir(report_dir) / "coverage.json"
 
 
 def read_csv_dicts(path, required_headers):
@@ -41,11 +95,11 @@ def has_dep_versions(row):
     return old_ver not in ("", "-") or new_ver not in ("", "-")
 
 def gate_step1_scope(d):
-    csv_path = f"{d}/s1_dep_changes.csv"
-    current_csv_path = f"{d}/s1_deps_current_resolved.csv"
-    provenance_path = f"{d}/build_provenance.json"
-    if not os.path.exists(csv_path):
-        fail("s1_dep_changes.csv 不存在，请先执行 Step 1",
+    csv_path = dep_changes_path(d)
+    current_csv_path = current_resolved_path(d)
+    provenance_file = provenance_path(d)
+    if not csv_path.exists():
+        fail("evidence/dependencies/dep_changes.csv 不存在，请先执行 Step 1",
              [f"{pc} scripts/run_step.py --step step1 --project-dir . --report-dir .upgrade-report --base-branch <base_branch> --current-branch <current_branch>"
               for pc in python_cmds()])
     dep_rows = read_csv_dicts(
@@ -54,9 +108,9 @@ def gate_step1_scope(d):
     )
     valid_dep_rows = [row for row in dep_rows if (row.get("coord") or "").strip() and has_dep_versions(row)]
     if not valid_dep_rows:
-        fail("s1_dep_changes.csv 没有有效依赖数据行，请检查 Step1 的真实构建结果是否完整")
-    if not os.path.exists(current_csv_path):
-        fail("s1_deps_current_resolved.csv 不存在，请重新执行 Step 1",
+        fail("evidence/dependencies/dep_changes.csv 没有有效依赖数据行，请检查 Step1 的真实构建结果是否完整")
+    if not current_csv_path.exists():
+        fail("evidence/dependencies/deps_current_resolved.csv 不存在，请重新执行 Step 1",
              [f"{pc} scripts/run_step.py --step step1 --project-dir . --report-dir .upgrade-report --base-branch <base_branch> --current-branch <current_branch>"
               for pc in python_cmds()])
     current_rows = read_csv_dicts(
@@ -68,16 +122,16 @@ def gate_step1_scope(d):
         if (row.get("coord") or "").strip() and (row.get("version") or "").strip() not in ("", "-")
     ]
     if not valid_current_rows:
-        fail("s1_deps_current_resolved.csv 没有有效当前依赖数据行，请重新执行 Step 1")
-    if not os.path.exists(provenance_path):
-        fail("build_provenance.json 不存在，无法证明 base/current 均来自成功构建或有效产物")
-    with open(provenance_path, encoding="utf-8", errors="replace") as f:
+        fail("evidence/dependencies/deps_current_resolved.csv 没有有效当前依赖数据行，请重新执行 Step 1")
+    if not provenance_file.exists():
+        fail("evidence/dependencies/build_provenance.json 不存在，无法证明 base/current 均来自成功构建或有效产物")
+    with open(provenance_file, encoding="utf-8", errors="replace") as f:
         provenance = json.load(f)
     sides = list(provenance.get("sides") or [])
     if not provenance.get("both_builds_succeeded") or {item.get("side") for item in sides} != {"base", "current"}:
         fail("仅允许分析 base/current 均成功构建的升级结果")
     if any(not item.get("artifact_sha256") for item in sides):
-        fail("build_provenance.json 缺少 base/current 产物哈希，无法校验源码与制品对齐")
+        fail("evidence/dependencies/build_provenance.json 缺少 base/current 产物哈希，无法校验源码与制品对齐")
     for item in sides:
         artifact_path = str(item.get("artifact_path") or "").strip()
         if not artifact_path or not Path(artifact_path).is_file():
@@ -87,12 +141,12 @@ def gate_step1_scope(d):
     ok(f"step1_scope 门控通过：变更清单={len(valid_dep_rows)} 当前依赖={len(valid_current_rows)}")
 
 def gate_context(d):
-    ctx_path = f"{d}/s2_context.json"
-    if not os.path.exists(ctx_path): fail("s2_context.json 不存在")
+    ctx_path = context_path(d)
+    if not ctx_path.exists(): fail("evidence/context/context.json 不存在")
     with open(ctx_path, encoding="utf-8", errors="replace") as f:
         ctx = json.load(f)
     missing = [f for f in ['build_tool', 'base_branch', 'current_branch'] if not ctx.get(f)]
-    if missing: fail(f"s2_context.json 缺少字段：{missing}", ["请手动编辑 s2_context.json 补充缺失字段"])
+    if missing: fail(f"evidence/context/context.json 缺少字段：{missing}", ["请在 Step2 checkpoint 中补充缺失字段后重跑"])
     needs = []
     if not ctx.get('jdk_base') or ctx.get('jdk_base') == 'unknown': needs.append("jdk_base")
     if not ctx.get('jdk_current') or ctx.get('jdk_current') == 'unknown': needs.append("jdk_current")
@@ -102,15 +156,16 @@ def gate_context(d):
             file=sys.stderr,
         )
         print(
-            '  - 请复核 .upgrade-report/s2_context.json 中的 jdk_base/jdk_current，必要时手动补为 "8"、"17"、"21"',
+            '  - 请复核 .upgrade-report/evidence/context/context.json 中的 jdk_base/jdk_current，必要时手动补为 "8"、"17"、"21"',
             file=sys.stderr,
         )
     ok(f"context 门控通过：JDK {ctx.get('jdk_base')}→{ctx.get('jdk_current')}")
 
 def gate_scan(d):
-    ctx_path = f"{d}/s2_context.json"
+    ctx_path = context_path(d)
     ctx = {}
-    if os.path.exists(ctx_path):
+    scan_dir = evidence_static_scan_dir(d)
+    if ctx_path.exists():
         with open(ctx_path, encoding="utf-8", errors="replace") as f:
             ctx = json.load(f)
     issues = []
@@ -123,39 +178,40 @@ def gate_scan(d):
             's3_jdk_serialization.txt',
             's3_jdk_runtime_flags.csv',
         ]:
-            if not os.path.exists(f"{d}/{f}"):
+            if not (scan_dir / f).exists():
                 issues.append(f)
-    if ctx.get('springboot_major_upgrade') and not os.path.exists(f"{d}/s3_jdk_javax_refs.csv"):
+    if ctx.get('springboot_major_upgrade') and not (scan_dir / "s3_jdk_javax_refs.csv").exists():
         issues.append('s3_jdk_javax_refs.csv')
     if ctx.get('springboot_major_upgrade'):
         for f in ['s3_springboot_config.csv', 's3_springboot_autoconfig.txt']:
-            if not os.path.exists(f"{d}/{f}"):
+            if not (scan_dir / f).exists():
                 issues.append(f)
-    if os.path.exists(f"{d}/s1_deps_current_resolved.csv") or os.path.exists(f"{d}/s1_dep_changes.csv"):
-        dep_compat = f"{d}/s3_dependency_compat.csv"
-        if not os.path.exists(dep_compat):
+    if current_resolved_path(d).exists() or dep_changes_path(d).exists():
+        dep_compat = scan_dir / "s3_dependency_compat.csv"
+        if not dep_compat.exists():
             issues.append('s3_dependency_compat.csv')
-        dep_classfile = f"{d}/s3_dependency_classfile.csv"
-        if not os.path.exists(dep_classfile):
+        dep_classfile = scan_dir / "s3_dependency_classfile.csv"
+        if not dep_classfile.exists():
             issues.append('s3_dependency_classfile.csv')
     if issues:
         fail(f"以下扫描文件缺失：{issues}",
-             [f"{pc} scripts/s3_scan.py --all --source-dir . --output-dir .upgrade-report --dep-current .upgrade-report/s1_deps_current_resolved.csv"
+             [f"{pc} scripts/run_step.py --step step3 --project-dir . --report-dir .upgrade-report"
               for pc in python_cmds()])
     ok("scan 门控通过")
 
 def gate_jar_compare(d):
-    csv_path = f"{d}/s4_jar_compare/all_changed_apis.csv"
-    ref_txt_path = f"{d}/s4_jar_compare/git_ref_matches.txt"
-    ref_json_path = f"{d}/s4_jar_compare/git_ref_matches.json"
-    pending_ref_path = f"{d}/s4_jar_compare/git_ref_pending.json"
-    timeouts_path = f"{d}/s4_jar_compare/timeouts.json"
-    if not os.path.exists(csv_path):
-        fail("all_changed_apis.csv 不存在，请先执行 Step 4（jar 对比）")
+    jar_dir = evidence_api_changes_dir(d)
+    csv_path = jar_dir / "all_changed_apis.csv"
+    ref_txt_path = jar_dir / "git_ref_matches.txt"
+    ref_json_path = jar_dir / "git_ref_matches.json"
+    pending_ref_path = jar_dir / "git_ref_pending.json"
+    timeouts_path = jar_dir / "timeouts.json"
+    if not csv_path.exists():
+        fail("evidence/api_changes/all_changed_apis.csv 不存在，请先执行 Step 4（jar 对比）")
     for path in (ref_txt_path, ref_json_path):
-        if not os.path.exists(path):
+        if not path.exists():
             fail(f"{os.path.basename(path)} 不存在，请重新执行 Step 4，确认源码 diff ref 匹配结果已生成")
-    if os.path.exists(pending_ref_path):
+    if pending_ref_path.exists():
         with open(pending_ref_path, encoding="utf-8", errors="replace") as f:
             pending_payload = json.load(f)
         pending_items = list(pending_payload.get("items") or [])
@@ -163,11 +219,11 @@ def gate_jar_compare(d):
             fail(
                 f"以下依赖的 git refs 仍待人工确认：{len(pending_items)} 个",
                 [
-                    "查看 s4_jar_compare/git_ref_pending.json 与 git_ref_matches.*，确认 old_ref/new_ref 后重跑 Step4",
+                    "查看 evidence/api_changes/git_ref_pending.json 与 git_ref_matches.*，确认 old_ref/new_ref 后重跑 Step4",
                     "通过 --response-json 传入 dependency_git_ref_overrides，再继续流程",
                 ],
             )
-    if os.path.exists(timeouts_path):
+    if timeouts_path.exists():
         with open(timeouts_path, encoding="utf-8", errors="replace") as f:
             timeout_payload = json.load(f)
         timeout_items = list(timeout_payload.get("items") or [])
@@ -175,7 +231,7 @@ def gate_jar_compare(d):
             fail(
                 f"Step4 存在超时导致的证据缺失：{len(timeout_items)} 项",
                 [
-                    "查看 s4_jar_compare/timeouts.json，确认是 git diff、JApiCmp 还是 dependency:get 超时",
+                    "查看 evidence/api_changes/timeouts.json，确认是 git diff、JApiCmp 还是 dependency:get 超时",
                     "通过 --response-json 调整 step4_git_diff_timeout / step4_japicmp_timeout / step4_fetch_timeout 后重跑 Step4",
                 ],
             )
@@ -187,12 +243,11 @@ def gate_jar_compare(d):
         print("\n⚠️  Step 4 未识别到变更 API。Step5 将基于空输入生成跳过说明，而不是直接得出“无风险”结论。", file=sys.stderr)
 
     jar_missing = []
-    jar_dir = f"{d}/s4_jar_compare"
-    if os.path.isdir(jar_dir):
+    if jar_dir.is_dir():
         for f in os.listdir(jar_dir):
             if f.endswith('_binary.txt'):
                 try:
-                    content = open(f"{jar_dir}/{f}", encoding="utf-8", errors="replace").read(200)
+                    content = open(jar_dir / f, encoding="utf-8", errors="replace").read(200)
                     if '未找到' in content or 'jar 未找到' in content:
                         jar_missing.append(f)
                 except Exception:
@@ -205,18 +260,18 @@ def gate_jar_compare(d):
     ok(f"jar_compare 门控通过：{rows} 个变更 API")
 
 def gate_call_chain(d, strict_risk_gate=False):
-    summary_path = f"{d}/s5_call_chain/summary.json"
-    if not os.path.exists(summary_path):
-        fail("s5_call_chain/summary.json 不存在，请先执行 Step 5")
+    summary_path = evidence_call_chain_dir(d) / "summary.json"
+    if not summary_path.exists():
+        fail("evidence/call_chain/summary.json 不存在，请先执行 Step 5")
     with open(summary_path, encoding="utf-8", errors="replace") as f:
         summary = json.load(f)
-    coverage_path = Path(d) / 'coverage.json'
+    coverage_file = coverage_path(d)
     coverage = {}
-    if coverage_path.is_file():
+    if coverage_file.is_file():
         try:
-            coverage = json.loads(coverage_path.read_text(encoding='utf-8'))
+            coverage = json.loads(coverage_file.read_text(encoding='utf-8'))
         except json.JSONDecodeError:
-            fail('coverage.json 无效，无法判断分析完整性')
+            fail('.runtime/coverage/coverage.json 无效，无法判断分析完整性')
     critical_incomplete = list(coverage.get('critical_incomplete') or [])
     components = {item.get('id'): item for item in coverage.get('components') or []}
     critical_insufficient = [
@@ -235,7 +290,7 @@ def gate_call_chain(d, strict_risk_gate=False):
     if strict_risk_gate and critical_incomplete:
         fail(
             f"严格模式要求关键覆盖维度全部 complete：{critical_incomplete}",
-            ['根据 coverage.json 补齐 partial/insufficient 维度后重跑'],
+            ['根据 .runtime/coverage/coverage.json 补齐 partial/insufficient 维度后重跑'],
         )
     if summary.get('status') == 'skipped':
         if strict_risk_gate:

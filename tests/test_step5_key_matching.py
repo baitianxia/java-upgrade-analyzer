@@ -27,6 +27,69 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def _call_chain_dir(self, report_dir):
+        return Path(report_dir) / "evidence" / "call_chain"
+
+    def _api_changes_dir(self, report_dir):
+        return Path(report_dir) / "evidence" / "api_changes"
+
+    def _dependencies_dir(self, report_dir):
+        return Path(report_dir) / "evidence" / "dependencies"
+
+    def _runtime_cache_dir(self, report_dir):
+        return Path(report_dir) / ".runtime" / "cache"
+
+    def _write_text(self, path, text, **kwargs):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path.write_text(text, **kwargs)
+
+    def test_step5_emits_tree_sitter_missing_checkpoint_before_regex_degrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            output_dir = self._call_chain_dir(report_dir)
+            source_dir = Path(tmp) / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            (source_dir / "Demo.java").write_text(
+                "package demo; public class Demo { public void run() {} }\n",
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                report_dir=str(report_dir),
+                output_dir=str(output_dir),
+                all_changed_apis="",
+                source_dirs=[str(source_dir)],
+                dependency_source_mappings=[],
+                allow_degraded=False,
+                jdk_scan_dir="",
+                max_depth=5,
+                max_methods=None,
+                debug_analysis=False,
+                debug_break=False,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with patch.object(step5, "ensure_tree_sitter_available", return_value=False), patch.object(
+                step5,
+                "tree_sitter_status",
+                return_value={
+                    "available": False,
+                    "auto_install_attempted": True,
+                    "auto_install_error": "pip_returncode=1",
+                    "install_command": "python -m pip install tree-sitter tree-sitter-java",
+                    "python_executable": "python",
+                },
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = step5.step5_integrated_main(args)
+
+            self.assertEqual(rc, step5.EXIT_AWAITING_USER)
+            payload = json.loads(stdout.getvalue().split(step5.STEP_INTERACTION_PREFIX, 1)[1].strip())
+            self.assertEqual(payload["reason_code"], "step5_tree_sitter_missing_need_resolution")
+            self.assertIn("allow_degraded", payload["response_schema"]["properties"])
+            self.assertIn("tree_sitter_installed", payload["response_schema"]["properties"])
+            self.assertTrue((output_dir / "tree_sitter_preflight.json").exists())
+
     def _compile_java_fixture(self, tmp, relative_path, source):
         if not shutil.which("javac"):
             self.skipTest("javac is required for this bytecode fixture")
@@ -333,6 +396,111 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 [(method.class_fqcn, method.method_name) for method in methods],
                 [("com.example.Demo", "live")],
             )
+
+    def test_analyze_file_auto_installs_tree_sitter_before_regex_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            java_file = Path(tmp) / "Demo.java"
+            java_file.write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "public class Demo {",
+                        "    public void run() {",
+                        "    }",
+                        "}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            sentinel_method = SimpleNamespace(method_name="run")
+
+            class FakeTreeSitterAnalyzer:
+                error_nodes = 0
+                non_empty_source = True
+                has_type_declarations = True
+
+                def __init__(self, file_path, source_root):
+                    self.file_path = file_path
+                    self.source_root = source_root
+
+                def analyze(self):
+                    return [sentinel_method]
+
+            def fake_ensure_tree_sitter_available():
+                source_analyzer.TREE_SITTER_AVAILABLE = True
+                source_analyzer.TREE_SITTER_AUTO_INSTALL_ATTEMPTED = True
+                source_analyzer.TREE_SITTER_AUTO_INSTALL_ERROR = ""
+                return True
+
+            with patch.object(source_analyzer, "TREE_SITTER_AVAILABLE", False), patch.object(
+                source_analyzer,
+                "TREE_SITTER_AUTO_INSTALL_ATTEMPTED",
+                False,
+            ), patch.object(
+                source_analyzer,
+                "TREE_SITTER_AUTO_INSTALL_ERROR",
+                "",
+            ), patch.object(
+                source_analyzer,
+                "_ensure_tree_sitter_available",
+                side_effect=fake_ensure_tree_sitter_available,
+            ) as ensure_mock, patch.object(
+                source_analyzer,
+                "TreeSitterAnalyzer",
+                FakeTreeSitterAnalyzer,
+            ):
+                methods, parser_info = source_analyzer.analyze_file(
+                    str(java_file),
+                    {"root": tmp, "owner_type": "business", "owner_coord": "BUSINESS", "module": "app"},
+                    return_diagnostics=True,
+                )
+
+            ensure_mock.assert_called_once()
+            self.assertEqual(methods, [sentinel_method])
+            self.assertEqual(parser_info["actual_parser"], "tree_sitter")
+            self.assertTrue(parser_info["tree_sitter_available"])
+            self.assertTrue(parser_info["tree_sitter_auto_install_attempted"])
+            self.assertEqual(parser_info["tree_sitter_auto_install_error"], "")
+
+    def test_analyze_file_records_tree_sitter_auto_install_failure_before_degrading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            java_file = Path(tmp) / "Demo.java"
+            java_file.write_text(
+                "package com.example; public class Demo { public void run() {} }\n",
+                encoding="utf-8",
+            )
+
+            def fake_ensure_tree_sitter_available():
+                source_analyzer.TREE_SITTER_AUTO_INSTALL_ATTEMPTED = True
+                source_analyzer.TREE_SITTER_AUTO_INSTALL_ERROR = "pip_returncode=1"
+                return False
+
+            with patch.object(source_analyzer, "TREE_SITTER_AVAILABLE", False), patch.object(
+                source_analyzer,
+                "TREE_SITTER_AUTO_INSTALL_ATTEMPTED",
+                False,
+            ), patch.object(
+                source_analyzer,
+                "TREE_SITTER_AUTO_INSTALL_ERROR",
+                "",
+            ), patch.object(
+                source_analyzer,
+                "_ensure_tree_sitter_available",
+                side_effect=fake_ensure_tree_sitter_available,
+            ) as ensure_mock:
+                methods, parser_info = source_analyzer.analyze_file(
+                    str(java_file),
+                    {"root": tmp, "owner_type": "business", "owner_coord": "BUSINESS", "module": "app"},
+                    return_diagnostics=True,
+                )
+
+            ensure_mock.assert_called_once()
+            self.assertIsInstance(methods, list)
+            self.assertEqual(parser_info["actual_parser"], "regex")
+            self.assertEqual(parser_info["fallback_reason"], "tree_sitter_unavailable")
+            self.assertTrue(parser_info["tree_sitter_auto_install_attempted"])
+            self.assertEqual(parser_info["tree_sitter_auto_install_error"], "pip_returncode=1")
 
     def test_format_call_chain_outputs_every_hop_in_forward_order(self):
         direct = SimpleNamespace(
@@ -814,7 +982,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
             results = tracer.trace_all_apis_with_confidence_weighting(api_rows, graph, {}, max_total_cost=5)
 
         self.assertEqual([result.analysis_status for result in results], ["reachable", "reachable"])
-        self.assertEqual(mocked_builder.call_count, 1)
+        self.assertEqual(mocked_builder.call_count, 2)
 
     def test_trace_api_prefers_polymorphic_reachable_path_over_earlier_exact_name_dead_end(self):
         api_row = {
@@ -4503,7 +4671,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
     def test_strict_gate_blocks_not_found_in_static_analysis(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            output_dir = report_dir / "s5_call_chain"
+            output_dir = self._call_chain_dir(report_dir)
             output_dir.mkdir(parents=True)
             (output_dir / "summary.json").write_text(
                 json.dumps(
@@ -5523,7 +5691,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            output_dir = report_dir / "s5_call_chain"
+            output_dir = self._call_chain_dir(report_dir)
             results = [
                 tracer.TraceResult(
                     coord="a:b",
@@ -5582,7 +5750,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
             ]
 
             formatter.generate_enhanced_summary(results, output_dir)
-            per_dependency_summary = report_dir / PER_DEPENDENCY_DIRNAME / "a_b" / "summary.json"
+            per_dependency_summary = self._api_changes_dir(report_dir) / PER_DEPENDENCY_DIRNAME / "a_b" / "summary.json"
             self.assertTrue(per_dependency_summary.exists())
             summary = json.loads(per_dependency_summary.read_text(encoding="utf-8"))
 
@@ -5671,6 +5839,80 @@ class Step5KeyMatchingTest(unittest.TestCase):
         }
 
         self.assertTrue(tracer.is_system_code_touched(method_def, type_metadata))
+
+    def test_dependency_scheduled_entry_is_reachable_without_business_source_caller(self):
+        scheduled_method = SimpleNamespace(
+            symbol_id="dep_job",
+            qualified_key="com.dep.CleanupJob.cleanup",
+            simple_key="method:cleanup",
+            class_fqcn="com.dep.CleanupJob",
+            class_name="CleanupJob",
+            method_name="cleanup",
+            file="/repo/dep/src/main/java/com/dep/CleanupJob.java",
+            line=7,
+            owner_type="dependency",
+            owner_coord="com.example:dep-job",
+            module="dep-job",
+            is_test=False,
+            annotations=["Scheduled"],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+        )
+        edge_to_removed_api = SimpleNamespace(
+            caller_symbol_id="dep_job",
+            caller_qualified_key="com.dep.CleanupJob.cleanup",
+            callee_key="com.vendor.LegacyApi.removed()",
+            callee_simple_key="method:removed()",
+            evidence_type="ast_method_invocation",
+            confidence="high",
+            file=scheduled_method.file,
+            line=8,
+            owner_type="dependency",
+            owner_coord="com.example:dep-job",
+            module="dep-job",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"dep_job": scheduled_method},
+            reverse_edges={"com.vendor.LegacyApi.removed()": [edge_to_removed_api]},
+            framework_entry_symbols={
+                "dep_job": [
+                    {
+                        "adapter": "spring_basic",
+                        "edge_kind": "spring_runtime_active_entry",
+                        "provenance": {"annotation": "@Scheduled"},
+                    }
+                ]
+            },
+            runtime_dependency_catalog={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(
+            {
+                "coord": "com.vendor:legacy",
+                "api_name": "com.vendor.LegacyApi.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P1",
+                "confirmed": "true",
+                "source": "old_jar",
+                "analysis_scope": "method",
+            },
+            graph,
+            {},
+            max_total_cost=5,
+        )
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertEqual(result.dependency_chain_coords, ["com.example:dep-job"])
+        self.assertEqual(
+            result.call_paths,
+            ["com.dep.CleanupJob.cleanup → com.vendor.LegacyApi.removed()"],
+        )
 
     def test_generate_enhanced_summary_cleans_stale_by_api_and_by_module_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5795,7 +6037,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
     def test_s6_report_matches_by_api_using_signature_and_expands_not_found_items(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            s5_dir = report_dir / "s5_call_chain"
+            s5_dir = report_dir / "evidence" / "call_chain"
             by_api_dir = s5_dir / "by_api"
             by_module_dir = s5_dir / "by_module"
             by_api_dir.mkdir(parents=True)
@@ -5897,12 +6139,96 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
         self.assertEqual(findings["not_found_reason_summary"]["NO_STATIC_PATH"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["not_found"], 1)
-        self.assertIn("| app | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 1 |", report_text)
+        self.assertIn("未发现调用路径", report_text)
+
+    def test_s6_report_starts_with_concrete_impact_overview_from_alerts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            s5_dir = report_dir / "evidence" / "call_chain"
+            s5_dir.mkdir(parents=True)
+            summary = {
+                "status": "done",
+                "reachable": 1,
+                "uncertain": 0,
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": 0,
+                "user_conclusion_summary": {"已确认影响": 1},
+                "reachable_apis": [
+                    {
+                        "coord": "a:b",
+                        "api": "com.vendor.LegacyApi.removed",
+                        "api_name": "com.vendor.LegacyApi.removed",
+                        "api_signature": "(String)",
+                        "symbol_kind": "method",
+                        "change_type": "REMOVED",
+                        "severity": "P1",
+                        "reason_code": "SYSTEM_CODE_REACHED",
+                    }
+                ],
+            }
+            (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+            with (s5_dir / "alerts.csv").open("w", newline="", encoding="utf-8") as f:
+                fieldnames = [
+                    "target_coord", "changed_symbol", "api_signature", "symbol_kind",
+                    "change_type", "api_status", "path_status", "conclusion_level",
+                    "business_reachable", "business_entry", "consumer_coord",
+                    "consumer_class", "consumer_method", "path_text", "stop_reason",
+                    "reason", "action", "path_occurrence_count", "evidence_files",
+                ]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow({
+                    "target_coord": "a:b",
+                    "changed_symbol": "com.vendor.LegacyApi.removed",
+                    "api_signature": "(String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "api_status": "reachable",
+                    "path_status": "reachable",
+                    "conclusion_level": "confirmed",
+                    "business_reachable": "true",
+                    "business_entry": "com.acme.OrderService.submit",
+                    "consumer_coord": "BUSINESS",
+                    "consumer_class": "com.acme.OrderService",
+                    "consumer_method": "submit",
+                    "path_text": "com.acme.OrderService.submit -> com.vendor.LegacyApi.removed(String)",
+                    "stop_reason": "SYSTEM_CODE_REACHED",
+                    "reason": "已找到从系统代码到变更 API 的调用链",
+                    "action": "优先按调用链定位受影响业务",
+                    "path_occurrence_count": "2",
+                    "evidence_files": "/repo/order/src/main/java/com/acme/OrderService.java",
+                })
+
+            findings = s6_report.collect_findings(str(report_dir))
+            report_text = s6_report.generate_report(findings)
+
+        self.assertEqual(len(findings["impact_overview"]["confirmed_apis"]), 1)
+        self.assertIn("## 报告目录", report_text)
+        self.assertIn("## 一、核心结论", report_text)
+        self.assertIn("## 二、结论限制", report_text)
+        self.assertIn("## 三、分析结果总表", report_text)
+        self.assertIn("## 四、附录", report_text)
+        self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |", report_text)
+        self.assertLess(
+            report_text.index("## 一、核心结论"),
+            report_text.index("## 二、结论限制"),
+        )
+        self.assertLess(
+            report_text.index("## 二、结论限制"),
+            report_text.index("## 三、分析结果总表"),
+        )
+        self.assertLess(
+            report_text.index("## 三、分析结果总表"),
+            report_text.index("## 四、附录"),
+        )
+        self.assertIn("com.vendor.LegacyApi.removed", report_text)
+        self.assertIn("com.acme.OrderService.submit", report_text)
+        self.assertIn("com.acme.OrderService.submit -> com.vendor.LegacyApi.removed(String)", report_text)
 
     def test_s6_report_summarizes_large_not_found_list_outside_main_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            s5_dir = report_dir / "s5_call_chain"
+            s5_dir = report_dir / "evidence" / "call_chain"
             s5_dir.mkdir(parents=True)
             not_found_apis = [
                 {
@@ -5929,6 +6255,29 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 "not_found_apis": not_found_apis,
             }
             (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+            s4_dir = report_dir / "evidence" / "api_changes"
+            s4_dir.mkdir(parents=True)
+            changed_api_lines = ["coord,api_name,api_signature,symbol_kind,change_type,severity"]
+            for i in range(s6_report.S6_CHANGED_API_SPLIT_ROWS + 1):
+                changed_api_lines.append(f"a:b,com.example.Api{i}.removed,(),method,REMOVED,P1")
+            (s4_dir / "all_changed_apis.csv").write_text(
+                "\n".join(changed_api_lines) + "\n",
+                encoding="utf-8",
+            )
+            coverage_dir = report_dir / ".runtime" / "coverage"
+            coverage_dir.mkdir(parents=True)
+            (coverage_dir / "coverage.json").write_text(json.dumps({
+                "overall_status": "partial",
+                "critical_incomplete": ["indirect_usage_matrix"],
+                "components": [
+                    {
+                        "id": "indirect_usage_matrix",
+                        "status": "partial",
+                        "reason_codes": ["reflection_source_partial"],
+                        "evidence": ["evidence/call_chain/alerts.csv"],
+                    }
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
 
             findings = s6_report.collect_findings(str(report_dir))
             findings.setdefault("artifacts", {}).update(
@@ -5942,17 +6291,67 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertTrue(not_found_md.exists())
             with not_found_csv.open(encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 100)
-            self.assertIn("完整清单见", report_text)
-            self.assertIn("其余 80 条请查看完整清单文件", report_text)
+            self.assertIn("## 三、分析结果总表", report_text)
+            self.assertIn("本表共有 100 条 API 分析结果，当前展示 20 条，省略 80 条", report_text)
+            self.assertIn("完整逐链路台账见 `evidence/call_chain/alerts.csv`", report_text)
+            self.assertIn("按结论拆分的完整明细见 `deliverables/s6_probable_impact_apis.csv/md`", report_text)
+            self.assertIn("### 运行产物阅读分层", report_text)
+            self.assertIn("#### 给用户看的产物", report_text)
+            self.assertIn("#### 用户深入排查时看的产物", report_text)
+            self.assertIn("#### 程序使用的产物", report_text)
+            self.assertIn("| `deliverables/report.md` | 最终报告；优先阅读这一份 |", report_text)
+            self.assertIn("| `evidence/static_scan/s3_*.csv/.txt` | JDK、Spring Boot、反射等静态扫描命中 |", report_text)
+            self.assertIn("| `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化全集 |", report_text)
+            self.assertIn("| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 500 条一份） |", report_text)
+            self.assertNotIn("all_changed_apis_alerts.csv", report_text)
+            self.assertIn("| `evidence/call_chain/alerts_<status>.csv` / `alerts_<status>_NNN.csv` | 按链路状态拆分的台账 |", report_text)
+            self.assertIn("| `deliverables/s6_probable_impact_apis.csv/md` | 可能影响清单 |", report_text)
+            self.assertIn("| `deliverables/s6_uncertain_apis.csv/md` | 需人工复核清单 |", report_text)
+            self.assertIn("| `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物，无法回溯调用链清单 |", report_text)
+            self.assertIn("| `deliverables/s6_not_analyzed_apis.csv/md` | 本次未完成分析清单 |", report_text)
+            self.assertIn("| `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |", report_text)
+            self.assertNotIn("### 产物索引", report_text)
+            self.assertIn("## 二、结论限制", report_text)
+            self.assertIn("| 分析完整度 | 部分完整 |", report_text)
+            self.assertIn("动态调用可能漏报", report_text)
+            self.assertIn("反射调用可能漏报。", report_text)
+            self.assertIn("排序：已确认/高风险、可能影响、需人工复核、缺少依赖源码/构建产物，无法回溯调用链、本次未完成分析、未发现调用路径。", report_text)
+            self.assertIn("静态分析未找到调用路径", report_text)
+            self.assertNotIn("NO_STATIC_PATH", report_text)
+            self.assertNotIn("当前无法确认清单", report_text)
+            self.assertNotIn("需要补充输入清单", report_text)
+            self.assertNotIn("未覆盖/未分析清单", report_text)
+            self.assertNotIn("静态未找到清单", report_text)
+            self.assertNotIn("- 状态：部分完整", report_text)
+            self.assertNotIn("整体状态：partial", report_text)
+            self.assertNotIn("关键未完成维度", report_text)
+            self.assertNotIn("dependency_source_mapping", report_text)
+            self.assertNotIn("背景证据入口", report_text)
+            self.assertNotIn("背景信号（未证明影响当前系统）", report_text)
+            self.assertNotIn("背景文件数量倒推风险", report_text)
+            self.assertNotIn("### 扫描统计", report_text)
+            self.assertNotIn("### 依赖变更概览", report_text)
+            self.assertNotIn("机器可消费", report_text)
+            self.assertNotIn("scan_stats", report_text)
+            self.assertIn("| `.runtime/findings/s6_findings.json` | Step6 结构化结果；供程序读取，不作为人工优先阅读文件 |", report_text)
+            self.assertIn("主报告按结论类型各展示前 20 条", report_text)
             self.assertIn("com.example.Api0.removed", report_text)
             self.assertNotIn("com.example.Api99.removed", report_text)
             self.assertEqual(report_text.count("### `com.example.Api"), 0)
             self.assertIn("com.example.Api99.removed", not_found_md.read_text(encoding="utf-8"))
+            part_001 = s4_dir / "all_changed_apis_part_001.csv"
+            part_002 = s4_dir / "all_changed_apis_part_002.csv"
+            self.assertTrue(part_001.exists())
+            self.assertTrue(part_002.exists())
+            with part_001.open(encoding="utf-8") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), s6_report.S6_CHANGED_API_SPLIT_ROWS)
+            with part_002.open(encoding="utf-8") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 1)
 
     def test_s6_report_summarizes_large_review_buckets_outside_main_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            s5_dir = report_dir / "s5_call_chain"
+            s5_dir = self._call_chain_dir(report_dir)
             s5_dir.mkdir(parents=True)
 
             uncertain_apis = [
@@ -6024,11 +6423,11 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
             with (report_dir / findings["artifacts"]["not_analyzed_csv"]).open(encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 30)
-            self.assertIn("## 十、待人工验证（30 项）", report_text)
-            self.assertIn("## 十一、可能影响（30 项）", report_text)
-            self.assertIn("## 十二、需要补充输入（30 项）", report_text)
-            self.assertIn("## 十三、未覆盖/未分析（30 项）", report_text)
-            self.assertIn("其余 10 条请查看完整清单文件", report_text)
+            self.assertIn("## 三、分析结果总表", report_text)
+            self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |", report_text)
+            self.assertIn("| 可能影响 | - | Probable reason |", report_text)
+            self.assertIn("| 需人工复核 | - | 字节码命中但未确认回业务入口 |", report_text)
+            self.assertIn("主报告按结论类型各展示前 20 条", report_text)
             self.assertIn("com.example.Uncertain0.changed", report_text)
             self.assertNotIn("com.example.Uncertain29.changed", report_text)
             self.assertEqual(report_text.count("### `com.example.Uncertain"), 0)
@@ -6040,7 +6439,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
     def test_s6_detail_markdown_stays_readable_for_very_large_bucket(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            s5_dir = report_dir / "s5_call_chain"
+            s5_dir = self._call_chain_dir(report_dir)
             s5_dir.mkdir(parents=True)
             not_found_apis = [
                 {
@@ -6080,15 +6479,15 @@ class Step5KeyMatchingTest(unittest.TestCase):
             md_text = not_found_md.read_text(encoding="utf-8")
             self.assertIn("## 原因分类", md_text)
             self.assertIn("## 依赖坐标分布", md_text)
-            self.assertIn("## 优先抽查样例（前 50 条）", md_text)
-            self.assertIn("完整全集请看 `s6_not_found_apis.csv`", md_text)
+            self.assertIn("## 明细样例（前 50 条）", md_text)
+            self.assertIn("完整全集请看 `deliverables/s6_not_found_apis.csv`", md_text)
             self.assertIn("com.example.Huge0.removed", md_text)
             self.assertNotIn("com.example.Huge259.removed", md_text)
 
     def test_s6_report_keeps_probable_impact_and_needs_input_out_of_uncovered_section(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            s5_dir = report_dir / "s5_call_chain"
+            s5_dir = report_dir / "evidence" / "call_chain"
             s5_dir.mkdir(parents=True)
             by_module_dir = s5_dir / "by_module"
             by_module_dir.mkdir(parents=True)
@@ -6191,21 +6590,27 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(findings["module_impacts"]["app"]["probable_impact"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["needs_input"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["not_analyzed"], 1)
-        self.assertIn("## 十一、可能影响（1 项）", report_text)
-        self.assertIn("## 十二、需要补充输入（1 项）", report_text)
-        self.assertIn("## 十三、未覆盖/未分析（1 项）", report_text)
-        self.assertIn("| a:b |  | 否 |  |  | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 0 | 3 |", report_text)
-        self.assertIn("| app | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 0 | 3 |", report_text)
-        self.assertNotIn("## 十一、未覆盖/未分析（3 项）", report_text)
+        self.assertIn("## 三、分析结果总表", report_text)
+        self.assertIn("com.example.Demo.behavior", report_text)
+        self.assertIn("com.example.Demo.bridge", report_text)
+        self.assertIn("com.example.Demo.unknown", report_text)
+        self.assertIn("| 可能影响 | 1 |", report_text)
+        self.assertIn("| 缺少依赖源码/构建产物，无法回溯调用链 | 1 |", report_text)
+        self.assertIn("| 本次未完成分析 | 1 |", report_text)
+        self.assertIn("可能影响", report_text)
+        self.assertIn("缺少依赖源码/构建产物，无法回溯调用链", report_text)
+        self.assertIn("需人工复核", report_text)
+        self.assertNotIn("### 5.4 未覆盖/未分析（3 项）", report_text)
 
     def test_s6_report_reads_per_dependency_summary_and_renders_dependency_conclusion_table(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            s5_dir = report_dir / "s5_call_chain"
-            per_dep_dir = report_dir / PER_DEPENDENCY_DIRNAME / "a_b"
+            s5_dir = self._call_chain_dir(report_dir)
+            per_dep_dir = self._api_changes_dir(report_dir) / PER_DEPENDENCY_DIRNAME / "a_b"
             s5_dir.mkdir(parents=True)
             per_dep_dir.mkdir(parents=True)
-            (report_dir / "s1_dep_changes.csv").write_text(
+            self._write_text(
+                self._dependencies_dir(report_dir) / "dep_changes.csv",
                 "\n".join(
                     [
                         "coord,old_version,new_version,change_type,scope",
@@ -6265,13 +6670,15 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(findings["per_dependency_results"][0]["coord"], "a:b")
         self.assertTrue(findings["per_dependency_results"][0]["reaches_system_source"])
         self.assertEqual(findings["impacted_dependencies"][0]["change_type"], "移除")
-        self.assertIn("### 单依赖包最终结论", report_text)
-        self.assertIn("| a:b | 移除 | 是 | reachable |  |  | strong | com.example.Demo.call |", report_text)
+        self.assertNotIn("单依赖包最终结论", report_text)
+        self.assertIn("## 三、分析结果总表", report_text)
+        self.assertIn("com.example.Demo.call", report_text)
+        self.assertNotIn("| a:b | 移除 | 是 | reachable |  |  | strong | com.example.Demo.call |", report_text)
 
     def test_gate_allows_checkpoint_when_inputs_are_missing_without_strict_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            output_dir = report_dir / "s5_call_chain"
+            output_dir = self._call_chain_dir(report_dir)
             output_dir.mkdir(parents=True)
             (output_dir / "summary.json").write_text(
                 json.dumps(
@@ -6398,8 +6805,8 @@ class Step5KeyMatchingTest(unittest.TestCase):
     def test_infer_step5_report_dir_prefers_all_changed_apis_parent(self):
         args = SimpleNamespace(
             report_dir="",
-            all_changed_apis="/tmp/demo/.upgrade-report/s4_jar_compare/all_changed_apis.csv",
-            output_dir="/tmp/other/s5_call_chain",
+            all_changed_apis="/tmp/demo/.upgrade-report/evidence/api_changes/all_changed_apis.csv",
+            output_dir="/tmp/other/evidence/call_chain",
         )
 
         self.assertEqual(
@@ -6411,7 +6818,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         args = SimpleNamespace(
             report_dir="",
             all_changed_apis="",
-            output_dir="/tmp/demo/.upgrade-report/s5_call_chain_recheck",
+            output_dir="/tmp/demo/.upgrade-report/evidence/call_chain",
         )
 
         self.assertEqual(
@@ -6433,9 +6840,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 [
                     "step5",
                     "--all-changed-apis",
-                    "/tmp/demo/.upgrade-report/s4_jar_compare/all_changed_apis.csv",
+                    "/tmp/demo/.upgrade-report/evidence/api_changes/all_changed_apis.csv",
                     "--output-dir",
-                    "/tmp/demo/.upgrade-report/s5_call_chain",
+                    "/tmp/demo/.upgrade-report/evidence/call_chain",
                     "--source-dirs",
                     "/tmp/demo/src/main/java",
                 ],
@@ -6449,13 +6856,12 @@ class Step5KeyMatchingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            output_dir = report_dir / "s5_call_chain"
+            output_dir = self._call_chain_dir(report_dir)
             source_dir = project_dir / "src" / "main" / "java"
             source_dir.mkdir(parents=True)
             output_dir.mkdir(parents=True)
-            (report_dir / "s4_jar_compare").mkdir(parents=True)
-            all_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis.csv"
-            all_changed_apis.write_text("coord,api_name\ncom.example:demo,com.example.Target.call\n", encoding="utf-8")
+            all_changed_apis = self._api_changes_dir(report_dir) / "all_changed_apis.csv"
+            self._write_text(all_changed_apis, "coord,api_name\ncom.example:demo,com.example.Target.call\n", encoding="utf-8")
 
             args = SimpleNamespace(
                 report_dir=str(report_dir),
@@ -6526,14 +6932,14 @@ class Step5KeyMatchingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            output_dir = report_dir / "s5_call_chain"
+            output_dir = self._call_chain_dir(report_dir)
             source_dir = project_dir / "src" / "main" / "java"
             source_dir.mkdir(parents=True)
             output_dir.mkdir(parents=True)
-            (report_dir / "s4_jar_compare").mkdir(parents=True)
-            all_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis.csv"
-            all_changed_apis.write_text("coord,api_name\ncom.example:demo,com.example.Target.call\n", encoding="utf-8")
-            (report_dir / "s1_deps_current_resolved.csv").write_text(
+            all_changed_apis = self._api_changes_dir(report_dir) / "all_changed_apis.csv"
+            self._write_text(all_changed_apis, "coord,api_name\ncom.example:demo,com.example.Target.call\n", encoding="utf-8")
+            self._write_text(
+                self._dependencies_dir(report_dir) / "deps_current_resolved.csv",
                 "coord,version,scope\nsample:consumer,1.0.0,packaged\n",
                 encoding="utf-8",
             )
@@ -6625,15 +7031,14 @@ class Step5KeyMatchingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            output_dir = report_dir / "s5_call_chain"
+            output_dir = self._call_chain_dir(report_dir)
             source_dir = project_dir / "src" / "main" / "java"
             source_dir.mkdir(parents=True)
             output_dir.mkdir(parents=True)
             dep_source_dir = project_dir / "deps" / "demo-lib" / "src" / "main" / "java"
             dep_source_dir.mkdir(parents=True)
-            (report_dir / "s4_jar_compare").mkdir(parents=True)
-            all_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis.csv"
-            all_changed_apis.write_text("coord,api_name\ncom.example:demo,com.example.Target.call\n", encoding="utf-8")
+            all_changed_apis = self._api_changes_dir(report_dir) / "all_changed_apis.csv"
+            self._write_text(all_changed_apis, "coord,api_name\ncom.example:demo,com.example.Target.call\n", encoding="utf-8")
 
             args = SimpleNamespace(
                 report_dir=str(report_dir),
@@ -7185,6 +7590,114 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertEqual(result.analysis_status, "reachable")
             self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
             self.assertIn("UserController.getAllUsers", result.call_paths[0])
+
+    def test_trace_api_keeps_upstream_business_chain_after_first_system_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example" / "chain"
+            source_dir.mkdir(parents=True)
+
+            (source_dir / "A.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example.chain;",
+                        "",
+                        "public class A {",
+                        "    public String start() {",
+                        "        B b = new B();",
+                        "        return b.callB();",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (source_dir / "B.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example.chain;",
+                        "",
+                        "public class B {",
+                        "    public String callB() {",
+                        "        C c = new C();",
+                        "        return c.callC();",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (source_dir / "C.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example.chain;",
+                        "",
+                        "public class C {",
+                        "    public String callC() {",
+                        "        D d = new D();",
+                        "        return d.changed();",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (source_dir / "D.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example.chain;",
+                        "",
+                        "public class D {",
+                        "    public String changed() {",
+                        '        return "changed";',
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(source_dir.parent.parent.parent),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ]
+            )
+            graph = graph_result["graph"]
+            type_metadata = graph_result["type_metadata"]
+
+            result = tracer.trace_api_with_confidence_weighting(
+                {
+                    "coord": "sample:chain",
+                    "api_name": "com.example.chain.D.changed",
+                    "api_simple": "changed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "severity": "P1",
+                    "confirmed": "true",
+                    "source": "validation",
+                    "analysis_scope": "method",
+                },
+                graph,
+                type_metadata,
+                max_total_cost=5,
+            )
+
+            self.assertEqual(result.analysis_status, "reachable")
+            self.assertTrue(
+                any(
+                    "com.example.chain.A.start" in item.get("path_text", "")
+                    and "com.example.chain.B.callB" in item.get("path_text", "")
+                    and "com.example.chain.C.callC" in item.get("path_text", "")
+                    and "com.example.chain.D.changed" in item.get("path_text", "")
+                    for item in getattr(result, "path_details", [])
+                ),
+                getattr(result, "path_details", []),
+            )
 
     def test_trace_api_reaches_parent_method_via_super_and_skips_bridge_requirement(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -10304,7 +10817,7 @@ public class com.example.consumer.ReflectiveCall {
             ["com.example:dep-b", "com.example:dep-a"],
         )
         self.assertTrue(any(
-            "com.app.App.run -> com.depa.FacadeA.entry(String) -> "
+            "com.app.App.run -> com.example:dep-a:com.depa.FacadeA.entry(String) -> "
             "com.example:dep-b:com.depb.BridgeB.use(String) -> com.vendor.Target.removed(String)"
             in path
             for path in reachable.call_paths
@@ -10387,8 +10900,8 @@ public class com.example.consumer.ReflectiveCall {
             ["com.example:dep-c", "com.example:dep-b", "com.example:dep-a"],
         )
         self.assertTrue(any(
-            "com.app.App.run -> com.depa.FacadeA.entry(String) -> "
-            "com.depb.MiddleB.call(String) -> com.example:dep-c:com.depc.LeafC.use(String) -> "
+            "com.app.App.run -> com.example:dep-a:com.depa.FacadeA.entry(String) -> "
+            "com.example:dep-b:com.depb.MiddleB.call(String) -> com.example:dep-c:com.depc.LeafC.use(String) -> "
             "com.vendor.Target.removed(String)"
             in path
             for path in reachable.call_paths
@@ -10468,7 +10981,7 @@ public class com.example.consumer.ReflectiveCall {
             ["com.example:dep-b", "com.example:dep-a"],
         )
         self.assertTrue(any(
-            "com.app.App.run -> com.consumer.FacadeA.entry(String) -> "
+            "com.app.App.run -> com.example:dep-a:com.consumer.FacadeA.entry(String) -> "
             "com.example:dep-b:com.consumer.BridgeB.use(String) -> "
             "org.apache.commons.lang.StringUtils.isBlank(String)"
             in path
@@ -10718,7 +11231,7 @@ public class com.example.consumer.ReflectiveCall {
             ["com.example:dep-b", "com.example:dep-a"],
         )
         self.assertTrue(any(
-            "com.app.App.run -> com.depa.FacadeA.entry() -> "
+            "com.app.App.run -> com.example:dep-a:com.depa.FacadeA.entry() -> "
             "com.example:dep-b:com.depb.BridgeB.use() -> com.vendor.Target.REMOVED_FIELD"
             in path
             for path in reachable.call_paths

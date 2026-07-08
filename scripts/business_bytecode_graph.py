@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import struct
 import zipfile
 from pathlib import Path
 
@@ -25,6 +26,358 @@ CLASS_CP_RE = re.compile(r'^\s*#\d+\s+=\s+Class\s+.*//\s+([A-Za-z0-9_/$]+)\s*$')
 INVOKEDYNAMIC_RE = re.compile(r'\binvokedynamic\b.*//\s+InvokeDynamic\s+([^:]+):([^\s]+)')
 DESCRIPTOR_CLASS_RE = re.compile(r'L([A-Za-z0-9_/$]+);')
 METHOD_HEADER_RE = re.compile(r'^\s*(?:[\w.$<>\[\],?]+\s+)+([\w$<>]+)\([^;]*\);\s*$')
+REFLECTION_UTF8_MARKERS = {
+    'Class.forName',
+    'forName',
+    'getMethod',
+    'getDeclaredMethod',
+    'getField',
+    'getDeclaredField',
+    'getConstructor',
+    'getDeclaredConstructor',
+    'MethodHandles',
+    'findStatic',
+    'findVirtual',
+    'findSpecial',
+    'findGetter',
+    'findSetter',
+    'unreflect',
+}
+
+
+def _cp_class_name(cp, index):
+    item = cp.get(index) or {}
+    if item.get('tag') != 7:
+        return ''
+    return str((cp.get(item.get('name_index')) or {}).get('value') or '')
+
+
+def _cp_utf8(cp, index):
+    return str((cp.get(index) or {}).get('value') or '')
+
+
+def _cp_name_and_type(cp, index):
+    item = cp.get(index) or {}
+    if item.get('tag') != 12:
+        return '', ''
+    return _cp_utf8(cp, item.get('name_index')), _cp_utf8(cp, item.get('descriptor_index'))
+
+
+def _parse_classfile_constant_pool(data):
+    if not data or len(data) < 10 or data[:4] != b'\xca\xfe\xba\xbe':
+        return None, 0
+    cp_count = struct.unpack_from('>H', data, 8)[0]
+    cp = {}
+    idx = 10
+    cp_index = 1
+    while cp_index < cp_count:
+        if idx >= len(data):
+            return None, 0
+        tag = data[idx]
+        idx += 1
+        if tag == 1:  # Utf8
+            if idx + 2 > len(data):
+                return None, 0
+            length = struct.unpack_from('>H', data, idx)[0]
+            idx += 2
+            if idx + length > len(data):
+                return None, 0
+            cp[cp_index] = {
+                'tag': tag,
+                'value': data[idx:idx + length].decode('utf-8', errors='replace'),
+            }
+            idx += length
+        elif tag == 7:  # Class
+            if idx + 2 > len(data):
+                return None, 0
+            cp[cp_index] = {'tag': tag, 'name_index': struct.unpack_from('>H', data, idx)[0]}
+            idx += 2
+        elif tag in (9, 10, 11):  # Fieldref / Methodref / InterfaceMethodref
+            if idx + 4 > len(data):
+                return None, 0
+            cp[cp_index] = {
+                'tag': tag,
+                'class_index': struct.unpack_from('>H', data, idx)[0],
+                'name_and_type_index': struct.unpack_from('>H', data, idx + 2)[0],
+            }
+            idx += 4
+        elif tag == 12:  # NameAndType
+            if idx + 4 > len(data):
+                return None, 0
+            cp[cp_index] = {
+                'tag': tag,
+                'name_index': struct.unpack_from('>H', data, idx)[0],
+                'descriptor_index': struct.unpack_from('>H', data, idx + 2)[0],
+            }
+            idx += 4
+        elif tag in (3, 4):  # Integer / Float
+            idx += 4
+        elif tag in (5, 6):  # Long / Double
+            idx += 8
+            cp_index += 1
+        elif tag == 8:  # String
+            idx += 2
+        elif tag == 15:  # MethodHandle
+            idx += 3
+        elif tag == 16:  # MethodType
+            idx += 2
+        elif tag in (17, 18):  # Dynamic / InvokeDynamic
+            if idx + 4 > len(data):
+                return None, 0
+            cp[cp_index] = {
+                'tag': tag,
+                'bootstrap_method_attr_index': struct.unpack_from('>H', data, idx)[0],
+                'name_and_type_index': struct.unpack_from('>H', data, idx + 2)[0],
+            }
+            idx += 4
+        elif tag in (19, 20):  # Module / Package
+            idx += 2
+        else:
+            return None, 0
+        if idx > len(data):
+            return None, 0
+        cp_index += 1
+    return cp, idx
+
+
+def _skip_attributes(data, idx, count):
+    for _ in range(count):
+        if idx + 6 > len(data):
+            return 0
+        length = struct.unpack_from('>I', data, idx + 2)[0]
+        idx += 6 + length
+        if idx > len(data):
+            return 0
+    return idx
+
+
+def _skip_member_table(data, idx):
+    if idx + 2 > len(data):
+        return 0
+    count = struct.unpack_from('>H', data, idx)[0]
+    idx += 2
+    for _ in range(count):
+        if idx + 8 > len(data):
+            return 0
+        attr_count = struct.unpack_from('>H', data, idx + 6)[0]
+        idx = _skip_attributes(data, idx + 8, attr_count)
+        if not idx:
+            return 0
+    return idx
+
+
+FIXED_OPCODE_LENGTHS = {
+    **{op: 1 for op in range(0x00, 0x10)},
+    0x10: 2, 0x11: 3, 0x12: 2, 0x13: 3, 0x14: 3,
+    **{op: 2 for op in range(0x15, 0x1a)},
+    **{op: 1 for op in range(0x1a, 0x36)},
+    **{op: 2 for op in range(0x36, 0x3b)},
+    **{op: 1 for op in range(0x3b, 0x84)},
+    0x84: 3,
+    **{op: 1 for op in range(0x85, 0x99)},
+    **{op: 3 for op in range(0x99, 0xa8)},
+    0xa8: 3, 0xa9: 2,
+    **{op: 1 for op in range(0xac, 0xb2)},
+    0xb2: 3, 0xb3: 3, 0xb4: 3, 0xb5: 3,
+    0xb6: 3, 0xb7: 3, 0xb8: 3, 0xb9: 5, 0xba: 5,
+    0xbb: 3, 0xbc: 2, 0xbd: 3, 0xbe: 1, 0xbf: 1, 0xc0: 3, 0xc1: 3,
+    0xc2: 1, 0xc3: 1, 0xc5: 4, 0xc6: 3, 0xc7: 3, 0xc8: 5, 0xc9: 5,
+}
+
+
+def _next_instruction_offset(code, offset):
+    opcode = code[offset]
+    if opcode == 0xaa:  # tableswitch
+        pos = offset + 1
+        while (pos - offset) % 4:
+            pos += 1
+        if pos + 12 > len(code):
+            return len(code)
+        low = struct.unpack_from('>i', code, pos + 4)[0]
+        high = struct.unpack_from('>i', code, pos + 8)[0]
+        return pos + 12 + max(0, high - low + 1) * 4
+    if opcode == 0xab:  # lookupswitch
+        pos = offset + 1
+        while (pos - offset) % 4:
+            pos += 1
+        if pos + 8 > len(code):
+            return len(code)
+        npairs = struct.unpack_from('>i', code, pos + 4)[0]
+        return pos + 8 + max(0, npairs) * 8
+    if opcode == 0xc4:  # wide
+        if offset + 1 >= len(code):
+            return len(code)
+        return offset + (6 if code[offset + 1] == 0x84 else 4)
+    return offset + FIXED_OPCODE_LENGTHS.get(opcode, 1)
+
+
+def _classfile_ref(cp, index):
+    ref = cp.get(index) or {}
+    tag = ref.get('tag')
+    if tag not in (9, 10, 11):
+        return '', '', '', tag
+    owner = _cp_class_name(cp, ref.get('class_index'))
+    name, descriptor = _cp_name_and_type(cp, ref.get('name_and_type_index'))
+    return owner, name, descriptor, tag
+
+
+def parse_classfile_calls(data, class_name):
+    """Parse bytecode directly. Return None when javap fallback is required."""
+    try:
+        cp, idx = _parse_classfile_constant_pool(data)
+        if cp is None:
+            return None
+        utf8_values = {str(item.get('value') or '') for item in cp.values() if item.get('tag') == 1}
+        if REFLECTION_UTF8_MARKERS & utf8_values:
+            return None
+        class_simple = class_name.rsplit('.', 1)[-1]
+        edges = []
+        class_refs = {
+            _cp_class_name(cp, cp_index).replace('/', '.').replace('$', '.')
+            for cp_index, item in cp.items()
+            if item.get('tag') == 7
+        }
+        class_refs.discard(class_name)
+        if idx + 8 > len(data):
+            return None
+        idx += 6  # access_flags, this_class, super_class
+        interfaces_count = struct.unpack_from('>H', data, idx)[0]
+        idx += 2 + interfaces_count * 2
+        idx = _skip_member_table(data, idx)  # fields
+        if not idx or idx + 2 > len(data):
+            return None
+        method_count = struct.unpack_from('>H', data, idx)[0]
+        idx += 2
+        for _ in range(method_count):
+            if idx + 8 > len(data):
+                return None
+            name = _cp_utf8(cp, struct.unpack_from('>H', data, idx + 2)[0])
+            descriptor = _cp_utf8(cp, struct.unpack_from('>H', data, idx + 4)[0])
+            attr_count = struct.unpack_from('>H', data, idx + 6)[0]
+            idx += 8
+            caller_name = class_simple if name == '<init>' else name
+            caller_signature = method_descriptor_signature(descriptor)
+            for _attr in range(attr_count):
+                if idx + 6 > len(data):
+                    return None
+                attr_name = _cp_utf8(cp, struct.unpack_from('>H', data, idx)[0])
+                attr_len = struct.unpack_from('>I', data, idx + 2)[0]
+                attr_start = idx + 6
+                attr_end = attr_start + attr_len
+                if attr_end > len(data):
+                    return None
+                if attr_name == 'Code':
+                    if attr_start + 8 > attr_end:
+                        return None
+                    code_len = struct.unpack_from('>I', data, attr_start + 4)[0]
+                    code_start = attr_start + 8
+                    code_end = code_start + code_len
+                    if code_end > attr_end:
+                        return None
+                    code = data[code_start:code_end]
+                    offset = 0
+                    while offset < len(code):
+                        opcode = code[offset]
+                        if opcode in (0xb2, 0xb3, 0xb4, 0xb5) and offset + 2 < len(code):
+                            cp_idx = struct.unpack_from('>H', code, offset + 1)[0]
+                            owner, member, _desc, _tag = _classfile_ref(cp, cp_idx)
+                            owner = owner.replace('/', '.').replace('$', '.')
+                            if owner and member:
+                                edges.append({
+                                    'caller_owner': class_name,
+                                    'caller_name': caller_name,
+                                    'caller_signature': caller_signature,
+                                    'callee_key': f'{owner}.{member}',
+                                    'callee_simple_key': f'field:{member}',
+                                    'evidence_type': 'bytecode_field_access',
+                                    'line': offset,
+                                    'content': f'classfile opcode 0x{opcode:02x}',
+                                })
+                        elif opcode in (0xb6, 0xb7, 0xb8, 0xb9) and offset + 2 < len(code):
+                            cp_idx = struct.unpack_from('>H', code, offset + 1)[0]
+                            owner, member, desc, _tag = _classfile_ref(cp, cp_idx)
+                            owner = owner.replace('/', '.').replace('$', '.')
+                            if owner and member:
+                                signature = method_descriptor_signature(desc)
+                                display_member = owner.rsplit('.', 1)[-1] if member == '<init>' else member
+                                edges.append({
+                                    'caller_owner': class_name,
+                                    'caller_name': caller_name,
+                                    'caller_signature': caller_signature,
+                                    'callee_key': f'{owner}.{display_member}{signature}',
+                                    'callee_simple_key': f'method:{display_member}{signature}',
+                                    'evidence_type': 'bytecode_constructor_invocation' if member == '<init>' else 'bytecode_method_invocation',
+                                    'line': offset,
+                                    'content': f'classfile opcode 0x{opcode:02x}',
+                                })
+                        elif opcode == 0xba and offset + 2 < len(code):
+                            cp_idx = struct.unpack_from('>H', code, offset + 1)[0]
+                            indy = cp.get(cp_idx) or {}
+                            indy_name, indy_desc = _cp_name_and_type(cp, indy.get('name_and_type_index'))
+                            signature = method_descriptor_signature(indy_desc)
+                            edges.append({
+                                'caller_owner': class_name,
+                                'caller_name': caller_name,
+                                'caller_signature': caller_signature,
+                                'callee_key': f'invokedynamic:{indy_name}{signature}',
+                                'callee_simple_key': f'invokedynamic:{indy_name}',
+                                'evidence_type': 'bytecode_invokedynamic',
+                                'line': offset,
+                                'content': 'classfile invokedynamic',
+                            })
+                        elif opcode in (0xbb, 0xbd, 0xc0, 0xc1) and offset + 2 < len(code):
+                            cp_idx = struct.unpack_from('>H', code, offset + 1)[0]
+                            owner = _cp_class_name(cp, cp_idx).replace('/', '.').replace('$', '.')
+                            if owner:
+                                edges.append({
+                                    'caller_owner': class_name,
+                                    'caller_name': caller_name,
+                                    'caller_signature': caller_signature,
+                                    'callee_key': owner,
+                                    'callee_simple_key': f'class:{owner.rsplit(".", 1)[-1]}',
+                                    'evidence_type': 'bytecode_type_reference',
+                                    'line': offset,
+                                    'content': f'classfile opcode 0x{opcode:02x}',
+                                })
+                        elif opcode == 0xc5 and offset + 2 < len(code):
+                            cp_idx = struct.unpack_from('>H', code, offset + 1)[0]
+                            owner = _cp_class_name(cp, cp_idx).replace('/', '.').replace('$', '.')
+                            if owner:
+                                edges.append({
+                                    'caller_owner': class_name,
+                                    'caller_name': caller_name,
+                                    'caller_signature': caller_signature,
+                                    'callee_key': owner,
+                                    'callee_simple_key': f'class:{owner.rsplit(".", 1)[-1]}',
+                                    'evidence_type': 'bytecode_type_reference',
+                                    'line': offset,
+                                    'content': 'classfile multianewarray',
+                                })
+                        next_offset = _next_instruction_offset(code, offset)
+                        if next_offset <= offset:
+                            return None
+                        offset = next_offset
+                idx = attr_end
+        existing_type_refs = {
+            item['callee_key'] for item in edges
+            if item.get('evidence_type') == 'bytecode_type_reference'
+        }
+        for owner in sorted(item for item in class_refs if item and not item.startswith('[')):
+            if owner in existing_type_refs:
+                continue
+            edges.append({
+                'caller_owner': class_name,
+                'caller_name': class_simple,
+                'caller_signature': '',
+                'callee_key': owner,
+                'callee_simple_key': f'class:{owner.rsplit(".", 1)[-1]}',
+                'evidence_type': 'bytecode_class_reference',
+                'line': 0,
+                'content': 'classfile constant-pool/signature/annotation reference',
+            })
+        return edges
+    except Exception:
+        return None
 
 
 def _descriptor_type(descriptor, index):
@@ -223,6 +576,8 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
     evidence = []
     failures = []
     scanned = 0
+    fast_path_classes = 0
+    javap_fallback_classes = 0
     business_item = ((artifact_catalog or {}).get('by_coord') or {}).get('__business__') or {}
     business_jar = str(business_item.get('jar_path') or '').strip()
     cache_key = str(business_item.get('sha256') or '').strip()
@@ -242,23 +597,30 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                     and not name.startswith('META-INF/')
                     and not name.endswith(('module-info.class', 'package-info.class'))
                 )
-            for entry in class_entries:
-                if scanned >= max_classes:
-                    failures.append('class_scan_limit_reached')
-                    break
-                class_name = entry[:-6].replace('/', '.')
-                stdout, stderr, rc = run_cmd(
-                    ['javap', '-classpath', business_jar, '-c', '-s', '-p', '-v', class_name],
-                    timeout=30,
-                )
-                scanned += 1
-                if rc != 0:
-                    failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
-                    continue
-                for item in parse_javap_calls(stdout, class_name):
-                    item['class_file'] = f'{business_jar}!/{entry}'
-                    item['artifact_sha256'] = business_item.get('sha256', '')
-                    evidence.append(item)
+                for entry in class_entries:
+                    if scanned >= max_classes:
+                        failures.append('class_scan_limit_reached')
+                        break
+                    class_name = entry[:-6].replace('/', '.')
+                    data = zf.read(entry)
+                    scanned += 1
+                    parsed_edges = parse_classfile_calls(data, class_name)
+                    if parsed_edges is None:
+                        javap_fallback_classes += 1
+                        stdout, stderr, rc = run_cmd(
+                            ['javap', '-classpath', business_jar, '-c', '-s', '-p', '-v', class_name],
+                            timeout=30,
+                        )
+                        if rc != 0:
+                            failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
+                            continue
+                        parsed_edges = parse_javap_calls(stdout, class_name)
+                    else:
+                        fast_path_classes += 1
+                    for item in parsed_edges:
+                        item['class_file'] = f'{business_jar}!/{entry}'
+                        item['artifact_sha256'] = business_item.get('sha256', '')
+                        evidence.append(item)
             metrics = {
                 'classes_scanned': scanned,
                 'edges_found': len(evidence),
@@ -266,6 +628,8 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                 'field_edges': sum(item.get('evidence_type') == 'bytecode_field_access' for item in evidence),
                 'type_edges': sum(item.get('evidence_type') in {'bytecode_type_reference', 'bytecode_class_reference'} for item in evidence),
                 'invokedynamic_edges': sum(item.get('evidence_type') == 'bytecode_invokedynamic' for item in evidence),
+                'classfile_fast_path_classes': fast_path_classes,
+                'javap_fallback_classes': javap_fallback_classes,
                 'failures': failures,
                 'evidence_source': 'current_final_artifact',
             }
@@ -292,20 +656,33 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
             if '$' in relative.rsplit('/', 1)[-1]:
                 continue
             class_name = relative[:-6].replace('/', '.')
-            stdout, stderr, rc = run_cmd(
-                ['javap', '-classpath', str(class_root), '-c', '-s', '-p', '-v', class_name],
-                timeout=30,
-            )
-            scanned += 1
-            if rc != 0:
-                failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
+            try:
+                data = class_file.read_bytes()
+            except OSError as exc:
+                failures.append(f'class_read_failed:{class_name}:{exc}')
                 continue
-            for item in parse_javap_calls(stdout, class_name):
+            scanned += 1
+            parsed_edges = parse_classfile_calls(data, class_name)
+            if parsed_edges is None:
+                javap_fallback_classes += 1
+                stdout, stderr, rc = run_cmd(
+                    ['javap', '-classpath', str(class_root), '-c', '-s', '-p', '-v', class_name],
+                    timeout=30,
+                )
+                if rc != 0:
+                    failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
+                    continue
+                parsed_edges = parse_javap_calls(stdout, class_name)
+            else:
+                fast_path_classes += 1
+            for item in parsed_edges:
                 item['class_file'] = str(class_file)
                 evidence.append(item)
     return evidence, {
         'classes_scanned': scanned,
         'edges_found': len(evidence),
+        'classfile_fast_path_classes': fast_path_classes,
+        'javap_fallback_classes': javap_fallback_classes,
         'failures': failures,
         'evidence_source': 'build_directory_fallback' if scanned else 'unavailable',
     }

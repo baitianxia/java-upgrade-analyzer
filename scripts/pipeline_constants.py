@@ -32,6 +32,23 @@ STEP3_RISK_CANDIDATES_FILE = "s3_risk_candidates.csv"
 STEP5_ARTIFACT_BYTECODE_DIRNAME = "s5_artifact_bytecode"
 STEP5_ARTIFACT_BYTECODE_CATALOG_FILE = "s5_artifact_bytecode_catalog.json"
 STEP5_ARTIFACT_BYTECODE_INDEX_FILE = "s5_artifact_bytecode_index.json"
+STEP5_QUERY_INDEX_FILE = "s5_query_index.json"
+
+DELIVERABLES_DIRNAME = "deliverables"
+EVIDENCE_DIRNAME = "evidence"
+RUNTIME_DIRNAME = ".runtime"
+
+EVIDENCE_DEPENDENCIES_DIRNAME = "dependencies"
+EVIDENCE_CONTEXT_DIRNAME = "context"
+EVIDENCE_STATIC_SCAN_DIRNAME = "static_scan"
+EVIDENCE_API_CHANGES_DIRNAME = "api_changes"
+EVIDENCE_CALL_CHAIN_DIRNAME = "call_chain"
+
+RUNTIME_STATE_DIRNAME = "state"
+RUNTIME_COVERAGE_DIRNAME = "coverage"
+RUNTIME_INDEXES_DIRNAME = "indexes"
+RUNTIME_FINDINGS_DIRNAME = "findings"
+RUNTIME_CACHE_DIRNAME = "cache"
 
 BLOCKED_AT_VALUES = (
     "system_source",

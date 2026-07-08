@@ -15,6 +15,35 @@ import run_step  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    def _dep_dir(self, report_dir):
+        return run_step.evidence_dependencies_dir(report_dir)
+
+    def _context_dir(self, report_dir):
+        return run_step.evidence_context_dir(report_dir)
+
+    def _static_scan_dir(self, report_dir):
+        return run_step.evidence_static_scan_dir(report_dir)
+
+    def _api_changes_dir(self, report_dir):
+        return run_step.evidence_api_changes_dir(report_dir)
+
+    def _call_chain_dir(self, report_dir):
+        return run_step.evidence_call_chain_dir(report_dir)
+
+    def _runtime_state_dir(self, report_dir):
+        return run_step.runtime_state_dir(report_dir)
+
+    def _runtime_cache_dir(self, report_dir):
+        return run_step.runtime_cache_dir(report_dir)
+
+    def _deliverables_dir(self, report_dir):
+        return run_step.deliverables_dir(report_dir)
+
+    def _write_text(self, path, text, **kwargs):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path.write_text(text, **kwargs)
+
     def _make_default_args(self, project_dir, report_dir):
         return SimpleNamespace(
             project_dir=str(project_dir),
@@ -337,8 +366,8 @@ class RunStepMainStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            (report_dir / "s4_jar_compare").mkdir(parents=True, exist_ok=True)
-            with (report_dir / "s4_jar_compare" / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
+            self._api_changes_dir(report_dir).mkdir(parents=True, exist_ok=True)
+            with (self._api_changes_dir(report_dir) / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
                 writer = csv.DictWriter(fh, fieldnames=["coord", "class_name", "member"])
                 writer.writeheader()
                 writer.writerow(
@@ -385,8 +414,8 @@ class RunStepMainStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            (report_dir / "s4_jar_compare").mkdir(parents=True, exist_ok=True)
-            with (report_dir / "s4_jar_compare" / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
+            self._api_changes_dir(report_dir).mkdir(parents=True, exist_ok=True)
+            with (self._api_changes_dir(report_dir) / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
                 writer = csv.DictWriter(fh, fieldnames=["coord", "class_name", "member"])
                 writer.writeheader()
                 writer.writerow({"coord": "com.example:demo-lib", "class_name": "a.A", "member": "m()"})
@@ -707,6 +736,90 @@ class RunStepMainStateTest(unittest.TestCase):
             },
         )
 
+    def test_validate_pending_interaction_response_accepts_step5_rerun_with_selected_coords(self):
+        interaction = {
+            "step_id": "step5",
+            "reason_code": "step5_dependency_source_mapping_missing",
+            "response_schema": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "dependency_source_dirs": {"type": "array"},
+                    "allow_degraded": {"type": "boolean"},
+                    "step5_selected_coords": {"type": "array"},
+                },
+            },
+        }
+
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {
+                "action": "rerun_current_step",
+                "step5_selected_coords": ["com.example:demo-lib"],
+            },
+        )
+
+    def test_validate_pending_interaction_response_requires_japicmp_or_degraded_confirmation(self):
+        interaction = {
+            "step_id": "step4",
+            "reason_code": "step4_japicmp_missing_need_resolution",
+            "response_schema": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "japicmp_jar": {"type": "string"},
+                    "allow_degraded": {"type": "boolean"},
+                },
+            },
+        }
+
+        with self.assertRaises(run_step.StepError):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "rerun_current_step"},
+            )
+
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {"action": "rerun_current_step", "japicmp_jar": "/tmp/japicmp.jar"},
+        )
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {"action": "rerun_current_step", "allow_degraded": True},
+        )
+
+    def test_validate_pending_interaction_response_requires_tree_sitter_install_or_degraded_confirmation(self):
+        interaction = {
+            "step_id": "step5",
+            "reason_code": "step5_tree_sitter_missing_need_resolution",
+            "response_schema": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "tree_sitter_installed": {"type": "boolean"},
+                    "allow_degraded": {"type": "boolean"},
+                },
+            },
+        }
+
+        with self.assertRaises(run_step.StepError):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "rerun_current_step"},
+            )
+
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {"action": "rerun_current_step", "tree_sitter_installed": True},
+        )
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {"action": "rerun_current_step", "allow_degraded": True},
+        )
+
     def test_build_resume_command_examples_uses_intent_patch_payload(self):
         examples = run_step.build_resume_command_examples(
             [{"id": "restart_from_step", "label": "从指定步骤重跑"}],
@@ -831,6 +944,57 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(normalized["selected_targets"], ["demo-lib"])
         self.assertEqual(normalized["step5_selected_coords"], [])
         self.assertEqual(normalized["step5_selected_names"], ["demo-lib"])
+
+    def test_step5_checkpoint_allows_selected_targets_from_step4_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            s4_dir = self._api_changes_dir(report_dir)
+            s4_dir.mkdir(parents=True)
+            with (s4_dir / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=run_step.ALL_CHANGED_APIS_FIELDS)
+                writer.writeheader()
+                writer.writerow({
+                    "coord": "com.example:demo-lib",
+                    "api_name": "com.example.Demo.removed",
+                    "api_simple": "removed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                })
+            manifest_steps = {
+                "step5": {
+                    "title": "调用链分析",
+                    "interaction": {
+                        "type": "review",
+                        "question": "请确认 Step5 结果。",
+                        "options": [
+                            {"id": "rerun_current_step", "label": "重跑"},
+                            {"id": "continue", "label": "继续"},
+                        ],
+                    },
+                    "outputs": ["evidence/call_chain/summary.json"],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step5",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={},
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        properties = payload["response_schema"]["properties"]
+        self.assertIn("selected_targets", properties)
+        self.assertIn("step5_selected_coords", properties)
+        self.assertIn("step5_selected_names", properties)
+        self.assertTrue(payload["selection_resolution"]["enabled"])
+        run_step.validate_pending_interaction_response(
+            payload,
+            {"action": "rerun_current_step", "selected_targets": ["coord:com.example:demo-lib"]},
+        )
 
     def test_build_run_context_keeps_dependency_source_mappings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1226,7 +1390,7 @@ class RunStepMainStateTest(unittest.TestCase):
             with patch.object(run_step, "ensure_exists"), patch.object(run_step, "is_git_repo", return_value=True):
                 with self.assertRaisesRegex(
                     run_step.StepError,
-                    "checkpoint 或修正 main_state.json.*两个不同分支",
+                    r"checkpoint 或修正 \.runtime/state/main_state\.json.*两个不同分支",
                 ):
                     run_step.execute_step("step2", args, manifest_steps, run_context)
 
@@ -1235,7 +1399,7 @@ class RunStepMainStateTest(unittest.TestCase):
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
             report_dir.mkdir(parents=True)
-            (report_dir / "s1_dep_changes.csv").write_text("coord\n", encoding="utf-8")
+            self._write_text(run_step.step1_dep_changes_path(report_dir), "coord\n", encoding="utf-8")
             run_context = {
                 "base_branch": "main",
                 "current_branch": "feature/demo",
@@ -1260,8 +1424,8 @@ class RunStepMainStateTest(unittest.TestCase):
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
             report_dir.mkdir(parents=True)
-            (report_dir / "s2_context.json").write_text("{}", encoding="utf-8")
-            (report_dir / "s1_deps_current_resolved.csv").write_text("coord\n", encoding="utf-8")
+            self._write_text(run_step.step2_context_path(report_dir), "{}", encoding="utf-8")
+            self._write_text(run_step.step1_current_resolved_path(report_dir), "coord\n", encoding="utf-8")
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
@@ -1309,12 +1473,12 @@ class RunStepMainStateTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (report_dir / "s1_dep_changes.csv").write_text(
+            self._write_text(run_step.step1_dep_changes_path(report_dir),
                 "coord,change_type,resolution_status,old_version,new_version\n"
                 "com.example:demo-lib,升级,resolved,1.0.0,2.0.0\n",
                 encoding="utf-8",
             )
-            (report_dir / "s2_context.json").write_text(
+            self._write_text(run_step.step2_context_path(report_dir),
                 "{\"changed_dependencies\":[{\"coord\":\"com.example:demo-lib\"}]}",
                 encoding="utf-8",
             )
@@ -1416,7 +1580,7 @@ class RunStepMainStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            s4_dir = report_dir / "s4_jar_compare"
+            s4_dir = self._api_changes_dir(report_dir)
             s4_dir.mkdir(parents=True)
             with open(s4_dir / "all_changed_apis.csv", "w", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=run_step.ALL_CHANGED_APIS_FIELDS)
@@ -1444,7 +1608,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "question": "请确认",
                         "options": [{"id": "continue", "label": "继续", "description": "继续"}],
                     },
-                    "outputs": ["s4_jar_compare/all_changed_apis.csv"],
+                    "outputs": ["evidence/api_changes/all_changed_apis.csv"],
                 }
             }
 
@@ -1527,8 +1691,8 @@ class RunStepMainStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            (report_dir / "s4_jar_compare").mkdir(parents=True)
-            with (report_dir / "s4_jar_compare" / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
+            self._api_changes_dir(report_dir).mkdir(parents=True)
+            with (self._api_changes_dir(report_dir) / "all_changed_apis.csv").open("w", encoding="utf-8", newline="") as fh:
                 writer = csv.DictWriter(fh, fieldnames=["coord", "class_name", "member"])
                 writer.writeheader()
                 for idx in range(21):
@@ -1546,7 +1710,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "question": "请确认",
                         "options": [{"id": "continue", "label": "继续", "description": "继续"}],
                     },
-                    "outputs": ["s4_jar_compare/all_changed_apis.csv"],
+                    "outputs": ["evidence/api_changes/all_changed_apis.csv"],
                 }
             }
 
@@ -1671,7 +1835,7 @@ class RunStepMainStateTest(unittest.TestCase):
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
             report_dir.mkdir(parents=True)
-            (report_dir / "s4_jar_compare").mkdir(parents=True)
+            self._api_changes_dir(report_dir).mkdir(parents=True)
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
@@ -1707,7 +1871,7 @@ class RunStepMainStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            s4_dir = report_dir / "s4_jar_compare"
+            s4_dir = self._api_changes_dir(report_dir)
             s4_dir.mkdir(parents=True)
             with open(s4_dir / "all_changed_apis.csv", "w", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=run_step.ALL_CHANGED_APIS_FIELDS)
@@ -1793,7 +1957,7 @@ class RunStepMainStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
-            s4_dir = report_dir / "s4_jar_compare"
+            s4_dir = self._api_changes_dir(report_dir)
             s4_dir.mkdir(parents=True)
             with open(s4_dir / "all_changed_apis.csv", "w", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=run_step.ALL_CHANGED_APIS_FIELDS)
@@ -1833,7 +1997,7 @@ class RunStepMainStateTest(unittest.TestCase):
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
             report_dir.mkdir(parents=True)
-            (report_dir / "s4_jar_compare").mkdir(parents=True)
+            self._api_changes_dir(report_dir).mkdir(parents=True)
             args = SimpleNamespace(
                 project_dir=str(project_dir),
                 report_dir=str(report_dir),
@@ -1887,7 +2051,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (report_dir / "s1_dep_changes.csv").write_text(
+            self._write_text(run_step.step1_dep_changes_path(report_dir),
                 "coord,change_type,resolution_status,old_version,new_version\n"
                 "com.example:demo-lib,升级,resolved,1.0.0,2.0.0\n",
                 encoding="utf-8",
@@ -1923,7 +2087,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (report_dir / "s1_dep_changes.csv").write_text(
+            self._write_text(run_step.step1_dep_changes_path(report_dir),
                 "coord,change_type,resolution_status,old_version,new_version\n"
                 "com.example:demo-lib,升级,resolved,1.0.0,2.0.0\n",
                 encoding="utf-8",
@@ -1961,7 +2125,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (report_dir / "s1_dep_changes.csv").write_text(
+            self._write_text(run_step.step1_dep_changes_path(report_dir),
                 "coord,change_type,resolution_status,old_version,new_version\n"
                 "com.example:demo-lib,升级,resolved,1.0.0,2.0.0\n",
                 encoding="utf-8",
@@ -2033,12 +2197,12 @@ class RunStepMainStateTest(unittest.TestCase):
             report_dir.mkdir(parents=True)
             source_dir = project_dir / "src" / "main" / "java"
             source_dir.mkdir(parents=True)
-            (report_dir / "s1_dep_changes.csv").write_text(
+            self._write_text(run_step.step1_dep_changes_path(report_dir), 
                 "coord,change_type,resolution_status,old_version,new_version\n"
                 "com.example:demo-lib,升级,resolved,1.0.0,2.0.0\n",
                 encoding="utf-8",
             )
-            (report_dir / "s2_context.json").write_text("{}", encoding="utf-8")
+            self._write_text(run_step.step2_context_path(report_dir), "{}", encoding="utf-8")
             args = self._make_default_args(project_dir, report_dir)
             captured = []
 
@@ -2074,18 +2238,18 @@ class RunStepMainStateTest(unittest.TestCase):
     def test_cleanup_step_outputs_only_removes_current_step_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            step2_context = report_dir / "s2_context.json"
-            step2_graph = report_dir / "s2_dep_graph.json"
-            step2_summary = report_dir / "s2_source_mapping_summary.json"
-            step1_output = report_dir / "s1_dep_changes.csv"
-            main_state = report_dir / "main_state.json"
-            interaction = report_dir / "interaction.json"
-            step2_context.write_text("{}", encoding="utf-8")
-            step2_graph.write_text("{}", encoding="utf-8")
-            step2_summary.write_text("{}", encoding="utf-8")
-            step1_output.write_text("coord", encoding="utf-8")
-            main_state.write_text("{}", encoding="utf-8")
-            interaction.write_text("{}", encoding="utf-8")
+            step2_context = run_step.step2_context_path(report_dir)
+            step2_graph = run_step.step2_dep_graph_path(report_dir)
+            step2_summary = run_step.step2_source_mapping_summary_path(report_dir)
+            step1_output = run_step.step1_dep_changes_path(report_dir)
+            main_state = run_step.main_state_path(report_dir)
+            interaction = self._runtime_state_dir(report_dir) / "interaction.json"
+            self._write_text(step2_context, "{}", encoding="utf-8")
+            self._write_text(step2_graph, "{}", encoding="utf-8")
+            self._write_text(step2_summary, "{}", encoding="utf-8")
+            self._write_text(step1_output, "coord", encoding="utf-8")
+            self._write_text(main_state, "{}", encoding="utf-8")
+            self._write_text(interaction, "{}", encoding="utf-8")
 
             run_step.cleanup_step_outputs("step2", report_dir)
 
@@ -2099,23 +2263,23 @@ class RunStepMainStateTest(unittest.TestCase):
     def test_cleanup_step_outputs_removes_all_step1_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            step1_alerts = report_dir / "s1_dep_alerts.csv"
-            step1_changes = report_dir / "s1_dep_changes.csv"
-            step1_summary = report_dir / "s1_dep_summary.txt"
-            step1_resolved = report_dir / "s1_deps_current_resolved.csv"
-            build_provenance = report_dir / "build_provenance.json"
-            artifacts_dir = report_dir / run_step.STEP1_ARTIFACTS_DIRNAME
-            main_state = report_dir / "main_state.json"
-            interaction = report_dir / "interaction.json"
-            step1_alerts.write_text("coord\n", encoding="utf-8")
-            step1_changes.write_text("coord\n", encoding="utf-8")
-            step1_summary.write_text("summary\n", encoding="utf-8")
-            step1_resolved.write_text("coord\n", encoding="utf-8")
-            build_provenance.write_text("{}", encoding="utf-8")
+            step1_alerts = run_step.step1_dep_alerts_path(report_dir)
+            step1_changes = run_step.step1_dep_changes_path(report_dir)
+            step1_summary = run_step.step1_dep_summary_path(report_dir)
+            step1_resolved = run_step.step1_current_resolved_path(report_dir)
+            build_provenance = run_step.build_provenance_path(report_dir)
+            artifacts_dir = run_step.step1_artifacts_dir(report_dir)
+            main_state = run_step.main_state_path(report_dir)
+            interaction = self._runtime_state_dir(report_dir) / "interaction.json"
+            self._write_text(step1_alerts, "coord\n", encoding="utf-8")
+            self._write_text(step1_changes, "coord\n", encoding="utf-8")
+            self._write_text(step1_summary, "summary\n", encoding="utf-8")
+            self._write_text(step1_resolved, "coord\n", encoding="utf-8")
+            self._write_text(build_provenance, "{}", encoding="utf-8")
             artifacts_dir.mkdir(parents=True)
             (artifacts_dir / "current.jar").write_text("jar\n", encoding="utf-8")
-            main_state.write_text("{}", encoding="utf-8")
-            interaction.write_text("{}", encoding="utf-8")
+            self._write_text(main_state, "{}", encoding="utf-8")
+            self._write_text(interaction, "{}", encoding="utf-8")
 
             run_step.cleanup_step_outputs("step1", report_dir)
 
@@ -2131,22 +2295,24 @@ class RunStepMainStateTest(unittest.TestCase):
     def test_cleanup_step_outputs_removes_all_step5_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            step5_dir = report_dir / "s5_call_chain"
-            artifact_catalog = report_dir / run_step.STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
-            artifact_index = report_dir / run_step.STEP5_ARTIFACT_BYTECODE_INDEX_FILE
-            artifact_bytecode_dir = report_dir / run_step.STEP5_ARTIFACT_BYTECODE_DIRNAME
-            framework_adapters = report_dir / "framework_adapters.json"
-            source_alignment = report_dir / "source_artifact_alignment.json"
-            main_state = report_dir / "main_state.json"
-            interaction = report_dir / "interaction.json"
+            step5_dir = self._call_chain_dir(report_dir)
+            artifact_catalog = self._runtime_cache_dir(report_dir) / run_step.STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+            artifact_index = self._runtime_cache_dir(report_dir) / run_step.STEP5_ARTIFACT_BYTECODE_INDEX_FILE
+            artifact_bytecode_dir = self._runtime_cache_dir(report_dir) / run_step.STEP5_ARTIFACT_BYTECODE_DIRNAME
+            framework_adapters = self._call_chain_dir(report_dir) / "framework_adapters.json"
+            source_alignment = self._call_chain_dir(report_dir) / "source_artifact_alignment.json"
+            main_state = self._runtime_state_dir(report_dir) / "main_state.json"
+            interaction = self._runtime_state_dir(report_dir) / "interaction.json"
             step5_dir.mkdir(parents=True)
             (step5_dir / "summary.json").write_text("{}", encoding="utf-8")
             artifact_bytecode_dir.mkdir(parents=True)
             (artifact_bytecode_dir / "current.jar").write_text("jar\n", encoding="utf-8")
+            artifact_catalog.parent.mkdir(parents=True, exist_ok=True)
             artifact_catalog.write_text("{}", encoding="utf-8")
             artifact_index.write_text("{}", encoding="utf-8")
             framework_adapters.write_text("{}", encoding="utf-8")
             source_alignment.write_text("{}", encoding="utf-8")
+            main_state.parent.mkdir(parents=True, exist_ok=True)
             main_state.write_text("{}", encoding="utf-8")
             interaction.write_text("{}", encoding="utf-8")
 
@@ -2164,9 +2330,10 @@ class RunStepMainStateTest(unittest.TestCase):
     def test_cleanup_step_outputs_step3_removes_bridge_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            risk_candidates = report_dir / run_step.STEP3_RISK_CANDIDATES_FILE
+            risk_candidates = self._static_scan_dir(report_dir) / run_step.STEP3_RISK_CANDIDATES_FILE
+            risk_candidates.parent.mkdir(parents=True, exist_ok=True)
             risk_candidates.write_text("coord\n", encoding="utf-8")
-            per_dep_dir = report_dir / run_step.PER_DEPENDENCY_DIRNAME / "sample_demo"
+            per_dep_dir = self._api_changes_dir(report_dir) / run_step.PER_DEPENDENCY_DIRNAME / "sample_demo"
             per_dep_dir.mkdir(parents=True)
             candidate_hits = per_dep_dir / "candidate_hits.csv"
             candidate_hits.write_text("coord\nsample:demo\n", encoding="utf-8")
@@ -2227,14 +2394,14 @@ class RunStepMainStateTest(unittest.TestCase):
             state["step6"]["output"] = {"report": "stale-step6"}
             run_step.save_main_state(report_dir, state)
 
-            (report_dir / "s1_dep_changes.csv").write_text("coord\n", encoding="utf-8")
-            (report_dir / "s3_jdk_removed_api.csv").write_text("symbol\n", encoding="utf-8")
-            (report_dir / "s4_jar_compare").mkdir()
-            (report_dir / "s4_jar_compare" / "all_changed_apis.csv").write_text("coord\n", encoding="utf-8")
-            (report_dir / "s5_call_chain").mkdir()
-            (report_dir / "s5_call_chain" / "summary.json").write_text("{}", encoding="utf-8")
-            (report_dir / "s6_findings.json").write_text("{}", encoding="utf-8")
-            (report_dir / "s6_report.md").write_text("# stale\n", encoding="utf-8")
+            self._write_text(run_step.step1_dep_changes_path(report_dir), "coord\n", encoding="utf-8")
+            self._write_text(self._static_scan_dir(report_dir) / "s3_jdk_removed_api.csv", "symbol\n", encoding="utf-8")
+            self._api_changes_dir(report_dir).mkdir()
+            (self._api_changes_dir(report_dir) / "all_changed_apis.csv").write_text("coord\n", encoding="utf-8")
+            self._call_chain_dir(report_dir).mkdir()
+            (self._call_chain_dir(report_dir) / "summary.json").write_text("{}", encoding="utf-8")
+            self._write_text(run_step.s6_findings_path(report_dir), "{}", encoding="utf-8")
+            self._write_text(run_step.s6_report_path(report_dir), "# stale\n", encoding="utf-8")
 
             captured = {}
 
@@ -2242,12 +2409,12 @@ class RunStepMainStateTest(unittest.TestCase):
                 captured["step_id"] = step_id
                 captured["run_context"] = dict(run_context)
                 captured["state"] = run_step.load_main_state(report_dir)
-                captured["step1_output_exists"] = (report_dir / "s1_dep_changes.csv").exists()
-                captured["step3_output_exists"] = (report_dir / "s3_jdk_removed_api.csv").exists()
-                captured["step4_output_exists"] = (report_dir / "s4_jar_compare").exists()
-                captured["step5_output_exists"] = (report_dir / "s5_call_chain").exists()
-                captured["step6_findings_exists"] = (report_dir / "s6_findings.json").exists()
-                captured["step6_report_exists"] = (report_dir / "s6_report.md").exists()
+                captured["step1_output_exists"] = (run_step.step1_dep_changes_path(report_dir)).exists()
+                captured["step3_output_exists"] = (self._static_scan_dir(report_dir) / "s3_jdk_removed_api.csv").exists()
+                captured["step4_output_exists"] = self._api_changes_dir(report_dir).exists()
+                captured["step5_output_exists"] = self._call_chain_dir(report_dir).exists()
+                captured["step6_findings_exists"] = run_step.s6_findings_path(report_dir).exists()
+                captured["step6_report_exists"] = run_step.s6_report_path(report_dir).exists()
                 return None
 
             with patch.object(
@@ -2355,13 +2522,16 @@ class RunStepMainStateTest(unittest.TestCase):
                 exit_code = run_step.main()
 
             saved = run_step.load_main_state(report_dir)
-            interaction_exists = (report_dir / "interaction.json").exists()
+            interaction_exists = (self._runtime_state_dir(report_dir) / "interaction.json").exists()
 
             self.assertEqual(exit_code, run_step.EXIT_AWAITING_USER)
             self.assertEqual(saved["state"]["status"], "awaiting_user_input")
             self.assertEqual(saved["state"]["current_step"], "step5")
             self.assertEqual(saved["state"]["completed_step"], "step4")
             self.assertEqual(saved["state"]["pending_interaction"]["reason_code"], "step5_dependency_source_mapping_missing")
+            pending_properties = saved["state"]["pending_interaction"]["response_schema"]["properties"]
+            self.assertIn("step5_selected_coords", pending_properties)
+            self.assertIn("step5_selected_names", pending_properties)
             self.assertTrue(interaction_exists)
 
     def test_main_auto_repairs_missing_step4_prereq_by_restarting_step1(self):
@@ -2388,7 +2558,7 @@ class RunStepMainStateTest(unittest.TestCase):
             }
             state["step3"]["output"] = dict(state["step2"]["output"])
             run_step.save_main_state(report_dir, state)
-            (report_dir / "s2_context.json").write_text("{}", encoding="utf-8")
+            self._write_text(run_step.step2_context_path(report_dir), "{}", encoding="utf-8")
             captured = {}
 
             def fake_execute_step(step_id, _args, _manifest_steps, run_context, **_kwargs):
@@ -2428,6 +2598,7 @@ class RunStepMainStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp) / "project"
             project_dir.mkdir(parents=True)
+            (project_dir / "src" / "main" / "java").mkdir(parents=True)
             report_dir = project_dir / ".upgrade-report"
             report_dir.mkdir(parents=True)
             state = run_step.new_main_state(report_dir)
@@ -2438,8 +2609,8 @@ class RunStepMainStateTest(unittest.TestCase):
                 "current_branch": "current",
             }
             run_step.save_main_state(report_dir, state)
-            (report_dir / "s4_jar_compare").mkdir(parents=True, exist_ok=True)
-            (report_dir / "s4_jar_compare" / "all_changed_apis.csv").write_text(
+            self._api_changes_dir(report_dir).mkdir(parents=True, exist_ok=True)
+            (self._api_changes_dir(report_dir) / "all_changed_apis.csv").write_text(
                 "coord,class_name,member\ncom.example:demo-lib,com.example.Demo,run()\n",
                 encoding="utf-8",
             )
@@ -2494,6 +2665,99 @@ class RunStepMainStateTest(unittest.TestCase):
             )
             self.assertEqual(saved["state"]["current_step"], "step6")
             self.assertEqual(saved["state"]["completed_step"], "step5")
+
+    def test_main_auto_restarts_from_step_after_pipeline_done_without_business_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            project_dir.mkdir(parents=True)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            state = run_step.new_main_state(report_dir)
+            state["state"]["current_step"] = "done"
+            state["state"]["completed_step"] = "step6"
+            base_context = {
+                "base_branch": "base",
+                "current_branch": "current",
+                "source_dirs": [str((project_dir / "src/main/java").resolve())],
+                "analysis_mode": "checkout_build",
+                "target_module": ".",
+            }
+            state["step1"]["output"] = dict(base_context)
+            state["step2"]["output"] = dict(base_context)
+            state["step3"]["output"] = dict(base_context)
+            state["step4"]["input"] = dict(base_context)
+            state["step4"]["output"] = dict(base_context)
+            state["step5"]["output"] = {"stale": True}
+            state["step6"]["output"] = {"stale": True}
+            run_step.save_main_state(report_dir, state)
+
+            self._write_text(run_step.step1_dep_changes_path(report_dir), 
+                "change_type,group_id,artifact_id,base_version,current_version\n",
+                encoding="utf-8",
+            )
+            self._write_text(run_step.step2_context_path(report_dir), "{}", encoding="utf-8")
+            self._api_changes_dir(report_dir).mkdir(parents=True, exist_ok=True)
+            (self._api_changes_dir(report_dir) / "all_changed_apis.csv").write_text(
+                "coord,class_name,member\ncom.example:demo,com.example.Demo,run()\n",
+                encoding="utf-8",
+            )
+            self._call_chain_dir(report_dir).mkdir(parents=True, exist_ok=True)
+            (self._call_chain_dir(report_dir) / "alerts.csv").write_text("x\n", encoding="utf-8")
+            self._write_text(run_step.s6_report_path(report_dir), "# stale\n", encoding="utf-8")
+            captured = {}
+
+            def fake_execute_step(step_id, _args, _manifest_steps, run_context, **_kwargs):
+                captured["step_id"] = step_id
+                captured["run_context"] = dict(run_context)
+                captured["s4_exists_before_step"] = self._api_changes_dir(report_dir).exists()
+                captured["s5_exists_before_step"] = self._call_chain_dir(report_dir).exists()
+                captured["s6_exists_before_step"] = run_step.s6_report_path(report_dir).exists()
+                return None
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_step.py",
+                    "--step",
+                    "auto",
+                    "--project-dir",
+                    str(project_dir),
+                    "--report-dir",
+                    str(report_dir),
+                    "--response-json",
+                    json.dumps(
+                        {
+                            "intent_patch": {
+                                "action": "restart_from_step",
+                                "restart_step_id": "step4",
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                ],
+            ), patch.object(
+                run_step,
+                "load_manifest",
+                return_value=({}, {"step4": {"gate": "jar_compare"}}),
+            ), patch.object(
+                run_step,
+                "execute_step",
+                side_effect=fake_execute_step,
+            ):
+                exit_code = run_step.main()
+
+            saved = run_step.load_main_state(report_dir)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(captured["step_id"], "step4")
+            self.assertEqual(captured["run_context"]["base_branch"], "base")
+            self.assertEqual(captured["run_context"]["current_branch"], "current")
+            self.assertFalse(captured["s4_exists_before_step"])
+            self.assertFalse(captured["s5_exists_before_step"])
+            self.assertFalse(captured["s6_exists_before_step"])
+            self.assertEqual(saved["state"]["current_step"], "step5")
+            self.assertEqual(saved["state"]["completed_step"], "step4")
+            self.assertEqual(saved["step5"]["input"]["base_branch"], "base")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,9 @@ class AutoDiscoverBridgeSourcesTest(unittest.TestCase):
     def test_load_source_mapping_inputs_reads_from_main_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            (report_dir / "main_state.json").write_text(
+            state_dir = report_dir / ".runtime" / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / "main_state.json").write_text(
                 json.dumps(
                     {
                         "state": {"current_step": "step5"},
@@ -40,7 +42,9 @@ class AutoDiscoverBridgeSourcesTest(unittest.TestCase):
     def test_update_main_state_dependency_source_dirs_writes_back_to_current_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            (report_dir / "main_state.json").write_text(
+            state_dir = report_dir / ".runtime" / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / "main_state.json").write_text(
                 json.dumps(
                     {
                         "state": {"current_step": "step4"},
@@ -52,7 +56,7 @@ class AutoDiscoverBridgeSourcesTest(unittest.TestCase):
             )
 
             bridges.update_main_state_dependency_source_dirs(report_dir, ["/tmp/repo-b"])
-            updated = json.loads((report_dir / "main_state.json").read_text(encoding="utf-8"))
+            updated = json.loads((state_dir / "main_state.json").read_text(encoding="utf-8"))
 
         self.assertEqual(
             updated["step4"]["input"]["dependency_source_dirs"],

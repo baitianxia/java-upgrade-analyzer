@@ -16,7 +16,7 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 允许做的事：
 
 1. 执行 `scripts/run_step.py`、门控脚本和只读检查命令
-2. 读取 `.upgrade-report/main_state.json`、`.upgrade-report/interaction.json` 与本阶段产物
+2. 读取 `.upgrade-report/.runtime/state/main_state.json`、`.upgrade-report/.runtime/state/interaction.json` 与本阶段产物
 3. 向用户原样转述 `interaction.json` 中的 `question`、`options`、`files_to_review`，并优先消费其中的 `missing_inputs`、`fallback_inputs`、`input_modes`、`response_schema`、`input_normalization`、`action_requirements`、`selection_resolution`
 4. 把用户的真实答复整理成结构化 `intent_patch`，再通过 `--response-json` 或 `--response-file` 传回下一条恢复命令
 
@@ -44,10 +44,12 @@ python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
 ## Meta Rules
 
 1. 本 Skill 含多个 `[CHECKPOINT]`；每个 `[CHECKPOINT]` 都是硬中断，不是建议。
-2. 只要脚本输出包含 `AWAITING USER INPUT`、`run_step.py` 返回退出码 `4`，或 `.upgrade-report/main_state.json` 中的 `state.status` 进入 `awaiting_*`，就必须立即停止。
-3. 停止后只允许读取 `.upgrade-report/interaction.json`，向用户原样转述问题、候选动作、关键产物，并按 `missing_inputs/input_modes/response_schema` 向用户索取缺失输入。
+2. 只要脚本输出包含 `AWAITING USER INPUT`、`run_step.py` 返回退出码 `4`，或 `.upgrade-report/.runtime/state/main_state.json` 中的 `state.status` 进入 `awaiting_*`，就必须立即停止。
+3. 停止后只允许读取 `.upgrade-report/.runtime/state/interaction.json`，向用户原样转述问题、候选动作、关键产物，并按 `missing_inputs/input_modes/response_schema` 向用户索取缺失输入。
 4. 未获得用户答复前，不得执行任何“继续”“恢复”“下一步”命令。
 5. 如果发现自己越过了 `[CHECKPOINT]`，必须立即停止，明确承认越界，并回到最近一个待交互点。
+
+窄例外：如果 Step5 已经成功生成 `.upgrade-report/.runtime/indexes/s5_query_index.json`，且用户只是询问某个方法的调用链，允许执行只读诊断查询 `scripts/s5_query_call_chain.py` 并直接返回调用链文本。该动作不得修改 `main_state.json`、不得清理/重跑任何 Step、不得恢复 checkpoint，也不得继续推进 Step6。
 
 ## 目标
 
@@ -73,16 +75,17 @@ python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
 6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
 8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
+9. **关键工具不可静默降级**：JApiCmp 缺失时，Step4 会先自动尝试安装；若安装失败，必须 checkpoint 让用户安装/提供 `japicmp_jar`，或明确 `allow_degraded=true` 接受二进制 API 对比缺失后才能继续。tree-sitter 缺失时，Step5 也必须先自动尝试安装；若安装失败，必须 checkpoint 让用户安装并声明 `tree_sitter_installed=true` 后重跑，或明确 `allow_degraded=true` 接受 Java AST 主链路降级后才能继续。
 
 ## 执行模式
 
 把整个任务当成**状态机**，一次只推进一个 Step：
 
 ```text
-main_state = read(.upgrade-report/main_state.json if exists)
+main_state = read(.upgrade-report/.runtime/state/main_state.json if exists)
 
 if main_state.state.status startswith "awaiting_":
-    interaction = read(.upgrade-report/interaction.json)
+    interaction = read(.upgrade-report/.runtime/state/interaction.json)
     向用户原样展示:
       - interaction.question
       - interaction.options
@@ -115,7 +118,7 @@ if gate failed or step blocked:
 
 硬规则：
 
-1. 遇到 `awaiting_*` 时，唯一合法动作是“读交互文件 -> 问用户 -> 等用户答复 -> 用答复恢复”
+1. 遇到 `awaiting_*` 时，唯一合法动作是“读交互文件 -> 问用户 -> 等用户答复 -> 用答复恢复”；唯一例外是用户明确要求查询 Step5 已生成索引中的某个方法调用链，此时只允许执行只读 `s5_query_call_chain.py` 查询并返回链路
 2. `run_step.py` 退出码 `4` 表示 `AWAITING_USER`；必须读取 `interaction.json` 后停下问用户，不能把它当成失败重试，也不能当成成功完成
 3. 恢复命令只使用 `--response-json` 或 `--response-file`；不得使用裸动作参数绕过结构化用户答复
 
@@ -146,11 +149,15 @@ if gate failed or step blocked:
 4. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本仅用于开发调试，不等价于完整主状态流程。
 5. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
 
-安装 `tree-sitter` 相关依赖时，必须使用**当前实际执行 Skill 的那个 Python 解释器**，不要直接使用裸 `pip install`。推荐命令：
+Step5 默认优先使用 `tree-sitter` 做 Java AST 分析。若当前 Python 环境缺少 `tree-sitter` / `tree-sitter-java`，正式流程会先用**当前实际执行 Skill 的 Python 解释器**自动尝试安装一次；安装失败后必须进入 checkpoint，提示用户手动安装。只有用户明确 `allow_degraded=true` 接受 Java AST 主链路降级风险后，才允许继续用增强正则。
+
+不要在用户未要求时先让用户手动安装。只有自动安装失败、网络/权限受限，或用户明确要提前准备环境时，才提示手动安装命令：
 
 ```bash
 python3 -m pip install tree-sitter tree-sitter-java
 ```
+
+用户安装完成后恢复 checkpoint 时，应将自然语言“已安装，重跑 Step5”归一化为 `action=rerun_current_step` 与 `tree_sitter_installed=true`。可通过 `JUA_TREE_SITTER_AUTO_INSTALL=0` 关闭自动安装；这通常只用于离线 CI 或严格无网络环境。
 
 首次进入任务时，先确认：
 
@@ -202,7 +209,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
   --seed-json /abs/path/to/seed.json
 ```
 
-如果 `.upgrade-report/main_state.json` 已存在，优先读取主状态，再决定从哪个 Step 恢复。
+如果 `.upgrade-report/.runtime/state/main_state.json` 已存在，优先读取主状态，再决定从哪个 Step 恢复。
 
 若需要执行单步，优先使用：
 
@@ -273,13 +280,13 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 1. 只要进入 `[CHECKPOINT]`，就必须停下并向用户发问
 2. 只要 `main_state.json.state.status` 为 `awaiting_user_input` 或其他 `awaiting_*`，不得继续推进
-3. Claude Code 不会因为 Python 子进程输出 JSON 自动弹出对话，因此 Agent 必须主动读取 `.upgrade-report/main_state.json` 和 `.upgrade-report/interaction.json`
+3. Claude Code 不会因为 Python 子进程输出 JSON 自动弹出对话，因此 Agent 必须主动读取 `.upgrade-report/.runtime/state/main_state.json` 和 `.upgrade-report/.runtime/state/interaction.json`
 4. `main_state.json + interaction.json` 是恢复状态的实现细节；真正决定“这里必须停”的依据，是本文件中的 `[CHECKPOINT]` 约束
 
 进入 `[CHECKPOINT]` 后，只允许做以下动作：
 
-1. 读取 `.upgrade-report/main_state.json`
-2. 若 `status` 为 `awaiting_*`，读取 `.upgrade-report/interaction.json`
+1. 读取 `.upgrade-report/.runtime/state/main_state.json`
+2. 若 `status` 为 `awaiting_*`，读取 `.upgrade-report/.runtime/state/interaction.json`
 3. 原样转述 `question`
 4. 原样列出 `options`
 5. 原样列出 `files_to_review`
@@ -301,7 +308,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### Phase 1 [AUTO] Discovery
 
 - 对应步骤：`step1`
-- 目标：获取真实依赖结果，产出 `.upgrade-report/s1_dep_changes.csv`
+- 目标：获取真实依赖结果，产出 `.upgrade-report/evidence/dependencies/dep_changes.csv`
 - 输入：先确认唯一 `target_module`，再从以下方式二选一
   - `artifact_inputs`：`base_artifact_path/current_artifact_path`
   - `checkout_build`：`base_branch/current_branch`
@@ -315,7 +322,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### Phase 2 [CHECKPOINT] Confirm Dependency Scope
 
 - 对应步骤：`step1` 完成后立即进入
-- 必须展示：构建来源、变更范围、`s1_dep_changes.csv`
+- 必须展示：构建来源、变更范围、`evidence/dependencies/dep_changes.csv`
 - 必须确认：当前真实构建结果是否可信，是否可以作为后续分析范围
 - 若用户指定“只分析某个模块”，或用户首轮其实已明确模块但 Agent 漏传导致仍跑成 root 范围，不得直接进入 `step2`；必须把该答复写成结构化 JSON，并以 `action=rerun_current_step` 连同 `primary_module` / `modules` 一起重跑 `step1`
 - 用户答复前，不得进入 `step2`
@@ -341,15 +348,15 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 - 对应步骤：`step2`
 - 目标：从依赖树推断升级上下文
-- 输入：`.upgrade-report/s1_dep_changes.csv`
-- 输出：`.upgrade-report/s2_context.json`、`.upgrade-report/s2_dep_graph.json`
-- 规则：若上下文缺字段，要求用户补齐 `s2_context.json` 或运行配置
+- 输入：`.upgrade-report/evidence/dependencies/dep_changes.csv`
+- 输出：`.upgrade-report/evidence/context/context.json`、`.upgrade-report/evidence/context/dep_graph.json`
+- 规则：若上下文缺字段，要求用户补齐 `evidence/context/context.json` 或运行配置
 - 门控：执行 `context`
 
 ### Phase 4 [CHECKPOINT] Confirm Upgrade Context
 
 - 对应步骤：`step2` 完成后立即进入
-- 必须展示：`s2_context.json`、`s2_dep_graph.json` 的关键摘要
+- 必须展示：`evidence/context/context.json`、`evidence/context/dep_graph.json` 的关键摘要
 - 必须确认：`base_branch`、`current_branch`、JDK / Spring Boot 口径、升级依赖识别结果是否正确
 - 用户答复前，不得进入 `step3`
 - 允许动作：`continue`、`cancel`
@@ -384,10 +391,10 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 - 对应步骤：`step4`
 - 输入：依赖变更清单、上下文、分支信息、依赖源码目录（推荐字段：`dependency_source_dirs`）
-- 输出：`.upgrade-report/s4_jar_compare/` 与 `all_changed_apis.csv`
+- 输出：`.upgrade-report/evidence/api_changes/` 与 `all_changed_apis.csv`
 - 重点：JApiCmp XML 是机器解析主证据，stdout 仅用于人读和 XML 失败回退；分别保留 binary/source compatibility，不能把“二进制兼容但源码重编译不兼容”合并掉
-- 规则：Step4 必须优先复用 Step1 `build_provenance.json` 指向的 base/current 最终构建产物，并按 `s1_dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 jar；只有最终制品中无法定位时，才回退到本地 Maven 仓库或 Maven 拉取
-- 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `s1_dep_changes.csv` 原始顺序稳定合并
+- 规则：Step4 必须优先复用 Step1 `evidence/dependencies/build_provenance.json` 指向的 base/current 最终构建产物，并按 `evidence/dependencies/dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 jar；只有最终制品中无法定位时，才回退到本地 Maven 仓库或 Maven 拉取
+- 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应超时
 - 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再按依赖的 `old_version/new_version` 只在对应源码仓库远端分支 `remotes` 中匹配 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支；old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；若未匹配到或存在歧义，必须进入人工确认，不得直接套用主项目分支名
 - 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
@@ -431,8 +438,8 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### Phase 8 [AUTO] Call Chain Analysis
 
 - 对应步骤：`step5`
-- 输入：仅使用 `s4_jar_compare/all_changed_apis.csv`（由 Phase 4 产出）作为变更 API 目标集；若在 Phase 7 指定了 `selected_targets` 或正式 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
-- 输出：`.upgrade-report/s5_call_chain/`
+- 输入：仅使用 `evidence/api_changes/all_changed_apis.csv`（由 Phase 4 产出）作为变更 API 目标集；若在 Phase 7 指定了 `selected_targets` 或正式 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
+- 输出：`.upgrade-report/evidence/call_chain/`
 - 附加证据：Step1 留存的 current 最终制品业务 class、嵌套运行时 JAR 字节码边与 `.upgrade-report/framework_adapters.json`
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
 - 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
@@ -446,17 +453,19 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：本地 Maven JAR 只能作为显式 fallback；一旦使用、缺失嵌套 JAR、坐标 unresolved、SHA 不一致或 javap 失败，字节码覆盖必须降级，未命中不得解释为无影响
 - 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4
 - 规则：准确性相关变更必须运行显式基准矩阵 `python3 scripts/accuracy_benchmark.py --profile core|step5|all`，覆盖 `jdeps` 对照、运行时依赖字节码链路、间接引用、owner/signature 精度、alerts 完整台账和汇总结论
-- 规则：真实项目矩阵的 `passed` 不代表没有质量风险；必须使用 `scripts/quality_signal_audit.py` 审计 skipped、`not_analyzed`、`uncertain`、`not_found_in_static_analysis` 和 non-gating production missing，并按 `QUALITY_RISK_MATRIX.md` 解释或升级为回归测试
+- 规则：真实项目矩阵的 `passed` 不代表没有质量风险；必须使用 `scripts/quality_signal_audit.py` 审计 skipped、`not_analyzed`、`uncertain`、`not_found_in_static_analysis` 和 non-gating production missing，并按 `docs/developer/quality.md` 解释或升级为回归测试
 - 规则：打包给真实工程测试前必须优先执行 `python3 scripts/quality_gate.py --profile release`；若因本地缺少真实项目矩阵而使用 `--skip-real`，交付说明必须明确标记真实项目矩阵未执行
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
 - 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`
 - 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中保留 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` / `RUNTIME_DEPENDENCY_USES_REMOVED_API` 事实，但若该依赖存在源码映射，Step5 必须先继续尝试回溯到业务代码，只有未能证明业务入口时才收敛为 `uncertain`
+- 规则：若依赖源码或资源配置中存在明确运行时主动入口（如 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle、Quartz `Job.execute`、Spring XML `task:scheduled`、`init-method`、`MethodInvokingJobDetailFactoryBean`），且该入口链路触达变更 API，即使没有业务源码显式调用方，也应作为 Step5 影响链路处理，不得仅因未回溯到业务源码而降为静态未找到
 - 规则：验收测试必须包含真实 `jdeps` 对照；`jdeps` 能发现的静态跨 JAR 类依赖，本 Skill 不得漏报，并继续提供成员级方法/字段匹配
 - 规则：业务源码图与当前业务字节码图使用统一 owner/name/signature 身份；冲突时保留两类 provenance，不得用字节码静默覆盖源码证据
-- 规则：`s5_call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条唯一终止链路独立一行，禁止只保留第一条路径或静默截断；同一终止链路重复命中时合并为一行并用 `path_occurrence_count` 表示次数
+- 规则：`evidence/call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条唯一终止链路独立一行，禁止只保留第一条路径或静默截断；同一终止链路重复命中时合并为一行并用 `path_occurrence_count` 表示次数
 - 规则：`alerts.csv` 必须作为完整主文件保留；当台账较大时，Step5 可额外输出 `alerts_reachable.csv`、`alerts_uncertain.csv`、`alerts_not_found_in_static_analysis.csv`、`alerts_not_analyzed.csv` 及 `alerts_<status>_NNN.csv` 分片作为人工阅读视图。拆分文件不得替代完整主文件，也不得做成轻量索引或样例子集
+- 规则：Step5 可输出内部 `s5_query_index.json` 支持按方法全限定名即时查询调用链；当用户只是询问某个方法的调用链时，默认直接返回链路文本，不额外落查询结果文件，不展开诊断字段
 - 规则：链路台账必须显式给出 target/consumer 坐标、消费类和方法、业务入口、逐链路状态、中断原因、证据文件及稳定 api_id/path_id；API 汇总状态不得覆盖或删除其他候选链路
-- 人工排查入口固定为 Step4 `all_changed_apis.csv`、Step5 `alerts.csv`、Step6 `s6_report.md`；其他 JSON/catalog 默认作为机器或深度排障证据
+- 人工排查入口固定为 Step4 `evidence/api_changes/all_changed_apis.csv`、Step5 `evidence/call_chain/alerts.csv`、Step6 `deliverables/report.md`；其他 JSON/catalog 默认作为机器或深度排障证据
 - 规则：业务字节码索引必须覆盖方法/构造/字段、类型指令、常量池/泛型签名/注解类引用与 `invokedynamic`，并按 current 制品 SHA-256 缓存；制品变化必须失效重建
 - 规则：运行时依赖字节码必须解析 lambda/方法引用的 bootstrap method handle；Multi-Release JAR 必须按 `jdk_current` 选择生效 class，目标 JDK 未知时未命中不得解释为无影响
 - 规则：Step5 必须独立解析与 Step4 目标相关的反射、可静态求值 MethodHandle 和资源间接引用；精确证据合并到统一图，动态或不唯一目标输出 `uncertain`，不得伪装为静态未找到
@@ -466,7 +475,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：SPI、Spring、MyBatis 隐式关系由独立 Adapter 输出；条件未决和多实现必须保留 ambiguity，禁止任意绑定到某个实现
 - 规则：Spring `@Bean` 必须绑定方法返回类型与实际构造实现；无法解析工厂返回实现时 Adapter 状态必须为 `partial`，禁止绑定到配置类并报告完整覆盖
 - 规则：动态代理只有在注册点能够绑定具体 handler 时才能输出具体回调证据，但仅注册不能把 handler 提升为业务入口；声明式 HTTP Client 属于出站边，也不得作为业务代码入站入口
-- 规则：`.upgrade-report/coverage.json` 是从证据派生的覆盖视图，状态仅允许 complete/partial/insufficient/not_applicable；它不是新的事实真相源
+- 规则：`.upgrade-report/.runtime/coverage/coverage.json` 是从证据派生的覆盖视图，状态仅允许 complete/partial/insufficient/not_applicable；它不是新的事实真相源
 - 门控：执行 `call_chain`
 
 **置信度加权深度策略**：
@@ -515,12 +524,12 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 - 对应步骤：`step6`
 - 输入：前面所有产物
-- 输出：`.upgrade-report/s6_findings.json`、`.upgrade-report/s6_report.md`
+- 输出：`.upgrade-report/.runtime/findings/s6_findings.json`、`.upgrade-report/deliverables/report.md`
 - 规则：主报告优先呈现已证明影响当前系统的项，并保持 Step5 用户侧结论分桶一致；`可能影响`、`需要补充输入` 与剩余 `未覆盖/未分析` 不能混并成同一详情列表
 
 ## 恢复与压缩
 
-默认由 `run_step.py` 自动保存主状态。若步骤执行后进入待交互状态，还会额外生成 `.upgrade-report/interaction.json`，并以退出码 `4` 结束当前命令，供 Agent 读取并转成用户对话。若需要手动保存压缩摘要，执行：
+默认由 `run_step.py` 自动保存主状态。若步骤执行后进入待交互状态，还会额外生成 `.upgrade-report/.runtime/state/interaction.json`，并以退出码 `4` 结束当前命令，供 Agent 读取并转成用户对话。若需要手动保存压缩摘要，执行：
 
 ```bash
 export PYTHONUTF8=1
@@ -548,8 +557,8 @@ python3 "$SKILL/scripts/context_compress.py" load \
 
 `run_step.py` 在 `[CHECKPOINT]` 阶段不会把“待交互”当成普通成功完成，而是进入明确的待交互退出状态：
 
-1. 更新 `.upgrade-report/main_state.json`
-2. 生成 `.upgrade-report/interaction.json`
+1. 更新 `.upgrade-report/.runtime/state/main_state.json`
+2. 生成 `.upgrade-report/.runtime/state/interaction.json`
 3. 标记 `status=awaiting_user_input`（或其他 `awaiting_*` 状态）
 4. 在 stdout / stderr / `interaction.json` 中输出结构化交互提示
 5. **以退出码 `4` 结束当前脚本**

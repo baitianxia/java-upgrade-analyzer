@@ -21,7 +21,9 @@ class OrchestratedStepInputTest(unittest.TestCase):
     def _write_main_state(self, report_dir, payload):
         state = {"step1": {"input": {}}, "step2": {"input": {}}, "step3": {"input": {}}, "step4": {"input": {}}, "step5": {"input": {}}}
         state.update(payload)
-        (report_dir / "main_state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        state_dir = report_dir / ".runtime" / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "main_state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
     def test_step1_reads_orchestrated_input_from_main_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -46,7 +48,9 @@ class OrchestratedStepInputTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
             self._write_main_state(report_dir, {"step3": {"input": {"source_dirs": ["src/main/java"], "include_test_scope": True}}})
-            (report_dir / "s2_context.json").write_text(
+            context_dir = report_dir / "evidence" / "context"
+            context_dir.mkdir(parents=True, exist_ok=True)
+            (context_dir / "context.json").write_text(
                 json.dumps({"jdk_upgraded": True, "springboot_major_upgrade": True, "jdk_current": "17"}, ensure_ascii=False),
                 encoding="utf-8",
             )
@@ -65,7 +69,7 @@ class OrchestratedStepInputTest(unittest.TestCase):
                 {"step4": {"input": {"dependency_repo_mappings": ["com.example:demo=/repo"], "step4_git_diff_timeout": 600}}},
             )
             with patch.dict(os.environ, {"JUA_ORCHESTRATED": "1", "UPGRADE_REPORT_DIR": str(report_dir)}, clear=False):
-                loaded = s4_jar_compare.load_orchestrated_step4_input(str(report_dir / "s4_jar_compare"))
+                loaded = s4_jar_compare.load_orchestrated_step4_input(str(report_dir / "evidence" / "api_changes"))
         self.assertEqual(loaded["dependency_repo_mappings"], ["com.example:demo=/repo"])
         self.assertEqual(loaded["step4_git_diff_timeout"], 600)
 

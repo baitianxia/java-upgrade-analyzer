@@ -67,7 +67,7 @@ def load_orchestrated_step1_input():
     report_dir = os.environ.get("UPGRADE_REPORT_DIR", "").strip()
     if not report_dir:
         return {}
-    state_path = Path(report_dir) / MAIN_STATE_FILE_NAME
+    state_path = Path(report_dir) / ".runtime" / "state" / MAIN_STATE_FILE_NAME
     if not state_path.exists():
         return {}
     try:
@@ -2118,12 +2118,12 @@ def print_manual_instructions(base_branch, current_branch, primary_module=None, 
         print(f"  python scripts\\s1_dep_diff.py `", file=sys.stderr)
         print(f"    --base {base_branch} `", file=sys.stderr)
         print(f"    --current {current_branch} `", file=sys.stderr)
-        print(f"    --output .upgrade-report\\s1_dep_changes.csv", file=sys.stderr)
+        print(f"    --output .upgrade-report\\evidence\\dependencies\\dep_changes.csv", file=sys.stderr)
     else:
         print(f"  python scripts/s1_dep_diff.py \\", file=sys.stderr)
         print(f"    --base {base_branch} \\", file=sys.stderr)
         print(f"    --current {current_branch} \\", file=sys.stderr)
-        print(f"    --output .upgrade-report/s1_dep_changes.csv", file=sys.stderr)
+        print(f"    --output .upgrade-report/evidence/dependencies/dep_changes.csv", file=sys.stderr)
     print(f"\n依赖遗漏常见原因：", file=sys.stderr)
     print(f"  1. 目标模块无法成功 package", file=sys.stderr)
     print(f"  2. 多模块项目在子模块目录执行（应在根 pom.xml 所在目录执行）", file=sys.stderr)
@@ -2716,7 +2716,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    current_out = str((out_dir / "s1_deps_current_resolved.csv").resolve())
+    current_out = str((out_dir / "deps_current_resolved.csv").resolve())
     current_rows = []
     for item in sorted(curr_entries, key=_entry_sort_key):
         current_rows.append({
@@ -2784,7 +2784,7 @@ def main():
 
     alerts = [r for r in rows
               if '降级' in r['change_type'] or '❓' in r['risk']]
-    alerts_out = str((out_dir / "s1_dep_alerts.csv").resolve())
+    alerts_out = str((out_dir / "dep_alerts.csv").resolve())
     with open(alerts_out, 'w', newline='', encoding='utf-8') as f:
         fields = ['coord', 'old_version', 'new_version', 'change_type',
                   'risk', 'scope', 'remark', 'current_packaged', 'downgrade_confirmed', 'resolution_status']
@@ -2793,12 +2793,12 @@ def main():
         writer.writeheader()
         writer.writerows(alert_rows)
 
-    summary_out = str((out_dir / "s1_dep_summary.txt").resolve())
+    summary_out = str((out_dir / "dep_summary.txt").resolve())
     summary_lines = []
     summary_lines.append("=== Step1 依赖变更摘要 ===")
     summary_lines.append("用途：对比 base/current 的最终打包依赖结果，产出后续 Step3/Step4/Step5 的分析范围依据。")
     summary_lines.append("抽查：确认 base/current 分支、目标模块与构建产物是否正确。")
-    summary_lines.append("抽查：优先查看 s1_dep_alerts.csv 中的降级/❓项，确保范围与预期一致。")
+    summary_lines.append("抽查：优先查看 dep_alerts.csv 中的降级/❓项，确保范围与预期一致。")
     if args.base_artifact_path and args.current_artifact_path:
         summary_lines.append("模式：用户提供编译包路径")
         summary_lines.append(f"base_artifact_path={str(Path(args.base_artifact_path).expanduser().resolve())}")

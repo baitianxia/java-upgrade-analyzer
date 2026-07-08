@@ -1,4 +1,4 @@
-# IMPLEMENTATION_OVERVIEW
+# Architecture
 
 ## 文档定位
 
@@ -12,7 +12,8 @@
 
 - `SKILL.md`
 - `RUNBOOK.md`
-- `DESIGN_PRINCIPLES.md`
+- `docs/developer/quality.md`
+- `docs/archive/DESIGN_PRINCIPLES.md`
 
 ## 系统目标
 

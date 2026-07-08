@@ -105,7 +105,9 @@ class AnalysisContractTest(unittest.TestCase):
     def test_coverage_report_marks_ambiguous_pairing_partial(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp)
-            (report / "s1_dep_changes.csv").write_text(
+            dependencies_dir = report / "evidence" / "dependencies"
+            dependencies_dir.mkdir(parents=True, exist_ok=True)
+            (dependencies_dir / "dep_changes.csv").write_text(
                 "coord,resolution_status,pairing_reason_code\n"
                 "com.acme:shared,unresolved,ambiguous_artifact_migration_candidates\n",
                 encoding="utf-8",
@@ -121,7 +123,7 @@ class AnalysisContractTest(unittest.TestCase):
     def test_indirect_usage_partial_is_a_critical_coverage_gap(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp)
-            summary = report / "s5_call_chain/summary.json"
+            summary = report / "evidence" / "call_chain" / "summary.json"
             summary.parent.mkdir(parents=True)
             summary.write_text(json.dumps({
                 "total_apis": 1,

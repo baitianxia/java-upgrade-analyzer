@@ -13,10 +13,10 @@ s5_call_chain_engine_integrated.py
 
 使用方式：
   python s5_call_chain_engine_integrated.py \
-    --all-changed-apis .upgrade-report/s4_jar_compare/all_changed_apis.csv \
+    --all-changed-apis .upgrade-report/evidence/api_changes/all_changed_apis.csv \
     --source-dirs src/main/java \
     --report-dir .upgrade-report \
-    --output-dir .upgrade-report/s5_call_chain
+    --output-dir .upgrade-report/evidence/call_chain
 
 注：无需手动配置 `--dependency-source-mappings`，系统自动从 Step 4 配置推断
 """
@@ -43,7 +43,9 @@ from enhanced_source_analyzer import (
     CallEdge,
     MethodDef,
     analyze_file,
+    ensure_tree_sitter_available,
     extract_call_edges_enhanced,
+    tree_sitter_status,
 )
 from confidence_weighted_tracer import (
     build_api_identity_key,
@@ -59,14 +61,73 @@ from indirect_usage_analyzer import analyze_and_merge_indirect_usages
 from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
 from analysis_contract import sha256_file
 from pipeline_constants import (
+    EVIDENCE_API_CHANGES_DIRNAME,
+    EVIDENCE_CALL_CHAIN_DIRNAME,
+    EVIDENCE_CONTEXT_DIRNAME,
+    EVIDENCE_DEPENDENCIES_DIRNAME,
+    EVIDENCE_DIRNAME,
+    RUNTIME_CACHE_DIRNAME,
+    RUNTIME_DIRNAME,
+    RUNTIME_INDEXES_DIRNAME,
+    RUNTIME_STATE_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
     STEP5_ARTIFACT_BYTECODE_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
+    STEP5_QUERY_INDEX_FILE,
 )
+from s5_query_call_chain import write_query_index
 
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
+
+
+def _evidence_dir(report_dir, name):
+    return Path(report_dir) / EVIDENCE_DIRNAME / name
+
+
+def _runtime_dir(report_dir, name):
+    return Path(report_dir) / RUNTIME_DIRNAME / name
+
+
+def _state_path(report_dir):
+    return _runtime_dir(report_dir, RUNTIME_STATE_DIRNAME) / MAIN_STATE_FILE_NAME
+
+
+def _dep_changes_path(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_DEPENDENCIES_DIRNAME) / "dep_changes.csv"
+
+
+def _current_resolved_path(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_DEPENDENCIES_DIRNAME) / "deps_current_resolved.csv"
+
+
+def _build_provenance_path(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_DEPENDENCIES_DIRNAME) / "build_provenance.json"
+
+
+def _context_path(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_CONTEXT_DIRNAME) / "context.json"
+
+
+def _source_mapping_summary_path(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_CONTEXT_DIRNAME) / "source_mapping_summary.json"
+
+
+def _all_changed_apis_path(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_API_CHANGES_DIRNAME) / "all_changed_apis.csv"
+
+
+def _call_chain_dir(report_dir):
+    return _evidence_dir(report_dir, EVIDENCE_CALL_CHAIN_DIRNAME)
+
+
+def _runtime_cache_dir(report_dir):
+    return _runtime_dir(report_dir, RUNTIME_CACHE_DIRNAME)
+
+
+def _default_query_index_path(report_dir):
+    return _runtime_dir(report_dir, RUNTIME_INDEXES_DIRNAME) / STEP5_QUERY_INDEX_FILE
 
 
 def _env_flag_enabled(name):
@@ -100,10 +161,15 @@ def _write_step5_timing_csv(output_dir, graph_stats):
             'business_graph_elapsed_sec',
             'dependency_graph_elapsed_sec',
             'business_bytecode_elapsed_sec',
+            'business_bytecode_classes_scanned',
+            'business_bytecode_edges_found',
+            'business_bytecode_classfile_fast_path_classes',
+            'business_bytecode_javap_fallback_classes',
             'source_artifact_alignment_elapsed_sec',
             'framework_adapters_elapsed_sec',
             'framework_adapter_merge_elapsed_sec',
             'indirect_usage_elapsed_sec',
+            'query_index_elapsed_sec',
             'indirect_usage_target_count',
             'indirect_usage_owner_count',
             'indirect_usage_source_methods_scanned',
@@ -204,11 +270,11 @@ def load_orchestrated_step5_input(report_dir):
     """正式流程下仅从 main_state 读取 Step5 已确认输入，调试 CLI 不参与正式求值。"""
     if os.environ.get("JUA_ORCHESTRATED") != "1":
         return {}
-    state_path = os.path.join(report_dir, MAIN_STATE_FILE_NAME)
-    if not os.path.exists(state_path):
+    state_path = _state_path(report_dir)
+    if not state_path.exists():
         return {}
     try:
-        with open(state_path, "r", encoding="utf-8") as f:
+        with state_path.open("r", encoding="utf-8") as f:
             main_state = json.load(f)
     except Exception:
         return {}
@@ -249,10 +315,10 @@ def build_missing_dependency_mapping_interaction(
     has_provided_dependency_inputs,
 ):
     files_to_review = [os.path.abspath(details_path)]
-    report_dir = os.path.abspath(os.path.dirname(output_dir))
+    report_dir = str(Path(output_dir).resolve().parent.parent)
     for extra_name in (
-        os.path.join(report_dir, "s2_source_mapping_summary.json"),
-        os.path.join(report_dir, "s4_jar_compare", "all_changed_apis.csv"),
+        str(_source_mapping_summary_path(report_dir)),
+        str(_all_changed_apis_path(report_dir)),
     ):
         if os.path.exists(extra_name):
             files_to_review.append(os.path.abspath(extra_name))
@@ -357,6 +423,165 @@ def build_missing_dependency_mapping_interaction(
         "exit_code": EXIT_AWAITING_USER,
     }
 
+
+def _iter_existing_source_dirs(source_dirs):
+    for item in source_dirs or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        if path.exists() and path.is_dir():
+            yield path
+
+
+def _dependency_mapping_source_dirs(dependency_source_mappings):
+    dirs = []
+    for item in dependency_source_mappings or []:
+        if isinstance(item, dict):
+            candidates = item.get("source_dirs") or item.get("paths") or []
+            if isinstance(candidates, str):
+                candidates = [candidates]
+            dirs.extend(str(candidate or "").strip() for candidate in candidates)
+            if item.get("path"):
+                dirs.append(str(item.get("path") or "").strip())
+            continue
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "=" in text:
+            dirs.append(text.split("=", 1)[1].strip())
+        else:
+            dirs.append(text)
+    return [item for item in dirs if item]
+
+
+def has_java_source_file(source_dirs, max_dirs=200):
+    checked = 0
+    for source_dir in _iter_existing_source_dirs(source_dirs):
+        checked += 1
+        if checked > max_dirs:
+            return True
+        try:
+            for _path in source_dir.rglob("*.java"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def write_tree_sitter_preflight_details(output_dir, status, source_dirs):
+    details_path = os.path.join(output_dir, "tree_sitter_preflight.json")
+    details = {
+        "status": "awaiting_user_input",
+        "reason_code": "step5_tree_sitter_missing_need_resolution",
+        "generated_at": datetime.now().isoformat(),
+        "tree_sitter": dict(status or {}),
+        "source_dirs_checked": [str(item) for item in (source_dirs or [])],
+        "impact": [
+            "Step5 无法使用 tree-sitter Java AST 主链路。",
+            "如果降级到增强正则，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。",
+            "降级不会阻止字节码扫描，但源码图相关结论的漏报/误报风险会上升。",
+        ],
+        "manual_install": [
+            (status or {}).get("install_command") or "python -m pip install tree-sitter tree-sitter-java",
+        ],
+    }
+    with open(details_path, "w", encoding="utf-8") as f:
+        json.dump(details, f, ensure_ascii=False, indent=2)
+    return details_path
+
+
+def build_tree_sitter_missing_interaction(output_dir, details_path, status):
+    install_command = (status or {}).get("install_command") or "python -m pip install tree-sitter tree-sitter-java"
+    return {
+        "schema": "java-upgrade-analyzer.interaction.v2",
+        "checkpoint": True,
+        "hard_stop": True,
+        "status": "awaiting_user_input",
+        "kind": "review",
+        "step_id": "step5",
+        "title": "step5 缺少 tree-sitter，Java AST 主链路不可用",
+        "question": (
+            "Step5 需要 tree-sitter/tree-sitter-java 提升 Java 源码调用链分析准确性。"
+            "系统已尝试自动安装但失败。请优先安装 tree-sitter 后重跑 Step5；"
+            "只有在你明确接受源码 AST 证据降级风险时，才允许 allow_degraded=true 继续。"
+        ),
+        "summary": "tree-sitter 不可用；如果降级，Step5 将使用增强正则分析 Java 源码。",
+        "reason_code": "step5_tree_sitter_missing_need_resolution",
+        "files_to_review": [os.path.abspath(details_path)],
+        "required_fields": ["action"],
+        "options": [
+            {
+                "id": "rerun_current_step",
+                "label": "处理 tree-sitter 后重跑",
+                "description": "安装 tree-sitter/tree-sitter-java 后重跑；或显式 allow_degraded=true 接受源码 AST 降级后重跑。",
+            },
+            {
+                "id": "restart_from_step",
+                "label": "从指定步骤重跑",
+                "description": "如输入或环境需要调整，可从 step1..step5 重新处理。",
+            },
+            {
+                "id": "cancel",
+                "label": "取消",
+                "description": "先人工安装 tree-sitter 或确认风险后再继续。",
+            },
+        ],
+        "response_schema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["rerun_current_step", "restart_from_step", "cancel"],
+                },
+                "allow_degraded": {
+                    "type": "boolean",
+                    "description": "可选。设为 true 时允许 tree-sitter 缺失情况下用增强正则降级分析 Java 源码。",
+                },
+                "tree_sitter_installed": {
+                    "type": "boolean",
+                    "description": "可选。用户已按提示安装 tree-sitter/tree-sitter-java 后设为 true，再重跑 Step5。",
+                },
+                "restart_step_id": {
+                    "type": "string",
+                    "enum": ["step1", "step2", "step3", "step4", "step5"],
+                },
+                "notes": {
+                    "type": "string",
+                },
+            },
+        },
+        "input_normalization": {
+            "enabled": True,
+            "allowed_actions": ["rerun_current_step", "restart_from_step", "cancel"],
+            "required_fields": ["action"],
+        },
+        "action_requirements": {
+            "rerun_current_step": {
+                "at_least_one_of": ["tree_sitter_installed", "allow_degraded"],
+                "description": "重跑 Step5 时，需要先安装 tree-sitter 并声明 tree_sitter_installed=true；若仍不可用，则必须显式 allow_degraded=true。",
+            },
+            "restart_from_step": {
+                "required_fields": ["restart_step_id"],
+                "description": "从更早步骤重跑时，必须明确 restart_step_id。",
+            },
+        },
+        "tree_sitter": {
+            "install_command": install_command,
+            "auto_install_error": (status or {}).get("auto_install_error") or "",
+            "python_executable": (status or {}).get("python_executable") or "",
+        },
+        "resume_hint": (
+            f"请优先执行或让环境具备：{install_command}；"
+            "安装完成后 action=rerun_current_step 且 tree_sitter_installed=true。"
+            "若用户接受风险，可 action=rerun_current_step 且 allow_degraded=true。"
+        ),
+        "next_action_rule": "只能先处理 tree-sitter 缺失并等待用户回复，不得直接继续生成 Step6。",
+        "must_wait_for_user_reply": True,
+        "exit_code": EXIT_AWAITING_USER,
+    }
+
 def step5_integrated_main(args):
     previous_debug = os.environ.get('JUA_STEP5_DEBUG')
     previous_break = os.environ.get('JUA_STEP5_DEBUG_BREAK')
@@ -385,14 +610,14 @@ def infer_step5_report_dir(args):
     all_changed_apis = str(getattr(args, 'all_changed_apis', '') or '').strip()
     if all_changed_apis:
         api_path = Path(all_changed_apis).expanduser()
-        if api_path.name == 'all_changed_apis.csv' and api_path.parent.name == 's4_jar_compare':
-            return str(api_path.parent.parent)
+        if api_path.name == 'all_changed_apis.csv' and api_path.parent.name == EVIDENCE_API_CHANGES_DIRNAME:
+            return str(api_path.parent.parent.parent)
 
     output_dir = str(getattr(args, 'output_dir', '') or '').strip()
     if output_dir:
         output_path = Path(output_dir).expanduser()
-        if output_path.name.startswith('s5_call_chain'):
-            return str(output_path.parent)
+        if output_path.name == EVIDENCE_CALL_CHAIN_DIRNAME:
+            return str(output_path.parent.parent)
 
     return '.upgrade-report'
 
@@ -429,17 +654,17 @@ def _step5_integrated_main_impl(args):
 
     # Phase 0: 参数准备
     report_dir = infer_step5_report_dir(args)
-    output_dir = args.output_dir or os.path.join(report_dir, 's5_call_chain')
+    output_dir = args.output_dir or str(_call_chain_dir(report_dir))
     os.makedirs(output_dir, exist_ok=True)
     orchestrated_input = load_orchestrated_step5_input(report_dir)
 
     # Phase 1: 先确定 all_changed_apis_path（避免未定义变量错误）
     all_changed_apis_path = args.all_changed_apis
     if not all_changed_apis_path:
-        all_changed_apis_path = os.path.join(report_dir, 's4_jar_compare', 'all_changed_apis.csv')
+        all_changed_apis_path = str(_all_changed_apis_path(report_dir))
 
     # Phase 2: 正式流程优先使用 main_state 中已确认的 Step5 输入；调试模式才使用 CLI
-    context_path = os.path.join(report_dir, 's2_context.json')
+    context_path = str(_context_path(report_dir))
     context_source_dirs = []
 
     if os.path.exists(context_path):
@@ -535,6 +760,40 @@ def _step5_integrated_main_impl(args):
             'unresolved_dependency_source_dirs': list((bridge_discovery or {}).get('unresolved_dependency_source_dirs') or []),
         },
     )
+
+    # Phase 2.6: Java AST parser preflight.
+    # tree-sitter 不是“可有可无”的小优化：它直接影响 Step5 源码图的准确性。
+    # 因此正式流程中，若存在 Java 源码但自动安装失败，必须让用户确认后才允许 regex 降级。
+    tree_sitter_source_dirs = list(business_source_dirs or []) + _dependency_mapping_source_dirs(dependency_source_mappings)
+    if has_java_source_file(tree_sitter_source_dirs):
+        if not ensure_tree_sitter_available():
+            status = tree_sitter_status()
+            if not allow_degraded:
+                print("\n❌ tree-sitter 不可用，且未确认 allow_degraded=true。", file=sys.stderr)
+                print("影响：Step5 将无法使用 Java AST 主链路，源码调用链准确性会下降。", file=sys.stderr)
+                if status.get("auto_install_error"):
+                    print(f"自动安装失败原因：{status.get('auto_install_error')}", file=sys.stderr)
+                print(f"请优先安装：{status.get('install_command')}", file=sys.stderr)
+                details_path = write_tree_sitter_preflight_details(
+                    output_dir,
+                    status,
+                    tree_sitter_source_dirs,
+                )
+                emit_step_interaction(
+                    build_tree_sitter_missing_interaction(output_dir, details_path, status)
+                )
+                return EXIT_AWAITING_USER
+            print(
+                "⚠️  tree-sitter 不可用，但已显式 allow_degraded=true；"
+                "Step5 将使用增强正则降级分析 Java 源码。",
+                file=sys.stderr,
+            )
+    else:
+        _step5_debug(
+            'tree_sitter_preflight',
+            'skip tree-sitter preflight because no Java source files were detected',
+            checked_source_dirs=list(tree_sitter_source_dirs or []),
+        )
 
     # Phase 3: 先只用业务源码构建基础图，判断哪些API真的必须跨依赖边界
     business_roots = build_source_roots(business_source_dirs, [])
@@ -814,7 +1073,7 @@ def _step5_integrated_main_impl(args):
     bytecode_evidence, bytecode_stats = collect_business_bytecode_edges(
         business_roots,
         artifact_catalog=runtime_dependency_catalog,
-        cache_path=os.path.join(report_dir, STEP5_ARTIFACT_BYTECODE_INDEX_FILE),
+        cache_path=str(_runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE),
     )
     bytecode_merge = merge_business_bytecode_edges(graph, bytecode_evidence)
     graph_stats['business_bytecode'] = {
@@ -830,6 +1089,18 @@ def _step5_integrated_main_impl(args):
         ),
     }
     graph_stats['step5_perf']['main']['business_bytecode_elapsed_sec'] = round(time.perf_counter() - bytecode_timer, 3)
+    graph_stats['step5_perf']['main']['business_bytecode_classes_scanned'] = int(
+        bytecode_stats.get('classes_scanned') or 0
+    )
+    graph_stats['step5_perf']['main']['business_bytecode_edges_found'] = int(
+        bytecode_stats.get('edges_found') or 0
+    )
+    graph_stats['step5_perf']['main']['business_bytecode_classfile_fast_path_classes'] = int(
+        bytecode_stats.get('classfile_fast_path_classes') or 0
+    )
+    graph_stats['step5_perf']['main']['business_bytecode_javap_fallback_classes'] = int(
+        bytecode_stats.get('javap_fallback_classes') or 0
+    )
     graph_stats['artifact_bytecode'] = {
         'status': runtime_dependency_catalog.get('status', 'insufficient'),
         'reason_codes': list(runtime_dependency_catalog.get('reason_codes') or []),
@@ -842,9 +1113,9 @@ def _step5_integrated_main_impl(args):
     graph_stats['step5_perf']['main']['source_artifact_alignment_elapsed_sec'] = round(
         time.perf_counter() - source_alignment_timer, 3
     )
-    framework_output = os.path.join(report_dir, 'framework_adapters.json')
+    framework_output = str(_call_chain_dir(report_dir) / 'framework_adapters.json')
     framework_timer = time.perf_counter()
-    framework_evidence = run_framework_adapters(business_roots, framework_output)
+    framework_evidence = run_framework_adapters(source_roots, framework_output)
     graph_stats['step5_perf']['main']['framework_adapters_elapsed_sec'] = round(
         time.perf_counter() - framework_timer, 3
     )
@@ -920,6 +1191,20 @@ def _step5_integrated_main_impl(args):
         graph_stats=graph_stats,
         type_metadata_count=len(type_metadata or {}),
     )
+    query_index_timer = time.perf_counter()
+    query_index_path = write_query_index(
+        graph,
+        str(Path(getattr(args, 'query_index', '') or _default_query_index_path(report_dir))),
+        graph_stats={
+            'methods_indexed': len(graph.methods_by_id),
+            'reverse_edge_keys': len(graph.reverse_edges),
+        },
+    )
+    graph_stats['step5_perf']['main']['query_index_elapsed_sec'] = round(
+        time.perf_counter() - query_index_timer,
+        3,
+    )
+    print(f"  调用链查询索引 → {query_index_path}", file=sys.stderr)
 
     # Phase 5: 置信度加权反向追踪（核心改进）
     print("\n反向追踪调用链（置信度加权）...", file=sys.stderr)
@@ -1106,7 +1391,7 @@ def _find_maven_jar(coord, version):
 
 
 def _load_coord_versions(report_dir):
-    dep_changes_path = os.path.join(report_dir, 's1_dep_changes.csv')
+    dep_changes_path = str(_dep_changes_path(report_dir))
     result = {}
     if not os.path.exists(dep_changes_path):
         return result
@@ -1122,7 +1407,7 @@ def _load_coord_versions(report_dir):
 
 
 def build_runtime_dependency_catalog(report_dir):
-    current_resolved_path = os.path.join(report_dir, 's1_deps_current_resolved.csv')
+    current_resolved_path = str(_current_resolved_path(report_dir))
     catalog = {
         'by_coord': {},
         'entries': [],
@@ -1132,7 +1417,7 @@ def build_runtime_dependency_catalog(report_dir):
         'metrics': {},
         'target_jdk': '',
     }
-    context_path = os.path.join(report_dir, 's2_context.json')
+    context_path = str(_context_path(report_dir))
     if os.path.exists(context_path):
         try:
             context = json.loads(Path(context_path).read_text(encoding='utf-8'))
@@ -1149,7 +1434,7 @@ def build_runtime_dependency_catalog(report_dir):
 
     artifact_path = ''
     artifact_expected_hash = ''
-    provenance_path = os.path.join(report_dir, 'build_provenance.json')
+    provenance_path = str(_build_provenance_path(report_dir))
     if os.path.exists(provenance_path):
         try:
             provenance = json.loads(Path(provenance_path).read_text(encoding='utf-8'))
@@ -1174,7 +1459,7 @@ def build_runtime_dependency_catalog(report_dir):
     fallback_count = 0
     extraction_failures = []
     business_class_count = 0
-    cache_dir = Path(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME / 'current'
+    cache_dir = _runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME / 'current'
     if artifact_ok:
         cache_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -1298,14 +1583,16 @@ def build_runtime_dependency_catalog(report_dir):
     }
     catalog['extraction_failures'] = extraction_failures
     serializable = {key: value for key, value in catalog.items() if not key.startswith('_')}
-    (Path(report_dir) / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE).write_text(
+    catalog_path = _runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+    catalog_path.parent.mkdir(parents=True, exist_ok=True)
+    catalog_path.write_text(
         json.dumps(serializable, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
     return catalog
 
 
 def assess_source_artifact_alignment(report_dir, business_source_dirs):
-    provenance_path = Path(report_dir) / 'build_provenance.json'
+    provenance_path = _build_provenance_path(report_dir)
     current = {}
     if provenance_path.is_file():
         try:
@@ -1360,7 +1647,9 @@ def assess_source_artifact_alignment(report_dir, business_source_dirs):
         'artifact_path': current.get('artifact_path', ''),
         'artifact_sha256': current.get('artifact_sha256', ''),
     }
-    (Path(report_dir) / 'source_artifact_alignment.json').write_text(
+    alignment_path = _call_chain_dir(report_dir) / 'source_artifact_alignment.json'
+    alignment_path.parent.mkdir(parents=True, exist_ok=True)
+    alignment_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
     return payload
@@ -2750,7 +3039,13 @@ def main():
     ap.add_argument(
         '--output-dir',
         default='',
-        help='输出目录（默认report-dir/s5_call_chain）'
+        help='输出目录（默认report-dir/evidence/call_chain）'
+    )
+
+    ap.add_argument(
+        '--query-index',
+        default='',
+        help='调用链查询索引输出路径（默认report-dir/.runtime/indexes/s5_query_index.json）'
     )
 
     ap.add_argument(
@@ -2815,7 +3110,7 @@ def check_if_needs_bridge_sources(all_apis_path, report_dir, source_dirs=None, b
     import csv
 
     # Read context
-    context_path = os.path.join(report_dir, 's2_context.json')
+    context_path = str(_context_path(report_dir))
     context_source_dirs = []
     if os.path.exists(context_path):
         with open(context_path, 'r', encoding='utf-8') as f:
@@ -2885,7 +3180,7 @@ def check_apis_that_need_bridge(
     Returns dict: {coord: {'needs_bridge': bool, 'reason': str}}
     """
     # Read context
-    context_path = os.path.join(report_dir, 's2_context.json')
+    context_path = str(_context_path(report_dir))
     if os.path.exists(context_path):
         with open(context_path, 'r', encoding='utf-8') as f:
             context = json.load(f)

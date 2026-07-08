@@ -45,6 +45,32 @@ def _status(applicable, errors):
     return 'partial' if errors else 'complete'
 
 
+def _xml_local_name(tag):
+    return str(tag or '').rsplit('}', 1)[-1].split(':')[-1]
+
+
+def _xml_attr(element, *names):
+    attrs = element.attrib or {}
+    for name in names:
+        if name in attrs:
+            return str(attrs.get(name) or '').strip()
+    for key, value in attrs.items():
+        if _xml_local_name(key) in names:
+            return str(value or '').strip()
+    return ''
+
+
+def _split_bean_ref(value):
+    text = str(value or '').strip()
+    if not text:
+        return '', ''
+    if '.' in text and not text.startswith('&'):
+        bean_id, method = text.rsplit('.', 1)
+        if bean_id and method:
+            return bean_id, method
+    return text, ''
+
+
 def run_spi_adapter(source_roots):
     edges, nodes, findings, errors = [], [], [], []
     files = []
@@ -189,6 +215,11 @@ def run_spring_adapter(source_roots):
     applicable = False
     bean_candidates = []
     listener_pattern = re.compile(r'@EventListener(?:\([^)]*\))?[\s\S]{0,500}?\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{')
+    active_method_pattern = re.compile(
+        r'@(?:[\w.]+\.)?(Scheduled|PostConstruct)(?:\([^)]*\))?'
+        r'[\s\S]{0,500}?'
+        r'\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{'
+    )
     bean_pattern = re.compile(r'@(Component|Service|Repository|Controller|Configuration|Bean)\b')
     bean_method_pattern = re.compile(
         r'@Bean(?:\s*\([^)]*\))?\s*'
@@ -201,6 +232,11 @@ def run_spring_adapter(source_roots):
     callback_methods = {
         'ApplicationRunner': {'run'},
         'CommandLineRunner': {'run'},
+        'InitializingBean': {'afterPropertiesSet'},
+        'Lifecycle': {'start', 'stop'},
+        'SmartLifecycle': {'start', 'stop'},
+        'ApplicationListener': {'onApplicationEvent'},
+        'Job': {'execute'},
         'Filter': {'doFilter'},
         'HandlerInterceptor': {'preHandle', 'postHandle', 'afterCompletion'},
         'Converter': {'convert'},
@@ -215,7 +251,14 @@ def run_spring_adapter(source_roots):
             except OSError as exc:
                 errors.append(f'{path}:{type(exc).__name__}')
                 continue
-            if not ('org.springframework' in text or '@EventListener' in text or bean_pattern.search(text)):
+            if not (
+                'org.springframework' in text
+                or 'org.quartz' in text
+                or '@EventListener' in text
+                or '@Scheduled' in text
+                or '@PostConstruct' in text
+                or bean_pattern.search(text)
+            ):
                 continue
             applicable = True
             owner = _java_package_and_class(text, path.stem)
@@ -314,6 +357,19 @@ def run_spring_adapter(source_roots):
                     'conditions': conditions, 'ambiguity': False,
                     'provenance': {'file': str(path), 'annotation': '@EventListener'},
                 })
+            for match in active_method_pattern.finditer(text):
+                annotation = match.group(1)
+                target = f'{owner}.{match.group(2)}'
+                nodes.append({'id': target, 'kind': 'spring_runtime_active_entry'})
+                edges.append({
+                    'source': f'framework:spring-active-entry:{annotation}',
+                    'target': target,
+                    'edge_kind': 'spring_runtime_active_entry',
+                    'confidence': 'high',
+                    'conditions': conditions,
+                    'ambiguity': False,
+                    'provenance': {'file': str(path), 'annotation': f'@{annotation}'},
+                })
             if conditions:
                 findings.append({
                     'reason_code': 'spring_conditions_require_runtime_evaluation',
@@ -345,10 +401,123 @@ def run_spring_adapter(source_roots):
                 'candidate_count': len(candidates),
                 'ambiguity_reason': 'multiple beans and no unique @Primary candidate',
             })
+    xml_files = 0
+    for root in _resource_roots(source_roots):
+        for path in sorted(root.rglob('*.xml')):
+            try:
+                tree = ET.parse(str(path))
+            except ET.ParseError:
+                continue
+            except OSError as exc:
+                errors.append(f'{path}:{type(exc).__name__}')
+                continue
+            root_element = tree.getroot()
+            bean_classes = {}
+            bean_factory_methods = {}
+            xml_active_entries = []
+            for element in root_element.iter():
+                tag = _xml_local_name(element.tag)
+                if tag != 'bean':
+                    continue
+                bean_id = _xml_attr(element, 'id', 'name')
+                bean_class = _xml_attr(element, 'class')
+                if bean_id and bean_class:
+                    bean_classes[bean_id] = bean_class
+                init_method = _xml_attr(element, 'init-method')
+                if bean_id and bean_class and init_method:
+                    xml_active_entries.append({
+                        'bean_id': bean_id,
+                        'class': bean_class,
+                        'method': init_method,
+                        'kind': 'spring_xml_init_method',
+                    })
+                factory_class = _xml_attr(element, 'class')
+                if bean_id and factory_class.endswith('MethodInvokingJobDetailFactoryBean'):
+                    props = {
+                        _xml_attr(child, 'name'): child
+                        for child in list(element)
+                        if _xml_local_name(child.tag) == 'property' and _xml_attr(child, 'name')
+                    }
+                    target_bean = ''
+                    target_method = ''
+                    target_object = props.get('targetObject')
+                    if target_object is not None:
+                        target_bean = _xml_attr(target_object, 'ref', 'bean')
+                        if not target_bean:
+                            for child in list(target_object):
+                                if _xml_local_name(child.tag) == 'ref':
+                                    target_bean = _xml_attr(child, 'bean', 'local')
+                                    break
+                    target_method_element = props.get('targetMethod')
+                    if target_method_element is not None:
+                        target_method = _xml_attr(target_method_element, 'value')
+                        if not target_method:
+                            for child in list(target_method_element):
+                                if _xml_local_name(child.tag) == 'value':
+                                    target_method = (child.text or '').strip()
+                                    break
+                    target_class = bean_classes.get(target_bean, '')
+                    if target_class and target_method:
+                        xml_active_entries.append({
+                            'bean_id': target_bean,
+                            'class': target_class,
+                            'method': target_method,
+                            'kind': 'spring_xml_quartz_method_invoking_job',
+                        })
+                    else:
+                        findings.append({
+                            'reason_code': 'spring_xml_quartz_job_unresolved',
+                            'subject': bean_id,
+                            'file': str(path),
+                        })
+            for element in root_element.iter():
+                tag = _xml_local_name(element.tag)
+                if tag != 'scheduled':
+                    continue
+                ref = _xml_attr(element, 'ref')
+                method = _xml_attr(element, 'method')
+                if not ref:
+                    ref, method_from_ref = _split_bean_ref(_xml_attr(element, 'target'))
+                    method = method or method_from_ref
+                bean_class = bean_classes.get(ref, '')
+                if bean_class and method:
+                    xml_active_entries.append({
+                        'bean_id': ref,
+                        'class': bean_class,
+                        'method': method,
+                        'kind': 'spring_xml_scheduled_task',
+                    })
+                else:
+                    findings.append({
+                        'reason_code': 'spring_xml_scheduled_task_unresolved',
+                        'subject': ref or _xml_attr(element, 'target'),
+                        'method': method,
+                        'file': str(path),
+                    })
+            if xml_active_entries:
+                xml_files += 1
+                applicable = True
+            for item in xml_active_entries:
+                target = f"{item['class']}.{item['method']}"
+                nodes.append({'id': target, 'kind': 'spring_runtime_active_entry'})
+                edges.append({
+                    'source': f"framework:{item['kind']}",
+                    'target': target,
+                    'edge_kind': 'spring_runtime_active_entry',
+                    'confidence': 'high',
+                    'conditions': [],
+                    'ambiguity': False,
+                    'provenance': {
+                        'file': str(path),
+                        'xml_kind': item['kind'],
+                        'bean_id': item.get('bean_id', ''),
+                    },
+                })
     unresolved = any(
         finding.get('reason_code') in {
             'spring_conditions_require_runtime_evaluation', 'AMBIGUOUS_FRAMEWORK_DISPATCH',
-            'spring_bean_method_unresolved',
+            'spring_bean_method_unresolved', 'spring_xml_scheduled_task_unresolved',
+            'spring_xml_quartz_job_unresolved',
         }
         for finding in findings
     )
@@ -356,7 +525,7 @@ def run_spring_adapter(source_roots):
         'adapter': 'spring_basic', 'version': '1',
         'status': 'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
         'nodes': nodes, 'edges': edges, 'findings': findings, 'errors': errors,
-        'metrics': {'source_files_scanned': scanned, 'edges': len(edges)},
+        'metrics': {'source_files_scanned': scanned, 'xml_files_scanned': xml_files, 'edges': len(edges)},
     }
 
 
@@ -809,11 +978,21 @@ def run_framework_adapters(source_roots, output_path=''):
 def attach_framework_edges_to_graph(graph, payload):
     """Attach deterministic framework callback entries to the normal source/bytecode graph."""
     methods = list((getattr(graph, 'methods_by_id', {}) or {}).values())
+    methods_by_qualified = {}
+    methods_by_unsigned = {}
+    for method in methods:
+        qualified = str(getattr(method, 'qualified_key', '') or '')
+        if not qualified:
+            continue
+        methods_by_qualified.setdefault(qualified, []).append(method)
+        unsigned = qualified.split('(', 1)[0]
+        methods_by_unsigned.setdefault(unsigned, []).append(method)
     entries = {}
     matched_edges = 0
     unmatched_edges = 0
     supported_kinds = {
         'spring_event_listener', 'spring_framework_callback', 'spring_bean_dispatch',
+        'spring_runtime_active_entry',
         'java_spi_load_point', 'java_spi_registration',
         'mybatis_mapper_binding', 'mybatis_annotation_binding',
         'mybatis_type_reference',
@@ -826,11 +1005,19 @@ def attach_framework_edges_to_graph(graph, payload):
             if edge.get('edge_kind') not in supported_kinds:
                 continue
             target = str(edge.get('target') or '').strip()
-            candidates = []
-            for method in methods:
-                qualified = str(getattr(method, 'qualified_key', '') or '')
-                if qualified == target or qualified.startswith(target + '('):
-                    candidates.append(method)
+            if not target:
+                unmatched_edges += 1
+                continue
+            target_unsigned = target.split('(', 1)[0]
+            candidates = list(methods_by_qualified.get(target) or [])
+            if target_unsigned != target:
+                for method in methods_by_unsigned.get(target_unsigned) or []:
+                    if method not in candidates:
+                        candidates.append(method)
+            else:
+                for method in methods_by_unsigned.get(target) or []:
+                    if method not in candidates:
+                        candidates.append(method)
             if not candidates:
                 unmatched_edges += 1
                 continue

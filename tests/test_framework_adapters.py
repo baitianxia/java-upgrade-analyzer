@@ -90,6 +90,124 @@ class FrameworkAdaptersTest(unittest.TestCase):
         spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
         self.assertTrue(any(edge["edge_kind"] == "spring_framework_callback" for edge in spring["edges"]))
 
+    def test_spring_scheduled_method_emits_runtime_active_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "CleanupJob.java").write_text(
+                "package com.acme; import org.springframework.scheduling.annotation.Scheduled; "
+                "class CleanupJob { @Scheduled(fixedDelay = 1000) public void cleanup() {} }",
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertTrue(any(
+            edge["edge_kind"] == "spring_runtime_active_entry"
+            and edge["target"] == "com.acme.CleanupJob.cleanup"
+            for edge in spring["edges"]
+        ))
+
+    def test_spring_post_construct_method_emits_runtime_active_entry_without_spring_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "Warmup.java").write_text(
+                "package com.acme; import jakarta.annotation.PostConstruct; "
+                "class Warmup { @PostConstruct public void init() {} }",
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertTrue(any(
+            edge["edge_kind"] == "spring_runtime_active_entry"
+            and edge["target"] == "com.acme.Warmup.init"
+            for edge in spring["edges"]
+        ))
+
+    def test_spring_xml_scheduled_task_emits_runtime_active_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            resources = module / "src/main/resources"
+            java.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            (java / "CleanupJob.java").write_text(
+                "package com.acme; class CleanupJob { public void cleanup() {} }",
+                encoding="utf-8",
+            )
+            (resources / "spring-jobs.xml").write_text(
+                """<beans xmlns:task="http://www.springframework.org/schema/task">
+  <bean id="cleanupJob" class="com.acme.CleanupJob"/>
+  <task:scheduled-tasks>
+    <task:scheduled ref="cleanupJob" method="cleanup" fixed-delay="1000"/>
+  </task:scheduled-tasks>
+</beans>""",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{"root": str(module / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertTrue(any(
+            edge["edge_kind"] == "spring_runtime_active_entry"
+            and edge["target"] == "com.acme.CleanupJob.cleanup"
+            and edge["evidence"].get("xml_kind") == "spring_xml_scheduled_task"
+            for edge in spring["edges"]
+        ))
+
+    def test_spring_xml_quartz_method_invoking_job_emits_runtime_active_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            resources = module / "src/main/resources"
+            java.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            (java / "CleanupJob.java").write_text(
+                "package com.acme; class CleanupJob { public void cleanup() {} }",
+                encoding="utf-8",
+            )
+            (resources / "quartz.xml").write_text(
+                """<beans>
+  <bean id="cleanupJob" class="com.acme.CleanupJob"/>
+  <bean id="jobDetail" class="org.springframework.scheduling.quartz.MethodInvokingJobDetailFactoryBean">
+    <property name="targetObject" ref="cleanupJob"/>
+    <property name="targetMethod" value="cleanup"/>
+  </bean>
+</beans>""",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{"root": str(module / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertTrue(any(
+            edge["edge_kind"] == "spring_runtime_active_entry"
+            and edge["target"] == "com.acme.CleanupJob.cleanup"
+            and edge["evidence"].get("xml_kind") == "spring_xml_quartz_method_invoking_job"
+            for edge in spring["edges"]
+        ))
+
+    def test_spring_xml_runtime_active_entry_is_attached_to_graph_method(self):
+        method = SimpleNamespace(symbol_id="m1", qualified_key="com.acme.CleanupJob.cleanup")
+        graph = SimpleNamespace(methods_by_id={"m1": method})
+        payload = {"adapters": [{
+            "adapter": "spring_basic",
+            "version": "1",
+            "edges": [{
+                "source": "framework:spring_xml_scheduled_task",
+                "target": "com.acme.CleanupJob.cleanup",
+                "edge_kind": "spring_runtime_active_entry",
+                "confidence": "high",
+            }],
+        }]}
+
+        stats = attach_framework_edges_to_graph(graph, payload)
+
+        self.assertEqual(stats["matched_callback_edges"], 1)
+        self.assertEqual(graph.framework_entry_symbols["m1"][0]["edge_kind"], "spring_runtime_active_entry")
+
     def test_spring_bean_method_binds_return_type_to_created_implementation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "src/main/java/com/acme"
