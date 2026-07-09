@@ -159,7 +159,7 @@ class RealProjectRegressionTest(unittest.TestCase):
             )
 
             def fake_run_step5(_case, _project_root, _changed_apis, report_dir):
-                output = report_dir / "s5_call_chain"
+                output = report_dir / "evidence" / "call_chain"
                 output.mkdir(parents=True)
                 (output / "alerts.csv").write_text(
                     "changed_symbol,evidence_files\n"
@@ -241,7 +241,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 with changed_apis.open(encoding="utf-8") as fh:
                     rows = list(csv.DictReader(fh))
                 self.assertEqual(rows[0]["api_name"], embedded_row["api_name"])
-                output = report_dir / "s5_call_chain"
+                output = report_dir / "evidence" / "call_chain"
                 output.mkdir(parents=True)
                 (output / "alerts.csv").write_text(
                     "changed_symbol,evidence_files\n"
@@ -268,7 +268,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 result = realreg.run_case(case, root, external, report_root)
 
         self.assertEqual(result["status"], "passed")
-        self.assertEqual(Path(result["changed_apis"]).name, "input_all_changed_apis.csv")
+        self.assertTrue(str(result["changed_apis"]).endswith("evidence/api_changes/all_changed_apis.csv"))
 
 
 if __name__ == "__main__":

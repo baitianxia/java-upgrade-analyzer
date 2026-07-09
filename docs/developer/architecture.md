@@ -48,7 +48,7 @@
 - 升级变化识别依赖 `jar` 与产物层证据
 - 影响证明依赖业务源码与依赖源码构成的静态图
 - 正式流程只有一个调度入口：`scripts/run_step.py`
-- 正式流程只有一个业务参数与状态真相源：`.upgrade-report/main_state.json`
+- 正式流程只有一个业务参数与状态真相源：`.upgrade-report/.runtime/state/main_state.json`
 - `interaction.json` 只负责展示待交互信息，不参与求值
 - Step5 的目标是高精度影响证明，不是最大召回
 - 证据不足时系统进入保守状态，不将“未覆盖”误写成“未影响”
@@ -203,7 +203,7 @@
 
 ### 唯一主状态
 
-`.upgrade-report/main_state.json` 是正式流程的唯一主状态文件，也是唯一业务参数真相源。
+`.upgrade-report/.runtime/state/main_state.json` 是正式流程的唯一主状态文件，也是唯一业务参数真相源。
 
 它承载：
 
@@ -342,7 +342,7 @@ Step1 负责识别依赖变化范围，并建立后续分析所需的最小可�
 
 ### Step2：升级上下文收敛
 
-Step2 负责把后续步骤真正依赖的上下文收敛回主状态，并产出 `s2_context.json`。
+Step2 负责把后续步骤真正依赖的上下文收敛回主状态，并产出 `evidence/context/context.json`。
 
 当前实现的关键点：
 
@@ -456,17 +456,20 @@ Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系�
 - 自动推断或用户补齐的依赖源码映射
 - 必要时由 Step4 checkpoint 指定的目标 API 子集
 
-当 `Step5` 作为独立 CLI 运行且未显式传 `--report-dir` 时，当前实现会优先从 `all_changed_apis.csv` 的 `s4_jar_compare` 父目录推导报告目录；若该输入也未提供，则再回退到 `output_dir` 的父目录。
+当 `Step5` 作为独立 CLI 运行且未显式传 `--report-dir` 时，当前实现会优先从 `all_changed_apis.csv` 所在的 `evidence/api_changes/` 目录推导报告目录；若该输入也未提供，则再回退到 `output_dir` 的父目录。
 
 当前正式输出：
 
-- `s3_risk_candidates.csv`
-- `s4_per_dependency/<coord>/candidate_hits.csv`
+- `evidence/call_chain/alerts.csv`
+- `evidence/call_chain/summary.json`
+- `evidence/call_chain/by_api/*.json`
+- `evidence/call_chain/by_module/*_impacts.json`
+- `evidence/api_changes/s4_per_dependency/<coord>/candidate_hits.csv`
 - `reachable`
 - `uncertain`
 - `not_analyzed`
 - `not_found_in_static_analysis`
-- `s4_per_dependency/<coord>/summary.json` 中的单依赖结果视图
+- `evidence/api_changes/s4_per_dependency/<coord>/summary.json` 中的单依赖结果视图
 
 四态属于正式语义，不是展示标签。
 
@@ -851,8 +854,8 @@ Step6 负责把 Step1 到 Step5 的结构化产物收敛成最终交付结果。
 
 核心产物包括：
 
-- `s6_findings.json`
-- `s6_report.md`
+- `.runtime/findings/s6_findings.json`
+- `deliverables/report.md`
 
 Step6 的职责是读取和重组前序结构化产物，回填 `reason_code` 与 `evidence_paths`，并按用户可理解的视角组织 findings。
 
@@ -860,11 +863,11 @@ Step6 的职责是读取和重组前序结构化产物，回填 `reason_code` �
 
 当前 Step6 主要消费以下产物：
 
-- `s5_call_chain/summary.json`
+- `evidence/call_chain/summary.json`
   - 四态统计、`user_conclusion_summary`、`quality_gate`
-- `s5_call_chain/by_api/*.json`
+- `evidence/call_chain/by_api/*.json`
   - 单条 API 的 `reason_code`、`call_paths`、`evidence_paths`
-- `s4_jar_compare/all_changed_apis.csv`
+- `evidence/api_changes/all_changed_apis.csv`
   - Step4 输入变更集，用于反向核对 Step6 汇总项
 
 Step6 不是新的分析层，而是对 Step4 和 Step5 的正式证据做收敛、分组和可读化表达。

@@ -6223,6 +6223,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
         self.assertIn("com.vendor.LegacyApi.removed", report_text)
         self.assertIn("com.acme.OrderService.submit", report_text)
+        self.assertIn("展示 1 条样例；台账命中 2 次", report_text)
         self.assertIn("com.acme.OrderService.submit -> com.vendor.LegacyApi.removed(String)", report_text)
 
     def test_s6_report_summarizes_large_not_found_list_outside_main_markdown(self):

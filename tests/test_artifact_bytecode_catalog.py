@@ -319,14 +319,16 @@ BootstrapMethods:
                 zf.writestr("BOOT-INF/lib/consumer-1.0.jar", nested_bytes)
                 zf.writestr("BOOT-INF/classes/com/example/App.class", b"business-bytecode")
 
-            with (report / "s1_deps_current_resolved.csv").open("w", newline="", encoding="utf-8") as f:
+            deps_dir = report / "evidence" / "dependencies"
+            deps_dir.mkdir(parents=True)
+            with (deps_dir / "deps_current_resolved.csv").open("w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=["coord", "version", "scope", "lib_entry"])
                 writer.writeheader()
                 writer.writerow({
                     "coord": "com.acme:consumer", "version": "1.0", "scope": "packaged",
                     "lib_entry": "BOOT-INF/lib/consumer-1.0.jar",
                 })
-            (report / "build_provenance.json").write_text(json.dumps({
+            (deps_dir / "build_provenance.json").write_text(json.dumps({
                 "sides": [{
                     "side": "current", "artifact_path": str(artifact),
                     "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
@@ -350,7 +352,9 @@ BootstrapMethods:
             fallback = report / "fallback.jar"
             with zipfile.ZipFile(fallback, "w") as zf:
                 zf.writestr("com/acme/Consumer.class", b"x")
-            with (report / "s1_deps_current_resolved.csv").open("w", newline="", encoding="utf-8") as f:
+            deps_dir = report / "evidence" / "dependencies"
+            deps_dir.mkdir(parents=True)
+            with (deps_dir / "deps_current_resolved.csv").open("w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=["coord", "version", "scope", "lib_entry"])
                 writer.writeheader()
                 writer.writerow({"coord": "com.acme:consumer", "version": "1", "scope": "packaged", "lib_entry": ""})

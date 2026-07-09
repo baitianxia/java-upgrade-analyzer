@@ -117,12 +117,12 @@ Step1 构建事实
 
 | 阶段 | 输入问题 | 技术手段 | 输出证据 |
 |---|---|---|---|
-| Step1 | 系统真实带了什么依赖 | 构建产物解析、fat jar/war 解包、Maven 坐标补全 | `s1_dep_changes.csv`、`build_provenance.json` |
-| Step2 | 分析哪个模块和源码范围 | Maven reactor 解析、project scope 推导、上下文归一化 | `s2_context.json`、`s2_dep_graph.json` |
+| Step1 | 系统真实带了什么依赖 | 构建产物解析、fat jar/war 解包、Maven 坐标补全 | `evidence/dependencies/dep_changes.csv`、`evidence/dependencies/build_provenance.json` |
+| Step2 | 分析哪个模块和源码范围 | Maven reactor 解析、project scope 推导、上下文归一化 | `evidence/context/context.json`、`evidence/context/dep_graph.json` |
 | Step3 | 背景风险有哪些 | 规则包扫描、源码/资源文本扫描、JDK/Jakarta/Spring 规则 | `s3_*.csv`、`s3_*.txt` |
 | Step4 | API 真实变了什么 | JApiCmp、git diff、removed jar 符号导出、CSV 契约 | `all_changed_apis.csv` |
 | Step5 | 变化是否触达业务 | AST、字节码、反向图、置信度追踪、动态调用补偿 | `alerts.csv`、`summary.json`、`by_api/*.json` |
-| Step6 | 如何交付复核 | 多源证据聚合、四态分桶、Markdown 报告生成 | `s6_findings.json`、`s6_report.md` |
+| Step6 | 如何交付复核 | 多源证据聚合、四态分桶、Markdown 报告生成 | `.runtime/findings/s6_findings.json`、`deliverables/report.md` |
 
 正式流程由 `scripts/run_step.py` 编排，并通过 `.upgrade-report/` 持久化所有关键证据。最终报告不是黑盒结论，而是可以沿文件回溯到每一步的输入、输出和证据来源。
 
@@ -176,7 +176,7 @@ Step4 使用三类主要技术构建 API 变化事实。
 所有变化最终统一写入：
 
 ```text
-s4_jar_compare/all_changed_apis.csv
+evidence/api_changes/all_changed_apis.csv
 ```
 
 字段由 `scripts/s4_contract.py` 统一定义，包含 `coord`、`change_type`、`api_name`、`symbol_kind`、`api_signature`、`source`、`evidence_path` 等。
@@ -227,9 +227,9 @@ Step5 把 API 变化目标转换成 lookup key，再在源码图、字节码图�
 核心产物包括：
 
 ```text
-s5_call_chain/alerts.csv
-s5_call_chain/summary.json
-s5_call_chain/by_api/*.json
+evidence/call_chain/alerts.csv
+evidence/call_chain/summary.json
+evidence/call_chain/by_api/*.json
 ```
 
 ## 八、关键技术四：把框架和动态调用纳入证据体系
@@ -280,9 +280,9 @@ s5_call_chain/by_api/*.json
 
 正式入口统一为 `scripts/run_step.py`，并通过两个状态文件约束流程。
 
-`.upgrade-report/main_state.json` 是唯一主状态和业务参数真相源，保存当前 Step、已完成 Step、每步输入输出、用户确认参数和待交互状态。
+`.upgrade-report/.runtime/state/main_state.json` 是唯一主状态和业务参数真相源，保存当前 Step、已完成 Step、每步输入输出、用户确认参数和待交互状态。
 
-`.upgrade-report/interaction.json` 只负责展示待确认问题，不参与求值。用户答复必须整理成结构化 `intent_patch`，再恢复到主状态。
+`.upgrade-report/.runtime/state/interaction.json` 只负责展示待确认问题，不参与求值。用户答复必须整理成结构化 `intent_patch`，再恢复到主状态。
 
 ### 达成的效果
 
@@ -372,7 +372,7 @@ Step5 对目标执行多证据追踪：
 - Step1 保留依赖变化和构建来源；
 - Step4 保留 JApiCmp、git diff、removed jar 符号和 `all_changed_apis.csv`；
 - Step5 保留 `alerts.csv`、`summary.json`、`by_api/*.json`；
-- Step6 输出 `s6_findings.json` 和 `s6_report.md`。
+- Step6 输出 `.runtime/findings/s6_findings.json` 和 `deliverables/report.md`。
 
 其中 `alerts.csv` 是完整链路台账，不是样例抽样。
 

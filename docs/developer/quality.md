@@ -137,7 +137,7 @@ python3 scripts/smoke_regression.py --group orchestrator
 Step5 性能验证优先看：
 
 ```text
-s5_call_chain/step5_timing.csv
+evidence/call_chain/step5_timing.csv
 ```
 
 关键指标：
@@ -187,4 +187,3 @@ python3 scripts/quality_gate.py --profile quick
 - `.pytest_cache/`;
 - 历史 zip；
 - 临时日志。
-

@@ -705,6 +705,7 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         production_missing = sorted(production_baseline - alert_files)
         test_missing = sorted(test_baseline - alert_files)
         extra = sorted(alert_files - production_baseline - test_baseline)
+        project_root_resolved = project_root.resolve()
         check = {
             "symbol": spec.symbol,
             "gating": spec.require_zero_production_missing,
@@ -716,8 +717,8 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
             "test_missing": len(test_missing),
             "extra_alert_files": len(extra),
             "notes": spec.notes,
-            "production_missing_files": [str(Path(item).relative_to(project_root)) for item in production_missing[:20]],
-            "test_missing_files": [str(Path(item).relative_to(project_root)) for item in test_missing[:20]],
+            "production_missing_files": [str(Path(item).resolve().relative_to(project_root_resolved)) for item in production_missing[:20]],
+            "test_missing_files": [str(Path(item).resolve().relative_to(project_root_resolved)) for item in test_missing[:20]],
         }
         checks.append(check)
         if spec.require_zero_production_missing and production_missing:

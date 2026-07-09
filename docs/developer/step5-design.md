@@ -20,9 +20,9 @@ Step5 消费 Step4 产生的 API 变化集合，判断这些变化是否可能�
 
 | 输入 | 来源 | 用途 |
 |---|---|---|
-| `s4_jar_compare/all_changed_apis.csv` | Step4 | API 变化目标集合 |
-| `.upgrade-report/build_provenance.json` | Step1 | 确认业务制品来源 |
-| `s1_artifacts/` | Step1 | 提取业务 class 和运行时依赖 JAR |
+| `evidence/api_changes/all_changed_apis.csv` | Step4 | API 变化目标集合 |
+| `evidence/dependencies/build_provenance.json` | Step1 | 确认业务制品来源 |
+| `evidence/dependencies/s1_artifacts/` | Step1 | 提取业务 class 和运行时依赖 JAR |
 | 系统源码目录 | `project_dir` / `project_scope` | 构建业务源码调用图 |
 | `dependency_source_dirs` | 用户可选输入 | 依赖源码映射和跨依赖源码链路 |
 
@@ -50,7 +50,7 @@ Step4 all_changed_apis
   -> 扫描 current 运行时依赖 JAR
   -> 合并反射/框架/字节码证据
   -> 对每个 API 做反向追踪
-  -> 输出 alerts.csv / summary.json / by_api
+  -> 输出 evidence/call_chain/alerts.csv / summary.json / by_api
 ```
 
 ## 目标键与反向图
@@ -181,7 +181,7 @@ Step5 的性能优化必须保持分析语义不变。
 Step5 会输出：
 
 ```text
-s5_call_chain/step5_timing.csv
+evidence/call_chain/step5_timing.csv
 ```
 
 重点看：

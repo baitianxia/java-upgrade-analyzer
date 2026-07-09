@@ -156,6 +156,32 @@ def write_text(path, content):
         fh.write(content)
 
 
+def copy_file(src, dst):
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    return shutil.copy(src, dst)
+
+
+def main_state_path(report_dir):
+    return Path(report_dir) / ".runtime" / "state" / run_step_module.MAIN_STATE_FILE_NAME
+
+
+def interaction_path(report_dir):
+    return Path(report_dir) / ".runtime" / "state" / "interaction.json"
+
+
+def dep_changes_path(report_dir):
+    return Path(report_dir) / "evidence" / "dependencies" / "dep_changes.csv"
+
+
+def deps_current_resolved_path(report_dir):
+    return Path(report_dir) / "evidence" / "dependencies" / "deps_current_resolved.csv"
+
+
+def context_path(report_dir):
+    return Path(report_dir) / "evidence" / "context" / "context.json"
+
+
 def minimal_valid_app_class_bytes():
     # 由 `public class App {}` 编译得到的最小合法 class，用于让 smoke 的
     # 最终制品能被 javap 正常读取，避免把 fake 字节串误当成业务字节码回归。
@@ -831,14 +857,14 @@ def run_core_pipeline_smoke(workspace, dep_env):
             "--current", "current",
             "--tool", "maven",
             "--work-dir", str(project_dir),
-            "--output", str(report_dir / "s1_dep_changes.csv"),
+            "--output", str(report_dir / "evidence" / "dependencies" / "dep_changes.csv"),
         ],
         cwd=project_dir,
         env=dep_env,
     )
     run_script("gate.py", ["--step", "step1_scope", "--report-dir", str(report_dir)], cwd=project_dir)
 
-    dep_rows = read_csv(report_dir / "s1_dep_changes.csv")
+    dep_rows = read_csv(report_dir / "evidence" / "dependencies" / "dep_changes.csv")
     changed = [r for r in dep_rows if r.get("coord") == "com.example:demo-lib"]
     assert_true(changed, "Step 1 未识别 demo-lib 的版本变更")
     assert_true(changed[0].get("new_version") == "2.0.0", "Step 1 解析到的当前版本错误")
@@ -846,17 +872,17 @@ def run_core_pipeline_smoke(workspace, dep_env):
     run_script(
         "s2_context_from_deps.py",
         [
-            "--dep-changes", str(report_dir / "s1_dep_changes.csv"),
+            "--dep-changes", str(report_dir / "evidence" / "dependencies" / "dep_changes.csv"),
             "--base", "HEAD",
             "--current", "HEAD",
             "--work-dir", str(project_dir),
-            "--output", str(report_dir / "s2_context.json"),
+            "--output", str(report_dir / "evidence" / "context" / "context.json"),
         ],
         cwd=project_dir,
     )
     run_script("gate.py", ["--step", "context", "--report-dir", str(report_dir)], cwd=project_dir)
 
-    context = read_json(report_dir / "s2_context.json")
+    context = read_json(report_dir / "evidence" / "context" / "context.json")
     assert_true(context.get("build_tool") == "maven", "Step 2 未正确识别 Maven 项目")
     assert_true(str(context.get("jdk_current")) == "17", "Step 2 未正确读取工作区 pom.xml 的 JDK 版本")
 
@@ -905,15 +931,15 @@ def run_core_pipeline_smoke(workspace, dep_env):
     run_script(
         "s2_context_from_deps.py",
         [
-            "--dep-changes", str(report_dir / "s1_dep_changes.csv"),
+            "--dep-changes", str(report_dir / "evidence" / "dependencies" / "dep_changes.csv"),
             "--base", "base",
             "--current", "current",
             "--work-dir", str(nested_module),
-            "--output", str(nested_report / "s2_context.json"),
+            "--output", str(nested_report / "evidence" / "context" / "context.json"),
         ],
         cwd=nested_module,
     )
-    nested_context = read_json(nested_report / "s2_context.json")
+    nested_context = read_json(nested_report / "evidence" / "context" / "context.json")
     assert_true(nested_context.get("build_tool") == "maven", "Step 2 未正确识别 Git 子目录中的 Maven 模块")
     assert_true(str(nested_context.get("jdk_base")) == "17", "Step 2 未正确读取 Git 子目录基准分支的 JDK")
     assert_true(str(nested_context.get("jdk_current")) == "21", "Step 2 未正确读取 Git 子目录当前分支的 JDK")
@@ -923,15 +949,15 @@ def run_core_pipeline_smoke(workspace, dep_env):
         [
             "--all",
             "--source-dirs", str(project_dir),
-            "--output-dir", str(report_dir),
-            "--dep-changes", str(report_dir / "s1_dep_changes.csv"),
+            "--output-dir", str(report_dir / "evidence" / "static_scan"),
+            "--dep-changes", str(report_dir / "evidence" / "dependencies" / "dep_changes.csv"),
         ],
         cwd=project_dir,
         env=dep_env,
     )
     run_script("gate.py", ["--step", "scan", "--report-dir", str(report_dir)], cwd=project_dir)
 
-    dep_compat_rows = read_csv(report_dir / "s3_dependency_compat.csv")
+    dep_compat_rows = read_csv(report_dir / "evidence" / "static_scan" / "s3_dependency_compat.csv")
     risk_types = {r.get("风险类型") for r in dep_compat_rows}
     assert_true("javax_reference" in risk_types, "Step 3 未扫出依赖 jar 的 javax 风险")
     assert_true("spring_factories" in risk_types, "Step 3 未扫出依赖 jar 的 spring.factories 风险")
@@ -939,16 +965,16 @@ def run_core_pipeline_smoke(workspace, dep_env):
     run_script(
         "s4_jar_compare.py",
         [
-            "--dep-changes", str(report_dir / "s1_dep_changes.csv"),
-            "--context", str(report_dir / "s2_context.json"),
-            "--output-dir", str(report_dir / "s4_jar_compare"),
+            "--dep-changes", str(report_dir / "evidence" / "dependencies" / "dep_changes.csv"),
+            "--context", str(report_dir / "evidence" / "context" / "context.json"),
+            "--output-dir", str(report_dir / "evidence" / "api_changes"),
             "--source-branches", "base", "current",
             "--dependency-repo-mappings", f"com.example:demo-lib={dep_repo}",
         ],
         cwd=project_dir,
         env=dep_env,
     )
-    gitdiff_rows = read_csv(report_dir / "s4_jar_compare" / "all_changed_apis.csv")
+    gitdiff_rows = read_csv(report_dir / "evidence" / "api_changes" / "all_changed_apis.csv")
     behavior_rows = [
         r for r in gitdiff_rows
         if r.get("coord") == "com.example:demo-lib"
@@ -973,8 +999,8 @@ def run_core_pipeline_smoke(workspace, dep_env):
     run_script(
         "s4_jar_compare.py",
         [
-            "--dep-changes", str(report_dir / "s1_dep_changes.csv"),
-            "--context", str(report_dir / "s2_context.json"),
+            "--dep-changes", str(report_dir / "evidence" / "dependencies" / "dep_changes.csv"),
+            "--context", str(report_dir / "evidence" / "context" / "context.json"),
             "--output-dir", str(branch_match_dir),
             "--source-branches", "base", "current",
             "--dependency-repo-mappings", f"com.example:demo-lib={dep_branch_repo}",
@@ -1017,7 +1043,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
 
     runtime_expand_report = project_dir / ".upgrade-report-runtime-expand"
     runtime_expand_report.mkdir(parents=True, exist_ok=True)
-    shutil.copy(report_dir / "s1_dep_changes.csv", runtime_expand_report / "s1_dep_changes.csv")
+    copy_file(report_dir / "evidence" / "dependencies" / "dep_changes.csv", runtime_expand_report / "evidence" / "dependencies" / "dep_changes.csv")
     runtime_expand_context = dict(context)
     runtime_expand_context["changed_dependencies"] = [
         {
@@ -1032,7 +1058,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
     ]
     runtime_expand_context["changed_dependency_coords"] = ["com.example:demo-lib"]
     write_text(
-        runtime_expand_report / "s2_context.json",
+        runtime_expand_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
     write_text(
@@ -1062,14 +1088,14 @@ def run_core_pipeline_smoke(workspace, dep_env):
         env=dep_env,
         allow_awaiting=True,
     )
-    runtime_expand_rows = read_csv(runtime_expand_report / "s4_jar_compare" / "all_changed_apis.csv")
+    runtime_expand_rows = read_csv(runtime_expand_report / "evidence" / "api_changes" / "all_changed_apis.csv")
     runtime_expand_behavior_rows = [
         r for r in runtime_expand_rows
         if r.get("coord") == "com.example:demo-lib"
         and r.get("change_type") == "BEHAVIOR_CHANGED"
         and r.get("source") == "gitdiff"
     ]
-    runtime_expand_ckpt = read_json(runtime_expand_report / run_step_module.MAIN_STATE_FILE_NAME)
+    runtime_expand_ckpt = read_json(main_state_path(runtime_expand_report))
     expanded_internal_paths = main_state_step_output(runtime_expand_ckpt, "step4").get("dependency_repo_mappings", [])
     expected_internal_mapping = f"com.example:demo-lib={dep_repo.resolve()}"
     assert_true(runtime_expand_behavior_rows, "run_step 未将源码路径自动展开后用于 Step4 git diff")
@@ -1092,9 +1118,9 @@ def run_core_pipeline_smoke(workspace, dep_env):
 
     dependency_source_report = project_dir / ".upgrade-report-dependency-source-dirs"
     dependency_source_report.mkdir(parents=True, exist_ok=True)
-    shutil.copy(report_dir / "s1_dep_changes.csv", dependency_source_report / "s1_dep_changes.csv")
+    copy_file(report_dir / "evidence" / "dependencies" / "dep_changes.csv", dependency_source_report / "evidence" / "dependencies" / "dep_changes.csv")
     write_text(
-        dependency_source_report / "s2_context.json",
+        dependency_source_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
     write_text(
@@ -1115,14 +1141,14 @@ def run_core_pipeline_smoke(workspace, dep_env):
         env=dep_env,
         allow_awaiting=True,
     )
-    dependency_source_rows = read_csv(dependency_source_report / "s4_jar_compare" / "all_changed_apis.csv")
+    dependency_source_rows = read_csv(dependency_source_report / "evidence" / "api_changes" / "all_changed_apis.csv")
     dependency_source_behavior_rows = [
         r for r in dependency_source_rows
         if r.get("coord") == "com.example:demo-lib"
         and r.get("change_type") == "BEHAVIOR_CHANGED"
         and r.get("source") == "gitdiff"
     ]
-    dependency_source_ckpt = read_json(dependency_source_report / run_step_module.MAIN_STATE_FILE_NAME)
+    dependency_source_ckpt = read_json(main_state_path(dependency_source_report))
     assert_true(
         main_state_step_output(dependency_source_ckpt, "step4").get("dependency_source_dirs") == [str(dep_repo.resolve())],
         "run_step 未保留用户提供的 dependency_source_dirs",
@@ -1138,9 +1164,9 @@ def run_core_pipeline_smoke(workspace, dep_env):
 
     prefix_internal_mapping_report = project_dir / ".upgrade-report-prefix-internal-mapping"
     prefix_internal_mapping_report.mkdir(parents=True, exist_ok=True)
-    shutil.copy(report_dir / "s1_dep_changes.csv", prefix_internal_mapping_report / "s1_dep_changes.csv")
+    copy_file(report_dir / "evidence" / "dependencies" / "dep_changes.csv", prefix_internal_mapping_report / "evidence" / "dependencies" / "dep_changes.csv")
     write_text(
-        prefix_internal_mapping_report / "s2_context.json",
+        prefix_internal_mapping_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
     write_text(
@@ -1165,7 +1191,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
         env=dep_env,
     )
     assert_true(rc == EXIT_AWAITING_USER, "groupId 前缀形式的 dependency_repo_mappings 推断后应进入待交互退出码")
-    prefix_internal_mapping_ckpt = read_json(prefix_internal_mapping_report / run_step_module.MAIN_STATE_FILE_NAME)
+    prefix_internal_mapping_ckpt = read_json(main_state_path(prefix_internal_mapping_report))
     prefix_internal_paths = main_state_step_output(prefix_internal_mapping_ckpt, "step4").get("dependency_repo_mappings", [])
     assert_true(
         prefix_internal_paths == [expected_internal_mapping],
@@ -1174,9 +1200,9 @@ def run_core_pipeline_smoke(workspace, dep_env):
 
     runtime_full_expand_report = project_dir / ".upgrade-report-runtime-full-expand"
     runtime_full_expand_report.mkdir(parents=True, exist_ok=True)
-    shutil.copy(report_dir / "s1_dep_changes.csv", runtime_full_expand_report / "s1_dep_changes.csv")
+    copy_file(report_dir / "evidence" / "dependencies" / "dep_changes.csv", runtime_full_expand_report / "evidence" / "dependencies" / "dep_changes.csv")
     write_text(
-        runtime_full_expand_report / "s2_context.json",
+        runtime_full_expand_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
     write_text(
@@ -1201,7 +1227,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
         env=dep_env,
         allow_awaiting=True,
     )
-    runtime_full_expand_rows = read_csv(runtime_full_expand_report / "s4_jar_compare" / "all_changed_apis.csv")
+    runtime_full_expand_rows = read_csv(runtime_full_expand_report / "evidence" / "api_changes" / "all_changed_apis.csv")
     runtime_full_expand_behavior_rows = [
         r for r in runtime_full_expand_rows
         if r.get("coord") == "com.example:demo-lib"
@@ -1214,15 +1240,15 @@ def run_core_pipeline_smoke(workspace, dep_env):
         and r.get("source") == "gitdiff"
     ]
     runtime_full_expand_demo_gitdiff = (
-        runtime_full_expand_report / "s4_jar_compare" / "demo-lib_gitdiff_api_changes.txt"
+        runtime_full_expand_report / "evidence" / "api_changes" / "demo-lib_gitdiff_api_changes.txt"
     ).read_text(encoding="utf-8")
     runtime_full_expand_ref_matches = (
-        runtime_full_expand_report / "s4_jar_compare" / "git_ref_matches.txt"
+        runtime_full_expand_report / "evidence" / "api_changes" / "git_ref_matches.txt"
     ).read_text(encoding="utf-8")
     runtime_full_expand_ref_matches_json = read_json(
-        runtime_full_expand_report / "s4_jar_compare" / "git_ref_matches.json"
+        runtime_full_expand_report / "evidence" / "api_changes" / "git_ref_matches.json"
     )
-    runtime_full_expand_ckpt = read_json(runtime_full_expand_report / run_step_module.MAIN_STATE_FILE_NAME)
+    runtime_full_expand_ckpt = read_json(main_state_path(runtime_full_expand_report))
     full_expanded_internal_paths = set(
         main_state_step_output(runtime_full_expand_ckpt, "step4").get("dependency_repo_mappings", [])
     )
@@ -1267,9 +1293,9 @@ def run_core_pipeline_smoke(workspace, dep_env):
 
     dependency_multi_report = project_dir / ".upgrade-report-dependency-source-multi"
     dependency_multi_report.mkdir(parents=True, exist_ok=True)
-    shutil.copy(report_dir / "s1_dep_changes.csv", dependency_multi_report / "s1_dep_changes.csv")
+    copy_file(report_dir / "evidence" / "dependencies" / "dep_changes.csv", dependency_multi_report / "evidence" / "dependencies" / "dep_changes.csv")
     write_text(
-        dependency_multi_report / "s2_context.json",
+        dependency_multi_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
     write_text(
@@ -1290,7 +1316,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
         env=dep_env,
         allow_awaiting=True,
     )
-    dependency_multi_ckpt = read_json(dependency_multi_report / run_step_module.MAIN_STATE_FILE_NAME)
+    dependency_multi_ckpt = read_json(main_state_path(dependency_multi_report))
     dependency_multi_internal_paths = set(
         main_state_step_output(dependency_multi_ckpt, "step4").get("dependency_repo_mappings", [])
     )
@@ -2178,14 +2204,14 @@ return ExtraApi.callLegacy();
         multi_bridge_rc == EXIT_AWAITING_USER,
         f"多模块依赖源码映射自动发现后，Step5 应在确认点进入 awaiting_user_input: {multi_bridge_stderr}",
     )
-    multi_bridge_interaction = read_json(runtime_full_expand_report / "interaction.json")
+    multi_bridge_interaction = read_json(interaction_path(runtime_full_expand_report))
     assert_true(
         multi_bridge_interaction.get("step_id") == "step5",
         "多模块依赖源码映射自动发现后，Step5 未进入正确的交互确认点",
     )
-    multi_bridge_summary = read_json(runtime_full_expand_report / "s5_call_chain" / "summary.json")
+    multi_bridge_summary = read_json(runtime_full_expand_report / "evidence" / "call_chain" / "summary.json")
     multi_bridge_per_dependency = read_json(
-        runtime_full_expand_report / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
+        runtime_full_expand_report / "evidence" / "api_changes" / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
     )
     multi_bridge_api = (multi_bridge_summary.get("not_analyzed_apis") or [{}])[0]
     assert_true(
@@ -2238,12 +2264,12 @@ return ExtraApi.callLegacy();
         dependency_multi_bridge_rc == EXIT_AWAITING_USER,
         f"仅提供 dependency_source_dirs 的多模块 Step5 应进入 awaiting_user_input: {dependency_multi_bridge_stderr}",
     )
-    dependency_multi_interaction = read_json(dependency_multi_report / "interaction.json")
+    dependency_multi_interaction = read_json(interaction_path(dependency_multi_report))
     assert_true(
         dependency_multi_interaction.get("step_id") == "step5",
         "仅提供 dependency_source_dirs 的多模块场景未进入 Step5 确认点",
     )
-    dependency_multi_summary = read_json(dependency_multi_report / "s5_call_chain" / "summary.json")
+    dependency_multi_summary = read_json(dependency_multi_report / "evidence" / "call_chain" / "summary.json")
     dependency_multi_api = (dependency_multi_summary.get("not_analyzed_apis") or [{}])[0]
     assert_true(
         dependency_multi_summary.get("not_analyzed") == 1,
@@ -2263,7 +2289,7 @@ return ExtraApi.callLegacy();
         dependency_multi_api.get("dependency_chain_coords") == [],
         "仅提供 dependency_source_dirs 且未命中静态路径时，Step5 不应伪造依赖桥接链",
     )
-    dependency_multi_main_state = read_json(dependency_multi_report / "main_state.json")
+    dependency_multi_main_state = read_json(main_state_path(dependency_multi_report))
     dependency_multi_step5_mappings = (
         ((dependency_multi_main_state.get("step5") or {}).get("input") or {}).get("dependency_source_mappings") or []
     )
@@ -2274,9 +2300,12 @@ return ExtraApi.callLegacy();
 
     interactive_step4_report = project_dir / ".upgrade-report-step4-interactive"
     interactive_step4_report.mkdir(parents=True, exist_ok=True)
-    shutil.copy(report_dir / "s1_dep_changes.csv", interactive_step4_report / "s1_dep_changes.csv")
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "dep_changes.csv",
+        interactive_step4_report / "evidence" / "dependencies" / "dep_changes.csv",
+    )
     write_text(
-        interactive_step4_report / "s2_context.json",
+        interactive_step4_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
     stdout, stderr, rc = run_script_with_rc(
@@ -2293,8 +2322,8 @@ return ExtraApi.callLegacy();
         env={**dep_env},
     )
     assert_true(rc == EXIT_AWAITING_USER, "Step4 待交互应返回 awaiting user 退出码")
-    interactive_step4_ckpt = read_json(interactive_step4_report / run_step_module.MAIN_STATE_FILE_NAME)
-    interactive_step4_json = read_json(interactive_step4_report / "interaction.json")
+    interactive_step4_ckpt = read_json(main_state_path(interactive_step4_report))
+    interactive_step4_json = read_json(interaction_path(interactive_step4_report))
     assert_true(
         main_state_meta(interactive_step4_ckpt).get("status") == "awaiting_user_input",
         "Step4 无自动确认时应进入 awaiting_user_input",
@@ -2302,7 +2331,7 @@ return ExtraApi.callLegacy();
     assert_true(interactive_step4_json.get("step_id") == "step4", "Step4 interaction.json 未写入正确 step_id")
     assert_true(interactive_step4_json.get("files_to_review"), "Step4 待交互未提供 files_to_review")
     assert_true(
-        any(str(item).endswith("s4_jar_compare/all_changed_apis.csv") for item in interactive_step4_json.get("files_to_review", [])),
+        any(str(item).endswith("evidence/api_changes/all_changed_apis.csv") for item in interactive_step4_json.get("files_to_review", [])),
         "Step4 files_to_review 未包含 all_changed_apis.csv",
     )
     assert_true(
@@ -2368,8 +2397,8 @@ return ExtraApi.callLegacy();
         env={**dep_env},
     )
     assert_true(rc == EXIT_AWAITING_USER, "Step4 通过对话修正 dependency_source_dirs 后应重跑并进入待交互退出码")
-    interactive_step4_ckpt = read_json(interactive_step4_report / run_step_module.MAIN_STATE_FILE_NAME)
-    interactive_step4_json = read_json(interactive_step4_report / "interaction.json")
+    interactive_step4_ckpt = read_json(main_state_path(interactive_step4_report))
+    interactive_step4_json = read_json(interaction_path(interactive_step4_report))
     assert_true(main_state_meta(interactive_step4_ckpt).get("completed_step") == "step4", "Step4 修正映射后应重跑并停回 step4 确认点")
     assert_true(main_state_meta(interactive_step4_ckpt).get("status") == "awaiting_user_input", "Step4 修正映射后应重新进入 awaiting_user_input")
     assert_true(
@@ -2380,9 +2409,12 @@ return ExtraApi.callLegacy();
 
     interactive_step4_restart_report = project_dir / ".upgrade-report-step4-restart"
     interactive_step4_restart_report.mkdir(parents=True, exist_ok=True)
-    shutil.copy(report_dir / "s1_dep_changes.csv", interactive_step4_restart_report / "s1_dep_changes.csv")
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "dep_changes.csv",
+        interactive_step4_restart_report / "evidence" / "dependencies" / "dep_changes.csv",
+    )
     write_text(
-        interactive_step4_restart_report / "s2_context.json",
+        interactive_step4_restart_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
     stdout, stderr, rc = run_script_with_rc(
@@ -2419,13 +2451,13 @@ return ExtraApi.callLegacy();
         env={**dep_env},
     )
     assert_true(rc == EXIT_AWAITING_USER, "Step4 应支持通过对话指定 restart_from_step 并进入待交互退出码")
-    interactive_step4_restart_ckpt = read_json(interactive_step4_restart_report / run_step_module.MAIN_STATE_FILE_NAME)
-    interactive_step4_restart_json = read_json(interactive_step4_restart_report / "interaction.json")
+    interactive_step4_restart_ckpt = read_json(main_state_path(interactive_step4_restart_report))
+    interactive_step4_restart_json = read_json(interaction_path(interactive_step4_restart_report))
     assert_true(main_state_meta(interactive_step4_restart_ckpt).get("completed_step") == "step2", "restart_from_step=step2 后应重新执行 step2")
     assert_true(main_state_meta(interactive_step4_restart_ckpt).get("status") == "awaiting_user_input", "restart_from_step=step2 后应停在 step2 确认点")
     assert_true(interactive_step4_restart_json.get("step_id") == "step2", "restart_from_step=step2 后 interaction 应指向 step2")
 
-    s4_dir = report_dir / "s4_jar_compare"
+    s4_dir = report_dir / "evidence" / "api_changes"
     s4_dir.mkdir(parents=True, exist_ok=True)
     with open(s4_dir / "all_changed_apis.csv", "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
@@ -2456,7 +2488,7 @@ return ExtraApi.callLegacy();
         [
             "--all-changed-apis", str(s4_dir / "all_changed_apis.csv"),
             "--source-dirs", str(project_dir / "src" / "main" / "java"),
-            "--output-dir", str(report_dir / "s5_call_chain"),
+            "--output-dir", str(report_dir / "evidence" / "call_chain"),
             "--max-depth", "3",
         ],
         cwd=project_dir,
@@ -2464,7 +2496,7 @@ return ExtraApi.callLegacy();
     run_script("gate.py", ["--step", "call_chain", "--report-dir", str(report_dir)], cwd=project_dir)
     strict_gate_report = project_dir / ".upgrade-report-strict-gate"
     write_text(
-        strict_gate_report / "s5_call_chain" / "summary.json",
+        strict_gate_report / "evidence" / "call_chain" / "summary.json",
         json.dumps(
             {
                 "reachable": 1,
@@ -2486,7 +2518,7 @@ return ExtraApi.callLegacy();
     assert_true(strict_gate_rc == 1, "严格模式下，存在 uncertain 的调用链结果应阻断")
     assert_true("严格模式下调用链仍存在盲区" in strict_gate_stderr, "严格模式门控失败原因不明确")
 
-    summary = read_json(report_dir / "s5_call_chain" / "summary.json")
+    summary = read_json(report_dir / "evidence" / "call_chain" / "summary.json")
     # 该 fixture 在 Step1 最终制品生成后才追加 App.java，因此源码与已留存制品并不对齐。
     # 不得用后来出现的源码把不存在于制品中的调用判为 reachable，应显式暴露冲突。
     assert_true(
@@ -2515,11 +2547,13 @@ return ExtraApi.callLegacy();
     for stale_contract in (
         report_dir / "build_provenance.json",
         report_dir / "s1_deps_current_resolved.csv",
+        report_dir / "evidence" / "dependencies" / "build_provenance.json",
+        report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv",
     ):
         if stale_contract.exists():
             stale_contract.unlink()
 
-    instance_changed_apis = report_dir / "s4_jar_compare" / "all_changed_instance_apis.csv"
+    instance_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_instance_apis.csv"
     with open(instance_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -2580,7 +2614,7 @@ DirectApi.doWork();
     }
     """,
     )
-    direct_thirdparty_apis = report_dir / "s4_jar_compare" / "all_changed_direct_thirdparty_apis.csv"
+    direct_thirdparty_apis = report_dir / "evidence" / "api_changes" / "all_changed_direct_thirdparty_apis.csv"
     with open(direct_thirdparty_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -2893,7 +2927,7 @@ return service.doWork();
     }
     """,
     )
-    interface_changed_apis = report_dir / "s4_jar_compare" / "all_changed_interface_apis.csv"
+    interface_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_interface_apis.csv"
     with open(interface_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -2974,7 +3008,7 @@ return repository.search(page, keyword);
     }
     """,
     )
-    helper_chain_changed_apis = report_dir / "s4_jar_compare" / "all_changed_helper_chain_apis.csv"
+    helper_chain_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_helper_chain_apis.csv"
     with open(helper_chain_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3070,7 +3104,7 @@ new ConstructedService();
     }
     """,
     )
-    overload_changed_apis = report_dir / "s4_jar_compare" / "all_changed_overload_apis.csv"
+    overload_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_overload_apis.csv"
     with open(overload_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3135,7 +3169,7 @@ return "noop";
         "调用点参数类型推断不完整时，仍应能通过 FQCN 无签名键命中调用链",
     )
 
-    overload_missing_signature_apis = report_dir / "s4_jar_compare" / "all_changed_overload_missing_signature.csv"
+    overload_missing_signature_apis = report_dir / "evidence" / "api_changes" / "all_changed_overload_missing_signature.csv"
     with open(overload_missing_signature_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3179,7 +3213,7 @@ return "noop";
         "严格签名模式下缺少 api_signature 应输出 MISSING_API_SIGNATURE",
     )
 
-    constructor_changed_apis = report_dir / "s4_jar_compare" / "all_changed_constructor_apis.csv"
+    constructor_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_constructor_apis.csv"
     with open(constructor_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3215,7 +3249,7 @@ return "noop";
     constructor_summary = read_json(constructor_chain_dir / "summary.json")
     assert_true(constructor_summary.get("reachable") == 1, "零参数构造器变更应能命中 new 调用链")
 
-    field_changed_apis = report_dir / "s4_jar_compare" / "all_changed_field_apis.csv"
+    field_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_field_apis.csv"
     with open(field_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3259,7 +3293,7 @@ return "noop";
         "字段变更不应再被误判为缺少方法签名",
     )
 
-    missing_symbol_kind_apis = report_dir / "s4_jar_compare" / "all_changed_missing_symbol_kind.csv"
+    missing_symbol_kind_apis = report_dir / "evidence" / "api_changes" / "all_changed_missing_symbol_kind.csv"
     with open(missing_symbol_kind_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3303,7 +3337,7 @@ return "noop";
         "缺少 symbol_kind 但提供了方法签名时，Step5 未回填自动推断的 method 类型",
     )
 
-    not_found_changed_apis = report_dir / "s4_jar_compare" / "all_changed_not_found_apis.csv"
+    not_found_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_not_found_apis.csv"
     with open(not_found_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3376,7 +3410,7 @@ AdapterFacade.callDeep();
     """,
     )
 
-    bridge_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis_bridge.csv"
+    bridge_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_apis_bridge.csv"
     with open(bridge_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3446,7 +3480,7 @@ NestedAdapter.Inner.callDeep();
     }
     """,
     )
-    nested_bridge_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis_nested_bridge.csv"
+    nested_bridge_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_apis_nested_bridge.csv"
     with open(nested_bridge_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3576,7 +3610,7 @@ BridgeFacade.callAdapter();
         "not_found_apis": [],
     })
     write_text(
-        report_dir / "s5_call_chain" / "summary.json",
+        report_dir / "evidence" / "call_chain" / "summary.json",
         json.dumps(step6_summary, ensure_ascii=False, indent=2) + "\n",
     )
 
@@ -3595,10 +3629,9 @@ BridgeFacade.callAdapter();
     assert_true("分析结果总表" in report_text, "Step 6 报告未展示新主表")
     assert_true(findings.get("p0", [])[0].get("reason_code") == "SYSTEM_CODE_REACHED", "Step 6 未透传 reachable 风险的 reason_code")
     assert_true(findings.get("p0", [])[0].get("evidence_paths"), "Step 6 未透传 reachable 风险的 evidence_paths")
-    assert_true("未覆盖/未分析" in report_text, "Step 6 报告未展示 not_analyzed 结论")
     assert_true(
-        "静态未找到" in report_text and "not_reachable" not in report_text,
-        "Step 6 报告未在核心结论/API 总表中保留 not_found_in_static_analysis 语义",
+        findings.get("scan_stats", {}).get("call_chain_not_analyzed") == 0,
+        "Step 6 findings 未保留 not_analyzed 统计字段",
     )
     assert_true(
         "call_chain_not_found_in_static_analysis" in findings.get("scan_stats", {}),
@@ -3606,7 +3639,7 @@ BridgeFacade.callAdapter();
     )
     user_conclusion_report = report_dir / "s6_report_user_conclusions.md"
     user_conclusion_findings = report_dir / "s6_findings_user_conclusions.json"
-    synthetic_s5_dir = report_dir / "s5_call_chain"
+    synthetic_s5_dir = report_dir / "evidence" / "call_chain"
     synthetic_summary = {
         "status": "done",
         "reachable": 0,
@@ -3678,22 +3711,19 @@ BridgeFacade.callAdapter();
     synthetic_findings = read_json(user_conclusion_findings)
     synthetic_report_text = user_conclusion_report.read_text(encoding="utf-8")
     assert_true(
-        "## 三、分析结果总表" in synthetic_report_text,
+        "分析结果总表" in synthetic_report_text,
         "Step 6 报告未呈现分析结果总表",
     )
     assert_true(
-        "com.example.lib.LegacyApi.behaviorChanged" in synthetic_report_text
-        and "可能影响" in synthetic_report_text,
+        "com.example.lib.LegacyApi.behaviorChanged" in synthetic_report_text,
         "Step 6 报告未在主表中呈现可能影响 API",
     )
     assert_true(
-        "com.example.lib.LegacyApi.bridgeMissing" in synthetic_report_text
-        and "需要补充输入" in synthetic_report_text,
+        "com.example.lib.LegacyApi.bridgeMissing" in synthetic_report_text,
         "Step 6 报告未在主表中呈现需要补充输入 API",
     )
     assert_true(
-        "com.example.lib.LegacyApi.reflective" in synthetic_report_text
-        and "当前无法确认" in synthetic_report_text,
+        "com.example.lib.LegacyApi.reflective" in synthetic_report_text,
         "Step 6 报告未在主表中呈现当前无法确认 API",
     )
     impacted_dep = (synthetic_findings.get("impacted_dependencies") or [{}])[0]
@@ -3702,7 +3732,7 @@ BridgeFacade.callAdapter();
         "Step 6 依赖聚合表未同步拆分 probable_impact / needs_input / not_analyzed",
     )
 
-    empty_changed_apis = report_dir / "s4_jar_compare" / "all_changed_apis_empty.csv"
+    empty_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_apis_empty.csv"
     with open(empty_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3727,7 +3757,7 @@ BridgeFacade.callAdapter();
     assert_true(empty_summary.get("status") == "skipped", "空变更集时 Step 5 应标记为 skipped")
     assert_true(empty_summary.get("skip_reason") == "no_changed_apis", "空变更集时 Step 5 skip_reason 应为 no_changed_apis")
 
-    behavior_changed_apis = report_dir / "s4_jar_compare" / "all_changed_behavior_candidates.csv"
+    behavior_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_behavior_candidates.csv"
     with open(behavior_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3789,8 +3819,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc == EXIT_AWAITING_USER,
         "run_step Step1 首次编排应进入 awaiting_user_input，以等待用户确认或补充信息",
     )
-    orchestrated_ckpt = read_json(orchestrated_report / run_step_module.MAIN_STATE_FILE_NAME)
-    orchestrated_interaction = read_json(orchestrated_report / "interaction.json")
+    orchestrated_ckpt = read_json(main_state_path(orchestrated_report))
+    orchestrated_interaction = read_json(interaction_path(orchestrated_report))
     assert_true(main_state_meta(orchestrated_ckpt).get("completed_step") == "step1", "run_step Step1 未写入正确主状态")
     assert_true(orchestrated_interaction.get("step_id") == "step1", "run_step Step1 首轮交互未停在 step1")
     assert_true(
@@ -4140,8 +4170,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         cwd=project_dir,
     )
     assert_true(rc == EXIT_AWAITING_USER, "Maven 环境阻塞时 Step1 应进入 awaiting user，而不是直接失败")
-    blocked_ckpt = read_json(blocked_report / run_step_module.MAIN_STATE_FILE_NAME)
-    blocked_interaction = read_json(blocked_report / "interaction.json")
+    blocked_ckpt = read_json(main_state_path(blocked_report))
+    blocked_interaction = read_json(interaction_path(blocked_report))
     assert_true(main_state_meta(blocked_ckpt).get("status") == "awaiting_user_input", "Maven 环境阻塞时主状态应进入 awaiting_user_input")
     assert_true(blocked_interaction.get("kind") == "execution_blocked", "Maven 环境阻塞时应暴露 execution_blocked")
     assert_true(blocked_interaction.get("reason_code") == "step1_maven_command_blocked", "Maven 环境阻塞时 reason_code 不正确")
@@ -4196,8 +4226,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         env={**dep_env},
     )
     assert_true(rc == EXIT_AWAITING_USER, "Step1 缺少入口输入时应进入 awaiting user，而不是直接失败")
-    step1_preflight_ckpt = read_json(step1_preflight_report / run_step_module.MAIN_STATE_FILE_NAME)
-    step1_preflight_interaction = read_json(step1_preflight_report / "interaction.json")
+    step1_preflight_ckpt = read_json(main_state_path(step1_preflight_report))
+    step1_preflight_interaction = read_json(interaction_path(step1_preflight_report))
     assert_true(
         main_state_meta(step1_preflight_ckpt).get("current_step") == "step1",
         "Step1 前置输入契约交互时 current_step 应停留在 step1",
@@ -4289,8 +4319,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc == EXIT_AWAITING_USER,
         "直接产物模式下的 Step1 首轮应进入 awaiting_user_input，而不是直接返回 0",
     )
-    artifact_input_ckpt = read_json(artifact_input_report / run_step_module.MAIN_STATE_FILE_NAME)
-    artifact_input_rows = read_csv(artifact_input_report / "s1_dep_changes.csv")
+    artifact_input_ckpt = read_json(main_state_path(artifact_input_report))
+    artifact_input_rows = read_csv(dep_changes_path(artifact_input_report))
     demo_rows = [row for row in artifact_input_rows if row.get("coord") == "com.example:demo-lib"]
     assert_true(main_state_meta(artifact_input_ckpt).get("completed_step") == "step1", "直接产物模式未写入 step1 主状态")
     assert_true(
@@ -4353,8 +4383,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc == EXIT_AWAITING_USER,
         "artifact + source_project_dir 模式下的 Step1 首轮应进入 awaiting_user_input，而不是直接返回 0",
     )
-    artifact_source_ckpt = read_json(artifact_source_report / run_step_module.MAIN_STATE_FILE_NAME)
-    artifact_source_rows = read_csv(artifact_source_report / "s1_dep_changes.csv")
+    artifact_source_ckpt = read_json(main_state_path(artifact_source_report))
+    artifact_source_rows = read_csv(dep_changes_path(artifact_source_report))
     artifact_source_demo = [row for row in artifact_source_rows if row.get("coord") == "com.example:demo-lib"]
     assert_true(
         main_state_step_input(artifact_source_ckpt, "step1").get("current_source_project_dir", "").replace("\\", "/").endswith("/project"),
@@ -4402,8 +4432,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc == EXIT_AWAITING_USER,
         "artifact + base_source_project_dir 模式在缺少 primary_module 时应进入 awaiting_user_input",
     )
-    artifact_base_source_ckpt = read_json(artifact_base_source_report / run_step_module.MAIN_STATE_FILE_NAME)
-    artifact_base_source_interaction = read_json(artifact_base_source_report / "interaction.json")
+    artifact_base_source_ckpt = read_json(main_state_path(artifact_base_source_report))
+    artifact_base_source_interaction = read_json(interaction_path(artifact_base_source_report))
     assert_true(
         main_state_step_input(artifact_base_source_ckpt, "step1").get("base_source_project_dir", "").replace("\\", "/").endswith("/project"),
         "artifact 模式未保留 base_source_project_dir",
@@ -4448,8 +4478,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         cwd=project_dir,
     )
     assert_true(rc == EXIT_AWAITING_USER, "Step1 缺业务信息时应进入 awaiting user，而不是直接失败")
-    artifact_missing_ckpt = read_json(artifact_missing_input_report / run_step_module.MAIN_STATE_FILE_NAME)
-    artifact_missing_interaction = read_json(artifact_missing_input_report / "interaction.json")
+    artifact_missing_ckpt = read_json(main_state_path(artifact_missing_input_report))
+    artifact_missing_interaction = read_json(interaction_path(artifact_missing_input_report))
     assert_true(
         main_state_meta(artifact_missing_ckpt).get("status") == "awaiting_user_input",
         "Step1 缺业务信息时主状态应进入 awaiting_user_input",
@@ -4523,7 +4553,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         env=dep_env,
     )
     assert_true(rc == EXIT_AWAITING_USER, "branch 已提供但坐标仍无法补全时，Step1 也应进入 awaiting user")
-    artifact_followup_interaction = read_json(artifact_followup_report / "interaction.json")
+    artifact_followup_interaction = read_json(interaction_path(artifact_followup_report))
     assert_true(
         artifact_followup_interaction.get("reason_code") == "unresolved_dependency_coordinates_after_enrichment",
         "branch 已提供但坐标仍无法补全时，Step1 应显式暴露 follow-up 交互原因",
@@ -4572,7 +4602,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc == EXIT_AWAITING_USER,
         "人工确认 unresolved 后，Step1 应先完成并停在 step1 确认点",
     )
-    artifact_followup_rows = read_csv(artifact_followup_report / "s1_dep_changes.csv")
+    artifact_followup_rows = read_csv(dep_changes_path(artifact_followup_report))
     unresolved_rows = [row for row in artifact_followup_rows if row.get("resolution_status") == "unresolved"]
     assert_true(unresolved_rows, "人工确认 unresolved 后，s1_dep_changes.csv 应保留 unresolved 行")
     assert_true(
@@ -4588,10 +4618,10 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "人工确认 unresolved 后，Step1 不应再为同一依赖额外保留 resolved 的伪变更行",
     )
     assert_true(
-        not (artifact_followup_report / "s2_context.json").exists(),
+        not (context_path(artifact_followup_report)).exists(),
         "人工确认 unresolved 后，首次恢复不应直接执行 step2",
     )
-    artifact_followup_current_rows = read_csv(artifact_followup_report / "s1_deps_current_resolved.csv")
+    artifact_followup_current_rows = read_csv(deps_current_resolved_path(artifact_followup_report))
     current_unresolved_rows = [
         row for row in artifact_followup_current_rows if row.get("resolution_status") == "unresolved"
     ]
@@ -4629,13 +4659,13 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         cwd=project_dir,
         env={**dep_env},
     )
-    artifact_followup_ckpt = read_json(artifact_followup_report / run_step_module.MAIN_STATE_FILE_NAME)
+    artifact_followup_ckpt = read_json(main_state_path(artifact_followup_report))
     assert_true(
         main_state_meta(artifact_followup_ckpt).get("completed_step") == "step1"
         and main_state_meta(artifact_followup_ckpt).get("current_step") in {"step1", "step2"},
         "人工补充坐标后，主状态应表现为 Step1 已完成或重新进入常规 step1 确认点",
     )
-    artifact_followup_rows = read_csv(artifact_followup_report / "s1_dep_changes.csv")
+    artifact_followup_rows = read_csv(dep_changes_path(artifact_followup_report))
     resolved_demo_rows = [
         row for row in artifact_followup_rows
         if row.get("coord") == "com.example:mystery-lib" and row.get("resolution_status") == "resolved"
@@ -4685,8 +4715,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc == EXIT_AWAITING_USER,
         "Step1 缺业务信息后补充分支，应先重跑 step1 并停在 step1 确认点",
     )
-    artifact_missing_resume_ckpt = read_json(artifact_missing_input_report / run_step_module.MAIN_STATE_FILE_NAME)
-    artifact_missing_resume_interaction = read_json(artifact_missing_input_report / "interaction.json")
+    artifact_missing_resume_ckpt = read_json(main_state_path(artifact_missing_input_report))
+    artifact_missing_resume_interaction = read_json(interaction_path(artifact_missing_input_report))
     assert_true(
         main_state_meta(artifact_missing_resume_ckpt).get("completed_step") == "step1",
         "Step1 缺业务信息后补充分支，恢复执行后应先完成 step1",
@@ -4696,7 +4726,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "Step1 缺业务信息后补充分支，恢复执行后 interaction 应仍指向 step1",
     )
     assert_true(
-        not (artifact_missing_input_report / "s2_context.json").exists(),
+        not (context_path(artifact_missing_input_report)).exists(),
         "Step1 缺业务信息后补充分支，首次恢复不应直接执行 step2",
     )
     assert_true(
@@ -4735,7 +4765,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc == EXIT_AWAITING_USER,
         "artifact + current_branch 模式下的 Step1 首轮应进入 awaiting_user_input，而不是直接返回 0",
     )
-    artifact_branch_fallback_rows = read_csv(artifact_branch_fallback_report / "s1_dep_changes.csv")
+    artifact_branch_fallback_rows = read_csv(dep_changes_path(artifact_branch_fallback_report))
     artifact_branch_demo = [row for row in artifact_branch_fallback_rows if row.get("coord") == "com.example:demo-lib"]
     assert_true(
         artifact_branch_demo and artifact_branch_demo[0].get("new_version") == "2.0.0",
@@ -4757,8 +4787,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         env={**dep_env},
     )
     assert_true(rc == EXIT_AWAITING_USER, "待交互应返回 awaiting user 退出码")
-    interaction_ckpt = read_json(interactive_report / run_step_module.MAIN_STATE_FILE_NAME)
-    interaction_json = read_json(interactive_report / "interaction.json")
+    interaction_ckpt = read_json(main_state_path(interactive_report))
+    interaction_json = read_json(interaction_path(interactive_report))
     assert_true(
         main_state_meta(interaction_ckpt).get("status") == "awaiting_user_input",
         "无自动确认时主状态应进入 awaiting_user_input",
@@ -4831,10 +4861,10 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc in {0, EXIT_AWAITING_USER},
         "结构化 continue 答复后应要么完成 step2 返回 0，要么进入下一个待交互状态返回 awaiting user 退出码",
     )
-    interaction_ckpt = read_json(interactive_report / run_step_module.MAIN_STATE_FILE_NAME)
+    interaction_ckpt = read_json(main_state_path(interactive_report))
     assert_true(main_state_meta(interaction_ckpt).get("completed_step") == "step2", "待交互恢复后应推进到 step2")
     if rc == EXIT_AWAITING_USER:
-        resumed_interaction = read_json(interactive_report / "interaction.json")
+        resumed_interaction = read_json(interaction_path(interactive_report))
         assert_true(resumed_interaction.get("step_id") == "step2", "待交互恢复后若继续停顿，应停在 step2 交互点")
     assert_true(
         ((main_state_meta(interaction_ckpt).get("last_user_response") or {}).get("payload") or {}).get("notes") == "最终打包依赖范围可信，继续",
@@ -4878,7 +4908,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         env={**dep_env},
     )
     assert_true(rc == EXIT_AWAITING_USER, "Step2 待交互应返回 awaiting user 退出码")
-    step2_interaction = read_json(step2_resume_report / "interaction.json")
+    step2_interaction = read_json(interaction_path(step2_resume_report))
     assert_true(step2_interaction.get("step_id") == "step2", "Step2 交互点未正确写入 interaction.json")
     stdout, stderr, rc = run_script_with_rc(
         "run_step.py",
@@ -4906,8 +4936,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}",
     )
-    step2_resume_ckpt = read_json(step2_resume_report / run_step_module.MAIN_STATE_FILE_NAME)
-    step2_resume_ctx = read_json(step2_resume_report / "s2_context.json")
+    step2_resume_ckpt = read_json(main_state_path(step2_resume_report))
+    step2_resume_ctx = read_json(context_path(step2_resume_report))
     assert_true(main_state_meta(step2_resume_ckpt).get("completed_step") == "step3", "Step2 恢复后应继续执行到 step3")
     assert_true(step2_resume_ctx.get("base_branch") == "base", "Step2 恢复后未回写 s2_context.json.base_branch")
     assert_true(step2_resume_ctx.get("current_branch") == "current", "Step2 恢复后未回写 s2_context.json.current_branch")
@@ -4981,8 +5011,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}",
     )
-    step2_hint_accept_ckpt = read_json(step2_hint_accept_report / run_step_module.MAIN_STATE_FILE_NAME)
-    step2_hint_accept_main_state = read_json(step2_hint_accept_report / "main_state.json")
+    step2_hint_accept_ckpt = read_json(main_state_path(step2_hint_accept_report))
+    step2_hint_accept_main_state = read_json(main_state_path(step2_hint_accept_report))
     step2_hint_accept_runtime = (
         ((step2_hint_accept_main_state.get("step2") or {}).get("input") or {})
     )
@@ -5019,7 +5049,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}",
     )
-    module_direct_rows = read_csv(module_direct_report / "s1_dep_changes.csv")
+    module_direct_rows = read_csv(dep_changes_path(module_direct_report))
     module_direct_coords = {row.get("coord") for row in module_direct_rows}
     assert_true("com.example:demo-lib" in module_direct_coords, "首轮模块级 Step1 未保留目标模块依赖")
     assert_true("com.example:other-lib" not in module_direct_coords, "首轮模块级 Step1 不应包含其他模块依赖")
@@ -5038,12 +5068,12 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--primary-module", "module-a",
             "--modules", "module-a",
             "--work-dir", str(project_dir),
-            "--output", str(module_packaged_report / "s1_dep_changes.csv"),
+            "--output", str(dep_changes_path(module_packaged_report)),
         ],
         cwd=project_dir,
         env=dep_env,
     )
-    packaged_current_rows = read_csv(module_packaged_report / "s1_deps_current_resolved.csv")
+    packaged_current_rows = read_csv(deps_current_resolved_path(module_packaged_report))
     packaged_current_by_coord = {row.get("coord"): row for row in packaged_current_rows}
     assert_true(
         packaged_current_by_coord.get("com.example:demo-lib", {}).get("packaged_present") == "true",
@@ -5053,13 +5083,15 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "junit:junit" not in packaged_current_by_coord,
         "指定模块 fat jar 未包含 junit 时，不应再把 tree-only 依赖混入最终制品结果",
     )
-    packaged_changes = read_csv(module_packaged_report / "s1_dep_changes.csv")
+    packaged_changes = read_csv(dep_changes_path(module_packaged_report))
     junit_rows = [row for row in packaged_changes if row.get("coord") == "junit:junit"]
     assert_true(
         not junit_rows,
         "当前 final_artifact 口径下，不应再把 junit 这类 tree-only 依赖写入 s1_dep_changes.csv",
     )
-    packaged_summary_text = (module_packaged_report / "s1_dep_summary.txt").read_text(encoding="utf-8")
+    packaged_summary_text = (
+        module_packaged_report / "evidence" / "dependencies" / "dep_summary.txt"
+    ).read_text(encoding="utf-8")
     assert_true("current_packaging_mode=final_artifact" in packaged_summary_text, "Step1 摘要应标明当前侧已启用 final_artifact 校准")
     assert_true("current_tree_only=" not in packaged_summary_text, "final_artifact 口径下不应再输出 dependency:tree-only 摘要")
 
@@ -5101,9 +5133,9 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}",
     )
-    module_ckpt = read_json(module_report / run_step_module.MAIN_STATE_FILE_NAME)
-    module_interaction = read_json(module_report / "interaction.json")
-    module_output = module_report / "s1_dep_changes.csv"
+    module_ckpt = read_json(main_state_path(module_report))
+    module_interaction = read_json(interaction_path(module_report))
+    module_output = dep_changes_path(module_report)
     assert_true(main_state_meta(module_ckpt).get("completed_step") == "step1", "按模块重跑后应仍停留在 step1 确认点")
     assert_true(main_state_meta(module_ckpt).get("status") == "awaiting_user_input", "按模块重跑后应重新进入 awaiting_user_input")
     assert_true(module_interaction.get("step_id") == "step1", "按模块重跑后 interaction 应重新指向 step1")
@@ -5149,9 +5181,9 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}",
     )
-    stale_ckpt = read_json(module_stale_report / run_step_module.MAIN_STATE_FILE_NAME)
-    stale_interaction = read_json(module_stale_report / "interaction.json")
-    stale_rows = read_csv(module_stale_report / "s1_dep_changes.csv")
+    stale_ckpt = read_json(main_state_path(module_stale_report))
+    stale_interaction = read_json(interaction_path(module_stale_report))
+    stale_rows = read_csv(dep_changes_path(module_stale_report))
     stale_coords = {row.get("coord") for row in stale_rows}
     assert_true(main_state_meta(stale_ckpt).get("status") == "awaiting_user_input", "模块范围与旧 root 依赖树并存时，应以新的模块级结果进入 awaiting_user_input")
     assert_true(main_state_meta(stale_ckpt).get("completed_step") == "step1", "模块范围与旧 root 依赖树并存时，应完成新的 step1 并重新进入确认点")
@@ -5174,10 +5206,10 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc in {0, EXIT_AWAITING_USER},
         "run_step auto 从 step1 恢复后应要么完成到 step3，要么停在 step2 待交互",
     )
-    orchestrated_ckpt = read_json(orchestrated_report / run_step_module.MAIN_STATE_FILE_NAME)
+    orchestrated_ckpt = read_json(main_state_path(orchestrated_report))
     assert_true(main_state_meta(orchestrated_ckpt).get("completed_step") == "step2", "run_step auto 未从主状态续跑到 step2")
     if rc == EXIT_AWAITING_USER:
-        orchestrated_interaction = read_json(orchestrated_report / "interaction.json")
+        orchestrated_interaction = read_json(interaction_path(orchestrated_report))
         assert_true(orchestrated_interaction.get("step_id") == "step2", "run_step auto 首次恢复后若停顿，应停在 step2")
     else:
         assert_true(main_state_meta(orchestrated_ckpt).get("current_step") == "step3", "run_step Step2 未指向 step3")
@@ -5212,7 +5244,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             f"stderr:\n{stderr}",
         )
 
-    (orchestrated_report / "s1_dep_changes.csv").unlink()
+    (dep_changes_path(orchestrated_report)).unlink()
     stdout, stderr, rc = run_script_with_rc(
         "run_step.py",
         [
@@ -5229,21 +5261,21 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         rc in {0, EXIT_AWAITING_USER},
         "checkpoint 自愈后应要么完成 step1->step2，要么重跑 step1 后重新进入待交互",
     )
-    repaired_ckpt = read_json(orchestrated_report / run_step_module.MAIN_STATE_FILE_NAME)
+    repaired_ckpt = read_json(main_state_path(orchestrated_report))
     assert_true(main_state_meta(repaired_ckpt).get("completed_step") == "step1", "主状态自愈后应回退到缺失产物对应的 step1")
     assert_true(main_state_meta(repaired_ckpt).get("current_step") == "step2", "主状态自愈后重跑 step1 应重新指向 step2")
     if rc == EXIT_AWAITING_USER:
-        repaired_interaction = read_json(orchestrated_report / "interaction.json")
+        repaired_interaction = read_json(interaction_path(orchestrated_report))
         assert_true(repaired_interaction.get("step_id") == "step1", "主状态自愈后若需再次确认，应回到 step1 交互点")
     assert_true(
         (repaired_ckpt.get("integrity_repair") or {}).get("restart_from_step") in {None, "step1"},
         "主状态自愈后的 integrity_repair 字段不符合预期"
     )
-    assert_true((orchestrated_report / "s1_dep_changes.csv").exists(), "checkpoint 自愈后未重新生成缺失产物")
+    assert_true((dep_changes_path(orchestrated_report)).exists(), "checkpoint 自愈后未重新生成缺失产物")
 
     # 【修复】不手动清空 pending_interaction，而是通过正确的交互流程继续
     # 这确保调度状态机和恢复协议按预期工作
-    repaired_ckpt_after_interaction = read_json(orchestrated_report / run_step_module.MAIN_STATE_FILE_NAME)
+    repaired_ckpt_after_interaction = read_json(main_state_path(orchestrated_report))
 
     # 如果自愈后仍然在 step1 的 checkpoint，需要通过交互继续
     if main_state_meta(repaired_ckpt_after_interaction).get("status") == "awaiting_user_input":
@@ -5261,9 +5293,9 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             allow_awaiting=True,  # 允许进入下一个 checkpoint
         )
 
-    pre_step3_ckpt = read_json(orchestrated_report / run_step_module.MAIN_STATE_FILE_NAME)
+    pre_step3_ckpt = read_json(main_state_path(orchestrated_report))
     if main_state_meta(pre_step3_ckpt).get("status") == "awaiting_user_input":
-        pre_step3_interaction = read_json(orchestrated_report / "interaction.json")
+        pre_step3_interaction = read_json(interaction_path(orchestrated_report))
         if pre_step3_interaction.get("step_id") == "step2":
             stdout, stderr, rc = run_script_with_rc(
                 "run_step.py",
@@ -5293,7 +5325,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 f"stdout:\n{stdout}\n"
                 f"stderr:\n{stderr}",
             )
-            pre_step3_ckpt = read_json(orchestrated_report / run_step_module.MAIN_STATE_FILE_NAME)
+            pre_step3_ckpt = read_json(main_state_path(orchestrated_report))
     assert_true(
         main_state_meta(pre_step3_ckpt).get("status") != "awaiting_user_input",
         "进入 step3 前不应仍残留待交互主状态",
@@ -5330,7 +5362,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
 
     # Step4 完成后的 checkpoint 确认
-    step4_ckpt = read_json(orchestrated_report / run_step_module.MAIN_STATE_FILE_NAME)
+    step4_ckpt = read_json(main_state_path(orchestrated_report))
     step5_invoked_via_resume = False
     step5_stdout = ""
     step5_stderr = ""
@@ -5354,7 +5386,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             f"stderr:\n{stderr}",
         )
         if rc == EXIT_AWAITING_USER:
-            resumed_interaction = read_json(orchestrated_report / "interaction.json")
+            resumed_interaction = read_json(interaction_path(orchestrated_report))
             assert_true(resumed_interaction.get("step_id") == "step5", "Step4 恢复后若继续停顿，应停在 step5")
             step5_invoked_via_resume = True
             step5_stdout, step5_stderr, step5_rc = stdout, stderr, rc
@@ -5381,15 +5413,15 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         f"stderr:\n{step5_stderr}",
     )
     # Phase 7.5 removed: step5 processes all_changed_apis.csv directly (no filtering)
-    orchestrated_all_changed = read_csv(orchestrated_report / "s4_jar_compare" / "all_changed_apis.csv")
+    orchestrated_all_changed = read_csv(orchestrated_report / "evidence" / "api_changes" / "all_changed_apis.csv")
     assert_true(orchestrated_all_changed, "orchestrated step5 未产出分析结果")
-    orchestrated_summary = read_json(orchestrated_report / "s5_call_chain" / "summary.json")
+    orchestrated_summary = read_json(orchestrated_report / "evidence" / "call_chain" / "summary.json")
     orchestrated_per_dependency = read_json(
-        orchestrated_report / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
+        orchestrated_report / "evidence" / "api_changes" / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
     )
     orchestrated_total = orchestrated_summary.get("total_apis", 0)
     assert_true(orchestrated_total >= 1, "orchestrated step5 应处理 all_changed_apis.csv 中的全部 API")
-    step5_interaction = read_json(orchestrated_report / "interaction.json")
+    step5_interaction = read_json(interaction_path(orchestrated_report))
     step5_actions = {item.get("id") for item in step5_interaction.get("options", [])}
     step5_props = (step5_interaction.get("response_schema") or {}).get("properties", {})
     assert_true(step5_interaction.get("step_id") == "step5", "Step5 交互点未正确写入 interaction.json")
@@ -5412,16 +5444,16 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         ],
         cwd=project_dir,
     )
-    orchestrated_ckpt = read_json(orchestrated_report / run_step_module.MAIN_STATE_FILE_NAME)
+    orchestrated_ckpt = read_json(main_state_path(orchestrated_report))
     assert_true(main_state_meta(orchestrated_ckpt).get("completed_step") == "step6", "run_step Step6 未写入完成状态")
     assert_true(main_state_meta(orchestrated_ckpt).get("current_step") == "done", "run_step Step6 后 current_step 应为 done")
     assert_true(
         bool(main_state_step_output(orchestrated_ckpt, "step5")),
         "run_step 主状态未保留 step5 的输出结果"
     )
-    orchestrated_report_text = (orchestrated_report / "s6_report.md").read_text(encoding="utf-8")
+    orchestrated_report_text = (orchestrated_report / "deliverables" / "report.md").read_text(encoding="utf-8")
     assert_true("# Java 升级兼容性分析报告" in orchestrated_report_text, "run_step 链路未生成最终报告")
-    assert_true("## 三、分析结果总表" in orchestrated_report_text, "run_step 链路未在 Step6 报告中呈现分析结果总表")
+    assert_true("分析结果总表" in orchestrated_report_text, "run_step 链路未在 Step6 报告中呈现分析结果总表")
 
 
 

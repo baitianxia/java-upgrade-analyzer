@@ -8,9 +8,9 @@
 
 | 顺序 | 文件 | 作用 |
 |---:|---|---|
-| 1 | `s4_jar_compare/all_changed_apis.csv` | 依赖 API 变化事实清单 |
-| 2 | `s5_call_chain/alerts.csv` | Step5 完整链路台账 |
-| 3 | `s6_report.md` | 面向评审和交付的最终摘要 |
+| 1 | `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化事实清单 |
+| 2 | `evidence/call_chain/alerts.csv` | Step5 完整链路台账 |
+| 3 | `deliverables/report.md` | 面向评审和交付的最终摘要 |
 
 如果结果存在疑问，再回到对应步骤的原始证据文件继续追溯。
 
@@ -20,11 +20,11 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 
 | 文件 | 说明 | 复核重点 |
 |---|---|---|
-| `s1_dep_changes.csv` | base/current 依赖差异明细 | 依赖坐标、版本、scope、变化类型是否符合预期 |
-| `s1_dep_summary.txt` | Step1 摘要 | 目标模块、构建产物、依赖变化规模 |
-| `s1_dep_alerts.csv` | 需要优先复核的依赖变化 | 降级、删除、无法解析或高风险依赖 |
-| `build_provenance.json` | base/current 构建产物来源和摘要 | 后续字节码分析是否基于正确制品 |
-| `s1_artifacts/` | 留存的 base/current 产物 | Step5 业务字节码和运行时依赖 JAR 的来源 |
+| `evidence/dependencies/dep_changes.csv` | base/current 依赖差异明细 | 依赖坐标、版本、scope、变化类型是否符合预期 |
+| `evidence/dependencies/dep_summary.txt` | Step1 摘要 | 目标模块、构建产物、依赖变化规模 |
+| `evidence/dependencies/dep_alerts.csv` | 需要优先复核的依赖变化 | 降级、删除、无法解析或高风险依赖 |
+| `evidence/dependencies/build_provenance.json` | base/current 构建产物来源和摘要 | 后续字节码分析是否基于正确制品 |
+| `evidence/dependencies/s1_artifacts/` | 留存的 base/current 产物 | Step5 业务字节码和运行时依赖 JAR 的来源 |
 
 注意：Step1 当前以真实构建结果或用户提供的构建产物为准，不把手工 dependency tree 当作正式事实源。
 
@@ -32,8 +32,8 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 
 | 文件 | 说明 | 复核重点 |
 |---|---|---|
-| `s2_context.json` | 升级上下文，如 JDK、Spring、依赖变化等 | 后续规则为什么启用或跳过 |
-| `s2_dep_graph.json` | 依赖关系和分析顺序 | 依赖升级传播关系 |
+| `evidence/context/context.json` | 升级上下文，如 JDK、Spring、依赖变化等 | 后续规则为什么启用或跳过 |
+| `evidence/context/dep_graph.json` | 依赖关系和分析顺序 | 依赖升级传播关系 |
 
 ## Step3：背景风险扫描
 
@@ -45,20 +45,20 @@ Step3 用于识别 JDK、Jakarta、Spring 等框架升级带来的背景风险�
 
 | 文件 | 说明 |
 |---|---|
-| `s3_jdk_removed_api.csv` | JDK 移除 API 命中 |
-| `s3_jdk_javax_refs.csv` | `javax.*` 引用 |
-| `s3_jdk_internal_api.csv` | JDK 内部 API 引用 |
-| `s3_springboot_config.csv` | Spring Boot 配置相关线索 |
-| `s3_springboot_autoconfig.txt` | 自动装配相关线索 |
-| `s3_dependency_compat.csv` | 依赖兼容性规则命中 |
-| `s3_dependency_classfile.csv` | classfile 版本等字节码线索 |
+| `evidence/static_scan/s3_jdk_removed_api.csv` | JDK 移除 API 命中 |
+| `evidence/static_scan/s3_jdk_javax_refs.csv` | `javax.*` 引用 |
+| `evidence/static_scan/s3_jdk_internal_api.csv` | JDK 内部 API 引用 |
+| `evidence/static_scan/s3_springboot_config.csv` | Spring Boot 配置相关线索 |
+| `evidence/static_scan/s3_springboot_autoconfig.txt` | 自动装配相关线索 |
+| `evidence/static_scan/s3_dependency_compat.csv` | 依赖兼容性规则命中 |
+| `evidence/static_scan/s3_dependency_classfile.csv` | classfile 版本等字节码线索 |
 
 ## Step4：依赖 API 变化事实
 
 Step4 的核心输出目录：
 
 ```text
-s4_jar_compare/
+evidence/api_changes/
 ```
 
 | 文件 | 说明 | 复核重点 |
@@ -75,7 +75,7 @@ s4_jar_compare/
 目录：
 
 ```text
-s4_per_dependency/<coord>/
+evidence/api_changes/s4_per_dependency/<coord>/
 ```
 
 常见文件：
@@ -91,7 +91,7 @@ s4_per_dependency/<coord>/
 Step5 的核心输出目录：
 
 ```text
-s5_call_chain/
+evidence/call_chain/
 ```
 
 | 文件 | 说明 | 复核重点 |
@@ -100,7 +100,7 @@ s5_call_chain/
 | `summary.json` | 结构化汇总 | `analysis_status`、`reason_code`、能力覆盖 |
 | `summary.txt` | 人类可读摘要 | reachable、uncertain、not_found、not_analyzed 分布 |
 | `step5_timing.csv` | Step5 耗时拆解 | 性能问题定位 |
-| `s5_query_index.json` | 内部调用链查询索引 | Claude Code 按方法即时查询调用链；默认不作为人工阅读文件 |
+| `.runtime/indexes/s5_query_index.json` | 内部调用链查询索引 | Claude Code 按方法即时查询调用链；默认不作为人工阅读文件 |
 | `by_api/*.json` | 单 API 详细证据 | 逐跳链路、证据路径、终止原因 |
 | `by_module/*_impacts.json` | 按模块聚合视图 | 分派处理责任 |
 
@@ -149,9 +149,13 @@ alerts_reachable_002.csv
 
 | 文件 | 说明 |
 |---|---|
-| `s6_findings.json` | 结构化最终发现 |
-| `s6_report.md` | 面向人类评审的最终报告 |
-| `s6_details/` | 大量明细的附属阅读文件，避免主报告过长 |
+| `deliverables/report.md` | 面向人类评审的最终报告 |
+| `deliverables/s6_probable_impact_apis.csv/md` | 可能影响清单 |
+| `deliverables/s6_uncertain_apis.csv/md` | 需人工复核清单 |
+| `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物，无法回溯调用链清单 |
+| `deliverables/s6_not_analyzed_apis.csv/md` | 本次未完成分析清单 |
+| `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |
+| `.runtime/findings/s6_findings.json` | Step6 结构化结果；主要供程序读取 |
 
 Step6 会避免把大量未命中 API 全部塞进主报告；主报告用于传达结论，附属明细用于展开复核。
 
@@ -160,7 +164,7 @@ Step6 会避免把大量未命中 API 全部塞进主报告；主报告用于传
 Step5 慢时优先查看：
 
 ```text
-s5_call_chain/step5_timing.csv
+evidence/call_chain/step5_timing.csv
 ```
 
 重点指标：

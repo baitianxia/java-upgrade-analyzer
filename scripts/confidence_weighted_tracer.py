@@ -6185,10 +6185,10 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
             'severity': api_row.get('severity', ''),
             'elapsed_sec': api_elapsed_sec,
             'analysis_status': status,
-            'direct_callers': result.direct_callers,
-            'business_reach_depth': result.business_reach_depth,
-            'confidence_score': result.confidence_score,
-            'reason_code': result.reason_code,
+            'direct_callers': getattr(result, 'direct_callers', 0),
+            'business_reach_depth': getattr(result, 'business_reach_depth', None),
+            'confidence_score': getattr(result, 'confidence_score', None),
+            'reason_code': getattr(result, 'reason_code', ''),
         })
         status_counts[status] = status_counts.get(status, 0) + 1
         if should_log_progress(idx, total, progress_interval):

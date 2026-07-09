@@ -220,7 +220,7 @@ def _dedupe_and_prefer_longest(paths, methods, target, limit):
     return filtered[:limit]
 
 
-def query_call_chains(index, method, max_depth=5, limit=20):
+def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000):
     methods = index.get("methods") or {}
     lookup_keys_by_symbol = index.get("lookup_keys_by_symbol") or {}
     reverse_edges = index.get("reverse_edges") or {}
@@ -230,11 +230,14 @@ def query_call_chains(index, method, max_depth=5, limit=20):
     queue = deque((key, []) for key in target_keys)
     collected = []
     visited = set()
-    while queue:
+    visits = 0
+    while queue and len(collected) < limit and visits < max_visits:
         current_key, path = queue.popleft()
+        visits += 1
         if len(path) >= max_depth:
             continue
-        state = (current_key, tuple(edge.get("caller_symbol_id", "") for edge in path))
+        path_callers = tuple(edge.get("caller_symbol_id", "") for edge in path)
+        state = (current_key, path_callers)
         if state in visited:
             continue
         visited.add(state)
@@ -242,12 +245,16 @@ def query_call_chains(index, method, max_depth=5, limit=20):
             if edge.get("is_test"):
                 continue
             caller_id = edge.get("caller_symbol_id") or ""
+            if caller_id in path_callers:
+                continue
             method_record = methods.get(caller_id)
             if not method_record or method_record.get("is_test"):
                 continue
             next_path = path + [edge]
             if method_record.get("owner_type") == "business":
                 collected.append(next_path)
+                if len(collected) >= limit:
+                    break
             if len(next_path) >= max_depth:
                 continue
             for next_key in lookup_keys_by_symbol.get(caller_id) or []:
@@ -274,11 +281,18 @@ def main(argv=None):
     parser.add_argument("--method", required=True, help="方法全限定名，可带签名，例如 a.b.C.m(String)")
     parser.add_argument("--max-depth", type=int, default=5)
     parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--max-visits", type=int, default=50000, help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", help="以 JSON 输出调用链列表")
     args = parser.parse_args(argv)
 
     index, _path = load_query_index(args.report_dir)
-    chains = query_call_chains(index, args.method, max_depth=args.max_depth, limit=args.limit)
+    chains = query_call_chains(
+        index,
+        args.method,
+        max_depth=args.max_depth,
+        limit=args.limit,
+        max_visits=args.max_visits,
+    )
     if args.json:
         print(json.dumps({"method": args.method, "chains": chains}, ensure_ascii=False, indent=2))
     else:

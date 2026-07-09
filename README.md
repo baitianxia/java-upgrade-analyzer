@@ -190,23 +190,23 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 | 顺序 | 文件 | 用途 |
 |---:|---|---|
-| 1 | `.upgrade-report/s4_jar_compare/all_changed_apis.csv` | 查看依赖 API 变化事实 |
-| 2 | `.upgrade-report/s5_call_chain/alerts.csv` | 查看每个变化 API 的调用链追踪台账 |
-| 3 | `.upgrade-report/s6_report.md` | 查看最终汇总结论 |
+| 1 | `.upgrade-report/evidence/api_changes/all_changed_apis.csv` | 查看依赖 API 变化事实 |
+| 2 | `.upgrade-report/evidence/call_chain/alerts.csv` | 查看每个变化 API 的调用链追踪台账 |
+| 3 | `.upgrade-report/deliverables/report.md` | 查看最终汇总结论 |
 
 如果 `alerts.csv` 很大，Skill 会额外生成按状态拆分的阅读视图：
 
 ```text
-.upgrade-report/s5_call_chain/alerts_reachable.csv
-.upgrade-report/s5_call_chain/alerts_uncertain.csv
-.upgrade-report/s5_call_chain/alerts_not_found_in_static_analysis.csv
-.upgrade-report/s5_call_chain/alerts_not_analyzed.csv
+.upgrade-report/evidence/call_chain/alerts_reachable.csv
+.upgrade-report/evidence/call_chain/alerts_uncertain.csv
+.upgrade-report/evidence/call_chain/alerts_not_found_in_static_analysis.csv
+.upgrade-report/evidence/call_chain/alerts_not_analyzed.csv
 ```
 
 这些拆分文件只是方便阅读；完整主文件仍然是：
 
 ```text
-.upgrade-report/s5_call_chain/alerts.csv
+.upgrade-report/evidence/call_chain/alerts.csv
 ```
 
 如果只是想确认某个方法“到底有没有调用链”，可以让 Claude Code 基于 Step5 查询索引即时查询。默认只返回调用链，不额外落文件：
@@ -240,12 +240,12 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 | Step | 作用 | 关键产物 |
 |---|---|---|
-| Step1 | 比较 base/current 最终依赖差异 | `s1_dep_changes.csv` |
-| Step2 | 建立升级上下文、源码和依赖映射 | `s2_context.json` |
-| Step3 | 分析 JDK/Spring/Jakarta 等框架级风险 | `s3_*.csv` |
-| Step4 | 比较变更依赖 jar 的 API 变化 | `s4_jar_compare/all_changed_apis.csv` |
-| Step5 | 追踪变化 API 是否触达业务代码 | `s5_call_chain/alerts.csv` |
-| Step6 | 汇总成人可读报告 | `s6_report.md` |
+| Step1 | 比较 base/current 最终依赖差异 | `evidence/dependencies/dep_changes.csv` |
+| Step2 | 建立升级上下文、源码和依赖映射 | `evidence/context/context.json` |
+| Step3 | 分析 JDK/Spring/Jakarta 等框架级风险 | `evidence/static_scan/*.csv` |
+| Step4 | 比较变更依赖 jar 的 API 变化 | `evidence/api_changes/all_changed_apis.csv` |
+| Step5 | 追踪变化 API 是否触达业务代码 | `evidence/call_chain/alerts.csv` |
+| Step6 | 汇总成人可读报告 | `deliverables/report.md` |
 
 ---
 
@@ -278,7 +278,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 让 Claude Code 查看：
 
 ```text
-.upgrade-report/s5_call_chain/step5_timing.csv
+.upgrade-report/evidence/call_chain/step5_timing.csv
 ```
 
 重点关注：
@@ -323,13 +323,13 @@ scripts/run_step.py
 主状态文件：
 
 ```text
-.upgrade-report/main_state.json
+.upgrade-report/.runtime/state/main_state.json
 ```
 
 待交互文件：
 
 ```text
-.upgrade-report/interaction.json
+.upgrade-report/.runtime/state/interaction.json
 ```
 
 维护或排障时可以参考：

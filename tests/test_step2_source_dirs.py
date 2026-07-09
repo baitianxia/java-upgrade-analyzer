@@ -138,7 +138,9 @@ class Step2SourceDirsTest(unittest.TestCase):
     def test_gate_context_allows_unknown_jdk_for_checkpoint_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            (report_dir / "s2_context.json").write_text(
+            context_dir = report_dir / "evidence" / "context"
+            context_dir.mkdir(parents=True)
+            (context_dir / "context.json").write_text(
                 json.dumps(
                     {
                         "build_tool": "maven",

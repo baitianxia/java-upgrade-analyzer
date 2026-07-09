@@ -167,6 +167,58 @@ class S5QueryCallChainTest(unittest.TestCase):
 
         self.assertEqual(chains, ["com.app.App.run → com.vendor.Target.removed()"])
 
+    def test_query_respects_limit_on_many_business_callers(self):
+        target = "com.vendor.Target.removed()"
+        methods = {}
+        lookup_keys = {}
+        edges = []
+        for idx in range(200):
+            app = method(
+                f"app{idx}",
+                f"com.app.App{idx}.run",
+                owner_type="business",
+                owner_coord="BUSINESS",
+                module="app",
+            )
+            methods[app.symbol_id] = app
+            lookup_keys[app.symbol_id] = [app.qualified_key, "method:run"]
+            edges.append(edge(app, target, owner_type="business", owner_coord="BUSINESS", module="app"))
+        graph = SimpleNamespace(
+            methods_by_id=methods,
+            lookup_keys_by_symbol=lookup_keys,
+            reverse_edges={target: edges},
+        )
+
+        chains = query_call_chains(build_query_index(graph), target, limit=3)
+
+        self.assertEqual(len(chains), 3)
+
+    def test_query_avoids_cycles_while_finding_business_chain(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        dep = method("dep", "com.dep.Looper.loop", owner_coord="com.example:dep", module="dep")
+        target = "com.vendor.Target.removed()"
+        graph = SimpleNamespace(
+            methods_by_id={"app": app, "dep": dep},
+            lookup_keys_by_symbol={
+                "app": ["com.app.App.run", "method:run"],
+                "dep": ["com.dep.Looper.loop", "method:loop"],
+            },
+            reverse_edges={
+                target: [edge(dep, target, owner_coord="com.example:dep", module="dep")],
+                "com.dep.Looper.loop": [
+                    edge(dep, "com.dep.Looper.loop", owner_coord="com.example:dep", module="dep"),
+                    edge(app, "com.dep.Looper.loop", owner_type="business", owner_coord="BUSINESS", module="app"),
+                ],
+            },
+        )
+
+        chains = query_call_chains(build_query_index(graph), target, limit=5, max_visits=20)
+
+        self.assertEqual(
+            chains,
+            ["com.app.App.run → com.example:dep:com.dep.Looper.loop → com.vendor.Target.removed()"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

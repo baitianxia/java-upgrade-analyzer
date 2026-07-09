@@ -1563,6 +1563,16 @@ def _paths_for_report(item, overview_lookup):
     return paths[:5]
 
 
+def _path_count_for_report(item, overview_lookup, sampled_paths):
+    overview = overview_lookup.get(_identity_without_severity(item)) or {}
+    raw_count = overview.get('path_count')
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError):
+        count = 0
+    return max(count, len(sampled_paths or []))
+
+
 def _human_reason(value):
     text = str(value or '').strip()
     if not text:
@@ -1593,7 +1603,12 @@ def _human_reason(value):
 def _result_evidence_reason(row):
     paths = row.get('paths') or []
     if paths:
-        evidence = "<br>".join(f"`{_md_cell(path, 260)}`" for path in paths)
+        path_count = int(row.get('path_count') or len(paths))
+        if path_count > len(paths):
+            prefix = f"展示 {len(paths)} 条样例；台账命中 {path_count} 次。<br>"
+        else:
+            prefix = f"共 {len(paths)} 条链路。<br>"
+        evidence = prefix + "<br>".join(f"`{_md_cell(path, 260)}`" for path in paths)
         return evidence, "-"
     reason = _human_reason(row.get('reason'))
     return "-", _md_cell(reason, 260) if reason else "-"
@@ -1629,12 +1644,14 @@ def build_api_result_rows(findings):
             if key in seen:
                 continue
             seen.add(key)
+            sampled_paths = _paths_for_report(item, overview_lookup)
             rows.append({
                 'coord': item.get('coord', ''),
                 'api': item.get('api', '') or item.get('api_name', ''),
                 'change': _change_cell(item, severity),
                 'conclusion': _conclusion_for_report(item, fallback_conclusion),
-                'paths': _paths_for_report(item, overview_lookup),
+                'paths': sampled_paths,
+                'path_count': _path_count_for_report(item, overview_lookup, sampled_paths),
                 'reason': item.get('user_reason') or item.get('reason') or item.get('reason_code') or '',
             })
     return rows

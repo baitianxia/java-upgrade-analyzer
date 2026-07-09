@@ -15,7 +15,9 @@ class ContextCompressTest(unittest.TestCase):
     def test_summarize_step3_includes_risk_candidate_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            (report_dir / "s3_risk_candidates.csv").write_text(
+            static_dir = report_dir / "evidence" / "static_scan"
+            static_dir.mkdir(parents=True)
+            (static_dir / "s3_risk_candidates.csv").write_text(
                 "coord,api_name\nsample:dep,com.example.Api\nsample:dep,com.example.Other\n",
                 encoding="utf-8",
             )
@@ -27,7 +29,7 @@ class ContextCompressTest(unittest.TestCase):
     def test_summarize_step5_preserves_skipped_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            step5_dir = report_dir / "s5_call_chain"
+            step5_dir = report_dir / "evidence" / "call_chain"
             step5_dir.mkdir(parents=True)
             (step5_dir / "summary.json").write_text(
                 json.dumps(
@@ -58,7 +60,7 @@ class ContextCompressTest(unittest.TestCase):
     def test_summarize_step5_derives_module_count_and_severity_breakdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
-            step5_dir = report_dir / "s5_call_chain"
+            step5_dir = report_dir / "evidence" / "call_chain"
             by_module_dir = step5_dir / "by_module"
             by_module_dir.mkdir(parents=True)
             (step5_dir / "summary.json").write_text(

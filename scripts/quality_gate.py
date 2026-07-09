@@ -43,6 +43,7 @@ STEP5_TESTS = [
     "tests.test_business_bytecode_graph",
     "tests.test_artifact_bytecode_catalog",
     "tests.test_indirect_usage_analyzer",
+    "tests.test_s5_query_call_chain",
 ]
 
 
@@ -51,6 +52,8 @@ CORE_SEMANTIC_TESTS = [
     "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_business_to_transitive_packaged_hit",
     "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_three_hop_packaged_hit",
     "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_business_to_changed_field_hit",
+    "tests.test_s5_query_call_chain.S5QueryCallChainTest.test_query_respects_limit_on_many_business_callers",
+    "tests.test_s5_query_call_chain.S5QueryCallChainTest.test_query_avoids_cycles_while_finding_business_chain",
 ]
 
 

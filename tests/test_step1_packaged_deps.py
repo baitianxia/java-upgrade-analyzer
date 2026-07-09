@@ -318,7 +318,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
             ):
                 s1_dep_diff.main()
 
-            alerts_path = work_dir / "s1_dep_alerts.csv"
+            alerts_path = work_dir / "dep_alerts.csv"
             self.assertTrue(alerts_path.exists())
             with alerts_path.open("r", encoding="utf-8", newline="") as f:
                 rows = list(csv.DictReader(f))

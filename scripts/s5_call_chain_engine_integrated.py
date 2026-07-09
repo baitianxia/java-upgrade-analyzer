@@ -678,7 +678,7 @@ def _step5_integrated_main_impl(args):
     # 业务源码目录来源优先级：
     # 1. 正式流程：main_state.step5.input.source_dirs
     # 2. 调试模式：命令行 args.source_dirs
-    # 3. s2_context.json（恢复/兼容兜底）
+    # 3. 当前报告 evidence/context/context.json
     business_source_dirs = (
         orchestrated_input.get("source_dirs")
         if orchestrated_input.get("source_dirs")
@@ -690,7 +690,7 @@ def _step5_integrated_main_impl(args):
         print("  请通过以下方式指定：", file=sys.stderr)
         print("  1. 命令行 --source-dirs", file=sys.stderr)
         print("  2. 主状态中已确认并由调度层展开到 args.source_dirs 的业务源码目录", file=sys.stderr)
-        print("  3. s2_context.json 中的 source_dirs（恢复场景）", file=sys.stderr)
+        print("  3. evidence/context/context.json 中的 source_dirs", file=sys.stderr)
         return 1
 
     if orchestrated_input.get("source_dirs"):
@@ -698,7 +698,7 @@ def _step5_integrated_main_impl(args):
     elif args.source_dirs:
         print(f"  使用命令行指定源码目录：{args.source_dirs}", file=sys.stderr)
     elif context_source_dirs:
-        print(f"  【恢复场景】从 context 恢复源码目录：{context_source_dirs}", file=sys.stderr)
+        print(f"  从 evidence/context/context.json 读取源码目录：{context_source_dirs}", file=sys.stderr)
     _step5_debug(
         'step5_inputs',
         'resolved step5 input sources',
