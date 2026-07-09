@@ -56,6 +56,10 @@ class RealProjectCase:
     min_methods_indexed: int = 0
     min_reverse_edges_indexed: int = 0
     max_elapsed_seconds: float = 0.0
+    run_step4: bool = False
+    step4_dep_rows: tuple[dict[str, str], ...] = field(default_factory=tuple)
+    expected_step4_api_names: tuple[str, ...] = field(default_factory=tuple)
+    max_step4_elapsed_seconds: float = 0.0
     run_step6_report: bool = False
     expected_report_texts: tuple[str, ...] = field(default_factory=tuple)
     query_methods: tuple[str, ...] = field(default_factory=tuple)
@@ -416,6 +420,24 @@ CASES = {
         min_methods_indexed=15000,
         min_reverse_edges_indexed=100000,
         max_elapsed_seconds=60.0,
+        run_step4=True,
+        step4_dep_rows=(
+            {
+                "coord": "org.apache.dubbo:dubbo-common",
+                "old_version": "3.3.7-SNAPSHOT",
+                "new_version": "-",
+                "change_type": "移除",
+                "scope": "compile",
+            },
+        ),
+        expected_step4_api_names=(
+            "org.apache.dubbo.common.utils.StringUtils.isEquals",
+            "org.apache.dubbo.common.utils.StringUtils.parseQueryString",
+            "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap",
+            "org.apache.dubbo.common.URL.valueOf",
+            "org.apache.dubbo.common.utils.NetUtils.getLocalHost",
+        ),
+        max_step4_elapsed_seconds=120.0,
         run_step6_report=True,
         expected_report_texts=(
             "org.apache.dubbo:dubbo-common",
@@ -633,6 +655,113 @@ def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_
     return changed_apis
 
 
+def materialize_step4_inputs(case: RealProjectCase, report_dir: Path) -> tuple[Path, Path]:
+    runtime_dir = report_dir / ".runtime" / "real_project_regression"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    dep_changes = runtime_dir / "s1_dep_changes.csv"
+    context = runtime_dir / "s2_context.json"
+    fields = [
+        "coord",
+        "old_version",
+        "new_version",
+        "change_type",
+        "scope",
+        "base_coord",
+        "current_coord",
+        "base_lib_entry",
+        "current_lib_entry",
+    ]
+    with dep_changes.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in case.step4_dep_rows:
+            normalized = {field: str((row or {}).get(field) or "") for field in fields}
+            if not normalized.get("scope"):
+                normalized["scope"] = "compile"
+            writer.writerow(normalized)
+    context.write_text(
+        json.dumps(
+            {
+                "changed_dependencies": [
+                    {"coord": str((row or {}).get("coord") or "").strip()}
+                    for row in case.step4_dep_rows
+                    if str((row or {}).get("coord") or "").strip()
+                ]
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return dep_changes, context
+
+
+def run_step4(case: RealProjectCase, report_dir: Path) -> dict:
+    output_dir = report_dir / "evidence" / "api_changes"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dep_changes, context = materialize_step4_inputs(case, report_dir)
+    cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "s4_jar_compare.py"),
+        "--dep-changes",
+        str(dep_changes),
+        "--context",
+        str(context),
+        "--output-dir",
+        str(output_dir),
+        "--allow-degraded",
+        "--workers",
+        "1",
+        "--fetch-timeout",
+        "30",
+    ]
+    start = time.time()
+    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True)
+    elapsed = time.time() - start
+    return {
+        "returncode": proc.returncode,
+        "elapsed_seconds": round(elapsed, 2),
+        "dep_changes": str(dep_changes),
+        "context": str(context),
+        "output_dir": str(output_dir),
+        "all_changed_apis": str(output_dir / "all_changed_apis.csv"),
+    }
+
+
+def select_step4_changed_apis(step4_all_changed_apis: Path, selected_names: Iterable[str], output_path: Path) -> dict:
+    selected_set = {str(name or "").strip() for name in selected_names if str(name or "").strip()}
+    if not step4_all_changed_apis.exists():
+        return {
+            "status": "missing",
+            "source": str(step4_all_changed_apis),
+            "selected": str(output_path),
+            "total_rows": 0,
+            "selected_rows": 0,
+            "missing_api_names": sorted(selected_set),
+        }
+    with step4_all_changed_apis.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        fields = list(reader.fieldnames or [])
+        rows = list(reader)
+    matched_names = {str(row.get("api_name") or "").strip() for row in rows if str(row.get("api_name") or "").strip() in selected_set}
+    selected_rows = [row for row in rows if str(row.get("api_name") or "").strip() in selected_set]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(selected_rows)
+    return {
+        "status": "ok",
+        "source": str(step4_all_changed_apis),
+        "selected": str(output_path),
+        "total_rows": len(rows),
+        "selected_rows": len(selected_rows),
+        "matched_api_names": sorted(matched_names),
+        "missing_api_names": sorted(selected_set - matched_names),
+    }
+
+
 def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, report_dir: Path) -> tuple[int, float]:
     output_dir = report_dir / "evidence" / "call_chain"
     cmd = [
@@ -713,12 +842,64 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         return {"case": case.name, "status": "skipped", "reason": f"project root missing: {project_root}"}
     report_dir = report_root / case.name
     report_dir.mkdir(parents=True, exist_ok=True)
-    changed_apis = ensure_changed_apis(
-        case,
-        changed_apis,
-        report_dir / "evidence" / "api_changes" / "all_changed_apis.csv",
-    )
+    step4_result = {}
+    step4_selection = {}
+    failures = []
+    warnings = []
+    if case.run_step4:
+        step4_result = run_step4(case, report_dir)
+        step4_all_changed_apis = Path(step4_result.get("all_changed_apis") or "")
+        if step4_result.get("returncode") != 0:
+            failures.append(f"step4_returncode={step4_result.get('returncode')}")
+        if case.max_step4_elapsed_seconds and float(step4_result.get("elapsed_seconds") or 0.0) > case.max_step4_elapsed_seconds:
+            failures.append(
+                "step4_performance: "
+                f"elapsed={float(step4_result.get('elapsed_seconds') or 0.0):.2f}s "
+                f"over_budget={case.max_step4_elapsed_seconds:.2f}s"
+            )
+        selected_names = case.expected_step4_api_names or tuple(
+            str(row.get("api_name") or "").strip()
+            for row in case.changed_api_rows
+            if str(row.get("api_name") or "").strip()
+        )
+        step4_selection = select_step4_changed_apis(
+            step4_all_changed_apis,
+            selected_names,
+            report_dir / "evidence" / "api_changes" / "selected_all_changed_apis.csv",
+        )
+        for missing in step4_selection.get("missing_api_names") or []:
+            failures.append(f"step4_missing_expected_api:{missing}")
+        if int(step4_selection.get("selected_rows") or 0) <= 0:
+            failures.append("step4_selected_changed_apis_empty")
+        changed_apis = Path(step4_selection.get("selected") or "")
+    else:
+        changed_apis = ensure_changed_apis(
+            case,
+            changed_apis,
+            report_dir / "evidence" / "api_changes" / "all_changed_apis.csv",
+        )
     if not changed_apis.exists():
+        if failures:
+            return {
+                "case": case.name,
+                "status": "failed",
+                "project_root": str(project_root),
+                "changed_apis": str(changed_apis),
+                "report_dir": str(report_dir),
+                "elapsed_seconds": 0.0,
+                "performance_budget_seconds": case.max_elapsed_seconds,
+                "step4": step4_result,
+                "step4_selection": step4_selection,
+                "step5_returncode": None,
+                "summary": {},
+                "graph_stats": {},
+                "source_shape_metrics": {},
+                "step6": {},
+                "queries": [],
+                "checks": [],
+                "failures": failures + [f"changed APIs missing: {changed_apis}"],
+                "warnings": warnings,
+            }
         return {"case": case.name, "status": "skipped", "reason": f"changed APIs missing: {changed_apis}"}
 
     returncode, elapsed = run_step5(case, project_root, changed_apis, report_dir)
@@ -727,8 +908,6 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
     source_shape_metrics = collect_source_shape_metrics(project_root, case.source_shape_patterns)
     alerts_csv = report_dir / "evidence" / "call_chain" / "alerts.csv"
     checks = []
-    failures = []
-    warnings = []
     step6_result = {}
     query_results = []
 
@@ -826,6 +1005,8 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         "report_dir": str(report_dir),
         "elapsed_seconds": round(elapsed, 2),
         "performance_budget_seconds": case.max_elapsed_seconds,
+        "step4": step4_result,
+        "step4_selection": step4_selection,
         "step5_returncode": returncode,
         "summary": {
             "total_apis": summary.get("total_apis"),
@@ -890,6 +1071,17 @@ def main(argv=None):
             if item.get("performance_budget_seconds"):
                 print(f"  performance budget: {item['performance_budget_seconds']}s")
             print(f"  report: {item['report_dir']}")
+            if item.get("step4"):
+                step4 = item.get("step4") or {}
+                selection = item.get("step4_selection") or {}
+                print(
+                    f"  step4: rc={step4.get('returncode')} elapsed={step4.get('elapsed_seconds')}s "
+                    f"all_changed={step4.get('all_changed_apis')}"
+                )
+                print(
+                    f"  step4_selection: selected_rows={selection.get('selected_rows')} "
+                    f"total_rows={selection.get('total_rows')} missing={selection.get('missing_api_names')}"
+                )
             print(f"  summary: {item['summary']}")
             if item.get("graph_stats"):
                 print(f"  graph_stats: {item['graph_stats']}")

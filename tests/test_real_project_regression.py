@@ -94,6 +94,35 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(stats["edge_cap_hits"], 2)
         self.assertEqual(realreg.extract_graph_stats({})["methods_indexed"], 0)
 
+    def test_select_step4_changed_apis_filters_expected_names_and_reports_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "all_changed_apis.csv"
+            selected = Path(tmp) / "selected_all_changed_apis.csv"
+            source.write_text(
+                "coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source\n"
+                "org.apache.dubbo:dubbo-common,3.3.7-SNAPSHOT,-,REMOVED,org.apache.dubbo.common.URL.valueOf,valueOf,method,(java.lang.String),true,P1,old_jar\n"
+                "org.apache.dubbo:dubbo-common,3.3.7-SNAPSHOT,-,REMOVED,org.apache.dubbo.common.URL.valueOf,valueOf,method,\"(java.lang.String, boolean)\",true,P1,old_jar\n"
+                "org.apache.dubbo:dubbo-common,3.3.7-SNAPSHOT,-,REMOVED,org.apache.dubbo.common.utils.NetUtils.getLocalHost,getLocalHost,method,(),true,P1,old_jar\n",
+                encoding="utf-8",
+            )
+
+            result = realreg.select_step4_changed_apis(
+                source,
+                (
+                    "org.apache.dubbo.common.URL.valueOf",
+                    "org.apache.dubbo.common.Missing.call",
+                ),
+                selected,
+            )
+
+            with selected.open(encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+
+        self.assertEqual(result["total_rows"], 3)
+        self.assertEqual(result["selected_rows"], 2)
+        self.assertEqual(result["missing_api_names"], ["org.apache.dubbo.common.Missing.call"])
+        self.assertEqual({row["api_name"] for row in rows}, {"org.apache.dubbo.common.URL.valueOf"})
+
     def test_run_case_flags_source_shape_graph_and_performance_regressions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -269,6 +298,211 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "passed")
         self.assertTrue(str(result["changed_apis"]).endswith("evidence/api_changes/all_changed_apis.csv"))
+
+    def test_run_case_can_feed_step5_from_step4_selected_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            root.mkdir()
+            java_file = root / "src/main/java/demo/App.java"
+            java_file.parent.mkdir(parents=True)
+            java_file.write_text(
+                "import org.apache.dubbo.common.URL;\n"
+                "class App { void run(String s) { URL.valueOf(s); } }\n",
+                encoding="utf-8",
+            )
+            case = realreg.RealProjectCase(
+                name="dubbo-step4-mini",
+                default_project=root,
+                default_changed_apis=Path(""),
+                changed_api_rows=(
+                    {
+                        "coord": "org.apache.dubbo:dubbo-common",
+                        "old_version": "3.3.7-SNAPSHOT",
+                        "new_version": "-",
+                        "change_type": "REMOVED",
+                        "api_name": "org.apache.dubbo.common.URL.valueOf",
+                        "api_simple": "valueOf",
+                        "symbol_kind": "method",
+                        "api_signature": "(String)",
+                        "confirmed": "true",
+                        "severity": "P1",
+                        "source": "test",
+                    },
+                ),
+                run_step4=True,
+                step4_dep_rows=(
+                    {
+                        "coord": "org.apache.dubbo:dubbo-common",
+                        "old_version": "3.3.7-SNAPSHOT",
+                        "new_version": "-",
+                        "change_type": "移除",
+                    },
+                ),
+                expected_step4_api_names=("org.apache.dubbo.common.URL.valueOf",),
+                baseline_specs=(),
+            )
+
+            def fake_run_step4(_case, report_dir):
+                output = report_dir / "evidence" / "api_changes"
+                output.mkdir(parents=True)
+                all_changed = output / "all_changed_apis.csv"
+                all_changed.write_text(
+                    "coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source\n"
+                    "org.apache.dubbo:dubbo-common,3.3.7-SNAPSHOT,-,REMOVED,org.apache.dubbo.common.URL.valueOf,valueOf,method,(java.lang.String),true,P1,old_jar\n"
+                    "org.apache.dubbo:dubbo-common,3.3.7-SNAPSHOT,-,REMOVED,org.apache.dubbo.common.URL.valueOf,valueOf,method,\"(java.lang.String, boolean)\",true,P1,old_jar\n"
+                    "org.apache.dubbo:dubbo-common,3.3.7-SNAPSHOT,-,REMOVED,org.apache.dubbo.common.utils.NetUtils.getLocalHost,getLocalHost,method,(),true,P1,old_jar\n",
+                    encoding="utf-8",
+                )
+                return {
+                    "returncode": 0,
+                    "elapsed_seconds": 0.2,
+                    "all_changed_apis": str(all_changed),
+                    "output_dir": str(output),
+                }
+
+            def fake_run_step5(_case, _project_root, changed_apis, report_dir):
+                self.assertEqual(changed_apis.name, "selected_all_changed_apis.csv")
+                with changed_apis.open(encoding="utf-8") as fh:
+                    rows = list(csv.DictReader(fh))
+                self.assertEqual(len(rows), 2)
+                self.assertEqual({row["source"] for row in rows}, {"old_jar"})
+                output = report_dir / "evidence" / "call_chain"
+                output.mkdir(parents=True)
+                (output / "alerts.csv").write_text(
+                    "changed_symbol,evidence_files\n"
+                    f"org.apache.dubbo.common.URL.valueOf,{java_file}\n",
+                    encoding="utf-8",
+                )
+                (output / "alerts_reachable.csv").write_text("changed_symbol\n", encoding="utf-8")
+                (output / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "total_apis": 2,
+                            "reachable": 1,
+                            "uncertain": 0,
+                            "not_analyzed": 0,
+                            "not_found_in_static_analysis": 0,
+                            "meta": {"graph_stats": {}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, 0.1
+
+            with patch.object(realreg, "run_step4", side_effect=fake_run_step4), \
+                 patch.object(realreg, "run_step5", side_effect=fake_run_step5):
+                result = realreg.run_case(case, root, Path(""), report_root)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["step4_selection"]["selected_rows"], 2)
+        self.assertEqual(result["step4_selection"]["missing_api_names"], [])
+        self.assertTrue(str(result["changed_apis"]).endswith("selected_all_changed_apis.csv"))
+
+    def test_run_case_fails_when_step4_output_misses_expected_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            root.mkdir()
+            case = realreg.RealProjectCase(
+                name="dubbo-step4-missing",
+                default_project=root,
+                default_changed_apis=Path(""),
+                run_step4=True,
+                step4_dep_rows=(
+                    {
+                        "coord": "org.apache.dubbo:dubbo-common",
+                        "old_version": "3.3.7-SNAPSHOT",
+                        "new_version": "-",
+                        "change_type": "移除",
+                    },
+                ),
+                expected_step4_api_names=("org.apache.dubbo.common.URL.valueOf",),
+                baseline_specs=(),
+            )
+
+            def fake_run_step4(_case, report_dir):
+                output = report_dir / "evidence" / "api_changes"
+                output.mkdir(parents=True)
+                all_changed = output / "all_changed_apis.csv"
+                all_changed.write_text(
+                    "coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source\n"
+                    "org.apache.dubbo:dubbo-common,3.3.7-SNAPSHOT,-,REMOVED,org.apache.dubbo.common.utils.NetUtils.getLocalHost,getLocalHost,method,(),true,P1,old_jar\n",
+                    encoding="utf-8",
+                )
+                return {
+                    "returncode": 0,
+                    "elapsed_seconds": 0.1,
+                    "all_changed_apis": str(all_changed),
+                    "output_dir": str(output),
+                }
+
+            def fake_run_step5(_case, _project_root, _changed_apis, report_dir):
+                output = report_dir / "evidence" / "call_chain"
+                output.mkdir(parents=True)
+                (output / "alerts.csv").write_text("changed_symbol,evidence_files\n", encoding="utf-8")
+                (output / "alerts_reachable.csv").write_text("changed_symbol\n", encoding="utf-8")
+                (output / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "total_apis": 0,
+                            "reachable": 0,
+                            "uncertain": 0,
+                            "not_analyzed": 0,
+                            "not_found_in_static_analysis": 0,
+                            "meta": {"graph_stats": {}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, 0.1
+
+            with patch.object(realreg, "run_step4", side_effect=fake_run_step4), \
+                 patch.object(realreg, "run_step5", side_effect=fake_run_step5):
+                result = realreg.run_case(case, root, Path(""), report_root)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("step4_missing_expected_api:org.apache.dubbo.common.URL.valueOf", result["failures"])
+        self.assertIn("step4_selected_changed_apis_empty", result["failures"])
+
+    def test_run_case_reports_failure_when_step4_does_not_materialize_changed_apis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            root.mkdir()
+            case = realreg.RealProjectCase(
+                name="dubbo-step4-no-output",
+                default_project=root,
+                default_changed_apis=Path(""),
+                run_step4=True,
+                step4_dep_rows=(
+                    {
+                        "coord": "org.apache.dubbo:dubbo-common",
+                        "old_version": "3.3.7-SNAPSHOT",
+                        "new_version": "-",
+                        "change_type": "移除",
+                    },
+                ),
+                expected_step4_api_names=("org.apache.dubbo.common.URL.valueOf",),
+                baseline_specs=(),
+            )
+
+            def fake_run_step4(_case, report_dir):
+                output = report_dir / "evidence" / "api_changes"
+                output.mkdir(parents=True)
+                return {
+                    "returncode": 1,
+                    "elapsed_seconds": 0.1,
+                    "all_changed_apis": str(output / "all_changed_apis.csv"),
+                    "output_dir": str(output),
+                }
+
+            with patch.object(realreg, "run_step4", side_effect=fake_run_step4):
+                result = realreg.run_case(case, root, Path(""), report_root)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("step4_returncode=1", result["failures"])
+        self.assertTrue(any(item.startswith("changed APIs missing:") for item in result["failures"]))
 
     def test_run_case_can_validate_step6_report_and_query_for_user_journey(self):
         with tempfile.TemporaryDirectory() as tmp:
