@@ -109,6 +109,22 @@ def _real_project_task(python_exe, case, report_root):
     )
 
 
+def _user_scenario_task(python_exe):
+    return GateTask(
+        name="user_scenario_regression",
+        command=[
+            python_exe,
+            "scripts/user_scenario_regression.py",
+            "--scenario",
+            "all",
+            "--workspace",
+            "/private/tmp/java-upgrade-quality-user-scenarios",
+        ],
+        purpose="固定模拟用户场景：删除依赖跨 jar 链路、jar-primary 过滤、Step5 即时查询",
+        heavy=True,
+    )
+
+
 def _accuracy_benchmark_task(python_exe, profile):
     return GateTask(
         name=f"accuracy_benchmark_{profile}",
@@ -150,12 +166,14 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="all", repor
         ))
         tasks.append(_smoke_task(python_exe, "core"))
         tasks.append(_smoke_task(python_exe, "step5"))
+        tasks.append(_user_scenario_task(python_exe))
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root))
     elif profile == "release":
         tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all"))
+        tasks.append(_user_scenario_task(python_exe))
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root))
         tasks.append(_diff_check_task())

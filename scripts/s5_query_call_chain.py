@@ -9,6 +9,7 @@ source/bytecode graph for every question.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from collections import deque
@@ -266,6 +267,47 @@ def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000):
     ]
 
 
+def query_alert_chains(report_dir_or_file, method, limit=20):
+    """Fallback to Step5 alerts.csv when the graph query index has no chain.
+
+    The query index is built from the source/graph structure.  Runtime packaged
+    dependency paths can be present only in alerts.csv, especially for:
+      business source -> dependency jar A -> dependency jar B -> changed API
+    This fallback keeps the user-facing query useful after Step5 completes.
+    """
+    root = Path(report_dir_or_file)
+    if root.is_file():
+        root = root.parent.parent.parent if root.name == STEP5_QUERY_INDEX_FILE else root.parent
+    alerts_path = root / "evidence" / "call_chain" / "alerts.csv"
+    if not alerts_path.exists():
+        return []
+
+    method_name, signature = _split_method_and_signature(method)
+    wanted_signature = normalize_signature_for_lookup(signature) if signature else ""
+    chains = []
+    seen = set()
+    with alerts_path.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            if _clean(row.get("path_status")) and _clean(row.get("path_status")) != "reachable":
+                continue
+            changed_symbol = _clean(row.get("changed_symbol"))
+            if changed_symbol != method_name:
+                continue
+            row_signature = normalize_signature_for_lookup(_clean(row.get("api_signature")))
+            if wanted_signature and row_signature and row_signature != wanted_signature:
+                continue
+            path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
+            if not path_text:
+                continue
+            if path_text in seen:
+                continue
+            seen.add(path_text)
+            chains.append(path_text)
+            if len(chains) >= limit:
+                break
+    return chains
+
+
 def render_call_chains(chains):
     if not chains:
         return "未找到调用链。"
@@ -293,6 +335,8 @@ def main(argv=None):
         limit=args.limit,
         max_visits=args.max_visits,
     )
+    if not chains:
+        chains = query_alert_chains(args.report_dir, args.method, limit=args.limit)
     if args.json:
         print(json.dumps({"method": args.method, "chains": chains}, ensure_ascii=False, indent=2))
     else:

@@ -13,6 +13,7 @@ if str(SCRIPTS) not in sys.path:
 from enhanced_source_analyzer import CallEdge
 from s5_query_call_chain import (
     build_query_index,
+    query_alert_chains,
     query_call_chains,
     render_call_chains,
     write_query_index,
@@ -166,6 +167,31 @@ class S5QueryCallChainTest(unittest.TestCase):
             chains = query_call_chains(index, target)
 
         self.assertEqual(chains, ["com.app.App.run → com.vendor.Target.removed()"])
+
+    def test_query_falls_back_to_alerts_for_packaged_dependency_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            alerts = report_dir / "evidence" / "call_chain" / "alerts.csv"
+            alerts.parent.mkdir(parents=True)
+            alerts.write_text(
+                "changed_symbol,api_signature,path_status,path_text\n"
+                "com.vendor.LegacyApi.removed,(String),reachable,"
+                "com.app.App.run -> com.example:dep-a:com.depa.FacadeA.entry(String) -> "
+                "com.example:dep-b:com.depb.BridgeB.call(String) -> "
+                "com.vendor.LegacyApi.removed(String)\n",
+                encoding="utf-8",
+            )
+
+            chains = query_alert_chains(report_dir, "com.vendor.LegacyApi.removed(String)")
+
+        self.assertEqual(
+            chains,
+            [
+                "com.app.App.run → com.example:dep-a:com.depa.FacadeA.entry(String) → "
+                "com.example:dep-b:com.depb.BridgeB.call(String) → "
+                "com.vendor.LegacyApi.removed(String)"
+            ],
+        )
 
     def test_query_respects_limit_on_many_business_callers(self):
         target = "com.vendor.Target.removed()"
