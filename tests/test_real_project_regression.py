@@ -270,6 +270,101 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertTrue(str(result["changed_apis"]).endswith("evidence/api_changes/all_changed_apis.csv"))
 
+    def test_run_case_can_validate_step6_report_and_query_for_user_journey(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            root.mkdir()
+            java_file = root / "src/main/java/demo/App.java"
+            java_file.parent.mkdir(parents=True)
+            java_file.write_text(
+                "import org.apache.dubbo.common.URL;\n"
+                "class App { void run(String s) { URL.valueOf(s); } }\n",
+                encoding="utf-8",
+            )
+            changed_apis = Path(tmp) / "all_changed_apis.csv"
+            changed_apis.write_text(
+                "coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source\n"
+                "org.apache.dubbo:dubbo-common,probe,-,REMOVED,org.apache.dubbo.common.URL.valueOf,valueOf,method,(String),true,P1,test\n",
+                encoding="utf-8",
+            )
+            case = realreg.RealProjectCase(
+                name="dubbo-user-mini",
+                default_project=root,
+                default_changed_apis=changed_apis,
+                baseline_specs=(
+                    realreg.BaselineSpec(
+                        symbol="org.apache.dubbo.common.URL.valueOf",
+                        pattern=r"\bURL\s*\.\s*valueOf\s*\(",
+                        import_pattern=r"import\s+org\.apache\.dubbo\.common\.URL\s*;",
+                    ),
+                ),
+                run_step6_report=True,
+                query_methods=("org.apache.dubbo.common.URL.valueOf(String)",),
+            )
+
+            def fake_run_step5(_case, _project_root, _changed_apis, report_dir):
+                output = report_dir / "evidence" / "call_chain"
+                output.mkdir(parents=True)
+                (output / "alerts.csv").write_text(
+                    "changed_symbol,evidence_files,path_status,path_text\n"
+                    f"org.apache.dubbo.common.URL.valueOf,{java_file},reachable,"
+                    "demo.App.run -> org.apache.dubbo.common.URL.valueOf(String)\n",
+                    encoding="utf-8",
+                )
+                (output / "alerts_reachable.csv").write_text(
+                    (output / "alerts.csv").read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                (output / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "total_apis": 1,
+                            "reachable": 1,
+                            "uncertain": 0,
+                            "not_analyzed": 0,
+                            "not_found_in_static_analysis": 0,
+                            "meta": {"graph_stats": {"methods_indexed": 10, "reverse_edges_indexed": 20}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, 0.5
+
+            def fake_run_step6(report_dir):
+                report = report_dir / "deliverables" / "report.md"
+                findings = report_dir / ".runtime" / "findings" / "s6_findings.json"
+                report.parent.mkdir(parents=True)
+                findings.parent.mkdir(parents=True)
+                report.write_text(
+                    "org.apache.dubbo:dubbo-common\norg.apache.dubbo.common.URL.valueOf\n",
+                    encoding="utf-8",
+                )
+                findings.write_text("{}", encoding="utf-8")
+                return {
+                    "returncode": 0,
+                    "elapsed_seconds": 0.1,
+                    "findings": str(findings),
+                    "report": str(report),
+                }
+
+            def fake_query_step5(_report_dir, method):
+                return {
+                    "method": method,
+                    "returncode": 0,
+                    "stdout": "找到 1 条调用链：\n1. demo.App.run → org.apache.dubbo.common.URL.valueOf(String)",
+                    "stderr": "",
+                }
+
+            with patch.object(realreg, "run_step5", side_effect=fake_run_step5), \
+                 patch.object(realreg, "run_step6", side_effect=fake_run_step6), \
+                 patch.object(realreg, "query_step5", side_effect=fake_query_step5):
+                result = realreg.run_case(case, root, changed_apis, report_root)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["step6"]["returncode"], 0)
+        self.assertEqual(result["queries"][0]["returncode"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

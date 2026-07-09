@@ -56,6 +56,9 @@ class RealProjectCase:
     min_methods_indexed: int = 0
     min_reverse_edges_indexed: int = 0
     max_elapsed_seconds: float = 0.0
+    run_step6_report: bool = False
+    expected_report_texts: tuple[str, ...] = field(default_factory=tuple)
+    query_methods: tuple[str, ...] = field(default_factory=tuple)
 
 
 CASES = {
@@ -413,6 +416,15 @@ CASES = {
         min_methods_indexed=15000,
         min_reverse_edges_indexed=100000,
         max_elapsed_seconds=60.0,
+        run_step6_report=True,
+        expected_report_texts=(
+            "org.apache.dubbo:dubbo-common",
+            "org.apache.dubbo.common",
+        ),
+        query_methods=(
+            "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap(Map<?, ?>)",
+            "org.apache.dubbo.common.URL.valueOf(String)",
+        ),
     ),
     "commons-lang": RealProjectCase(
         name="commons-lang",
@@ -643,6 +655,52 @@ def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, rep
     return proc.returncode, time.time() - start
 
 
+def run_step6(report_dir: Path) -> dict:
+    output_findings = report_dir / ".runtime" / "findings" / "s6_findings.json"
+    output_report = report_dir / "deliverables" / "report.md"
+    cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "s6_report.py"),
+        "--report-dir",
+        str(report_dir),
+        "--output-findings",
+        str(output_findings),
+        "--output-report",
+        str(output_report),
+    ]
+    start = time.time()
+    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    elapsed = time.time() - start
+    return {
+        "returncode": proc.returncode,
+        "elapsed_seconds": round(elapsed, 2),
+        "findings": str(output_findings),
+        "report": str(output_report),
+        "stdout_tail": (proc.stdout or "")[-2000:],
+        "stderr_tail": (proc.stderr or "")[-2000:],
+    }
+
+
+def query_step5(report_dir: Path, method: str) -> dict:
+    cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "s5_query_call_chain.py"),
+        "--report-dir",
+        str(report_dir),
+        "--method",
+        method,
+        "--limit",
+        "5",
+    ]
+    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return {
+        "method": method,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout or "",
+        "stderr": proc.stderr or "",
+    }
+
+
 def load_summary(report_dir: Path) -> dict:
     summary_path = report_dir / "evidence" / "call_chain" / "summary.json"
     if not summary_path.exists():
@@ -671,6 +729,8 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
     checks = []
     failures = []
     warnings = []
+    step6_result = {}
+    query_results = []
 
     for name, minimum_files in (case.min_source_shape_files or {}).items():
         actual_files = int((source_shape_metrics.get(name) or {}).get("files") or 0)
@@ -726,6 +786,34 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         if spec.require_zero_production_missing and not production_baseline:
             failures.append(f"{spec.symbol}: production_baseline_empty")
 
+    if case.run_step6_report and returncode == 0:
+        step6_result = run_step6(report_dir)
+        report_path = Path(step6_result.get("report") or "")
+        findings_path = Path(step6_result.get("findings") or "")
+        if step6_result.get("returncode") != 0:
+            failures.append(f"step6_returncode={step6_result.get('returncode')}")
+        if not report_path.exists() or report_path.stat().st_size == 0:
+            failures.append("step6_report_missing_or_empty")
+        else:
+            report_text = report_path.read_text(encoding="utf-8", errors="ignore")
+            for expected in case.expected_report_texts:
+                if expected not in report_text:
+                    failures.append(f"step6_report_missing_text:{expected}")
+        if not findings_path.exists() or findings_path.stat().st_size == 0:
+            failures.append("step6_findings_missing_or_empty")
+
+    for method in case.query_methods:
+        query_result = query_step5(report_dir, method)
+        query_results.append(query_result)
+        output = query_result.get("stdout") or ""
+        if query_result.get("returncode") != 0:
+            failures.append(f"query_returncode:{method}={query_result.get('returncode')}")
+        if "未找到调用链" in output or "找到" not in output:
+            failures.append(f"query_no_chain:{method}")
+        owner = method.split("(", 1)[0]
+        if owner and owner not in output:
+            failures.append(f"query_missing_method:{method}")
+
     status = "passed" if returncode == 0 and not failures else "failed"
     if returncode != 0:
         failures.append(f"step5_returncode={returncode}")
@@ -748,6 +836,8 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         },
         "graph_stats": graph_stats,
         "source_shape_metrics": source_shape_metrics,
+        "step6": step6_result,
+        "queries": query_results,
         "checks": checks,
         "failures": failures,
         "warnings": warnings,
@@ -803,6 +893,18 @@ def main(argv=None):
             print(f"  summary: {item['summary']}")
             if item.get("graph_stats"):
                 print(f"  graph_stats: {item['graph_stats']}")
+            if item.get("step6"):
+                step6 = item.get("step6") or {}
+                print(
+                    f"  step6: rc={step6.get('returncode')} "
+                    f"elapsed={step6.get('elapsed_seconds')}s report={step6.get('report')}"
+                )
+            for query in item.get("queries") or []:
+                first_line = (query.get("stdout") or "").strip().splitlines()
+                print(
+                    f"  query: {query.get('method')} rc={query.get('returncode')} "
+                    f"result={first_line[0] if first_line else ''}"
+                )
             for name, metric in sorted((item.get("source_shape_metrics") or {}).items()):
                 print(
                     f"  source_shape: {name} files={metric.get('files', 0)} "
