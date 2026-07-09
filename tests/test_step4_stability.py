@@ -1115,6 +1115,157 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertEqual(apis[0]["change_type"], "SIGNATURE_CHANGED")
         self.assertEqual(apis[0]["api_signature"], "(String)")
 
+    def test_gitdiff_structural_changes_are_auxiliary_when_jar_is_primary_truth(self):
+        rows = [
+            {
+                "coord": "com.example:demo",
+                "old_version": "1.0.0",
+                "new_version": "2.0.0",
+                "change_type": "REMOVED",
+                "api_name": "com.example.Dto.getName",
+                "api_simple": "getName",
+                "symbol_kind": "method",
+                "api_signature": "()",
+                "confirmed": "true",
+                "severity": "P1",
+                "source": "gitdiff",
+            },
+            {
+                "coord": "com.example:demo",
+                "old_version": "1.0.0",
+                "new_version": "2.0.0",
+                "change_type": "BEHAVIOR_CHANGED",
+                "api_name": "com.example.Service.run",
+                "api_simple": "run",
+                "symbol_kind": "method",
+                "api_signature": "(String)",
+                "confirmed": "true",
+                "severity": "P2",
+                "source": "gitdiff",
+            },
+        ]
+        jar_index = {
+            "classes": {"com.example.Dto", "com.example.Service"},
+            "members": {
+                ("com.example.Dto.getName", "method", "()"),
+                ("com.example.Service.run", "method", "(String)"),
+            },
+            "errors": [],
+        }
+
+        with patch.object(step4, "_jar_public_api_index", return_value=jar_index):
+            accepted, rejected = step4.filter_gitdiff_rows_with_jar_truth(
+                rows,
+                old_jar="/tmp/old.jar",
+                new_jar="/tmp/new.jar",
+                coord="com.example:demo",
+                old_ver="1.0.0",
+                new_ver="2.0.0",
+            )
+
+        self.assertEqual([item["api_name"] for item in accepted], ["com.example.Service.run"])
+        self.assertEqual([item["api_name"] for item in rejected], ["com.example.Dto.getName"])
+        self.assertEqual(
+            rejected[0]["filter_reason"],
+            "source_structural_change_not_promoted_japicmp_is_primary",
+        )
+
+    def test_gitdiff_behavior_change_requires_member_in_both_jars(self):
+        row = {
+            "coord": "com.example:demo",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "change_type": "BEHAVIOR_CHANGED",
+            "api_name": "com.example.Dto.getName",
+            "api_simple": "getName",
+            "symbol_kind": "method",
+            "api_signature": "()",
+            "confirmed": "true",
+            "severity": "P2",
+            "source": "gitdiff",
+        }
+        old_index = {
+            "classes": {"com.example.Dto"},
+            "members": {("com.example.Dto.getName", "method", "()")},
+            "errors": [],
+        }
+        new_index = {
+            "classes": {"com.example.Dto"},
+            "members": set(),
+            "errors": [],
+        }
+
+        with patch.object(step4, "_jar_public_api_index", side_effect=[old_index, new_index]):
+            accepted, rejected = step4.filter_gitdiff_rows_with_jar_truth(
+                [row],
+                old_jar="/tmp/old.jar",
+                new_jar="/tmp/new.jar",
+                coord="com.example:demo",
+                old_ver="1.0.0",
+                new_ver="2.0.0",
+            )
+
+        self.assertEqual(accepted, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("new_jar_member_missing", rejected[0]["filter_reason"])
+
+    def test_gitdiff_jar_truth_accepts_normalized_java_lang_signature(self):
+        row = {
+            "coord": "com.example:demo",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "change_type": "BEHAVIOR_CHANGED",
+            "api_name": "com.example.Service.run",
+            "api_simple": "run",
+            "symbol_kind": "method",
+            "api_signature": "(String)",
+            "confirmed": "true",
+            "severity": "P2",
+            "source": "gitdiff",
+        }
+        jar_index = {
+            "classes": {"com.example.Service"},
+            "members": {("com.example.Service.run", "method", "(String)")},
+            "errors": [],
+        }
+
+        with patch.object(step4, "_jar_public_api_index", return_value=jar_index):
+            accepted, rejected = step4.filter_gitdiff_rows_with_jar_truth(
+                [row],
+                old_jar="/tmp/old.jar",
+                new_jar="/tmp/new.jar",
+                coord="com.example:demo",
+                old_ver="1.0.0",
+                new_ver="2.0.0",
+            )
+
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(rejected, [])
+
+    def test_step5_input_dedup_prefers_japicmp_over_gitdiff_for_same_api(self):
+        base = {
+            "coord": "com.example:demo",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "change_type": "SIGNATURE_CHANGED",
+            "api_name": "com.example.Service.run",
+            "api_simple": "run",
+            "symbol_kind": "method",
+            "api_signature": "(String)",
+            "confirmed": "true",
+            "severity": "P1",
+        }
+        rows = [
+            {**base, "source": "gitdiff", "reason_code": "source_only"},
+            {**base, "source": "japicmp", "reason_code": "binary_or_source_incompatible"},
+        ]
+
+        normalized = step4.normalize_step5_input_rows(rows)
+
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0]["source"], "japicmp")
+        self.assertEqual(normalized[0]["reason_code"], "binary_or_source_incompatible")
+
     def test_parse_japicmp_output_prefers_terminal_method_in_chained_expression(self):
         output = (
             "***! MODIFIED METHOD: "

@@ -193,11 +193,49 @@ def minimal_valid_app_class_bytes():
     )
 
 
+def minimal_valid_legacy_api_class_bytes(include_multi_line=True):
+    # 由以下源码编译得到，用于让 Step4 的 jar truth 校验能通过 javap
+    # 读取真实公开方法，而不是依赖 fake class 字节串：
+    #
+    # package com.example.lib;
+    # public class LegacyApi {
+    #   public String singleLine() { return "x"; }
+    #   public String multiLine() { return "x"; }      // v1 only
+    #   public static String bridgeMethod() { return "x"; }
+    # }
+    if include_multi_line:
+        payload = (
+            "yv66vgAAAEQAEwoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClW"
+            "CAAIAQABeAcACgEAGWNvbS9leGFtcGxlL2xpYi9MZWdhY3lBcGkBAARDb2RlAQAPTGluZU51bWJl"
+            "clRhYmxlAQAKc2luZ2xlTGluZQEAFCgpTGphdmEvbGFuZy9TdHJpbmc7AQAJbXVsdGlMaW5lAQAM"
+            "YnJpZGdlTWV0aG9kAQAKU291cmNlRmlsZQEADkxlZ2FjeUFwaS5qYXZhACEACQACAAAAAAAEAAEA"
+            "BQAGAAEACwAAAB0AAQABAAAABSq3AAGxAAAAAQAMAAAABgABAAAAAgABAA0ADgABAAsAAAAbAAEA"
+            "AQAAAAMSB7AAAAABAAwAAAAGAAEAAAADAAEADwAOAAEACwAAABsAAQABAAAAAxIHsAAAAAEADAAA"
+            "AAYAAQAAAAQACQAQAA4AAQALAAAAGwABAAAAAAADEgewAAAAAQAMAAAABgABAAAABQABABEAAAAC"
+            "ABI="
+        )
+    else:
+        payload = (
+            "yv66vgAAAEQAEgoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClW"
+            "CAAIAQABeAcACgEAGWNvbS9leGFtcGxlL2xpYi9MZWdhY3lBcGkBAARDb2RlAQAPTGluZU51bWJl"
+            "clRhYmxlAQAKc2luZ2xlTGluZQEAFCgpTGphdmEvbGFuZy9TdHJpbmc7AQAMYnJpZGdlTWV0aG9k"
+            "AQAKU291cmNlRmlsZQEADkxlZ2FjeUFwaS5qYXZhACEACQACAAAAAAADAAEABQAGAAEACwAAAB0A"
+            "AQABAAAABSq3AAGxAAAAAQAMAAAABgABAAAAAgABAA0ADgABAAsAAAAbAAEAAQAAAAMSB7AAAAAB"
+            "AAwAAAAGAAEAAAADAAkADwAOAAEACwAAABsAAQAAAAAAAxIHsAAAAAEADAAAAAYAAQAAAAQAAQAQ"
+            "AAAAAgAR"
+        )
+    return base64.b64decode(payload)
+
+
 def create_fake_jar(path, marker=b""):
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr(
             "com/example/lib/LegacyApi.class",
+            minimal_valid_legacy_api_class_bytes(include_multi_line=marker != b"v2"),
+        )
+        zf.writestr(
+            "com/example/lib/RiskMarker.class",
             b"javax/xml/bind setAccessible java/lang/SecurityManager com/sun/" + (marker or b""),
         )
         zf.writestr(
@@ -991,9 +1029,19 @@ def run_core_pipeline_smoke(workspace, dep_env):
         if r.get("coord") == "com.example:demo-lib"
         and r.get("change_type") == "REMOVED"
     ]
-    assert_true(removed_rows, "Step 4 应识别被删除的方法（multiLine）")
-    helper_behavior = [r for r in behavior_rows if "Helper" in r.get("api_name", "")]
-    assert_true(helper_behavior, "Step 4 应识别 Helper 类的行为变更")
+    assert_true(
+        not any(r.get("source") == "gitdiff" for r in removed_rows),
+        "Step 4 不应仅凭源码 diff 将结构性删除作为主变更 API；删除/签名变化应以 jar/JApiCmp 为主",
+    )
+    auxiliary_rows = read_csv(report_dir / "evidence" / "api_changes" / "demo-lib_gitdiff_auxiliary_only.csv")
+    assert_true(
+        any(r.get("change_type") == "REMOVED" and "multiLine" in r.get("api_name", "") for r in auxiliary_rows),
+        "Step 4 应将未经 jar 证实的源码结构性删除保留为辅助证据",
+    )
+    assert_true(
+        not any("Helper" in r.get("api_name", "") for r in behavior_rows),
+        "Step 4 不应将源码中的包可见 Helper 类当作依赖 jar 公开 API 行为变更",
+    )
 
     branch_match_dir = report_dir / "s4_jar_compare_branch_match"
     run_script(
@@ -1257,7 +1305,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
         "run_step 在提供完整坐标时应只固化当前变更依赖的源码仓库映射",
     )
     assert_true(
-        runtime_full_expand_behavior_rows,
+        "bridgeMethod" in runtime_full_expand_demo_gitdiff,
         "run_step 在提供完整坐标时未将自动展开结果用于 Step4 git diff",
     )
     assert_true(

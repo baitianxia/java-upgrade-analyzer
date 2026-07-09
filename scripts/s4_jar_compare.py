@@ -56,6 +56,7 @@ from pipeline_constants import (
     RUNTIME_DIRNAME,
     RUNTIME_STATE_DIRNAME,
 )
+from signature_utils import normalize_signature_for_lookup
 
 INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -1344,6 +1345,158 @@ def _parse_removed_jar_javap_output(text, coord, old_ver, class_binary_name):
             )
         )
     return rows
+
+
+def _api_owner_class(api_name):
+    text = str(api_name or '').strip()
+    if '.' not in text:
+        return ''
+    return text.rsplit('.', 1)[0]
+
+
+def _jar_public_api_index(jar_path, coord='', version='', target_classes=None):
+    """Return public/protected API membership from a jar.
+
+    Step4 treats the dependency jar as the primary truth. Source git diff is
+    only auxiliary, so source-derived API rows must be checked against the
+    compiled artifact before they are allowed into Step5 input.
+    """
+    jar_path = str(jar_path or '').strip()
+    index = {
+        'classes': set(),
+        'members': set(),
+        'errors': [],
+    }
+    if not jar_path or not os.path.exists(jar_path):
+        index['errors'].append('jar_missing')
+        return index
+    wanted_classes = {
+        str(item or '').replace('$', '.').strip()
+        for item in (target_classes or [])
+        if str(item or '').strip()
+    }
+    try:
+        class_entries = list(_iter_jar_class_entries(jar_path))
+    except Exception as exc:
+        index['errors'].append(f'jar_read_failed:{str(exc)[:120]}')
+        return index
+
+    for class_binary_name in class_entries:
+        class_fqcn = class_binary_name.replace('$', '.')
+        if wanted_classes and class_fqcn not in wanted_classes:
+            continue
+        index['classes'].add(class_fqcn)
+        try:
+            javap_text = _run_javap_public_api_dump(jar_path, class_binary_name)
+            rows = _parse_removed_jar_javap_output(
+                javap_text,
+                coord or 'unknown:unknown',
+                version or '',
+                class_binary_name,
+            )
+        except Exception as exc:
+            index['errors'].append(f'{class_fqcn}:{str(exc)[:120]}')
+            continue
+        for row in rows:
+            if row.get('symbol_kind') in {'method', 'constructor'}:
+                signature = str(row.get('api_signature') or '').strip()
+                normalized = normalize_signature_for_lookup(signature) or signature
+                index['members'].add((
+                    str(row.get('api_name') or '').strip(),
+                    str(row.get('symbol_kind') or '').strip(),
+                    normalized,
+                ))
+            elif row.get('symbol_kind') == 'class':
+                index['classes'].add(str(row.get('api_name') or '').strip())
+    return index
+
+
+def _jar_index_has_api(index, row):
+    row = row or {}
+    symbol_kind = str(row.get('symbol_kind') or '').strip()
+    api_name = str(row.get('api_name') or '').strip()
+    if not api_name:
+        return False
+    if symbol_kind == 'class':
+        return api_name in (index or {}).get('classes', set())
+    if symbol_kind in {'method', 'constructor'}:
+        signature = str(row.get('api_signature') or '').strip()
+        normalized = normalize_signature_for_lookup(signature) or signature
+        return (api_name, symbol_kind, normalized) in (index or {}).get('members', set())
+    if symbol_kind == 'field':
+        # Source git diff does not currently produce field rows. If it does in
+        # the future, require an explicit field index instead of assuming true.
+        return False
+    return False
+
+
+def filter_gitdiff_rows_with_jar_truth(gitdiff_rows, old_jar='', new_jar='', coord='', old_ver='', new_ver=''):
+    """Promote only jar-confirmed source rows to Step5 input.
+
+    Structural API changes from source diff are intentionally *not* promoted:
+    JApiCmp/removed-jar export is the primary source for binary API changes.
+    Source diff remains useful for BEHAVIOR_CHANGED, but only when the changed
+    member exists in both compiled jars.
+    """
+    rows = list(gitdiff_rows or [])
+    if not rows:
+        return [], []
+
+    target_classes = sorted({
+        _api_owner_class(row.get('api_name'))
+        for row in rows
+        if _api_owner_class(row.get('api_name'))
+    })
+    old_index = _jar_public_api_index(old_jar, coord, old_ver, target_classes=target_classes)
+    new_index = _jar_public_api_index(new_jar, coord, new_ver, target_classes=target_classes)
+    old_errors = old_index.get('errors') or []
+    new_errors = new_index.get('errors') or []
+    accepted = []
+    rejected = []
+
+    for row in rows:
+        item = dict(row)
+        change_type = str(item.get('change_type') or '').strip()
+        if change_type != 'BEHAVIOR_CHANGED':
+            item['filter_reason'] = 'source_structural_change_not_promoted_japicmp_is_primary'
+            rejected.append(item)
+            continue
+        old_has = _jar_index_has_api(old_index, item)
+        new_has = _jar_index_has_api(new_index, item)
+        if old_has and new_has:
+            item['confirmed'] = 'true'
+            item['source'] = 'gitdiff'
+            accepted.append(item)
+        else:
+            reasons = []
+            if not old_has:
+                reasons.append('old_jar_member_missing')
+            if not new_has:
+                reasons.append('new_jar_member_missing')
+            if old_errors:
+                reasons.append('old_jar_index_errors')
+            if new_errors:
+                reasons.append('new_jar_index_errors')
+            item['filter_reason'] = '|'.join(reasons) or 'jar_member_not_confirmed'
+            rejected.append(item)
+    return accepted, rejected
+
+
+def write_gitdiff_auxiliary_rows(output_dir, coord, rows):
+    rows = list(rows or [])
+    if not rows:
+        return ''
+    artifact = (str(coord or '').split(':')[-1] or 'dependency').replace('.', '-')
+    path = os.path.join(output_dir, f"{artifact}_gitdiff_auxiliary_only.csv")
+    fields = list(ALL_CHANGED_APIS_FIELDS)
+    for extra in ('filter_reason', 'jar_truth'):
+        if extra not in fields:
+            fields.append(extra)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
 
 
 def export_removed_jar_apis(
@@ -3068,9 +3221,9 @@ def normalize_step5_input_rows(rows):
       - 归一化键必须包含 api_signature 与 symbol_kind，避免重载/字段/构造器串味
     """
     source_rank = {
-        'gitdiff': 0,
-        'japicmp': 1,
-        'old_jar': 1,
+        'japicmp': 0,
+        'old_jar': 0,
+        'gitdiff': 1,
         'changelog': 2,
     }
 
@@ -3137,7 +3290,7 @@ def _load_json_file(path):
         return {}
 
 
-def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_export=None):
+def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_export=None, gitdiff_auxiliary_rows=None):
     """
     为单个依赖写出 Step4 的 per-dependency 产物。
 
@@ -3155,6 +3308,7 @@ def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_expo
     os.makedirs(per_dependency_dir, exist_ok=True)
 
     raw_rows = list(raw_rows or [])
+    gitdiff_auxiliary_rows = list(gitdiff_auxiliary_rows or [])
     normalized_rows = normalize_step5_input_rows(raw_rows)
     removed_rows = [row for row in raw_rows if str(row.get('source') or '').strip() == 'old_jar']
 
@@ -3185,6 +3339,18 @@ def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_expo
             "export_error": str((removed_jar_export or {}).get("error") or "").strip(),
             "class_count": int((removed_jar_export or {}).get("class_count") or 0),
             "errors": list((removed_jar_export or {}).get("errors") or []),
+        },
+        "gitdiff_auxiliary": {
+            "count": len(gitdiff_auxiliary_rows),
+            "reason": (
+                "依赖源码 diff 仅作为辅助证据；结构性 API 变化以 jar/JApiCmp 为主，"
+                "行为变化只有在 old/new jar 都能确认成员存在时才进入 Step5。"
+            ),
+            "filter_reasons": sorted({
+                str(row.get("filter_reason") or "").strip()
+                for row in gitdiff_auxiliary_rows
+                if str(row.get("filter_reason") or "").strip()
+            }),
         },
         "artifacts": {
             "removed_jar_symbols_csv": str(removed_symbols_path),
@@ -3747,6 +3913,10 @@ def main():
         is_added_dependency = (change == '新增') or (old_ver == '-' and new_ver != '-')
         dependency_raw_apis = []
         dependency_removed_jar_export = {}
+        dependency_gitdiff_apis = []
+        dependency_gitdiff_auxiliary_rows = []
+        dependency_old_jar = ""
+        dependency_new_jar = ""
 
         is_focus_dependency = coord in changed_dependency_coords if changed_dependency_coords else True
         source_mapping = dependency_paths.get(coord) or {}
@@ -3856,14 +4026,18 @@ def main():
                         }
                     )
             else:
-                all_apis.extend(apis)
-                dependency_raw_apis.extend(apis)
+                dependency_gitdiff_apis = list(apis)
                 behavior_changed = sum(1 for a in apis if a.get("change_type") == "BEHAVIOR_CHANGED")
-                print(f"    → {len(apis)} 个源码差异（含 behavior_changed={behavior_changed}）", file=sys.stderr)
+                structural_changed = len(apis) - behavior_changed
+                print(
+                    f"    → {len(apis)} 个源码差异（含 behavior_changed={behavior_changed}, "
+                    f"structural={structural_changed}；待 jar truth 过滤）",
+                    file=sys.stderr,
+                )
                 emit_progress(
                     "step4",
                     "gitdiff",
-                    f"源码 diff 完成，提取 {len(apis)} 个变化，behavior_changed={behavior_changed}",
+                    f"源码 diff 完成，提取 {len(apis)} 个变化，待 jar truth 过滤，behavior_changed={behavior_changed}",
                     current=i,
                     total=len(dep_rows),
                     elapsed=time.perf_counter() - gitdiff_timer,
@@ -3876,6 +4050,7 @@ def main():
                         "new_version": new_ver,
                         "api_changes": len(apis),
                         "behavior_changed": behavior_changed,
+                        "structural_source_changes": structural_changed,
                         "out_file": os.path.abspath(_out_file),
                         "base_ref": (meta or {}).get("base_ref"),
                         "cur_ref": (meta or {}).get("cur_ref"),
@@ -4066,8 +4241,42 @@ def main():
                     elapsed=time.perf_counter() - japicmp_timer,
                     item=coord,
                 )
+            dependency_old_jar = str((jar_info or {}).get("old_jar") or "")
+            dependency_new_jar = str((jar_info or {}).get("new_jar") or "")
             dependency_raw_apis.extend(apis)
             result["all_apis"].extend(apis)
+
+        if dependency_gitdiff_apis:
+            accepted_source_apis, rejected_source_apis = filter_gitdiff_rows_with_jar_truth(
+                dependency_gitdiff_apis,
+                old_jar=dependency_old_jar,
+                new_jar=dependency_new_jar,
+                coord=coord,
+                old_ver=old_ver,
+                new_ver=new_ver,
+            )
+            dependency_gitdiff_auxiliary_rows = rejected_source_apis
+            aux_path = write_gitdiff_auxiliary_rows(args.output_dir, coord, rejected_source_apis)
+            dependency_raw_apis.extend(accepted_source_apis)
+            result["all_apis"].extend(accepted_source_apis)
+            for run_item in result["gitdiff_runs"]:
+                if run_item.get("coord") == coord:
+                    run_item["promoted_to_step5"] = len(accepted_source_apis)
+                    run_item["auxiliary_only"] = len(rejected_source_apis)
+                    run_item["auxiliary_only_file"] = os.path.abspath(aux_path) if aux_path else ""
+            print(
+                f"    → 源码 diff 经 jar truth 过滤：进入 Step5={len(accepted_source_apis)}，"
+                f"辅助证据={len(rejected_source_apis)}",
+                file=sys.stderr,
+            )
+            emit_progress(
+                "step4",
+                "gitdiff",
+                f"源码 diff jar truth 过滤完成，promoted={len(accepted_source_apis)}，auxiliary={len(rejected_source_apis)}",
+                current=i,
+                total=len(dep_rows),
+                item=coord,
+            )
 
         # 4c: changelog 分析任务文件（由 AI agent 后续填写）
         if change in ('大版本升级', '小版本升级') and (not has_source_repo):
@@ -4077,6 +4286,7 @@ def main():
             "dep_row": {k: v for k, v in dict(row).items() if not str(k).startswith("_step4_")},
             "raw_rows": dependency_raw_apis,
             "removed_jar_export": dependency_removed_jar_export,
+            "gitdiff_auxiliary_rows": dependency_gitdiff_auxiliary_rows,
         }
         emit_progress(
             "step4",
@@ -4130,6 +4340,7 @@ def main():
             dep_row=item.get("dep_row") or {},
             raw_rows=item.get("raw_rows") or [],
             removed_jar_export=item.get("removed_jar_export") or None,
+            gitdiff_auxiliary_rows=item.get("gitdiff_auxiliary_rows") or [],
         )
 
     changed_classes_path = os.path.join(args.output_dir, "changed_classes.json")
