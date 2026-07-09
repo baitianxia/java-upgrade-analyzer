@@ -6226,6 +6226,93 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("展示 1 条样例；台账命中 2 次", report_text)
         self.assertIn("com.acme.OrderService.submit -> com.vendor.LegacyApi.removed(String)", report_text)
 
+    def test_s6_report_uses_step5_graph_stats_as_coverage_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            s5_dir = report_dir / "evidence" / "call_chain"
+            s5_dir.mkdir(parents=True)
+            summary = {
+                "status": "done",
+                "reachable": 1,
+                "uncertain": 0,
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": 0,
+                "user_conclusion_summary": {"已确认影响": 1},
+                "meta": {
+                    "graph_stats": {
+                        "truncated": False,
+                        "parser_fallback_reasons": {"unsupported_language_kotlin": 2},
+                        "source_artifact_alignment": {
+                            "status": "unverified",
+                            "reason_codes": ["build_provenance_missing"],
+                            "git_root": "/repo/app",
+                        },
+                        "indirect_usage": {
+                            "status": "partial",
+                            "reason_codes": ["reflection_source_partial"],
+                        },
+                    }
+                },
+                "reachable_apis": [
+                    {
+                        "coord": "a:b",
+                        "api": "com.vendor.LegacyApi.removed",
+                        "api_name": "com.vendor.LegacyApi.removed",
+                        "api_signature": "(String)",
+                        "symbol_kind": "method",
+                        "change_type": "REMOVED",
+                        "severity": "P1",
+                        "reason_code": "SYSTEM_CODE_REACHED",
+                    }
+                ],
+            }
+            (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+
+            findings = s6_report.collect_findings(str(report_dir))
+            report_text = s6_report.generate_report(findings)
+
+        self.assertEqual(findings["coverage"]["source"], "step5_summary_fallback")
+        self.assertEqual(findings["coverage"]["overall_status"], "partial")
+        self.assertIn("分析完整度 | 部分完整", report_text)
+        self.assertIn("源码与制品一致性", report_text)
+        self.assertIn("动态调用可能漏报", report_text)
+
+    def test_s6_report_prefers_formal_coverage_over_step5_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            s5_dir = report_dir / "evidence" / "call_chain"
+            s5_dir.mkdir(parents=True)
+            runtime_coverage_dir = report_dir / ".runtime" / "coverage"
+            runtime_coverage_dir.mkdir(parents=True)
+            summary = {
+                "status": "done",
+                "reachable": 0,
+                "uncertain": 0,
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": 0,
+                "meta": {
+                    "graph_stats": {
+                        "truncated": True,
+                        "truncation_reasons": ["max_methods"],
+                    }
+                },
+            }
+            coverage = {
+                "schema": "java-upgrade-analyzer.coverage.v1",
+                "overall_status": "complete",
+                "critical_incomplete": [],
+                "components": [],
+            }
+            (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+            (runtime_coverage_dir / "coverage.json").write_text(json.dumps(coverage, ensure_ascii=False), encoding="utf-8")
+
+            findings = s6_report.collect_findings(str(report_dir))
+            report_text = s6_report.generate_report(findings)
+
+        self.assertEqual(findings["coverage"]["overall_status"], "complete")
+        self.assertNotEqual(findings["coverage"].get("source"), "step5_summary_fallback")
+        self.assertIn("分析完整度 | 完整", report_text)
+
     def test_s6_report_summarizes_large_not_found_list_outside_main_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

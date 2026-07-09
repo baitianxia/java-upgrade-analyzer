@@ -79,6 +79,99 @@ def _coverage_path(report_dir):
     return _runtime_dir(report_dir, RUNTIME_COVERAGE_DIRNAME) / "coverage.json"
 
 
+def _step5_summary_coverage_fallback(call_summary):
+    """Build a conservative coverage view when formal coverage.json is absent.
+
+    The orchestrated pipeline writes .runtime/coverage/coverage.json. Some
+    direct Step5/Step6 uses only have evidence/call_chain/summary.json. In that
+    case the report should not show an unhelpful "unknown" if Step5 already
+    emitted graph/coverage signals in meta.graph_stats.
+    """
+    graph_stats = ((call_summary or {}).get('meta') or {}).get('graph_stats') or {}
+    if not graph_stats:
+        return {}
+
+    components = []
+    critical = []
+
+    def add_component(component_id, status, reason_codes=None, evidence=None, critical_if_incomplete=True):
+        status = str(status or 'unknown')
+        item = {
+            'id': component_id,
+            'status': status,
+            'reason_codes': list(reason_codes or []),
+            'evidence': [item for item in (evidence or []) if item],
+        }
+        components.append(item)
+        if critical_if_incomplete and status not in {'complete', 'not_applicable'}:
+            critical.append(component_id)
+
+    truncated = bool(graph_stats.get('truncated'))
+    truncation_reasons = list(graph_stats.get('truncation_reasons') or [])
+    business_reason_codes = list(truncation_reasons)
+    edge_cap_hits = graph_stats.get('edge_cap_hits') or 0
+    if edge_cap_hits:
+        business_reason_codes.append('edge_cap_hits')
+    parser_fallback_reasons = graph_stats.get('parser_fallback_reasons') or {}
+    if parser_fallback_reasons:
+        business_reason_codes.append('parser_fallback')
+    add_component(
+        'business_reachability',
+        'partial' if (truncated or parser_fallback_reasons or edge_cap_hits) else 'complete',
+        business_reason_codes,
+        truncation_reasons,
+    )
+
+    source_alignment = graph_stats.get('source_artifact_alignment') or {}
+    if source_alignment:
+        add_component(
+            'source_artifact_alignment',
+            source_alignment.get('status') or 'unknown',
+            source_alignment.get('reason_codes') or [],
+            [source_alignment.get('artifact_path') or source_alignment.get('git_root') or ''],
+        )
+
+    artifact_bytecode = graph_stats.get('artifact_bytecode') or {}
+    if artifact_bytecode:
+        add_component(
+            'artifact_bytecode_dependencies',
+            artifact_bytecode.get('status') or 'unknown',
+            artifact_bytecode.get('reason_codes') or [],
+        )
+
+    business_bytecode = graph_stats.get('business_bytecode') or {}
+    if business_bytecode:
+        add_component(
+            'business_bytecode_graph',
+            business_bytecode.get('status') or 'unknown',
+            business_bytecode.get('failures') or [],
+            critical_if_incomplete=False,
+        )
+
+    indirect_usage = graph_stats.get('indirect_usage') or {}
+    if indirect_usage:
+        add_component(
+            'indirect_usage_matrix',
+            indirect_usage.get('status') or 'unknown',
+            indirect_usage.get('reason_codes') or [],
+        )
+
+    if critical:
+        overall_status = 'partial'
+    elif any(item.get('status') == 'unknown' for item in components):
+        overall_status = 'unknown'
+    else:
+        overall_status = 'complete'
+
+    return {
+        'schema': 'java-upgrade-analyzer.coverage.v1',
+        'source': 'step5_summary_fallback',
+        'overall_status': overall_status,
+        'critical_incomplete': critical,
+        'components': components,
+    }
+
+
 S6_DETAIL_BUCKETS = {
     "uncertain": {
         "title": "需人工复核清单",
@@ -695,6 +788,8 @@ def collect_findings(d):
     call_summary = load_json(_call_chain_dir(d) / "summary.json")
     impacted_coords = set()
     if call_summary:
+        if not findings.get('coverage'):
+            findings['coverage'] = _step5_summary_coverage_fallback(call_summary)
         findings['user_conclusion_summary'] = dict(call_summary.get('user_conclusion_summary') or {})
         not_found_count = call_summary.get(
             'not_found_in_static_analysis',
