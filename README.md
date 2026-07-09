@@ -6,7 +6,7 @@
 
 > JDK、Spring、Jakarta 或依赖升级/删除后，哪些变更 API 真的会影响当前业务系统？
 
-使用者不需要直接运行内部脚本。正确使用方式是：在 Claude Code 中描述你的升级场景，让 Claude Code 调用本 Skill，按交互提示补充信息，并查看最终报告。
+使用者只需要在 Claude Code 中描述升级场景，让 Claude Code 调用本 Skill，按交互提示补充信息，并查看最终报告。
 
 ---
 
@@ -19,6 +19,7 @@
 - 分析 JDK、Spring、Jakarta 等框架级迁移风险；
 - 追踪变化 API 是否被业务源码、业务字节码或运行时依赖 jar 使用；
 - 尽量给出完整调用链，例如“业务代码 A → 依赖 B → 依赖 C → 变更 API D”；
+- 在 Step5 完成后，支持按指定方法即时查询调用链，直接返回链路文本；
 - 输出人工可复核的明细和最终汇总报告。
 
 它不是自动修代码工具。默认只分析风险、输出证据和结论。
@@ -37,58 +38,11 @@
 - 某个依赖 jar 被删除；
 - 想确认某个依赖 API 变化是否真正影响当前业务系统。
 
-典型问题示例：
-
-- “帮我分析这个工程从 JDK 8 升到 17 的兼容性风险。”
-- “使用 java-upgrade-analyzer 分析 Spring Boot 2 升 3 的影响。”
-- “commons-lang 这个 jar 删除后，当前系统是否还有直接或间接调用？”
-- “这个依赖版本升级后，哪些 API 变化会触达业务代码？”
-
 ---
 
-## 在 Claude Code 中如何使用
+## 快速开始
 
-在待分析 Java 工程中打开 Claude Code，然后直接提出需求即可：
-
-```text
-使用 java-upgrade-analyzer 分析当前工程从 main 分支升级到 feature/upgrade 分支的兼容性风险。
-目标模块是 app-module。
-如果需要依赖源码，我可以提供 /abs/path/to/dependency-source-repo。
-```
-
-或者：
-
-```text
-使用 java-upgrade-analyzer 分析 commons-lang 被删除对当前系统的影响。
-目标模块是 app-module。
-```
-
-Claude Code 会负责：
-
-1. 读取本 Skill 的规则；
-2. 判断需要哪些输入；
-3. 调用内部分析脚本；
-4. 遇到 checkpoint 时停下来向你确认；
-5. 根据你的答复恢复执行；
-6. 最后告诉你应该看哪些报告文件、结论是什么。
-
-你不需要手工执行 `scripts/run_step.py`。这些命令是 Claude Code/Skill 内部使用的。
-
----
-
-## 第一次使用时建议告诉 Claude Code 什么
-
-为了少来回追问，建议一开始就提供这些信息：
-
-| 信息 | 是否必需 | 说明 |
-|---|---:|---|
-| 待分析工程 | 通常已知 | Claude Code 当前打开的工程；如果不是目标工程，请明确路径 |
-| 目标模块 | 必需 | 本次唯一分析的可部署模块；多模块项目必须明确 |
-| 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current jar/war |
-| 依赖源码路径 | 可选但推荐 | 依赖包源码仓库路径，用于提升 API 行为变更和跨依赖调用链分析能力 |
-| 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
-
-推荐一次性这样说：
+在待分析 Java 工程中打开 Claude Code，然后用自然语言说明升级前后来源和目标模块。推荐一次性这样说：
 
 ```text
 使用 java-upgrade-analyzer 分析当前工程升级影响：
@@ -96,7 +50,6 @@ Claude Code 会负责：
 - current 分支：feature/upgrade
 - 目标模块：app-module
 - 依赖源码路径：/abs/path/to/dependency-source-repo
-- 最大调用链深度使用默认值
 ```
 
 如果你已经有升级前后的构建产物，可以这样说：
@@ -110,17 +63,38 @@ Claude Code 会负责：
 - 目标模块：app-module
 ```
 
+Claude Code 会负责：
+
+1. 读取本 Skill 的规则；
+2. 判断需要哪些输入；
+3. 执行分析流程；
+4. 遇到需要确认的信息时停下来向你确认；
+5. 根据你的答复恢复执行；
+6. 最后告诉你应该看哪些报告文件、结论是什么。
+
+为了少来回追问，首次使用时重点提供这些信息：
+
+| 信息 | 是否必需 | 说明 |
+|---|---:|---|
+| 待分析工程 | 通常已知 | Claude Code 当前打开的工程；如果不是目标工程，请明确路径 |
+| 目标模块 | 必需 | 本次唯一分析的可部署模块；多模块项目必须明确 |
+| 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current jar/war |
+| 依赖源码路径 | 可选但推荐 | 依赖包源码仓库路径，用于提升 API 行为变更和跨依赖调用链分析能力 |
+| 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
+
 说明：
 
 - 标准 Maven 结构下，业务系统源码路径通常不需要你提供，Skill 会从目标模块推断。
-- `dependency_source_dirs` 指的是依赖包源码路径，不是当前业务系统源码路径。
+- 依赖源码路径指的是依赖包自己的源码仓库路径，不是当前业务系统源码路径。
 - 如果存在多个可部署模块且无法唯一判断，Claude Code 必须让你选择目标模块。
+- 如果只表达“想分析什么”，但没有提供 base/current 来源或目标模块，Claude Code 会继续追问，不会猜测执行。
+- 如果只是查询某个方法调用链，则需要当前工程已经跑完 Step5 并生成查询索引。
 
 ---
 
 ## Claude Code 停下来问问题怎么办
 
-分析过程中，Skill 可能会进入 checkpoint。Claude Code 会停下来向你确认，而不是继续猜。
+分析过程中，Skill 可能会遇到需要人工确认的信息。Claude Code 会停下来向你确认，而不是继续猜。
 
 常见确认点：
 
@@ -146,6 +120,41 @@ Claude Code 会负责：
 ```
 
 Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢复执行。
+
+---
+
+## 即时查询某个方法的调用链
+
+当 Step5 已经生成调用链查询索引后，如果你只是想确认某个方法是否存在调用链，可以直接让 Claude Code 查询：
+
+```text
+查询 com.foo.Bar.baz(String) 的调用链
+```
+
+或者：
+
+```text
+帮我看一下 org.apache.commons.lang.StringUtils.isBlank(String) 是从哪里被调用到的。
+```
+
+默认行为：
+
+- 直接在对话中返回调用链；
+- 默认按全限定名精确匹配，不会自动退回简单名匹配，避免 `StringUtils`、`JSONArray`、`isEmpty` 这类同名类/方法串链误报；
+- 如果没有精确命中，会明确告诉你“未找到精确匹配的调用链”；
+- 不额外生成查询结果文件；
+- 不重跑 Step5；
+- 不推进 Step6；
+- 即使当前流程停在某个确认点，只要 Step5 查询索引已经生成，也可以只读查询。
+
+如果确实需要按简单名扩大排查范围，可以让 Claude Code 显式开启 fuzzy 查询；这类结果只适合辅助定位，不能直接作为确定影响结论。
+
+这个能力适合用来复核分析结果，例如确认：
+
+- 某个 `reachable` API 的完整链路是否符合预期；
+- 某个依赖方法是否通过其他依赖间接触达业务代码；
+- 报告里某条链路为什么成立；
+- 人工排查时临时追问某个方法的上游调用者。
 
 ---
 
@@ -209,16 +218,6 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 .upgrade-report/evidence/call_chain/alerts.csv
 ```
 
-如果只是想确认某个方法“到底有没有调用链”，可以让 Claude Code 基于 Step5 查询索引即时查询。默认只返回调用链，不额外落文件：
-
-```text
-查询 com.foo.Bar.baz(String) 的调用链
-```
-
-这个查询是只读能力。只要 Step5 已经成功完成并生成查询索引，即使当前还停在确认点等待你决定是否继续，也可以直接查询，不会推进后续步骤。
-
----
-
 ## Step5 结果状态怎么理解
 
 | 状态 | 含义 |
@@ -273,9 +272,26 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 没有依赖源码时，Skill 仍会尽量通过业务源码、业务字节码、运行时依赖 jar 字节码和框架适配器追踪影响。但依赖内部行为变化、跨依赖源码调用链、部分反射/配置关系可能只能给出 `uncertain` 或 `not_analyzed`。
 
-### Step5 很慢怎么办？
+### Step4 / Step5 很慢怎么办？
 
-让 Claude Code 查看：
+Step4 慢时，让 Claude Code 先查看：
+
+```text
+.upgrade-report/evidence/api_changes/step4_timing.csv
+```
+
+重点关注：
+
+- `artifact_resolve`
+- `dependency.gitdiff`
+- `dependency.japicmp`
+- `dependency.removed_jar_export`
+- `dependency.changed_classes`
+- `write.*`
+
+这些指标可以判断耗时主要来自 jar 定位/解压、源码 diff、JApiCmp、删除依赖符号导出、类 hash 或输出汇总。
+
+Step5 慢时，让 Claude Code 查看：
 
 ```text
 .upgrade-report/evidence/call_chain/step5_timing.csv
@@ -296,7 +312,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 Step4 需要 JApiCmp 做 jar API 对比。
 
-如果缺失，Skill 会先自动尝试安装 JApiCmp。自动安装失败时，Claude Code 会停下来提示你手动安装或提供 `japicmp_jar`；只有你明确确认接受降级后，才会继续。
+如果缺失，Skill 会先自动尝试安装 JApiCmp。自动安装失败时，Claude Code 会停下来提示你手动安装或提供 JApiCmp 工具路径；只有你明确确认接受降级后，才会继续。
 
 不安装 JApiCmp 的后果是：二进制 API 对比证据不完整，可能漏掉删除方法、签名变化、字段变化、源码重编译不兼容等风险。
 
@@ -307,36 +323,3 @@ Step4 需要 JApiCmp 做 jar API 对比。
 Step5 默认会先使用运行 Skill 的同一个 Python 环境自动安装 `tree-sitter` 和 `tree-sitter-java`。如果自动安装失败，Claude Code 会停下来提示你手动安装；只有你明确确认接受降级后，才会继续使用增强正则。
 
 不安装 tree-sitter 的后果是：Java AST 主链路不可用，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。
-
----
-
-## 面向维护者：内部执行入口
-
-普通使用者不需要直接执行这些命令。它们是 Claude Code 根据 `SKILL.md` 和 checkpoint 协议内部调用的入口。
-
-统一调度脚本：
-
-```text
-scripts/run_step.py
-```
-
-主状态文件：
-
-```text
-.upgrade-report/.runtime/state/main_state.json
-```
-
-待交互文件：
-
-```text
-.upgrade-report/.runtime/state/interaction.json
-```
-
-维护或排障时可以参考：
-
-- `SKILL.md`：Claude Code 执行规则和 checkpoint 硬约束；
-- `CHECKPOINT_RULES.md`：最小交互硬规则；
-- `docs/user/outputs.md`：输出文件说明；
-- `docs/developer/architecture.md`：整体架构；
-- `docs/developer/step5-design.md`：Step5 调用链分析设计；
-- `docs/developer/quality.md`：质量和测试策略。

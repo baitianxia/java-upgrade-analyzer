@@ -18,7 +18,11 @@ from pipeline_constants import (
 )
 
 # CSV 字段定义（顺序固定，不可随意调整）
+# 前 3 列是给人工复核看的摘要列；后续字段仍保持 Step4 -> Step5 的机器契约。
 ALL_CHANGED_APIS_FIELDS = [
+    "conclusion",    # 人工可读结论，如 高风险变更 / 需要复核 / 变更事实
+    "change_summary",# 人工可读变化摘要，如 删除方法，foo，参数：String，严重级别：P1
+    "review_reason", # 为什么需要看这一行，如 严重级别 P1；来源为 changelog
     "coord",         # groupId:artifactId — 来自哪个依赖包
     "old_version",   # 旧版本号
     "new_version",   # 新版本号
@@ -45,6 +49,7 @@ ALL_CHANGED_APIS_FIELDS = [
 ]
 
 OPTIONAL_FIELDS = {
+    "conclusion", "change_summary", "review_reason",
     "api_signature", "binary_compatible", "source_compatible",
     "compatibility_flags", "reason_code", "evidence_path",
     "old_value", "new_value",

@@ -1,5 +1,6 @@
 import json
 import io
+import csv
 import sys
 import tempfile
 import threading
@@ -20,6 +21,72 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_write_readable_outputs_uses_human_first_summary_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            all_changed = output_dir / "all_changed_apis.csv"
+            with all_changed.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=step4.ALL_CHANGED_APIS_FIELDS)
+                writer.writeheader()
+                writer.writerow({
+                    "coord": "com.acme:api",
+                    "api_name": "com.acme.Api.removed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "severity": "P1",
+                    "confirmed": "true",
+                    "source": "japicmp",
+                })
+
+            alerts_path, summary_path = step4.write_readable_outputs(
+                dep_rows=[{"coord": "com.acme:api", "change_type": "小版本升级"}],
+                output_dir=str(output_dir),
+                all_apis=[{"coord": "com.acme:api"}],
+                jar_missing_deps=[],
+                japicmp_missing_deps=[],
+                other_failed_deps=[],
+                changed_deps_missing_source=[],
+                valid_count=1,
+                invalid_count=0,
+            )
+
+            summary_text = Path(summary_path).read_text(encoding="utf-8")
+            with Path(alerts_path).open(encoding="utf-8") as f:
+                alert_rows = list(csv.DictReader(f))
+
+        self.assertIn("Step4 依赖 API 变化摘要", summary_text)
+        self.assertLess(summary_text.index("一、结论总览"), summary_text.index("二、复核入口"))
+        self.assertLess(summary_text.index("二、复核入口"), summary_text.index("三、判断口径"))
+        self.assertIn("- 变更 API 有效行：1", summary_text)
+        self.assertIn("- 完整变更 API 清单：", summary_text)
+        self.assertNotIn("generated_at=", summary_text)
+        self.assertNotIn("all_changed_apis=", summary_text)
+        self.assertEqual(
+            ["conclusion", "change_summary", "review_reason"],
+            list(alert_rows[0].keys())[:3],
+        )
+        self.assertEqual("需关注变更", alert_rows[0]["conclusion"])
+        self.assertIn("删除方法，removed", alert_rows[0]["change_summary"])
+        self.assertIn("严重级别 P1", alert_rows[0]["review_reason"])
+
+    def test_human_checkpoint_uses_reader_friendly_console_format(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            step4.human_checkpoint_1(
+                dep_rows=[{"coord": "com.acme:api", "change_type": "小版本升级"}],
+                all_apis=[],
+                output_dir="/tmp/report/evidence/api_changes",
+            )
+
+        output = stdout.getvalue()
+
+        self.assertIn("【Step4 摘要】依赖 API 变化识别完成", output)
+        self.assertIn("结论总览：", output)
+        self.assertIn("复核文件：", output)
+        self.assertNotIn("人工抽查节点", output)
+        self.assertNotIn("建议优先查看", output)
+
     def test_main_emits_japicmp_missing_checkpoint_before_degraded_step4(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / ".upgrade-report"
@@ -466,12 +533,65 @@ class Step4StabilityTest(unittest.TestCase):
             pending = json.loads((output_dir / "git_ref_pending.json").read_text(encoding="utf-8"))
             matches = json.loads((output_dir / "git_ref_matches.json").read_text(encoding="utf-8"))
             summary_text = (output_dir / "summary.txt").read_text(encoding="utf-8")
+            with (output_dir / step4.STEP4_TIMING_FILE).open(encoding="utf-8") as fh:
+                timing_rows = list(csv.DictReader(fh))
 
         self.assertEqual(exit_code, 2)
         self.assertEqual(len(pending["items"]), 1)
         self.assertEqual(pending["items"][0]["coord"], "com.acme:acct-sdk")
         self.assertTrue(matches["need_user_confirmation"])
-        self.assertIn("Step4 preflight", summary_text)
+        self.assertIn("Step4 依赖源码 git refs 预检摘要", summary_text)
+        self.assertIn("一、结论总览", summary_text)
+        self.assertIn("preflight.git_refs", {row["phase"] for row in timing_rows})
+        self.assertIn("step4.total", {row["phase"] for row in timing_rows})
+        self.assertEqual(timing_rows[-1]["status"], "awaiting_git_ref_confirmation")
+
+    def test_main_writes_step4_timing_csv_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s4_jar_compare"
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,scope\n",
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps({"changed_dependencies": []}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes",
+                    str(dep_changes),
+                    "--context",
+                    str(context_json),
+                    "--output-dir",
+                    str(output_dir),
+                    "--japicmp-jar",
+                    str(report_dir / "missing-but-unused-japicmp.jar"),
+                ],
+            ):
+                exit_code = step4.main()
+
+            timing_path = output_dir / step4.STEP4_TIMING_FILE
+            timing_exists = timing_path.exists()
+            with timing_path.open(encoding="utf-8") as fh:
+                timing_rows = list(csv.DictReader(fh))
+
+        phases = {row["phase"] for row in timing_rows}
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(timing_exists)
+        self.assertIn("input.load", phases)
+        self.assertIn("artifact_resolve", phases)
+        self.assertIn("dependencies.process_all", phases)
+        self.assertIn("write.all_changed_apis", phases)
+        self.assertIn("step4.total", phases)
+        self.assertEqual(timing_rows[-1]["status"], "done")
 
     def test_resolve_repo_ref_for_version_accepts_manual_override_when_no_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1520,7 +1640,9 @@ class Step4StabilityTest(unittest.TestCase):
             text = Path(txt_path).read_text(encoding="utf-8")
 
         self.assertFalse(payload["need_user_confirmation"])
-        self.assertIn("已自动匹配，可抽查", text)
+        self.assertIn("Step4 依赖源码 git ref 匹配结果（自动匹配完成）", text)
+        self.assertIn("一、结论总览", text)
+        self.assertNotIn("generated_at=", text)
 
     def test_cleanup_step4_generated_outputs_removes_stale_generated_files_only(self):
         with tempfile.TemporaryDirectory() as tmp:

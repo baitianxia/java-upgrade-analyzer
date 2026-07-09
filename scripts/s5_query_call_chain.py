@@ -134,7 +134,7 @@ def _split_method_and_signature(method):
     return prefix.strip(), "(" + suffix.strip()
 
 
-def build_target_keys(method):
+def build_target_keys(method, *, fuzzy=False):
     method_name, signature = _split_method_and_signature(method)
     keys = []
     if not method_name:
@@ -147,6 +147,11 @@ def build_target_keys(method):
                     keys.append(candidate)
     if method_name not in keys:
         keys.append(method_name)
+    class_key = f"class:{method_name}"
+    if not signature and "." in method_name and class_key not in keys:
+        keys.append(class_key)
+    if not fuzzy:
+        return keys
     simple_name = method_name.rsplit(".", 1)[-1]
     if simple_name and signature:
         for sig in [signature, normalize_signature_for_lookup(signature)]:
@@ -157,7 +162,60 @@ def build_target_keys(method):
     simple_key = f"method:{simple_name}" if simple_name else ""
     if simple_key and simple_key not in keys:
         keys.append(simple_key)
+    fuzzy_class_key = f"class:{simple_name}" if simple_name and not signature else ""
+    if fuzzy_class_key and fuzzy_class_key not in keys:
+        keys.append(fuzzy_class_key)
     return keys
+
+
+def _target_match_prefixes(method):
+    method_name, signature = _split_method_and_signature(method)
+    prefixes = []
+    for key in build_target_keys(method, fuzzy=False):
+        if key not in prefixes:
+            prefixes.append(key)
+    if method_name and not signature:
+        prefixes.append(f"{method_name}(")
+    return tuple(prefixes)
+
+
+def _edge_contains_exact_target(edge, exact_target_keys, target_prefixes, *, fuzzy=False):
+    if fuzzy:
+        return True
+    callee_key = _clean(edge.get("callee_key"))
+    if not callee_key:
+        return False
+    if callee_key in exact_target_keys:
+        return True
+    return any(prefix.endswith("(") and callee_key.startswith(prefix) for prefix in target_prefixes)
+
+
+def _is_precise_lookup_key(key):
+    """Return True for lookup keys that keep owner/package identity.
+
+    Query expansion must not use simple fallback keys by default.  A precise
+    target match followed by ``method:use`` can still jump to an unrelated
+    class that happens to have a method named ``use``.  Keep those keys only
+    for explicit fuzzy mode.
+    """
+    text = _clean(key)
+    if not text:
+        return False
+    if text.startswith("method:"):
+        return False
+    if text.startswith("class:"):
+        class_name = text.split(":", 1)[1].strip()
+        return "." in class_name
+    return "." in text
+
+
+def _iter_next_lookup_keys(lookup_keys, *, fuzzy=False):
+    for key in lookup_keys or []:
+        text = _clean(key)
+        if not text:
+            continue
+        if fuzzy or _is_precise_lookup_key(text):
+            yield text
 
 
 def _edge_sort_key(edge):
@@ -221,11 +279,13 @@ def _dedupe_and_prefer_longest(paths, methods, target, limit):
     return filtered[:limit]
 
 
-def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000):
+def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000, *, fuzzy=False):
     methods = index.get("methods") or {}
     lookup_keys_by_symbol = index.get("lookup_keys_by_symbol") or {}
     reverse_edges = index.get("reverse_edges") or {}
-    target_keys = [key for key in build_target_keys(method) if reverse_edges.get(key)]
+    exact_target_keys = build_target_keys(method, fuzzy=False)
+    target_prefixes = _target_match_prefixes(method)
+    target_keys = [key for key in build_target_keys(method, fuzzy=fuzzy) if reverse_edges.get(key)]
     if not target_keys:
         return []
     queue = deque((key, []) for key in target_keys)
@@ -253,12 +313,18 @@ def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000):
                 continue
             next_path = path + [edge]
             if method_record.get("owner_type") == "business":
-                collected.append(next_path)
+                if next_path and _edge_contains_exact_target(
+                    next_path[0],
+                    exact_target_keys,
+                    target_prefixes,
+                    fuzzy=fuzzy,
+                ):
+                    collected.append(next_path)
                 if len(collected) >= limit:
                     break
             if len(next_path) >= max_depth:
                 continue
-            for next_key in lookup_keys_by_symbol.get(caller_id) or []:
+            for next_key in _iter_next_lookup_keys(lookup_keys_by_symbol.get(caller_id), fuzzy=fuzzy):
                 if reverse_edges.get(next_key):
                     queue.append((next_key, next_path))
     return [
@@ -284,6 +350,7 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
 
     method_name, signature = _split_method_and_signature(method)
     wanted_signature = normalize_signature_for_lookup(signature) if signature else ""
+    target_prefixes = _target_match_prefixes(method)
     chains = []
     seen = set()
     with alerts_path.open(newline="", encoding="utf-8") as fh:
@@ -299,6 +366,11 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
             path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
             if not path_text:
                 continue
+            if not any(
+                target in path_text or (target.endswith("(") and target[:-1] in path_text)
+                for target in target_prefixes
+            ):
+                continue
             if path_text in seen:
                 continue
             seen.add(path_text)
@@ -306,6 +378,50 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
             if len(chains) >= limit:
                 break
     return chains
+
+
+def query_call_chain_result(report_dir_or_file, method, max_depth=5, limit=20, max_visits=50000, *, fuzzy=False):
+    """Return query chains with trust metadata for CLI and programmatic callers."""
+    index, index_path = load_query_index(report_dir_or_file)
+    exact_keys = build_target_keys(method, fuzzy=False)
+    all_keys = build_target_keys(method, fuzzy=fuzzy)
+    reverse_edges = index.get("reverse_edges") or {}
+    exact_present = any(reverse_edges.get(key) for key in exact_keys)
+    matched_keys = [key for key in all_keys if reverse_edges.get(key)]
+    warnings = []
+    chains = query_call_chains(
+        index,
+        method,
+        max_depth=max_depth,
+        limit=limit,
+        max_visits=max_visits,
+        fuzzy=fuzzy,
+    )
+    match_mode = "exact" if exact_present else "not_found"
+    if not chains:
+        alert_chains = query_alert_chains(report_dir_or_file, method, limit=limit)
+        if alert_chains:
+            chains = alert_chains
+            match_mode = "alerts_exact"
+    if not chains:
+        if not exact_present and matched_keys and not fuzzy:
+            warnings.append("未使用简单名候选结果；请使用全限定名精确查询，或显式开启 fuzzy 模式后人工核验。")
+        elif not exact_present and fuzzy and matched_keys:
+            warnings.append("当前结果来自 fuzzy 简单名匹配，可能包含同名类/方法误匹配，不能作为确定影响结论。")
+        else:
+            warnings.append("未找到精确匹配的调用链。")
+    elif fuzzy and not exact_present:
+        match_mode = "fuzzy"
+        warnings.append("当前结果来自 fuzzy 简单名匹配，可能包含同名类/方法误匹配，不能作为确定影响结论。")
+    return {
+        "method": method,
+        "chains": chains,
+        "exact_match": bool(chains and match_mode in {"exact", "alerts_exact"}),
+        "match_mode": match_mode,
+        "matched_keys": matched_keys,
+        "index_path": str(index_path),
+        "warnings": warnings,
+    }
 
 
 def render_call_chains(chains):
@@ -317,6 +433,17 @@ def render_call_chains(chains):
     return "\n".join(lines)
 
 
+def render_query_result(result):
+    warnings = result.get("warnings") or []
+    chains = result.get("chains") or []
+    if not chains:
+        return "\n".join(warnings) if warnings else "未找到精确匹配的调用链。"
+    lines = [render_call_chains(chains)]
+    if warnings:
+        lines.extend(["", *warnings])
+    return "\n".join(lines)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="查询 Step5 调用链索引，默认只返回调用链文本")
     parser.add_argument("--report-dir", required=True, help="升级报告根目录，或 s5_query_index.json 文件路径")
@@ -324,23 +451,22 @@ def main(argv=None):
     parser.add_argument("--max-depth", type=int, default=5)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--max-visits", type=int, default=50000, help=argparse.SUPPRESS)
+    parser.add_argument("--fuzzy", action="store_true", help="允许简单名模糊匹配；结果仅供排查，不能作为确定影响结论")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出调用链列表")
     args = parser.parse_args(argv)
 
-    index, _path = load_query_index(args.report_dir)
-    chains = query_call_chains(
-        index,
+    result = query_call_chain_result(
+        args.report_dir,
         args.method,
         max_depth=args.max_depth,
         limit=args.limit,
         max_visits=args.max_visits,
+        fuzzy=args.fuzzy,
     )
-    if not chains:
-        chains = query_alert_chains(args.report_dir, args.method, limit=args.limit)
     if args.json:
-        print(json.dumps({"method": args.method, "chains": chains}, ensure_ascii=False, indent=2))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(render_call_chains(chains))
+        print(render_query_result(result))
     return 0
 
 

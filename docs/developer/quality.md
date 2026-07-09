@@ -2,6 +2,8 @@
 
 本文面向维护者，定义本工程修改代码时必须遵守的质量要求。
 
+修改代码前应先阅读 [工程宪法](constitution.md)。本文中的测试策略和质量门禁都服务于工程宪法，不得用“测试通过”替代对原则性约束的判断。
+
 ## 基本原则
 
 准确性优先于性能。
@@ -133,6 +135,22 @@ python3 scripts/smoke_regression.py --group orchestrator
 - 多依赖链路深；
 - 反射/MethodHandle 候选多；
 - class/field 变化多。
+
+Step4 性能验证优先看：
+
+```text
+evidence/api_changes/step4_timing.csv
+```
+
+关键阶段：
+
+- `artifact_resolve`;
+- `dependency.gitdiff`;
+- `dependency.japicmp`;
+- `dependency.removed_jar_export`;
+- `dependency.changed_classes`;
+- `dependencies.process_all`;
+- `write.*`。
 
 Step5 性能验证优先看：
 

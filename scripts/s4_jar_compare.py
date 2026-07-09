@@ -65,6 +65,107 @@ DEFAULT_JAPICMP_TIMEOUT = None
 DEFAULT_GIT_DIFF_TIMEOUT = None
 DEFAULT_JAPICMP_COORD = "com.github.siom79.japicmp:japicmp:0.21.2:jar:jar-with-dependencies"
 _WRITE_RESULT_LOCK = threading.RLock()
+STEP4_TIMING_FILE = "step4_timing.csv"
+
+
+_CHANGE_TYPE_LABELS = {
+    "REMOVED": "删除",
+    "SIGNATURE_CHANGED": "签名变更",
+    "BEHAVIOR_CHANGED": "行为变更",
+    "ACCESS_REDUCED": "访问权限降低",
+    "SOURCE_INCOMPATIBLE": "源码不兼容",
+    "CONSTANT_VALUE_CHANGED": "常量值变更",
+}
+
+_SYMBOL_KIND_LABELS = {
+    "method": "方法",
+    "field": "字段",
+    "class": "类",
+    "constructor": "构造方法",
+}
+
+
+def _api_display_name(row):
+    api_name = str((row or {}).get("api_name") or "").strip()
+    api_simple = str((row or {}).get("api_simple") or "").strip()
+    if api_simple:
+        return api_simple
+    if not api_name:
+        return "-"
+    method_match = re.search(r"\.([A-Za-z_$][\w$]*)$", api_name)
+    return method_match.group(1) if method_match else api_name.rsplit(".", 1)[-1]
+
+
+def _signature_display(signature):
+    signature = str(signature or "").strip()
+    if not signature:
+        return "无参数或未知"
+    inner = signature
+    if inner.startswith("(") and ")" in inner:
+        inner = inner[1:inner.index(")")]
+    inner = inner.strip()
+    if not inner:
+        return "无参数"
+    return inner
+
+
+def _changed_api_conclusion(row):
+    severity = str((row or {}).get("severity") or "").strip()
+    confirmed = str((row or {}).get("confirmed") or "").strip().lower()
+    source = str((row or {}).get("source") or "").strip().lower()
+    if severity == "P0":
+        return "高风险变更"
+    if severity == "P1":
+        return "需关注变更"
+    if confirmed == "false" or source == "changelog":
+        return "需要复核"
+    return "变更事实"
+
+
+def _changed_api_summary(row):
+    row = row or {}
+    change_type = str(row.get("change_type") or "").strip()
+    symbol_kind = str(row.get("symbol_kind") or "").strip()
+    severity = str(row.get("severity") or "").strip() or "-"
+    change_label = _CHANGE_TYPE_LABELS.get(change_type, change_type or "变更")
+    kind_label = _SYMBOL_KIND_LABELS.get(symbol_kind, symbol_kind or "API")
+    api_name = _api_display_name(row)
+    if symbol_kind in {"method", "constructor"}:
+        return f"{change_label}{kind_label}，{api_name}，参数：{_signature_display(row.get('api_signature'))}，严重级别：{severity}"
+    return f"{change_label}{kind_label}，{api_name}，严重级别：{severity}"
+
+
+def _changed_api_review_reason(row):
+    row = row or {}
+    reasons = []
+    severity = str(row.get("severity") or "").strip()
+    confirmed = str(row.get("confirmed") or "").strip().lower()
+    source = str(row.get("source") or "").strip().lower()
+    reason_code = str(row.get("reason_code") or "").strip()
+    compatibility_flags = str(row.get("compatibility_flags") or "").strip()
+    if severity in {"P0", "P1"}:
+        reasons.append(f"严重级别 {severity}")
+    if confirmed == "false":
+        reasons.append("未由二进制对比确认")
+    if source == "changelog":
+        reasons.append("来源为 changelog")
+    if reason_code:
+        reasons.append(f"原因码 {reason_code}")
+    if compatibility_flags:
+        reasons.append(f"兼容性标记 {compatibility_flags}")
+    return "；".join(reasons) or "记录 API 变化事实"
+
+
+def _enrich_changed_api_row(row):
+    enriched = dict(row or {})
+    enriched["conclusion"] = str(enriched.get("conclusion") or "").strip() or _changed_api_conclusion(enriched)
+    enriched["change_summary"] = str(enriched.get("change_summary") or "").strip() or _changed_api_summary(enriched)
+    enriched["review_reason"] = str(enriched.get("review_reason") or "").strip() or _changed_api_review_reason(enriched)
+    return enriched
+
+
+def _enrich_changed_api_rows(rows):
+    return [_enrich_changed_api_row(row) for row in (rows or [])]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -128,6 +229,70 @@ def write_result(path, content):
         write_text(path, content)
 
 
+class Step4TimingRecorder:
+    """Collect Step4 timing as side-channel evidence without affecting analysis results."""
+
+    FIELDS = [
+        "phase",
+        "coord",
+        "old_version",
+        "new_version",
+        "status",
+        "elapsed_sec",
+        "api_count",
+        "details",
+    ]
+
+    def __init__(self, output_dir):
+        self.output_dir = Path(output_dir)
+        self.path = self.output_dir / STEP4_TIMING_FILE
+        self._lock = threading.RLock()
+        self._rows = []
+
+    def record(
+        self,
+        phase,
+        *,
+        coord="",
+        old_version="",
+        new_version="",
+        status="",
+        elapsed=None,
+        api_count="",
+        details=None,
+    ):
+        try:
+            elapsed_value = "" if elapsed is None else f"{max(0.0, float(elapsed)):.6f}"
+        except (TypeError, ValueError):
+            elapsed_value = ""
+        if isinstance(details, (dict, list, tuple)):
+            details_value = json.dumps(details, ensure_ascii=False, sort_keys=True)
+        else:
+            details_value = "" if details is None else str(details)
+        row = {
+            "phase": str(phase or ""),
+            "coord": str(coord or ""),
+            "old_version": str(old_version or ""),
+            "new_version": str(new_version or ""),
+            "status": str(status or ""),
+            "elapsed_sec": elapsed_value,
+            "api_count": "" if api_count is None else str(api_count),
+            "details": details_value,
+        }
+        with self._lock:
+            self._rows.append(row)
+
+    def flush(self):
+        with self._lock:
+            rows = list(self._rows)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        return str(self.path)
+
+
 def cleanup_step4_generated_outputs(output_dir):
     """清理当前 output_dir 下旧的 Step4 产物，避免重跑时混入陈旧证据。"""
     output_path = Path(output_dir)
@@ -145,6 +310,7 @@ def cleanup_step4_generated_outputs(output_dir):
         "git_ref_pending.json",
         "git_ref_matches.txt",
         "git_ref_matches.json",
+        STEP4_TIMING_FILE,
         "summary.txt",
     )
     for pattern in removable_patterns:
@@ -1483,7 +1649,7 @@ def filter_gitdiff_rows_with_jar_truth(gitdiff_rows, old_jar='', new_jar='', coo
 
 
 def write_gitdiff_auxiliary_rows(output_dir, coord, rows):
-    rows = list(rows or [])
+    rows = _enrich_changed_api_rows(rows or [])
     if not rows:
         return ''
     artifact = (str(coord or '').split(':')[-1] or 'dependency').replace('.', '-')
@@ -2628,23 +2794,27 @@ def write_git_ref_pending_file(output_dir, pending_items):
 def write_git_ref_preflight_summary(output_dir, pending_items, matched_items):
     summary_path = os.path.join(output_dir, "summary.txt")
     lines = [
-        "Step4 preflight：依赖源码 git refs 需要先确认",
+        "Step4 依赖源码 git refs 预检摘要",
         "",
-        f"待人工确认 refs：{len(pending_items or [])}",
-        f"已自动匹配 refs：{len(matched_items or [])}",
+        "一、结论总览",
+        f"- 待确认 refs：{len(pending_items or [])}",
+        f"- 已自动匹配 refs：{len(matched_items or [])}",
         "",
-        "说明：为避免先执行耗时的 JApiCmp、removed jar 导出或源码 diff 后才要求重跑，Step4 在正式分析前先检查依赖源码 git refs。",
-        "处理方式：确认 git_ref_pending.json 中每个依赖的 old_ref/new_ref，然后通过 dependency_git_ref_overrides 重跑 Step4。",
+        "二、判断口径",
+        "- 为避免先执行耗时分析后才发现 ref 歧义，Step4 会在正式分析前先检查依赖源码 git refs。",
+        "- 待确认项表示 old_version/new_version 无法唯一映射到依赖源码仓库中的 refs。",
     ]
+    if pending_items:
+        lines += ["", f"三、待确认 ref 明细（前 {min(20, len(pending_items or []))} 项）"]
     for item in (pending_items or [])[:20]:
         lines.append("")
-        lines.append(f"- {item.get('coord')} {item.get('old_version')}→{item.get('new_version')}")
-        lines.append(f"  reason={item.get('reason') or '-'}")
-        lines.append(f"  repo_path={item.get('repo_path') or '-'}")
+        lines.append(f"- {item.get('coord')}：{item.get('old_version')} -> {item.get('new_version')}")
+        lines.append(f"  - 原因：{item.get('reason') or '-'}")
+        lines.append(f"  - 仓库路径：{item.get('repo_path') or '-'}")
         old_candidates = item.get("old_candidates") or []
         new_candidates = item.get("new_candidates") or []
-        lines.append(f"  old_candidates={', '.join(c.get('ref', '') for c in old_candidates[:10]) or '(无)'}")
-        lines.append(f"  new_candidates={', '.join(c.get('ref', '') for c in new_candidates[:10]) or '(无)'}")
+        lines.append(f"  - old 候选 refs：{', '.join(c.get('ref', '') for c in old_candidates[:10]) or '无'}")
+        lines.append(f"  - new 候选 refs：{', '.join(c.get('ref', '') for c in new_candidates[:10]) or '无'}")
     if len(pending_items or []) > 20:
         lines.append(f"\n...（仅展示前 20，共 {len(pending_items)}）")
     Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
@@ -2923,76 +3093,83 @@ def write_git_ref_match_outputs(
 
     lines = []
     if needs_user_confirmation:
-        lines.append("=== Step4 依赖源码 git ref 匹配结果（需用户确认） ===")
+        lines.append("Step4 依赖源码 git ref 匹配结果（需要确认）")
     else:
-        lines.append("=== Step4 依赖源码 git ref 匹配结果（已自动匹配，可抽查） ===")
-    lines.append("说明：以下 old_version/new_version 到 git ref 的映射，将直接决定源码 diff 对比范围。")
+        lines.append("Step4 依赖源码 git ref 匹配结果（自动匹配完成）")
+    lines.append("")
+    lines.append("一、结论总览")
+    lines.append(f"- 已匹配：{len(gitdiff_runs)}")
+    lines.append(f"- 待确认：{len(gitdiff_pending)}")
+    lines.append(f"- 未匹配/跳过：{len(gitdiff_skipped)}")
+    lines.append(f"- 源码仓库映射：{len(source_repo_mappings)}")
+    lines.append(f"- 生成时间：{payload['generated_at']}")
+    lines.append("")
+    lines.append("二、判断口径")
+    lines.append("- old_version/new_version 到 git ref 的映射会直接决定源码 diff 对比范围。")
     lines.append(
-        "当前自动匹配策略：仅扫描远端分支 remotes；"
+        "- 当前自动匹配策略：仅扫描远端分支 remotes；"
         "只去掉版本号末尾的 -SNAPSHOT 后，按分支名包含版本号命中；非 DEV 分支优先于 DEV 分支。"
     )
     if needs_user_confirmation:
-        lines.append("要求：继续 Step5 前，请逐项确认“依赖坐标 -> 源码仓库 -> git refs”的映射是否正确；如有误，应通过对话修正 dependency_source_dirs 并重跑 Step4。")
+        lines.append("- 当前存在待确认项；这些依赖的源码 diff 范围还不能视为可信。")
     else:
-        lines.append("说明：当前没有待人工确认的 ref；建议抽查“依赖坐标 -> 源码仓库 -> git refs”的映射是否符合预期。")
-    lines.append(f"generated_at={payload['generated_at']}")
+        lines.append("- 当前没有待确认项；可按需抽查依赖坐标、源码仓库和 git refs 是否符合预期。")
     lines.append("")
-    lines.append(f"源码仓库映射：{len(source_repo_mappings)}")
+    lines.append("三、源码仓库映射")
     for item in source_repo_mappings:
         lines.append(
-            f"- {item.get('coord')} | repo={item.get('repo_path')} | input={item.get('input_spec') or '(auto)'} | mapping={item.get('mapping_mode') or '-'}"
+            f"- {item.get('coord')}：仓库={item.get('repo_path')}；输入={item.get('input_spec') or '自动发现'}；映射方式={item.get('mapping_mode') or '-'}"
         )
         if item.get("module_path"):
-            lines.append(f"  module_path={item.get('module_path')}")
+            lines.append(f"  - 模块路径：{item.get('module_path')}")
         repo_coords = item.get("repo_inferred_coords") or []
-        lines.append(f"  repo_inferred_coords={', '.join(repo_coords[:10]) or '(无)'}")
+        lines.append(f"  - 仓库内识别到的坐标：{', '.join(repo_coords[:10]) or '无'}")
     if not source_repo_mappings:
         lines.append("- (无)")
     lines.append("")
-    lines.append(f"已匹配：{len(gitdiff_runs)}")
+    lines.append("四、已匹配 ref")
     for item in gitdiff_runs:
         lines.append(
-            f"- {item.get('coord')} | versions={item.get('old_version')}->{item.get('new_version')} "
-            f"| selected={item.get('base_ref')}..{item.get('cur_ref')} | reason=old[{item.get('old_match_reason') or '-'}],new[{item.get('new_match_reason') or '-'}]"
+            f"- {item.get('coord')}：版本={item.get('old_version')} -> {item.get('new_version')}；"
+            f"ref={item.get('base_ref')}..{item.get('cur_ref')}；"
+            f"匹配原因=old[{item.get('old_match_reason') or '-'}]，new[{item.get('new_match_reason') or '-'}]"
         )
         if item.get("repo_path"):
-            lines.append(f"  repo_path={item.get('repo_path')}")
+            lines.append(f"  - 仓库路径：{item.get('repo_path')}")
         if item.get("module_path"):
-            lines.append(f"  module_path={item.get('module_path')}")
+            lines.append(f"  - 模块路径：{item.get('module_path')}")
         if item.get("module_rel_path"):
-            lines.append(f"  module_rel_path={item.get('module_rel_path')}")
+            lines.append(f"  - 模块相对路径：{item.get('module_rel_path')}")
         old_candidates = item.get("old_candidates") or []
         new_candidates = item.get("new_candidates") or []
-        lines.append(f"  old_candidates={', '.join(c.get('ref', '') for c in old_candidates[:10]) or '(无)'}")
-        lines.append(f"  new_candidates={', '.join(c.get('ref', '') for c in new_candidates[:10]) or '(无)'}")
+        lines.append(f"  - old 候选 refs：{', '.join(c.get('ref', '') for c in old_candidates[:10]) or '无'}")
+        lines.append(f"  - new 候选 refs：{', '.join(c.get('ref', '') for c in new_candidates[:10]) or '无'}")
     if not gitdiff_runs:
         lines.append("- (无)")
     lines.append("")
-    lines.append(f"待人工确认：{len(gitdiff_pending)}")
+    lines.append("五、待确认 ref")
     for item in gitdiff_pending:
         lines.append(
-            f"- {item.get('coord')} | versions={item.get('old_version')}->{item.get('new_version')} "
-            f"| reason={item.get('reason') or '-'}"
+            f"- {item.get('coord')}：版本={item.get('old_version')} -> {item.get('new_version')}；原因={item.get('reason') or '-'}"
         )
         old_candidates = item.get("old_candidates") or []
         new_candidates = item.get("new_candidates") or []
-        lines.append(f"  old_candidates={', '.join(c.get('ref', '') for c in old_candidates[:10]) or '(无)'}")
-        lines.append(f"  new_candidates={', '.join(c.get('ref', '') for c in new_candidates[:10]) or '(无)'}")
+        lines.append(f"  - old 候选 refs：{', '.join(c.get('ref', '') for c in old_candidates[:10]) or '无'}")
+        lines.append(f"  - new 候选 refs：{', '.join(c.get('ref', '') for c in new_candidates[:10]) or '无'}")
     if not gitdiff_pending:
         lines.append("- (无)")
     lines.append("")
-    lines.append(f"未匹配/跳过：{len(gitdiff_skipped)}")
+    lines.append("六、未匹配/跳过")
     for item in gitdiff_skipped:
         lines.append(
-            f"- {item.get('coord')} | versions={item.get('old_version')}->{item.get('new_version')} "
-            f"| reason={item.get('reason') or '-'}"
+            f"- {item.get('coord')}：版本={item.get('old_version')} -> {item.get('new_version')}；原因={item.get('reason') or '-'}"
         )
         old_candidates = item.get("old_candidates") or []
         new_candidates = item.get("new_candidates") or []
         if old_candidates:
-            lines.append(f"  old_candidates={', '.join(c.get('ref', '') for c in old_candidates[:10])}")
+            lines.append(f"  - old 候选 refs：{', '.join(c.get('ref', '') for c in old_candidates[:10])}")
         if new_candidates:
-            lines.append(f"  new_candidates={', '.join(c.get('ref', '') for c in new_candidates[:10])}")
+            lines.append(f"  - new 候选 refs：{', '.join(c.get('ref', '') for c in new_candidates[:10])}")
     if not gitdiff_skipped:
         lines.append("- (无)")
     write_result(txt_path, "\n".join(lines) + "\n")
@@ -3350,7 +3527,7 @@ def write_all_changed_apis(all_apis, output_dir):
         if errors:
             invalid_rows.append({'row': row, 'errors': errors})
         else:
-            valid_rows.append(row)
+            valid_rows.append(_enrich_changed_api_row(row))
 
     if invalid_rows:
         print(f"\n⚠️  {len(invalid_rows)} 行数据未通过契约验证，已跳过：",
@@ -3364,7 +3541,7 @@ def write_all_changed_apis(all_apis, output_dir):
         writer.writeheader()
         writer.writerows(valid_rows)
 
-    normalized_rows = normalize_step5_input_rows(valid_rows)
+    normalized_rows = _enrich_changed_api_rows(normalize_step5_input_rows(valid_rows))
     with open(out_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS)
         writer.writeheader()
@@ -3438,7 +3615,7 @@ def normalize_step5_input_rows(rows):
                     merged[field] = row[field]
         buckets[key] = merged
 
-    normalized_rows = list(buckets.values())
+    normalized_rows = _enrich_changed_api_rows(buckets.values())
     normalized_rows.sort(
         key=lambda r: (
             _normalize_contract_value(r, 'coord'),
@@ -3455,7 +3632,7 @@ def _write_contract_csv(path, rows):
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS)
         writer.writeheader()
-        writer.writerows(rows or [])
+        writer.writerows(_enrich_changed_api_rows(rows or []))
 
 
 def _load_json_file(path):
@@ -3572,7 +3749,7 @@ def human_checkpoint_1(dep_rows, all_apis, output_dir):
     供 run_step.py 后续统一组织为用户交互材料。
     """
     print("\n" + "="*60)
-    print("【人工抽查节点 1】Step 4 完成，请确认以下摘要")
+    print("【Step4 摘要】依赖 API 变化识别完成")
     print("="*60)
     by_coord = {}
     for api in all_apis:
@@ -3595,23 +3772,25 @@ def human_checkpoint_1(dep_rows, all_apis, output_dir):
             zero_change.append(coord)
         else:
             p0 = sum(1 for a in apis_found if (a.get('severity') or '').strip() == 'P0')
-            print(f"  ✓ {coord}: {len(apis_found)} 个变更 API（P0={p0}）")
+
+    print(f"\n结论总览：")
+    print(f"  - 变更 API 总数：{len(all_apis)}")
+    print(f"  - 版本变更但未发现 API 变化的依赖：{len(zero_change)}")
 
     if zero_change:
-        print(f"\n⚠️  以下依赖版本发生了变更，但未找到任何 API 变化（共 {len(zero_change)} 个）：")
+        print(f"\n版本变更但未发现 API 变化的依赖（前 {min(50, len(zero_change))} 个）：")
         for c in zero_change[:50]:
-            print(f"   - {c}")
+            print(f"  - {c}")
         if len(zero_change) > 50:
-            print(f"   ...（仅展示前 50，共 {len(zero_change)}）")
-        print("\n  可能原因：")
-        print("    A. jar 文件未找到，JApiCmp 未能执行（查看对应 _binary.txt 确认）")
-        print("    B. JApiCmp 工具本身未安装或执行失败")
-        print("    C. 该版本确实没有 binary incompatible 变更（正常）")
-        print("    D. 变更只体现在 changelog 或签名不变的行为变更，需要源码 git diff/人工确认")
+            print(f"  ...（仅展示前 50，共 {len(zero_change)}）")
+        print("\n说明：")
+        print("  - 可能是该版本确实没有可见 API 变化。")
+        print("  - 也可能是 jar/JApiCmp/依赖源码证据不完整，或变化只体现在签名不变的行为逻辑。")
 
-    print(f"\n全部变更 API：{len(all_apis)} 个")
-    print(f"输出目录：{output_dir}")
-    print("建议优先查看：summary.txt / all_changed_apis_alerts.csv")
+    print(f"\n复核文件：")
+    print(f"  - 摘要：{os.path.join(output_dir, 'summary.txt')}")
+    print(f"  - 完整变更 API：{os.path.join(output_dir, 'all_changed_apis.csv')}")
+    print(f"  - 高风险/需关注 API：{os.path.join(output_dir, 'all_changed_apis_alerts.csv')}")
     print("="*60)
 
 
@@ -3639,6 +3818,7 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
         source = (r.get('source') or '').strip()
         if sev in ('P0', 'P1') or confirmed == 'false' or source == 'changelog':
             alerts.append(r)
+    alerts = _enrich_changed_api_rows(alerts)
     alerts.sort(key=lambda x: (_severity_rank(x.get('severity')), x.get('coord', ''), x.get('api_name', '')))
 
     alerts_path = os.path.join(output_dir, "all_changed_apis_alerts.csv")
@@ -3677,31 +3857,46 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
 
     summary_path = os.path.join(output_dir, "summary.txt")
     lines = []
-    lines.append("=== Step4 jar 对比摘要 ===")
-    lines.append("用途：识别依赖升级引入的 API 契约变化/二进制不兼容/行为变更线索，作为 Step5 反向调用链分析的输入。")
-    lines.append("注意：本步骤仅说明“依赖发生了什么变化”，不等于“影响当前系统”；是否影响以 Step5 reachable/uncertain 为准。")
-    lines.append("抽查：优先看 all_changed_apis_alerts.csv 的 P0/P1；并抽查 *_binary.txt / *_gitdiff_api_changes.txt 的原始证据。")
-    lines.append("确认：如提供了依赖源码，请务必打开 git_ref_matches.txt / git_ref_matches.json 确认 old_version/new_version 命中的 refs 是否正确。")
-    lines.append(f"generated_at={datetime.now().isoformat()}")
-    lines.append(f"all_changed_apis={os.path.abspath(os.path.join(output_dir, 'all_changed_apis.csv'))}")
-    lines.append(f"alerts_csv={os.path.abspath(alerts_path)}")
-    lines.append(f"git_ref_matches_txt={os.path.abspath(os.path.join(output_dir, 'git_ref_matches.txt'))}")
-    lines.append(f"git_ref_matches_json={os.path.abspath(os.path.join(output_dir, 'git_ref_matches.json'))}")
+    lines.append("Step4 依赖 API 变化摘要")
+    lines.append("")
+    lines.append("一、结论总览")
+    lines.append(f"- 变更 API 有效行：{valid_count}")
+    lines.append(f"- 契约校验失败：{invalid_count}")
+    lines.append(f"- 高风险/需关注条目：{len(alerts)}")
+    lines.append(f"- jar 未找到：{len(jar_missing_deps)}")
+    lines.append(f"- JApiCmp 未安装导致未分析：{len(japicmp_missing_deps)}")
+    lines.append(f"- 其他 JApiCmp 失败：{len(other_failed_deps)}")
+    if valid_count:
+        lines.append("- 结论：已生成变更 API 清单，可作为 Step5 调用链分析输入。")
+    elif invalid_count or jar_missing_deps or japicmp_missing_deps or other_failed_deps:
+        lines.append("- 结论：变更 API 清单不完整，需先复核缺失或失败项。")
+    else:
+        lines.append("- 结论：未发现可进入 Step5 的变更 API。")
+    lines.append("")
+    lines.append("二、复核入口")
+    lines.append(f"- 完整变更 API 清单：{os.path.abspath(os.path.join(output_dir, 'all_changed_apis.csv'))}")
+    lines.append(f"- 高风险/需关注 API：{os.path.abspath(alerts_path)}")
+    lines.append(f"- 依赖源码 ref 匹配说明：{os.path.abspath(os.path.join(output_dir, 'git_ref_matches.txt'))}")
+    lines.append(f"- 依赖源码 ref 匹配明细：{os.path.abspath(os.path.join(output_dir, 'git_ref_matches.json'))}")
+    lines.append("")
+    lines.append("三、判断口径")
+    lines.append("- Step4 只说明依赖 API 发生了什么变化。")
+    lines.append("- Step4 不证明这些变化是否影响当前系统；是否触达业务代码以 Step5/Step6 为准。")
+    lines.append("- 如提供了依赖源码，需确认 old_version/new_version 命中的 git refs 是否正确。")
+    lines.append("")
+    lines.append("四、运行信息")
+    lines.append(f"- 生成时间：{datetime.now().isoformat()}")
     if source_branches:
-        lines.append(f"project_source_branches={source_branches[0]}..{source_branches[1]}")
-        lines.append("note=依赖源码仓库 git diff 默认优先按 old_version/new_version 模糊匹配其自身 refs，不直接沿用主项目分支名。")
+        lines.append(f"- 主工程分支范围：{source_branches[0]}..{source_branches[1]}")
+        lines.append("- 依赖源码仓库 git diff 默认按依赖自身版本匹配 refs，不直接沿用主工程分支名。")
     lines.append("")
-    lines.append(f"变更 API（有效行）：{valid_count}")
-    lines.append(f"契约校验失败：{invalid_count}")
-    lines.append(f"告警条目：{len(alerts)}")
-    lines.append("")
-    lines.append("按严重级别：")
+    lines.append("五、严重级别分布")
     for k in ('P0', 'P1', 'P2'):
-        lines.append(f"  {k}: {by_sev.get(k, 0)}")
+        lines.append(f"- {k}: {by_sev.get(k, 0)}")
     lines.append("")
-    lines.append("按来源：")
+    lines.append("六、证据来源分布")
     for k, v in sorted(by_source.items(), key=lambda x: (-x[1], x[0])):
-        lines.append(f"  {k or '(空)'}: {v}")
+        lines.append(f"- {k or '未标明来源'}: {v}")
     lines.append("")
     if gitdiff_runs is None:
         gitdiff_runs = []
@@ -3712,96 +3907,99 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
     if timeout_items is None:
         timeout_items = []
     if gitdiff_runs or gitdiff_skipped or gitdiff_pending:
-        lines.append("源码对比（git diff）：")
-        lines.append(f"  已执行：{len(gitdiff_runs)}")
+        lines.append("七、依赖源码对比")
+        lines.append(f"- 已执行 git diff：{len(gitdiff_runs)}")
         if gitdiff_runs:
             top = sorted(gitdiff_runs, key=lambda x: (-int(x.get("api_changes", 0)), x.get("coord", "")))
+            lines.append(f"- 已执行明细（前 {min(20, len(top))} 项）：")
             for it in top[:20]:
                 ref_part = ""
                 if it.get("base_ref") or it.get("cur_ref"):
-                    ref_part = f" refs={it.get('base_ref')}..{it.get('cur_ref')}({it.get('ref_source')})"
+                    ref_part = f"；refs={it.get('base_ref')}..{it.get('cur_ref')}（{it.get('ref_source')}）"
                 match_part = ""
                 if it.get("old_match_reason") or it.get("new_match_reason"):
                     match_part = (
-                        f" match=old[{it.get('old_match_reason') or '-'}]"
-                        f",new[{it.get('new_match_reason') or '-'}]"
+                        f"；匹配原因=old[{it.get('old_match_reason') or '-'}]"
+                        f"，new[{it.get('new_match_reason') or '-'}]"
                     )
                 lines.append(
-                    f"  - {it.get('coord')} api_changes={it.get('api_changes')} behavior_changed={it.get('behavior_changed')}{ref_part}{match_part} out={it.get('out_file')}"
+                    f"  - {it.get('coord')}：API 变化 {it.get('api_changes')}；行为变化 {it.get('behavior_changed')}{ref_part}{match_part}；证据文件={it.get('out_file')}"
                 )
             if len(top) > 20:
                 lines.append(f"  ...（仅展示前 20，共 {len(top)}）")
-        lines.append(f"  跳过：{len(gitdiff_skipped)}")
+        lines.append(f"- 跳过 git diff：{len(gitdiff_skipped)}")
         if gitdiff_skipped:
+            lines.append(f"- 跳过明细（前 {min(20, len(gitdiff_skipped))} 项）：")
             for it in gitdiff_skipped[:20]:
-                lines.append(f"  - {it.get('coord')} reason={it.get('reason')}")
+                lines.append(f"  - {it.get('coord')}：{it.get('reason')}")
             if len(gitdiff_skipped) > 20:
                 lines.append(f"  ...（仅展示前 20，共 {len(gitdiff_skipped)}）")
-        lines.append(f"  待人工确认 refs：{len(gitdiff_pending)}")
+        lines.append(f"- 待人工确认 refs：{len(gitdiff_pending)}")
         if gitdiff_pending:
+            lines.append(f"- 待确认明细（前 {min(20, len(gitdiff_pending))} 项）：")
             for it in gitdiff_pending[:20]:
-                lines.append(f"  - {it.get('coord')} reason={it.get('reason')}")
+                lines.append(f"  - {it.get('coord')}：{it.get('reason')}")
             if len(gitdiff_pending) > 20:
                 lines.append(f"  ...（仅展示前 20，共 {len(gitdiff_pending)}）")
         lines.append("")
     if timeout_items:
-        lines.append(f"超时项：{len(timeout_items)}")
+        lines.append(f"八、超时项（前 {min(20, len(timeout_items))} 项）")
         for item in timeout_items[:20]:
             lines.append(
-                f"  - {item.get('coord')} stage={item.get('stage')} timeout={item.get('timeout_seconds')}s reason={item.get('reason') or '-'}"
+                f"- {item.get('coord')}：阶段={item.get('stage')}；超时={item.get('timeout_seconds')}s；原因={item.get('reason') or '-'}"
             )
         if len(timeout_items) > 20:
-            lines.append(f"  ...（仅展示前 20，共 {len(timeout_items)}）")
+            lines.append(f"...（仅展示前 20，共 {len(timeout_items)}）")
         lines.append("")
-    lines.append("按变更类型：")
+    lines.append("九、变更类型分布")
     for k, v in sorted(by_change_type.items(), key=lambda x: (-x[1], x[0])):
-        lines.append(f"  {k or '(空)'}: {v}")
+        lines.append(f"- {k or '未标明类型'}: {v}")
     lines.append("")
-    lines.append(f"jar 未找到：{len(jar_missing_deps)}")
     if jar_missing_deps:
+        lines.append(f"十、jar 未找到（前 {min(20, len(jar_missing_deps))} 项）")
         for c in jar_missing_deps[:20]:
-            lines.append(f"  - {c}")
+            lines.append(f"- {c}")
         if len(jar_missing_deps) > 20:
-            lines.append(f"  ...（仅展示前 20，共 {len(jar_missing_deps)}）")
-    lines.append("")
-    lines.append(f"JApiCmp 未安装：{len(japicmp_missing_deps)}")
+            lines.append(f"...（仅展示前 20，共 {len(jar_missing_deps)}）")
+        lines.append("")
     if japicmp_missing_deps:
+        lines.append(f"十一、JApiCmp 未安装导致未分析（前 {min(20, len(japicmp_missing_deps))} 项）")
         for c in japicmp_missing_deps[:20]:
-            lines.append(f"  - {c}")
+            lines.append(f"- {c}")
         if len(japicmp_missing_deps) > 20:
-            lines.append(f"  ...（仅展示前 20，共 {len(japicmp_missing_deps)}）")
-    lines.append("")
-    lines.append(f"其他 JApiCmp 失败：{len(other_failed_deps)}")
+            lines.append(f"...（仅展示前 20，共 {len(japicmp_missing_deps)}）")
+        lines.append("")
     if other_failed_deps:
+        lines.append(f"十二、其他 JApiCmp 失败（前 {min(20, len(other_failed_deps))} 项）")
         for c in other_failed_deps[:20]:
-            lines.append(f"  - {c}")
+            lines.append(f"- {c}")
         if len(other_failed_deps) > 20:
-            lines.append(f"  ...（仅展示前 20，共 {len(other_failed_deps)}）")
-    lines.append("")
+            lines.append(f"...（仅展示前 20，共 {len(other_failed_deps)}）")
+        lines.append("")
     if changed_deps_missing_source:
         uniq = {}
         for it in changed_deps_missing_source:
             if it.get('coord'):
                 uniq[it['coord']] = it
         items = list(uniq.values())
-        lines.append(f"升级依赖缺少源码映射：{len(items)}")
+        lines.append(f"十三、升级依赖缺少源码映射（前 {min(20, len(items))} 项）")
         for it in items[:20]:
-            lines.append(f"  - {it.get('coord')} ({it.get('old_version')}→{it.get('new_version')})")
+            lines.append(f"- {it.get('coord')}：{it.get('old_version')} -> {it.get('new_version')}")
         if len(items) > 20:
-            lines.append(f"  ...（仅展示前 20，共 {len(items)}）")
+            lines.append(f"...（仅展示前 20，共 {len(items)}）")
         lines.append("")
     if zero_change:
-        lines.append(f"版本已变更但未发现 API 变化：{len(zero_change)}")
+        lines.append(f"十四、版本已变更但未发现 API 变化（前 {min(50, len(zero_change))} 项）")
         for c in zero_change[:50]:
-            lines.append(f"  - {c}")
+            lines.append(f"- {c}")
         if len(zero_change) > 50:
-            lines.append(f"  ...（仅展示前 50，共 {len(zero_change)}）")
+            lines.append(f"...（仅展示前 50，共 {len(zero_change)}）")
         lines.append("")
     if alerts:
-        lines.append("告警 Top 50：")
+        lines.append(f"十五、高风险/需关注 API（前 {min(50, len(alerts))} 项）")
         for r in alerts[:50]:
             lines.append(
-                f"  {r.get('coord')} | {r.get('severity')} | {r.get('change_type')} | {r.get('api_name')} | confirmed={r.get('confirmed')} | source={r.get('source')}"
+                f"- {r.get('coord')}：{r.get('severity')}；{r.get('change_type')}；{r.get('api_name')}；来源={r.get('source')}；已确认={r.get('confirmed')}"
             )
     with open(summary_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write("\n".join(lines) + "\n")
@@ -3877,15 +4075,25 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     cleanup_step4_generated_outputs(args.output_dir)
+    timing = Step4TimingRecorder(args.output_dir)
     try:
         dependency_git_ref_overrides = parse_dependency_git_ref_overrides(args.dependency_git_ref_overrides_json)
     except ValueError as exc:
         print(f"❌ {exc}", file=sys.stderr)
+        timing.record("input.dependency_git_ref_overrides", status="error", details=str(exc))
+        timing.flush()
         return 2
 
     step_timer = PhaseTimer("step4", "total")
+    load_inputs_timer = time.perf_counter()
     dep_rows = load_csv(args.dep_changes)
     ctx      = load_json(args.context)
+    timing.record(
+        "input.load",
+        status="success",
+        elapsed=time.perf_counter() - load_inputs_timer,
+        details={"dependencies": len(dep_rows), "changed_dependencies": len(ctx.get("changed_dependencies") or [])},
+    )
     japicmp_planned_rows = [row for row in dep_rows if dependency_needs_japicmp(row)]
     compute_changed_classes_enabled = (not args.skip_changed_classes) and len(dep_rows) <= 200
     if not compute_changed_classes_enabled:
@@ -3899,6 +4107,7 @@ def main():
     # 解析依赖源码仓库映射
     dependency_paths = {}
     dependency_path_meta = {}
+    source_mapping_timer = time.perf_counter()
 
     def register_dependency_path(mapped_coord, repo_path, module_path, input_spec, input_coord, mapping_mode, repo_inferred_coords):
         if mapped_coord and mapped_coord not in dependency_paths:
@@ -3937,7 +4146,20 @@ def main():
                         f"   仓库内推断出的坐标有：{', '.join(inferred_coords[:10]) or '(无)'}",
                         file=sys.stderr,
                     )
-                    sys.exit(2)
+                    timing.record(
+                        "source_mapping.resolve",
+                        coord=coord,
+                        status="error",
+                        elapsed=time.perf_counter() - source_mapping_timer,
+                        details={
+                            "path": abs_path,
+                            "reason": "coord_not_matched_in_repo",
+                            "inferred_coords": inferred_coords[:20],
+                        },
+                    )
+                    timing.record("step4.total", status="source_mapping_error", elapsed=step_timer.elapsed())
+                    timing.flush()
+                    return 2
                 for matched_coord in matched_coords:
                     location = location_by_coord.get(matched_coord) or {}
                     register_dependency_path(
@@ -3978,16 +4200,32 @@ def main():
                     "repo_inference_all",
                     coords,
                 )
+    timing.record(
+        "source_mapping.resolve",
+        status="success",
+        elapsed=time.perf_counter() - source_mapping_timer,
+        details={
+            "input_mappings": len(args.dependency_repo_mappings or []),
+            "resolved_coords": len(dependency_paths),
+        },
+    )
 
     changed_dependency_coords = {
         dep['coord'] for dep in ctx.get('changed_dependencies', []) if dep.get('coord')
     }
 
+    preflight_timer = time.perf_counter()
     preflight_gitdiff_runs, preflight_gitdiff_pending = preflight_gitdiff_refs(
         dep_rows,
         dependency_paths,
         dependency_path_meta,
         dependency_git_ref_overrides,
+    )
+    timing.record(
+        "preflight.git_refs",
+        status="pending" if preflight_gitdiff_pending else "success",
+        elapsed=time.perf_counter() - preflight_timer,
+        details={"matched": len(preflight_gitdiff_runs), "pending": len(preflight_gitdiff_pending)},
     )
     if preflight_gitdiff_pending:
         source_repo_mappings = [
@@ -4021,17 +4259,31 @@ def main():
         print(f"  输出：{pending_refs_path}", file=sys.stderr)
         print(f"  输出：{ref_matches_json}", file=sys.stderr)
         print(f"  输出：{ref_matches_txt}", file=sys.stderr)
+        timing.record("step4.total", status="awaiting_git_ref_confirmation", elapsed=step_timer.elapsed())
+        timing_path = timing.flush()
+        print(f"  输出：{timing_path}", file=sys.stderr)
         if os.environ.get("JUA_ORCHESTRATED") == "1":
             emit_interaction(interaction)
             return 0
         return 2
 
     if japicmp_planned_rows and not os.path.exists(args.japicmp_jar):
+        japicmp_preflight_timer = time.perf_counter()
         installed, resolved_japicmp_jar, install_error = auto_install_japicmp(
             args.japicmp_jar,
             timeout=args.fetch_timeout,
         )
         args.japicmp_jar = resolved_japicmp_jar
+        timing.record(
+            "preflight.japicmp",
+            status="installed" if installed else "missing",
+            elapsed=time.perf_counter() - japicmp_preflight_timer,
+            details={
+                "planned_dependencies": len(japicmp_planned_rows),
+                "japicmp_jar": args.japicmp_jar,
+                "install_error": install_error or "",
+            },
+        )
         if (not installed) and (not args.allow_degraded):
             planned_dependencies = [
                 {
@@ -4049,12 +4301,16 @@ def main():
                 planned_dependencies,
             )
             if os.environ.get("JUA_ORCHESTRATED") == "1":
+                timing.record("step4.total", status="awaiting_japicmp_resolution", elapsed=step_timer.elapsed())
+                timing.flush()
                 emit_interaction(interaction)
                 return 0
             print("\n❌ JApiCmp 不可用，且未确认 allow_degraded=true。", file=sys.stderr)
             print(f"   自动安装失败原因：{install_error}", file=sys.stderr)
             print(f"   请执行：mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}", file=sys.stderr)
             print("   或提供 --japicmp-jar 后重跑 Step4；若确认降级，请显式设置 --allow-degraded。", file=sys.stderr)
+            timing.record("step4.total", status="japicmp_missing", elapsed=step_timer.elapsed())
+            timing.flush()
             return 2
         if (not installed) and args.allow_degraded:
             print(
@@ -4077,6 +4333,7 @@ def main():
     binary_runs = []
 
     report_dir = str(Path(args.output_dir).resolve().parent)
+    artifact_resolve_timer = time.perf_counter()
     artifact_resolver = Step1ArtifactJarResolver(report_dir, args.output_dir)
     prepared_dep_rows = []
     artifact_jar_hits = 0
@@ -4093,6 +4350,12 @@ def main():
             prepared["_step4_current_jar_path"] = current_evidence.get("path") or ""
             prepared["_step4_current_jar_evidence"] = current_evidence
         prepared_dep_rows.append(prepared)
+    timing.record(
+        "artifact_resolve",
+        status="success",
+        elapsed=time.perf_counter() - artifact_resolve_timer,
+        details={"dependencies": len(dep_rows), "jar_hits": artifact_jar_hits},
+    )
 
     workers = max(1, int(args.workers or 1))
     if len(dep_rows) <= 1:
@@ -4125,8 +4388,18 @@ def main():
         scope      = row.get('scope', 'compile')
 
         if not coord:
+            timing.record("dependency.total", status="skipped", elapsed=time.perf_counter() - dependency_timer, details="empty_coord")
             return result
         if change == '未变':
+            timing.record(
+                "dependency.total",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="skipped",
+                elapsed=time.perf_counter() - dependency_timer,
+                details="unchanged",
+            )
             return result
 
         is_removed_dependency = (change == '移除') or (new_ver == '-' and old_ver != '-')
@@ -4183,7 +4456,11 @@ def main():
             apis = gitdiff_result.get("apis") or []
             err = gitdiff_result.get("error")
             meta = gitdiff_result.get("meta") or {}
+            gitdiff_status = "success"
+            gitdiff_details = {"out_file": _out_file or ""}
             if gitdiff_result.get("status") == "needs_user_confirmation":
+                gitdiff_status = "pending"
+                gitdiff_details = meta.get("reason") or err or ""
                 print("    ⚠️  git refs 无法自动确定，已加入待人工确认清单。", file=sys.stderr)
                 emit_progress(
                     "step4",
@@ -4211,6 +4488,8 @@ def main():
                     }
                 )
             elif gitdiff_result.get("status") == "error":
+                gitdiff_status = "error"
+                gitdiff_details = err or ""
                 print(f"    ⚠️  git diff 失败：{err}", file=sys.stderr)
                 emit_progress(
                     "step4",
@@ -4285,6 +4564,16 @@ def main():
                         "mapping_mode": (dependency_path_meta.get(coord) or {}).get("mapping_mode"),
                     }
                 )
+            timing.record(
+                "dependency.gitdiff",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status=gitdiff_status,
+                elapsed=time.perf_counter() - gitdiff_timer,
+                api_count=len(apis),
+                details=gitdiff_details,
+            )
 
         # 4a: 升级依赖做 JApiCmp；removed 依赖导出旧 jar 符号集作为 Step5 输入
         if is_removed_dependency:
@@ -4359,6 +4648,16 @@ def main():
                     elapsed=time.perf_counter() - removed_timer,
                     item=coord,
                 )
+            timing.record(
+                "dependency.removed_jar_export",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="error" if err else "success",
+                elapsed=time.perf_counter() - removed_timer,
+                api_count=len(apis),
+                details=err or {"old_jar_source": str((jar_info or {}).get("old_jar_source") or "")},
+            )
         elif old_ver != '-' and new_ver != '-':
             japicmp_timer = time.perf_counter()
             emit_progress(
@@ -4398,6 +4697,7 @@ def main():
                 'error': str(err or ''),
             })
             if compute_changed_classes_enabled and jar_info and jar_info.get("old_jar") and jar_info.get("new_jar"):
+                changed_classes_timer = time.perf_counter()
                 try:
                     result["changed_classes_by_coord"][coord] = {
                         "coord": coord,
@@ -4407,8 +4707,26 @@ def main():
                         "new_jar": jar_info["new_jar"],
                         **compute_changed_classes(jar_info["old_jar"], jar_info["new_jar"]),
                     }
+                    timing.record(
+                        "dependency.changed_classes",
+                        coord=coord,
+                        old_version=old_ver,
+                        new_version=new_ver,
+                        status="success",
+                        elapsed=time.perf_counter() - changed_classes_timer,
+                        details={"old_jar": jar_info["old_jar"], "new_jar": jar_info["new_jar"]},
+                    )
                 except Exception as e:
                     result["changed_classes_errors"].append(f"{coord}: {str(e)[:120]}")
+                    timing.record(
+                        "dependency.changed_classes",
+                        coord=coord,
+                        old_version=old_ver,
+                        new_version=new_ver,
+                        status="error",
+                        elapsed=time.perf_counter() - changed_classes_timer,
+                        details=str(e)[:200],
+                    )
             if err:
                 print(f"    ⚠️  JApiCmp 失败：{err}", file=sys.stderr)
                 emit_progress(
@@ -4461,12 +4779,27 @@ def main():
                     elapsed=time.perf_counter() - japicmp_timer,
                     item=coord,
                 )
+            timing.record(
+                "dependency.japicmp",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="error" if err else "success",
+                elapsed=time.perf_counter() - japicmp_timer,
+                api_count=len(apis),
+                details=err or {
+                    "old_jar_source": str((jar_info or {}).get("old_jar_source") or ""),
+                    "new_jar_source": str((jar_info or {}).get("new_jar_source") or ""),
+                    "parser_mode": str((jar_info or {}).get("parser_mode") or ""),
+                },
+            )
             dependency_old_jar = str((jar_info or {}).get("old_jar") or "")
             dependency_new_jar = str((jar_info or {}).get("new_jar") or "")
             dependency_raw_apis.extend(apis)
             result["all_apis"].extend(apis)
 
         if dependency_gitdiff_apis:
+            gitdiff_filter_timer = time.perf_counter()
             accepted_source_apis, rejected_source_apis = filter_gitdiff_rows_with_jar_truth(
                 dependency_gitdiff_apis,
                 old_jar=dependency_old_jar,
@@ -4497,10 +4830,29 @@ def main():
                 total=len(dep_rows),
                 item=coord,
             )
+            timing.record(
+                "dependency.gitdiff_jar_truth_filter",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="success",
+                elapsed=time.perf_counter() - gitdiff_filter_timer,
+                api_count=len(accepted_source_apis),
+                details={"auxiliary_only": len(rejected_source_apis)},
+            )
 
         # 4c: changelog 分析任务文件（由 AI agent 后续填写）
         if change in ('大版本升级', '小版本升级') and (not has_source_repo):
+            changelog_timer = time.perf_counter()
             analyze_changelog(coord, old_ver, new_ver, args.output_dir)
+            timing.record(
+                "dependency.changelog_task",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="success",
+                elapsed=time.perf_counter() - changelog_timer,
+            )
         result["per_dependency_record"] = {
             "coord": coord,
             "dep_row": {k: v for k, v in dict(row).items() if not str(k).startswith("_step4_")},
@@ -4517,10 +4869,20 @@ def main():
             elapsed=time.perf_counter() - dependency_timer,
             item=coord,
         )
+        timing.record(
+            "dependency.total",
+            coord=coord,
+            old_version=old_ver,
+            new_version=new_ver,
+            status="success",
+            elapsed=time.perf_counter() - dependency_timer,
+            api_count=len(dependency_raw_apis),
+        )
         return result
 
     per_dependency_records = {}
     task_results = []
+    dependencies_timer = time.perf_counter()
     if workers == 1:
         for i, row in enumerate(prepared_dep_rows, 1):
             task_results.append(process_dependency(i, row))
@@ -4532,6 +4894,12 @@ def main():
             ]
             for future in as_completed(futures):
                 task_results.append(future.result())
+    timing.record(
+        "dependencies.process_all",
+        status="success",
+        elapsed=time.perf_counter() - dependencies_timer,
+        details={"dependencies": len(prepared_dep_rows), "workers": workers},
+    )
 
     for item in sorted(task_results, key=lambda value: value.get("index") or 0):
         all_apis.extend(item.get("all_apis") or [])
@@ -4551,8 +4919,17 @@ def main():
             per_dependency_records[per_record.get("coord")] = per_record
 
     # 写入汇总文件
+    write_all_timer = time.perf_counter()
     csv_file, valid_count, invalid_count = write_all_changed_apis(
         all_apis, args.output_dir)
+    timing.record(
+        "write.all_changed_apis",
+        status="success",
+        elapsed=time.perf_counter() - write_all_timer,
+        api_count=valid_count,
+        details={"invalid_count": invalid_count, "output": csv_file},
+    )
+    write_per_dep_timer = time.perf_counter()
     for coord in sorted(per_dependency_records.keys()):
         item = per_dependency_records.get(coord) or {}
         write_per_dependency_outputs(
@@ -4562,7 +4939,14 @@ def main():
             removed_jar_export=item.get("removed_jar_export") or None,
             gitdiff_auxiliary_rows=item.get("gitdiff_auxiliary_rows") or [],
         )
+    timing.record(
+        "write.per_dependency_outputs",
+        status="success",
+        elapsed=time.perf_counter() - write_per_dep_timer,
+        details={"dependencies": len(per_dependency_records)},
+    )
 
+    changed_classes_write_timer = time.perf_counter()
     changed_classes_path = os.path.join(args.output_dir, "changed_classes.json")
     with open(changed_classes_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -4584,6 +4968,12 @@ def main():
             ensure_ascii=False,
             indent=2,
         )
+    timing.record(
+        "write.changed_classes",
+        status="success",
+        elapsed=time.perf_counter() - changed_classes_write_timer,
+        details={"enabled": compute_changed_classes_enabled, "dependencies": len(changed_classes_by_coord)},
+    )
 
     print(f"\nStep 4 完成：", file=sys.stderr)
     print(f"  变更 API 总数：{valid_count}", file=sys.stderr)
@@ -4596,6 +4986,7 @@ def main():
     print(f"  输出：{csv_file}", file=sys.stderr)
 
     timeouts_path = os.path.join(args.output_dir, "timeouts.json")
+    write_aux_timer = time.perf_counter()
     with open(timeouts_path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -4606,6 +4997,12 @@ def main():
             ensure_ascii=False,
             indent=2,
         )
+    timing.record(
+        "write.auxiliary_json",
+        status="success",
+        elapsed=time.perf_counter() - write_aux_timer,
+        details={"timeouts": len(timeout_items), "gitdiff_pending": len(gitdiff_pending)},
+    )
     pending_refs_path = os.path.join(args.output_dir, "git_ref_pending.json")
     with open(pending_refs_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -4669,11 +5066,19 @@ def main():
         },
     }
     coverage_output = Path(args.coverage_output) if args.coverage_output else default_coverage_output_path(args.output_dir)
+    coverage_write_timer = time.perf_counter()
     coverage_output.parent.mkdir(parents=True, exist_ok=True)
     coverage_output.write_text(
         json.dumps(step4_coverage, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
+    timing.record(
+        "write.coverage",
+        status="success",
+        elapsed=time.perf_counter() - coverage_write_timer,
+        details={"output": str(coverage_output)},
+    )
 
+    readable_write_timer = time.perf_counter()
     alerts_path, summary_path = write_readable_outputs(
         dep_rows=dep_rows,
         output_dir=args.output_dir,
@@ -4690,6 +5095,13 @@ def main():
         timeout_items=timeout_items,
         source_branches=args.source_branches,
     )
+    timing.record(
+        "write.readable_outputs",
+        status="success",
+        elapsed=time.perf_counter() - readable_write_timer,
+        details={"alerts": alerts_path, "summary": summary_path},
+    )
+    ref_matches_timer = time.perf_counter()
     ref_matches_json, ref_matches_txt = write_git_ref_match_outputs(
         output_dir=args.output_dir,
         gitdiff_runs=gitdiff_runs,
@@ -4698,6 +5110,12 @@ def main():
         source_repo_mappings=[
             dependency_path_meta[key] for key in sorted(dependency_path_meta.keys())
         ],
+    )
+    timing.record(
+        "write.git_ref_matches",
+        status="success",
+        elapsed=time.perf_counter() - ref_matches_timer,
+        details={"json": ref_matches_json, "txt": ref_matches_txt},
     )
     print(f"  输出：{alerts_path}", file=sys.stderr)
     print(f"  输出：{summary_path}", file=sys.stderr)
@@ -4718,23 +5136,20 @@ def main():
         for item in changed_deps_missing_source:
             uniq[item["coord"]] = item
         items = list(uniq.values())
-        print(f"\n⚠️  检测到升级依赖未提供源码路径映射：{len(items)} 个（将无法通过 git diff 识别“签名不变的行为变更”）", file=sys.stderr)
+        print(f"\n⚠️  升级依赖缺少源码路径映射：{len(items)} 个", file=sys.stderr)
+        print("影响：这部分依赖无法通过 git diff 识别“签名不变的行为变更”。", file=sys.stderr)
         for it in items[:10]:
             print(f"  - {it['coord']} ({it['old_version']}→{it['new_version']})", file=sys.stderr)
-        print("\n建议：在运行 Step4 时提供依赖源码路径（本地 git repo 根目录）", file=sys.stderr)
-        print("  只要给到 repo 根目录，调度层会自动扫描 pom.xml 并展开多模块坐标。", file=sys.stderr)
-        print("  方式1：命令行参数 --dependency-repo-mappings /abs/path/to/repo", file=sys.stderr)
-        print("        标准格式：--dependency-repo-mappings groupId:artifactId=/abs/path/to/repo", file=sys.stderr)
-        print("  方式2：先将 dependency_repo_mappings 写入 .upgrade-report/.runtime/state/main_state.json 的当前步骤输入", file=sys.stderr)
-        print("示例：", file=sys.stderr)
+        print("\n相关输入：dependency_repo_mappings / dependency_source_dirs", file=sys.stderr)
+        print("说明：给到依赖源码 repo 根目录后，调度层会扫描 pom.xml 并展开多模块坐标。", file=sys.stderr)
+        print("示例输入：", file=sys.stderr)
         print('  {"dependency_repo_mappings":["/abs/path/internal-repo"]}', file=sys.stderr)
         print('  {"dependency_repo_mappings":[{"coord":"com.myco:lib-a","path":"/abs/path/internal-repo"}]}', file=sys.stderr)
 
     # 输出摘要，真正的交互暂停由 run_step.py 统一处理
     human_checkpoint_1(dep_rows, all_apis, args.output_dir)
     print(
-        "\nStep 4 交互提示：进入 Step5 前，"
-        "请由调度层统一提示用户复核 summary.txt、all_changed_apis.csv、git_ref_matches.* 等证据文件。",
+        "\nStep4 复核文件：summary.txt、all_changed_apis.csv、git_ref_matches.*",
         file=sys.stderr,
     )
     emit_progress(
@@ -4743,6 +5158,17 @@ def main():
         f"Step4 完成，变更 API={valid_count}，待确认 git refs={len(gitdiff_pending)}，超时项={len(timeout_items)}",
         elapsed=step_timer.elapsed(),
     )
+    timing.record(
+        "step4.total",
+        status=(
+            "awaiting_git_ref_confirmation" if gitdiff_pending
+            else ("awaiting_timeout_resolution" if timeout_items else "done")
+        ),
+        elapsed=step_timer.elapsed(),
+        api_count=valid_count,
+    )
+    timing_path = timing.flush()
+    print(f"  输出：{timing_path}", file=sys.stderr)
     if gitdiff_pending:
         interaction = build_git_ref_confirmation_interaction(args.output_dir, gitdiff_pending)
         if os.environ.get("JUA_ORCHESTRATED") == "1":

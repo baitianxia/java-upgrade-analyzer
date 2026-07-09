@@ -2786,61 +2786,96 @@ def main():
               if '降级' in r['change_type'] or '❓' in r['risk']]
     alerts_out = str((out_dir / "dep_alerts.csv").resolve())
     with open(alerts_out, 'w', newline='', encoding='utf-8') as f:
-        fields = ['coord', 'old_version', 'new_version', 'change_type',
+        fields = ['conclusion', 'change_summary', 'review_reason',
+                  'coord', 'old_version', 'new_version', 'change_type',
                   'risk', 'scope', 'remark', 'current_packaged', 'downgrade_confirmed', 'resolution_status']
-        alert_rows = [{field: item.get(field, '') for field in fields} for item in alerts]
+        alert_rows = []
+        for item in alerts:
+            reasons = []
+            if '降级' in str(item.get('change_type') or ''):
+                reasons.append('依赖版本发生降级')
+            if '❓' in str(item.get('risk') or ''):
+                reasons.append('风险状态不明确')
+            resolution_status = str(item.get('resolution_status') or '').strip()
+            if resolution_status and resolution_status != 'resolved':
+                reasons.append(f'依赖坐标解析状态：{resolution_status}')
+            row = {field: item.get(field, '') for field in fields}
+            row['conclusion'] = '需要人工复核'
+            row['change_summary'] = (
+                f"{item.get('coord', '-')}: {item.get('old_version', '-')} -> "
+                f"{item.get('new_version', '-')}，{item.get('change_type', '-')}"
+            )
+            row['review_reason'] = '；'.join(reasons) or str(item.get('remark') or '依赖变化需要确认')
+            alert_rows.append(row)
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(alert_rows)
 
     summary_out = str((out_dir / "dep_summary.txt").resolve())
     summary_lines = []
-    summary_lines.append("=== Step1 依赖变更摘要 ===")
-    summary_lines.append("用途：对比 base/current 的最终打包依赖结果，产出后续 Step3/Step4/Step5 的分析范围依据。")
-    summary_lines.append("抽查：确认 base/current 分支、目标模块与构建产物是否正确。")
-    summary_lines.append("抽查：优先查看 dep_alerts.csv 中的降级/❓项，确保范围与预期一致。")
-    if args.base_artifact_path and args.current_artifact_path:
-        summary_lines.append("模式：用户提供编译包路径")
-        summary_lines.append(f"base_artifact_path={str(Path(args.base_artifact_path).expanduser().resolve())}")
-        summary_lines.append(f"current_artifact_path={str(Path(args.current_artifact_path).expanduser().resolve())}")
-    else:
-        summary_lines.append("模式：自动切分支")
-        summary_lines.append(f"base_branch={args.base_branch}")
-        summary_lines.append(f"current_branch={args.current_branch}")
-    summary_lines.append(f"format={base_fmt}")
-    want = resolve_primary_module_id(args.primary_module, args.work_dir)
-    summary_lines.append(f"primary_module={want or ''}")
-    summary_lines.append(f"current_packaging_mode={packaged_summary.get('mode')}")
-    summary_lines.append(f"current_packaging_archives={len(packaged_summary.get('archives') or [])}")
-    if packaged_summary.get('archives'):
-        for archive_path in (packaged_summary.get('archives') or [])[:5]:
-            summary_lines.append(f"current_packaging_archive={archive_path}")
+    summary_lines.append("Step1 依赖变更摘要")
+    summary_lines.append("")
+    summary_lines.append("一、结论总览")
+    summary_lines.append(f"- 依赖记录总数：{len(rows)}")
+    summary_lines.append(f"- 需要人工确认：{len(alerts)}")
     if curr_entries:
-        summary_lines.append(f"current_packaged_deps={len(curr_entries)}")
-        summary_lines.append(f"current_packaged_matched={sum(1 for item in curr_entries if str(item.get('resolution_status') or '').strip() == 'resolved')}")
-        summary_lines.append(f"current_packaged_unresolved={sum(1 for item in curr_entries if str(item.get('resolution_status') or '').strip() != 'resolved')}")
-        summary_lines.append(f"current_packaged_read_errors={sum(1 for item in curr_entries if str(item.get('read_error') or '').strip())}")
-    if base_meta.get('module_dir'):
-        summary_lines.append(f"base_module_dir={base_meta.get('module_dir')}")
-    if curr_meta.get('module_dir'):
-        summary_lines.append(f"current_module_dir={curr_meta.get('module_dir')}")
-    summary_lines.append("")
-    summary_lines.append(f"总依赖数：{len(rows)}")
-    summary_lines.append("变更统计：")
-    for t, c in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
-        summary_lines.append(f"  {t}: {c}")
-    summary_lines.append("")
-    summary_lines.append(f"需人工确认：{len(alerts)}")
-    if unresolved_records:
-        summary_lines.append(f"保留 unresolved：{len(unresolved_records)}")
-        for item in unresolved_records[:50]:
-            summary_lines.append(f"  unresolved {item.get('label')}")
+        unresolved_count = sum(1 for item in curr_entries if str(item.get('resolution_status') or '').strip() != 'resolved')
+        read_error_count = sum(1 for item in curr_entries if str(item.get('read_error') or '').strip())
+        summary_lines.append(f"- 当前打包依赖数：{len(curr_entries)}")
+        summary_lines.append(f"- 当前打包依赖坐标未解析：{unresolved_count}")
+        summary_lines.append(f"- 当前打包依赖读取失败：{read_error_count}")
     if alerts:
-        summary_lines.append("Top 50：")
+        summary_lines.append("- 结论：存在需要优先复核的依赖变化，请先查看 dep_alerts.csv。")
+    else:
+        summary_lines.append("- 结论：未发现需要优先复核的依赖变化。")
+    summary_lines.append("")
+    summary_lines.append("二、分析范围")
+    if args.base_artifact_path and args.current_artifact_path:
+        summary_lines.append("- 输入模式：用户提供 base/current 编译产物")
+        summary_lines.append(f"- base 编译产物：{str(Path(args.base_artifact_path).expanduser().resolve())}")
+        summary_lines.append(f"- current 编译产物：{str(Path(args.current_artifact_path).expanduser().resolve())}")
+    else:
+        summary_lines.append("- 输入模式：自动切换 base/current 分支构建")
+        summary_lines.append(f"- base 分支：{args.base_branch}")
+        summary_lines.append(f"- current 分支：{args.current_branch}")
+    want = resolve_primary_module_id(args.primary_module, args.work_dir)
+    summary_lines.append(f"- 目标模块：{want or '未指定'}")
+    summary_lines.append(f"- 构建产物类型：{base_fmt}")
+    summary_lines.append(f"- current 打包模式：{packaged_summary.get('mode') or '未知'}")
+    summary_lines.append(f"- current 可解析打包产物数量：{len(packaged_summary.get('archives') or [])}")
+    if packaged_summary.get('archives'):
+        summary_lines.append("- current 打包产物样例：")
+        for archive_path in (packaged_summary.get('archives') or [])[:5]:
+            summary_lines.append(f"  - {archive_path}")
+    if base_meta.get('module_dir'):
+        summary_lines.append(f"- base 模块目录：{base_meta.get('module_dir')}")
+    if curr_meta.get('module_dir'):
+        summary_lines.append(f"- current 模块目录：{curr_meta.get('module_dir')}")
+    summary_lines.append("")
+    summary_lines.append("三、依赖变化统计")
+    for t, c in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+        summary_lines.append(f"- {t}: {c}")
+    summary_lines.append("")
+    summary_lines.append("四、复核入口")
+    summary_lines.append("- 完整依赖变化：dep_changes.csv")
+    summary_lines.append("- 需要优先复核的依赖：dep_alerts.csv")
+    summary_lines.append("- 构建产物来源：build_provenance.json")
+    summary_lines.append("")
+    if unresolved_records:
+        summary_lines.append(f"五、坐标未解析依赖（前 {min(50, len(unresolved_records))} 项）")
+        for item in unresolved_records[:50]:
+            summary_lines.append(f"- {item.get('label')}")
+        summary_lines.append("")
+    if alerts:
+        summary_lines.append(f"六、优先复核依赖（前 {min(50, len(alerts))} 项）")
         for r in alerts[:50]:
             summary_lines.append(
-                f"  {r['coord']} | {r['old_version']} -> {r['new_version']} | {r['change_type']} | {r['risk']} | {r['scope']} | {r.get('remark','')}"
+                f"- {r['coord']}：{r['old_version']} -> {r['new_version']}；变化={r['change_type']}；风险={r['risk']}；范围={r['scope']}；说明={r.get('remark','')}"
             )
+        summary_lines.append("")
+    summary_lines.append("附：阅读说明")
+    summary_lines.append("- Step1 只确定依赖变化范围，不证明业务是否受影响。")
+    summary_lines.append("- 是否触达业务代码，以 Step5 的 alerts.csv 和 Step6 的 report.md 为准。")
     with open(summary_out, 'w', encoding='utf-8', newline='\n') as f:
         f.write("\n".join(summary_lines) + "\n")
     if alerts:

@@ -544,8 +544,8 @@ def _apply_source_artifact_miss(result, graph, reachable_note):
     else:
         result.reason_code = 'SOURCE_ARTIFACT_ALIGNMENT_UNVERIFIED'
         result.reachable_note = (
-            '源码图存在目标调用，但源码与最终制品未证明来自同一 revision/profile；'
-            '字节码未命中不能用于反证源码候选'
+            '源码中发现了目标调用，但无法确认这份源码就是本次打包产物对应的源码；'
+            '因此不能用打包产物未命中来否定这条源码调用线索'
         )
     _downgrade_reachable_path_details(result, 'uncertain', result.reason_code)
     return result
@@ -3242,8 +3242,8 @@ def trace_api_with_confidence_weighting(
     if direct_usage_result is not None:
         if artifact_scan_miss:
             _apply_source_artifact_miss(direct_usage_result, graph, (
-                '源码图存在目标调用，但与当前最终制品的完整字节码扫描结果冲突；'
-                '可能是源码与制品 revision/profile 不一致，当前不能确认影响'
+                '源码中发现了目标调用，但当前打包产物的字节码扫描没有发现对应引用；'
+                '可能是源码、构建参数或目标模块与本次打包产物不一致，当前不能确认影响'
             ))
         if artifact_dependency_hits:
             for hit in artifact_dependency_hits:
@@ -3295,6 +3295,21 @@ def trace_api_with_confidence_weighting(
         result.verification_commands = [
             '回到 Step 4 重新生成包含 symbol_kind 的变更 API 清单',
             '确认 all_changed_apis.csv 每一行都明确标注 symbol_kind',
+        ]
+        _debug_trace_result('trace_api_result', result)
+        return result
+
+    if method_api_requires_signature(api_row) and not (api_row.get('api_name') or '').strip():
+        result.analysis_status = 'not_analyzed'
+        result.reason_code = 'MISSING_API_NAME'
+        result.reachable_note = (
+            '方法级调用链分析要求目标 API 具备全限定名；'
+            '当前输入只有简单名/签名时，Step5 不会使用 method:* 回退键生成结论，'
+            '以避免跨类同名方法误匹配'
+        )
+        result.verification_commands = [
+            '回到 Step 4 重新生成包含 api_name 全限定名的变更 API 清单',
+            '确认 all_changed_apis.csv 中方法/构造器行的 api_name 不是空值',
         ]
         _debug_trace_result('trace_api_result', result)
         return result
@@ -3783,8 +3798,8 @@ def trace_api_with_confidence_weighting(
         if artifact_scan_miss:
             built = build_reachable_result(result, best, graph)
             _apply_source_artifact_miss(built, graph, (
-                '源码图存在可达调用链，但当前最终制品的完整字节码扫描未发现对应引用；'
-                '可能是源码与制品 revision/profile 不一致，当前不能确认影响'
+                '源码中发现了可达调用链，但当前打包产物的字节码扫描没有发现对应引用；'
+                '可能是源码、构建参数或目标模块与本次打包产物不一致，当前不能确认影响'
             ))
             _debug_trace_result('trace_api_result', built)
             return built
@@ -5070,10 +5085,20 @@ def get_cached_method_lookup_resolution(method_def, type_metadata, graph, trace_
 
     lookup_key_groups = build_method_lookup_key_groups(method_def, type_metadata, graph=graph)
     matched_lookup_groups = select_matching_key_groups(lookup_key_groups, getattr(graph, 'reverse_edges', {}) or {})
+    # Accuracy guard: never expand the main Step5 trace through method-name-only
+    # fallback keys.  A path such as A -> method:send -> B.send is exactly the
+    # class of false positive that can stitch unrelated implementations or
+    # unpackaged source modules into a business impact chain.  If the caller
+    # cannot be resolved by FQCN/signature/polymorphic evidence, the static
+    # trace must stop instead of inventing a chain from a simple method name.
+    matched_lookup_groups = [
+        group for group in matched_lookup_groups
+        if group.get('provenance') != 'fallback_simple'
+    ]
     if not matched_lookup_groups:
         _step5_debug(
             'method_lookup_resolution',
-            'no lookup groups matched reverse edges',
+            'no precise lookup groups matched reverse edges',
             method=method_def.qualified_key,
             lookup_key_groups=lookup_key_groups,
         )

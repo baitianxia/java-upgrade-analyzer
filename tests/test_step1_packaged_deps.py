@@ -329,7 +329,13 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(rows[0]["new_version"], "1.0.0")
         self.assertEqual(rows[0]["change_type"], "降级⚠️")
         self.assertEqual(
-            set(rows[0].keys()),
+            ["conclusion", "change_summary", "review_reason"],
+            list(rows[0].keys())[:3],
+        )
+        self.assertEqual(rows[0]["conclusion"], "需要人工复核")
+        self.assertIn("org.example:demo-lib: 2.0.0 -> 1.0.0", rows[0]["change_summary"])
+        self.assertIn("依赖版本发生降级", rows[0]["review_reason"])
+        self.assertTrue(
             {
                 "coord",
                 "old_version",
@@ -341,7 +347,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 "current_packaged",
                 "downgrade_confirmed",
                 "resolution_status",
-            },
+            }.issubset(set(rows[0].keys()))
         )
 
 

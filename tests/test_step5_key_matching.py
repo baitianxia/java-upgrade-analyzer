@@ -1237,9 +1237,71 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
 
-        self.assertEqual(result.analysis_status, "not_analyzed")
-        self.assertEqual(result.reason_code, "BEHAVIOR_CHANGED_PRECISE_TARGET_NOT_CONFIRMED")
-        self.assertEqual(result.match_provenance, "fallback_simple")
+        self.assertEqual(result.analysis_status, "not_found_in_static_analysis")
+        self.assertEqual(result.reason_code, "NO_STATIC_PATH")
+        self.assertFalse(result.call_paths)
+        self.assertFalse(result.evidence_paths)
+
+    def test_method_api_without_fqcn_is_not_traced_by_simple_name(self):
+        api_row = {
+            "api_name": "",
+            "api_simple": "call",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.example:demo",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "gitdiff",
+            "analysis_scope": "method",
+        }
+        business_entry = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="org.example.Controller.handle",
+            simple_key="method:handle",
+            class_fqcn="org.example.Controller",
+            class_name="Controller",
+            method_name="handle",
+            param_types={},
+            param_declared_types={},
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            annotations=["GetMapping"],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/Controller.java",
+            line=60,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_entry},
+            reverse_edges={
+                "method:call(String)": [
+                    SimpleNamespace(
+                        caller_symbol_id="business_entry",
+                        caller_qualified_key=business_entry.qualified_key,
+                        callee_key="method:call(String)",
+                        callee_simple_key="method:call(String)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=business_entry.file,
+                        line=business_entry.line,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    ),
+                ],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual("not_analyzed", result.analysis_status)
+        self.assertEqual("MISSING_API_NAME", result.reason_code)
+        self.assertFalse(result.call_paths)
+        self.assertFalse(result.evidence_paths)
 
     def test_behavior_changed_precise_signature_prefers_exact_name_over_better_fallback_simple(self):
         api_row = {
@@ -1465,11 +1527,148 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
 
-        self.assertEqual(result.analysis_status, "not_analyzed")
-        self.assertEqual(result.reason_code, "FALLBACK_SIMPLE_PATH_UNCONFIRMED")
-        self.assertEqual(result.match_provenance, "fallback_simple")
-        self.assertTrue(result.evidence_paths)
-        self.assertIn("Controller.handle", result.call_paths[0])
+        self.assertEqual(result.analysis_status, "not_found_in_static_analysis")
+        self.assertEqual(result.reason_code, "NO_STATIC_PATH")
+        self.assertFalse(result.call_paths)
+        self.assertFalse(result.evidence_paths)
+
+    def test_trace_does_not_stitch_business_call_to_dependency_method_by_simple_name(self):
+        api_row = {
+            "api_name": "org.apache.commons.lang.StringUtils.equals",
+            "api_simple": "equals",
+            "api_signature": "(String, String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "commons-lang:commons-lang",
+            "severity": "P0",
+            "confirmed": "true",
+            "source": "old_jar",
+            "analysis_scope": "method",
+        }
+        bclfs_send = SimpleNamespace(
+            symbol_id="bclfs_send",
+            qualified_key="com.unpacked.BclfsRmbService.sendAndReceiveRMBMessage",
+            simple_key="method:sendAndReceiveRMBMessage",
+            class_fqcn="com.unpacked.BclfsRmbService",
+            class_name="BclfsRmbService",
+            method_name="sendAndReceiveRMBMessage",
+            param_types={"def": "RmbServiceDef", "map": "Map", "ctx": "SendMessageCtx"},
+            param_declared_types={"def": "RmbServiceDef", "map": "Map", "ctx": "SendMessageCtx"},
+            owner_type="dependency",
+            owner_coord="pd-bcl-fs-online-common",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/BclfsRmbService.java",
+            line=10,
+        )
+        bclfs_trace = SimpleNamespace(
+            symbol_id="bclfs_trace",
+            qualified_key="com.unpacked.BclfsSendCpsMsgLowerCaseTrace.regTrace",
+            simple_key="method:regTrace",
+            class_fqcn="com.unpacked.BclfsSendCpsMsgLowerCaseTrace",
+            class_name="BclfsSendCpsMsgLowerCaseTrace",
+            method_name="regTrace",
+            param_types={},
+            param_declared_types={},
+            owner_type="dependency",
+            owner_coord="pd-bcl-fs-online-common",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/BclfsSendCpsMsgLowerCaseTrace.java",
+            line=20,
+        )
+        business_entry = SimpleNamespace(
+            symbol_id="business_call_rmb",
+            qualified_key="com.app.CallCpsRepayApplyAction.callRmb",
+            simple_key="method:callRmb",
+            class_fqcn="com.app.CallCpsRepayApplyAction",
+            class_name="CallCpsRepayApplyAction",
+            method_name="callRmb",
+            param_types={},
+            param_declared_types={},
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/CallCpsRepayApplyAction.java",
+            line=30,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={
+                "bclfs_send": bclfs_send,
+                "bclfs_trace": bclfs_trace,
+                "business_call_rmb": business_entry,
+            },
+            reverse_edges={
+                "org.apache.commons.lang.StringUtils.equals(String, String)": [
+                    SimpleNamespace(
+                        caller_symbol_id="bclfs_trace",
+                        caller_qualified_key=bclfs_trace.qualified_key,
+                        callee_key="org.apache.commons.lang.StringUtils.equals(String, String)",
+                        callee_simple_key="method:equals(String, String)",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=bclfs_trace.file,
+                        line=bclfs_trace.line,
+                        owner_type="dependency",
+                        owner_coord="pd-bcl-fs-online-common",
+                        module="unpacked-common",
+                        is_test=False,
+                    ),
+                ],
+                "com.unpacked.BclfsSendCpsMsgLowerCaseTrace.regTrace": [
+                    SimpleNamespace(
+                        caller_symbol_id="bclfs_send",
+                        caller_qualified_key=bclfs_send.qualified_key,
+                        callee_key="com.unpacked.BclfsSendCpsMsgLowerCaseTrace.regTrace",
+                        callee_simple_key="method:regTrace",
+                        confidence="high",
+                        evidence_type="ast_method_invocation",
+                        file=bclfs_send.file,
+                        line=bclfs_send.line,
+                        owner_type="dependency",
+                        owner_coord="pd-bcl-fs-online-common",
+                        module="unpacked-common",
+                        is_test=False,
+                    ),
+                ],
+                # This is the exact false-positive shape: business code was not
+                # resolved to BclfsRmbService by type; only a bare simple method
+                # name exists. Step5 must not stitch it into the dependency chain.
+                "method:sendAndReceiveRMBMessage(RmbServiceDef, Map, SendMessageCtx)": [
+                    SimpleNamespace(
+                        caller_symbol_id="business_call_rmb",
+                        caller_qualified_key=business_entry.qualified_key,
+                        callee_key="method:sendAndReceiveRMBMessage(RmbServiceDef, Map, SendMessageCtx)",
+                        callee_simple_key="method:sendAndReceiveRMBMessage(RmbServiceDef, Map, SendMessageCtx)",
+                        confidence="low",
+                        evidence_type="ast_method_invocation",
+                        file=business_entry.file,
+                        line=business_entry.line,
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                        is_test=False,
+                    ),
+                ],
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertEqual(result.analysis_status, "not_found_in_static_analysis")
+        self.assertEqual(result.reason_code, "NO_STATIC_PATH")
+        self.assertFalse(result.call_paths)
+        self.assertFalse(result.evidence_paths)
 
     def test_method_changed_prefers_exact_name_reachable_over_better_fallback_simple(self):
         api_row = {
@@ -3276,6 +3475,60 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertEqual(result.analysis_status, "reachable")
             self.assertTrue(any("com.example.Demo.check" in path for path in result.call_paths))
 
+    def test_build_graph_uses_runtime_jar_class_index_for_wildcard_import_static_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            src_dir.mkdir(parents=True)
+            (src_dir / "Demo.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "",
+                        "import com.vendor.*;",
+                        "",
+                        "public class Demo {",
+                        "    public boolean check(String value) {",
+                        "        return TargetApi.removed(value);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            jar_path = Path(tmp) / "vendor.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr("com/vendor/TargetApi.class", b"")
+            jar_metadata = {
+                "by_coord": {
+                    "com.vendor:target": {
+                        "coord": "com.vendor:target",
+                        "version": "1.0.0",
+                        "jar_path": str(jar_path),
+                        "classes": {},
+                    }
+                },
+                "by_class": {},
+                "jar_paths": {"com.vendor:target": str(jar_path)},
+                "all_class_fqcns": ["com.vendor.TargetApi"],
+                "classes_by_simple": {"TargetApi": ["com.vendor.TargetApi"]},
+            }
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(Path(tmp)),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    }
+                ],
+                jar_metadata=jar_metadata,
+            )
+            graph = graph_result["graph"]
+
+            self.assertIn("com.vendor.TargetApi.removed(String)", graph.reverse_edges)
+            self.assertNotIn("com.example.TargetApi.removed(String)", graph.reverse_edges)
+
     def test_build_graph_infers_argument_type_from_inherited_getter(self):
         with tempfile.TemporaryDirectory() as tmp:
             src_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
@@ -4805,6 +5058,28 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(summary["user_conclusion"], "已确认影响")
         self.assertIn("目标字段访问", summary["user_reason"])
 
+    def test_user_facing_source_artifact_messages_are_readable(self):
+        for reason_code in ("SOURCE_BYTECODE_EDGE_CONFLICT", "SOURCE_ARTIFACT_ALIGNMENT_UNVERIFIED"):
+            result = SimpleNamespace(
+                analysis_status="uncertain",
+                reason_code=reason_code,
+                change_type="method_changed",
+                severity="P1",
+                call_paths=[],
+                evidence_paths=[],
+                dependency_chain_coords=[],
+            )
+
+            summary = formatter.summarize_user_facing_outcome(result)
+            combined = f"{summary.get('user_reason', '')}\n{summary.get('suggested_action', '')}"
+
+            self.assertIn("源码", combined)
+            self.assertIn("打包", combined)
+            self.assertNotIn("源码图", combined)
+            self.assertNotIn("最终制品", combined)
+            self.assertNotIn("revision", combined)
+            self.assertNotIn("profile", combined)
+
     def test_generate_enhanced_summary_outputs_user_conclusion_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -4886,13 +5161,22 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 ),
             ]
 
-            _, summary_json_path = formatter.generate_enhanced_summary(results, output_dir)
+            summary_path, summary_json_path = formatter.generate_enhanced_summary(results, output_dir)
             summary = json.loads(Path(summary_json_path).read_text(encoding="utf-8"))
+            summary_text = Path(summary_path).read_text(encoding="utf-8")
+            by_api_text = next((output_dir / "by_api").glob("a_b_com_example_OrderService_run*.txt")).read_text(
+                encoding="utf-8"
+            )
 
         self.assertEqual(summary["user_conclusion_summary"]["已确认影响"], 1)
         self.assertEqual(summary["user_conclusion_summary"]["可能影响"], 1)
         self.assertEqual(summary["user_conclusion_summary"]["需要补充输入"], 1)
         self.assertEqual(summary["quality_gate"]["needs_input"], 1)
+        self.assertLess(summary_text.index("一、结论总览"), summary_text.index("附：内部状态统计"))
+        self.assertIn("二、已确认影响（优先处理）", summary_text)
+        self.assertIn("五、需要补充输入（建议先补齐后重跑）", summary_text)
+        self.assertLess(by_api_text.index("【结论】"), by_api_text.index("【变更信息】"))
+        self.assertIn("【调用链路】", by_api_text)
 
     def test_generate_enhanced_summary_persists_step5_perf_report_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5666,7 +5950,15 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         row = formatter._alert_rows_for_result(result)[0]
 
+        self.assertEqual("需要人工复核", row["conclusion"])
+        self.assertIn("变更方法，changed", row["change_summary"])
+        self.assertEqual("入口：A.call；终点：B.call；1 跳", row["chain_summary"])
+        self.assertEqual("A.call", row["chain_entry"])
+        self.assertEqual("B.call", row["chain_target"])
+        self.assertEqual("1", row["chain_hop_count"])
+        self.assertEqual("1. A.call -> 2. B.call", row["chain_detail"])
         self.assertIn("低置信度边", row["reason"])
+        self.assertIn("低置信度边", row["review_reason"])
         self.assertNotIn("已证明变更 API 触达系统代码", row["reason"])
 
     def test_alerts_csv_keeps_api_without_any_path(self):
@@ -5685,6 +5977,10 @@ class Step5KeyMatchingTest(unittest.TestCase):
             with output.open(encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 1)
+        self.assertEqual("未发现静态调用路径", rows[0]["conclusion"])
+        self.assertIn("删除方法，gone", rows[0]["change_summary"])
+        self.assertIn("未形成完整链路", rows[0]["chain_summary"])
+        self.assertEqual("com.acme.Api.gone", rows[0]["chain_target"])
         self.assertEqual(rows[0]["conclusion_level"], "no_static_path")
         self.assertEqual(rows[0]["path_text"], "")
 
@@ -6125,6 +6421,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
             findings = s6_report.collect_findings(str(report_dir))
             report_text = s6_report.generate_report(findings)
+            s6_report.write_s6_detail_artifacts(str(report_dir), findings)
+            not_found_md = (report_dir / "deliverables" / "s6_not_found_apis.md").read_text(encoding="utf-8")
+            not_found_csv = (report_dir / "deliverables" / "s6_not_found_apis.csv").read_text(encoding="utf-8")
 
         self.assertEqual(findings["p1"][0]["reason"], "命中了 String 重载")
         self.assertEqual(
@@ -6140,6 +6439,20 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(findings["not_found_reason_summary"]["NO_STATIC_PATH"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["not_found"], 1)
         self.assertIn("未发现调用路径", report_text)
+        self.assertIn("删除方法，call，参数：String，严重级别：P1", report_text)
+        self.assertIn("删除方法，call，参数：Long，严重级别：P1", report_text)
+        self.assertNotIn("REMOVED / method", report_text)
+        self.assertNotIn("`REMOVED` / `method`", report_text)
+        self.assertIn("| # | 依赖坐标 | API | 变化 | 原因码 | 说明 |", not_found_md)
+        self.assertIn("删除方法，call，参数：Long，严重级别：P1", not_found_md)
+        self.assertIn("change_summary", not_found_csv)
+        self.assertIn("conclusion", not_found_csv)
+        self.assertIn("review_reason", not_found_csv)
+        self.assertIn("chain_summary", not_found_csv)
+        self.assertIn("chain_detail", not_found_csv)
+        self.assertIn("未发现静态调用路径", not_found_csv)
+        self.assertIn("入口：Other.run；终点：com.example.Demo.call(Long)；1 跳", not_found_csv)
+        self.assertIn("删除方法，call，参数：Long，严重级别：P1", not_found_csv)
 
     def test_s6_report_starts_with_concrete_impact_overview_from_alerts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6208,7 +6521,8 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("## 二、结论限制", report_text)
         self.assertIn("## 三、分析结果总表", report_text)
         self.assertIn("## 四、附录", report_text)
-        self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |", report_text)
+        self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |", report_text)
+        self.assertNotIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |", report_text)
         self.assertLess(
             report_text.index("## 一、核心结论"),
             report_text.index("## 二、结论限制"),
@@ -6223,6 +6537,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
         self.assertIn("com.vendor.LegacyApi.removed", report_text)
         self.assertIn("com.acme.OrderService.submit", report_text)
+        self.assertIn("### 3.1 调用链样例", report_text)
         self.assertIn("展示 1 条样例；台账命中 2 次", report_text)
         self.assertIn("com.acme.OrderService.submit -> com.vendor.LegacyApi.removed(String)", report_text)
 
@@ -6512,9 +6827,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
             with (report_dir / findings["artifacts"]["not_analyzed_csv"]).open(encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 30)
             self.assertIn("## 三、分析结果总表", report_text)
-            self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |", report_text)
-            self.assertIn("| 可能影响 | - | Probable reason |", report_text)
-            self.assertIn("| 需人工复核 | - | 字节码命中但未确认回业务入口 |", report_text)
+            self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |", report_text)
+            self.assertIn("| 可能影响 | Probable reason |", report_text)
+            self.assertIn("| 需人工复核 | 字节码命中但未确认回业务入口 |", report_text)
             self.assertIn("主报告按结论类型各展示前 20 条", report_text)
             self.assertIn("com.example.Uncertain0.changed", report_text)
             self.assertNotIn("com.example.Uncertain29.changed", report_text)
@@ -7200,6 +7515,88 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertTrue(build_calls[0][1].get("retain_analysis_cache"))
             self.assertFalse(build_calls[1][1].get("retain_analysis_cache"))
 
+    def test_step5_filters_dependency_sources_before_building_full_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            output_dir = self._call_chain_dir(report_dir)
+            source_dir = project_dir / "src" / "main" / "java"
+            used_dep_dir = project_dir / "deps" / "used" / "src" / "main" / "java"
+            unused_dep_dir = project_dir / "deps" / "unused" / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            used_dep_dir.mkdir(parents=True)
+            unused_dep_dir.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            all_changed_apis = self._api_changes_dir(report_dir) / "all_changed_apis.csv"
+            self._write_text(all_changed_apis, "coord,api_name\ncom.vendor:target,com.vendor.Target.call\n", encoding="utf-8")
+
+            args = SimpleNamespace(
+                report_dir=str(report_dir),
+                output_dir=str(output_dir),
+                all_changed_apis=str(all_changed_apis),
+                source_dirs=[str(source_dir)],
+                dependency_source_mappings=[
+                    f"com.example:used={used_dep_dir}",
+                    f"com.example:unused={unused_dep_dir}",
+                ],
+                allow_degraded=False,
+                jdk_scan_dir="",
+                max_methods=None,
+                max_depth=5,
+            )
+
+            business_root = {
+                "root": str(source_dir),
+                "owner_type": "business",
+                "owner_coord": "BUSINESS",
+                "module": "java",
+            }
+            used_root = {
+                "root": str(used_dep_dir),
+                "owner_type": "dependency",
+                "owner_coord": "com.example:used",
+                "module": "java",
+            }
+            dependency_mapping_args = []
+            business_graph_result = {
+                "graph": SimpleNamespace(reverse_edges={}, methods_by_id={}),
+                "type_metadata": {},
+                "stats": {"parser_usage": {}, "parser_fallback_reasons": {}, "truncated": False, "edge_cap_hits": 0},
+                "analysis_cache": [],
+            }
+            full_graph_result = {
+                "graph": SimpleNamespace(reverse_edges={}, methods_by_id={}),
+                "type_metadata": {},
+                "stats": {"parser_usage": {}, "parser_fallback_reasons": {}, "truncated": False, "edge_cap_hits": 0},
+                "analysis_cache": [],
+            }
+
+            def fake_build_source_roots(source_dirs_arg, dependency_mappings_arg):
+                dependency_mapping_args.append(list(dependency_mappings_arg or []))
+                if dependency_mappings_arg:
+                    return [business_root, used_root]
+                return [business_root]
+
+            with patch.object(step5, "auto_discover_bridge_sources"), \
+                 patch.object(step5, "load_changed_apis", return_value=[{"coord": "com.vendor:target", "api_name": "com.vendor.Target.call"}]), \
+                 patch.object(step5, "build_runtime_dependency_catalog", return_value={"by_coord": {"com.example:used": {"coord": "com.example:used"}}}), \
+                 patch.object(step5, "build_source_roots", side_effect=fake_build_source_roots), \
+                 patch.object(step5, "build_enhanced_source_graph", side_effect=[business_graph_result, full_graph_result]), \
+                 patch.object(step5, "check_apis_that_need_bridge", return_value={}), \
+                 patch.object(step5, "build_jar_metadata_for_source_roots", return_value={"jar_paths": {}, "by_coord": {}, "by_class": {}}), \
+                 patch.object(step5, "trace_all_apis_with_confidence_weighting", return_value=[]), \
+                 patch.object(step5, "generate_enhanced_summary"):
+                exit_code = step5.step5_integrated_main(args)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                dependency_mapping_args,
+                [
+                    [],
+                    [f"com.example:used={used_dep_dir}"],
+                ],
+            )
+
     def test_build_enhanced_source_graph_can_drop_analysis_cache_for_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
             business_dir = Path(tmp) / "business" / "src" / "main" / "java" / "com" / "example"
@@ -7491,6 +7888,69 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
             self.assertEqual(calls, [("App.java", "business", True), ("Lib.java", "dependency", True)])
 
+    def test_dependency_source_mappings_are_filtered_to_current_runtime_catalog(self):
+        mappings = [
+            "/broken/mapping",
+            "com.example:used=/tmp/used-src",
+            "com.example:unused=/tmp/unused-src",
+            "com.example:versioned:jar:tests=/tmp/versioned-src",
+        ]
+        catalog = {
+            "by_coord": {
+                "__business__": {"coord": "__business__"},
+                "com.example:used": {"coord": "com.example:used"},
+                "com.example:versioned": {"coord": "com.example:versioned"},
+            }
+        }
+
+        filtered, skipped = step5.filter_dependency_source_mappings_for_runtime(mappings, catalog)
+
+        self.assertEqual(
+            filtered,
+            [
+                "com.example:used=/tmp/used-src",
+                "com.example:versioned:jar:tests=/tmp/versioned-src",
+            ],
+        )
+        self.assertEqual(
+            [item["reason"] for item in skipped],
+            ["invalid_mapping_format", "dependency_source_not_in_current_runtime_catalog"],
+        )
+        self.assertEqual(skipped[1]["coord"], "com.example:unused")
+
+    def test_dependency_source_graph_does_not_index_simple_method_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dependency_dir = Path(tmp) / "dependency" / "src" / "main" / "java" / "com" / "unused"
+            dependency_dir.mkdir(parents=True)
+            (dependency_dir / "UnusedAdapter.java").write_text(
+                "\n".join(
+                    [
+                        "package com.unused;",
+                        "public class UnusedAdapter {",
+                        "    public boolean call(String value) {",
+                        "        return removed(value);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            source_roots = [{
+                "root": str(dependency_dir.parent.parent.parent),
+                "owner_type": "dependency",
+                "owner_coord": "com.example:unused",
+                "module": "unused",
+            }]
+
+            graph_result = step5.build_enhanced_source_graph(source_roots)
+
+            self.assertIn(
+                "com.unused.UnusedAdapter.removed(String)",
+                graph_result["graph"].reverse_edges,
+            )
+            self.assertNotIn("method:removed(String)", graph_result["graph"].reverse_edges)
+            self.assertNotIn("method:removed", graph_result["graph"].reverse_edges)
+
     def test_build_enhanced_source_graph_does_not_hydrate_dependency_only_external_types(self):
         with tempfile.TemporaryDirectory() as tmp:
             business_dir = Path(tmp) / "business" / "src" / "main" / "java" / "com" / "example"
@@ -7678,6 +8138,152 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertEqual(result.analysis_status, "reachable")
             self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
             self.assertIn("UserController.getAllUsers", result.call_paths[0])
+
+    def test_business_field_interface_call_is_resolved_to_fqcn_not_simple_method_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            business_dir = Path(tmp) / "business" / "src" / "main" / "java" / "com" / "example" / "app"
+            dependency_dir = Path(tmp) / "dependency" / "src" / "main" / "java" / "com" / "example" / "service"
+            business_dir.mkdir(parents=True)
+            dependency_dir.mkdir(parents=True)
+
+            (business_dir / "CallCpsRepayApplyAction.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example.app;",
+                        "",
+                        "import com.example.service.RmbService;",
+                        "import com.example.service.RmbServiceDef;",
+                        "import com.example.service.SendMessageCtx;",
+                        "import java.util.Map;",
+                        "",
+                        "public class CallCpsRepayApplyAction {",
+                        "    @javax.annotation.Resource",
+                        "    private RmbService rmbService;",
+                        "",
+                        "    public void callRmb(RmbServiceDef def, Map map, SendMessageCtx ctx) {",
+                        "        rmbService.sendAndReceiveRMBMessage(def, map, ctx);",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (dependency_dir / "RmbService.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example.service;",
+                        "",
+                        "import java.util.Map;",
+                        "",
+                        "public interface RmbService {",
+                        "    void sendAndReceiveRMBMessage(RmbServiceDef def, Map map, SendMessageCtx ctx);",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (dependency_dir / "BclfsRmbService.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example.service;",
+                        "",
+                        "import java.util.Map;",
+                        "",
+                        "public class BclfsRmbService implements RmbService {",
+                        "    public void sendAndReceiveRMBMessage(RmbServiceDef def, Map map, SendMessageCtx ctx) {",
+                        "        new BclfsSendCpsMsgLowerCaseTrace().regTrace();",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (dependency_dir / "BclfsSendCpsMsgLowerCaseTrace.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example.service;",
+                        "",
+                        "import org.apache.commons.lang.StringUtils;",
+                        "",
+                        "public class BclfsSendCpsMsgLowerCaseTrace {",
+                        "    public void regTrace() {",
+                        '        StringUtils.equals("a", "b");',
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (dependency_dir / "RmbServiceDef.java").write_text(
+                "package com.example.service; public class RmbServiceDef {}\n",
+                encoding="utf-8",
+            )
+            (dependency_dir / "SendMessageCtx.java").write_text(
+                "package com.example.service; public class SendMessageCtx {}\n",
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph(
+                [
+                    {
+                        "root": str(business_dir.parent.parent.parent),
+                        "owner_type": "business",
+                        "owner_coord": "BUSINESS",
+                        "module": "app",
+                    },
+                    {
+                        "root": str(dependency_dir.parent.parent.parent),
+                        "owner_type": "dependency",
+                        "owner_coord": "sample:rmb-service",
+                        "module": "rmb-service",
+                    },
+                ]
+            )
+            graph = graph_result["graph"]
+            interface_call_key = (
+                "com.example.service.RmbService."
+                "sendAndReceiveRMBMessage(RmbServiceDef, Map, SendMessageCtx)"
+            )
+
+            self.assertIn(interface_call_key, graph.reverse_edges)
+            business_edges = [
+                edge
+                for edge in graph.reverse_edges[interface_call_key]
+                if edge.caller_qualified_key == "com.example.app.CallCpsRepayApplyAction.callRmb"
+            ]
+            self.assertEqual(1, len(business_edges))
+            self.assertEqual("high", business_edges[0].confidence)
+            self.assertEqual(interface_call_key, business_edges[0].callee_key)
+            self.assertEqual(
+                "method:sendAndReceiveRMBMessage(RmbServiceDef, Map, SendMessageCtx)",
+                business_edges[0].callee_simple_key,
+            )
+            result = tracer.trace_api_with_confidence_weighting(
+                {
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.equals",
+                    "api_simple": "equals",
+                    "api_signature": "(String, String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "severity": "P0",
+                    "confirmed": "true",
+                    "source": "old_jar",
+                    "analysis_scope": "method",
+                },
+                graph,
+                graph_result["type_metadata"],
+                max_total_cost=5,
+            )
+
+            self.assertEqual("reachable", result.analysis_status)
+            self.assertEqual("SYSTEM_CODE_REACHED", result.reason_code)
+            joined_paths = "\n".join(result.call_paths)
+            self.assertIn("CallCpsRepayApplyAction.callRmb", joined_paths)
+            self.assertIn("RmbService.sendAndReceiveRMBMessage", joined_paths)
+            self.assertIn("BclfsRmbService.sendAndReceiveRMBMessage", joined_paths)
+            self.assertIn("BclfsSendCpsMsgLowerCaseTrace.regTrace", joined_paths)
+            self.assertIn("StringUtils.equals", joined_paths)
 
     def test_trace_api_keeps_upstream_business_chain_after_first_system_hit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -10107,7 +10713,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         output = stderr.getvalue()
         self.assertIn('"topic": "method_lookup_resolution"', output)
-        self.assertIn("no lookup groups matched reverse edges", output)
+        self.assertIn("no precise lookup groups matched reverse edges", output)
 
     def test_debug_logging_emits_trace_lifecycle_details_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:

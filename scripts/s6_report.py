@@ -34,8 +34,6 @@ from pipeline_constants import (
 )
 
 S6_INLINE_LIMIT = 20
-S6_IMPACT_INLINE_LIMIT = 15
-S6_ENTRY_INLINE_LIMIT = 20
 S6_NOT_FOUND_INLINE_LIMIT = S6_INLINE_LIMIT
 S6_DETAIL_MD_FULL_LIMIT = 200
 S6_DETAIL_MD_SAMPLE_LIMIT = 50
@@ -283,11 +281,105 @@ def _md_cell(value, limit=240):
     return text
 
 
+def _api_short_name(item):
+    api = str(item.get('api') or item.get('api_name') or '').strip()
+    if not api:
+        return ''
+    if '(' in api:
+        api = api.split('(', 1)[0]
+    return api.rsplit('.', 1)[-1] if '.' in api else api
+
+
+def _human_signature(signature):
+    text = str(signature or '').strip()
+    if not text:
+        return ''
+    text = text.strip('`')
+    if text.startswith('(') and text.endswith(')'):
+        text = text[1:-1]
+    if not text:
+        return '无参数'
+    parts = []
+    for part in text.split(','):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        cleaned = cleaned.replace('java.lang.', '')
+        cleaned = cleaned.replace('java.util.', '')
+        cleaned = cleaned.replace('$', '.')
+        parts.append(cleaned)
+    return ', '.join(parts) if parts else '无参数'
+
+
+def _human_symbol_kind(kind):
+    text = str(kind or '').strip().lower()
+    labels = {
+        'class': '类',
+        'interface': '接口',
+        'method': '方法',
+        'constructor': '构造方法',
+        'field': '字段',
+        'enum': '枚举',
+        'annotation': '注解',
+    }
+    return labels.get(text, text or 'API')
+
+
+def _human_change_type(change_type, symbol_kind=''):
+    text = str(change_type or '').strip().upper()
+    kind = _human_symbol_kind(symbol_kind)
+    labels = {
+        'REMOVED': f'删除{kind}',
+        'METHOD_REMOVED': '删除方法',
+        'CLASS_REMOVED': '删除类',
+        'FIELD_REMOVED': '删除字段',
+        'CONSTRUCTOR_REMOVED': '删除构造方法',
+        'ADDED': f'新增{kind}',
+        'METHOD_ADDED': '新增方法',
+        'CLASS_ADDED': '新增类',
+        'FIELD_ADDED': '新增字段',
+        'MODIFIED': f'修改{kind}',
+        'CHANGED': f'修改{kind}',
+        'METHOD_CHANGED': '修改方法',
+        'FIELD_CHANGED': '修改字段',
+        'BEHAVIOR_CHANGED': '行为变化',
+        'CONSTANT_VALUE_CHANGED': '常量值变化',
+        'SIGNATURE_CHANGED': '方法签名变化',
+        'RETURN_TYPE_CHANGED': '返回类型变化',
+        'ACCESS_MODIFIER_CHANGED': '访问权限变化',
+        'DEPRECATED': f'废弃{kind}',
+    }
+    if text in labels:
+        return labels[text]
+    if text.endswith('_REMOVED'):
+        return f'删除{kind}'
+    if text.endswith('_ADDED'):
+        return f'新增{kind}'
+    if text.endswith('_CHANGED') or text.endswith('_MODIFIED'):
+        return f'修改{kind}'
+    return text.replace('_', ' ').strip().capitalize() if text else f'{kind}变化'
+
+
+def _change_summary(item, severity=''):
+    change = _human_change_type(item.get('change_type'), item.get('symbol_kind'))
+    api_short = _api_short_name(item)
+    signature = _human_signature(item.get('api_signature'))
+    sev = str(severity or item.get('severity') or '').strip()
+    pieces = [change]
+    if api_short:
+        pieces.append(api_short)
+    if signature:
+        pieces.append(f"参数：{signature}")
+    if sev:
+        pieces.append(f"严重级别：{sev}")
+    return "，".join(pieces)
+
+
 def _detail_row(idx, item):
     reason = item.get("user_reason") or item.get("reason") or item.get("recommended_action") or ""
     return (
         f"| {idx} | `{_md_cell(item.get('coord'))}` | `{_md_cell(item.get('api'))}` | "
-        f"`{_md_cell(item.get('api_signature'), 160)}` | `{_md_cell(item.get('symbol_kind'))}` | "
+        f"{_md_cell(_change_summary(item), 220)} | "
         f"`{_md_cell(item.get('reason_code'))}` | {_md_cell(reason)} |"
     )
 
@@ -339,8 +431,8 @@ def build_bucket_detail_markdown(config, items, csv_name):
         lines += [
             "## API 明细（完整）",
             "",
-            "| # | 依赖坐标 | API | 签名 | 符号 | 原因码 | 说明 |",
-            "|---:|---|---|---|---|---|---|",
+            "| # | 依赖坐标 | API | 变化 | 原因码 | 说明 |",
+            "|---:|---|---|---|---|---|",
         ]
         for idx, item in enumerate(items, 1):
             lines.append(_detail_row(idx, item))
@@ -351,8 +443,8 @@ def build_bucket_detail_markdown(config, items, csv_name):
             "",
             f"> 本桶共有 {len(items)} 条，Markdown 只展示样例，避免明细文件自身难以阅读或预览失败；完整全集请看 `{csv_name}`。",
             "",
-            "| # | 依赖坐标 | API | 签名 | 符号 | 原因码 | 说明 |",
-            "|---:|---|---|---|---|---|---|",
+            "| # | 依赖坐标 | API | 变化 | 原因码 | 说明 |",
+            "|---:|---|---|---|---|---|",
         ]
         for idx, item in enumerate(items[:S6_DETAIL_MD_SAMPLE_LIMIT], 1):
             lines.append(_detail_row(idx, item))
@@ -381,6 +473,14 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
     csv_path = report_path / config.get("csv", f"s6_{bucket_name}_apis.csv")
     md_path = report_path / config.get("md", f"s6_{bucket_name}_apis.md")
     fieldnames = [
+        "conclusion",
+        "change_summary",
+        "review_reason",
+        "chain_summary",
+        "chain_entry",
+        "chain_target",
+        "chain_hop_count",
+        "chain_detail",
         "coord",
         "api",
         "api_signature",
@@ -397,7 +497,17 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for item in items:
-            writer.writerow({key: _csv_cell(item.get(key)) for key in fieldnames})
+            row = {key: _csv_cell(item.get(key)) for key in fieldnames}
+            chain_view = _csv_chain_view(item)
+            row["conclusion"] = _csv_cell(_bucket_csv_conclusion(bucket_name, item))
+            row["change_summary"] = _change_summary(item)
+            row["review_reason"] = _csv_cell(item.get("user_reason") or item.get("reason") or item.get("reason_code") or "")
+            row["chain_summary"] = _csv_cell(chain_view["summary"])
+            row["chain_entry"] = _csv_cell(chain_view["entry"])
+            row["chain_target"] = _csv_cell(chain_view["target"])
+            row["chain_hop_count"] = _csv_cell(chain_view["hop_count"])
+            row["chain_detail"] = _csv_cell(chain_view["detail"])
+            writer.writerow(row)
 
     write_text(
         str(md_path),
@@ -406,6 +516,79 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
     artifacts[f"{bucket_name}_csv"] = relpath_for_report(csv_path, report_dir)
     artifacts[f"{bucket_name}_md"] = relpath_for_report(md_path, report_dir)
     return artifacts
+
+
+def _bucket_csv_conclusion(bucket_name, item):
+    if bucket_name == "not_found":
+        return "未发现静态调用路径"
+    if bucket_name == "not_analyzed":
+        return "未完成分析"
+    user_conclusion = str((item or {}).get("user_conclusion") or "").strip()
+    if user_conclusion:
+        return user_conclusion
+    return {
+        "probable_impact": "可能影响",
+        "uncertain": "需要人工复核",
+        "needs_input": "需要补充输入",
+        "not_analyzed": "未完成分析",
+        "not_found": "未发现静态调用路径",
+    }.get(bucket_name, "需要人工复核")
+
+
+def _csv_chain_view(item):
+    item = item or {}
+    nodes = []
+    for path in item.get("call_paths") or []:
+        nodes = _split_csv_chain_nodes(path)
+        if nodes:
+            break
+    if not nodes:
+        for evidence_path in item.get("evidence_paths") or []:
+            nodes = _nodes_from_csv_evidence(evidence_path)
+            if nodes:
+                break
+    api = str(item.get("api") or item.get("api_name") or "").strip()
+    if not nodes and api:
+        return {
+            "summary": f"未形成完整链路；目标 API：{api}",
+            "entry": "",
+            "target": api,
+            "hop_count": "",
+            "detail": api,
+        }
+    if not nodes:
+        return {"summary": "未形成完整链路", "entry": "", "target": "", "hop_count": "", "detail": ""}
+    entry = nodes[0]
+    target = nodes[-1]
+    hop_count = max(0, len(nodes) - 1)
+    return {
+        "summary": f"入口：{entry}；终点：{target}；{hop_count} 跳" if len(nodes) >= 2 else f"未形成完整链路；目标 API：{target}",
+        "entry": entry if len(nodes) >= 2 else "",
+        "target": target,
+        "hop_count": str(hop_count) if len(nodes) >= 2 else "",
+        "detail": " -> ".join(f"{idx}. {node}" for idx, node in enumerate(nodes, 1)),
+    }
+
+
+def _split_csv_chain_nodes(path_text):
+    text = str(path_text or "").strip()
+    if not text:
+        return []
+    normalized = text.replace("→", "->")
+    parts = [part.strip() for part in normalized.split("->") if part.strip()]
+    return parts if len(parts) >= 2 else ([text] if text else [])
+
+
+def _nodes_from_csv_evidence(evidence_path):
+    nodes = []
+    for edge in evidence_path or []:
+        caller = str(edge.get("caller_symbol") or "").strip()
+        callee = str(edge.get("callee_key") or "").strip()
+        if caller and (not nodes or nodes[-1] != caller):
+            nodes.append(caller)
+        if callee and (not nodes or nodes[-1] != callee):
+            nodes.append(callee)
+    return nodes
 
 
 def write_not_found_detail_artifacts(report_dir, findings):
@@ -1120,204 +1303,6 @@ def _join_inline(values, limit=3, empty="-"):
     return text
 
 
-def _status_counts_cell(counts):
-    if not counts:
-        return "-"
-    labels = {
-        "reachable": "已确认",
-        "uncertain": "待确认",
-        "not_analyzed": "未分析",
-        "not_found_in_static_analysis": "未发现调用路径",
-    }
-    return "<br>".join(
-        f"{labels.get(status, status)}: {count}"
-        for status, count in counts.items()
-    )
-
-
-def _status_counts_text(counts):
-    if not counts:
-        return "-"
-    labels = {
-        "reachable": "已确认",
-        "uncertain": "待确认",
-        "not_analyzed": "未分析",
-        "not_found_in_static_analysis": "未发现调用路径",
-    }
-    return "，".join(
-        f"{labels.get(status, status)} {count}"
-        for status, count in counts.items()
-    )
-
-
-def _render_inline_list(title, values, limit=3):
-    cleaned = [str(value or "").strip() for value in values or [] if str(value or "").strip()]
-    if not cleaned:
-        return f"- **{title}**：-"
-    rendered = "；".join(f"`{_md_cell(value, 220)}`" for value in cleaned[:limit])
-    if len(cleaned) > limit:
-        rendered += f"；…另 {len(cleaned) - limit} 项"
-    return f"- **{title}**：{rendered}"
-
-
-def _top_modules_from_items(items, limit=5):
-    counts = defaultdict(int)
-    for item in items or []:
-        for module in item.get("sample_modules") or []:
-            counts[module] += 1
-    return [module for module, _count in sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:limit]]
-
-
-def _render_api_cards(title, items, limit, empty_text, review=False):
-    lines = [title, ""]
-    if not items:
-        lines += [empty_text, ""]
-        return lines
-    for idx, item in enumerate(items[:limit], 1):
-        lines += [
-            f"#### {idx}. `{_md_cell(item.get('api'), 220)}`",
-            "",
-            f"- **变化**：`{_md_cell(item.get('change_type'))}` / `{_md_cell(item.get('symbol_kind'))}`"
-            + (f" / `{_md_cell(item.get('api_signature'))}`" if item.get("api_signature") else ""),
-            f"- **影响范围**：{item.get('entry_count', 0)} 个业务入口，{item.get('module_count', 0)} 个模块/组件；链路状态：{_status_counts_text(item.get('status_counts'))}",
-            _render_inline_list("涉及模块", item.get("sample_modules"), limit=5),
-            _render_inline_list("代表业务入口", item.get("sample_entries"), limit=3),
-        ]
-        if review:
-            reasons = item.get("sample_reasons") or item.get("sample_actions") or []
-            lines.append(_render_inline_list("中断原因/建议", reasons, limit=2))
-            lines.append(_render_inline_list("证据文件", item.get("sample_files"), limit=2))
-        lines.append("")
-    if len(items) > limit:
-        lines += [f"> 还有 {len(items) - limit} 个未在主报告展开，请查看 Step5 的 `alerts.csv` 及按状态拆分文件。", ""]
-    return lines
-
-
-def render_impact_overview_section(findings):
-    overview = findings.get("impact_overview") or {}
-    confirmed = overview.get("confirmed_apis") or []
-    review = overview.get("review_apis") or []
-    entries = overview.get("business_entries") or []
-    stat = findings.get("scan_stats") or {}
-    p0 = findings.get("p0") or []
-    p1 = findings.get("p1") or []
-    p2 = findings.get("p2") or []
-    probable_impact = findings.get("probable_impact") or []
-    needs_input = findings.get("needs_input") or []
-    not_analyzed = [
-        item for item in findings.get("not_analyzed") or []
-        if item.get("user_conclusion") not in {"可能影响", "需要补充输入"}
-    ]
-    not_found = findings.get("not_found") or []
-    call_status = stat.get("call_chain_status", "done")
-    lines = [
-        "## 一、核心结论",
-        "",
-        "这一节只回答三个问题：是否确认影响、影响面有多大、下一步先做什么。",
-        "",
-    ]
-    if not confirmed and not review and not entries:
-        lines += [
-            "- 当前没有从 Step5 链路台账中提取到具体影响链路。",
-            "- 若 Step5 被跳过或 alerts.csv 缺失，请先检查 Step4/Step5 产物是否完整。",
-            "",
-        ]
-        return lines
-
-    total_entries = len(entries)
-    top_modules = _top_modules_from_items(confirmed + review)
-    lines += [
-        "### 1.1 结论卡片",
-        "",
-        "| 项目 | 结果 |",
-        "|---|---|",
-        f"| 调用链分析状态 | `{call_status}` |",
-        f"| 已确认影响 | {len(confirmed)} 个变更 API，约 {total_entries} 个业务入口 |",
-        f"| 需要人工复核 | {len(review)} 个变更 API |",
-        f"| 主要影响模块 | {', '.join(f'`{item}`' for item in top_modules) if top_modules else '暂未识别'} |",
-        "",
-        "### 1.2 风险分布",
-        "",
-        "| 类别 | 数量 |",
-        "|---|---:|",
-        f"| P0 静态编译不兼容候选 | {len(p0)} |",
-        f"| P1 运行时崩溃 | {len(p1)} |",
-        f"| P2 行为异常 | {len(p2)} |",
-        f"| 待人工验证 | {len(review)} |",
-        f"| 可能影响 | {len(probable_impact)} |",
-        f"| 缺少依赖源码/构建产物，无法回溯调用链 | {len(needs_input)} |",
-        f"| 本次未完成分析 | {len(not_analyzed)} |",
-        f"| 未发现调用路径 | {len(not_found)} |",
-        "",
-        "### 1.3 建议处理顺序",
-        "",
-    ]
-    if confirmed:
-        lines += [
-            "1. 先处理“已确认触达业务代码”的 API：这些已经有调用链证据，不需要再争论是否可能影响。",
-            "2. 按第 3 节的依赖和模块分派负责人，再到 `evidence/call_chain/alerts.csv` 定位具体链路。",
-        ]
-    else:
-        lines += [
-            "1. 当前没有确认触达业务代码的 API；不要直接表述为“无影响”，应先看第 5 节的未确认原因。",
-        ]
-    if review:
-        lines.append("3. 对“需要人工复核”的 API，优先核对 stop_reason、consumer 信息和 evidence_files。")
-    if findings.get("needs_input"):
-        lines.append("4. 如果存在“缺少依赖源码/构建产物，无法回溯调用链”，先补齐依赖源码、目标模块或构建产物后重跑相关 Step。")
-    if findings.get("not_found"):
-        lines.append("5. “未发现调用路径”只表示当前静态证据未发现路径，建议按附录C抽样复核。")
-    lines.append("")
-
-    if confirmed:
-        lines += _render_api_cards(
-            f"## 二、已确认影响清单（{len(confirmed)} 个变更 API）",
-            confirmed,
-            S6_IMPACT_INLINE_LIMIT,
-            "✅ 暂无已确认触达业务代码的变更 API。",
-        )
-
-    if review:
-        lines += _render_api_cards(
-            f"### 2.1 需要人工复核但已有候选线索（{len(review)} 个变更 API）",
-            review,
-            S6_IMPACT_INLINE_LIMIT,
-            "✅ 暂无需要人工复核的候选线索。",
-            review=True,
-        )
-
-    lines += [
-        "> 本节只回答“影响了什么、影响面多大”；逐链路证据在第 4 节和 `evidence/call_chain/alerts.csv`。",
-        "",
-    ]
-    return lines
-
-
-def render_business_entries_section(findings, section_no="3.3"):
-    overview = findings.get("impact_overview") or {}
-    entries = overview.get("business_entries") or []
-    if not entries:
-        return []
-    lines = [
-        f"### {section_no} 受影响业务入口 Top {min(S6_ENTRY_INLINE_LIMIT, len(entries))}",
-        "",
-        "| 业务入口 | 关联变更 API 数 | 链路命中数 | 示例变更 API | 示例证据文件 |",
-        "|---|---:|---:|---|---|",
-    ]
-    for item in entries[:S6_ENTRY_INLINE_LIMIT]:
-        lines.append(
-            f"| `{_md_cell(item.get('entry'), 180)}` | {item.get('api_count', 0)} | "
-            f"{item.get('path_count', 0)} | {_join_inline(item.get('sample_apis'))} | "
-            f"{_join_inline(item.get('sample_files'), limit=2)} |"
-        )
-    lines += [
-        "",
-        "> 这里只展示入口聚合视图；完整链路仍以 `evidence/call_chain/alerts.csv` 为准。",
-        "",
-    ]
-    return lines
-
-
 def render_report_toc():
     return [
         "## 报告目录",
@@ -1332,40 +1317,6 @@ def render_report_toc():
         "> 关键证据在主表中展示；完整逐链路台账以 `evidence/call_chain/alerts.csv` 为准。",
         "",
     ]
-
-
-def _item_action_reason(item):
-    return (
-        item.get('user_reason')
-        or item.get('reason')
-        or item.get('reason_code')
-        or ''
-    )
-
-
-def _render_result_bucket(title, items, meaning, evidence, limit=S6_INLINE_LIMIT):
-    lines = [f"### {title}（{len(items)} 项）", ""]
-    if not items:
-        lines += ["✅ 暂无", ""]
-        return lines
-    lines += [
-        f"- **分类含义**：{meaning}",
-        f"- **证据入口**：{evidence}",
-        "",
-        "| # | 依赖坐标 | 变更 API | 变化 | 分析依据 |",
-        "|---:|---|---|---|---|",
-    ]
-    for idx, item in enumerate(items[:limit], 1):
-        lines.append(
-            f"| {idx} | `{_md_cell(item.get('coord'))}` | `{_md_cell(item.get('api'), 220)}` | "
-            f"`{_md_cell(item.get('change_type'))}` / `{_md_cell(item.get('symbol_kind'))}`"
-            f"{('<br>`' + _md_cell(item.get('api_signature'), 160) + '`') if item.get('api_signature') else ''} | "
-            f"{_md_cell(_item_action_reason(item), 220)} |"
-        )
-    if len(items) > limit:
-        lines += ["", f"> 其余 {len(items) - limit} 项不在主报告展开，完整集合见对应明细文件或 `evidence/call_chain/alerts.csv`。"]
-    lines.append("")
-    return lines
 
 
 def _status_label_from_item(item):
@@ -1542,67 +1493,6 @@ def render_core_conclusion(findings):
     return lines
 
 
-def render_result_layers_section(findings):
-    p0 = findings.get('p0') or []
-    p1 = findings.get('p1') or []
-    p2 = findings.get('p2') or []
-    probable = findings.get('probable_impact') or []
-    uncertain = findings.get('uncertain') or []
-    needs_input = findings.get('needs_input') or []
-    not_analyzed = [
-        item for item in findings.get('not_analyzed') or []
-        if item.get('user_conclusion') not in {'可能影响', '需要补充输入'}
-    ]
-    not_found = findings.get('not_found') or []
-    high_risk = p0 + p1 + p2
-    lines = [
-        "## 二、分析结果分层",
-        "",
-        "这一节按结果确定性分层展示，不包含处置建议。",
-        "",
-    ]
-    if not (high_risk or probable or uncertain or needs_input or not_analyzed or not_found):
-        lines += ["✅ 没有可展示的影响、未确认或覆盖缺口条目。", ""]
-        return lines
-    lines += _render_result_bucket(
-        "2.1 已确认/高风险影响项",
-        high_risk,
-        "存在系统代码触达证据，或变更类型被归入编译/运行/行为高风险。",
-        "`evidence/call_chain/alerts.csv` 为完整链路台账；`evidence/api_changes/all_changed_apis.csv` 为变更事实集合。",
-    )
-    lines += _render_result_bucket(
-        "2.2 可能影响",
-        probable,
-        "已有强相关证据，但还没有证明当前系统代码一定会调用到该 API。",
-        "`deliverables/s6_probable_impact_apis.csv/md` 与 `evidence/call_chain/alerts.csv`。",
-    )
-    lines += _render_result_bucket(
-        "2.3 需人工复核",
-        uncertain,
-        "存在候选线索，但证据链存在冲突、歧义或无法完全回溯。",
-        "`deliverables/s6_uncertain_apis.csv/md`、`evidence/call_chain/alerts.csv`。",
-    )
-    lines += _render_result_bucket(
-        "2.4 缺少依赖源码/构建产物，无法回溯调用链",
-        needs_input,
-        "缺少依赖源码、目标模块或构建产物，当前无法完整回溯调用链。",
-        "`s6_needs_input_apis.csv/md`。",
-    )
-    lines += _render_result_bucket(
-        "2.5 本次未完成分析",
-        not_analyzed,
-        "工具已知未完成有效分析，不能解释为不影响。",
-        "`s6_not_analyzed_apis.csv/md`。",
-    )
-    lines += _render_result_bucket(
-        "2.6 未发现调用路径",
-        not_found,
-        "当前源码中未找到调用路径；不等于确定不影响。",
-        "`deliverables/s6_not_found_apis.csv/md`；完整链路台账见 `evidence/call_chain/alerts.csv`。",
-    )
-    return lines
-
-
 def _identity_without_severity(item):
     return (
         str(item.get('coord', '') or '').strip(),
@@ -1614,13 +1504,7 @@ def _identity_without_severity(item):
 
 
 def _change_cell(item, severity=''):
-    parts = [
-        str(item.get('change_type') or '').strip(),
-        str(item.get('symbol_kind') or '').strip(),
-        str(item.get('api_signature') or '').strip(),
-        str(severity or item.get('severity') or '').strip(),
-    ]
-    return " / ".join(f"`{_md_cell(part, 120)}`" for part in parts if part)
+    return _md_cell(_change_summary(item, severity), 220)
 
 
 def _conclusion_for_report(item, fallback):
@@ -1668,6 +1552,46 @@ def _path_count_for_report(item, overview_lookup, sampled_paths):
     return max(count, len(sampled_paths or []))
 
 
+def _evidence_summary_text(row):
+    paths = row.get('paths') or []
+    if paths:
+        path_count = int(row.get('path_count') or len(paths))
+        if path_count > len(paths):
+            return f"有调用链证据；展示 {len(paths)} 条样例，台账命中 {path_count} 次"
+        return f"有 {len(paths)} 条调用链证据"
+    reason = _human_reason(row.get('reason'))
+    return reason or "-"
+
+
+def _render_path_sample_cards(rows):
+    cards = []
+    for idx, row in enumerate(rows, 1):
+        paths = row.get('paths') or []
+        if not paths:
+            continue
+        path_count = int(row.get('path_count') or len(paths))
+        cards += [
+            f"#### {idx}. `{_md_cell(row.get('api'), 220)}`",
+            "",
+            f"- **依赖坐标**：`{_md_cell(row.get('coord'), 180)}`",
+            f"- **变化**：{row.get('change') or '-'}",
+            f"- **结论**：{_md_cell(row.get('conclusion'), 160)}",
+            f"- **链路数量**：展示 {len(paths)} 条样例；台账命中 {path_count} 次",
+            "- **调用链样例**：",
+        ]
+        for path in paths:
+            cards.append(f"  - `{_md_cell(path, 320)}`")
+        cards.append("")
+    if not cards:
+        return []
+    return [
+        "### 3.1 调用链样例",
+        "",
+        "下面只展示主表中已找到链路的 API。完整逐链路台账以 `evidence/call_chain/alerts.csv` 为准。",
+        "",
+    ] + cards
+
+
 def _human_reason(value):
     text = str(value or '').strip()
     if not text:
@@ -1693,20 +1617,6 @@ def _human_reason(value):
         'BUSINESS_ARTIFACT_BYTECODE_USAGE': '业务制品字节码命中该 API。',
     }
     return labels.get(text, text.replace('_', ' ').strip().capitalize() if text.isupper() else text)
-
-
-def _result_evidence_reason(row):
-    paths = row.get('paths') or []
-    if paths:
-        path_count = int(row.get('path_count') or len(paths))
-        if path_count > len(paths):
-            prefix = f"展示 {len(paths)} 条样例；台账命中 {path_count} 次。<br>"
-        else:
-            prefix = f"共 {len(paths)} 条链路。<br>"
-        evidence = prefix + "<br>".join(f"`{_md_cell(path, 260)}`" for path in paths)
-        return evidence, "-"
-    reason = _human_reason(row.get('reason'))
-    return "-", _md_cell(reason, 260) if reason else "-"
 
 
 def build_api_result_rows(findings):
@@ -1781,16 +1691,15 @@ def render_api_result_table(findings):
         "`deliverables/s6_needs_input_apis.csv/md`、`deliverables/s6_not_analyzed_apis.csv/md`、`deliverables/s6_not_found_apis.csv/md`。",
         "> 排序：已确认/高风险、可能影响、需人工复核、缺少依赖源码/构建产物，无法回溯调用链、本次未完成分析、未发现调用路径。",
         "",
-        "| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |",
-        "|---|---|---|---|---|---|",
+        "| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |",
+        "|---|---|---|---|---|",
     ]
 
     for row in displayed:
-        evidence_cell, reason_cell = _result_evidence_reason(row)
         lines.append(
             f"| `{_md_cell(row.get('coord'), 180)}` | `{_md_cell(row.get('api'), 220)}` | "
             f"{row.get('change') or '-'} | {_md_cell(row.get('conclusion'), 160)} | "
-            f"{evidence_cell} | {reason_cell} |"
+            f"{_md_cell(_evidence_summary_text(row), 220)} |"
         )
     if skipped_by_conclusion:
         skipped = "；".join(f"{name} 省略 {count} 条" for name, count in skipped_by_conclusion.items())
@@ -1799,6 +1708,7 @@ def render_api_result_table(findings):
             f"> 主报告按结论类型各展示前 {S6_INLINE_LIMIT} 条，{skipped}。",
         ]
     lines.append("")
+    lines += _render_path_sample_cards(displayed)
     return lines
 
 
@@ -1891,12 +1801,8 @@ def generate_report(findings):
 def _fmt_issue(item):
     lines = [f"#### `{item.get('api','')}`", "",
              f"- **依赖坐标**：`{item.get('coord','?')}`",
-             f"- **变更类型**：{item.get('change_type','')}",
+             f"- **变化**：{_change_summary(item)}",
              f"- **业务直接命中**：{item.get('direct_callers',0)} 处"]
-    if item.get('symbol_kind'):
-        lines.append(f"- **符号类型**：`{item.get('symbol_kind')}`")
-    if item.get('api_signature'):
-        lines.append(f"- **方法签名**：`{item.get('api_signature')}`")
     if item.get('reason_code'):
         lines.append(f"- **原因码**：`{item.get('reason_code')}`")
     if item.get('user_conclusion'):

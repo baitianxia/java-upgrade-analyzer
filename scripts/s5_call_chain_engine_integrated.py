@@ -829,12 +829,52 @@ def _step5_integrated_main_impl(args):
         ],
     )
 
+    _report_step5_debug_event(
+        'CATALOG',
+        's5_call_chain_engine_integrated.py:runtime-catalog',
+        'starting runtime dependency catalog build',
+        data={
+            'report_dir': report_dir,
+            'all_api_count': len(all_apis),
+        },
+    )
+    runtime_dependency_catalog = build_runtime_dependency_catalog(report_dir)
+    dependency_source_mappings, skipped_dependency_source_mappings = (
+        filter_dependency_source_mappings_for_runtime(
+            dependency_source_mappings,
+            runtime_dependency_catalog,
+        )
+    )
+    if skipped_dependency_source_mappings:
+        print(
+            f"  ⚠️ 已忽略 {len(skipped_dependency_source_mappings)} 个不属于当前运行时依赖的源码映射",
+            file=sys.stderr,
+        )
+    _report_step5_debug_event(
+        'CATALOG',
+        's5_call_chain_engine_integrated.py:runtime-catalog',
+        'finished runtime dependency catalog build',
+        data={
+            'report_dir': report_dir,
+            'runtime_coord_count': len((runtime_dependency_catalog or {}).get('by_coord') or {}),
+            'sample_runtime_coords': sorted(list(((runtime_dependency_catalog or {}).get('by_coord') or {}).keys()))[:8],
+            'dependency_source_mapping_count_after_runtime_filter': len(dependency_source_mappings or []),
+            'skipped_dependency_source_mappings': skipped_dependency_source_mappings[:20],
+        },
+    )
+
     print("\n构建业务源码基础图（跨依赖判定预分析）...", file=sys.stderr)
     business_graph_timer = time.perf_counter()
     emit_progress("step5", "graph", "开始构建业务源码基础图")
+    business_jar_metadata = build_jar_metadata_for_source_roots(
+        business_roots,
+        report_dir,
+        runtime_dependency_catalog=runtime_dependency_catalog,
+    )
     business_graph_result = build_enhanced_source_graph(
         business_roots,
         max_methods=getattr(args, 'max_methods', None),
+        jar_metadata=business_jar_metadata,
         retain_analysis_cache=bool(dependency_source_mappings),
     )
     business_graph_elapsed = time.perf_counter() - business_graph_timer
@@ -847,26 +887,6 @@ def _step5_integrated_main_impl(args):
 
     bridge_check_timer = time.perf_counter()
     emit_progress("step5", "bridge-check", "开始判断哪些 API 需要跨依赖继续分析")
-    _report_step5_debug_event(
-        'CATALOG',
-        's5_call_chain_engine_integrated.py:runtime-catalog',
-        'starting runtime dependency catalog build',
-        data={
-            'report_dir': report_dir,
-            'all_api_count': len(all_apis),
-        },
-    )
-    runtime_dependency_catalog = build_runtime_dependency_catalog(report_dir)
-    _report_step5_debug_event(
-        'CATALOG',
-        's5_call_chain_engine_integrated.py:runtime-catalog',
-        'finished runtime dependency catalog build',
-        data={
-            'report_dir': report_dir,
-            'runtime_coord_count': len((runtime_dependency_catalog or {}).get('by_coord') or {}),
-            'sample_runtime_coords': sorted(list(((runtime_dependency_catalog or {}).get('by_coord') or {}).keys()))[:8],
-        },
-    )
     api_bridge_requirements = check_apis_that_need_bridge(
         all_apis,
         report_dir,
@@ -1008,7 +1028,11 @@ def _step5_integrated_main_impl(args):
 
     # Phase 5: 构建增强型源码图
     source_roots = build_source_roots(business_source_dirs, dependency_source_mappings)
-    jar_metadata = build_jar_metadata_for_source_roots(source_roots, report_dir)
+    jar_metadata = build_jar_metadata_for_source_roots(
+        source_roots,
+        report_dir,
+        runtime_dependency_catalog=runtime_dependency_catalog,
+    )
     _step5_debug(
         'graph_roots',
         'prepared source roots and jar metadata',
@@ -1349,6 +1373,62 @@ def build_source_roots(source_dirs, dependency_source_mappings):
             })
 
     return roots
+
+
+def _coord_ga(coord):
+    parts = str(coord or '').strip().split(':')
+    if len(parts) < 2:
+        return ''
+    return ':'.join(parts[:2])
+
+
+def filter_dependency_source_mappings_for_runtime(dependency_source_mappings, runtime_dependency_catalog):
+    """
+    Keep dependency source mappings scoped to jars that are actually present in the
+    current runtime dependency catalog.
+
+    Dependency source is auxiliary evidence for jars used by the analyzed system;
+    it must not expand the graph through arbitrary source repositories provided by
+    the user. If the runtime catalog is unavailable, keep the old behavior rather
+    than silently dropping possible evidence.
+    """
+    mappings = list(dependency_source_mappings or [])
+    by_coord = (runtime_dependency_catalog or {}).get('by_coord') or {}
+    runtime_coords = {
+        str(coord or '').strip()
+        for coord in by_coord.keys()
+        if str(coord or '').strip() and str(coord or '').strip() != '__business__'
+    }
+    if not mappings or not runtime_coords:
+        return mappings, []
+
+    runtime_ga = {_coord_ga(coord) for coord in runtime_coords if _coord_ga(coord)}
+    kept = []
+    skipped = []
+    seen_kept = set()
+    for mapping in mappings:
+        raw = str(mapping or '').strip()
+        if '=' not in raw:
+            skipped.append({
+                'mapping': raw,
+                'coord': '',
+                'reason': 'invalid_mapping_format',
+            })
+            continue
+        coord, path = raw.split('=', 1)
+        coord = coord.strip()
+        coord_key = _coord_ga(coord)
+        if coord in runtime_coords or (coord_key and coord_key in runtime_ga):
+            if raw not in seen_kept:
+                kept.append(raw)
+                seen_kept.add(raw)
+            continue
+        skipped.append({
+            'mapping': raw,
+            'coord': coord,
+            'reason': 'dependency_source_not_in_current_runtime_catalog',
+        })
+    return kept, skipped
 
 
 def infer_module_name(path):
@@ -1904,13 +1984,63 @@ def hydrate_jar_metadata_for_classes(metadata, target_classes, source_known_clas
                 queued.add(normalized_parent)
 
 
-def build_jar_metadata_for_source_roots(source_roots, report_dir):
+def _index_jar_classes_for_source_resolution(metadata):
+    by_simple = defaultdict(set)
+    all_classes = set()
+    for jar_path in (metadata.get('jar_paths') or {}).values():
+        if not jar_path or not os.path.isfile(jar_path):
+            continue
+        try:
+            with zipfile.ZipFile(jar_path) as jar:
+                for name in jar.namelist():
+                    if not name.endswith('.class') or name.startswith('META-INF/'):
+                        continue
+                    if name.endswith('module-info.class') or name.endswith('package-info.class'):
+                        continue
+                    class_name = name[:-6].replace('/', '.')
+                    for prefix in ('BOOT-INF.classes.', 'WEB-INF.classes.'):
+                        if class_name.startswith(prefix):
+                            class_name = class_name[len(prefix):]
+                            break
+                    if class_name.startswith(('BOOT-INF.', 'WEB-INF.', 'lib.')):
+                        continue
+                    all_classes.add(class_name)
+                    simple = class_name.rsplit('.', 1)[-1].split('$', 1)[0]
+                    if simple:
+                        by_simple[simple].add(class_name)
+        except (OSError, zipfile.BadZipFile):
+            continue
+    metadata['all_class_fqcns'] = sorted(all_classes)
+    metadata['classes_by_simple'] = {
+        simple: sorted(values)
+        for simple, values in sorted(by_simple.items())
+    }
+    return metadata
+
+
+def build_jar_metadata_for_source_roots(source_roots, report_dir, runtime_dependency_catalog=None):
     coord_versions = _load_coord_versions(report_dir)
     metadata = {
         'by_coord': {},
         'by_class': {},
         'jar_paths': {},
+        'all_class_fqcns': [],
+        'classes_by_simple': {},
     }
+    for coord, item in ((runtime_dependency_catalog or {}).get('by_coord') or {}).items():
+        coord = str(coord or '').strip()
+        if not coord or coord == '__business__':
+            continue
+        jar_path = str((item or {}).get('jar_path') or '').strip()
+        if not jar_path or not os.path.isfile(jar_path):
+            continue
+        metadata['jar_paths'][coord] = jar_path
+        metadata['by_coord'].setdefault(coord, {
+            'coord': coord,
+            'version': str((item or {}).get('version') or ''),
+            'jar_path': jar_path,
+            'classes': {},
+        })
     dependency_coords = []
     seen_coords = set()
     for root in source_roots or []:
@@ -1936,7 +2066,7 @@ def build_jar_metadata_for_source_roots(source_roots, report_dir):
             'jar_path': jar_path,
             'classes': {},
         }
-    return metadata
+    return _index_jar_classes_for_source_resolution(metadata)
 
 
 def _collect_external_class_candidates(class_info, all_methods, resolve_type_name, known_classes):
@@ -2263,9 +2393,25 @@ def build_enhanced_source_graph(
     unique_signatures_by_qualified_key = defaultdict(set)
     unique_signatures_by_simple_key = defaultdict(set)
 
+    def is_probably_fully_qualified_method_key(edge_key):
+        value = str(edge_key or '').strip()
+        if not value or value.startswith(('method:', 'class:', 'field:', 'invokedynamic:')):
+            return False
+        prefix = value.split('(', 1)[0]
+        if '.' not in prefix:
+            return False
+        owner = prefix.rsplit('.', 1)[0]
+        return '.' in owner
+
     def build_reverse_edge_keys(edge):
+        callee_key = (getattr(edge, 'callee_key', '') or '').strip()
+        is_dependency_edge = getattr(edge, 'owner_type', '') == 'dependency'
+        if is_dependency_edge and not is_probably_fully_qualified_method_key(callee_key):
+            stats['dependency_edges_skipped_without_fqcn'] = stats.get('dependency_edges_skipped_without_fqcn', 0) + 1
+            return []
         keys = []
-        for edge_key in [edge.callee_key, edge.callee_simple_key]:
+        edge_key_candidates = [edge.callee_key] if is_dependency_edge else [edge.callee_key, edge.callee_simple_key]
+        for edge_key in edge_key_candidates:
             edge_key = (edge_key or '').strip()
             if not edge_key:
                 continue
@@ -2280,6 +2426,8 @@ def build_enhanced_source_graph(
                 ((edge.callee_key or '').strip(), unique_signatures_by_qualified_key),
                 ((edge.callee_simple_key or '').strip(), unique_signatures_by_simple_key),
             ]:
+                if is_dependency_edge and base_key == (edge.callee_simple_key or '').strip():
+                    continue
                 if not base_key or '(' in base_key:
                     continue
                 signatures = sorted(signature_map.get(base_key, set()))
@@ -2411,6 +2559,11 @@ def build_enhanced_source_graph(
     classes_by_simple = defaultdict(list)
     for class_fqcn in known_classes:
         classes_by_simple[class_fqcn.rsplit('.', 1)[-1]].append(class_fqcn)
+    classpath_classes = set(jar_metadata.get('all_class_fqcns') or [])
+    classpath_classes_by_simple = {
+        simple: list(values or [])
+        for simple, values in (jar_metadata.get('classes_by_simple') or {}).items()
+    }
 
     def resolve_type_name(raw_name, owner_info):
         name = (raw_name or '').strip()
@@ -2434,6 +2587,9 @@ def build_enhanced_source_graph(
         matches = classes_by_simple.get(name, [])
         if len(matches) == 1:
             return matches[0]
+        classpath_matches = classpath_classes_by_simple.get(name, [])
+        if len(classpath_matches) == 1:
+            return classpath_matches[0]
         if name == 'Object':
             return 'java.lang.Object'
         return package_candidate
@@ -2653,6 +2809,12 @@ def build_enhanced_source_graph(
         if class_fqcn not in known_classes:
             known_classes.add(class_fqcn)
             classes_by_simple[class_fqcn.rsplit('.', 1)[-1]].append(class_fqcn)
+    known_class_fqcns_for_resolution = set(known_classes) | classpath_classes | jar_classes
+    known_classes_by_simple_for_resolution = defaultdict(list)
+    for class_fqcn in sorted(known_class_fqcns_for_resolution):
+        simple = class_fqcn.rsplit('.', 1)[-1].split('$', 1)[0]
+        if simple and class_fqcn not in known_classes_by_simple_for_resolution[simple]:
+            known_classes_by_simple_for_resolution[simple].append(class_fqcn)
 
     for class_fqcn, info in class_info.items():
         info['extends'] = []
@@ -2888,6 +3050,8 @@ def build_enhanced_source_graph(
         method_def.known_method_return_types_by_signature = global_method_return_types_by_signature
         method_def.known_type_metadata = type_metadata
         method_def.known_field_types = global_field_types
+        method_def.known_class_fqcns = known_class_fqcns_for_resolution
+        method_def.known_classes_by_simple = dict(known_classes_by_simple_for_resolution)
 
     for method_def in all_methods:
         if getattr(method_def, 'method_name', '') == '<class-init>':

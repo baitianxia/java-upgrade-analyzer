@@ -42,6 +42,8 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════
 
 ALERTS_CSV_FIELDNAMES = [
+    'conclusion', 'change_summary', 'review_reason', 'chain_summary',
+    'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
     'api_id', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
     'symbol_kind', 'change_type', 'severity', 'api_status', 'path_status',
     'conclusion_level', 'action_type', 'business_reachable', 'business_entry',
@@ -117,6 +119,65 @@ def trace_result_to_api_entry(r):
         'recommended_action':  user_view['recommended_action'],
         'key_evidence':        user_view['key_evidence'],
     }
+
+
+def _api_display_name(result):
+    api_name = str(getattr(result, 'api_name', '') or '').strip()
+    signature = str(getattr(result, 'api_signature', '') or '').strip()
+    if api_name and signature and not api_name.endswith(signature):
+        return f"{api_name}{signature}"
+    return api_name or str(getattr(result, 'api_simple', '') or '').strip() or '<unknown-api>'
+
+
+def _short_api_name(result):
+    api_name = _api_display_name(result)
+    if '(' in api_name:
+        prefix, suffix = api_name.split('(', 1)
+        short = prefix.rsplit('.', 1)[-1]
+        return f"{short}({suffix}"
+    return api_name.rsplit('.', 1)[-1] if '.' in api_name else api_name
+
+
+def _first_call_path(result):
+    paths = list(getattr(result, 'call_paths', []) or [])
+    return paths[0] if paths else ''
+
+
+def _first_business_entry(result):
+    entry = _result_business_entry(result)
+    if entry:
+        return entry
+    first_path = _first_call_path(result)
+    if first_path:
+        separator = ' -> ' if ' -> ' in first_path else (' → ' if ' → ' in first_path else '')
+        if separator:
+            return first_path.split(separator, 1)[0].strip()
+    return ''
+
+
+def _summary_item_line(index, result, include_action=False):
+    view = summarize_user_facing_outcome(result)
+    api_name = _api_display_name(result)
+    entry = _first_business_entry(result)
+    entry_part = f" | 入口: {entry}" if entry else ""
+    reason = view['user_reason']
+    action = view['recommended_action']
+    line = (
+        f"  {index}. [{result.severity}] {result.coord} | {api_name}"
+        f" | 原因: {reason}{entry_part}"
+    )
+    if include_action and action:
+        line += f" | 建议: {action}"
+    return line
+
+
+def _reason_summary(results):
+    grouped = defaultdict(int)
+    for result in results or []:
+        view = summarize_user_facing_outcome(result)
+        reason = view['user_reason'] or result.reason_code or '未说明原因'
+        grouped[reason] += 1
+    return sorted(grouped.items(), key=lambda item: (-item[1], item[0]))
 
 
 def _load_json_if_exists(path):
@@ -429,12 +490,12 @@ REASON_CODE_EXPLANATIONS = {
         'action': '修复制品留存、嵌套 JAR 提取或 javap 环境后重跑；当前未命中不能解释为无影响'
     },
     'SOURCE_BYTECODE_EDGE_CONFLICT': {
-        'reason': '源码调用图与当前最终制品字节码扫描结果冲突',
-        'action': '核对制品 SHA、源码 revision、构建 profile、生成源码和目标模块后重新构建分析'
+        'reason': '源码中看到调用，但打包后的 class/jar 没看到对应引用',
+        'action': '核对当前源码是否就是本次打包产物对应的源码，并确认目标模块、构建参数、生成源码是否一致后重跑'
     },
     'SOURCE_ARTIFACT_ALIGNMENT_UNVERIFIED': {
-        'reason': '源码与当前最终制品尚未证明来自同一 revision、模块和构建配置',
-        'action': '使用由 Step1 留存制品对应的源码 revision/profile 重跑；当前字节码未命中不能证明无影响'
+        'reason': '无法确认当前源码和本次分析的打包产物完全一致',
+        'action': '请使用本次打包产物对应的源码、目标模块和构建参数重跑；当前字节码未命中不能证明无影响'
     },
     'INLINED_CONSTANT_USAGE_UNDETECTABLE': {
         'reason': '编译期常量可能已内联到调用方，class 中不会保留字段访问指令',
@@ -616,44 +677,23 @@ def format_call_chain_readable(trace_result):
     """
     lines = []
 
-    # 标题
-    lines.append("=" * 70)
-    lines.append(f"API: {trace_result.api_name}")
-    lines.append(f"依赖: {trace_result.coord}")
-    lines.append("=" * 70)
-    lines.append("")
-
-    # 基本信息
-    lines.append("【基本信息】")
-    lines.append(f"  变更类型: {trace_result.change_type}")
-    lines.append(f"  严重程度: {trace_result.severity}")
-    lines.append(f"  分析状态: {trace_result.analysis_status}")
-    lines.append(f"  原因代码: {trace_result.reason_code}")
-    lines.append("")
-
-    # 状态说明
     explanation = explain_reason_code(trace_result.reason_code, trace_result)
     user_view = summarize_user_facing_outcome(trace_result)
+    display_api = _api_display_name(trace_result)
+
+    # 标题和首屏结论
+    lines.append("=" * 70)
+    lines.append(f"变更 API: {display_api}")
+    lines.append(f"依赖坐标: {trace_result.coord}")
+    lines.append("=" * 70)
+    lines.append("")
+
     lines.append("【结论】")
     lines.append(f"  结论: {user_view['user_conclusion']}")
     lines.append(f"  原因: {user_view['user_reason']}")
-    lines.append(f"  推荐动作: {user_view['recommended_action']}")
+    lines.append(f"  建议: {user_view['recommended_action']}")
     if user_view.get('key_evidence'):
         lines.append(f"  关键证据: {user_view['key_evidence']}")
-    lines.append("")
-
-    lines.append("【状态说明】")
-    lines.append(f"  原因: {explanation['reason']}")
-    if explanation.get('action'):
-        lines.append(f"  建议动作: {explanation['action']}")
-    lines.append("")
-
-    # 追踪质量指标
-    lines.append("【追踪质量】")
-    lines.append(f"  置信度: {trace_result.confidence_score:.2f}")
-    lines.append(f"  业务触达深度: {trace_result.business_reach_depth} 跳")
-    if trace_result.dependency_chain_coords:
-        lines.append(f"  跨依赖边界: {' -> '.join(trace_result.dependency_chain_coords)}")
     lines.append("")
 
     # 调用链路
@@ -662,6 +702,26 @@ def format_call_chain_readable(trace_result):
         for idx, path in enumerate(trace_result.call_paths, 1):
             lines.append(f"  路径 {idx}: {path}")
         lines.append("")
+    else:
+        lines.append("【调用链路】")
+        lines.append("  未形成可确认的完整调用链。")
+        lines.append("")
+
+    # 基本信息后置，避免首屏被内部状态淹没。
+    lines.append("【变更信息】")
+    lines.append(f"  变更类型: {trace_result.change_type}")
+    lines.append(f"  严重程度: {trace_result.severity}")
+    lines.append(f"  分析状态: {trace_result.analysis_status}")
+    lines.append(f"  原因代码: {trace_result.reason_code}")
+    if trace_result.dependency_chain_coords:
+        lines.append(f"  涉及依赖链: {' -> '.join(trace_result.dependency_chain_coords)}")
+    lines.append("")
+
+    lines.append("【状态说明】")
+    lines.append(f"  原因: {explanation['reason']}")
+    if explanation.get('action'):
+        lines.append(f"  建议: {explanation['action']}")
+    lines.append("")
 
     # 证据详情（原始边）
     if trace_result.evidence_paths:
@@ -685,11 +745,11 @@ def format_call_chain_readable(trace_result):
                 lines.append(f"    ... (还有 {len(path) - 10} 条边)")
         lines.append("")
 
-    # 验证命令
+    # 后续复核建议
     if trace_result.verification_commands:
-        lines.append("【验证命令】")
+        lines.append("【后续复核建议】")
         for cmd in trace_result.verification_commands:
-            lines.append(f"  $ {cmd}")
+            lines.append(f"  - {cmd}")
         lines.append("")
 
     # 关键节点
@@ -698,6 +758,12 @@ def format_call_chain_readable(trace_result):
         for node in trace_result.critical_nodes_hit:
             lines.append(f"  {format_critical_node(node)}")
         lines.append("")
+
+    # 追踪质量指标最后展示，供需要深挖的人参考。
+    lines.append("【追踪质量】")
+    lines.append(f"  置信度: {trace_result.confidence_score:.2f}")
+    lines.append(f"  业务触达深度: {trace_result.business_reach_depth} 跳")
+    lines.append("")
 
     return '\n'.join(lines)
 
@@ -857,29 +923,30 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
         user_conclusion_summary[item['user_conclusion']] += 1
         decision_bucket_summary[item['decision_bucket']] += 1
 
-    # 生成摘要文本
+    # 生成摘要文本：用户可见文件必须先给结论、原因和判断入口；内部状态后置。
     summary_lines = [
-        "=== Step 5 调用链分析摘要（增强版）===",
-        f"generated_at: {datetime.now().isoformat()}",
+        "Step5 调用链分析摘要",
+        f"生成时间: {datetime.now().isoformat()}",
         "",
-        "面向用户的结论：",
-        f"  - 已确认影响: {user_conclusion_summary.get('已确认影响', 0)}",
-        f"  - 可能影响: {user_conclusion_summary.get('可能影响', 0)}",
-        f"  - 当前无法确认: {user_conclusion_summary.get('当前无法确认', 0)}",
-        f"  - 需要补充输入: {user_conclusion_summary.get('需要补充输入', 0)}",
+        "一、结论总览",
+        f"- 分析 API 总数: {len(all_results)}",
+        f"- 已确认影响: {user_conclusion_summary.get('已确认影响', 0)}",
+        f"- 可能影响: {user_conclusion_summary.get('可能影响', 0)}",
+        f"- 当前无法确认: {user_conclusion_summary.get('当前无法确认', 0)}",
+        f"- 需要补充输入: {user_conclusion_summary.get('需要补充输入', 0)}",
         "",
-        "内部状态统计：",
-        f"  总API数：{len(all_results)}",
-        f"  ✓ reachable: {len(reachable)}",
-        f"  ❓ uncertain: {len(uncertain)}",
-        f"  ⊘ not_analyzed: {len(not_analyzed)}",
-        f"  ✗ not_found_in_static_analysis: {len(not_found)}",
+        "判断口径:",
+        "- 已确认影响: 找到从系统代码到变更 API 的可证明调用链。",
+        "- 可能影响/当前无法确认: 有证据缺口或只能证明部分链路，不能当作无影响。",
+        "- 需要补充输入: 缺少源码映射、构建产物或关键工具证据，建议补齐后重跑。",
         "",
     ]
 
+    unresolved_for_reason = probable = inconclusive = input_required = []
+
     # Reachable Top 20
     if reachable:
-        summary_lines.append("已确认影响（优先处理）：")
+        summary_lines.append("二、已确认影响（优先处理）")
         reachable_sorted = sorted(
             reachable,
             key=lambda r: (
@@ -890,16 +957,7 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
         )
 
         for idx, r in enumerate(reachable_sorted[:20], 1):
-            api_short = r.api_name.rsplit('.', 1)[-1] if '.' in r.api_name else r.api_name
-            entry_method = ""
-            if r.critical_nodes_hit:
-                entry = r.critical_nodes_hit[0]
-                entry_method = entry.get('method', '').rsplit('.', 1)[-1]
-
-            summary_lines.append(
-                f"  [{idx}] [{r.severity}] {api_short} → {entry_method} "
-                f"(depth={r.business_reach_depth}, conf={r.confidence_score:.2f})"
-            )
+            summary_lines.append(_summary_item_line(idx, r))
 
         summary_lines.append("")
 
@@ -907,30 +965,45 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     probable = [r for r in all_results if summarize_user_facing_outcome(r)['user_conclusion'] == '可能影响']
     inconclusive = [r for r in all_results if summarize_user_facing_outcome(r)['user_conclusion'] == '当前无法确认']
     input_required = [r for r in all_results if summarize_user_facing_outcome(r)['user_conclusion'] == '需要补充输入']
+    unresolved_for_reason = probable + inconclusive + input_required
 
     if probable:
-        summary_lines.append("可能影响（优先做验证）：")
+        summary_lines.append("三、可能影响（需要验证）")
         for idx, r in enumerate(sorted(probable, key=lambda r: severity_rank(r.severity))[:20], 1):
-            api_short = r.api_name.rsplit('.', 1)[-1] if '.' in r.api_name else r.api_name
-            view = summarize_user_facing_outcome(r)
-            summary_lines.append(f"  [{idx}] [{r.severity}] {api_short} | {view['recommended_action'][:60]}")
+            summary_lines.append(_summary_item_line(idx, r, include_action=True))
         summary_lines.append("")
 
     if inconclusive:
-        summary_lines.append("当前无法确认（需要人工复核或补证据）：")
+        summary_lines.append("四、当前无法确认（不能解释为无影响）")
         for idx, r in enumerate(sorted(inconclusive, key=lambda r: severity_rank(r.severity))[:20], 1):
-            api_short = r.api_name.rsplit('.', 1)[-1] if '.' in r.api_name else r.api_name
-            view = summarize_user_facing_outcome(r)
-            summary_lines.append(f"  [{idx}] [{r.severity}] {api_short} | {view['user_reason'][:60]}")
+            summary_lines.append(_summary_item_line(idx, r, include_action=True))
         summary_lines.append("")
 
     if input_required:
-        summary_lines.append("需要补充输入（建议先补输入再继续）：")
+        summary_lines.append("五、需要补充输入（建议先补齐后重跑）")
         for idx, r in enumerate(sorted(input_required, key=lambda r: severity_rank(r.severity))[:20], 1):
-            api_short = r.api_name.rsplit('.', 1)[-1] if '.' in r.api_name else r.api_name
-            view = summarize_user_facing_outcome(r)
-            summary_lines.append(f"  [{idx}] [{r.severity}] {api_short} | {view['recommended_action'][:60]}")
+            summary_lines.append(_summary_item_line(idx, r, include_action=True))
         summary_lines.append("")
+
+    if unresolved_for_reason:
+        summary_lines.append("六、无法确认/需补输入的主要原因")
+        for idx, (reason, count) in enumerate(_reason_summary(unresolved_for_reason)[:10], 1):
+            summary_lines.append(f"  {idx}. {reason}: {count} 个 API")
+        summary_lines.append("")
+
+    summary_lines.extend([
+        "七、复核文件",
+        "- 完整链路台账: alerts.csv",
+        "- 单 API 明细: by_api/",
+        "- 最终交付报告: ../../deliverables/report.md",
+        "",
+        "附：内部状态统计",
+        f"- reachable: {len(reachable)}",
+        f"- uncertain: {len(uncertain)}",
+        f"- not_analyzed: {len(not_analyzed)}",
+        f"- not_found_in_static_analysis: {len(not_found)}",
+        "",
+    ])
 
     # 保存摘要
     # 关键修复：同时生成 summary.txt（文档承诺的合约）和 s5_enhanced_summary.txt
@@ -1264,11 +1337,23 @@ def _alert_rows_for_result(result):
         conclusion_level, action_type = _path_conclusion(path_status)
         reachable = detail.get('business_reachable')
         capability_coverage = dict(getattr(result, 'capability_coverage', {}) or {})
+        path_text = detail.get('path_text') or ''
+        business_entry = detail.get('business_entry') or ''
+        changed_symbol = result.api_name or ''
+        chain_view = _alert_chain_view(path_text, business_entry, changed_symbol, evidence)
         rows.append({
+            'conclusion': _alert_conclusion_label(path_status, conclusion_level),
+            'change_summary': _alert_change_summary(result),
+            'review_reason': explanation['reason'] or stop_reason,
+            'chain_summary': chain_view['summary'],
+            'chain_entry': chain_view['entry'],
+            'chain_target': chain_view['target'],
+            'chain_hop_count': chain_view['hop_count'],
+            'chain_detail': chain_view['detail'],
             'api_id': api_id,
             'path_id': path_id,
             'target_coord': result.coord,
-            'changed_symbol': result.api_name,
+            'changed_symbol': changed_symbol,
             'api_signature': getattr(result, 'api_signature', '') or '',
             'symbol_kind': getattr(result, 'symbol_kind', '') or '',
             'change_type': result.change_type,
@@ -1278,12 +1363,12 @@ def _alert_rows_for_result(result):
             'conclusion_level': conclusion_level,
             'action_type': action_type,
             'business_reachable': 'true' if reachable is True else ('false' if reachable is False else 'unknown'),
-            'business_entry': detail.get('business_entry') or '',
+            'business_entry': business_entry,
             'consumer_coord': detail.get('consumer_coord') or '',
             'consumer_class': detail.get('consumer_class') or '',
             'consumer_method': detail.get('consumer_method') or '',
             'consumer_signature': detail.get('consumer_signature') or '',
-            'path_text': detail.get('path_text') or '',
+            'path_text': path_text,
             'stop_reason': stop_reason,
             'reason': explanation['reason'],
             'action': explanation['action'] or '',
@@ -1304,6 +1389,120 @@ def _alert_rows_for_result(result):
             'detail_file': detail_file,
         })
     return rows
+
+
+def _alert_conclusion_label(path_status, conclusion_level):
+    status = str(path_status or '')
+    if status == 'reachable':
+        return '已确认影响'
+    if status == 'uncertain':
+        return '需要人工复核'
+    if status in {'not_found_in_static_analysis', 'not_reachable'}:
+        return '未发现静态调用路径'
+    if status == 'not_analyzed':
+        return '未完成分析'
+    level = str(conclusion_level or '')
+    return {
+        'confirmed': '已确认影响',
+        'candidate': '需要人工复核',
+        'no_static_path': '未发现静态调用路径',
+        'incomplete': '未完成分析',
+    }.get(level, '需要人工复核')
+
+
+def _alert_change_summary(result):
+    change_type = str(getattr(result, 'change_type', '') or '').strip()
+    symbol_kind = str(getattr(result, 'symbol_kind', '') or '').strip()
+    severity = str(getattr(result, 'severity', '') or '').strip() or '-'
+    api_name = str(getattr(result, 'api_name', '') or '').strip()
+    api_simple = str(getattr(result, 'api_simple', '') or '').strip()
+    display_name = api_simple or (api_name.rsplit('.', 1)[-1] if api_name else '-')
+    change_label = {
+        'REMOVED': '删除',
+        'SIGNATURE_CHANGED': '签名变更',
+        'BEHAVIOR_CHANGED': '行为变更',
+        'ACCESS_REDUCED': '访问权限降低',
+        'SOURCE_INCOMPATIBLE': '源码不兼容',
+        'CONSTANT_VALUE_CHANGED': '常量值变更',
+        'METHOD_CHANGED': '变更',
+    }.get(change_type, change_type or '变更')
+    kind_label = {
+        'method': '方法',
+        'field': '字段',
+        'class': '类',
+        'constructor': '构造方法',
+    }.get(symbol_kind, symbol_kind or 'API')
+    if symbol_kind in {'method', 'constructor'}:
+        return f"{change_label}{kind_label}，{display_name}，参数：{_alert_signature_display(getattr(result, 'api_signature', '') or '')}，严重级别：{severity}"
+    return f"{change_label}{kind_label}，{display_name}，严重级别：{severity}"
+
+
+def _alert_signature_display(signature):
+    signature = str(signature or '').strip()
+    if not signature:
+        return '无参数或未知'
+    if signature.startswith('(') and ')' in signature:
+        signature = signature[1:signature.index(')')]
+    signature = signature.strip()
+    return signature or '无参数'
+
+
+def _alert_chain_summary(path_text, business_entry, changed_symbol):
+    return _alert_chain_view(path_text, business_entry, changed_symbol, evidence=[])['summary']
+
+
+def _alert_chain_view(path_text, business_entry, changed_symbol, evidence):
+    path_text = str(path_text or '').strip()
+    business_entry = str(business_entry or '').strip()
+    changed_symbol = str(changed_symbol or '').strip()
+    nodes = _split_chain_nodes(path_text)
+    if not nodes:
+        nodes = _nodes_from_evidence(evidence)
+    if not nodes and business_entry and changed_symbol:
+        nodes = [business_entry, changed_symbol]
+    elif not nodes:
+        nodes = [node for node in (business_entry, changed_symbol) if node]
+
+    entry = nodes[0] if nodes else ''
+    target = nodes[-1] if nodes else changed_symbol
+    hop_count = max(0, len(nodes) - 1)
+    if nodes and len(nodes) >= 2:
+        summary = f"入口：{entry}；终点：{target}；{hop_count} 跳"
+        detail = ' -> '.join(f"{idx}. {node}" for idx, node in enumerate(nodes, 1))
+    elif changed_symbol:
+        summary = f"未形成完整链路；目标 API：{changed_symbol}"
+        detail = path_text or changed_symbol
+    else:
+        summary = "未形成完整链路"
+        detail = path_text
+    return {
+        'summary': summary,
+        'entry': entry,
+        'target': target,
+        'hop_count': str(hop_count) if nodes else '',
+        'detail': detail,
+    }
+
+
+def _split_chain_nodes(path_text):
+    text = str(path_text or '').strip()
+    if not text:
+        return []
+    normalized = text.replace('→', '->')
+    parts = [part.strip() for part in normalized.split('->') if part.strip()]
+    return parts if len(parts) >= 2 else ([text] if text else [])
+
+
+def _nodes_from_evidence(evidence):
+    nodes = []
+    for edge in evidence or []:
+        caller = str(edge.get('caller_symbol') or '').strip()
+        callee = str(edge.get('callee_key') or '').strip()
+        if caller and (not nodes or nodes[-1] != caller):
+            nodes.append(caller)
+        if callee and (not nodes or nodes[-1] != callee):
+            nodes.append(callee)
+    return nodes
 
 
 def _deduplicate_equivalent_path_details(details):

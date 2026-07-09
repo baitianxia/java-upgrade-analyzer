@@ -2,6 +2,35 @@
 
 本文面向使用者和人工复核人，说明 `.upgrade-report/` 中哪些文件应该优先阅读，以及每类结果代表什么。
 
+## 阅读原则
+
+这些文件的目标是帮助你快速判断，而不是展示内部实现细节。
+
+阅读时请始终把所有输出当成一条连续链路，而不是一堆孤立文件：
+
+```text
+依赖发生了什么变化
+  → 哪些 API 发生了变化
+  → 哪些调用链触达业务或依赖入口
+  → 最终结论是什么、为什么
+```
+
+建议按这个顺序阅读：
+
+1. 先看结论：已确认影响、可能影响、当前无法确认、需要补充输入。
+2. 再看原因：为什么确定，或为什么不能确认。
+3. 再看链路：哪个依赖、哪个变更 API、哪条调用链触达业务代码。
+4. 最后看明细：只有当结论和预期不一致，才进入 `by_api/`、原始 JApiCmp 或耗时统计文件排查。
+
+每个用户可见文件都应让你第一时间知道：
+
+- 这个文件回答什么问题；
+- 当前结论是什么；
+- 结论来自哪个依赖、哪个变更 API、哪条链路或哪类证据；
+- 如果需要继续复核，下一个应该看的文件是什么。
+
+如果某个文件只有大量数字、内部字段或文件名，而不能直接说明问题和结果，应视为输出可读性缺陷。
+
 ## 复核入口
 
 一次完整分析通常只需要先看三个文件：
@@ -13,6 +42,12 @@
 | 3 | `deliverables/report.md` | 面向评审和交付的最终摘要 |
 
 如果结果存在疑问，再回到对应步骤的原始证据文件继续追溯。
+
+这三个入口之间的关系是：
+
+- `all_changed_apis.csv` 回答“变更 API 是什么”；
+- `alerts.csv` 回答“这些变更 API 有没有调用链影响”；
+- `deliverables/report.md` 回答“最终应该如何理解本次分析结果”。
 
 ## Step1：依赖变化范围
 
@@ -69,6 +104,7 @@ evidence/api_changes/
 | `*_binary.txt` / `*_binary.xml` | JApiCmp 原始证据 | 二进制兼容性变化来源 |
 | `*_gitdiff_api_changes.txt` | 依赖源码 git diff 证据 | 行为变化、源码级 API 变化 |
 | `*_removed_symbols.txt` | removed jar 的旧版 public/protected 符号导出 | 删除依赖场景目标池是否完整 |
+| `step4_timing.csv` | Step4 耗时拆解 | 定位 jar 解析、git diff、JApiCmp、removed jar 导出、changed_classes 或汇总写文件等耗时点 |
 
 ### per-dependency 视图
 
@@ -100,7 +136,7 @@ evidence/call_chain/
 | `summary.json` | 结构化汇总 | `analysis_status`、`reason_code`、能力覆盖 |
 | `summary.txt` | 人类可读摘要 | reachable、uncertain、not_found、not_analyzed 分布 |
 | `step5_timing.csv` | Step5 耗时拆解 | 性能问题定位 |
-| `.runtime/indexes/s5_query_index.json` | 内部调用链查询索引 | Claude Code 按方法即时查询调用链；默认不作为人工阅读文件 |
+| `.runtime/indexes/s5_query_index.json` | 内部调用链查询索引 | Claude Code 按方法即时查询调用链；默认精确匹配全限定名，不作为人工阅读文件 |
 | `by_api/*.json` | 单 API 详细证据 | 逐跳链路、证据路径、终止原因 |
 | `by_module/*_impacts.json` | 按模块聚合视图 | 分派处理责任 |
 

@@ -13,8 +13,11 @@ if str(SCRIPTS) not in sys.path:
 from enhanced_source_analyzer import CallEdge
 from s5_query_call_chain import (
     build_query_index,
+    build_target_keys,
+    _is_precise_lookup_key,
     query_alert_chains,
     query_call_chains,
+    query_call_chain_result,
     render_call_chains,
     write_query_index,
     load_query_index,
@@ -108,6 +111,156 @@ class S5QueryCallChainTest(unittest.TestCase):
         self.assertEqual(query_call_chains(build_query_index(graph), "com.vendor.Missing.call()"), [])
         self.assertEqual(render_call_chains([]), "未找到调用链。")
 
+    def test_default_target_keys_do_not_include_simple_name_fallbacks(self):
+        self.assertEqual(
+            build_target_keys("io.seata.common.util.CollectionUtils.isEmpty(java.util.Collection)"),
+            [
+                "io.seata.common.util.CollectionUtils.isEmpty(java.util.Collection)",
+                "io.seata.common.util.CollectionUtils.isEmpty(Collection)",
+                "io.seata.common.util.CollectionUtils.isEmpty",
+            ],
+        )
+        self.assertEqual(
+            build_target_keys("net.sf.json.JSONArray"),
+            ["net.sf.json.JSONArray", "class:net.sf.json.JSONArray"],
+        )
+        self.assertIn(
+            "method:isEmpty",
+            build_target_keys(
+                "io.seata.common.util.CollectionUtils.isEmpty(java.util.Collection)",
+                fuzzy=True,
+            ),
+        )
+
+    def test_query_does_not_fall_back_to_unrelated_simple_method_key(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        unrelated_target = "java.util.List.isEmpty()"
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": ["com.app.App.run", "method:run"]},
+            reverse_edges={
+                "method:isEmpty": [
+                    edge(app, unrelated_target, owner_type="business", owner_coord="BUSINESS", module="app"),
+                ],
+            },
+        )
+
+        chains = query_call_chains(
+            build_query_index(graph),
+            "io.seata.common.util.CollectionUtils.isEmpty(java.util.Collection)",
+        )
+
+        self.assertEqual(chains, [])
+
+    def test_query_does_not_fall_back_to_unrelated_simple_class_key(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": ["com.app.App.run", "method:run"]},
+            reverse_edges={
+                "class:JSONArray": [
+                    edge(
+                        app,
+                        "jsonSwitch.JSONArray",
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                    ),
+                ],
+            },
+        )
+
+        chains = query_call_chains(build_query_index(graph), "net.sf.json.JSONArray")
+
+        self.assertEqual(chains, [])
+
+    def test_query_rejects_chain_that_does_not_contain_exact_target(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": ["com.app.App.run", "method:run"]},
+            reverse_edges={
+                "com.vendor.Target.removed": [
+                    edge(
+                        app,
+                        "com.other.Target.removed",
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                    ),
+                ],
+            },
+        )
+
+        chains = query_call_chains(build_query_index(graph), "com.vendor.Target.removed")
+
+        self.assertEqual(chains, [])
+
+    def test_upstream_expansion_does_not_follow_simple_lookup_keys_by_default(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        unrelated_app = method("other", "com.other.Other.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        dep = method("dep", "com.dep.Bridge.use", owner_coord="com.example:dep", module="dep")
+        target = "com.vendor.Target.removed()"
+        graph = SimpleNamespace(
+            methods_by_id={"app": app, "other": unrelated_app, "dep": dep},
+            lookup_keys_by_symbol={
+                "app": ["com.app.App.run", "method:run"],
+                "other": ["com.other.Other.run", "method:run"],
+                "dep": ["com.dep.Bridge.use", "method:use"],
+            },
+            reverse_edges={
+                target: [edge(dep, target, owner_coord="com.example:dep", module="dep")],
+                # Only the simple key has an incoming business caller.  Default
+                # exact query must not use it, otherwise com.other.Other.run is
+                # incorrectly stitched onto com.dep.Bridge.use.
+                "method:use": [
+                    edge(
+                        unrelated_app,
+                        "com.other.Unrelated.use()",
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                    )
+                ],
+            },
+        )
+
+        chains = query_call_chains(build_query_index(graph), target)
+
+        self.assertEqual(chains, [])
+
+    def test_upstream_expansion_follows_precise_lookup_keys(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        dep = method("dep", "com.dep.Bridge.use", owner_coord="com.example:dep", module="dep")
+        target = "com.vendor.Target.removed()"
+        graph = SimpleNamespace(
+            methods_by_id={"app": app, "dep": dep},
+            lookup_keys_by_symbol={
+                "app": ["com.app.App.run", "method:run"],
+                "dep": ["com.dep.Bridge.use", "method:use"],
+            },
+            reverse_edges={
+                target: [edge(dep, target, owner_coord="com.example:dep", module="dep")],
+                "com.dep.Bridge.use": [
+                    edge(app, "com.dep.Bridge.use", owner_type="business", owner_coord="BUSINESS", module="app")
+                ],
+            },
+        )
+
+        chains = query_call_chains(build_query_index(graph), target)
+
+        self.assertEqual(
+            chains,
+            ["com.app.App.run → com.example:dep:com.dep.Bridge.use → com.vendor.Target.removed()"],
+        )
+
+    def test_precise_lookup_key_classifier_blocks_simple_keys(self):
+        self.assertFalse(_is_precise_lookup_key("method:isEmpty"))
+        self.assertFalse(_is_precise_lookup_key("method:isEmpty(String)"))
+        self.assertFalse(_is_precise_lookup_key("class:JSONArray"))
+        self.assertTrue(_is_precise_lookup_key("class:net.sf.json.JSONArray"))
+        self.assertTrue(_is_precise_lookup_key("net.sf.json.JSONArray.fromObject(Object)"))
+
     def test_query_index_can_be_loaded_from_report_dir_and_rendered(self):
         app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
         target = "com.vendor.Target.removed()"
@@ -192,6 +345,53 @@ class S5QueryCallChainTest(unittest.TestCase):
                 "com.vendor.LegacyApi.removed(String)"
             ],
         )
+
+    def test_alert_fallback_rejects_exact_symbol_with_wrong_path_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            alerts = report_dir / "evidence" / "call_chain" / "alerts.csv"
+            alerts.parent.mkdir(parents=True)
+            alerts.write_text(
+                "changed_symbol,api_signature,path_status,path_text\n"
+                "net.sf.json.JSONArray,,reachable,"
+                "com.app.App.run -> jsonSwitch.JSONArray -> com.alibaba.fastjson.JSONArray\n",
+                encoding="utf-8",
+            )
+
+            chains = query_alert_chains(report_dir, "net.sf.json.JSONArray")
+
+        self.assertEqual(chains, [])
+
+    def test_query_result_reports_exact_not_found_without_silent_fuzzy_match(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": ["com.app.App.run", "method:run"]},
+            reverse_edges={
+                "method:isEmpty": [
+                    edge(
+                        app,
+                        "java.util.List.isEmpty()",
+                        owner_type="business",
+                        owner_coord="BUSINESS",
+                        module="app",
+                    ),
+                ],
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            write_query_index(graph, report_dir / ".runtime" / "indexes" / "s5_query_index.json")
+
+            result = query_call_chain_result(
+                report_dir,
+                "io.seata.common.util.CollectionUtils.isEmpty(java.util.Collection)",
+            )
+
+        self.assertEqual(result["chains"], [])
+        self.assertFalse(result["exact_match"])
+        self.assertEqual(result["match_mode"], "not_found")
+        self.assertIn("未找到精确匹配的调用链。", result["warnings"])
 
     def test_query_respects_limit_on_many_business_callers(self):
         target = "com.vendor.Target.removed()"

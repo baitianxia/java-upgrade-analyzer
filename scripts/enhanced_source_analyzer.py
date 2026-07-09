@@ -388,6 +388,8 @@ class MethodDef:
     local_method_return_types: dict = field(default_factory=dict)
     known_method_return_types: dict = field(default_factory=dict)
     known_method_return_types_by_signature: dict = field(default_factory=dict)
+    known_class_fqcns: set = field(default_factory=set)
+    known_classes_by_simple: dict = field(default_factory=dict)
     local_var_types: dict = field(default_factory=dict)
     ast_local_var_sites: list = field(default_factory=list)
     ast_call_sites: list = field(default_factory=list)
@@ -2498,6 +2500,28 @@ def resolve_type_fqn(type_expr, method_def):
         if outer in imports:
             return f"{imports[outer]}.{inner_suffix}"
 
+    known_class_fqcns = set(getattr(method_def, 'known_class_fqcns', set()) or set())
+    known_classes_by_simple = getattr(method_def, 'known_classes_by_simple', {}) or {}
+    if '.' not in type_expr:
+        package_name = getattr(method_def, 'package_name', '') or ''
+        package_candidate = f"{package_name}.{type_expr}" if package_name else type_expr
+        if package_candidate in known_class_fqcns:
+            return package_candidate
+
+        wildcard_candidates = []
+        for wildcard_pkg in getattr(method_def, 'wildcard_imports', []) or []:
+            if wildcard_pkg:
+                candidate = f"{wildcard_pkg}.{type_expr}"
+                if not known_class_fqcns or candidate in known_class_fqcns:
+                    wildcard_candidates.append(candidate)
+        wildcard_candidates = list(dict.fromkeys(wildcard_candidates))
+        if len(wildcard_candidates) == 1:
+            return wildcard_candidates[0]
+
+        simple_matches = list(known_classes_by_simple.get(type_expr, []) or [])
+        if len(simple_matches) == 1:
+            return simple_matches[0]
+
     # Search field types
     for field_type in method_def.field_types.values():
         if field_type.endswith(f".{type_expr}") or field_type == type_expr:
@@ -3093,11 +3117,16 @@ def infer_receiver_type_enhanced(expr, method_def, local_var_types=None):
       - method() → 返回值类型
     """
     local_var_types = local_var_types or getattr(method_def, 'local_var_types', {}) or {}
+    expr = (expr or '').strip()
 
     if expr == 'this':
         return method_def.class_fqcn
     if expr == 'super':
         return _resolve_super_type(method_def)
+
+    constructor_receiver = re.match(r'^(?:\(?\s*)*new\s+([A-Za-z_][\w.]*)\s*\(', expr)
+    if constructor_receiver:
+        return resolve_type_fqn(constructor_receiver.group(1), method_def)
 
     if expr.startswith('this.'):
         expr = expr[5:]
