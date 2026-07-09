@@ -2476,6 +2476,182 @@ def infer_method_symbol_kind_from_api_name(api_name):
     return 'constructor' if member == owner_simple else 'method'
 
 
+def dependency_is_removed_or_added(row):
+    row = row or {}
+    change = str(row.get('change_type') or '').strip()
+    old_ver = str(row.get('old_version') or '-').strip()
+    new_ver = str(row.get('new_version') or '-').strip()
+    is_removed_dependency = (change == '移除') or (new_ver == '-' and old_ver != '-')
+    is_added_dependency = (change == '新增') or (old_ver == '-' and new_ver != '-')
+    return is_removed_dependency or is_added_dependency
+
+
+def dependency_needs_gitdiff_preflight(row, source_mapping):
+    row = row or {}
+    if not str(row.get('coord') or '').strip():
+        return False
+    if str(row.get('change_type') or '').strip() == '未变':
+        return False
+    if dependency_is_removed_or_added(row):
+        return False
+    if not (source_mapping or {}).get("repo_path"):
+        return False
+    if is_ephemeral_dependency_source_mapping(source_mapping):
+        return False
+    return True
+
+
+def resolve_gitdiff_ref_plan_for_row(row, source_mapping, source_meta, dependency_git_ref_overrides):
+    row = row or {}
+    source_mapping = source_mapping or {}
+    source_meta = source_meta or {}
+    coord = str(row.get('coord') or '').strip()
+    old_ver = str(row.get('old_version') or '').strip()
+    new_ver = str(row.get('new_version') or '').strip()
+    repo_path = source_mapping.get("repo_path") or ""
+    module_path = source_mapping.get("module_path") or repo_path
+    overrides = dependency_git_ref_overrides.get(coord) or {}
+    override_old_ref = str(overrides.get("old_ref") or "").strip()
+    override_new_ref = str(overrides.get("new_ref") or "").strip()
+
+    resolved_old_ref = resolved_new_ref = None
+    old_reason = new_reason = ""
+    old_candidates = []
+    new_candidates = []
+    reason = ""
+    if not repo_path or not os.path.isdir(repo_path):
+        reason = "源码路径未提供或不存在"
+    elif not os.path.isdir(os.path.join(repo_path, ".git")):
+        reason = "非 git 仓库"
+    elif override_old_ref or override_new_ref:
+        resolved_old_ref, old_reason, old_candidates = resolve_repo_ref_for_version(
+            repo_path,
+            old_ver,
+            selected_ref=override_old_ref,
+        )
+        resolved_new_ref, new_reason, new_candidates = resolve_repo_ref_for_version(
+            repo_path,
+            new_ver,
+            selected_ref=override_new_ref,
+        )
+    else:
+        (
+            resolved_old_ref,
+            resolved_new_ref,
+            old_reason,
+            new_reason,
+            old_candidates,
+            new_candidates,
+        ) = resolve_repo_ref_pair_for_versions(repo_path, old_ver, new_ver)
+
+    module_rel_path = ""
+    if module_path and repo_path:
+        try:
+            module_rel_path = Path(module_path).resolve().relative_to(Path(repo_path).resolve()).as_posix()
+        except Exception:
+            module_rel_path = ""
+
+    common = {
+        "coord": coord,
+        "old_version": old_ver,
+        "new_version": new_ver,
+        "repo_path": os.path.abspath(repo_path) if repo_path else "",
+        "module_path": os.path.abspath(module_path) if module_path else "",
+        "module_rel_path": module_rel_path,
+        "old_candidates": old_candidates,
+        "new_candidates": new_candidates,
+        "old_ref_override": override_old_ref,
+        "new_ref_override": override_new_ref,
+        "mapping_mode": source_meta.get("mapping_mode"),
+    }
+    if reason or (not resolved_old_ref) or (not resolved_new_ref):
+        return {
+            **common,
+            "status": "pending",
+            "reason": reason or "无法定位对比 ref",
+            "resolved_old_ref": resolved_old_ref,
+            "resolved_new_ref": resolved_new_ref,
+            "old_reason": old_reason,
+            "new_reason": new_reason,
+        }
+    return {
+        **common,
+        "status": "matched",
+        "api_changes": 0,
+        "behavior_changed": 0,
+        "structural_source_changes": 0,
+        "out_file": "",
+        "base_ref": resolved_old_ref,
+        "cur_ref": resolved_new_ref,
+        "ref_source": "preflight",
+        "old_match_reason": old_reason,
+        "new_match_reason": new_reason,
+    }
+
+
+def preflight_gitdiff_refs(dep_rows, dependency_paths, dependency_path_meta, dependency_git_ref_overrides):
+    matched = []
+    pending = []
+    for row in dep_rows:
+        coord = str((row or {}).get("coord") or "").strip()
+        source_mapping = dependency_paths.get(coord) or {}
+        if not dependency_needs_gitdiff_preflight(row, source_mapping):
+            continue
+        plan = resolve_gitdiff_ref_plan_for_row(
+            row,
+            source_mapping,
+            dependency_path_meta.get(coord) or {},
+            dependency_git_ref_overrides,
+        )
+        if plan.get("status") == "matched":
+            matched.append(plan)
+        else:
+            pending.append(plan)
+    return matched, pending
+
+
+def write_git_ref_pending_file(output_dir, pending_items):
+    pending_refs_path = os.path.join(output_dir, "git_ref_pending.json")
+    with open(pending_refs_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "generated_at": datetime.now().isoformat(),
+                "items": pending_items or [],
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return pending_refs_path
+
+
+def write_git_ref_preflight_summary(output_dir, pending_items, matched_items):
+    summary_path = os.path.join(output_dir, "summary.txt")
+    lines = [
+        "Step4 preflight：依赖源码 git refs 需要先确认",
+        "",
+        f"待人工确认 refs：{len(pending_items or [])}",
+        f"已自动匹配 refs：{len(matched_items or [])}",
+        "",
+        "说明：为避免先执行耗时的 JApiCmp、removed jar 导出或源码 diff 后才要求重跑，Step4 在正式分析前先检查依赖源码 git refs。",
+        "处理方式：确认 git_ref_pending.json 中每个依赖的 old_ref/new_ref，然后通过 dependency_git_ref_overrides 重跑 Step4。",
+    ]
+    for item in (pending_items or [])[:20]:
+        lines.append("")
+        lines.append(f"- {item.get('coord')} {item.get('old_version')}→{item.get('new_version')}")
+        lines.append(f"  reason={item.get('reason') or '-'}")
+        lines.append(f"  repo_path={item.get('repo_path') or '-'}")
+        old_candidates = item.get("old_candidates") or []
+        new_candidates = item.get("new_candidates") or []
+        lines.append(f"  old_candidates={', '.join(c.get('ref', '') for c in old_candidates[:10]) or '(无)'}")
+        lines.append(f"  new_candidates={', '.join(c.get('ref', '') for c in new_candidates[:10]) or '(无)'}")
+    if len(pending_items or []) > 20:
+        lines.append(f"\n...（仅展示前 20，共 {len(pending_items)}）")
+    Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(summary_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return summary_path
+
+
 # ══════════════════════════════════════════════════════════════════
 # 4b. 依赖源码 git diff
 # ══════════════════════════════════════════════════════════════════
@@ -3711,42 +3887,6 @@ def main():
     dep_rows = load_csv(args.dep_changes)
     ctx      = load_json(args.context)
     japicmp_planned_rows = [row for row in dep_rows if dependency_needs_japicmp(row)]
-    if japicmp_planned_rows and not os.path.exists(args.japicmp_jar):
-        installed, resolved_japicmp_jar, install_error = auto_install_japicmp(
-            args.japicmp_jar,
-            timeout=args.fetch_timeout,
-        )
-        args.japicmp_jar = resolved_japicmp_jar
-        if (not installed) and (not args.allow_degraded):
-            planned_dependencies = [
-                {
-                    "coord": row.get("coord", ""),
-                    "old_version": row.get("old_version", ""),
-                    "new_version": row.get("new_version", ""),
-                    "change_type": row.get("change_type", ""),
-                }
-                for row in japicmp_planned_rows
-            ]
-            interaction = build_japicmp_missing_interaction(
-                args.output_dir,
-                args.japicmp_jar,
-                install_error,
-                planned_dependencies,
-            )
-            if os.environ.get("JUA_ORCHESTRATED") == "1":
-                emit_interaction(interaction)
-                return 0
-            print("\n❌ JApiCmp 不可用，且未确认 allow_degraded=true。", file=sys.stderr)
-            print(f"   自动安装失败原因：{install_error}", file=sys.stderr)
-            print(f"   请执行：mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}", file=sys.stderr)
-            print("   或提供 --japicmp-jar 后重跑 Step4；若确认降级，请显式设置 --allow-degraded。", file=sys.stderr)
-            return 2
-        if (not installed) and args.allow_degraded:
-            print(
-                "⚠️  JApiCmp 自动安装失败，但已显式 allow_degraded=true；"
-                "Step4 将缺少二进制 API 对比证据。",
-                file=sys.stderr,
-            )
     compute_changed_classes_enabled = (not args.skip_changed_classes) and len(dep_rows) <= 200
     if not compute_changed_classes_enabled:
         print("  ℹ️  changed_classes.json 已降级为轻量模式，跳过 class hash 计算以提升大批量依赖稳定性。", file=sys.stderr)
@@ -3842,6 +3982,86 @@ def main():
     changed_dependency_coords = {
         dep['coord'] for dep in ctx.get('changed_dependencies', []) if dep.get('coord')
     }
+
+    preflight_gitdiff_runs, preflight_gitdiff_pending = preflight_gitdiff_refs(
+        dep_rows,
+        dependency_paths,
+        dependency_path_meta,
+        dependency_git_ref_overrides,
+    )
+    if preflight_gitdiff_pending:
+        source_repo_mappings = [
+            dependency_path_meta[key] for key in sorted(dependency_path_meta.keys())
+        ]
+        pending_refs_path = write_git_ref_pending_file(args.output_dir, preflight_gitdiff_pending)
+        write_git_ref_preflight_summary(
+            args.output_dir,
+            preflight_gitdiff_pending,
+            preflight_gitdiff_runs,
+        )
+        ref_matches_json, ref_matches_txt = write_git_ref_match_outputs(
+            output_dir=args.output_dir,
+            gitdiff_runs=preflight_gitdiff_runs,
+            gitdiff_skipped=[],
+            gitdiff_pending=preflight_gitdiff_pending,
+            source_repo_mappings=source_repo_mappings,
+        )
+        interaction = build_git_ref_confirmation_interaction(args.output_dir, preflight_gitdiff_pending)
+        emit_progress(
+            "step4",
+            "preflight",
+            f"git refs 预检需要人工确认，pending={len(preflight_gitdiff_pending)}，已提前停止耗时分析",
+            elapsed=step_timer.elapsed(),
+        )
+        print(
+            "\n⚠️  Step4 preflight 发现依赖源码 git refs 需要人工确认，"
+            "已提前停止，避免执行后续耗时分析。",
+            file=sys.stderr,
+        )
+        print(f"  输出：{pending_refs_path}", file=sys.stderr)
+        print(f"  输出：{ref_matches_json}", file=sys.stderr)
+        print(f"  输出：{ref_matches_txt}", file=sys.stderr)
+        if os.environ.get("JUA_ORCHESTRATED") == "1":
+            emit_interaction(interaction)
+            return 0
+        return 2
+
+    if japicmp_planned_rows and not os.path.exists(args.japicmp_jar):
+        installed, resolved_japicmp_jar, install_error = auto_install_japicmp(
+            args.japicmp_jar,
+            timeout=args.fetch_timeout,
+        )
+        args.japicmp_jar = resolved_japicmp_jar
+        if (not installed) and (not args.allow_degraded):
+            planned_dependencies = [
+                {
+                    "coord": row.get("coord", ""),
+                    "old_version": row.get("old_version", ""),
+                    "new_version": row.get("new_version", ""),
+                    "change_type": row.get("change_type", ""),
+                }
+                for row in japicmp_planned_rows
+            ]
+            interaction = build_japicmp_missing_interaction(
+                args.output_dir,
+                args.japicmp_jar,
+                install_error,
+                planned_dependencies,
+            )
+            if os.environ.get("JUA_ORCHESTRATED") == "1":
+                emit_interaction(interaction)
+                return 0
+            print("\n❌ JApiCmp 不可用，且未确认 allow_degraded=true。", file=sys.stderr)
+            print(f"   自动安装失败原因：{install_error}", file=sys.stderr)
+            print(f"   请执行：mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}", file=sys.stderr)
+            print("   或提供 --japicmp-jar 后重跑 Step4；若确认降级，请显式设置 --allow-degraded。", file=sys.stderr)
+            return 2
+        if (not installed) and args.allow_degraded:
+            print(
+                "⚠️  JApiCmp 自动安装失败，但已显式 allow_degraded=true；"
+                "Step4 将缺少二进制 API 对比证据。",
+                file=sys.stderr,
+            )
 
     all_apis            = []
     jar_missing_deps    = []

@@ -362,6 +362,117 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertEqual(reason, "no_ref_match_for_version=3.0.7")
         self.assertEqual(candidates, [])
 
+    def test_preflight_gitdiff_refs_reports_pending_before_expensive_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "acct-sdk"
+            repo_dir.mkdir()
+            (repo_dir / ".git").mkdir()
+            dep_rows = [
+                {
+                    "coord": "com.acme:acct-sdk",
+                    "old_version": "1.0.0",
+                    "new_version": "2.0.0",
+                    "change_type": "小版本升级",
+                }
+            ]
+            dependency_paths = {
+                "com.acme:acct-sdk": {
+                    "repo_path": str(repo_dir),
+                    "module_path": str(repo_dir),
+                }
+            }
+            dependency_path_meta = {
+                "com.acme:acct-sdk": {
+                    "mapping_mode": "explicit",
+                }
+            }
+
+            with patch.object(
+                step4,
+                "resolve_repo_ref_pair_for_versions",
+                return_value=(None, None, "miss-old", "miss-new", [], []),
+            ):
+                matched, pending = step4.preflight_gitdiff_refs(
+                    dep_rows,
+                    dependency_paths,
+                    dependency_path_meta,
+                    {},
+                )
+
+        self.assertEqual(matched, [])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["coord"], "com.acme:acct-sdk")
+        self.assertEqual(pending[0]["reason"], "无法定位对比 ref")
+
+    def test_main_preflights_git_refs_before_japicmp_or_removed_jar_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s4_jar_compare"
+            repo_dir = report_dir / "acct-sdk"
+            repo_dir.mkdir()
+            (repo_dir / ".git").mkdir()
+            japicmp_jar = report_dir / "japicmp.jar"
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            dep_changes.write_text(
+                "\n".join(
+                    [
+                        "coord,old_version,new_version,change_type,scope",
+                        "com.acme:acct-sdk,1.0.0,2.0.0,小版本升级,compile",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps({"changed_dependencies": [{"coord": "com.acme:acct-sdk"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes",
+                    str(dep_changes),
+                    "--context",
+                    str(context_json),
+                    "--output-dir",
+                    str(output_dir),
+                    "--japicmp-jar",
+                    str(japicmp_jar),
+                    "--dependency-repo-mappings",
+                    f"com.acme:acct-sdk={repo_dir}",
+                ],
+            ), patch.object(
+                step4,
+                "resolve_repo_ref_pair_for_versions",
+                return_value=(None, None, "miss-old", "miss-new", [], []),
+            ), patch.object(
+                step4,
+                "run_japicmp",
+                side_effect=AssertionError("JApiCmp should not run before git ref confirmation"),
+            ), patch.object(
+                step4,
+                "auto_install_japicmp",
+                side_effect=AssertionError("JApiCmp install should not run before git ref confirmation"),
+            ), patch.object(
+                step4,
+                "export_removed_jar_apis",
+                side_effect=AssertionError("removed jar export should not run before git ref confirmation"),
+            ):
+                exit_code = step4.main()
+
+            pending = json.loads((output_dir / "git_ref_pending.json").read_text(encoding="utf-8"))
+            matches = json.loads((output_dir / "git_ref_matches.json").read_text(encoding="utf-8"))
+            summary_text = (output_dir / "summary.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(len(pending["items"]), 1)
+        self.assertEqual(pending["items"][0]["coord"], "com.acme:acct-sdk")
+        self.assertTrue(matches["need_user_confirmation"])
+        self.assertIn("Step4 preflight", summary_text)
+
     def test_resolve_repo_ref_for_version_accepts_manual_override_when_no_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
