@@ -22,6 +22,7 @@ import enhanced_source_analyzer as source_analyzer  # noqa: E402
 import enhanced_output_formatter as formatter  # noqa: E402
 import framework_adapters  # noqa: E402
 import gate  # noqa: E402
+import s4_jar_compare  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
 import s6_report  # noqa: E402
 from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
@@ -44,6 +45,101 @@ class Step5KeyMatchingTest(unittest.TestCase):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path.write_text(text, **kwargs)
+
+    def test_changed_dependencies_markdown_is_a_reviewable_selection_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "api_changes"
+            rows = [
+                {
+                    "coord": "com.acme:alpha",
+                    "api_name": "com.acme.Alpha.removed",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "severity": "P1",
+                },
+                {
+                    "coord": "com.acme:beta",
+                    "api_name": "com.acme.Beta.changed",
+                    "symbol_kind": "class",
+                    "change_type": "MODIFIED",
+                    "severity": "P3",
+                },
+            ]
+
+            s4_jar_compare.write_changed_dependencies(rows, output_dir)
+            md_text = (output_dir / "changed_dependencies.md").read_text(encoding="utf-8")
+
+        self.assertIn("展示 2 / 2 个依赖包", md_text)
+        self.assertIn("选择 Step5 范围时使用 `selection_key`", md_text)
+        self.assertIn("完整 API 明细：`all_changed_apis.csv`", md_text)
+        self.assertIn("依赖包明细目录：`s4_per_dependency/`", md_text)
+        self.assertIn("| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 主要变化类型 | 明细 |", md_text)
+
+    def test_alerts_generation_writes_human_summary_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "alerts.csv"
+            results = [
+                tracer.TraceResult(
+                    coord="a:b",
+                    api_name="com.acme.Api.reachable",
+                    api_simple="reachable",
+                    api_signature="()",
+                    symbol_kind="method",
+                    change_type="METHOD_CHANGED",
+                    severity="P1",
+                    confirmed=True,
+                    source="japicmp",
+                    analysis_scope="method",
+                    analysis_status="reachable",
+                    direct_callers=1,
+                    is_reachable=True,
+                    reachable_note="业务入口命中",
+                    business_reach_depth=1,
+                    dependency_chain_coords=[],
+                    call_paths=["Service.run -> Api.reachable"],
+                    evidence_paths=[],
+                    reason_code="SYSTEM_CODE_REACHED",
+                    verification_commands=[],
+                    hops=[],
+                    confidence_score=1.0,
+                    critical_nodes_hit=[],
+                ),
+                tracer.TraceResult(
+                    coord="a:b",
+                    api_name="com.acme.Api.uncertain",
+                    api_simple="uncertain",
+                    api_signature="()",
+                    symbol_kind="method",
+                    change_type="METHOD_CHANGED",
+                    severity="P1",
+                    confirmed=True,
+                    source="japicmp",
+                    analysis_scope="method",
+                    analysis_status="uncertain",
+                    direct_callers=0,
+                    is_reachable=None,
+                    reachable_note="依赖字节码命中",
+                    business_reach_depth=0,
+                    dependency_chain_coords=["a:consumer"],
+                    call_paths=[],
+                    evidence_paths=[],
+                    reason_code="RUNTIME_DEPENDENCY_USES_REMOVED_API",
+                    verification_commands=[],
+                    hops=[],
+                    confidence_score=1.0,
+                    critical_nodes_hit=[],
+                ),
+            ]
+
+            formatter.generate_alerts_csv(results, output)
+            summary_text = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertIn("# Step5 调用链复核摘要", summary_text)
+        self.assertIn("| 链路状态 | 含义 | 数量 | 阅读入口 |", summary_text)
+        self.assertIn("已确认触达当前系统", summary_text)
+        self.assertIn("需要人工复核或补充证据", summary_text)
+        self.assertIn("完整台账：`alerts.csv`", summary_text)
+        self.assertIn("按状态拆分：`alerts_<status>.csv`", summary_text)
 
     def test_step5_emits_tree_sitter_missing_checkpoint_before_regex_degrade(self):
         with tempfile.TemporaryDirectory() as tmp:

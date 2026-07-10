@@ -1327,6 +1327,78 @@ def generate_alerts_csv(all_results, output_path):
         writer.writeheader()
         writer.writerows(rows)
     write_alerts_review_splits(rows, os.path.dirname(os.path.abspath(output_path)))
+    write_alerts_human_summary(rows, os.path.dirname(os.path.abspath(output_path)))
+
+
+def write_alerts_human_summary(rows, output_dir):
+    """Write a human-readable Step5 review summary next to alerts.csv."""
+    rows = list(rows or [])
+    status_counts = defaultdict(int)
+    for row in rows:
+        status_counts[str(row.get('path_status') or '').strip() or 'unknown'] += 1
+
+    status_rows = [
+        (
+            'reachable',
+            '已确认触达当前系统',
+            'alerts_reachable.csv',
+        ),
+        (
+            'uncertain',
+            '需要人工复核或补充证据',
+            'alerts_uncertain.csv',
+        ),
+        (
+            'not_impacted',
+            '有直接制品证据确认 API 未实际消失',
+            'alerts_not_impacted.csv',
+        ),
+        (
+            'not_found_in_static_analysis',
+            '当前静态分析未找到调用路径',
+            'alerts_not_found_in_static_analysis.csv',
+        ),
+        (
+            'not_analyzed',
+            '本轮未完成有效分析',
+            'alerts_not_analyzed.csv',
+        ),
+    ]
+
+    lines = [
+        '# Step5 调用链复核摘要',
+        '',
+        '本文件帮助人工阅读 `alerts.csv`。它不替代完整台账；完整台账仍以 `alerts.csv` 为准。',
+        '',
+        f'- 完整台账：`alerts.csv`',
+        f'- 按状态拆分：`alerts_<status>.csv`',
+        f'- 单 API 证据：`by_api/`',
+        '',
+        '| 链路状态 | 含义 | 数量 | 阅读入口 |',
+        '|---|---|---:|---|',
+    ]
+    for status, meaning, file_name in status_rows:
+        count = status_counts.get(status, 0)
+        entry = f'`{file_name}`' if count else '-'
+        lines.append(f'| `{status}` | {meaning} | {count} | {entry} |')
+    other_count = sum(
+        count
+        for status, count in status_counts.items()
+        if status not in {item[0] for item in status_rows}
+    )
+    if other_count:
+        lines.append(f'| `other` | 未归入标准状态的链路 | {other_count} | `alerts.csv` |')
+    lines.extend([
+        '',
+        '阅读建议：',
+        '',
+        '1. 先按 `path_status` 查看状态拆分文件。',
+        '2. 需要追踪单条 API 时，用 `api_id` 和 `path_id` 回到 `alerts.csv` 或 `by_api/`。',
+        '3. `reason` 和 `review_reason` 是给人看的原因说明，优先看这两列。',
+        '',
+    ])
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    Path(output_dir, 'summary.md').write_text('\n'.join(lines), encoding='utf-8')
 
 
 def write_alerts_review_splits(rows, output_dir, max_rows=None):

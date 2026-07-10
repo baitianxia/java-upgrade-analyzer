@@ -468,6 +468,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertIn("依赖包维度变化摘要", api_changes_readme)
             self.assertIn("不要从 `all_changed_apis.csv` 逐行挑 API", api_changes_readme)
             self.assertIn("完整逐链路台账", call_chain_readme)
+            self.assertIn("`summary.md`", call_chain_readme)
 
     def test_user_decision_card_hides_internal_fields_and_shows_direct_replies(self):
         interaction = {

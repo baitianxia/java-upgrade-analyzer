@@ -303,6 +303,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
     call_chain/
       README.md
       alerts.csv
+      summary.md
       summary.json
       by_api/
       by_module/
