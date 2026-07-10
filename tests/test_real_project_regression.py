@@ -267,6 +267,49 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(any(item.startswith("performance:") for item in result["failures"]))
         self.assertIn("alerts_reachable.csv missing", result["warnings"])
 
+    def test_run_case_emits_quality_signals_for_blocking_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            root.mkdir()
+            changed_apis = Path(tmp) / "all_changed_apis.csv"
+            changed_apis.write_text(
+                "coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source\n"
+                "demo:dep,1,-,REMOVED,demo.Api.removed,removed,method,(String),true,P1,test\n",
+                encoding="utf-8",
+            )
+            case = realreg.RealProjectCase(
+                name="mini",
+                default_project=root,
+                default_changed_apis=changed_apis,
+                baseline_specs=(),
+            )
+
+            def fake_run_step5(_case, _project_root, _changed_apis, report_dir):
+                output = report_dir / "evidence" / "call_chain"
+                output.mkdir(parents=True)
+                (output / "alerts.csv").write_text("changed_symbol,evidence_files\n", encoding="utf-8")
+                (output / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "total_apis": 1,
+                            "reachable": 0,
+                            "uncertain": 0,
+                            "not_analyzed": 1,
+                            "not_found_in_static_analysis": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, 0.1
+
+            with patch.object(realreg, "run_step5", side_effect=fake_run_step5):
+                result = realreg.run_case(case, root, changed_apis, report_root)
+
+        signals = result["quality_signals"]
+        self.assertTrue(any(item["signal_type"] == "capability_gap" for item in signals))
+        self.assertTrue(any(item["blocking"] for item in signals))
+
     def test_run_case_prefers_embedded_changed_api_rows_over_existing_external_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

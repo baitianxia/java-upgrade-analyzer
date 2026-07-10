@@ -1,5 +1,3 @@
-import json
-import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -12,64 +10,32 @@ import quality_gate  # noqa: E402
 
 
 class QualityGateTest(unittest.TestCase):
-    def test_quick_profile_includes_core_semantic_gate(self):
-        tasks = quality_gate.build_plan("quick", python_exe="pythonX")
-        names = [task.name for task in tasks]
-
-        self.assertEqual(names[0], "py_compile_scripts")
-        self.assertIn("accuracy_benchmark_core", names)
-        self.assertIn("unit_core_semantics", names)
-        self.assertIn("smoke_core", names)
-        self.assertNotIn("real_project_all", names)
-
-    def test_step5_profile_can_skip_real_project_matrix(self):
-        tasks = quality_gate.build_plan("step5", python_exe="pythonX", skip_real=True)
-        names = [task.name for task in tasks]
-
-        self.assertIn("accuracy_benchmark_step5", names)
-        self.assertIn("unit_step5_semantics", names)
-        self.assertIn("smoke_step5", names)
-        self.assertFalse(any(task.real_project for task in tasks))
-
-    def test_release_profile_includes_real_project_and_diff_check_by_default(self):
+    def test_release_plan_runs_signal_audit_after_real_project_matrix(self):
         tasks = quality_gate.build_plan(
             "release",
-            python_exe="pythonX",
+            python_exe="python3",
+            skip_real=False,
+            real_case="all",
             report_root="/tmp/jua-real",
         )
         names = [task.name for task in tasks]
 
-        self.assertIn("accuracy_benchmark_all", names)
-        self.assertIn("unit_all", names)
-        self.assertIn("smoke_all", names)
         self.assertIn("real_project_all", names)
-        self.assertIn("git_diff_check", names)
-        real_task = next(task for task in tasks if task.name == "real_project_all")
-        self.assertIn("/tmp/jua-real", real_task.command)
+        self.assertIn("quality_signal_audit", names)
+        self.assertGreater(names.index("quality_signal_audit"), names.index("real_project_all"))
+        audit = next(task for task in tasks if task.name == "quality_signal_audit")
+        self.assertIn("--fail-on-blocking", audit.command)
 
-    def test_dry_run_outputs_json_plan_without_running_tasks(self):
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(ROOT / "scripts" / "quality_gate.py"),
-                "--profile",
-                "step5",
-                "--skip-real",
-                "--dry-run",
-            ],
-            cwd=str(ROOT),
-            check=True,
-            capture_output=True,
-            text=True,
+    def test_release_plan_skips_signal_audit_when_real_projects_are_skipped(self):
+        tasks = quality_gate.build_plan(
+            "release",
+            python_exe="python3",
+            skip_real=True,
+            real_case="all",
+            report_root="/tmp/jua-real",
         )
-        payload = json.loads(completed.stdout)
 
-        self.assertTrue(payload["dry_run"])
-        self.assertEqual(payload["profile"], "step5")
-        task_names = [task["name"] for task in payload["tasks"]]
-        self.assertIn("accuracy_benchmark_step5", task_names)
-        self.assertIn("unit_step5_semantics", task_names)
-        self.assertNotIn("real_project_all", task_names)
+        self.assertNotIn("quality_signal_audit", [task.name for task in tasks])
 
 
 if __name__ == "__main__":

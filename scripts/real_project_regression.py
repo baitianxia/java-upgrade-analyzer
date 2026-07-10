@@ -977,6 +977,150 @@ def load_summary(report_dir: Path) -> dict:
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
+def make_signal(
+    signal_type: str,
+    severity: str,
+    case: str,
+    *,
+    step: str = "",
+    symbol: str = "",
+    message: str = "",
+    count: int = 0,
+    expected: str = "",
+    actual: str = "",
+    evidence: Iterable[str] = (),
+    fixture_status: str = "missing",
+    notes: str = "",
+    blocking: bool | None = None,
+) -> dict:
+    if blocking is None:
+        blocking = severity in {"P0", "P1"} and signal_type in {
+            "correctness_failure",
+            "capability_gap",
+            "evidence_weakness",
+        }
+    return {
+        "signal_type": signal_type,
+        "severity": severity,
+        "blocking": bool(blocking),
+        "case": case,
+        "step": step,
+        "symbol": symbol,
+        "message": message,
+        "count": int(count or 0),
+        "expected": expected,
+        "actual": actual,
+        "evidence": [str(item) for item in evidence],
+        "fixture_status": fixture_status,
+        "notes": notes,
+    }
+
+
+def build_quality_signals(
+    case: RealProjectCase,
+    *,
+    summary: dict,
+    checks: list[dict],
+    failures: list[str],
+    result_audit: dict,
+    report_dir: Path,
+) -> list[dict]:
+    signals: list[dict] = []
+    for field in ("not_analyzed", "not_found_in_static_analysis"):
+        count = int(summary.get(field) or 0)
+        if count:
+            signals.append(make_signal(
+                "capability_gap",
+                "P1",
+                case.name,
+                step="step5",
+                message=f"{case.name} summary has {count} {field} item(s)",
+                count=count,
+                expected="available evidence should produce a reviewable conclusion",
+                actual=field,
+                evidence=[
+                    report_dir / "evidence" / "call_chain" / "summary.json",
+                    report_dir / "evidence" / "call_chain" / "alerts.csv",
+                ],
+            ))
+    uncertain = int(summary.get("uncertain") or 0)
+    if uncertain:
+        signals.append(make_signal(
+            "capability_gap",
+            "P2",
+            case.name,
+            step="step5",
+            message=f"{case.name} summary has {uncertain} uncertain item(s)",
+            count=uncertain,
+            expected="reduce uncertainty when source or bytecode evidence is sufficient",
+            actual="uncertain",
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+            blocking=False,
+        ))
+
+    for check in checks:
+        prod_missing = int(check.get("production_missing") or 0)
+        if not prod_missing:
+            continue
+        symbol = str(check.get("symbol") or "")
+        if check.get("gating"):
+            signals.append(make_signal(
+                "correctness_failure",
+                "P1",
+                case.name,
+                step="step5",
+                symbol=symbol,
+                message=f"{symbol} missing {prod_missing} gated production baseline file(s)",
+                count=prod_missing,
+                expected="production baseline files represented in alerts.csv",
+                actual="production baseline missing from alerts.csv",
+                evidence=[report_dir / "evidence" / "call_chain" / "alerts.csv"],
+                notes=str(check.get("notes") or ""),
+            ))
+        else:
+            signals.append(make_signal(
+                "capability_gap",
+                "P2",
+                case.name,
+                step="step5",
+                symbol=symbol,
+                message=f"{symbol} has {prod_missing} non-gating production baseline miss(es)",
+                count=prod_missing,
+                expected="investigate whether the analyzer can distinguish this probe precisely",
+                actual="non-gating baseline miss",
+                evidence=[report_dir / "evidence" / "call_chain" / "alerts.csv"],
+                notes=str(check.get("notes") or ""),
+                blocking=False,
+            ))
+
+    for failure in result_audit.get("failures") or []:
+        signals.append(make_signal(
+            "evidence_weakness",
+            "P1",
+            case.name,
+            step="step5",
+            message=str(failure),
+            expected="complete and reviewable evidence files",
+            actual=str(failure),
+            evidence=[report_dir / "evidence" / "call_chain" / "alerts.csv"],
+        ))
+
+    for failure in failures:
+        text = str(failure)
+        if text.startswith(("graph_stats:", "performance:", "source_shape:")):
+            signals.append(make_signal(
+                "capability_gap",
+                "P1",
+                case.name,
+                step="step5",
+                message=text,
+                expected="real project scale and performance stay within configured thresholds",
+                actual=text,
+                evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+            ))
+    return signals
+
+
 def run_case(
     case: RealProjectCase,
     project_root: Path,
@@ -986,7 +1130,23 @@ def run_case(
     full_step4_apis: bool = False,
 ) -> dict:
     if not project_root.exists():
-        return {"case": case.name, "status": "skipped", "reason": f"project root missing: {project_root}"}
+        reason = f"project root missing: {project_root}"
+        return {
+            "case": case.name,
+            "status": "skipped",
+            "reason": reason,
+            "quality_signals": [
+                make_signal(
+                    "infra_skip",
+                    "P1",
+                    case.name,
+                    message=reason,
+                    actual="real project checkout unavailable",
+                    blocking=False,
+                    fixture_status="",
+                )
+            ],
+        }
     report_dir = report_root / case.name
     report_dir.mkdir(parents=True, exist_ok=True)
     step4_result = {}
@@ -1060,6 +1220,7 @@ def run_case(
 
     if not changed_apis.exists():
         if failures:
+            missing_reason = f"changed APIs missing: {changed_apis}"
             return {
                 "case": case.name,
                 "status": "failed",
@@ -1077,10 +1238,39 @@ def run_case(
                 "step6": {},
                 "queries": [],
                 "checks": [],
-                "failures": failures + [f"changed APIs missing: {changed_apis}"],
+                "failures": failures + [missing_reason],
                 "warnings": warnings,
+                "quality_signals": [
+                    make_signal(
+                        "infra_skip",
+                        "P1",
+                        case.name,
+                        step="step4",
+                        message=missing_reason,
+                        actual="changed API input unavailable",
+                        blocking=False,
+                        fixture_status="",
+                    )
+                ],
             }
-        return {"case": case.name, "status": "skipped", "reason": f"changed APIs missing: {changed_apis}"}
+        reason = f"changed APIs missing: {changed_apis}"
+        return {
+            "case": case.name,
+            "status": "skipped",
+            "reason": reason,
+            "quality_signals": [
+                make_signal(
+                    "infra_skip",
+                    "P1",
+                    case.name,
+                    step="step4",
+                    message=reason,
+                    actual="changed API input unavailable",
+                    blocking=False,
+                    fixture_status="",
+                )
+            ],
+        }
 
     returncode, elapsed = run_step5(case, project_root, changed_apis, report_dir)
     summary = load_summary(report_dir)
@@ -1187,6 +1377,14 @@ def run_case(
     status = "passed" if returncode == 0 and not failures else "failed"
     if returncode != 0:
         failures.append(f"step5_returncode={returncode}")
+    quality_signals = build_quality_signals(
+        case,
+        summary=summary,
+        checks=checks,
+        failures=failures,
+        result_audit=result_audit,
+        report_dir=report_dir,
+    )
 
     return {
         "case": case.name,
@@ -1214,6 +1412,7 @@ def run_case(
         "result_audit": result_audit,
         "failures": failures,
         "warnings": warnings,
+        "quality_signals": quality_signals,
     }
 
 

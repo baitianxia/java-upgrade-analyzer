@@ -188,6 +188,16 @@ evidence/call_chain/step5_timing.csv
 
 如果每轮真实项目测试都发现新问题，说明测试矩阵仍不足，应继续补充针对性测试和压力模型。
 
+## Fixture Debt
+
+每个 P0/P1 真实项目质量信号都必须进入以下状态之一：
+
+- 已沉淀为 L0/L1/L2 回归测试；
+- 已记录为 planned，并写清楚目标 fixture 形态；
+- 已 waived，并写清楚原因和过期时间。
+
+Release 门禁会统计 blocking signal 中尚未沉淀的 `fixture_debt`。不能让真实项目反复发现同一类问题，却只保留一次性运行记录。
+
 ## 打包前最低要求
 
 打包给使用者验证前至少执行：

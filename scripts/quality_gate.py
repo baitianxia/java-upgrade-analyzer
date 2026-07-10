@@ -96,15 +96,33 @@ def _smoke_task(python_exe, group):
     )
 
 
-def _real_project_task(python_exe, case, report_root):
+def _real_project_task(python_exe, case, report_root, json_out=""):
     command = [python_exe, "scripts/real_project_regression.py", "--case", case]
     if report_root:
         command.extend(["--report-root", report_root])
+    if json_out:
+        command.extend(["--json-out", json_out])
     return GateTask(
         name=f"real_project_{case}",
         command=command,
         purpose="真实项目矩阵，验证复杂源码、字节码、输出语义和性能边界",
         heavy=True,
+        real_project=True,
+    )
+
+
+def _quality_signal_audit_task(python_exe, real_json, audit_json):
+    return GateTask(
+        name="quality_signal_audit",
+        command=[
+            python_exe,
+            "scripts/quality_signal_audit.py",
+            real_json,
+            "--fail-on-blocking",
+            "--json-out",
+            audit_json,
+        ],
+        purpose="审计真实项目质量信号，阻塞 P0/P1 correctness/capability/evidence 问题",
         real_project=True,
     )
 
@@ -145,6 +163,9 @@ def _diff_check_task():
 def build_plan(profile, python_exe=None, skip_real=False, real_case="all", report_root=None):
     python_exe = python_exe or sys.executable
     tasks = [_py_compile_task(python_exe)]
+    audit_root = Path(report_root or "/private/tmp/jua-quality-gate")
+    real_json = str(audit_root / f"real_project_{real_case}.json")
+    audit_json = str(audit_root / f"quality_signal_audit_{real_case}.json")
 
     if profile == "quick":
         tasks.append(_accuracy_benchmark_task(python_exe, "core"))
@@ -168,14 +189,16 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="all", repor
         tasks.append(_smoke_task(python_exe, "step5"))
         tasks.append(_user_scenario_task(python_exe))
         if not skip_real:
-            tasks.append(_real_project_task(python_exe, real_case, report_root))
+            tasks.append(_real_project_task(python_exe, real_case, report_root, real_json))
+            tasks.append(_quality_signal_audit_task(python_exe, real_json, audit_json))
     elif profile == "release":
         tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all"))
         tasks.append(_user_scenario_task(python_exe))
         if not skip_real:
-            tasks.append(_real_project_task(python_exe, real_case, report_root))
+            tasks.append(_real_project_task(python_exe, real_case, report_root, real_json))
+            tasks.append(_quality_signal_audit_task(python_exe, real_json, audit_json))
         tasks.append(_diff_check_task())
     else:
         raise ValueError(f"unknown profile: {profile}")
@@ -209,6 +232,28 @@ def _write_json(path, payload):
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _read_audit_summary(tasks):
+    for task in tasks:
+        if task.name != "quality_signal_audit":
+            continue
+        command = list(task.command)
+        if "--json-out" not in command:
+            return {}
+        index = command.index("--json-out") + 1
+        if index >= len(command):
+            return {}
+        path = Path(command[index])
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        summary = payload.get("summary")
+        return summary if isinstance(summary, dict) else {}
+    return {}
 
 
 def main(argv=None):
@@ -253,10 +298,16 @@ def main(argv=None):
             if not args.continue_on_failure:
                 break
 
+    audit_summary = _read_audit_summary(tasks)
     payload = {
         "profile": args.profile,
         "status": overall,
+        "decision": "release_blocked" if overall == "failed" else "release_allowed",
         "elapsed_sec": round(time.perf_counter() - started, 3),
+        "blocking_signals": int(audit_summary.get("blocking_signals") or 0),
+        "non_blocking_signals": int(audit_summary.get("non_blocking_signals") or 0),
+        "fixture_debt": int(audit_summary.get("fixture_debt") or 0),
+        "real_project_skipped": int((audit_summary.get("by_type") or {}).get("infra_skip") or 0),
         "results": [asdict(result) for result in results],
         "skipped_tasks": [asdict(task) for task in tasks[len(results):]],
     }
