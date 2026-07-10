@@ -73,7 +73,8 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("选择 Step5 范围时使用 `selection_key`", md_text)
         self.assertIn("完整 API 明细：`all_changed_apis.csv`", md_text)
         self.assertIn("依赖包明细目录：`s4_per_dependency/`", md_text)
-        self.assertIn("| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 主要变化类型 | 明细 |", md_text)
+        self.assertIn("| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |", md_text)
+        self.assertIn("含高风险 API，优先进入 Step5", md_text)
 
     def test_alerts_generation_does_not_write_low_value_summary_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6393,6 +6394,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual("B.call", row["chain_target"])
         self.assertEqual("1", row["chain_hop_count"])
         self.assertEqual("1. A.call -> 2. B.call", row["chain_detail"])
+        self.assertEqual("核对这条候选链路是否真实会在运行时触发。", row["review_focus"])
         self.assertIn("低置信度边", row["reason"])
         self.assertIn("低置信度边", row["review_reason"])
         self.assertNotIn("已证明变更 API 触达系统代码", row["reason"])

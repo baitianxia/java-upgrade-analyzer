@@ -3641,6 +3641,19 @@ def build_changed_dependency_rows(api_rows):
     return sorted(result, key=lambda row: (-int(row["high_risk_api_count"]), row["coord"]))
 
 
+def _dependency_review_focus(row):
+    high_risk = int((row or {}).get("high_risk_api_count") or 0)
+    changed = int((row or {}).get("changed_api_count") or 0)
+    change_types = str((row or {}).get("change_types") or "").lower()
+    if high_risk:
+        return "含高风险 API，优先进入 Step5"
+    if "removed" in change_types or "signature" in change_types:
+        return "包含删除或签名变化，建议纳入 Step5"
+    if changed >= 20:
+        return "变化 API 较多，建议按依赖包复核"
+    return "低风险变化，可在全量分析时覆盖"
+
+
 def write_changed_dependencies(api_rows, output_dir):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -3655,8 +3668,11 @@ def write_changed_dependencies(api_rows, output_dir):
         "high_risk_api_count",
         "change_types",
         "symbol_kinds",
+        "review_focus",
         "detail",
     ]
+    for row in dependency_rows:
+        row["review_focus"] = _dependency_review_focus(row)
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -3670,22 +3686,24 @@ def write_changed_dependencies(api_rows, output_dir):
         f"展示 {len(dependency_rows)} / {len(dependency_rows)} 个依赖包。",
         "",
         "选择 Step5 范围时使用 `selection_key`，例如 `coord:com.example:demo-lib`。",
+        "先看顺序：优先查看高风险 API 数大于 0 的依赖包；如果只做定向分析，复制对应 `selection_key`。",
         "",
         "完整 API 明细：`all_changed_apis.csv`。",
         "依赖包明细目录：`s4_per_dependency/`。",
         "",
-        "| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 主要变化类型 | 明细 |",
-        "|---|---|---:|---:|---|---|",
+        "| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |",
+        "|---|---|---:|---:|---|---|---|",
     ]
     if dependency_rows:
         for row in dependency_rows:
             lines.append(
                 f"| `{row['selection_key']}` | `{row['coord']}` | "
                 f"{row['changed_api_count']} | {row['high_risk_api_count']} | "
+                f"{row['review_focus']} | "
                 f"{row['change_types'] or '-'} | `{row['detail']}` |"
             )
     else:
-        lines.append("| - | - | 0 | 0 | - | - |")
+        lines.append("| - | - | 0 | 0 | - | - | - |")
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return csv_path, md_path
 

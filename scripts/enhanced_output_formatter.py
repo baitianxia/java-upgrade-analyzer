@@ -43,7 +43,7 @@ except ImportError:
 
 ALERTS_CSV_FIELDNAMES = [
     'conclusion', 'change_summary', 'review_reason', 'chain_summary',
-    'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
+    'review_focus', 'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
     'api_id', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
     'symbol_kind', 'change_type', 'severity', 'api_status', 'path_status',
     'conclusion_level', 'action_type', 'business_reachable', 'business_entry',
@@ -1335,6 +1335,7 @@ def _alert_rows_for_result(result):
             'change_summary': _alert_change_summary(result),
             'review_reason': review_reason,
             'chain_summary': chain_view['summary'],
+            'review_focus': _alert_review_focus(path_status, conclusion_level, stop_reason),
             'chain_entry': chain_view['entry'],
             'chain_target': chain_view['target'],
             'chain_hop_count': chain_view['hop_count'],
@@ -1454,6 +1455,29 @@ def _alert_change_summary(result):
     else:
         change_sentence = f"变更了{target}"
     return f"依赖 {coord} {change_sentence}（严重级别 {severity}）"
+
+
+def _alert_review_focus(path_status, conclusion_level, stop_reason):
+    status = str(path_status or '').strip()
+    reason = str(stop_reason or '').strip()
+    if status == 'reachable':
+        return "核对业务入口和终点是否符合预期。"
+    if status == 'uncertain':
+        return "核对这条候选链路是否真实会在运行时触发。"
+    if status == 'not_impacted':
+        return "核对当前制品中保留该 API 的依赖是否符合预期。"
+    if status in {'not_found_in_static_analysis', 'not_reachable'}:
+        return "核对本轮分析范围是否覆盖目标模块和依赖源码。"
+    if status == 'not_analyzed':
+        if reason == 'DEPENDENCY_SOURCE_MAPPING_MISSING':
+            return "补充缺失依赖源码目录后重跑 Step5。"
+        return "查看原因并补齐本轮未完成分析所需输入。"
+    level = str(conclusion_level or '').strip()
+    if level == 'candidate':
+        return "核对候选证据是否足以证明运行时触发。"
+    if level == 'incomplete':
+        return "补齐输入或工具能力后重跑。"
+    return "结合结论、原因和链路字段复核这一行。"
 
 
 def _alert_review_reason(result, detail, evidence, explanation, stop_reason):

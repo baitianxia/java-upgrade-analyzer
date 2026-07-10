@@ -30,6 +30,31 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertLess(text.index("#### 用户深入排查时看的产物"), text.index("`evidence/call_chain/by_api/*.json`"))
         self.assertLess(text.index("`evidence/call_chain/by_api/*.json`"), text.index("#### 程序使用的产物"))
 
+    def test_bucket_detail_markdown_starts_with_reader_task_not_numeric_summary(self):
+        config = {
+            "title": "需人工复核清单",
+            "conclusion": "需要人工复核",
+            "note": "静态分析发现候选路径但存在歧义，需要人工核实。",
+        }
+        text = s6_report.build_bucket_detail_markdown(
+            config,
+            [
+                {
+                    "coord": "com.acme:demo",
+                    "api": "com.acme.Demo.changed",
+                    "change_type": "METHOD_CHANGED",
+                    "symbol_kind": "method",
+                    "severity": "P1",
+                    "user_reason": "字节码命中但未确认业务入口",
+                }
+            ],
+            "s6_uncertain_apis.csv",
+        )
+
+        self.assertIn("## 先看什么", text)
+        self.assertIn("复核重点", text)
+        self.assertLess(text.index("## 先看什么"), text.index("## 原因分类"))
+
 
 if __name__ == "__main__":
     unittest.main()

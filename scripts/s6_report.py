@@ -410,12 +410,31 @@ def _change_summary(item, severity=''):
 
 def _detail_row(idx, item, conclusion=''):
     reason = item.get("user_reason") or item.get("reason") or item.get("recommended_action") or ""
+    focus = _detail_review_focus(item, conclusion)
     return (
         f"| {idx} | `{_md_cell(item.get('coord'))}` | `{_md_cell(item.get('api'))}` | "
         f"{_md_cell(_change_summary(item), 220)} | "
         f"{_md_cell(conclusion or item.get('user_conclusion') or _bucket_csv_conclusion('', item))} | "
-        f"{_md_cell(reason)} |"
+        f"{_md_cell(reason)} | {_md_cell(focus)} |"
     )
+
+
+def _detail_review_focus(item, conclusion=''):
+    conclusion_text = str(conclusion or item.get("user_conclusion") or "").strip()
+    reason = str(item.get("user_reason") or item.get("reason") or item.get("reason_code") or "").strip()
+    if conclusion_text == "已确认影响":
+        return "核对业务入口、消费方和变更 API 是否属于本次升级范围。"
+    if conclusion_text == "可能影响":
+        return "结合业务测试或运行时配置确认该行为变化是否会触发。"
+    if conclusion_text == "需要补充输入":
+        return "先补齐原因中提到的源码、构建产物或映射信息。"
+    if conclusion_text == "已确认不受影响":
+        return "核对保留该 API 的当前制品依赖是否确实随应用发布。"
+    if "未找到" in conclusion_text:
+        return "核对本轮源码、依赖和静态分析范围是否完整。"
+    if reason:
+        return "围绕原因字段核对对应证据。"
+    return "打开 CSV 查看完整字段并按依赖坐标筛选。"
 
 
 def build_bucket_detail_markdown(config, items, csv_name):
@@ -428,11 +447,11 @@ def build_bucket_detail_markdown(config, items, csv_name):
         f"- 说明：{config.get('note') or ''}",
         f"- 完整可筛选清单：`{csv_name}`",
         "",
-        "## 文件说明",
+        "## 先看什么",
         "",
-        "- “原因分类”和“依赖坐标分布”用于展示该清单内条目的聚集情况。",
-        "- Markdown 展示样例或完整明细；CSV 是该桶的完整全集。",
-        "- CSV 优先查看开头的结论、变化、复核原因和调用链字段；需要筛选时可使用依赖坐标或变更 API。",
+        "- 先看下面的 API 明细表，重点读“原因”和“复核重点”。",
+        "- 如果 Markdown 只展示样例，用完整 CSV 按依赖坐标或变更 API 筛选。",
+        "- 需要调用链证据时，回到 `evidence/call_chain/alerts.csv` 按 API 或依赖坐标筛选。",
         "",
     ]
     if reason_summary:
@@ -465,8 +484,8 @@ def build_bucket_detail_markdown(config, items, csv_name):
         lines += [
             "## API 明细（完整）",
             "",
-            "| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 |",
-            "|---:|---|---|---|---|---|",
+            "| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 | 复核重点 |",
+            "|---:|---|---|---|---|---|---|",
         ]
         for idx, item in enumerate(items, 1):
             lines.append(_detail_row(idx, item, config.get('conclusion') or ''))
@@ -477,8 +496,8 @@ def build_bucket_detail_markdown(config, items, csv_name):
             "",
             f"> 本桶共有 {len(items)} 条，Markdown 只展示样例，避免明细文件自身难以阅读或预览失败；完整全集请看 `{csv_name}`。",
             "",
-            "| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 |",
-            "|---:|---|---|---|---|---|",
+            "| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 | 复核重点 |",
+            "|---:|---|---|---|---|---|---|",
         ]
         for idx, item in enumerate(items[:S6_DETAIL_MD_SAMPLE_LIMIT], 1):
             lines.append(_detail_row(idx, item, config.get('conclusion') or ''))

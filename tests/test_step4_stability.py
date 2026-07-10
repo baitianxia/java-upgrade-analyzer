@@ -78,6 +78,9 @@ class Step4StabilityTest(unittest.TestCase):
             self.assertIn("selection_key,coord,dependency_name,changed_api_count", csv_text)
             self.assertIn("coord:com.acme:alpha", csv_text)
             self.assertIn("本文件回答：哪些依赖包发生 API 变化", md_text)
+            self.assertIn("先看顺序", md_text)
+            self.assertIn("为什么先看", md_text)
+            self.assertIn("含高风险 API，优先进入 Step5", md_text)
             self.assertIn("`coord:com.acme:alpha`", md_text)
             self.assertIn("完整 API 明细", md_text)
 
