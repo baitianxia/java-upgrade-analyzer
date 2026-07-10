@@ -310,6 +310,59 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(any(item["signal_type"] == "capability_gap" for item in signals))
         self.assertTrue(any(item["blocking"] for item in signals))
 
+    def test_run_case_includes_real_project_matrix_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            root.mkdir()
+            java_file = root / "src/main/java/demo/App.java"
+            java_file.parent.mkdir(parents=True)
+            java_file.write_text("class App {}\n", encoding="utf-8")
+            changed_apis = Path(tmp) / "all_changed_apis.csv"
+            changed_apis.write_text(
+                "coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source\n"
+                "demo:dep,1,-,REMOVED,demo.Api.removed,removed,method,(String),true,P1,test\n",
+                encoding="utf-8",
+            )
+            case = realreg.RealProjectCase(
+                name="mini",
+                default_project=root,
+                default_changed_apis=changed_apis,
+                baseline_specs=(),
+            )
+
+            def fake_run_step5(_case, _project_root, _changed_apis, report_dir):
+                output = report_dir / "evidence" / "call_chain"
+                output.mkdir(parents=True)
+                self._write_readable_alerts(output / "alerts.csv", "demo.Api.removed", java_file)
+                (output / "alerts_reachable.csv").write_text(
+                    (output / "alerts.csv").read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                (output / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "total_apis": 1,
+                            "reachable": 1,
+                            "uncertain": 0,
+                            "not_analyzed": 0,
+                            "not_found_in_static_analysis": 0,
+                            "meta": {"graph_stats": {}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, 0.1
+
+            with patch.object(realreg, "run_step5", side_effect=fake_run_step5):
+                result = realreg.run_case(case, root, changed_apis, report_root)
+
+        policy = result["matrix_policy"]
+        self.assertEqual(policy["role"], "problem_finder")
+        self.assertIn("exploration", policy["lifecycle"])
+        self.assertIn("fixture_debt", policy["promotion_rules"])
+        self.assertIn("rotate_to_new_project", policy["promotion_rules"])
+
     def test_run_case_prefers_embedded_changed_api_rows_over_existing_external_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

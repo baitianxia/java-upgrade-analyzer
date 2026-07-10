@@ -977,6 +977,26 @@ def load_summary(report_dir: Path) -> dict:
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
+def real_project_matrix_policy() -> dict:
+    return {
+        "role": "problem_finder",
+        "lifecycle": ["exploration", "convergence", "guardian", "rotation"],
+        "promotion_rules": [
+            "fixture_debt",
+            "convert_new_findings_to_l0_l1_l2_fixtures",
+            "clear_p0_p1_fixture_debt_before_release",
+            "keep_only_representative_guardian_probes_after_convergence",
+            "rotate_to_new_project",
+            "rotate_to_new_project_when_current_project_no_longer_finds_new_signals",
+        ],
+        "selection_bias": [
+            "prefer_projects_with_uncovered_framework_or_build_shapes",
+            "prefer_projects_that_exercise_current_capability_boundaries",
+            "do_not_spend_discovery_budget_on_projects_whose_findings_are_already_fixtured",
+        ],
+    }
+
+
 def make_signal(
     signal_type: str,
     severity: str,
@@ -1135,6 +1155,7 @@ def run_case(
             "case": case.name,
             "status": "skipped",
             "reason": reason,
+            "matrix_policy": real_project_matrix_policy(),
             "quality_signals": [
                 make_signal(
                     "infra_skip",
@@ -1240,6 +1261,7 @@ def run_case(
                 "checks": [],
                 "failures": failures + [missing_reason],
                 "warnings": warnings,
+                "matrix_policy": real_project_matrix_policy(),
                 "quality_signals": [
                     make_signal(
                         "infra_skip",
@@ -1258,6 +1280,7 @@ def run_case(
             "case": case.name,
             "status": "skipped",
             "reason": reason,
+            "matrix_policy": real_project_matrix_policy(),
             "quality_signals": [
                 make_signal(
                     "infra_skip",
@@ -1412,6 +1435,7 @@ def run_case(
         "result_audit": result_audit,
         "failures": failures,
         "warnings": warnings,
+        "matrix_policy": real_project_matrix_policy(),
         "quality_signals": quality_signals,
     }
 

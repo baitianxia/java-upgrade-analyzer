@@ -188,6 +188,15 @@ evidence/call_chain/step5_timing.csv
 
 如果每轮真实项目测试都发现新问题，说明测试矩阵仍不足，应继续补充针对性测试和压力模型。
 
+真实项目矩阵必须按“发现池”而不是“固定纪念碑”维护。每次执行真实项目测试时都要遵守：
+
+- 探索期项目用于发现未知问题；
+- 收敛期项目必须把 P0/P1 findings 转成 L0/L1/L2 fixture；
+- 守护期项目只保留少量代表性 probe；
+- 当一个项目的问题都已沉淀且不再发现新信号时，应把主要发现预算轮换到更适合暴露未知问题的新工程。
+
+优先轮换到能覆盖当前能力边界的工程，例如 Spring Boot 2 到 3、Jakarta 迁移、多模块应用、annotation processor、SPI、反射、动态代理、fat jar、shaded jar、nested jar、Kotlin/Groovy 混合 Java、复杂 Maven 依赖管理等。
+
 ## Fixture Debt
 
 每个 P0/P1 真实项目质量信号都必须进入以下状态之一：
