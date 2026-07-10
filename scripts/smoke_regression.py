@@ -12,6 +12,7 @@ import argparse
 import base64
 import csv
 from dataclasses import dataclass
+import hashlib
 import io
 import json
 import os
@@ -268,6 +269,184 @@ def create_fake_boot_jar(path, embedded_deps):
                 f"BOOT-INF/lib/{artifact_id}-{version}.jar",
                 build_embedded_maven_jar_bytes(group_id, artifact_id, version, marker=artifact_id.encode("utf-8")),
             )
+
+
+def create_scoped_runtime_evidence(report_dir, dependencies):
+    """Create a final-artifact fixture whose dependency classes match source fixtures."""
+    report_dir = Path(report_dir)
+    artifact_path = report_dir / "evidence" / "dependencies" / "s1_artifacts" / "current.jar"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_rows = []
+    with zipfile.ZipFile(artifact_path, "w") as outer:
+        outer.writestr("BOOT-INF/classes/com/example/App.class", minimal_valid_app_class_bytes())
+        for coord, version, class_names in dependencies:
+            group_id, artifact_id = coord.split(":", 1)
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as jar:
+                jar.writestr(
+                    f"META-INF/maven/{group_id}/{artifact_id}/pom.properties",
+                    f"groupId={group_id}\nartifactId={artifact_id}\nversion={version}\n",
+                )
+                for class_name in class_names:
+                    jar.writestr(class_name.replace(".", "/") + ".class", b"fixture-class")
+            lib_entry = f"BOOT-INF/lib/{artifact_id}-{version}.jar"
+            outer.writestr(lib_entry, nested.getvalue())
+            resolved_rows.append({
+                "coord": coord,
+                "version": version,
+                "scope": "runtime",
+                "lib_entry": lib_entry,
+                "resolution_status": "resolved",
+            })
+
+    resolved_path = report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv"
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    with resolved_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"],
+        )
+        writer.writeheader()
+        writer.writerows(resolved_rows)
+    digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    write_text(
+        report_dir / "evidence" / "dependencies" / "build_provenance.json",
+        json.dumps({
+            "schema": "java-upgrade-analyzer.build-provenance.v1",
+            "both_builds_succeeded": True,
+            "sides": [{
+                "side": "current",
+                "source_mode": "fixture_final_artifact",
+                "artifact_path": str(artifact_path),
+                "artifact_sha256": digest,
+                "build_succeeded": True,
+            }],
+        }, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def commit_source_fixture(repo_dir):
+    git = git_cmd()
+    run_external_cmd(git + ["init"], repo_dir)
+    run_external_cmd(git + ["config", "user.name", "Trae Smoke"], repo_dir)
+    run_external_cmd(git + ["config", "user.email", "smoke@example.com"], repo_dir)
+    run_external_cmd(git + ["add", "."], repo_dir)
+    run_external_cmd(git + ["commit", "-m", "runtime source fixture"], repo_dir)
+
+
+def write_scoped_ref_evidence(report_dir, coord_repositories):
+    items = []
+    for coord, repo_dir in coord_repositories:
+        items.append({
+            "coord": coord,
+            "repo_path": str(Path(repo_dir).resolve()),
+            "module_rel_path": ".",
+            "cur_ref": "HEAD",
+            "status": "matched",
+        })
+    write_text(
+        Path(report_dir) / "evidence" / "api_changes" / "git_ref_matches.json",
+        json.dumps({"matched_items": items}, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def commit_business_fixture_and_update_provenance(project_dir, report_dir, message):
+    git = git_cmd()
+    run_external_cmd(git + ["add", "src/main/java"], project_dir)
+    _stdout, _stderr, status_rc = compat_run_cmd(
+        git + ["diff", "--cached", "--quiet"],
+        cwd=str(project_dir),
+    )
+    if status_rc != 0:
+        run_external_cmd(git + ["commit", "-m", message], project_dir)
+    revision_stdout, _revision_stderr = run_external_cmd(
+        git + ["rev-parse", "HEAD"],
+        project_dir,
+    )
+    revision = revision_stdout.strip()
+    provenance_path = Path(report_dir) / "evidence" / "dependencies" / "build_provenance.json"
+    provenance = read_json(provenance_path)
+    current = next(item for item in provenance.get("sides") or [] if item.get("side") == "current")
+    current["revision"] = revision
+    current["source_mode"] = "checkout_build"
+    write_text(
+        provenance_path,
+        json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def refresh_fixture_business_bytecode(report_dir, source_files):
+    report_dir = Path(report_dir)
+    artifact_path = report_dir / "evidence" / "dependencies" / "s1_artifacts" / "current.jar"
+    with tempfile.TemporaryDirectory(prefix="jua-smoke-javac-") as tmp:
+        classes_dir = Path(tmp) / "classes"
+        classes_dir.mkdir()
+        stdout, stderr, rc = compat_run_cmd(
+            ["javac", "-d", str(classes_dir), *[str(Path(path)) for path in source_files]],
+            cwd=str(report_dir.parent),
+        )
+        if rc != 0:
+            raise RuntimeError(f"fixture javac failed\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        compiled_classes = {
+            class_file.relative_to(classes_dir).as_posix(): class_file.read_bytes()
+            for class_file in sorted(classes_dir.rglob("*.class"))
+        }
+        dependency_prefixes = {
+            "deep-lib-": "com/example/deep/",
+            "adapter-lib-": "com/example/adapter/",
+            "bridge-lib-": "com/example/bridge/",
+        }
+        replacement = artifact_path.with_suffix(".tmp.jar")
+        with zipfile.ZipFile(artifact_path) as original, zipfile.ZipFile(replacement, "w") as updated:
+            for info in original.infolist():
+                if info.filename.startswith("BOOT-INF/classes/"):
+                    continue
+                dependency_prefix = next(
+                    (
+                        class_prefix
+                        for artifact_prefix, class_prefix in dependency_prefixes.items()
+                        if info.filename.startswith(f"BOOT-INF/lib/{artifact_prefix}")
+                    ),
+                    "",
+                )
+                if dependency_prefix:
+                    nested_output = io.BytesIO()
+                    with zipfile.ZipFile(io.BytesIO(original.read(info.filename))) as nested_original, zipfile.ZipFile(nested_output, "w") as nested_updated:
+                        for nested_info in nested_original.infolist():
+                            if not (
+                                nested_info.filename.startswith(dependency_prefix)
+                                and nested_info.filename.endswith(".class")
+                            ):
+                                nested_updated.writestr(
+                                    nested_info,
+                                    nested_original.read(nested_info.filename),
+                                )
+                        for relative, class_bytes in compiled_classes.items():
+                            if relative.startswith(dependency_prefix):
+                                nested_updated.writestr(relative, class_bytes)
+                    updated.writestr(info, nested_output.getvalue())
+                    continue
+                updated.writestr(info, original.read(info.filename))
+            for relative, class_bytes in compiled_classes.items():
+                if relative.startswith("com/example/") and any(
+                    relative.startswith(prefix)
+                    for prefix in (
+                        "com/example/BridgeApp",
+                        "com/example/NestedBridgeApp",
+                        "com/example/BridgeChainApp",
+                    )
+                ):
+                    updated.writestr(f"BOOT-INF/classes/{relative}", class_bytes)
+        os.replace(replacement, artifact_path)
+
+    provenance_path = report_dir / "evidence" / "dependencies" / "build_provenance.json"
+    provenance = read_json(provenance_path)
+    current = next(item for item in provenance.get("sides") or [] if item.get("side") == "current")
+    current["artifact_sha256"] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    write_text(
+        provenance_path,
+        json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
 def create_plain_jar(path):
@@ -676,13 +855,21 @@ def create_boot_jar(path, deps):
     with zipfile.ZipFile(path, "w") as outer:
         outer.writestr("BOOT-INF/classes/com/example/App.class", minimal_valid_app_class_bytes())
         for group_id, artifact_id, version in deps:
-            nested = io.BytesIO()
-            with zipfile.ZipFile(nested, "w") as inner:
-                inner.writestr(
-                    f"META-INF/maven/{group_id}/{artifact_id}/pom.properties",
-                    f"groupId={group_id}\\nartifactId={artifact_id}\\nversion={version}\\n".encode("utf-8"),
-                )
-            outer.writestr(f"BOOT-INF/lib/{artifact_id}-{version}.jar", nested.getvalue())
+            local_jar = (
+                Path.home() / ".m2" / "repository" / Path(*group_id.split("."))
+                / artifact_id / version / f"{artifact_id}-{version}.jar"
+            )
+            if local_jar.is_file():
+                nested_bytes = local_jar.read_bytes()
+            else:
+                nested = io.BytesIO()
+                with zipfile.ZipFile(nested, "w") as inner:
+                    inner.writestr(
+                        f"META-INF/maven/{group_id}/{artifact_id}/pom.properties",
+                        f"groupId={group_id}\\nartifactId={artifact_id}\\nversion={version}\\n".encode("utf-8"),
+                    )
+                nested_bytes = nested.getvalue()
+            outer.writestr(f"BOOT-INF/lib/{artifact_id}-{version}.jar", nested_bytes)
 
 
 def print_dependency_list(module, branch):
@@ -794,6 +981,7 @@ public class App {
     run_external_cmd(git + ["commit", "-m", "base"], project_dir)
     run_external_cmd(git + ["branch", "-M", "base"], project_dir)
     run_external_cmd(git + ["checkout", "-b", "current"], project_dir)
+    write_text(project_dir / ".git" / "info" / "exclude", ".upgrade-report*\n")
 
 
 def build_smoke_dep_env(workspace):
@@ -863,6 +1051,18 @@ public class AdapterFacade {
 }
 """,
     )
+    write_text(
+        adapter_source_dir / "NestedAdapter.java",
+        """package com.example.adapter;
+public class NestedAdapter {
+  public static class Inner {
+    public static String callDeep() {
+      return AdapterFacade.callDeep();
+    }
+  }
+}
+""",
+    )
 
     bridge_source_dir = workspace.bridge_repo / "src" / "main" / "java" / "com" / "example" / "bridge"
     bridge_source_dir.mkdir(parents=True, exist_ok=True)
@@ -877,6 +1077,8 @@ public class BridgeFacade {
 }
 """,
     )
+    for repo_dir in (workspace.deep_repo, workspace.adapter_repo, workspace.bridge_repo):
+        commit_source_fixture(repo_dir)
 
 
 def run_core_pipeline_smoke(workspace, dep_env):
@@ -1061,7 +1263,10 @@ def run_core_pipeline_smoke(workspace, dep_env):
     branch_ref_match_txt = (branch_match_dir / "git_ref_matches.txt").read_text(encoding="utf-8")
     branch_ref_match_json = read_json(branch_match_dir / "git_ref_matches.json")
     assert_true(
-        "refs=origin/release-1.0.0..origin/release-2.0.0(version)" in branch_summary,
+        (
+            "refs=origin/release-1.0.0..origin/release-2.0.0（version）" in branch_summary
+            or "refs=origin/release-1.0.0..origin/release-2.0.0(version)" in branch_summary
+        ),
         "Step 4 未按依赖版本号命中 release-* 形态的源码 refs",
     )
     assert_true(
@@ -1075,8 +1280,14 @@ def run_core_pipeline_smoke(workspace, dep_env):
         "Step 4 未输出版本匹配命中原因",
     )
     assert_true(
-        "已自动匹配，可抽查" in branch_ref_match_txt
-        and "selected=origin/release-1.0.0..origin/release-2.0.0" in branch_ref_match_txt,
+        (
+            "当前没有待确认项；可按需抽查" in branch_ref_match_txt
+            or "已自动匹配，可抽查" in branch_ref_match_txt
+        )
+        and (
+            "ref=origin/release-1.0.0..origin/release-2.0.0" in branch_ref_match_txt
+            or "selected=origin/release-1.0.0..origin/release-2.0.0" in branch_ref_match_txt
+        ),
         "Step 4 未产出 release-* 版本命中的 git ref 匹配摘要",
     )
     assert_true(
@@ -1249,6 +1460,14 @@ def run_core_pipeline_smoke(workspace, dep_env):
     runtime_full_expand_report = project_dir / ".upgrade-report-runtime-full-expand"
     runtime_full_expand_report.mkdir(parents=True, exist_ok=True)
     copy_file(report_dir / "evidence" / "dependencies" / "dep_changes.csv", runtime_full_expand_report / "evidence" / "dependencies" / "dep_changes.csv")
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv",
+        runtime_full_expand_report / "evidence" / "dependencies" / "deps_current_resolved.csv",
+    )
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "build_provenance.json",
+        runtime_full_expand_report / "evidence" / "dependencies" / "build_provenance.json",
+    )
     write_text(
         runtime_full_expand_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
@@ -1321,7 +1540,16 @@ def run_core_pipeline_smoke(workspace, dep_env):
     matched_items = runtime_full_expand_ref_matches_json.get("matched_items") or []
     demo_lib_match = next((item for item in matched_items if item.get("coord") == "com.example:demo-lib"), {})
     assert_true(
-        "module_path=" in runtime_full_expand_ref_matches and "module_rel_path=demo-lib" in runtime_full_expand_ref_matches,
+        (
+            (
+                "模块路径：" in runtime_full_expand_ref_matches
+                and "模块相对路径：demo-lib" in runtime_full_expand_ref_matches
+            )
+            or (
+                "module_path=" in runtime_full_expand_ref_matches
+                and "module_rel_path=demo-lib" in runtime_full_expand_ref_matches
+            )
+        ),
         "git_ref_matches.txt 应展示模块路径信息，便于人工复核多模块映射",
     )
     assert_true(
@@ -2261,25 +2489,25 @@ return ExtraApi.callLegacy();
     multi_bridge_per_dependency = read_json(
         runtime_full_expand_report / "evidence" / "api_changes" / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
     )
-    multi_bridge_api = (multi_bridge_summary.get("not_analyzed_apis") or [{}])[0]
+    multi_bridge_api = (multi_bridge_summary.get("not_found_apis") or [{}])[0]
     assert_true(
-        multi_bridge_summary.get("not_analyzed") == 1,
-        "repo 根目录自动展开后，Step5 应把行为变更归入运行时验证类 not_analyzed",
+        multi_bridge_summary.get("not_found_in_static_analysis") == 1,
+        "repo 根目录自动展开后，未打包模块不得形成行为变更调用链",
     )
     assert_true(
-        multi_bridge_api.get("reason_code") == "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION",
-        "多模块依赖源码映射自动发现后，Step5 未保留行为变更的运行时验证语义",
+        multi_bridge_api.get("reason_code") == "NO_STATIC_PATH",
+        "排除未打包模块后，Step5 应基于完整 current 制品给出静态未找到路径",
     )
     assert_true(
-        multi_bridge_api.get("business_reach_depth") == 2,
-        "repo 根目录自动展开后，Step5 未在第2跳回溯到系统代码",
+        multi_bridge_api.get("business_reach_depth") == 0,
+        "未打包的 demo-lib-extra 源码不得把变更 API 错误回溯到业务代码",
     )
     assert_true(
-        multi_bridge_api.get("dependency_chain_coords") == ["com.example:demo-lib-extra"],
-        "repo 根目录自动展开后，Step5 未正确记录多模块桥接依赖链",
+        multi_bridge_api.get("dependency_chain_coords") == [],
+        "未打包的 demo-lib-extra 不得出现在依赖调用链中",
     )
     assert_true(
-        multi_bridge_per_dependency.get("step5", {}).get("final_status") == "not_analyzed",
+        multi_bridge_per_dependency.get("step5", {}).get("final_status") == "not_found_in_static_analysis",
         "repo 根目录自动展开后，per_dependency summary 未写入 final_status",
     )
     assert_true(
@@ -3458,7 +3686,41 @@ AdapterFacade.callDeep();
     """,
     )
 
-    bridge_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_apis_bridge.csv"
+    bridge_runtime_report = project_dir / ".upgrade-report-bridge-runtime"
+    create_scoped_runtime_evidence(
+        bridge_runtime_report,
+        [
+            ("com.example:deep-lib", "2.0.0", ["com.example.deep.DeepApi"]),
+            (
+                "com.example:adapter-lib",
+                "2.0.0",
+                ["com.example.adapter.AdapterFacade", "com.example.adapter.NestedAdapter$Inner"],
+            ),
+            ("com.example:bridge-lib", "2.0.0", ["com.example.bridge.BridgeFacade"]),
+        ],
+    )
+    write_scoped_ref_evidence(
+        bridge_runtime_report,
+        [
+            ("com.example:deep-lib", deep_repo),
+            ("com.example:adapter-lib", adapter_repo),
+            ("com.example:bridge-lib", bridge_repo),
+        ],
+    )
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        bridge_runtime_report,
+        "bridge runtime business entry",
+    )
+    refresh_fixture_business_bytecode(
+        bridge_runtime_report,
+        [
+            source_dir / "BridgeApp.java",
+            adapter_source_dir / "AdapterFacade.java",
+            deep_repo / "src" / "main" / "java" / "com" / "example" / "deep" / "DeepApi.java",
+        ],
+    )
+    bridge_changed_apis = bridge_runtime_report / "evidence" / "api_changes" / "all_changed_apis_bridge.csv"
     with open(bridge_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3487,6 +3749,7 @@ AdapterFacade.callDeep();
         "s5_call_chain.py",
         [
             "--all-changed-apis", str(bridge_changed_apis),
+            "--report-dir", str(bridge_runtime_report),
             "--source-dirs", str(project_dir / "src" / "main" / "java"),
             "--dependency-source-mappings", f"com.example:deep-lib={deep_repo / 'src' / 'main' / 'java'}",
             "--dependency-source-mappings", f"com.example:adapter-lib={adapter_repo / 'src' / 'main' / 'java'}",
@@ -3526,9 +3789,24 @@ public static String callDeep() {
 NestedAdapter.Inner.callDeep();
       }
     }
-    """,
+""",
     )
-    nested_bridge_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_apis_nested_bridge.csv"
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        bridge_runtime_report,
+        "nested bridge business entry",
+    )
+    refresh_fixture_business_bytecode(
+        bridge_runtime_report,
+        [
+            source_dir / "BridgeApp.java",
+            source_dir / "NestedBridgeApp.java",
+            adapter_source_dir / "AdapterFacade.java",
+            adapter_source_dir / "NestedAdapter.java",
+            deep_repo / "src" / "main" / "java" / "com" / "example" / "deep" / "DeepApi.java",
+        ],
+    )
+    nested_bridge_changed_apis = bridge_runtime_report / "evidence" / "api_changes" / "all_changed_apis_nested_bridge.csv"
     with open(nested_bridge_changed_apis, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -3555,6 +3833,7 @@ NestedAdapter.Inner.callDeep();
         "s5_call_chain.py",
         [
             "--all-changed-apis", str(nested_bridge_changed_apis),
+            "--report-dir", str(bridge_runtime_report),
             "--source-dirs", str(project_dir / "src" / "main" / "java"),
             "--dependency-source-mappings", f"com.example:deep-lib={deep_repo / 'src' / 'main' / 'java'}",
             "--dependency-source-mappings", f"com.example:adapter-lib={adapter_repo / 'src' / 'main' / 'java'}",
@@ -3577,6 +3856,7 @@ NestedAdapter.Inner.callDeep();
         "s5_call_chain.py",
         [
             "--all-changed-apis", str(bridge_changed_apis),
+            "--report-dir", str(bridge_runtime_report),
             "--source-dirs", str(project_dir / "src" / "main" / "java"),
             "--output-dir", str(guarded_chain_dir),
             "--max-depth", "3",
@@ -3607,7 +3887,21 @@ NestedAdapter.Inner.callDeep();
 BridgeFacade.callAdapter();
       }
     }
-    """,
+""",
+    )
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        bridge_runtime_report,
+        "multi-hop bridge business entry",
+    )
+    refresh_fixture_business_bytecode(
+        bridge_runtime_report,
+        [
+            source_dir / "BridgeChainApp.java",
+            bridge_repo / "src" / "main" / "java" / "com" / "example" / "bridge" / "BridgeFacade.java",
+            adapter_source_dir / "AdapterFacade.java",
+            deep_repo / "src" / "main" / "java" / "com" / "example" / "deep" / "DeepApi.java",
+        ],
     )
 
     # Phase 7.5 removed: step5 reads bridge_changed_apis.csv directly with both bridge dirs
@@ -3616,6 +3910,7 @@ BridgeFacade.callAdapter();
         "s5_call_chain.py",
         [
             "--all-changed-apis", str(bridge_changed_apis),
+            "--report-dir", str(bridge_runtime_report),
             "--source-dirs", str(project_dir / "src" / "main" / "java"),
             "--dependency-source-mappings",
             f"com.example:deep-lib={deep_repo / 'src' / 'main' / 'java'}",
@@ -5140,7 +5435,13 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     packaged_summary_text = (
         module_packaged_report / "evidence" / "dependencies" / "dep_summary.txt"
     ).read_text(encoding="utf-8")
-    assert_true("current_packaging_mode=final_artifact" in packaged_summary_text, "Step1 摘要应标明当前侧已启用 final_artifact 校准")
+    assert_true(
+        (
+            "current 打包模式：final_artifact" in packaged_summary_text
+            or "current_packaging_mode=final_artifact" in packaged_summary_text
+        ),
+        "Step1 摘要应标明当前侧已启用 final_artifact 校准",
+    )
     assert_true("current_tree_only=" not in packaged_summary_text, "final_artifact 口径下不应再输出 dependency:tree-only 摘要")
 
     stdout, stderr, rc = run_script_with_rc(

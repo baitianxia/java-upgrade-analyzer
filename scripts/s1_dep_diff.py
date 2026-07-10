@@ -16,7 +16,7 @@ s1_dep_diff.py — Step 1：依赖变更全景扫描
 Windows 兼容：通过 compat.py 统一处理编码，不会因 GBK/UTF-8 不匹配崩溃。
 """
 
-import argparse, csv, io, json, os, re, shutil, sys, tempfile, zipfile
+import argparse, csv, hashlib, io, json, os, re, shutil, sys, tempfile, zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
@@ -1212,6 +1212,7 @@ def _is_ignorable_packaging_support_dep(entry):
 
 def _extract_packaged_dep_from_nested_jar(blob, entry_name):
     entry = _build_packaged_entry(entry_name)
+    entry['content_sha256'] = hashlib.sha256(blob).hexdigest()
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as nested_zip:
             for nested_name in nested_zip.namelist():
@@ -1248,6 +1249,84 @@ def _extract_packaged_dep_from_nested_jar(blob, entry_name):
         'match_source': 'filename',
     })
     return entry
+
+
+def _enrich_filename_only_deps_from_local_m2(packaged_deps):
+    """Resolve coordinates from an exact local-repository JAR byte match.
+
+    Some published JARs omit META-INF/maven/pom.properties. Running
+    ``dependency:list`` across a large snapshot reactor can fail even after a
+    successful package because dependency-plugin goals try to resolve every
+    upstream module from ~/.m2. An exact SHA-256 match against a uniquely
+    identified local Maven artifact is stronger coordinate evidence and avoids
+    that unnecessary reactor-wide command.
+    """
+    unresolved = [
+        item for item in packaged_deps or []
+        if not str(item.get('coord') or '').strip()
+        and str(item.get('lib_name') or '').strip()
+        and str(item.get('content_sha256') or '').strip()
+    ]
+    if not unresolved:
+        return packaged_deps
+    repo = Path(os.environ.get('MAVEN_REPO_LOCAL') or (Path.home() / '.m2' / 'repository'))
+    if not repo.is_dir():
+        return packaged_deps
+    by_filename = defaultdict(list)
+    for item in unresolved:
+        by_filename[str(item.get('lib_name') or '').strip()].append(item)
+    for filename, items in by_filename.items():
+        expected_hashes = {str(item.get('content_sha256') or '').strip() for item in items}
+        candidates_by_hash = defaultdict(list)
+        try:
+            candidates = repo.rglob(filename)
+            for candidate in candidates:
+                if not candidate.is_file() or candidate.suffix.lower() != '.jar':
+                    continue
+                digest = sha256_file(candidate)
+                if digest not in expected_hashes:
+                    continue
+                try:
+                    relative = candidate.resolve().relative_to(repo.resolve())
+                except ValueError:
+                    continue
+                parts = relative.parts
+                if len(parts) < 4:
+                    continue
+                artifact_id = parts[-3]
+                version = parts[-2]
+                group_id = '.'.join(parts[:-3])
+                if not group_id or not artifact_id or not version:
+                    continue
+                stem = candidate.stem
+                base_stem = f'{artifact_id}-{version}'
+                classifier = stem[len(base_stem) + 1:] if stem.startswith(base_stem + '-') else ''
+                coord = f'{group_id}:{artifact_id}' + (f':{classifier}' if classifier else '')
+                candidates_by_hash[digest].append({
+                    'coord': coord,
+                    'group_id': group_id,
+                    'artifact_id': artifact_id,
+                    'version': version,
+                    'classifier': classifier,
+                    'path': str(candidate),
+                })
+        except OSError:
+            continue
+        for item in items:
+            matches = candidates_by_hash.get(str(item.get('content_sha256') or '').strip(), [])
+            unique = {match['coord']: match for match in matches}
+            if len(unique) != 1:
+                continue
+            match = next(iter(unique.values()))
+            item.update({
+                'coord': match['coord'],
+                'group_id': match['group_id'],
+                'artifact_id': match['artifact_id'],
+                'version': match['version'],
+                'classifier': match['classifier'],
+                'match_source': 'local-m2-sha256',
+            })
+    return packaged_deps
 
 
 def _inspect_packaged_archive(artifact_path):
@@ -1777,6 +1856,7 @@ def collect_packaged_deps_from_artifact_path(
             "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不再作为正式结果输出。"
         )
 
+    packaged_raw = _enrich_filename_only_deps_from_local_m2(packaged_raw)
     resolved_runtime_deps = runtime_deps or {}
     if any(not (item.get('coord') or '').strip() for item in packaged_raw):
         if not resolved_runtime_deps and runtime_deps_loader is not None:

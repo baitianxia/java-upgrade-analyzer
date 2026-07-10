@@ -70,7 +70,7 @@ python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
 1. **最终产物优先**：Step1 只比较单个目标模块的最终打包依赖；输入既可以是自动切分支后的真实构建结果，也可以是用户直接提供的 base/current 编译产物路径。`boot jar/war` 读最终产物，`thin jar` / 无嵌套依赖场景直接阻塞。若 direct artifact 模式还要继续进入 Step2+，必须显式给出 `base_branch/current_branch`，不能让系统自动猜。
 2. **门控强制**：上一步输入不完整或门控失败，不进入下一步。
 3. **结论可追溯**：每条结论都要记录证据来源。
-4. **不猜测**：无法确认时必须区分四态：`reachable` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis`，不要把”未覆盖”误写成”未影响”。
+4. **不猜测**：必须区分五态：`reachable` / `not_impacted` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis`。只有当前制品中的其他依赖以完全相同的类字节码保留目标 API 时才能使用 `not_impacted`；不要把“未覆盖”或“静态未找到”误写成“未影响”。
 5. **影响优先**：主报告优先展示已证明触达当前系统的风险。
 6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
@@ -490,8 +490,9 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
   - max_depth=5，混合链路：3High+1Medium=cost=5（达到上限）
 - 关键节点识别：业务入口（Controller/Service）标记为 `reachable`，框架边界（@Autowired/动态代理）标记为 `not_analyzed`
 
-**四态分类**：
+**五态分类**：
   - `reachable`（高置信）：确定性链路，已触达系统代码，不要求必须到达最外层 HTTP 入口
+  - `not_impacted`（直接制品证据）：变更 API 仍由当前运行时依赖以完全相同的类字节码提供；该结论只覆盖 API 符号，不覆盖被删除 jar 中的资源、SPI 等非 API 内容
   - `uncertain`（待确认）：候选链路，存在歧义需人工审查
   - `not_analyzed`（未分析）：已知分析能力受限（如缺依赖源码映射、行为变更、反射命中），**不能解释为"未影响"**
   - `not_found_in_static_analysis`（静态未找到）：在当前源码图中未找到调用路径，但不代表确定未影响，仍需结合 `not_analyzed` 与能力边界判断
@@ -499,7 +500,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### Phase 9 [CHECKPOINT] Confirm Impact Judgment
 
 - 对应步骤：`step5` 完成后进入
-- 必须展示：`reachable` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis` 摘要与关键调用链证据
+- 必须展示：`reachable` / `not_impacted` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis` 摘要，以及关键调用链或符号保留证据
 - 必须确认：当前影响判定是否可接受，是否还要补依赖源码映射后重跑
 - 用户答复前，不得进入 `step6`
 - 允许动作：`continue`、`rerun_current_step`、`cancel`

@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -267,6 +268,166 @@ class FrameworkAdaptersTest(unittest.TestCase):
         kinds = {edge["edge_kind"] for edge in spi["edges"]}
         self.assertIn("spring_autoconfiguration_registration", kinds)
         self.assertIn("spring_factories_registration", kinds)
+
+    def test_packaged_spring_listener_is_runtime_entry_when_business_starts_spring_boot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; import org.springframework.boot.SpringApplication; "
+                "class Application { public static void main(String[] args) { "
+                "SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            runtime_jar = module / "runtime.jar"
+            with zipfile.ZipFile(runtime_jar, "w") as jar:
+                jar.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener=\\\n"
+                    "com.vendor.RuntimeListener\n"
+                    "org.springframework.boot.autoconfigure.EnableAutoConfiguration=\\\n"
+                    "com.vendor.OptionalAutoConfiguration\n",
+                )
+            payload = run_framework_adapters(
+                [{"root": str(module / "src/main/java")}],
+                artifact_catalog={"entries": [{
+                    "coord": "com.vendor:runtime",
+                    "jar_path": str(runtime_jar),
+                }]},
+            )
+
+        runtime = next(item for item in payload["adapters"] if item["adapter"] == "spring_runtime_artifact")
+        callback = next(edge for edge in runtime["edges"] if edge["edge_kind"] == "spring_runtime_registered_callback")
+        autoconfig = next(edge for edge in runtime["edges"] if edge["edge_kind"] == "spring_runtime_autoconfiguration_registration")
+        self.assertEqual(callback["target"], "com.vendor.RuntimeListener.onApplicationEvent")
+        self.assertEqual(callback["runtime_activation"], "active")
+        self.assertEqual(autoconfig["runtime_activation"], "conditional")
+
+        graph = SimpleNamespace(methods_by_id={})
+        stats = attach_framework_edges_to_graph(graph, payload)
+        self.assertEqual(stats["runtime_framework_entry_methods"], 1)
+        self.assertIn("com.vendor.RuntimeListener.onApplicationEvent", graph.framework_runtime_entry_methods)
+
+    def test_dependency_test_source_does_not_activate_spring_boot_runtime_callbacks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            business = module / "app/src/main/java/com/acme"
+            dependency_tests = module / "dep/src/test/java/com/vendor"
+            business.mkdir(parents=True)
+            dependency_tests.mkdir(parents=True)
+            (business / "PlainApp.java").write_text(
+                "package com.acme; class PlainApp { public static void main(String[] args) {} }",
+                encoding="utf-8",
+            )
+            (dependency_tests / "DependencyTestApplication.java").write_text(
+                "package com.vendor; import org.springframework.boot.SpringApplication; "
+                "class DependencyTestApplication { public static void main(String[] args) { "
+                "SpringApplication.run(DependencyTestApplication.class, args); } }",
+                encoding="utf-8",
+            )
+            runtime_jar = module / "runtime.jar"
+            with zipfile.ZipFile(runtime_jar, "w") as jar:
+                jar.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener=com.vendor.RuntimeListener\n",
+                )
+
+            payload = run_framework_adapters(
+                [
+                    {"root": str(module / "app/src/main/java"), "owner_type": "business"},
+                    {"root": str(module / "dep"), "owner_type": "dependency"},
+                ],
+                artifact_catalog={"entries": [{
+                    "coord": "com.vendor:runtime",
+                    "jar_path": str(runtime_jar),
+                }]},
+            )
+
+        runtime = next(item for item in payload["adapters"] if item["adapter"] == "spring_runtime_artifact")
+        callback = next(edge for edge in runtime["edges"] if edge["edge_kind"] == "spring_runtime_registered_callback")
+        self.assertEqual(callback["runtime_activation"], "unproven")
+        self.assertEqual(callback["provenance"]["business_activation"], [])
+
+    def test_source_framework_adapters_exclude_dependency_test_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp) / "dependency"
+            main = module / "src/main/java/com/vendor"
+            tests = module / "src/test/java/com/vendor"
+            main.mkdir(parents=True)
+            tests.mkdir(parents=True)
+            (main / "CleanupJob.java").write_text(
+                "package com.vendor; import org.springframework.scheduling.annotation.Scheduled; "
+                "class CleanupJob { @Scheduled(fixedDelay=1000) public void cleanup() {} }",
+                encoding="utf-8",
+            )
+            (tests / "DependencyTestJob.java").write_text(
+                "package com.vendor; import org.springframework.scheduling.annotation.Scheduled; "
+                "class DependencyTestJob { @Scheduled(fixedDelay=1000) public void testOnly() {} "
+                "void proxy() { java.lang.reflect.Proxy.newProxyInstance(null, null, null); } }",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{
+                "root": str(module),
+                "owner_type": "dependency",
+                "coord": "com.vendor:dependency",
+            }])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        proxy = next(item for item in payload["adapters"] if item["adapter"] == "dynamic_proxy_basic")
+        self.assertTrue(any(edge["target"] == "com.vendor.CleanupJob.cleanup" for edge in spring["edges"]))
+        self.assertFalse(any("DependencyTestJob" in edge.get("target", "") for edge in spring["edges"]))
+        self.assertFalse(any("src/test" in item.get("file", "") for item in proxy["findings"]))
+        self.assertEqual(proxy["metrics"]["source_files_scanned"], 1)
+
+    def test_active_runtime_registration_is_added_to_reverse_call_graph(self):
+        app = SimpleNamespace(
+            symbol_id="app", qualified_key="com.acme.Application.main",
+            declared_qualified_key="com.acme.Application.main(String[])",
+            declared_signature="(String[])", owner_type="business",
+            owner_coord="BUSINESS", module="app", is_test=False,
+        )
+        listener = SimpleNamespace(
+            symbol_id="listener", qualified_key="com.vendor.RuntimeListener.onApplicationEvent",
+            declared_qualified_key="com.vendor.RuntimeListener.onApplicationEvent(Object)",
+            declared_signature="(Object)", owner_type="dependency",
+            owner_coord="com.vendor:runtime", module="runtime", is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"app": app, "listener": listener},
+            reverse_edges={},
+        )
+        payload = {"adapters": [{
+            "adapter": "spring_runtime_artifact",
+            "version": "1",
+            "edges": [{
+                "source": "framework:spring-factories:org.springframework.context.ApplicationListener",
+                "target": "com.vendor.RuntimeListener.onApplicationEvent",
+                "edge_kind": "spring_runtime_registered_callback",
+                "confidence": "high",
+                "runtime_activation": "active",
+                "conditions": [],
+                "ambiguity": False,
+                "provenance": {
+                    "jar": "/runtime/runtime.jar",
+                    "line": 1,
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "file": "/app/Application.java",
+                        "spring_application_run": True,
+                    }],
+                },
+            }],
+        }]}
+
+        stats = attach_framework_edges_to_graph(graph, payload)
+
+        self.assertEqual(stats["framework_activation_linked_methods"], 1)
+        self.assertIn("listener", graph.framework_activation_linked_symbols)
+        linked = graph.reverse_edges["com.vendor.RuntimeListener.onApplicationEvent(Object)"]
+        self.assertEqual(linked[0].caller_symbol_id, "app")
+        self.assertEqual(linked[0].evidence_type, "spring_runtime_registered_callback")
 
     def test_edges_have_stable_schema_and_ambiguous_spring_dispatch_is_not_resolved(self):
         with tempfile.TemporaryDirectory() as tmp:

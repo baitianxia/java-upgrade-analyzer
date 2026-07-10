@@ -6,7 +6,9 @@ from __future__ import annotations
 import json
 import re
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Protocol
 
 
@@ -25,6 +27,31 @@ def _source_paths(source_roots):
         value = (item or {}).get('root') if isinstance(item, dict) else item
         if value and Path(value).is_dir():
             yield Path(value).resolve()
+
+
+def _is_production_source_file(path):
+    normalized = '/' + Path(path).as_posix().strip('/') + '/'
+    return not any(marker in normalized for marker in (
+        '/src/test/',
+        '/src/tests/',
+        '/src/it/',
+        '/src/integration-test/',
+        '/src/integrationTest/',
+        '/target/generated-test-sources/',
+        '/build/generated/sources/test/',
+    ))
+
+
+def _production_java_files(source_roots):
+    """Yield each production Java file once across overlapping source roots."""
+    seen = set()
+    for root in _source_paths(source_roots):
+        for path in sorted(root.rglob('*.java')):
+            resolved = path.resolve()
+            if resolved in seen or not _is_production_source_file(resolved):
+                continue
+            seen.add(resolved)
+            yield resolved
 
 
 def _resource_roots(source_roots):
@@ -76,28 +103,27 @@ def run_spi_adapter(source_roots):
     files = []
     source_classes = set()
     load_points = []
-    for source in _source_paths(source_roots):
-        for java_file in sorted(source.rglob('*.java')):
-            try:
-                source_text = java_file.read_text(encoding='utf-8', errors='replace')
-            except OSError as exc:
-                errors.append(f'{java_file}:{type(exc).__name__}')
-                continue
-            owner = _java_package_and_class(source_text, java_file.stem)
-            if owner:
-                source_classes.add(owner)
-            imports = {value.rsplit('.', 1)[-1]: value for value in re.findall(r'\bimport\s+([\w.]+)\s*;', source_text)}
-            for line_no, line in enumerate(source_text.splitlines(), 1):
-                for match in re.finditer(r'\bServiceLoader\s*\.\s*load\s*\(\s*([\w.]+)\s*\.class', line):
-                    raw = match.group(1)
-                    interface = imports.get(raw, raw)
-                    load_points.append((owner, interface, str(java_file), line_no))
-                    edges.append({
-                        'source': owner, 'target': interface,
-                        'edge_kind': 'java_spi_load_point', 'confidence': 'high',
-                        'conditions': [], 'ambiguity': False,
-                        'provenance': {'file': str(java_file), 'line': line_no},
-                    })
+    for java_file in _production_java_files(source_roots):
+        try:
+            source_text = java_file.read_text(encoding='utf-8', errors='replace')
+        except OSError as exc:
+            errors.append(f'{java_file}:{type(exc).__name__}')
+            continue
+        owner = _java_package_and_class(source_text, java_file.stem)
+        if owner:
+            source_classes.add(owner)
+        imports = {value.rsplit('.', 1)[-1]: value for value in re.findall(r'\bimport\s+([\w.]+)\s*;', source_text)}
+        for line_no, line in enumerate(source_text.splitlines(), 1):
+            for match in re.finditer(r'\bServiceLoader\s*\.\s*load\s*\(\s*([\w.]+)\s*\.class', line):
+                raw = match.group(1)
+                interface = imports.get(raw, raw)
+                load_points.append((owner, interface, str(java_file), line_no))
+                edges.append({
+                    'source': owner, 'target': interface,
+                    'edge_kind': 'java_spi_load_point', 'confidence': 'high',
+                    'conditions': [], 'ambiguity': False,
+                    'provenance': {'file': str(java_file), 'line': line_no},
+                })
     for root in _resource_roots(source_roots):
         services = root / 'META-INF' / 'services'
         service_files = sorted(item for item in services.iterdir() if item.is_file()) if services.is_dir() else []
@@ -243,8 +269,7 @@ def run_spring_adapter(source_roots):
         'Formatter': {'parse', 'print'},
         'WebMvcConfigurer': set(),
     }
-    for root in _source_paths(source_roots):
-        for path in sorted(root.rglob('*.java')):
+    for path in _production_java_files(source_roots):
             scanned += 1
             try:
                 text = path.read_text(encoding='utf-8', errors='replace')
@@ -628,8 +653,7 @@ def run_mybatis_adapter(source_roots):
                             'provenance': {'file': str(path)},
                         })
     annotation_pattern = re.compile(r'@(Select|Insert|Update|Delete|SelectProvider|InsertProvider|UpdateProvider|DeleteProvider)\b')
-    for source in _source_paths(source_roots):
-        for path in sorted(source.rglob('*.java')):
+    for path in _production_java_files(source_roots):
             try:
                 text = path.read_text(encoding='utf-8', errors='replace')
             except OSError as exc:
@@ -665,8 +689,7 @@ def run_dynamic_proxy_adapter(source_roots):
     }
     source_files = []
     handlers = {}
-    for root in _source_paths(source_roots):
-        for path in sorted(root.rglob('*.java')):
+    for path in _production_java_files(source_roots):
             scanned += 1
             try:
                 text = path.read_text(encoding='utf-8', errors='replace')
@@ -841,8 +864,7 @@ def run_declarative_http_client_adapter(source_roots):
         r'(?P<method_name>[A-Za-z_$]\w*)\s*\([^;{}]*\)\s*;',
         re.S,
     )
-    for root in _source_paths(source_roots):
-        for path in sorted(root.rglob('*.java')):
+    for path in _production_java_files(source_roots):
             scanned += 1
             try:
                 text = path.read_text(encoding='utf-8', errors='replace')
@@ -935,10 +957,214 @@ def run_declarative_http_client_adapter(source_roots):
     }
 
 
-def run_framework_adapters(source_roots, output_path=''):
+_SPRING_RUNTIME_CALLBACK_METHODS = {
+    'org.springframework.context.ApplicationListener': 'onApplicationEvent',
+    'org.springframework.boot.env.EnvironmentPostProcessor': 'postProcessEnvironment',
+    'org.springframework.context.ApplicationContextInitializer': 'initialize',
+}
+
+
+def _spring_boot_business_activation(source_roots):
+    evidence = []
+    business_roots = []
+    for item in source_roots or []:
+        if isinstance(item, dict):
+            if str(item.get('owner_type') or 'business').strip() != 'business':
+                continue
+            value = item.get('root')
+        else:
+            value = item
+        if value and Path(value).is_dir():
+            business_roots.append(Path(value).resolve())
+    for root in business_roots:
+        for path in sorted(root.rglob('*.java')):
+            normalized_path = path.as_posix()
+            if '/src/test/' in normalized_path or '/test/' in normalized_path:
+                continue
+            try:
+                text = path.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            if not (
+                re.search(r'\bSpringApplication\s*\.\s*run\s*\(', text)
+                or re.search(r'@(?:[\w.]+\.)?(?:SpringBootApplication|EnableAutoConfiguration)\b', text)
+            ):
+                continue
+            owner = _java_package_and_class(text, path.stem)
+            spring_application_run = bool(re.search(r'\bSpringApplication\s*\.\s*run\s*\(', text))
+            evidence.append({
+                'file': str(path),
+                'spring_application_run': spring_application_run,
+                'spring_boot_annotation': bool(re.search(
+                    r'@(?:[\w.]+\.)?(?:SpringBootApplication|EnableAutoConfiguration)\b', text
+                )),
+                'business_entry': f'{owner}.main' if owner and spring_application_run else owner,
+            })
+    return evidence
+
+
+def _logical_properties(text):
+    logical_lines = []
+    pending = ''
+    for raw in str(text or '').splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(('#', '!')):
+            continue
+        pending += stripped[:-1] if stripped.endswith('\\') else stripped
+        if not stripped.endswith('\\'):
+            logical_lines.append(pending)
+            pending = ''
+    if pending:
+        logical_lines.append(pending)
+    for line_no, line in enumerate(logical_lines, 1):
+        if '=' not in line:
+            continue
+        key, values = line.split('=', 1)
+        yield line_no, key.strip(), [item.strip() for item in values.split(',') if item.strip()]
+
+
+def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None):
+    """Read Spring registrations from the exact packaged runtime jars.
+
+    A registration is a confirmed runtime entry only when business code proves that Spring Boot
+    starts. Auto-configuration classes remain conditional: registration alone does not prove that
+    a particular @Bean method executes.
+    """
+    activation_evidence = _spring_boot_business_activation(source_roots)
+    spring_boot_active = bool(activation_evidence)
+    edges, nodes, findings, errors = [], [], [], []
+    resource_files = 0
+    active_callbacks = 0
+    conditional_autoconfigurations = 0
+    seen = set()
+    for item in (artifact_catalog or {}).get('entries') or []:
+        coord = str(item.get('coord') or '').strip()
+        if coord == '__business__':
+            continue
+        jar_path = str(item.get('jar_path') or '').strip()
+        if not jar_path or not Path(jar_path).is_file():
+            continue
+        try:
+            with zipfile.ZipFile(jar_path) as jar:
+                names = set(jar.namelist())
+                factories_name = 'META-INF/spring.factories'
+                if factories_name in names:
+                    resource_files += 1
+                    text = jar.read(factories_name).decode('utf-8', errors='replace')
+                    for line_no, registration_type, targets in _logical_properties(text):
+                        callback_method = _SPRING_RUNTIME_CALLBACK_METHODS.get(registration_type)
+                        for target_class in targets:
+                            if callback_method:
+                                target = f'{target_class}.{callback_method}'
+                                identity = ('callback', registration_type, target, jar_path)
+                                if identity in seen:
+                                    continue
+                                seen.add(identity)
+                                nodes.append({'id': target, 'kind': 'spring_runtime_registered_callback'})
+                                edges.append({
+                                    'source': f'framework:spring-factories:{registration_type}',
+                                    'target': target,
+                                    'edge_kind': 'spring_runtime_registered_callback',
+                                    'confidence': 'high' if spring_boot_active else 'medium',
+                                    'conditions': [] if spring_boot_active else ['spring_boot_activation_unproven'],
+                                    'ambiguity': False,
+                                    'runtime_activation': 'active' if spring_boot_active else 'unproven',
+                                    'provenance': {
+                                        'coord': coord,
+                                        'jar': jar_path,
+                                        'resource': factories_name,
+                                        'line': line_no,
+                                        'registration_type': registration_type,
+                                        'business_activation': activation_evidence,
+                                    },
+                                })
+                                if spring_boot_active:
+                                    active_callbacks += 1
+                            elif registration_type == 'org.springframework.boot.autoconfigure.EnableAutoConfiguration':
+                                identity = ('autoconfiguration', target_class, jar_path)
+                                if identity in seen:
+                                    continue
+                                seen.add(identity)
+                                nodes.append({'id': target_class, 'kind': 'spring_runtime_autoconfiguration'})
+                                edges.append({
+                                    'source': 'framework:spring-autoconfiguration',
+                                    'target': target_class,
+                                    'edge_kind': 'spring_runtime_autoconfiguration_registration',
+                                    'confidence': 'medium',
+                                    'conditions': ['auto_configuration_conditions_require_runtime_evaluation'],
+                                    'ambiguity': False,
+                                    'runtime_activation': 'conditional',
+                                    'provenance': {
+                                        'coord': coord,
+                                        'jar': jar_path,
+                                        'resource': factories_name,
+                                        'line': line_no,
+                                        'registration_type': registration_type,
+                                        'business_activation': activation_evidence,
+                                    },
+                                })
+                                conditional_autoconfigurations += 1
+                imports_name = 'META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports'
+                if imports_name in names:
+                    resource_files += 1
+                    text = jar.read(imports_name).decode('utf-8', errors='replace')
+                    for line_no, raw in enumerate(text.splitlines(), 1):
+                        target_class = raw.split('#', 1)[0].strip()
+                        if not target_class:
+                            continue
+                        identity = ('autoconfiguration', target_class, jar_path)
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        nodes.append({'id': target_class, 'kind': 'spring_runtime_autoconfiguration'})
+                        edges.append({
+                            'source': 'framework:spring-autoconfiguration',
+                            'target': target_class,
+                            'edge_kind': 'spring_runtime_autoconfiguration_registration',
+                            'confidence': 'medium',
+                            'conditions': ['auto_configuration_conditions_require_runtime_evaluation'],
+                            'ambiguity': False,
+                            'runtime_activation': 'conditional',
+                            'provenance': {
+                                'coord': coord,
+                                'jar': jar_path,
+                                'resource': imports_name,
+                                'line': line_no,
+                                'business_activation': activation_evidence,
+                            },
+                        })
+                        conditional_autoconfigurations += 1
+        except (OSError, zipfile.BadZipFile, UnicodeError) as exc:
+            errors.append(f'{jar_path}:{type(exc).__name__}')
+    if resource_files and not spring_boot_active:
+        findings.append({
+            'reason_code': 'spring_boot_activation_unproven',
+            'subject': 'packaged_spring_registrations',
+        })
+    applicable = bool(resource_files or activation_evidence)
+    return {
+        'adapter': 'spring_runtime_artifact',
+        'version': '1',
+        'status': 'partial' if applicable and (errors or (resource_files and not spring_boot_active)) else _status(applicable, errors),
+        'nodes': nodes,
+        'edges': edges,
+        'findings': findings,
+        'errors': errors,
+        'metrics': {
+            'resource_files': resource_files,
+            'business_activation_files': len(activation_evidence),
+            'active_callbacks': active_callbacks,
+            'conditional_autoconfigurations': conditional_autoconfigurations,
+            'edges': len(edges),
+        },
+    }
+
+
+def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
     adapters = [
         run_spi_adapter(source_roots),
         run_spring_adapter(source_roots),
+        run_runtime_spring_registration_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_mybatis_adapter(source_roots),
         run_dynamic_proxy_adapter(source_roots),
         run_declarative_http_client_adapter(source_roots),
@@ -978,6 +1204,8 @@ def run_framework_adapters(source_roots, output_path=''):
 def attach_framework_edges_to_graph(graph, payload):
     """Attach deterministic framework callback entries to the normal source/bytecode graph."""
     methods = list((getattr(graph, 'methods_by_id', {}) or {}).values())
+    if not hasattr(graph, 'reverse_edges') or getattr(graph, 'reverse_edges') is None:
+        graph.reverse_edges = {}
     methods_by_qualified = {}
     methods_by_unsigned = {}
     for method in methods:
@@ -988,6 +1216,8 @@ def attach_framework_edges_to_graph(graph, payload):
         unsigned = qualified.split('(', 1)[0]
         methods_by_unsigned.setdefault(unsigned, []).append(method)
     entries = {}
+    runtime_entries = {}
+    activation_linked_symbols = set()
     matched_edges = 0
     unmatched_edges = 0
     supported_kinds = {
@@ -998,7 +1228,8 @@ def attach_framework_edges_to_graph(graph, payload):
         'mybatis_type_reference',
         'mybatis_type_handler_binding', 'mybatis_type_handler_registration',
         'mybatis_plugin_registration', 'spring_autoconfiguration_registration',
-        'spring_factories_registration',
+        'spring_factories_registration', 'spring_runtime_registered_callback',
+        'spring_runtime_autoconfiguration_registration',
     }
     for adapter in (payload or {}).get('adapters') or []:
         for edge in adapter.get('edges') or []:
@@ -1008,6 +1239,15 @@ def attach_framework_edges_to_graph(graph, payload):
             if not target:
                 unmatched_edges += 1
                 continue
+            if (
+                edge.get('edge_kind') == 'spring_runtime_registered_callback'
+                and edge.get('runtime_activation') == 'active'
+            ):
+                runtime_entries.setdefault(target.split('(', 1)[0], []).append({
+                    **edge,
+                    'adapter': adapter.get('adapter'),
+                    'adapter_version': adapter.get('version'),
+                })
             target_unsigned = target.split('(', 1)[0]
             candidates = list(methods_by_qualified.get(target) or [])
             if target_unsigned != target:
@@ -1028,7 +1268,82 @@ def attach_framework_edges_to_graph(graph, payload):
                     'adapter_version': adapter.get('version'),
                 })
                 matched_edges += 1
+
+                if not (
+                    edge.get('edge_kind') == 'spring_runtime_registered_callback'
+                    and edge.get('runtime_activation') == 'active'
+                ):
+                    continue
+                activations = list((edge.get('provenance') or {}).get('business_activation') or [])
+                for activation in activations:
+                    activation_name = str((activation or {}).get('business_entry') or '').strip()
+                    if not activation_name:
+                        continue
+                    activation_methods = list(methods_by_qualified.get(activation_name) or [])
+                    activation_methods.extend(
+                        item for item in methods_by_unsigned.get(activation_name) or []
+                        if item not in activation_methods
+                    )
+                    activation_methods = [
+                        item for item in activation_methods
+                        if getattr(item, 'owner_type', '') == 'business'
+                        and not getattr(item, 'is_test', False)
+                    ]
+                    if not activation_methods:
+                        continue
+                    callback_signature = str(getattr(method, 'declared_signature', '') or '').strip()
+                    callback_key = (
+                        str(getattr(method, 'declared_qualified_key', '') or '').strip()
+                        or (
+                            f"{getattr(method, 'qualified_key', '')}{callback_signature}"
+                            if callback_signature else str(getattr(method, 'qualified_key', '') or '').strip()
+                        )
+                    )
+                    callback_keys = [
+                        callback_key,
+                        str(getattr(method, 'qualified_key', '') or '').strip(),
+                        target,
+                    ]
+                    for activation_method in activation_methods:
+                        synthetic = SimpleNamespace(
+                            caller_symbol_id=getattr(activation_method, 'symbol_id', ''),
+                            caller_qualified_key=getattr(activation_method, 'qualified_key', ''),
+                            callee_key=callback_key or target,
+                            callee_simple_key='',
+                            evidence_type='spring_runtime_registered_callback',
+                            confidence='high',
+                            file=str((edge.get('provenance') or {}).get('jar') or ''),
+                            line=int((edge.get('provenance') or {}).get('line') or 0),
+                            content='Spring Boot 启动后根据当前制品的框架注册触发回调',
+                            owner_type='business',
+                            owner_coord='BUSINESS',
+                            module=getattr(activation_method, 'module', ''),
+                            is_test=False,
+                            framework_registration=True,
+                            framework_source=edge.get('source') or '',
+                            framework_target=target,
+                            runtime_activation='active',
+                        )
+                        for lookup_key in dict.fromkeys(key for key in callback_keys if key):
+                            bucket = graph.reverse_edges.setdefault(lookup_key, [])
+                            identity = (
+                                synthetic.caller_symbol_id,
+                                synthetic.callee_key,
+                                synthetic.evidence_type,
+                            )
+                            if not any(
+                                (
+                                    getattr(existing, 'caller_symbol_id', ''),
+                                    getattr(existing, 'callee_key', ''),
+                                    getattr(existing, 'evidence_type', ''),
+                                ) == identity
+                                for existing in bucket
+                            ):
+                                bucket.append(synthetic)
+                        activation_linked_symbols.add(method.symbol_id)
     graph.framework_entry_symbols = entries
+    graph.framework_runtime_entry_methods = runtime_entries
+    graph.framework_activation_linked_symbols = activation_linked_symbols
     graph.framework_edges = [
         edge
         for adapter in (payload or {}).get('adapters') or []
@@ -1038,4 +1353,6 @@ def attach_framework_edges_to_graph(graph, payload):
         'matched_callback_edges': matched_edges,
         'unmatched_callback_edges': unmatched_edges,
         'framework_entry_methods': len(entries),
+        'runtime_framework_entry_methods': len(runtime_entries),
+        'framework_activation_linked_methods': len(activation_linked_symbols),
     }

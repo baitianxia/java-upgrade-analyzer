@@ -393,6 +393,8 @@ class MethodDef:
     local_var_types: dict = field(default_factory=dict)
     ast_local_var_sites: list = field(default_factory=list)
     ast_call_sites: list = field(default_factory=list)
+    declared_signature: str = ""
+    declared_qualified_key: str = ""
     # 【内存优化】可选的延迟加载
     body_text: str = ""  # 保留兼容，为空时使用延迟加载
     _body_text_cached: str = field(default="", repr=False)  # 缓存
@@ -444,6 +446,9 @@ class CallEdge:
     is_test: bool
     caller_qualified_key: str = ""
     callee_param_types: list = field(default_factory=list)
+    callee_signature_complete: bool = False
+    callee_fqcn_complete: bool = False
+    callee_resolution_note: str = ""
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2500,7 +2505,10 @@ def resolve_type_fqn(type_expr, method_def):
         if outer in imports:
             return f"{imports[outer]}.{inner_suffix}"
 
-    known_class_fqcns = set(getattr(method_def, 'known_class_fqcns', set()) or set())
+    # The graph builder installs a shared read-only set on every MethodDef.
+    # Type resolution only performs membership checks, so copying the complete
+    # class set for every lookup wastes CPU and creates large transient peaks.
+    known_class_fqcns = getattr(method_def, 'known_class_fqcns', None) or set()
     known_classes_by_simple = getattr(method_def, 'known_classes_by_simple', {}) or {}
     if '.' not in type_expr:
         package_name = getattr(method_def, 'package_name', '') or ''

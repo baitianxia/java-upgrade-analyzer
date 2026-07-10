@@ -54,13 +54,80 @@ ALERTS_CSV_FIELDNAMES = [
 ]
 
 ALERTS_SPLIT_MAX_ROWS = 50000
+ALERTS_SPLIT_MAX_BYTES = 8 * 1024 * 1024
 
 ALERTS_REVIEW_BUCKETS = [
     ('reachable', {'reachable'}),
     ('uncertain', {'uncertain'}),
+    ('not_impacted', {'not_impacted'}),
     ('not_found_in_static_analysis', {'not_found_in_static_analysis', 'not_reachable'}),
     ('not_analyzed', {'not_analyzed'}),
 ]
+
+
+def humanize_user_text(value):
+    """Remove internal graph notation from every human-facing text surface."""
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    text = text.replace('**business**:', '业务制品：')
+    text = text.replace('__business__:', '业务制品：')
+    text = text.replace('__business__', '业务制品')
+    text = text.replace('BUSINESS:', '业务代码：')
+    text = re.sub(r'\.<class>(?:\(\))?', '（类加载/链接）', text)
+    text = re.sub(r'\.<class-init>(?:\(\))?', '（静态初始化）', text)
+    text = re.sub(r'\.<clinit>(?:\(\))?', '（静态初始化）', text)
+    if text in {'<class>', '<class>()'}:
+        text = '类加载/链接'
+    elif text in {'<class-init>', '<class-init>()', '<clinit>', '<clinit>()'}:
+        text = '静态初始化'
+    text = text.replace('变更API:', '变更 API：')
+    return text
+
+
+def _humanize_path_details(details):
+    cleaned = []
+    for detail in details or []:
+        item = dict(detail or {})
+        for key in ('business_entry', 'consumer_class', 'consumer_method', 'path_text', 'terminal_symbol'):
+            if item.get(key):
+                item[key] = humanize_user_text(item[key])
+        if item.get('consumer_coord') in {'__business__', 'BUSINESS'}:
+            item['consumer_coord'] = '业务制品'
+        evidence = []
+        for raw in item.get('evidence') or []:
+            edge = dict(raw or {})
+            edge['caller_symbol'] = humanize_user_text(edge.get('caller_symbol'))
+            edge['callee_key'] = humanize_user_text(edge.get('callee_key'))
+            if edge.get('owner_coord') in {'__business__', 'BUSINESS'}:
+                edge['owner_coord'] = '业务制品'
+            evidence.append(edge)
+        item['evidence'] = evidence
+        cleaned.append(item)
+    return cleaned
+
+
+def _human_evidence_type(value):
+    return {
+        'bytecode_class_reference': '制品字节码类型引用',
+        'bytecode_method_invocation': '制品字节码方法调用',
+        'bytecode_constructor_invocation': '制品字节码构造调用',
+        'bytecode_field_access': '制品字节码字段访问',
+        'ast_method_invocation': '源码方法调用',
+        'spring_runtime_registered_callback': 'Spring Boot 制品注册回调',
+        'runtime_dependency_bytecode_invocation': '运行时依赖字节码方法调用',
+    }.get(str(value or ''), '静态分析证据')
+
+
+def _human_analysis_status(value):
+    return {
+        'reachable': '已确认影响',
+        'uncertain': '需要人工复核',
+        'not_impacted': '已确认不受影响',
+        'not_found_in_static_analysis': '静态分析未找到路径',
+        'not_reachable': '静态分析未找到路径',
+        'not_analyzed': '当前未完成有效分析',
+    }.get(str(value or ''), str(value or '') or '未知')
 
 
 def trace_result_to_api_entry(r):
@@ -80,8 +147,18 @@ def trace_result_to_api_entry(r):
         confidence_weighted_tracer.py already writes caller_symbol/callee_key,
         which matches s6_report.py:L603-628 expectations.
         """
-        # No conversion needed - tracer already writes correct field names
-        return evidence_paths or []
+        cleaned_paths = []
+        for path in evidence_paths or []:
+            cleaned = []
+            for raw in path or []:
+                edge = dict(raw or {})
+                edge['caller_symbol'] = humanize_user_text(edge.get('caller_symbol'))
+                edge['callee_key'] = humanize_user_text(edge.get('callee_key'))
+                if edge.get('owner_coord') in {'__business__', 'BUSINESS'}:
+                    edge['owner_coord'] = '业务制品'
+                cleaned.append(edge)
+            cleaned_paths.append(cleaned)
+        return cleaned_paths
 
 
     user_view = summarize_user_facing_outcome(r)
@@ -104,9 +181,9 @@ def trace_result_to_api_entry(r):
         'direct_callers':      r.direct_callers,
         'business_reach_depth': r.business_reach_depth,
         'dependency_chain_coords':  r.dependency_chain_coords or [],
-        'call_paths':          r.call_paths or [],
+        'call_paths':          [humanize_user_text(path) for path in (r.call_paths or [])],
         'evidence_paths':      _edges_for_s6(r.evidence_paths),
-        'path_details':        getattr(r, 'path_details', []) or [],
+        'path_details':        _humanize_path_details(getattr(r, 'path_details', []) or []),
         'verification':        r.verification_commands or [],
         'verification_commands': r.verification_commands or [],
         'confidence_score':    round(r.confidence_score, 3),
@@ -159,7 +236,8 @@ def _summary_item_line(index, result, include_action=False):
     view = summarize_user_facing_outcome(result)
     api_name = _api_display_name(result)
     entry = _first_business_entry(result)
-    entry_part = f" | 入口: {entry}" if entry else ""
+    entry_label = '符号提供方' if result.analysis_status == 'not_impacted' else '入口'
+    entry_part = f" | {entry_label}: {entry}" if entry else ""
     reason = view['user_reason']
     action = view['recommended_action']
     line = (
@@ -192,9 +270,10 @@ def _per_dependency_status_rank(status):
     return {
         'reachable': 0,
         'uncertain': 1,
-        'not_analyzed': 2,
+        'not_impacted': 2,
         'not_found_in_static_analysis': 3,
         'not_reachable': 3,
+        'not_analyzed': 4,
     }.get(str(status or '').strip(), 9)
 
 
@@ -392,6 +471,14 @@ REASON_CODE_EXPLANATIONS = {
         'reason': '已证明变更 API 触达系统代码（业务层）',
         'action': None  # 无需action，已确认
     },
+    'RUNTIME_DEPENDENCY_ENTRY_REACHED': {
+        'reason': '已证明变更 API 触达当前制品中会被框架或运行时机制触发的依赖入口',
+        'action': None
+    },
+    'RUNTIME_FRAMEWORK_ENTRY_REACHED': {
+        'reason': '已通过业务启动代码、当前制品的框架注册和依赖调用证明变更 API 会进入运行时路径',
+        'action': None
+    },
     # 向后兼容旧 reason_code（已废弃）
     'BUSINESS_ENTRY_FOUND': {
         'reason': '已证明变更 API 触达系统代码（业务层）',
@@ -454,8 +541,8 @@ REASON_CODE_EXPLANATIONS = {
         'action': '优先核对 static import 对应字段的用途，并评估删除或变更后的影响'
     },
     'FRAMEWORK_BOUNDARY': {
-        'reason': '遇到框架边界（动态代理/接口注入）',
-        'action': '审查框架配置（Spring/MyBatis），确认实际注入的实现类'
+        'reason': '调用链停在由框架、反射或运行时配置决定的入口，当前静态证据不足以确认该入口会执行',
+        'action': '核对当前制品中的框架注册、启用条件、反射参数或实际实现类'
     },
     'NO_CALLERS': {
         'reason': '未找到方法的调用者',
@@ -504,6 +591,10 @@ REASON_CODE_EXPLANATIONS = {
     'RUNTIME_DEPENDENCY_USES_REMOVED_API': {
         'reason': '当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号',
         'action': '优先检查命中的消费依赖及其业务入口，并执行覆盖该路径的启动/集成测试；存在 NoClassDefFoundError/NoSuchMethodError 风险'
+    },
+    'RUNTIME_SYMBOL_PRESERVED_IDENTICALLY': {
+        'reason': '依赖坐标虽被删除，但当前最终制品中的另一个运行时 JAR 仍提供完全相同的 class 字节码；该 API 没有从运行时类路径消失',
+        'action': ''
     },
     'MISSING_API_SIGNATURE': {
         'reason': '方法级变更缺少参数签名，无法精确区分重载方法',
@@ -573,13 +664,13 @@ def _get_trace_attr(obj, name, default=None):
 def build_key_evidence(call_paths=None, evidence_paths=None):
     call_paths = list(call_paths or [])
     if call_paths:
-        return call_paths[0]
+        return humanize_user_text(call_paths[0])
     evidence_paths = list(evidence_paths or [])
     if evidence_paths and evidence_paths[0]:
         edge = evidence_paths[0][0]
         caller = edge.get('caller_symbol', '?')
         callee = edge.get('callee_key', '?')
-        return f"{caller} -> {callee}"
+        return f"{humanize_user_text(caller)} -> {humanize_user_text(callee)}"
     return ""
 
 
@@ -594,12 +685,21 @@ def summarize_user_facing_outcome(trace_like):
     if analysis_status == 'reachable':
         conclusion = '已确认影响'
         decision_bucket = 'confirmed_impact'
-        if reason_code in {'DIRECT_CLASS_USAGE', 'DIRECT_FIELD_USAGE', 'DIRECT_STATIC_IMPORT_USAGE'}:
+        if reason_code in {
+            'DIRECT_CLASS_USAGE', 'DIRECT_FIELD_USAGE', 'DIRECT_STATIC_IMPORT_USAGE',
+            'BUSINESS_ARTIFACT_BYTECODE_USAGE', 'RUNTIME_DEPENDENCY_ENTRY_REACHED',
+            'RUNTIME_FRAMEWORK_ENTRY_REACHED',
+        }:
             user_reason = explanation.get('reason') or '已在系统源码中直接命中目标引用。'
             recommended_action = explanation.get('action') or '优先打开命中的业务方法，确认影响范围。'
         else:
-            user_reason = '已找到从系统代码到变更 API 的调用链。'
+            user_reason = '已找到从业务代码或当前制品中已激活入口到变更 API 的完整路径。'
             recommended_action = '优先按调用链定位受影响业务，并安排修复或验证。'
+    elif analysis_status == 'not_impacted':
+        conclusion = '已确认不受影响'
+        decision_bucket = 'confirmed_no_impact'
+        user_reason = explanation.get('reason') or '已有充分证据确认该变更不会移除当前 API。'
+        recommended_action = ''
     elif reason_code in INPUT_REQUIRED_REASON_CODES:
         conclusion = '需要补充输入'
         decision_bucket = 'input_required'
@@ -696,23 +796,21 @@ def format_call_chain_readable(trace_result):
         lines.append(f"  关键证据: {user_view['key_evidence']}")
     lines.append("")
 
-    # 调用链路
+    # 调用链路；确定不受影响时这里展示的是符号保留证据，不伪装成调用链。
     if trace_result.call_paths:
-        lines.append("【调用链路】")
+        lines.append("【符号保留证据】" if trace_result.analysis_status == 'not_impacted' else "【调用链路】")
         for idx, path in enumerate(trace_result.call_paths, 1):
-            lines.append(f"  路径 {idx}: {path}")
+            lines.append(f"  路径 {idx}: {humanize_user_text(path)}")
         lines.append("")
     else:
-        lines.append("【调用链路】")
+        lines.append("【符号保留证据】" if trace_result.analysis_status == 'not_impacted' else "【调用链路】")
         lines.append("  未形成可确认的完整调用链。")
         lines.append("")
 
     # 基本信息后置，避免首屏被内部状态淹没。
     lines.append("【变更信息】")
-    lines.append(f"  变更类型: {trace_result.change_type}")
-    lines.append(f"  严重程度: {trace_result.severity}")
-    lines.append(f"  分析状态: {trace_result.analysis_status}")
-    lines.append(f"  原因代码: {trace_result.reason_code}")
+    lines.append(f"  {_alert_change_summary(trace_result)}")
+    lines.append(f"  分析状态: {_human_analysis_status(trace_result.analysis_status)}")
     if trace_result.dependency_chain_coords:
         lines.append(f"  涉及依赖链: {' -> '.join(trace_result.dependency_chain_coords)}")
     lines.append("")
@@ -731,15 +829,15 @@ def format_call_chain_readable(trace_result):
                 break  # 只显示第一条路径
             lines.append(f"  路径 {path_idx}:")
             for edge_idx, edge in enumerate(path[:10], 1):  # 最多显示10条边
-                caller = edge.get('caller_symbol', edge.get('caller', '?'))
-                callee = edge.get('callee_key', edge.get('callee', '?'))
+                caller = humanize_user_text(edge.get('caller_symbol', edge.get('caller', '?')))
+                callee = humanize_user_text(edge.get('callee_key', edge.get('callee', '?')))
                 conf = edge.get('confidence', '?')
                 evidence_type = edge.get('evidence_type', '?')
                 file_name = extract_file_name(edge.get('file', '?'))
                 line = edge.get('line', '?')
 
                 lines.append(f"    [{edge_idx}] {caller} -> {callee}")
-                lines.append(f"        类型: {evidence_type}, 置信度: {conf}")
+                lines.append(f"        证据: {_human_evidence_type(evidence_type)}，置信度: {conf}")
                 lines.append(f"        位置: {file_name}:{line}")
             if len(path) > 10:
                 lines.append(f"    ... (还有 {len(path) - 10} 条边)")
@@ -912,6 +1010,7 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
 
     # 分类统计（支持新状态名）
     reachable = [r for r in all_results if r.analysis_status == 'reachable']
+    not_impacted = [r for r in all_results if r.analysis_status == 'not_impacted']
     uncertain = [r for r in all_results if r.analysis_status == 'uncertain']
     not_analyzed = [r for r in all_results if r.analysis_status == 'not_analyzed']
     # 兼容新旧状态名
@@ -931,12 +1030,14 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
         "一、结论总览",
         f"- 分析 API 总数: {len(all_results)}",
         f"- 已确认影响: {user_conclusion_summary.get('已确认影响', 0)}",
+        f"- 已确认不受影响: {user_conclusion_summary.get('已确认不受影响', 0)}",
         f"- 可能影响: {user_conclusion_summary.get('可能影响', 0)}",
         f"- 当前无法确认: {user_conclusion_summary.get('当前无法确认', 0)}",
         f"- 需要补充输入: {user_conclusion_summary.get('需要补充输入', 0)}",
         "",
         "判断口径:",
         "- 已确认影响: 找到从系统代码到变更 API 的可证明调用链。",
+        "- 已确认不受影响: 有直接制品证据证明变更 API 仍以相同字节码存在。",
         "- 可能影响/当前无法确认: 有证据缺口或只能证明部分链路，不能当作无影响。",
         "- 需要补充输入: 缺少源码映射、构建产物或关键工具证据，建议补齐后重跑。",
         "",
@@ -944,9 +1045,19 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
 
     unresolved_for_reason = probable = inconclusive = input_required = []
 
+    section_number = 2
+
+    def section_title(title):
+        """Keep the user-facing outline sequential and consistently Chinese."""
+        nonlocal section_number
+        numerals = ('零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十')
+        number = numerals[section_number] if section_number < len(numerals) else str(section_number)
+        section_number += 1
+        return f"{number}、{title}"
+
     # Reachable Top 20
     if reachable:
-        summary_lines.append("二、已确认影响（优先处理）")
+        summary_lines.append(section_title("已确认影响（优先处理）"))
         reachable_sorted = sorted(
             reachable,
             key=lambda r: (
@@ -961,6 +1072,12 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
 
         summary_lines.append("")
 
+    if not_impacted:
+        summary_lines.append(section_title("已确认不受影响"))
+        for idx, r in enumerate(sorted(not_impacted, key=lambda r: (severity_rank(r.severity), r.api_name))[:20], 1):
+            summary_lines.append(_summary_item_line(idx, r))
+        summary_lines.append("")
+
     # Uncertain Top 20
     probable = [r for r in all_results if summarize_user_facing_outcome(r)['user_conclusion'] == '可能影响']
     inconclusive = [r for r in all_results if summarize_user_facing_outcome(r)['user_conclusion'] == '当前无法确认']
@@ -968,37 +1085,38 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     unresolved_for_reason = probable + inconclusive + input_required
 
     if probable:
-        summary_lines.append("三、可能影响（需要验证）")
+        summary_lines.append(section_title("可能影响（需要验证）"))
         for idx, r in enumerate(sorted(probable, key=lambda r: severity_rank(r.severity))[:20], 1):
             summary_lines.append(_summary_item_line(idx, r, include_action=True))
         summary_lines.append("")
 
     if inconclusive:
-        summary_lines.append("四、当前无法确认（不能解释为无影响）")
+        summary_lines.append(section_title("当前无法确认（不能解释为无影响）"))
         for idx, r in enumerate(sorted(inconclusive, key=lambda r: severity_rank(r.severity))[:20], 1):
             summary_lines.append(_summary_item_line(idx, r, include_action=True))
         summary_lines.append("")
 
     if input_required:
-        summary_lines.append("五、需要补充输入（建议先补齐后重跑）")
+        summary_lines.append(section_title("需要补充输入（建议先补齐后重跑）"))
         for idx, r in enumerate(sorted(input_required, key=lambda r: severity_rank(r.severity))[:20], 1):
             summary_lines.append(_summary_item_line(idx, r, include_action=True))
         summary_lines.append("")
 
     if unresolved_for_reason:
-        summary_lines.append("六、无法确认/需补输入的主要原因")
+        summary_lines.append(section_title("无法确认/需补输入的主要原因"))
         for idx, (reason, count) in enumerate(_reason_summary(unresolved_for_reason)[:10], 1):
             summary_lines.append(f"  {idx}. {reason}: {count} 个 API")
         summary_lines.append("")
 
     summary_lines.extend([
-        "七、复核文件",
+        section_title("复核文件"),
         "- 完整链路台账: alerts.csv",
         "- 单 API 明细: by_api/",
         "- 最终交付报告: ../../deliverables/report.md",
         "",
         "附：内部状态统计",
         f"- reachable: {len(reachable)}",
+        f"- not_impacted: {len(not_impacted)}",
         f"- uncertain: {len(uncertain)}",
         f"- not_analyzed: {len(not_analyzed)}",
         f"- not_found_in_static_analysis: {len(not_found)}",
@@ -1110,6 +1228,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
       uncertain_reason_summary{}, deprecated_aliases{}, meta{}
     """
     reachable       = [r for r in all_results if r.analysis_status == 'reachable']
+    not_impacted    = [r for r in all_results if r.analysis_status == 'not_impacted']
     uncertain       = [r for r in all_results if r.analysis_status == 'uncertain']
     not_analyzed    = [r for r in all_results if r.analysis_status == 'not_analyzed']
     # 兼容新旧状态名
@@ -1135,6 +1254,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
             'generated_at': datetime.now().isoformat(),
             'total_apis':   len(all_results),
             'reachable':    len(reachable),
+            'not_impacted': len(not_impacted),
             'uncertain':    len(uncertain),
             'not_analyzed': len(not_analyzed),
             'not_found_in_static_analysis': len(not_found),
@@ -1145,10 +1265,12 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         'skip_reason':      '',
         'total_apis':       len(all_results),
         'reachable':        len(reachable),
+        'not_impacted':     len(not_impacted),
         'not_found_in_static_analysis': len(not_found),
         'uncertain':        len(uncertain),
         'not_analyzed':     len(not_analyzed),
         'reachable_apis':     [trace_result_to_api_entry(r) for r in reachable],
+        'not_impacted_apis':  [trace_result_to_api_entry(r) for r in not_impacted],
         'uncertain_apis':     [trace_result_to_api_entry(r) for r in uncertain],
         'not_analyzed_apis':  [trace_result_to_api_entry(r) for r in not_analyzed],
         'not_found_apis':     [trace_result_to_api_entry(r) for r in not_found],
@@ -1156,6 +1278,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         'user_conclusion_summary': dict(sorted(user_conclusion_summary.items(), key=lambda x: x[0])),
         'quality_gate': {
             'confirmed_impact': decision_bucket_summary.get('confirmed_impact', 0),
+            'confirmed_no_impact': decision_bucket_summary.get('confirmed_no_impact', 0),
             'probable_impact': decision_bucket_summary.get('probable_impact', 0),
             'inconclusive': decision_bucket_summary.get('inconclusive', 0),
             'needs_input': decision_bucket_summary.get('input_required', 0),
@@ -1193,7 +1316,7 @@ def generate_alerts_csv(all_results, output_path):
     for result in all_results:
         rows.extend(_alert_rows_for_result(result))
     rows.sort(key=lambda row: (
-        {'confirmed': 0, 'candidate': 1, 'incomplete': 2, 'no_static_path': 3}.get(
+        {'confirmed': 0, 'candidate': 1, 'confirmed_no_impact': 2, 'no_static_path': 3, 'incomplete': 4}.get(
             row['conclusion_level'], 9
         ),
         severity_rank(row['severity']), row['target_coord'], row['changed_symbol'], row['path_id'],
@@ -1264,6 +1387,20 @@ def _write_alerts_review_bucket(output_dir, bucket_name, rows, max_rows):
         return
     os.makedirs(output_dir, exist_ok=True)
     max_rows = max(1, int(max_rows or ALERTS_SPLIT_MAX_ROWS))
+    raw_max_bytes = str(os.environ.get('JUA_ALERTS_SPLIT_MAX_BYTES') or '').strip()
+    try:
+        max_bytes = max(1, int(raw_max_bytes)) if raw_max_bytes else ALERTS_SPLIT_MAX_BYTES
+    except ValueError:
+        max_bytes = ALERTS_SPLIT_MAX_BYTES
+    estimated_bytes = sum(
+        sum(len(str(row.get(field) or '').encode('utf-8')) + 1 for field in ALERTS_CSV_FIELDNAMES)
+        for row in rows
+    )
+    if estimated_bytes > max_bytes:
+        max_rows = min(
+            max_rows,
+            max(1, int(len(rows) * max_bytes / estimated_bytes)),
+        )
     if len(rows) <= max_rows:
         _write_alert_rows_csv(os.path.join(output_dir, f'alerts_{bucket_name}.csv'), rows)
         return
@@ -1337,14 +1474,15 @@ def _alert_rows_for_result(result):
         conclusion_level, action_type = _path_conclusion(path_status)
         reachable = detail.get('business_reachable')
         capability_coverage = dict(getattr(result, 'capability_coverage', {}) or {})
-        path_text = detail.get('path_text') or ''
-        business_entry = detail.get('business_entry') or ''
+        path_text = humanize_user_text(detail.get('path_text') or '')
+        business_entry = humanize_user_text(detail.get('business_entry') or '')
         changed_symbol = result.api_name or ''
         chain_view = _alert_chain_view(path_text, business_entry, changed_symbol, evidence)
+        review_reason = _alert_review_reason(result, detail, evidence, explanation, stop_reason)
         rows.append({
-            'conclusion': _alert_conclusion_label(path_status, conclusion_level),
+            'conclusion': _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_reason),
             'change_summary': _alert_change_summary(result),
-            'review_reason': explanation['reason'] or stop_reason,
+            'review_reason': review_reason,
             'chain_summary': chain_view['summary'],
             'chain_entry': chain_view['entry'],
             'chain_target': chain_view['target'],
@@ -1364,9 +1502,13 @@ def _alert_rows_for_result(result):
             'action_type': action_type,
             'business_reachable': 'true' if reachable is True else ('false' if reachable is False else 'unknown'),
             'business_entry': business_entry,
-            'consumer_coord': detail.get('consumer_coord') or '',
-            'consumer_class': detail.get('consumer_class') or '',
-            'consumer_method': detail.get('consumer_method') or '',
+            'consumer_coord': (
+                '业务制品'
+                if (detail.get('consumer_coord') or '') in {'__business__', 'BUSINESS'}
+                else detail.get('consumer_coord') or ''
+            ),
+            'consumer_class': humanize_user_text(detail.get('consumer_class') or ''),
+            'consumer_method': humanize_user_text(detail.get('consumer_method') or ''),
             'consumer_signature': detail.get('consumer_signature') or '',
             'path_text': path_text,
             'stop_reason': stop_reason,
@@ -1397,6 +1539,8 @@ def _alert_conclusion_label(path_status, conclusion_level):
         return '已确认影响'
     if status == 'uncertain':
         return '需要人工复核'
+    if status == 'not_impacted':
+        return '已确认不受影响'
     if status in {'not_found_in_static_analysis', 'not_reachable'}:
         return '未发现静态调用路径'
     if status == 'not_analyzed':
@@ -1405,9 +1549,23 @@ def _alert_conclusion_label(path_status, conclusion_level):
     return {
         'confirmed': '已确认影响',
         'candidate': '需要人工复核',
+        'confirmed_no_impact': '已确认不受影响',
         'no_static_path': '未发现静态调用路径',
         'incomplete': '未完成分析',
     }.get(level, '需要人工复核')
+
+
+def _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_reason):
+    symbol_kind = str(getattr(result, 'symbol_kind', '') or '')
+    if path_status == 'reachable':
+        if stop_reason == 'RUNTIME_DEPENDENCY_ENTRY_REACHED':
+            return '已确认影响：当前制品中已激活的运行时入口会使用该变更 API'
+        if symbol_kind == 'class':
+            return '已确认影响：业务制品直接引用了被删除的类'
+        return '已确认影响：已找到业务或已激活入口到变更 API 的路径'
+    if path_status == 'uncertain' and detail.get('consumer_coord'):
+        return '需要复核：当前制品中的依赖已引用该 API，但尚未证明会由业务入口触发'
+    return _alert_conclusion_label(path_status, conclusion_level)
 
 
 def _alert_change_summary(result):
@@ -1415,26 +1573,62 @@ def _alert_change_summary(result):
     symbol_kind = str(getattr(result, 'symbol_kind', '') or '').strip()
     severity = str(getattr(result, 'severity', '') or '').strip() or '-'
     api_name = str(getattr(result, 'api_name', '') or '').strip()
-    api_simple = str(getattr(result, 'api_simple', '') or '').strip()
-    display_name = api_simple or (api_name.rsplit('.', 1)[-1] if api_name else '-')
-    change_label = {
-        'REMOVED': '删除',
-        'SIGNATURE_CHANGED': '签名变更',
-        'BEHAVIOR_CHANGED': '行为变更',
-        'ACCESS_REDUCED': '访问权限降低',
-        'SOURCE_INCOMPATIBLE': '源码不兼容',
-        'CONSTANT_VALUE_CHANGED': '常量值变更',
-        'METHOD_CHANGED': '变更',
-    }.get(change_type, change_type or '变更')
+    coord = str(getattr(result, 'coord', '') or '').strip() or '未知依赖'
+    normalized_change = change_type.upper()
     kind_label = {
         'method': '方法',
         'field': '字段',
         'class': '类',
         'constructor': '构造方法',
     }.get(symbol_kind, symbol_kind or 'API')
-    if symbol_kind in {'method', 'constructor'}:
-        return f"{change_label}{kind_label}，{display_name}，参数：{_alert_signature_display(getattr(result, 'api_signature', '') or '')}，严重级别：{severity}"
-    return f"{change_label}{kind_label}，{display_name}，严重级别：{severity}"
+    signature = (
+        str(getattr(result, 'api_signature', '') or '').strip()
+        if symbol_kind in {'method', 'constructor'} else ''
+    )
+    target = f"{kind_label} {api_name}{signature}"
+    if normalized_change == 'SIGNATURE_CHANGED':
+        change_sentence = f"修改了{target}的签名"
+    elif normalized_change == 'BEHAVIOR_CHANGED':
+        change_sentence = f"修改了{target}的行为"
+    elif normalized_change == 'ACCESS_REDUCED':
+        change_sentence = f"降低了{target}的访问权限"
+    elif normalized_change == 'SOURCE_INCOMPATIBLE':
+        change_sentence = f"使{target}产生源码不兼容"
+    elif normalized_change == 'CONSTANT_VALUE_CHANGED':
+        change_sentence = f"修改了{target}的常量值"
+    elif normalized_change == 'REMOVED' or normalized_change.endswith('_REMOVED'):
+        change_sentence = f"删除了{target}"
+    elif normalized_change == 'ADDED' or normalized_change.endswith('_ADDED'):
+        change_sentence = f"新增了{target}"
+    else:
+        change_sentence = f"变更了{target}"
+    return f"依赖 {coord} {change_sentence}（严重级别 {severity}）"
+
+
+def _alert_review_reason(result, detail, evidence, explanation, stop_reason):
+    api_name = str(getattr(result, 'api_name', '') or '').strip()
+    signature = str(getattr(result, 'api_signature', '') or '').strip()
+    symbol_kind = str(getattr(result, 'symbol_kind', '') or '').strip()
+    consumer_coord = str((detail or {}).get('consumer_coord') or '').strip()
+    consumer_class = humanize_user_text((detail or {}).get('consumer_class') or '')
+    consumer_method = humanize_user_text((detail or {}).get('consumer_method') or '')
+    consumer = '.'.join(item for item in (consumer_class, consumer_method) if item)
+    evidence_types = {str((item or {}).get('evidence_type') or '') for item in evidence or []}
+    removed = str(getattr(result, 'change_type', '') or '').upper() == 'REMOVED'
+    if (detail or {}).get('path_status') == 'reachable' and symbol_kind == 'class' and 'bytecode_class_reference' in evidence_types:
+        consequence = '；相关类被加载或链接时可能出现 NoClassDefFoundError' if removed else ''
+        return f"业务制品中的 {consumer_class or '当前业务类'} 直接引用 {api_name}{consequence}。"
+    if (detail or {}).get('path_status') == 'reachable' and consumer_coord in {'__business__', 'BUSINESS'}:
+        consequence = '；执行到该路径时可能出现 NoSuchMethodError 或 NoClassDefFoundError' if removed else ''
+        return f"业务制品中的 {consumer or '业务代码'} 直接调用 {api_name}{signature}{consequence}。"
+    if stop_reason == 'RUNTIME_DEPENDENCY_ENTRY_REACHED':
+        return f"当前制品已证明该框架入口会被激活，且完整路径最终使用 {api_name}{signature}。"
+    if (detail or {}).get('path_status') == 'uncertain' and consumer_coord:
+        return (
+            f"运行时依赖 {consumer_coord} 中的 {consumer or '字节码'} "
+            f"精确引用 {api_name}{signature}；尚缺少从业务入口到该依赖方法的可确认路径。"
+        )
+    return str(explanation.get('reason') or stop_reason or '当前证据不足。')
 
 
 def _alert_signature_display(signature):
@@ -1452,8 +1646,8 @@ def _alert_chain_summary(path_text, business_entry, changed_symbol):
 
 
 def _alert_chain_view(path_text, business_entry, changed_symbol, evidence):
-    path_text = str(path_text or '').strip()
-    business_entry = str(business_entry or '').strip()
+    path_text = humanize_user_text(path_text)
+    business_entry = humanize_user_text(business_entry)
     changed_symbol = str(changed_symbol or '').strip()
     nodes = _split_chain_nodes(path_text)
     if not nodes:
@@ -1463,10 +1657,14 @@ def _alert_chain_view(path_text, business_entry, changed_symbol, evidence):
     elif not nodes:
         nodes = [node for node in (business_entry, changed_symbol) if node]
 
-    entry = nodes[0] if nodes else ''
-    target = nodes[-1] if nodes else changed_symbol
+    entry = humanize_user_text(nodes[0]) if nodes else ''
+    target = humanize_user_text(_strip_changed_api_marker(nodes[-1])) if nodes else changed_symbol
     hop_count = max(0, len(nodes) - 1)
-    if nodes and len(nodes) >= 2:
+    evidence_types = {str((item or {}).get('evidence_type') or '') for item in evidence or []}
+    if 'bytecode_class_reference' in evidence_types and nodes and len(nodes) >= 2:
+        summary = f"类型引用：{entry} 依赖 {target}"
+        detail = f"1. {entry} --类加载/链接时需要--> 2. {target}"
+    elif nodes and len(nodes) >= 2:
         summary = f"入口：{entry}；终点：{target}；{hop_count} 跳"
         detail = ' -> '.join(f"{idx}. {node}" for idx, node in enumerate(nodes, 1))
     elif changed_symbol:
@@ -1484,8 +1682,16 @@ def _alert_chain_view(path_text, business_entry, changed_symbol, evidence):
     }
 
 
+def _strip_changed_api_marker(value):
+    value = str(value or '').strip()
+    for marker in ('变更 API：', '变更 API:', '变更API:', '变更API：'):
+        if value.startswith(marker):
+            return value[len(marker):].strip()
+    return value
+
+
 def _split_chain_nodes(path_text):
-    text = str(path_text or '').strip()
+    text = humanize_user_text(path_text)
     if not text:
         return []
     normalized = text.replace('→', '->')
@@ -1496,8 +1702,8 @@ def _split_chain_nodes(path_text):
 def _nodes_from_evidence(evidence):
     nodes = []
     for edge in evidence or []:
-        caller = str(edge.get('caller_symbol') or '').strip()
-        callee = str(edge.get('callee_key') or '').strip()
+        caller = humanize_user_text(edge.get('caller_symbol'))
+        callee = humanize_user_text(edge.get('callee_key'))
         if caller and (not nodes or nodes[-1] != caller):
             nodes.append(caller)
         if callee and (not nodes or nodes[-1] != callee):
@@ -1515,7 +1721,21 @@ def _deduplicate_equivalent_path_details(details):
             existing['_path_occurrence_count'] = int(existing.get('_path_occurrence_count') or 1) + 1
             existing_evidence = list(existing.get('evidence') or [])
             existing_evidence.extend(list(detail.get('evidence') or []))
-            existing['evidence'] = existing_evidence
+            unique_evidence = []
+            evidence_seen = set()
+            for item in existing_evidence:
+                identity = json.dumps({
+                    key: item.get(key) or ''
+                    for key in (
+                        'caller_symbol', 'callee_key', 'evidence_type',
+                        'owner_coord', 'file', 'line',
+                    )
+                }, ensure_ascii=False, sort_keys=True)
+                if identity in evidence_seen:
+                    continue
+                evidence_seen.add(identity)
+                unique_evidence.append(item)
+            existing['evidence'] = unique_evidence
             continue
         copied = dict(detail)
         copied['_path_occurrence_count'] = int(copied.get('_path_occurrence_count') or 1)
@@ -1525,13 +1745,10 @@ def _deduplicate_equivalent_path_details(details):
 
 
 def _alert_path_detail_identity(detail):
-    semantic_evidence = [
-        {
-            key: item.get(key) or ''
-            for key in ('caller_symbol', 'callee_key', 'evidence_type', 'owner_coord')
-        }
-        for item in list((detail or {}).get('evidence') or [])
-    ]
+    # The rendered node chain is the review unit. The same exact chain can be
+    # discovered through normalized and fully-qualified signature spellings or
+    # through multiple equivalent bytecode records. Keep one row and merge its
+    # evidence instead of assigning different path IDs to identical chains.
     return json.dumps({
         'path_status': (detail or {}).get('path_status') or '',
         'stop_reason': (detail or {}).get('stop_reason') or '',
@@ -1542,7 +1759,6 @@ def _alert_path_detail_identity(detail):
         'consumer_method': (detail or {}).get('consumer_method') or '',
         'consumer_signature': (detail or {}).get('consumer_signature') or '',
         'path_text': (detail or {}).get('path_text') or '',
-        'evidence': semantic_evidence,
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -1572,9 +1788,10 @@ def _alert_path_status_rank(path_status):
     return {
         'reachable': 0,
         'uncertain': 1,
-        'not_analyzed': 2,
+        'not_impacted': 2,
         'not_found_in_static_analysis': 3,
         'not_reachable': 3,
+        'not_analyzed': 4,
     }.get(str(path_status or ''), 9)
 
 
@@ -1620,6 +1837,7 @@ def _path_conclusion(path_status):
     return {
         'reachable': ('confirmed', 'fix'),
         'uncertain': ('candidate', 'review'),
+        'not_impacted': ('confirmed_no_impact', 'none'),
         'not_analyzed': ('incomplete', 'rerun_analysis'),
         'not_found_in_static_analysis': ('no_static_path', 'review'),
         'not_reachable': ('no_static_path', 'review'),

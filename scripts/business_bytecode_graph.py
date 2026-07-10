@@ -739,6 +739,21 @@ def merge_business_bytecode_edges(graph, evidence):
             is_test=False,
             callee_param_types=[],
         )
+        callee_key = str(edge.callee_key or '')
+        edge.callee_fqcn_complete = bool(
+            callee_key.startswith('class:')
+            or ('.' in callee_key.split('(', 1)[0] and not callee_key.startswith(('method:', 'field:')))
+        )
+        edge.callee_signature_complete = bool(
+            edge.evidence_type not in {'bytecode_method_invocation', 'bytecode_constructor_invocation'}
+            or ('(' in callee_key and callee_key.endswith(')'))
+        )
+        if edge.callee_fqcn_complete and edge.callee_signature_complete:
+            edge.callee_resolution_note = '调用目标已解析到全限定名和签名'
+        elif not edge.callee_fqcn_complete:
+            edge.callee_resolution_note = '缺少调用目标所属类全限定名'
+        else:
+            edge.callee_resolution_note = '缺少调用目标方法参数签名'
         for key in (edge.callee_key, edge.callee_simple_key):
             bucket = reverse_edges.setdefault(key, [])
             identity = (edge.caller_symbol_id, edge.callee_key, edge.evidence_type)

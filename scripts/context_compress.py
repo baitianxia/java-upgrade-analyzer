@@ -283,6 +283,7 @@ def summarize_step5(report_dir):
         'skip_reason':        summary.get('skip_reason', ''),
         'total_apis':         summary.get('total_apis', 0),
         'reachable':          summary.get('reachable', 0),
+        'not_impacted':       summary.get('not_impacted', 0),
         'not_found_in_static_analysis': summary.get('not_found_in_static_analysis', summary.get('not_reachable', 0)),
         'uncertain':          summary.get('uncertain', 0),
         'not_analyzed':       summary.get('not_analyzed', 0),
@@ -293,6 +294,8 @@ def summarize_step5(report_dir):
         'deprecated_aliases': summary.get('deprecated_aliases', {}),
         # 只保留 Top 10 可达风险
         'top_reachable': summary.get('reachable_apis', [])[:10],
+        # 保留少量直接制品证据，便于解释为何某个 removed API 未形成风险。
+        'top_not_impacted': summary.get('not_impacted_apis', [])[:10],
         # 保留所有 uncertain（需人工验证，不能丢）
         'all_uncertain': summary.get('uncertain_apis', []),
         'note': f'完整调用链在 {report_dir}/evidence/call_chain/by_api/ 和 by_module/'

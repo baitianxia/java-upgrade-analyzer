@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 import confidence_weighted_tracer as tracer  # noqa: E402
 import enhanced_source_analyzer as source_analyzer  # noqa: E402
 import enhanced_output_formatter as formatter  # noqa: E402
+import framework_adapters  # noqa: E402
 import gate  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
 import s6_report  # noqa: E402
@@ -512,8 +513,27 @@ class Step5KeyMatchingTest(unittest.TestCase):
             callee_key="com.dep.B.callC",
         )
         self.assertEqual(
-            tracer.format_call_chain([direct, upstream], "com.app.A.callB"),
-            "com.app.A.callB → com.dep.B.callC → com.changed.C.removed",
+            tracer.format_call_chain([direct, upstream], "com.changed.C.removed()"),
+            "com.app.A.callB → com.dep.B.callC → com.changed.C.removed → 变更API: com.changed.C.removed()",
+        )
+
+    def test_format_call_chain_keeps_actual_callee_and_ends_with_changed_api(self):
+        direct = SimpleNamespace(
+            caller_qualified_key="org.apache.dubbo.metrics.model.MetricsSupport.getGroup",
+            caller_symbol_id="m",
+            callee_key="org.apache.dubbo.rpc.model.ServiceMetadata.getGroup()",
+        )
+
+        self.assertEqual(
+            tracer.format_call_chain(
+                [direct],
+                "org.apache.dubbo.common.BaseServiceMetadata.getGroup()",
+            ),
+            (
+                "org.apache.dubbo.metrics.model.MetricsSupport.getGroup"
+                " → org.apache.dubbo.rpc.model.ServiceMetadata.getGroup()"
+                " → 变更API: org.apache.dubbo.common.BaseServiceMetadata.getGroup()"
+            ),
         )
 
     def test_inlined_constant_miss_remains_uncertain(self):
@@ -2282,6 +2302,79 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(result.analysis_status, "not_analyzed")
         self.assertEqual(result.reason_code, "OVERLOAD_AMBIGUOUS_TARGET")
 
+    def test_trace_api_reports_not_found_when_all_unsigned_edges_have_complete_incompatible_signatures(self):
+        api_row = {
+            "api_name": "org.slf4j.Logger.isDebugEnabled",
+            "api_simple": "isDebugEnabled",
+            "api_signature": "(org.slf4j.Marker)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.slf4j:slf4j-api",
+            "severity": "P0",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_scope": "method",
+        }
+        caller = SimpleNamespace(
+            symbol_id="caller",
+            qualified_key="com.vendor.LoggingAdapter.enabled",
+            simple_key="method:enabled",
+            class_fqcn="com.vendor.LoggingAdapter",
+            class_name="LoggingAdapter",
+            method_name="enabled",
+            param_types={},
+            param_declared_types={},
+            owner_type="dependency",
+            owner_coord="com.vendor:adapter",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=["public"],
+            is_interface=False,
+            file="/LoggingAdapter.java",
+            line=10,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="caller",
+            caller_qualified_key=caller.qualified_key,
+            callee_key="org.slf4j.Logger.isDebugEnabled()",
+            callee_simple_key="method:isDebugEnabled()",
+            confidence="high",
+            evidence_type="ast_method_invocation",
+            file=caller.file,
+            line=12,
+            owner_type="dependency",
+            owner_coord="com.vendor:adapter",
+            module="runtime",
+            is_test=False,
+            callee_fqcn_complete=True,
+            callee_signature_complete=True,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"caller": caller},
+            reverse_edges={
+                "org.slf4j.Logger.isDebugEnabled": [edge],
+                "org.slf4j.Logger.isDebugEnabled()": [edge],
+            },
+            runtime_dependency_catalog={},
+        )
+
+        with patch.object(
+            tracer,
+            "_scan_packaged_runtime_dependencies_for_api",
+            return_value={"status": "miss", "hits": []},
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                max_total_cost=5,
+                has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.analysis_status, "not_found_in_static_analysis")
+        self.assertNotEqual(result.reason_code, "OVERLOAD_AMBIGUOUS_TARGET")
+
     def test_collect_overload_signatures_ignores_invalid_parser_noise(self):
         reverse_edges = {
             "org.example.Expression.write(StringBuilder, int)": [object()],
@@ -2667,6 +2760,155 @@ class Step5KeyMatchingTest(unittest.TestCase):
         path_texts = [item.get("path_text", "") for item in result.path_details]
         self.assertTrue(any("com.biz.TwoArg.call" in path for path in path_texts))
         self.assertTrue(any("com.biz.ThreeArg.call" in path for path in path_texts))
+
+    def test_varargs_target_does_not_steal_exact_sibling_overload_call(self):
+        api_row = {
+            "api_name": "org.slf4j.Logger.info",
+            "api_simple": "info",
+            "api_signature": "(java.lang.String, java.lang.Object...)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.slf4j:slf4j-api",
+            "severity": "P0",
+            "confirmed": "true",
+            "source": "old_jar",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business",
+            qualified_key="com.biz.App.run",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            file="App.java",
+            line=10,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="business",
+            caller_qualified_key=business_method.qualified_key,
+            callee_key="org.slf4j.Logger.info(String, Object)",
+            callee_simple_key="method:info(String, Object)",
+            confidence="high",
+            evidence_type="bytecode_method_invocation",
+            file="app.jar!/App.class",
+            line=10,
+            owner_type="business",
+            owner_coord="BUSINESS",
+            module="app",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business": business_method},
+            reverse_edges={"org.slf4j.Logger.info(String, Object)": [edge]},
+            changed_api_overload_signatures={
+                "org.slf4j.Logger.info": frozenset({
+                    "(java.lang.String, java.lang.Object)",
+                    "(java.lang.String, java.lang.Object...)",
+                })
+            },
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {}, max_total_cost=5)
+
+        self.assertNotEqual(result.analysis_status, "reachable")
+        self.assertNotIn("String, Object) →", "\n".join(result.call_paths))
+
+    def test_varargs_target_does_not_steal_call_applicable_to_fixed_sibling(self):
+        graph = SimpleNamespace(
+            changed_api_overload_signatures={
+                "org.slf4j.Logger.info": frozenset({
+                    "(java.lang.String, java.lang.Object)",
+                    "(java.lang.String, java.lang.Object...)",
+                })
+            }
+        )
+
+        retained = tracer.exclude_signatures_owned_by_sibling_overloads(
+            "org.slf4j.Logger.info",
+            "(java.lang.String, java.lang.Object...)",
+            ["(String, String)", "(String, Object[])"],
+            graph,
+            {},
+        )
+
+        self.assertEqual(retained, ["(String, Object[])"])
+
+    def test_exact_packaged_bytecode_hit_survives_source_overload_ambiguity(self):
+        api_row = {
+            "api_name": "org.slf4j.Logger.info",
+            "api_simple": "info",
+            "api_signature": "(java.lang.String, java.lang.Object...)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.slf4j:slf4j-api",
+            "new_version": "-",
+            "severity": "P0",
+            "confirmed": "true",
+            "source": "old_jar",
+        }
+        identity = tracer.build_api_identity_key(api_row)
+        dependency_hit = {
+            "coord": "com.example:consumer",
+            "jar_path": "/runtime/consumer.jar",
+            "class_fqcn": "com.example.Consumer",
+            "consumer_method": "run",
+            "consumer_signature": "()",
+            "evidence_type": "bytecode_method_invocation",
+            "target_display": "org.slf4j.Logger.info(String, Object[])",
+        }
+        dependency_method = SimpleNamespace(
+            symbol_id="dep",
+            qualified_key="com.example.Consumer.run",
+            owner_type="dependency",
+            owner_coord="com.example:consumer",
+            is_test=False,
+            file="Consumer.java",
+            line=10,
+            annotations=[],
+            class_annotations=[],
+        )
+        ambiguous_edge = SimpleNamespace(
+            caller_symbol_id="dep",
+            caller_qualified_key=dependency_method.qualified_key,
+            callee_key="org.slf4j.Logger.info(String, String)",
+            callee_simple_key="method:info(String, String)",
+            confidence="high",
+            evidence_type="ast_method_invocation",
+            file="Consumer.java",
+            line=10,
+            owner_type="dependency",
+            owner_coord="com.example:consumer",
+            module="consumer",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"dep": dependency_method},
+            reverse_edges={"org.slf4j.Logger.info(String, String)": [ambiguous_edge]},
+            runtime_dependency_catalog={
+                "_packaged_api_scan_results": {
+                    identity: {"status": "hit", "hits": [dependency_hit]}
+                }
+            },
+            changed_api_overload_signatures={
+                "org.slf4j.Logger.info": frozenset({
+                    "(java.lang.String, java.lang.Object)",
+                    "(java.lang.String, java.lang.Object...)",
+                })
+            },
+            framework_runtime_entry_methods={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(
+            api_row,
+            graph,
+            {},
+            max_total_cost=5,
+            has_packaged_bytecode_fallback=True,
+        )
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "RUNTIME_DEPENDENCY_USES_REMOVED_API")
+        self.assertIn("com.example:consumer", result.call_paths[0])
+        self.assertIn("Object[]", result.call_paths[0])
 
     def test_build_graph_infers_boolean_expression_for_varargs_validation_call(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5174,7 +5416,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(summary["quality_gate"]["needs_input"], 1)
         self.assertLess(summary_text.index("一、结论总览"), summary_text.index("附：内部状态统计"))
         self.assertIn("二、已确认影响（优先处理）", summary_text)
-        self.assertIn("五、需要补充输入（建议先补齐后重跑）", summary_text)
+        self.assertIn("四、需要补充输入（建议先补齐后重跑）", summary_text)
         self.assertLess(by_api_text.index("【结论】"), by_api_text.index("【变更信息】"))
         self.assertIn("【调用链路】", by_api_text)
 
@@ -5373,6 +5615,108 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
         perf = tracer._finalize_step5_perf_stats(graph)["trace"]
         self.assertEqual(perf["critical_node_fast_none"], 1)
+
+    def test_concrete_dependency_interface_method_is_not_a_dynamic_proxy_boundary(self):
+        graph = SimpleNamespace(
+            methods_by_id={},
+            framework_entry_symbols={},
+            framework_runtime_entry_methods={},
+            framework_activation_linked_symbols=set(),
+        )
+        type_metadata = {
+            "org.apache.dubbo.common.utils.FieldUtils": {
+                "kind": "interface",
+                "implementations": [],
+                "annotations": [],
+            }
+        }
+
+        for symbol_id, is_static, modifiers in (
+            ("static", True, ["public", "static"]),
+            ("default", False, ["public", "default"]),
+            ("private", False, ["private"]),
+        ):
+            with self.subTest(symbol_id=symbol_id):
+                method_def = SimpleNamespace(
+                    symbol_id=symbol_id,
+                    qualified_key=f"org.apache.dubbo.common.utils.FieldUtils.{symbol_id}",
+                    owner_type="dependency",
+                    is_test=False,
+                    file="FieldUtils.java",
+                    line=1,
+                    class_fqcn="org.apache.dubbo.common.utils.FieldUtils",
+                    class_name="FieldUtils",
+                    annotations=[],
+                    class_annotations=[],
+                    is_interface=True,
+                    is_static=is_static,
+                    modifiers=modifiers,
+                )
+
+                self.assertIsNone(
+                    tracer.get_cached_critical_node(
+                        method_def,
+                        graph,
+                        type_metadata,
+                        trace_cache=tracer.ensure_trace_cache(),
+                    )
+                )
+
+    def test_dependency_method_lookup_does_not_cross_into_unrelated_object_method(self):
+        method_def = source_analyzer.MethodDef(
+            symbol_id="annotation_get_class",
+            qualified_key="com.vendor.AnnotationMeta.getClass",
+            simple_key="method:getClass",
+            class_fqcn="com.vendor.AnnotationMeta",
+            class_name="AnnotationMeta",
+            method_name="getClass",
+            return_type="Class",
+            file="/AnnotationMeta.java",
+            line=1,
+            end_line=2,
+            package_name="com.vendor",
+            owner_type="dependency",
+            owner_coord="com.vendor:runtime",
+            module="runtime",
+            source_root="/src",
+            language="java",
+            is_test=False,
+            param_types={"attributeName": "java.lang.String"},
+            param_declared_types={"attributeName": "String"},
+            declared_signature="(String)",
+            declared_qualified_key="com.vendor.AnnotationMeta.getClass(String)",
+        )
+        object_edge = SimpleNamespace(
+            caller_symbol_id="field_utils",
+            caller_qualified_key="com.vendor.FieldUtils.findField",
+            callee_key="java.lang.Object.getClass()",
+            callee_simple_key="method:getClass()",
+            evidence_type="ast_method_invocation",
+            confidence="high",
+            file="/FieldUtils.java",
+            line=10,
+            owner_type="dependency",
+            owner_coord="com.vendor:runtime",
+            module="runtime",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            reverse_edges={
+                "java.lang.Object.getClass()": [object_edge],
+                "java.lang.Object.getClass": [object_edge],
+            },
+            methods_by_id={},
+        )
+
+        matched_groups, overload_block = tracer.get_cached_method_lookup_resolution(
+            method_def,
+            {"com.vendor.AnnotationMeta": {"kind": "class"}},
+            graph,
+            trace_cache=tracer.ensure_trace_cache(),
+        )
+
+        self.assertEqual(matched_groups, [])
+        self.assertIsNone(overload_block)
 
     def test_declared_method_signature_index_is_built_once_for_many_api_filters(self):
         graph = SimpleNamespace(
@@ -5951,7 +6295,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         row = formatter._alert_rows_for_result(result)[0]
 
         self.assertEqual("需要人工复核", row["conclusion"])
-        self.assertIn("变更方法，changed", row["change_summary"])
+        self.assertEqual("依赖 a:b 变更了方法 com.acme.Api.changed()（严重级别 P1）", row["change_summary"])
         self.assertEqual("入口：A.call；终点：B.call；1 跳", row["chain_summary"])
         self.assertEqual("A.call", row["chain_entry"])
         self.assertEqual("B.call", row["chain_target"])
@@ -5960,6 +6304,85 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("低置信度边", row["reason"])
         self.assertIn("低置信度边", row["review_reason"])
         self.assertNotIn("已证明变更 API 触达系统代码", row["reason"])
+
+    def test_alert_chain_target_strips_changed_api_marker(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED",
+            severity="P0", confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="reachable", direct_callers=1, is_reachable=True,
+            reachable_note="触达", business_reach_depth=2,
+            dependency_chain_coords=[],
+            call_paths=["com.app.A.call → com.alt.Adapter.gone() → 变更API: com.acme.Api.gone()"],
+            evidence_paths=[],
+            reason_code="SYSTEM_CODE_REACHED", verification_commands=[], hops=[],
+            confidence_score=0.9, critical_nodes_hit=[],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("com.acme.Api.gone()", row["chain_target"])
+        self.assertIn("变更 API： com.acme.Api.gone()", row["chain_detail"])
+
+    def test_removed_class_alert_explains_who_references_it_and_runtime_consequence(self):
+        result = tracer.TraceResult(
+            coord="org.slf4j:slf4j-api",
+            api_name="org.slf4j.Logger",
+            api_simple="Logger",
+            api_signature="",
+            symbol_kind="class",
+            change_type="REMOVED",
+            severity="P0",
+            confirmed=True,
+            source="old_jar",
+            analysis_scope="class_usage",
+            analysis_status="reachable",
+            direct_callers=1,
+            is_reachable=True,
+            reachable_note="业务制品字节码引用",
+            business_reach_depth=1,
+            dependency_chain_coords=[],
+            call_paths=["__business__:com.acme.Application.<class> -> org.slf4j.Logger"],
+            evidence_paths=[],
+            reason_code="BUSINESS_ARTIFACT_BYTECODE_USAGE",
+            verification_commands=[],
+            hops=[],
+            confidence_score=1.0,
+            critical_nodes_hit=[],
+            path_details=[{
+                "path_status": "reachable",
+                "stop_reason": "BUSINESS_ARTIFACT_BYTECODE_USAGE",
+                "business_reachable": True,
+                "business_entry": "__business__:com.acme.Application.<class>",
+                "consumer_coord": "__business__",
+                "consumer_class": "com.acme.Application",
+                "consumer_method": "<class>",
+                "consumer_signature": "",
+                "path_text": "__business__:com.acme.Application.<class> -> org.slf4j.Logger",
+                "confidence": 1.0,
+                "depth": 1,
+                "evidence": [{
+                    "caller_symbol": "__business__:com.acme.Application.<class>",
+                    "callee_key": "org.slf4j.Logger",
+                    "evidence_type": "bytecode_class_reference",
+                    "owner_coord": "__business__",
+                    "file": "/app.jar",
+                }],
+            }],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("已确认影响：业务制品直接引用了被删除的类", row["conclusion"])
+        self.assertEqual(
+            "依赖 org.slf4j:slf4j-api 删除了类 org.slf4j.Logger（严重级别 P0）",
+            row["change_summary"],
+        )
+        self.assertIn("com.acme.Application", row["review_reason"])
+        self.assertIn("NoClassDefFoundError", row["review_reason"])
+        self.assertEqual("类型引用：业务制品：com.acme.Application（类加载/链接） 依赖 org.slf4j.Logger", row["chain_summary"])
+        self.assertNotIn("__business__", json.dumps(row, ensure_ascii=False))
+        self.assertNotIn("<class>", json.dumps(row, ensure_ascii=False))
 
     def test_alerts_csv_keeps_api_without_any_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5978,7 +6401,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 1)
         self.assertEqual("未发现静态调用路径", rows[0]["conclusion"])
-        self.assertIn("删除方法，gone", rows[0]["change_summary"])
+        self.assertEqual("依赖 a:b 删除了方法 com.acme.Api.gone()（严重级别 P0）", rows[0]["change_summary"])
         self.assertIn("未形成完整链路", rows[0]["chain_summary"])
         self.assertEqual("com.acme.Api.gone", rows[0]["chain_target"])
         self.assertEqual(rows[0]["conclusion_level"], "no_static_path")
@@ -6203,12 +6626,555 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
 
         self.assertEqual(result.analysis_status, "reachable")
-        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertEqual(result.reason_code, "RUNTIME_DEPENDENCY_ENTRY_REACHED")
         self.assertEqual(result.dependency_chain_coords, ["com.example:dep-job"])
         self.assertEqual(
             result.call_paths,
-            ["com.dep.CleanupJob.cleanup → com.vendor.LegacyApi.removed()"],
+            ["com.dep.CleanupJob.cleanup → 变更API: com.vendor.LegacyApi.removed()"],
         )
+
+    def test_packaged_spring_listener_is_reachable_from_runtime_registration(self):
+        listener = SimpleNamespace(
+            symbol_id="runtime:com.vendor:boot:com.vendor.RuntimeListener.onApplicationEvent(java.lang.Object)",
+            qualified_key="com.vendor.RuntimeListener.onApplicationEvent(java.lang.Object)",
+            simple_key="onApplicationEvent(java.lang.Object)",
+            class_fqcn="com.vendor.RuntimeListener",
+            class_name="RuntimeListener",
+            method_name="onApplicationEvent",
+            file="/runtime/boot.jar",
+            line=0,
+            owner_type="dependency",
+            owner_coord="com.vendor:boot",
+            module="",
+            is_test=False,
+            annotations=[],
+            class_annotations=[],
+            modifiers=[],
+            is_interface=False,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id=listener.symbol_id,
+            caller_qualified_key=listener.qualified_key,
+            callee_key="com.vendor.LegacyApi.removed()",
+            callee_simple_key="method:removed()",
+            evidence_type="runtime_dependency_bytecode_invocation",
+            confidence="high",
+            file=listener.file,
+            line=0,
+            owner_type="dependency",
+            owner_coord="com.vendor:boot",
+            module="",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={listener.symbol_id: listener},
+            reverse_edges={"com.vendor.LegacyApi.removed()": [edge]},
+            framework_entry_symbols={},
+            framework_runtime_entry_methods={
+                "com.vendor.RuntimeListener.onApplicationEvent": [{
+                    "adapter": "spring_runtime_artifact",
+                    "edge_kind": "spring_runtime_registered_callback",
+                    "runtime_activation": "active",
+                }],
+            },
+            runtime_dependency_catalog={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(
+            {
+                "coord": "com.vendor:legacy",
+                "api_name": "com.vendor.LegacyApi.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P1",
+                "confirmed": "true",
+                "source": "old_jar",
+                "analysis_scope": "method",
+            },
+            graph,
+            {},
+            max_total_cost=5,
+        )
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "RUNTIME_DEPENDENCY_ENTRY_REACHED")
+        self.assertEqual(result.dependency_chain_coords, ["com.vendor:boot"])
+
+    def test_active_spring_registration_produces_complete_business_to_callback_chain(self):
+        def method_def(symbol_id, qualified_key, owner_type, owner_coord, method_name, params):
+            class_fqcn = qualified_key.rsplit('.', 1)[0]
+            signature = '(' + ', '.join(params) + ')'
+            return source_analyzer.MethodDef(
+                symbol_id=symbol_id,
+                qualified_key=qualified_key,
+                simple_key=f"method:{method_name}",
+                class_fqcn=class_fqcn,
+                class_name=class_fqcn.rsplit('.', 1)[-1],
+                method_name=method_name,
+                return_type="void",
+                file=f"/{symbol_id}.java",
+                line=1,
+                end_line=2,
+                package_name=class_fqcn.rsplit('.', 1)[0],
+                owner_type=owner_type,
+                owner_coord=owner_coord,
+                module="app" if owner_type == "business" else "runtime",
+                source_root="/src",
+                language="java",
+                is_test=False,
+                param_types={f"p{idx}": value for idx, value in enumerate(params)},
+                param_declared_types={f"p{idx}": value for idx, value in enumerate(params)},
+                declared_signature=signature,
+                declared_qualified_key=qualified_key + signature,
+            )
+
+        app = method_def(
+            "app", "com.acme.Application.main", "business", "BUSINESS", "main", ["String[]"]
+        )
+        listener = method_def(
+            "listener", "com.vendor.RuntimeListener.onApplicationEvent",
+            "dependency", "com.vendor:runtime", "onApplicationEvent", ["Object"],
+        )
+        target_edge = source_analyzer.CallEdge(
+            caller_symbol_id="listener",
+            caller_qualified_key=listener.qualified_key,
+            callee_key="com.vendor.LegacyApi.removed()",
+            callee_simple_key="method:removed()",
+            evidence_type="bytecode_method_invocation",
+            confidence="high",
+            file="/runtime.jar",
+            line=1,
+            content="",
+            owner_type="dependency",
+            owner_coord="com.vendor:runtime",
+            module="runtime",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"app": app, "listener": listener},
+            reverse_edges={"com.vendor.LegacyApi.removed()": [target_edge]},
+            runtime_dependency_catalog={},
+        )
+        framework_adapters.attach_framework_edges_to_graph(graph, {"adapters": [{
+            "adapter": "spring_runtime_artifact",
+            "version": "1",
+            "edges": [{
+                "source": "framework:spring-factories:org.springframework.context.ApplicationListener",
+                "target": "com.vendor.RuntimeListener.onApplicationEvent",
+                "edge_kind": "spring_runtime_registered_callback",
+                "confidence": "high",
+                "runtime_activation": "active",
+                "conditions": [],
+                "ambiguity": False,
+                "provenance": {
+                    "jar": "/runtime.jar",
+                    "line": 1,
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "file": "/app/Application.java",
+                        "spring_application_run": True,
+                    }],
+                },
+            }],
+        }]})
+
+        result = tracer.trace_api_with_confidence_weighting(
+            {
+                "coord": "com.vendor:legacy",
+                "api_name": "com.vendor.LegacyApi.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P0",
+                "confirmed": "true",
+                "source": "old_jar",
+                "analysis_scope": "method",
+            },
+            graph,
+            {},
+            max_total_cost=5,
+        )
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertIn(
+            "com.acme.Application.main → Spring Boot框架注册 → "
+            "com.vendor.RuntimeListener.onApplicationEvent → 变更API: com.vendor.LegacyApi.removed()",
+            result.call_paths,
+        )
+
+    def test_conditional_dependency_framework_callback_is_not_confirmed_reachable(self):
+        callback = SimpleNamespace(
+            symbol_id="callback",
+            qualified_key="com.vendor.OptionalAutoConfiguration.onApplicationEvent",
+            simple_key="method:onApplicationEvent",
+            class_fqcn="com.vendor.OptionalAutoConfiguration",
+            class_name="OptionalAutoConfiguration",
+            method_name="onApplicationEvent",
+            file="/OptionalAutoConfiguration.java",
+            line=1,
+            owner_type="dependency",
+            owner_coord="com.vendor:runtime",
+            module="runtime",
+            is_test=False,
+            annotations=[],
+            class_annotations=["Configuration"],
+            modifiers=["public"],
+            is_interface=False,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="callback",
+            caller_qualified_key=callback.qualified_key,
+            callee_key="com.vendor.LegacyApi.removed()",
+            callee_simple_key="method:removed()",
+            evidence_type="ast_method_invocation",
+            confidence="high",
+            file=callback.file,
+            line=2,
+            owner_type="dependency",
+            owner_coord="com.vendor:runtime",
+            module="runtime",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"callback": callback},
+            reverse_edges={"com.vendor.LegacyApi.removed()": [edge]},
+            framework_entry_symbols={"callback": [{
+                "adapter": "spring_basic",
+                "edge_kind": "spring_framework_callback",
+                "runtime_activation": "conditional",
+                "conditions": ["ConditionalOnClass"],
+                "ambiguity": False,
+            }]},
+            framework_runtime_entry_methods={},
+            runtime_dependency_catalog={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(
+            {
+                "coord": "com.vendor:legacy",
+                "api_name": "com.vendor.LegacyApi.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P0",
+                "confirmed": "true",
+                "source": "old_jar",
+                "analysis_scope": "method",
+            },
+            graph,
+            {},
+            max_total_cost=5,
+        )
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "FRAMEWORK_BOUNDARY")
+        self.assertNotEqual(result.analysis_status, "reachable")
+
+    def test_packaged_hit_is_reachable_when_consumer_is_registered_spring_callback(self):
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={},
+            framework_runtime_entry_methods={
+                "com.vendor.RuntimeListener.onApplicationEvent": [{
+                    "adapter": "spring_runtime_artifact",
+                    "source": "framework:spring-factories:org.springframework.context.ApplicationListener",
+                    "edge_kind": "spring_runtime_registered_callback",
+                    "runtime_activation": "active",
+                    "confidence": "high",
+                    "provenance": {
+                        "coord": "com.vendor:boot",
+                        "jar": "/runtime/boot.jar",
+                        "resource": "META-INF/spring.factories",
+                        "line": 1,
+                        "business_activation": [{
+                            "business_entry": "com.acme.Application.main",
+                            "file": "/app/Application.java",
+                            "spring_application_run": True,
+                        }],
+                    },
+                }],
+            },
+        )
+        result = tracer.TraceResult(
+            api_name="com.vendor.LegacyApi.removed",
+            api_simple="removed",
+            api_signature="()",
+            symbol_kind="method",
+            change_type="REMOVED",
+            coord="com.vendor:legacy",
+            severity="P1",
+            confirmed=True,
+            source="old_jar",
+            analysis_scope="method",
+            analysis_status="not_analyzed",
+            direct_callers=0,
+            is_reachable=False,
+            reachable_note="",
+            business_reach_depth=0,
+            dependency_chain_coords=[],
+            call_paths=[],
+            evidence_paths=[],
+            reason_code="",
+            verification_commands=[],
+            hops=[],
+            confidence_score=1.0,
+            critical_nodes_hit=[],
+        )
+        hit = {
+            "coord": "com.vendor:boot",
+            "jar_path": "/runtime/boot.jar",
+            "class_fqcn": "com.vendor.RuntimeListener",
+            "consumer_method": "onApplicationEvent",
+            "consumer_signature": "(java.lang.Object)",
+            "target_display": "com.vendor.LegacyApi.removed()",
+            "evidence_type": "bytecode_method_invocation",
+        }
+
+        built = tracer._build_packaged_dependency_hit_result(result, [hit], graph)
+
+        self.assertEqual(built.analysis_status, "reachable")
+        self.assertEqual(built.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
+        self.assertIn("com.acme.Application.main -> Spring Boot框架注册", built.call_paths[-1])
+        self.assertEqual(
+            built.path_details[-1]["stop_reason"],
+            "RUNTIME_FRAMEWORK_ENTRY_REACHED",
+        )
+
+        generic = tracer.replace(
+            built,
+            reason_code="SYSTEM_CODE_REACHED",
+            call_paths=[
+                "com.vendor.RuntimeListener.onApplicationEvent(java.lang.Object) "
+                "→ 变更API: com.vendor.LegacyApi.removed()"
+            ],
+            evidence_paths=[[]],
+            path_details=[{
+                "path_status": "reachable",
+                "stop_reason": "SYSTEM_CODE_REACHED",
+                "business_reachable": True,
+                "business_entry": "com.vendor.RuntimeListener.onApplicationEvent",
+                "path_text": (
+                    "com.vendor.RuntimeListener.onApplicationEvent(java.lang.Object) "
+                    "→ 变更API: com.vendor.LegacyApi.removed()"
+                ),
+                "evidence": [],
+            }],
+        )
+        merged = tracer._merge_runtime_framework_paths(generic, [hit], graph)
+        self.assertEqual(merged.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
+        self.assertTrue(any(
+            "com.acme.Application.main -> Spring Boot框架注册" in item["path_text"]
+            for item in merged.path_details
+        ))
+
+    def test_javap_parser_keeps_intra_class_method_and_field_owners(self):
+        javap = """
+  public void onApplicationEvent(java.lang.Object);
+    descriptor: (Ljava/lang/Object;)V
+    Code:
+         0: aload_0
+         1: invokevirtual #31                 // Method buildBannerText:()Ljava/lang/String;
+         4: getstatic     #9                  // Field processed:Ljava/util/concurrent/atomic/AtomicBoolean;
+         7: return
+
+  java.lang.String buildBannerText();
+    descriptor: ()Ljava/lang/String;
+    Code:
+         0: invokestatic  #61                 // Method com/vendor/LegacyApi.removed:()V
+         3: aconst_null
+         4: areturn
+"""
+
+        parsed = tracer._parse_javap_bytecode_references(
+            javap,
+            "com.vendor.RuntimeListener",
+        )
+
+        local_method = next(
+            item for item in parsed["method_refs"]
+            if item["name"] == "buildBannerText"
+        )
+        local_field = next(
+            item for item in parsed["field_refs"]
+            if item["name"] == "processed"
+        )
+        self.assertEqual(local_method["owner"], "com.vendor.RuntimeListener")
+        self.assertEqual(local_method["consumer_method"], "onApplicationEvent")
+        self.assertEqual(local_method["consumer_signature"], "(Object)")
+        self.assertEqual(local_field["owner"], "com.vendor.RuntimeListener")
+
+    def test_packaged_hit_reaches_registered_callback_through_intra_class_method(self):
+        callback = tracer._runtime_method_def_for_packaged_caller(
+            "com.vendor:boot",
+            "/runtime/boot.jar",
+            "com.vendor.RuntimeListener",
+            "onApplicationEvent",
+            "(java.lang.Object)",
+        )
+        bridge = tracer.CallEdge(
+            caller_symbol_id=callback.symbol_id,
+            caller_qualified_key=callback.qualified_key,
+            callee_key="com.vendor.RuntimeListener.buildBannerText()",
+            callee_simple_key="method:buildBannerText()",
+            evidence_type="runtime_dependency_bytecode_invocation",
+            confidence="high",
+            file="/runtime/boot.jar",
+            line=0,
+            content="runtime dependency bytecode caller",
+            owner_type="dependency",
+            owner_coord="com.vendor:boot",
+            module="",
+            is_test=False,
+            callee_param_types=[],
+        )
+        graph = SimpleNamespace(
+            methods_by_id={callback.symbol_id: callback},
+            reverse_edges={"com.vendor.RuntimeListener.buildBannerText()": [bridge]},
+            framework_runtime_entry_methods={
+                "com.vendor.RuntimeListener.onApplicationEvent": [{
+                    "adapter": "spring_runtime_artifact",
+                    "runtime_activation": "active",
+                    "provenance": {
+                        "business_activation": [{
+                            "business_entry": "com.acme.Application.main",
+                        }],
+                    },
+                }],
+            },
+        )
+        hit = {
+            "coord": "com.vendor:boot",
+            "jar_path": "/runtime/boot.jar",
+            "class_fqcn": "com.vendor.RuntimeListener",
+            "consumer_method": "buildBannerText",
+            "consumer_signature": "()",
+        }
+
+        paths = tracer._find_business_callers_for_packaged_hit(hit, graph)
+
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0][0].qualified_key, callback.qualified_key)
+        self.assertEqual(len(paths[0][1]), 1)
+        self.assertTrue(paths[0][2])
+
+    def test_removed_api_is_not_impacted_when_current_jar_keeps_identical_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            dep_dir = report / "evidence" / "dependencies"
+            old_dir = report / "evidence" / "api_changes" / "step4_artifact_jars" / "base"
+            dep_dir.mkdir(parents=True)
+            old_dir.mkdir(parents=True)
+            dep_changes = dep_dir / "dep_changes.csv"
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,scope,base_coord,current_coord,base_lib_entry,current_lib_entry\n"
+                "com.vendor:legacy,1.0,-,移除,runtime,com.vendor:legacy,,BOOT-INF/lib/legacy-1.0.jar,\n",
+                encoding="utf-8",
+            )
+            class_entry = "com/vendor/LegacyApi.class"
+            class_bytes = b"identical-classfile-bytes"
+            old_jar = old_dir / "BOOT-INF__lib__legacy-1.0.jar"
+            current_jar = Path(tmp) / "aggregate.jar"
+            for jar in (old_jar, current_jar):
+                with zipfile.ZipFile(jar, "w") as zf:
+                    zf.writestr(class_entry, class_bytes)
+            api = {
+                "coord": "com.vendor:legacy",
+                "old_version": "1.0",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "com.vendor.LegacyApi.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "confirmed": "true",
+                "severity": "P0",
+                "source": "old_jar",
+                "analysis_scope": "method",
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report),
+                runtime_dependency_catalog={
+                    "entries": [{
+                        "coord": "com.vendor:aggregate",
+                        "jar_path": str(current_jar),
+                    }],
+                },
+            )
+
+            providers = tracer._build_identical_current_class_provider_index([api], graph)
+            result = tracer.trace_api_with_confidence_weighting(
+                api,
+                graph,
+                {},
+                has_packaged_bytecode_fallback=True,
+            )
+            call_chain_dir = report / "evidence" / "call_chain"
+            summary_path, summary_json_path = formatter.generate_enhanced_summary([result], call_chain_dir)
+            summary_payload = json.loads(Path(summary_json_path).read_text(encoding="utf-8"))
+            summary_text = Path(summary_path).read_text(encoding="utf-8")
+            with (call_chain_dir / "alerts.csv").open(encoding="utf-8") as alert_file:
+                alert_rows = list(csv.DictReader(alert_file))
+            findings = s6_report.collect_findings(str(report))
+            final_report = s6_report.generate_report(findings)
+
+        self.assertIn(("com.vendor:legacy", "com.vendor.LegacyApi"), providers)
+        self.assertEqual(result.analysis_status, "not_impacted")
+        self.assertEqual(result.reason_code, "RUNTIME_SYMBOL_PRESERVED_IDENTICALLY")
+        self.assertIn("com.vendor:aggregate", result.call_paths[0])
+        self.assertEqual(
+            result.evidence_paths[0][0]["evidence_type"],
+            "identical_current_class_provider",
+        )
+        self.assertEqual(summary_payload["not_impacted"], 1)
+        self.assertEqual(alert_rows[0]["api_status"], "not_impacted")
+        self.assertEqual(alert_rows[0]["conclusion_level"], "confirmed_no_impact")
+        self.assertIn("已确认不受影响", summary_text)
+        self.assertIn("### 3.1 符号保留证据", final_report)
+        self.assertIn("com.vendor:aggregate", final_report)
+        self.assertIn("不包含被删除 JAR 中的 SPI 配置、资源文件、清单等非 API 内容", final_report)
+
+    def test_same_class_name_with_different_bytecode_is_not_marked_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            dep_dir = report / "evidence" / "dependencies"
+            old_dir = report / "evidence" / "api_changes" / "step4_artifact_jars" / "base"
+            dep_dir.mkdir(parents=True)
+            old_dir.mkdir(parents=True)
+            (dep_dir / "dep_changes.csv").write_text(
+                "coord,old_version,new_version,change_type,scope,base_coord,current_coord,base_lib_entry,current_lib_entry\n"
+                "com.vendor:legacy,1.0,-,移除,runtime,com.vendor:legacy,,BOOT-INF/lib/legacy-1.0.jar,\n",
+                encoding="utf-8",
+            )
+            with zipfile.ZipFile(old_dir / "BOOT-INF__lib__legacy-1.0.jar", "w") as zf:
+                zf.writestr("com/vendor/LegacyApi.class", b"old")
+            current_jar = Path(tmp) / "aggregate.jar"
+            with zipfile.ZipFile(current_jar, "w") as zf:
+                zf.writestr("com/vendor/LegacyApi.class", b"different")
+            api = {
+                "coord": "com.vendor:legacy",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "com.vendor.LegacyApi.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report),
+                runtime_dependency_catalog={"entries": [{
+                    "coord": "com.vendor:aggregate",
+                    "jar_path": str(current_jar),
+                }]},
+            )
+
+            providers = tracer._build_identical_current_class_provider_index([api], graph)
+
+        self.assertNotIn(("com.vendor:legacy", "com.vendor.LegacyApi"), providers)
 
     def test_generate_enhanced_summary_cleans_stale_by_api_and_by_module_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6443,7 +7409,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("删除方法，call，参数：Long，严重级别：P1", report_text)
         self.assertNotIn("REMOVED / method", report_text)
         self.assertNotIn("`REMOVED` / `method`", report_text)
-        self.assertIn("| # | 依赖坐标 | API | 变化 | 原因码 | 说明 |", not_found_md)
+        self.assertIn("| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 |", not_found_md)
+        self.assertNotIn("原因码", not_found_md)
+        self.assertNotIn("NO_STATIC_PATH", not_found_md)
         self.assertIn("删除方法，call，参数：Long，严重级别：P1", not_found_md)
         self.assertIn("change_summary", not_found_csv)
         self.assertIn("conclusion", not_found_csv)
@@ -6537,9 +7505,300 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
         self.assertIn("com.vendor.LegacyApi.removed", report_text)
         self.assertIn("com.acme.OrderService.submit", report_text)
-        self.assertIn("### 3.1 调用链样例", report_text)
-        self.assertIn("展示 1 条样例；台账命中 2 次", report_text)
+        self.assertIn("### 3.1 调用链证据", report_text)
+        self.assertIn("已确认链路 2 条", report_text)
         self.assertIn("com.acme.OrderService.submit -> com.vendor.LegacyApi.removed(String)", report_text)
+
+    def test_s6_report_does_not_mix_uncertain_paths_into_confirmed_api_evidence(self):
+        confirmed_path = "com.acme.App.main -> com.vendor.LegacyApi.removed(String)"
+        uncertain_path = "com.vendor:helper:com.vendor.Helper.call -> com.vendor.LegacyApi.removed(String)"
+        alert_rows = [
+            {
+                "api_id": "API-exact-target",
+                "target_coord": "a:b",
+                "changed_symbol": "com.vendor.LegacyApi.removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "path_status": "reachable",
+                "conclusion_level": "confirmed",
+                "business_reachable": "true",
+                "business_entry": "com.acme.App.main",
+                "path_text": confirmed_path,
+                "path_occurrence_count": "1",
+            },
+            {
+                "api_id": "API-exact-target",
+                "target_coord": "a:b",
+                "changed_symbol": "com.vendor.LegacyApi.removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "path_status": "uncertain",
+                "conclusion_level": "candidate",
+                "business_reachable": "unknown",
+                "consumer_coord": "com.vendor:helper",
+                "consumer_class": "com.vendor.Helper",
+                "consumer_method": "call",
+                "path_text": uncertain_path,
+                "path_occurrence_count": "1",
+            },
+        ]
+        findings = {
+            "impact_overview": s6_report.build_impact_overview(alert_rows),
+            "p0": [{
+                "coord": "a:b",
+                "api": "com.vendor.LegacyApi.removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "user_conclusion": "已确认影响",
+                # Step5 summary may carry mixed statuses; Step6 must prefer the
+                # status-partitioned alerts paths instead of merging this list.
+                "call_paths": [confirmed_path, uncertain_path],
+            }],
+            "p1": [], "p2": [], "probable_impact": [], "uncertain": [],
+            "not_impacted": [], "needs_input": [], "not_analyzed": [], "not_found": [],
+        }
+
+        report_text = "\n".join(s6_report.render_api_result_table(findings))
+
+        self.assertIn(confirmed_path, report_text)
+        self.assertIn(uncertain_path, report_text)
+        self.assertLess(
+            report_text.index("**已确认链路（当前展示 1 条，共 1 条）**"),
+            report_text.index(confirmed_path),
+        )
+        self.assertLess(
+            report_text.index("**尚未回溯到业务入口的依赖引用（当前展示 1 条，共 1 条）**"),
+            report_text.index(uncertain_path),
+        )
+        self.assertIn(
+            "[已确认链路 1 条；另有 1 条依赖引用尚未回溯到业务入口。查看具体链路]"
+            "(#api-api-exact-target)",
+            report_text,
+        )
+        self.assertIn('<a id="api-api-exact-target"></a>', report_text)
+        self.assertIn("筛选 `api_id = API-exact-target`", report_text)
+        self.assertIn("`path_status = reachable` 是已确认链路", report_text)
+        self.assertIn(
+            "`path_status = uncertain` 是尚未回溯到业务入口的依赖引用",
+            report_text,
+        )
+        self.assertNotIn("已确认/高风险影响；已确认影响", report_text)
+
+    def test_s6_report_links_uncertain_evidence_by_exact_api_id(self):
+        target = {
+            "target_coord": "a:b",
+            "changed_symbol": "com.vendor.LegacyApi.removed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "api_id": "API-uncertain-target",
+            "path_status": "uncertain",
+            "conclusion_level": "candidate",
+            "business_reachable": "unknown",
+        }
+        alert_rows = [
+            dict(target, path_text="com.vendor.Helper.one -> com.vendor.LegacyApi.removed(String)"),
+            dict(target, path_text="com.vendor.Helper.two -> com.vendor.LegacyApi.removed(String)"),
+        ]
+        findings = {
+            "impact_overview": s6_report.build_impact_overview(alert_rows),
+            "p0": [], "p1": [], "p2": [], "probable_impact": [],
+            "uncertain": [{
+                "coord": "a:b",
+                "api": "com.vendor.LegacyApi.removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "user_conclusion": "当前无法确认",
+            }],
+            "not_impacted": [], "needs_input": [], "not_analyzed": [], "not_found": [],
+        }
+
+        report_text = "\n".join(s6_report.render_api_result_table(findings))
+
+        self.assertIn(
+            "| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |",
+            report_text,
+        )
+        self.assertIn(
+            "[发现 2 条依赖引用，尚未回溯到业务入口。查看引用详情]"
+            "(#api-api-uncertain-target)",
+            report_text,
+        )
+        self.assertIn('<a id="api-api-uncertain-target"></a>', report_text)
+        self.assertIn("筛选 `api_id = API-uncertain-target`", report_text)
+
+    def test_s6_report_does_not_link_ambiguous_or_missing_api_id(self):
+        base = {
+            "target_coord": "a:b",
+            "changed_symbol": "com.vendor.LegacyApi.removed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "path_status": "uncertain",
+            "conclusion_level": "candidate",
+            "business_reachable": "unknown",
+        }
+        finding = {
+            "coord": "a:b",
+            "api": "com.vendor.LegacyApi.removed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "user_conclusion": "当前无法确认",
+        }
+        empty_findings = {
+            "p0": [], "p1": [], "p2": [], "probable_impact": [],
+            "uncertain": [finding], "not_impacted": [], "needs_input": [],
+            "not_analyzed": [], "not_found": [],
+        }
+
+        conflicting_rows = [
+            dict(base, api_id="API-one", path_text="Helper.one -> LegacyApi.removed"),
+            dict(base, api_id="API-two", path_text="Helper.two -> LegacyApi.removed"),
+        ]
+        conflicting_findings = dict(
+            empty_findings,
+            impact_overview=s6_report.build_impact_overview(conflicting_rows),
+        )
+        conflicting_report = "\n".join(s6_report.render_api_result_table(conflicting_findings))
+
+        missing_findings = dict(
+            empty_findings,
+            impact_overview=s6_report.build_impact_overview([
+                dict(base, path_text="Helper.missing -> LegacyApi.removed")
+            ]),
+        )
+        missing_report = "\n".join(s6_report.render_api_result_table(missing_findings))
+
+        for report_text, expected_count in (
+            (conflicting_report, 2),
+            (missing_report, 1),
+        ):
+            self.assertIn(f"发现 {expected_count} 条依赖引用", report_text)
+            self.assertNotIn("(#api-", report_text)
+            self.assertNotIn('<a id="api-', report_text)
+
+    def test_s6_report_keeps_same_simple_names_in_separate_evidence_anchors(self):
+        def alert(coord, owner, api_id, caller):
+            return {
+                "api_id": api_id,
+                "target_coord": coord,
+                "changed_symbol": f"{owner}.StringUtils.isEmpty",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "path_status": "reachable",
+                "conclusion_level": "confirmed",
+                "business_reachable": "true",
+                "path_text": f"{caller} -> {owner}.StringUtils.isEmpty(String)",
+            }
+
+        alert_rows = [
+            alert("a:b", "com.alpha", "API-alpha", "com.app.AlphaCaller.run"),
+            alert("c:d", "com.beta", "API-beta", "com.app.BetaCaller.run"),
+        ]
+        p0 = []
+        for coord, owner in (("a:b", "com.alpha"), ("c:d", "com.beta")):
+            p0.append({
+                "coord": coord,
+                "api": f"{owner}.StringUtils.isEmpty",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "user_conclusion": "已确认影响",
+            })
+        findings = {
+            "impact_overview": s6_report.build_impact_overview(alert_rows),
+            "p0": p0, "p1": [], "p2": [], "probable_impact": [], "uncertain": [],
+            "not_impacted": [], "needs_input": [], "not_analyzed": [], "not_found": [],
+        }
+
+        report_text = "\n".join(s6_report.render_api_result_table(findings))
+
+        self.assertEqual(report_text.count("(#api-api-alpha)"), 1)
+        self.assertEqual(report_text.count("(#api-api-beta)"), 1)
+        self.assertEqual(report_text.count('<a id="api-api-alpha"></a>'), 1)
+        self.assertEqual(report_text.count('<a id="api-api-beta"></a>'), 1)
+        self.assertIn("com.app.AlphaCaller.run -> com.alpha.StringUtils.isEmpty(String)", report_text)
+        self.assertIn("com.app.BetaCaller.run -> com.beta.StringUtils.isEmpty(String)", report_text)
+
+    def test_s6_report_uses_not_analyzed_filter_for_incomplete_evidence(self):
+        alert_rows = [{
+            "api_id": "API-incomplete",
+            "target_coord": "a:b",
+            "changed_symbol": "com.vendor.DynamicApi.call",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "path_status": "not_analyzed",
+            "conclusion_level": "incomplete",
+            "business_reachable": "unknown",
+            "path_text": "com.vendor.DynamicProxy.invoke -> com.vendor.DynamicApi.call(String)",
+        }]
+        findings = {
+            "impact_overview": s6_report.build_impact_overview(alert_rows),
+            "p0": [], "p1": [], "p2": [], "probable_impact": [], "uncertain": [],
+            "not_impacted": [], "needs_input": [],
+            "not_analyzed": [{
+                "coord": "a:b",
+                "api": "com.vendor.DynamicApi.call",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "user_conclusion": "本次未完成分析",
+            }],
+            "not_found": [],
+        }
+
+        report_text = "\n".join(s6_report.render_api_result_table(findings))
+
+        self.assertIn(
+            "[发现 1 条分析证据，但本项未完成有效分析。查看证据详情]"
+            "(#api-api-incomplete)",
+            report_text,
+        )
+        self.assertIn("`path_status = not_analyzed` 是本次未完成有效分析的证据", report_text)
+        self.assertNotIn("`path_status = uncertain`", report_text)
+
+    def test_s6_report_does_not_use_mixed_summary_paths_when_exact_alert_exists(self):
+        alert_rows = [{
+            "api_id": "API-exact-without-path",
+            "target_coord": "a:b",
+            "changed_symbol": "com.vendor.LegacyApi.removed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "path_status": "uncertain",
+            "conclusion_level": "candidate",
+            "business_reachable": "unknown",
+            "path_text": "",
+        }]
+        mixed_summary_path = "com.app.Unrelated.run -> com.vendor.OtherApi.call(String)"
+        findings = {
+            "impact_overview": s6_report.build_impact_overview(alert_rows),
+            "p0": [], "p1": [], "p2": [], "probable_impact": [],
+            "uncertain": [{
+                "coord": "a:b",
+                "api": "com.vendor.LegacyApi.removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "user_conclusion": "当前无法确认",
+                "user_reason": "依赖引用存在，但当前记录没有可展示的完整路径。",
+                "call_paths": [mixed_summary_path],
+            }],
+            "not_impacted": [], "needs_input": [], "not_analyzed": [], "not_found": [],
+        }
+
+        report_text = "\n".join(s6_report.render_api_result_table(findings))
+
+        self.assertNotIn(mixed_summary_path, report_text)
+        self.assertNotIn("(#api-api-exact-without-path)", report_text)
+        self.assertIn("依赖引用存在，但当前记录没有可展示的完整路径。", report_text)
 
     def test_s6_report_uses_step5_graph_stats_as_coverage_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6697,7 +7956,8 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertIn("## 三、分析结果总表", report_text)
             self.assertIn("本表共有 100 条 API 分析结果，当前展示 20 条，省略 80 条", report_text)
             self.assertIn("完整逐链路台账见 `evidence/call_chain/alerts.csv`", report_text)
-            self.assertIn("按结论拆分的完整明细见 `deliverables/s6_probable_impact_apis.csv/md`", report_text)
+            self.assertIn("`deliverables/s6_not_found_apis.csv/md`", report_text)
+            self.assertNotIn("`deliverables/s6_probable_impact_apis.csv/md`", report_text)
             self.assertIn("### 运行产物阅读分层", report_text)
             self.assertIn("#### 给用户看的产物", report_text)
             self.assertIn("#### 用户深入排查时看的产物", report_text)
@@ -6708,17 +7968,17 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertIn("| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 500 条一份） |", report_text)
             self.assertNotIn("all_changed_apis_alerts.csv", report_text)
             self.assertIn("| `evidence/call_chain/alerts_<status>.csv` / `alerts_<status>_NNN.csv` | 按链路状态拆分的台账 |", report_text)
-            self.assertIn("| `deliverables/s6_probable_impact_apis.csv/md` | 可能影响清单 |", report_text)
-            self.assertIn("| `deliverables/s6_uncertain_apis.csv/md` | 需人工复核清单 |", report_text)
-            self.assertIn("| `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物，无法回溯调用链清单 |", report_text)
-            self.assertIn("| `deliverables/s6_not_analyzed_apis.csv/md` | 本次未完成分析清单 |", report_text)
+            self.assertNotIn("| `deliverables/s6_probable_impact_apis.csv/md` |", report_text)
+            self.assertNotIn("| `deliverables/s6_uncertain_apis.csv/md` |", report_text)
+            self.assertNotIn("| `deliverables/s6_needs_input_apis.csv/md` |", report_text)
+            self.assertNotIn("| `deliverables/s6_not_analyzed_apis.csv/md` |", report_text)
             self.assertIn("| `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |", report_text)
             self.assertNotIn("### 产物索引", report_text)
             self.assertIn("## 二、结论限制", report_text)
             self.assertIn("| 分析完整度 | 部分完整 |", report_text)
             self.assertIn("动态调用可能漏报", report_text)
             self.assertIn("反射调用可能漏报。", report_text)
-            self.assertIn("排序：已确认/高风险、可能影响、需人工复核、缺少依赖源码/构建产物，无法回溯调用链、本次未完成分析、未发现调用路径。", report_text)
+            self.assertIn("排序：已确认/高风险、可能影响、需人工复核、已确认不受影响、缺少依赖源码/构建产物，无法回溯调用链、本次未完成分析、未发现调用路径。", report_text)
             self.assertIn("静态分析未找到调用路径", report_text)
             self.assertNotIn("NO_STATIC_PATH", report_text)
             self.assertNotIn("当前无法确认清单", report_text)
@@ -6886,6 +8146,24 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertIn("完整全集请看 `deliverables/s6_not_found_apis.csv`", md_text)
             self.assertIn("com.example.Huge0.removed", md_text)
             self.assertNotIn("com.example.Huge259.removed", md_text)
+
+    def test_s6_detail_writer_removes_stale_files_for_empty_bucket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            deliverables = report_dir / "deliverables"
+            deliverables.mkdir(parents=True)
+            stale_csv = deliverables / "s6_not_analyzed_apis.csv"
+            stale_md = deliverables / "s6_not_analyzed_apis.md"
+            stale_csv.write_text("old result\n", encoding="utf-8")
+            stale_md.write_text("old result\n", encoding="utf-8")
+
+            findings = {bucket: [] for bucket in s6_report.S6_DETAIL_BUCKETS}
+            artifacts = s6_report.write_s6_detail_artifacts(str(report_dir), findings)
+
+            self.assertNotIn("not_analyzed_csv", artifacts)
+            self.assertNotIn("not_analyzed_md", artifacts)
+            self.assertFalse(stale_csv.exists())
+            self.assertFalse(stale_md.exists())
 
     def test_s6_report_keeps_probable_impact_and_needs_input_out_of_uncovered_section(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -7499,6 +8777,12 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
             with patch.object(step5, "auto_discover_bridge_sources"), \
                  patch.object(step5, "load_changed_apis", return_value=[{"coord": "com.example:demo", "api_name": "com.example.Target.call"}]), \
+                 patch.object(step5, "align_dependency_source_mappings", return_value={
+                     "mappings": [f"com.example:demo={dep_source_dir}"],
+                     "allowed_classes_by_coord": {"com.example:demo": {"com.example.Target"}},
+                     "records": [{"coord": "com.example:demo", "status": "aligned"}],
+                     "evidence_path": str(output_dir / "dependency_source_alignment.json"),
+                 }), \
                  patch.object(step5, "build_source_roots", side_effect=[[business_root], [business_root, dependency_root]]), \
                  patch.object(step5, "build_enhanced_source_graph", side_effect=fake_build_graph), \
                  patch.object(step5, "check_apis_that_need_bridge", return_value={}), \
@@ -7514,6 +8798,10 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertIs(build_calls[1][1].get("reused_analysis"), business_graph_result["analysis_cache"])
             self.assertTrue(build_calls[0][1].get("retain_analysis_cache"))
             self.assertFalse(build_calls[1][1].get("retain_analysis_cache"))
+            self.assertEqual(
+                build_calls[1][1].get("allowed_dependency_classes_by_coord"),
+                {"com.example:demo": {"com.example.Target"}},
+            )
 
     def test_step5_filters_dependency_sources_before_building_full_graph(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -7580,6 +8868,12 @@ class Step5KeyMatchingTest(unittest.TestCase):
             with patch.object(step5, "auto_discover_bridge_sources"), \
                  patch.object(step5, "load_changed_apis", return_value=[{"coord": "com.vendor:target", "api_name": "com.vendor.Target.call"}]), \
                  patch.object(step5, "build_runtime_dependency_catalog", return_value={"by_coord": {"com.example:used": {"coord": "com.example:used"}}}), \
+                 patch.object(step5, "align_dependency_source_mappings", return_value={
+                     "mappings": [f"com.example:used={used_dep_dir}"],
+                     "allowed_classes_by_coord": {"com.example:used": {"com.example.Used"}},
+                     "records": [{"coord": "com.example:used", "status": "aligned"}],
+                     "evidence_path": str(output_dir / "dependency_source_alignment.json"),
+                 }), \
                  patch.object(step5, "build_source_roots", side_effect=fake_build_source_roots), \
                  patch.object(step5, "build_enhanced_source_graph", side_effect=[business_graph_result, full_graph_result]), \
                  patch.object(step5, "check_apis_that_need_bridge", return_value={}), \
@@ -7620,6 +8914,33 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertIn("graph", graph_result)
             self.assertIn("type_metadata", graph_result)
             self.assertEqual(graph_result["analysis_cache"], [])
+
+    def test_build_enhanced_source_graph_shares_class_resolution_indexes_across_methods(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            source_dir.mkdir(parents=True)
+            (source_dir / "App.java").write_text(
+                "package com.example; public class App { void first() {} void second() {} }",
+                encoding="utf-8",
+            )
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_dir.parent.parent.parent),
+                "owner_type": "business",
+                "owner_coord": "BUSINESS",
+                "module": "app",
+            }])
+            methods = [
+                method for method in graph_result["graph"].methods_by_id.values()
+                if method.class_fqcn == "com.example.App"
+            ]
+
+            self.assertGreaterEqual(len(methods), 2)
+            shared_simple_index = methods[0].known_classes_by_simple
+            shared_fqcn_index = methods[0].known_class_fqcns
+            self.assertTrue(all(method.known_classes_by_simple is shared_simple_index for method in methods[1:]))
+            self.assertTrue(all(method.known_class_fqcns is shared_fqcn_index for method in methods[1:]))
+            self.assertIsInstance(shared_simple_index["App"], tuple)
+            self.assertIn("com.example.App", shared_simple_index["App"])
 
     def test_build_jar_metadata_for_source_roots_defers_javap_until_class_is_needed(self):
         source_roots = [
@@ -7950,6 +9271,160 @@ class Step5KeyMatchingTest(unittest.TestCase):
             )
             self.assertNotIn("method:removed(String)", graph_result["graph"].reverse_edges)
             self.assertNotIn("method:removed", graph_result["graph"].reverse_edges)
+
+    def test_dependency_source_graph_excludes_classes_missing_from_same_coord_jar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dependency_dir = Path(tmp) / "src" / "main" / "java" / "com" / "example"
+            dependency_dir.mkdir(parents=True)
+            (dependency_dir / "Packaged.java").write_text(
+                "package com.example; public class Packaged { public void kept() {} }\n",
+                encoding="utf-8",
+            )
+            (dependency_dir / "Unpackaged.java").write_text(
+                "package com.example; public class Unpackaged { public void leaked() {} }\n",
+                encoding="utf-8",
+            )
+            source_roots = [{
+                "root": str(dependency_dir.parent.parent.parent),
+                "owner_type": "dependency",
+                "owner_coord": "com.example:dep",
+                "module": "dep",
+            }]
+
+            graph_result = step5.build_enhanced_source_graph(
+                source_roots,
+                allowed_dependency_classes_by_coord={
+                    "com.example:dep": {"com.example.Packaged"},
+                },
+            )
+            methods = list(graph_result["graph"].methods_by_id.values())
+
+            self.assertTrue(any(method.class_fqcn == "com.example.Packaged" for method in methods))
+            self.assertFalse(any(method.class_fqcn == "com.example.Unpackaged" for method in methods))
+            self.assertFalse(any("Unpackaged" in key for key in graph_result["graph"].reverse_edges))
+
+    def test_dependency_source_class_allowlist_is_scoped_by_coordinate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alpha_dir = Path(tmp) / "alpha" / "src" / "main" / "java" / "com" / "shared"
+            beta_dir = Path(tmp) / "beta" / "src" / "main" / "java" / "com" / "shared"
+            alpha_dir.mkdir(parents=True)
+            beta_dir.mkdir(parents=True)
+            (alpha_dir / "StringUtils.java").write_text(
+                "package com.shared; public class StringUtils { public void alphaOnly() {} }\n",
+                encoding="utf-8",
+            )
+            (beta_dir / "StringUtils.java").write_text(
+                "package com.shared; public class StringUtils { public void betaOnly() {} }\n",
+                encoding="utf-8",
+            )
+            source_roots = [
+                {
+                    "root": str(alpha_dir.parent.parent.parent),
+                    "owner_type": "dependency",
+                    "owner_coord": "com.example:alpha",
+                    "module": "alpha",
+                },
+                {
+                    "root": str(beta_dir.parent.parent.parent),
+                    "owner_type": "dependency",
+                    "owner_coord": "com.example:beta",
+                    "module": "beta",
+                },
+            ]
+
+            graph_result = step5.build_enhanced_source_graph(
+                source_roots,
+                allowed_dependency_classes_by_coord={
+                    "com.example:alpha": {"com.shared.StringUtils"},
+                    "com.example:beta": {"com.other.StringUtils"},
+                },
+            )
+            methods = list(graph_result["graph"].methods_by_id.values())
+
+            self.assertTrue(any(method.method_name == "alphaOnly" for method in methods))
+            self.assertFalse(any(method.method_name == "betaOnly" for method in methods))
+
+    def test_source_graph_lookup_keys_include_declared_fqcn_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            business_dir = Path(tmp) / "business" / "src" / "main" / "java" / "com" / "example"
+            business_dir.mkdir(parents=True)
+            (business_dir / "OrderService.java").write_text(
+                "\n".join(
+                    [
+                        "package com.example;",
+                        "public class OrderService {",
+                        "    public void submit(String orderId) { }",
+                        "    public void submit(Integer orderId) { }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(business_dir.parent.parent.parent),
+                "owner_type": "business",
+                "owner_coord": "BUSINESS",
+                "module": "app",
+            }])
+            graph = graph_result["graph"]
+            methods = [
+                method for method in graph.methods_by_id.values()
+                if method.qualified_key == "com.example.OrderService.submit"
+            ]
+
+            declared_keys = {
+                method.declared_qualified_key
+                for method in methods
+            }
+            lookup_keys = {
+                key
+                for method in methods
+                for key in graph.lookup_keys_by_symbol.get(method.symbol_id, [])
+            }
+
+            self.assertEqual(
+                {
+                    "com.example.OrderService.submit(String)",
+                    "com.example.OrderService.submit(Integer)",
+                },
+                declared_keys,
+            )
+            self.assertIn("com.example.OrderService.submit(String)", lookup_keys)
+            self.assertIn("com.example.OrderService.submit(Integer)", lookup_keys)
+            self.assertIn("method:submit(String)", lookup_keys)
+            self.assertIn("method:submit(Integer)", lookup_keys)
+
+    def test_dependency_method_edge_without_signature_is_not_indexed_as_confirmed_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dependency_dir = Path(tmp) / "dependency" / "src" / "main" / "java" / "com" / "vendor"
+            dependency_dir.mkdir(parents=True)
+            (dependency_dir / "Adapter.java").write_text(
+                "\n".join(
+                    [
+                        "package com.vendor;",
+                        "public class Adapter {",
+                        "    public void run() {",
+                        "        Runnable r = this::missing;",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(dependency_dir.parent.parent.parent),
+                "owner_type": "dependency",
+                "owner_coord": "com.vendor:adapter",
+                "module": "adapter",
+            }])
+
+            self.assertNotIn("com.vendor.Adapter.missing", graph_result["graph"].reverse_edges)
+            self.assertGreaterEqual(
+                graph_result["stats"].get("dependency_method_edges_skipped_without_signature", 0),
+                1,
+            )
 
     def test_build_enhanced_source_graph_does_not_hydrate_dependency_only_external_types(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -37,6 +37,8 @@ def _method_to_record(method_def):
         "simple_key": _clean(getattr(method_def, "simple_key", "")),
         "class_fqcn": _clean(getattr(method_def, "class_fqcn", "")),
         "method_name": _clean(getattr(method_def, "method_name", "")),
+        "declared_signature": _clean(getattr(method_def, "declared_signature", "")),
+        "declared_qualified_key": _clean(getattr(method_def, "declared_qualified_key", "")),
         "owner_type": _clean(getattr(method_def, "owner_type", "")),
         "owner_coord": _clean(getattr(method_def, "owner_coord", "")),
         "module": _clean(getattr(method_def, "module", "")),
@@ -60,6 +62,9 @@ def _edge_to_record(edge):
         "owner_coord": _clean(getattr(edge, "owner_coord", "")),
         "module": _clean(getattr(edge, "module", "")),
         "is_test": bool(getattr(edge, "is_test", False)),
+        "callee_fqcn_complete": bool(getattr(edge, "callee_fqcn_complete", False)),
+        "callee_signature_complete": bool(getattr(edge, "callee_signature_complete", False)),
+        "callee_resolution_note": _clean(getattr(edge, "callee_resolution_note", "")),
     }
 
 
@@ -81,7 +86,13 @@ def build_query_index(graph, graph_stats=None):
             if text and text not in keys:
                 keys.append(text)
         for value in (
+            getattr(method_def, "declared_qualified_key", ""),
             getattr(method_def, "qualified_key", ""),
+            (
+                f"{getattr(method_def, 'simple_key', '')}{getattr(method_def, 'declared_signature', '')}"
+                if getattr(method_def, "declared_signature", "")
+                else ""
+            ),
             getattr(method_def, "simple_key", ""),
             f"class:{getattr(method_def, 'class_fqcn', '')}" if getattr(method_def, "class_fqcn", "") else "",
         ):
@@ -145,7 +156,11 @@ def build_target_keys(method, *, fuzzy=False):
                 candidate = f"{method_name}{sig}"
                 if candidate not in keys:
                     keys.append(candidate)
-    if method_name not in keys:
+    # A signed query must never silently fall back to an unsigned owner.method
+    # key. That key mixes every overload and can make an exact Object[] query
+    # return a String,Object call. Unsigned lookup remains available when the
+    # user omitted a signature or explicitly requested fuzzy mode.
+    if (not signature or fuzzy) and method_name not in keys:
         keys.append(method_name)
     class_key = f"class:{method_name}"
     if not signature and "." in method_name and class_key not in keys:

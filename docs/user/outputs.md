@@ -17,7 +17,7 @@
 
 建议按这个顺序阅读：
 
-1. 先看结论：已确认影响、可能影响、当前无法确认、需要补充输入。
+1. 先看结论：已确认影响、可能影响、已确认不受影响、当前无法确认、需要补充输入。
 2. 再看原因：为什么确定，或为什么不能确认。
 3. 再看链路：哪个依赖、哪个变更 API、哪条调用链触达业务代码。
 4. 最后看明细：只有当结论和预期不一致，才进入 `by_api/`、原始 JApiCmp 或耗时统计文件排查。
@@ -136,9 +136,12 @@ evidence/call_chain/
 | `summary.json` | 结构化汇总 | `analysis_status`、`reason_code`、能力覆盖 |
 | `summary.txt` | 人类可读摘要 | reachable、uncertain、not_found、not_analyzed 分布 |
 | `step5_timing.csv` | Step5 耗时拆解 | 性能问题定位 |
+| `dependency_source_alignment.json` | 依赖源码版本对齐证据 | 使用了哪个 current ref/commit、用户工作区是否保持不变、多少源码类被 current JAR 保留或排除 |
 | `.runtime/indexes/s5_query_index.json` | 内部调用链查询索引 | Claude Code 按方法即时查询调用链；默认精确匹配全限定名，不作为人工阅读文件 |
 | `by_api/*.json` | 单 API 详细证据 | 逐跳链路、证据路径、终止原因 |
 | `by_module/*_impacts.json` | 按模块聚合视图 | 分派处理责任 |
+
+`dependency_source_alignment.json` 是结果与预期不一致时才需要查看的辅助证据。依赖源码未能与 Step4 确认的当前版本或 current JAR 对齐时，Step5 会拒绝这份源码并继续使用 JAR 字节码分析，不会静默使用本地仓库当前分支。
 
 ### alerts.csv 的语义
 
@@ -172,14 +175,15 @@ alerts_reachable_002.csv
 
 拆分文件只是人工阅读视图，不是索引、抽样或替代结论。
 
-## Step5 四态结论
+## Step5 五态结论
 
-| 状态 | 解释 | 人工动作 |
+| 人工结论 | 含义 | 程序状态（排查时使用） |
 |---|---|---|
-| `reachable` | 已确认触达业务代码 | 优先处理 |
-| `uncertain` | 有候选证据，但不能形成确定链路 | 查看 `reason_code` 和 `by_api/*.json` |
-| `not_found_in_static_analysis` | 静态分析未找到路径 | 不能解释为确定无影响 |
-| `not_analyzed` | 输入或工具能力不足，未完成有效分析 | 补输入或确认能力边界 |
+| 已确认影响 | 已找到业务代码或当前制品中已激活入口到变更 API 的完整路径 | `reachable` |
+| 已确认不受影响 | 当前制品中的其他依赖以完全相同的类字节码保留该 API；不覆盖资源、SPI 等非 API 内容 | `not_impacted` |
+| 需要人工复核 | 有候选证据，但尚不能形成确定链路 | `uncertain` |
+| 静态分析未找到路径 | 已完成静态分析，但没有找到路径；不能解释为确定不影响 | `not_found_in_static_analysis` |
+| 当前未完成有效分析 | 输入或工具能力不足，无法完成本项分析 | `not_analyzed` |
 
 ## Step6：最终报告
 
@@ -188,12 +192,27 @@ alerts_reachable_002.csv
 | `deliverables/report.md` | 面向人类评审的最终报告 |
 | `deliverables/s6_probable_impact_apis.csv/md` | 可能影响清单 |
 | `deliverables/s6_uncertain_apis.csv/md` | 需人工复核清单 |
+| `deliverables/s6_not_impacted_apis.csv/md` | 有直接制品证据确认 API 未实际消失的清单 |
 | `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物，无法回溯调用链清单 |
 | `deliverables/s6_not_analyzed_apis.csv/md` | 本次未完成分析清单 |
 | `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |
 | `.runtime/findings/s6_findings.json` | Step6 结构化结果；主要供程序读取 |
 
 Step6 会避免把大量未命中 API 全部塞进主报告；主报告用于传达结论，附属明细用于展开复核。
+
+Step6 主结果表固定使用以下五列：
+
+```text
+依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因
+```
+
+存在调用证据时，“证据摘要 / 未确认原因”会同时给出证据数量和可点击链接。阅读顺序是：
+
+1. 在五列表格中查看变更事实和结论。
+2. 点击“证据摘要 / 未确认原因”中的链接，跳到同一报告内的具体调用链证据。
+3. 需要检查全部路径时，按照证据说明给出的 `api_id` 和 `path_status` 筛选 `evidence/call_chain/alerts.csv`。
+
+报告内会把 `path_status = reachable` 的已确认链路与 `path_status = uncertain` 的未回溯依赖引用分开显示，避免把不同可信度的证据混为一类。静态分析未找到路径时不存在可展示的调用链，因此该行只说明已检查范围和未找到原因，不生成空链接。
 
 ## 性能排查入口
 

@@ -117,7 +117,6 @@ class S5QueryCallChainTest(unittest.TestCase):
             [
                 "io.seata.common.util.CollectionUtils.isEmpty(java.util.Collection)",
                 "io.seata.common.util.CollectionUtils.isEmpty(Collection)",
-                "io.seata.common.util.CollectionUtils.isEmpty",
             ],
         )
         self.assertEqual(
@@ -131,6 +130,31 @@ class S5QueryCallChainTest(unittest.TestCase):
                 fuzzy=True,
             ),
         )
+
+    def test_signed_query_does_not_fall_back_to_unsigned_overload_key(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        wrong_edge = edge(
+            app,
+            "org.slf4j.Logger.info(java.lang.String,java.lang.Object)",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            module="app",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": ["com.app.App.run", "method:run"]},
+            reverse_edges={
+                "org.slf4j.Logger.info": [wrong_edge],
+                "org.slf4j.Logger.info(java.lang.String,java.lang.Object)": [wrong_edge],
+            },
+        )
+
+        chains = query_call_chains(
+            build_query_index(graph),
+            "org.slf4j.Logger.info(java.lang.String,java.lang.Object[])",
+        )
+
+        self.assertEqual(chains, [])
 
     def test_query_does_not_fall_back_to_unrelated_simple_method_key(self):
         app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")

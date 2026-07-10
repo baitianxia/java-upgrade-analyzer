@@ -1,5 +1,6 @@
 import io
 import csv
+import os
 import sys
 import tempfile
 import unittest
@@ -73,6 +74,52 @@ class Step1PackagedDepsTest(unittest.TestCase):
             [item.get("coord") for item in meta.get("dep_entries") or []],
             ["org.example:demo-lib"],
         )
+
+    def test_filename_only_nested_jar_uses_unique_local_m2_sha_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repository"
+            local_jar = repo / "org" / "example" / "plain-lib" / "1.2.3" / "plain-lib-1.2.3.jar"
+            local_jar.parent.mkdir(parents=True)
+            nested_bytes = self._nested_jar_bytes([
+                ("com/example/Plain.class", b"class-bytes"),
+            ])
+            local_jar.write_bytes(nested_bytes)
+            artifact = root / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr("BOOT-INF/lib/plain-lib-1.2.3.jar", nested_bytes)
+
+            with patch.dict(os.environ, {"MAVEN_REPO_LOCAL": str(repo)}):
+                deps, meta = s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                    str(artifact),
+                    runtime_deps_loader=lambda: self.fail("dependency:list must not run"),
+                )
+
+        self.assertIn("org.example:plain-lib", deps)
+        self.assertEqual(meta["unresolved_items"], [])
+        self.assertEqual(meta["dep_entries"][0]["match_source"], "local-m2-sha256")
+
+    def test_local_m2_sha_match_stays_unresolved_when_coordinates_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repository"
+            nested_bytes = self._nested_jar_bytes([("Plain.class", b"same")])
+            for group in ("one", "two"):
+                jar = repo / "org" / group / "plain-lib" / "1.2.3" / "plain-lib-1.2.3.jar"
+                jar.parent.mkdir(parents=True)
+                jar.write_bytes(nested_bytes)
+            artifact = root / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr("BOOT-INF/lib/plain-lib-1.2.3.jar", nested_bytes)
+
+            with patch.dict(os.environ, {"MAVEN_REPO_LOCAL": str(repo)}):
+                _deps, meta = s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                    str(artifact),
+                    runtime_deps={},
+                    allow_unresolved=True,
+                )
+
+        self.assertEqual(len(meta["unresolved_items"]), 1)
 
     def test_classify_change_marks_removed_dependency(self):
         change_type, risk = s1_dep_diff.classify_change("1.2.3", "-")

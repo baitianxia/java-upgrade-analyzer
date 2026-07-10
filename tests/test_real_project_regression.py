@@ -14,6 +14,47 @@ import real_project_regression as realreg  # noqa: E402
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def _write_readable_alerts(self, path, symbol, evidence_file, signature="(String)", path_status="reachable"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            "conclusion",
+            "change_summary",
+            "review_reason",
+            "chain_summary",
+            "chain_entry",
+            "chain_target",
+            "chain_hop_count",
+            "chain_detail",
+            "changed_symbol",
+            "api_signature",
+            "symbol_kind",
+            "path_status",
+            "path_text",
+            "evidence_files",
+        ]
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            writer.writerow({
+                "conclusion": (
+                    "已确认影响：已找到业务入口到变更 API 的完整调用链"
+                    if path_status == "reachable" else "需要人工复核"
+                ),
+                "change_summary": f"删除方法，{symbol.rsplit('.', 1)[-1]}，参数：{signature.strip('()') or '无参数'}，严重级别：P1",
+                "review_reason": "已找到从系统代码到变更 API 的调用链",
+                "chain_summary": f"入口：demo.App.run；终点：{symbol}{signature}；1 跳",
+                "chain_entry": "demo.App.run",
+                "chain_target": f"{symbol}{signature}",
+                "chain_hop_count": "1",
+                "chain_detail": f"1. demo.App.run -> 2. {symbol}{signature}",
+                "changed_symbol": symbol,
+                "api_signature": signature,
+                "symbol_kind": "method",
+                "path_status": path_status,
+                "path_text": f"demo.App.run -> {symbol}{signature}",
+                "evidence_files": str(evidence_file),
+            })
+
     def test_collect_source_shape_metrics_counts_files_and_occurrences(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -190,10 +231,10 @@ class RealProjectRegressionTest(unittest.TestCase):
             def fake_run_step5(_case, _project_root, _changed_apis, report_dir):
                 output = report_dir / "evidence" / "call_chain"
                 output.mkdir(parents=True)
-                (output / "alerts.csv").write_text(
-                    "changed_symbol,evidence_files\n"
-                    f"org.apache.dubbo.common.utils.StringUtils.isBlank,{java_file}\n",
-                    encoding="utf-8",
+                self._write_readable_alerts(
+                    output / "alerts.csv",
+                    "org.apache.dubbo.common.utils.StringUtils.isBlank",
+                    java_file,
                 )
                 (output / "summary.json").write_text(
                     json.dumps(
@@ -272,10 +313,10 @@ class RealProjectRegressionTest(unittest.TestCase):
                 self.assertEqual(rows[0]["api_name"], embedded_row["api_name"])
                 output = report_dir / "evidence" / "call_chain"
                 output.mkdir(parents=True)
-                (output / "alerts.csv").write_text(
-                    "changed_symbol,evidence_files\n"
-                    f"{embedded_row['api_name']},{java_file}\n",
-                    encoding="utf-8",
+                self._write_readable_alerts(
+                    output / "alerts.csv",
+                    embedded_row["api_name"],
+                    java_file,
                 )
                 (output / "alerts_reachable.csv").write_text("changed_symbol\n", encoding="utf-8")
                 (output / "summary.json").write_text(
@@ -369,12 +410,45 @@ class RealProjectRegressionTest(unittest.TestCase):
                 self.assertEqual({row["source"] for row in rows}, {"old_jar"})
                 output = report_dir / "evidence" / "call_chain"
                 output.mkdir(parents=True)
-                (output / "alerts.csv").write_text(
-                    "changed_symbol,evidence_files\n"
-                    f"org.apache.dubbo.common.URL.valueOf,{java_file}\n",
+                self._write_readable_alerts(
+                    output / "alerts.csv",
+                    "org.apache.dubbo.common.URL.valueOf",
+                    java_file,
+                    signature="(java.lang.String)",
+                )
+                with (output / "alerts.csv").open(encoding="utf-8") as read_fh:
+                    alert_fields = list(csv.DictReader(read_fh).fieldnames or [])
+                with (output / "alerts.csv").open("a", newline="", encoding="utf-8") as fh:
+                    writer = csv.DictWriter(fh, fieldnames=alert_fields)
+                    writer.writerow({
+                        "conclusion": "已确认影响：已找到业务入口到变更 API 的完整调用链",
+                        "change_summary": "删除方法，valueOf，参数：java.lang.String, boolean，严重级别：P1",
+                        "review_reason": "已找到从系统代码到变更 API 的调用链",
+                        "chain_summary": (
+                            "入口：demo.App.run；终点："
+                            "org.apache.dubbo.common.URL.valueOf(java.lang.String, boolean)；1 跳"
+                        ),
+                        "chain_entry": "demo.App.run",
+                        "chain_target": "org.apache.dubbo.common.URL.valueOf(java.lang.String, boolean)",
+                        "chain_hop_count": "1",
+                        "chain_detail": (
+                            "1. demo.App.run -> 2. "
+                            "org.apache.dubbo.common.URL.valueOf(java.lang.String, boolean)"
+                        ),
+                        "changed_symbol": "org.apache.dubbo.common.URL.valueOf",
+                        "api_signature": "(java.lang.String, boolean)",
+                        "symbol_kind": "method",
+                        "path_status": "reachable",
+                        "path_text": (
+                            "demo.App.run -> "
+                            "org.apache.dubbo.common.URL.valueOf(java.lang.String, boolean)"
+                        ),
+                        "evidence_files": str(java_file),
+                    })
+                (output / "alerts_reachable.csv").write_text(
+                    (output / "alerts.csv").read_text(encoding="utf-8"),
                     encoding="utf-8",
                 )
-                (output / "alerts_reachable.csv").write_text("changed_symbol\n", encoding="utf-8")
                 (output / "summary.json").write_text(
                     json.dumps(
                         {
@@ -540,11 +614,11 @@ class RealProjectRegressionTest(unittest.TestCase):
             def fake_run_step5(_case, _project_root, _changed_apis, report_dir):
                 output = report_dir / "evidence" / "call_chain"
                 output.mkdir(parents=True)
-                (output / "alerts.csv").write_text(
-                    "changed_symbol,evidence_files,path_status,path_text\n"
-                    f"org.apache.dubbo.common.URL.valueOf,{java_file},reachable,"
-                    "demo.App.run -> org.apache.dubbo.common.URL.valueOf(String)\n",
-                    encoding="utf-8",
+                self._write_readable_alerts(
+                    output / "alerts.csv",
+                    "org.apache.dubbo.common.URL.valueOf",
+                    java_file,
+                    signature="(String)",
                 )
                 (output / "alerts_reachable.csv").write_text(
                     (output / "alerts.csv").read_text(encoding="utf-8"),

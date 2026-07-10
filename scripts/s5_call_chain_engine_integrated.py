@@ -76,6 +76,7 @@ from pipeline_constants import (
     STEP5_QUERY_INDEX_FILE,
 )
 from s5_query_call_chain import write_query_index
+from dependency_source_alignment import align_dependency_source_mappings
 
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
@@ -716,6 +717,7 @@ def _step5_integrated_main_impl(args):
         if "dependency_source_mappings" in orchestrated_input
         else (args.dependency_source_mappings or [])
     )
+    raw_dependency_source_mappings = list(dependency_source_mappings or [])
     allow_degraded = (
         bool(orchestrated_input.get("allow_degraded"))
         if "allow_degraded" in orchestrated_input
@@ -731,6 +733,7 @@ def _step5_integrated_main_impl(args):
 
         if bridge_discovery['dependency_source_mappings']:
             dependency_source_mappings = bridge_discovery['dependency_source_mappings']
+            raw_dependency_source_mappings = list(dependency_source_mappings or [])
             print(f"  发现：{len(bridge_discovery['matched_coords'])} 个可用依赖源码映射", file=sys.stderr)
         else:
             provided_dependency_dirs = bridge_discovery.get('provided_dependency_source_dirs') or []
@@ -850,6 +853,42 @@ def _step5_integrated_main_impl(args):
             f"  ⚠️ 已忽略 {len(skipped_dependency_source_mappings)} 个不属于当前运行时依赖的源码映射",
             file=sys.stderr,
         )
+    dependency_source_alignment = align_dependency_source_mappings(
+        report_dir,
+        dependency_source_mappings,
+        runtime_dependency_catalog,
+    )
+    dependency_source_mappings = list(dependency_source_alignment.get('mappings') or [])
+    allowed_dependency_classes_by_coord = {
+        str(coord): set(classes or set())
+        for coord, classes in (
+            dependency_source_alignment.get('allowed_classes_by_coord') or {}
+        ).items()
+    }
+    rejected_source_records = [
+        item for item in (dependency_source_alignment.get('records') or [])
+        if item.get('status') != 'aligned'
+    ]
+    if rejected_source_records:
+        bridge_discovery = dict(bridge_discovery or {})
+        unresolved = list(bridge_discovery.get('unresolved_dependency_source_dirs') or [])
+        for item in rejected_source_records:
+            unresolved.append({
+                'root_path': item.get('original_mapping_path') or '',
+                'coord': item.get('coord') or '',
+                'reason': item.get('reason') or '依赖源码版本无法与当前运行时 JAR 对齐',
+                'reason_code': item.get('reason_code') or 'dependency_source_alignment_failed',
+            })
+        bridge_discovery['unresolved_dependency_source_dirs'] = unresolved
+        print(
+            f"  ⚠️ 已拒绝 {len(rejected_source_records)} 个未与当前运行时 JAR 版本对齐的依赖源码映射",
+            file=sys.stderr,
+        )
+    if dependency_source_mappings:
+        print(
+            f"  已将 {len(dependency_source_mappings)} 个依赖源码根固定到 Step4 确认的当前版本 commit",
+            file=sys.stderr,
+        )
     _report_step5_debug_event(
         'CATALOG',
         's5_call_chain_engine_integrated.py:runtime-catalog',
@@ -860,6 +899,8 @@ def _step5_integrated_main_impl(args):
             'sample_runtime_coords': sorted(list(((runtime_dependency_catalog or {}).get('by_coord') or {}).keys()))[:8],
             'dependency_source_mapping_count_after_runtime_filter': len(dependency_source_mappings or []),
             'skipped_dependency_source_mappings': skipped_dependency_source_mappings[:20],
+            'dependency_source_alignment_evidence': dependency_source_alignment.get('evidence_path') or '',
+            'dependency_source_alignment_rejected': len(rejected_source_records),
         },
     )
 
@@ -950,6 +991,7 @@ def _step5_integrated_main_impl(args):
 
     has_provided_dependency_inputs = bool(
         dependency_source_mappings
+        or raw_dependency_source_mappings
         or (bridge_discovery or {}).get('provided_dependency_source_dirs')
         or (bridge_discovery or {}).get('source_dirs_detected_without_coord')
     )
@@ -1065,6 +1107,7 @@ def _step5_integrated_main_impl(args):
             jar_metadata=jar_metadata,
             reused_analysis=reused_analysis,
             retain_analysis_cache=False,
+            allowed_dependency_classes_by_coord=allowed_dependency_classes_by_coord,
         )
         full_graph_elapsed = time.perf_counter() - full_graph_timer
         business_graph_result = None
@@ -1092,6 +1135,8 @@ def _step5_integrated_main_impl(args):
         'source_root_count': len(source_roots or []),
         'business_source_root_count': len(business_roots or []),
         'dependency_source_mapping_count': len(dependency_source_mappings or []),
+        'dependency_source_alignment_rejected': len(rejected_source_records),
+        'dependency_source_alignment_evidence': dependency_source_alignment.get('evidence_path') or '',
     })
     bytecode_timer = time.perf_counter()
     bytecode_evidence, bytecode_stats = collect_business_bytecode_edges(
@@ -1139,7 +1184,11 @@ def _step5_integrated_main_impl(args):
     )
     framework_output = str(_call_chain_dir(report_dir) / 'framework_adapters.json')
     framework_timer = time.perf_counter()
-    framework_evidence = run_framework_adapters(source_roots, framework_output)
+    framework_evidence = run_framework_adapters(
+        source_roots,
+        framework_output,
+        artifact_catalog=runtime_dependency_catalog,
+    )
     graph_stats['step5_perf']['main']['framework_adapters_elapsed_sec'] = round(
         time.perf_counter() - framework_timer, 3
     )
@@ -1190,6 +1239,7 @@ def _step5_integrated_main_impl(args):
         ),
     )
     graph.runtime_dependency_catalog = runtime_dependency_catalog
+    graph.report_dir = str(report_dir)
 
     print(f"  方法数：{len(graph.methods_by_id)}", file=sys.stderr)
     print(f"  反向边数：{len(graph.reverse_edges)}", file=sys.stderr)
@@ -1263,6 +1313,7 @@ def _step5_integrated_main_impl(args):
         total_results=len(all_results),
         status_counts={
             'reachable': sum(1 for r in all_results if r.analysis_status == 'reachable'),
+            'not_impacted': sum(1 for r in all_results if r.analysis_status == 'not_impacted'),
             'uncertain': sum(1 for r in all_results if r.analysis_status == 'uncertain'),
             'not_analyzed': sum(1 for r in all_results if r.analysis_status == 'not_analyzed'),
             'not_found_in_static_analysis': sum(
@@ -1297,6 +1348,7 @@ def _step5_integrated_main_impl(args):
 
     # 统计
     reachable_count = sum(1 for r in all_results if r.analysis_status == 'reachable')
+    not_impacted_count = sum(1 for r in all_results if r.analysis_status == 'not_impacted')
     uncertain_count = sum(1 for r in all_results if r.analysis_status == 'uncertain')
     not_analyzed_count = sum(1 for r in all_results if r.analysis_status == 'not_analyzed')
     not_found_count = sum(
@@ -1306,6 +1358,7 @@ def _step5_integrated_main_impl(args):
 
     print("\n分析结果：", file=sys.stderr)
     print(f"  ✓ reachable: {reachable_count}", file=sys.stderr)
+    print(f"  ○ not_impacted: {not_impacted_count}", file=sys.stderr)
     print(f"  ❓ uncertain: {uncertain_count}", file=sys.stderr)
     print(f"  ⊘ not_analyzed: {not_analyzed_count}", file=sys.stderr)
     print(f"  ✗ not_found_in_static_analysis: {not_found_count}", file=sys.stderr)
@@ -1317,7 +1370,7 @@ def _step5_integrated_main_impl(args):
         "done",
         (
             "Step5 完成，"
-            f"reachable={reachable_count}，uncertain={uncertain_count}，"
+            f"reachable={reachable_count}，not_impacted={not_impacted_count}，uncertain={uncertain_count}，"
             f"not_analyzed={not_analyzed_count}，not_found={not_found_count}"
         ),
         elapsed=step_timer.elapsed(),
@@ -2255,7 +2308,53 @@ def _analyze_source_file_entry(file_path, root):
     }
 
 
-def _collect_source_file_entries(source_roots, reused_analysis=None):
+def _source_class_in_allowed_jar(class_fqcn, allowed_classes):
+    class_fqcn = str(class_fqcn or '').strip()
+    if not class_fqcn:
+        return False
+    if class_fqcn in allowed_classes:
+        return True
+    # Source parsers commonly represent nested classes as Outer.Inner while
+    # classfiles use Outer$Inner. Try only package-preserving nested variants.
+    parts = class_fqcn.split('.')
+    for class_start in range(1, len(parts)):
+        candidate = '.'.join(parts[:class_start]) + '.' + '$'.join(parts[class_start:])
+        if candidate in allowed_classes:
+            return True
+    return any(value.startswith(f"{class_fqcn}$") for value in allowed_classes)
+
+
+def _filter_dependency_source_entry(entry, allowed_dependency_classes_by_coord):
+    root = (entry or {}).get('root') or {}
+    if str(root.get('owner_type') or '').strip() != 'dependency':
+        return entry
+    coord = str(root.get('owner_coord') or '').strip()
+    allowed = set((allowed_dependency_classes_by_coord or {}).get(coord) or set())
+    if not allowed:
+        return None
+    kept_methods = [
+        method for method in (entry.get('methods') or [])
+        if _source_class_in_allowed_jar(getattr(method, 'class_fqcn', ''), allowed)
+    ]
+    package_name = str(entry.get('package_name') or '').strip()
+    kept_declared_types = {}
+    for class_name, metadata in (entry.get('declared_types') or {}).items():
+        class_fqcn = f"{package_name}.{class_name}" if package_name else str(class_name)
+        if _source_class_in_allowed_jar(class_fqcn, allowed):
+            kept_declared_types[class_name] = metadata
+    if not kept_methods and not kept_declared_types:
+        return None
+    filtered = dict(entry)
+    filtered['methods'] = kept_methods
+    filtered['declared_types'] = kept_declared_types
+    return filtered
+
+
+def _collect_source_file_entries(
+    source_roots,
+    reused_analysis=None,
+    allowed_dependency_classes_by_coord=None,
+):
     skip_dirs = {
         '.git', 'target', 'build', '.gradle', 'out', 'bin',
         'node_modules', '.idea', '.upgrade-report'
@@ -2275,9 +2374,19 @@ def _collect_source_file_entries(source_roots, reused_analysis=None):
             copied = dict(entry)
             copied['file_path'] = file_path
             copied['root'] = dict(entry.get('root') or {})
-            entries.append(copied)
+            filtered = _filter_dependency_source_entry(
+                copied,
+                allowed_dependency_classes_by_coord,
+            ) if allowed_dependency_classes_by_coord is not None else copied
+            if filtered is not None:
+                entries.append(filtered)
         else:
-            entries.append(entry)
+            filtered = _filter_dependency_source_entry(
+                entry,
+                allowed_dependency_classes_by_coord,
+            ) if allowed_dependency_classes_by_coord is not None else entry
+            if filtered is not None:
+                entries.append(filtered)
         seen_files.add(file_path)
         _record_parser_info(stats, file_path, entry.get('parser_info') or {})
 
@@ -2307,9 +2416,16 @@ def _collect_source_file_entries(source_roots, reused_analysis=None):
                 if file_path in seen_files:
                     continue
                 entry = _analyze_source_file_entry(file_path, root)
-                entries.append(entry)
+                parser_info = entry.get('parser_info') or {}
+                if allowed_dependency_classes_by_coord is not None:
+                    entry = _filter_dependency_source_entry(
+                        entry,
+                        allowed_dependency_classes_by_coord,
+                    )
+                if entry is not None:
+                    entries.append(entry)
                 seen_files.add(file_path)
-                _record_parser_info(stats, file_path, entry.get('parser_info') or {})
+                _record_parser_info(stats, file_path, parser_info)
     _step5_debug(
         'graph_source_collection',
         'collected source file entries for graph build',
@@ -2329,6 +2445,7 @@ def build_enhanced_source_graph(
     jar_metadata=None,
     reused_analysis=None,
     retain_analysis_cache=True,
+    allowed_dependency_classes_by_coord=None,
 ):
     """
     构建增强型源码图
@@ -2363,7 +2480,11 @@ def build_enhanced_source_graph(
     class_info = {}  # class_fqcn -> ClassInfo
     interface_implementations = defaultdict(list)  # interface -> 实现类列表
 
-    file_entries, stats = _collect_source_file_entries(source_roots, reused_analysis=reused_analysis)
+    file_entries, stats = _collect_source_file_entries(
+        source_roots,
+        reused_analysis=reused_analysis,
+        allowed_dependency_classes_by_coord=allowed_dependency_classes_by_coord,
+    )
     _step5_debug(
         'graph_build_start',
         'starting enhanced source graph build',
@@ -2390,6 +2511,32 @@ def build_enhanced_source_graph(
             normalized.append(text)
         return '(' + ', '.join(normalized) + ')' if normalized or values == [] else ''
 
+    def enrich_method_declared_identity(method_def):
+        signature = build_method_declared_signature(method_def)
+        qualified_key = str(getattr(method_def, 'qualified_key', '') or '').strip()
+        declared_key = f"{qualified_key}{signature}" if qualified_key and signature else qualified_key
+        try:
+            method_def.declared_signature = signature
+            method_def.declared_qualified_key = declared_key
+        except Exception:
+            pass
+        return signature, declared_key
+
+    def method_lookup_keys(method_def):
+        signature, declared_key = enrich_method_declared_identity(method_def)
+        keys = []
+        for value in (
+            declared_key,
+            getattr(method_def, 'qualified_key', ''),
+            f"{getattr(method_def, 'simple_key', '')}{signature}" if signature else '',
+            getattr(method_def, 'simple_key', ''),
+            f"class:{getattr(method_def, 'class_fqcn', '')}" if getattr(method_def, 'class_fqcn', '') else '',
+        ):
+            value = str(value or '').strip()
+            if value and value not in keys:
+                keys.append(value)
+        return keys
+
     unique_signatures_by_qualified_key = defaultdict(set)
     unique_signatures_by_simple_key = defaultdict(set)
 
@@ -2403,11 +2550,54 @@ def build_enhanced_source_graph(
         owner = prefix.rsplit('.', 1)[0]
         return '.' in owner
 
+    def is_method_like_edge(edge):
+        evidence_type = str(getattr(edge, 'evidence_type', '') or '')
+        callee_key = str(getattr(edge, 'callee_key', '') or '')
+        if evidence_type in {
+            'ast_method_invocation',
+            'instance_call',
+            'lambda_call',
+            'method_reference',
+            'constructor_invocation',
+            'bytecode_method_invocation',
+            'bytecode_constructor_invocation',
+            'runtime_dependency_method_invocation',
+            'runtime_dependency_constructor_invocation',
+        }:
+            return True
+        return bool(callee_key and not callee_key.startswith(('class:', 'field:', 'invokedynamic:')) and '(' in callee_key)
+
+    def has_method_signature(edge_key):
+        value = str(edge_key or '').strip()
+        return '(' in value and value.endswith(')')
+
+    def annotate_edge_resolution(edge):
+        callee_key = str(getattr(edge, 'callee_key', '') or '').strip()
+        fqcn_complete = is_probably_fully_qualified_method_key(callee_key) or callee_key.startswith('class:')
+        signature_complete = (not is_method_like_edge(edge)) or has_method_signature(callee_key)
+        try:
+            edge.callee_fqcn_complete = bool(fqcn_complete)
+            edge.callee_signature_complete = bool(signature_complete)
+            if not fqcn_complete and is_method_like_edge(edge):
+                edge.callee_resolution_note = '缺少调用目标所属类全限定名'
+            elif not signature_complete:
+                edge.callee_resolution_note = '缺少调用目标方法参数签名'
+            else:
+                edge.callee_resolution_note = '调用目标已解析到全限定名和签名'
+        except Exception:
+            pass
+
     def build_reverse_edge_keys(edge):
+        annotate_edge_resolution(edge)
         callee_key = (getattr(edge, 'callee_key', '') or '').strip()
         is_dependency_edge = getattr(edge, 'owner_type', '') == 'dependency'
         if is_dependency_edge and not is_probably_fully_qualified_method_key(callee_key):
             stats['dependency_edges_skipped_without_fqcn'] = stats.get('dependency_edges_skipped_without_fqcn', 0) + 1
+            return []
+        if is_dependency_edge and is_method_like_edge(edge) and not has_method_signature(callee_key):
+            stats['dependency_method_edges_skipped_without_signature'] = (
+                stats.get('dependency_method_edges_skipped_without_signature', 0) + 1
+            )
             return []
         keys = []
         edge_key_candidates = [edge.callee_key] if is_dependency_edge else [edge.callee_key, edge.callee_simple_key]
@@ -2531,11 +2721,7 @@ def build_enhanced_source_graph(
             # 额外索引（兼容confidence_weighted_tracer）
             methods_by_qualified[method_def.qualified_key].append(method_def.symbol_id)
             methods_by_simple[method_def.simple_key].append(method_def.symbol_id)
-            lookup_keys_by_symbol[method_def.symbol_id] = [
-                method_def.qualified_key,
-                method_def.simple_key,
-                f"class:{method_def.class_fqcn}"
-            ]
+            lookup_keys_by_symbol[method_def.symbol_id] = method_lookup_keys(method_def)
             all_methods.append(method_def)
 
             # 关键修复：更新class_info的kind（interface vs class）
@@ -2815,6 +3001,13 @@ def build_enhanced_source_graph(
         simple = class_fqcn.rsplit('.', 1)[-1].split('$', 1)[0]
         if simple and class_fqcn not in known_classes_by_simple_for_resolution[simple]:
             known_classes_by_simple_for_resolution[simple].append(class_fqcn)
+    # This lookup is read-only during edge extraction.  Keep one shared mapping
+    # instead of allocating an O(class-count) dict for every source method.
+    # Tuple values also prevent accidental mutation through a MethodDef.
+    shared_known_classes_by_simple_for_resolution = {
+        simple: tuple(class_fqcns)
+        for simple, class_fqcns in known_classes_by_simple_for_resolution.items()
+    }
 
     for class_fqcn, info in class_info.items():
         info['extends'] = []
@@ -2937,11 +3130,7 @@ def build_enhanced_source_graph(
         methods_by_id[method_def.symbol_id] = method_def
         methods_by_qualified[method_def.qualified_key].append(method_def.symbol_id)
         methods_by_simple[method_def.simple_key].append(method_def.symbol_id)
-        lookup_keys_by_symbol[method_def.symbol_id] = [
-            method_def.qualified_key,
-            method_def.simple_key,
-            f"class:{method_def.class_fqcn}",
-        ]
+        lookup_keys_by_symbol[method_def.symbol_id] = method_lookup_keys(method_def)
         all_methods.append(method_def)
     stats['initializer_methods_indexed'] = len(initializer_methods)
     stats['initializer_edges_discovered'] = len(initializer_edges)
@@ -3051,7 +3240,7 @@ def build_enhanced_source_graph(
         method_def.known_type_metadata = type_metadata
         method_def.known_field_types = global_field_types
         method_def.known_class_fqcns = known_class_fqcns_for_resolution
-        method_def.known_classes_by_simple = dict(known_classes_by_simple_for_resolution)
+        method_def.known_classes_by_simple = shared_known_classes_by_simple_for_resolution
 
     for method_def in all_methods:
         if getattr(method_def, 'method_name', '') == '<class-init>':

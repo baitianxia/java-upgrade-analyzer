@@ -669,6 +669,60 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertIn("已收到 dependency_source_dirs", annotated["question"])
             self.assertIn("仅当现有目录不正确", annotated["response_schema"]["properties"]["dependency_source_dirs"]["description"])
 
+    def test_step5_review_does_not_require_removed_target_source_when_analysis_did_not_need_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            dep_repo = Path(tmp) / "dependency-repo"
+            module = dep_repo / "helper"
+            (module / "src/main/java").mkdir(parents=True)
+            (dep_repo / ".git").mkdir()
+            (module / "pom.xml").write_text(
+                "<project><modelVersion>4.0.0</modelVersion>"
+                "<groupId>com.example</groupId><artifactId>helper</artifactId><version>1</version>"
+                "</project>",
+                encoding="utf-8",
+            )
+            self._write_text(
+                self._api_changes_dir(report_dir) / "all_changed_apis.csv",
+                "coord,new_version,change_type,api_name,symbol_kind\n"
+                "org.slf4j:slf4j-api,-,REMOVED,org.slf4j.Logger,class\n",
+                encoding="utf-8",
+            )
+            self._write_text(
+                self._call_chain_dir(report_dir) / "summary.json",
+                json.dumps({
+                    "reachable": 1,
+                    "uncertain": 0,
+                    "not_analyzed": 0,
+                    "reachable_apis": [{
+                        "coord": "org.slf4j:slf4j-api",
+                        "api": "org.slf4j.Logger",
+                        "reason_code": "BUSINESS_ARTIFACT_BYTECODE_USAGE",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            interaction = {
+                "step_id": "step5",
+                "question": "请确认 Step5 结果。",
+                "response_schema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string"},
+                        "dependency_source_dirs": {"type": "array"},
+                    },
+                },
+            }
+
+            annotated = run_step.annotate_dependency_source_dirs_interaction(
+                interaction,
+                {"dependency_source_dirs": [str(dep_repo.resolve())]},
+                report_dir,
+            )
+
+        self.assertNotIn("仍未覆盖这些目标依赖坐标", annotated["question"])
+        self.assertIn("本轮没有因依赖源码缺失而中断的 API", annotated["question"])
+
     def test_validate_pending_interaction_response_rejects_empty_step5_rerun(self):
         interaction = {
             "step_id": "step5",

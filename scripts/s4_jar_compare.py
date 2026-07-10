@@ -387,7 +387,7 @@ class Step1ArtifactJarResolver:
         self._entry_cache = {}
 
     def _load_sides(self):
-        provenance_path = self.report_dir / "build_provenance.json"
+        provenance_path = self.report_dir / "dependencies" / "build_provenance.json"
         if not provenance_path.is_file():
             return {}
         try:
@@ -641,6 +641,32 @@ def _git_ref_exists(repo_dir: str, ref: str):
         return False
     _out, _err, rc = run_cmd(git_cmd() + ["rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=repo_dir, timeout=10)
     return rc == 0
+
+
+def source_refs_have_different_commits(source_branches, repo_dir):
+    """Return whether two source refs can represent different source content.
+
+    Different branch names may point at the same commit (notably artifact-only
+    comparisons).  In that case scanning every unchanged dependency is both
+    wasteful and misleading.  If either ref cannot be resolved, stay
+    conservative and treat them as different.
+    """
+    refs = [str(item or '').strip() for item in (source_branches or [])[:2]]
+    if len(refs) < 2 or not all(refs):
+        return False
+    if refs[0] == refs[1]:
+        return False
+    commits = []
+    for ref in refs:
+        stdout, _stderr, rc = run_cmd(
+            git_cmd() + ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+            cwd=repo_dir,
+            timeout=10,
+        )
+        if rc != 0 or not str(stdout or '').strip():
+            return True
+        commits.append(str(stdout).strip().splitlines()[-1])
+    return commits[0] != commits[1]
 
 
 def _extract_branch_prefix(branch_name: str, match_start: int):
@@ -2656,8 +2682,6 @@ def dependency_needs_gitdiff_preflight(row, source_mapping):
     row = row or {}
     if not str(row.get('coord') or '').strip():
         return False
-    if str(row.get('change_type') or '').strip() == '未变':
-        return False
     if dependency_is_removed_or_added(row):
         return False
     if not (source_mapping or {}).get("repo_path"):
@@ -4087,6 +4111,10 @@ def main():
     step_timer = PhaseTimer("step4", "total")
     load_inputs_timer = time.perf_counter()
     dep_rows = load_csv(args.dep_changes)
+    analysis_dep_rows = [
+        row for row in dep_rows
+        if str(row.get('change_type') or '').strip() != '未变'
+    ]
     ctx      = load_json(args.context)
     timing.record(
         "input.load",
@@ -4095,9 +4123,7 @@ def main():
         details={"dependencies": len(dep_rows), "changed_dependencies": len(ctx.get("changed_dependencies") or [])},
     )
     japicmp_planned_rows = [row for row in dep_rows if dependency_needs_japicmp(row)]
-    compute_changed_classes_enabled = (not args.skip_changed_classes) and len(dep_rows) <= 200
-    if not compute_changed_classes_enabled:
-        print("  ℹ️  changed_classes.json 已降级为轻量模式，跳过 class hash 计算以提升大批量依赖稳定性。", file=sys.stderr)
+    compute_changed_classes_enabled = False
     if (not args.source_branches) and ctx.get("base_branch") and ctx.get("current_branch"):
         base_br = str(ctx.get("base_branch")).strip()
         cur_br = str(ctx.get("current_branch")).strip()
@@ -4214,9 +4240,25 @@ def main():
         dep['coord'] for dep in ctx.get('changed_dependencies', []) if dep.get('coord')
     }
 
+    # “版本未变”只表示 Maven 坐标没有变化，不能证明依赖源码/制品内容未变。
+    # 当 base/current 是不同源码 ref 且存在依赖源码映射时，仍需执行 git diff，
+    # 以免漏掉未改版本号的方法体行为变化。相同 ref 则没有必要重复扫描。
+    source_refs_differ = source_refs_have_different_commits(args.source_branches, os.getcwd())
+    analysis_dep_rows = [
+        row for row in dep_rows
+        if str(row.get('change_type') or '').strip() != '未变'
+        or (
+            source_refs_differ
+            and str(row.get('coord') or '').strip() in dependency_paths
+        )
+    ]
+    compute_changed_classes_enabled = (not args.skip_changed_classes) and len(analysis_dep_rows) <= 200
+    if not compute_changed_classes_enabled:
+        print("  ℹ️  changed_classes.json 已降级为轻量模式，跳过 class hash 计算以提升大批量依赖稳定性。", file=sys.stderr)
+
     preflight_timer = time.perf_counter()
     preflight_gitdiff_runs, preflight_gitdiff_pending = preflight_gitdiff_refs(
-        dep_rows,
+        analysis_dep_rows,
         dependency_paths,
         dependency_path_meta,
         dependency_git_ref_overrides,
@@ -4337,7 +4379,7 @@ def main():
     artifact_resolver = Step1ArtifactJarResolver(report_dir, args.output_dir)
     prepared_dep_rows = []
     artifact_jar_hits = 0
-    for row in dep_rows:
+    for row in analysis_dep_rows:
         prepared = dict(row)
         base_evidence = artifact_resolver.resolve_for_row(row, "base")
         current_evidence = artifact_resolver.resolve_for_row(row, "current")
@@ -4354,14 +4396,20 @@ def main():
         "artifact_resolve",
         status="success",
         elapsed=time.perf_counter() - artifact_resolve_timer,
-        details={"dependencies": len(dep_rows), "jar_hits": artifact_jar_hits},
+        details={"dependencies": len(analysis_dep_rows), "jar_hits": artifact_jar_hits},
     )
 
     workers = max(1, int(args.workers or 1))
-    if len(dep_rows) <= 1:
+    if len(analysis_dep_rows) <= 1:
         workers = 1
-    print(f"\nStep 4 开始：处理 {len(dep_rows)} 个依赖（workers={workers}，Step1 产物 jar 命中={artifact_jar_hits}）", file=sys.stderr)
-    emit_progress("step4", "plan", f"开始构建 jar 对比证据池，共 {len(dep_rows)} 个依赖，workers={workers}")
+    total_dependencies = len(analysis_dep_rows)
+    print(
+        f"\nStep 4 开始：处理 {total_dependencies} 个需分析依赖"
+        f"（跳过 {len(dep_rows) - total_dependencies} 个无需分析依赖，workers={workers}，"
+        f"Step1 产物 jar 命中={artifact_jar_hits}）",
+        file=sys.stderr,
+    )
+    emit_progress("step4", "plan", f"开始构建 jar 对比证据池，共 {total_dependencies} 个需分析依赖，workers={workers}")
 
     def process_dependency(i, row):
         result = {
@@ -4390,18 +4438,6 @@ def main():
         if not coord:
             timing.record("dependency.total", status="skipped", elapsed=time.perf_counter() - dependency_timer, details="empty_coord")
             return result
-        if change == '未变':
-            timing.record(
-                "dependency.total",
-                coord=coord,
-                old_version=old_ver,
-                new_version=new_ver,
-                status="skipped",
-                elapsed=time.perf_counter() - dependency_timer,
-                details="unchanged",
-            )
-            return result
-
         is_removed_dependency = (change == '移除') or (new_ver == '-' and old_ver != '-')
         is_added_dependency = (change == '新增') or (old_ver == '-' and new_ver != '-')
         dependency_raw_apis = []
@@ -4421,7 +4457,7 @@ def main():
             "dependency",
             f"开始处理 {coord} ({old_ver}→{new_ver}) {'源码可用' if has_source_repo else scope}",
             current=i,
-            total=len(dep_rows),
+            total=total_dependencies,
             item=coord,
         )
         if is_focus_dependency and (not has_source_repo):
@@ -4439,7 +4475,7 @@ def main():
                 "gitdiff",
                 f"开始源码 diff：{coord}",
                 current=i,
-                total=len(dep_rows),
+                total=total_dependencies,
                 item=coord,
             )
             lib_info = {
@@ -4467,7 +4503,7 @@ def main():
                     "gitdiff",
                     "源码 diff 需要人工确认 git refs",
                     current=i,
-                    total=len(dep_rows),
+                    total=total_dependencies,
                     elapsed=time.perf_counter() - gitdiff_timer,
                     item=coord,
                 )
@@ -4496,7 +4532,7 @@ def main():
                     "gitdiff",
                     f"源码 diff 失败：{err}",
                     current=i,
-                    total=len(dep_rows),
+                    total=total_dependencies,
                     elapsed=time.perf_counter() - gitdiff_timer,
                     item=coord,
                 )
@@ -4538,7 +4574,7 @@ def main():
                     "gitdiff",
                     f"源码 diff 完成，提取 {len(apis)} 个变化，待 jar truth 过滤，behavior_changed={behavior_changed}",
                     current=i,
-                    total=len(dep_rows),
+                    total=total_dependencies,
                     elapsed=time.perf_counter() - gitdiff_timer,
                     item=coord,
                 )
@@ -4583,7 +4619,7 @@ def main():
                 "japicmp",
                 f"开始导出 removed jar 旧版符号：{coord}",
                 current=i,
-                total=len(dep_rows),
+                total=total_dependencies,
                 item=coord,
             )
             removed_out_file, apis, jar_info, err = export_removed_jar_apis(
@@ -4613,7 +4649,7 @@ def main():
                     "japicmp",
                     f"removed jar 旧版符号导出失败：{err}",
                     current=i,
-                    total=len(dep_rows),
+                    total=total_dependencies,
                     elapsed=time.perf_counter() - removed_timer,
                     item=coord,
                 )
@@ -4644,7 +4680,7 @@ def main():
                     "japicmp",
                     f"removed jar 符号导出完成，提取 {len(apis)} 个变化",
                     current=i,
-                    total=len(dep_rows),
+                    total=total_dependencies,
                     elapsed=time.perf_counter() - removed_timer,
                     item=coord,
                 )
@@ -4658,14 +4694,14 @@ def main():
                 api_count=len(apis),
                 details=err or {"old_jar_source": str((jar_info or {}).get("old_jar_source") or "")},
             )
-        elif old_ver != '-' and new_ver != '-':
+        elif change != '未变' and old_ver != '-' and new_ver != '-':
             japicmp_timer = time.perf_counter()
             emit_progress(
                 "step4",
                 "japicmp",
                 f"开始二进制对比：{coord}",
                 current=i,
-                total=len(dep_rows),
+                total=total_dependencies,
                 item=coord,
             )
             _out_file, apis, jar_info, err = run_japicmp(
@@ -4734,7 +4770,7 @@ def main():
                     "japicmp",
                     f"二进制对比失败：{err}",
                     current=i,
-                    total=len(dep_rows),
+                    total=total_dependencies,
                     elapsed=time.perf_counter() - japicmp_timer,
                     item=coord,
                 )
@@ -4775,7 +4811,7 @@ def main():
                     "japicmp",
                     f"二进制对比完成，提取 {len(apis)} 个变化",
                     current=i,
-                    total=len(dep_rows),
+                    total=total_dependencies,
                     elapsed=time.perf_counter() - japicmp_timer,
                     item=coord,
                 )
@@ -4827,7 +4863,7 @@ def main():
                 "gitdiff",
                 f"源码 diff jar truth 过滤完成，promoted={len(accepted_source_apis)}，auxiliary={len(rejected_source_apis)}",
                 current=i,
-                total=len(dep_rows),
+                total=total_dependencies,
                 item=coord,
             )
             timing.record(
@@ -4865,7 +4901,7 @@ def main():
             "dependency",
             f"完成处理 {coord}",
             current=i,
-            total=len(dep_rows),
+            total=total_dependencies,
             elapsed=time.perf_counter() - dependency_timer,
             item=coord,
         )
@@ -5023,8 +5059,8 @@ def main():
         else ('partial' if binary_failures or text_fallbacks or missing_classes_ignored else 'complete')
     ) if binary_runs else 'not_applicable'
     behavior_expected = [
-        row for row in dep_rows
-        if row.get('change_type') != '未变'
+        row for row in analysis_dep_rows
+        if row.get('coord') in dependency_paths
         and row.get('old_version') not in ('', '-')
         and row.get('new_version') not in ('', '-')
     ]

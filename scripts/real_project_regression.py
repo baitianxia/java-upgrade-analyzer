@@ -56,6 +56,7 @@ class RealProjectCase:
     min_methods_indexed: int = 0
     min_reverse_edges_indexed: int = 0
     max_elapsed_seconds: float = 0.0
+    max_full_step4_api_elapsed_seconds: float = 0.0
     run_step4: bool = False
     step4_dep_rows: tuple[dict[str, str], ...] = field(default_factory=tuple)
     expected_step4_api_names: tuple[str, ...] = field(default_factory=tuple)
@@ -420,6 +421,7 @@ CASES = {
         min_methods_indexed=15000,
         min_reverse_edges_indexed=100000,
         max_elapsed_seconds=60.0,
+        max_full_step4_api_elapsed_seconds=180.0,
         run_step4=True,
         step4_dep_rows=(
             {
@@ -598,6 +600,144 @@ def collect_alert_files(alerts_csv: Path, symbol: str) -> set[str]:
                 if item:
                     files.add(str(Path(item).resolve()))
     return files
+
+
+def _csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    if not path.exists():
+        return [], []
+    with path.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        return list(reader.fieldnames or []), list(reader)
+
+
+def _api_identity_from_changed_row(row: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        str(row.get("api_name") or "").strip(),
+        str(row.get("api_signature") or "").strip(),
+        str(row.get("symbol_kind") or "").strip(),
+    )
+
+
+def _api_identity_from_alert_row(row: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        str(row.get("changed_symbol") or "").strip(),
+        str(row.get("api_signature") or "").strip(),
+        str(row.get("symbol_kind") or "").strip(),
+    )
+
+
+def audit_analysis_outputs(changed_apis: Path, alerts_csv: Path, summary: dict) -> dict:
+    """Audit full real-project outputs for correctness signals, not just completion."""
+    changed_fields, changed_rows = _csv_rows(changed_apis)
+    alert_fields, alert_rows = _csv_rows(alerts_csv)
+    failures: list[str] = []
+    warnings: list[str] = []
+    required_alert_fields = {
+        "conclusion",
+        "change_summary",
+        "review_reason",
+        "chain_summary",
+        "chain_target",
+        "changed_symbol",
+        "api_signature",
+        "symbol_kind",
+        "path_status",
+    }
+    missing_alert_fields = sorted(required_alert_fields - set(alert_fields))
+    if missing_alert_fields:
+        failures.append(f"alerts_missing_readable_fields:{','.join(missing_alert_fields)}")
+
+    changed_identities = {
+        identity for row in changed_rows
+        if (identity := _api_identity_from_changed_row(row))[0]
+    }
+    alert_identities = {
+        identity for row in alert_rows
+        if (identity := _api_identity_from_alert_row(row))[0]
+    }
+    missing_alert_identities = sorted(changed_identities - alert_identities)
+    if missing_alert_identities:
+        failures.append(f"alerts_missing_api_rows:{len(missing_alert_identities)}")
+
+    total_apis = summary.get("total_apis")
+    if total_apis is not None and int(total_apis or 0) != len(changed_rows):
+        failures.append(f"summary_total_mismatch:summary={total_apis}:changed_rows={len(changed_rows)}")
+    if alert_rows and len(alert_rows) < len(changed_identities):
+        failures.append(f"alerts_rows_less_than_changed_apis:alerts={len(alert_rows)}:apis={len(changed_identities)}")
+
+    readable_blank = []
+    unreadable_markers = []
+    unexplained_reachable = []
+    suspicious_reachable = []
+    human_fields = (
+        "conclusion", "change_summary", "review_reason", "chain_summary",
+        "chain_entry", "chain_target", "chain_detail", "path_text",
+    )
+    forbidden_human_markers = (
+        "__business__", "**business**", "<class>", "<clinit>",
+        "源码图存在目标调用", "revision/profile", "fallback simple key",
+    )
+    for index, row in enumerate(alert_rows, 1):
+        if any(not str(row.get(field) or "").strip() for field in ("conclusion", "change_summary", "review_reason")):
+            readable_blank.append(index)
+        human_text = " ".join(str(row.get(field) or "") for field in human_fields)
+        matched_markers = [marker for marker in forbidden_human_markers if marker in human_text]
+        if matched_markers:
+            unreadable_markers.append({"row": index, "markers": matched_markers})
+        path_status = str(row.get("path_status") or "").strip()
+        changed_symbol = str(row.get("changed_symbol") or "").strip()
+        if path_status == "reachable" and str(row.get("conclusion") or "").strip() == "已确认影响":
+            unexplained_reachable.append(index)
+        if path_status == "reachable" and changed_symbol:
+            chain_text = " ".join(
+                str(row.get(field) or "")
+                for field in ("chain_target", "chain_detail", "path_text")
+            )
+            if changed_symbol not in chain_text:
+                suspicious_reachable.append({
+                    "row": index,
+                    "changed_symbol": changed_symbol,
+                    "chain_target": row.get("chain_target") or "",
+                    "path_text": row.get("path_text") or "",
+                })
+    if readable_blank:
+        failures.append(f"alerts_readable_fields_blank_rows:{len(readable_blank)}")
+    if unreadable_markers:
+        failures.append(f"alerts_internal_markers_in_human_fields:{len(unreadable_markers)}")
+    if unexplained_reachable:
+        failures.append(f"alerts_reachable_conclusion_without_explanation:{len(unexplained_reachable)}")
+    if suspicious_reachable:
+        failures.append(f"reachable_chain_missing_target_symbol:{len(suspicious_reachable)}")
+
+    status_counts: dict[str, int] = {}
+    for row in alert_rows:
+        status = str(row.get("path_status") or "<blank>").strip() or "<blank>"
+        status_counts[status] = status_counts.get(status, 0) + 1
+    if not alert_rows:
+        failures.append("alerts_no_rows")
+    if not changed_rows:
+        failures.append("changed_apis_no_rows")
+    if len(missing_alert_identities) > 50:
+        warnings.append("large_missing_alert_identity_sample_truncated")
+    if len(suspicious_reachable) > 50:
+        warnings.append("suspicious_reachable_sample_truncated")
+
+    return {
+        "changed_api_rows": len(changed_rows),
+        "changed_api_unique_identities": len(changed_identities),
+        "alert_rows": len(alert_rows),
+        "alert_unique_identities": len(alert_identities),
+        "alert_status_counts": status_counts,
+        "missing_alert_identities": [
+            {"api_name": api, "api_signature": sig, "symbol_kind": kind}
+            for api, sig, kind in missing_alert_identities[:50]
+        ],
+        "suspicious_reachable": suspicious_reachable[:50],
+        "unreadable_markers": unreadable_markers[:50],
+        "unexplained_reachable": unexplained_reachable[:50],
+        "failures": failures,
+        "warnings": warnings,
+    }
 
 
 def collect_source_shape_metrics(project_root: Path, patterns: dict[str, str]) -> dict[str, dict[str, int]]:
@@ -837,7 +977,14 @@ def load_summary(report_dir: Path) -> dict:
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
-def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, report_root: Path) -> dict:
+def run_case(
+    case: RealProjectCase,
+    project_root: Path,
+    changed_apis: Path,
+    report_root: Path,
+    *,
+    full_step4_apis: bool = False,
+) -> dict:
     if not project_root.exists():
         return {"case": case.name, "status": "skipped", "reason": f"project root missing: {project_root}"}
     report_dir = report_root / case.name
@@ -857,27 +1004,60 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
                 f"elapsed={float(step4_result.get('elapsed_seconds') or 0.0):.2f}s "
                 f"over_budget={case.max_step4_elapsed_seconds:.2f}s"
             )
-        selected_names = case.expected_step4_api_names or tuple(
-            str(row.get("api_name") or "").strip()
-            for row in case.changed_api_rows
-            if str(row.get("api_name") or "").strip()
-        )
-        step4_selection = select_step4_changed_apis(
-            step4_all_changed_apis,
-            selected_names,
-            report_dir / "evidence" / "api_changes" / "selected_all_changed_apis.csv",
-        )
-        for missing in step4_selection.get("missing_api_names") or []:
-            failures.append(f"step4_missing_expected_api:{missing}")
-        if int(step4_selection.get("selected_rows") or 0) <= 0:
-            failures.append("step4_selected_changed_apis_empty")
-        changed_apis = Path(step4_selection.get("selected") or "")
+        if full_step4_apis:
+            _, step4_rows = _csv_rows(step4_all_changed_apis)
+            step4_api_names = {
+                str(row.get("api_name") or "").strip()
+                for row in step4_rows
+                if str(row.get("api_name") or "").strip()
+            }
+            expected_names = {
+                str(name or "").strip()
+                for name in (case.expected_step4_api_names or ())
+                if str(name or "").strip()
+            }
+            missing_expected = sorted(expected_names - step4_api_names)
+            step4_selection = {
+                "status": "full",
+                "source": str(step4_all_changed_apis),
+                "selected": str(step4_all_changed_apis),
+                "total_rows": len(step4_rows),
+                "selected_rows": len(step4_rows),
+                "missing_api_names": missing_expected,
+            }
+            for missing in missing_expected:
+                failures.append(f"step4_missing_expected_api:{missing}")
+            if int(step4_selection.get("selected_rows") or 0) <= 0:
+                failures.append("step4_full_changed_apis_empty")
+            changed_apis = step4_all_changed_apis
+        else:
+            selected_names = case.expected_step4_api_names or tuple(
+                str(row.get("api_name") or "").strip()
+                for row in case.changed_api_rows
+                if str(row.get("api_name") or "").strip()
+            )
+            step4_selection = select_step4_changed_apis(
+                step4_all_changed_apis,
+                selected_names,
+                report_dir / "evidence" / "api_changes" / "selected_all_changed_apis.csv",
+            )
+            for missing in step4_selection.get("missing_api_names") or []:
+                failures.append(f"step4_missing_expected_api:{missing}")
+            if int(step4_selection.get("selected_rows") or 0) <= 0:
+                failures.append("step4_selected_changed_apis_empty")
+            changed_apis = Path(step4_selection.get("selected") or "")
     else:
         changed_apis = ensure_changed_apis(
             case,
             changed_apis,
             report_dir / "evidence" / "api_changes" / "all_changed_apis.csv",
         )
+    performance_budget = (
+        case.max_full_step4_api_elapsed_seconds
+        if full_step4_apis and case.max_full_step4_api_elapsed_seconds
+        else case.max_elapsed_seconds
+    )
+
     if not changed_apis.exists():
         if failures:
             return {
@@ -887,7 +1067,7 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
                 "changed_apis": str(changed_apis),
                 "report_dir": str(report_dir),
                 "elapsed_seconds": 0.0,
-                "performance_budget_seconds": case.max_elapsed_seconds,
+                "performance_budget_seconds": performance_budget,
                 "step4": step4_result,
                 "step4_selection": step4_selection,
                 "step5_returncode": None,
@@ -910,6 +1090,7 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
     checks = []
     step6_result = {}
     query_results = []
+    result_audit = {}
 
     for name, minimum_files in (case.min_source_shape_files or {}).items():
         actual_files = int((source_shape_metrics.get(name) or {}).get("files") or 0)
@@ -929,14 +1110,18 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         failures.append(
             f"graph_stats: truncated={graph_stats['truncated']} edge_cap_hits={graph_stats['edge_cap_hits']}"
         )
-    if case.max_elapsed_seconds and elapsed > case.max_elapsed_seconds:
-        failures.append(f"performance: elapsed={elapsed:.2f}s over_budget={case.max_elapsed_seconds:.2f}s")
+    if performance_budget and elapsed > performance_budget:
+        failures.append(f"performance: elapsed={elapsed:.2f}s over_budget={performance_budget:.2f}s")
     if not alerts_csv.exists():
         failures.append("alerts.csv missing")
     elif alerts_csv.stat().st_size == 0:
         failures.append("alerts.csv empty")
     if (report_dir / "evidence" / "call_chain" / "alerts_reachable.csv").exists() is False:
         warnings.append("alerts_reachable.csv missing")
+
+    result_audit = audit_analysis_outputs(changed_apis, alerts_csv, summary)
+    failures.extend(result_audit.get("failures") or [])
+    warnings.extend(result_audit.get("warnings") or [])
 
     for spec in case.baseline_specs:
         production_baseline, test_baseline, occurrences = collect_baseline_files(project_root, spec)
@@ -975,6 +1160,12 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
             failures.append("step6_report_missing_or_empty")
         else:
             report_text = report_path.read_text(encoding="utf-8", errors="ignore")
+            for marker in (
+                "__business__", "**business**", "<class>", "<clinit>",
+                "源码图存在目标调用", "revision/profile", "fallback simple key",
+            ):
+                if marker in report_text:
+                    failures.append(f"step6_report_internal_marker:{marker}")
             for expected in case.expected_report_texts:
                 if expected not in report_text:
                     failures.append(f"step6_report_missing_text:{expected}")
@@ -1004,7 +1195,7 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         "changed_apis": str(changed_apis),
         "report_dir": str(report_dir),
         "elapsed_seconds": round(elapsed, 2),
-        "performance_budget_seconds": case.max_elapsed_seconds,
+        "performance_budget_seconds": performance_budget,
         "step4": step4_result,
         "step4_selection": step4_selection,
         "step5_returncode": returncode,
@@ -1020,6 +1211,7 @@ def run_case(case: RealProjectCase, project_root: Path, changed_apis: Path, repo
         "step6": step6_result,
         "queries": query_results,
         "checks": checks,
+        "result_audit": result_audit,
         "failures": failures,
         "warnings": warnings,
     }
@@ -1030,6 +1222,11 @@ def parse_args(argv=None):
     parser.add_argument("--case", choices=sorted(CASES.keys()) + ["all"], default="all")
     parser.add_argument("--project-root", help="Override project root for a single --case run.")
     parser.add_argument("--changed-apis", help="Override all_changed_apis.csv for a single --case run.")
+    parser.add_argument(
+        "--full-step4-apis",
+        action="store_true",
+        help="For cases with Step4 enabled, feed the full Step4 all_changed_apis.csv into Step5 instead of probe selection.",
+    )
     parser.add_argument(
         "--report-root",
         default="/private/tmp/java-upgrade-real-project-regression",
@@ -1051,7 +1248,15 @@ def main(argv=None):
             raise SystemExit("--project-root/--changed-apis can only be used with a single --case")
         project_root = Path(args.project_root) if args.project_root else case.default_project
         changed_apis = Path(args.changed_apis) if args.changed_apis else case.default_changed_apis
-        results.append(run_case(case, project_root, changed_apis, report_root))
+        results.append(
+            run_case(
+                case,
+                project_root,
+                changed_apis,
+                report_root,
+                full_step4_apis=args.full_step4_apis,
+            )
+        )
 
     failed = any(item.get("status") == "failed" for item in results)
     payload = {"status": "failed" if failed else "passed", "results": results}
@@ -1083,6 +1288,12 @@ def main(argv=None):
                     f"total_rows={selection.get('total_rows')} missing={selection.get('missing_api_names')}"
                 )
             print(f"  summary: {item['summary']}")
+            if item.get("result_audit"):
+                audit = item.get("result_audit") or {}
+                print(
+                    "  result_audit: changed_api_rows={changed_api_rows} "
+                    "alert_rows={alert_rows} statuses={alert_status_counts}".format(**audit)
+                )
             if item.get("graph_stats"):
                 print(f"  graph_stats: {item['graph_stats']}")
             if item.get("step6"):

@@ -12,7 +12,7 @@ s6_report.py — Step 6：汇总报告
     --output-report   .upgrade-report/deliverables/report.md
 """
 
-import argparse, csv, json, os, sys
+import argparse, csv, json, os, re, sys
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -91,6 +91,11 @@ def _step5_summary_coverage_fallback(call_summary):
 
     components = []
     critical = []
+    total_apis = int((call_summary or {}).get('total_apis') or 0)
+    all_symbols_preserved = bool(
+        total_apis
+        and int((call_summary or {}).get('not_impacted') or 0) == total_apis
+    )
 
     def add_component(component_id, status, reason_codes=None, evidence=None, critical_if_incomplete=True):
         status = str(status or 'unknown')
@@ -115,7 +120,9 @@ def _step5_summary_coverage_fallback(call_summary):
         business_reason_codes.append('parser_fallback')
     add_component(
         'business_reachability',
-        'partial' if (truncated or parser_fallback_reasons or edge_cap_hits) else 'complete',
+        'not_applicable' if all_symbols_preserved else (
+            'partial' if (truncated or parser_fallback_reasons or edge_cap_hits) else 'complete'
+        ),
         business_reason_codes,
         truncation_reasons,
     )
@@ -124,7 +131,7 @@ def _step5_summary_coverage_fallback(call_summary):
     if source_alignment:
         add_component(
             'source_artifact_alignment',
-            source_alignment.get('status') or 'unknown',
+            'not_applicable' if all_symbols_preserved else (source_alignment.get('status') or 'unknown'),
             source_alignment.get('reason_codes') or [],
             [source_alignment.get('artifact_path') or source_alignment.get('git_root') or ''],
         )
@@ -141,7 +148,7 @@ def _step5_summary_coverage_fallback(call_summary):
     if business_bytecode:
         add_component(
             'business_bytecode_graph',
-            business_bytecode.get('status') or 'unknown',
+            'not_applicable' if all_symbols_preserved else (business_bytecode.get('status') or 'unknown'),
             business_bytecode.get('failures') or [],
             critical_if_incomplete=False,
         )
@@ -150,7 +157,7 @@ def _step5_summary_coverage_fallback(call_summary):
     if indirect_usage:
         add_component(
             'indirect_usage_matrix',
-            indirect_usage.get('status') or 'unknown',
+            'not_applicable' if all_symbols_preserved else (indirect_usage.get('status') or 'unknown'),
             indirect_usage.get('reason_codes') or [],
         )
 
@@ -171,8 +178,17 @@ def _step5_summary_coverage_fallback(call_summary):
 
 
 S6_DETAIL_BUCKETS = {
+    "not_impacted": {
+        "title": "已确认不受影响清单",
+        "conclusion": "已确认不受影响",
+        "csv": "s6_not_impacted_apis.csv",
+        "md": "s6_not_impacted_apis.md",
+        "summary_key": "",
+        "note": "最终制品证据证明这些变更 API 仍由其他运行时 JAR 以完全相同的 class 字节码提供。",
+    },
     "uncertain": {
         "title": "需人工复核清单",
+        "conclusion": "需要人工复核",
         "csv": "s6_uncertain_apis.csv",
         "md": "s6_uncertain_apis.md",
         "summary_key": "uncertain_reason_summary",
@@ -180,6 +196,7 @@ S6_DETAIL_BUCKETS = {
     },
     "probable_impact": {
         "title": "可能影响完整清单",
+        "conclusion": "可能影响",
         "csv": "s6_probable_impact_apis.csv",
         "md": "s6_probable_impact_apis.md",
         "summary_key": "not_analyzed_reason_summary",
@@ -187,6 +204,7 @@ S6_DETAIL_BUCKETS = {
     },
     "needs_input": {
         "title": "缺少依赖源码/构建产物，无法回溯调用链清单",
+        "conclusion": "需要补充输入",
         "csv": "s6_needs_input_apis.csv",
         "md": "s6_needs_input_apis.md",
         "summary_key": "not_analyzed_reason_summary",
@@ -194,6 +212,7 @@ S6_DETAIL_BUCKETS = {
     },
     "not_analyzed": {
         "title": "本次未完成分析清单",
+        "conclusion": "本次未完成分析",
         "csv": "s6_not_analyzed_apis.csv",
         "md": "s6_not_analyzed_apis.md",
         "summary_key": "not_analyzed_reason_summary",
@@ -201,6 +220,7 @@ S6_DETAIL_BUCKETS = {
     },
     "not_found": {
         "title": "未发现调用路径清单",
+        "conclusion": "静态分析未找到调用路径（不等于确定不影响）",
         "csv": "s6_not_found_apis.csv",
         "md": "s6_not_found_apis.md",
         "summary_key": "not_found_reason_summary",
@@ -264,6 +284,19 @@ def summarize_item_reason_codes(items):
     counts = defaultdict(int)
     for item in items or []:
         counts[item.get("reason_code") or "UNKNOWN"] += 1
+    return dict(sorted(counts.items(), key=lambda x: (-x[1], x[0])))
+
+
+def summarize_item_reasons(items):
+    """Summarize human explanations without exposing internal reason codes."""
+    counts = defaultdict(int)
+    for item in items or []:
+        reason = str(
+            item.get("user_reason")
+            or item.get("reason")
+            or "未提供足够证据说明原因"
+        ).strip()
+        counts[reason] += 1
     return dict(sorted(counts.items(), key=lambda x: (-x[1], x[0])))
 
 
@@ -375,17 +408,18 @@ def _change_summary(item, severity=''):
     return "，".join(pieces)
 
 
-def _detail_row(idx, item):
+def _detail_row(idx, item, conclusion=''):
     reason = item.get("user_reason") or item.get("reason") or item.get("recommended_action") or ""
     return (
         f"| {idx} | `{_md_cell(item.get('coord'))}` | `{_md_cell(item.get('api'))}` | "
         f"{_md_cell(_change_summary(item), 220)} | "
-        f"`{_md_cell(item.get('reason_code'))}` | {_md_cell(reason)} |"
+        f"{_md_cell(conclusion or item.get('user_conclusion') or _bucket_csv_conclusion('', item))} | "
+        f"{_md_cell(reason)} |"
     )
 
 
 def build_bucket_detail_markdown(config, items, csv_name):
-    reason_summary = summarize_item_reason_codes(items)
+    reason_summary = summarize_item_reasons(items)
     coord_summary = summarize_item_coords(items)
     lines = [
         f"# {config.get('title') or 'S6 明细'}",
@@ -396,20 +430,20 @@ def build_bucket_detail_markdown(config, items, csv_name):
         "",
         "## 文件说明",
         "",
-        "- “原因分类”和“依赖坐标分布”用于展示该桶内条目的聚集情况。",
+        "- “原因分类”和“依赖坐标分布”用于展示该清单内条目的聚集情况。",
         "- Markdown 展示样例或完整明细；CSV 是该桶的完整全集。",
-        "- CSV 字段可按 `coord`、`reason_code`、`api` 过滤。",
+        "- CSV 优先查看开头的结论、变化、复核原因和调用链字段；需要筛选时可使用依赖坐标或变更 API。",
         "",
     ]
     if reason_summary:
         lines += [
             "## 原因分类",
             "",
-            "| 原因码 | 数量 |",
+            "| 原因 | 数量 |",
             "|---|---:|",
         ]
-        for reason_code, count in reason_summary.items():
-            lines.append(f"| `{_md_cell(reason_code)}` | {count} |")
+        for reason, count in reason_summary.items():
+            lines.append(f"| {_md_cell(reason)} | {count} |")
         lines.append("")
     if coord_summary:
         lines += [
@@ -431,11 +465,11 @@ def build_bucket_detail_markdown(config, items, csv_name):
         lines += [
             "## API 明细（完整）",
             "",
-            "| # | 依赖坐标 | API | 变化 | 原因码 | 说明 |",
+            "| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 |",
             "|---:|---|---|---|---|---|",
         ]
         for idx, item in enumerate(items, 1):
-            lines.append(_detail_row(idx, item))
+            lines.append(_detail_row(idx, item, config.get('conclusion') or ''))
         lines.append("")
     else:
         lines += [
@@ -443,11 +477,11 @@ def build_bucket_detail_markdown(config, items, csv_name):
             "",
             f"> 本桶共有 {len(items)} 条，Markdown 只展示样例，避免明细文件自身难以阅读或预览失败；完整全集请看 `{csv_name}`。",
             "",
-            "| # | 依赖坐标 | API | 变化 | 原因码 | 说明 |",
+            "| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 |",
             "|---:|---|---|---|---|---|",
         ]
         for idx, item in enumerate(items[:S6_DETAIL_MD_SAMPLE_LIMIT], 1):
-            lines.append(_detail_row(idx, item))
+            lines.append(_detail_row(idx, item, config.get('conclusion') or ''))
         lines += [
             "",
             f"> 其余 {len(items) - S6_DETAIL_MD_SAMPLE_LIMIT} 条未在 Markdown 展开，请在 CSV 中筛选查看。",
@@ -466,12 +500,20 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
             if item.get("user_conclusion") not in {"可能影响", "需要补充输入"}
         ]
     artifacts = {}
-    if not items:
-        return artifacts
     report_path = _deliverables_dir(report_dir)
-    report_path.mkdir(parents=True, exist_ok=True)
     csv_path = report_path / config.get("csv", f"s6_{bucket_name}_apis.csv")
     md_path = report_path / config.get("md", f"s6_{bucket_name}_apis.md")
+    if not items:
+        # A rerun can legitimately move every item out of a bucket.  Keeping the
+        # previous files would expose stale conclusions to users and contradict
+        # the new report counts, so empty buckets must actively remove them.
+        for stale_path in (csv_path, md_path):
+            try:
+                stale_path.unlink()
+            except FileNotFoundError:
+                pass
+        return artifacts
+    report_path.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "conclusion",
         "change_summary",
@@ -519,6 +561,8 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
 
 
 def _bucket_csv_conclusion(bucket_name, item):
+    if bucket_name == "not_impacted":
+        return "已确认不受影响"
     if bucket_name == "not_found":
         return "未发现静态调用路径"
     if bucket_name == "not_analyzed":
@@ -529,6 +573,7 @@ def _bucket_csv_conclusion(bucket_name, item):
     return {
         "probable_impact": "可能影响",
         "uncertain": "需要人工复核",
+        "not_impacted": "已确认不受影响",
         "needs_input": "需要补充输入",
         "not_analyzed": "未完成分析",
         "not_found": "未发现静态调用路径",
@@ -559,7 +604,7 @@ def _csv_chain_view(item):
     if not nodes:
         return {"summary": "未形成完整链路", "entry": "", "target": "", "hop_count": "", "detail": ""}
     entry = nodes[0]
-    target = nodes[-1]
+    target = _strip_changed_api_marker(nodes[-1])
     hop_count = max(0, len(nodes) - 1)
     return {
         "summary": f"入口：{entry}；终点：{target}；{hop_count} 跳" if len(nodes) >= 2 else f"未形成完整链路；目标 API：{target}",
@@ -568,6 +613,14 @@ def _csv_chain_view(item):
         "hop_count": str(hop_count) if len(nodes) >= 2 else "",
         "detail": " -> ".join(f"{idx}. {node}" for idx, node in enumerate(nodes, 1)),
     }
+
+
+def _strip_changed_api_marker(value):
+    value = str(value or "").strip()
+    marker = "变更API:"
+    if value.startswith(marker):
+        return value[len(marker):].strip()
+    return value
 
 
 def _split_csv_chain_nodes(path_text):
@@ -601,6 +654,23 @@ def write_s6_detail_artifacts(report_dir, findings):
         artifacts.update(write_bucket_detail_artifacts(report_dir, findings, bucket_name))
     artifacts.update(write_changed_api_split_artifacts(report_dir))
     return artifacts
+
+
+def available_s6_detail_artifacts(findings):
+    """Return only bucket detail files produced by the current Step6 run."""
+    artifacts = (findings or {}).get("artifacts") or {}
+    rows = []
+    for bucket_name, config in S6_DETAIL_BUCKETS.items():
+        csv_key = f"{bucket_name}_csv"
+        md_key = f"{bucket_name}_md"
+        if not artifacts.get(csv_key) or not artifacts.get(md_key):
+            continue
+        rows.append({
+            "bucket": bucket_name,
+            "path": f"deliverables/{config['csv'][:-4]}.csv/md",
+            "title": config.get("title") or bucket_name,
+        })
+    return rows
 
 
 def write_changed_api_split_artifacts(report_dir):
@@ -697,6 +767,8 @@ def _impact_bucket(row):
     business_reachable = str(row.get("business_reachable") or "").strip().lower()
     if status == "reachable" or conclusion == "confirmed" or business_reachable == "true":
         return "confirmed"
+    if status == "not_impacted" or conclusion == "confirmed_no_impact":
+        return "not_impacted"
     if status in {"uncertain", "not_analyzed"} or conclusion in {"candidate", "incomplete"}:
         return "review"
     if status == "not_found_in_static_analysis":
@@ -705,7 +777,7 @@ def _impact_bucket(row):
 
 
 def _bucket_rank(bucket):
-    return {"confirmed": 0, "review": 1, "not_found": 2, "unknown": 3}.get(bucket or "unknown", 9)
+    return {"confirmed": 0, "review": 1, "not_impacted": 2, "not_found": 3, "unknown": 4}.get(bucket or "unknown", 9)
 
 
 def _impact_sort_key(item):
@@ -747,10 +819,13 @@ def build_impact_overview(alert_rows):
             "path_count": 0,
             "entries": set(),
             "paths": [],
+            "paths_by_status": defaultdict(list),
+            "path_counts_by_status": defaultdict(int),
             "files": set(),
             "modules": set(),
             "actions": set(),
             "reasons": set(),
+            "api_ids": set(),
         })
         if _bucket_rank(bucket) < _bucket_rank(item["bucket"]):
             item["bucket"] = bucket
@@ -761,6 +836,10 @@ def build_impact_overview(alert_rows):
         except ValueError:
             occurrence_count = 1
         item["path_count"] += occurrence_count
+        item["path_counts_by_status"][status] += occurrence_count
+        api_id = str(row.get("api_id") or "").strip()
+        if api_id:
+            item["api_ids"].add(api_id)
 
         entry = str(row.get("business_entry") or "").strip()
         if not entry:
@@ -773,6 +852,8 @@ def build_impact_overview(alert_rows):
         path_text = str(row.get("path_text") or "").strip()
         if path_text and path_text not in item["paths"]:
             item["paths"].append(path_text)
+        if path_text and path_text not in item["paths_by_status"][status]:
+            item["paths_by_status"][status].append(path_text)
         for raw_file in str(row.get("evidence_files") or "").split("|"):
             raw_file = raw_file.strip()
             if raw_file:
@@ -812,6 +893,7 @@ def build_impact_overview(alert_rows):
     for item in api_map.values():
         status_counts = dict(sorted(item["status_counts"].items(), key=lambda x: (-x[1], x[0])))
         api_items.append({
+            "api_id": next(iter(item["api_ids"])) if len(item["api_ids"]) == 1 else "",
             "coord": item["coord"],
             "api": item["api"],
             "api_signature": item["api_signature"],
@@ -826,6 +908,11 @@ def build_impact_overview(alert_rows):
             "sample_entries": sorted(item["entries"])[:3],
             "sample_paths": item["paths"][:2],
             "paths": item["paths"][:10],
+            "paths_by_status": {
+                status: paths[:10]
+                for status, paths in item["paths_by_status"].items()
+            },
+            "path_counts_by_status": dict(item["path_counts_by_status"]),
             "sample_files": [_short_path(path) for path in sorted(item["files"])[:3]],
             "sample_actions": sorted(item["actions"])[:2],
             "sample_reasons": sorted(item["reasons"])[:2],
@@ -849,6 +936,7 @@ def build_impact_overview(alert_rows):
         "apis": api_items,
         "confirmed_apis": [item for item in api_items if item.get("bucket") == "confirmed"],
         "review_apis": [item for item in api_items if item.get("bucket") == "review"],
+        "not_impacted_apis": [item for item in api_items if item.get("bucket") == "not_impacted"],
         "not_found_apis": [item for item in api_items if item.get("bucket") == "not_found"],
         "business_entries": entry_items,
     }
@@ -882,6 +970,7 @@ def collect_findings(d):
         'p2':                  [],
         'uncertain':           [],
         'probable_impact':     [],
+        'not_impacted':        [],
         'needs_input':         [],
         'not_analyzed':        [],
         'not_found':           [],
@@ -981,10 +1070,30 @@ def collect_findings(d):
         findings['scan_stats']['call_chain_status'] = call_summary.get('status', 'done')
         findings['scan_stats']['call_chain_skip_reason'] = call_summary.get('skip_reason', '')
         findings['scan_stats']['call_chain_reachable']   = call_summary.get('reachable', 0)
+        findings['scan_stats']['call_chain_not_impacted'] = call_summary.get('not_impacted', 0)
         findings['scan_stats']['call_chain_not_found_in_static_analysis'] = not_found_count
         findings['scan_stats']['call_chain_unreachable'] = not_found_count  # 向后兼容旧字段名
         findings['scan_stats']['call_chain_uncertain']   = call_summary.get('uncertain', 0)
         findings['scan_stats']['call_chain_not_analyzed'] = call_summary.get('not_analyzed', 0)
+
+        for api_info in call_summary.get('not_impacted_apis', []):
+            findings['not_impacted'].append({
+                'coord': api_info.get('coord', ''),
+                'api': api_info.get('api', ''),
+                'api_signature': api_info.get('api_signature', ''),
+                'symbol_kind': api_info.get('symbol_kind', ''),
+                'change_type': api_info.get('change_type', ''),
+                'severity': api_info.get('severity', ''),
+                'call_paths': api_info.get('call_paths', []),
+                'reason_code': api_info.get('reason_code', ''),
+                'reason': api_info.get('reason', ''),
+                'user_conclusion': api_info.get('user_conclusion', ''),
+                'user_reason': api_info.get('user_reason', ''),
+                'recommended_action': api_info.get('recommended_action', ''),
+                'key_evidence': api_info.get('key_evidence', ''),
+                'dependency_chain_coords': api_info.get('dependency_chain_coords', []),
+                'evidence_paths': [],
+            })
 
         for api_info in call_summary.get('reachable_apis', []):
             sev   = api_info.get('severity', 'P2')
@@ -1112,7 +1221,7 @@ def collect_findings(d):
             if identity_key[0] and identity_key[1]:
                 by_api_lookup[identity_key] = payload
 
-    for bucket_name in ('p0', 'p1', 'p2', 'uncertain', 'not_analyzed', 'not_found'):
+    for bucket_name in ('p0', 'p1', 'p2', 'uncertain', 'not_impacted', 'not_analyzed', 'not_found'):
         for item in findings[bucket_name]:
             payload = by_api_lookup.get(build_api_identity_key(item), {})
             if payload:
@@ -1328,6 +1437,8 @@ def _status_label_from_item(item):
         return '已确认影响'
     if bucket == 'review':
         return '需要人工复核'
+    if bucket == 'not_impacted':
+        return '已确认不受影响'
     if bucket == 'not_found':
         return '未发现调用路径'
     return '待确认'
@@ -1464,11 +1575,14 @@ def render_core_conclusion(findings):
         if item.get('user_conclusion') not in {'可能影响', '需要补充输入'}
     ]
     not_found = findings.get('not_found') or []
+    not_impacted = findings.get('not_impacted') or []
     confirmed_count = len(p0) + len(p1) + len(p2)
     if confirmed_count:
         verdict = f"发现 {confirmed_count} 个已确认/高风险影响项。"
     elif probable or uncertain or needs_input or not_analyzed:
         verdict = "本次报告未确认任何已影响当前系统的变更 API。仍有条目需要复核或补齐依赖源码/构建产物。"
+    elif not_impacted and not (probable or uncertain or needs_input or not_analyzed or not_found):
+        verdict = f"Step4 识别的 {len(not_impacted)} 个变更 API 均已确认仍由当前制品以相同字节码提供。"
     elif not_found:
         verdict = "未发现业务调用路径。"
     else:
@@ -1482,12 +1596,13 @@ def render_core_conclusion(findings):
         "|---|---|",
         f"| 调用链分析状态 | `{stat.get('call_chain_status', 'unknown')}` |",
         f"| 已确认/高风险影响项 | {confirmed_count} |",
+        f"| 已确认不受影响 | {len(not_impacted)} |",
         f"| 可能影响 | {len(probable)} |",
         f"| 需人工复核 | {len(uncertain)} |",
         f"| 缺少依赖源码/构建产物，无法回溯调用链 | {len(needs_input)} |",
         f"| 本次未完成分析 | {len(not_analyzed)} |",
         f"| 未发现调用路径 | {len(not_found)} |",
-        f"| 分析完整度 | {_coverage_status_label(coverage.get('overall_status'))} |",
+        f"| 分析完整度 | {'API 范围内完整' if not_impacted and len(not_impacted) == int(stat.get('call_chain_total') or len(not_impacted)) else _coverage_status_label(coverage.get('overall_status'))} |",
         "",
     ]
     return lines
@@ -1509,6 +1624,8 @@ def _change_cell(item, severity=''):
 
 def _conclusion_for_report(item, fallback):
     conclusion = str(item.get('user_conclusion') or '').strip()
+    if fallback == '已确认/高风险影响' and conclusion == '已确认影响':
+        return conclusion
     if conclusion and fallback and fallback != conclusion:
         return _display_label(f"{fallback}；{conclusion}")
     if conclusion:
@@ -1516,17 +1633,29 @@ def _conclusion_for_report(item, fallback):
     return _display_label(fallback)
 
 
-def _paths_for_report(item, overview_lookup):
+def _paths_for_report(item, overview_lookup, desired_statuses=None):
     paths = []
-    overview = overview_lookup.get(_identity_without_severity(item)) or {}
-    for path in overview.get('paths') or overview.get('sample_paths') or []:
+    identity = _identity_without_severity(item)
+    overview_found = identity in overview_lookup
+    overview = overview_lookup.get(identity) or {}
+    overview_paths = []
+    paths_by_status = overview.get('paths_by_status') or {}
+    for status in desired_statuses or []:
+        overview_paths.extend(paths_by_status.get(status) or [])
+    if not overview_paths and not desired_statuses:
+        overview_paths = overview.get('paths') or overview.get('sample_paths') or []
+    for path in overview_paths:
         text = str(path or '').strip()
         if text and text not in paths:
             paths.append(text)
-    for path in item.get('call_paths') or []:
-        text = str(path or '').strip()
-        if text and text not in paths:
-            paths.append(text)
+    # alerts.csv keeps paths partitioned by path_status. Summary call_paths may
+    # mix reachable and uncertain evidence, so it is only a fallback when the
+    # exact-identity overview has no path for the requested status.
+    if not paths and not overview_found:
+        for path in item.get('call_paths') or []:
+            text = str(path or '').strip()
+            if text and text not in paths:
+                paths.append(text)
     if not paths:
         for evidence_path in item.get('evidence_paths') or []:
             edge_texts = []
@@ -1542,9 +1671,13 @@ def _paths_for_report(item, overview_lookup):
     return paths[:5]
 
 
-def _path_count_for_report(item, overview_lookup, sampled_paths):
+def _path_count_for_report(item, overview_lookup, sampled_paths, desired_statuses=None):
     overview = overview_lookup.get(_identity_without_severity(item)) or {}
-    raw_count = overview.get('path_count')
+    if desired_statuses:
+        counts = overview.get('path_counts_by_status') or {}
+        raw_count = sum(int(counts.get(status) or 0) for status in desired_statuses)
+    else:
+        raw_count = overview.get('path_count')
     try:
         count = int(raw_count)
     except (TypeError, ValueError):
@@ -1552,13 +1685,45 @@ def _path_count_for_report(item, overview_lookup, sampled_paths):
     return max(count, len(sampled_paths or []))
 
 
+def _evidence_anchor(api_id):
+    normalized = re.sub(
+        r"[^a-z0-9_-]+",
+        "-",
+        str(api_id or "").strip().lower(),
+    ).strip("-")
+    return f"api-{normalized}" if normalized else ""
+
+
+def _linked_evidence_text(row, text, link_label):
+    anchor = _evidence_anchor(row.get('api_id'))
+    if not anchor:
+        return text
+    return f"[{text}。{link_label}](#{anchor})"
+
+
 def _evidence_summary_text(row):
     paths = row.get('paths') or []
     if paths:
+        preserved = str(row.get('conclusion') or '') == '已确认不受影响'
+        if row.get('confirmed_path_count'):
+            text = f"已确认链路 {int(row.get('confirmed_path_count') or 0)} 条"
+            uncertain_count = int(row.get('uncertain_path_count') or 0)
+            not_analyzed_count = int(row.get('not_analyzed_path_count') or 0)
+            if uncertain_count:
+                text += f"；另有 {uncertain_count} 条依赖引用尚未回溯到业务入口"
+            if not_analyzed_count:
+                text += f"；另有 {not_analyzed_count} 条证据未完成分析"
+            return _linked_evidence_text(row, text, '查看具体链路')
+        evidence_label = '符号保留证据' if preserved else '调用链证据'
         path_count = int(row.get('path_count') or len(paths))
-        if path_count > len(paths):
-            return f"有调用链证据；展示 {len(paths)} 条样例，台账命中 {path_count} 次"
-        return f"有 {len(paths)} 条调用链证据"
+        if preserved:
+            text = f"发现 {path_count} 条{evidence_label}"
+            return _linked_evidence_text(row, text, '查看具体证据')
+        if 'not_analyzed' in set(row.get('evidence_statuses') or []):
+            text = f"发现 {path_count} 条分析证据，但本项未完成有效分析"
+            return _linked_evidence_text(row, text, '查看证据详情')
+        text = f"发现 {path_count} 条依赖引用，尚未回溯到业务入口"
+        return _linked_evidence_text(row, text, '查看引用详情')
     reason = _human_reason(row.get('reason'))
     return reason or "-"
 
@@ -1567,27 +1732,120 @@ def _render_path_sample_cards(rows):
     cards = []
     for idx, row in enumerate(rows, 1):
         paths = row.get('paths') or []
-        if not paths:
+        uncertain_paths = row.get('uncertain_paths') or []
+        not_analyzed_paths = row.get('not_analyzed_paths') or []
+        if not paths and not uncertain_paths and not not_analyzed_paths:
             continue
         path_count = int(row.get('path_count') or len(paths))
+        confirmed_count = int(row.get('confirmed_path_count') or 0)
+        uncertain_count = int(row.get('uncertain_path_count') or 0)
+        not_analyzed_count = int(row.get('not_analyzed_path_count') or 0)
+        preserved = str(row.get('conclusion') or '') == '已确认不受影响'
+        api_id = str(row.get('api_id') or '').strip()
+        anchor = _evidence_anchor(api_id)
+        if anchor:
+            cards += [f'<a id="{anchor}"></a>', ""]
         cards += [
-            f"#### {idx}. `{_md_cell(row.get('api'), 220)}`",
+            f"#### {idx}. `{_md_cell(row.get('api'), 220)}` 的证据",
             "",
             f"- **依赖坐标**：`{_md_cell(row.get('coord'), 180)}`",
             f"- **变化**：{row.get('change') or '-'}",
             f"- **结论**：{_md_cell(row.get('conclusion'), 160)}",
-            f"- **链路数量**：展示 {len(paths)} 条样例；台账命中 {path_count} 次",
-            "- **调用链样例**：",
         ]
-        for path in paths:
-            cards.append(f"  - `{_md_cell(path, 320)}`")
+        if api_id:
+            cards.append(f"- **API 编号**：`{_md_cell(api_id, 160)}`")
+        if confirmed_count:
+            count_text = f"- **证据数量**：已确认链路 {confirmed_count} 条"
+            if uncertain_count:
+                count_text += f"；另有 {uncertain_count} 条依赖引用尚未回溯到业务入口"
+            if not_analyzed_count:
+                count_text += f"；另有 {not_analyzed_count} 条证据未完成分析"
+            cards.append(count_text)
+            cards += [
+                "",
+                f"**已确认链路（当前展示 {len(paths)} 条，共 {confirmed_count} 条）**：",
+                "",
+            ]
+            for path in paths:
+                cards.append(f"- `{_md_cell(path, 320)}`")
+            if uncertain_count:
+                cards += [
+                    "",
+                    f"**尚未回溯到业务入口的依赖引用（当前展示 {len(uncertain_paths)} 条，共 {uncertain_count} 条）**：",
+                    "",
+                ]
+                for path in uncertain_paths:
+                    cards.append(f"- `{_md_cell(path, 320)}`")
+            if not_analyzed_count:
+                cards += [
+                    "",
+                    f"**未完成有效分析的证据（当前展示 {len(not_analyzed_paths)} 条，共 {not_analyzed_count} 条）**：",
+                    "",
+                ]
+                for path in not_analyzed_paths:
+                    cards.append(f"- `{_md_cell(path, 320)}`")
+        else:
+            statuses = set(row.get('evidence_statuses') or [])
+            if preserved:
+                evidence_label = '符号保留证据'
+            elif 'not_analyzed' in statuses:
+                evidence_label = '未完成有效分析的证据'
+            else:
+                evidence_label = '依赖引用'
+            cards += [
+                f"- **证据数量**：{path_count} 条",
+                "",
+                f"**{evidence_label}（当前展示 {len(paths)} 条，共 {path_count} 条）**：",
+                "",
+            ]
+            for path in paths:
+                cards.append(f"- `{_md_cell(path, 320)}`")
+        if api_id:
+            cards += [
+                "",
+                (
+                    "完整证据：打开 `evidence/call_chain/alerts.csv`，"
+                    f"筛选 `api_id = {_md_cell(api_id, 160)}`。"
+                ),
+            ]
+            status_filters = []
+            if confirmed_count:
+                status_filters.append("`path_status = reachable` 是已确认链路")
+            if uncertain_count or (
+                not confirmed_count
+                and not preserved
+                and 'uncertain' in set(row.get('evidence_statuses') or [])
+            ):
+                status_filters.append(
+                    "`path_status = uncertain` 是尚未回溯到业务入口的依赖引用"
+                )
+            if not_analyzed_count or (
+                not confirmed_count
+                and 'not_analyzed' in set(row.get('evidence_statuses') or [])
+            ):
+                status_filters.append(
+                    "`path_status = not_analyzed` 是本次未完成有效分析的证据"
+                )
+            if status_filters:
+                cards.append("；".join(status_filters) + "。")
         cards.append("")
     if not cards:
         return []
+    has_symbol_evidence = any(row.get('conclusion') == '已确认不受影响' and row.get('paths') for row in rows)
+    has_call_chain = any(row.get('conclusion') != '已确认不受影响' and row.get('paths') for row in rows)
+    if has_call_chain and has_symbol_evidence:
+        title = '调用链与符号保留证据'
+        intro = '下面展示主表中的调用链和符号保留证据。'
+    elif has_symbol_evidence:
+        title = '符号保留证据'
+        intro = '下面展示变更 API 仍由当前制品以相同字节码提供的证据。'
+    else:
+        title = '调用链证据'
+        intro = '下面按 API 展示主表中的调用链证据。'
     return [
-        "### 3.1 调用链样例",
+        f"### 3.1 {title}",
         "",
-        "下面只展示主表中已找到链路的 API。完整逐链路台账以 `evidence/call_chain/alerts.csv` 为准。",
+        f"{intro}完整证据台账以 `evidence/call_chain/alerts.csv` 为准。",
         "",
     ] + cards
 
@@ -1630,6 +1888,7 @@ def build_api_result_rows(findings):
         ('已确认/高风险影响', 'P2', findings.get('p2') or []),
         ('可能影响', '', findings.get('probable_impact') or []),
         ('需人工复核', '', findings.get('uncertain') or []),
+        ('已确认不受影响', '', findings.get('not_impacted') or []),
         ('缺少依赖源码/构建产物，无法回溯调用链', '', findings.get('needs_input') or []),
         (
             '本次未完成分析',
@@ -1644,19 +1903,50 @@ def build_api_result_rows(findings):
     rows = []
     seen = set()
     for fallback_conclusion, severity, items in source_buckets:
+        desired_statuses = {
+            '已确认/高风险影响': ('reachable',),
+            '可能影响': ('not_analyzed',),
+            '需人工复核': ('uncertain',),
+            '已确认不受影响': ('not_impacted',),
+            '缺少依赖源码/构建产物，无法回溯调用链': ('not_analyzed',),
+            '本次未完成分析': ('not_analyzed',),
+            '未发现调用路径': ('not_found_in_static_analysis', 'not_reachable'),
+        }.get(fallback_conclusion, ())
         for item in items:
             key = (_identity_without_severity(item), fallback_conclusion, severity)
             if key in seen:
                 continue
             seen.add(key)
-            sampled_paths = _paths_for_report(item, overview_lookup)
+            sampled_paths = _paths_for_report(item, overview_lookup, desired_statuses)
+            overview = overview_lookup.get(_identity_without_severity(item)) or {}
+            counts_by_status = overview.get('path_counts_by_status') or {}
+            confirmed_path_count = int(counts_by_status.get('reachable') or 0)
+            additional_review_path_count = sum(
+                int(counts_by_status.get(status) or 0)
+                for status in ('uncertain', 'not_analyzed')
+            ) if fallback_conclusion == '已确认/高风险影响' else 0
+            uncertain_path_count = int(counts_by_status.get('uncertain') or 0)
+            not_analyzed_path_count = int(counts_by_status.get('not_analyzed') or 0)
+            paths_by_status = overview.get('paths_by_status') or {}
+            uncertain_paths = list(paths_by_status.get('uncertain') or [])[:5]
+            not_analyzed_paths = list(paths_by_status.get('not_analyzed') or [])[:5]
             rows.append({
+                'api_id': str(overview.get('api_id') or '').strip(),
                 'coord': item.get('coord', ''),
                 'api': item.get('api', '') or item.get('api_name', ''),
                 'change': _change_cell(item, severity),
                 'conclusion': _conclusion_for_report(item, fallback_conclusion),
                 'paths': sampled_paths,
-                'path_count': _path_count_for_report(item, overview_lookup, sampled_paths),
+                'uncertain_paths': uncertain_paths,
+                'not_analyzed_paths': not_analyzed_paths,
+                'evidence_statuses': list(desired_statuses),
+                'path_count': _path_count_for_report(
+                    item, overview_lookup, sampled_paths, desired_statuses
+                ),
+                'confirmed_path_count': confirmed_path_count if fallback_conclusion == '已确认/高风险影响' else 0,
+                'additional_review_path_count': additional_review_path_count,
+                'uncertain_path_count': uncertain_path_count,
+                'not_analyzed_path_count': not_analyzed_path_count,
                 'reason': item.get('user_reason') or item.get('reason') or item.get('reason_code') or '',
             })
     return rows
@@ -1687,9 +1977,13 @@ def render_api_result_table(findings):
     lines += [
         f"> 本表共有 {len(rows)} 条 API 分析结果，当前展示 {len(displayed)} 条，省略 {omitted_count} 条；"
         "完整逐链路台账见 `evidence/call_chain/alerts.csv`。",
-        "> 按结论拆分的完整明细见 `deliverables/s6_probable_impact_apis.csv/md`、`deliverables/s6_uncertain_apis.csv/md`、"
-        "`deliverables/s6_needs_input_apis.csv/md`、`deliverables/s6_not_analyzed_apis.csv/md`、`deliverables/s6_not_found_apis.csv/md`。",
-        "> 排序：已确认/高风险、可能影响、需人工复核、缺少依赖源码/构建产物，无法回溯调用链、本次未完成分析、未发现调用路径。",
+    ]
+    detail_rows = available_s6_detail_artifacts(findings)
+    if detail_rows:
+        detail_paths = "、".join(f"`{row['path']}`" for row in detail_rows)
+        lines.append(f"> 本轮已生成的分类明细：{detail_paths}。")
+    lines += [
+        "> 排序：已确认/高风险、可能影响、需人工复核、已确认不受影响、缺少依赖源码/构建产物，无法回溯调用链、本次未完成分析、未发现调用路径。",
         "",
         "| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |",
         "|---|---|---|---|---|",
@@ -1699,7 +1993,7 @@ def render_api_result_table(findings):
         lines.append(
             f"| `{_md_cell(row.get('coord'), 180)}` | `{_md_cell(row.get('api'), 220)}` | "
             f"{row.get('change') or '-'} | {_md_cell(row.get('conclusion'), 160)} | "
-            f"{_md_cell(_evidence_summary_text(row), 220)} |"
+            f"{_md_cell(_evidence_summary_text(row), 500)} |"
         )
     if skipped_by_conclusion:
         skipped = "；".join(f"{name} 省略 {count} 条" for name, count in skipped_by_conclusion.items())
@@ -1715,6 +2009,17 @@ def render_api_result_table(findings):
 def render_limitations_section(findings):
     coverage = findings.get('coverage') or {}
     gap_rows = _coverage_gap_rows(coverage)
+    not_impacted = findings.get('not_impacted') or []
+    if not_impacted:
+        gap_rows.append({
+            'label': '已确认不受影响的范围',
+            'status': 'scope_boundary',
+            'impact': (
+                '该结论只表示 Step4 识别的 API 仍由当前制品以相同类字节码提供；'
+                '不包含被删除 JAR 中的 SPI 配置、资源文件、清单等非 API 内容。'
+            ),
+            'evidence': ['evidence/call_chain/alerts.csv'],
+        })
     lines = [
         "## 二、结论限制", "",
     ]
@@ -1744,11 +2049,10 @@ def render_report_appendix(findings):
         "| 文件 | 承载的信息 |",
         "|---|---|",
         "| `deliverables/report.md` | 最终报告；优先阅读这一份 |",
-        "| `deliverables/s6_probable_impact_apis.csv/md` | 可能影响清单 |",
-        "| `deliverables/s6_uncertain_apis.csv/md` | 需人工复核清单 |",
-        "| `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物，无法回溯调用链清单 |",
-        "| `deliverables/s6_not_analyzed_apis.csv/md` | 本次未完成分析清单 |",
-        "| `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |",
+    ]
+    for row in available_s6_detail_artifacts(findings):
+        lines.append(f"| `{row['path']}` | {row['title']} |")
+    lines += [
         "",
         "#### 用户深入排查时看的产物", "",
         "| 文件 | 承载的信息 |",
@@ -1803,8 +2107,6 @@ def _fmt_issue(item):
              f"- **依赖坐标**：`{item.get('coord','?')}`",
              f"- **变化**：{_change_summary(item)}",
              f"- **业务直接命中**：{item.get('direct_callers',0)} 处"]
-    if item.get('reason_code'):
-        lines.append(f"- **原因码**：`{item.get('reason_code')}`")
     if item.get('user_conclusion'):
         lines.append(f"- **结论**：{item.get('user_conclusion')}")
     if item.get('user_reason') or item.get('reason'):

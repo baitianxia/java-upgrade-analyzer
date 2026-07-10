@@ -19,7 +19,7 @@
 1. 这个问题属于漏报、误报、性能、可读性还是交互问题；
 2. 影响哪个 Step；
 3. 是否会改变正式输出契约；
-4. 是否可能影响 Step5 四态语义；
+4. 是否可能影响 Step5 五态语义；
 5. 是否需要新增正例和负例；
 6. 是否需要真实项目或压力模型验证。
 
@@ -87,9 +87,11 @@ python3 scripts/smoke_regression.py --group orchestrator
 - 不得漏掉 jdeps 能发现的跨 JAR 类依赖；
 - 删除依赖、升级依赖、字段变化、构造器变化、多依赖链路都要覆盖；
 - 反射、MethodHandle、资源、表达式语言不能静默当成未命中；
-- `reachable` / `uncertain` / `not_found_in_static_analysis` / `not_analyzed` 语义不能混淆；
+- `reachable` / `not_impacted` / `uncertain` / `not_found_in_static_analysis` / `not_analyzed` 语义不能混淆；`not_impacted` 必须有当前制品中的相同类字节码证据；
 - `alerts.csv` 必须是完整链路台账，不是样例；
 - 性能优化不能通过减少分析范围实现。
+- 重载匹配必须同时校验全限定类名和参数描述符；最终制品已完整扫描且精确描述符未命中时，不得被无签名别名阻塞为 `not_analyzed`。
+- 不得把具有方法体的接口 `static` / `default` / `private` 方法当成动态代理边界。
 
 ### Step6
 

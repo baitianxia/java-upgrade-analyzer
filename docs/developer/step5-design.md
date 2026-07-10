@@ -21,10 +21,11 @@ Step5 消费 Step4 产生的 API 变化集合，判断这些变化是否可能�
 | 输入 | 来源 | 用途 |
 |---|---|---|
 | `evidence/api_changes/all_changed_apis.csv` | Step4 | API 变化目标集合 |
+| `evidence/api_changes/git_ref_matches.json` | Step4 | 确认依赖当前版本对应的源码 ref 和模块路径 |
 | `evidence/dependencies/build_provenance.json` | Step1 | 确认业务制品来源 |
 | `evidence/dependencies/s1_artifacts/` | Step1 | 提取业务 class 和运行时依赖 JAR |
 | 系统源码目录 | `project_dir` / `project_scope` | 构建业务源码调用图 |
-| `dependency_source_dirs` | 用户可选输入 | 依赖源码映射和跨依赖源码链路 |
+| `dependency_source_dirs` | 用户可选输入 | 提供依赖源码仓库位置；Step5 会固定到 Step4 已确认的当前版本，不直接使用工作区当前分支 |
 
 ## 证据层
 
@@ -35,7 +36,7 @@ Step5 当前不是单一源码扫描，而是多证据融合。
 | 业务源码 AST/增强正则 | 构建业务方法、调用边、类型和 import 信息 |
 | 业务字节码 | 证明最终制品中的业务 class 是否真实引用目标 |
 | 运行时依赖 JAR 字节码 | 发现依赖包之间对变化 API 的引用 |
-| 依赖源码映射 | 补足跨依赖源码链路 |
+| 依赖源码映射 | 补足跨依赖源码链路；只允许与当前运行时 JAR 同坐标、同版本且实际打包的类进入图 |
 | framework adapters | 补充 SPI、Spring、MyBatis、动态代理、运行时主动入口等隐式边 |
 | indirect usage analyzer | 识别反射、MethodHandle、资源、表达式语言等候选 |
 
@@ -48,10 +49,26 @@ Step4 all_changed_apis
   -> 构建系统源码图
   -> 提取 current 最终制品业务 class
   -> 扫描 current 运行时依赖 JAR
+  -> 将依赖源码固定到 Step4 确认的 current ref，并按同坐标 JAR 类清单过滤
   -> 合并反射/框架/字节码证据
   -> 对每个 API 做反向追踪
   -> 输出 evidence/call_chain/alerts.csv / summary.json / by_api
 ```
+
+## 依赖源码版本对齐
+
+依赖源码只是运行时 JAR 的辅助证据，不能扩大当前制品的实际范围。Step5 使用 Step4 已确认的 `current ref` 创建只读的 detached worktree 快照，不切换、不修改用户仓库的当前分支、HEAD 或未提交内容。
+
+对齐后还会按相同依赖坐标的 current JAR 类清单过滤源码：源码仓库中存在、但没有打进该 JAR 的类和方法不会进入调用图。这能防止错误分支、其他 profile、未打包模块或仓库附带源码形成虚假链路。
+
+以下任一情况都会拒绝该源码映射：
+
+- Step4 没有唯一确认 current ref；
+- 源码映射与 Step4 记录的 Git 仓库不一致；
+- ref、模块路径或快照无效；
+- current 最终制品中没有同坐标 JAR，无法校验源码范围。
+
+拒绝后 Step5 继续使用 current JAR 字节码证据，不会退回本地工作区当前分支。对齐明细写入 `evidence/call_chain/dependency_source_alignment.json`，包括选定 ref、commit、JAR 类数量以及被保留和排除的源码类数量。
 
 ## 目标键与反向图
 
@@ -69,6 +86,13 @@ Step5 会为每个变更 API 构建目标 key，例如：
 ```text
 callee_key -> caller edges
 ```
+
+目标匹配必须遵守两个准确性边界：
+
+- 不会把任意类的同名方法隐式合并到 `java.lang.Object`；继承边只能来自已证明的类型元数据。
+- 源码图只命中其他重载、但当前最终制品已完整扫描且未命中目标精确描述符时，结论是 `not_found_in_static_analysis`，不是 `not_analyzed`。
+
+依赖接口中已有方法体的 `static` / `default` / `private` 方法不属于动态代理边界，不得因“无实现类”提前停止回溯。
 
 反向追踪从目标 API 出发，沿调用者方向回溯，直到：
 
@@ -90,11 +114,12 @@ callee_key -> caller edges
 - 避免低置信候选无限扩散；
 - 让 `uncertain` 明确保留为人工复核对象。
 
-## 四态结果
+## 五态结果
 
 | 状态 | 语义 |
 |---|---|
 | `reachable` | 已找到确认链路并触达业务代码 |
+| `not_impacted` | removed API 的旧类与当前其他运行时依赖中的同名类字节码完全一致，证明该 API 未从当前制品消失 |
 | `uncertain` | 有候选证据，但链路或证据不足以确认 |
 | `not_found_in_static_analysis` | 分析已执行，但当前静态证据未找到路径 |
 | `not_analyzed` | 输入缺失、工具能力不足或覆盖不完整，无法有效分析 |
@@ -103,6 +128,7 @@ callee_key -> caller edges
 
 - `not_found_in_static_analysis` 不是“确定不影响”。
 - `not_analyzed` 不能被当成无风险。
+- `not_impacted` 只证明目标 API 符号仍被相同字节码提供，不证明被删除 jar 的资源、SPI、清单或其他非 API 内容没有影响。
 - 字节码命中运行时依赖使用目标 API，但无法回溯到业务入口时，通常应进入 `uncertain`，并保留消费依赖、消费类和消费方法。
 
 ## 删除依赖 jar 的语义

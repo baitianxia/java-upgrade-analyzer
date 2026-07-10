@@ -309,6 +309,7 @@ def gate_call_chain(d, strict_risk_gate=False):
     inconclusive = int(quality_gate.get('inconclusive', user_conclusion_summary.get('当前无法确认', 0)) or 0)
     probable_impact = int(quality_gate.get('probable_impact', user_conclusion_summary.get('可能影响', 0)) or 0)
     confirmed_impact = int(quality_gate.get('confirmed_impact', user_conclusion_summary.get('已确认影响', 0)) or 0)
+    confirmed_no_impact = int(summary.get('not_impacted', user_conclusion_summary.get('已确认不受影响', 0)) or 0)
     high_risk_inconclusive = int(quality_gate.get('high_risk_inconclusive', 0) or 0)
     if uncertain > 0:
         print(f"\n⚠️  {uncertain} 个风险点无法静态确认：", file=sys.stderr)
@@ -340,7 +341,7 @@ def gate_call_chain(d, strict_risk_gate=False):
         )
     ok(
         f"call_chain 门控通过：已确认影响={confirmed_impact} 可能影响={probable_impact} "
-        f"当前无法确认={inconclusive} 静态未找到={not_found}"
+        f"已确认不受影响={confirmed_no_impact} 当前无法确认={inconclusive} 静态未找到={not_found}"
     )
 
 def main():

@@ -16,6 +16,7 @@ confidence_weighted_tracer.py
 """
 
 import json
+import hashlib
 import os
 import re
 import struct
@@ -24,7 +25,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from compat import run_cmd
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
@@ -533,6 +534,194 @@ def _get_runtime_dependency_catalog(graph):
     return getattr(graph, 'runtime_dependency_catalog', {}) or {}
 
 
+def _changed_api_owner_fqcn(api_row):
+    api_name = str((api_row or {}).get('api_name') or '').strip()
+    kind = get_symbol_kind(api_row or {})
+    if not api_name:
+        return ''
+    if kind == 'class':
+        return api_name.replace('$', '.')
+    if kind == 'constructor':
+        simple = str((api_row or {}).get('api_simple') or '').strip()
+        suffix = f'.{simple}' if simple else ''
+        if suffix and api_name.endswith(suffix):
+            return api_name[:-len(suffix)].replace('$', '.')
+    return api_name.rsplit('.', 1)[0].replace('$', '.') if '.' in api_name else ''
+
+
+def _step4_artifact_cache_filename(lib_entry):
+    raw = str(lib_entry or '').replace('\\', '/').strip('/')
+    safe = re.sub(r'[^A-Za-z0-9._/-]+', '_', raw).replace('/', '__')
+    return safe or 'unknown.jar'
+
+
+def _normalized_class_fqcn(entry_name):
+    entry = str(entry_name or '').replace('\\', '/')
+    if not entry.endswith('.class') or entry.endswith(('module-info.class', 'package-info.class')):
+        return ''
+    return entry[:-6].replace('/', '.').replace('$', '.')
+
+
+def _build_identical_current_class_provider_index(all_apis, graph):
+    """Find removed classes that remain byte-for-byte present in current JARs.
+
+    A dependency coordinate can disappear while an aggregate/shaded runtime JAR
+    still supplies the same class. Treating every reference as a removal impact
+    in that case is incorrect: the symbol never left the runtime class path.
+    Only byte-for-byte identical class providers are accepted here; a same-name
+    but different class remains subject to ordinary impact tracing.
+    """
+    if not graph:
+        return {}
+    cached = getattr(graph, 'identical_current_class_providers', None)
+    if cached is not None:
+        return cached
+    report_dir = str(getattr(graph, 'report_dir', '') or '').strip()
+    targets = defaultdict(set)
+    for api_row in all_apis or []:
+        if str(api_row.get('new_version') or '').strip() != '-':
+            continue
+        if str(api_row.get('change_type') or '').strip().upper() not in {'REMOVED', 'METHOD_REMOVED', 'CLASS_REMOVED'}:
+            continue
+        coord = str(api_row.get('coord') or '').strip()
+        owner = _changed_api_owner_fqcn(api_row)
+        if coord and owner:
+            targets[coord].add(owner)
+    if not report_dir or not targets:
+        setattr(graph, 'identical_current_class_providers', {})
+        return {}
+
+    dep_changes_path = os.path.join(report_dir, 'evidence', 'dependencies', 'dep_changes.csv')
+    old_jars = {}
+    try:
+        import csv
+        with open(dep_changes_path, newline='', encoding='utf-8-sig') as handle:
+            for row in csv.DictReader(handle):
+                coord = str(row.get('coord') or '').strip()
+                entry = str(row.get('base_lib_entry') or '').strip()
+                if coord not in targets or not entry:
+                    continue
+                candidate = os.path.join(
+                    report_dir,
+                    'evidence',
+                    'api_changes',
+                    'step4_artifact_jars',
+                    'base',
+                    _step4_artifact_cache_filename(entry),
+                )
+                if os.path.isfile(candidate):
+                    old_jars[coord] = candidate
+    except (OSError, ValueError):
+        old_jars = {}
+
+    old_hashes = {}
+    for coord, jar_path in old_jars.items():
+        owners = targets.get(coord) or set()
+        try:
+            with zipfile.ZipFile(jar_path) as zf:
+                for entry in zf.namelist():
+                    owner = _normalized_class_fqcn(entry)
+                    if owner not in owners:
+                        continue
+                    data = zf.read(entry)
+                    old_hashes[(coord, owner)] = {
+                        'sha256': hashlib.sha256(data).hexdigest(),
+                        'old_jar': jar_path,
+                        'old_class_entry': entry,
+                    }
+        except Exception:
+            continue
+
+    providers = defaultdict(list)
+    wanted_owners = {owner for _coord, owner in old_hashes}
+    catalog = _get_runtime_dependency_catalog(graph)
+    for item in list(catalog.get('entries') or []):
+        provider_coord = str(item.get('coord') or '').strip()
+        jar_path = str(item.get('jar_path') or '').strip()
+        if not provider_coord or provider_coord == '__business__' or not os.path.isfile(jar_path):
+            continue
+        try:
+            with zipfile.ZipFile(jar_path) as zf:
+                for entry in zf.namelist():
+                    owner = _normalized_class_fqcn(entry)
+                    if owner not in wanted_owners:
+                        continue
+                    digest = hashlib.sha256(zf.read(entry)).hexdigest()
+                    for target_coord in targets:
+                        old = old_hashes.get((target_coord, owner))
+                        if not old or old['sha256'] != digest or provider_coord == target_coord:
+                            continue
+                        providers[(target_coord, owner)].append({
+                            'provider_coord': provider_coord,
+                            'provider_jar': jar_path,
+                            'provider_class_entry': entry,
+                            'class_sha256': digest,
+                            **old,
+                        })
+        except Exception:
+            continue
+    result = {key: value for key, value in providers.items() if value}
+    setattr(graph, 'identical_current_class_providers', result)
+    _perf_add(graph, 'trace', 'identical_provider_classes', len(result))
+    return result
+
+
+def _build_runtime_symbol_preserved_result(result, api_row, graph):
+    owner = _changed_api_owner_fqcn(api_row)
+    providers = list((getattr(graph, 'identical_current_class_providers', {}) or {}).get(
+        (str(api_row.get('coord') or '').strip(), owner),
+        [],
+    ))
+    if not providers:
+        return None
+    provider = providers[0]
+    provider_coord = provider.get('provider_coord') or ''
+    target = changed_api_display_target(result)
+    provider_node = f'{provider_coord}:{owner}（与删除前 class 字节码完全一致）'
+    path_text = f'{provider_node} -> {target}'
+    evidence = [{
+        'caller_symbol': provider_node,
+        'callee_key': target,
+        'evidence_type': 'identical_current_class_provider',
+        'confidence': 'high',
+        'file': provider.get('provider_jar') or '',
+        'line': 0,
+        'owner_coord': provider_coord,
+        'class_sha256': provider.get('class_sha256') or '',
+        'old_jar': provider.get('old_jar') or '',
+        'old_class_entry': provider.get('old_class_entry') or '',
+        'provider_class_entry': provider.get('provider_class_entry') or '',
+    }]
+    result.analysis_status = 'not_impacted'
+    result.is_reachable = False
+    result.reason_code = 'RUNTIME_SYMBOL_PRESERVED_IDENTICALLY'
+    result.reachable_note = (
+        f'当前最终制品中的 {provider_coord} 仍提供 {owner}，且 class 字节码与删除前完全一致；'
+        '该变更 API 没有从运行时类路径消失。'
+    )
+    result.dependency_chain_coords = [provider_coord] if provider_coord else []
+    result.call_paths = [path_text]
+    result.evidence_paths = [evidence]
+    result.path_details = [{
+        'path_status': 'not_impacted',
+        'stop_reason': 'RUNTIME_SYMBOL_PRESERVED_IDENTICALLY',
+        'business_entry': '',
+        'business_reachable': False,
+        'consumer_coord': provider_coord,
+        'consumer_class': owner,
+        'consumer_method': '',
+        'consumer_signature': '',
+        'path_text': path_text,
+        'confidence': 1.0,
+        'depth': 0,
+        'evidence': evidence,
+    }]
+    result.direct_callers = 0
+    result.business_reach_depth = 0
+    result.verification_commands = []
+    return result
+
+
 def _apply_source_artifact_miss(result, graph, reachable_note):
     alignment = getattr(graph, 'source_artifact_alignment', {}) or {}
     alignment_status = str(alignment.get('status') or '').strip()
@@ -687,6 +876,20 @@ def _extract_target_owner_and_member(api_row):
     if symbol_kind == 'constructor':
         return owner, '<init>', symbol_kind
     return owner, api_simple or member, symbol_kind
+
+
+def _jvm_internal_owner_name(owner):
+    """Convert a source-style FQCN to its JVM internal nested-class name."""
+    parts = [part for part in str(owner or '').strip().split('.') if part]
+    if not parts:
+        return ''
+    class_start = next(
+        (idx for idx, part in enumerate(parts) if part[:1].isupper()),
+        len(parts) - 1,
+    )
+    package = '/'.join(parts[:class_start])
+    classes = '$'.join(parts[class_start:])
+    return f"{package}/{classes}" if package else classes
 
 
 def _class_bytes_might_reference_target(data, owner_internal_name, member_name=''):
@@ -869,7 +1072,7 @@ def _runtime_prefilter_owner_candidates(owner_candidates, data, target_rows_by_o
     ref_member_names = summary.get('ref_member_names') or set()
     filtered = []
     for owner, _internal_bytes, _dotted_bytes in owner_candidates:
-        internal = owner.replace('.', '/')
+        internal = _jvm_internal_owner_name(owner)
         if internal in class_names or internal in ref_names:
             filtered.append(owner)
             continue
@@ -1004,11 +1207,17 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
         'field_refs': [],
         'class_refs': set(),
     }
+    # javap omits the owner for references to members declared by the class
+    # currently being disassembled, for example:
+    #   invokevirtual #31 // Method buildBannerText:()Ljava/lang/String;
+    # Requiring ``owner.member`` here silently removes every such intra-class
+    # edge and breaks otherwise valid dependency A -> B -> changed-API chains.
     method_pattern = re.compile(
-        r'//\s+(?:Interface)?Method\s+([A-Za-z0-9_/$]+)\.(?:"([^"]+)"|([A-Za-z0-9_$<>]+)):(\S+)'
+        r'//\s+(?:Interface)?Method\s+(?:([A-Za-z0-9_/$]+)\.)?'
+        r'(?:"([^"]+)"|([A-Za-z0-9_$<>]+)):(\S+)'
     )
     field_pattern = re.compile(
-        r'//\s+Field\s+([A-Za-z0-9_/$]+)\.([A-Za-z0-9_$]+):(\S+)'
+        r'//\s+Field\s+(?:([A-Za-z0-9_/$]+)\.)?([A-Za-z0-9_$]+):(\S+)'
     )
     class_pattern = re.compile(r'//\s+class\s+([A-Za-z0-9_/$]+)')
     descriptor_pattern = re.compile(r'L([A-Za-z0-9_/$]+);')
@@ -1091,7 +1300,11 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
                 references['class_refs'].add(target.get('owner') or '')
         method_match = method_pattern.search(line)
         if method_match and instruction_line:
-            owner = method_match.group(1).replace('/', '.').replace('$', '.')
+            owner = (
+                method_match.group(1).replace('/', '.').replace('$', '.')
+                if method_match.group(1)
+                else str(class_binary_name or '').replace('/', '.').replace('$', '.')
+            )
             method_name = method_match.group(2) or method_match.group(3) or ''
             descriptor = method_match.group(4).strip()
             references['method_refs'].append({
@@ -1106,7 +1319,11 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
             continue
         field_match = field_pattern.search(line)
         if field_match and instruction_line:
-            owner = field_match.group(1).replace('/', '.').replace('$', '.')
+            owner = (
+                field_match.group(1).replace('/', '.').replace('$', '.')
+                if field_match.group(1)
+                else str(class_binary_name or '').replace('/', '.').replace('$', '.')
+            )
             descriptor = field_match.group(3).strip()
             references['field_refs'].append({
                 'owner': owner,
@@ -1324,7 +1541,7 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
         return {'status': 'unavailable', 'reason': 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE'}
 
     owner, member_name, _symbol_kind = _extract_target_owner_and_member(api_row)
-    owner_internal_name = str(owner or '').replace('.', '/')
+    owner_internal_name = _jvm_internal_owner_name(owner)
     if not owner_internal_name:
         return {'status': 'unavailable', 'reason': 'BYTECODE_TARGET_UNRESOLVED'}
 
@@ -1512,7 +1729,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             }
             continue
         target_rows_by_owner[owner].append(row)
-        owner_internal_names[owner] = owner.replace('.', '/')
+        owner_internal_names[owner] = _jvm_internal_owner_name(owner)
 
     if not target_rows_by_owner:
         _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
@@ -2062,6 +2279,18 @@ def _add_runtime_dependency_caller_edge(graph, lookup_key, coord, jar_path, clas
         is_test=False,
         callee_param_types=[],
     )
+    edge.callee_fqcn_complete = bool(
+        lookup_key
+        and '.' in str(lookup_key).split('(', 1)[0]
+        and not str(lookup_key).startswith(('method:', 'field:', 'class:'))
+    )
+    edge.callee_signature_complete = bool(lookup_signature)
+    if edge.callee_fqcn_complete and edge.callee_signature_complete:
+        edge.callee_resolution_note = '调用目标已解析到全限定名和签名'
+    elif not edge.callee_fqcn_complete:
+        edge.callee_resolution_note = '缺少调用目标所属类全限定名'
+    else:
+        edge.callee_resolution_note = '缺少调用目标方法参数签名'
     for key in (lookup_key, edge.callee_simple_key):
         bucket = reverse_edges.setdefault(key, [])
         identity = (edge.caller_symbol_id, edge.callee_key, edge.evidence_type)
@@ -2214,7 +2443,7 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
         return None
     task_ids = set((index.get('direct_by_owner_member') or {}).get((owner, member), set()))
     owner_ids = set((index.get('owner_string_ids') or {}).get(owner, set()))
-    owner_ids.update((index.get('owner_string_ids') or {}).get(owner.replace('.', '/'), set()))
+    owner_ids.update((index.get('owner_string_ids') or {}).get(_jvm_internal_owner_name(owner), set()))
     member_ids = set((index.get('member_string_ids') or {}).get(member, set()))
     reflection_ids = set(index.get('reflection_ids') or set())
     task_ids.update(owner_ids & member_ids & reflection_ids)
@@ -2222,7 +2451,7 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
     candidates = [tasks[item] for item in sorted(task_ids) if 0 <= item < len(tasks)]
     unparsed_checked = 0
     unparsed_selected = 0
-    owner_internal = owner.replace('.', '/')
+    owner_internal = _jvm_internal_owner_name(owner)
     for task in index.get('unparsed_tasks') or []:
         unparsed_checked += 1
         jar_path = str(task.get('jar_path') or '')
@@ -2288,7 +2517,7 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
         ({'coord': coord, **item} if not item.get('coord') else item)
         for coord, item in by_coord.items()
     ])
-    owner_internal = owner.replace('.', '/')
+    owner_internal = _jvm_internal_owner_name(owner)
     target_rows_by_owner = {owner: [api_row]}
     visited_classes = 0
     javap_classes = 0
@@ -2433,11 +2662,18 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
     if javap_tasks:
         workers = min(_step5_bytecode_javap_workers(), len(javap_tasks))
         javap_started_at = time.perf_counter()
-        emit_progress(
-            "step5",
-            "bytecode-expand",
-            f"扩展运行时依赖调用者字节码，lookup={lookup_key[:120]}，候选class={len(javap_tasks)}，并行度={workers}",
-        )
+        # Small lookups are frequent during reverse traversal. Emitting one or
+        # more lines for every 1-8 class lookup can create tens of thousands of
+        # log lines while hiding the actual hotspots. Large lookups remain
+        # visible here; all lookups are still retained in aggregate timing and
+        # slow-item statistics.
+        log_lookup_progress = len(javap_tasks) >= 50
+        if log_lookup_progress:
+            emit_progress(
+                "step5",
+                "bytecode-expand",
+                f"扩展运行时依赖调用者字节码，lookup={lookup_key[:120]}，候选class={len(javap_tasks)}，并行度={workers}",
+            )
         if workers <= 1:
             for task in javap_tasks:
                 _task, references = _load_runtime_dependency_class_references_for_task(task)
@@ -2456,7 +2692,7 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                     except Exception:
                         _task, references = task, None
                     handle_javap_result(_task, references)
-                    if should_log_progress(done_count, len(future_map), progress_interval):
+                    if log_lookup_progress and should_log_progress(done_count, len(future_map), progress_interval):
                         emit_progress(
                             "step5",
                             "bytecode-expand",
@@ -2517,10 +2753,14 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
     methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
     if not reverse_edges:
         return []
-    if not any(
+    has_business_methods = any(
         getattr(method_def, 'owner_type', '') == 'business' and not getattr(method_def, 'is_test', False)
         for method_def in methods_by_id.values()
-    ):
+    )
+    has_runtime_framework_entries = bool(
+        getattr(graph, 'framework_runtime_entry_methods', {}) or {}
+    )
+    if not has_business_methods and not has_runtime_framework_entries:
         return []
     lookup_keys = tuple(_packaged_hit_consumer_lookup_keys(hit))
     if not lookup_keys:
@@ -2549,7 +2789,11 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
                 continue
             next_path = path + [edge]
             if getattr(method_def, 'owner_type', '') == 'business' and not getattr(method_def, 'is_test', False):
-                paths.append((method_def, next_path))
+                paths.append((method_def, next_path, []))
+                continue
+            runtime_entries = _runtime_framework_entries_for_method(method_def, graph)
+            if runtime_entries:
+                paths.append((method_def, next_path, runtime_entries))
                 continue
             caller_key = getattr(method_def, 'qualified_key', '') or getattr(edge, 'caller_qualified_key', '')
             if caller_key:
@@ -2557,6 +2801,31 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
                     queue.append((variant, next_path))
     path_cache[cache_key] = list(paths)
     return paths
+
+
+def _runtime_framework_entries_for_method(method_def, graph):
+    unsigned = str(getattr(method_def, 'qualified_key', '') or '').split('(', 1)[0]
+    if not unsigned:
+        return []
+    return list((getattr(graph, 'framework_runtime_entry_methods', {}) or {}).get(unsigned) or [])
+
+
+def _packaged_hit_runtime_framework_entry(hit, graph):
+    if not graph:
+        return None, []
+    class_fqcn = str(hit.get('class_fqcn') or '').strip()
+    consumer_method = str(hit.get('consumer_method') or '').strip()
+    if not class_fqcn or not consumer_method or consumer_method == '<class>':
+        return None, []
+    method = _runtime_method_def_for_packaged_caller(
+        str(hit.get('coord') or ''),
+        str(hit.get('jar_path') or ''),
+        class_fqcn,
+        consumer_method,
+        str(hit.get('consumer_signature') or ''),
+    )
+    entries = _runtime_framework_entries_for_method(method, graph)
+    return (method, entries) if entries else (None, [])
 
 
 def _build_packaged_dependency_hit_result(result, hits, graph=None):
@@ -2567,11 +2836,21 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
     for item in hits:
         if item.get('coord') == '__business__':
             continue
-        for business_entry, bridge_edges in _find_business_callers_for_packaged_hit(item, graph):
+        runtime_entry, framework_entries = _packaged_hit_runtime_framework_entry(item, graph)
+        if runtime_entry is not None:
+            bridged_hits.append({
+                'hit': item,
+                'business_entry': runtime_entry,
+                'bridge_edges': [],
+                'framework_entries': framework_entries,
+            })
+            continue
+        for business_entry, bridge_edges, framework_entries in _find_business_callers_for_packaged_hit(item, graph):
             bridged_hits.append({
                 'hit': item,
                 'business_entry': business_entry,
                 'bridge_edges': bridge_edges,
+                'framework_entries': framework_entries,
             })
     dependency_chain = []
     for item in hits:
@@ -2586,8 +2865,14 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
     has_business_path = bool(business_hits or bridged_hits)
     result.analysis_status = 'reachable' if has_business_path else 'uncertain'
     result.is_reachable = True if has_business_path else None
-    result.reason_code = 'BUSINESS_ARTIFACT_BYTECODE_USAGE' if has_business_path else 'PACKAGED_DEPENDENCY_BYTECODE_USAGE'
+    has_framework_path = any(item.get('framework_entries') for item in bridged_hits)
+    result.reason_code = (
+        'RUNTIME_FRAMEWORK_ENTRY_REACHED' if has_framework_path
+        else ('BUSINESS_ARTIFACT_BYTECODE_USAGE' if has_business_path else 'PACKAGED_DEPENDENCY_BYTECODE_USAGE')
+    )
     result.reachable_note = (
+        '已通过业务启动代码、最终制品框架注册和依赖字节码确认目标符号会进入运行时调用路径'
+        if has_framework_path else
         '已在当前最终制品中确认业务 class 可到达目标符号引用'
         if has_business_path else
         '已在当前最终制品的运行时依赖字节码中确认对目标符号的稳定引用，'
@@ -2635,13 +2920,16 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
     for bridged in bridged_hits:
         hit = bridged['hit']
         bridge_edges = bridged.get('bridge_edges') or []
+        framework_entries = bridged.get('framework_entries') or []
         business_entry = bridged.get('business_entry')
         consumer_member = str(hit.get('consumer_method') or '<unknown>')
         consumer_signature = str(hit.get('consumer_signature') or '')
         consumer_symbol = f"{hit.get('class_fqcn')}.{consumer_member}{consumer_signature}"
         consumer_display = f"{hit.get('coord')}:{consumer_symbol}"
         target_display = hit.get('target_display')
-        path_nodes = [
+        activation = ((framework_entries[0].get('provenance') or {}).get('business_activation') or []) if framework_entries else []
+        activation_entry = str((activation[0] or {}).get('business_entry') or '').strip() if activation else ''
+        path_nodes = ([activation_entry, 'Spring Boot框架注册'] if activation_entry else []) + [
             _format_bridge_edge_caller(edge)
             for edge in reversed(bridge_edges)
         ]
@@ -2650,6 +2938,19 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         path_text = " -> ".join(str(item) for item in path_nodes if item)
         result.call_paths.append(path_text)
         evidence = []
+        for framework_entry in framework_entries:
+            provenance = framework_entry.get('provenance') or {}
+            evidence.append({
+                'caller_symbol': framework_entry.get('source') or 'framework:spring',
+                'callee_key': getattr(business_entry, 'qualified_key', ''),
+                'evidence_type': framework_entry.get('edge_kind') or 'spring_runtime_registered_callback',
+                'confidence': framework_entry.get('confidence') or 'high',
+                'file': provenance.get('jar') or '',
+                'line': provenance.get('line') or 0,
+                'owner_coord': provenance.get('coord') or '',
+                'resource': provenance.get('resource') or '',
+                'business_activation': provenance.get('business_activation') or [],
+            })
         for edge in reversed(bridge_edges):
             evidence.append({
                 'caller_symbol': getattr(edge, 'caller_qualified_key', '') or getattr(edge, 'caller_symbol_id', '?'),
@@ -2675,7 +2976,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         result.evidence_paths.append(evidence)
         result.path_details.append({
             'path_status': 'reachable',
-            'stop_reason': '',
+            'stop_reason': 'RUNTIME_FRAMEWORK_ENTRY_REACHED' if framework_entries else '',
             'business_entry': getattr(business_entry, 'qualified_key', '') or path_nodes[0],
             'business_reachable': True,
             'consumer_coord': hit.get('coord', ''),
@@ -2695,6 +2996,73 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
         '优先审查命中的无源码依赖及其对外暴露入口'
     ]
+    return result
+
+
+def _merge_runtime_framework_paths(result, hits, graph):
+    """Keep complete runtime-registration paths alongside source-graph paths.
+
+    The ordinary reverse tracer can recognize a packaged callback as a critical
+    node.  Its generic result, however, starts at that callback and loses the
+    business-startup and Spring registration evidence.  Rebuild the artifact
+    result on a separate TraceResult and merge only confirmed framework paths so
+    that the human-facing chain retains the actual runtime entry.
+    """
+    if not hits:
+        return result
+    packaged_seed = replace(
+        result,
+        call_paths=[],
+        evidence_paths=[],
+        path_details=[],
+        dependency_chain_coords=list(result.dependency_chain_coords or []),
+        verification_commands=list(result.verification_commands or []),
+        hops=list(result.hops or []),
+        critical_nodes_hit=list(result.critical_nodes_hit or []),
+    )
+    packaged = _build_packaged_dependency_hit_result(packaged_seed, hits, graph)
+    if packaged.reason_code != 'RUNTIME_FRAMEWORK_ENTRY_REACHED':
+        return result
+    confirmed_details = [
+        item for item in list(packaged.path_details or [])
+        if item.get('path_status') == 'reachable'
+        and item.get('stop_reason') == 'RUNTIME_FRAMEWORK_ENTRY_REACHED'
+    ]
+    if not confirmed_details:
+        return result
+    runtime_entry_keys = set((getattr(graph, 'framework_runtime_entry_methods', {}) or {}).keys())
+    result.path_details = [
+        item for item in list(result.path_details or [])
+        if not (
+            item.get('stop_reason') == 'SYSTEM_CODE_REACHED'
+            and str(item.get('business_entry') or '').split('(', 1)[0] in runtime_entry_keys
+        )
+    ]
+    retained_pairs = []
+    for path_text, evidence in zip(result.call_paths or [], result.evidence_paths or []):
+        if '变更API:' in str(path_text) and any(key in str(path_text) for key in runtime_entry_keys):
+            continue
+        retained_pairs.append((path_text, evidence))
+    result.call_paths = [item[0] for item in retained_pairs]
+    result.evidence_paths = [item[1] for item in retained_pairs]
+    existing_paths = {
+        str(item.get('path_text') or '')
+        for item in list(result.path_details or [])
+    }
+    for detail in confirmed_details:
+        path_text = str(detail.get('path_text') or '')
+        if path_text and path_text not in existing_paths:
+            result.path_details.append(detail)
+            existing_paths.add(path_text)
+    for path_text, evidence in zip(packaged.call_paths or [], packaged.evidence_paths or []):
+        if path_text not in (result.call_paths or []):
+            result.call_paths.append(path_text)
+            result.evidence_paths.append(evidence)
+    for coord in packaged.dependency_chain_coords or []:
+        if coord not in result.dependency_chain_coords:
+            result.dependency_chain_coords.append(coord)
+    result.reason_code = 'RUNTIME_FRAMEWORK_ENTRY_REACHED'
+    result.reachable_note = packaged.reachable_note
     return result
 
 
@@ -2986,7 +3354,7 @@ def edge_to_evidence(edge, graph=None):
         caller_key = method_def.qualified_key
     if not caller_key:
         caller_key = getattr(edge, 'caller_symbol_id', '?')
-    return {
+    evidence = {
         'caller_symbol': caller_key,
         'callee_key': getattr(edge, 'callee_key', '?'),
         'confidence': getattr(edge, 'confidence', '?'),
@@ -2996,6 +3364,15 @@ def edge_to_evidence(edge, graph=None):
         'owner_coord': getattr(edge, 'owner_coord', ''),
         'module': getattr(edge, 'module', ''),
     }
+    if getattr(edge, 'framework_registration', False):
+        evidence.update({
+            'framework_registration': True,
+            'framework_source': getattr(edge, 'framework_source', ''),
+            'framework_target': getattr(edge, 'framework_target', ''),
+            'runtime_activation': getattr(edge, 'runtime_activation', ''),
+            'human_edge': 'Spring Boot 根据当前制品中的框架注册触发回调',
+        })
+    return evidence
 
 
 def is_system_code_touched(method_def, _type_metadata):
@@ -3041,8 +3418,14 @@ def is_framework_boundary(method_def, type_metadata):
     if any(ann in all_annotations for ann in FRAMEWORK_BOUNDARY_ANNOTATIONS):
         return True
 
-    # 规则 2: 接口无实现（动态代理）- 通用情况
+    # 规则 2: 接口无实现（动态代理）- 通用情况。
+    # Java 接口也可以声明 static/default/private 具体方法；这些方法的
+    # 实现就在接口中，不依赖动态代理或实现类。把它们当成边界会让
+    # FieldUtils/MethodUtils 这类真实调用链过早停止。
     if class_meta.get('kind') == 'interface':
+        modifiers = set(getattr(method_def, 'modifiers', None) or [])
+        if getattr(method_def, 'is_static', False) or modifiers.intersection({'static', 'default', 'private'}):
+            return False
         # 检查是否有实现类
         implementations = class_meta.get('implementations', [])
         if not implementations:
@@ -3211,6 +3594,11 @@ def trace_api_with_confidence_weighting(
         has_packaged_bytecode_fallback=has_packaged_bytecode_fallback,
         allow_degraded=allow_degraded,
     )
+
+    preserved_result = _build_runtime_symbol_preserved_result(result, api_row, graph)
+    if preserved_result is not None:
+        _debug_trace_result('trace_api_result', preserved_result)
+        return preserved_result
 
     # 行为变更：即使找到调用链也需运行时验证
     if result.change_type == 'BEHAVIOR_CHANGED':
@@ -3390,6 +3778,43 @@ def trace_api_with_confidence_weighting(
             target_match_groups=target_match_groups,
             overload_info=target_overload_block,
         )
+        # An exact current-artifact bytecode descriptor is stronger than an
+        # ambiguous source-graph fallback. Preserve the concrete dependency
+        # consumer and signature for review; only the path back to business code
+        # remains uncertain.
+        if artifact_dependency_hits:
+            packaged_dependency_result = _build_packaged_dependency_hit_result(
+                result,
+                artifact_dependency_hits,
+                graph,
+            )
+            if dependency_removed:
+                packaged_dependency_result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
+                packaged_dependency_result.reachable_note = (
+                    '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
+                    '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
+                )
+            _debug_trace_result(
+                'trace_api_result',
+                packaged_dependency_result,
+                overload_info=target_overload_block,
+            )
+            return packaged_dependency_result
+        if artifact_scan_miss:
+            # The source graph may retain an unsigned alias beside fully typed
+            # calls to sibling overloads.  If the complete current artifact scan
+            # found no exact descriptor hit, there is no remaining static path
+            # to disambiguate: report a static miss instead of claiming the
+            # requested overload could not be analyzed.  This does not mean the
+            # runtime is proven safe; the returned result keeps the standard
+            # reflection/configuration caveat.
+            built = _build_packaged_dependency_not_found_result(result)
+            _debug_trace_result(
+                'trace_api_result',
+                built,
+                overload_info=target_overload_block,
+            )
+            return built
         blocked = build_overload_ambiguous_result(result, target_overload_block)
         _debug_trace_result('trace_api_result', blocked, overload_info=target_overload_block)
         return blocked
@@ -3790,6 +4215,7 @@ def trace_api_with_confidence_weighting(
         uncertain_candidates,
         not_analyzed_candidates,
         graph,
+        final_target=changed_api_display_target(result),
     )
 
     # 选择最优结果
@@ -3834,6 +4260,12 @@ def trace_api_with_confidence_weighting(
             })
             return built
         built = build_reachable_result(result, safe_best or best, graph)
+        if artifact_dependency_hits:
+            built = _merge_runtime_framework_paths(
+                built,
+                artifact_dependency_hits,
+                graph,
+            )
         _debug_trace_result('trace_api_result', built, candidate_counts={
             'reachable': len(reachable_candidates),
             'uncertain': len(uncertain_candidates),
@@ -4117,19 +4549,86 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
     framework_entries = (
         getattr(graph, 'framework_entry_symbols', {}) or {}
     ).get(symbol_id) or []
-    if framework_entries:
-        first_framework_entry = framework_entries[0]
+    runtime_framework_entries = (
+        getattr(graph, 'framework_runtime_entry_methods', {}) or {}
+    ).get(str(getattr(method_def, 'qualified_key', '') or '').split('(', 1)[0]) or []
+    activation_linked = symbol_id in (
+        getattr(graph, 'framework_activation_linked_symbols', set()) or set()
+    )
+    if runtime_framework_entries and not activation_linked:
+        first_framework_entry = runtime_framework_entries[0]
+        entry_scope = (
+            'business'
+            if getattr(method_def, 'owner_type', '') == 'business'
+            else 'runtime_dependency_entry'
+        )
         critical_node = {
             'type': 'system_code_touched',
+            'entry_scope': entry_scope,
             'method': method_def.qualified_key,
             'file': method_def.file,
             'line': method_def.line,
             'framework_edge_kind': first_framework_entry.get('edge_kind'),
             'framework_adapter': first_framework_entry.get('adapter'),
+            'framework_runtime_registration': True,
         }
+    elif framework_entries and not activation_linked:
+        confirmed_framework_entries = []
+        for item in framework_entries:
+            if item.get('ambiguity'):
+                continue
+            runtime_activation = str(item.get('runtime_activation') or '').strip()
+            if runtime_activation in {'conditional', 'unproven'}:
+                continue
+            edge_kind = str(item.get('edge_kind') or '').strip()
+            # Dependency callbacks require positive activation evidence. A source
+            # declaration such as ApplicationListener or an auto-configuration
+            # registration is only a candidate until the current artifact proves
+            # activation. Scheduled/PostConstruct/XML task entries are explicit
+            # runtime triggers and remain confirmable.
+            if getattr(method_def, 'owner_type', '') != 'business' and not (
+                runtime_activation == 'active'
+                or edge_kind == 'spring_runtime_active_entry'
+            ):
+                continue
+            if item.get('conditions') and runtime_activation != 'active' and edge_kind != 'spring_runtime_active_entry':
+                continue
+            confirmed_framework_entries.append(item)
+        first_framework_entry = confirmed_framework_entries[0] if confirmed_framework_entries else None
+        if first_framework_entry is None:
+            if is_system_code_touched(method_def, type_metadata):
+                critical_node = {
+                    'type': 'system_code_touched',
+                    'entry_scope': 'business',
+                    'method': method_def.qualified_key,
+                    'file': method_def.file,
+                    'line': method_def.line,
+                }
+            else:
+                critical_node = {
+                    'type': 'framework_boundary',
+                    'method': method_def.qualified_key,
+                    'reason': '框架入口存在运行条件，当前制品证据尚未证明该入口会被激活',
+                }
+        else:
+            entry_scope = (
+                'business'
+                if getattr(method_def, 'owner_type', '') == 'business'
+                else 'runtime_dependency_entry'
+            )
+            critical_node = {
+                'type': 'system_code_touched',
+                'entry_scope': entry_scope,
+                'method': method_def.qualified_key,
+                'file': method_def.file,
+                'line': method_def.line,
+                'framework_edge_kind': first_framework_entry.get('edge_kind'),
+                'framework_adapter': first_framework_entry.get('adapter'),
+            }
     elif is_system_code_touched(method_def, type_metadata):
         critical_node = {
             'type': 'system_code_touched',
+            'entry_scope': 'business',
             'method': method_def.qualified_key,
             'file': method_def.file,
             'line': method_def.line
@@ -4234,7 +4733,16 @@ def select_best_candidate(candidates):
     )
 
 
-def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph):
+def changed_api_display_target(result):
+    api_name = str(getattr(result, 'api_name', '') or '').strip()
+    api_signature = str(getattr(result, 'api_signature', '') or '').strip()
+    symbol_kind = str(getattr(result, 'symbol_kind', '') or '').strip()
+    if api_name and symbol_kind in {'method', 'constructor'} and api_signature:
+        return f"{api_name}{api_signature}"
+    return api_name
+
+
+def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph, final_target=''):
     details = []
     groups = (
         ('reachable', 'SYSTEM_CODE_REACHED', reachable or []),
@@ -4247,9 +4755,10 @@ def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph):
             path_edges = list(candidate.get('path') or [])
             evidence = [edge_to_evidence(edge, graph=graph) for edge in path_edges]
             entry = dict(candidate.get('entry_point') or candidate.get('boundary') or {})
+            entry_scope = str(entry.get('entry_scope') or '')
             stop_reason = str(candidate.get('reason') or default_reason)
-            final_target = entry.get('method') or stop_reason or '未找到业务入口'
-            path_text = format_call_chain(path_edges, final_target) if path_edges else final_target
+            display_target = final_target or entry.get('method') or stop_reason or '未找到业务入口'
+            path_text = format_call_chain(path_edges, display_target) if path_edges else display_target
             identity = (
                 path_status,
                 stop_reason,
@@ -4265,12 +4774,16 @@ def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph):
             last = evidence[-1] if evidence else {}
             consumer_symbol = str(first.get('caller_symbol') or '')
             consumer_class, consumer_method = split_consumer_symbol(consumer_symbol)
-            business_entry = str(entry.get('method') or '') if path_status == 'reachable' else ''
+            business_reachable = path_status == 'reachable' and entry_scope != 'runtime_dependency_entry'
+            business_entry = str(entry.get('method') or '') if business_reachable else ''
+            effective_stop_reason = stop_reason
+            if path_status == 'reachable' and entry_scope == 'runtime_dependency_entry':
+                effective_stop_reason = 'RUNTIME_DEPENDENCY_ENTRY_REACHED'
             details.append({
                 'path_status': path_status,
-                'stop_reason': stop_reason,
+                'stop_reason': effective_stop_reason,
                 'business_entry': business_entry,
-                'business_reachable': path_status == 'reachable',
+                'business_reachable': business_reachable,
                 'consumer_coord': str(first.get('owner_coord') or ''),
                 'consumer_class': consumer_class,
                 'consumer_method': consumer_method,
@@ -4714,6 +5227,66 @@ def select_compatible_overload_signatures(target_signature, overload_signatures,
     return compatible
 
 
+def exclude_signatures_owned_by_sibling_overloads(
+    api_name,
+    target_signature,
+    compatible_signatures,
+    graph,
+    type_metadata=None,
+):
+    """Do not assign a call-site signature to the wrong overload.
+
+    Source edges may describe argument types rather than the selected JVM method
+    descriptor.  That is useful for resolving a lone varargs/general overload, but
+    it becomes unsafe when the same declaration family contains a more specific
+    sibling with exactly that signature.  Java overload resolution selects the
+    sibling in that case (for example Logger.info(String, Object) must not prove
+    Logger.info(String, Object...)).
+    """
+    overload_index = getattr(graph, 'changed_api_overload_signatures', {}) or {}
+    declared_targets = set(overload_index.get((api_name or '').strip()) or set())
+    if not declared_targets:
+        return list(compatible_signatures or [])
+
+    target_normalized = normalize_signature_for_lookup(target_signature) or target_signature
+    sibling_signatures = {
+        signature
+        for signature in declared_targets
+        if (normalize_signature_for_lookup(signature) or signature) != target_normalized
+    }
+    target_params = split_signature_params(target_signature)
+    target_is_varargs = bool(target_params and is_varargs_type_reference(target_params[-1]))
+    retained = []
+    for signature in compatible_signatures or []:
+        candidate_normalized = normalize_signature_for_lookup(signature) or signature
+        if any(
+            candidate_normalized == (normalize_signature_for_lookup(sibling) or sibling)
+            for sibling in sibling_signatures
+        ):
+            continue
+        # Java considers applicable fixed-arity overloads before a varargs
+        # declaration. A source call inferred as (String, String), for example,
+        # selects info(String, Object) rather than info(String, Object...).
+        if target_is_varargs:
+            candidate_params = split_signature_params(signature)
+            fixed_sibling_applies = False
+            for sibling in sibling_signatures:
+                sibling_params = split_signature_params(sibling)
+                if sibling_params is None or any(is_varargs_type_reference(item) for item in sibling_params):
+                    continue
+                if is_candidate_signature_compatible_with_target(
+                    candidate_params,
+                    sibling_params,
+                    type_metadata or {},
+                ):
+                    fixed_sibling_applies = True
+                    break
+            if fixed_sibling_applies:
+                continue
+        retained.append(signature)
+    return retained
+
+
 def build_declared_method_signature_index(graph):
     index = defaultdict(set)
     methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
@@ -4779,6 +5352,13 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
             declared_signatures,
             type_metadata or {},
         )
+        declared_compatible_signatures = exclude_signatures_owned_by_sibling_overloads(
+            api_name,
+            target_signature,
+            declared_compatible_signatures,
+            graph,
+            type_metadata=type_metadata,
+        )
         if len(declared_compatible_signatures) == 1:
             allow_multiple_observed_compatible = True
 
@@ -4824,6 +5404,13 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
                 overload_signatures,
                 type_metadata or {},
             )
+            compatible_signatures = exclude_signatures_owned_by_sibling_overloads(
+                api_name,
+                target_signature,
+                compatible_signatures,
+                graph,
+                type_metadata=type_metadata,
+            )
             for compatible_signature in compatible_signatures:
                 compatible_key = f"{api_name}{compatible_signature}"
                 if (getattr(graph, 'reverse_edges', {}) or {}).get(compatible_key):
@@ -4835,6 +5422,13 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
             target_signature,
             overload_signatures,
             type_metadata or {},
+        )
+        compatible_signatures = exclude_signatures_owned_by_sibling_overloads(
+            api_name,
+            target_signature,
+            compatible_signatures,
+            graph,
+            type_metadata=type_metadata,
         )
         if target_is_varargs and compatible_signatures:
             compatible_keys = [
@@ -5534,7 +6128,7 @@ def get_lookup_keys(method_def, type_metadata, graph=None):
       1. 递归处理多层继承
       2. 完整处理接口继承链
       3. 处理接口的父接口
-      4. 添加Object类默认方法
+      4. 仅使用元数据中已证明的继承关系，不把所有同名方法隐式并入 Object
     """
     return flatten_key_tiers(get_lookup_key_tiers(method_def, type_metadata, graph=graph))
 
@@ -5726,10 +6320,6 @@ def collect_inheritance_chain_tiers(class_fqcn, method_name, signature_suffixes,
     for implementation in class_meta.get('implementations', []):
         append_method_keys(implementation)
 
-    # 添加Object类（所有类的最终父类）
-    if class_fqcn != 'java.lang.Object':
-        append_method_keys('java.lang.Object')
-
     tiers = []
     append_key_tier(tiers, method_sig_keys)
     append_key_tier(tiers, method_no_sig_keys)
@@ -5800,15 +6390,21 @@ def build_reachable_result(result, candidate, graph):
     result.is_reachable = True
     result.business_reach_depth = candidate['depth']
     result.confidence_score = candidate['confidence']
-    result.reason_code = 'SYSTEM_CODE_REACHED'
-    result.reachable_note = f"触达系统代码（置信度{candidate['confidence']:.2f}）"
+    entry_point = candidate['entry_point']
+    if entry_point.get('entry_scope') == 'runtime_dependency_entry':
+        result.reason_code = 'RUNTIME_DEPENDENCY_ENTRY_REACHED'
+        result.reachable_note = (
+            f"已触达当前制品中会由框架或运行时机制触发的依赖入口"
+            f"（置信度{candidate['confidence']:.2f}）"
+        )
+    else:
+        result.reason_code = 'SYSTEM_CODE_REACHED'
+        result.reachable_note = f"触达系统代码（置信度{candidate['confidence']:.2f}）"
 
     # 构建调用链
     path_edges = candidate['path']
-    entry_point = candidate['entry_point']
-
     result.call_paths = [
-        format_call_chain(path_edges, entry_point['method'])
+        format_call_chain(path_edges, changed_api_display_target(result))
     ]
     result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
 
@@ -5851,7 +6447,7 @@ def build_behavior_changed_result(result, candidate, graph):
     entry_point = candidate['entry_point']
 
     result.call_paths = [
-        format_call_chain(path_edges, entry_point['method'])
+        format_call_chain(path_edges, changed_api_display_target(result))
     ]
     result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
 
@@ -5894,7 +6490,7 @@ def build_behavior_changed_fallback_simple_result(result, candidate, graph):
     entry_point = candidate['entry_point']
 
     result.call_paths = [
-        format_call_chain(path_edges, entry_point['method'])
+        format_call_chain(path_edges, changed_api_display_target(result))
     ]
     result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
 
@@ -5934,7 +6530,7 @@ def build_fallback_simple_unconfirmed_result(result, candidate, graph):
     entry_point = candidate['entry_point']
 
     result.call_paths = [
-        format_call_chain(path_edges, entry_point['method'])
+        format_call_chain(path_edges, changed_api_display_target(result))
     ]
     result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
 
@@ -5973,7 +6569,7 @@ def build_internal_only_direct_consumer_result(result, candidate, graph):
     entry_point = candidate['entry_point']
 
     result.call_paths = [
-        format_call_chain(path_edges, entry_point['method'])
+        format_call_chain(path_edges, changed_api_display_target(result))
     ]
     result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
 
@@ -6007,7 +6603,7 @@ def build_uncertain_result(result, candidate):
     path_edges = candidate['path']
 
     result.call_paths = [
-        format_call_chain(path_edges, "未找到业务入口")
+        format_call_chain(path_edges, changed_api_display_target(result) or "未找到业务入口")
     ]
     result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
 
@@ -6092,13 +6688,23 @@ def format_call_chain(path_edges, final_target):
     if not path_edges:
         return final_target
 
-    parts = [
-        str(getattr(edge, 'caller_qualified_key', '') or getattr(edge, 'caller_symbol_id', '?'))
-        for edge in reversed(path_edges)
-    ]
-    # path_edges[0] 是变更符号的直接消费边，其 callee 才是链路终点。
-    changed_target = str(getattr(path_edges[0], 'callee_key', '') or final_target)
-    parts.append(changed_target)
+    parts = []
+    for edge in reversed(path_edges):
+        parts.append(str(
+            getattr(edge, 'caller_qualified_key', '')
+            or getattr(edge, 'caller_symbol_id', '?')
+        ))
+        if getattr(edge, 'framework_registration', False):
+            parts.append('Spring Boot框架注册')
+    # path_edges[0] 是变更符号的直接消费边。源码/字节码里看到的 callee
+    # 可能是子类、适配器或继承分派目标；对外展示时仍必须以 Step4 的
+    # 变更 API 作为链路终点，否则用户会看到“分析 A，终点却是 B”。
+    direct_callee = str(getattr(path_edges[0], 'callee_key', '') or '').strip()
+    final_target = str(final_target or '').strip()
+    if direct_callee and direct_callee != final_target:
+        parts.append(direct_callee)
+    if final_target:
+        parts.append(f"变更API: {final_target}")
 
     return " → ".join(parts)
 
@@ -6136,6 +6742,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
     started_at = time.perf_counter()
     status_counts = {
         'reachable': 0,
+        'not_impacted': 0,
         'uncertain': 0,
         'not_analyzed': 0,
         'not_found_in_static_analysis': 0,
@@ -6150,7 +6757,27 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         graph_stats=graph_stats or {},
     )
     if graph is not None and all_apis:
-        _build_packaged_runtime_dependency_scan_cache(all_apis, graph)
+        changed_api_overload_signatures = defaultdict(set)
+        for row in all_apis:
+            if not method_api_requires_signature(row):
+                continue
+            api_name = str(row.get('api_name') or '').strip()
+            api_signature = str(row.get('api_signature') or '').strip()
+            if api_name and api_signature:
+                changed_api_overload_signatures[api_name].add(api_signature)
+        graph.changed_api_overload_signatures = {
+            api_name: frozenset(signatures)
+            for api_name, signatures in changed_api_overload_signatures.items()
+        }
+        identical_providers = _build_identical_current_class_provider_index(all_apis, graph)
+        scan_apis = [
+            row for row in all_apis
+            if (
+                str(row.get('coord') or '').strip(),
+                _changed_api_owner_fqcn(row),
+            ) not in identical_providers
+        ]
+        _build_packaged_runtime_dependency_scan_cache(scan_apis, graph)
 
     for idx, api_row in enumerate(all_apis, 1):
         api_started_at = time.perf_counter()
@@ -6223,6 +6850,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                 (
                     "追踪进度更新，"
                     f"reachable={status_counts.get('reachable', 0)}，"
+                    f"not_impacted={status_counts.get('not_impacted', 0)}，"
                     f"uncertain={status_counts.get('uncertain', 0)}，"
                     f"not_analyzed={status_counts.get('not_analyzed', 0)}，"
                     f"not_found={status_counts.get('not_found_in_static_analysis', 0) + status_counts.get('not_reachable', 0)}"
@@ -6238,6 +6866,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         (
             "反向追踪完成，"
             f"reachable={status_counts.get('reachable', 0)}，"
+            f"not_impacted={status_counts.get('not_impacted', 0)}，"
             f"uncertain={status_counts.get('uncertain', 0)}，"
             f"not_analyzed={status_counts.get('not_analyzed', 0)}，"
             f"not_found={status_counts.get('not_found_in_static_analysis', 0) + status_counts.get('not_reachable', 0)}"

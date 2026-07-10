@@ -3947,6 +3947,20 @@ def build_dependency_source_dirs_state(run_context, report_dir):
     covers_targets = bool(current_mapping)
     if relevant_coords:
         covers_targets = not uncovered_target_coords
+    required_uncovered_coords = []
+    if report_dir:
+        summary_path = step5_call_chain_dir(report_dir) / "summary.json"
+        call_summary = read_json(summary_path) if summary_path.exists() else {}
+        for item in list(call_summary.get("uncertain_apis") or []) + list(call_summary.get("not_analyzed_apis") or []):
+            if str(item.get("reason_code") or "").strip() != "DEPENDENCY_SOURCE_MAPPING_MISSING":
+                continue
+            coords = list(item.get("dependency_chain_coords") or [])
+            if not coords and item.get("coord"):
+                coords = [item.get("coord")]
+            for coord in coords:
+                coord = str(coord or "").strip()
+                if coord and coord not in current_mapping and coord not in required_uncovered_coords:
+                    required_uncovered_coords.append(coord)
     return {
         "provided": bool(dependency_source_dirs),
         "recognized": recognized,
@@ -3954,6 +3968,8 @@ def build_dependency_source_dirs_state(run_context, report_dir):
         "dependency_source_dirs": dependency_source_dirs,
         "current_mapped_coords": sorted(current_mapping.keys()),
         "uncovered_target_coords": uncovered_target_coords,
+        "required_uncovered_coords": required_uncovered_coords,
+        "analysis_requires_more_source": bool(required_uncovered_coords),
     }
 
 
@@ -3976,6 +3992,18 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
     question_prefix = "已收到 dependency_source_dirs。"
     if not source_state.get("recognized"):
         question_prefix = "已收到 dependency_source_dirs，但当前目录未识别出有效依赖源码仓库。"
+    elif (
+        str(payload.get("step_id") or "").strip() == "step5"
+        and reason_code != "step5_dependency_source_mapping_missing"
+        and not source_state.get("analysis_requires_more_source")
+    ):
+        question_prefix = (
+            "已识别 dependency_source_dirs；本轮没有因依赖源码缺失而中断的 API。"
+            "被删除依赖本身已有旧 JAR 符号证据，不要求额外提供其源码。"
+        )
+    elif source_state.get("required_uncovered_coords"):
+        missing = ", ".join((source_state.get("required_uncovered_coords") or [])[:10])
+        question_prefix = f"已收到 dependency_source_dirs，但这些实际调用链仍因缺少依赖源码而中断：{missing}。"
     elif source_state.get("uncovered_target_coords"):
         missing = ", ".join((source_state.get("uncovered_target_coords") or [])[:10])
         question_prefix = f"已收到 dependency_source_dirs，但当前仍未覆盖这些目标依赖坐标：{missing}。"
@@ -4029,9 +4057,15 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     interaction_meta = augment_interaction_meta_with_restart_option(step_id, interaction_meta)
     title = f"{step_id} {step_meta.get('title') or ''}（进入下一步前请确认）".strip()
     outputs = step_meta.get("outputs", []) or []
-    files_to_review = [str(artifact_path(report_dir, rel).resolve()) for rel in outputs]
+    if step_id == "step5":
+        files_to_review = [
+            str((step5_call_chain_dir(report_dir) / "summary.txt").resolve()),
+            str((step5_call_chain_dir(report_dir) / "alerts.csv").resolve()),
+        ]
+    else:
+        files_to_review = [str(artifact_path(report_dir, rel).resolve()) for rel in outputs]
     checklist_lines = []
-    if outputs:
+    if files_to_review:
         checklist_lines.append("需要打开并复核的产物：")
         for item in files_to_review:
             checklist_lines.append(f"  - {item}")
@@ -4212,6 +4246,12 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 )
     if step_id == "step5":
         summary_json = step5_call_chain_dir(report_dir) / "summary.json"
+        # Checkpoint is user-facing: point readers to the concise summary and
+        # complete ledger, not to caches/indexes that only the program consumes.
+        files_to_review = [
+            str((step5_call_chain_dir(report_dir) / "summary.txt").resolve()),
+            str((step5_call_chain_dir(report_dir) / "alerts.csv").resolve()),
+        ]
         call_summary = read_json(summary_json) if summary_json.exists() else {}
         runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
         runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
@@ -4225,18 +4265,15 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         not_analyzed_apis = list(call_summary.get("not_analyzed_apis") or [])
         reachable_apis = list(call_summary.get("reachable_apis") or [])
         not_found_apis = list(call_summary.get("not_found_apis") or [])
-        for item in [str(summary_json.resolve())]:
-            if item not in files_to_review:
-                files_to_review.append(item)
         checklist_lines.extend(
             [
-                "调用链结论摘要（影响 Step6 是否可直接出报告）：",
+                "调用链结论摘要：",
                 f"  - 已确认影响={user_conclusion_summary.get('已确认影响', call_summary.get('reachable', 0))}",
                 f"  - 可能影响={user_conclusion_summary.get('可能影响', 0)}",
+                f"  - 已确认不受影响={user_conclusion_summary.get('已确认不受影响', call_summary.get('not_impacted', 0))}",
                 f"  - 当前无法确认={user_conclusion_summary.get('当前无法确认', 0)}",
                 f"  - 需要补充输入={user_conclusion_summary.get('需要补充输入', 0)}",
-                f"  - dependency_source_dirs={len(dependency_source_dirs)}",
-                f"  - step5_selected_coords={len(step5_selected_coords)} step5_selected_names={len(step5_selected_names)}",
+                f"  - 已提供依赖源码目录={len(dependency_source_dirs)} 个",
             ]
         )
         if step5_selected_coords:
@@ -4266,40 +4303,48 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             if coords:
                 checklist_lines.append(f"  - 建议优先补这些依赖：{', '.join(coords[:10])}")
         if reachable_apis:
-            checklist_lines.append("已确认影响 Top（抽查前 3 条即可）：")
+            checklist_lines.append("已确认影响示例（完整结果见 alerts.csv）：")
             for item in reachable_apis[:3]:
                 checklist_lines.append(
-                    f"  - {item.get('severity')} {item.get('coord')} | {item.get('user_reason') or item.get('reason') or '(无)'}"
+                    f"  - {item.get('severity')} {item.get('coord')} | "
+                    f"{item.get('api') or item.get('api_name') or '未知 API'} | "
+                    f"{item.get('user_reason') or item.get('reason') or '未说明原因'}"
                 )
         possible_items = [
             item for item in (uncertain_apis + not_analyzed_apis)
             if (item.get("user_conclusion") or "").strip() == "可能影响"
         ]
         if possible_items:
-            checklist_lines.append("可能影响 Top（抽查前 3 条即可）：")
+            checklist_lines.append("可能影响示例（完整结果见 alerts.csv）：")
             for item in possible_items[:3]:
                 checklist_lines.append(
-                    f"  - {item.get('severity')} {item.get('coord')} | {item.get('recommended_action') or item.get('reason_code') or '(无)'}"
+                    f"  - {item.get('severity')} {item.get('coord')} | "
+                    f"{item.get('api') or item.get('api_name') or '未知 API'} | "
+                    f"{item.get('user_reason') or item.get('reason') or '需要运行时验证'}"
                 )
         inconclusive_items = [
             item for item in (uncertain_apis + not_analyzed_apis + not_found_apis)
             if (item.get("user_conclusion") or "").strip() == "当前无法确认"
         ]
         if inconclusive_items:
-            checklist_lines.append("当前无法确认 Top（抽查前 3 条即可）：")
+            checklist_lines.append("当前无法确认示例（完整结果见 alerts.csv）：")
             for item in inconclusive_items[:3]:
                 checklist_lines.append(
-                    f"  - {item.get('severity')} {item.get('coord')} | {item.get('user_reason') or item.get('reason') or '(无)'}"
+                    f"  - {item.get('severity')} {item.get('coord')} | "
+                    f"{item.get('api') or item.get('api_name') or '未知 API'} | "
+                    f"{item.get('user_reason') or item.get('reason') or '未说明原因'}"
                 )
         needs_input_items = [
             item for item in (uncertain_apis + not_analyzed_apis + not_found_apis)
             if (item.get("user_conclusion") or "").strip() == "需要补充输入"
         ]
         if needs_input_items:
-            checklist_lines.append("需要补充输入 Top（抽查前 3 条即可）：")
+            checklist_lines.append("需要补充输入示例（完整结果见 alerts.csv）：")
             for item in needs_input_items[:3]:
                 checklist_lines.append(
-                    f"  - {item.get('severity')} {item.get('coord')} | {item.get('recommended_action') or '(无)'}"
+                    f"  - {item.get('severity')} {item.get('coord')} | "
+                    f"{item.get('api') or item.get('api_name') or '未知 API'} | "
+                    f"{item.get('user_reason') or item.get('reason') or '缺少完成分析所需的输入'}"
                 )
     option_values = [item.get("id") for item in (interaction_meta.get("options", []) or []) if item.get("id")]
     response_schema = interaction_meta.get("response_schema") or {

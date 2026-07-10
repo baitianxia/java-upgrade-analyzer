@@ -21,6 +21,34 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_source_refs_compare_resolved_commits_not_only_branch_names(self):
+        with patch.object(
+            step4,
+            "run_cmd",
+            side_effect=[("same-commit\n", "", 0), ("same-commit\n", "", 0)],
+        ):
+            self.assertFalse(
+                step4.source_refs_have_different_commits(
+                    ["jua/base-artifact", "jua/current-artifact"],
+                    "/repo",
+                )
+            )
+
+        with patch.object(
+            step4,
+            "run_cmd",
+            side_effect=[("base-commit\n", "", 0), ("current-commit\n", "", 0)],
+        ):
+            self.assertTrue(
+                step4.source_refs_have_different_commits(["base", "current"], "/repo")
+            )
+
+    def test_source_refs_stay_conservative_when_commit_cannot_be_resolved(self):
+        with patch.object(step4, "run_cmd", return_value=("", "missing", 1)):
+            self.assertTrue(
+                step4.source_refs_have_different_commits(["base", "current"], "/repo")
+            )
+
     def test_write_readable_outputs_uses_human_first_summary_format(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -1670,9 +1698,13 @@ class Step4StabilityTest(unittest.TestCase):
             current_entry = "BOOT-INF/lib/demo-2.0.0.jar"
             with zipfile.ZipFile(base_artifact, "w") as zf:
                 zf.writestr(base_entry, b"base demo jar")
+                zf.writestr("BOOT-INF/lib/stable-1.0.0.jar", b"stable jar")
             with zipfile.ZipFile(current_artifact, "w") as zf:
                 zf.writestr(current_entry, b"current demo jar")
-            (report_dir / "build_provenance.json").write_text(
+                zf.writestr("BOOT-INF/lib/stable-1.0.0.jar", b"stable jar")
+            dependencies_dir = report_dir / "dependencies"
+            dependencies_dir.mkdir()
+            (dependencies_dir / "build_provenance.json").write_text(
                 json.dumps(
                     {
                         "sides": [
@@ -1691,6 +1723,7 @@ class Step4StabilityTest(unittest.TestCase):
                     [
                         "coord,old_version,new_version,change_type,scope,base_coord,current_coord,base_lib_entry,current_lib_entry",
                         f"com.example:demo,1.0.0,2.0.0,小版本升级,compile,com.example:demo,com.example:demo,{base_entry},{current_entry}",
+                        "com.example:stable,1.0.0,1.0.0,未变,compile,com.example:stable,com.example:stable,BOOT-INF/lib/stable-1.0.0.jar,BOOT-INF/lib/stable-1.0.0.jar",
                     ]
                 ),
                 encoding="utf-8",
@@ -1734,6 +1767,10 @@ class Step4StabilityTest(unittest.TestCase):
             self.assertTrue(Path(kwargs["new_jar_path"]).exists())
             self.assertEqual(Path(kwargs["old_jar_path"]).read_bytes(), b"base demo jar")
             self.assertEqual(Path(kwargs["new_jar_path"]).read_bytes(), b"current demo jar")
+            self.assertFalse(any(
+                "stable" in path.name
+                for path in (output_dir / "step4_artifact_jars").rglob("*.jar")
+            ))
 
     def test_main_processes_dependencies_in_parallel_when_workers_gt_one(self):
         with tempfile.TemporaryDirectory() as tmp:
