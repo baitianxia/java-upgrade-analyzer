@@ -433,6 +433,14 @@ class RunStepMainStateTest(unittest.TestCase):
     def test_report_landing_docs_separate_user_evidence_and_runtime_layers(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / ".upgrade-report"
+            for relative in (
+                "evidence/dependencies",
+                "evidence/context",
+                "evidence/static_scan",
+                "evidence/api_changes",
+                "evidence/call_chain",
+            ):
+                (report_dir / relative).mkdir(parents=True, exist_ok=True)
 
             run_step.write_report_landing_docs(report_dir)
 
@@ -440,14 +448,26 @@ class RunStepMainStateTest(unittest.TestCase):
             deliverables_readme = (report_dir / "deliverables" / "README.md").read_text(encoding="utf-8")
             evidence_readme = (report_dir / "evidence" / "README.md").read_text(encoding="utf-8")
             runtime_readme = (report_dir / ".runtime" / "README.md").read_text(encoding="utf-8")
+            dependencies_readme = (report_dir / "evidence" / "dependencies" / "README.md").read_text(encoding="utf-8")
+            context_readme = (report_dir / "evidence" / "context" / "README.md").read_text(encoding="utf-8")
+            static_scan_readme = (report_dir / "evidence" / "static_scan" / "README.md").read_text(encoding="utf-8")
+            api_changes_readme = (report_dir / "evidence" / "api_changes" / "README.md").read_text(encoding="utf-8")
+            call_chain_readme = (report_dir / "evidence" / "call_chain" / "README.md").read_text(encoding="utf-8")
 
             self.assertIn("先看 `deliverables/report.md`", root_readme)
-            self.assertIn("给用户看的交付物", deliverables_readme)
+            self.assertIn("按问题找文件", root_readme)
+            self.assertIn("给人看的交付结果", deliverables_readme)
             self.assertIn("深入复核证据", evidence_readme)
             self.assertIn("程序使用的状态和缓存", runtime_readme)
             self.assertIn("普通用户不需要阅读", runtime_readme)
             self.assertIn("changed_dependencies.md", evidence_readme)
             self.assertIn("all_changed_apis.csv", evidence_readme)
+            self.assertIn("本次分析到底比较了哪些依赖变化", dependencies_readme)
+            self.assertIn("后续分析使用了什么升级上下文", context_readme)
+            self.assertIn("背景风险扫描结果", static_scan_readme)
+            self.assertIn("依赖包维度变化摘要", api_changes_readme)
+            self.assertIn("不要从 `all_changed_apis.csv` 逐行挑 API", api_changes_readme)
+            self.assertIn("完整逐链路台账", call_chain_readme)
 
     def test_user_decision_card_hides_internal_fields_and_shows_direct_replies(self):
         interaction = {

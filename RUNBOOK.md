@@ -265,6 +265,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
   evidence/
     README.md
     dependencies/
+      README.md
       dep_changes.csv
       dep_alerts.csv
       dep_summary.txt
@@ -272,10 +273,12 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
       build_provenance.json
       s1_artifacts/
     context/
+      README.md
       context.json
       dep_graph.json
       source_mapping_summary.json
     static_scan/
+      README.md
       s3_jdk_removed_api.csv
       s3_jdk_javax_refs.csv
       s3_jdk_internal_api.csv
@@ -287,6 +290,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
       s3_dependency_compat.csv
       s3_dependency_classfile.csv
     api_changes/
+      README.md
       changed_dependencies.md
       changed_dependencies.csv
       all_changed_apis.csv
@@ -297,6 +301,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
           resolved_targets.csv
           summary.json
     call_chain/
+      README.md
       alerts.csv
       summary.json
       by_api/

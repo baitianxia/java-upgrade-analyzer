@@ -242,6 +242,11 @@ def write_report_landing_docs(report_dir):
     deliverables = deliverables_dir(report_dir)
     evidence = evidence_dir(report_dir)
     runtime = runtime_dir(report_dir)
+    evidence_dependencies = evidence_dependencies_dir(report_dir)
+    evidence_context = evidence_context_dir(report_dir)
+    evidence_static_scan = evidence_static_scan_dir(report_dir)
+    evidence_api_changes = evidence_api_changes_dir(report_dir)
+    evidence_call_chain = evidence_call_chain_dir(report_dir)
     for path in (report_dir, deliverables, evidence, runtime):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -249,7 +254,7 @@ def write_report_landing_docs(report_dir):
         report_dir / "README.md",
         """# 升级分析产物阅读入口
 
-这个目录分成三层，避免把给人看的报告、深入复核证据和程序状态混在一起。
+这个目录是本次分析结果的阅读入口。它分成三层，避免把给人看的报告、深入复核证据和程序状态混在一起。
 
 | 目录 | 谁看 | 用途 |
 |---|---|---|
@@ -257,38 +262,60 @@ def write_report_landing_docs(report_dir):
 | `evidence/` | 需要深入复核的人 | Step1-Step5 的事实证据和完整台账。 |
 | `.runtime/` | 程序和 Agent | 状态、缓存、索引、恢复信息；普通用户不需要阅读。 |
 
-## 推荐阅读顺序
+## 先看什么
 
 1. 先看 `deliverables/report.md`。
-2. 如需核对依赖包变化，看 `evidence/api_changes/changed_dependencies.md`。
-3. 如需核对完整 API 明细，看 `evidence/api_changes/all_changed_apis.csv`。
-4. 如需核对调用链，看 `evidence/call_chain/alerts.csv`。
+2. 如果要核对依赖包变化，看 `evidence/api_changes/changed_dependencies.md`。
+3. 如果要核对完整 API 明细，看 `evidence/api_changes/all_changed_apis.csv`。
+4. 如果要核对调用链，看 `evidence/call_chain/alerts.csv`。
+
+## 按问题找文件
+
+| 想确认的问题 | 先看 | 继续深入 |
+|---|---|---|
+| 最终分析结果是什么 | `deliverables/report.md` | `deliverables/s6_*_apis.md/csv` |
+| 哪些依赖包发生 API 变化 | `evidence/api_changes/changed_dependencies.md` | `evidence/api_changes/changed_dependencies.csv` |
+| 完整变更 API 有哪些 | `evidence/api_changes/all_changed_apis.csv` | `evidence/api_changes/all_changed_apis_part_*.csv` |
+| 变更 API 是否触达当前系统 | `evidence/call_chain/alerts.csv` | `evidence/call_chain/alerts_<status>.csv` |
+| 依赖范围是否正确 | `evidence/dependencies/dep_changes.csv` | `evidence/dependencies/build_provenance.json` |
+| 为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/summary.json`、`evidence/call_chain/by_api/` |
+
+## 不建议先看的文件
+
+- `.runtime/` 下的 JSON、索引和缓存只给程序恢复流程使用。
+- `evidence/call_chain/by_api/` 适合追单条 API 的逐边证据，不适合作为第一入口。
+- 耗时统计文件只用于性能排查，不用于判断风险。
 """,
     )
     _write_text_file(
         deliverables / "README.md",
         """# deliverables/
 
-给用户看的交付物目录。
+这个目录放给人看的交付结果。先看 `report.md`，只有需要核对某个分类全集时，再看拆分清单。
 
-| 文件 | 用途 |
-|---|---|
-| `report.md` | 最终报告；呈现客观分析结果、证据和结论限制。 |
-| `s6_*_apis.md/csv` | Step6 按结论分类拆出的明细；当主报告省略大量结果时再打开。 |
+| 文件 | 什么时候看 | 说明 |
+|---|---|---|
+| `report.md` | 第一入口 | 最终报告；呈现客观分析结果、证据和结论限制。 |
+| `s6_probable_impact_apis.md/csv` | 主报告提示存在可能影响时 | 可能影响清单。 |
+| `s6_uncertain_apis.md/csv` | 需要人工判断候选链路时 | 当前证据不足以确认的清单。 |
+| `s6_not_impacted_apis.md/csv` | 要核对“已确认不受影响”来源时 | 有直接制品证据的清单。 |
+| `s6_needs_input_apis.md/csv` | 主报告提示缺少输入时 | 缺依赖源码、构建产物或其他输入的清单。 |
+| `s6_not_analyzed_apis.md/csv` | 要看本轮未完成分析的项时 | 未完成分析清单。 |
+| `s6_not_found_apis.md/csv` | 要看未发现调用路径的项时 | 静态分析未找到调用路径的清单。 |
 
-这里的文件面向阅读和评审，不作为程序恢复状态的来源。
+这些文件只描述分析结果。它们不直接告诉用户修改什么，也不作为程序恢复状态的来源。
 """,
     )
     _write_text_file(
         evidence / "README.md",
         """# evidence/
 
-深入复核证据目录。这里保存 Step1-Step5 的事实材料和完整台账。
+这个目录放深入复核证据。只有当主报告或交付清单需要追溯来源时，才需要进入这里。
 
 | 目录 | 主要文件 | 用途 |
 |---|---|---|
 | `dependencies/` | `dep_changes.csv`、`build_provenance.json` | 依赖变更和构建产物来源。 |
-| `context/` | `context.json`、`source_mapping_summary.json` | 分析上下文和源码/依赖映射。 |
+| `context/` | `context.json`、`dep_graph.json` | 分析上下文和依赖关系。 |
 | `static_scan/` | `s3_*.csv/.txt` | JDK、Spring、Jakarta 等背景线索。 |
 | `api_changes/` | `changed_dependencies.md`、`changed_dependencies.csv`、`all_changed_apis.csv` | 依赖包维度选择入口和完整 API 变化事实。 |
 | `call_chain/` | `alerts.csv`、`alerts_<status>.csv`、`summary.json` | 调用链完整台账和拆分阅读视图。 |
@@ -313,6 +340,106 @@ def write_report_landing_docs(report_dir):
 不要把这里的 JSON 当作用户报告；需要给人看的结论在 `../deliverables/`，需要复核的证据在 `../evidence/`。
 """,
     )
+    if evidence_dependencies.exists():
+        _write_text_file(
+            evidence_dependencies / "README.md",
+            """# evidence/dependencies/
+
+这个目录回答“本次分析到底比较了哪些依赖变化”。
+
+| 文件 | 回答的问题 |
+|---|---|
+| `dep_changes.csv` | base/current 的依赖差异明细。 |
+| `dep_summary.txt` | 依赖变化规模、目标模块和构建来源摘要。 |
+| `dep_alerts.csv` | 需要优先复核的依赖变化，如删除、降级、无法解析。 |
+| `deps_current_resolved.csv` | 当前版本解析后的依赖集合。 |
+| `build_provenance.json` | base/current 构建产物来源、留存路径和摘要。 |
+| `s1_artifacts/` | 留存的构建产物，后续字节码分析以这里记录的产物为依据。 |
+
+先看 `dep_summary.txt` 和 `dep_changes.csv`。如果后续结果看起来范围不对，再核对 `build_provenance.json`。
+""",
+        )
+    if evidence_context.exists():
+        _write_text_file(
+            evidence_context / "README.md",
+            """# evidence/context/
+
+这个目录回答“后续分析使用了什么升级上下文”。
+
+| 文件 | 回答的问题 |
+|---|---|
+| `context.json` | JDK、Spring、目标模块、源码目录、依赖源码目录等上下文。 |
+| `dep_graph.json` | 当前依赖关系和传播关系。 |
+| `source_mapping_summary.json` | 依赖源码目录自动识别和映射结果。 |
+
+如果 Step4 或 Step5 提示依赖源码覆盖不足，先看 `source_mapping_summary.json`。
+""",
+        )
+    if evidence_static_scan.exists():
+        _write_text_file(
+            evidence_static_scan / "README.md",
+            """# evidence/static_scan/
+
+这个目录保存背景风险扫描结果。这里的命中只说明存在升级相关线索，不直接证明当前系统一定受影响。
+
+| 文件 | 说明 |
+|---|---|
+| `s3_jdk_removed_api.csv` | JDK 移除 API 命中。 |
+| `s3_jdk_javax_refs.csv` | `javax.*` 引用。 |
+| `s3_jdk_internal_api.csv` | JDK 内部 API 引用。 |
+| `s3_jdk_reflection.csv` | 反射相关线索。 |
+| `s3_jdk_runtime_flags.csv` | JDK 运行参数线索。 |
+| `s3_springboot_config.csv` | Spring Boot 配置键线索。 |
+| `s3_springboot_autoconfig.txt` | Spring Boot 自动装配线索。 |
+| `s3_dependency_compat.csv` | 依赖兼容性规则命中。 |
+| `s3_dependency_classfile.csv` | classfile 版本等字节码线索。 |
+
+需要判断是否影响当前系统时，继续看 `../call_chain/alerts.csv` 和最终报告。
+""",
+        )
+    if evidence_api_changes.exists():
+        _write_text_file(
+            evidence_api_changes / "README.md",
+            """# evidence/api_changes/
+
+这个目录回答“哪些依赖包和 API 发生了变化”。
+
+| 文件 | 什么时候看 | 说明 |
+|---|---|---|
+| `changed_dependencies.md` | 第一入口 | 给人看的依赖包维度变化摘要，也是 Step5 选择分析范围的入口。 |
+| `changed_dependencies.csv` | 需要筛选或自动化时 | 结构化依赖包清单，包含 `selection_key`。 |
+| `all_changed_apis.csv` | 需要核对完整 API 事实时 | 每行一个变更 API 或候选目标。文件可能很大。 |
+| `all_changed_apis_part_*.csv` | `all_changed_apis.csv` 太大时 | API 明细拆分文件，便于打开和分段复核。 |
+| `all_changed_apis_alerts.csv` | 只想先看高风险变化时 | 删除、签名变化、行为变化等高风险子集。 |
+| `summary.txt` | 判断 Step4 覆盖情况时 | jar 获取、JApiCmp、git diff、removed jar 导出等摘要。 |
+| `git_ref_matches.txt/json` | 依赖源码 ref 需要复核时 | old_version/new_version 到 git ref 的匹配证据。 |
+| `s4_per_dependency/` | 追某个依赖包细节时 | 每个依赖包的原始比较证据和摘要。 |
+| `step4_timing.csv` | 排查 Step4 慢在哪里时 | 各阶段耗时拆解。 |
+
+如果只是决定 Step5 分析范围，不要从 `all_changed_apis.csv` 逐行挑 API；使用 `changed_dependencies.md` 或 `changed_dependencies.csv` 的依赖包维度候选。
+""",
+        )
+    if evidence_call_chain.exists():
+        _write_text_file(
+            evidence_call_chain / "README.md",
+            """# evidence/call_chain/
+
+这个目录回答“变更 API 有没有调用链触达当前系统或运行时依赖入口”。
+
+| 文件 | 什么时候看 | 说明 |
+|---|---|---|
+| `alerts.csv` | 第一入口 | 完整逐链路台账。每条变更 API 至少保留一行。 |
+| `alerts_<status>.csv` | 只看某类结论时 | 按链路状态拆分的台账。 |
+| `alerts_<status>_NNN.csv` | 单个状态文件过大时 | 分片阅读视图。 |
+| `summary.json` | 需要解释统计和能力覆盖时 | Step5 汇总、原因码、覆盖状态。 |
+| `by_api/` | 追单条 API 证据时 | 单个 API 的逐边证据、路径和中断原因。 |
+| `framework_adapters.json` | 复核框架隐式入口时 | SPI、Spring、MyBatis 等 Adapter 输出。 |
+| `source_artifact_alignment.json` | 复核源码与制品是否对齐时 | 源码、依赖和构建产物对齐情况。 |
+| `step5_timing.csv` | 排查 Step5 慢在哪里时 | 调用链分析耗时拆解。 |
+
+先看 `alerts.csv`。只有当某一行的状态、原因或证据路径需要追溯时，再进入 `by_api/`。
+""",
+        )
 
 
 def read_csv_rows(path):

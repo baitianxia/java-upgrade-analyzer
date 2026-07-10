@@ -216,6 +216,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 | `.upgrade-report/README.md` | 解释产物目录分层和推荐阅读顺序 |
 | `.upgrade-report/deliverables/README.md` | 解释给用户看的交付物 |
 | `.upgrade-report/evidence/README.md` | 解释深入复核证据 |
+| `.upgrade-report/evidence/*/README.md` | 解释各步骤证据目录的阅读入口和复核路径 |
 | `.upgrade-report/.runtime/README.md` | 解释程序状态和缓存；普通用户不需要阅读 |
 
 人工阅读优先按这个顺序：

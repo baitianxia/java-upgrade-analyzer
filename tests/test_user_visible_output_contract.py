@@ -48,11 +48,14 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         manifest = self.read("scripts/step_manifest.json")
 
         self.assertIn(".upgrade-report/README.md", readme)
+        self.assertIn(".upgrade-report/evidence/*/README.md", readme)
         self.assertLess(
             readme.index(".upgrade-report/deliverables/report.md"),
             readme.index(".upgrade-report/evidence/api_changes/changed_dependencies.md"),
         )
         self.assertIn("README.md", runbook)
+        self.assertIn("api_changes/\n      README.md", runbook)
+        self.assertIn("call_chain/\n      README.md", runbook)
         self.assertIn("changed_dependencies.md", runbook)
         self.assertIn("changed_dependencies.csv", manifest)
         self.assertIn("selection_key", manifest)
