@@ -366,10 +366,17 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 s1_dep_diff.main()
 
             alerts_path = work_dir / "dep_alerts.csv"
+            summary_path = work_dir / "dep_summary.txt"
             self.assertTrue(alerts_path.exists())
+            self.assertTrue(summary_path.exists())
+            summary_text = summary_path.read_text(encoding="utf-8")
             with alerts_path.open("r", encoding="utf-8", newline="") as f:
                 rows = list(csv.DictReader(f))
 
+        self.assertIn("一、先看什么", summary_text)
+        self.assertIn("先看 dep_alerts.csv", summary_text)
+        self.assertIn("二、本次依赖范围是否可信", summary_text)
+        self.assertLess(summary_text.index("一、先看什么"), summary_text.index("四、依赖变化统计"))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["coord"], "org.example:demo-lib")
         self.assertEqual(rows[0]["old_version"], "2.0.0")

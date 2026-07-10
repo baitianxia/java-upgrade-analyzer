@@ -3931,7 +3931,11 @@ def human_checkpoint_1(dep_rows, all_apis, output_dir):
         else:
             p0 = sum(1 for a in apis_found if (a.get('severity') or '').strip() == 'P0')
 
-    print(f"\n结论总览：")
+    print("\n先看什么：")
+    print(f"  - 决定 Step5 范围：{os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)}")
+    print(f"  - 核对完整 API 事实：{os.path.join(output_dir, 'all_changed_apis.csv')}")
+    print("  - 是否影响当前系统：继续看 Step5 alerts.csv 和 Step6 report.md")
+    print("\n本次是否能进入 Step5：")
     print(f"  - 变更 API 总数：{len(all_apis)}")
     print(f"  - 版本变更但未发现 API 变化的依赖：{len(zero_change)}")
 
@@ -3947,6 +3951,7 @@ def human_checkpoint_1(dep_rows, all_apis, output_dir):
 
     print(f"\n复核文件：")
     print(f"  - 摘要：{os.path.join(output_dir, 'summary.txt')}")
+    print(f"  - 依赖包选择：{os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)}")
     print(f"  - 完整变更 API：{os.path.join(output_dir, 'all_changed_apis.csv')}")
     print(f"  - 高风险/需关注 API：{os.path.join(output_dir, 'all_changed_apis_alerts.csv')}")
     print("="*60)
@@ -4017,7 +4022,12 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
     lines = []
     lines.append("Step4 依赖 API 变化摘要")
     lines.append("")
-    lines.append("一、结论总览")
+    lines.append("一、先看什么")
+    lines.append("- 如果只决定 Step5 分析范围，先打开 changed_dependencies.md，按依赖包选择 selection_key。")
+    lines.append("- 如果要核对完整 API 事实，再打开 all_changed_apis.csv。")
+    lines.append("- 如果报告提示缺少 jar、JApiCmp 或依赖源码 ref，再看本文件后面的缺口清单。")
+    lines.append("")
+    lines.append("二、本次是否能进入 Step5")
     lines.append(f"- 变更 API 有效行：{valid_count}")
     lines.append(f"- 契约校验失败：{invalid_count}")
     lines.append(f"- 高风险/需关注条目：{len(alerts)}")
@@ -4031,28 +4041,31 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
     else:
         lines.append("- 结论：未发现可进入 Step5 的变更 API。")
     lines.append("")
-    lines.append("二、复核入口")
+    lines.append("三、复核入口")
+    lines.append(f"- 依赖包选择清单：{os.path.abspath(os.path.join(output_dir, CHANGED_DEPENDENCIES_MD))}")
     lines.append(f"- 完整变更 API 清单：{os.path.abspath(os.path.join(output_dir, 'all_changed_apis.csv'))}")
     lines.append(f"- 高风险/需关注 API：{os.path.abspath(alerts_path)}")
     lines.append(f"- 依赖源码 ref 匹配说明：{os.path.abspath(os.path.join(output_dir, 'git_ref_matches.txt'))}")
     lines.append(f"- 依赖源码 ref 匹配明细：{os.path.abspath(os.path.join(output_dir, 'git_ref_matches.json'))}")
     lines.append("")
-    lines.append("三、判断口径")
+    lines.append("四、判断口径")
     lines.append("- Step4 只说明依赖 API 发生了什么变化。")
     lines.append("- Step4 不证明这些变化是否影响当前系统；是否触达业务代码以 Step5/Step6 为准。")
     lines.append("- 如提供了依赖源码，需确认 old_version/new_version 命中的 git refs 是否正确。")
     lines.append("")
-    lines.append("四、运行信息")
+    lines.append("五、运行信息")
     lines.append(f"- 生成时间：{datetime.now().isoformat()}")
     if source_branches:
         lines.append(f"- 主工程分支范围：{source_branches[0]}..{source_branches[1]}")
         lines.append("- 依赖源码仓库 git diff 默认按依赖自身版本匹配 refs，不直接沿用主工程分支名。")
     lines.append("")
-    lines.append("五、严重级别分布")
+    lines.append("附录：统计分布")
+    lines.append("")
+    lines.append("严重级别分布")
     for k in ('P0', 'P1', 'P2'):
         lines.append(f"- {k}: {by_sev.get(k, 0)}")
     lines.append("")
-    lines.append("六、证据来源分布")
+    lines.append("证据来源分布")
     for k, v in sorted(by_source.items(), key=lambda x: (-x[1], x[0])):
         lines.append(f"- {k or '未标明来源'}: {v}")
     lines.append("")
@@ -4065,7 +4078,7 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
     if timeout_items is None:
         timeout_items = []
     if gitdiff_runs or gitdiff_skipped or gitdiff_pending:
-        lines.append("七、依赖源码对比")
+        lines.append("依赖源码对比")
         lines.append(f"- 已执行 git diff：{len(gitdiff_runs)}")
         if gitdiff_runs:
             top = sorted(gitdiff_runs, key=lambda x: (-int(x.get("api_changes", 0)), x.get("coord", "")))
@@ -4101,7 +4114,7 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
                 lines.append(f"  ...（仅展示前 20，共 {len(gitdiff_pending)}）")
         lines.append("")
     if timeout_items:
-        lines.append(f"八、超时项（前 {min(20, len(timeout_items))} 项）")
+        lines.append(f"超时项（前 {min(20, len(timeout_items))} 项）")
         for item in timeout_items[:20]:
             lines.append(
                 f"- {item.get('coord')}：阶段={item.get('stage')}；超时={item.get('timeout_seconds')}s；原因={item.get('reason') or '-'}"
@@ -4109,26 +4122,26 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
         if len(timeout_items) > 20:
             lines.append(f"...（仅展示前 20，共 {len(timeout_items)}）")
         lines.append("")
-    lines.append("九、变更类型分布")
+    lines.append("变更类型分布")
     for k, v in sorted(by_change_type.items(), key=lambda x: (-x[1], x[0])):
         lines.append(f"- {k or '未标明类型'}: {v}")
     lines.append("")
     if jar_missing_deps:
-        lines.append(f"十、jar 未找到（前 {min(20, len(jar_missing_deps))} 项）")
+        lines.append(f"jar 未找到（前 {min(20, len(jar_missing_deps))} 项）")
         for c in jar_missing_deps[:20]:
             lines.append(f"- {c}")
         if len(jar_missing_deps) > 20:
             lines.append(f"...（仅展示前 20，共 {len(jar_missing_deps)}）")
         lines.append("")
     if japicmp_missing_deps:
-        lines.append(f"十一、JApiCmp 未安装导致未分析（前 {min(20, len(japicmp_missing_deps))} 项）")
+        lines.append(f"JApiCmp 未安装导致未分析（前 {min(20, len(japicmp_missing_deps))} 项）")
         for c in japicmp_missing_deps[:20]:
             lines.append(f"- {c}")
         if len(japicmp_missing_deps) > 20:
             lines.append(f"...（仅展示前 20，共 {len(japicmp_missing_deps)}）")
         lines.append("")
     if other_failed_deps:
-        lines.append(f"十二、其他 JApiCmp 失败（前 {min(20, len(other_failed_deps))} 项）")
+        lines.append(f"其他 JApiCmp 失败（前 {min(20, len(other_failed_deps))} 项）")
         for c in other_failed_deps[:20]:
             lines.append(f"- {c}")
         if len(other_failed_deps) > 20:
@@ -4140,14 +4153,14 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
             if it.get('coord'):
                 uniq[it['coord']] = it
         items = list(uniq.values())
-        lines.append(f"十三、升级依赖缺少源码映射（前 {min(20, len(items))} 项）")
+        lines.append(f"升级依赖缺少源码映射（前 {min(20, len(items))} 项）")
         for it in items[:20]:
             lines.append(f"- {it.get('coord')}：{it.get('old_version')} -> {it.get('new_version')}")
         if len(items) > 20:
             lines.append(f"...（仅展示前 20，共 {len(items)}）")
         lines.append("")
     if zero_change:
-        lines.append(f"十四、版本已变更但未发现 API 变化（前 {min(50, len(zero_change))} 项）")
+        lines.append(f"版本已变更但未发现 API 变化（前 {min(50, len(zero_change))} 项）")
         for c in zero_change[:50]:
             lines.append(f"- {c}")
         if len(zero_change) > 50:
@@ -5320,7 +5333,7 @@ def main():
     # 输出摘要，真正的交互暂停由 run_step.py 统一处理
     human_checkpoint_1(dep_rows, all_apis, args.output_dir)
     print(
-        "\nStep4 复核文件：summary.txt、all_changed_apis.csv、git_ref_matches.*",
+        "\nStep4 复核文件：changed_dependencies.md、summary.txt、all_changed_apis.csv、git_ref_matches.*",
         file=sys.stderr,
     )
     emit_progress(

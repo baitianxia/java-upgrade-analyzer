@@ -147,10 +147,12 @@ class Step4StabilityTest(unittest.TestCase):
                 alert_rows = list(csv.DictReader(f))
 
         self.assertIn("Step4 依赖 API 变化摘要", summary_text)
-        self.assertLess(summary_text.index("一、结论总览"), summary_text.index("二、复核入口"))
-        self.assertLess(summary_text.index("二、复核入口"), summary_text.index("三、判断口径"))
+        self.assertLess(summary_text.index("一、先看什么"), summary_text.index("二、本次是否能进入 Step5"))
+        self.assertLess(summary_text.index("二、本次是否能进入 Step5"), summary_text.index("三、复核入口"))
+        self.assertIn("如果只决定 Step5 分析范围，先打开 changed_dependencies.md", summary_text)
         self.assertIn("- 变更 API 有效行：1", summary_text)
         self.assertIn("- 完整变更 API 清单：", summary_text)
+        self.assertIn("附录：统计分布", summary_text)
         self.assertNotIn("generated_at=", summary_text)
         self.assertNotIn("all_changed_apis=", summary_text)
         self.assertEqual(
@@ -173,7 +175,9 @@ class Step4StabilityTest(unittest.TestCase):
         output = stdout.getvalue()
 
         self.assertIn("【Step4 摘要】依赖 API 变化识别完成", output)
-        self.assertIn("结论总览：", output)
+        self.assertIn("先看什么：", output)
+        self.assertIn("本次是否能进入 Step5：", output)
+        self.assertIn("changed_dependencies.md", output)
         self.assertIn("复核文件：", output)
         self.assertNotIn("人工抽查节点", output)
         self.assertNotIn("建议优先查看", output)

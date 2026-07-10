@@ -2895,7 +2895,15 @@ def main():
     summary_lines = []
     summary_lines.append("Step1 依赖变更摘要")
     summary_lines.append("")
-    summary_lines.append("一、结论总览")
+    summary_lines.append("一、先看什么")
+    if alerts:
+        summary_lines.append("- 先看 dep_alerts.csv：这里列出降级、无法确认或解析异常的依赖。")
+    else:
+        summary_lines.append("- 未生成需要优先复核的依赖；如范围不符合预期，再看 dep_changes.csv。")
+    summary_lines.append("- 如怀疑分析范围不对，核对 build_provenance.json 中的 base/current 构建产物来源。")
+    summary_lines.append("- Step1 只确认依赖变化范围；是否影响业务，以 Step5 alerts.csv 和 Step6 report.md 为准。")
+    summary_lines.append("")
+    summary_lines.append("二、本次依赖范围是否可信")
     summary_lines.append(f"- 依赖记录总数：{len(rows)}")
     summary_lines.append(f"- 需要人工确认：{len(alerts)}")
     if curr_entries:
@@ -2909,7 +2917,7 @@ def main():
     else:
         summary_lines.append("- 结论：未发现需要优先复核的依赖变化。")
     summary_lines.append("")
-    summary_lines.append("二、分析范围")
+    summary_lines.append("三、分析范围")
     if args.base_artifact_path and args.current_artifact_path:
         summary_lines.append("- 输入模式：用户提供 base/current 编译产物")
         summary_lines.append(f"- base 编译产物：{str(Path(args.base_artifact_path).expanduser().resolve())}")
@@ -2932,22 +2940,24 @@ def main():
     if curr_meta.get('module_dir'):
         summary_lines.append(f"- current 模块目录：{curr_meta.get('module_dir')}")
     summary_lines.append("")
-    summary_lines.append("三、依赖变化统计")
+    summary_lines.append("四、依赖变化统计")
     for t, c in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
         summary_lines.append(f"- {t}: {c}")
     summary_lines.append("")
-    summary_lines.append("四、复核入口")
+    summary_lines.append("五、复核入口")
     summary_lines.append("- 完整依赖变化：dep_changes.csv")
     summary_lines.append("- 需要优先复核的依赖：dep_alerts.csv")
     summary_lines.append("- 构建产物来源：build_provenance.json")
     summary_lines.append("")
+    section_number = 6
     if unresolved_records:
-        summary_lines.append(f"五、坐标未解析依赖（前 {min(50, len(unresolved_records))} 项）")
+        summary_lines.append(f"{section_number}、坐标未解析依赖（前 {min(50, len(unresolved_records))} 项）")
+        section_number += 1
         for item in unresolved_records[:50]:
             summary_lines.append(f"- {item.get('label')}")
         summary_lines.append("")
     if alerts:
-        summary_lines.append(f"六、优先复核依赖（前 {min(50, len(alerts))} 项）")
+        summary_lines.append(f"{section_number}、优先复核依赖（前 {min(50, len(alerts))} 项）")
         for r in alerts[:50]:
             summary_lines.append(
                 f"- {r['coord']}：{r['old_version']} -> {r['new_version']}；变化={r['change_type']}；风险={r['risk']}；范围={r['scope']}；说明={r.get('remark','')}"
