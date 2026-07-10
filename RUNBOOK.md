@@ -258,9 +258,12 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ```text
 .upgrade-report/
+  README.md
   deliverables/
+    README.md
     report.md
   evidence/
+    README.md
     dependencies/
       dep_changes.csv
       dep_alerts.csv
@@ -284,6 +287,8 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
       s3_dependency_compat.csv
       s3_dependency_classfile.csv
     api_changes/
+      changed_dependencies.md
+      changed_dependencies.csv
       all_changed_apis.csv
       all_changed_apis_part_001.csv
       s4_per_dependency/
@@ -297,6 +302,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
       by_api/
       by_module/
   .runtime/
+    README.md
     state/
       main_state.json
       interaction.json

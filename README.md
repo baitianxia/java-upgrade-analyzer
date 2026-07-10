@@ -125,6 +125,8 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 
 ## 如何阅读结果
 
+运行后 `.upgrade-report/README.md` 是产物目录的落地阅读入口；它会把 `deliverables/`、`evidence/`、`.runtime/` 的用途分开说明。
+
 1. 先看 `.upgrade-report/deliverables/report.md`，了解客观分析结果和结论限制。
 2. 如果需要核对依赖 API 变化，先看 `.upgrade-report/evidence/api_changes/changed_dependencies.md`。
 3. 如果需要核对完整 API 明细，再看 `.upgrade-report/evidence/api_changes/all_changed_apis.csv`。
@@ -207,13 +209,23 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 .upgrade-report/
 ```
 
-人工复核优先看这三个文件：
+产物目录自带阅读入口：
+
+| 文件 | 用途 |
+|---|---|
+| `.upgrade-report/README.md` | 解释产物目录分层和推荐阅读顺序 |
+| `.upgrade-report/deliverables/README.md` | 解释给用户看的交付物 |
+| `.upgrade-report/evidence/README.md` | 解释深入复核证据 |
+| `.upgrade-report/.runtime/README.md` | 解释程序状态和缓存；普通用户不需要阅读 |
+
+人工阅读优先按这个顺序：
 
 | 顺序 | 文件 | 用途 |
 |---:|---|---|
-| 1 | `.upgrade-report/evidence/api_changes/all_changed_apis.csv` | 查看依赖 API 变化事实 |
-| 2 | `.upgrade-report/evidence/call_chain/alerts.csv` | 查看每个变化 API 的调用链追踪台账 |
-| 3 | `.upgrade-report/deliverables/report.md` | 查看最终汇总结论 |
+| 1 | `.upgrade-report/deliverables/report.md` | 查看最终客观分析结果和结论限制 |
+| 2 | `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 查看依赖包维度的 API 变化摘要和 Step5 选择值 |
+| 3 | `.upgrade-report/evidence/api_changes/all_changed_apis.csv` | 查看完整 API 变化事实 |
+| 4 | `.upgrade-report/evidence/call_chain/alerts.csv` | 查看每个变化 API 的完整调用链台账 |
 
 如果 `alerts.csv` 很大，Skill 会额外生成按状态拆分的阅读视图：
 
@@ -255,7 +267,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 | Step1 | 比较 base/current 最终依赖差异 | `evidence/dependencies/dep_changes.csv` |
 | Step2 | 建立升级上下文、源码和依赖映射 | `evidence/context/context.json` |
 | Step3 | 分析 JDK/Spring/Jakarta 等框架级风险 | `evidence/static_scan/*.csv` |
-| Step4 | 比较变更依赖 jar 的 API 变化 | `evidence/api_changes/all_changed_apis.csv` |
+| Step4 | 比较变更依赖 jar 的 API 变化 | `evidence/api_changes/changed_dependencies.md`、`evidence/api_changes/all_changed_apis.csv` |
 | Step5 | 追踪变化 API 是否触达业务代码 | `evidence/call_chain/alerts.csv` |
 | Step6 | 汇总成人可读报告 | `deliverables/report.md` |
 

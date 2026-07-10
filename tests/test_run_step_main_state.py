@@ -430,6 +430,25 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(selection_resolution["options"][0]["api_count"], 42)
             self.assertEqual(selection_resolution["options"][0]["high_risk_api_count"], 5)
 
+    def test_report_landing_docs_separate_user_evidence_and_runtime_layers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+
+            run_step.write_report_landing_docs(report_dir)
+
+            root_readme = (report_dir / "README.md").read_text(encoding="utf-8")
+            deliverables_readme = (report_dir / "deliverables" / "README.md").read_text(encoding="utf-8")
+            evidence_readme = (report_dir / "evidence" / "README.md").read_text(encoding="utf-8")
+            runtime_readme = (report_dir / ".runtime" / "README.md").read_text(encoding="utf-8")
+
+            self.assertIn("先看 `deliverables/report.md`", root_readme)
+            self.assertIn("给用户看的交付物", deliverables_readme)
+            self.assertIn("深入复核证据", evidence_readme)
+            self.assertIn("程序使用的状态和缓存", runtime_readme)
+            self.assertIn("普通用户不需要阅读", runtime_readme)
+            self.assertIn("changed_dependencies.md", evidence_readme)
+            self.assertIn("all_changed_apis.csv", evidence_readme)
+
     def test_user_decision_card_hides_internal_fields_and_shows_direct_replies(self):
         interaction = {
             "step_id": "step4",

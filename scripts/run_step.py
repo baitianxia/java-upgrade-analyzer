@@ -231,6 +231,90 @@ def write_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _write_text_file(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+
+def write_report_landing_docs(report_dir):
+    report_dir = Path(report_dir)
+    deliverables = deliverables_dir(report_dir)
+    evidence = evidence_dir(report_dir)
+    runtime = runtime_dir(report_dir)
+    for path in (report_dir, deliverables, evidence, runtime):
+        path.mkdir(parents=True, exist_ok=True)
+
+    _write_text_file(
+        report_dir / "README.md",
+        """# 升级分析产物阅读入口
+
+这个目录分成三层，避免把给人看的报告、深入复核证据和程序状态混在一起。
+
+| 目录 | 谁看 | 用途 |
+|---|---|---|
+| `deliverables/` | 普通使用者、评审人 | 给用户看的交付物。先看 `deliverables/report.md`。 |
+| `evidence/` | 需要深入复核的人 | Step1-Step5 的事实证据和完整台账。 |
+| `.runtime/` | 程序和 Agent | 状态、缓存、索引、恢复信息；普通用户不需要阅读。 |
+
+## 推荐阅读顺序
+
+1. 先看 `deliverables/report.md`。
+2. 如需核对依赖包变化，看 `evidence/api_changes/changed_dependencies.md`。
+3. 如需核对完整 API 明细，看 `evidence/api_changes/all_changed_apis.csv`。
+4. 如需核对调用链，看 `evidence/call_chain/alerts.csv`。
+""",
+    )
+    _write_text_file(
+        deliverables / "README.md",
+        """# deliverables/
+
+给用户看的交付物目录。
+
+| 文件 | 用途 |
+|---|---|
+| `report.md` | 最终报告；呈现客观分析结果、证据和结论限制。 |
+| `s6_*_apis.md/csv` | Step6 按结论分类拆出的明细；当主报告省略大量结果时再打开。 |
+
+这里的文件面向阅读和评审，不作为程序恢复状态的来源。
+""",
+    )
+    _write_text_file(
+        evidence / "README.md",
+        """# evidence/
+
+深入复核证据目录。这里保存 Step1-Step5 的事实材料和完整台账。
+
+| 目录 | 主要文件 | 用途 |
+|---|---|---|
+| `dependencies/` | `dep_changes.csv`、`build_provenance.json` | 依赖变更和构建产物来源。 |
+| `context/` | `context.json`、`source_mapping_summary.json` | 分析上下文和源码/依赖映射。 |
+| `static_scan/` | `s3_*.csv/.txt` | JDK、Spring、Jakarta 等背景线索。 |
+| `api_changes/` | `changed_dependencies.md`、`changed_dependencies.csv`、`all_changed_apis.csv` | 依赖包维度选择入口和完整 API 变化事实。 |
+| `call_chain/` | `alerts.csv`、`alerts_<status>.csv`、`summary.json` | 调用链完整台账和拆分阅读视图。 |
+
+普通选择 Step5 分析范围时优先使用 `api_changes/changed_dependencies.md` 中的 `selection_key`；`all_changed_apis.csv` 是完整 API 明细，不作为普通选择入口。
+""",
+    )
+    _write_text_file(
+        runtime / "README.md",
+        """# .runtime/
+
+程序使用的状态和缓存目录。普通用户不需要阅读这里。
+
+| 目录 | 用途 |
+|---|---|
+| `state/` | `main_state.json`、`interaction.json`，用于恢复流程和 checkpoint。 |
+| `coverage/` | 各步骤覆盖情况，用于 Step6 结论限制。 |
+| `indexes/` | Step5 查询索引。 |
+| `findings/` | Step6 结构化结果，供程序读取。 |
+| `cache/` | 中间缓存和筛选后的输入。 |
+
+不要把这里的 JSON 当作用户报告；需要给人看的结论在 `../deliverables/`，需要复核的证据在 `../evidence/`。
+""",
+    )
+
+
 def read_csv_rows(path):
     import csv
 
@@ -314,6 +398,7 @@ def load_main_state(report_dir, manifest_path=""):
 
 
 def save_main_state(report_dir, state):
+    write_report_landing_docs(report_dir)
     normalized = ensure_main_state_structure(state, report_dir, manifest_path=(state.get("state") or {}).get("manifest_path", ""))
     normalized["state"]["saved_at"] = datetime.now().isoformat()
     write_json(main_state_path(report_dir), normalized)

@@ -32,6 +32,21 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("可直接回复", text)
         self.assertIn("不要把 action_requirements", text)
 
+    def test_landing_docs_prefer_report_and_dependency_level_selection(self):
+        readme = self.read("README.md")
+        runbook = self.read("RUNBOOK.md")
+        manifest = self.read("scripts/step_manifest.json")
+
+        self.assertIn(".upgrade-report/README.md", readme)
+        self.assertLess(
+            readme.index(".upgrade-report/deliverables/report.md"),
+            readme.index(".upgrade-report/evidence/api_changes/changed_dependencies.md"),
+        )
+        self.assertIn("README.md", runbook)
+        self.assertIn("changed_dependencies.md", runbook)
+        self.assertIn("changed_dependencies.csv", manifest)
+        self.assertIn("selection_key", manifest)
+
 
 if __name__ == "__main__":
     unittest.main()

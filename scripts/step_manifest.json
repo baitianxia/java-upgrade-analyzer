@@ -443,6 +443,7 @@
         "step4"
       ],
       "inputs": [
+        "evidence/api_changes/changed_dependencies.csv",
         "evidence/api_changes/all_changed_apis.csv"
       ],
       "outputs": [
@@ -455,7 +456,7 @@
         "evidence/call_chain/source_artifact_alignment.json"
       ],
       "notes": [
-        "Step5 默认会遍历 all_changed_apis.csv，并对每条变更做反向调用链追踪；若 Step4 checkpoint 指定了坐标/名称，则只分析被选中的依赖。"
+        "Step5 默认会遍历 all_changed_apis.csv，并对每条变更做反向调用链追踪；若 Step4 checkpoint 指定了 changed_dependencies.csv 中的 selection_key，则只分析被选中的依赖包。"
       ]
     },
     {
