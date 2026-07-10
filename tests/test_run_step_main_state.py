@@ -456,6 +456,8 @@ class RunStepMainStateTest(unittest.TestCase):
 
             self.assertIn("先看 `deliverables/report.md`", root_readme)
             self.assertIn("按问题找文件", root_readme)
+            self.assertNotIn("为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/summary.json`", root_readme)
+            self.assertIn("为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/alerts.csv`", root_readme)
             self.assertIn("给人看的交付结果", deliverables_readme)
             self.assertIn("深入复核证据", evidence_readme)
             self.assertIn("程序使用的状态和缓存", runtime_readme)
@@ -468,6 +470,9 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertIn("依赖包维度变化摘要", api_changes_readme)
             self.assertIn("不要从 `all_changed_apis.csv` 逐行挑 API", api_changes_readme)
             self.assertIn("完整逐链路台账", call_chain_readme)
+            self.assertIn("人工优先看的文件", call_chain_readme)
+            self.assertIn("深度排查或程序使用的文件", call_chain_readme)
+            self.assertLess(call_chain_readme.index("`alerts.csv`"), call_chain_readme.index("`summary.json`"))
 
     def test_user_decision_card_hides_internal_fields_and_shows_direct_replies(self):
         interaction = {
@@ -1184,6 +1189,36 @@ class RunStepMainStateTest(unittest.TestCase):
             payload,
             {"action": "rerun_current_step", "selected_targets": ["coord:com.example:demo-lib"]},
         )
+
+    def test_step5_checkpoint_review_files_point_to_alerts_not_summary_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            manifest_steps = {
+                "step5": {
+                    "title": "调用链分析",
+                    "interaction": {
+                        "type": "review",
+                        "question": "请确认 Step5 结果。",
+                        "options": [{"id": "continue", "label": "继续"}],
+                    },
+                    "outputs": ["evidence/call_chain/summary.json"],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step5",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={},
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        review_files = "\n".join(payload.get("files_to_review") or [])
+        self.assertIn("evidence/call_chain/alerts.csv", review_files)
+        self.assertNotIn("summary.txt", review_files)
+        self.assertNotIn("summary.json", review_files)
 
     def test_build_run_context_keeps_dependency_source_mappings(self):
         with tempfile.TemporaryDirectory() as tmp:

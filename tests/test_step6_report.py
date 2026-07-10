@@ -23,6 +23,13 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         for phrase in forbidden:
             self.assertNotIn(phrase, text)
 
+    def test_appendix_keeps_by_api_evidence_out_of_program_only_section(self):
+        text = "\n".join(s6_report.render_report_appendix({"artifacts": {}}))
+
+        self.assertIn("| `evidence/call_chain/by_api/*.json` | 单 API 原始链路证据；排查时按需读取 |", text)
+        self.assertLess(text.index("#### 用户深入排查时看的产物"), text.index("`evidence/call_chain/by_api/*.json`"))
+        self.assertLess(text.index("`evidence/call_chain/by_api/*.json`"), text.index("#### 程序使用的产物"))
+
 
 if __name__ == "__main__":
     unittest.main()

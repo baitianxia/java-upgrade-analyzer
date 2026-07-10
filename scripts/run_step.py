@@ -278,7 +278,7 @@ def write_report_landing_docs(report_dir):
 | 完整变更 API 有哪些 | `evidence/api_changes/all_changed_apis.csv` | `evidence/api_changes/all_changed_apis_part_*.csv` |
 | 变更 API 是否触达当前系统 | `evidence/call_chain/alerts.csv` | `evidence/call_chain/alerts_<status>.csv` |
 | 依赖范围是否正确 | `evidence/dependencies/dep_changes.csv` | `evidence/dependencies/build_provenance.json` |
-| 为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/summary.json`、`evidence/call_chain/by_api/` |
+| 为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/alerts.csv`、`evidence/call_chain/by_api/` |
 
 ## 不建议先看的文件
 
@@ -318,7 +318,7 @@ def write_report_landing_docs(report_dir):
 | `context/` | `context.json`、`dep_graph.json` | 分析上下文和依赖关系。 |
 | `static_scan/` | `s3_*.csv/.txt` | JDK、Spring、Jakarta 等背景线索。 |
 | `api_changes/` | `changed_dependencies.md`、`changed_dependencies.csv`、`all_changed_apis.csv` | 依赖包维度选择入口和完整 API 变化事实。 |
-| `call_chain/` | `alerts.csv`、`alerts_<status>.csv`、`summary.json` | 调用链完整台账、拆分阅读视图和结构化汇总。 |
+| `call_chain/` | `alerts.csv`、`alerts_<status>.csv`、`by_api/` | 调用链完整台账、拆分阅读视图和单 API 证据。 |
 
 普通选择 Step5 分析范围时优先使用 `api_changes/changed_dependencies.md` 中的 `selection_key`；`all_changed_apis.csv` 是完整 API 明细，不作为普通选择入口。
 """,
@@ -426,13 +426,22 @@ def write_report_landing_docs(report_dir):
 
 这个目录回答“变更 API 有没有调用链触达当前系统或运行时依赖入口”。
 
+## 人工优先看的文件
+
 | 文件 | 什么时候看 | 说明 |
 |---|---|---|
 | `alerts.csv` | 第一入口 | 完整逐链路台账。每条变更 API 至少保留一行。 |
 | `alerts_<status>.csv` | 只看某类结论时 | 按链路状态拆分的台账。 |
 | `alerts_<status>_NNN.csv` | 单个状态文件过大时 | 分片阅读视图。 |
-| `summary.json` | 需要解释统计和能力覆盖时 | Step5 结构化汇总、原因码、覆盖状态。 |
 | `by_api/` | 追单条 API 证据时 | 单个 API 的逐边证据、路径和中断原因。 |
+
+## 深度排查或程序使用的文件
+
+这些文件不是普通阅读入口。只有当主报告、`alerts.csv` 或 Agent 明确指向它们时再打开。
+
+| 文件 | 类型 | 说明 |
+|---|---|---|
+| `summary.json` | 程序使用 | Step6 读取的结构化汇总、原因码和覆盖状态。 |
 | `framework_adapters.json` | 复核框架隐式入口时 | SPI、Spring、MyBatis 等 Adapter 输出。 |
 | `source_artifact_alignment.json` | 复核源码与制品是否对齐时 | 源码、依赖和构建产物对齐情况。 |
 | `step5_timing.csv` | 排查 Step5 慢在哪里时 | 调用链分析耗时拆解。 |
@@ -4459,7 +4468,6 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     outputs = step_meta.get("outputs", []) or []
     if step_id == "step5":
         files_to_review = [
-            str((step5_call_chain_dir(report_dir) / "summary.txt").resolve()),
             str((step5_call_chain_dir(report_dir) / "alerts.csv").resolve()),
         ]
     else:
@@ -4653,10 +4661,9 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 )
     if step_id == "step5":
         summary_json = step5_call_chain_dir(report_dir) / "summary.json"
-        # Checkpoint is user-facing: point readers to the concise summary and
-        # complete ledger, not to caches/indexes that only the program consumes.
+        # Checkpoint is user-facing: point readers to the complete ledger,
+        # not to summary JSON, caches, or indexes that only the program consumes.
         files_to_review = [
-            str((step5_call_chain_dir(report_dir) / "summary.txt").resolve()),
             str((step5_call_chain_dir(report_dir) / "alerts.csv").resolve()),
         ]
         call_summary = read_json(summary_json) if summary_json.exists() else {}

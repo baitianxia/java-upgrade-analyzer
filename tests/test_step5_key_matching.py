@@ -5413,7 +5413,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertNotIn("revision", combined)
             self.assertNotIn("profile", combined)
 
-    def test_generate_enhanced_summary_outputs_user_conclusion_counts(self):
+    def test_generate_enhanced_summary_outputs_user_conclusion_counts_without_low_value_text_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
             results = [
@@ -5496,18 +5496,19 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
             summary_path, summary_json_path = formatter.generate_enhanced_summary(results, output_dir)
             summary = json.loads(Path(summary_json_path).read_text(encoding="utf-8"))
-            summary_text = Path(summary_path).read_text(encoding="utf-8")
             by_api_text = next((output_dir / "by_api").glob("a_b_com_example_OrderService_run*.txt")).read_text(
                 encoding="utf-8"
             )
+            summary_txt_exists = (output_dir / "summary.txt").exists()
+            enhanced_summary_exists = (output_dir / "s5_enhanced_summary.txt").exists()
 
+        self.assertIsNone(summary_path)
+        self.assertFalse(summary_txt_exists)
+        self.assertFalse(enhanced_summary_exists)
         self.assertEqual(summary["user_conclusion_summary"]["已确认影响"], 1)
         self.assertEqual(summary["user_conclusion_summary"]["可能影响"], 1)
         self.assertEqual(summary["user_conclusion_summary"]["需要补充输入"], 1)
         self.assertEqual(summary["quality_gate"]["needs_input"], 1)
-        self.assertLess(summary_text.index("一、结论总览"), summary_text.index("附：内部状态统计"))
-        self.assertIn("二、已确认影响（优先处理）", summary_text)
-        self.assertIn("四、需要补充输入（建议先补齐后重跑）", summary_text)
         self.assertLess(by_api_text.index("【结论】"), by_api_text.index("【变更信息】"))
         self.assertIn("【调用链路】", by_api_text)
 
@@ -7207,12 +7208,12 @@ class Step5KeyMatchingTest(unittest.TestCase):
             call_chain_dir = report / "evidence" / "call_chain"
             summary_path, summary_json_path = formatter.generate_enhanced_summary([result], call_chain_dir)
             summary_payload = json.loads(Path(summary_json_path).read_text(encoding="utf-8"))
-            summary_text = Path(summary_path).read_text(encoding="utf-8")
             with (call_chain_dir / "alerts.csv").open(encoding="utf-8") as alert_file:
                 alert_rows = list(csv.DictReader(alert_file))
             findings = s6_report.collect_findings(str(report))
             final_report = s6_report.generate_report(findings)
 
+        self.assertIsNone(summary_path)
         self.assertIn(("com.vendor:legacy", "com.vendor.LegacyApi"), providers)
         self.assertEqual(result.analysis_status, "not_impacted")
         self.assertEqual(result.reason_code, "RUNTIME_SYMBOL_PRESERVED_IDENTICALLY")

@@ -2064,6 +2064,7 @@ def render_report_appendix(findings):
         f"| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 {S6_CHANGED_API_SPLIT_ROWS} 条一份） |",
         "| `evidence/call_chain/alerts.csv` | 完整逐链路台账 |",
         "| `evidence/call_chain/alerts_<status>.csv` / `alerts_<status>_NNN.csv` | 按链路状态拆分的台账 |",
+        "| `evidence/call_chain/by_api/*.json` | 单 API 原始链路证据；排查时按需读取 |",
         "| `evidence/static_scan/s3_*.csv/.txt` | JDK、Spring Boot、反射等静态扫描命中 |",
         "",
         "#### 程序使用的产物", "",
@@ -2074,7 +2075,6 @@ def render_report_appendix(findings):
         "| `.runtime/coverage/coverage.json` / `.runtime/coverage/s*_coverage.json` | 各步骤覆盖情况；用于判断结论限制 |",
         "| `.runtime/findings/s6_findings.json` | Step6 结构化结果；供程序读取，不作为人工优先阅读文件 |",
         "| `.runtime/indexes/s5_query_index.json` | 调用链查询索引；供只读查询命令使用 |",
-        "| `evidence/call_chain/by_api/*.json` | 单 API 原始链路证据；排查时按需读取 |",
         "",
     ]
     return lines

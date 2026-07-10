@@ -154,15 +154,25 @@ Step5 的核心输出目录：
 evidence/call_chain/
 ```
 
+### 人工优先看的文件
+
 | 文件 | 说明 | 复核重点 |
 |---|---|---|
-| `alerts.csv` | 完整链路台账 | 每个 API、每条终止链路、状态和原因 |
-| `summary.json` | 结构化汇总 | `analysis_status`、`reason_code`、能力覆盖 |
-| `summary.txt` | 执行摘要 | reachable、uncertain、not_found、not_analyzed 分布 |
-| `step5_timing.csv` | Step5 耗时拆解 | 性能问题定位 |
+| `alerts.csv` | 人工优先入口，完整链路台账 | 每个 API、每条终止链路、状态和原因 |
+| `alerts_<status>.csv` | 按结论状态拆分的链路台账 | 只看已确认影响、需人工复核、未发现路径或未完成分析时使用 |
+| `alerts_<status>_NNN.csv` | 大文件分片 | 单个状态文件太大时分段打开 |
+| `by_api/*.json` | 单 API 详细证据 | 已经锁定某个 API，需要看逐跳链路、证据路径、终止原因 |
+
+### 深度排查或程序使用的文件
+
+这些文件不作为普通阅读入口。只有当主报告、`alerts.csv` 或 Agent 明确指向它们时再打开。
+
+| 文件 | 类型 | 说明 |
+|---|---|---|
+| `summary.json` | 程序使用 | Step6 读取的结构化汇总，包含 `analysis_status`、`reason_code` 和能力覆盖 |
+| `step5_timing.csv` | 深度排查 | Step5 耗时拆解，用于性能问题定位 |
 | `dependency_source_alignment.json` | 依赖源码版本对齐证据 | 使用了哪个 current ref/commit、用户工作区是否保持不变、多少源码类被 current JAR 保留或排除 |
-| `.runtime/indexes/s5_query_index.json` | 内部调用链查询索引 | Claude Code 按方法即时查询调用链；默认精确匹配全限定名，不作为人工阅读文件 |
-| `by_api/*.json` | 单 API 详细证据 | 逐跳链路、证据路径、终止原因 |
+| `.runtime/indexes/s5_query_index.json` | 程序使用 | Agent 按方法即时查询调用链；不作为人工阅读文件 |
 | `by_module/*_impacts.json` | 按模块聚合视图 | 分派处理责任 |
 
 `dependency_source_alignment.json` 是结果与预期不一致时才需要查看的辅助证据。依赖源码未能与 Step4 确认的当前版本或 current JAR 对齐时，Step5 会拒绝这份源码并继续使用 JAR 字节码分析，不会静默使用本地仓库当前分支。
@@ -220,7 +230,7 @@ alerts_reachable_002.csv
 | `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物，无法回溯调用链清单 |
 | `deliverables/s6_not_analyzed_apis.csv/md` | 本次未完成分析清单 |
 | `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |
-| `.runtime/findings/s6_findings.json` | Step6 结构化结果；主要供程序读取 |
+| `.runtime/findings/s6_findings.json` | 程序使用；Step6 结构化结果，不作为人工阅读入口 |
 
 Step6 会避免把大量未命中 API 全部塞进主报告；主报告用于传达结论，附属明细用于展开复核。
 

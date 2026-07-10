@@ -26,6 +26,15 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("all_changed_apis.csv", text)
         self.assertIn("完整 API", text)
 
+    def test_outputs_doc_separates_human_first_files_from_program_files(self):
+        text = self.read("docs/user/outputs.md")
+        self.assertIn("人工优先看的文件", text)
+        self.assertIn("深度排查或程序使用的文件", text)
+        step5_text = text[text.index("## Step5：调用链影响证明") : text.index("## Step5 五态结论")]
+        self.assertLess(step5_text.index("`alerts.csv` | 人工优先入口"), step5_text.index("`summary.json`"))
+        self.assertIn("`.runtime/indexes/s5_query_index.json` | 程序使用", text)
+        self.assertIn("`.runtime/findings/s6_findings.json` | 程序使用", text)
+
     def test_skill_doc_requires_user_facing_decision_card(self):
         text = self.read("SKILL.md")
         self.assertIn("决策卡片", text)

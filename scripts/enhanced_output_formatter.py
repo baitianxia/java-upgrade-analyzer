@@ -232,32 +232,6 @@ def _first_business_entry(result):
     return ''
 
 
-def _summary_item_line(index, result, include_action=False):
-    view = summarize_user_facing_outcome(result)
-    api_name = _api_display_name(result)
-    entry = _first_business_entry(result)
-    entry_label = '符号提供方' if result.analysis_status == 'not_impacted' else '入口'
-    entry_part = f" | {entry_label}: {entry}" if entry else ""
-    reason = view['user_reason']
-    action = view['recommended_action']
-    line = (
-        f"  {index}. [{result.severity}] {result.coord} | {api_name}"
-        f" | 原因: {reason}{entry_part}"
-    )
-    if include_action and action:
-        line += f" | 建议: {action}"
-    return line
-
-
-def _reason_summary(results):
-    grouped = defaultdict(int)
-    for result in results or []:
-        view = summarize_user_facing_outcome(result)
-        reason = view['user_reason'] or result.reason_code or '未说明原因'
-        grouped[reason] += 1
-    return sorted(grouped.items(), key=lambda item: (-item[1], item[0]))
-
-
 def _load_json_if_exists(path):
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -995,12 +969,12 @@ def cleanup_generated_output_dir(dir_path, allowed_suffixes=None):
 
 def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     """
-    生成增强型摘要报告
+    生成 Step5 调用链台账和结构化汇总。
 
     输出文件：
-      - s5_enhanced_summary.txt：人类可读摘要
       - alerts.csv：完整逐链路人工台账
       - by_api/*.txt：每个API的详细分析报告
+      - summary.json：供 Step6 使用的结构化汇总
     """
     report_started_at = time.perf_counter()
     report_perf = None
@@ -1008,136 +982,13 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
         report_perf = graph_stats.setdefault('step5_perf', {}).setdefault('report', {})
     os.makedirs(output_dir, exist_ok=True)
 
-    # 分类统计（支持新状态名）
-    reachable = [r for r in all_results if r.analysis_status == 'reachable']
-    not_impacted = [r for r in all_results if r.analysis_status == 'not_impacted']
-    uncertain = [r for r in all_results if r.analysis_status == 'uncertain']
-    not_analyzed = [r for r in all_results if r.analysis_status == 'not_analyzed']
-    # 兼容新旧状态名
-    not_found = [r for r in all_results if r.analysis_status in ('not_reachable', 'not_found_in_static_analysis')]
-    user_views = [summarize_user_facing_outcome(r) for r in all_results]
-    user_conclusion_summary = defaultdict(int)
-    decision_bucket_summary = defaultdict(int)
-    for item in user_views:
-        user_conclusion_summary[item['user_conclusion']] += 1
-        decision_bucket_summary[item['decision_bucket']] += 1
-
-    # 生成摘要文本：用户可见文件必须先给结论、原因和判断入口；内部状态后置。
-    summary_lines = [
-        "Step5 调用链分析摘要",
-        f"生成时间: {datetime.now().isoformat()}",
-        "",
-        "一、结论总览",
-        f"- 分析 API 总数: {len(all_results)}",
-        f"- 已确认影响: {user_conclusion_summary.get('已确认影响', 0)}",
-        f"- 已确认不受影响: {user_conclusion_summary.get('已确认不受影响', 0)}",
-        f"- 可能影响: {user_conclusion_summary.get('可能影响', 0)}",
-        f"- 当前无法确认: {user_conclusion_summary.get('当前无法确认', 0)}",
-        f"- 需要补充输入: {user_conclusion_summary.get('需要补充输入', 0)}",
-        "",
-        "判断口径:",
-        "- 已确认影响: 找到从系统代码到变更 API 的可证明调用链。",
-        "- 已确认不受影响: 有直接制品证据证明变更 API 仍以相同字节码存在。",
-        "- 可能影响/当前无法确认: 有证据缺口或只能证明部分链路，不能当作无影响。",
-        "- 需要补充输入: 缺少源码映射、构建产物或关键工具证据，建议补齐后重跑。",
-        "",
-    ]
-
-    unresolved_for_reason = probable = inconclusive = input_required = []
-
-    section_number = 2
-
-    def section_title(title):
-        """Keep the user-facing outline sequential and consistently Chinese."""
-        nonlocal section_number
-        numerals = ('零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十')
-        number = numerals[section_number] if section_number < len(numerals) else str(section_number)
-        section_number += 1
-        return f"{number}、{title}"
-
-    # Reachable Top 20
-    if reachable:
-        summary_lines.append(section_title("已确认影响（优先处理）"))
-        reachable_sorted = sorted(
-            reachable,
-            key=lambda r: (
-                severity_rank(r.severity),
-                -r.business_reach_depth,
-                -r.confidence_score
-            )
-        )
-
-        for idx, r in enumerate(reachable_sorted[:20], 1):
-            summary_lines.append(_summary_item_line(idx, r))
-
-        summary_lines.append("")
-
-    if not_impacted:
-        summary_lines.append(section_title("已确认不受影响"))
-        for idx, r in enumerate(sorted(not_impacted, key=lambda r: (severity_rank(r.severity), r.api_name))[:20], 1):
-            summary_lines.append(_summary_item_line(idx, r))
-        summary_lines.append("")
-
-    # Uncertain Top 20
-    probable = [r for r in all_results if summarize_user_facing_outcome(r)['user_conclusion'] == '可能影响']
-    inconclusive = [r for r in all_results if summarize_user_facing_outcome(r)['user_conclusion'] == '当前无法确认']
-    input_required = [r for r in all_results if summarize_user_facing_outcome(r)['user_conclusion'] == '需要补充输入']
-    unresolved_for_reason = probable + inconclusive + input_required
-
-    if probable:
-        summary_lines.append(section_title("可能影响（需要验证）"))
-        for idx, r in enumerate(sorted(probable, key=lambda r: severity_rank(r.severity))[:20], 1):
-            summary_lines.append(_summary_item_line(idx, r, include_action=True))
-        summary_lines.append("")
-
-    if inconclusive:
-        summary_lines.append(section_title("当前无法确认（不能解释为无影响）"))
-        for idx, r in enumerate(sorted(inconclusive, key=lambda r: severity_rank(r.severity))[:20], 1):
-            summary_lines.append(_summary_item_line(idx, r, include_action=True))
-        summary_lines.append("")
-
-    if input_required:
-        summary_lines.append(section_title("需要补充输入（建议先补齐后重跑）"))
-        for idx, r in enumerate(sorted(input_required, key=lambda r: severity_rank(r.severity))[:20], 1):
-            summary_lines.append(_summary_item_line(idx, r, include_action=True))
-        summary_lines.append("")
-
-    if unresolved_for_reason:
-        summary_lines.append(section_title("无法确认/需补输入的主要原因"))
-        for idx, (reason, count) in enumerate(_reason_summary(unresolved_for_reason)[:10], 1):
-            summary_lines.append(f"  {idx}. {reason}: {count} 个 API")
-        summary_lines.append("")
-
-    summary_lines.extend([
-        section_title("复核文件"),
-        "- 完整链路台账: alerts.csv",
-        "- 单 API 明细: by_api/",
-        "- 最终交付报告: ../../deliverables/report.md",
-        "",
-        "附：内部状态统计",
-        f"- reachable: {len(reachable)}",
-        f"- not_impacted: {len(not_impacted)}",
-        f"- uncertain: {len(uncertain)}",
-        f"- not_analyzed: {len(not_analyzed)}",
-        f"- not_found_in_static_analysis: {len(not_found)}",
-        "",
-    ])
-
-    # 保存摘要
-    # 关键修复：同时生成 summary.txt（文档承诺的合约）和 s5_enhanced_summary.txt
-    summary_path = os.path.join(output_dir, 'summary.txt')
-    summary_text_timer = time.perf_counter()
-    with open(summary_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write('\n'.join(summary_lines))
-
-    # 也生成增强版摘要（向后兼容）
-    enhanced_summary_path = os.path.join(output_dir, 's5_enhanced_summary.txt')
-    with open(enhanced_summary_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write('\n'.join(summary_lines))
+    summary_path = None
+    for stale_name in ('summary.txt', 's5_enhanced_summary.txt'):
+        stale_path = os.path.join(output_dir, stale_name)
+        if os.path.isfile(stale_path):
+            os.remove(stale_path)
     if report_perf is not None:
-        report_perf['summary_text_elapsed_sec'] = round(time.perf_counter() - summary_text_timer, 3)
-
-    print(f"  摘要报告 → {summary_path}", file=sys.stderr)
+        report_perf['summary_text_elapsed_sec'] = 0.0
 
     # 生成每个API的详细报告
     by_api_timer = time.perf_counter()
