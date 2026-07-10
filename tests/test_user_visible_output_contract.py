@@ -31,6 +31,16 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("决策卡片", text)
         self.assertIn("可直接回复", text)
         self.assertIn("不要把 action_requirements", text)
+        self.assertIn("覆盖当前所有交互点", text)
+        self.assertNotIn("原样转述", text)
+        self.assertNotIn("原样列出", text)
+
+    def test_checkpoint_rules_keep_internal_protocol_out_of_user_main_message(self):
+        text = self.read("CHECKPOINT_RULES.md")
+        self.assertIn("当前所有交互点", text)
+        self.assertIn("用户主信息", text)
+        self.assertIn("response_schema", text)
+        self.assertNotIn("原样转述", text)
 
     def test_landing_docs_prefer_report_and_dependency_level_selection(self):
         readme = self.read("README.md")

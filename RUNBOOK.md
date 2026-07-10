@@ -362,7 +362,7 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 - Maven 场景下，Step1 会真实执行 `package`，或直接读取用户提供的编译产物
 - `boot jar/war` 直接读取最终产物
 - `thin jar` / 无嵌套依赖场景当前不支持，会直接报错
-- 若 Step1 先进入待交互，Agent 不应只看 `question/options/files_to_review`，还应优先读取 `missing_inputs`、`fallback_inputs`、`input_modes`、`response_schema`、`input_normalization`
+- 若 Step1 先进入待交互，Agent 必须把 `interaction.json` 整理成用户可读的决策卡片：缺什么输入、可用哪种输入方式、可以直接怎么回复；协议字段只用于内部恢复命令构造
 - 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支执行 `mvn dependency:list` 补全坐标；但这不是 direct artifact 模式的执行前硬前置
 - `base_source_project_dir/current_source_project_dir` 仅保留给特殊兼容场景，不作为默认交互模型
 - 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源
@@ -384,16 +384,14 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
   --current-artifact-path /abs/path/to/current-app.jar
 ```
 
-若 Step1 返回待交互状态，推荐 Agent 至少检查：
+若 Step1 返回待交互状态，给用户看的第一层只保留决策信息：
 
-- `interaction.question`
-- `interaction.missing_inputs`
-- `interaction.fallback_inputs`
-- `interaction.input_modes`
-- `interaction.response_schema`
-- `interaction.input_normalization`
-- `interaction.action_requirements`
-- `interaction.selection_resolution`
+- 当前缺哪些输入
+- 可以用哪种输入方式补齐
+- 哪些信息是可选补充
+- 用户可以直接怎么回复
+
+`response_schema`、`input_normalization`、`action_requirements`、`selection_resolution` 仅用于 Agent 把用户原话整理成恢复命令，不作为用户主信息展示。
 
 ### 门控
 

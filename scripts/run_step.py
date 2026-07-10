@@ -3859,19 +3859,173 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
     return payload
 
 
+def _user_field_label(field):
+    labels = {
+        "action": "动作",
+        "target_module": "目标模块",
+        "primary_module": "目标模块",
+        "modules": "模块列表",
+        "base_branch": "基准分支",
+        "current_branch": "当前分支",
+        "base_artifact_path": "升级前构建产物",
+        "current_artifact_path": "升级后构建产物",
+        "source_dirs": "业务源码目录",
+        "dependency_source_dirs": "依赖源码目录",
+        "source_repo_hints": "源码仓库线索",
+        "dependency_git_ref_overrides": "依赖 git ref 确认",
+        "step5_selected_coords": "Step5 选择的依赖坐标",
+        "step5_selected_names": "Step5 选择的依赖名称",
+        "selected_targets": "选择的依赖包",
+        "strict_risk_gate": "严格门控",
+        "step4_git_diff_timeout": "Step4 git diff 超时秒数",
+        "step4_japicmp_timeout": "Step4 JApiCmp 超时秒数",
+        "step4_fetch_timeout": "Step4 拉取依赖超时秒数",
+        "restart_step_id": "重跑起点",
+        "notes": "备注",
+    }
+    return labels.get(str(field or "").strip(), str(field or "").strip())
+
+
+def _user_field_description(field, meta=None):
+    meta = meta or {}
+    description = str(meta.get("description") or "").strip()
+    descriptions = {
+        "target_module": "要分析的业务模块。",
+        "primary_module": "要分析的业务模块。",
+        "modules": "一个或多个要分析的业务模块。",
+        "base_branch": "升级前代码所在分支。",
+        "current_branch": "升级后代码所在分支。",
+        "base_artifact_path": "升级前构建出的 jar/war 路径。",
+        "current_artifact_path": "升级后构建出的 jar/war 路径。",
+        "dependency_source_dirs": "相关依赖源码仓库或多模块仓库根目录。",
+        "dependency_git_ref_overrides": "当依赖版本无法自动匹配 git ref 时，显式给出 old_ref/new_ref。",
+        "selected_targets": "来自 changed_dependencies.md/csv 的 selection_key、依赖坐标或依赖名称。",
+        "step5_selected_coords": "只让 Step5 分析这些依赖坐标。",
+        "step5_selected_names": "只让 Step5 分析这些依赖名称。",
+        "strict_risk_gate": "要求存在未确认项时不要继续产出无盲区结论。",
+    }
+    return descriptions.get(str(field or "").strip(), description)
+
+
+def _format_user_field(field, meta=None):
+    label = _user_field_label(field)
+    description = _user_field_description(field, meta)
+    if description:
+        return f"{label}：{description}"
+    return label
+
+
+def _humanize_interaction_text(text):
+    value = str(text or "")
+    replacements = {
+        "dependency_source_dirs": "依赖源码目录",
+        "dependency_git_ref_overrides": "依赖 old_ref/new_ref",
+        "source_dirs": "业务源码目录",
+        "target_module": "目标模块",
+        "project_scope": "项目范围",
+        "step5_selected_coords": "Step5 选择的依赖坐标",
+        "step5_selected_names": "Step5 选择的依赖名称",
+        "selected_targets": "选择的依赖包",
+        "allow_degraded=true": "允许降级执行",
+    }
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value)
+    return value
+
+
+def _response_schema_properties(interaction):
+    response_schema = dict((interaction or {}).get("response_schema") or {})
+    properties = response_schema.get("properties") or {}
+    return properties if isinstance(properties, dict) else {}
+
+
+def _decision_card_reply_examples(interaction, selection_options, options):
+    properties = _response_schema_properties(interaction)
+    fields = set(properties)
+    for item in (interaction.get("missing_inputs") or []):
+        field = str((item or {}).get("field") or "").strip()
+        if field:
+            fields.add(field)
+    examples = []
+    option_ids = {str((item or {}).get("id") or "").strip() for item in options}
+    if selection_options:
+        first_key = selection_options[0].get("selection_key") or "<selection_key>"
+        examples.append("全量继续")
+        examples.append(f"只分析 {first_key}")
+    elif "continue" in option_ids:
+        examples.append("继续")
+
+    if {"base_artifact_path", "current_artifact_path"} & fields:
+        examples.append("目标模块是 app，升级前产物是 /path/base.jar，升级后产物是 /path/current.jar")
+    if {"base_branch", "current_branch"} <= fields:
+        examples.append("目标模块是 app，基准分支 main，当前分支 feature/upgrade")
+    elif {"base_branch", "current_branch"} & fields:
+        examples.append("基准分支 main，当前分支 feature/upgrade")
+    if "dependency_source_dirs" in fields:
+        examples.append("依赖源码目录是 /path/to/dependency-repo，补充后重跑")
+    if "dependency_git_ref_overrides" in fields:
+        examples.append('依赖 com.acme:lib 的 old_ref 是 v1.0.0，new_ref 是 v2.0.0，补充后重跑')
+    if {"step4_git_diff_timeout", "step4_japicmp_timeout", "step4_fetch_timeout"} & fields:
+        examples.append("把 Step4 JApiCmp 超时放宽到 1800 秒后重跑")
+    if "restart_from_step" in option_ids:
+        examples.append("从 step2 重跑")
+
+    unique = []
+    for item in examples:
+        if item and item not in unique:
+            unique.append(item)
+    return unique[:5]
+
+
 def build_user_decision_card(interaction):
     lines = []
     interaction = interaction or {}
-    question = str(interaction.get("question") or "请确认当前结果，然后继续。").strip()
+    question = _humanize_interaction_text(interaction.get("question") or "请确认当前结果，然后继续。").strip()
     lines.append(f"当前需要确认：{question}")
 
-    reason = str(interaction.get("user_reason") or interaction.get("reason") or "").strip()
+    reason = _humanize_interaction_text(interaction.get("user_reason") or interaction.get("reason") or "").strip()
     if reason:
         lines.append(f"为什么停下：{reason}")
 
-    recommended = str(interaction.get("recommended_action") or "").strip()
+    recommended = _humanize_interaction_text(interaction.get("recommended_action") or "").strip()
     if recommended:
         lines.append(f"推荐动作：{recommended}")
+
+    missing_inputs = list(interaction.get("missing_inputs") or [])
+    if missing_inputs:
+        lines.append("需要补充的信息：")
+        for item in missing_inputs[:10]:
+            field = str(item.get("field") or "").strip()
+            label = item.get("label") or _user_field_label(field)
+            reason_text = str(item.get("reason") or "").strip()
+            suffix = f" - {reason_text}" if reason_text else ""
+            lines.append(f"- {label}{suffix}")
+
+    fallback_inputs = list(interaction.get("fallback_inputs") or [])
+    if fallback_inputs:
+        lines.append("可选补充信息：")
+        for item in fallback_inputs[:8]:
+            field = str(item.get("field") or "").strip()
+            label = item.get("label") or _user_field_label(field)
+            reason_text = str(item.get("reason") or "").strip()
+            suffix = f" - {reason_text}" if reason_text else ""
+            lines.append(f"- {label}{suffix}")
+
+    input_modes = list(interaction.get("input_modes") or [])
+    if input_modes:
+        lines.append("可选输入方式：")
+        for item in input_modes[:5]:
+            label = item.get("label") or item.get("id") or "输入方式"
+            required_fields = [
+                _user_field_label(field)
+                for field in (item.get("required_fields") or [])
+                if str(field or "").strip()
+            ]
+            if required_fields:
+                lines.append(f"- {label}：需要 " + "、".join(required_fields))
+            else:
+                lines.append(f"- {label}")
 
     options = list(interaction.get("options") or [])
     if options:
@@ -3892,21 +4046,32 @@ def build_user_decision_card(interaction):
                 f"| `{item.get('selection_key')}` | `{item.get('coord') or ''}` | "
                 f"{item.get('api_count') or 0} | {item.get('high_risk_api_count') or 0} |"
             )
+        if len(selection_options) > 10:
+            lines.append(f"这里只展示前 10 个候选；完整候选请看下面的文件。")
 
     files_to_review = list(interaction.get("files_to_review") or [])
     if files_to_review:
         lines.append("完整候选或证据文件：")
         for path in files_to_review[:5]:
             lines.append(f"- `{path}`")
+        if len(files_to_review) > 5:
+            lines.append(f"- 其余 {len(files_to_review) - 5} 个文件见 interaction.json 的 files_to_review。")
 
-    if selection_options:
-        first_key = selection_options[0].get("selection_key") or "<selection_key>"
+    checklist_lines = [
+        _humanize_interaction_text(item).strip()
+        for item in (interaction.get("checklist_lines") or [])
+        if str(item or "").strip()
+    ]
+    if checklist_lines:
+        lines.append("复核提示：")
+        for item in checklist_lines[:8]:
+            lines.append(f"- {item.lstrip('- ').strip()}")
+
+    reply_examples = _decision_card_reply_examples(interaction, selection_options, options)
+    if reply_examples:
         lines.append("你可以直接回复：")
-        lines.append("- “全量继续”")
-        lines.append(f"- “只分析 {first_key}”")
-        lines.append("- “我补充依赖源码目录 /path/to/repo 后重跑”")
-    elif options:
-        lines.append("你可以直接回复选项名称，例如：“继续”或“补材料后重跑”。")
+        for item in reply_examples:
+            lines.append(f"- “{item}”")
     return lines
 
 
@@ -3984,92 +4149,14 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
     sys.stderr.write("=" * 60 + "\n")
     for line in build_user_decision_card(interaction):
         sys.stderr.write(f"{line}\n")
-    sys.stderr.write("-" * 60 + "\n")
-    question = interaction.get("question")
-    if question:
-        sys.stderr.write(f"问题：{question}\n")
     missing_inputs = interaction.get("missing_inputs", []) or []
-    if missing_inputs:
-        sys.stderr.write("缺失输入：\n")
-        for item in missing_inputs:
-            field = item.get("field") or ""
-            label = item.get("label") or field
-            side = item.get("side") or ""
-            reason = item.get("reason") or ""
-            artifact_path = item.get("artifact_path") or ""
-            sys.stderr.write(f"  - {field}（{label}）")
-            if side:
-                sys.stderr.write(f" [side={side}]")
-            sys.stderr.write("\n")
-            if reason:
-                sys.stderr.write(f"    原因: {reason}\n")
-            if artifact_path:
-                sys.stderr.write(f"    产物: {artifact_path}\n")
     fallback_inputs = interaction.get("fallback_inputs", []) or []
-    if fallback_inputs:
-        sys.stderr.write("可选兜底输入：\n")
-        for item in fallback_inputs:
-            field = item.get("field") or ""
-            label = item.get("label") or field
-            side = item.get("side") or ""
-            reason = item.get("reason") or ""
-            sys.stderr.write(f"  - {field}（{label}）")
-            if side:
-                sys.stderr.write(f" [side={side}]")
-            sys.stderr.write("\n")
-            if reason:
-                sys.stderr.write(f"    说明: {reason}\n")
     input_modes = interaction.get("input_modes", []) or []
-    if input_modes:
-        sys.stderr.write("支持输入方式：\n")
-        for item in input_modes:
-            mode_id = item.get("id") or ""
-            label = item.get("label") or mode_id
-            required_fields = ", ".join(item.get("required_fields") or []) or "(无)"
-            recommended_fields = ", ".join(item.get("recommended_fields") or []) or ""
-            sys.stderr.write(f"  - {mode_id}（{label}） required={required_fields}\n")
-            if recommended_fields:
-                sys.stderr.write(f"    推荐: {recommended_fields}\n")
     files_to_review = interaction.get("files_to_review", []) or []
-    if files_to_review:
-        sys.stderr.write("需优先复核文件：\n")
-        for item in files_to_review:
-            sys.stderr.write(f"  - {item}\n")
-    for line in interaction.get("checklist_lines", []) or []:
-        if line is None:
-            continue
-        sys.stderr.write(f"- {str(line).rstrip()}\n")
     options = interaction.get("options", []) or []
-    if options:
-        sys.stderr.write("可选动作：\n")
-        for option in options:
-            line = f"  - {option.get('id')}: {option.get('label') or option.get('id')}"
-            desc = option.get("description")
-            if desc:
-                line += f" - {desc}"
-            sys.stderr.write(line.rstrip() + "\n")
     action_requirements = interaction.get("action_requirements") or {}
-    if action_requirements:
-        sys.stderr.write("动作约束：\n")
-        for action_id, spec in action_requirements.items():
-            required_fields = ", ".join(spec.get("required_fields") or []) or "(无)"
-            at_least_one = ", ".join(spec.get("at_least_one_of") or []) or ""
-            recommended = ", ".join(spec.get("recommended_fields") or []) or ""
-            sys.stderr.write(f"  - {action_id}: required={required_fields}\n")
-            if at_least_one:
-                sys.stderr.write(f"    至少其一: {at_least_one}\n")
-            if recommended:
-                sys.stderr.write(f"    推荐: {recommended}\n")
     selection_options = interaction.get("selection_options", []) or []
-    if selection_options:
-        sys.stderr.write("候选目标：\n")
-        for item in selection_options[:10]:
-            selection_key = item.get("selection_key") or ""
-            coord = item.get("coord") or ""
-            name = item.get("name") or ""
-            sys.stderr.write(
-                f"  - {selection_key} | coord={coord or '(无)'} | name={name or '(无)'}\n"
-            )
+    sys.stderr.write(f"完整交互协议：{(runtime_state_dir(report_dir) / 'interaction.json').resolve()}\n")
     sys.stderr.write("=" * 60 + "\n")
     sys.stderr.flush()
     body = {
@@ -4175,26 +4262,26 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
     if not source_state.get("provided"):
         return payload
 
-    question_prefix = "已收到 dependency_source_dirs。"
+    question_prefix = "已收到依赖源码目录。"
     if not source_state.get("recognized"):
-        question_prefix = "已收到 dependency_source_dirs，但当前目录未识别出有效依赖源码仓库。"
+        question_prefix = "已收到依赖源码目录，但当前目录未识别出有效依赖源码仓库。"
     elif (
         str(payload.get("step_id") or "").strip() == "step5"
         and reason_code != "step5_dependency_source_mapping_missing"
         and not source_state.get("analysis_requires_more_source")
     ):
         question_prefix = (
-            "已识别 dependency_source_dirs；本轮没有因依赖源码缺失而中断的 API。"
+            "已识别依赖源码目录；本轮没有因依赖源码缺失而中断的 API。"
             "被删除依赖本身已有旧 JAR 符号证据，不要求额外提供其源码。"
         )
     elif source_state.get("required_uncovered_coords"):
         missing = ", ".join((source_state.get("required_uncovered_coords") or [])[:10])
-        question_prefix = f"已收到 dependency_source_dirs，但这些实际调用链仍因缺少依赖源码而中断：{missing}。"
+        question_prefix = f"已收到依赖源码目录，但这些实际调用链仍因缺少依赖源码而中断：{missing}。"
     elif source_state.get("uncovered_target_coords"):
         missing = ", ".join((source_state.get("uncovered_target_coords") or [])[:10])
-        question_prefix = f"已收到 dependency_source_dirs，但当前仍未覆盖这些目标依赖坐标：{missing}。"
+        question_prefix = f"已收到依赖源码目录，但当前仍未覆盖这些目标依赖坐标：{missing}。"
     elif source_state.get("covers_targets"):
-        question_prefix = "已收到 dependency_source_dirs；仅当现有目录不正确或覆盖范围不足时才需要修正。"
+        question_prefix = "已收到依赖源码目录；仅当现有目录不正确或覆盖范围不足时才需要修正。"
 
     checklist_lines = list(payload.get("checklist_lines") or [])
     if question_prefix not in checklist_lines:
@@ -4491,7 +4578,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                     if coord and coord not in coords:
                         coords.append(coord)
             checklist_lines.append(
-                "存在缺失依赖源码映射的调用链项；优先补齐 dependency_source_dirs 后重跑 Step5，通常能显著减少 uncertain / not_analyzed。"
+                "存在缺失依赖源码映射的调用链项；补齐依赖源码目录后重跑 Step5，通常能减少无法确认或未分析的项。"
             )
             if coords:
                 checklist_lines.append(f"  - 建议优先补这些依赖：{', '.join(coords[:10])}")
@@ -4809,9 +4896,8 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         )
         if not dependency_source_dirs and not allow_degraded and not has_selection_override:
             raise StepError(
-                "Step5 当前检查点要求先补充 dependency_source_dirs，或显式设置 "
-                "allow_degraded=true，或选择需要分析的目标 jar 后，再使用 "
-                "action=rerun_current_step 重跑。"
+                "Step5 当前检查点要求先补充依赖源码目录，或明确允许降级执行，"
+                "或选择需要分析的目标 jar 后，再重跑当前步骤。"
             )
 
     if (
@@ -4830,8 +4916,8 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         ) or []
         if not overrides and not dependency_source_dirs:
             raise StepError(
-                "Step4 当前检查点要求先确认 dependency_git_ref_overrides，或修正 "
-                "dependency_source_dirs 后，再使用 action=rerun_current_step 重跑。"
+                "Step4 当前检查点要求先确认依赖 old_ref/new_ref，"
+                "或修正依赖源码目录后，再重跑当前步骤。"
             )
     if (
         step_id == "step4"
@@ -4852,7 +4938,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         if not has_timeout_override and not dependency_source_dirs:
             raise StepError(
                 "Step4 当前检查点要求先调整至少一个 Step4 超时参数，或修正 "
-                "dependency_source_dirs 后，再使用 action=rerun_current_step 重跑。"
+                "依赖源码目录后，再重跑当前步骤。"
             )
     if (
         step_id == "step4"

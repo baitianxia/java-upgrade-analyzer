@@ -1055,7 +1055,7 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
                 },
                 "dependency_source_dirs": {
                     "type": "array",
-                    "description": "若源码仓库映射有误，也可同时修正 dependency_source_dirs。",
+                    "description": "若源码仓库映射有误，也可同时修正依赖源码目录。",
                 },
                 "restart_step_id": {
                     "type": "string",
@@ -1074,7 +1074,7 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
         "action_requirements": {
             "rerun_current_step": {
                 "at_least_one_of": ["dependency_git_ref_overrides", "dependency_source_dirs"],
-                "description": "重跑 Step4 时，至少要确认 git refs，或修正 dependency_source_dirs。",
+                "description": "重跑 Step4 时，至少要确认 git refs，或修正依赖源码目录。",
             },
             "restart_from_step": {
                 "required_fields": ["restart_step_id"],
@@ -1085,7 +1085,7 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
         "resume_hint": (
             "用户确认 old_ref/new_ref 后，可使用 --response-json 传回 "
             "action=rerun_current_step 与 dependency_git_ref_overrides 重跑 Step4；"
-            "若问题源于 dependency_source_dirs 指向错误，也可同时修正 dependency_source_dirs 后重跑。"
+            "若问题源于依赖源码目录指向错误，也可同时修正依赖源码目录后重跑。"
         ),
         "next_action_rule": "只能向用户确认 git refs 并等待回复，不得直接继续执行后续步骤。",
         "must_wait_for_user_reply": True,
@@ -1154,7 +1154,7 @@ def build_timeout_resolution_interaction(output_dir, timeout_items):
                 },
                 "dependency_source_dirs": {
                     "type": "array",
-                    "description": "可选。若超时与源码映射范围过大有关，也可同时修正 dependency_source_dirs。",
+                    "description": "可选。若超时与源码映射范围过大有关，也可同时修正依赖源码目录。",
                 },
                 "restart_step_id": {
                     "type": "string",
@@ -1173,7 +1173,7 @@ def build_timeout_resolution_interaction(output_dir, timeout_items):
                     "step4_fetch_timeout",
                     "dependency_source_dirs"
                 ],
-                "description": "重跑 Step4 时，至少要调整一个超时参数，或修正 dependency_source_dirs。",
+                "description": "重跑 Step4 时，至少要调整一个超时参数，或修正依赖源码目录。",
             },
             "restart_from_step": {
                 "required_fields": ["restart_step_id"],
@@ -1189,7 +1189,7 @@ def build_timeout_resolution_interaction(output_dir, timeout_items):
         "resume_hint": (
             "若用户调整了 Step4 超时参数，请使用 --response-json 传回 "
             "action=rerun_current_step 与 step4_git_diff_timeout/step4_japicmp_timeout/step4_fetch_timeout 重跑 Step4；"
-            "若根因是 dependency_source_dirs 范围过大或映射错误，也可同时修正 dependency_source_dirs 后重跑。"
+            "若根因是依赖源码目录范围过大或映射错误，也可同时修正依赖源码目录后重跑。"
         ),
         "next_action_rule": "只能先处理超时导致的证据缺口并等待用户回复，不得直接继续执行后续步骤。",
         "must_wait_for_user_reply": True,

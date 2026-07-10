@@ -481,6 +481,50 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("action_requirements", text)
         self.assertNotIn("selection_resolution", text)
 
+    def test_user_decision_card_covers_step1_missing_input_request(self):
+        interaction = run_step.build_step1_preflight_interaction({})
+
+        lines = run_step.build_user_decision_card(interaction)
+        text = "\n".join(lines)
+
+        self.assertIn("需要补充的信息：", text)
+        self.assertIn("可选输入方式：", text)
+        self.assertIn("升级前构建产物", text)
+        self.assertIn("升级后构建产物", text)
+        self.assertIn("基准分支", text)
+        self.assertIn("当前分支", text)
+        self.assertIn("你可以直接回复：", text)
+        self.assertIn("目标模块是 app", text)
+        self.assertNotIn("response_schema", text)
+        self.assertNotIn("input_normalization", text)
+        self.assertNotIn("action_requirements", text)
+
+    def test_user_decision_card_covers_dependency_source_rerun_without_generic_continue_example(self):
+        interaction = {
+            "step_id": "step5",
+            "question": "需要补充依赖源码目录后重跑 Step5。",
+            "options": [
+                {"id": "rerun_current_step", "label": "补源码后重跑"},
+                {"id": "cancel", "label": "取消"},
+            ],
+            "response_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "dependency_source_dirs": {"type": "array"},
+                },
+            },
+            "action_requirements": {
+                "rerun_current_step": {"at_least_one_of": ["dependency_source_dirs"]}
+            },
+        }
+
+        text = "\n".join(run_step.build_user_decision_card(interaction))
+
+        self.assertIn("依赖源码目录是 /path/to/dependency-repo，补充后重跑", text)
+        self.assertNotIn("“继续”", text)
+        self.assertNotIn("action_requirements", text)
+
     def test_apply_structured_user_response_resolves_name_selected_targets_without_pending(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -737,7 +781,7 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
             self.assertTrue(annotated["dependency_source_dirs_state"]["provided"])
-            self.assertIn("已收到 dependency_source_dirs", annotated["question"])
+            self.assertIn("已收到依赖源码目录", annotated["question"])
             self.assertIn("仅当现有目录不正确", annotated["response_schema"]["properties"]["dependency_source_dirs"]["description"])
 
     def test_step5_review_does_not_require_removed_target_source_when_analysis_did_not_need_it(self):
@@ -809,7 +853,7 @@ class RunStepMainStateTest(unittest.TestCase):
             },
         }
 
-        with self.assertRaisesRegex(run_step.StepError, "dependency_source_dirs"):
+        with self.assertRaisesRegex(run_step.StepError, "依赖源码目录"):
             run_step.validate_pending_interaction_response(
                 interaction,
                 {"action": "rerun_current_step"},

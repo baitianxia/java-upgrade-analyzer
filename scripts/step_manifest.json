@@ -113,7 +113,7 @@
       "interaction": {
         "type": "decision",
         "status": "awaiting_user_input",
-        "question": "请确认升级口径、分支信息、target_module 及自动生成的 project_scope 是否正确；标准 Maven 工程无需填写 source_dirs。若已知相关依赖源码目录，可补充 dependency_source_dirs。",
+        "question": "请确认升级口径、分支信息、目标模块及自动生成的项目范围是否正确；标准 Maven 工程无需填写业务源码目录。若已知相关依赖源码目录，也可以一并补充。",
         "required_fields": [
           "action"
         ],
@@ -172,7 +172,7 @@
           {
             "id": "continue",
             "label": "继续",
-            "description": "口径正确；若提供了 dependency_source_dirs 或源码线索，系统会自动识别模块并生成映射建议，但不会在 continue 时覆盖已存在映射。"
+            "description": "口径正确；若提供了依赖源码目录或源码线索，系统会自动识别模块并生成映射建议，但不会在 continue 时覆盖已存在映射。"
           },
           {
             "id": "cancel",
@@ -253,7 +253,7 @@
             "cancel"
           ]
         },
-        "question": "请复核 jar 对比结果是否完整，尤其确认依赖源码目录是否覆盖相关仓库、自动识别出的模块坐标是否正确，以及 old_version/new_version 命中的 git refs 是否需要人工确认；若源码仓库已识别但 git refs 无法自动确定，应补充 dependency_git_ref_overrides 后重跑 Step4；若映射有误，可补充或修正 dependency_source_dirs；若只想让 Step5 分析部分变更 jar，可直接指定 all_changed_apis.csv 中的 coord 或名称；若 JApiCmp / git diff / dependency:get 出现超时，应补充 Step4 超时参数后重跑，而不是直接继续。",
+        "question": "请复核 jar 对比结果是否完整，尤其确认依赖源码目录是否覆盖相关仓库、自动识别出的模块坐标是否正确，以及 old_version/new_version 命中的 git refs 是否需要人工确认；若源码仓库已识别但 git refs 无法自动确定，应补充依赖 old_ref/new_ref 后重跑 Step4；若映射有误，可补充或修正依赖源码目录；若只想让 Step5 分析部分变更 jar，请从 changed_dependencies.md/csv 的依赖包候选中选择；若 JApiCmp / git diff / dependency:get 出现超时，应补充 Step4 超时参数后重跑，而不是直接继续。",
         "response_schema": {
           "type": "object",
           "required": [
@@ -302,7 +302,7 @@
             }
           }
         },
-        "resume_hint": "若用户补充 dependency_source_dirs、dependency_git_ref_overrides 或 Step4 超时参数，请使用 --response-json 传回 action=rerun_current_step 与对应字段，并重跑 Step4；若用户已确认证据池，但只想让 Step5 分析部分变更 jar，可在 continue 时同时传回 step5_selected_coords / step5_selected_names；若用户要求从更早阶段重跑，请传回 action=restart_from_step 与 restart_step_id（如 step2 / step4）。",
+        "resume_hint": "若用户补充依赖源码目录、依赖 old_ref/new_ref 或 Step4 超时参数，请使用 --response-json 传回 action=rerun_current_step 与对应字段，并重跑 Step4；若用户已确认证据池，但只想让 Step5 分析部分变更 jar，可在 continue 时同时传回 step5_selected_coords / step5_selected_names；若用户要求从更早阶段重跑，请传回 action=restart_from_step 与 restart_step_id（如 step2 / step4）。",
         "options": [
           {
             "id": "continue",
@@ -435,7 +435,7 @@
             "at_least_one_of": [
               "dependency_source_dirs"
             ],
-            "description": "重跑 Step5 时，应至少补充 dependency_source_dirs。"
+            "description": "重跑 Step5 时，应至少补充依赖源码目录。"
           }
         }
       },

@@ -326,7 +326,7 @@ def build_missing_dependency_mapping_interaction(
     if has_provided_dependency_inputs:
         question = (
             "Step5 检测到需要跨依赖边界分析的变更 API，但当前提供的依赖源码目录/仓库"
-            "仍不足以解析出完整 dependency_source_mappings。请先补齐或修正 dependency_source_dirs，"
+            "仍不足以解析出完整源码映射。请先补齐或修正依赖源码目录，"
             "或者明确允许降级执行后再重跑 Step5；在此之前不要继续 Step6。"
         )
         summary = (
@@ -336,7 +336,7 @@ def build_missing_dependency_mapping_interaction(
     else:
         question = (
             "Step5 检测到需要跨依赖边界分析的变更 API，但当前没有可用的依赖源码映射。"
-            "请先补充 dependency_source_dirs，或者明确允许降级执行后再重跑 Step5；"
+            "请先补充依赖源码目录，或者明确允许降级执行后再重跑 Step5；"
             "在此之前不要继续 Step6。"
         )
         summary = (
@@ -360,7 +360,7 @@ def build_missing_dependency_mapping_interaction(
             {
                 "id": "rerun_current_step",
                 "label": "补输入后重跑",
-                "description": "补充 dependency_source_dirs 或允许降级后，重跑 Step5。",
+                "description": "补充依赖源码目录或允许降级后，重跑 Step5。",
             },
             {
                 "id": "restart_from_step",
@@ -383,7 +383,7 @@ def build_missing_dependency_mapping_interaction(
                 },
                 "dependency_source_dirs": {
                     "type": "array",
-                    "description": "可选。补充依赖源码目录或仓库根目录，系统会自动重新推断 dependency_source_mappings。",
+                    "description": "可选。补充依赖源码目录或仓库根目录，系统会自动重新推断源码映射。",
                 },
                 "allow_degraded": {
                     "type": "boolean",
@@ -406,7 +406,7 @@ def build_missing_dependency_mapping_interaction(
         "action_requirements": {
             "rerun_current_step": {
                 "at_least_one_of": ["dependency_source_dirs", "allow_degraded"],
-                "description": "重跑 Step5 时，至少要补充 dependency_source_dirs，或显式允许降级执行。",
+                "description": "重跑 Step5 时，至少要补充依赖源码目录，或显式允许降级执行。",
             },
             "restart_from_step": {
                 "required_fields": ["restart_step_id"],
@@ -415,11 +415,11 @@ def build_missing_dependency_mapping_interaction(
         },
         "missing_mapping_coords": list(missing_mapping_coords or []),
         "resume_hint": (
-            "若用户补充 dependency_source_dirs，请使用 --response-json 传回 "
+            "若用户补充依赖源码目录，请使用 --response-json 传回 "
             "action=rerun_current_step 与 dependency_source_dirs 重跑 Step5；"
             "若用户接受降级执行，可同时传回 allow_degraded=true。"
         ),
-        "next_action_rule": "只能先补充 dependency_source_dirs 或明确允许降级后重跑 Step5，不得直接继续 Step6。",
+        "next_action_rule": "只能先补充依赖源码目录或明确允许降级后重跑 Step5，不得直接继续 Step6。",
         "must_wait_for_user_reply": True,
         "exit_code": EXIT_AWAITING_USER,
     }

@@ -45,7 +45,7 @@ python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
 
 1. 本 Skill 含多个 `[CHECKPOINT]`；每个 `[CHECKPOINT]` 都是硬中断，不是建议。
 2. 只要脚本输出包含 `AWAITING USER INPUT`、`run_step.py` 返回退出码 `4`，或 `.upgrade-report/.runtime/state/main_state.json` 中的 `state.status` 进入 `awaiting_*`，就必须立即停止。
-3. 停止后只允许读取 `.upgrade-report/.runtime/state/interaction.json`，先形成用户可读的决策卡片，再按 `missing_inputs/input_modes/response_schema` 向用户索取缺失输入。
+3. 停止后只允许读取 `.upgrade-report/.runtime/state/interaction.json`，先形成用户可读的决策卡片；协议字段只用于判断该问什么、如何恢复。
 4. 未获得用户答复前，不得执行任何“继续”“恢复”“下一步”命令。
 5. 如果发现自己越过了 `[CHECKPOINT]`，必须立即停止，明确承认越界，并回到最近一个待交互点。
 
@@ -87,11 +87,12 @@ main_state = read(.upgrade-report/.runtime/state/main_state.json if exists)
 if main_state.state.status startswith "awaiting_":
     interaction = read(.upgrade-report/.runtime/state/interaction.json)
     向用户展示决策卡片:
-      - interaction.question
-      - interaction.options
-      - interaction.files_to_review
-      - interaction.missing_inputs / fallback_inputs
-      - interaction.input_modes
+      - 当前需要确认什么
+      - 为什么停下
+      - 可选动作
+      - 需要补充的信息
+      - 候选对象
+      - 完整候选或证据文件
       - 用户可直接回复的自然语言示例
     等待用户答复
     run("python3 .../run_step.py --step auto --response-json '<intent_patch JSON>'")
@@ -290,13 +291,12 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 1. 读取 `.upgrade-report/.runtime/state/main_state.json`
 2. 若 `status` 为 `awaiting_*`，读取 `.upgrade-report/.runtime/state/interaction.json`
-3. 原样转述 `question`
-4. 原样列出 `options`
-5. 原样列出 `files_to_review`
-6. 优先读取并转述 `missing_inputs`、`fallback_inputs`、`input_modes`
-7. 按 `response_schema` / `input_normalization` 把用户原话整理成结构化答复，优先输出 `intent_patch`
-8. 等待用户答复
-9. 用用户原始答复构造 `--response-json` 或 `--response-file`
+3. 把 `interaction.json` 整理成用户可读的决策卡片，而不是把协议字段逐项甩给用户
+4. 决策卡片必须说明：当前要确认什么、为什么停下、可选动作、需要补什么、候选对象、完整候选或证据文件、用户可以直接怎么回复
+5. 覆盖当前所有交互点：缺少 Step1 输入、Step1/Step2/Step4/Step5 checkpoint、补依赖源码目录、补 git ref/超时参数、选择 Step5 依赖包范围、从指定步骤重跑
+6. `response_schema` / `input_normalization` / `action_requirements` / `selection_resolution` 只用于把用户原话整理成结构化答复，不作为用户主信息展示
+7. 等待用户答复
+8. 用用户真实答复构造 `--response-json` 或 `--response-file`
 
 进入 `[CHECKPOINT]` 后，明确禁止：
 
@@ -571,7 +571,7 @@ Agent 在恢复或接收新的正式用户意图时必须：
 
 1. 先读取 `main_state.json`
 2. 若 `status` 为 `awaiting_*`，再读取 `interaction.json`
-3. 若存在 `pending_interaction`，根据 `pending_interaction.question/options`，并优先结合 `pending_interaction.missing_inputs/fallback_inputs/input_modes/response_schema` 向用户发起对话
+3. 若存在 `pending_interaction`，先生成用户可读的决策卡片；卡片必须覆盖问题、停下原因、可选动作、缺失材料、候选对象、完整文件入口和可直接回复示例
 4. 将用户答复或新的正式业务意图整理为结构化 JSON；当前推荐统一整理为 `intent_patch`
 5. 收到结构化输入后，再执行：
 
