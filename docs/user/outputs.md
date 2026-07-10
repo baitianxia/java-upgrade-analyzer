@@ -158,7 +158,6 @@ evidence/call_chain/
 |---|---|---|
 | `alerts.csv` | 完整链路台账 | 每个 API、每条终止链路、状态和原因 |
 | `summary.json` | 结构化汇总 | `analysis_status`、`reason_code`、能力覆盖 |
-| `summary.md` | 人类可读复核摘要 | 状态含义、数量和阅读入口 |
 | `summary.txt` | 执行摘要 | reachable、uncertain、not_found、not_analyzed 分布 |
 | `step5_timing.csv` | Step5 耗时拆解 | 性能问题定位 |
 | `dependency_source_alignment.json` | 依赖源码版本对齐证据 | 使用了哪个 current ref/commit、用户工作区是否保持不变、多少源码类被 current JAR 保留或排除 |

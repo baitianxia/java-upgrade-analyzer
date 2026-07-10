@@ -75,7 +75,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("依赖包明细目录：`s4_per_dependency/`", md_text)
         self.assertIn("| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 主要变化类型 | 明细 |", md_text)
 
-    def test_alerts_generation_writes_human_summary_markdown(self):
+    def test_alerts_generation_does_not_write_low_value_summary_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "alerts.csv"
             results = [
@@ -132,14 +132,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
             ]
 
             formatter.generate_alerts_csv(results, output)
-            summary_text = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+            summary_exists = (Path(tmp) / "summary.md").exists()
 
-        self.assertIn("# Step5 调用链复核摘要", summary_text)
-        self.assertIn("| 链路状态 | 含义 | 数量 | 阅读入口 |", summary_text)
-        self.assertIn("已确认触达当前系统", summary_text)
-        self.assertIn("需要人工复核或补充证据", summary_text)
-        self.assertIn("完整台账：`alerts.csv`", summary_text)
-        self.assertIn("按状态拆分：`alerts_<status>.csv`", summary_text)
+        self.assertFalse(summary_exists)
 
     def test_step5_emits_tree_sitter_missing_checkpoint_before_regex_degrade(self):
         with tempfile.TemporaryDirectory() as tmp:
