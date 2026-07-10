@@ -203,23 +203,27 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ### Step4 后按单依赖包进入 Step5
 
-当 Step4 已生成 `evidence/api_changes/all_changed_apis.csv` 后，可在主状态中通过以下字段只让某个或某几个依赖进入 Step5：
+当 Step4 已生成 `evidence/api_changes/changed_dependencies.md` / `changed_dependencies.csv` 后，可在主状态中通过依赖包维度的 `selection_key` 只让某个或某几个依赖进入 Step5。
 
-- `step5_selected_coords`
-- `step5_selected_names`
+优先让用户从 `changed_dependencies.md` 选择，例如：
 
-推荐优先使用 `step5_selected_coords`，因为 `coord` 是单依赖分析的正式主键。
+```text
+coord:com.example:legacy-lib
+```
 
-`seed json` 或恢复输入示例：
+恢复输入示例：
 
-```json
-{
-  "step5_selected_coords": ["com.example:legacy-lib"]
-}
+```bash
+python3 "$SKILL/scripts/run_step.py" --step auto \
+  --project-dir . \
+  --report-dir .upgrade-report \
+  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:legacy-lib"]}}}'
 ```
 
 说明：
 
+- `selected_targets` 优先填写 `changed_dependencies.md/csv` 中的 `selection_key`
+- 也支持精确填写完整 `coord` 或 artifactId `name`
 - 这些选择字段必须先归一化写入 `main_state.json`
 - 正式流程中不要把选中依赖直接透传给 `s5_call_chain*.py`
 - Step5 只消费 Step4 API 目标的选中子集；Step3 candidate 保留为独立风险线索，不再生成合并后的 Step5 目标文件
@@ -237,7 +241,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 - 调度器会先把 `selected_targets` 归一化为正式 `step5_selected_coords` / `step5_selected_names`，再自动桥接为从 `step5` 重跑，而不是直接卡死在“当前没有 pending interaction”
 - 只有已进入 Step4 API 目标集的依赖才能通过 `step5_selected_coords` / `step5_selected_names` 被选中
-- Step4 checkpoint 中展示给用户的候选列表可以按数量截断，但 `selected_targets` 的正式解析范围仍是完整候选集；因此即使目标未出现在前端展示片段中，也可以直接提交精确 `coord` 或 `name`
+- Step4 checkpoint 中展示给用户的候选列表可以按数量截断，但 `selected_targets` 的正式解析范围仍是完整候选集；因此即使目标未出现在前端展示片段中，也可以直接提交精确 `selection_key` / `coord` / `name`
 
 若用户答复较长，优先使用：
 

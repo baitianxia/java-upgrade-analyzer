@@ -17,7 +17,7 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 
 1. 执行 `scripts/run_step.py`、门控脚本和只读检查命令
 2. 读取 `.upgrade-report/.runtime/state/main_state.json`、`.upgrade-report/.runtime/state/interaction.json` 与本阶段产物
-3. 向用户原样转述 `interaction.json` 中的 `question`、`options`、`files_to_review`，并优先消费其中的 `missing_inputs`、`fallback_inputs`、`input_modes`、`response_schema`、`input_normalization`、`action_requirements`、`selection_resolution`
+3. 将 `interaction.json` 转成用户可读的决策卡片：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可直接回复什么；内部字段只用于恢复命令构造
 4. 把用户的真实答复整理成结构化 `intent_patch`，再通过 `--response-json` 或 `--response-file` 传回下一条恢复命令
 
 首次调用 `step1` 前，必须先读取静态前置协议，而不是先试跑：
@@ -45,7 +45,7 @@ python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
 
 1. 本 Skill 含多个 `[CHECKPOINT]`；每个 `[CHECKPOINT]` 都是硬中断，不是建议。
 2. 只要脚本输出包含 `AWAITING USER INPUT`、`run_step.py` 返回退出码 `4`，或 `.upgrade-report/.runtime/state/main_state.json` 中的 `state.status` 进入 `awaiting_*`，就必须立即停止。
-3. 停止后只允许读取 `.upgrade-report/.runtime/state/interaction.json`，向用户原样转述问题、候选动作、关键产物，并按 `missing_inputs/input_modes/response_schema` 向用户索取缺失输入。
+3. 停止后只允许读取 `.upgrade-report/.runtime/state/interaction.json`，先形成用户可读的决策卡片，再按 `missing_inputs/input_modes/response_schema` 向用户索取缺失输入。
 4. 未获得用户答复前，不得执行任何“继续”“恢复”“下一步”命令。
 5. 如果发现自己越过了 `[CHECKPOINT]`，必须立即停止，明确承认越界，并回到最近一个待交互点。
 
@@ -86,13 +86,13 @@ main_state = read(.upgrade-report/.runtime/state/main_state.json if exists)
 
 if main_state.state.status startswith "awaiting_":
     interaction = read(.upgrade-report/.runtime/state/interaction.json)
-    向用户原样展示:
+    向用户展示决策卡片:
       - interaction.question
       - interaction.options
       - interaction.files_to_review
       - interaction.missing_inputs / fallback_inputs
       - interaction.input_modes
-      - interaction.response_schema / input_normalization
+      - 用户可直接回复的自然语言示例
     等待用户答复
     run("python3 .../run_step.py --step auto --response-json '<intent_patch JSON>'")
     停止
@@ -121,6 +121,9 @@ if gate failed or step blocked:
 1. 遇到 `awaiting_*` 时，唯一合法动作是“读交互文件 -> 问用户 -> 等用户答复 -> 用答复恢复”；唯一例外是用户明确要求查询 Step5 已生成索引中的某个方法调用链，此时只允许执行只读 `s5_query_call_chain.py` 查询并返回链路
 2. `run_step.py` 退出码 `4` 表示 `AWAITING_USER`；必须读取 `interaction.json` 后停下问用户，不能把它当成失败重试，也不能当成成功完成
 3. 恢复命令只使用 `--response-json` 或 `--response-file`；不得使用裸动作参数绕过结构化用户答复
+4. checkpoint 转述必须先形成用户可读的“决策卡片”：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可以直接怎么回复。
+5. Agent 不要把 action_requirements、selection_resolution、response_schema、runtime_rules 作为普通用户的主信息；这些字段只用于构造恢复命令。
+6. Step4 后进入 Step5 的候选对象必须按依赖包维度展示，优先引用 `evidence/api_changes/changed_dependencies.md`，不要要求用户从 `all_changed_apis.csv` 中逐行挑 API。
 
 优先使用统一调度入口 `scripts/run_step.py`。不要要求自己一次记住所有命令；具体命令、参数、产物清单统一按需查看 `RUNBOOK.md`。
 
@@ -403,11 +406,11 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### Phase 7 [CHECKPOINT] Confirm Evidence Completeness
 
 - 对应步骤：`step4` 完成后进入
-- 必须展示：`all_changed_apis.csv`、`git_ref_matches.txt/json`、`summary.txt`
-- 必须确认：jar diff、源码 diff、依赖源码映射线索与变更集是否足以支撑下一步调用链分析；若只想分析部分变更 jar，应在这里指定 `all_changed_apis.csv` 中的 `coord` 或名称
+- 必须展示：`changed_dependencies.md/csv`、`all_changed_apis.csv`、`git_ref_matches.txt/json`、`summary.txt`
+- 必须确认：Step5 是全量分析还是只分析部分依赖包；若只想分析部分变更 jar，应在这里指定 `changed_dependencies.md/csv` 中的 `selection_key`
 - 若证据不足，应先补 `dependency_source_dirs`，而不是直接进入 `step5`
 - 允许在 `continue` 时优先附带 `selected_targets`，让系统自动归一化为 `step5_selected_coords` / `step5_selected_names`
-- `selection_options` 只反映 Step4 API 目标；每个候选都应带稳定 `selection_key`
+- `selection_options` 只反映 Step4 依赖包维度候选；每个候选都应带稳定 `selection_key`
 - Step4 checkpoint 若只展示部分 `selection_options` 作为人工阅读摘要，这不应收窄正式选择范围；`selected_targets` 的解析仍必须基于完整候选集，允许用户直接提交未展示但合法的 `selection_key` / `coord` / `name`
 - `selected_targets` 若填写 `selection_key` 或 `coord`，调度层必须严格按该唯一目标执行；若只填写 `name`，则按 `artifactId` 名称筛选命中的全部候选
 - 恢复前必须遵守 `action_requirements`；若当前动作缺少 required / at_least_one_of 字段，必须先追问，不能空恢复

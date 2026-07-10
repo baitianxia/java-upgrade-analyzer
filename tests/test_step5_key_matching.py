@@ -7964,6 +7964,8 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertIn("#### 程序使用的产物", report_text)
             self.assertIn("| `deliverables/report.md` | 最终报告；优先阅读这一份 |", report_text)
             self.assertIn("| `evidence/static_scan/s3_*.csv/.txt` | JDK、Spring Boot、反射等静态扫描命中 |", report_text)
+            self.assertIn("| `evidence/api_changes/changed_dependencies.md` | 依赖包维度的 Step4 变化摘要；用于选择 Step5 分析范围 |", report_text)
+            self.assertIn("| `evidence/api_changes/changed_dependencies.csv` | 依赖包维度的结构化清单；供筛选和自动化使用 |", report_text)
             self.assertIn("| `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化全集 |", report_text)
             self.assertIn("| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 500 条一份） |", report_text)
             self.assertNotIn("all_changed_apis_alerts.csv", report_text)

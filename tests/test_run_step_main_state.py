@@ -410,6 +410,58 @@ class RunStepMainStateTest(unittest.TestCase):
                 ["com.example:demo-lib"],
             )
 
+    def test_step4_checkpoint_uses_changed_dependencies_for_selection_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            report_dir = project_dir / ".upgrade-report"
+            api_dir = report_dir / "evidence" / "api_changes"
+            api_dir.mkdir(parents=True, exist_ok=True)
+            (api_dir / "changed_dependencies.csv").write_text(
+                "selection_key,coord,dependency_name,changed_api_count,high_risk_api_count,change_types,symbol_kinds,detail\n"
+                "coord:com.acme:alpha,com.acme:alpha,alpha,42,5,removed,method,s4_per_dependency/com.acme__alpha/summary.json\n",
+                encoding="utf-8",
+            )
+
+            selection_resolution = run_step.build_report_dir_step5_selection_resolution(report_dir)
+
+            self.assertTrue(selection_resolution["enabled"])
+            self.assertEqual(selection_resolution["options"][0]["selection_key"], "coord:com.acme:alpha")
+            self.assertEqual(selection_resolution["options"][0]["coord"], "com.acme:alpha")
+            self.assertEqual(selection_resolution["options"][0]["api_count"], 42)
+            self.assertEqual(selection_resolution["options"][0]["high_risk_api_count"], 5)
+
+    def test_user_decision_card_hides_internal_fields_and_shows_direct_replies(self):
+        interaction = {
+            "step_id": "step4",
+            "question": "Step5 是全量分析，还是只分析部分依赖包？",
+            "recommended_action": "依赖包数量不多时，选择全量继续。",
+            "options": [
+                {"id": "continue", "label": "全量继续"},
+                {"id": "rerun_current_step", "label": "补材料后重跑"},
+            ],
+            "selection_options": [
+                {
+                    "selection_key": "coord:com.acme:alpha",
+                    "coord": "com.acme:alpha",
+                    "api_count": 42,
+                    "high_risk_api_count": 5,
+                }
+            ],
+            "selection_resolution": {"enabled": True},
+            "action_requirements": {"continue": {"required_fields": []}},
+            "files_to_review": ["/tmp/.upgrade-report/evidence/api_changes/changed_dependencies.md"],
+        }
+
+        lines = run_step.build_user_decision_card(interaction)
+        text = "\n".join(lines)
+
+        self.assertIn("当前需要确认：Step5 是全量分析，还是只分析部分依赖包？", text)
+        self.assertIn("推荐动作：依赖包数量不多时，选择全量继续。", text)
+        self.assertIn("`coord:com.acme:alpha`", text)
+        self.assertIn("你可以直接回复：", text)
+        self.assertNotIn("action_requirements", text)
+        self.assertNotIn("selection_resolution", text)
+
     def test_apply_structured_user_response_resolves_name_selected_targets_without_pending(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)

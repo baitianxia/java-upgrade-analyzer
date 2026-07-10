@@ -200,7 +200,7 @@ S6_DETAIL_BUCKETS = {
         "csv": "s6_probable_impact_apis.csv",
         "md": "s6_probable_impact_apis.md",
         "summary_key": "not_analyzed_reason_summary",
-        "note": "已找到强相关证据，但仍需测试或运行时验证。",
+        "note": "已找到强相关证据，但当前静态证据不足以确认运行时表现。",
     },
     "needs_input": {
         "title": "缺少依赖源码/构建产物，无法回溯调用链清单",
@@ -2058,6 +2058,8 @@ def render_report_appendix(findings):
         "| 文件 | 承载的信息 |",
         "|---|---|",
         "| `evidence/dependencies/dep_changes.csv` | 依赖包变更列表 |",
+        "| `evidence/api_changes/changed_dependencies.md` | 依赖包维度的 Step4 变化摘要；用于选择 Step5 分析范围 |",
+        "| `evidence/api_changes/changed_dependencies.csv` | 依赖包维度的结构化清单；供筛选和自动化使用 |",
         "| `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化全集 |",
         f"| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 {S6_CHANGED_API_SPLIT_ROWS} 条一份） |",
         "| `evidence/call_chain/alerts.csv` | 完整逐链路台账 |",
@@ -2076,6 +2078,17 @@ def render_report_appendix(findings):
         "",
     ]
     return lines
+
+
+def build_report_sections_for_test_only():
+    return [
+        "核心结论",
+        "结论限制",
+        "分析结果总表",
+        "附录",
+        "本报告只呈现分析结果、证据和结论限制，不替使用者决定修改、验证或发布动作。",
+        *render_report_appendix({}),
+    ]
 
 
 def generate_report(findings):

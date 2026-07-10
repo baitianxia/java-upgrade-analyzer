@@ -41,12 +41,15 @@ from compat import (
 sys.path.insert(0, os.path.dirname(__file__))
 from s4_contract import (
     ALL_CHANGED_APIS_FIELDS,
+    CHANGED_DEPENDENCIES_CSV,
+    CHANGED_DEPENDENCIES_MD,
     DEFAULT_SEVERITY,
     PER_DEPENDENCY_DIRNAME,
     PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE,
     PER_DEPENDENCY_RESOLVED_TARGETS_FILE,
     PER_DEPENDENCY_SUMMARY_FILE,
     get_per_dependency_dir,
+    make_per_dependency_dirname,
     validate_row,
 )
 from progress_logging import PhaseTimer, emit_progress
@@ -3574,6 +3577,114 @@ def write_all_changed_apis(all_apis, output_dir):
     return out_file, len(normalized_rows), len(invalid_rows)
 
 
+def _dependency_name_from_coord(coord):
+    parts = [part.strip() for part in str(coord or "").split(":")]
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _is_high_risk_api_row(row):
+    severity = str((row or {}).get("severity") or "").strip().upper()
+    change_type = str((row or {}).get("change_type") or "").strip().lower()
+    if severity:
+        return severity in {"P0", "P1", "HIGH", "CRITICAL"}
+    return change_type in {
+        "removed",
+        "signature_changed",
+        "method_removed",
+        "field_removed",
+        "class_removed",
+    }
+
+
+def build_changed_dependency_rows(api_rows):
+    grouped = {}
+    for row in api_rows or []:
+        coord = str((row or {}).get("coord") or "").strip()
+        if not coord:
+            continue
+        item = grouped.setdefault(
+            coord,
+            {
+                "selection_key": f"coord:{coord}",
+                "coord": coord,
+                "dependency_name": _dependency_name_from_coord(coord),
+                "changed_api_count": 0,
+                "high_risk_api_count": 0,
+                "change_type_set": set(),
+                "symbol_kind_set": set(),
+            },
+        )
+        item["changed_api_count"] += 1
+        if _is_high_risk_api_row(row):
+            item["high_risk_api_count"] += 1
+        change_type = str((row or {}).get("change_type") or "").strip()
+        symbol_kind = str((row or {}).get("symbol_kind") or "").strip()
+        if change_type:
+            item["change_type_set"].add(change_type)
+        if symbol_kind:
+            item["symbol_kind_set"].add(symbol_kind)
+
+    result = []
+    for item in grouped.values():
+        result.append(
+            {
+                "selection_key": item["selection_key"],
+                "coord": item["coord"],
+                "dependency_name": item["dependency_name"],
+                "changed_api_count": item["changed_api_count"],
+                "high_risk_api_count": item["high_risk_api_count"],
+                "change_types": ", ".join(sorted(item["change_type_set"])),
+                "symbol_kinds": ", ".join(sorted(item["symbol_kind_set"])),
+                "detail": f"{PER_DEPENDENCY_DIRNAME}/{make_per_dependency_dirname(item['coord'])}/{PER_DEPENDENCY_SUMMARY_FILE}",
+            }
+        )
+    return sorted(result, key=lambda row: (-int(row["high_risk_api_count"]), row["coord"]))
+
+
+def write_changed_dependencies(api_rows, output_dir):
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    dependency_rows = build_changed_dependency_rows(api_rows)
+    csv_path = output_path / CHANGED_DEPENDENCIES_CSV
+    md_path = output_path / CHANGED_DEPENDENCIES_MD
+    fieldnames = [
+        "selection_key",
+        "coord",
+        "dependency_name",
+        "changed_api_count",
+        "high_risk_api_count",
+        "change_types",
+        "symbol_kinds",
+        "detail",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(dependency_rows)
+
+    lines = [
+        "# 发生 API 变化的依赖包",
+        "",
+        "本文件回答：哪些依赖包发生 API 变化，以及是否可作为 Step5 调用链分析范围。",
+        "",
+        "完整 API 明细：`all_changed_apis.csv`。",
+        "",
+        "| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 主要变化类型 | 明细 |",
+        "|---|---|---:|---:|---|---|",
+    ]
+    if dependency_rows:
+        for row in dependency_rows:
+            lines.append(
+                f"| `{row['selection_key']}` | `{row['coord']}` | "
+                f"{row['changed_api_count']} | {row['high_risk_api_count']} | "
+                f"{row['change_types'] or '-'} | `{row['detail']}` |"
+            )
+    else:
+        lines.append("| - | - | 0 | 0 | - | - |")
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return csv_path, md_path
+
+
 def _normalize_contract_value(row, field):
     return str((row or {}).get(field, '') or '').strip()
 
@@ -4958,6 +5069,7 @@ def main():
     write_all_timer = time.perf_counter()
     csv_file, valid_count, invalid_count = write_all_changed_apis(
         all_apis, args.output_dir)
+    write_changed_dependencies(load_csv(csv_file), args.output_dir)
     timing.record(
         "write.all_changed_apis",
         status="success",

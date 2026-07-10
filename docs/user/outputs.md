@@ -15,6 +15,14 @@
   → 最终结论是什么、为什么
 ```
 
+`.upgrade-report/` 按阅读对象分成三层：
+
+| 目录 | 谁主要阅读 | 用途 |
+|---|---|---|
+| `deliverables/` | 普通使用者、评审人 | 交付报告和分类清单 |
+| `evidence/` | 需要深入复核的人 | Step1-Step5 的事实证据 |
+| `.runtime/` | 程序和 Agent | 状态、索引、恢复信息；普通阅读不需要进入 |
+
 建议按这个顺序阅读：
 
 1. 先看结论：已确认影响、可能影响、已确认不受影响、当前无法确认、需要补充输入。
@@ -37,15 +45,16 @@
 
 | 顺序 | 文件 | 作用 |
 |---:|---|---|
-| 1 | `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化事实清单 |
-| 2 | `evidence/call_chain/alerts.csv` | Step5 完整链路台账 |
-| 3 | `deliverables/report.md` | 面向评审和交付的最终摘要 |
+| 1 | `deliverables/report.md` | 面向评审和交付的最终摘要 |
+| 2 | `evidence/api_changes/changed_dependencies.md` | 依赖包维度的 API 变化摘要 |
+| 3 | `evidence/call_chain/alerts.csv` | Step5 完整链路台账 |
 
 如果结果存在疑问，再回到对应步骤的原始证据文件继续追溯。
 
 这三个入口之间的关系是：
 
-- `all_changed_apis.csv` 回答“变更 API 是什么”；
+- `changed_dependencies.md` 回答“哪些依赖包发生 API 变化”；
+- `all_changed_apis.csv` 回答“完整 API 变化事实是什么”；
 - `alerts.csv` 回答“这些变更 API 有没有调用链影响”；
 - `deliverables/report.md` 回答“最终应该如何理解本次分析结果”。
 
@@ -98,13 +107,28 @@ evidence/api_changes/
 
 | 文件 | 说明 | 复核重点 |
 |---|---|---|
-| `all_changed_apis.csv` | Step5 的核心输入，每行一个变更 API 或候选目标 | 变化 API 是否真实、符号类型是否正确 |
+| `changed_dependencies.md` | 给人看的依赖包维度清单 | Step5 全量分析还是选择部分依赖包 |
+| `changed_dependencies.csv` | 结构化依赖包清单 | `selection_key`、变化 API 数、高风险 API 数 |
+| `all_changed_apis.csv` | 完整 API 变化事实集合，每行一个变更 API 或候选目标 | 变化 API 是否真实、符号类型是否正确 |
 | `all_changed_apis_alerts.csv` | 高风险 API 变化子集 | P0/P1、删除、行为变化等 |
 | `summary.txt` | Step4 覆盖率和执行摘要 | jar 是否缺失、JApiCmp 是否失败、git diff 是否跳过 |
 | `*_binary.txt` / `*_binary.xml` | JApiCmp 原始证据 | 二进制兼容性变化来源 |
 | `*_gitdiff_api_changes.txt` | 依赖源码 git diff 证据 | 行为变化、源码级 API 变化 |
 | `*_removed_symbols.txt` | removed jar 的旧版 public/protected 符号导出 | 删除依赖场景目标池是否完整 |
 | `step4_timing.csv` | Step4 耗时拆解 | 定位 jar 解析、git diff、JApiCmp、removed jar 导出、changed_classes 或汇总写文件等耗时点 |
+
+### 依赖包维度选择入口
+
+Step4 完成后，如果要决定 Step5 是全量分析还是只分析部分依赖包，优先看：
+
+| 文件 | 用途 |
+|---|---|
+| `evidence/api_changes/changed_dependencies.md` | 给人看的依赖包维度清单 |
+| `evidence/api_changes/changed_dependencies.csv` | 结构化依赖包清单 |
+| `evidence/api_changes/all_changed_apis.csv` | 完整 API 变化事实集合 |
+
+普通选择应使用 `changed_dependencies.md` 中的 `selection_key`，例如 `coord:com.foo:bar`。
+`all_changed_apis.csv` 可能很大，它用于核对完整 API 明细，不作为普通选择入口。
 
 ### per-dependency 视图
 

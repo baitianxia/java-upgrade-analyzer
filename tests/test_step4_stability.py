@@ -21,6 +21,66 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_changed_dependencies_view_groups_api_rows_by_coord(self):
+        rows = [
+            {
+                "coord": "com.acme:alpha",
+                "change_type": "removed",
+                "severity": "P1",
+                "api_name": "com.acme.Alpha.removed",
+                "symbol_kind": "method",
+            },
+            {
+                "coord": "com.acme:alpha",
+                "change_type": "signature_changed",
+                "severity": "P2",
+                "api_name": "com.acme.Alpha.changed",
+                "symbol_kind": "method",
+            },
+            {
+                "coord": "com.acme:beta",
+                "change_type": "behavior_changed",
+                "severity": "P0",
+                "api_name": "com.acme.Beta.risky",
+                "symbol_kind": "field",
+            },
+        ]
+
+        result = step4.build_changed_dependency_rows(rows)
+
+        self.assertEqual([item["coord"] for item in result], ["com.acme:alpha", "com.acme:beta"])
+        self.assertEqual(result[0]["selection_key"], "coord:com.acme:alpha")
+        self.assertEqual(result[0]["dependency_name"], "alpha")
+        self.assertEqual(result[0]["changed_api_count"], 2)
+        self.assertEqual(result[0]["high_risk_api_count"], 1)
+        self.assertEqual(result[0]["change_types"], "removed, signature_changed")
+        self.assertEqual(result[1]["high_risk_api_count"], 1)
+
+    def test_write_changed_dependencies_outputs_csv_and_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            rows = [
+                {
+                    "coord": "com.acme:alpha",
+                    "change_type": "removed",
+                    "severity": "P1",
+                    "api_name": "com.acme.Alpha.removed",
+                    "symbol_kind": "method",
+                }
+            ]
+
+            csv_path, md_path = step4.write_changed_dependencies(rows, output_dir)
+
+            self.assertTrue(csv_path.exists())
+            self.assertTrue(md_path.exists())
+            csv_text = csv_path.read_text(encoding="utf-8")
+            md_text = md_path.read_text(encoding="utf-8")
+            self.assertIn("selection_key,coord,dependency_name,changed_api_count", csv_text)
+            self.assertIn("coord:com.acme:alpha", csv_text)
+            self.assertIn("本文件回答：哪些依赖包发生 API 变化", md_text)
+            self.assertIn("`coord:com.acme:alpha`", md_text)
+            self.assertIn("完整 API 明细", md_text)
+
     def test_source_refs_compare_resolved_commits_not_only_branch_names(self):
         with patch.object(
             step4,

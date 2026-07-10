@@ -123,6 +123,18 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 
 ---
 
+## 如何阅读结果
+
+1. 先看 `.upgrade-report/deliverables/report.md`，了解客观分析结果和结论限制。
+2. 如果需要核对依赖 API 变化，先看 `.upgrade-report/evidence/api_changes/changed_dependencies.md`。
+3. 如果需要核对完整 API 明细，再看 `.upgrade-report/evidence/api_changes/all_changed_apis.csv`。
+4. 如果需要核对调用链证据，看 `.upgrade-report/evidence/call_chain/alerts.csv`。
+5. `.upgrade-report/.runtime/` 是程序状态目录，普通阅读不需要进入。
+
+Step4 后如果 Claude Code 询问 Step5 是全量分析还是只分析部分依赖包，候选项来自 `changed_dependencies.md/csv` 的依赖包维度清单，不需要从 `all_changed_apis.csv` 逐行挑 API。
+
+---
+
 ## 即时查询某个方法的调用链
 
 当 Step5 已经生成调用链查询索引后，如果你只是想确认某个方法是否存在调用链，可以直接让 Claude Code 查询：
