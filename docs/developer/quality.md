@@ -138,6 +138,8 @@ python3 scripts/smoke_regression.py --group orchestrator
 - 反射/MethodHandle 候选多；
 - class/field 变化多。
 
+每次执行真实项目矩阵时，性能也必须作为质量信号审计。超过 Step4/Step5 配置预算、图规模异常下降、边截断、edge cap 命中，都不能只作为日志观察；其中耗时超预算应输出 `performance_regression`，P1 阻塞 release。性能优化只能降低重复计算和资源消耗，不能通过缩小分析范围换取通过。
+
 Step4 性能验证优先看：
 
 ```text

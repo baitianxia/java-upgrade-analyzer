@@ -51,7 +51,12 @@ LEGACY_SEVERITY_TO_P = {
 def _default_blocking(signal_type: str, severity: str) -> bool:
     if severity == "P0":
         return True
-    if severity == "P1" and signal_type in {"correctness_failure", "capability_gap", "evidence_weakness"}:
+    if severity == "P1" and signal_type in {
+        "correctness_failure",
+        "capability_gap",
+        "evidence_weakness",
+        "performance_regression",
+    }:
         return True
     return False
 

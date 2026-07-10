@@ -33,6 +33,21 @@ class QualitySignalAuditTest(unittest.TestCase):
         self.assertTrue(signal.blocking)
         self.assertEqual(signal.evidence, ("alerts.csv", "summary.json"))
 
+    def test_performance_regression_is_blocking_when_severity_is_p1(self):
+        signal = quality_signal_audit.normalize_signal(
+            {
+                "signal_type": "performance_regression",
+                "severity": "P1",
+                "case": "dubbo",
+                "step": "step5",
+                "expected": "elapsed <= 60s",
+                "actual": "elapsed=92s",
+            }
+        )
+
+        self.assertEqual(signal.signal_type, "performance_regression")
+        self.assertTrue(signal.blocking)
+
     def test_audit_accepts_explicit_quality_signals_from_real_project_payload(self):
         payload = {
             "results": [

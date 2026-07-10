@@ -1127,7 +1127,21 @@ def build_quality_signals(
 
     for failure in failures:
         text = str(failure)
-        if text.startswith(("graph_stats:", "performance:", "source_shape:")):
+        if text.startswith("performance:"):
+            signals.append(make_signal(
+                "performance_regression",
+                "P1",
+                case.name,
+                step="step5",
+                message=text,
+                expected="real project performance stays within configured budget",
+                actual=text,
+                evidence=[
+                    report_dir / "evidence" / "call_chain" / "summary.json",
+                    report_dir / "evidence" / "call_chain" / "step5_timing.csv",
+                ],
+            ))
+        elif text.startswith(("graph_stats:", "source_shape:")):
             signals.append(make_signal(
                 "capability_gap",
                 "P1",

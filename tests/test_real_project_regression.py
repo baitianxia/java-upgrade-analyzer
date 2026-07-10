@@ -266,6 +266,9 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(any(item.startswith("graph_stats: reverse_edges_indexed") for item in result["failures"]))
         self.assertTrue(any(item.startswith("performance:") for item in result["failures"]))
         self.assertIn("alerts_reachable.csv missing", result["warnings"])
+        self.assertTrue(
+            any(item["signal_type"] == "performance_regression" for item in result["quality_signals"])
+        )
 
     def test_run_case_emits_quality_signals_for_blocking_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
