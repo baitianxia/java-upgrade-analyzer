@@ -262,12 +262,22 @@ def write_report_landing_docs(report_dir):
 | `evidence/` | 需要深入复核的人 | Step1-Step5 的事实证据和完整台账。 |
 | `.runtime/` | 程序和 Agent | 状态、缓存、索引、恢复信息；普通用户不需要阅读。 |
 
-## 先看什么
+## 推荐阅读顺序
 
 1. 先看 `deliverables/report.md`。
-2. 如果要核对依赖包变化，看 `evidence/api_changes/changed_dependencies.md`。
-3. 如果要核对完整 API 明细，看 `evidence/api_changes/all_changed_apis.csv`。
-4. 如果要核对调用链，看 `evidence/call_chain/alerts.csv`。
+2. 如果主报告提示需要看完整分类清单，再打开对应的 `deliverables/s6_*_apis.md/csv`。
+3. 如果要解释某条结论来自哪里，再进入 `evidence/call_chain/alerts.csv` 或 `evidence/call_chain/by_api/`。
+4. 如果要确认 Step5 分析范围，使用 `evidence/api_changes/changed_dependencies.md` 的依赖包维度候选。
+5. 如果要核对完整 API 变化事实，再看 `evidence/api_changes/all_changed_apis.csv` 或拆分文件。
+
+## 不同阶段的第一入口
+
+| 阶段 | 先看 | 读完能判断什么 |
+|---|---|---|
+| Step1 依赖识别后 | `evidence/dependencies/dep_summary.txt` | 本次比较的模块、构建产物和依赖范围是否符合预期。 |
+| Step4 API 对比后 | `evidence/api_changes/changed_dependencies.md` | 哪些依赖包发生 API 变化，以及 Step5 是否需要全量或定向分析。 |
+| Step5 调用链分析后 | `evidence/call_chain/alerts.csv` | 每条变更 API 的调用链证据、状态和原因。 |
+| Step6 报告生成后 | `deliverables/report.md` | 本次客观分析结果、证据和结论限制。 |
 
 ## 按问题找文件
 
@@ -279,12 +289,6 @@ def write_report_landing_docs(report_dir):
 | 变更 API 是否触达当前系统 | `evidence/call_chain/alerts.csv` | `evidence/call_chain/alerts_<status>.csv` |
 | 依赖范围是否正确 | `evidence/dependencies/dep_changes.csv` | `evidence/dependencies/build_provenance.json` |
 | 为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/alerts.csv`、`evidence/call_chain/by_api/` |
-
-## 不建议先看的文件
-
-- `.runtime/` 下的 JSON、索引和缓存只给程序恢复流程使用。
-- `evidence/call_chain/by_api/` 适合追单条 API 的逐边证据，不适合作为第一入口。
-- 耗时统计文件只用于性能排查，不用于判断风险。
 """,
     )
     _write_text_file(
@@ -3950,7 +3954,7 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
             "step5_selected_coords",
             {
                 "type": "array",
-                "description": "可选。重跑 Step5 时，只分析这些依赖包对应的变更 API；优先使用 changed_dependencies.csv 中的 selection_key。",
+                "description": "可选。重跑 Step5 时，只分析这些依赖包对应的变更 API；先从 changed_dependencies.md 读取 selection_key，需要筛选时再用 changed_dependencies.csv。",
             },
         )
         properties.setdefault(
@@ -4062,6 +4066,8 @@ def _humanize_interaction_text(text):
         "step5_selected_coords": "Step5 选择的依赖坐标",
         "step5_selected_names": "Step5 选择的依赖名称",
         "selected_targets": "选择的依赖包",
+        "restart_step_id": "重跑起始步骤",
+        "not_analyzed": "本次未完成分析",
         "allow_degraded=true": "允许降级执行",
     }
     for old, new in replacements.items():
@@ -4168,7 +4174,7 @@ def build_user_decision_card(interaction):
         lines.append("可选动作：")
         for option in options:
             label = option.get("label") or option.get("id")
-            desc = option.get("description") or ""
+            desc = _humanize_interaction_text(option.get("description") or "").strip()
             suffix = f" - {desc}" if desc else ""
             lines.append(f"- `{option.get('id')}`：{label}{suffix}")
 
@@ -4395,11 +4401,11 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
 
     source_state = build_dependency_source_dirs_state(run_context, report_dir)
     payload["dependency_source_dirs_state"] = source_state
-    if not source_state.get("provided"):
-        return payload
 
-    question_prefix = "已收到依赖源码目录。"
-    if not source_state.get("recognized"):
+    question_prefix = ""
+    if not source_state.get("provided"):
+        question_prefix = "当前还没有可用于该调用链分析的依赖源码目录。"
+    elif not source_state.get("recognized"):
         question_prefix = "已收到依赖源码目录，但当前目录未识别出有效依赖源码仓库。"
     elif (
         str(payload.get("step_id") or "").strip() == "step5"
@@ -4418,29 +4424,38 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
         question_prefix = f"已收到依赖源码目录，但当前仍未覆盖这些目标依赖坐标：{missing}。"
     elif source_state.get("covers_targets"):
         question_prefix = "已收到依赖源码目录；仅当现有目录不正确或覆盖范围不足时才需要修正。"
+    elif source_state.get("provided"):
+        question_prefix = "已收到依赖源码目录；请确认当前目录是否仍然适用于本次重跑。"
 
     checklist_lines = list(payload.get("checklist_lines") or [])
-    if question_prefix not in checklist_lines:
+    if question_prefix and question_prefix not in checklist_lines:
         checklist_lines.insert(0, question_prefix)
-    dir_preview = "当前已记录目录： " + ", ".join((source_state.get("dependency_source_dirs") or [])[:5])
-    if dir_preview not in checklist_lines:
+    recorded_dirs = list((source_state.get("dependency_source_dirs") or [])[:5])
+    dir_preview = "当前已记录目录： " + ", ".join(recorded_dirs)
+    if recorded_dirs and dir_preview not in checklist_lines:
         checklist_lines.insert(1, dir_preview)
     payload["checklist_lines"] = checklist_lines
 
     question = str(payload.get("question") or "").strip()
     if reason_code == "step5_dependency_source_mapping_missing":
-        payload["question"] = (
-            question_prefix
-            + " 请仅补充仍缺失的依赖源码目录，或确认现有目录需要替换后再重跑。"
-        )
+        if source_state.get("provided"):
+            payload["question"] = (
+                question_prefix
+                + "请补充仍缺失的依赖源码目录，或确认现有目录需要替换后再重跑。"
+            )
+        else:
+            payload["question"] = (
+                question_prefix
+                + "请补充依赖源码目录后重跑 Step5；如果暂时没有源码，可以明确选择降级执行。"
+            )
     elif has_dependency_source_dirs_field and question and question_prefix not in question:
         payload["question"] = question_prefix + " " + question
 
     if has_dependency_source_dirs_field:
         dep_dirs_prop = dict(properties.get("dependency_source_dirs") or {})
         dep_dirs_prop["description"] = (
-            "可选。系统已收到 dependency_source_dirs；仅当现有目录不正确、无法识别，"
-            "或仍未覆盖目标依赖时再修正。"
+            "可选。填写依赖源码目录或仓库根目录；仅当现有目录不正确、无法识别，"
+            "或仍未覆盖目标依赖时再修正。字段名为 dependency_source_dirs。"
         )
         properties["dependency_source_dirs"] = dep_dirs_prop
         response_schema["properties"] = properties
@@ -4620,7 +4635,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         checklist_lines.append("当前需要确认：Step5 是全量分析，还是只分析部分依赖包？")
         checklist_lines.append("推荐默认动作：如果依赖包数量不多，选择 continue 全量进入 Step5。")
         checklist_lines.append("如果依赖包很多，请从候选依赖包中选择一个或多个 selection_key。")
-        checklist_lines.append("候选依赖包来自 evidence/api_changes/changed_dependencies.csv。")
+        checklist_lines.append("候选依赖包先看 evidence/api_changes/changed_dependencies.md；需要筛选或自动化时再用 changed_dependencies.csv。")
         checklist_lines.append(
             f"  - 可选依赖数={target_summary.get('available_target_count', 0)} "
             f"Step4 API 行数={len(available_rows)}"
@@ -4685,8 +4700,8 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 f"  - 已确认影响={user_conclusion_summary.get('已确认影响', call_summary.get('reachable', 0))}",
                 f"  - 可能影响={user_conclusion_summary.get('可能影响', 0)}",
                 f"  - 已确认不受影响={user_conclusion_summary.get('已确认不受影响', call_summary.get('not_impacted', 0))}",
-                f"  - 当前无法确认={user_conclusion_summary.get('当前无法确认', 0)}",
-                f"  - 需要补充输入={user_conclusion_summary.get('需要补充输入', 0)}",
+                f"  - 需人工复核={user_conclusion_summary.get('当前无法确认', 0)}",
+                f"  - 缺少依赖源码/构建产物={user_conclusion_summary.get('需要补充输入', 0)}",
                 f"  - 已提供依赖源码目录={len(dependency_source_dirs)} 个",
             ]
         )
@@ -4695,9 +4710,9 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         if step5_selected_names:
             checklist_lines.append("  - 本轮按名称定向分析: " + ", ".join(step5_selected_names[:10]))
         if quality_gate.get("needs_input", 0):
-            checklist_lines.append("推荐动作：先补充关键输入再重跑 Step5，否则最终结论不完整。")
+            checklist_lines.append("推荐动作：先补充 checkpoint 中点名的源码、构建产物或映射信息，再重跑 Step5。")
         elif quality_gate.get("inconclusive", 0):
-            checklist_lines.append("推荐动作：优先抽查“当前无法确认”的高风险项，再决定是否继续。")
+            checklist_lines.append("推荐动作：优先抽查“需人工复核”的高风险项，再决定是否继续。")
         elif quality_gate.get("probable_impact", 0):
             checklist_lines.append("推荐动作：优先执行相关业务测试，确认这些“可能影响”项。")
         missing_mapping_items = [
@@ -4712,7 +4727,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                     if coord and coord not in coords:
                         coords.append(coord)
             checklist_lines.append(
-                "存在缺失依赖源码映射的调用链项；补齐依赖源码目录后重跑 Step5，通常能减少无法确认或未分析的项。"
+                "存在缺失依赖源码映射的调用链项；补齐依赖源码目录后重跑 Step5，通常能减少需人工复核或本次未完成分析的项。"
             )
             if coords:
                 checklist_lines.append(f"  - 建议优先补这些依赖：{', '.join(coords[:10])}")
@@ -4741,7 +4756,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             if (item.get("user_conclusion") or "").strip() == "当前无法确认"
         ]
         if inconclusive_items:
-            checklist_lines.append("当前无法确认示例（完整结果见 alerts.csv）：")
+            checklist_lines.append("需人工复核示例（完整结果见 alerts.csv）：")
             for item in inconclusive_items[:3]:
                 checklist_lines.append(
                     f"  - {item.get('severity')} {item.get('coord')} | "
@@ -4753,7 +4768,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             if (item.get("user_conclusion") or "").strip() == "需要补充输入"
         ]
         if needs_input_items:
-            checklist_lines.append("需要补充输入示例（完整结果见 alerts.csv）：")
+            checklist_lines.append("缺少依赖源码/构建产物示例（完整结果见 alerts.csv）：")
             for item in needs_input_items[:3]:
                 checklist_lines.append(
                     f"  - {item.get('severity')} {item.get('coord')} | "
@@ -4797,7 +4812,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             "step5_selected_coords",
             {
                 "type": "array",
-                "description": "可选。继续进入 Step5 时，只分析这些依赖包对应的变更 API；优先使用 changed_dependencies.csv 中的 selection_key。",
+                "description": "可选。继续进入 Step5 时，只分析这些依赖包对应的变更 API；先从 changed_dependencies.md 读取 selection_key，需要筛选时再用 changed_dependencies.csv。",
             },
         )
         properties.setdefault(
@@ -4837,7 +4852,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             "step5_selected_coords",
             {
                 "type": "array",
-                "description": "可选。重跑 Step5 时，只分析这些依赖包对应的变更 API；优先使用 changed_dependencies.csv 中的 selection_key。",
+                "description": "可选。重跑 Step5 时，只分析这些依赖包对应的变更 API；先从 changed_dependencies.md 读取 selection_key，需要筛选时再用 changed_dependencies.csv。",
             },
         )
         properties.setdefault(
@@ -5002,8 +5017,23 @@ def validate_pending_interaction_response(pending_interaction, user_response):
     for field in requirement.get("required_fields") or []:
         if not _response_value_present(user_response.get(field)):
             raise StepError(f"当前动作 {action} 要求字段 {field} 必填，不能为空。")
+    step5_missing_source_rerun = (
+        step_id == "step5"
+        and reason_code == "step5_dependency_source_mapping_missing"
+        and action == "rerun_current_step"
+    )
+    step5_has_selection_override = False
+    if step5_missing_source_rerun:
+        step5_has_selection_override = any(
+            _response_value_present(user_response.get(field))
+            for field in ("selected_targets", "step5_selected_coords", "step5_selected_names")
+        )
     at_least_one_of = [str(field).strip() for field in (requirement.get("at_least_one_of") or []) if str(field).strip()]
-    if at_least_one_of and not any(_response_value_present(user_response.get(field)) for field in at_least_one_of):
+    if (
+        at_least_one_of
+        and not step5_has_selection_override
+        and not any(_response_value_present(user_response.get(field)) for field in at_least_one_of)
+    ):
         raise StepError(
             f"当前动作 {action} 至少需要提供以下字段之一：{', '.join(at_least_one_of)}"
         )
@@ -5013,22 +5043,14 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             user_response.get("selected_targets"),
         )
 
-    if (
-        step_id == "step5"
-        and reason_code == "step5_dependency_source_mapping_missing"
-        and action == "rerun_current_step"
-    ):
+    if step5_missing_source_rerun:
         dependency_source_dirs = [
             str(item).strip()
             for item in (user_response.get("dependency_source_dirs") or [])
             if str(item).strip()
         ]
         allow_degraded = bool(user_response.get("allow_degraded"))
-        has_selection_override = any(
-            _response_value_present(user_response.get(field))
-            for field in ("selected_targets", "step5_selected_coords", "step5_selected_names")
-        )
-        if not dependency_source_dirs and not allow_degraded and not has_selection_override:
+        if not dependency_source_dirs and not allow_degraded and not step5_has_selection_override:
             raise StepError(
                 "Step5 当前检查点要求先补充依赖源码目录，或明确允许降级执行，"
                 "或选择需要分析的目标 jar 后，再重跑当前步骤。"

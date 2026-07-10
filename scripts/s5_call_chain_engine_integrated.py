@@ -365,7 +365,7 @@ def build_missing_dependency_mapping_interaction(
             {
                 "id": "restart_from_step",
                 "label": "从指定步骤重跑",
-                "description": "若需要回到更早步骤修正输入，可指定 restart_step_id 后重跑。",
+                "description": "若需要回到更早步骤修正输入，可指定重跑起始步骤后重跑。",
             },
             {
                 "id": "cancel",
@@ -387,7 +387,7 @@ def build_missing_dependency_mapping_interaction(
                 },
                 "allow_degraded": {
                     "type": "boolean",
-                    "description": "可选。设为 true 时允许在缺失依赖源码映射的前提下降级执行，相关 API 将标记为 not_analyzed。",
+                    "description": "可选。设为 true 时允许在缺失依赖源码映射的前提下降级执行，相关 API 会进入“本次未完成分析”清单。",
                 },
                 "restart_step_id": {
                     "type": "string",
@@ -410,7 +410,7 @@ def build_missing_dependency_mapping_interaction(
             },
             "restart_from_step": {
                 "required_fields": ["restart_step_id"],
-                "description": "从更早步骤重跑时，必须明确 restart_step_id。",
+                "description": "从更早步骤重跑时，必须明确重跑起始步骤。",
             },
         },
         "missing_mapping_coords": list(missing_mapping_coords or []),
@@ -565,7 +565,7 @@ def build_tree_sitter_missing_interaction(output_dir, details_path, status):
             },
             "restart_from_step": {
                 "required_fields": ["restart_step_id"],
-                "description": "从更早步骤重跑时，必须明确 restart_step_id。",
+                "description": "从更早步骤重跑时，必须明确重跑起始步骤。",
             },
         },
         "tree_sitter": {
@@ -1007,7 +1007,7 @@ def _step5_integrated_main_impl(args):
         if has_provided_dependency_inputs:
             print("\n❌ 错误：检测到需要跨依赖边界分析的变更API。", file=sys.stderr)
             print("当前状态：用户已提供依赖源码目录，但系统尚未为全部目标依赖解析出可用的依赖源码映射。", file=sys.stderr)
-            print("影响：无法确认这些API是否真正影响系统。", file=sys.stderr)
+            print("影响：这些 API 本轮不能形成确定结论。", file=sys.stderr)
             unresolved_dirs = (bridge_discovery or {}).get('unresolved_dependency_source_dirs') or []
             if unresolved_dirs:
                 print("\n未解析成功的依赖源码输入：", file=sys.stderr)
@@ -1023,16 +1023,16 @@ def _step5_integrated_main_impl(args):
                     else:
                         print(f"  - {root_path} | reason={reason}", file=sys.stderr)
             print("\n解决方案：", file=sys.stderr)
-            print("  1. 优先修正 dependency_source_dirs，使其指向依赖工程根目录或多模块仓库根目录", file=sys.stderr)
+            print("  1. 优先修正依赖源码目录，使其指向依赖工程根目录或多模块仓库根目录", file=sys.stderr)
             print("  2. 确认目录下包含可识别的模块清单与源码目录（如 pom.xml/build.gradle、src/main/java）", file=sys.stderr)
-            print("  3. 或者使用 --allow-degraded 继续分析（相关API将标记为not_analyzed）", file=sys.stderr)
+            print("  3. 或者使用 --allow-degraded 继续分析；相关 API 会进入“本次未完成分析”清单", file=sys.stderr)
         else:
             print("\n❌ 错误：检测到需要跨依赖边界分析的变更API，但未提供可用的依赖源码映射", file=sys.stderr)
-            print("影响：无法确认这些API是否真正影响系统", file=sys.stderr)
+            print("影响：这些 API 本轮不能形成确定结论。", file=sys.stderr)
             print("\n解决方案：", file=sys.stderr)
-            print("  1. 提供 dependency_source_dirs 指向依赖源码目录/仓库", file=sys.stderr)
+            print("  1. 提供依赖源码目录或仓库根目录", file=sys.stderr)
             print("  2. 确认目录下包含可识别的模块清单与源码目录", file=sys.stderr)
-            print("  3. 或者使用 --allow-degraded 继续分析（相关API将标记为not_analyzed）", file=sys.stderr)
+            print("  3. 或者使用 --allow-degraded 继续分析；相关 API 会进入“本次未完成分析”清单", file=sys.stderr)
         if missing_mapping_coords:
             print(
                 f"  缺失映射的依赖坐标：{', '.join(missing_mapping_coords[:10])}",
@@ -1064,9 +1064,9 @@ def _step5_integrated_main_impl(args):
             missing_mapping_coords=missing_mapping_coords,
         )
         if has_provided_dependency_inputs:
-            print("  ⚠️ 允许降级执行：已提供依赖源码目录/仓库，但目标依赖的源码映射仍不完整；相关API将标记为not_analyzed", file=sys.stderr)
+            print("  ⚠️ 允许降级执行：已提供依赖源码目录/仓库，但目标依赖的源码映射仍不完整；相关 API 会进入“本次未完成分析”清单", file=sys.stderr)
         else:
-            print("  ⚠️ 允许降级执行：需要依赖源码映射的 API 将标记为 not_analyzed", file=sys.stderr)
+            print("  ⚠️ 允许降级执行：需要依赖源码映射的 API 会进入“本次未完成分析”清单", file=sys.stderr)
 
     # Phase 5: 构建增强型源码图
     source_roots = build_source_roots(business_source_dirs, dependency_source_mappings)
@@ -1357,11 +1357,11 @@ def _step5_integrated_main_impl(args):
     )
 
     print("\n分析结果：", file=sys.stderr)
-    print(f"  ✓ reachable: {reachable_count}", file=sys.stderr)
-    print(f"  ○ not_impacted: {not_impacted_count}", file=sys.stderr)
-    print(f"  ❓ uncertain: {uncertain_count}", file=sys.stderr)
-    print(f"  ⊘ not_analyzed: {not_analyzed_count}", file=sys.stderr)
-    print(f"  ✗ not_found_in_static_analysis: {not_found_count}", file=sys.stderr)
+    print(f"  ✓ 已确认影响: {reachable_count}", file=sys.stderr)
+    print(f"  ○ 已确认不受影响: {not_impacted_count}", file=sys.stderr)
+    print(f"  ❓ 需人工复核: {uncertain_count}", file=sys.stderr)
+    print(f"  ⊘ 本次未完成分析: {not_analyzed_count}", file=sys.stderr)
+    print(f"  ✗ 未发现调用路径: {not_found_count}", file=sys.stderr)
 
     print("\nStep 5 完成", file=sys.stderr)
     print("=" * 60, file=sys.stderr)

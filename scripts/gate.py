@@ -312,36 +312,36 @@ def gate_call_chain(d, strict_risk_gate=False):
     confirmed_no_impact = int(summary.get('not_impacted', user_conclusion_summary.get('已确认不受影响', 0)) or 0)
     high_risk_inconclusive = int(quality_gate.get('high_risk_inconclusive', 0) or 0)
     if uncertain > 0:
-        print(f"\n⚠️  {uncertain} 个风险点无法静态确认：", file=sys.stderr)
+        print(f"\n⚠️  {uncertain} 个风险点需要人工复核：", file=sys.stderr)
         for item in summary.get('uncertain_apis', [])[:5]:
             print(f"  - {item.get('api','')[:60]}: {item.get('reason','')[:60]}", file=sys.stderr)
     if not_analyzed > 0:
-        print(f"\n⚠️  {not_analyzed} 个风险点属于未覆盖/未分析：", file=sys.stderr)
+        print(f"\n⚠️  {not_analyzed} 个风险点本次未完成分析：", file=sys.stderr)
         for item in summary.get('not_analyzed_apis', [])[:5]:
             print(f"  - {item.get('api','')[:60]}: {item.get('reason','')[:60]}", file=sys.stderr)
     if not_found > 0:
-        print(f"\n⚠️  {not_found} 个风险点属于静态未找到路径：", file=sys.stderr)
+        print(f"\n⚠️  {not_found} 个风险点未发现调用路径：", file=sys.stderr)
         for item in summary.get('not_found_apis', [])[:5]:
             print(f"  - {item.get('api','')[:60]}: {item.get('reason','')[:60]}", file=sys.stderr)
     if needs_input > 0:
         print(
             f"\n⚠️  Step5 仍有 {needs_input} 个风险点需要补充输入，"
-            "应优先在 checkpoint 中补充 dependency_source_dirs 或选择重跑当前步骤。",
+            "应优先在 checkpoint 中补充依赖源码目录，或选择重跑当前步骤。",
             file=sys.stderr,
         )
     if strict_risk_gate and (uncertain > 0 or not_analyzed > 0 or not_found > 0):
         fail(
-            f"严格模式下调用链仍存在盲区：uncertain={uncertain}, not_analyzed={not_analyzed}, not_found={not_found}",
-            ["补齐 dependency_source_dirs、排查静态未找到项，或关闭严格模式后重试"]
+            f"严格模式下调用链仍存在未完成项：需人工复核={uncertain}, 本次未完成分析={not_analyzed}, 未发现调用路径={not_found}",
+            ["补齐依赖源码目录、排查未发现调用路径的项，或关闭严格模式后重试"]
         )
     if strict_risk_gate and high_risk_inconclusive > 0:
         fail(
-            f"严格模式下仍有 {high_risk_inconclusive} 个高风险项无法确认",
-            ["优先人工复核 P0/P1 的当前无法确认项，必要时补输入后重跑 Step5"],
+            f"严格模式下仍有 {high_risk_inconclusive} 个高风险项需要人工复核",
+            ["优先人工复核 P0/P1 项，必要时补输入后重跑 Step5"],
         )
     ok(
         f"call_chain 门控通过：已确认影响={confirmed_impact} 可能影响={probable_impact} "
-        f"已确认不受影响={confirmed_no_impact} 当前无法确认={inconclusive} 静态未找到={not_found}"
+        f"已确认不受影响={confirmed_no_impact} 需人工复核={inconclusive} 未发现调用路径={not_found}"
     )
 
 def main():

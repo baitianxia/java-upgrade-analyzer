@@ -18,6 +18,16 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("复核", text)
         self.assertIn("程序", text)
 
+    def test_outputs_doc_uses_reader_facing_conclusion_terms(self):
+        text = self.read("docs/user/outputs.md")
+        reading_section = text[text.index("建议按这个顺序阅读：") : text.index("每个用户可见文件")]
+
+        self.assertIn("需人工复核", reading_section)
+        self.assertIn("缺少依赖源码/构建产物", reading_section)
+        self.assertNotIn("当前无法确认", reading_section)
+        self.assertIn("本次未完成分析", text)
+        self.assertNotIn("当前未完成有效分析", text)
+
     def test_outputs_doc_explains_dependency_level_step4_selection(self):
         text = self.read("docs/user/outputs.md")
         self.assertIn("changed_dependencies.md", text)

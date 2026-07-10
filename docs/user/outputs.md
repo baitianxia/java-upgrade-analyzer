@@ -25,8 +25,8 @@
 
 建议按这个顺序阅读：
 
-1. 先看结论：已确认影响、可能影响、已确认不受影响、当前无法确认、需要补充输入。
-2. 再看原因：为什么确定，或为什么不能确认。
+1. 先看结论：已确认影响、可能影响、已确认不受影响、需人工复核、缺少依赖源码/构建产物。
+2. 再看原因：为什么确定，或为什么还不能形成确定结论。
 3. 再看链路：哪个依赖、哪个变更 API、哪条调用链触达业务代码。
 4. 最后看明细：只有当结论和预期不一致，才进入 `by_api/`、原始 JApiCmp 或耗时统计文件排查。
 
@@ -215,9 +215,9 @@ alerts_reachable_002.csv
 |---|---|---|
 | 已确认影响 | 已找到业务代码或当前制品中已激活入口到变更 API 的完整路径 | `reachable` |
 | 已确认不受影响 | 当前制品中的其他依赖以完全相同的类字节码保留该 API；不覆盖资源、SPI 等非 API 内容 | `not_impacted` |
-| 需要人工复核 | 有候选证据，但尚不能形成确定链路 | `uncertain` |
+| 需人工复核 | 有候选证据，但尚不能形成确定链路 | `uncertain` |
 | 静态分析未找到路径 | 已完成静态分析，但没有找到路径；不能解释为确定不影响 | `not_found_in_static_analysis` |
-| 当前未完成有效分析 | 输入或工具能力不足，无法完成本项分析 | `not_analyzed` |
+| 本次未完成分析 | 输入或工具能力不足，无法完成本项分析 | `not_analyzed` |
 
 ## Step6：最终报告
 
@@ -227,7 +227,7 @@ alerts_reachable_002.csv
 | `deliverables/s6_probable_impact_apis.csv/md` | 可能影响清单 |
 | `deliverables/s6_uncertain_apis.csv/md` | 需人工复核清单 |
 | `deliverables/s6_not_impacted_apis.csv/md` | 有直接制品证据确认 API 未实际消失的清单 |
-| `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物，无法回溯调用链清单 |
+| `deliverables/s6_needs_input_apis.csv/md` | 缺少依赖源码/构建产物清单 |
 | `deliverables/s6_not_analyzed_apis.csv/md` | 本次未完成分析清单 |
 | `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |
 | `.runtime/findings/s6_findings.json` | 程序使用；Step6 结构化结果，不作为人工阅读入口 |

@@ -188,7 +188,7 @@ S6_DETAIL_BUCKETS = {
     },
     "uncertain": {
         "title": "需人工复核清单",
-        "conclusion": "需要人工复核",
+        "conclusion": "需人工复核",
         "csv": "s6_uncertain_apis.csv",
         "md": "s6_uncertain_apis.md",
         "summary_key": "uncertain_reason_summary",
@@ -203,8 +203,8 @@ S6_DETAIL_BUCKETS = {
         "note": "已找到强相关证据，但当前静态证据不足以确认运行时表现。",
     },
     "needs_input": {
-        "title": "缺少依赖源码/构建产物，无法回溯调用链清单",
-        "conclusion": "需要补充输入",
+        "title": "缺少依赖源码/构建产物清单",
+        "conclusion": "缺少依赖源码/构建产物",
         "csv": "s6_needs_input_apis.csv",
         "md": "s6_needs_input_apis.md",
         "summary_key": "not_analyzed_reason_summary",
@@ -426,7 +426,7 @@ def _detail_review_focus(item, conclusion=''):
         return "核对业务入口、消费方和变更 API 是否属于本次升级范围。"
     if conclusion_text == "可能影响":
         return "结合业务测试或运行时配置确认该行为变化是否会触发。"
-    if conclusion_text == "需要补充输入":
+    if conclusion_text in {"需要补充输入", "缺少依赖源码/构建产物"}:
         return "先补齐原因中提到的源码、构建产物或映射信息。"
     if conclusion_text == "已确认不受影响":
         return "核对保留该 API 的当前制品依赖是否确实随应用发布。"
@@ -454,31 +454,6 @@ def build_bucket_detail_markdown(config, items, csv_name):
         "- 需要调用链证据时，回到 `evidence/call_chain/alerts.csv` 按 API 或依赖坐标筛选。",
         "",
     ]
-    if reason_summary:
-        lines += [
-            "## 原因分类",
-            "",
-            "| 原因 | 数量 |",
-            "|---|---:|",
-        ]
-        for reason, count in reason_summary.items():
-            lines.append(f"| {_md_cell(reason)} | {count} |")
-        lines.append("")
-    if coord_summary:
-        lines += [
-            f"## 依赖坐标分布（Top {min(S6_DETAIL_MD_DEP_SUMMARY_LIMIT, len(coord_summary))}）",
-            "",
-            "| 依赖坐标 | 数量 |",
-            "|---|---:|",
-        ]
-        for coord, count in list(coord_summary.items())[:S6_DETAIL_MD_DEP_SUMMARY_LIMIT]:
-            lines.append(f"| `{_md_cell(coord)}` | {count} |")
-        if len(coord_summary) > S6_DETAIL_MD_DEP_SUMMARY_LIMIT:
-            lines.append(
-                f"| 其他 {len(coord_summary) - S6_DETAIL_MD_DEP_SUMMARY_LIMIT} 个依赖 | "
-                f"{sum(list(coord_summary.values())[S6_DETAIL_MD_DEP_SUMMARY_LIMIT:])} |"
-            )
-        lines.append("")
 
     if len(items) <= S6_DETAIL_MD_FULL_LIMIT:
         lines += [
@@ -506,6 +481,38 @@ def build_bucket_detail_markdown(config, items, csv_name):
             f"> 其余 {len(items) - S6_DETAIL_MD_SAMPLE_LIMIT} 条未在 Markdown 展开，请在 CSV 中筛选查看。",
             "",
         ]
+    if reason_summary or coord_summary:
+        lines += [
+            "## 附录：聚合统计",
+            "",
+            "下面的统计只用于筛选明细，不作为单独结论。",
+            "",
+        ]
+    if reason_summary:
+        lines += [
+            "### 原因分类",
+            "",
+            "| 原因 | 数量 |",
+            "|---|---:|",
+        ]
+        for reason, count in reason_summary.items():
+            lines.append(f"| {_md_cell(reason)} | {count} |")
+        lines.append("")
+    if coord_summary:
+        lines += [
+            f"### 依赖坐标分布（Top {min(S6_DETAIL_MD_DEP_SUMMARY_LIMIT, len(coord_summary))}）",
+            "",
+            "| 依赖坐标 | 数量 |",
+            "|---|---:|",
+        ]
+        for coord, count in list(coord_summary.items())[:S6_DETAIL_MD_DEP_SUMMARY_LIMIT]:
+            lines.append(f"| `{_md_cell(coord)}` | {count} |")
+        if len(coord_summary) > S6_DETAIL_MD_DEP_SUMMARY_LIMIT:
+            lines.append(
+                f"| 其他 {len(coord_summary) - S6_DETAIL_MD_DEP_SUMMARY_LIMIT} 个依赖 | "
+                f"{sum(list(coord_summary.values())[S6_DETAIL_MD_DEP_SUMMARY_LIMIT:])} |"
+            )
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -591,12 +598,12 @@ def _bucket_csv_conclusion(bucket_name, item):
         return user_conclusion
     return {
         "probable_impact": "可能影响",
-        "uncertain": "需要人工复核",
+        "uncertain": "需人工复核",
         "not_impacted": "已确认不受影响",
-        "needs_input": "需要补充输入",
+        "needs_input": "缺少依赖源码/构建产物",
         "not_analyzed": "未完成分析",
         "not_found": "未发现静态调用路径",
-    }.get(bucket_name, "需要人工复核")
+    }.get(bucket_name, "需人工复核")
 
 
 def _csv_chain_view(item):
@@ -1455,7 +1462,7 @@ def _status_label_from_item(item):
     if bucket == 'confirmed':
         return '已确认影响'
     if bucket == 'review':
-        return '需要人工复核'
+        return '需人工复核'
     if bucket == 'not_impacted':
         return '已确认不受影响'
     if bucket == 'not_found':
@@ -1466,7 +1473,7 @@ def _status_label_from_item(item):
 DISPLAY_LABELS = {
     '当前无法确认': '需人工复核',
     '需要人工复核': '需人工复核',
-    '需要补充输入': '缺少依赖源码/构建产物，无法回溯调用链',
+    '需要补充输入': '缺少依赖源码/构建产物',
     '未覆盖/未分析': '本次未完成分析',
     '静态未找到': '未发现调用路径',
 }
@@ -1496,6 +1503,20 @@ def _coverage_status_label(status):
         'unknown': '未知',
     }
     return labels.get(str(status or 'unknown'), str(status or 'unknown'))
+
+
+def _call_chain_status_label(status):
+    labels = {
+        'done': '已完成',
+        'completed': '已完成',
+        'complete': '已完成',
+        'partial': '部分完成',
+        'skipped': '未执行',
+        'not_run': '未执行',
+        'failed': '执行失败',
+        'unknown': '未知',
+    }
+    return labels.get(str(status or 'unknown').strip() or 'unknown', '未知')
 
 
 def _coverage_item_label(component_id):
@@ -1613,12 +1634,12 @@ def render_core_conclusion(findings):
         "",
         "| 项目 | 结果 |",
         "|---|---|",
-        f"| 调用链分析状态 | `{stat.get('call_chain_status', 'unknown')}` |",
+        f"| 调用链分析状态 | {_call_chain_status_label(stat.get('call_chain_status'))} |",
         f"| 已确认/高风险影响项 | {confirmed_count} |",
         f"| 已确认不受影响 | {len(not_impacted)} |",
         f"| 可能影响 | {len(probable)} |",
         f"| 需人工复核 | {len(uncertain)} |",
-        f"| 缺少依赖源码/构建产物，无法回溯调用链 | {len(needs_input)} |",
+        f"| 缺少依赖源码/构建产物 | {len(needs_input)} |",
         f"| 本次未完成分析 | {len(not_analyzed)} |",
         f"| 未发现调用路径 | {len(not_found)} |",
         f"| 分析完整度 | {'API 范围内完整' if not_impacted and len(not_impacted) == int(stat.get('call_chain_total') or len(not_impacted)) else _coverage_status_label(coverage.get('overall_status'))} |",
@@ -1908,7 +1929,7 @@ def build_api_result_rows(findings):
         ('可能影响', '', findings.get('probable_impact') or []),
         ('需人工复核', '', findings.get('uncertain') or []),
         ('已确认不受影响', '', findings.get('not_impacted') or []),
-        ('缺少依赖源码/构建产物，无法回溯调用链', '', findings.get('needs_input') or []),
+        ('缺少依赖源码/构建产物', '', findings.get('needs_input') or []),
         (
             '本次未完成分析',
             '',
@@ -1927,7 +1948,7 @@ def build_api_result_rows(findings):
             '可能影响': ('not_analyzed',),
             '需人工复核': ('uncertain',),
             '已确认不受影响': ('not_impacted',),
-            '缺少依赖源码/构建产物，无法回溯调用链': ('not_analyzed',),
+            '缺少依赖源码/构建产物': ('not_analyzed',),
             '本次未完成分析': ('not_analyzed',),
             '未发现调用路径': ('not_found_in_static_analysis', 'not_reachable'),
         }.get(fallback_conclusion, ())
@@ -2002,7 +2023,7 @@ def render_api_result_table(findings):
         detail_paths = "、".join(f"`{row['path']}`" for row in detail_rows)
         lines.append(f"> 本轮已生成的分类明细：{detail_paths}。")
     lines += [
-        "> 排序：已确认/高风险、可能影响、需人工复核、已确认不受影响、缺少依赖源码/构建产物，无法回溯调用链、本次未完成分析、未发现调用路径。",
+        "> 排序：已确认/高风险、可能影响、需人工复核、已确认不受影响、缺少依赖源码/构建产物、本次未完成分析、未发现调用路径。",
         "",
         "| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |",
         "|---|---|---|---|---|",

@@ -53,7 +53,24 @@ class Step6ReportObjectivityTest(unittest.TestCase):
 
         self.assertIn("## 先看什么", text)
         self.assertIn("复核重点", text)
-        self.assertLess(text.index("## 先看什么"), text.index("## 原因分类"))
+        self.assertIn("## API 明细（完整）", text)
+        self.assertIn("## 附录：聚合统计", text)
+        self.assertIn("### 原因分类", text)
+        self.assertLess(text.index("## API 明细（完整）"), text.index("## 附录：聚合统计"))
+        self.assertLess(text.index("## 附录：聚合统计"), text.index("### 原因分类"))
+
+    def test_core_conclusion_translates_internal_call_chain_status(self):
+        text = "\n".join(
+            s6_report.render_core_conclusion(
+                {
+                    "scan_stats": {"call_chain_status": "partial"},
+                    "coverage": {"overall_status": "partial"},
+                }
+            )
+        )
+
+        self.assertIn("| 调用链分析状态 | 部分完成 |", text)
+        self.assertNotIn("| 调用链分析状态 | `partial` |", text)
 
 
 if __name__ == "__main__":

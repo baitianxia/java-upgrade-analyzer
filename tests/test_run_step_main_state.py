@@ -456,8 +456,11 @@ class RunStepMainStateTest(unittest.TestCase):
 
             self.assertIn("先看 `deliverables/report.md`", root_readme)
             self.assertIn("按问题找文件", root_readme)
+            self.assertIn("推荐阅读顺序", root_readme)
+            self.assertIn("不同阶段的第一入口", root_readme)
             self.assertNotIn("为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/summary.json`", root_readme)
             self.assertIn("为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/alerts.csv`", root_readme)
+            self.assertNotIn("不建议先看的文件", root_readme)
             self.assertIn("给人看的交付结果", deliverables_readme)
             self.assertIn("深入复核证据", evidence_readme)
             self.assertIn("程序使用的状态和缓存", runtime_readme)
@@ -506,6 +509,58 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("action_requirements", text)
         self.assertNotIn("selection_resolution", text)
 
+    def test_step4_checkpoint_points_dependency_selection_to_markdown_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            api_dir = self._api_changes_dir(report_dir)
+            api_dir.mkdir(parents=True)
+            with (api_dir / "changed_dependencies.csv").open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["selection_key", "coord", "name", "api_count", "high_risk_api_count", "change_types"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "selection_key": "coord:com.example:demo-lib",
+                        "coord": "com.example:demo-lib",
+                        "name": "demo-lib",
+                        "api_count": "42",
+                        "high_risk_api_count": "5",
+                        "change_types": "REMOVED",
+                    }
+                )
+            (api_dir / "all_changed_apis.csv").write_text(
+                "coord,api_name,api_signature,symbol_kind,change_type,severity\n"
+                "com.example:demo-lib,com.example.Demo.removed,(),method,REMOVED,P1\n",
+                encoding="utf-8",
+            )
+            manifest_steps = {
+                "step4": {
+                    "title": "API 变化分析",
+                    "interaction": {
+                        "type": "review",
+                        "question": "Step5 是全量分析，还是只分析部分依赖包？",
+                        "options": [{"id": "continue", "label": "继续"}],
+                    },
+                    "outputs": ["evidence/api_changes/all_changed_apis.csv"],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step4",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={},
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        checklist_text = "\n".join(payload.get("checklist_lines") or [])
+        self.assertIn("先看 evidence/api_changes/changed_dependencies.md", checklist_text)
+        self.assertIn("需要筛选或自动化时再用 changed_dependencies.csv", checklist_text)
+
     def test_user_decision_card_covers_step1_missing_input_request(self):
         interaction = run_step.build_step1_preflight_interaction({})
 
@@ -549,6 +604,55 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("依赖源码目录是 /path/to/dependency-repo，补充后重跑", text)
         self.assertNotIn("“继续”", text)
         self.assertNotIn("action_requirements", text)
+
+    def test_user_decision_card_humanizes_option_descriptions(self):
+        interaction = {
+            "step_id": "step5",
+            "question": "请选择后续处理方式。",
+            "options": [
+                {
+                    "id": "restart_from_step",
+                    "label": "从指定步骤重跑",
+                    "description": "若需要回到更早步骤修正输入，可指定 restart_step_id 后重跑。",
+                },
+                {
+                    "id": "rerun_current_step",
+                    "label": "降级后重跑",
+                    "description": "相关 API 将标记为 not_analyzed。",
+                },
+            ],
+        }
+
+        text = "\n".join(run_step.build_user_decision_card(interaction))
+
+        self.assertIn("重跑起始步骤", text)
+        self.assertIn("本次未完成分析", text)
+        self.assertNotIn("restart_step_id", text)
+        self.assertNotIn("not_analyzed", text)
+
+    def test_step5_missing_source_interaction_question_uses_human_field_name(self):
+        interaction = {
+            "step_id": "step5",
+            "reason_code": "step5_dependency_source_mapping_missing",
+            "question": "请补充 dependency_source_dirs 后重跑 Step5。",
+            "response_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "dependency_source_dirs": {"type": "array"},
+                },
+            },
+        }
+
+        annotated = run_step.annotate_dependency_source_dirs_interaction(
+            interaction,
+            {},
+            Path("/tmp/.upgrade-report"),
+        )
+
+        self.assertIn("依赖源码目录", annotated["question"])
+        self.assertNotIn("dependency_source_dirs", annotated["question"])
+        self.assertIn("dependency_source_dirs", annotated["response_schema"]["properties"])
 
     def test_apply_structured_user_response_resolves_name_selected_targets_without_pending(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -944,6 +1048,11 @@ class RunStepMainStateTest(unittest.TestCase):
                     "step5_selected_coords": {"type": "array"},
                 },
             },
+            "action_requirements": {
+                "rerun_current_step": {
+                    "at_least_one_of": ["dependency_source_dirs", "allow_degraded"],
+                }
+            },
         }
 
         run_step.validate_pending_interaction_response(
@@ -1219,6 +1328,77 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("evidence/call_chain/alerts.csv", review_files)
         self.assertNotIn("summary.txt", review_files)
         self.assertNotIn("summary.json", review_files)
+
+    def test_step5_checkpoint_uses_reader_facing_conclusion_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            s5_dir = self._call_chain_dir(report_dir)
+            s5_dir.mkdir(parents=True)
+            (s5_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "reachable": 1,
+                        "not_impacted": 1,
+                        "user_conclusion_summary": {
+                            "已确认影响": 1,
+                            "可能影响": 2,
+                            "已确认不受影响": 1,
+                            "当前无法确认": 3,
+                            "需要补充输入": 4,
+                        },
+                        "quality_gate": {"inconclusive": 3, "needs_input": 4},
+                        "uncertain_apis": [
+                            {
+                                "severity": "P1",
+                                "coord": "com.example:demo",
+                                "api": "com.example.Demo.changed",
+                                "user_conclusion": "当前无法确认",
+                                "reason": "字节码命中，但没有找到从当前系统入口到该调用点的完整路径",
+                            }
+                        ],
+                        "not_analyzed_apis": [
+                            {
+                                "severity": "P1",
+                                "coord": "com.example:needs-input",
+                                "api": "com.example.Input.changed",
+                                "user_conclusion": "需要补充输入",
+                                "reason": "缺少依赖源码目录",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            manifest_steps = {
+                "step5": {
+                    "title": "调用链分析",
+                    "interaction": {
+                        "type": "review",
+                        "question": "请确认 Step5 结果。",
+                        "options": [{"id": "continue", "label": "继续"}],
+                    },
+                    "outputs": ["evidence/call_chain/summary.json"],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step5",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={},
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        checklist_text = "\n".join(payload.get("checklist_lines") or [])
+        self.assertIn("需人工复核=3", checklist_text)
+        self.assertIn("缺少依赖源码/构建产物=4", checklist_text)
+        self.assertIn("需人工复核示例", checklist_text)
+        self.assertIn("缺少依赖源码/构建产物示例", checklist_text)
+        self.assertNotIn("当前无法确认=", checklist_text)
+        self.assertNotIn("当前无法确认示例", checklist_text)
 
     def test_build_run_context_keeps_dependency_source_mappings(self):
         with tempfile.TemporaryDirectory() as tmp:
