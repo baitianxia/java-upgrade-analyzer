@@ -547,8 +547,6 @@ def _has_exact_business_bytecode_target(api_row, graph):
             continue
         if any(
             str(getattr(edge, 'evidence_type', '')).startswith('bytecode_')
-            and str(getattr(edge, 'evidence_source', '')) == 'current_final_artifact'
-            and bool(str(getattr(edge, 'artifact_sha256', '')).strip())
             and str(getattr(edge, 'owner_type', '')) == 'business'
             and not bool(getattr(edge, 'is_test', False))
             for edge in (edges or [])
@@ -1582,6 +1580,8 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     allow_constant_pool_fast_path = not bool(getattr(graph, 'reverse_edges', {}) or {})
     for item in catalog_entries:
         coord = str(item.get('coord') or '').strip()
+        if coord == str(api_row.get('coord') or '').strip():
+            continue
         jar_path = str(item.get('jar_path') or '').strip()
         if not jar_path or not os.path.exists(jar_path):
             scan_failures.append({
@@ -1906,6 +1906,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         constant_pool_matched_any = False
                         for owner in set(candidate_owners):
                             for api_row in target_rows_by_owner.get(owner, []):
+                                if coord == str(api_row.get('coord') or '').strip():
+                                    continue
                                 matches = _match_runtime_dependency_references_from_constant_pool(
                                     api_row, summary, class_binary_name
                                 )
@@ -2020,6 +2022,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             )
             for owner in set(candidate_owners) & {item for item in referenced_owners if item}:
                 for api_row in target_rows_by_owner.get(owner, []):
+                    if coord == str(api_row.get('coord') or '').strip():
+                        continue
                     matches = _match_runtime_dependency_references(api_row, references)
                     if not matches:
                         continue

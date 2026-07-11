@@ -18,6 +18,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import confidence_weighted_tracer as tracer  # noqa: E402
+import business_bytecode_graph  # noqa: E402
 import enhanced_source_analyzer as source_analyzer  # noqa: E402
 import enhanced_output_formatter as formatter  # noqa: E402
 import framework_adapters  # noqa: E402
@@ -61,8 +62,6 @@ class Step5KeyMatchingTest(unittest.TestCase):
             callee_simple_key="method:getPayloads()",
             confidence="high",
             evidence_type="bytecode_method_invocation",
-            evidence_source="current_final_artifact",
-            artifact_sha256="fixture-sha256",
             file="target/classes/app/JwtService.class",
             line=20,
             owner_type="business",
@@ -91,6 +90,30 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(result.analysis_status, "reachable")
         self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
         self.assertIn("bytecode_method_invocation", str(result.evidence_paths))
+
+    def test_business_bytecode_discovers_target_classes_under_multimodule_project_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            classes = project / "module-a" / "target" / "classes" / "app"
+            classes.mkdir(parents=True)
+            source = project / "Caller.java"
+            source.write_text(
+                "package app; public class Caller { "
+                "void run() { java.util.List.of(\"x\"); } }",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["javac", "-d", str(classes.parent), str(source)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            roots = business_bytecode_graph.discover_class_roots([
+                {"root": str(project), "owner_type": "business"}
+            ])
+
+        self.assertEqual(roots, [(project / "module-a" / "target" / "classes").resolve()])
 
     def _call_chain_dir(self, report_dir):
         return Path(report_dir) / "evidence" / "call_chain"
@@ -7290,7 +7313,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(summary_payload["not_impacted"], 1)
         self.assertEqual(alert_rows[0]["api_status"], "not_impacted")
         self.assertEqual(alert_rows[0]["conclusion_level"], "confirmed_no_impact")
-        self.assertIn("已确认不受影响", final_report)
+        self.assertIn("已确认不受影响", summary_text)
         self.assertIn("### 3.1 符号保留证据", final_report)
         self.assertIn("com.vendor:aggregate", final_report)
         self.assertIn("不包含被删除 JAR 中的 SPI 配置、资源文件、清单等非 API 内容", final_report)
@@ -12948,84 +12971,6 @@ public class com.example.consumer.ReflectiveCall {
                 cached[tracer.build_api_identity_key(apis[1])]["status"],
                 "miss",
             )
-
-    def test_batch_packaged_bytecode_scans_same_coord_runtime_jar_for_internal_calls(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            service_src = root / "src" / "com" / "example" / "lib" / "MyService.java"
-            props_src = root / "src" / "com" / "example" / "lib" / "ServiceProperties.java"
-            service_src.parent.mkdir(parents=True)
-            service_src.write_text(
-                """
-package com.example.lib;
-
-public class MyService {
-    private final ServiceProperties serviceProperties;
-
-    public MyService(ServiceProperties serviceProperties) {
-        this.serviceProperties = serviceProperties;
-    }
-
-    public String message() {
-        return this.serviceProperties.getMessage();
-    }
-}
-""",
-                encoding="utf-8",
-            )
-            props_src.write_text(
-                """
-package com.example.lib;
-
-public class ServiceProperties {
-    private String message;
-
-    public String getMessage() {
-        return message;
-    }
-
-    public void setMessage(String message) {
-        this.message = message;
-    }
-}
-""",
-                encoding="utf-8",
-            )
-            classes = self._compile_java_files(root / "classes", [service_src, props_src])
-            jar_path = root / "library.jar"
-            self._jar_compiled_classes(jar_path, classes)
-            graph = SimpleNamespace(
-                methods_by_id={},
-                reverse_edges={"dummy": [object()]},
-                runtime_dependency_catalog={
-                    "status": "complete",
-                    "by_coord": {
-                        "sample:library": {
-                            "coord": "sample:library",
-                            "version": "1",
-                            "scope": "compile",
-                            "jar_path": str(jar_path),
-                        }
-                    },
-                },
-            )
-            apis = [{
-                "coord": "sample:library",
-                "api_name": "com.example.lib.ServiceProperties.getMessage",
-                "api_simple": "getMessage",
-                "api_signature": "()",
-                "symbol_kind": "method",
-                "change_type": "REMOVED",
-            }]
-
-            tracer._build_packaged_runtime_dependency_scan_cache(apis, graph)
-
-            cached = graph.runtime_dependency_catalog["_packaged_api_scan_results"]
-            result = cached[tracer.build_api_identity_key(apis[0])]
-            self.assertEqual(result["status"], "hit")
-            self.assertEqual(len(result["hits"]), 1)
-            self.assertEqual(result["hits"][0]["coord"], "sample:library")
-            self.assertEqual(result["hits"][0]["consumer_method"], "message")
 
     def test_packaged_dependency_hit_is_reachable_when_business_bytecode_calls_consumer(self):
         result = tracer.TraceResult(
