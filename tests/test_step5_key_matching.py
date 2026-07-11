@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import io
 import os
@@ -18,6 +19,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import confidence_weighted_tracer as tracer  # noqa: E402
+import business_bytecode_graph  # noqa: E402
 import enhanced_source_analyzer as source_analyzer  # noqa: E402
 import enhanced_output_formatter as formatter  # noqa: E402
 import framework_adapters  # noqa: E402
@@ -465,6 +467,69 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(bridge["edge_role"], "internal_bridge")
         self.assertFalse(bridge["direct_consumer"])
 
+    def test_packaged_executable_scan_records_exact_ledger_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            report_dir = Path(tmp) / "report"
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as zf:
+                zf.writestr("BOOT-INF/lib/target.jar", jar_path.read_bytes())
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self._write_text(
+                report_dir / "evidence" / "dependencies" / "build_provenance.json",
+                json.dumps({
+                    "sides": [{
+                        "side": "current",
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": artifact_sha256,
+                    }]
+                }),
+                encoding="utf-8",
+            )
+            graph = SimpleNamespace(
+                report_dir=str(report_dir),
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "by_coord": {
+                        api_row["coord"]: {
+                            "coord": api_row["coord"],
+                            "jar_path": str(jar_path),
+                            "artifact_entry": "BOOT-INF/lib/target.jar",
+                            "evidence_source": "current_final_artifact",
+                        }
+                    },
+                },
+            )
+
+            tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+            graph_stats = {}
+            ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        bridge = next(row for row in rows if row["caller_owner"] == "com.vendor.InternalBridge")
+        self.assertEqual(bridge["artifact_sha256"], artifact_sha256)
+        self.assertEqual(
+            bridge["artifact_entry"],
+            "BOOT-INF/lib/target.jar!/com/vendor/InternalBridge.class",
+        )
+        self.assertEqual(bridge["caller_member"], "use")
+        self.assertEqual(
+            bridge["caller_descriptor"],
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        )
+        self.assertEqual(bridge["callee_owner"], "com.vendor.Target")
+        self.assertEqual(bridge["callee_member"], "removed")
+        self.assertEqual(
+            bridge["callee_descriptor"],
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        )
+        self.assertEqual(bridge["opcode_family"], "invokestatic")
+        self.assertTrue(bridge["instruction_offset"].isdigit())
+        self.assertTrue(graph_stats["edge_ledger_complete"])
+
     def test_same_coordinate_declaration_only_is_not_an_executable_edge(self):
         with tempfile.TemporaryDirectory() as tmp:
             api_row, jar_path = self._same_coordinate_bytecode_fixture(
@@ -544,6 +609,695 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(internal.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
         self.assertIn("com.vendor.InternalBridge.use(String)", internal.call_paths[0])
         self.assertEqual(internal.evidence_paths[0][0]["edge_role"], "internal_bridge")
+
+    def _analyzer_edge_ledger_graph(self, tmp, include_provenance=True):
+        report_dir = Path(tmp) / "report"
+        nested = io.BytesIO()
+        with zipfile.ZipFile(nested, "w") as zf:
+            zf.writestr("com/vendor/Bridge.class", b"bridge")
+            zf.writestr("com/vendor/Outer$Bridge.class", b"nested-bridge")
+        nested_path = Path(tmp) / "target.jar"
+        nested_path.write_bytes(nested.getvalue())
+        artifact = Path(tmp) / "application.jar"
+        with zipfile.ZipFile(artifact, "w") as zf:
+            zf.writestr("BOOT-INF/lib/target.jar", nested.getvalue())
+        artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if include_provenance:
+            provenance = report_dir / "evidence" / "dependencies" / "build_provenance.json"
+            self._write_text(
+                provenance,
+                json.dumps({
+                    "sides": [{
+                        "side": "current",
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": artifact_sha256,
+                    }]
+                }),
+                encoding="utf-8",
+            )
+        return SimpleNamespace(
+            report_dir=str(report_dir),
+            runtime_dependency_catalog={
+                "status": "complete",
+                "by_coord": {
+                    "com.vendor:target": {
+                        "coord": "com.vendor:target",
+                        "jar_path": str(nested_path),
+                        "artifact_entry": "BOOT-INF/lib/target.jar",
+                        "evidence_source": "current_final_artifact",
+                    }
+                },
+            },
+        ), artifact_sha256
+
+    def test_writes_complete_analyzer_edge_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            base_api = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.call",
+                "api_simple": "call",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }
+            evidence_jar = graph.runtime_dependency_catalog["by_coord"][
+                "com.vendor:target"
+            ]["jar_path"]
+            edges = [
+                {
+                    "coord": "com.vendor:target",
+                    "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                    "edge_role": "internal_bridge",
+                    "jar_path": evidence_jar,
+                    "class_entry": "com/vendor/Bridge.class",
+                    "class_fqcn": "com.vendor.Bridge",
+                    "consumer_method": "use",
+                    "consumer_descriptor": "(Ljava/lang/String;)V",
+                    "callee_owner": "com.vendor.Target",
+                    "callee_member": "call",
+                    "callee_descriptor": "(Ljava/lang/String;)V",
+                    "opcode_family": "invokevirtual",
+                    "instruction_offset": 7,
+                },
+                {
+                    "coord": "com.vendor:target",
+                    "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                    "edge_role": "internal_bridge",
+                    "jar_path": evidence_jar,
+                    "class_entry": "com/vendor/Bridge.class",
+                    "class_fqcn": "com.vendor.Bridge",
+                    "consumer_method": "use",
+                    "consumer_descriptor": "(Ljava/lang/String;)V",
+                    "callee_owner": "com.vendor.Target",
+                    "callee_member": "call",
+                    "callee_descriptor": "(I)V",
+                    "opcode_family": "invokevirtual",
+                    "instruction_offset": 12,
+                },
+                {
+                    "coord": "com.vendor:target",
+                    "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                    "edge_role": "internal_bridge",
+                    "jar_path": evidence_jar,
+                    "class_entry": "com/vendor/Bridge.class",
+                    "class_fqcn": "com.vendor.Bridge",
+                    "consumer_method": "make",
+                    "consumer_descriptor": "()V",
+                    "callee_owner": "com.vendor.Target",
+                    "callee_member": "<init>",
+                    "callee_descriptor": "()V",
+                    "opcode_family": "invokespecial",
+                    "instruction_offset": 4,
+                },
+            ]
+            int_overload = {**base_api, "api_signature": "(int)"}
+            constructor = {
+                **base_api,
+                "api_name": "com.vendor.Target.Target",
+                "api_simple": "Target",
+                "api_signature": "()",
+                "symbol_kind": "constructor",
+            }
+
+            tracer.record_analyzer_edge(graph, base_api, edges[0])
+            tracer.record_analyzer_edge(graph, base_api, edges[0])
+            tracer.record_analyzer_edge(
+                graph,
+                base_api,
+                {**edges[0], "instruction_offset": 2},
+            )
+            tracer.record_analyzer_edge(graph, int_overload, edges[1])
+            tracer.record_analyzer_edge(graph, constructor, edges[2])
+            graph_stats = {}
+            ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({row["artifact_sha256"] for row in rows}, {artifact_sha256})
+        self.assertEqual(
+            {row["artifact_entry"] for row in rows},
+            {"BOOT-INF/lib/target.jar!/com/vendor/Bridge.class"},
+        )
+        self.assertEqual({row["edge_role"] for row in rows}, {"internal_bridge"})
+        self.assertEqual(
+            {row["callee_descriptor"] for row in rows if row["callee_member"] == "call"},
+            {"(Ljava/lang/String;)V", "(I)V"},
+        )
+        self.assertIn("<init>", {row["callee_member"] for row in rows})
+        string_overload_offsets = {
+            row["instruction_offset"]
+            for row in rows
+            if row["callee_descriptor"] == "(Ljava/lang/String;)V"
+        }
+        self.assertEqual(string_overload_offsets, {"2", "7"})
+        self.assertEqual(
+            rows,
+            sorted(rows, key=tracer.canonical_analyzer_edge_sort_key),
+        )
+        self.assertEqual(graph_stats["analyzer_edge_count"], 4)
+        self.assertEqual(graph_stats["duplicate_edge_count"], 1)
+        self.assertEqual(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertTrue(graph_stats["edge_ledger_complete"])
+
+    def test_analyzer_edge_ledger_is_incomplete_without_final_artifact_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(
+                tmp, include_provenance=False
+            )
+            tracer.record_analyzer_edge(
+                graph,
+                {
+                    "coord": "com.vendor:target",
+                    "api_name": "com.vendor.Target.call",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "METHOD_REMOVED",
+                },
+                {
+                    "coord": "com.vendor:target",
+                    "edge_role": "internal_bridge",
+                    "class_entry": "com/vendor/Bridge.class",
+                    "class_fqcn": "com.vendor.Bridge",
+                    "consumer_method": "use",
+                    "consumer_descriptor": "()V",
+                    "callee_owner": "com.vendor.Target",
+                    "callee_member": "call",
+                    "callee_descriptor": "()V",
+                    "opcode_family": "invokestatic",
+                },
+            )
+            graph_stats = {}
+            tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+        self.assertEqual(graph_stats["analyzer_edge_count"], 0)
+        self.assertEqual(graph_stats["duplicate_edge_count"], 0)
+        self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertFalse(graph_stats["edge_ledger_complete"])
+
+    def test_analyzer_edge_ledger_requires_offset_but_preserves_real_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            jar_path = graph.runtime_dependency_catalog["by_coord"][
+                "com.vendor:target"
+            ]["jar_path"]
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.call",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }
+            edge = {
+                "coord": "com.vendor:target",
+                "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                "jar_path": jar_path,
+                "class_entry": "com/vendor/Bridge.class",
+                "caller_owner": "com.vendor.Bridge",
+                "consumer_method": "use",
+                "consumer_descriptor": "()V",
+                "callee_owner": "com.vendor.Target",
+                "callee_member": "call",
+                "callee_descriptor": "()V",
+                "opcode_family": "invokestatic",
+            }
+
+            tracer.record_analyzer_edge(graph, api_row, {**edge, "instruction_offset": 0})
+            tracer.record_analyzer_edge(graph, api_row, edge)
+            graph_stats = {}
+            ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual([row["instruction_offset"] for row in rows], ["0"])
+        self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertFalse(graph_stats["edge_ledger_complete"])
+
+    def test_invokedynamic_ledger_preserves_nested_bootstrap_owner(self):
+        javap_output = """
+public class com.vendor.Outer$Bridge {
+  public void use();
+    descriptor: ()V
+    Code:
+       0: invokedynamic #7,  0 // InvokeDynamic #0:call:()Ljava/lang/Runnable;
+       5: return
+BootstrapMethods:
+  0: #20 REF_invokeStatic com/vendor/Outer$Target.call:()V
+"""
+        references = tracer._parse_javap_bytecode_references(
+            javap_output, "com.vendor.Outer$Bridge"
+        )
+        api_row = {
+            "coord": "com.vendor:target",
+            "api_name": "com.vendor.Outer$Target.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+        }
+        matched = tracer._match_runtime_dependency_references(api_row, references)[0]
+
+        self.assertEqual(matched["callee_owner"], "com.vendor.Outer$Target")
+        self.assertEqual(matched["opcode_family"], "invokedynamic")
+        self.assertEqual(matched["instruction_offset"], 0)
+
+    def test_analyzer_edge_rejects_tampered_nested_jar_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            tampered_jar = Path(tmp) / "tampered-target.jar"
+            with zipfile.ZipFile(tampered_jar, "w") as zf:
+                zf.writestr("com/vendor/Bridge.class", b"tampered")
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.call",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }
+
+            accepted = tracer.record_analyzer_edge(
+                graph,
+                api_row,
+                {
+                    "coord": "com.vendor:target",
+                    "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                    "jar_path": str(tampered_jar),
+                    "class_entry": "com/vendor/Bridge.class",
+                    "caller_owner": "com.vendor.Bridge",
+                    "consumer_method": "use",
+                    "consumer_descriptor": "()V",
+                    "callee_owner": "com.vendor.Target",
+                    "callee_member": "call",
+                    "callee_descriptor": "()V",
+                    "opcode_family": "invokestatic",
+                    "instruction_offset": 0,
+                },
+            )
+            graph_stats = {}
+            tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+        self.assertIsNone(accepted)
+        self.assertEqual(graph_stats["analyzer_edge_count"], 0)
+        self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertFalse(graph_stats["edge_ledger_complete"])
+
+    def test_analyzer_edge_rejects_tampered_business_class_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as zf:
+                zf.writestr("BOOT-INF/classes/app/Service.class", b"expected")
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self._write_text(
+                report_dir / "evidence" / "dependencies" / "build_provenance.json",
+                json.dumps({
+                    "sides": [{
+                        "side": "current",
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": artifact_sha256,
+                    }]
+                }),
+                encoding="utf-8",
+            )
+            stale_business_jar = Path(tmp) / "business-classes.jar"
+            with zipfile.ZipFile(stale_business_jar, "w") as zf:
+                zf.writestr("app/Service.class", b"stale")
+            graph = SimpleNamespace(report_dir=str(report_dir), runtime_dependency_catalog={})
+
+            accepted = tracer.record_analyzer_edge(
+                graph,
+                {"api_name": "com.vendor.Target.call", "api_signature": "()"},
+                {
+                    "coord": "__business__",
+                    "jar_path": str(stale_business_jar),
+                    "class_entry": "app/Service.class",
+                    "caller_owner": "app.Service",
+                    "consumer_method": "run",
+                    "consumer_descriptor": "()V",
+                    "callee_owner": "com.vendor.Target",
+                    "callee_member": "call",
+                    "callee_descriptor": "()V",
+                    "opcode_family": "invokestatic",
+                    "instruction_offset": 0,
+                },
+            )
+            graph_stats = {}
+            tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+        self.assertIsNone(accepted)
+        self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertFalse(graph_stats["edge_ledger_complete"])
+
+    def test_absent_runtime_catalog_marks_edge_ledger_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            graph.runtime_dependency_catalog = {}
+            graph.methods_by_id = {}
+            graph.reverse_edges = {}
+
+            tracer._build_packaged_runtime_dependency_scan_cache([{
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.call",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }], graph)
+            graph_stats = {}
+            tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+        self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertFalse(graph_stats["edge_ledger_complete"])
+
+    def test_unknown_multi_release_target_marks_edge_ledger_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            runtime_jar = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(runtime_jar, "w") as zf:
+                zf.writestr(
+                    "META-INF/MANIFEST.MF",
+                    "Manifest-Version: 1.0\nMulti-Release: true\n",
+                )
+                zf.writestr("com/acme/Consumer.class", b"com/vendor/Target call")
+                zf.writestr(
+                    "META-INF/versions/11/com/acme/Consumer.class",
+                    b"com/vendor/Target call",
+                )
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as zf:
+                zf.writestr("BOOT-INF/lib/consumer.jar", runtime_jar.read_bytes())
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self._write_text(
+                report_dir / "evidence" / "dependencies" / "build_provenance.json",
+                json.dumps({
+                    "sides": [{
+                        "side": "current",
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": artifact_sha256,
+                    }]
+                }),
+                encoding="utf-8",
+            )
+            item = {
+                "coord": "com.acme:consumer",
+                "jar_path": str(runtime_jar),
+                "artifact_entry": "BOOT-INF/lib/consumer.jar",
+                "evidence_source": "current_final_artifact",
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report_dir),
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": [item],
+                    "by_coord": {item["coord"]: item},
+                },
+            )
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.call",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }
+
+            scan = tracer._scan_packaged_runtime_dependencies_for_api(api_row, graph)
+            graph_stats = {}
+            tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+        self.assertEqual(scan["reason"], "MULTI_RELEASE_TARGET_JDK_UNKNOWN")
+        self.assertIn(
+            "MULTI_RELEASE_TARGET_JDK_UNKNOWN",
+            {failure[0] for failure in graph._analyzer_edge_failures},
+        )
+        self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertFalse(graph_stats["edge_ledger_complete"])
+
+    def test_analyzer_edge_ledger_preserves_nested_class_binary_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            tracer.record_analyzer_edge(
+                graph,
+                {
+                    "coord": "com.vendor:target",
+                    "api_name": "com.vendor.Outer$Target.call",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "METHOD_REMOVED",
+                },
+                {
+                    "coord": "com.vendor:target",
+                    "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                    "jar_path": graph.runtime_dependency_catalog["by_coord"][
+                        "com.vendor:target"
+                    ]["jar_path"],
+                    "class_entry": "com/vendor/Outer$Bridge.class",
+                    "caller_owner": "com.vendor.Outer$Bridge",
+                    "consumer_method": "use",
+                    "consumer_descriptor": "()V",
+                    "callee_owner": "com.vendor.Outer$Target",
+                    "callee_member": "call",
+                    "callee_descriptor": "()V",
+                    "opcode_family": "invokestatic",
+                    "instruction_offset": 1,
+                },
+            )
+            ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats={})
+            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+                row = next(csv.DictReader(handle))
+
+        self.assertEqual(row["caller_owner"], "com.vendor.Outer$Bridge")
+        self.assertEqual(row["callee_owner"], "com.vendor.Outer$Target")
+
+    def test_analyzer_edge_ledger_marks_relevant_jar_scan_failure_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            missing_jar = Path(tmp) / "missing.jar"
+            item = {
+                "coord": "com.vendor:target",
+                "jar_path": str(missing_jar),
+                "artifact_entry": "BOOT-INF/lib/target.jar",
+                "evidence_source": "current_final_artifact",
+            }
+            graph.methods_by_id = {}
+            graph.reverse_edges = {}
+            graph.runtime_dependency_catalog = {
+                "status": "complete",
+                "entries": [item],
+                "by_coord": {item["coord"]: item},
+            }
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.call",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }
+
+            tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+            graph_stats = {}
+            tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+        self.assertEqual(graph_stats["analyzer_edge_count"], 0)
+        self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertFalse(graph_stats["edge_ledger_complete"])
+
+    def test_analyzer_edge_ledger_keeps_duplicate_coordinate_containers_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            report_dir = Path(tmp) / "report"
+            artifact = Path(tmp) / "application.jar"
+            container_entries = (
+                "BOOT-INF/lib/target-a.jar",
+                "BOOT-INF/lib/target-b.jar",
+            )
+            with zipfile.ZipFile(artifact, "w") as zf:
+                for entry in container_entries:
+                    zf.writestr(entry, jar_path.read_bytes())
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self._write_text(
+                report_dir / "evidence" / "dependencies" / "build_provenance.json",
+                json.dumps({
+                    "sides": [{
+                        "side": "current",
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": artifact_sha256,
+                    }]
+                }),
+                encoding="utf-8",
+            )
+            entries = [
+                {
+                    "coord": api_row["coord"],
+                    "jar_path": str(jar_path),
+                    "artifact_entry": container,
+                    "evidence_source": "current_final_artifact",
+                }
+                for container in container_entries
+            ]
+            graph = SimpleNamespace(
+                report_dir=str(report_dir),
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": entries,
+                    "by_coord": {api_row["coord"]: entries[0]},
+                },
+            )
+
+            tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+            ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats={})
+            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        bridge_entries = {
+            row["artifact_entry"]
+            for row in rows
+            if row["caller_owner"] == "com.vendor.InternalBridge"
+        }
+        self.assertEqual(
+            bridge_entries,
+            {
+                f"{container}!/com/vendor/InternalBridge.class"
+                for container in container_entries
+            },
+        )
+
+    def test_collects_verified_business_reverse_edge_from_boot_inf_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            target = src / "com/vendor/Target.java"
+            service = src / "app/Service.java"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            service.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                "package com.vendor; public class Target { "
+                "public static void call() {} }",
+                encoding="utf-8",
+            )
+            service.write_text(
+                "package app; public class Service { "
+                "public void run() { com.vendor.Target.call(); } }",
+                encoding="utf-8",
+            )
+            classes = self._compile_java_files(Path(tmp) / "classes", [target, service])
+            business_jar = Path(tmp) / "business-classes.jar"
+            with zipfile.ZipFile(business_jar, "w") as zf:
+                zf.write(classes / "app" / "Service.class", "app/Service.class")
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as zf:
+                zf.write(
+                    classes / "app" / "Service.class",
+                    "BOOT-INF/classes/app/Service.class",
+                )
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            report_dir = Path(tmp) / "report"
+            self._write_text(
+                report_dir / "evidence" / "dependencies" / "build_provenance.json",
+                json.dumps({
+                    "sides": [{
+                        "side": "current",
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": artifact_sha256,
+                    }]
+                }),
+                encoding="utf-8",
+            )
+            method = SimpleNamespace(
+                symbol_id="service_run",
+                qualified_key="app.Service.run",
+                class_fqcn="app.Service",
+                method_name="run",
+                owner_coord="__business__",
+                module="app",
+            )
+            business_sha256 = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+            business_item = {
+                "coord": "__business__",
+                "jar_path": str(business_jar),
+                "artifact_entry": "<business-classes>",
+                "sha256": business_sha256,
+                "evidence_source": "current_final_artifact",
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report_dir),
+                methods_by_id={method.symbol_id: method},
+                methods_by_qualified={method.qualified_key: [method.symbol_id]},
+                lookup_keys_by_symbol={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": [business_item],
+                    "by_coord": {"__business__": business_item},
+                },
+            )
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.call",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }
+
+            produced_edges, producer_metrics = business_bytecode_graph.collect_business_bytecode_edges(
+                [], artifact_catalog=graph.runtime_dependency_catalog
+            )
+            merged_metrics = business_bytecode_graph.merge_business_bytecode_edges(
+                graph, produced_edges
+            )
+            self.assertEqual(producer_metrics["failures"], [])
+            self.assertGreater(merged_metrics["merged_edges"], 0)
+            produced_edge = graph.reverse_edges["com.vendor.Target.call()"][0]
+            self.assertEqual(produced_edge.artifact_sha256, business_sha256)
+            self.assertNotEqual(produced_edge.artifact_sha256, artifact_sha256)
+
+            tracer.collect_graph_analyzer_edges(graph, [api_row])
+            graph_stats = {}
+            ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        row = next(item for item in rows if item["caller_owner"] == "app.Service")
+        self.assertEqual(row["artifact_sha256"], artifact_sha256)
+        self.assertEqual(row["artifact_entry"], "BOOT-INF/classes/app/Service.class")
+        self.assertEqual(row["caller_descriptor"], "()V")
+        self.assertEqual(row["callee_descriptor"], "()V")
+        self.assertEqual(row["opcode_family"], "invokestatic")
+        self.assertTrue(graph_stats["edge_ledger_complete"])
+
+    def test_business_jar_is_not_required_without_business_bytecode_edges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            graph.methods_by_id = {}
+            graph.reverse_edges = {}
+
+            tracer.collect_graph_analyzer_edges(graph, [])
+            graph_stats = {}
+            tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+        self.assertEqual(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertTrue(graph_stats["edge_ledger_complete"])
+
+    def test_user_output_documents_analyzer_edge_ledger_contract(self):
+        text = (ROOT_DIR / "docs" / "user" / "outputs.md").read_text(encoding="utf-8")
+
+        self.assertIn("analyzer_edges.csv", text)
+        for field in tracer.ANALYZER_EDGE_FIELDS:
+            self.assertIn(f"`{field}`", text)
+        for metric in (
+            "analyzer_edge_count",
+            "duplicate_edge_count",
+            "edge_ledger_failure_count",
+            "edge_ledger_complete",
+        ):
+            self.assertIn(f"`{metric}`", text)
+        self.assertIn("可执行字节码指令", text)
+        self.assertIn("不会从 `alerts.csv`", text)
+        self.assertIn("非负整数", text)
+        self.assertIn("字节 SHA-256", text)
+        self.assertIn("MULTI_RELEASE_TARGET_JDK_UNKNOWN", text)
 
     def test_runtime_dependency_caller_candidate_scan_is_reused_for_signature_variants(self):
         with tempfile.TemporaryDirectory() as tmp:

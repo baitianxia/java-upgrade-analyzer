@@ -170,12 +170,43 @@ evidence/call_chain/
 | 文件 | 类型 | 说明 |
 |---|---|---|
 | `summary.json` | 程序使用 | Step6 读取的结构化汇总，包含 `analysis_status`、`reason_code` 和能力覆盖 |
+| `analyzer_edges.csv` | 程序和深度复核使用 | 分析器从当前最终制品中确认的可执行边台账，用于和独立边真值核对 |
 | `step5_timing.csv` | 深度排查 | Step5 耗时拆解，用于性能问题定位 |
 | `dependency_source_alignment.json` | 依赖源码版本对齐证据 | 使用了哪个 current ref/commit、用户工作区是否保持不变、多少源码类被 current JAR 保留或排除 |
 | `.runtime/indexes/s5_query_index.json` | 程序使用 | Agent 按方法即时查询调用链；不作为人工阅读文件 |
 | `by_module/*_impacts.json` | 按模块聚合视图 | 分派处理责任 |
 
 `dependency_source_alignment.json` 是结果与预期不一致时才需要查看的辅助证据。依赖源码未能与 Step4 确认的当前版本或 current JAR 对齐时，Step5 会拒绝这份源码并继续使用 JAR 字节码分析，不会静默使用本地仓库当前分支。
+
+### analyzer_edges.csv 的语义
+
+`analyzer_edges.csv` 每行是一条在 SHA-256 已验证的 current 最终制品中发现的可执行字节码指令边。台账在字节码匹配形成边时直接记录，不会从 `alerts.csv` 的展示字符串或人工调用链文本反向重建。
+
+固定表头如下：
+
+```text
+artifact_sha256,artifact_entry,caller_owner,caller_member,caller_descriptor,callee_owner,callee_member,callee_descriptor,opcode_family,instruction_offset,api_identity,edge_role,evidence_path,authority,authority_version,procedure,procedure_version
+```
+
+字段含义：
+
+| 字段 | 含义 |
+|---|---|
+| `artifact_sha256`、`artifact_entry` | 已验证 current 最终制品的 SHA-256，以及外层 class 或嵌套运行时 JAR 内 class 的精确 entry |
+| `caller_owner`、`caller_member`、`caller_descriptor` | 调用方类、成员名和原始 JVM descriptor；嵌套类保留 JVM binary name 中的 `$` |
+| `callee_owner`、`callee_member`、`callee_descriptor` | 被调用方类、成员名和原始 JVM descriptor；嵌套类保留 `$`，构造器保留 `<init>` |
+| `opcode_family`、`instruction_offset` | 产生边的 JVM opcode 和方法内指令偏移；偏移是必填的非负整数，真实偏移 `0` 会保留，缺失或非法值会拒绝该行 |
+| `api_identity` | 该边匹配的 Step4 API 身份键 |
+| `edge_role` | `internal_bridge` 或 `external_consumer` 等边角色 |
+| `evidence_path` | 分析器读取的 JAR/class 证据路径 |
+| `authority`、`authority_version` | 产生该行的分析器及其版本 |
+| `procedure`、`procedure_version` | 可复现的边提取过程及过程版本 |
+
+Step5 结构化统计同时给出 `analyzer_edge_count`、`duplicate_edge_count`、`edge_ledger_failure_count` 和 `edge_ledger_complete`。同一 canonical identity 在不同 class entry 或不同 `instruction_offset` 出现时保留为多条物理指令；只有对同一制品 entry、调用方和指令偏移的重复发现才折叠并计入 `duplicate_edge_count`。业务 class 使用 `BOOT-INF/classes`、`WEB-INF/classes` 或根 class entry，嵌套依赖使用扫描命中时携带的精确容器 entry，不按依赖坐标反查。
+
+每条记录还会做字节 SHA-256 绑定：嵌套依赖要求扫描 JAR 与最终制品中的精确容器 entry 字节一致，并要求扫描 class 与该容器内的精确 class entry 一致；业务 class 的外层最终制品 SHA 和提取出的 `business-classes.jar` SHA 是两个独立身份，前者按 provenance 验证，后者按 catalog 和业务图边验证，再将扫描 class 字节与 `BOOT-INF/classes`、`WEB-INF/classes` 或根 class entry 的精确字节核对，不会把提取 JAR 的 SHA 当作外层制品 SHA。缺失、陈旧、被篡改或无关的扫描路径不能写入台账。
+
+最终制品缺失、SHA-256 不匹配、entry 无法验证、任一身份字段缺失，或相关 catalog、JAR、class 解析、`javap` 扫描失败时，`edge_ledger_failure_count` 大于 `0` 且 `edge_ledger_complete` 为 `false`。所有 `unavailable` 状态同样失败关闭，包括运行时 catalog 缺失和 `MULTI_RELEASE_TARGET_JDK_UNKNOWN`。
 
 ### alerts.csv 的语义
 

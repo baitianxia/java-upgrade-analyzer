@@ -15,8 +15,10 @@ confidence_weighted_tracer.py
 替换原有trace_one_api()的固定深度策略
 """
 
+import csv
 import json
 import hashlib
+import io
 import os
 import re
 import struct
@@ -26,8 +28,10 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 from compat import run_cmd
+from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import normalize_signature_for_lookup, split_signature_params
 from enhanced_source_analyzer import CallEdge, MethodDef
@@ -46,6 +50,315 @@ CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
     'class',
     'field',
 }
+
+ANALYZER_EDGE_PROCEDURE_VERSION = 'java-upgrade-analyzer.analyzer-edge-ledger.v1'
+ANALYZER_EDGE_PROCEDURE = (
+    'Step5 executable bytecode matching at analyzer edge creation points'
+)
+ANALYZER_EDGE_FIELDS = (
+    'artifact_sha256',
+    'artifact_entry',
+    'caller_owner',
+    'caller_member',
+    'caller_descriptor',
+    'callee_owner',
+    'callee_member',
+    'callee_descriptor',
+    'opcode_family',
+    'instruction_offset',
+    'api_identity',
+    'edge_role',
+    'evidence_path',
+    'authority',
+    'authority_version',
+    'procedure',
+    'procedure_version',
+)
+
+
+def _valid_sha256(value):
+    value = str(value or '').strip()
+    return len(value) == 64 and all(char in '0123456789abcdef' for char in value)
+
+
+def _verified_final_artifact_provenance(graph):
+    cached = getattr(graph, '_verified_final_artifact_provenance', None)
+    if cached is not None:
+        return cached
+    result = {
+        'complete': False,
+        'artifact_sha256': '',
+        'entries': set(),
+        'entry_sha256': {},
+        'nested_entries': {},
+        'nested_entry_sha256': {},
+    }
+    report_dir = str(getattr(graph, 'report_dir', '') or '').strip()
+    provenance_path = Path(report_dir) / 'evidence' / 'dependencies' / 'build_provenance.json'
+    try:
+        payload = json.loads(provenance_path.read_text(encoding='utf-8'))
+        current = next(
+            (item for item in payload.get('sides') or [] if item.get('side') == 'current'),
+            {},
+        )
+        artifact_path = Path(str(current.get('artifact_path') or '').strip())
+        expected_sha256 = str(current.get('artifact_sha256') or '').strip()
+        snapshot = artifact_path.read_bytes()
+        actual_sha256 = hashlib.sha256(snapshot).hexdigest()
+        if not _valid_sha256(expected_sha256) or actual_sha256 != expected_sha256:
+            raise ValueError('current final artifact SHA-256 is missing or mismatched')
+        with zipfile.ZipFile(io.BytesIO(snapshot)) as outer:
+            entries = {item.filename for item in outer.infolist() if not item.is_dir()}
+            entry_sha256 = {}
+            nested_entries = {}
+            nested_entry_sha256 = {}
+            for entry in sorted(entries):
+                entry_bytes = outer.read(entry)
+                entry_sha256[entry] = hashlib.sha256(entry_bytes).hexdigest()
+                if not entry.endswith('.jar'):
+                    continue
+                try:
+                    with zipfile.ZipFile(io.BytesIO(entry_bytes)) as nested:
+                        nested_entries[entry] = {
+                            item.filename for item in nested.infolist() if not item.is_dir()
+                        }
+                        nested_entry_sha256[entry] = {
+                            item.filename: hashlib.sha256(nested.read(item)).hexdigest()
+                            for item in nested.infolist()
+                            if not item.is_dir()
+                        }
+                except (OSError, zipfile.BadZipFile):
+                    continue
+        result = {
+            'complete': True,
+            'artifact_sha256': expected_sha256,
+            'entries': entries,
+            'entry_sha256': entry_sha256,
+            'nested_entries': nested_entries,
+            'nested_entry_sha256': nested_entry_sha256,
+        }
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, zipfile.BadZipFile):
+        pass
+    setattr(graph, '_verified_final_artifact_provenance', result)
+    return result
+
+
+def _analyzer_edge_artifact_entry(graph, edge, provenance):
+    class_entry = str((edge or {}).get('class_entry') or '').replace('\\', '/').strip('/')
+    container_entry = str(
+        (edge or {}).get('artifact_container_entry') or ''
+    ).replace('\\', '/').strip('/')
+    if not container_entry and str((edge or {}).get('coord') or '') != '__business__':
+        return ''
+    if container_entry and class_entry:
+        nested = (provenance.get('nested_entries') or {}).get(container_entry)
+        if nested is not None and class_entry in nested:
+            return f'{container_entry}!/{class_entry}'
+    if class_entry:
+        candidates = [
+            class_entry,
+            f'BOOT-INF/classes/{class_entry}',
+            f'WEB-INF/classes/{class_entry}',
+        ]
+        for candidate in candidates:
+            if candidate in (provenance.get('entries') or set()):
+                return candidate
+    return ''
+
+
+def _normalized_instruction_offset(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value >= 0 else None
+    text = str(value).strip() if value is not None else ''
+    return text if text.isdigit() else None
+
+
+def _evidence_bytes_match_final_artifact(edge, provenance, artifact_entry):
+    jar_path = str((edge or {}).get('jar_path') or '').strip()
+    class_entry = str((edge or {}).get('class_entry') or '').replace('\\', '/').strip('/')
+    if not jar_path or not class_entry or not os.path.isfile(jar_path):
+        return False
+    container_entry = str(
+        (edge or {}).get('artifact_container_entry') or ''
+    ).replace('\\', '/').strip('/')
+    try:
+        if container_entry:
+            expected_jar_sha = (provenance.get('entry_sha256') or {}).get(container_entry)
+            if not expected_jar_sha:
+                return False
+            scanned_jar = Path(jar_path).read_bytes()
+            if hashlib.sha256(scanned_jar).hexdigest() != expected_jar_sha:
+                return False
+            expected_class_sha = (
+                (provenance.get('nested_entry_sha256') or {}).get(container_entry) or {}
+            ).get(class_entry)
+            if not expected_class_sha:
+                return False
+            with zipfile.ZipFile(io.BytesIO(scanned_jar)) as archive:
+                return hashlib.sha256(archive.read(class_entry)).hexdigest() == expected_class_sha
+
+        expected_class_sha = (provenance.get('entry_sha256') or {}).get(artifact_entry)
+        if not expected_class_sha:
+            return False
+        with zipfile.ZipFile(jar_path) as archive:
+            scanned_class = archive.read(class_entry)
+        return hashlib.sha256(scanned_class).hexdigest() == expected_class_sha
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return False
+
+
+def _normalize_analyzer_edge(graph, api_row, edge):
+    provenance = _verified_final_artifact_provenance(graph)
+    artifact_entry = _analyzer_edge_artifact_entry(graph, edge, provenance)
+    instruction_offset = _normalized_instruction_offset(
+        (edge or {}).get('instruction_offset')
+    )
+    evidence_bound = bool(
+        provenance.get('complete')
+        and artifact_entry
+        and _evidence_bytes_match_final_artifact(edge, provenance, artifact_entry)
+    )
+    row = {
+        'artifact_sha256': provenance.get('artifact_sha256') or '',
+        'artifact_entry': artifact_entry,
+        'caller_owner': str(
+            (edge or {}).get('caller_owner') or (edge or {}).get('class_fqcn') or ''
+        ).strip(),
+        'caller_member': str((edge or {}).get('consumer_method') or '').strip(),
+        'caller_descriptor': str((edge or {}).get('consumer_descriptor') or '').strip(),
+        'callee_owner': str((edge or {}).get('callee_owner') or '').strip(),
+        'callee_member': str((edge or {}).get('callee_member') or '').strip(),
+        'callee_descriptor': str((edge or {}).get('callee_descriptor') or '').strip(),
+        'opcode_family': str((edge or {}).get('opcode_family') or '').strip(),
+        'instruction_offset': instruction_offset or '',
+        'api_identity': build_api_identity_key(api_row or {}),
+        'edge_role': str((edge or {}).get('edge_role') or 'external_consumer').strip(),
+        'evidence_path': str((edge or {}).get('jar_path') or '').strip()
+        + (f'!/{str((edge or {}).get("class_entry") or "").strip("/")}' if (edge or {}).get('class_entry') else ''),
+        'authority': 'java-upgrade-analyzer',
+        'authority_version': ANALYZER_EDGE_PROCEDURE_VERSION,
+        'procedure': ANALYZER_EDGE_PROCEDURE,
+        'procedure_version': ANALYZER_EDGE_PROCEDURE_VERSION,
+    }
+    complete = bool(
+        provenance.get('complete')
+        and artifact_entry
+        and instruction_offset is not None
+        and evidence_bound
+        and all(str(row.get(field) or '').strip() for field in EDGE_IDENTITY_FIELDS)
+    )
+    if provenance.get('complete') and artifact_entry and not evidence_bound:
+        _record_analyzer_ledger_failure(
+            graph,
+            'EDGE_EVIDENCE_BYTES_MISMATCH',
+            artifact_entry=artifact_entry,
+            evidence_path=row.get('evidence_path', ''),
+        )
+    return row, complete
+
+
+def record_analyzer_edge(graph, api_row, edge):
+    if graph is None:
+        return None
+    graph._analyzer_edge_discovery_count = int(
+        getattr(graph, '_analyzer_edge_discovery_count', 0) or 0
+    ) + 1
+    row, complete = _normalize_analyzer_edge(graph, api_row, edge)
+    if not complete:
+        graph._analyzer_edge_incomplete_count = int(
+            getattr(graph, '_analyzer_edge_incomplete_count', 0) or 0
+        ) + 1
+        return None
+    analyzer_edges = getattr(graph, 'analyzer_edges', None)
+    if analyzer_edges is None:
+        analyzer_edges = {}
+        graph.analyzer_edges = analyzer_edges
+    identity = physical_analyzer_edge_identity(row)
+    current = analyzer_edges.get(identity)
+    if current is None or canonical_analyzer_edge_sort_key(row) < canonical_analyzer_edge_sort_key(current):
+        analyzer_edges[identity] = row
+    return row
+
+
+def canonical_analyzer_edge_sort_key(row):
+    return tuple(str((row or {}).get(field) or '') for field in (
+        *EDGE_IDENTITY_FIELDS,
+        'artifact_entry',
+        'api_identity',
+        'edge_role',
+        'instruction_offset',
+    ))
+
+
+def physical_analyzer_edge_identity(row):
+    return '|'.join((
+        canonical_edge_identity(row),
+        str((row or {}).get('artifact_entry') or ''),
+        str((row or {}).get('caller_owner') or ''),
+        str((row or {}).get('caller_member') or ''),
+        str((row or {}).get('caller_descriptor') or ''),
+        str((row or {}).get('instruction_offset') or ''),
+    ))
+
+
+def _record_analyzer_ledger_failure(graph, reason, **fields):
+    if graph is None:
+        return
+    failures = getattr(graph, '_analyzer_edge_failures', None)
+    if failures is None:
+        failures = set()
+        graph._analyzer_edge_failures = failures
+    failures.add((
+        str(reason or 'unknown'),
+        tuple(sorted((str(key), str(value or '')) for key, value in fields.items())),
+    ))
+
+
+def _record_analyzer_scan_failures(graph, failures):
+    for failure in failures or []:
+        if isinstance(failure, dict):
+            reason = failure.get('reason') or 'bytecode_scan_failure'
+            _record_analyzer_ledger_failure(
+                graph,
+                reason,
+                **{key: value for key, value in failure.items() if key != 'reason'},
+            )
+        else:
+            _record_analyzer_ledger_failure(graph, str(failure or 'bytecode_scan_failure'))
+
+
+def write_analyzer_edge_ledger(graph, graph_stats=None):
+    graph_stats = graph_stats if graph_stats is not None else {}
+    provenance = _verified_final_artifact_provenance(graph)
+    rows = sorted(
+        list((getattr(graph, 'analyzer_edges', {}) or {}).values()),
+        key=canonical_analyzer_edge_sort_key,
+    )
+    discovery_count = int(getattr(graph, '_analyzer_edge_discovery_count', 0) or 0)
+    incomplete_count = int(getattr(graph, '_analyzer_edge_incomplete_count', 0) or 0)
+    failures = set(getattr(graph, '_analyzer_edge_failures', set()) or set())
+    if not provenance.get('complete'):
+        failures.add(('final_artifact_provenance_invalid', ()))
+    if incomplete_count:
+        failures.add(('incomplete_edge_metadata', (('count', str(incomplete_count)),)))
+    graph_stats['analyzer_edge_count'] = len(rows)
+    graph_stats['duplicate_edge_count'] = max(0, discovery_count - incomplete_count - len(rows))
+    graph_stats['edge_ledger_failure_count'] = len(failures)
+    graph_stats['edge_ledger_complete'] = bool(
+        provenance.get('complete') and not incomplete_count and not failures
+    )
+    report_dir = str(getattr(graph, 'report_dir', '') or '').strip()
+    if not report_dir:
+        return ''
+    output_path = Path(report_dir) / 'evidence' / 'call_chain' / 'analyzer_edges.csv'
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open('w', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=ANALYZER_EDGE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(output_path)
 
 
 def _env_flag_enabled(name):
@@ -1273,7 +1586,8 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
             bootstrap_targets.setdefault(current_bootstrap, [])
         handle = method_handle_pattern.search(line)
         if handle and current_bootstrap is not None:
-            owner = handle.group(1).replace('/', '.').replace('$', '.')
+            jvm_owner = handle.group(1).replace('/', '.')
+            owner = jvm_owner.replace('$', '.')
             if owner in {
                 'java.lang.invoke.LambdaMetafactory',
                 'java.lang.invoke.StringConcatFactory',
@@ -1281,11 +1595,13 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
                 continue
             bootstrap_targets[current_bootstrap].append({
                 'owner': owner,
+                'jvm_owner': jvm_owner,
                 'name': handle.group(2) or handle.group(3) or '',
                 'descriptor': handle.group(4),
             })
     current_member = ''
     current_signature = ''
+    current_descriptor = ''
     class_simple = str(class_binary_name or '').rsplit('.', 1)[-1]
     for raw_line in (text or '').splitlines():
         line = raw_line.strip()
@@ -1297,13 +1613,16 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
             if current_member == class_simple:
                 current_member = '<init>'
             current_signature = ''
+            current_descriptor = ''
             continue
         if re.match(r'^\s*static\s+\{\};\s*$', raw_line):
             current_member = '<clinit>'
             current_signature = ''
+            current_descriptor = ''
             continue
         if line.startswith('descriptor:') and current_member:
-            current_signature = _method_descriptor_to_lookup_signature(line.split(':', 1)[1].strip())
+            current_descriptor = line.split(':', 1)[1].strip()
+            current_signature = _method_descriptor_to_lookup_signature(current_descriptor)
             for match in descriptor_pattern.findall(line):
                 references['class_refs'].add(match.replace('/', '.').replace('$', '.'))
             continue
@@ -1311,54 +1630,71 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
         # but they do not identify the consuming method. Only instruction lines
         # are valid member-level usage evidence.
         instruction_line = bool(re.match(r'^\d+:', line))
+        instruction = re.match(r'^(\d+):\s+([a-z][a-z0-9_]*)\b', line)
+        instruction_offset = int(instruction.group(1)) if instruction else None
+        opcode_family = instruction.group(2) if instruction else ''
         dynamic_match = re.search(r'\binvokedynamic\b.*//\s+InvokeDynamic\s+#(\d+):', line)
         if dynamic_match and instruction_line:
             for target in bootstrap_targets.get(int(dynamic_match.group(1)), []):
                 descriptor = target.get('descriptor') or ''
                 references['method_refs'].append({
                     'owner': target.get('owner') or '',
+                    'jvm_owner': target.get('jvm_owner') or target.get('owner') or '',
                     'name': target.get('name') or '',
                     'descriptor': descriptor,
                     'signature': _method_descriptor_to_lookup_signature(descriptor),
                     'consumer_method': current_member,
                     'consumer_signature': current_signature,
+                    'consumer_descriptor': current_descriptor,
+                    'opcode_family': opcode_family,
+                    'instruction_offset': instruction_offset,
                     'reference_kind': 'invokedynamic_method_handle',
                 })
                 references['class_refs'].add(target.get('owner') or '')
         method_match = method_pattern.search(line)
         if method_match and instruction_line:
-            owner = (
-                method_match.group(1).replace('/', '.').replace('$', '.')
+            jvm_owner = (
+                method_match.group(1).replace('/', '.')
                 if method_match.group(1)
-                else str(class_binary_name or '').replace('/', '.').replace('$', '.')
+                else str(class_binary_name or '').replace('/', '.')
             )
+            owner = jvm_owner.replace('$', '.')
             method_name = method_match.group(2) or method_match.group(3) or ''
             descriptor = method_match.group(4).strip()
             references['method_refs'].append({
                 'owner': owner,
+                'jvm_owner': jvm_owner,
                 'name': method_name,
                 'descriptor': descriptor,
                 'signature': _method_descriptor_to_lookup_signature(descriptor),
                 'consumer_method': current_member,
                 'consumer_signature': current_signature,
+                'consumer_descriptor': current_descriptor,
+                'opcode_family': opcode_family,
+                'instruction_offset': instruction_offset,
             })
             references['class_refs'].add(owner)
             continue
         field_match = field_pattern.search(line)
         if field_match and instruction_line:
-            owner = (
-                field_match.group(1).replace('/', '.').replace('$', '.')
+            jvm_owner = (
+                field_match.group(1).replace('/', '.')
                 if field_match.group(1)
-                else str(class_binary_name or '').replace('/', '.').replace('$', '.')
+                else str(class_binary_name or '').replace('/', '.')
             )
+            owner = jvm_owner.replace('$', '.')
             descriptor = field_match.group(3).strip()
             references['field_refs'].append({
                 'owner': owner,
+                'jvm_owner': jvm_owner,
                 'name': field_match.group(2),
                 'descriptor': descriptor,
                 'signature': _field_descriptor_to_lookup_signature(descriptor),
                 'consumer_method': current_member,
                 'consumer_signature': current_signature,
+                'consumer_descriptor': current_descriptor,
+                'opcode_family': opcode_family,
+                'instruction_offset': instruction_offset,
             })
             references['class_refs'].add(owner)
             continue
@@ -1446,7 +1782,10 @@ def _match_runtime_dependency_references(api_row, references):
     if symbol_kind in {'method', 'constructor'}:
         matches = []
         for item in references.get('method_refs') or []:
-            if item.get('owner') != owner or item.get('name') != member_name:
+            if (
+                str(item.get('owner') or '').replace('$', '.') != str(owner or '').replace('$', '.')
+                or item.get('name') != member_name
+            ):
                 continue
             if target_lookup_signature:
                 if item.get('reference_kind', '').startswith('reflection_') and not item.get('signature_resolved'):
@@ -1464,13 +1803,22 @@ def _match_runtime_dependency_references(api_row, references):
                 'target_display': f"{owner}.{member_name}{item.get('signature') or ''}",
                 'consumer_method': item.get('consumer_method') or '<unknown>',
                 'consumer_signature': item.get('consumer_signature') or '',
+                'consumer_descriptor': item.get('consumer_descriptor') or '',
+                'callee_owner': item.get('jvm_owner') or item.get('owner') or '',
+                'callee_member': item.get('name') or '',
+                'callee_descriptor': item.get('descriptor') or '',
+                'opcode_family': item.get('opcode_family') or '',
+                'instruction_offset': item.get('instruction_offset'),
             })
         return _dedupe_runtime_matches(matches)
 
     if symbol_kind == 'field':
         matches = []
         for item in references.get('field_refs') or []:
-            if item.get('owner') != owner or item.get('name') != member_name:
+            if (
+                str(item.get('owner') or '').replace('$', '.') != str(owner or '').replace('$', '.')
+                or item.get('name') != member_name
+            ):
                 continue
             matches.append({
                 'evidence_type': (
@@ -1481,6 +1829,12 @@ def _match_runtime_dependency_references(api_row, references):
                 'target_display': f"{owner}.{member_name}",
                 'consumer_method': item.get('consumer_method') or '<unknown>',
                 'consumer_signature': item.get('consumer_signature') or '',
+                'consumer_descriptor': item.get('consumer_descriptor') or '',
+                'callee_owner': item.get('jvm_owner') or item.get('owner') or '',
+                'callee_member': item.get('name') or '',
+                'callee_descriptor': item.get('descriptor') or '',
+                'opcode_family': item.get('opcode_family') or '',
+                'instruction_offset': item.get('instruction_offset'),
             })
         return _dedupe_runtime_matches(matches)
 
@@ -1494,12 +1848,199 @@ def _dedupe_runtime_matches(matches):
         identity = (
             item.get('evidence_type'), item.get('target_display'),
             item.get('consumer_method'), item.get('consumer_signature'),
+            item.get('consumer_descriptor'), item.get('callee_descriptor'),
+            item.get('opcode_family'), item.get('instruction_offset'),
         )
         if identity in seen:
             continue
         seen.add(identity)
         unique.append(item)
     return unique
+
+
+def _api_row_for_graph_callee(callee_key, api_rows):
+    parsed = _parse_runtime_method_lookup_key(callee_key)
+    if parsed:
+        callee_owner, callee_member, callee_signature = parsed
+        normalized_callee_signature = (
+            normalize_signature_for_lookup(callee_signature) or callee_signature
+        )
+        for api_row in api_rows or []:
+            owner, member, symbol_kind = _extract_target_owner_and_member(api_row)
+            if symbol_kind not in {'method', 'constructor'}:
+                continue
+            if str(owner or '').replace('$', '.') != str(callee_owner or '').replace('$', '.'):
+                continue
+            graph_member = '<init>' if symbol_kind == 'constructor' else callee_member
+            if member != graph_member:
+                continue
+            api_signature = normalize_signature_for_lookup(
+                str((api_row or {}).get('api_signature') or '')
+            ) or str((api_row or {}).get('api_signature') or '')
+            if not api_signature or api_signature == normalized_callee_signature:
+                return api_row
+    return None
+
+
+def _graph_edge_target_row(edge, api_rows):
+    callee_key = str(getattr(edge, 'callee_key', '') or '').strip()
+    matched_api = _api_row_for_graph_callee(callee_key, api_rows)
+    if matched_api is not None:
+        return matched_api
+    parsed = _parse_runtime_method_lookup_key(callee_key)
+    if not parsed:
+        return None
+    owner, member, signature = parsed
+    evidence_type = str(getattr(edge, 'evidence_type', '') or '')
+    symbol_kind = 'field' if 'field' in evidence_type else 'method'
+    return {
+        'coord': str(getattr(edge, 'owner_coord', '') or ''),
+        'api_name': f'{owner}.{member}',
+        'api_simple': member,
+        'api_signature': signature,
+        'symbol_kind': symbol_kind,
+        'change_type': 'GRAPH_EXECUTABLE_EDGE',
+    }
+
+
+def collect_graph_analyzer_edges(graph, api_rows):
+    """Collect verified business bytecode instructions already merged into reverse_edges."""
+    if graph is None:
+        return 0
+    provenance = _verified_final_artifact_provenance(graph)
+    if not provenance.get('complete'):
+        _record_analyzer_ledger_failure(graph, 'final_artifact_provenance_invalid')
+        return 0
+    candidate_edges = []
+    seen_edges = set()
+    for edges in (getattr(graph, 'reverse_edges', {}) or {}).values():
+        for edge in edges or []:
+            edge_object_id = id(edge)
+            if edge_object_id in seen_edges:
+                continue
+            seen_edges.add(edge_object_id)
+            if str(getattr(edge, 'evidence_source', '') or '') != 'current_final_artifact':
+                continue
+            if str(getattr(edge, 'owner_type', '') or '') != 'business':
+                continue
+            if bool(getattr(edge, 'is_test', False)):
+                continue
+            evidence_type = str(getattr(edge, 'evidence_type', '') or '')
+            if evidence_type in {
+                'bytecode_method_invocation',
+                'bytecode_constructor_invocation',
+                'bytecode_field_access',
+            }:
+                candidate_edges.append(edge)
+    if not candidate_edges:
+        return 0
+
+    catalog = _get_runtime_dependency_catalog(graph)
+    business_item = (catalog.get('by_coord') or {}).get('__business__') or next(
+        (
+            item for item in (catalog.get('entries') or [])
+            if str(item.get('coord') or '') == '__business__'
+        ),
+        {},
+    )
+    business_jar = str(business_item.get('jar_path') or '').strip()
+    if not business_jar or not os.path.isfile(business_jar):
+        _record_analyzer_ledger_failure(
+            graph, 'BUSINESS_BYTECODE_JAR_MISSING', jar_path=business_jar
+        )
+        return 0
+    business_jar_sha256 = str(business_item.get('sha256') or '').strip()
+    try:
+        actual_business_jar_sha256 = hashlib.sha256(Path(business_jar).read_bytes()).hexdigest()
+    except OSError:
+        actual_business_jar_sha256 = ''
+    if (
+        not _valid_sha256(business_jar_sha256)
+        or actual_business_jar_sha256 != business_jar_sha256
+    ):
+        _record_analyzer_ledger_failure(
+            graph,
+            'BUSINESS_BYTECODE_JAR_SHA_MISMATCH',
+            jar_path=business_jar,
+        )
+        return 0
+
+    collected = 0
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    for edge in candidate_edges:
+        if str(getattr(edge, 'artifact_sha256', '') or '') != business_jar_sha256:
+            _record_analyzer_ledger_failure(
+                graph,
+                'BUSINESS_EDGE_ARTIFACT_SHA_MISMATCH',
+                callee_key=getattr(edge, 'callee_key', ''),
+            )
+            continue
+        _jar_path, separator, class_entry = str(getattr(edge, 'file', '') or '').partition('!/')
+        if not separator or not class_entry.endswith('.class'):
+            _record_analyzer_ledger_failure(
+                graph,
+                'BUSINESS_EDGE_CLASS_ENTRY_MISSING',
+                evidence_path=getattr(edge, 'file', ''),
+            )
+            continue
+        class_binary_name = class_entry[:-6].replace('/', '.')
+        references = _load_runtime_dependency_class_references(
+            catalog,
+            '__business__',
+            business_jar,
+            class_binary_name,
+        )
+        if references is None:
+            _record_analyzer_ledger_failure(
+                graph,
+                'BUSINESS_EDGE_JAVAP_FAILED',
+                class_entry=class_entry,
+            )
+            continue
+        target_row = _graph_edge_target_row(edge, api_rows)
+        if target_row is None:
+            _record_analyzer_ledger_failure(
+                graph,
+                'BUSINESS_EDGE_TARGET_UNRESOLVED',
+                callee_key=getattr(edge, 'callee_key', ''),
+            )
+            continue
+        matches = _match_runtime_dependency_references(target_row, references)
+        caller = methods_by_id.get(getattr(edge, 'caller_symbol_id', ''))
+        caller_member = str(getattr(caller, 'method_name', '') or '').strip()
+        if caller_member:
+            matches = [
+                match for match in matches
+                if str(match.get('consumer_method') or '') == caller_member
+            ]
+        if not matches:
+            _record_analyzer_ledger_failure(
+                graph,
+                'BUSINESS_EDGE_INSTRUCTION_UNRESOLVED',
+                class_entry=class_entry,
+                callee_key=getattr(edge, 'callee_key', ''),
+            )
+            continue
+        for matched in matches:
+            hit = {
+                'coord': '__business__',
+                'artifact_container_entry': '',
+                'edge_role': 'external_consumer',
+                'jar_path': business_jar,
+                'class_entry': class_entry,
+                'caller_owner': class_binary_name,
+                'class_fqcn': class_binary_name.replace('$', '.'),
+                'consumer_method': matched.get('consumer_method') or '<unknown>',
+                'consumer_descriptor': matched.get('consumer_descriptor') or '',
+                'callee_owner': matched.get('callee_owner') or '',
+                'callee_member': matched.get('callee_member') or '',
+                'callee_descriptor': matched.get('callee_descriptor') or '',
+                'opcode_family': matched.get('opcode_family') or '',
+                'instruction_offset': matched.get('instruction_offset'),
+            }
+            if record_analyzer_edge(graph, target_row, hit) is not None:
+                collected += 1
+    return collected
 
 
 def _match_runtime_dependency_reference(api_row, references):
@@ -1550,6 +2091,13 @@ def _runtime_class_variants(entries, target_jdk=None, multi_release_enabled=True
 
 def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     catalog = _get_runtime_dependency_catalog(graph)
+    catalog_status = str(catalog.get('status') or '').strip()
+    if catalog_status and catalog_status != 'complete':
+        _record_analyzer_ledger_failure(
+            graph,
+            'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
+            catalog_status=catalog_status,
+        )
     cached_results = catalog.get('_packaged_api_scan_results') or {}
     identity_key = build_api_identity_key(api_row)
     if identity_key in cached_results:
@@ -1565,11 +2113,13 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
         for coord, item in by_coord.items()
     ])
     if not catalog_entries:
+        _record_analyzer_ledger_failure(graph, 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE')
         return {'status': 'unavailable', 'reason': 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE'}
 
     owner, member_name, _symbol_kind = _extract_target_owner_and_member(api_row)
     owner_internal_name = _jvm_internal_owner_name(owner)
     if not owner_internal_name:
+        _record_analyzer_ledger_failure(graph, 'BYTECODE_TARGET_UNRESOLVED')
         return {'status': 'unavailable', 'reason': 'BYTECODE_TARGET_UNRESOLVED'}
 
     hits = []
@@ -1579,7 +2129,10 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     multi_release_seen = False
     multi_release_target_resolved = False
     target_jdk = catalog.get('target_jdk')
-    allow_constant_pool_fast_path = not bool(getattr(graph, 'reverse_edges', {}) or {})
+    allow_constant_pool_fast_path = bool(
+        not (getattr(graph, 'reverse_edges', {}) or {})
+        and not _verified_final_artifact_provenance(graph).get('complete')
+    )
     for item in catalog_entries:
         coord = str(item.get('coord') or '').strip()
         same_coord = coord == str(api_row.get('coord') or '').strip()
@@ -1632,6 +2185,8 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                                     'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
                                     'direct_consumer': not same_coord,
                                     'jar_path': jar_path,
+                                    'artifact_container_entry': item.get('artifact_entry') or '',
+                                    'caller_owner': class_binary_name,
                                     'class_fqcn': class_binary_name.replace('$', '.'),
                                     'consumer_method': matched.get('consumer_method') or '<unknown>',
                                     'consumer_signature': matched.get('consumer_signature') or '',
@@ -1657,25 +2212,36 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                     if not matches:
                         continue
                     for matched in matches:
-                        hits.append({
+                        hit = {
                             'coord': coord,
                             'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
                             'direct_consumer': not same_coord,
                             'jar_path': jar_path,
+                            'artifact_container_entry': item.get('artifact_entry') or '',
+                            'caller_owner': class_binary_name,
                             'class_fqcn': class_binary_name.replace('$', '.'),
                             'consumer_method': matched.get('consumer_method') or '<unknown>',
                             'consumer_signature': matched.get('consumer_signature') or '',
+                            'consumer_descriptor': matched.get('consumer_descriptor') or '',
+                            'callee_owner': matched.get('callee_owner') or '',
+                            'callee_member': matched.get('callee_member') or '',
+                            'callee_descriptor': matched.get('callee_descriptor') or '',
+                            'opcode_family': matched.get('opcode_family') or '',
+                            'instruction_offset': matched.get('instruction_offset'),
                             'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
                             'target_display': matched.get('target_display') or owner,
                             'class_entry': entry,
                             'multi_release_version': selected_version,
-                        })
+                        }
+                        hits.append(hit)
+                        record_analyzer_edge(graph, api_row, hit)
         except Exception as exc:
             scan_failures.append({
                 'reason': 'BYTECODE_SCAN_FAILED', 'coord': coord,
                 'jar_path': jar_path, 'error': str(exc),
             })
             continue
+    _record_analyzer_scan_failures(graph, scan_failures)
     if hits:
         unique_hits = []
         seen_hits = set()
@@ -1692,12 +2258,12 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
             'scanned_classes': scanned_classes, 'visited_classes': visited_classes,
         }
     if multi_release_seen and not multi_release_target_resolved:
+        _record_analyzer_ledger_failure(graph, 'MULTI_RELEASE_TARGET_JDK_UNKNOWN')
         return {
             'status': 'unavailable', 'reason': 'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
             'scan_failures': scan_failures, 'scanned_classes': scanned_classes,
             'visited_classes': visited_classes,
         }
-    catalog_status = str(catalog.get('status') or '').strip()
     if catalog_status and catalog_status != 'complete':
         return {
             'status': 'unavailable',
@@ -1728,7 +2294,15 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     """
     catalog = _get_runtime_dependency_catalog(graph)
     if not catalog:
+        _record_analyzer_ledger_failure(graph, 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE')
         return {}
+    initial_catalog_status = str(catalog.get('status') or '').strip()
+    if initial_catalog_status and initial_catalog_status != 'complete':
+        _record_analyzer_ledger_failure(
+            graph,
+            'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
+            catalog_status=initial_catalog_status,
+        )
     scan_started_at = time.perf_counter()
     _perf_add(graph, 'bytecode_scan', 'calls', 1)
     existing = catalog.setdefault('_packaged_api_scan_results', {})
@@ -1750,6 +2324,11 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         key = build_api_identity_key(row)
         owner, _member_name, _symbol_kind = _extract_target_owner_and_member(row)
         if not owner:
+            _record_analyzer_ledger_failure(
+                graph,
+                'BYTECODE_TARGET_UNRESOLVED',
+                api_identity=key,
+            )
             existing[key] = {
                 'status': 'unavailable',
                 'reason': 'BYTECODE_TARGET_UNRESOLVED',
@@ -1782,9 +2361,13 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     target_jdk = catalog.get('target_jdk')
     started_at = time.perf_counter()
     progress_interval = suggest_log_interval(len(catalog_entries), target_updates=8, minimum=1)
-    allow_constant_pool_fast_path = not bool(getattr(graph, 'reverse_edges', {}) or {})
+    allow_constant_pool_fast_path = bool(
+        not (getattr(graph, 'reverse_edges', {}) or {})
+        and not _verified_final_artifact_provenance(graph).get('complete')
+    )
 
     if not catalog_entries:
+        _record_analyzer_ledger_failure(graph, 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE')
         for row in missing_rows:
             key = build_api_identity_key(row)
             existing.setdefault(key, {
@@ -1927,6 +2510,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                                         'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
                                         'direct_consumer': not same_coord,
                                         'jar_path': jar_path,
+                                        'artifact_container_entry': item.get('artifact_entry') or '',
+                                        'caller_owner': class_binary_name,
                                         'class_fqcn': class_binary_name.replace('$', '.'),
                                         'consumer_method': matched.get('consumer_method') or '<unknown>',
                                         'consumer_signature': matched.get('consumer_signature') or '',
@@ -1941,6 +2526,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         'catalog': catalog,
                         'coord': coord,
                         'jar_path': jar_path,
+                        'artifact_container_entry': item.get('artifact_entry') or '',
+                        'caller_owner': class_binary_name,
                         'class_binary_name': class_binary_name,
                         'class_fqcn': class_binary_name.replace('$', '.'),
                         'class_entry': entry,
@@ -2034,19 +2621,29 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         continue
                     key = build_api_identity_key(api_row)
                     for matched in matches:
-                        hits_by_key[key].append({
+                        hit = {
                             'coord': coord,
                             'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
                             'direct_consumer': not same_coord,
                             'jar_path': jar_path,
+                            'artifact_container_entry': task.get('artifact_container_entry') or '',
+                            'caller_owner': task.get('caller_owner') or class_binary_name,
                             'class_fqcn': task.get('class_fqcn') or class_binary_name.replace('$', '.'),
                             'consumer_method': matched.get('consumer_method') or '<unknown>',
                             'consumer_signature': matched.get('consumer_signature') or '',
+                            'consumer_descriptor': matched.get('consumer_descriptor') or '',
+                            'callee_owner': matched.get('callee_owner') or '',
+                            'callee_member': matched.get('callee_member') or '',
+                            'callee_descriptor': matched.get('callee_descriptor') or '',
+                            'opcode_family': matched.get('opcode_family') or '',
+                            'instruction_offset': matched.get('instruction_offset'),
                             'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
                             'target_display': matched.get('target_display') or owner,
                             'class_entry': task.get('class_entry') or '',
                             'multi_release_version': selected_version,
-                        })
+                        }
+                        hits_by_key[key].append(hit)
+                        record_analyzer_edge(graph, api_row, hit)
 
         if workers <= 1:
             progress_interval = suggest_log_interval(len(javap_tasks), target_updates=12, minimum=1)
@@ -2093,6 +2690,9 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         )
         _perf_add(graph, 'bytecode_scan', 'javap_elapsed_sec', time.perf_counter() - javap_started_at)
 
+    _record_analyzer_scan_failures(graph, scan_failures)
+    for failures in candidate_failures_by_key.values():
+        _record_analyzer_scan_failures(graph, failures)
     catalog_status = str(catalog.get('status') or '').strip()
     for row in missing_rows:
         key = build_api_identity_key(row)
@@ -2122,6 +2722,11 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             }
             continue
         if multi_release_seen and not multi_release_target_resolved:
+            _record_analyzer_ledger_failure(
+                graph,
+                'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
+                api_identity=key,
+            )
             existing[key] = {
                 'status': 'unavailable',
                 'reason': 'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
@@ -6826,6 +7431,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         allow_degraded=allow_degraded,
         graph_stats=graph_stats or {},
     )
+    collect_graph_analyzer_edges(graph, all_apis)
     if graph is not None and all_apis:
         changed_api_overload_signatures = defaultdict(set)
         for row in all_apis:
@@ -6954,6 +7560,8 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
     )
     _perf_add(graph, 'trace', 'elapsed_sec', time.perf_counter() - trace_started_at)
     _perf_add(graph, 'trace', 'total_apis', total)
+    ledger_stats = graph_stats if graph_stats is not None else {}
+    write_analyzer_edge_ledger(graph, graph_stats=ledger_stats)
     if graph_stats is not None:
         _merge_step5_perf_stats(
             graph_stats.setdefault('step5_perf', {}),
