@@ -108,6 +108,23 @@ class RealProjectRegressionTest(unittest.TestCase):
         })
         self.assertTrue(all(item["blocking"] for item in signals))
 
+    def test_policy_ground_truth_signal_uses_exhaustive_oracle_counts(self):
+        case = realreg.RealProjectCase(
+            "dubbo", Path("."), Path(""), (), case_mode="discovery",
+            ground_truth_status="unreviewed",
+        )
+        signals = realreg.build_policy_signals(
+            case,
+            coverage=realreg.compute_api_coverage("discovery", 2, 2, 2),
+            performance={},
+            report_dir=Path("/tmp/report"),
+            oracle_audit={"selected": 2, "verified": 0, "unverified": 2, "incorrect": 0, "oracle_conflicts": 0},
+        )
+
+        signal = next(item for item in signals if item["signal_type"] == "ground_truth_insufficient")
+        self.assertEqual(signal["count"], 2)
+        self.assertIn("verified=0/2", signal["message"])
+
     def _write_readable_alerts(self, path, symbol, evidence_file, signature="(String)", path_status="reachable"):
         path.parent.mkdir(parents=True, exist_ok=True)
         fields = [

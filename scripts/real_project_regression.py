@@ -28,6 +28,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+from exhaustive_api_oracle import (
+    audit_api_oracle,
+    load_analyzer_rows,
+    load_oracle_manifest,
+    write_oracle_ledger,
+)
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
@@ -71,6 +78,7 @@ class RealProjectCase:
     case_mode: str = "guard"
     ground_truth_status: str = "reviewed"
     max_potential_pairs_per_api: float = 0.0
+    oracle_manifest: Path | None = None
 
 
 CASES = {
@@ -1186,6 +1194,7 @@ def build_policy_signals(
     coverage: dict,
     performance: dict,
     report_dir: Path,
+    oracle_audit: dict | None = None,
 ) -> list[dict]:
     signals: list[dict] = []
     if not coverage.get("complete"):
@@ -1199,13 +1208,32 @@ def build_policy_signals(
             actual=json.dumps(coverage, sort_keys=True),
             evidence=[report_dir / "evidence" / "api_changes" / "all_changed_apis.csv"],
         ))
-    if case.case_mode in {"discovery", "convergence"} and case.ground_truth_status != "reviewed":
+    needs_ground_truth = (
+        bool(oracle_audit.get("blocking"))
+        or int(oracle_audit.get("verified") or 0) != int(oracle_audit.get("selected") or 0)
+        if oracle_audit is not None
+        else case.ground_truth_status != "reviewed"
+    )
+    if case.case_mode in {"discovery", "convergence"} and needs_ground_truth:
+        oracle_audit = oracle_audit or {}
+        selected = int(oracle_audit.get("selected") or 0)
+        verified = int(oracle_audit.get("verified") or 0)
+        unverified = int(oracle_audit.get("unverified") or 0)
+        incorrect = int(oracle_audit.get("incorrect") or 0)
+        conflicts = int(oracle_audit.get("oracle_conflicts") or 0)
         signals.append(make_signal(
             "ground_truth_insufficient", "P1", case.name, step="step5",
-            message="discovery result has no reviewed ground-truth manifest",
-            expected="reviewed deterministic stratified ground truth",
-            actual=case.ground_truth_status,
-            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+            message=(
+                f"exhaustive third-party oracle incomplete: verified={verified}/{selected}, "
+                f"unverified={unverified}, incorrect={incorrect}, conflicts={conflicts}"
+            ),
+            count=unverified + incorrect + conflicts,
+            expected="one valid third-party oracle verdict for every selected API",
+            actual=json.dumps({
+                "selected": selected, "verified": verified, "unverified": unverified,
+                "incorrect": incorrect, "oracle_conflicts": conflicts,
+            }, sort_keys=True),
+            evidence=[report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"],
         ))
     pairs_per_api = float(performance.get("potential_pairs_per_api") or 0.0)
     if case.max_potential_pairs_per_api and pairs_per_api > case.max_potential_pairs_per_api:
@@ -1652,6 +1680,19 @@ def run_case(
         int(summary.get("total_apis") or 0),
     )
     performance_envelope = collect_performance_envelope(summary, elapsed, selected_count)
+    oracle_audit = None
+    oracle_ledger = ""
+    effective_ground_truth_status = case.ground_truth_status
+    if case.case_mode in {"discovery", "convergence"}:
+        oracle_audit = audit_api_oracle(
+            selected_rows,
+            load_analyzer_rows(summary),
+            load_oracle_manifest(case.oracle_manifest),
+        )
+        oracle_ledger_path = report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"
+        write_oracle_ledger(oracle_ledger_path, oracle_audit)
+        oracle_ledger = str(oracle_ledger_path)
+        effective_ground_truth_status = "reviewed" if not oracle_audit.get("blocking") else "unreviewed"
     quality_signals = build_quality_signals(
         case,
         summary=summary,
@@ -1665,6 +1706,7 @@ def run_case(
         coverage=coverage,
         performance=performance_envelope,
         report_dir=report_dir,
+        oracle_audit=oracle_audit,
     ))
     if failures and not any(item.get("blocking") for item in quality_signals):
         quality_signals.append(make_signal(
@@ -1674,7 +1716,7 @@ def run_case(
             actual="runner failures present",
             evidence=[report_dir],
         ))
-    status = derive_case_status(returncode == 0, quality_signals, case.ground_truth_status)
+    status = derive_case_status(returncode == 0, quality_signals, effective_ground_truth_status)
 
     return {
         "case": case.name,
@@ -1685,7 +1727,15 @@ def run_case(
         "elapsed_seconds": round(elapsed, 2),
         "performance_budget_seconds": performance_budget,
         "performance_envelope": performance_envelope,
-        "ground_truth_status": case.ground_truth_status,
+        "ground_truth_status": effective_ground_truth_status,
+        "oracle_audit": {
+            key: value for key, value in (oracle_audit or {}).items()
+            if key not in {
+                "ledger", "missing_identities", "duplicate_identities",
+                "extra_identities", "invalid_provenance",
+            }
+        },
+        "oracle_ledger": oracle_ledger,
         **coverage,
         "step4": step4_result,
         "step4_selection": step4_selection,
