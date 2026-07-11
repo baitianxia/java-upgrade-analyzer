@@ -94,24 +94,28 @@ The textual runner status and audit decision must never disagree.
 
 ### Accuracy Gate
 
-Large result sets require deterministic stratified ground truth. Sampling uses
-a stable hash of case, pinned commit, API identity, and result state. Samples
-cover each combination of:
+Accuracy is verified exhaustively, one API identity at a time. Sampling and
+statistical confidence cannot authorize a release. Every selected Step5 API
+must have exactly one independent oracle record containing:
 
-- Step5 state;
-- symbol kind: class, constructor, method, field;
-- reason code;
-- direct source, transitive source, bytecode, reflection, and fallback match;
-- production and test source.
+- canonical owner, symbol name, symbol kind, and descriptor;
+- analyzer conclusion;
+- oracle conclusion;
+- verdict: `correct`, `incorrect`, `unverified`, or `oracle_conflict`;
+- evidence mode and evidence paths;
+- oracle implementation version and reason.
 
-Each stratum samples at least 10 items or all items when smaller. P0 reachable
-items with fallback matching receive an additional sample. Ground truth must
-use exact owner and signature evidence from parsers, compiled bytecode, or
-manually reviewed manifests; broad grep is discovery evidence only.
+The oracle uses evidence independent from the conclusion being checked:
+compiled bytecode descriptors and call sites, source AST owner resolution,
+artifact dependency graphs, executable project tests, or a reviewed manual
+record. Re-running the analyzer or accepting its own path as truth is not an
+oracle. Broad grep is discovery evidence only.
 
-The result reports reviewed count, false positives, false negatives,
-unsupported conclusions, and Wilson confidence bounds. Until the initial
-manifest exists, the case is `observed`, not `passed`.
+Every API in the selected input must appear exactly once. Missing, duplicate,
+or extra oracle identities block release. `incorrect`, `unverified`, and
+`oracle_conflict` all block release per API. A case passes accuracy only when
+`verified == selected`, `incorrect == 0`, `unverified == 0`, and
+`oracle_conflicts == 0`.
 
 ### Performance Gate
 
@@ -144,11 +148,11 @@ The canonical signal types add:
 Existing `correctness_failure`, `capability_gap`, `evidence_weakness`,
 `performance_regression`, `project_asset_invalid`, and `infra_skip` remain.
 
-Signals must include `reason_code`, `symbol_kind`, `count`,
-`sample_symbols`, `expected`, `actual`, `evidence`, and `fixture_status` when
-those fields apply. Aggregate signals may group only semantically equivalent
-items. A single aggregate signal may not combine missing jars with overload
-ambiguity.
+Signals must include `reason_code`, `symbol_kind`, `count`, `expected`,
+`actual`, `evidence`, and `fixture_status` when those fields apply. Aggregate
+signals may group only semantically equivalent items for display, but the
+oracle ledger retains every API row. A single aggregate signal may not combine
+missing jars with overload ambiguity.
 
 ## Fixture Lifecycle
 
@@ -189,9 +193,9 @@ The first implementation slice changes the current runner and audit to:
 5. expose normalized performance metrics and candidate-pair budgets;
 6. mark cases without ground-truth manifests as `observed`.
 
-Deterministic sample manifest generation and reviewed-manifest ingestion follow
-as the second slice. The first slice must not claim accuracy before that second
-slice exists.
+Exhaustive oracle-ledger generation and reviewed-record ingestion follow as the
+second slice. The first slice must not claim accuracy before every selected API
+has an independent verdict.
 
 ## Acceptance Baseline
 
@@ -203,5 +207,4 @@ For the existing full Dubbo result:
   `RUNTIME_DEPENDENCY_JARS_UNAVAILABLE` and `OVERLOAD_AMBIGUOUS_TARGET`;
 - the case status is `failed`, never `passed`;
 - 143,240,640 potential method-target pairs are present in performance output;
-- without reviewed ground truth, no accuracy-pass claim is emitted.
-
+- without 5,440 independent oracle verdicts, no accuracy-pass claim is emitted.

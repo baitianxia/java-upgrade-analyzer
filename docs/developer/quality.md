@@ -189,7 +189,8 @@ evidence/call_chain/step5_timing.csv
 - 覆盖门禁：记录 API population、selected、accounted 和 coverage ratio；
 - 证据门禁：区分缺运行时 jar、缺源码映射、测试配置错误和真实外部缺失；
 - 结论门禁：按 reason code 与 symbol kind 分组 `not_analyzed`，不得压成一条模糊汇总；
-- 真值门禁：没有 reviewed ground truth 的探索结果只能是 `observed`，不能宣称准确性通过；
+- 真值门禁：每个输入 API 必须有且只有一条独立 oracle 记录；缺失、重复、错误、
+  无法验证或 oracle 冲突都阻断，不能用抽样比例宣称准确性通过；
 - 性能门禁：同时约束绝对耗时、每千 API 耗时、候选配对总数与每 API 配对数。
 
 runner 状态必须由质量信号派生。存在 blocking signal 时状态必须为 `failed`；
@@ -203,12 +204,12 @@ runner 状态必须由质量信号派生。存在 blocking signal 时状态必�
 - API 变化数量；
 - Step1~Step6 每步耗时；
 - reachable / uncertain / not_found / not_analyzed 分布；
-- 随机抽样复核结果；
+- 逐 API oracle 核对结果；
 - 与 jdeps 或人工预期不一致的差异。
 
-误报与漏报复核应使用稳定哈希做分层抽样，至少覆盖结论状态、symbol kind、
-reason code、源码/字节码/反射证据模式以及 production/test 分类。宽泛 grep 只能用来
-发现候选，不能作为 owner 或重载签名精度的最终真值。
+误报与漏报必须逐 API 核对。每条记录包含 canonical identity、analyzer conclusion、
+oracle conclusion、verdict、证据模式和证据文件。宽泛 grep 只能用来发现候选，不能
+作为 owner 或重载签名精度的最终真值；当前分析器自己的结论也不能反过来充当 oracle。
 
 如果每轮真实项目测试都发现新问题，说明测试矩阵仍不足，应继续补充针对性测试和压力模型。
 
