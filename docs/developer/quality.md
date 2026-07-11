@@ -216,8 +216,14 @@ oracle conclusion、verdict、证据模式和证据文件。宽泛 grep 只能�
 `all_changed_apis.csv`，再由独立的第二遍字节码扫描逐 API 裁决 Step5 结论。该模式禁止
 抽样，也禁止使用分析器输出生成输入集合。当前 `mall` discovery case 固定在提交
 `0504e86b1f1b6f1b8aa6a734d37a90fb67346be7`，以 `cn/hutool/` 为目标依赖边界；在
-Java 23+ 构建环境中需要显式传入 `-Dmaven.compiler.proc=full`，并仅运行 `compile`
-阶段以避免项目绑定在 `package` 的远程 Docker 部署副作用。
+Java 23+ 构建环境中需要显式传入 `-Dmaven.compiler.proc=full`。case 必须使用已完成
+Spring Boot repackage 的 `mall-admin` fat jar，并在远程 Docker goal 之前取得和校验该
+最终制品，不能退回 `compile` 阶段输出。
+
+确定性业务字节码结论只能来自经过 SHA-256 校验的 `current_final_artifact`。禁止使用
+`target/classes`、IDE 输出目录或其他散落 class 作为降级真值，因为这些目录可能包含
+旧 class、未打包模块或与部署参数不一致的产物。缺少最终制品时必须 fail closed，输出
+制品证据缺失；不得通过降低证据等级继续给出 `reachable` 或项目级准确性通过结论。
 
 如果每轮真实项目测试都发现新问题，说明测试矩阵仍不足，应继续补充针对性测试和压力模型。
 

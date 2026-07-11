@@ -547,6 +547,8 @@ def _has_exact_business_bytecode_target(api_row, graph):
             continue
         if any(
             str(getattr(edge, 'evidence_type', '')).startswith('bytecode_')
+            and str(getattr(edge, 'evidence_source', '')) == 'current_final_artifact'
+            and bool(str(getattr(edge, 'artifact_sha256', '')).strip())
             and str(getattr(edge, 'owner_type', '')) == 'business'
             and not bool(getattr(edge, 'is_test', False))
             for edge in (edges or [])

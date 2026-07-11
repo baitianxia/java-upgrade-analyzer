@@ -555,27 +555,6 @@ def parse_javap_calls(text, class_name):
     return edges
 
 
-def discover_class_roots(source_roots):
-    roots = []
-    for item in source_roots or []:
-        root = Path(str((item or {}).get('root') or item)).resolve()
-        normalized = root.as_posix()
-        for marker, replacement in (
-            ('/src/main/java', '/target/classes'),
-            ('/src/main/kotlin', '/target/classes'),
-            ('/src/main/groovy', '/target/classes'),
-        ):
-            if normalized.endswith(marker):
-                candidate = Path(normalized[:-len(marker)] + replacement)
-                if candidate.is_dir() and candidate not in roots:
-                    roots.append(candidate)
-        if root.is_dir() and '/src/' not in normalized:
-            for candidate in sorted(root.rglob('target/classes')):
-                if candidate.is_dir() and candidate not in roots:
-                    roots.append(candidate)
-    return roots
-
-
 def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_catalog=None, cache_path=None):
     evidence = []
     failures = []
@@ -624,6 +603,7 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                     for item in parsed_edges:
                         item['class_file'] = f'{business_jar}!/{entry}'
                         item['artifact_sha256'] = business_item.get('sha256', '')
+                        item['evidence_source'] = 'current_final_artifact'
                         evidence.append(item)
             metrics = {
                 'classes_scanned': scanned,
@@ -649,46 +629,14 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
             return evidence, metrics
         except (OSError, zipfile.BadZipFile) as exc:
             failures.append(f'business_artifact_scan_failed:{exc}')
-
-    for class_root in discover_class_roots(source_roots):
-        class_files = sorted(class_root.rglob('*.class'))
-        for class_file in class_files:
-            if scanned >= max_classes:
-                failures.append('class_scan_limit_reached')
-                break
-            relative = class_file.relative_to(class_root).as_posix()
-            if '$' in relative.rsplit('/', 1)[-1]:
-                continue
-            class_name = relative[:-6].replace('/', '.')
-            try:
-                data = class_file.read_bytes()
-            except OSError as exc:
-                failures.append(f'class_read_failed:{class_name}:{exc}')
-                continue
-            scanned += 1
-            parsed_edges = parse_classfile_calls(data, class_name)
-            if parsed_edges is None:
-                javap_fallback_classes += 1
-                stdout, stderr, rc = run_cmd(
-                    ['javap', '-classpath', str(class_root), '-c', '-s', '-p', '-v', class_name],
-                    timeout=30,
-                )
-                if rc != 0:
-                    failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
-                    continue
-                parsed_edges = parse_javap_calls(stdout, class_name)
-            else:
-                fast_path_classes += 1
-            for item in parsed_edges:
-                item['class_file'] = str(class_file)
-                evidence.append(item)
-    return evidence, {
-        'classes_scanned': scanned,
-        'edges_found': len(evidence),
-        'classfile_fast_path_classes': fast_path_classes,
-        'javap_fallback_classes': javap_fallback_classes,
+    failures.append('current_final_artifact_required')
+    return [], {
+        'classes_scanned': 0,
+        'edges_found': 0,
+        'classfile_fast_path_classes': 0,
+        'javap_fallback_classes': 0,
         'failures': failures,
-        'evidence_source': 'build_directory_fallback' if scanned else 'unavailable',
+        'evidence_source': 'unavailable',
     }
 
 
@@ -743,6 +691,8 @@ def merge_business_bytecode_edges(graph, evidence):
             is_test=False,
             callee_param_types=[],
         )
+        edge.evidence_source = item.get('evidence_source', '')
+        edge.artifact_sha256 = item.get('artifact_sha256', '')
         callee_key = str(edge.callee_key or '')
         edge.callee_fqcn_complete = bool(
             callee_key.startswith('class:')

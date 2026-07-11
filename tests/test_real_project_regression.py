@@ -22,6 +22,10 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(case.bytecode_coord, "cn.hutool:hutool-all")
         self.assertTrue(case.enable_jdk_oracle)
         self.assertTrue(case.require_valid_git)
+        self.assertEqual(
+            case.final_artifact,
+            Path("/private/tmp/jua-real-project-mall/mall-admin/target/mall-admin-1.0-SNAPSHOT.jar"),
+        )
         self.assertEqual(case.baseline_specs, ())
 
     def test_dubbo_samples_is_a_separate_full_discovery_consumer_case(self):

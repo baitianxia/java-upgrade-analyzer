@@ -18,7 +18,6 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import confidence_weighted_tracer as tracer  # noqa: E402
-import business_bytecode_graph  # noqa: E402
 import enhanced_source_analyzer as source_analyzer  # noqa: E402
 import enhanced_output_formatter as formatter  # noqa: E402
 import framework_adapters  # noqa: E402
@@ -62,7 +61,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
             callee_simple_key="method:getPayloads()",
             confidence="high",
             evidence_type="bytecode_method_invocation",
-            file="target/classes/app/JwtService.class",
+            evidence_source="current_final_artifact",
+            artifact_sha256="fixture-sha256",
+            file="app.jar!/app/JwtService.class",
             line=20,
             owner_type="business",
             owner_coord="BUSINESS",
@@ -91,29 +92,39 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
         self.assertIn("bytecode_method_invocation", str(result.evidence_paths))
 
-    def test_business_bytecode_discovers_target_classes_under_multimodule_project_root(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp) / "project"
-            classes = project / "module-a" / "target" / "classes" / "app"
-            classes.mkdir(parents=True)
-            source = project / "Caller.java"
-            source.write_text(
-                "package app; public class Caller { "
-                "void run() { java.util.List.of(\"x\"); } }",
-                encoding="utf-8",
-            )
-            subprocess.run(
-                ["javac", "-d", str(classes.parent), str(source)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+    def test_target_classes_bytecode_cannot_beat_missing_final_artifact(self):
+        api_row = {
+            "coord": "g:a", "api_name": "dep.Api.call", "api_simple": "call",
+            "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            "severity": "P1", "confirmed": "true",
+        }
+        edge = SimpleNamespace(
+            caller_symbol_id="business", caller_qualified_key="app.Service.run",
+            callee_key="dep.Api.call()", callee_simple_key="method:call()",
+            confidence="high", evidence_type="bytecode_method_invocation",
+            evidence_source="build_directory_fallback", artifact_sha256="",
+            file="target/classes/app/Service.class", line=1, owner_type="business",
+            owner_coord="BUSINESS", module="app", is_test=False,
+        )
+        method = SimpleNamespace(
+            symbol_id="business", qualified_key="app.Service.run", owner_type="business",
+            owner_coord="BUSINESS", is_test=False, file="Service.java", line=1,
+            annotations=[], class_annotations=[], class_name="Service",
+            class_fqcn="app.Service", modifiers=["public"],
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business": method}, reverse_edges={"dep.Api.call()": [edge]},
+            runtime_dependency_catalog={}, changed_api_overload_signatures={},
+            framework_runtime_entry_methods={},
+        )
 
-            roots = business_bytecode_graph.discover_class_roots([
-                {"root": str(project), "owner_type": "business"}
-            ])
+        result = tracer.trace_api_with_confidence_weighting(
+            api_row, graph, {}, needs_bridge=True, has_dependency_source_mapping=False,
+            has_packaged_bytecode_fallback=True, allow_degraded=True,
+        )
 
-        self.assertEqual(roots, [(project / "module-a" / "target" / "classes").resolve()])
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE")
 
     def _call_chain_dir(self, report_dir):
         return Path(report_dir) / "evidence" / "call_chain"

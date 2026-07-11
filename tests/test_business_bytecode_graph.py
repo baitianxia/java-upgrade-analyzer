@@ -22,6 +22,23 @@ from business_bytecode_graph import (
 
 
 class BusinessBytecodeGraphTest(unittest.TestCase):
+    def test_collect_business_bytecode_rejects_target_classes_without_final_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            classes = project / "module-a" / "target" / "classes" / "app"
+            classes.mkdir(parents=True)
+            (classes / "Stale.class").write_bytes(b"stale-unpackaged-bytecode")
+
+            evidence, metrics = collect_business_bytecode_edges(
+                [{"root": str(project), "owner_type": "business"}],
+                artifact_catalog={"by_coord": {}},
+            )
+
+        self.assertEqual(evidence, [])
+        self.assertEqual(metrics["classes_scanned"], 0)
+        self.assertEqual(metrics["evidence_source"], "unavailable")
+        self.assertIn("current_final_artifact_required", metrics["failures"])
+
     def test_descriptor_preserves_arrays_and_object_types(self):
         self.assertEqual(
             method_descriptor_signature("(Ljava/lang/String;[I[[Lcom/acme/Dto;)V"),
@@ -216,6 +233,8 @@ public class Service {
             "callee_key": "com.acme.Client.call(java.lang.String)",
             "callee_simple_key": "method:call(java.lang.String)",
             "evidence_type": "bytecode_method_invocation",
+            "evidence_source": "current_final_artifact",
+            "artifact_sha256": "fixture-sha256",
             "class_file": "/tmp/Service.class",
             "line": 12,
             "content": "invokevirtual Client.call",
@@ -228,6 +247,8 @@ public class Service {
         self.assertEqual(len(edges), 1)
         self.assertEqual(edges[0].caller_symbol_id, "m1")
         self.assertEqual(edges[0].caller_qualified_key, "com.acme.Service.execute()")
+        self.assertEqual(edges[0].evidence_source, "current_final_artifact")
+        self.assertEqual(edges[0].artifact_sha256, "fixture-sha256")
 
 
 if __name__ == "__main__":

@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import subprocess
 import sys
 import time
+import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
@@ -83,6 +85,7 @@ class RealProjectCase:
     enable_jdk_oracle: bool = False
     bytecode_owner_prefixes: tuple[str, ...] = field(default_factory=tuple)
     bytecode_coord: str = ""
+    final_artifact: Path | None = None
 
 
 CASES = {
@@ -601,6 +604,7 @@ CASES["mall"] = RealProjectCase(
     enable_jdk_oracle=True,
     bytecode_owner_prefixes=("cn/hutool/",),
     bytecode_coord="cn.hutool:hutool-all",
+    final_artifact=Path("/private/tmp/jua-real-project-mall/mall-admin/target/mall-admin-1.0-SNAPSHOT.jar"),
 )
 
 
@@ -924,7 +928,45 @@ def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_
 
 
 def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path, report_dir: Path) -> Path:
-    class_files = sorted(project_root.glob("**/target/classes/**/*.class"))
+    artifact = case.final_artifact
+    if artifact is None or not artifact.is_file():
+        raise ValueError("current final artifact is required for bytecode discovery")
+    artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    extracted_root = report_dir / ".runtime" / "final-artifact-classes"
+    extracted_root.mkdir(parents=True, exist_ok=True)
+    target_lib_entry = ""
+    with zipfile.ZipFile(artifact) as source:
+        for name in sorted(source.namelist()):
+            if name.startswith("BOOT-INF/classes/") and name.endswith(".class"):
+                relative = name[len("BOOT-INF/classes/"):]
+                destination = extracted_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(source.read(name))
+            if name.startswith("BOOT-INF/lib/hutool-all-") and name.endswith(".jar"):
+                target_lib_entry = name
+    class_files = sorted(extracted_root.rglob("*.class"))
+    if not class_files:
+        raise ValueError("current final artifact contains no business class files")
+    dependencies_dir = report_dir / "evidence" / "dependencies"
+    dependencies_dir.mkdir(parents=True, exist_ok=True)
+    (dependencies_dir / "build_provenance.json").write_text(json.dumps({
+        "sides": [{
+            "side": "current",
+            "artifact_path": str(artifact),
+            "artifact_sha256": artifact_sha256,
+        }],
+    }, indent=2) + "\n", encoding="utf-8")
+    with (dependencies_dir / "deps_current_resolved.csv").open("w", newline="", encoding="utf-8") as fh:
+        fields = ["coord", "version", "scope", "lib_entry", "resolution_status"]
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({
+            "coord": case.bytecode_coord,
+            "version": "5.8.40",
+            "scope": "compile",
+            "lib_entry": target_lib_entry,
+            "resolution_status": "resolved" if target_lib_entry else "unresolved",
+        })
     discovered = discover_calls(
         class_files,
         owner_prefixes=case.bytecode_owner_prefixes,
@@ -1779,7 +1821,12 @@ def run_case(
     if case.case_mode in {"discovery", "convergence"}:
         oracle_rows = load_oracle_manifest(case.oracle_manifest)
         if case.enable_jdk_oracle:
-            class_files = sorted(project_root.glob("**/target/classes/**/*.class"))
+            if case.final_artifact:
+                class_files = sorted(
+                    (report_dir / ".runtime" / "final-artifact-classes").rglob("*.class")
+                )
+            else:
+                class_files = []
             oracle_rows.extend(scan_class_files(
                 selected_rows,
                 class_files,
