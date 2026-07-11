@@ -530,6 +530,31 @@ def _try_build_direct_usage_result(api_row, result, graph, trace_cache=None):
     return None
 
 
+def _has_exact_business_bytecode_target(api_row, graph):
+    api_name = str((api_row or {}).get('api_name') or '').strip()
+    target_signature = normalize_signature_for_lookup(
+        str((api_row or {}).get('api_signature') or '').strip()
+    )
+    if not api_name or target_signature is None:
+        return False
+    reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    for key, edges in reverse_edges.items():
+        key = str(key or '')
+        if not key.startswith(api_name):
+            continue
+        signature = extract_signature_suffix_from_key(key)
+        if normalize_signature_for_lookup(signature) != target_signature:
+            continue
+        if any(
+            str(getattr(edge, 'evidence_type', '')).startswith('bytecode_')
+            and str(getattr(edge, 'owner_type', '')) == 'business'
+            and not bool(getattr(edge, 'is_test', False))
+            for edge in (edges or [])
+        ):
+            return True
+    return False
+
+
 def _get_runtime_dependency_catalog(graph):
     return getattr(graph, 'runtime_dependency_catalog', {}) or {}
 
@@ -3660,7 +3685,12 @@ def trace_api_with_confidence_weighting(
         _debug_trace_result('trace_api_result', packaged_dependency_result)
         return packaged_dependency_result
 
-    if artifact_scan_incomplete and needs_bridge and not has_dependency_source_mapping:
+    if (
+        artifact_scan_incomplete
+        and needs_bridge
+        and not has_dependency_source_mapping
+        and not _has_exact_business_bytecode_target(api_row, graph)
+    ):
         built = _build_packaged_dependency_incomplete_result(result, artifact_scan_incomplete)
         _debug_trace_result('trace_api_result', built)
         return built

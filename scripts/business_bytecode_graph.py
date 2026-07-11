@@ -569,6 +569,10 @@ def discover_class_roots(source_roots):
                 candidate = Path(normalized[:-len(marker)] + replacement)
                 if candidate.is_dir() and candidate not in roots:
                     roots.append(candidate)
+        if root.is_dir() and '/src/' not in normalized:
+            for candidate in sorted(root.rglob('target/classes')):
+                if candidate.is_dir() and candidate not in roots:
+                    roots.append(candidate)
     return roots
 
 

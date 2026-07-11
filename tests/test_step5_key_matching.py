@@ -18,6 +18,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import confidence_weighted_tracer as tracer  # noqa: E402
+import business_bytecode_graph  # noqa: E402
 import enhanced_source_analyzer as source_analyzer  # noqa: E402
 import enhanced_output_formatter as formatter  # noqa: E402
 import framework_adapters  # noqa: E402
@@ -29,6 +30,91 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def test_exact_business_bytecode_call_beats_missing_runtime_dependency_jars(self):
+        api_row = {
+            "coord": "cn.hutool:hutool-all",
+            "api_name": "cn.hutool.jwt.JWT.getPayloads",
+            "api_simple": "getPayloads",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+        }
+        method = SimpleNamespace(
+            symbol_id="business",
+            qualified_key="app.JwtService.read",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            file="JwtService.java",
+            line=10,
+            annotations=[],
+            class_annotations=[],
+            class_name="JwtService",
+            class_fqcn="app.JwtService",
+            modifiers=["public"],
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="business",
+            caller_qualified_key=method.qualified_key,
+            callee_key="cn.hutool.jwt.JWT.getPayloads()",
+            callee_simple_key="method:getPayloads()",
+            confidence="high",
+            evidence_type="bytecode_method_invocation",
+            file="target/classes/app/JwtService.class",
+            line=20,
+            owner_type="business",
+            owner_coord="BUSINESS",
+            module="app",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business": method},
+            reverse_edges={"cn.hutool.jwt.JWT.getPayloads()": [edge]},
+            runtime_dependency_catalog={},
+            changed_api_overload_signatures={},
+            framework_runtime_entry_methods={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(
+            api_row,
+            graph,
+            {},
+            needs_bridge=True,
+            has_dependency_source_mapping=False,
+            has_packaged_bytecode_fallback=True,
+            allow_degraded=True,
+        )
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertIn("bytecode_method_invocation", str(result.evidence_paths))
+
+    def test_business_bytecode_discovers_target_classes_under_multimodule_project_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            classes = project / "module-a" / "target" / "classes" / "app"
+            classes.mkdir(parents=True)
+            source = project / "Caller.java"
+            source.write_text(
+                "package app; public class Caller { "
+                "void run() { java.util.List.of(\"x\"); } }",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["javac", "-d", str(classes.parent), str(source)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            roots = business_bytecode_graph.discover_class_roots([
+                {"root": str(project), "owner_type": "business"}
+            ])
+
+        self.assertEqual(roots, [(project / "module-a" / "target" / "classes").resolve()])
+
     def _call_chain_dir(self, report_dir):
         return Path(report_dir) / "evidence" / "call_chain"
 
