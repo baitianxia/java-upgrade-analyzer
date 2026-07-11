@@ -14,6 +14,16 @@ import real_project_regression as realreg  # noqa: E402
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_mall_case_rebuilds_truth_set_from_all_hutool_bytecode_calls(self):
+        case = realreg.CASES["mall"]
+
+        self.assertEqual(case.case_mode, "discovery")
+        self.assertEqual(case.bytecode_owner_prefixes, ("cn/hutool/",))
+        self.assertEqual(case.bytecode_coord, "cn.hutool:hutool-all")
+        self.assertTrue(case.enable_jdk_oracle)
+        self.assertTrue(case.require_valid_git)
+        self.assertEqual(case.baseline_specs, ())
+
     def test_dubbo_samples_is_a_separate_full_discovery_consumer_case(self):
         case = realreg.CASES["dubbo-samples"]
 

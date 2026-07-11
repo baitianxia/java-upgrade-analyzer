@@ -34,7 +34,7 @@ from exhaustive_api_oracle import (
     load_oracle_manifest,
     write_oracle_ledger,
 )
-from third_party_jdk_oracle import scan_class_files
+from third_party_jdk_oracle import discover_calls, scan_class_files
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -81,6 +81,8 @@ class RealProjectCase:
     max_potential_pairs_per_api: float = 0.0
     oracle_manifest: Path | None = None
     enable_jdk_oracle: bool = False
+    bytecode_owner_prefixes: tuple[str, ...] = field(default_factory=tuple)
+    bytecode_coord: str = ""
 
 
 CASES = {
@@ -584,6 +586,23 @@ CASES["dubbo-samples"] = replace(
     max_generated_java_ratio=0.1,
 )
 
+CASES["mall"] = RealProjectCase(
+    name="mall",
+    default_project=Path("/private/tmp/jua-real-project-mall"),
+    default_changed_apis=Path(""),
+    baseline_specs=(),
+    min_project_java_files=500,
+    min_main_java_files=500,
+    max_generated_java_ratio=0.1,
+    require_valid_git=True,
+    max_elapsed_seconds=180.0,
+    case_mode="discovery",
+    ground_truth_status="unreviewed",
+    enable_jdk_oracle=True,
+    bytecode_owner_prefixes=("cn/hutool/",),
+    bytecode_coord="cn.hutool:hutool-all",
+)
+
 
 def is_test_source(path: Path) -> bool:
     normalized = path.as_posix()
@@ -902,6 +921,37 @@ def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_
         writer.writeheader()
         writer.writerows(case.changed_api_rows)
     return changed_apis
+
+
+def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path, report_dir: Path) -> Path:
+    class_files = sorted(project_root.glob("**/target/classes/**/*.class"))
+    discovered = discover_calls(
+        class_files,
+        owner_prefixes=case.bytecode_owner_prefixes,
+        coord=case.bytecode_coord,
+        evidence_dir=report_dir / "evidence" / "quality" / "jdk-javap-discovery",
+    )
+    rows = []
+    for row in discovered:
+        rows.append({
+            "coord": row["coord"],
+            "old_version": "bytecode-observed",
+            "new_version": "-",
+            "change_type": "REMOVED",
+            "api_name": row["api_name"],
+            "api_simple": row["api_name"].rsplit(".", 1)[-1],
+            "symbol_kind": row["symbol_kind"],
+            "api_signature": row["api_signature"],
+            "confirmed": "true",
+            "severity": "P1",
+            "source": "third_party_jdk_bytecode_discovery",
+        })
+    generated_case = replace(case, changed_api_rows=tuple(rows), prefer_embedded_changed_api_rows=True)
+    return ensure_changed_apis(
+        generated_case,
+        Path(""),
+        report_dir / "evidence" / "api_changes" / "all_changed_apis.csv",
+    )
 
 
 def materialize_step4_inputs(case: RealProjectCase, report_dir: Path) -> tuple[Path, Path]:
@@ -1482,6 +1532,8 @@ def run_case(
         }
     report_dir = report_root / case.name
     report_dir.mkdir(parents=True, exist_ok=True)
+    if case.bytecode_owner_prefixes:
+        changed_apis = materialize_bytecode_changed_apis(case, project_root, report_dir)
     step4_result = {}
     step4_selection = {}
     failures = []

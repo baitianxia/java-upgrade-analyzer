@@ -21,6 +21,92 @@ JAVA_LANG = {
     "Boolean", "Byte", "Character", "Short", "Integer", "Long", "Float",
     "Double", "String", "Object", "Class", "Throwable", "Exception",
 }
+DESCRIPTOR_PRIMITIVES = {value: key for key, value in PRIMITIVES.items()}
+
+
+def _descriptor_type(descriptor: str, offset: int) -> tuple[str, int]:
+    dimensions = 0
+    while descriptor[offset] == "[":
+        dimensions += 1
+        offset += 1
+    code = descriptor[offset]
+    if code in DESCRIPTOR_PRIMITIVES:
+        value = DESCRIPTOR_PRIMITIVES[code]
+        offset += 1
+    elif code == "L":
+        end = descriptor.index(";", offset)
+        value = descriptor[offset + 1:end].replace("/", ".")
+        offset = end + 1
+    else:
+        raise ValueError(f"unsupported JVM descriptor: {descriptor}")
+    return value + "[]" * dimensions, offset
+
+
+def _source_signature(parameter_descriptor: str) -> str:
+    offset = 1
+    parameters = []
+    while parameter_descriptor[offset] != ")":
+        value, offset = _descriptor_type(parameter_descriptor, offset)
+        parameters.append(value)
+    return "(" + ",".join(parameters) + ")"
+
+
+def discover_calls(
+    class_files: list[Path],
+    owner_prefixes: tuple[str, ...],
+    coord: str,
+    evidence_dir: Path,
+) -> list[dict]:
+    """Enumerate every distinct dependency method called by production bytecode."""
+    if not class_files:
+        raise ValueError("no production class files available for bytecode discovery")
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    evidence_path = evidence_dir / "jdk_javap_discovered_calls.txt"
+    discovered: dict[tuple[str, str, str], dict] = {}
+    with evidence_path.open("w", encoding="utf-8") as evidence:
+        for class_file in class_files:
+            completed = subprocess.run(
+                ["javap", "-c", "-s", "-p", str(class_file)],
+                capture_output=True,
+                text=True,
+            )
+            evidence.write(f"===== {class_file} =====\n")
+            evidence.write(completed.stdout)
+            if completed.stderr:
+                evidence.write(completed.stderr)
+            if completed.returncode != 0:
+                raise RuntimeError(f"javap failed for {class_file}: {completed.stderr.strip()}")
+            caller_match = re.search(r"(?:class|interface|enum)\s+([\w.$]+)", completed.stdout)
+            caller = caller_match.group(1) if caller_match else class_file.stem
+            for owner, member, descriptor in CALL_RE.findall(completed.stdout):
+                if not owner.startswith(owner_prefixes):
+                    continue
+                key = owner, member, descriptor
+                discovered.setdefault(key, {
+                    "coord": coord,
+                    "api_name": f"{owner.replace('/', '.')}.{member}",
+                    "api_signature": _source_signature(descriptor),
+                    "symbol_kind": "constructor" if member == "<init>" else "method",
+                    "oracle_conclusion": "reachable",
+                    "caller_class": caller,
+                })
+
+    digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    version = subprocess.run(["javap", "-version"], capture_output=True, text=True).stdout.strip()
+    generated_at = datetime.now(timezone.utc).isoformat()
+    for row in discovered.values():
+        row.update({
+            "authority": "jdk-javap",
+            "authority_version": version,
+            "procedure": "javap -c -s -p <class-file>; enumerate exact dependency calls",
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": digest,
+            "generated_at": generated_at,
+            "evidence_mode": "bytecode",
+        })
+    return sorted(discovered.values(), key=lambda row: (
+        row["api_name"], row["symbol_kind"], row["api_signature"]
+    ))
 
 
 def _split_parameters(text: str) -> list[str]:

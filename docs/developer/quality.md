@@ -211,6 +211,14 @@ runner 状态必须由质量信号派生。存在 blocking signal 时状态必�
 oracle conclusion、verdict、证据模式和证据文件。宽泛 grep 只能用来发现候选，不能
 作为 owner 或重载签名精度的最终真值；当前分析器自己的结论也不能反过来充当 oracle。
 
+对于已编译的真实业务项目，可使用“字节码变更语料”模式：由 JDK `javap` 穷举全部
+生产 class 对指定依赖包的精确 owner/member/JVM descriptor 调用，去重后动态生成
+`all_changed_apis.csv`，再由独立的第二遍字节码扫描逐 API 裁决 Step5 结论。该模式禁止
+抽样，也禁止使用分析器输出生成输入集合。当前 `mall` discovery case 固定在提交
+`0504e86b1f1b6f1b8aa6a734d37a90fb67346be7`，以 `cn/hutool/` 为目标依赖边界；在
+Java 23+ 构建环境中需要显式传入 `-Dmaven.compiler.proc=full`，并仅运行 `compile`
+阶段以避免项目绑定在 `package` 的远程 Docker 部署副作用。
+
 如果每轮真实项目测试都发现新问题，说明测试矩阵仍不足，应继续补充针对性测试和压力模型。
 
 真实项目矩阵必须按“发现池”而不是“固定纪念碑”维护。每次执行真实项目测试时都要遵守：
