@@ -20,12 +20,14 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import re
 import subprocess
 import sys
 import time
 import zipfile
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
@@ -36,6 +38,10 @@ from exhaustive_api_oracle import (
     load_oracle_manifest,
     write_oracle_ledger,
 )
+from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity, reconcile_edges
+from final_artifact_edge_oracle import scan_final_artifact
+from signature_utils import normalize_signature_for_lookup
+from third_party_jdk_oracle import _source_signature
 from third_party_jdk_oracle import discover_calls, scan_class_files
 from topology_coverage import (
     classify_topologies,
@@ -45,6 +51,19 @@ from topology_coverage import (
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+
+ORACLE_EDGE_FIELDS = (
+    "artifact_sha256", "artifact_entry", *EDGE_IDENTITY_FIELDS[1:],
+    "instruction_offset", "authority", "authority_version", "procedure",
+)
+EDGE_RECONCILIATION_FIELDS = (
+    "side", "index", "verdict", "reason", "identity", "artifact_sha256", "artifact_entry", "api_identity",
+    "physical_occurrence",
+)
+EDGE_COMPARISON_FIELDS = EDGE_IDENTITY_FIELDS[1:]
+EDGE_RECONCILIATION_VERDICTS = (
+    "correct", "missing", "extra", "identity_mismatch", "provenance_invalid", "oracle_conflict",
+)
 
 
 @dataclass(frozen=True)
@@ -1142,6 +1161,389 @@ def collect_performance_envelope(summary: dict, elapsed: float, selected: int) -
     }
 
 
+def serialized_api_identity(api_row: dict) -> str:
+    """Match the Task 4 ledger's serialized API identity without importing its parser."""
+    return str(tuple(str((api_row or {}).get(field) or "").strip() for field in (
+        "coord", "api_name", "api_signature", "symbol_kind", "change_type",
+    )))
+
+
+def _api_target_matches(api_row: dict, edge: dict) -> bool:
+    api_name = str((api_row or {}).get("api_name") or "").strip()
+    symbol_kind = str((api_row or {}).get("symbol_kind") or "method").strip().lower()
+    if symbol_kind == "constructor" and not api_name.endswith(".<init>"):
+        owner, separator, member = api_name, ".", "<init>"
+    else:
+        owner, separator, member = api_name.rpartition(".")
+    if not separator or not owner or not member:
+        return False
+    if symbol_kind == "constructor":
+        member = "<init>"
+    if (
+        str(edge.get("callee_owner") or "").strip() != owner
+        or str(edge.get("callee_member") or "").strip() != member
+    ):
+        return False
+    if symbol_kind == "field":
+        return True
+    descriptor = str(edge.get("callee_descriptor") or "").strip()
+    if not descriptor.startswith("("):
+        return False
+    try:
+        actual = normalize_signature_for_lookup(_source_signature(descriptor))
+    except (IndexError, ValueError):
+        return False
+    expected = normalize_signature_for_lookup(str(api_row.get("api_signature") or ""))
+    return bool(expected) and actual == expected
+
+
+def _caller_identity(edge: dict) -> tuple[str, str, str]:
+    return tuple(str(edge.get(field) or "").strip() for field in (
+        "caller_owner", "caller_member", "caller_descriptor",
+    ))
+
+
+def _callee_identity(edge: dict) -> tuple[str, str, str]:
+    return tuple(str(edge.get(field) or "").strip() for field in (
+        "callee_owner", "callee_member", "callee_descriptor",
+    ))
+
+
+def _business_artifact_entry(entry: str) -> bool:
+    value = str(entry or "").strip()
+    return bool(
+        value.startswith(("BOOT-INF/classes/", "WEB-INF/classes/"))
+        or (value.endswith(".class") and "!/" not in value)
+    )
+
+
+def physical_edge_occurrence(edge: dict) -> str:
+    """Identify one bytecode instruction without changing canonical edge identity."""
+    return "|".join((
+        canonical_edge_identity(edge),
+        str((edge or {}).get("artifact_entry") or "").strip(),
+        str((edge or {}).get("instruction_offset") or "").strip(),
+    ))
+
+
+def _retain_authoritative_api_path(selected_rows: list[dict], oracle_rows: list[dict]) -> tuple[list[dict], list[str]]:
+    """Keep every oracle edge from a selected API back to a packaged business boundary."""
+    incoming: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for edge in oracle_rows:
+        incoming[_callee_identity(edge)].append(edge)
+    selected: dict[str, list[dict]] = {}
+    errors: list[str] = []
+    for api_row in selected_rows:
+        identity = serialized_api_identity(api_row)
+        direct = [edge for edge in oracle_rows if _api_target_matches(api_row, edge)]
+        if not direct:
+            errors.append(f"selected_api_unresolved:{identity}")
+            continue
+        selected[identity] = direct
+
+    retained: dict[tuple[str, str], dict] = {}
+    for identity, direct_edges in selected.items():
+        pending = deque(direct_edges)
+        visited = set()
+        reached_boundary = False
+        while pending:
+            edge = pending.popleft()
+            physical_key = (identity, physical_edge_occurrence(edge))
+            if physical_key in visited:
+                continue
+            visited.add(physical_key)
+            retained[physical_key] = {**edge, "api_identity": identity}
+            if _business_artifact_entry(str(edge.get("artifact_entry") or "")):
+                reached_boundary = True
+                continue
+            for upstream in incoming.get(_caller_identity(edge), []):
+                pending.append(upstream)
+        if not reached_boundary:
+            errors.append(f"selected_api_unreached_business_boundary:{identity}")
+    return sorted(retained.values(), key=lambda row: (
+        str(row.get("api_identity") or ""), canonical_edge_identity(row),
+        str(row.get("artifact_entry") or ""), str(row.get("instruction_offset") or ""),
+    )), sorted(errors)
+
+
+def _retain_analyzer_api_path(selected_rows: list[dict], analyzer_rows: list[dict]) -> list[dict]:
+    """Associate upstream analyzer edges by bytecode graph path from a labeled target edge."""
+    incoming: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for edge in analyzer_rows:
+        incoming[_callee_identity(edge)].append(edge)
+
+    retained: dict[tuple[str, str], dict] = {}
+    for api_row in selected_rows:
+        identity = serialized_api_identity(api_row)
+        pending = deque(
+            edge for edge in analyzer_rows
+            if str(edge.get("api_identity") or "") == identity and _api_target_matches(api_row, edge)
+        )
+        visited: set[tuple[str, str]] = set()
+        while pending:
+            edge = pending.popleft()
+            physical_key = (identity, physical_edge_occurrence(edge))
+            if physical_key in visited:
+                continue
+            visited.add(physical_key)
+            retained[physical_key] = {**edge, "api_identity": identity}
+            if _business_artifact_entry(str(edge.get("artifact_entry") or "")):
+                continue
+            pending.extend(incoming.get(_caller_identity(edge), []))
+    return sorted(retained.values(), key=lambda row: (
+        str(row.get("api_identity") or ""), physical_edge_occurrence(row),
+    ))
+
+
+def _reconcile_physical_edge_occurrences(
+    analyzer_rows: list[dict],
+    oracle_rows: list[dict],
+    trusted_artifact_sha: str,
+    artifact_entries: set[str],
+) -> dict:
+    """Use the shared canonical contract inside each explicitly associated occurrence."""
+    grouped: dict[tuple[str, str], dict[str, list[dict]]] = defaultdict(
+        lambda: {"analyzer": [], "oracle": []}
+    )
+    for side, rows in (("analyzer", analyzer_rows), ("oracle", oracle_rows)):
+        for row in rows:
+            key = (str(row.get("api_identity") or ""), physical_edge_occurrence(row))
+            grouped[key][side].append(row)
+
+    ledger: list[dict] = []
+    verdict_counts = {verdict: 0 for verdict in EDGE_RECONCILIATION_VERDICTS}
+    for api_identity, occurrence in sorted(grouped):
+        rows = grouped[(api_identity, occurrence)]
+        result = reconcile_edges(
+            rows["analyzer"],
+            rows["oracle"],
+            trusted_artifact_sha=trusted_artifact_sha,
+            valid_artifact_entries=artifact_entries,
+        )
+        for row in result["ledger"]:
+            ledger.append({
+                **row,
+                "api_identity": api_identity,
+                "physical_occurrence": occurrence,
+            })
+        for verdict, count in result["verdict_counts"].items():
+            verdict_counts[verdict] += int(count)
+    return {
+        "ledger": ledger,
+        "verdict_counts": verdict_counts,
+        "blocking": any(verdict_counts[verdict] for verdict in verdict_counts if verdict != "correct"),
+    }
+
+
+def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(path)
+
+
+def reconcile_selected_api_edges(
+    report_dir: Path,
+    selected_rows: list[dict],
+    analyzer_rows: list[dict],
+    oracle_scan: dict,
+) -> dict:
+    """Reconcile all selected API runtime edges, never a sampled subset."""
+    report_dir = Path(report_dir)
+    oracle_rows = [dict(row) for row in (oracle_scan.get("edges") or [])]
+    retained_oracle_rows, path_errors = _retain_authoritative_api_path(selected_rows, oracle_rows)
+    retained_analyzer_rows = _retain_analyzer_api_path(selected_rows, [dict(row) for row in (analyzer_rows or [])])
+    artifact_entries = {
+        str(entry).strip() for entry in (oracle_scan.get("artifact_entries") or [])
+        if str(entry).strip()
+    }
+    if not artifact_entries:
+        artifact_entries = {
+            str(row.get("artifact_entry") or "").strip() for row in oracle_rows
+            if str(row.get("artifact_entry") or "").strip()
+        }
+    complete = bool(oracle_scan.get("complete")) and not path_errors
+    reconciliation = {
+        "ledger": [],
+        "verdict_counts": {verdict: 0 for verdict in EDGE_RECONCILIATION_VERDICTS},
+        "blocking": False,
+    }
+    if artifact_entries and str(oracle_scan.get("artifact_sha256") or ""):
+        reconciliation = _reconcile_physical_edge_occurrences(
+            retained_analyzer_rows,
+            retained_oracle_rows,
+            str(oracle_scan.get("artifact_sha256") or ""),
+            artifact_entries,
+        )
+    elif not artifact_entries:
+        path_errors.append("oracle_artifact_entries_unavailable")
+        complete = False
+    oracle_path = _write_csv(
+        report_dir / "evidence" / "call_chain" / "oracle_edges.csv",
+        ("api_identity",) + ORACLE_EDGE_FIELDS,
+        retained_oracle_rows,
+    )
+    reconciliation_path = _write_csv(
+        report_dir / "evidence" / "call_chain" / "edge_reconciliation.csv",
+        EDGE_RECONCILIATION_FIELDS,
+        reconciliation["ledger"],
+    )
+    counts = {
+        "oracle_edge_count": len(retained_oracle_rows),
+        "analyzer_edge_count": len(retained_analyzer_rows),
+        "edge_reconciliation_row_count": len(reconciliation["ledger"]),
+        **{f"edge_truth_{verdict}_count": int(count) for verdict, count in reconciliation["verdict_counts"].items()},
+    }
+    return {
+        "complete": complete,
+        "errors": sorted(path_errors + [str(item) for item in (oracle_scan.get("failures") or [])]),
+        "blocking": not complete or bool(reconciliation.get("blocking")),
+        "reconciliation": reconciliation,
+        "counts": counts,
+        "oracle_edges": oracle_path,
+        "edge_reconciliation": reconciliation_path,
+        "trusted_artifact_sha": str(oracle_scan.get("artifact_sha256") or ""),
+        "oracle_physical_occurrences": [
+            physical_edge_occurrence(row) for row in retained_oracle_rows
+        ],
+    }
+
+
+def _artifact_class_entries(artifact: Path) -> set[str]:
+    entries: set[str] = set()
+    with zipfile.ZipFile(artifact) as archive:
+        for info in archive.infolist():
+            if not info.is_dir() and info.filename.endswith(".class"):
+                entries.add(info.filename)
+            elif not info.is_dir() and info.filename.endswith(".jar") and info.filename.startswith(("BOOT-INF/lib/", "WEB-INF/lib/")):
+                with zipfile.ZipFile(io.BytesIO(archive.read(info))) as nested:
+                    entries.update(
+                        f"{info.filename}!/{nested_info.filename}"
+                        for nested_info in nested.infolist()
+                        if not nested_info.is_dir() and nested_info.filename.endswith(".class")
+                    )
+    return entries
+
+
+def _verified_current_final_artifact(report_dir: Path) -> tuple[Path | None, str, list[str]]:
+    provenance_path = Path(report_dir) / "evidence" / "dependencies" / "build_provenance.json"
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        current = next(item for item in provenance.get("sides") or [] if item.get("side") == "current")
+        artifact = Path(str(current.get("artifact_path") or ""))
+        expected_sha = str(current.get("artifact_sha256") or "")
+        actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if len(expected_sha) != 64 or actual_sha != expected_sha:
+            raise ValueError("current final artifact SHA-256 is missing or mismatched")
+        return artifact, expected_sha, []
+    except (OSError, StopIteration, ValueError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+        return None, "", [f"verified_current_final_artifact_unavailable:{error}"]
+
+
+def reconcile_final_artifact_edges(report_dir: Path, selected_rows: list[dict]) -> dict:
+    artifact, expected_sha, errors = _verified_current_final_artifact(report_dir)
+    analyzer_path = Path(report_dir) / "evidence" / "call_chain" / "analyzer_edges.csv"
+    _fields, analyzer_rows = _csv_rows(analyzer_path)
+    if artifact is None:
+        scan = {"artifact_sha256": "", "complete": False, "edges": [], "failures": errors,
+                "artifact_entries": []}
+    else:
+        scan = scan_final_artifact(artifact)
+        try:
+            scan["artifact_entries"] = sorted(_artifact_class_entries(artifact))
+        except (OSError, zipfile.BadZipFile) as error:
+            scan["complete"] = False
+            scan.setdefault("failures", []).append(f"artifact_class_inventory_failed:{error}")
+            scan["artifact_entries"] = []
+        if scan.get("artifact_sha256") != expected_sha:
+            scan["complete"] = False
+            scan.setdefault("failures", []).append("oracle_artifact_sha_mismatch")
+    return reconcile_selected_api_edges(report_dir, selected_rows, analyzer_rows, scan)
+
+
+def _valid_sha256(value: str) -> bool:
+    value = str(value or "").strip()
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def validate_source_bytecode_conflicts(summary: dict, edge_truth: dict | None = None) -> dict:
+    conflicts = [
+        item for item in (summary.get("uncertain_apis") or [])
+        if str(item.get("reason_code") or "") == "SOURCE_BYTECODE_EDGE_CONFLICT"
+    ]
+    edge_truth = edge_truth or {}
+    trusted_artifact_sha = str(edge_truth.get("trusted_artifact_sha") or "")
+    oracle_occurrences = set(edge_truth.get("oracle_physical_occurrences") or [])
+    final_artifact_bound = bool(
+        edge_truth.get("complete")
+        and _valid_sha256(trusted_artifact_sha)
+        and oracle_occurrences
+    )
+    errors: list[str] = []
+    for index, conflict in enumerate(conflicts):
+        provenance = conflict.get("source_revision_provenance") or conflict.get("source_provenance") or {}
+        source_edge = conflict.get("normalized_source_edge") or conflict.get("source_edge") or {}
+        final_edge = conflict.get("normalized_final_artifact_edge") or conflict.get("final_artifact_edge") or {}
+        prefix = f"source_bytecode_conflict[{index}]"
+        if not isinstance(provenance, dict) or not provenance.get("valid") or not provenance.get("git_revision"):
+            errors.append(f"{prefix}:source_revision_provenance_missing")
+        if not isinstance(source_edge, dict) or not all(str(source_edge.get(field) or "").strip() for field in EDGE_COMPARISON_FIELDS):
+            errors.append(f"{prefix}:normalized_source_edge_missing")
+        if not isinstance(final_edge, dict) or not all(str(final_edge.get(field) or "").strip() for field in EDGE_IDENTITY_FIELDS):
+            errors.append(f"{prefix}:normalized_final_artifact_edge_missing")
+            continue
+        if not str(final_edge.get("instruction_offset") or "").strip():
+            errors.append(f"{prefix}:final_artifact_instruction_offset_missing")
+        final_sha = str(final_edge.get("artifact_sha256") or "")
+        if not _valid_sha256(final_sha):
+            errors.append(f"{prefix}:final_artifact_sha_invalid")
+        elif not final_artifact_bound:
+            errors.append(f"{prefix}:final_artifact_oracle_binding_unavailable")
+        elif final_sha != trusted_artifact_sha:
+            errors.append(f"{prefix}:final_artifact_sha_mismatch")
+        elif physical_edge_occurrence(final_edge) not in oracle_occurrences:
+            errors.append(f"{prefix}:final_artifact_oracle_identity_missing")
+    return {"conflict_count": len(conflicts), "invalid_count": len({item.split(":", 1)[0] for item in errors}),
+            "valid": not errors, "errors": errors}
+
+
+def build_edge_truth_signals(case: RealProjectCase, edge_truth: dict, source_conflicts: dict) -> list[dict]:
+    signals: list[dict] = []
+    evidence = [edge_truth.get("oracle_edges", ""), edge_truth.get("edge_reconciliation", "")]
+    if not edge_truth.get("complete"):
+        signals.append(make_signal(
+            "oracle_incomplete", "P0", case.name, step="step5",
+            message="final-artifact edge oracle is incomplete",
+            count=len(edge_truth.get("errors") or []),
+            expected="complete SHA-verified final-artifact edge oracle for every selected API",
+            actual="; ".join((edge_truth.get("errors") or [])[:10]), evidence=evidence,
+        ))
+    if edge_truth.get("reconciliation", {}).get("blocking"):
+        counts = edge_truth["reconciliation"].get("verdict_counts") or {}
+        samples = [
+            row.get("identity", "") for row in edge_truth["reconciliation"].get("ledger") or []
+            if row.get("verdict") != "correct"
+        ][:10]
+        signals.append(make_signal(
+            "edge_truth_failure", "P0", case.name, step="step5",
+            message="final-artifact edge reconciliation found blocking edge truth differences",
+            count=sum(int(value or 0) for key, value in counts.items() if key != "correct"),
+            expected="every selected API runtime edge matches the final-artifact oracle",
+            actual=json.dumps(counts, sort_keys=True), evidence=evidence, sample_symbols=samples,
+        ))
+    if not source_conflicts.get("valid"):
+        signals.append(make_signal(
+            "source_bytecode_conflict_invalid", "P0", case.name, step="step5",
+            message="SOURCE_BYTECODE_EDGE_CONFLICT lacks authoritative normalized source/final evidence",
+            count=int(source_conflicts.get("invalid_count") or 0),
+            expected="normalized source and final-artifact edge identities with known source revision provenance",
+            actual="; ".join((source_conflicts.get("errors") or [])[:10]), evidence=evidence,
+        ))
+    return signals
+
+
 def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_path: Path | None = None) -> Path:
     if case.prefer_embedded_changed_api_rows and case.changed_api_rows:
         changed_apis = materialized_path or changed_apis
@@ -2099,7 +2501,10 @@ def run_case(
         selected_count,
         int(summary.get("total_apis") or 0),
     )
+    edge_truth = reconcile_final_artifact_edges(report_dir, selected_rows)
+    source_conflicts = validate_source_bytecode_conflicts(summary, edge_truth)
     performance_envelope = collect_performance_envelope(summary, elapsed, selected_count)
+    performance_envelope.update(edge_truth["counts"])
     oracle_audit = None
     oracle_ledger = ""
     effective_ground_truth_status = case.ground_truth_status
@@ -2167,6 +2572,7 @@ def run_case(
         topology_coverage,
         report_dir,
     ))
+    quality_signals.extend(build_edge_truth_signals(case, edge_truth, source_conflicts))
     if failures and not any(item.get("blocking") for item in quality_signals):
         quality_signals.append(make_signal(
             "correctness_failure", "P1", case.name,
@@ -2188,6 +2594,15 @@ def run_case(
         "elapsed_seconds": round(elapsed, 2),
         "performance_budget_seconds": performance_budget,
         "performance_envelope": performance_envelope,
+        "edge_truth": {
+            "complete": edge_truth["complete"],
+            "blocking": edge_truth["blocking"],
+            "errors": edge_truth["errors"],
+            "counts": edge_truth["counts"],
+            "verdict_counts": edge_truth["reconciliation"]["verdict_counts"],
+            "oracle_edges": edge_truth["oracle_edges"],
+            "edge_reconciliation": edge_truth["edge_reconciliation"],
+        },
         "ground_truth_status": effective_ground_truth_status,
         "oracle_audit": {
             key: value for key, value in (oracle_audit or {}).items()

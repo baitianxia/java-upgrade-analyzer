@@ -246,6 +246,279 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertAlmostEqual(envelope["potential_pairs_per_api"], 143240640 / 5440)
         self.assertAlmostEqual(envelope["elapsed_seconds_per_1000_apis"], 107.7 / 5.44)
 
+    def test_edge_truth_reconciliation_fails_when_an_intermediate_oracle_edge_is_missing(self):
+        artifact_sha256 = "a" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        direct = self._edge_row(
+            artifact_sha256, "bridge.Adapter", "call", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/bridge.jar!/bridge/Adapter.class",
+        )
+        intermediate = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "bridge.Adapter", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+        direct["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [direct], {"artifact_sha256": artifact_sha256,
+                "complete": True, "edges": [direct, intermediate], "failures": [],
+                "artifact_entries": [direct["artifact_entry"], intermediate["artifact_entry"]]},
+            )
+            with open(result["oracle_edges"], encoding="utf-8") as handle:
+                oracle_rows = list(csv.DictReader(handle))
+            with open(result["edge_reconciliation"], encoding="utf-8") as handle:
+                ledger_rows = list(csv.DictReader(handle))
+
+        self.assertTrue(result["blocking"])
+        self.assertEqual(result["reconciliation"]["verdict_counts"]["missing"], 1)
+        self.assertEqual(len(oracle_rows), 2)
+        self.assertEqual(len(ledger_rows), 3)
+
+    def test_edge_truth_preserves_duplicate_physical_oracle_occurrences(self):
+        artifact_sha256 = "d" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        first = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class",
+            instruction_offset=12,
+        )
+        duplicate = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/duplicate.jar!/app/Entry.class",
+            instruction_offset=28,
+        )
+        first["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [first], {
+                    "artifact_sha256": artifact_sha256,
+                    "complete": True,
+                    "edges": [first, duplicate],
+                    "failures": [],
+                    "artifact_entries": [first["artifact_entry"], duplicate["artifact_entry"]],
+                },
+            )
+            with open(result["oracle_edges"], encoding="utf-8") as handle:
+                oracle_rows = list(csv.DictReader(handle))
+            with open(result["edge_reconciliation"], encoding="utf-8") as handle:
+                ledger_rows = list(csv.DictReader(handle))
+
+        self.assertTrue(result["blocking"])
+        self.assertEqual(len(oracle_rows), 2)
+        self.assertEqual(result["reconciliation"]["verdict_counts"]["missing"], 1)
+        self.assertEqual(
+            {row["api_identity"] for row in ledger_rows},
+            {realreg.serialized_api_identity(target)},
+        )
+        self.assertEqual(len({row["physical_occurrence"] for row in ledger_rows}), 2)
+
+    def test_edge_truth_associates_unlabeled_bridge_edge_by_path_identity(self):
+        artifact_sha256 = "e" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        direct = self._edge_row(
+            artifact_sha256, "bridge.Adapter", "call", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/bridge.jar!/bridge/Adapter.class",
+            instruction_offset=7,
+        )
+        bridge = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "bridge.Adapter", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class",
+            instruction_offset=19,
+        )
+        direct["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [direct, bridge], {
+                    "artifact_sha256": artifact_sha256,
+                    "complete": True,
+                    "edges": [direct, bridge],
+                    "failures": [],
+                    "artifact_entries": [direct["artifact_entry"], bridge["artifact_entry"]],
+                },
+            )
+
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["reconciliation"]["verdict_counts"]["correct"], 4)
+
+    def test_source_bytecode_conflict_rejects_stale_or_fabricated_final_evidence(self):
+        artifact_sha256 = "f" * 64
+        oracle_edge = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class",
+            instruction_offset=23,
+        )
+        edge_truth = {
+            "complete": True,
+            "trusted_artifact_sha": artifact_sha256,
+            "oracle_physical_occurrences": [realreg.physical_edge_occurrence(oracle_edge)],
+        }
+        source_edge = {
+            field: oracle_edge[field]
+            for field in realreg.EDGE_COMPARISON_FIELDS
+        }
+        for label, final_edge, expected_error in (
+            ("stale", {**oracle_edge, "artifact_sha256": "a" * 64}, "final_artifact_sha_mismatch"),
+            ("fabricated", {**oracle_edge, "callee_member": "invented"}, "final_artifact_oracle_identity_missing"),
+        ):
+            with self.subTest(evidence=label):
+                result = realreg.validate_source_bytecode_conflicts({
+                    "uncertain_apis": [{
+                        "reason_code": "SOURCE_BYTECODE_EDGE_CONFLICT",
+                        "source_revision_provenance": {"valid": True, "git_revision": "abc123"},
+                        "normalized_source_edge": source_edge,
+                        "normalized_final_artifact_edge": final_edge,
+                    }]
+                }, edge_truth)
+
+                self.assertFalse(result["valid"])
+                self.assertTrue(any(expected_error in error for error in result["errors"]))
+
+    def test_edge_truth_extra_path_that_creates_false_reachability_is_blocking(self):
+        artifact_sha256 = "b" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        direct = self._edge_row(
+            artifact_sha256, "bridge.Adapter", "call", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/bridge.jar!/bridge/Adapter.class",
+        )
+        direct["api_identity"] = realreg.serialized_api_identity(target)
+        invented = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "bridge.Adapter", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+        invented["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [direct, invented], {"artifact_sha256": artifact_sha256,
+                "complete": True, "edges": [direct], "failures": [],
+                "artifact_entries": [direct["artifact_entry"], invented["artifact_entry"]]},
+            )
+
+        self.assertTrue(result["blocking"])
+        self.assertEqual(result["reconciliation"]["verdict_counts"]["extra"], 1)
+
+    def test_edge_truth_matches_constructor_api_using_its_owner_name(self):
+        artifact_sha256 = "c" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api",
+            "api_signature": "()",
+            "symbol_kind": "constructor",
+            "change_type": "REMOVED",
+        }
+        constructor = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "vendor.Api", "<init>", "()V", "invokespecial",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+        constructor["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [constructor], {"artifact_sha256": artifact_sha256,
+                "complete": True, "edges": [constructor], "failures": [],
+                "artifact_entries": [constructor["artifact_entry"]]},
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["reconciliation"]["verdict_counts"]["correct"], 2)
+
+    def test_edge_truth_accepts_plain_jar_root_class_as_business_boundary(self):
+        artifact_sha256 = "d" * 64
+        target = {
+            "coord": "vendor:api", "api_name": "vendor.Api.call",
+            "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+        }
+        edge = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "vendor.Api", "call", "()V", "invokestatic", "app/Entry.class",
+            instruction_offset=4,
+        )
+        edge["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [edge], {
+                    "artifact_sha256": artifact_sha256, "complete": True,
+                    "edges": [edge], "failures": [], "artifact_entries": ["app/Entry.class"],
+                },
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["blocking"])
+
+    def test_invalid_source_bytecode_conflict_requires_source_identity_and_revision_provenance(self):
+        result = realreg.validate_source_bytecode_conflicts({
+            "uncertain_apis": [{
+                "reason_code": "SOURCE_BYTECODE_EDGE_CONFLICT",
+                "source_edge": {"caller_owner": "app.Entry"},
+                "final_artifact_edge": {"caller_owner": "app.Entry"},
+            }]
+        })
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["invalid_count"], 1)
+        self.assertIn("source_revision_provenance_missing", result["errors"][0])
+
+    @staticmethod
+    def _edge_row(
+        artifact_sha256, caller_owner, caller_member, caller_descriptor,
+        callee_owner, callee_member, callee_descriptor, opcode_family, artifact_entry,
+        instruction_offset="",
+    ):
+        return {
+            "artifact_sha256": artifact_sha256,
+            "artifact_entry": artifact_entry,
+            "caller_owner": caller_owner,
+            "caller_member": caller_member,
+            "caller_descriptor": caller_descriptor,
+            "callee_owner": callee_owner,
+            "callee_member": callee_member,
+            "callee_descriptor": callee_descriptor,
+            "opcode_family": opcode_family,
+            "instruction_offset": instruction_offset,
+            "authority": "jdk-javap",
+            "authority_version": "21",
+            "procedure": "test oracle",
+        }
+
     def test_quality_signals_separate_not_analyzed_reason_groups(self):
         case = realreg.RealProjectCase("dubbo", Path("."), Path(""), ())
         summary = {

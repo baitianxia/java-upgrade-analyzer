@@ -64,6 +64,9 @@ def _default_blocking(signal_type: str, severity: str) -> bool:
         "test_configuration_failure",
         "ground_truth_insufficient",
         "conclusion_gap",
+        "edge_truth_failure",
+        "oracle_incomplete",
+        "source_bytecode_conflict_invalid",
     }:
         return True
     return False

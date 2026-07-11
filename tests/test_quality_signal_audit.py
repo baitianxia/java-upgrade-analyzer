@@ -62,6 +62,31 @@ class QualitySignalAuditTest(unittest.TestCase):
         self.assertEqual(signal.signal_type, "project_asset_invalid")
         self.assertTrue(signal.blocking)
 
+    def test_edge_truth_and_invalid_source_conflict_are_release_blocking(self):
+        payload = {
+            "results": [{
+                "case": "edge-case",
+                "status": "failed",
+                "quality_signals": [
+                    {
+                        "signal_type": "edge_truth_failure",
+                        "severity": "P0",
+                        "message": "one required intermediate edge is missing",
+                    },
+                    {
+                        "signal_type": "source_bytecode_conflict_invalid",
+                        "severity": "P0",
+                        "message": "source revision provenance missing",
+                    },
+                ],
+            }]
+        }
+
+        signals = quality_signal_audit.audit_real_project_payload(payload)
+
+        self.assertTrue(all(signal.blocking for signal in signals))
+        self.assertEqual(quality_signal_audit.summarize_signals(signals)["blocking_signals"], 2)
+
     def test_normalize_preserves_grouped_conclusion_dimensions(self):
         signal = quality_signal_audit.normalize_signal({
             "signal_type": "conclusion_gap",
