@@ -125,6 +125,26 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(signal["count"], 2)
         self.assertIn("verified=0/2", signal["message"])
 
+    def test_policy_emits_correctness_failure_for_third_party_disagreement(self):
+        case = realreg.RealProjectCase(
+            "dubbo", Path("."), Path(""), (), case_mode="discovery",
+            ground_truth_status="unreviewed",
+        )
+        signals = realreg.build_policy_signals(
+            case,
+            coverage=realreg.compute_api_coverage("discovery", 2, 2, 2),
+            performance={},
+            report_dir=Path("/tmp/report"),
+            oracle_audit={
+                "selected": 2, "verified": 1, "unverified": 0,
+                "incorrect": 1, "oracle_conflicts": 0, "blocking": True,
+            },
+        )
+
+        correctness = next(item for item in signals if item["signal_type"] == "correctness_failure")
+        self.assertEqual(correctness["count"], 1)
+        self.assertIn("third-party oracle disagrees", correctness["message"])
+
     def _write_readable_alerts(self, path, symbol, evidence_file, signature="(String)", path_status="reachable"):
         path.parent.mkdir(parents=True, exist_ok=True)
         fields = [

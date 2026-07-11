@@ -1218,26 +1218,46 @@ def build_policy_signals(
         else case.ground_truth_status != "reviewed"
     )
     if case.case_mode in {"discovery", "convergence"} and needs_ground_truth:
+        has_oracle_audit = oracle_audit is not None
         oracle_audit = oracle_audit or {}
         selected = int(oracle_audit.get("selected") or 0)
         verified = int(oracle_audit.get("verified") or 0)
         unverified = int(oracle_audit.get("unverified") or 0)
         incorrect = int(oracle_audit.get("incorrect") or 0)
         conflicts = int(oracle_audit.get("oracle_conflicts") or 0)
-        signals.append(make_signal(
-            "ground_truth_insufficient", "P1", case.name, step="step5",
-            message=(
-                f"exhaustive third-party oracle incomplete: verified={verified}/{selected}, "
-                f"unverified={unverified}, incorrect={incorrect}, conflicts={conflicts}"
-            ),
-            count=unverified + incorrect + conflicts,
-            expected="one valid third-party oracle verdict for every selected API",
-            actual=json.dumps({
-                "selected": selected, "verified": verified, "unverified": unverified,
-                "incorrect": incorrect, "oracle_conflicts": conflicts,
-            }, sort_keys=True),
-            evidence=[report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"],
-        ))
+        if incorrect:
+            signals.append(make_signal(
+                "correctness_failure", "P0", case.name, step="step5",
+                message=f"third-party oracle disagrees with {incorrect} analyzer conclusion(s)",
+                count=incorrect,
+                expected="analyzer conclusion equals independent third-party oracle conclusion",
+                actual=f"incorrect={incorrect}",
+                evidence=[report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"],
+            ))
+        if conflicts:
+            signals.append(make_signal(
+                "ground_truth_insufficient", "P1", case.name, step="step5",
+                message=f"third-party authorities conflict for {conflicts} API(s)",
+                count=conflicts,
+                expected="independent authorities agree without majority voting",
+                actual=f"oracle_conflicts={conflicts}",
+                evidence=[report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"],
+            ))
+        if unverified or not has_oracle_audit:
+            signals.append(make_signal(
+                "ground_truth_insufficient", "P1", case.name, step="step5",
+                message=(
+                    f"exhaustive third-party oracle incomplete: verified={verified}/{selected}, "
+                    f"unverified={unverified}, incorrect={incorrect}, conflicts={conflicts}"
+                ),
+                count=unverified,
+                expected="one valid third-party oracle verdict for every selected API",
+                actual=json.dumps({
+                    "selected": selected, "verified": verified, "unverified": unverified,
+                    "incorrect": incorrect, "oracle_conflicts": conflicts,
+                }, sort_keys=True),
+                evidence=[report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"],
+            ))
     pairs_per_api = float(performance.get("potential_pairs_per_api") or 0.0)
     if case.max_potential_pairs_per_api and pairs_per_api > case.max_potential_pairs_per_api:
         signals.append(make_signal(
