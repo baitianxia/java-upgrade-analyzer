@@ -48,6 +48,20 @@ class QualitySignalAuditTest(unittest.TestCase):
         self.assertEqual(signal.signal_type, "performance_regression")
         self.assertTrue(signal.blocking)
 
+    def test_project_asset_invalid_is_blocking_when_severity_is_p1(self):
+        signal = quality_signal_audit.normalize_signal(
+            {
+                "signal_type": "project_asset_invalid",
+                "severity": "P1",
+                "case": "dubbo",
+                "expected": "valid Git checkout with enough source files",
+                "actual": "git metadata missing HEAD",
+            }
+        )
+
+        self.assertEqual(signal.signal_type, "project_asset_invalid")
+        self.assertTrue(signal.blocking)
+
     def test_audit_accepts_explicit_quality_signals_from_real_project_payload(self):
         payload = {
             "results": [
@@ -72,6 +86,29 @@ class QualitySignalAuditTest(unittest.TestCase):
         self.assertEqual(len(signals), 1)
         self.assertEqual(signals[0].signal_type, "evidence_weakness")
         self.assertFalse(signals[0].blocking)
+
+    def test_audit_does_not_add_generic_skip_when_runner_emits_specific_signal(self):
+        payload = {
+            "results": [
+                {
+                    "case": "dubbo",
+                    "status": "skipped",
+                    "reason": "project asset invalid",
+                    "quality_signals": [
+                        {
+                            "signal_type": "project_asset_invalid",
+                            "severity": "P1",
+                            "blocking": True,
+                            "message": "git checkout invalid",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        signals = quality_signal_audit.audit_real_project_payload(payload)
+
+        self.assertEqual([signal.signal_type for signal in signals], ["project_asset_invalid"])
 
     def test_audit_flags_non_gating_production_misses_and_not_analyzed(self):
         payload = {

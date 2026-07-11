@@ -64,6 +64,10 @@ class RealProjectCase:
     run_step6_report: bool = False
     expected_report_texts: tuple[str, ...] = field(default_factory=tuple)
     query_methods: tuple[str, ...] = field(default_factory=tuple)
+    require_valid_git: bool = False
+    min_project_java_files: int = 0
+    min_main_java_files: int = 0
+    max_generated_java_ratio: float = 0.0
 
 
 CASES = {
@@ -449,6 +453,10 @@ CASES = {
             "org.apache.dubbo.common.utils.CollectionUtils.isEmptyMap(Map<?, ?>)",
             "org.apache.dubbo.common.URL.valueOf(String)",
         ),
+        require_valid_git=True,
+        min_project_java_files=500,
+        min_main_java_files=300,
+        max_generated_java_ratio=0.5,
     ),
     "commons-lang": RealProjectCase(
         name="commons-lang",
@@ -997,6 +1005,58 @@ def real_project_matrix_policy() -> dict:
     }
 
 
+def collect_project_asset_health(project_root: Path) -> dict:
+    java_files = list(iter_java_files(project_root)) if project_root.exists() else []
+    main_java_files = [
+        path for path in java_files
+        if "/src/main/java/" in path.as_posix()
+    ]
+    generated_java_files = [
+        path for path in java_files
+        if "/target/generated-sources/" in path.as_posix()
+        or "/generated-sources/" in path.as_posix()
+    ]
+    git_result = subprocess.run(
+        ["git", "-C", str(project_root), "rev-parse", "--is-inside-work-tree"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    generated_ratio = (len(generated_java_files) / len(java_files)) if java_files else 0.0
+    return {
+        "valid_git_checkout": git_result.returncode == 0 and git_result.stdout.strip() == "true",
+        "git_error": (git_result.stderr or git_result.stdout or "").strip(),
+        "java_files": len(java_files),
+        "main_java_files": len(main_java_files),
+        "generated_java_files": len(generated_java_files),
+        "generated_java_ratio": round(generated_ratio, 4),
+    }
+
+
+def project_asset_violations(case: RealProjectCase, health: dict) -> list[str]:
+    violations: list[str] = []
+    if case.require_valid_git and not health.get("valid_git_checkout"):
+        violations.append("git_checkout_invalid")
+    if case.min_project_java_files and int(health.get("java_files") or 0) < case.min_project_java_files:
+        violations.append(
+            f"java_files={int(health.get('java_files') or 0)} below_min={case.min_project_java_files}"
+        )
+    if case.min_main_java_files and int(health.get("main_java_files") or 0) < case.min_main_java_files:
+        violations.append(
+            f"main_java_files={int(health.get('main_java_files') or 0)} below_min={case.min_main_java_files}"
+        )
+    if (
+        case.max_generated_java_ratio
+        and float(health.get("generated_java_ratio") or 0.0) > case.max_generated_java_ratio
+    ):
+        violations.append(
+            "generated_java_ratio="
+            f"{float(health.get('generated_java_ratio') or 0.0):.4f} "
+            f"over_max={case.max_generated_java_ratio:.4f}"
+        )
+    return violations
+
+
 def make_signal(
     signal_type: str,
     severity: str,
@@ -1018,6 +1078,8 @@ def make_signal(
             "correctness_failure",
             "capability_gap",
             "evidence_weakness",
+            "performance_regression",
+            "project_asset_invalid",
         }
     return {
         "signal_type": signal_type,
@@ -1178,6 +1240,30 @@ def run_case(
                     message=reason,
                     actual="real project checkout unavailable",
                     blocking=False,
+                    fixture_status="",
+                )
+            ],
+        }
+    project_asset_health = collect_project_asset_health(project_root)
+    asset_violations = project_asset_violations(case, project_asset_health)
+    if asset_violations:
+        return {
+            "case": case.name,
+            "status": "skipped",
+            "reason": "project asset invalid",
+            "project_root": str(project_root),
+            "project_asset_health": project_asset_health,
+            "project_asset_violations": asset_violations,
+            "matrix_policy": real_project_matrix_policy(),
+            "quality_signals": [
+                make_signal(
+                    "project_asset_invalid",
+                    "P1",
+                    case.name,
+                    message="; ".join(asset_violations),
+                    expected="real project asset matches case scale and checkout assumptions",
+                    actual=json.dumps(project_asset_health, ensure_ascii=False, sort_keys=True),
+                    evidence=[project_root],
                     fixture_status="",
                 )
             ],
@@ -1449,6 +1535,7 @@ def run_case(
         "result_audit": result_audit,
         "failures": failures,
         "warnings": warnings,
+        "project_asset_health": project_asset_health,
         "matrix_policy": real_project_matrix_policy(),
         "quality_signals": quality_signals,
     }

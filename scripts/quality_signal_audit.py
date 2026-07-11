@@ -56,6 +56,7 @@ def _default_blocking(signal_type: str, severity: str) -> bool:
         "capability_gap",
         "evidence_weakness",
         "performance_regression",
+        "project_asset_invalid",
     }:
         return True
     return False
@@ -115,18 +116,21 @@ def audit_real_project_payload(payload: dict) -> list[QualitySignal]:
     signals: list[QualitySignal] = []
     for result in _extract_results(payload):
         case = str(result.get("case") or "")
+        explicit_signal_count = 0
         for raw_signal in result.get("quality_signals") or []:
             signals.append(normalize_signal(raw_signal, default_case=case))
+            explicit_signal_count += 1
         status = str(result.get("status") or "")
         if status == "skipped":
-            signals.append(
-                normalize_signal({
-                    "severity": "high",
-                    "kind": "real_project_skipped",
-                    "case": case,
-                    "message": str(result.get("reason") or "real project regression skipped"),
-                })
-            )
+            if not explicit_signal_count:
+                signals.append(
+                    normalize_signal({
+                        "severity": "high",
+                        "kind": "real_project_skipped",
+                        "case": case,
+                        "message": str(result.get("reason") or "real project regression skipped"),
+                    })
+                )
             continue
 
         summary = result.get("summary") or {}

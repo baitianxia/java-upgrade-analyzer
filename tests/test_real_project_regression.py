@@ -366,6 +366,43 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertIn("fixture_debt", policy["promotion_rules"])
         self.assertIn("rotate_to_new_project", policy["promotion_rules"])
 
+    def test_run_case_reports_invalid_real_project_asset_before_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            source = root / "src/main/java/demo/App.java"
+            source.parent.mkdir(parents=True)
+            source.write_text("class App {}\n", encoding="utf-8")
+            (root / ".git").mkdir()
+            changed_apis = Path(tmp) / "all_changed_apis.csv"
+            changed_apis.write_text(
+                "coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source\n"
+                "demo:dep,1,-,REMOVED,demo.Api.removed,removed,method,(String),true,P1,test\n",
+                encoding="utf-8",
+            )
+            case = realreg.RealProjectCase(
+                name="invalid-asset",
+                default_project=root,
+                default_changed_apis=changed_apis,
+                baseline_specs=(),
+                require_valid_git=True,
+                min_project_java_files=10,
+                min_main_java_files=5,
+                max_generated_java_ratio=0.5,
+            )
+
+            with patch.object(realreg, "run_step5") as fake_run_step5:
+                result = realreg.run_case(case, root, changed_apis, report_root)
+
+        fake_run_step5.assert_not_called()
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "project asset invalid")
+        self.assertLess(result["project_asset_health"]["java_files"], 10)
+        self.assertTrue(
+            any(item["signal_type"] == "project_asset_invalid" for item in result["quality_signals"])
+        )
+        self.assertTrue(any(item["blocking"] for item in result["quality_signals"]))
+
     def test_run_case_prefers_embedded_changed_api_rows_over_existing_external_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

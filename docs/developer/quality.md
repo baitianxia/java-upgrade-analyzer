@@ -199,6 +199,8 @@ evidence/call_chain/step5_timing.csv
 
 优先轮换到能覆盖当前能力边界的工程，例如 Spring Boot 2 到 3、Jakarta 迁移、多模块应用、annotation processor、SPI、反射、动态代理、fat jar、shaded jar、nested jar、Kotlin/Groovy 混合 Java、复杂 Maven 依赖管理等。
 
+真实项目测试必须先校验测试资产本身。若项目不是有效 Git checkout、源码规模低于 case 假设，或 `target/generated-sources` 占比异常高，应输出 `project_asset_invalid` 并阻塞 release，不能继续跑 Step4/Step5 后把资产问题误归因成 analyzer 能力缺口。
+
 ## Fixture Debt
 
 每个 P0/P1 真实项目质量信号都必须进入以下状态之一：
