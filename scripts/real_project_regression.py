@@ -34,6 +34,7 @@ from exhaustive_api_oracle import (
     load_oracle_manifest,
     write_oracle_ledger,
 )
+from third_party_jdk_oracle import scan_class_files
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -79,6 +80,7 @@ class RealProjectCase:
     ground_truth_status: str = "reviewed"
     max_potential_pairs_per_api: float = 0.0
     oracle_manifest: Path | None = None
+    enable_jdk_oracle: bool = False
 
 
 CASES = {
@@ -471,6 +473,7 @@ CASES = {
         case_mode="discovery",
         ground_truth_status="unreviewed",
         max_potential_pairs_per_api=30000.0,
+        enable_jdk_oracle=True,
     ),
     "commons-lang": RealProjectCase(
         name="commons-lang",
@@ -1684,10 +1687,18 @@ def run_case(
     oracle_ledger = ""
     effective_ground_truth_status = case.ground_truth_status
     if case.case_mode in {"discovery", "convergence"}:
+        oracle_rows = load_oracle_manifest(case.oracle_manifest)
+        if case.enable_jdk_oracle:
+            class_files = sorted(project_root.glob("**/target/classes/**/*.class"))
+            oracle_rows.extend(scan_class_files(
+                selected_rows,
+                class_files,
+                report_dir / "evidence" / "quality" / "jdk-javap",
+            ))
         oracle_audit = audit_api_oracle(
             selected_rows,
             load_analyzer_rows(summary),
-            load_oracle_manifest(case.oracle_manifest),
+            oracle_rows,
         )
         oracle_ledger_path = report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"
         write_oracle_ledger(oracle_ledger_path, oracle_audit)
@@ -1736,6 +1747,9 @@ def run_case(
             }
         },
         "oracle_ledger": oracle_ledger,
+        "third_party_authorities": sorted({
+            str(row.get("authority") or "") for row in oracle_rows
+        }) if case.case_mode in {"discovery", "convergence"} else [],
         **coverage,
         "step4": step4_result,
         "step4_selection": step4_selection,
