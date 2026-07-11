@@ -111,6 +111,22 @@ artifact dependency graphs, executable project tests, or a reviewed manual
 record. Re-running the analyzer or accepting its own path as truth is not an
 oracle. Broad grep is discovery evidence only.
 
+An oracle record is authoritative only when it comes from a third-party
+authority outside this repository's analyzer implementation. Accepted
+authorities include JDK `javap`/`jdeps` output, the project's own compiler and
+test suite, an independent static-analysis engine, upstream compatibility
+tests, or a signed human review record. The repository may orchestrate these
+authorities and compare their outputs, but its own matcher or call graph cannot
+be the sole source of a `correct` verdict.
+
+Every authority record contains `authority`, tool version, exact command or
+review procedure, raw evidence path, evidence SHA-256, and generation time.
+P0/P1 positive conclusions require at least one deterministic third-party
+authority. Dynamic-call and negative conclusions require two independent
+authorities or one executable project-test authority. Conflicting authorities
+produce `oracle_conflict`; majority voting is not allowed. AI review may help
+triage evidence but cannot be the only authority.
+
 Every API in the selected input must appear exactly once. Missing, duplicate,
 or extra oracle identities block release. `incorrect`, `unverified`, and
 `oracle_conflict` all block release per API. A case passes accuracy only when
