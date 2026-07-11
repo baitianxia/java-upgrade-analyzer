@@ -32,6 +32,9 @@ class QualitySignal:
     evidence: tuple[str, ...] = ()
     fixture_status: str = ""
     notes: str = ""
+    reason_code: str = ""
+    symbol_kind: str = ""
+    sample_symbols: tuple[str, ...] = ()
 
 
 LEGACY_KIND_TO_TYPE = {
@@ -57,6 +60,10 @@ def _default_blocking(signal_type: str, severity: str) -> bool:
         "evidence_weakness",
         "performance_regression",
         "project_asset_invalid",
+        "coverage_gap",
+        "test_configuration_failure",
+        "ground_truth_insufficient",
+        "conclusion_gap",
     }:
         return True
     return False
@@ -77,6 +84,11 @@ def normalize_signal(raw: dict, default_case: str = "") -> QualitySignal:
         evidence = (evidence,)
     else:
         evidence = tuple(str(item) for item in evidence)
+    sample_symbols = raw.get("sample_symbols") or ()
+    if isinstance(sample_symbols, str):
+        sample_symbols = (sample_symbols,)
+    else:
+        sample_symbols = tuple(str(item) for item in sample_symbols)
     blocking = raw.get("blocking")
     if blocking is None:
         blocking = _default_blocking(signal_type, severity)
@@ -95,6 +107,9 @@ def normalize_signal(raw: dict, default_case: str = "") -> QualitySignal:
         evidence=evidence,
         fixture_status=str(raw.get("fixture_status") or ""),
         notes=str(raw.get("notes") or ""),
+        reason_code=str(raw.get("reason_code") or ""),
+        symbol_kind=str(raw.get("symbol_kind") or ""),
+        sample_symbols=sample_symbols,
     )
 
 
@@ -131,6 +146,14 @@ def audit_real_project_payload(payload: dict) -> list[QualitySignal]:
                         "message": str(result.get("reason") or "real project regression skipped"),
                     })
                 )
+            continue
+        if status == "observed" and not explicit_signal_count:
+            signals.append(normalize_signal({
+                "signal_type": "ground_truth_insufficient",
+                "severity": "P1",
+                "case": case,
+                "message": "real project result is observed and has no reviewed ground truth",
+            }))
             continue
         if explicit_signal_count:
             continue

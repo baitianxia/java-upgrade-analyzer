@@ -178,6 +178,24 @@ evidence/call_chain/step5_timing.csv
 
 真实项目验证不能只证明“能跑完”。
 
+项目规模不能替代测试覆盖率。真实项目 case 必须声明生命周期：
+
+- `discovery`：Step4 产生的 API 必须 100% 进入 Step5；
+- `convergence`：保持全量覆盖，同时把 P0/P1 问题沉淀为 fixture；
+- `guard`：只运行已声明的代表性探针，输出不得暗示项目级全量覆盖。
+
+每次运行必须分别通过五类门禁：
+
+- 覆盖门禁：记录 API population、selected、accounted 和 coverage ratio；
+- 证据门禁：区分缺运行时 jar、缺源码映射、测试配置错误和真实外部缺失；
+- 结论门禁：按 reason code 与 symbol kind 分组 `not_analyzed`，不得压成一条模糊汇总；
+- 真值门禁：没有 reviewed ground truth 的探索结果只能是 `observed`，不能宣称准确性通过；
+- 性能门禁：同时约束绝对耗时、每千 API 耗时、候选配对总数与每 API 配对数。
+
+runner 状态必须由质量信号派生。存在 blocking signal 时状态必须为 `failed`；
+只有 ground truth 尚未完成且没有其他阻断时才是 `observed`；独立 audit 的发布决定
+不得与 runner 文本状态冲突。
+
 至少应记录：
 
 - 项目规模；
@@ -187,6 +205,10 @@ evidence/call_chain/step5_timing.csv
 - reachable / uncertain / not_found / not_analyzed 分布；
 - 随机抽样复核结果；
 - 与 jdeps 或人工预期不一致的差异。
+
+误报与漏报复核应使用稳定哈希做分层抽样，至少覆盖结论状态、symbol kind、
+reason code、源码/字节码/反射证据模式以及 production/test 分类。宽泛 grep 只能用来
+发现候选，不能作为 owner 或重载签名精度的最终真值。
 
 如果每轮真实项目测试都发现新问题，说明测试矩阵仍不足，应继续补充针对性测试和压力模型。
 

@@ -14,6 +14,100 @@ import real_project_regression as realreg  # noqa: E402
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_discovery_coverage_requires_full_step4_population(self):
+        coverage = realreg.compute_api_coverage("discovery", 5440, 9, 9)
+
+        self.assertEqual(coverage["coverage_scope"], "full")
+        self.assertAlmostEqual(coverage["coverage_ratio"], 9 / 5440)
+        self.assertFalse(coverage["complete"])
+
+    def test_guard_coverage_declares_probe_scope(self):
+        coverage = realreg.compute_api_coverage("guard", 5440, 9, 9)
+
+        self.assertEqual(coverage["coverage_scope"], "declared_probes")
+        self.assertTrue(coverage["complete"])
+
+    def test_conclusion_gaps_are_grouped_by_reason_and_symbol_kind(self):
+        groups = realreg.group_conclusion_gaps({
+            "not_analyzed_apis": [
+                {"api": "a.A.one", "reason_code": "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", "symbol_kind": "method"},
+                {"api": "a.A.two", "reason_code": "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", "symbol_kind": "method"},
+                {"api": "a.B.B", "reason_code": "OVERLOAD_AMBIGUOUS_TARGET", "symbol_kind": "constructor"},
+            ]
+        })
+
+        self.assertEqual([(item["reason_code"], item["symbol_kind"], item["count"]) for item in groups], [
+            ("OVERLOAD_AMBIGUOUS_TARGET", "constructor", 1),
+            ("RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", "method", 2),
+        ])
+        self.assertEqual(groups[1]["sample_symbols"], ["a.A.one", "a.A.two"])
+
+    def test_status_reflects_blocking_signals_and_unreviewed_discovery(self):
+        blocking = [{"blocking": True, "signal_type": "conclusion_gap"}]
+
+        self.assertEqual(realreg.derive_case_status(True, blocking, "reviewed"), "failed")
+        self.assertEqual(realreg.derive_case_status(False, [], "reviewed"), "skipped")
+        self.assertEqual(realreg.derive_case_status(True, [], "unreviewed"), "observed")
+        self.assertEqual(realreg.derive_case_status(True, [], "reviewed"), "passed")
+
+    def test_performance_envelope_normalizes_candidate_pairs(self):
+        envelope = realreg.collect_performance_envelope(
+            {"meta": {"graph_stats": {"step5_perf": {"main": {
+                "indirect_usage_potential_legacy_method_target_pairs": 143240640,
+                "indirect_usage_owner_presence_scans": 8058,
+            }}}}},
+            elapsed=107.7,
+            selected=5440,
+        )
+
+        self.assertEqual(envelope["potential_method_target_pairs"], 143240640)
+        self.assertEqual(envelope["owner_presence_scans"], 8058)
+        self.assertAlmostEqual(envelope["potential_pairs_per_api"], 143240640 / 5440)
+        self.assertAlmostEqual(envelope["elapsed_seconds_per_1000_apis"], 107.7 / 5.44)
+
+    def test_quality_signals_separate_not_analyzed_reason_groups(self):
+        case = realreg.RealProjectCase("dubbo", Path("."), Path(""), ())
+        summary = {
+            "not_analyzed": 3,
+            "not_analyzed_apis": [
+                {"api": "a.A.one", "reason_code": "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", "symbol_kind": "method"},
+                {"api": "a.A.two", "reason_code": "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", "symbol_kind": "method"},
+                {"api": "a.B.B", "reason_code": "OVERLOAD_AMBIGUOUS_TARGET", "symbol_kind": "constructor"},
+            ],
+        }
+
+        signals = realreg.build_quality_signals(
+            case,
+            summary=summary,
+            checks=[],
+            failures=[],
+            result_audit={},
+            report_dir=Path("/tmp/report"),
+        )
+
+        gaps = [item for item in signals if item["signal_type"] == "conclusion_gap"]
+        self.assertEqual(len(gaps), 2)
+        self.assertEqual({item["reason_code"] for item in gaps}, {
+            "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", "OVERLOAD_AMBIGUOUS_TARGET"
+        })
+
+    def test_policy_signals_gate_discovery_coverage_ground_truth_and_performance(self):
+        case = realreg.RealProjectCase(
+            "dubbo", Path("."), Path(""), (), case_mode="discovery",
+            ground_truth_status="unreviewed", max_potential_pairs_per_api=100.0,
+        )
+        signals = realreg.build_policy_signals(
+            case,
+            coverage=realreg.compute_api_coverage("discovery", 5440, 9, 9),
+            performance={"potential_pairs_per_api": 200.0},
+            report_dir=Path("/tmp/report"),
+        )
+
+        self.assertEqual({item["signal_type"] for item in signals}, {
+            "coverage_gap", "ground_truth_insufficient", "performance_regression"
+        })
+        self.assertTrue(all(item["blocking"] for item in signals))
+
     def _write_readable_alerts(self, path, symbol, evidence_file, signature="(String)", path_status="reachable"):
         path.parent.mkdir(parents=True, exist_ok=True)
         fields = [

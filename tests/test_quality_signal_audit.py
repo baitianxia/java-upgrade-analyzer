@@ -62,6 +62,21 @@ class QualitySignalAuditTest(unittest.TestCase):
         self.assertEqual(signal.signal_type, "project_asset_invalid")
         self.assertTrue(signal.blocking)
 
+    def test_normalize_preserves_grouped_conclusion_dimensions(self):
+        signal = quality_signal_audit.normalize_signal({
+            "signal_type": "conclusion_gap",
+            "severity": "P1",
+            "case": "dubbo",
+            "reason_code": "OVERLOAD_AMBIGUOUS_TARGET",
+            "symbol_kind": "constructor",
+            "sample_symbols": ["a.A.A", "b.B.B"],
+        })
+
+        self.assertEqual(signal.reason_code, "OVERLOAD_AMBIGUOUS_TARGET")
+        self.assertEqual(signal.symbol_kind, "constructor")
+        self.assertEqual(signal.sample_symbols, ("a.A.A", "b.B.B"))
+        self.assertTrue(signal.blocking)
+
     def test_audit_accepts_explicit_quality_signals_from_real_project_payload(self):
         payload = {
             "results": [
@@ -135,6 +150,14 @@ class QualitySignalAuditTest(unittest.TestCase):
         signals = quality_signal_audit.audit_real_project_payload(payload)
 
         self.assertEqual([signal.signal_type for signal in signals], ["project_asset_invalid"])
+
+    def test_audit_blocks_observed_result_without_explicit_signal(self):
+        signals = quality_signal_audit.audit_real_project_payload({
+            "results": [{"case": "dubbo", "status": "observed", "quality_signals": []}]
+        })
+
+        self.assertEqual([signal.signal_type for signal in signals], ["ground_truth_insufficient"])
+        self.assertTrue(signals[0].blocking)
 
     def test_audit_flags_non_gating_production_misses_and_not_analyzed(self):
         payload = {

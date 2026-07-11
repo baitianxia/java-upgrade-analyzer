@@ -68,6 +68,9 @@ class RealProjectCase:
     min_project_java_files: int = 0
     min_main_java_files: int = 0
     max_generated_java_ratio: float = 0.0
+    case_mode: str = "guard"
+    ground_truth_status: str = "reviewed"
+    max_potential_pairs_per_api: float = 0.0
 
 
 CASES = {
@@ -457,6 +460,9 @@ CASES = {
         min_project_java_files=500,
         min_main_java_files=300,
         max_generated_java_ratio=0.5,
+        case_mode="discovery",
+        ground_truth_status="unreviewed",
+        max_potential_pairs_per_api=30000.0,
     ),
     "commons-lang": RealProjectCase(
         name="commons-lang",
@@ -786,6 +792,72 @@ def extract_graph_stats(summary: dict) -> dict:
     }
 
 
+def compute_api_coverage(case_mode: str, population: int, selected: int, output_total: int) -> dict:
+    population = int(population or 0)
+    selected = int(selected or 0)
+    output_total = int(output_total or 0)
+    full_scope = case_mode in {"discovery", "convergence"}
+    ratio = selected / population if population else (1.0 if selected == 0 else 0.0)
+    return {
+        "case_mode": case_mode,
+        "coverage_scope": "full" if full_scope else "declared_probes",
+        "api_population": population,
+        "apis_selected": selected,
+        "apis_accounted": output_total,
+        "coverage_ratio": ratio,
+        "complete": output_total == selected and (not full_scope or ratio == 1.0),
+    }
+
+
+def group_conclusion_gaps(summary: dict) -> list[dict]:
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for item in summary.get("not_analyzed_apis") or []:
+        reason_code = str(item.get("reason_code") or "UNKNOWN")
+        symbol_kind = str(item.get("symbol_kind") or "unknown")
+        symbol = str(item.get("api") or item.get("api_name") or "")
+        grouped.setdefault((reason_code, symbol_kind), []).append(symbol)
+    return [
+        {
+            "reason_code": reason_code,
+            "symbol_kind": symbol_kind,
+            "count": len(symbols),
+            "sample_symbols": sorted(set(symbols))[:5],
+        }
+        for (reason_code, symbol_kind), symbols in sorted(grouped.items())
+    ]
+
+
+def derive_case_status(executed: bool, signals: list[dict], ground_truth_status: str) -> str:
+    if not executed:
+        return "skipped"
+    semantic_blockers = [
+        signal for signal in signals
+        if signal.get("blocking") and signal.get("signal_type") != "ground_truth_insufficient"
+    ]
+    if semantic_blockers:
+        return "failed"
+    if ground_truth_status != "reviewed":
+        return "observed"
+    return "passed"
+
+
+def collect_performance_envelope(summary: dict, elapsed: float, selected: int) -> dict:
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    graph_stats = meta.get("graph_stats") if isinstance(meta.get("graph_stats"), dict) else {}
+    step5_perf = graph_stats.get("step5_perf") if isinstance(graph_stats.get("step5_perf"), dict) else {}
+    perf_main = step5_perf.get("main") if isinstance(step5_perf.get("main"), dict) else {}
+    pairs = int(perf_main.get("indirect_usage_potential_legacy_method_target_pairs") or 0)
+    owner_scans = int(perf_main.get("indirect_usage_owner_presence_scans") or 0)
+    selected = int(selected or 0)
+    return {
+        "elapsed_seconds": float(elapsed or 0.0),
+        "elapsed_seconds_per_1000_apis": float(elapsed or 0.0) / (selected / 1000.0) if selected else 0.0,
+        "potential_method_target_pairs": pairs,
+        "potential_pairs_per_api": pairs / selected if selected else 0.0,
+        "owner_presence_scans": owner_scans,
+    }
+
+
 def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_path: Path | None = None) -> Path:
     if case.prefer_embedded_changed_api_rows and case.changed_api_rows:
         changed_apis = materialized_path or changed_apis
@@ -1072,6 +1144,9 @@ def make_signal(
     fixture_status: str = "missing",
     notes: str = "",
     blocking: bool | None = None,
+    reason_code: str = "",
+    symbol_kind: str = "",
+    sample_symbols: Iterable[str] = (),
 ) -> dict:
     if blocking is None:
         blocking = severity in {"P0", "P1"} and signal_type in {
@@ -1080,6 +1155,10 @@ def make_signal(
             "evidence_weakness",
             "performance_regression",
             "project_asset_invalid",
+            "coverage_gap",
+            "test_configuration_failure",
+            "ground_truth_insufficient",
+            "conclusion_gap",
         }
     return {
         "signal_type": signal_type,
@@ -1095,7 +1174,52 @@ def make_signal(
         "evidence": [str(item) for item in evidence],
         "fixture_status": fixture_status,
         "notes": notes,
+        "reason_code": reason_code,
+        "symbol_kind": symbol_kind,
+        "sample_symbols": [str(item) for item in sample_symbols],
     }
+
+
+def build_policy_signals(
+    case: RealProjectCase,
+    *,
+    coverage: dict,
+    performance: dict,
+    report_dir: Path,
+) -> list[dict]:
+    signals: list[dict] = []
+    if not coverage.get("complete"):
+        signals.append(make_signal(
+            "coverage_gap", "P1", case.name, step="step5",
+            message=(
+                f"API coverage incomplete: selected={coverage.get('apis_selected')} "
+                f"population={coverage.get('api_population')} accounted={coverage.get('apis_accounted')}"
+            ),
+            expected="discovery and convergence cases analyze the complete Step4 API population",
+            actual=json.dumps(coverage, sort_keys=True),
+            evidence=[report_dir / "evidence" / "api_changes" / "all_changed_apis.csv"],
+        ))
+    if case.case_mode in {"discovery", "convergence"} and case.ground_truth_status != "reviewed":
+        signals.append(make_signal(
+            "ground_truth_insufficient", "P1", case.name, step="step5",
+            message="discovery result has no reviewed ground-truth manifest",
+            expected="reviewed deterministic stratified ground truth",
+            actual=case.ground_truth_status,
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+        ))
+    pairs_per_api = float(performance.get("potential_pairs_per_api") or 0.0)
+    if case.max_potential_pairs_per_api and pairs_per_api > case.max_potential_pairs_per_api:
+        signals.append(make_signal(
+            "performance_regression", "P1", case.name, step="step5",
+            message=(
+                f"potential_pairs_per_api={pairs_per_api:.2f} "
+                f"over_budget={case.max_potential_pairs_per_api:.2f}"
+            ),
+            expected="normalized candidate-pair metric stays within budget",
+            actual=str(pairs_per_api),
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+        ))
+    return signals
 
 
 def build_quality_signals(
@@ -1108,9 +1232,28 @@ def build_quality_signals(
     report_dir: Path,
 ) -> list[dict]:
     signals: list[dict] = []
+    conclusion_groups = group_conclusion_gaps(summary)
+    for group in conclusion_groups:
+        signals.append(make_signal(
+            "conclusion_gap",
+            "P1",
+            case.name,
+            step="step5",
+            message=(
+                f"{case.name} has {group['count']} not_analyzed {group['symbol_kind']} item(s): "
+                f"{group['reason_code']}"
+            ),
+            count=group["count"],
+            expected="every selected P0/P1 API has a reviewable conclusion",
+            actual="not_analyzed",
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+            reason_code=group["reason_code"],
+            symbol_kind=group["symbol_kind"],
+            sample_symbols=group["sample_symbols"],
+        ))
     for field in ("not_analyzed", "not_found_in_static_analysis"):
         count = int(summary.get(field) or 0)
-        if count:
+        if count and not (field == "not_analyzed" and conclusion_groups):
             signals.append(make_signal(
                 "capability_gap",
                 "P1",
@@ -1497,9 +1640,18 @@ def run_case(
         if owner and owner not in output:
             failures.append(f"query_missing_method:{method}")
 
-    status = "passed" if returncode == 0 and not failures else "failed"
     if returncode != 0:
         failures.append(f"step5_returncode={returncode}")
+    _, selected_rows = _csv_rows(changed_apis)
+    selected_count = len(selected_rows)
+    population_count = int(step4_selection.get("total_rows") or selected_count)
+    coverage = compute_api_coverage(
+        case.case_mode,
+        population_count,
+        selected_count,
+        int(summary.get("total_apis") or 0),
+    )
+    performance_envelope = collect_performance_envelope(summary, elapsed, selected_count)
     quality_signals = build_quality_signals(
         case,
         summary=summary,
@@ -1508,6 +1660,21 @@ def run_case(
         result_audit=result_audit,
         report_dir=report_dir,
     )
+    quality_signals.extend(build_policy_signals(
+        case,
+        coverage=coverage,
+        performance=performance_envelope,
+        report_dir=report_dir,
+    ))
+    if failures and not any(item.get("blocking") for item in quality_signals):
+        quality_signals.append(make_signal(
+            "correctness_failure", "P1", case.name,
+            message="; ".join(str(item) for item in failures[:10]),
+            expected="real project runner completes without gating failures",
+            actual="runner failures present",
+            evidence=[report_dir],
+        ))
+    status = derive_case_status(returncode == 0, quality_signals, case.ground_truth_status)
 
     return {
         "case": case.name,
@@ -1517,6 +1684,9 @@ def run_case(
         "report_dir": str(report_dir),
         "elapsed_seconds": round(elapsed, 2),
         "performance_budget_seconds": performance_budget,
+        "performance_envelope": performance_envelope,
+        "ground_truth_status": case.ground_truth_status,
+        **coverage,
         "step4": step4_result,
         "step4_selection": step4_selection,
         "step5_returncode": returncode,
