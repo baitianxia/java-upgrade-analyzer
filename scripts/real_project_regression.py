@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -565,6 +565,24 @@ CASES = {
         ),
     ),
 }
+
+CASES["dubbo-samples"] = replace(
+    CASES["dubbo"],
+    name="dubbo-samples",
+    default_project=Path("/private/tmp/jua-real-project-dubbo-samples-retry"),
+    baseline_specs=(),
+    source_shape_patterns={},
+    min_source_shape_files={},
+    min_methods_indexed=500,
+    min_reverse_edges_indexed=1000,
+    max_elapsed_seconds=180.0,
+    max_full_step4_api_elapsed_seconds=300.0,
+    expected_report_texts=("org.apache.dubbo",),
+    query_methods=(),
+    min_project_java_files=1000,
+    min_main_java_files=900,
+    max_generated_java_ratio=0.1,
+)
 
 
 def is_test_source(path: Path) -> bool:

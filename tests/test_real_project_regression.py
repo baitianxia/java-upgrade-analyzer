@@ -14,6 +14,15 @@ import real_project_regression as realreg  # noqa: E402
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_dubbo_samples_is_a_separate_full_discovery_consumer_case(self):
+        case = realreg.CASES["dubbo-samples"]
+
+        self.assertEqual(case.case_mode, "discovery")
+        self.assertTrue(case.run_step4)
+        self.assertTrue(case.enable_jdk_oracle)
+        self.assertIn("dubbo-samples", str(case.default_project))
+        self.assertEqual(case.baseline_specs, ())
+
     def test_discovery_coverage_requires_full_step4_population(self):
         coverage = realreg.compute_api_coverage("discovery", 5440, 9, 9)
 
