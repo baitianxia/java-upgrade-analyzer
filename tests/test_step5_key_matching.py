@@ -381,6 +381,170 @@ class Step5KeyMatchingTest(unittest.TestCase):
             allow_degraded=True,
         )
 
+    def _same_coordinate_bytecode_fixture(self, tmp, include_executable_call=True):
+        src = Path(tmp) / "src"
+        target = src / "com/vendor/Target.java"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "package com.vendor; public class Target { "
+            "public static String removed(String value) { return value; } }",
+            encoding="utf-8",
+        )
+        java_files = [target]
+        if include_executable_call:
+            bridge = src / "com/vendor/InternalBridge.java"
+            bridge.write_text(
+                "package com.vendor; public class InternalBridge { "
+                "public String use(String value) { return Target.removed(value); } }",
+                encoding="utf-8",
+            )
+            java_files.append(bridge)
+        classes = self._compile_java_files(Path(tmp) / "classes", java_files)
+        jar_path = Path(tmp) / "target.jar"
+        self._jar_compiled_classes(jar_path, classes)
+        api_row = {
+            "coord": "com.vendor:target",
+            "api_name": "com.vendor.Target.removed",
+            "api_simple": "removed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+        }
+        return api_row, jar_path
+
+    def test_same_coordinate_single_scan_retains_internal_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={"force_javap_path": []},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+
+            with patch.object(tracer, "_build_packaged_runtime_dependency_scan_cache", return_value={}):
+                scan = tracer._scan_packaged_runtime_dependencies_for_api(api_row, graph)
+
+        self.assertEqual(scan["status"], "hit")
+        bridge = next(hit for hit in scan["hits"] if hit["class_fqcn"] == "com.vendor.InternalBridge")
+        self.assertEqual(bridge["edge_role"], "internal_bridge")
+        self.assertFalse(bridge["direct_consumer"])
+
+    def test_same_coordinate_batch_fast_path_retains_internal_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+
+        scan = scans[tracer.build_api_identity_key(api_row)]
+        self.assertEqual(scan["status"], "hit")
+        bridge = next(hit for hit in scan["hits"] if hit["class_fqcn"] == "com.vendor.InternalBridge")
+        self.assertEqual(bridge["edge_role"], "internal_bridge")
+        self.assertFalse(bridge["direct_consumer"])
+
+    def test_same_coordinate_batch_javap_retains_internal_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={"force_javap_path": []},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+
+        scan = scans[tracer.build_api_identity_key(api_row)]
+        self.assertEqual(scan["status"], "hit")
+        bridge = next(hit for hit in scan["hits"] if hit["class_fqcn"] == "com.vendor.InternalBridge")
+        self.assertEqual(bridge["edge_role"], "internal_bridge")
+        self.assertFalse(bridge["direct_consumer"])
+
+    def test_same_coordinate_declaration_only_is_not_an_executable_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(
+                tmp, include_executable_call=False
+            )
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+
+        self.assertEqual(scans[tracer.build_api_identity_key(api_row)]["status"], "miss")
+
+    def test_same_coordinate_internal_bridge_without_business_entry_is_not_reachable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+
+            result = self._trace_packaged_fixture(api_row, graph)
+            scan = graph.runtime_dependency_catalog["_packaged_api_scan_results"][
+                tracer.build_api_identity_key(api_row)
+            ]
+
+        self.assertTrue(all(hit["edge_role"] == "internal_bridge" for hit in scan["hits"]))
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertIsNone(result.is_reachable)
+        self.assertEqual(result.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+
+    def test_internal_bridge_hit_cannot_establish_removed_dependency_impact_without_business_entry(self):
+        api_row = {
+            "coord": "com.vendor:target",
+            "new_version": "-",
+            "api_name": "com.vendor.Target.removed",
+            "api_simple": "removed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+        }
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+        base_hit = {
+            "coord": "com.vendor:target",
+            "class_fqcn": "com.vendor.InternalBridge",
+            "consumer_method": "use",
+            "consumer_signature": "(String)",
+            "target_display": "com.vendor.Target.removed(String)",
+            "jar_path": "/tmp/target.jar",
+            "evidence_type": "bytecode_method_invocation",
+        }
+
+        results = {}
+        for role, direct_consumer in (
+            ("external_consumer", True),
+            ("internal_bridge", False),
+        ):
+            scan = {
+                "status": "hit",
+                "hits": [{**base_hit, "edge_role": role, "direct_consumer": direct_consumer}],
+            }
+            with patch.object(tracer, "_scan_packaged_runtime_dependencies_for_api", return_value=scan):
+                results[role] = self._trace_packaged_fixture(api_row, graph)
+
+        self.assertEqual(
+            results["external_consumer"].reason_code,
+            "RUNTIME_DEPENDENCY_USES_REMOVED_API",
+        )
+        internal = results["internal_bridge"]
+        self.assertEqual(internal.analysis_status, "uncertain")
+        self.assertIsNone(internal.is_reachable)
+        self.assertEqual(internal.reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+        self.assertIn("com.vendor.InternalBridge.use(String)", internal.call_paths[0])
+        self.assertEqual(internal.evidence_paths[0][0]["edge_role"], "internal_bridge")
+
     def test_runtime_dependency_caller_candidate_scan_is_reused_for_signature_variants(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "src"

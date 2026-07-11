@@ -1582,8 +1582,7 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     allow_constant_pool_fast_path = not bool(getattr(graph, 'reverse_edges', {}) or {})
     for item in catalog_entries:
         coord = str(item.get('coord') or '').strip()
-        if coord == str(api_row.get('coord') or '').strip():
-            continue
+        same_coord = coord == str(api_row.get('coord') or '').strip()
         jar_path = str(item.get('jar_path') or '').strip()
         if not jar_path or not os.path.exists(jar_path):
             scan_failures.append({
@@ -1630,6 +1629,8 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                             for matched in constant_pool_matches:
                                 hits.append({
                                     'coord': coord,
+                                    'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
+                                    'direct_consumer': not same_coord,
                                     'jar_path': jar_path,
                                     'class_fqcn': class_binary_name.replace('$', '.'),
                                     'consumer_method': matched.get('consumer_method') or '<unknown>',
@@ -1658,6 +1659,8 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                     for matched in matches:
                         hits.append({
                             'coord': coord,
+                            'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
+                            'direct_consumer': not same_coord,
                             'jar_path': jar_path,
                             'class_fqcn': class_binary_name.replace('$', '.'),
                             'consumer_method': matched.get('consumer_method') or '<unknown>',
@@ -1908,8 +1911,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         constant_pool_matched_any = False
                         for owner in set(candidate_owners):
                             for api_row in target_rows_by_owner.get(owner, []):
-                                if coord == str(api_row.get('coord') or '').strip():
-                                    continue
+                                same_coord = coord == str(api_row.get('coord') or '').strip()
                                 matches = _match_runtime_dependency_references_from_constant_pool(
                                     api_row, summary, class_binary_name
                                 )
@@ -1922,6 +1924,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                                     jar_constant_pool_hits += 1
                                     hits_by_key[key].append({
                                         'coord': coord,
+                                        'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
+                                        'direct_consumer': not same_coord,
                                         'jar_path': jar_path,
                                         'class_fqcn': class_binary_name.replace('$', '.'),
                                         'consumer_method': matched.get('consumer_method') or '<unknown>',
@@ -2024,8 +2028,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             )
             for owner in set(candidate_owners) & {item for item in referenced_owners if item}:
                 for api_row in target_rows_by_owner.get(owner, []):
-                    if coord == str(api_row.get('coord') or '').strip():
-                        continue
+                    same_coord = coord == str(api_row.get('coord') or '').strip()
                     matches = _match_runtime_dependency_references(api_row, references)
                     if not matches:
                         continue
@@ -2033,6 +2036,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     for matched in matches:
                         hits_by_key[key].append({
                             'coord': coord,
+                            'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
+                            'direct_consumer': not same_coord,
                             'jar_path': jar_path,
                             'class_fqcn': task.get('class_fqcn') or class_binary_name.replace('$', '.'),
                             'consumer_method': matched.get('consumer_method') or '<unknown>',
@@ -2855,6 +2860,31 @@ def _packaged_hit_runtime_framework_entry(hit, graph):
     return (method, entries) if entries else (None, [])
 
 
+def _packaged_hit_is_external_consumer(hit):
+    role = str((hit or {}).get('edge_role') or '').strip()
+    if role == 'internal_bridge':
+        return False
+    if role == 'external_consumer':
+        return True
+    if 'direct_consumer' in (hit or {}):
+        return bool(hit.get('direct_consumer'))
+    return True
+
+
+def _apply_removed_dependency_packaged_impact(result, hits):
+    has_direct_impact = result.is_reachable is True or any(
+        _packaged_hit_is_external_consumer(hit) for hit in hits or []
+    )
+    if not has_direct_impact:
+        return result
+    result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
+    result.reachable_note = (
+        '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
+        '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
+    )
+    return result
+
+
 def _build_packaged_dependency_hit_result(result, hits, graph=None):
     business_hits = [item for item in hits if item.get('coord') == '__business__']
     if graph is not None and len([item for item in hits if item.get('coord') != '__business__']) >= 8:
@@ -2921,6 +2951,8 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             'caller_symbol': consumer_display,
             'callee_key': hit.get('target_display'),
             'evidence_type': hit.get('evidence_type'),
+            'edge_role': hit.get('edge_role') or 'external_consumer',
+            'direct_consumer': _packaged_hit_is_external_consumer(hit),
             'confidence': 'high',
             'file': hit.get('jar_path', ''),
             'line': 0,
@@ -2939,6 +2971,8 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             'consumer_class': hit.get('class_fqcn', ''),
             'consumer_method': consumer_member,
             'consumer_signature': consumer_signature,
+            'edge_role': hit.get('edge_role') or 'external_consumer',
+            'direct_consumer': _packaged_hit_is_external_consumer(hit),
             'path_text': path_text,
             'confidence': 1.0,
             'depth': 1,
@@ -2992,6 +3026,8 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             'caller_symbol': consumer_display,
             'callee_key': target_display,
             'evidence_type': hit.get('evidence_type'),
+            'edge_role': hit.get('edge_role') or 'external_consumer',
+            'direct_consumer': _packaged_hit_is_external_consumer(hit),
             'confidence': 'high',
             'file': hit.get('jar_path', ''),
             'line': 0,
@@ -3010,6 +3046,8 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             'consumer_class': hit.get('class_fqcn', ''),
             'consumer_method': consumer_member,
             'consumer_signature': consumer_signature,
+            'edge_role': hit.get('edge_role') or 'external_consumer',
+            'direct_consumer': _packaged_hit_is_external_consumer(hit),
             'path_text': path_text,
             'confidence': 1.0,
             'depth': len(evidence),
@@ -3670,6 +3708,8 @@ def trace_api_with_confidence_weighting(
                     'caller_symbol': consumer_display,
                     'callee_key': hit.get('target_display'),
                     'evidence_type': hit.get('evidence_type'),
+                    'edge_role': hit.get('edge_role') or 'external_consumer',
+                    'direct_consumer': _packaged_hit_is_external_consumer(hit),
                     'confidence': 'high',
                     'file': hit.get('jar_path', ''),
                     'line': 0,
@@ -3821,10 +3861,9 @@ def trace_api_with_confidence_weighting(
                 graph,
             )
             if dependency_removed:
-                packaged_dependency_result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
-                packaged_dependency_result.reachable_note = (
-                    '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
-                    '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
+                _apply_removed_dependency_packaged_impact(
+                    packaged_dependency_result,
+                    artifact_dependency_hits,
                 )
             _debug_trace_result(
                 'trace_api_result',
@@ -4311,10 +4350,9 @@ def trace_api_with_confidence_weighting(
     if artifact_dependency_hits:
         packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits, graph)
         if dependency_removed:
-            packaged_dependency_result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
-            packaged_dependency_result.reachable_note = (
-                '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
-                '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
+            _apply_removed_dependency_packaged_impact(
+                packaged_dependency_result,
+                artifact_dependency_hits,
             )
         _debug_trace_result('trace_api_result', packaged_dependency_result, candidate_counts={
             'reachable': len(reachable_candidates),
