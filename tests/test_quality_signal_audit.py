@@ -87,6 +87,32 @@ class QualitySignalAuditTest(unittest.TestCase):
         self.assertEqual(signals[0].signal_type, "evidence_weakness")
         self.assertFalse(signals[0].blocking)
 
+    def test_audit_does_not_duplicate_legacy_summary_when_explicit_signals_exist(self):
+        payload = {
+            "results": [
+                {
+                    "case": "dubbo",
+                    "status": "passed",
+                    "summary": {"not_analyzed": 1},
+                    "quality_signals": [
+                        {
+                            "signal_type": "capability_gap",
+                            "severity": "P1",
+                            "blocking": True,
+                            "step": "step5",
+                            "message": "dubbo summary has 1 not_analyzed item(s)",
+                            "count": 1,
+                        }
+                    ],
+                }
+            ]
+        }
+
+        signals = quality_signal_audit.audit_real_project_payload(payload)
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0].signal_type, "capability_gap")
+
     def test_audit_does_not_add_generic_skip_when_runner_emits_specific_signal(self):
         payload = {
             "results": [

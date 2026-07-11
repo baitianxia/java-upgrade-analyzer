@@ -132,6 +132,8 @@ def audit_real_project_payload(payload: dict) -> list[QualitySignal]:
                     })
                 )
             continue
+        if explicit_signal_count:
+            continue
 
         summary = result.get("summary") or {}
         for field in ("uncertain", "not_analyzed", "not_found_in_static_analysis"):
