@@ -1,0 +1,102 @@
+{
+  "stable_topology_ids": [
+    "business_direct",
+    "same_jar_bridge",
+    "cross_jar_bridge",
+    "business_to_same_jar_bridge",
+    "business_to_cross_jar_bridge",
+    "same_coord_multimodule",
+    "overloaded_method",
+    "constructor",
+    "interface_dispatch",
+    "virtual_dispatch",
+    "static_dispatch",
+    "field_access",
+    "invokedynamic",
+    "reflection",
+    "spi",
+    "framework_proxy",
+    "source_bytecode_agree",
+    "source_bytecode_true_conflict"
+  ],
+  "entry_layout": [
+    {"prefix": "BOOT-INF/classes/", "role": "business", "coordinate": "topology:app", "module": "app"},
+    {"prefix": "BOOT-INF/lib/target.jar!/", "role": "target", "coordinate": "topology:library", "module": "target"},
+    {"prefix": "BOOT-INF/lib/samecoord.jar!/", "role": "dependency", "coordinate": "topology:library", "module": "samecoord"},
+    {"prefix": "BOOT-INF/lib/crossjar.jar!/", "role": "dependency", "coordinate": "topology:crossjar", "module": "crossjar"}
+  ],
+  "target_apis": [
+    {"owner": "topology.target.TargetApi", "member": "changed", "descriptor": "()V"},
+    {"owner": "topology.target.TargetApi", "member": "overloaded", "descriptor": "(Ljava/lang/String;)V"},
+    {"owner": "topology.target.TargetApi", "member": "overloaded", "descriptor": "(I)V"},
+    {"owner": "topology.target.TargetApi", "member": "<init>", "descriptor": "()V"},
+    {"owner": "topology.target.TargetApi", "member": "virtualCall", "descriptor": "()V"},
+    {"owner": "topology.target.TargetInterface", "member": "interfaceCall", "descriptor": "()V"},
+    {"owner": "topology.target.TargetApi", "member": "value", "descriptor": "I"}
+  ],
+  "hierarchy_evidence": [
+    {"owner": "topology.target.TargetApi", "runtime_family": ["topology.target.TargetApi"]}
+  ],
+  "source_edges": [
+    {
+      "caller_owner": "topology.business.App",
+      "caller_member": "run",
+      "caller_descriptor": "(Ltopology/target/TargetApi;Ltopology/target/TargetInterface;)V",
+      "callee_owner": "topology.target.TargetApi",
+      "callee_member": "changed",
+      "callee_descriptor": "()V",
+      "opcode_family": "invokestatic"
+    }
+  ],
+  "source_conflicts": [
+    {
+      "source_edge": {
+        "caller_owner": "topology.business.ConflictCaller",
+        "caller_member": "conflict",
+        "caller_descriptor": "()V",
+        "callee_owner": "topology.target.TargetApi",
+        "callee_member": "overloaded",
+        "callee_descriptor": "(Ljava/lang/String;)V",
+        "opcode_family": "invokestatic"
+      },
+      "bytecode_edge": {
+        "caller_owner": "topology.business.ConflictCaller",
+        "caller_member": "conflict",
+        "caller_descriptor": "()V",
+        "callee_owner": "topology.target.TargetApi",
+        "callee_member": "overloaded",
+        "callee_descriptor": "(I)V",
+        "opcode_family": "invokestatic"
+      },
+      "normalization_checked": true
+    }
+  ],
+  "registrations": [
+    {
+      "kind": "reflection",
+      "authority": "packaged_registration",
+      "resource": "META-INF/jua/authoritative-reflection-registration.json",
+      "target": "topology.target.TargetApi.changed()V"
+    },
+    {
+      "kind": "spi",
+      "authority": "service_provider_configuration",
+      "resource": "META-INF/services/topology.spi.TopologyService",
+      "contract": "topology.spi.TopologyService",
+      "provider": "topology.target.TopologyProvider"
+    },
+    {
+      "kind": "framework_proxy",
+      "authority": "packaged_registration",
+      "resource": "META-INF/jua/authoritative-framework-proxy-registration.json",
+      "contract": "topology.proxy.ProxyContract",
+      "target": "topology.target.TargetApi.changed()V"
+    }
+  ],
+  "expected_edges": [
+    {"caller_owner": "topology.business.App", "caller_member": "run", "callee_owner": "topology.target.TargetApi", "callee_member": "changed", "callee_descriptor": "()V", "opcode_family": "invokestatic"},
+    {"caller_owner": "topology.target.SameJarBridge", "caller_member": "bridge", "callee_owner": "topology.target.TargetApi", "callee_member": "changed", "callee_descriptor": "()V", "opcode_family": "invokestatic"},
+    {"caller_owner": "topology.samecoord.SameCoordinateBridge", "caller_member": "bridge", "callee_owner": "topology.target.TargetApi", "callee_member": "changed", "callee_descriptor": "()V", "opcode_family": "invokestatic"},
+    {"caller_owner": "topology.crossjar.CrossJarBridge", "caller_member": "bridge", "callee_owner": "topology.target.TargetApi", "callee_member": "changed", "callee_descriptor": "()V", "opcode_family": "invokestatic"}
+  ]
+}

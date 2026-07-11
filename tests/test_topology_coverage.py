@@ -1,0 +1,612 @@
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+FIXTURE = ROOT / "tests" / "fixtures" / "topologies"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import final_artifact_edge_oracle as oracle  # noqa: E402
+import topology_coverage  # noqa: E402
+
+
+JDK_TOOLS = shutil.which("javac") and shutil.which("javap") and shutil.which("java")
+
+
+def _compile(output: Path, sources: list[Path], classpath: list[Path] | None = None) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    command = ["javac", "-d", str(output)]
+    if classpath:
+        command.extend(["-classpath", ":".join(str(item) for item in classpath)])
+    command.extend(str(item) for item in sources)
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+
+def _jar_classes(path: Path, classes: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for class_file in sorted(classes.rglob("*.class")):
+            archive.write(class_file, class_file.relative_to(classes).as_posix())
+
+
+@unittest.skipUnless(JDK_TOOLS, "JDK tools required")
+class TopologyCoverageTest(unittest.TestCase):
+    def _build_fixture(
+        self,
+        root: Path,
+        *,
+        reflection_resource: str = "META-INF/jua/authoritative-reflection-registration.json",
+        proxy_resource: str = "META-INF/jua/authoritative-framework-proxy-registration.json",
+    ) -> tuple[Path, dict]:
+        source_root = FIXTURE / "src"
+        business_sources = sorted((source_root / "business").rglob("*.java"))
+        bytecode_sources = sorted((source_root / "bytecode").rglob("*.java"))
+        target_sources = sorted((source_root / "target").rglob("*.java"))
+        samecoord_sources = sorted((source_root / "samecoord").rglob("*.java"))
+        crossjar_sources = sorted((source_root / "crossjar").rglob("*.java"))
+
+        contracts = root / "contracts"
+        _compile(
+            contracts,
+            [item for item in business_sources if {"proxy", "spi"} & set(item.parts)],
+        )
+        target_classes = root / "target-classes"
+        _compile(target_classes, target_sources, [contracts])
+        shutil.copytree(contracts, target_classes, dirs_exist_ok=True)
+        target_jar = root / "target.jar"
+        _jar_classes(target_jar, target_classes)
+
+        samecoord_classes = root / "samecoord-classes"
+        _compile(samecoord_classes, samecoord_sources, [target_jar])
+        samecoord_jar = root / "samecoord.jar"
+        _jar_classes(samecoord_jar, samecoord_classes)
+
+        crossjar_classes = root / "crossjar-classes"
+        _compile(crossjar_classes, crossjar_sources, [target_jar])
+        crossjar_jar = root / "crossjar.jar"
+        _jar_classes(crossjar_jar, crossjar_classes)
+
+        business_classes = root / "business-classes"
+        _compile(business_classes, business_sources, [target_jar, samecoord_jar, crossjar_jar])
+        _compile(business_classes, bytecode_sources, [target_jar, samecoord_jar, crossjar_jar])
+        artifact = root / "topologies.jar"
+        reflection_registration = json.dumps({
+            "authority": "fixture-reflection-registry",
+            "authority_version": "1",
+            "procedure": "validated packaged reflection registration",
+            "target": "topology.target.TargetApi.changed()V",
+            "runtime_registration": {"target": "topology.target.TargetApi.changed()V", "validated": True},
+        }).encode()
+        proxy_registration = json.dumps({
+            "authority": "fixture-proxy-registry",
+            "authority_version": "1",
+            "procedure": "validated target-specific proxy registration",
+            "contract": "topology.proxy.ProxyContract",
+            "target": "topology.target.TargetApi.changed()V",
+            "runtime_registration": {"target": "topology.target.TargetApi.changed()V", "validated": True},
+        }).encode()
+        with zipfile.ZipFile(artifact, "w") as archive:
+            archive.writestr(
+                "META-INF/MANIFEST.MF",
+                "Manifest-Version: 1.0\r\nMain-Class: topology.business.App\r\n\r\n",
+            )
+            for class_file in sorted(business_classes.rglob("*.class")):
+                relative = class_file.relative_to(business_classes).as_posix()
+                archive.write(class_file, relative)
+                archive.write(class_file, "BOOT-INF/classes/" + relative)
+            for classes in (target_classes, samecoord_classes, crossjar_classes):
+                for class_file in sorted(classes.rglob("*.class")):
+                    relative = class_file.relative_to(classes).as_posix()
+                    if not (business_classes / relative).exists():
+                        archive.write(class_file, relative)
+            archive.write(target_jar, "BOOT-INF/lib/target.jar")
+            archive.write(samecoord_jar, "BOOT-INF/lib/samecoord.jar")
+            archive.write(crossjar_jar, "BOOT-INF/lib/crossjar.jar")
+            archive.writestr(
+                "META-INF/services/topology.spi.TopologyService",
+                "topology.target.TopologyProvider\n"
+                "topology.business.UnrelatedProvider\n"
+                "topology.business.WrongContractProvider\n",
+            )
+            archive.writestr(reflection_resource, reflection_registration)
+            archive.writestr(proxy_resource, proxy_registration)
+
+        manifest = json.loads((FIXTURE / "manifest.json").read_text(encoding="utf-8"))
+        return artifact, manifest
+
+    def _source_attestation(self, root: Path, artifact: Path, expectations: dict) -> tuple[Path, Path]:
+        repository = root / "source-repository"
+        shutil.copytree(FIXTURE / "src", repository / "src")
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.email", "fixture@example.test"], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.name", "Topology Fixture"], check=True)
+        subprocess.run(["git", "-C", str(repository), "add", "src"], check=True)
+        subprocess.run(["git", "-C", str(repository), "commit", "-q", "-m", "fixture source"], check=True)
+        revision = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        tree = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, check=True).stdout.strip()
+        evidence_path = root / "source_edges.json"
+        evidence_path.write_text(json.dumps({
+            "source_edges": expectations["source_edges"],
+            "source_conflicts": [
+                {**item, "evidence_authority": "external_fixture_source_compiler"}
+                for item in expectations["source_conflicts"]
+            ],
+        }, sort_keys=True), encoding="utf-8")
+        attestation_path = root / "source_attestation.json"
+        attestation_path.write_text(json.dumps({
+            "authority": "external-fixture-source-attestor",
+            "authority_version": "1",
+            "procedure": "compile and enumerate exact source JVM descriptors",
+            "git_revision": revision,
+            "git_tree": tree,
+            "source_path": "src",
+            "source_tree_sha256": topology_coverage.compute_source_tree_sha256(repository / "src"),
+            "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+        }, sort_keys=True), encoding="utf-8")
+        return repository, attestation_path
+
+    def test_real_final_artifact_oracle_classifies_every_stable_topology(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            source_root, source_attestation = self._source_attestation(root, artifact, expectations)
+            scan = oracle.scan_final_artifact(artifact)
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+                source_root=source_root,
+                source_attestation=source_attestation,
+            )
+
+        self.assertTrue(scan["complete"], scan["failures"])
+        self.assertTrue(evidence["complete"], evidence["errors"])
+        for expected in expectations["expected_edges"]:
+            self.assertTrue(any(all(row.get(key) == value for key, value in expected.items()) for row in scan["edges"]), expected)
+        self.assertEqual(
+            topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"]),
+            set(expectations["stable_topology_ids"]),
+        )
+
+    def _selected_api_rows(self, expectations: dict) -> list[dict]:
+        rows = []
+        for target in expectations["target_apis"]:
+            descriptor = target["descriptor"]
+            signature = topology_coverage.descriptor_source_signature(descriptor)
+            rows.append({
+                "coord": "topology:library",
+                "api_name": f"{target['owner']}.{target['member']}",
+                "api_signature": signature,
+                "symbol_kind": "field" if not descriptor.startswith("(") else "method",
+            })
+        return rows
+
+    def test_fixture_is_an_executable_jar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, _layout = self._build_fixture(Path(temp_dir))
+            completed = subprocess.run(
+                ["java", "-jar", str(artifact)], capture_output=True, text=True, check=False
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_registration_topologies_require_explicit_packaged_authority(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, expectations = self._build_fixture(Path(temp_dir))
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+            )
+
+        layout = evidence["artifact_layout"]
+        layout["registrations"] = []
+        layout["reflection_target_links"] = []
+        observed = topology_coverage.classify_topologies(evidence["edges"], layout)
+
+        self.assertNotIn("reflection", observed)
+        self.assertNotIn("spi", observed)
+        self.assertNotIn("framework_proxy", observed)
+
+    def test_reflection_requires_authoritative_packaged_registration_tied_to_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            source_root, source_attestation = self._source_attestation(root, artifact, expectations)
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+                source_root=source_root,
+                source_attestation=source_attestation,
+            )
+
+        layout = evidence["artifact_layout"]
+        layout["registrations"] = [
+            item for item in layout["registrations"] if item.get("kind") != "reflection"
+        ]
+        observed = topology_coverage.classify_topologies(evidence["edges"], layout)
+
+        self.assertNotIn("reflection", observed)
+
+    def test_reflection_does_not_match_a_registered_overload_without_parameter_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, expectations = self._build_fixture(Path(temp_dir))
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+            )
+
+        layout = evidence["artifact_layout"]
+        layout["target_apis"].append({
+            "owner": "topology.target.TargetApi", "member": "changed",
+            "descriptor": "(Ljava/lang/String;)V", "coordinate": "topology:library",
+        })
+
+        self.assertNotIn(
+            "reflection",
+            topology_coverage.classify_topologies(evidence["edges"], layout),
+        )
+
+    def test_reflection_legacy_resource_and_dataflow_alone_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, expectations = self._build_fixture(
+                Path(temp_dir), reflection_resource="META-INF/jua/reflection.json"
+            )
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+            )
+
+        self.assertTrue(evidence["artifact_layout"]["reflection_target_links"])
+        self.assertFalse(any(
+            item.get("kind") == "reflection"
+            for item in evidence["artifact_layout"]["registrations"]
+        ))
+        self.assertNotIn(
+            "reflection",
+            topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"]),
+        )
+
+    def test_proxy_requires_versioned_procedure_and_target_runtime_registration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+            )
+
+        layout = evidence["artifact_layout"]
+        for item in layout["registrations"]:
+            if item.get("kind") == "framework_proxy":
+                item.pop("authority_version", None)
+                item.pop("procedure", None)
+                item.pop("runtime_registration", None)
+        observed = topology_coverage.classify_topologies(evidence["edges"], layout)
+
+        self.assertNotIn("framework_proxy", observed)
+
+    def test_arbitrary_legacy_proxy_resource_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, expectations = self._build_fixture(
+                Path(temp_dir), proxy_resource="META-INF/jua/proxy.json"
+            )
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+            )
+
+        self.assertFalse(any(
+            item.get("kind") == "framework_proxy"
+            for item in evidence["artifact_layout"]["registrations"]
+        ))
+        self.assertNotIn(
+            "framework_proxy",
+            topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"]),
+        )
+
+    def test_expectation_manifest_cannot_self_declare_authority(self):
+        expectations = json.loads((FIXTURE / "manifest.json").read_text(encoding="utf-8"))
+
+        observed = topology_coverage.classify_topologies([], expectations)
+
+        self.assertEqual(observed, set())
+
+    def test_unrelated_invokedynamic_bootstrap_does_not_cover_selected_target(self):
+        target = {
+            "owner": "topology.target.TargetApi", "member": "changed", "descriptor": "()V"
+        }
+        edges = [
+            {
+                "artifact_sha256": "a" * 64,
+                "artifact_entry": "BOOT-INF/classes/topology/business/App.class",
+                "caller_owner": "topology.business.App", "caller_member": "run", "caller_descriptor": "()V",
+                "callee_owner": "java.lang.invoke.LambdaMetafactory", "callee_member": "metafactory",
+                "callee_descriptor": "()V", "opcode_family": "invokedynamic", "authority": "jdk-javap",
+            }
+        ]
+        layout = {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [target],
+            "entry_layout": [{"prefix": "BOOT-INF/classes/", "role": "business"}],
+            "bootstrap_target_links": [],
+        }
+
+        self.assertNotIn("invokedynamic", topology_coverage.classify_topologies(edges, layout))
+
+    def test_extractor_excludes_unrelated_packaged_dynamic_reflection_and_spi_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, expectations = self._build_fixture(Path(temp_dir))
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+            )
+
+        unrelated_dynamic = "topology.business.UnrelatedDynamic"
+        unrelated_reflection = "topology.business.UnrelatedReflection"
+        unrelated_provider = "topology.business.UnrelatedProvider"
+        wrong_contract_provider = "topology.business.WrongContractProvider"
+        colocated_reflection = "topology.business.CoLocatedReflection"
+        adversarial_reflection = "topology.business.AdversarialReflection"
+        self.assertTrue(any(row["caller_owner"] == unrelated_dynamic and row["opcode_family"] == "invokedynamic" for row in evidence["edges"]))
+        self.assertTrue(any(row["caller_owner"] == unrelated_reflection and row["callee_member"] == "forName" for row in evidence["edges"]))
+        self.assertFalse(any(item.get("caller", [None])[0] in {unrelated_dynamic, unrelated_reflection} for item in evidence["artifact_layout"]["bootstrap_target_links"] + evidence["artifact_layout"]["reflection_target_links"]))
+        self.assertFalse(any(item.get("provider") == unrelated_provider for item in evidence["artifact_layout"]["registrations"]))
+        self.assertFalse(any(item.get("provider") == wrong_contract_provider for item in evidence["artifact_layout"]["registrations"]))
+        self.assertFalse(any(item.get("caller", [None])[0] == colocated_reflection for item in evidence["artifact_layout"]["reflection_target_links"]))
+        self.assertFalse(any(item.get("caller", [None])[0] == adversarial_reflection for item in evidence["artifact_layout"]["reflection_target_links"]))
+        provider_records = [item for item in evidence["artifact_layout"]["registrations"] if item.get("provider") == "topology.target.TopologyProvider"]
+        self.assertTrue(provider_records)
+        self.assertTrue(all(item["provider_entry"].startswith("BOOT-INF/lib/target.jar!/") for item in provider_records))
+        self.assertTrue(all(
+            topology_coverage._entry_scope(item["child_entry"]) == topology_coverage._entry_scope(item["parent_entry"])
+            for item in evidence["artifact_layout"]["hierarchy_evidence"]
+        ))
+
+    def test_missing_exact_coordinate_mapping_rejects_ambiguous_root_and_nested_targets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, expectations = self._build_fixture(Path(temp_dir))
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {},
+            )
+
+        self.assertFalse(evidence["complete"])
+        self.assertTrue(any("ambiguous target artifact entries" in item for item in evidence["errors"]))
+
+    def test_source_conflict_requires_verified_provenance_and_explicit_normalization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            source_root, source_attestation = self._source_attestation(root, artifact, expectations)
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+                source_root=source_root,
+                source_attestation=source_attestation,
+            )
+
+        layout = evidence["artifact_layout"]
+        layout["source_provenance"]["artifact_sha256"] = "0" * 64
+        observed = topology_coverage.classify_topologies(evidence["edges"], layout)
+
+        self.assertNotIn("source_bytecode_agree", observed)
+        self.assertNotIn("source_bytecode_true_conflict", observed)
+
+    def test_mixed_root_layout_requires_exact_owner_entry_mapping(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, expectations = self._build_fixture(Path(temp_dir))
+            selected = self._selected_api_rows(expectations)
+            exact_entries = {
+                "topology.target.TargetApi": ["topology/target/TargetApi.class"],
+                "topology.target.TargetInterface": ["topology/target/TargetInterface.class"],
+                "topology.target.SameJarBridge": ["topology/target/SameJarBridge.class"],
+            }
+            positive = topology_coverage.extract_artifact_topology_evidence(
+                artifact, selected, {}, target_owner_entries=exact_entries,
+            )
+            negative = topology_coverage.extract_artifact_topology_evidence(
+                artifact, selected, {},
+            )
+
+        roles = {item.get("entry"): item["role"] for item in positive["artifact_layout"]["entry_layout"] if item.get("entry")}
+        self.assertEqual(roles["topology/business/App.class"], "business")
+        self.assertEqual(roles["topology/target/TargetApi.class"], "target")
+        self.assertFalse(negative["complete"])
+
+    def test_virtual_dispatch_requires_parsed_target_hierarchy_relation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, expectations = self._build_fixture(Path(temp_dir))
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact, self._selected_api_rows(expectations),
+                {"topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                 "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"]},
+            )
+
+        observed = topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"])
+        self.assertIn("virtual_dispatch", observed)
+        evidence["artifact_layout"]["hierarchy_evidence"] = [
+            {"child": "java.lang.String", "parent": "java.lang.Object", "authority": "javap_class_header"}
+        ]
+        self.assertNotIn("virtual_dispatch", topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"]))
+
+    def test_stale_source_tree_and_fake_revision_reject_source_ids(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            source_root, source_attestation = self._source_attestation(root, artifact, expectations)
+            payload = json.loads(source_attestation.read_text(encoding="utf-8"))
+            evidence_path = Path(payload["evidence_path"])
+            original_evidence = evidence_path.read_bytes()
+            evidence_path.write_bytes(original_evidence + b"\n")
+            tampered = topology_coverage.extract_artifact_topology_evidence(
+                artifact, self._selected_api_rows(expectations),
+                {"topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                 "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"]},
+                source_root=source_root, source_attestation=source_attestation,
+            )
+            evidence_path.write_bytes(original_evidence)
+            payload["git_revision"] = "b" * 40
+            source_attestation.write_text(json.dumps(payload), encoding="utf-8")
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact, self._selected_api_rows(expectations),
+                {"topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                 "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"]},
+                source_root=source_root, source_attestation=source_attestation,
+            )
+
+        observed = topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"])
+        tampered_observed = topology_coverage.classify_topologies(
+            tampered["edges"], tampered["artifact_layout"]
+        )
+        self.assertNotIn("source_bytecode_agree", tampered_observed)
+        self.assertNotIn("source_bytecode_agree", observed)
+        self.assertNotIn("source_bytecode_true_conflict", observed)
+
+    def test_source_attestation_rejects_dirty_tree_even_when_self_hash_is_recomputed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            source_root, source_attestation = self._source_attestation(root, artifact, expectations)
+            source_file = source_root / "src" / "business" / "topology" / "business" / "App.java"
+            source_file.write_text(
+                source_file.read_text(encoding="utf-8") + "\n// substituted live source\n",
+                encoding="utf-8",
+            )
+            payload = json.loads(source_attestation.read_text(encoding="utf-8"))
+            payload["source_tree_sha256"] = topology_coverage.compute_source_tree_sha256(
+                source_root / "src"
+            )
+            source_attestation.write_text(json.dumps(payload), encoding="utf-8")
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+                source_root=source_root,
+                source_attestation=source_attestation,
+            )
+
+        self.assertFalse(evidence["artifact_layout"]["source_provenance"]["valid"])
+        observed = topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"])
+        self.assertNotIn("source_bytecode_agree", observed)
+        self.assertNotIn("source_bytecode_true_conflict", observed)
+
+    def test_source_attestation_rejects_substituted_path_outside_declared_revision_tree(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            source_root, source_attestation = self._source_attestation(root, artifact, expectations)
+            substituted = root / "substituted"
+            shutil.copytree(source_root / "src", substituted)
+            payload = json.loads(source_attestation.read_text(encoding="utf-8"))
+            payload["source_path"] = "../substituted"
+            payload["source_tree_sha256"] = topology_coverage.compute_source_tree_sha256(substituted)
+            source_attestation.write_text(json.dumps(payload), encoding="utf-8")
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+                source_root=source_root,
+                source_attestation=source_attestation,
+            )
+
+        observed = topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"])
+        self.assertNotIn("source_bytecode_agree", observed)
+        self.assertNotIn("source_bytecode_true_conflict", observed)
+
+    def test_true_conflict_uses_distinct_source_and_packaged_java_fixtures(self):
+        source_text = (FIXTURE / "src" / "source" / "topology" / "business" / "ConflictCaller.java").read_text(encoding="utf-8")
+        bytecode_text = (FIXTURE / "src" / "bytecode" / "topology" / "business" / "ConflictCaller.java").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact, layout = self._build_fixture(Path(temp_dir))
+            edges = oracle.scan_final_artifact(artifact)["edges"]
+
+        conflict = layout["source_conflicts"][0]
+        self.assertIn('overloaded("source")', source_text)
+        self.assertIn("overloaded(7)", bytecode_text)
+        self.assertTrue(any(
+            all(row.get(key) == value for key, value in conflict["bytecode_edge"].items())
+            for row in edges
+        ))
+
+    def test_compute_coverage_sorts_deduplicates_and_marks_discovery_eligibility(self):
+        coverage = topology_coverage.compute_topology_coverage(
+            ("spi", "business_direct", "spi"),
+            {"business_direct", "virtual_dispatch"},
+            prior_covered={"business_direct"},
+            case_mode="discovery",
+        )
+
+        self.assertEqual(coverage["required"], ["business_direct", "spi"])
+        self.assertEqual(coverage["observed"], ["business_direct", "virtual_dispatch"])
+        self.assertEqual(coverage["missing"], ["spi"])
+        self.assertFalse(coverage["complete"])
+        self.assertEqual(coverage["newly_observed"], ["virtual_dispatch"])
+        self.assertTrue(coverage["discovery_target_eligible"])
+        self.assertFalse(
+            topology_coverage.compute_topology_coverage(
+                ("business_direct",), {"business_direct"},
+                prior_covered={"business_direct"}, case_mode="discovery",
+            )["discovery_target_eligible"]
+        )
+        self.assertFalse(
+            topology_coverage.compute_topology_coverage(
+                ("business_direct",), {"business_direct"}, case_mode="guard"
+            )["discovery_target_eligible"]
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

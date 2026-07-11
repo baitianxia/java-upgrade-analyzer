@@ -14,6 +14,164 @@ import real_project_regression as realreg  # noqa: E402
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_all_executable_real_cases_declare_nonempty_topology_requirements(self):
+        self.assertTrue(realreg.CASES)
+        for name, case in realreg.CASES.items():
+            with self.subTest(case=name):
+                self.assertTrue(case.required_topologies)
+
+    def test_actual_discovery_cases_require_valid_pinned_prior_matrix_and_rotation_math(self):
+        discovery = [case for case in realreg.CASES.values() if case.case_mode in {"discovery", "convergence"}]
+        self.assertTrue(discovery)
+        for case in discovery:
+            with self.subTest(case=case.name):
+                matrix = realreg.load_pinned_prior_topology_matrix(case.prior_topology_matrix)
+                self.assertTrue(matrix["valid"], matrix["errors"])
+                coverage = realreg.compute_topology_coverage(
+                    case.required_topologies,
+                    set(case.required_topologies),
+                    prior_covered=set(matrix["covered_ids"]),
+                    case_mode=case.case_mode,
+                )
+                self.assertEqual(
+                    coverage["newly_observed"],
+                    sorted(set(case.required_topologies) - set(matrix["covered_ids"])),
+                )
+        mall = realreg.CASES["mall"]
+        matrix = realreg.load_pinned_prior_topology_matrix(mall.prior_topology_matrix)
+        coverage = realreg.compute_topology_coverage(
+            mall.required_topologies, set(mall.required_topologies),
+            prior_covered=set(matrix["covered_ids"]), case_mode=mall.case_mode,
+        )
+        self.assertTrue(coverage["rotation_required"])
+
+    def test_actual_discovery_case_rejects_missing_and_corrupt_prior_matrix(self):
+        actual = realreg.CASES["mall"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corrupt = root / "matrix.json"
+            corrupt.write_text('{"covered_ids":["business_direct"],"evidence_sha256":"bad"}', encoding="utf-8")
+            missing_case = realreg.replace(actual, prior_topology_matrix=root / "missing.json")
+            corrupt_case = realreg.replace(actual, prior_topology_matrix=corrupt)
+            missing_result = realreg.load_pinned_prior_topology_matrix(missing_case.prior_topology_matrix)
+            corrupt_result = realreg.load_pinned_prior_topology_matrix(corrupt_case.prior_topology_matrix)
+
+        self.assertFalse(missing_result["valid"])
+        self.assertFalse(corrupt_result["valid"])
+
+    def test_prior_topology_matrix_persists_union_of_converged_guards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            realreg.update_prior_topology_matrix(
+                root, "guard-a", "guard", {"business_direct", "static_dispatch"}
+            )
+            realreg.update_prior_topology_matrix(
+                root, "guard-b", "convergence", {"spi"}
+            )
+            matrix = realreg.load_prior_topology_matrix(root)
+
+        self.assertEqual(
+            set(matrix["converged_guard_union"]),
+            {"business_direct", "static_dispatch", "spi"},
+        )
+
+    def test_discovery_prior_merges_pinned_and_report_root_converged_guard_matrix(self):
+        case = realreg.CASES["dubbo"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            realreg.update_prior_topology_matrix(root, "guard", "guard", {"spi"})
+            prior = realreg.resolve_discovery_prior_coverage(case, root)
+
+        self.assertTrue(prior["valid"])
+        self.assertEqual(set(prior["covered_ids"]), {"business_direct", "static_dispatch", "spi"})
+
+    def test_convergence_rejects_tampered_report_root_prior_matrix(self):
+        case = realreg.replace(realreg.CASES["dubbo"], case_mode="convergence")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "topology_prior_matrix.json").write_text(json.dumps({
+                "converged_guard_union": ["spi"],
+                "cases": {"forged": {"case_mode": "guard", "observed": ["spi"]}},
+            }), encoding="utf-8")
+            prior = realreg.resolve_discovery_prior_coverage(case, root)
+
+        self.assertFalse(prior["valid"])
+        self.assertEqual(prior["covered_ids"], [])
+
+    def test_discovery_rejects_missing_report_root_prior_matrix(self):
+        case = realreg.CASES["dubbo"]
+        with tempfile.TemporaryDirectory() as tmp:
+            prior = realreg.resolve_discovery_prior_coverage(case, Path(tmp))
+
+        self.assertFalse(prior["valid"])
+        self.assertEqual(prior["covered_ids"], [])
+
+    def test_discovery_case_rejects_empty_required_topology_policy(self):
+        case = realreg.RealProjectCase(
+            "mini", Path("."), Path(""), (), case_mode="discovery", required_topologies=()
+        )
+        coverage = realreg.compute_topology_coverage(
+            (), {"business_direct"}, case_mode="discovery"
+        )
+
+        signals = realreg.build_topology_coverage_signals(case, coverage, Path("/tmp/report"))
+
+        self.assertEqual([item["signal_type"] for item in signals], ["topology_configuration_invalid"])
+        self.assertTrue(signals[0]["blocking"])
+
+    def test_rotation_is_reported_when_discovery_observes_no_new_topology(self):
+        case = realreg.RealProjectCase(
+            "mini", Path("."), Path(""), (), case_mode="discovery",
+            required_topologies=("business_direct",),
+            prior_covered_topologies=("business_direct",),
+        )
+        coverage = realreg.compute_topology_coverage(
+            case.required_topologies, {"business_direct"},
+            prior_covered=set(case.prior_covered_topologies), case_mode=case.case_mode,
+        )
+
+        signals = realreg.build_topology_coverage_signals(case, coverage, Path("/tmp/report"))
+
+        self.assertIn("topology_rotation_required", {item["signal_type"] for item in signals})
+        self.assertFalse(next(item for item in signals if item["signal_type"] == "topology_rotation_required")["blocking"])
+
+    def test_topology_policy_emits_one_blocking_gap_with_all_missing_ids(self):
+        case = realreg.RealProjectCase(
+            "mini", Path("."), Path(""), (), required_topologies=("spi", "business_direct")
+        )
+        coverage = realreg.compute_topology_coverage(case.required_topologies, {"business_direct"})
+
+        signals = realreg.build_topology_coverage_signals(case, coverage, Path("/tmp/report"))
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["signal_type"], "topology_coverage_gap")
+        self.assertEqual(signals[0]["severity"], "P1")
+        self.assertTrue(signals[0]["blocking"])
+        self.assertEqual(signals[0]["sample_symbols"], ["spi"])
+        self.assertIn("spi", signals[0]["message"])
+
+    def test_topology_coverage_outputs_include_required_observed_and_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            coverage = realreg.compute_topology_coverage(
+                ("spi", "business_direct"), {"business_direct", "static_dispatch"}
+            )
+
+            paths = realreg.write_topology_coverage(report_dir, coverage)
+
+            payload = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
+            with Path(paths["csv"]).open(encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+        self.assertEqual(payload["missing"], ["spi"])
+        self.assertEqual(
+            {(row["topology_id"], row["required"], row["observed"], row["missing"]) for row in rows},
+            {
+                ("business_direct", "true", "true", "false"),
+                ("spi", "true", "false", "true"),
+                ("static_dispatch", "false", "true", "false"),
+            },
+        )
+
     def test_mall_case_rebuilds_truth_set_from_all_hutool_bytecode_calls(self):
         case = realreg.CASES["mall"]
 
@@ -519,6 +677,13 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertIn("exploration", policy["lifecycle"])
         self.assertIn("fixture_debt", policy["promotion_rules"])
         self.assertIn("rotate_to_new_project", policy["promotion_rules"])
+        self.assertFalse(result["topology_coverage"]["complete"])
+        self.assertIn(
+            "topology_evidence_invalid",
+            {item["signal_type"] for item in result["quality_signals"]},
+        )
+        self.assertTrue(result["topology_coverage_files"]["json"].endswith("topology_coverage.json"))
+        self.assertTrue(result["topology_coverage_files"]["csv"].endswith("topology_coverage.csv"))
 
     def test_run_case_reports_invalid_real_project_asset_before_analysis(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -627,7 +792,11 @@ class RealProjectRegressionTest(unittest.TestCase):
             with patch.object(realreg, "run_step5", side_effect=fake_run_step5):
                 result = realreg.run_case(case, root, external, report_root)
 
-        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn(
+            "topology_evidence_invalid",
+            {item["signal_type"] for item in result["quality_signals"]},
+        )
         self.assertTrue(str(result["changed_apis"]).endswith("evidence/api_changes/all_changed_apis.csv"))
 
     def test_run_case_can_feed_step5_from_step4_selected_output(self):
@@ -758,7 +927,11 @@ class RealProjectRegressionTest(unittest.TestCase):
                  patch.object(realreg, "run_step5", side_effect=fake_run_step5):
                 result = realreg.run_case(case, root, Path(""), report_root)
 
-        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn(
+            "topology_evidence_invalid",
+            {item["signal_type"] for item in result["quality_signals"]},
+        )
         self.assertEqual(result["step4_selection"]["selected_rows"], 2)
         self.assertEqual(result["step4_selection"]["missing_api_names"], [])
         self.assertTrue(str(result["changed_apis"]).endswith("selected_all_changed_apis.csv"))
@@ -959,7 +1132,11 @@ class RealProjectRegressionTest(unittest.TestCase):
                  patch.object(realreg, "query_step5", side_effect=fake_query_step5):
                 result = realreg.run_case(case, root, changed_apis, report_root)
 
-        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn(
+            "topology_evidence_invalid",
+            {item["signal_type"] for item in result["quality_signals"]},
+        )
         self.assertEqual(result["step6"]["returncode"], 0)
         self.assertEqual(result["queries"][0]["returncode"], 0)
 

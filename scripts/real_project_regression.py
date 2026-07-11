@@ -37,6 +37,11 @@ from exhaustive_api_oracle import (
     write_oracle_ledger,
 )
 from third_party_jdk_oracle import discover_calls, scan_class_files
+from topology_coverage import (
+    classify_topologies,
+    compute_topology_coverage,
+    extract_artifact_topology_evidence,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -86,6 +91,11 @@ class RealProjectCase:
     bytecode_owner_prefixes: tuple[str, ...] = field(default_factory=tuple)
     bytecode_coord: str = ""
     final_artifact: Path | None = None
+    required_topologies: tuple[str, ...] = field(default_factory=tuple)
+    prior_covered_topologies: tuple[str, ...] = field(default_factory=tuple)
+    target_owner_entries: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    source_attestation: Path | None = None
+    prior_topology_matrix: Path | None = None
 
 
 CASES = {
@@ -93,6 +103,7 @@ CASES = {
         name="commons-text",
         default_project=Path("/private/tmp/jua-real-system-commons-text"),
         default_changed_apis=Path(""),
+        required_topologies=("business_direct", "static_dispatch", "field_access"),
         changed_api_rows=(
             {
                 "coord": "org.apache.commons:commons-lang3",
@@ -236,6 +247,7 @@ CASES = {
         name="seata",
         default_project=Path("/private/tmp/jua-real-project-seata"),
         default_changed_apis=Path(""),
+        required_topologies=("business_direct", "static_dispatch", "field_access"),
         changed_api_rows=(
             {
                 "coord": "org.apache.seata:seata-common",
@@ -312,6 +324,7 @@ CASES = {
         name="dubbo",
         default_project=Path("/private/tmp/jua-real-project-dubbo"),
         default_changed_apis=Path(""),
+        required_topologies=("business_direct", "static_dispatch"),
         changed_api_rows=(
             {
                 "coord": "org.apache.dubbo:dubbo-common",
@@ -479,11 +492,17 @@ CASES = {
         ground_truth_status="unreviewed",
         max_potential_pairs_per_api=30000.0,
         enable_jdk_oracle=True,
+        prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
     ),
     "commons-lang": RealProjectCase(
         name="commons-lang",
         default_project=Path("/private/tmp/jua-real-git-commons-lang"),
         default_changed_apis=Path(""),
+        required_topologies=("same_jar_bridge", "static_dispatch", "field_access"),
+        target_owner_entries={
+            "org.apache.commons.lang3.StringUtils": ("org/apache/commons/lang3/StringUtils.class",),
+            "org.apache.commons.lang3.Validate": ("org/apache/commons/lang3/Validate.class",),
+        },
         changed_api_rows=(
             {
                 "coord": "org.apache.commons:commons-lang3",
@@ -605,6 +624,8 @@ CASES["mall"] = RealProjectCase(
     bytecode_owner_prefixes=("cn/hutool/",),
     bytecode_coord="cn.hutool:hutool-all",
     final_artifact=Path("/private/tmp/jua-real-project-mall/mall-admin/target/mall-admin-1.0-SNAPSHOT.jar"),
+    required_topologies=("business_direct",),
+    prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
 )
 
 
@@ -859,6 +880,217 @@ def compute_api_coverage(case_mode: str, population: int, selected: int, output_
         "coverage_ratio": ratio,
         "complete": output_total == selected and (not full_scope or ratio == 1.0),
     }
+
+
+def extract_case_topology_evidence(
+    case: RealProjectCase,
+    report_dir: Path,
+    selected_rows: list[dict],
+    project_root: Path,
+) -> dict:
+    errors: list[str] = []
+    provenance_path = report_dir / "evidence" / "dependencies" / "build_provenance.json"
+    artifact = None
+    expected_sha256 = ""
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        current = next(item for item in provenance.get("sides") or [] if item.get("side") == "current")
+        artifact = Path(str(current.get("artifact_path") or ""))
+        expected_sha256 = str(current.get("artifact_sha256") or "")
+        actual_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if len(expected_sha256) != 64 or actual_sha256 != expected_sha256:
+            raise ValueError("current final artifact SHA-256 is missing or mismatched")
+    except (OSError, StopIteration, ValueError, json.JSONDecodeError) as error:
+        errors.append(f"verified current final artifact unavailable: {error}")
+
+    coordinate_entries: dict[str, list[str]] = {}
+    _, dependency_rows = _csv_rows(
+        report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv"
+    )
+    for row in dependency_rows:
+        coordinate = str(row.get("coord") or "").strip()
+        entry = str(row.get("lib_entry") or "").strip()
+        if coordinate and entry:
+            coordinate_entries.setdefault(coordinate, []).append(entry)
+
+    if artifact is None or errors:
+        evidence = {
+            "complete": False,
+            "errors": errors,
+            "edges": [],
+            "artifact_layout": {
+                "authority": "final_artifact_edge_oracle", "complete": False,
+                "errors": errors, "target_apis": [], "entry_layout": [],
+            },
+        }
+    else:
+        source_root = project_root if {
+            "source_bytecode_agree", "source_bytecode_true_conflict"
+        } & set(case.required_topologies) else None
+        evidence = extract_artifact_topology_evidence(
+            artifact,
+            selected_rows,
+            coordinate_entries,
+            source_root=source_root,
+            source_attestation=case.source_attestation,
+            target_owner_entries={
+                owner: list(entries) for owner, entries in case.target_owner_entries.items()
+            },
+        )
+        if evidence.get("artifact_layout", {}).get("artifact_sha256") != expected_sha256:
+            evidence["complete"] = False
+            evidence.setdefault("errors", []).append("oracle artifact SHA-256 differs from verified provenance")
+            evidence["artifact_layout"]["complete"] = False
+            evidence["artifact_layout"].setdefault("errors", []).append(
+                "oracle artifact SHA-256 differs from verified provenance"
+            )
+    output = report_dir / "evidence" / "quality" / "topology_artifact_layout.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(evidence["artifact_layout"], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    evidence["layout_path"] = str(output)
+    return evidence
+
+
+def _prior_topology_matrix_path(report_root: Path) -> Path:
+    return Path(report_root) / "topology_prior_matrix.json"
+
+
+def _topology_matrix_digest(topology_ids: Iterable[str]) -> str:
+    covered = sorted(set(str(item) for item in topology_ids))
+    return hashlib.sha256("".join(f"{item}\n" for item in covered).encode()).hexdigest()
+
+
+def load_pinned_prior_topology_matrix(path: Path | None) -> dict:
+    if path is None:
+        return {"valid": False, "covered_ids": [], "errors": ["pinned prior matrix missing"]}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        covered = sorted(set(payload.get("covered_ids") or []))
+        digest = _topology_matrix_digest(covered)
+        valid = bool(
+            payload.get("authority")
+            and payload.get("authority_version")
+            and payload.get("procedure")
+            and covered
+            and payload.get("evidence_sha256") == digest
+        )
+    except (OSError, json.JSONDecodeError):
+        return {"valid": False, "covered_ids": [], "errors": ["pinned prior matrix unreadable"]}
+    return {**payload, "covered_ids": covered if valid else [], "valid": valid,
+            "errors": [] if valid else ["pinned prior matrix evidence invalid"]}
+
+
+def load_prior_topology_matrix(report_root: Path) -> dict:
+    path = _prior_topology_matrix_path(report_root)
+    if not path.exists():
+        return {"converged_guard_union": [], "cases": {}, "valid": False,
+                "errors": ["persisted prior matrix missing"]}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"converged_guard_union": [], "cases": {}, "valid": False,
+                "errors": ["persisted prior matrix unreadable"]}
+    cases = payload.get("cases")
+    if not isinstance(cases, dict):
+        return {"converged_guard_union": [], "cases": {}, "valid": False,
+                "errors": ["persisted prior matrix cases malformed"]}
+    normalized_cases = {}
+    union = set()
+    for case_name, item in cases.items():
+        if not isinstance(item, dict) or item.get("case_mode") not in {"guard", "convergence"}:
+            return {"converged_guard_union": [], "cases": {}, "valid": False,
+                    "errors": ["persisted prior matrix case malformed"]}
+        observed = item.get("observed")
+        if not isinstance(observed, list) or not all(isinstance(value, str) and value for value in observed):
+            return {"converged_guard_union": [], "cases": {}, "valid": False,
+                    "errors": ["persisted prior matrix observations malformed"]}
+        normalized_cases[str(case_name)] = {
+            "case_mode": item["case_mode"], "observed": sorted(set(observed)),
+        }
+        union.update(observed)
+    covered = sorted(union)
+    declared = sorted(set(payload.get("converged_guard_union") or []))
+    valid = bool(
+        payload.get("authority")
+        and payload.get("authority_version")
+        and payload.get("procedure")
+        and declared == covered
+        and payload.get("evidence_sha256") == _topology_matrix_digest(covered)
+    )
+    return {
+        "converged_guard_union": covered if valid else [],
+        "cases": normalized_cases if valid else {},
+        "valid": valid,
+        "errors": [] if valid else ["persisted prior matrix evidence invalid"],
+    }
+
+
+def update_prior_topology_matrix(
+    report_root: Path, case_name: str, case_mode: str, observed: set[str]
+) -> dict:
+    matrix = load_prior_topology_matrix(report_root)
+    if case_mode not in {"guard", "convergence"}:
+        return matrix
+    matrix["cases"][case_name] = {"case_mode": case_mode, "observed": sorted(observed)}
+    union = set()
+    for item in matrix["cases"].values():
+        if item.get("case_mode") in {"guard", "convergence"}:
+            union.update(item.get("observed") or [])
+    matrix["converged_guard_union"] = sorted(union)
+    matrix.update({
+        "authority": "converged-guard-runner",
+        "authority_version": "1",
+        "procedure": "union of topology IDs from passing guard and convergence cases",
+        "evidence_sha256": _topology_matrix_digest(matrix["converged_guard_union"]),
+    })
+    path = _prior_topology_matrix_path(report_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(matrix, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return matrix
+
+
+def resolve_discovery_prior_coverage(case: RealProjectCase, report_root: Path) -> dict:
+    pinned = load_pinned_prior_topology_matrix(case.prior_topology_matrix)
+    accumulated = load_prior_topology_matrix(report_root)
+    covered = set(pinned.get("covered_ids") or [])
+    covered.update(accumulated.get("converged_guard_union") or [])
+    return {
+        "valid": bool(pinned.get("valid") and accumulated.get("valid")),
+        "covered_ids": sorted(covered) if pinned.get("valid") and accumulated.get("valid") else [],
+        "pinned": pinned,
+        "accumulated": accumulated,
+    }
+
+
+def write_topology_coverage(report_dir: Path, coverage: dict) -> dict[str, str]:
+    output_dir = report_dir / "evidence" / "quality"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "topology_coverage.json"
+    csv_path = output_dir / "topology_coverage.csv"
+    json_path.write_text(
+        json.dumps(coverage, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    required = set(coverage.get("required") or [])
+    observed = set(coverage.get("observed") or [])
+    missing = set(coverage.get("missing") or [])
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("topology_id", "required", "observed", "missing"),
+        )
+        writer.writeheader()
+        for topology_id in sorted(required | observed):
+            writer.writerow({
+                "topology_id": topology_id,
+                "required": str(topology_id in required).lower(),
+                "observed": str(topology_id in observed).lower(),
+                "missing": str(topology_id in missing).lower(),
+            })
+    return {"json": str(json_path), "csv": str(csv_path)}
 
 
 def group_conclusion_gaps(summary: dict) -> list[dict]:
@@ -1280,6 +1512,7 @@ def make_signal(
             "test_configuration_failure",
             "ground_truth_insufficient",
             "conclusion_gap",
+            "topology_coverage_gap",
         }
     return {
         "signal_type": signal_type,
@@ -1299,6 +1532,58 @@ def make_signal(
         "symbol_kind": symbol_kind,
         "sample_symbols": [str(item) for item in sample_symbols],
     }
+
+
+def build_topology_coverage_signals(
+    case: RealProjectCase,
+    coverage: dict,
+    report_dir: Path,
+) -> list[dict]:
+    signals: list[dict] = []
+    if case.case_mode in {"discovery", "convergence"} and not case.required_topologies:
+        signals.append(make_signal(
+            "topology_configuration_invalid", "P1", case.name, step="step5",
+            message="discovery/convergence case has an empty required_topologies policy",
+            expected="nonempty stable topology requirements", actual="[]", blocking=True,
+        ))
+        return signals
+    if case.case_mode in {"discovery", "convergence"} and not coverage.get("prior_covered"):
+        signals.append(make_signal(
+            "topology_configuration_invalid", "P1", case.name, step="step5",
+            message="discovery/convergence case has no persistent prior topology coverage",
+            expected="nonempty configured or converged-guard prior set", actual="[]", blocking=True,
+        ))
+    if case.case_mode in {"discovery", "convergence"} and not coverage.get("prior_matrix_valid"):
+        signals.append(make_signal(
+            "topology_configuration_invalid", "P1", case.name, step="step5",
+            message="pinned prior topology matrix is missing, corrupt, or invalid",
+            expected="validated external prior matrix evidence", actual="invalid", blocking=True,
+        ))
+    if not coverage.get("evidence_complete"):
+        signals.append(make_signal(
+            "topology_evidence_invalid", "P1", case.name, step="step5",
+            message="independent final-artifact topology evidence is missing or malformed",
+            expected="complete final_artifact_edge_oracle extraction",
+            actual="incomplete", evidence=[report_dir / "evidence" / "quality" / "topology_artifact_layout.json"],
+            blocking=True,
+        ))
+    missing = list(coverage.get("missing") or [])
+    if missing:
+        signals.append(make_signal(
+            "topology_coverage_gap", "P1", case.name, step="step5",
+            message="Missing required stable topology IDs: " + ", ".join(missing),
+            count=len(missing), expected=json.dumps(coverage.get("required") or []),
+            actual=json.dumps(coverage.get("observed") or []),
+            evidence=[report_dir / "evidence" / "quality" / "topology_coverage.json"],
+            sample_symbols=missing, blocking=True,
+        ))
+    if coverage.get("rotation_required"):
+        signals.append(make_signal(
+            "topology_rotation_required", "P2", case.name, step="step5",
+            message="discovery project observed no topology beyond prior coverage; rotate target",
+            expected="nonempty observed minus prior_covered", actual="[]", blocking=False,
+        ))
+    return signals
 
 
 def build_policy_signals(
@@ -1841,6 +2126,27 @@ def run_case(
         write_oracle_ledger(oracle_ledger_path, oracle_audit)
         oracle_ledger = str(oracle_ledger_path)
         effective_ground_truth_status = "reviewed" if not oracle_audit.get("blocking") else "unreviewed"
+    topology_evidence = extract_case_topology_evidence(
+        case, report_dir, selected_rows, project_root
+    )
+    observed_topologies = classify_topologies(
+        topology_evidence["edges"], topology_evidence["artifact_layout"]
+    )
+    resolved_prior = resolve_discovery_prior_coverage(case, report_root)
+    effective_prior = set(resolved_prior.get("covered_ids") or [])
+    topology_coverage = compute_topology_coverage(
+        case.required_topologies,
+        observed_topologies,
+        prior_covered=effective_prior,
+        case_mode=case.case_mode,
+        evidence_complete=bool(topology_evidence.get("complete")),
+    )
+    topology_coverage["prior_matrix_valid"] = bool(
+        resolved_prior.get("valid") if case.case_mode in {"discovery", "convergence"} else True
+    )
+    topology_coverage["prior_matrix"] = str(case.prior_topology_matrix or "")
+    topology_coverage["report_root_prior_matrix"] = str(_prior_topology_matrix_path(report_root))
+    topology_coverage_files = write_topology_coverage(report_dir, topology_coverage)
     quality_signals = build_quality_signals(
         case,
         summary=summary,
@@ -1856,6 +2162,11 @@ def run_case(
         report_dir=report_dir,
         oracle_audit=oracle_audit,
     ))
+    quality_signals.extend(build_topology_coverage_signals(
+        case,
+        topology_coverage,
+        report_dir,
+    ))
     if failures and not any(item.get("blocking") for item in quality_signals):
         quality_signals.append(make_signal(
             "correctness_failure", "P1", case.name,
@@ -1865,6 +2176,8 @@ def run_case(
             evidence=[report_dir],
         ))
     status = derive_case_status(returncode == 0, quality_signals, effective_ground_truth_status)
+    if status == "passed" and case.case_mode in {"guard", "convergence"}:
+        update_prior_topology_matrix(report_root, case.name, case.case_mode, observed_topologies)
 
     return {
         "case": case.name,
@@ -1887,6 +2200,11 @@ def run_case(
         "third_party_authorities": sorted({
             str(row.get("authority") or "") for row in oracle_rows
         }) if case.case_mode in {"discovery", "convergence"} else [],
+        "topology_coverage": topology_coverage,
+        "topology_coverage_files": topology_coverage_files,
+        "topology_artifact_layout": topology_evidence.get("layout_path"),
+        "topology_evidence_errors": topology_evidence.get("errors") or [],
+        "topology_prior_matrix": str(_prior_topology_matrix_path(report_root)),
         **coverage,
         "step4": step4_result,
         "step4_selection": step4_selection,
