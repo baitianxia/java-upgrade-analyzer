@@ -29,12 +29,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from threading import Event, Lock
 
 from compat import run_cmd
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import normalize_signature_for_lookup, split_signature_params
 from enhanced_source_analyzer import CallEdge, MethodDef
+from business_bytecode_graph import parse_classfile_calls
 from indirect_usage_analyzer import (
     api_key as indirect_api_key,
     parse_javap_indirect_references,
@@ -52,9 +54,15 @@ CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
 }
 
 ANALYZER_EDGE_PROCEDURE_VERSION = 'java-upgrade-analyzer.analyzer-edge-ledger.v1'
+ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION = 'java-upgrade-analyzer.runtime-javap.v1'
 ANALYZER_EDGE_PROCEDURE = (
     'Step5 executable bytecode matching at analyzer edge creation points'
 )
+_IMMUTABLE_ARTIFACT_PARSE_CACHE = {}
+_IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK = Lock()
+_IMMUTABLE_ARTIFACT_PARSE_INFLIGHT = {}
+_IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION = 0
+_STEP5_PERF_STATS_INIT_LOCK = Lock()
 ANALYZER_EDGE_FIELDS = (
     'artifact_sha256',
     'artifact_entry',
@@ -79,6 +87,40 @@ ANALYZER_EDGE_FIELDS = (
 def _valid_sha256(value):
     value = str(value or '').strip()
     return len(value) == 64 and all(char in '0123456789abcdef' for char in value)
+
+
+def clear_immutable_artifact_parse_cache():
+    """Reset immutable parsed-bytecode entries for isolated process tests."""
+    global _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
+    with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+        _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION += 1
+        stale_events = list(_IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.values())
+        _IMMUTABLE_ARTIFACT_PARSE_CACHE.clear()
+        _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.clear()
+    for event in stale_events:
+        event.set()
+
+
+def _artifact_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _immutable_artifact_parse_cache_key(
+    artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+    class_entry='',
+):
+    return (
+        str(artifact_sha256 or '').strip(),
+        ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION,
+        str(target_jdk or '').strip(),
+        str(class_binary_name or '').strip(),
+        str(multi_release_version or '').strip(),
+        str(class_entry or '').strip(),
+    )
 
 
 def _verified_final_artifact_provenance(graph):
@@ -424,47 +466,90 @@ def _should_prefer_runtime_member_candidate_index(graph, catalog_entries):
     return False, ''
 
 
-def _step5_perf_stats(graph):
+def _step5_perf_state(graph):
     if graph is None:
-        return None
-    stats = getattr(graph, '_step5_perf_stats', None)
-    if stats is None:
-        stats = {
-            'bytecode_scan': defaultdict(float),
-            'bytecode_expand': defaultdict(float),
-            'trace': defaultdict(float),
-        }
-        setattr(graph, '_step5_perf_stats', stats)
+        return None, None
+    with _STEP5_PERF_STATS_INIT_LOCK:
+        lock = getattr(graph, '_step5_perf_lock', None)
+        if lock is None:
+            lock = Lock()
+            setattr(graph, '_step5_perf_lock', lock)
+        stats = getattr(graph, '_step5_perf_stats', None)
+        if stats is None:
+            stats = {
+                'bytecode_scan': defaultdict(float),
+                'bytecode_expand': defaultdict(float),
+                'trace': defaultdict(float),
+            }
+            setattr(graph, '_step5_perf_stats', stats)
+    return stats, lock
+
+
+def _step5_perf_stats(graph):
+    stats, _lock = _step5_perf_state(graph)
     return stats
 
 
 def _perf_add(graph, section, key, value=1):
-    stats = _step5_perf_stats(graph)
+    stats, lock = _step5_perf_state(graph)
     if stats is None:
         return
-    stats.setdefault(section, defaultdict(float))[key] += value
+    with lock:
+        stats.setdefault(section, defaultdict(float))[key] += value
 
 
 def _perf_max(graph, section, key, value):
-    stats = _step5_perf_stats(graph)
+    stats, lock = _step5_perf_state(graph)
     if stats is None:
         return
-    bucket = stats.setdefault(section, defaultdict(float))
-    bucket[key] = max(bucket.get(key, 0), value)
+    with lock:
+        bucket = stats.setdefault(section, defaultdict(float))
+        bucket[key] = max(bucket.get(key, 0), value)
 
 
 def _perf_record_top(graph, section, key, item, elapsed_key='elapsed_sec', limit=20):
-    stats = _step5_perf_stats(graph)
+    stats, lock = _step5_perf_state(graph)
     if stats is None or not isinstance(item, dict):
         return
-    bucket = stats.setdefault(section, defaultdict(float))
-    values = bucket.get(key)
-    if not isinstance(values, list):
-        values = []
-        bucket[key] = values
-    values.append(dict(item))
-    values.sort(key=lambda row: float(row.get(elapsed_key) or 0), reverse=True)
-    del values[limit:]
+    with lock:
+        bucket = stats.setdefault(section, defaultdict(float))
+        values = bucket.get(key)
+        if not isinstance(values, list):
+            values = []
+            bucket[key] = values
+        values.append(dict(item))
+        values.sort(key=lambda row: (
+            -float(row.get(elapsed_key) or 0),
+            json.dumps(row, sort_keys=True, default=str, ensure_ascii=True),
+        ))
+        del values[limit:]
+
+
+def _record_actual_artifact_class_parse(
+    graph, artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+):
+    stats, lock = _step5_perf_state(graph)
+    if stats is None:
+        return
+    physical_class_key = (
+        str(artifact_sha256 or '').strip(),
+        ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION,
+        str(target_jdk or '').strip(),
+        str(class_binary_name or '').strip(),
+        str(multi_release_version or '').strip(),
+    )
+    with lock:
+        bucket = stats.setdefault('bytecode_scan', defaultdict(float))
+        bucket['class_entries_parsed'] += 1
+        if not _valid_sha256(artifact_sha256):
+            return
+        parsed_classes = getattr(graph, '_step5_parsed_artifact_classes', None)
+        if parsed_classes is None:
+            parsed_classes = set()
+            setattr(graph, '_step5_parsed_artifact_classes', parsed_classes)
+        if physical_class_key in parsed_classes:
+            bucket['duplicate_class_scans'] += 1
+        parsed_classes.add(physical_class_key)
 
 
 def _round_perf_value(value):
@@ -478,11 +563,20 @@ def _round_perf_value(value):
 
 
 def _finalize_step5_perf_stats(graph):
-    stats = _step5_perf_stats(graph)
+    stats, lock = _step5_perf_state(graph)
     if not stats:
         return {}
+    with lock:
+        snapshot = {
+            section: {
+                key: ([dict(item) if isinstance(item, dict) else item for item in value]
+                      if isinstance(value, list) else value)
+                for key, value in dict(values or {}).items()
+            }
+            for section, values in stats.items()
+        }
     finalized = {}
-    for section, values in stats.items():
+    for section, values in snapshot.items():
         bucket = {}
         for key, value in dict(values or {}).items():
             bucket[key] = _round_perf_value(value)
@@ -1400,135 +1494,6 @@ def _parse_classfile_constant_pool_summary(data):
         return None
 
 
-def _runtime_prefilter_owner_candidates(owner_candidates, data, target_rows_by_owner):
-    if not owner_candidates:
-        return []
-    summary = _parse_classfile_constant_pool_summary(data)
-    if summary is None:
-        return [owner for owner, _internal_bytes, _dotted_bytes in owner_candidates]
-    class_names = summary.get('class_internal_names') or set()
-    ref_names = summary.get('ref_internal_names') or set()
-    utf8_values = summary.get('utf8_values') or set()
-    ref_member_names = summary.get('ref_member_names') or set()
-    filtered = []
-    for owner, _internal_bytes, _dotted_bytes in owner_candidates:
-        internal = _jvm_internal_owner_name(owner)
-        if internal in class_names or internal in ref_names:
-            filtered.append(owner)
-            continue
-        owner_as_string = internal in utf8_values or owner in utf8_values
-        if not owner_as_string:
-            continue
-        for api_row in target_rows_by_owner.get(owner, []):
-            _api_owner, member_name, symbol_kind = _extract_target_owner_and_member(api_row)
-            if symbol_kind == 'class' or str(api_row.get('analysis_scope') or '').strip() == 'class_usage':
-                filtered.append(owner)
-                break
-            if symbol_kind == 'constructor':
-                constructor_reflection_names = {
-                    'getConstructor',
-                    'getDeclaredConstructor',
-                    'newInstance',
-                }
-                if constructor_reflection_names & (utf8_values | ref_member_names):
-                    filtered.append(owner)
-                    break
-            if symbol_kind == 'field':
-                field_reflection_names = {
-                    'getField',
-                    'getDeclaredField',
-                    'findGetter',
-                    'findSetter',
-                    'findStaticGetter',
-                    'findStaticSetter',
-                }
-                if (
-                    member_name
-                    and (member_name in utf8_values or member_name in ref_member_names)
-                    and field_reflection_names & (utf8_values | ref_member_names)
-                ):
-                    filtered.append(owner)
-                    break
-            if symbol_kind == 'method':
-                method_reflection_names = {
-                    'getMethod',
-                    'getDeclaredMethod',
-                    'findStatic',
-                    'findVirtual',
-                    'findSpecial',
-                    'unreflect',
-                    'unreflectSpecial',
-                }
-                if (
-                    member_name
-                    and (member_name in utf8_values or member_name in ref_member_names)
-                    and method_reflection_names & (utf8_values | ref_member_names)
-                ):
-                    filtered.append(owner)
-                    break
-    return list(dict.fromkeys(filtered))
-
-
-def _references_from_constant_pool_summary(summary, class_binary_name=''):
-    references = {
-        'class_refs': set(),
-        'method_refs': [],
-        'field_refs': [],
-    }
-    if not summary:
-        return references
-    for internal in summary.get('class_internal_names') or set():
-        references['class_refs'].add(str(internal).replace('/', '.').replace('$', '.'))
-    for internal in summary.get('ref_internal_names') or set():
-        references['class_refs'].add(str(internal).replace('/', '.').replace('$', '.'))
-    for item in summary.get('ref_members') or []:
-        owner = str(item.get('owner') or '').replace('/', '.').replace('$', '.')
-        name = str(item.get('name') or '')
-        descriptor = str(item.get('descriptor') or '')
-        tag = item.get('tag')
-        if not owner or not name:
-            continue
-        references['class_refs'].add(owner)
-        if tag == 9:
-            references['field_refs'].append({
-                'owner': owner,
-                'name': name,
-                'descriptor': descriptor,
-                'signature': _field_descriptor_to_lookup_signature(descriptor),
-                'consumer_method': '<unknown>',
-                'consumer_signature': '',
-                'reference_kind': 'constant_pool_fieldref',
-            })
-        elif tag in (10, 11):
-            references['method_refs'].append({
-                'owner': owner,
-                'name': name,
-                'descriptor': descriptor,
-                'signature': _method_descriptor_to_lookup_signature(descriptor),
-                'consumer_method': '<unknown>',
-                'consumer_signature': '',
-                'reference_kind': 'constant_pool_methodref',
-            })
-    references['class_refs'] = sorted(references['class_refs'])
-    return references
-
-
-def _match_runtime_dependency_references_from_constant_pool(api_row, summary, class_binary_name=''):
-    _owner, _member_name, symbol_kind = _extract_target_owner_and_member(api_row)
-    if symbol_kind == 'method' and (summary or {}).get('has_dynamic_reference'):
-        return []
-    references = _references_from_constant_pool_summary(summary, class_binary_name)
-    matches = _match_runtime_dependency_references(api_row, references)
-    for item in matches:
-        if item.get('evidence_type') == 'bytecode_method_invocation':
-            item['evidence_type'] = 'bytecode_constant_pool_method_reference'
-        elif item.get('evidence_type') == 'bytecode_field_access':
-            item['evidence_type'] = 'bytecode_constant_pool_field_reference'
-        elif item.get('evidence_type') == 'bytecode_class_reference':
-            item['evidence_type'] = 'bytecode_constant_pool_class_reference'
-    return matches
-
-
 def _run_javap_bytecode_dump(jar_path, class_binary_name, multi_release_version=None):
     command = ['javap', '-classpath', jar_path, '-verbose', '-c', '-s', '-p']
     if multi_release_version not in (None, '', 'base'):
@@ -1541,11 +1506,97 @@ def _run_javap_bytecode_dump(jar_path, class_binary_name, multi_release_version=
     return stdout if rc == 0 else ''
 
 
+_CLASSFILE_OPCODE_NAMES = {
+    0xb2: 'getstatic', 0xb3: 'putstatic', 0xb4: 'getfield', 0xb5: 'putfield',
+    0xb6: 'invokevirtual', 0xb7: 'invokespecial', 0xb8: 'invokestatic',
+    0xb9: 'invokeinterface', 0xbb: 'new', 0xbd: 'anewarray',
+    0xc0: 'checkcast', 0xc1: 'instanceof', 0xc5: 'multianewarray',
+}
+
+
+def _references_from_executable_classfile_edges(edges):
+    references = {
+        'method_refs': [],
+        'field_refs': [],
+        'class_refs': set(),
+        'class_instruction_refs': [],
+    }
+    for edge in edges or []:
+        evidence_type = str(edge.get('evidence_type') or '')
+        if evidence_type == 'bytecode_class_reference':
+            continue
+        content = str(edge.get('content') or '')
+        opcode_match = re.search(r'opcode 0x([0-9a-fA-F]{2})', content)
+        opcode_family = _CLASSFILE_OPCODE_NAMES.get(
+            int(opcode_match.group(1), 16) if opcode_match else -1, ''
+        )
+        instruction_offset = edge.get('line')
+        if not opcode_family or instruction_offset is None:
+            continue
+        callee_key = str(edge.get('callee_key') or '')
+        caller_method = '<unknown>'
+        caller_signature = ''
+        if evidence_type in {'bytecode_method_invocation', 'bytecode_constructor_invocation'}:
+            owner_and_member, _, signature_tail = callee_key.partition('(')
+            owner, _, member = owner_and_member.rpartition('.')
+            signature = normalize_signature_for_lookup(
+                f'({signature_tail}' if signature_tail else ''
+            )
+            jvm_member = '<init>' if evidence_type == 'bytecode_constructor_invocation' else member
+            references['method_refs'].append({
+                'owner': owner,
+                'jvm_owner': owner,
+                'name': jvm_member,
+                'descriptor': '',
+                'signature': signature,
+                'consumer_method': caller_method,
+                'consumer_signature': caller_signature,
+                'consumer_descriptor': '',
+                'opcode_family': opcode_family,
+                'instruction_offset': instruction_offset,
+                'reference_kind': 'classfile_methodref',
+            })
+            references['class_refs'].add(owner)
+        elif evidence_type == 'bytecode_field_access':
+            owner, _, member = callee_key.rpartition('.')
+            references['field_refs'].append({
+                'owner': owner,
+                'jvm_owner': owner,
+                'name': member,
+                'descriptor': '',
+                'signature': '',
+                'consumer_method': caller_method,
+                'consumer_signature': caller_signature,
+                'consumer_descriptor': '',
+                'opcode_family': opcode_family,
+                'instruction_offset': instruction_offset,
+                'reference_kind': 'classfile_fieldref',
+            })
+            references['class_refs'].add(owner)
+        elif evidence_type == 'bytecode_type_reference':
+            owner = callee_key
+        else:
+            continue
+        references['class_instruction_refs'].append({
+            'owner': owner,
+            'consumer_method': caller_method,
+            'consumer_signature': caller_signature,
+            'consumer_descriptor': '',
+            'reference_kind': 'classfile_type_reference',
+            'opcode_family': opcode_family,
+            'instruction_offset': instruction_offset,
+        })
+        references['class_refs'].add(owner)
+    references['class_refs'] = sorted(references['class_refs'])
+    return references
+
+
 def _parse_javap_bytecode_references(text, class_binary_name=''):
     references = {
         'method_refs': [],
         'field_refs': [],
         'class_refs': set(),
+        'class_instruction_refs': [],
     }
     # javap omits the owner for references to members declared by the class
     # currently being disassembled, for example:
@@ -1603,6 +1654,23 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
     current_signature = ''
     current_descriptor = ''
     class_simple = str(class_binary_name or '').rsplit('.', 1)[-1]
+
+    def record_class_instruction(
+        owner, reference_kind, opcode_family, instruction_offset,
+        consumer_method=None, consumer_signature=None, consumer_descriptor=None,
+    ):
+        if not owner or not opcode_family or instruction_offset is None:
+            return
+        references['class_instruction_refs'].append({
+            'owner': owner,
+            'consumer_method': current_member if consumer_method is None else consumer_method,
+            'consumer_signature': current_signature if consumer_signature is None else consumer_signature,
+            'consumer_descriptor': current_descriptor if consumer_descriptor is None else consumer_descriptor,
+            'reference_kind': reference_kind,
+            'opcode_family': opcode_family,
+            'instruction_offset': instruction_offset,
+        })
+
     for raw_line in (text or '').splitlines():
         line = raw_line.strip()
         if not line:
@@ -1651,6 +1719,10 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
                     'reference_kind': 'invokedynamic_method_handle',
                 })
                 references['class_refs'].add(target.get('owner') or '')
+                record_class_instruction(
+                    target.get('owner') or '', 'invokedynamic_method_handle',
+                    opcode_family, instruction_offset,
+                )
         method_match = method_pattern.search(line)
         if method_match and instruction_line:
             jvm_owner = (
@@ -1674,6 +1746,7 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
                 'instruction_offset': instruction_offset,
             })
             references['class_refs'].add(owner)
+            record_class_instruction(owner, 'method_reference', opcode_family, instruction_offset)
             continue
         field_match = field_pattern.search(line)
         if field_match and instruction_line:
@@ -1697,10 +1770,14 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
                 'instruction_offset': instruction_offset,
             })
             references['class_refs'].add(owner)
+            record_class_instruction(owner, 'field_reference', opcode_family, instruction_offset)
             continue
         class_match = class_pattern.search(line)
         if class_match:
-            references['class_refs'].add(class_match.group(1).replace('/', '.').replace('$', '.'))
+            owner = class_match.group(1).replace('/', '.').replace('$', '.')
+            references['class_refs'].add(owner)
+            if instruction_line:
+                record_class_instruction(owner, 'type_reference', opcode_family, instruction_offset)
         if line.startswith('descriptor:'):
             descriptor = line.split(':', 1)[1].strip()
             for match in descriptor_pattern.findall(descriptor):
@@ -1710,6 +1787,13 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
         owner = item.get('owner') or ''
         references['class_refs'].add(owner)
         if kind == 'class':
+            record_class_instruction(
+                owner, item.get('reference_kind') or '',
+                item.get('opcode_family') or '', item.get('instruction_offset'),
+                consumer_method=item.get('consumer_method') or '',
+                consumer_signature=item.get('consumer_signature') or '',
+                consumer_descriptor=item.get('consumer_descriptor') or '',
+            )
             continue
         if kind == 'field':
             references['field_refs'].append({
@@ -1717,6 +1801,8 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
                 'signature': '', 'consumer_method': item.get('consumer_method') or '',
                 'consumer_signature': item.get('consumer_signature') or '',
                 'reference_kind': item.get('reference_kind'),
+                'opcode_family': item.get('opcode_family') or '',
+                'instruction_offset': item.get('instruction_offset'),
             })
             continue
         references['method_refs'].append({
@@ -1727,26 +1813,129 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
             'consumer_method': item.get('consumer_method') or '',
             'consumer_signature': item.get('consumer_signature') or '',
             'reference_kind': item.get('reference_kind'),
+            'opcode_family': item.get('opcode_family') or '',
+            'instruction_offset': item.get('instruction_offset'),
         })
     references['class_refs'] = sorted(references['class_refs'])
     return references
 
 
-def _load_runtime_dependency_class_references(
-    catalog, coord, jar_path, class_binary_name, multi_release_version=None
+def _load_immutable_artifact_parse(
+    artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+    graph, parse, class_entry='',
 ):
-    cache = catalog.setdefault('_bytecode_reference_cache', {})
-    cache_key = (coord, jar_path, class_binary_name, multi_release_version)
-    if cache_key in cache:
-        return cache[cache_key]
-    text = _run_javap_bytecode_dump(
-        jar_path, class_binary_name, multi_release_version=multi_release_version
+    """Parse one physical class once per artifact, procedure, JDK, and generation."""
+    if not _valid_sha256(artifact_sha256):
+        return parse()
+    immutable_key = _immutable_artifact_parse_cache_key(
+        artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        class_entry=class_entry,
     )
-    if not text:
-        cache[cache_key] = None
-        return None
-    parsed = _parse_javap_bytecode_references(text, class_binary_name)
-    cache[cache_key] = parsed
+
+    def deserialize(serialized):
+        return json.loads(serialized)
+
+    while True:
+        with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+            generation = _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
+            cached_serialized = _IMMUTABLE_ARTIFACT_PARSE_CACHE.get(immutable_key)
+            if isinstance(cached_serialized, str):
+                cached = deserialize(cached_serialized)
+                cache_hit = True
+                parse_event = None
+                owns_parse = False
+            else:
+                if immutable_key in _IMMUTABLE_ARTIFACT_PARSE_CACHE:
+                    _IMMUTABLE_ARTIFACT_PARSE_CACHE.pop(immutable_key, None)
+                cache_hit = False
+                inflight_key = (generation, immutable_key)
+                parse_event = _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.get(inflight_key)
+                owns_parse = parse_event is None
+                if owns_parse:
+                    parse_event = Event()
+                    _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT[inflight_key] = parse_event
+        if cache_hit:
+            _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
+            return cached
+        if not owns_parse:
+            parse_event.wait()
+            continue
+        _perf_add(graph, 'bytecode_scan', 'artifact_cache_misses', 1)
+        parse_started_at = time.perf_counter()
+        try:
+            parsed = parse()
+        except Exception:
+            with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+                inflight_key = (generation, immutable_key)
+                if _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.get(inflight_key) is parse_event:
+                    _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.pop(inflight_key, None)
+                    parse_event.set()
+            raise
+        finally:
+            _perf_add(
+                graph, 'bytecode_scan', 'class_parse_elapsed_sec',
+                time.perf_counter() - parse_started_at,
+            )
+        serialized = json.dumps(
+            parsed,
+            default=lambda value: sorted(value) if isinstance(value, set) else TypeError,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+            inflight_key = (generation, immutable_key)
+            if (
+                _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION == generation
+                and _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.get(inflight_key) is parse_event
+            ):
+                _IMMUTABLE_ARTIFACT_PARSE_CACHE[immutable_key] = serialized
+                _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.pop(inflight_key, None)
+                parse_event.set()
+        return parsed
+
+
+def _load_runtime_dependency_class_references(
+    catalog, coord, jar_path, class_binary_name, multi_release_version=None,
+    artifact_sha256='', target_jdk=None, graph=None, class_entry='',
+):
+    immutable_key = _immutable_artifact_parse_cache_key(
+        artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        class_entry=class_entry,
+    )
+    cache_key = (coord, jar_path, *immutable_key)
+    with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+        generation = _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
+        cache = catalog.setdefault('_bytecode_reference_cache', {})
+        cache_generations = catalog.setdefault('_bytecode_reference_cache_generations', {})
+        if cache_generations.get(cache_key) == generation and cache_key in cache:
+            _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
+            return cache[cache_key]
+        cache.pop(cache_key, None)
+        cache_generations.pop(cache_key, None)
+
+    def parse():
+        text = _run_javap_bytecode_dump(
+            jar_path, class_binary_name, multi_release_version=multi_release_version
+        )
+        _perf_add(graph, 'bytecode_scan', 'javap_fallbacks', 1)
+        if not text:
+            return None
+        parsed = _parse_javap_bytecode_references(text, class_binary_name)
+        _record_actual_artifact_class_parse(
+            graph, artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        )
+        return parsed
+
+    parsed = _load_immutable_artifact_parse(
+        artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        graph, parse, class_entry=class_entry,
+    )
+    with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+        if _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION == generation:
+            cache = catalog.setdefault('_bytecode_reference_cache', {})
+            cache_generations = catalog.setdefault('_bytecode_reference_cache_generations', {})
+            cache[cache_key] = parsed
+            cache_generations[cache_key] = generation
     return parsed
 
 
@@ -1757,6 +1946,10 @@ def _load_runtime_dependency_class_references_for_task(task):
         task['jar_path'],
         task['class_binary_name'],
         multi_release_version=task.get('multi_release_version'),
+        artifact_sha256=task.get('artifact_sha256') or '',
+        target_jdk=task.get('target_jdk'),
+        graph=task.get('graph'),
+        class_entry=task.get('class_entry') or '',
     )
     return task, references
 
@@ -1770,14 +1963,29 @@ def _match_runtime_dependency_references(api_row, references):
     target_lookup_signature = normalize_signature_for_lookup(target_signature) or target_signature
 
     if symbol_kind == 'class' or str(api_row.get('analysis_scope') or '').strip() == 'class_usage':
-        if owner in set(references.get('class_refs') or []):
-            return [{
-                'evidence_type': 'bytecode_class_reference',
+        matches = []
+        for item in references.get('class_instruction_refs') or []:
+            if str(item.get('owner') or '').replace('$', '.') != str(owner).replace('$', '.'):
+                continue
+            if not item.get('opcode_family') or item.get('instruction_offset') is None:
+                continue
+            matches.append({
+                'evidence_type': (
+                    'bytecode_reflection_class_lookup'
+                    if item.get('reference_kind') == 'reflection_class'
+                    else 'bytecode_class_reference'
+                ),
                 'target_display': owner,
-                'consumer_method': '<class>',
-                'consumer_signature': '',
-            }]
-        return []
+                'consumer_method': item.get('consumer_method') or '<unknown>',
+                'consumer_signature': item.get('consumer_signature') or '',
+                'consumer_descriptor': item.get('consumer_descriptor') or '',
+                'callee_owner': owner,
+                'callee_member': '',
+                'callee_descriptor': '',
+                'opcode_family': item.get('opcode_family') or '',
+                'instruction_offset': item.get('instruction_offset'),
+            })
+        return _dedupe_runtime_matches(matches)
 
     if symbol_kind in {'method', 'constructor'}:
         matches = []
@@ -1785,6 +1993,11 @@ def _match_runtime_dependency_references(api_row, references):
             if (
                 str(item.get('owner') or '').replace('$', '.') != str(owner or '').replace('$', '.')
                 or item.get('name') != member_name
+            ):
+                continue
+            if (
+                str(item.get('reference_kind') or '').startswith('reflection_')
+                and (not item.get('opcode_family') or item.get('instruction_offset') is None)
             ):
                 continue
             if target_lookup_signature:
@@ -1796,6 +2009,8 @@ def _match_runtime_dependency_references(api_row, references):
                 'evidence_type': (
                     'bytecode_invokedynamic_method_reference'
                     if item.get('reference_kind') == 'invokedynamic_method_handle'
+                    else 'bytecode_constant_pool_method_reference'
+                    if item.get('reference_kind') == 'classfile_methodref'
                     else 'bytecode_reflection_method_invocation'
                     if item.get('reference_kind') in {'reflection_method', 'reflection_constructor'}
                     else ('bytecode_method_invocation' if symbol_kind == 'method' else 'bytecode_constructor_invocation')
@@ -1820,10 +2035,17 @@ def _match_runtime_dependency_references(api_row, references):
                 or item.get('name') != member_name
             ):
                 continue
+            if (
+                str(item.get('reference_kind') or '').startswith('reflection_')
+                and (not item.get('opcode_family') or item.get('instruction_offset') is None)
+            ):
+                continue
             matches.append({
                 'evidence_type': (
                     'bytecode_reflection_field_access'
                     if item.get('reference_kind') == 'reflection_field'
+                    else 'bytecode_constant_pool_field_reference'
+                    if item.get('reference_kind') == 'classfile_fieldref'
                     else 'bytecode_field_access'
                 ),
                 'target_display': f"{owner}.{member_name}",
@@ -1989,6 +2211,10 @@ def collect_graph_analyzer_edges(graph, api_rows):
             '__business__',
             business_jar,
             class_binary_name,
+            artifact_sha256=business_jar_sha256,
+            target_jdk=catalog.get('target_jdk'),
+            graph=graph,
+            class_entry=class_entry,
         )
         if references is None:
             _record_analyzer_ledger_failure(
@@ -2129,10 +2355,6 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     multi_release_seen = False
     multi_release_target_resolved = False
     target_jdk = catalog.get('target_jdk')
-    allow_constant_pool_fast_path = bool(
-        not (getattr(graph, 'reverse_edges', {}) or {})
-        and not _verified_final_artifact_provenance(graph).get('complete')
-    )
     for item in catalog_entries:
         coord = str(item.get('coord') or '').strip()
         same_coord = coord == str(api_row.get('coord') or '').strip()
@@ -2145,6 +2367,7 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
             })
             continue
         try:
+            artifact_sha256 = _artifact_sha256(jar_path)
             with zipfile.ZipFile(jar_path) as zf:
                 try:
                     manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
@@ -2166,39 +2389,12 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                     data = zf.read(entry)
                     if not _class_bytes_might_reference_target(data, owner_internal_name, member_name):
                         continue
-                    if not _runtime_prefilter_owner_candidates(
-                        [(owner, owner_internal_name.encode('utf-8'), owner.encode('utf-8'))],
-                        data,
-                        {owner: [api_row]},
-                    ):
-                        continue
                     class_binary_name = logical_name[:-6].replace('/', '.')
-                    if allow_constant_pool_fast_path:
-                        summary = _parse_classfile_constant_pool_summary(data)
-                        constant_pool_matches = _match_runtime_dependency_references_from_constant_pool(
-                            api_row, summary, class_binary_name
-                        )
-                        if constant_pool_matches:
-                            for matched in constant_pool_matches:
-                                hits.append({
-                                    'coord': coord,
-                                    'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
-                                    'direct_consumer': not same_coord,
-                                    'jar_path': jar_path,
-                                    'artifact_container_entry': item.get('artifact_entry') or '',
-                                    'caller_owner': class_binary_name,
-                                    'class_fqcn': class_binary_name.replace('$', '.'),
-                                    'consumer_method': matched.get('consumer_method') or '<unknown>',
-                                    'consumer_signature': matched.get('consumer_signature') or '',
-                                    'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
-                                    'target_display': matched.get('target_display') or owner,
-                                    'class_entry': entry,
-                                    'multi_release_version': selected_version,
-                                })
-                            continue
                     references = _load_runtime_dependency_class_references(
                         catalog, coord, jar_path, class_binary_name,
                         multi_release_version=selected_version,
+                        artifact_sha256=artifact_sha256, target_jdk=target_jdk, graph=graph,
+                        class_entry=entry,
                     )
                     if references is None:
                         scan_failures.append({
@@ -2305,6 +2501,13 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         )
     scan_started_at = time.perf_counter()
     _perf_add(graph, 'bytecode_scan', 'calls', 1)
+    for metric in (
+        'artifact_bytes', 'artifact_count', 'class_entries_scoped',
+        'internal_bridge_class_scans', 'direct_consumer_class_scans',
+        'artifact_cache_hits', 'artifact_cache_misses', 'javap_fallbacks',
+        'class_entries_parsed', 'class_parse_elapsed_sec', 'duplicate_class_scans',
+    ):
+        _perf_add(graph, 'bytecode_scan', metric, 0)
     existing = catalog.setdefault('_packaged_api_scan_results', {})
     api_rows = [dict(row or {}) for row in (api_rows or []) if (row or {}).get('api_name')]
     missing_rows = [
@@ -2359,12 +2562,9 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     multi_release_seen = False
     multi_release_target_resolved = False
     target_jdk = catalog.get('target_jdk')
+    counted_artifacts = set()
     started_at = time.perf_counter()
     progress_interval = suggest_log_interval(len(catalog_entries), target_updates=8, minimum=1)
-    allow_constant_pool_fast_path = bool(
-        not (getattr(graph, 'reverse_edges', {}) or {})
-        and not _verified_final_artifact_provenance(graph).get('complete')
-    )
 
     if not catalog_entries:
         _record_analyzer_ledger_failure(graph, 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE')
@@ -2441,6 +2641,11 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             })
             continue
         try:
+            artifact_sha256 = _artifact_sha256(jar_path)
+            if artifact_sha256 not in counted_artifacts:
+                counted_artifacts.add(artifact_sha256)
+                _perf_add(graph, 'bytecode_scan', 'artifact_bytes', os.path.getsize(jar_path))
+                _perf_add(graph, 'bytecode_scan', 'artifact_count', 1)
             with zipfile.ZipFile(jar_path) as zf:
                 try:
                     manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
@@ -2460,6 +2665,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         continue
                     visited_classes += 1
                     jar_visited_classes += 1
+                    _perf_add(graph, 'bytecode_scan', 'class_entries_scoped', 1)
                     data = zf.read(entry)
                     owner_candidates = []
                     for internal_package_bytes, dotted_package_bytes, grouped_owners in package_bytes:
@@ -2475,53 +2681,9 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         owner for owner, internal_bytes, dotted_bytes in owner_candidates
                         if internal_bytes in data or dotted_bytes in data
                     ]
-                    if candidate_owners:
-                        candidate_owner_set = set(candidate_owners)
-                        candidate_owners = _runtime_prefilter_owner_candidates(
-                            [
-                                (owner, internal_bytes, dotted_bytes)
-                                for owner, internal_bytes, dotted_bytes in owner_candidates
-                                if owner in candidate_owner_set
-                            ],
-                            data,
-                            target_rows_by_owner,
-                        )
                     if not candidate_owners:
                         continue
                     class_binary_name = logical_name[:-6].replace('/', '.')
-                    if allow_constant_pool_fast_path:
-                        summary = _parse_classfile_constant_pool_summary(data)
-                        constant_pool_matched_any = False
-                        for owner in set(candidate_owners):
-                            for api_row in target_rows_by_owner.get(owner, []):
-                                same_coord = coord == str(api_row.get('coord') or '').strip()
-                                matches = _match_runtime_dependency_references_from_constant_pool(
-                                    api_row, summary, class_binary_name
-                                )
-                                if not matches:
-                                    continue
-                                constant_pool_matched_any = True
-                                key = build_api_identity_key(api_row)
-                                for matched in matches:
-                                    _perf_add(graph, 'bytecode_scan', 'constant_pool_hits', 1)
-                                    jar_constant_pool_hits += 1
-                                    hits_by_key[key].append({
-                                        'coord': coord,
-                                        'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
-                                        'direct_consumer': not same_coord,
-                                        'jar_path': jar_path,
-                                        'artifact_container_entry': item.get('artifact_entry') or '',
-                                        'caller_owner': class_binary_name,
-                                        'class_fqcn': class_binary_name.replace('$', '.'),
-                                        'consumer_method': matched.get('consumer_method') or '<unknown>',
-                                        'consumer_signature': matched.get('consumer_signature') or '',
-                                        'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
-                                        'target_display': matched.get('target_display') or owner,
-                                        'class_entry': entry,
-                                        'multi_release_version': selected_version,
-                                    })
-                        if constant_pool_matched_any:
-                            continue
                     javap_tasks.append({
                         'catalog': catalog,
                         'coord': coord,
@@ -2532,6 +2694,9 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         'class_fqcn': class_binary_name.replace('$', '.'),
                         'class_entry': entry,
                         'multi_release_version': selected_version,
+                        'artifact_sha256': artifact_sha256,
+                        'target_jdk': target_jdk,
+                        'graph': graph,
                         'candidate_owners': sorted(set(candidate_owners)),
                     })
                     jar_candidate_classes += 1
@@ -2574,8 +2739,6 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             task_elapsed = time.perf_counter() - task_started_at
             selected_version = task.get('multi_release_version')
             candidate_owners = task.get('candidate_owners') or []
-            cache = catalog.setdefault('_bytecode_reference_cache', {})
-            cache[(coord, jar_path, class_binary_name, selected_version)] = references
             if references is None:
                 _perf_add(graph, 'bytecode_scan', 'javap_failures', 1)
                 _perf_record_top(graph, 'bytecode_scan', 'slow_javap_tasks', {
@@ -2613,6 +2776,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             referenced_owners.update(
                 item.get('owner') for item in references.get('field_refs') or []
             )
+            matched_api_keys = set()
             for owner in set(candidate_owners) & {item for item in referenced_owners if item}:
                 for api_row in target_rows_by_owner.get(owner, []):
                     same_coord = coord == str(api_row.get('coord') or '').strip()
@@ -2620,6 +2784,14 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     if not matches:
                         continue
                     key = build_api_identity_key(api_row)
+                    if key not in matched_api_keys:
+                        matched_api_keys.add(key)
+                        metric = (
+                            'internal_bridge_class_scans'
+                            if coord == str(api_row.get('coord') or '').strip()
+                            else 'direct_consumer_class_scans'
+                        )
+                        _perf_add(graph, 'bytecode_scan', metric, 1)
                     for matched in matches:
                         hit = {
                             'coord': coord,
@@ -2939,17 +3111,6 @@ def _add_runtime_dependency_caller_edge(graph, lookup_key, coord, jar_path, clas
     return edge
 
 
-_BYTECODE_REFLECTION_MEMBER_LOOKUP_NAMES = {
-    'getMethod',
-    'getDeclaredMethod',
-    'findStatic',
-    'findVirtual',
-    'findSpecial',
-    'unreflect',
-    'unreflectSpecial',
-}
-
-
 def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk):
     index_started_at = time.perf_counter()
     _perf_add(graph, 'bytecode_expand', 'member_index_builds', 1)
@@ -2981,6 +3142,8 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
         if not jar_path or not os.path.exists(jar_path):
             continue
         try:
+            catalog = _get_runtime_dependency_catalog(graph)
+            artifact_sha256 = _artifact_sha256(jar_path)
             with zipfile.ZipFile(jar_path) as zf:
                 try:
                     manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
@@ -2996,44 +3159,38 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                     if logical_name.endswith(('module-info.class', 'package-info.class')):
                         continue
                     visited_classes += 1
-                    try:
-                        data = zf.read(entry)
-                    except Exception:
-                        parse_failures += 1
-                        continue
-                    summary = _parse_classfile_constant_pool_summary(data)
                     class_binary_name = logical_name[:-6].replace('/', '.')
                     task = {
-                        'catalog': _get_runtime_dependency_catalog(graph),
+                        'catalog': catalog,
                         'coord': coord,
                         'jar_path': jar_path,
                         'class_entry': entry,
                         'class_binary_name': class_binary_name,
                         'class_fqcn': class_binary_name.replace('$', '.'),
                         'multi_release_version': selected_version,
+                        'artifact_sha256': artifact_sha256,
+                        'target_jdk': target_jdk,
+                        'graph': graph,
                     }
-                    if summary is None:
+                    references = _load_runtime_dependency_class_references(
+                        catalog, coord, jar_path, class_binary_name,
+                        multi_release_version=selected_version,
+                        artifact_sha256=artifact_sha256, target_jdk=target_jdk, graph=graph,
+                        class_entry=entry,
+                    )
+                    if references is None:
                         parse_failures += 1
                         unparsed_tasks.append(task)
                         continue
                     task_id = len(tasks)
                     tasks.append(task)
-                    for ref in summary.get('ref_members') or []:
-                        owner = str(ref.get('owner') or '').replace('/', '.').replace('$', '.')
+                    member_refs = list(references.get('method_refs') or [])
+                    member_refs.extend(references.get('field_refs') or [])
+                    for ref in member_refs:
+                        owner = str(ref.get('owner') or '')
                         member = str(ref.get('name') or '')
                         if owner and member:
                             direct_by_owner_member[(owner, member)].add(task_id)
-                    utf8_values = set(summary.get('utf8_values') or set())
-                    for value in utf8_values:
-                        text = str(value or '')
-                        if not text or len(text) > 240:
-                            continue
-                        owner_string_ids[text.replace('/', '.').replace('$', '.')].add(task_id)
-                        if re.match(r'^[A-Za-z_$][\w$]*$', text):
-                            member_string_ids[text].add(task_id)
-                    ref_member_names = set(summary.get('ref_member_names') or set())
-                    if _BYTECODE_REFLECTION_MEMBER_LOOKUP_NAMES & (utf8_values | ref_member_names):
-                        reflection_ids.add(task_id)
         except Exception:
             parse_failures += 1
             continue
@@ -3155,7 +3312,6 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
         for coord, item in by_coord.items()
     ])
     owner_internal = _jvm_internal_owner_name(owner)
-    target_rows_by_owner = {owner: [api_row]}
     visited_classes = 0
     javap_classes = 0
     edges_added = 0
@@ -3238,6 +3394,7 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                 if not jar_path or not os.path.exists(jar_path):
                     continue
                 try:
+                    artifact_sha256 = _artifact_sha256(jar_path)
                     with zipfile.ZipFile(jar_path) as zf:
                         try:
                             manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
@@ -3256,20 +3413,18 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                             data = zf.read(entry)
                             if not _class_bytes_might_reference_target(data, owner_internal, member):
                                 continue
-                            if not _runtime_prefilter_owner_candidates(
-                                [(owner, owner_internal.encode('utf-8'), owner.encode('utf-8'))],
-                                data,
-                                target_rows_by_owner,
-                            ):
-                                continue
                             class_binary_name = logical_name[:-6].replace('/', '.')
                             javap_tasks.append({
                                 'catalog': catalog,
                                 'coord': coord,
                                 'jar_path': jar_path,
+                                'class_entry': entry,
                                 'class_binary_name': class_binary_name,
                                 'class_fqcn': class_binary_name.replace('$', '.'),
                                 'multi_release_version': selected_version,
+                                'artifact_sha256': artifact_sha256,
+                                'target_jdk': target_jdk,
+                                'graph': graph,
                             })
                 except Exception:
                     _perf_add(graph, 'bytecode_expand', 'light_scan_failures', 1)

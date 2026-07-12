@@ -14,6 +14,32 @@ import real_project_regression as realreg  # noqa: E402
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_all_real_cases_have_active_measurable_performance_budgets(self):
+        self.assertTrue(realreg.CASES)
+        for name, case in realreg.CASES.items():
+            with self.subTest(case=name):
+                self.assertGreater(case.max_elapsed_seconds, 0.0)
+                self.assertGreater(case.max_potential_pairs_per_api, 0.0)
+                self.assertGreaterEqual(case.max_duplicate_class_scans, 0)
+                self.assertGreater(case.max_seconds_per_100k_edges, 0.0)
+                self.assertGreater(case.min_classes_per_second, 0.0)
+
+    def test_real_case_performance_defaults_and_mall_policy_match_the_measured_baseline(self):
+        self.assertEqual(
+            realreg.REAL_CASE_PERFORMANCE_BUDGET,
+            {
+                "max_elapsed_seconds": 300.0,
+                "max_potential_pairs_per_api": 100000.0,
+                "max_duplicate_class_scans": 0,
+                "max_seconds_per_100k_edges": 1000000.0,
+                "min_classes_per_second": 1.0,
+            },
+        )
+        mall = realreg.CASES["mall"]
+        self.assertEqual(mall.max_duplicate_class_scans, 0)
+        self.assertEqual(mall.max_seconds_per_100k_edges, 1000000.0)
+        self.assertEqual(mall.min_classes_per_second, 1.0)
+
     def test_all_executable_real_cases_declare_nonempty_topology_requirements(self):
         self.assertTrue(realreg.CASES)
         for name, case in realreg.CASES.items():
@@ -245,6 +271,134 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(envelope["owner_presence_scans"], 8058)
         self.assertAlmostEqual(envelope["potential_pairs_per_api"], 143240640 / 5440)
         self.assertAlmostEqual(envelope["elapsed_seconds_per_1000_apis"], 107.7 / 5.44)
+
+    def test_performance_envelope_includes_parse_reconcile_and_cache_metrics(self):
+        envelope = realreg.collect_performance_envelope(
+            {"meta": {"graph_stats": {"step5_perf": {"bytecode_scan": {
+                "artifact_bytes": 4096,
+                "class_entries_scoped": 16,
+                "class_entries_parsed": 5,
+                "elapsed_sec": 2.0,
+                "class_parse_elapsed_sec": 2.5,
+                "artifact_cache_hits": 3,
+                "javap_fallbacks": 4,
+                "duplicate_class_scans": 1,
+            }}}}},
+            elapsed=8.0,
+            selected=2,
+        )
+        envelope.update({
+            "oracle_edge_count": 10,
+            "analyzer_edge_count": 8,
+            "reconcile_seconds": 0.5,
+        })
+        realreg.finalize_performance_envelope(envelope)
+
+        self.assertEqual(envelope["artifact_bytes"], 4096)
+        self.assertEqual(envelope["class_count"], 16)
+        self.assertEqual(envelope["parsed_class_count"], 5)
+        self.assertEqual(envelope["artifact_cache_hits"], 3)
+        self.assertEqual(envelope["javap_fallbacks"], 4)
+        self.assertEqual(envelope["duplicate_class_scans"], 1)
+        self.assertEqual(envelope["oracle_edge_count"], 10)
+        self.assertEqual(envelope["analyzer_edge_count"], 8)
+        self.assertEqual(envelope["parse_seconds"], 2.5)
+        self.assertEqual(envelope["parse_classes_per_second"], 2.0)
+        self.assertTrue(envelope["parse_rate_available"])
+        self.assertEqual(envelope["reconcile_edges_per_second"], 20.0)
+        self.assertEqual(envelope["elapsed_seconds_per_100k_edges"], 80000.0)
+        self.assertTrue(envelope["edge_rate_available"])
+
+    def test_zero_edge_rate_is_unavailable_and_blocks_a_configured_budget(self):
+        envelope = realreg.collect_performance_envelope({}, elapsed=8.0, selected=2)
+        envelope.update({
+            "oracle_edge_count": 0,
+            "analyzer_edge_count": 0,
+            "reconcile_seconds": 0.5,
+        })
+        realreg.finalize_performance_envelope(envelope)
+
+        self.assertFalse(envelope["edge_rate_available"])
+        self.assertIsNone(envelope["elapsed_seconds_per_100k_edges"])
+
+        case = realreg.RealProjectCase(
+            name="zero-edge-budgeted",
+            default_project=Path("."),
+            default_changed_apis=Path(""),
+            baseline_specs=(),
+            max_seconds_per_100k_edges=100.0,
+        )
+        signals = realreg.build_policy_signals(
+            case,
+            coverage={"complete": True},
+            performance=envelope,
+            report_dir=Path("/tmp/report"),
+        )
+
+        regressions = [item for item in signals if item["signal_type"] == "performance_regression"]
+        self.assertEqual(len(regressions), 1)
+        self.assertTrue(regressions[0]["blocking"])
+        self.assertIn("unavailable", regressions[0]["message"])
+
+    def test_zero_parsed_class_rate_is_unavailable_and_blocks_a_configured_budget(self):
+        envelope = realreg.collect_performance_envelope(
+            {"meta": {"graph_stats": {"step5_perf": {"bytecode_scan": {
+                "class_entries_scoped": 16,
+                "class_entries_parsed": 0,
+                "class_parse_elapsed_sec": 0.0,
+            }}}}},
+            elapsed=8.0,
+            selected=2,
+        )
+        realreg.finalize_performance_envelope(envelope)
+
+        self.assertFalse(envelope["parse_rate_available"])
+        self.assertIsNone(envelope["parse_classes_per_second"])
+
+        case = realreg.RealProjectCase(
+            name="zero-class-budgeted",
+            default_project=Path("."),
+            default_changed_apis=Path(""),
+            baseline_specs=(),
+            min_classes_per_second=1.0,
+        )
+        signals = realreg.build_policy_signals(
+            case,
+            coverage={"complete": True},
+            performance=envelope,
+            report_dir=Path("/tmp/report"),
+        )
+
+        regressions = [item for item in signals if item["signal_type"] == "performance_regression"]
+        self.assertEqual(len(regressions), 1)
+        self.assertTrue(regressions[0]["blocking"])
+        self.assertIn("unavailable", regressions[0]["message"])
+
+    def test_policy_signals_block_normalized_performance_budget_regressions(self):
+        case = realreg.RealProjectCase(
+            name="budgeted",
+            default_project=Path("."),
+            default_changed_apis=Path(""),
+            baseline_specs=(),
+            max_duplicate_class_scans=0,
+            max_seconds_per_100k_edges=100.0,
+            min_classes_per_second=20.0,
+        )
+        signals = realreg.build_policy_signals(
+            case,
+            coverage={"complete": True},
+            performance={
+                "duplicate_class_scans": 1,
+                "elapsed_seconds_per_100k_edges": 101.0,
+                "parse_classes_per_second": 19.0,
+            },
+            report_dir=Path("/tmp/report"),
+        )
+
+        regressions = [item for item in signals if item["signal_type"] == "performance_regression"]
+        self.assertEqual(len(regressions), 3)
+        self.assertTrue(all(item["blocking"] for item in regressions))
+        self.assertTrue(any("elapsed_seconds_per_100k_edges=101.00" in item["message"] for item in regressions))
 
     def test_edge_truth_reconciliation_fails_when_an_intermediate_oracle_edge_is_missing(self):
         artifact_sha256 = "a" * 64

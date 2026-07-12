@@ -1,4 +1,5 @@
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import io
@@ -7,6 +8,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
@@ -1231,6 +1234,7 @@ BootstrapMethods:
                     "status": "complete",
                     "entries": [business_item],
                     "by_coord": {"__business__": business_item},
+                    "target_jdk": "17",
                 },
             )
             api_row = {
@@ -1253,7 +1257,19 @@ BootstrapMethods:
             self.assertEqual(produced_edge.artifact_sha256, business_sha256)
             self.assertNotEqual(produced_edge.artifact_sha256, artifact_sha256)
 
-            tracer.collect_graph_analyzer_edges(graph, [api_row])
+            with patch.object(
+                tracer,
+                "_load_runtime_dependency_class_references",
+                wraps=tracer._load_runtime_dependency_class_references,
+            ) as mocked_loader:
+                tracer.collect_graph_analyzer_edges(graph, [api_row])
+            loader_kwargs = mocked_loader.call_args.kwargs
+            self.assertEqual(loader_kwargs["artifact_sha256"], business_sha256)
+            self.assertEqual(loader_kwargs["target_jdk"], "17")
+            self.assertIs(loader_kwargs["graph"], graph)
+            bytecode_scan = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+            self.assertEqual(bytecode_scan["artifact_cache_misses"], 1)
+            self.assertEqual(bytecode_scan["class_entries_parsed"], 1)
             graph_stats = {}
             ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
             with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
@@ -1394,6 +1410,713 @@ BootstrapMethods:
         self.assertEqual(len(first), 1)
         self.assertEqual(len(second), 1)
         self.assertEqual(calls, calls_after_first)
+
+    def test_artifact_hash_parse_cache_preserves_scope_and_target_internal_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "target.jar"
+            source_root = Path(tmp) / "src"
+            target_source = source_root / "com/vendor/Target.java"
+            bridge_source = source_root / "com/example/TargetBridge.java"
+            target_source.parent.mkdir(parents=True)
+            bridge_source.parent.mkdir(parents=True)
+            target_source.write_text(
+                "package com.vendor; public class Target { "
+                "public static void removed(String value) {} }",
+                encoding="utf-8",
+            )
+            bridge_source.write_text(
+                "package com.example; public class TargetBridge { "
+                "public void use(String value) { com.vendor.Target.removed(value); } }",
+                encoding="utf-8",
+            )
+            classes = self._compile_java_files(
+                Path(tmp) / "classes", [target_source, bridge_source]
+            )
+            self._jar_compiled_classes(jar_path, classes)
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+
+            def graph():
+                item = {
+                    "coord": api_row["coord"],
+                    "jar_path": str(jar_path),
+                    "artifact_entry": "BOOT-INF/lib/target.jar",
+                }
+                return SimpleNamespace(
+                    methods_by_id={},
+                    reverse_edges={"force_javap_path": []},
+                    runtime_dependency_catalog={
+                        "status": "complete",
+                        "entries": [item],
+                        "by_coord": {item["coord"]: item},
+                        "target_jdk": "17",
+                    },
+                )
+
+            javap_output = """
+public class com.example.TargetBridge {
+  public void use(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+    Code:
+       0: invokestatic #7 // Method com/vendor/Target.removed:(Ljava/lang/String;)V
+}
+"""
+            tracer.clear_immutable_artifact_parse_cache()
+            first_graph = graph()
+            second_graph = graph()
+            with patch.object(tracer, "run_cmd", return_value=(javap_output, "", 0)) as mocked_run:
+                tracer._build_packaged_runtime_dependency_scan_cache([api_row], first_graph)
+                tracer._build_packaged_runtime_dependency_scan_cache([api_row], second_graph)
+
+            first = first_graph.runtime_dependency_catalog["_packaged_api_scan_results"][
+                tracer.build_api_identity_key(api_row)
+            ]
+            second = second_graph.runtime_dependency_catalog["_packaged_api_scan_results"][
+                tracer.build_api_identity_key(api_row)
+            ]
+            first_perf = tracer._finalize_step5_perf_stats(first_graph)["bytecode_scan"]
+            second_perf = tracer._finalize_step5_perf_stats(second_graph)["bytecode_scan"]
+
+        self.assertEqual(mocked_run.call_count, 2)
+        self.assertEqual(first["visited_classes"], second["visited_classes"])
+        self.assertEqual(first["status"], second["status"])
+        self.assertEqual(second["hits"][0]["edge_role"], "internal_bridge")
+        self.assertFalse(second["hits"][0]["direct_consumer"])
+        self.assertEqual(first_perf["class_entries_scoped"], second_perf["class_entries_scoped"])
+        self.assertEqual(second_perf["artifact_cache_hits"], 2)
+        self.assertEqual(second_perf["class_entries_parsed"], 0)
+        self.assertEqual(second_perf["duplicate_class_scans"], 0)
+        self.assertEqual(second_perf["direct_consumer_class_scans"], 0)
+        self.assertEqual(second_perf["internal_bridge_class_scans"], 2)
+
+    def test_artifact_hash_parse_cache_deduplicates_concurrent_class_parses(self):
+        javap_output = """
+public class com.example.TargetBridge {
+  public void use(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+    Code:
+       0: invokestatic #7 // Method com/vendor/Target.removed:(Ljava/lang/String;)V
+}
+"""
+        graph = SimpleNamespace()
+        tracer.clear_immutable_artifact_parse_cache()
+
+        def load_references():
+            return tracer._load_runtime_dependency_class_references(
+                {}, "com.vendor:target", "/tmp/target.jar", "com.example.TargetBridge",
+                artifact_sha256="a" * 64, target_jdk="17", graph=graph,
+            )
+
+        def slow_javap(*_args, **_kwargs):
+            time.sleep(0.05)
+            return javap_output
+
+        with patch.object(tracer, "_run_javap_bytecode_dump", side_effect=slow_javap) as mocked_javap:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first, second = [future.result() for future in (
+                    executor.submit(load_references), executor.submit(load_references)
+                )]
+
+        self.assertEqual(mocked_javap.call_count, 1)
+        self.assertEqual(first, second)
+        self.assertGreaterEqual(
+            tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]["artifact_cache_hits"], 1
+        )
+
+    def test_artifact_hash_parse_cache_counts_only_actual_duplicate_parses(self):
+        javap_output = """
+public class com.example.TargetBridge {
+  public void use(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+    Code:
+       0: invokestatic #7 // Method com/vendor/Target.removed:(Ljava/lang/String;)V
+}
+"""
+        graph = SimpleNamespace()
+        artifact_sha256 = "a" * 64
+
+        def load_references(catalog):
+            return tracer._load_runtime_dependency_class_references(
+                catalog, "com.vendor:target", "/tmp/target.jar", "com.example.TargetBridge",
+                artifact_sha256=artifact_sha256, target_jdk="17", graph=graph,
+            )
+
+        tracer.clear_immutable_artifact_parse_cache()
+        with patch.object(tracer, "_run_javap_bytecode_dump", return_value=javap_output) as mocked_javap:
+            first = load_references({})
+            second = load_references({})
+            tracer.clear_immutable_artifact_parse_cache()
+            third = load_references({})
+
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertEqual(first, second)
+        self.assertEqual(first, third)
+        self.assertEqual(mocked_javap.call_count, 2)
+        self.assertEqual(perf["class_entries_parsed"], 2)
+        self.assertEqual(perf["duplicate_class_scans"], 1)
+
+    def test_artifact_hash_parse_cache_never_decodes_an_invalidated_none_value(self):
+        graph = SimpleNamespace()
+        artifact_sha256 = "a" * 64
+        immutable_key = tracer._immutable_artifact_parse_cache_key(
+            artifact_sha256, "17", "com.example.TargetBridge", None
+        )
+        tracer.clear_immutable_artifact_parse_cache()
+        tracer._IMMUTABLE_ARTIFACT_PARSE_CACHE[immutable_key] = None
+        try:
+            with patch.object(
+                tracer, "_run_javap_bytecode_dump", return_value="public class com.example.TargetBridge {}"
+            ) as mocked_javap:
+                references = tracer._load_runtime_dependency_class_references(
+                    {}, "com.vendor:target", "/tmp/target.jar", "com.example.TargetBridge",
+                    artifact_sha256=artifact_sha256, target_jdk="17", graph=graph,
+                )
+        finally:
+            tracer.clear_immutable_artifact_parse_cache()
+
+        self.assertEqual(references["class_refs"], [])
+        self.assertEqual(mocked_javap.call_count, 1)
+
+    def test_artifact_hash_parse_cache_clear_isolates_post_clear_waiters(self):
+        javap_output = "public class com.example.TargetBridge {}"
+        graph = SimpleNamespace()
+        first_parse_started = threading.Event()
+        second_parse_started = threading.Event()
+        release_first_parse = threading.Event()
+        release_second_parse = threading.Event()
+        old_waiter_woken = threading.Event()
+        release_old_waiter = threading.Event()
+        created_events = []
+        calls = 0
+
+        class TrackingEvent:
+            def __init__(self):
+                self.event = threading.Event()
+                self.sequence = len(created_events)
+                created_events.append(self)
+
+            def set(self):
+                self.event.set()
+
+            def wait(self, timeout=None):
+                result = self.event.wait(timeout)
+                if self.sequence == 0:
+                    old_waiter_woken.set()
+                    release_old_waiter.wait(timeout=1)
+                return result
+
+        def load_references():
+            return tracer._load_runtime_dependency_class_references(
+                {}, "com.vendor:target", "/tmp/target.jar", "com.example.TargetBridge",
+                artifact_sha256="a" * 64, target_jdk="17", graph=graph,
+            )
+
+        def delayed_javap(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_parse_started.set()
+                self.assertTrue(release_first_parse.wait(timeout=1))
+            elif calls == 2:
+                second_parse_started.set()
+                self.assertTrue(release_second_parse.wait(timeout=1))
+            return javap_output
+
+        tracer.clear_immutable_artifact_parse_cache()
+        executor = ThreadPoolExecutor(max_workers=4)
+        try:
+            with patch.object(tracer, "Event", TrackingEvent), patch.object(
+                tracer, "_run_javap_bytecode_dump", side_effect=delayed_javap
+            ):
+                first_owner = executor.submit(load_references)
+                self.assertTrue(first_parse_started.wait(timeout=1))
+                old_waiter = executor.submit(load_references)
+                deadline = time.time() + 1
+                while len(created_events) < 1 and time.time() < deadline:
+                    time.sleep(0.005)
+                tracer.clear_immutable_artifact_parse_cache()
+                self.assertTrue(old_waiter_woken.wait(timeout=1))
+
+                post_clear_owner = executor.submit(load_references)
+                self.assertTrue(second_parse_started.wait(timeout=1))
+                post_clear_waiter = executor.submit(load_references)
+                release_first_parse.set()
+                first_owner.result(timeout=1)
+
+                self.assertFalse(post_clear_waiter.done())
+                release_old_waiter.set()
+                release_second_parse.set()
+                self.assertEqual(post_clear_owner.result(timeout=1), post_clear_waiter.result(timeout=1))
+                old_waiter.result(timeout=1)
+        finally:
+            release_first_parse.set()
+            release_second_parse.set()
+            release_old_waiter.set()
+            for event in created_events:
+                event.set()
+            executor.shutdown(wait=True)
+            tracer.clear_immutable_artifact_parse_cache()
+
+    def test_runtime_parse_cache_uses_javap_once_and_never_constant_pool(self):
+        graph = SimpleNamespace()
+        catalog = {}
+        artifact_sha256 = "a" * 64
+        javap_output = """
+public class com.example.TargetBridge {
+  public void use(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+    Code:
+       0: invokestatic #7 // Method com/vendor/Target.removed:(Ljava/lang/String;)V
+}
+"""
+
+        tracer.clear_immutable_artifact_parse_cache()
+        try:
+            with patch.object(
+                tracer, "_run_javap_bytecode_dump", return_value=javap_output,
+            ) as mocked_javap, patch.object(
+                tracer, "_parse_classfile_constant_pool_summary",
+                side_effect=AssertionError("constant pool must not be parsed for runtime evidence"),
+            ):
+                first = tracer._load_runtime_dependency_class_references(
+                    catalog, "com.vendor:target", "/tmp/target.jar",
+                    "com.example.TargetBridge", artifact_sha256=artifact_sha256,
+                    target_jdk="17", graph=graph,
+                )
+                second = tracer._load_runtime_dependency_class_references(
+                    catalog, "com.vendor:target", "/tmp/target.jar",
+                    "com.example.TargetBridge", artifact_sha256=artifact_sha256,
+                    target_jdk="17", graph=graph,
+                )
+        finally:
+            tracer.clear_immutable_artifact_parse_cache()
+
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertEqual(first, second)
+        self.assertEqual(mocked_javap.call_count, 1)
+        self.assertEqual(perf["class_entries_parsed"], 1)
+        self.assertEqual(perf.get("duplicate_class_scans", 0), 0)
+
+    def test_catalog_parse_cache_varies_by_sha_jdk_and_procedure_at_same_path(self):
+        graph = SimpleNamespace()
+        catalog = {}
+        jar_path = "/tmp/replaced-in-place.jar"
+        class_name = "com.example.TargetBridge"
+
+        def javap_for(owner):
+            return f'''\npublic class {class_name} {{\n  public void use();\n    descriptor: ()V\n    Code:\n       0: checkcast #7 // class {owner.replace('.', '/')}\n}}\n'''
+
+        outputs = [
+            javap_for("com.vendor.First"),
+            javap_for("com.vendor.Second"),
+            javap_for("com.vendor.Third"),
+            javap_for("com.vendor.Fourth"),
+        ]
+
+        tracer.clear_immutable_artifact_parse_cache()
+        try:
+            with patch.object(
+                tracer, "_run_javap_bytecode_dump", side_effect=outputs,
+            ) as mocked_javap:
+                first = tracer._load_runtime_dependency_class_references(
+                    catalog, "com.vendor:target", jar_path, class_name,
+                    artifact_sha256="a" * 64, target_jdk="17", graph=graph,
+                )
+                second = tracer._load_runtime_dependency_class_references(
+                    catalog, "com.vendor:target", jar_path, class_name,
+                    artifact_sha256="b" * 64, target_jdk="17", graph=graph,
+                )
+                third = tracer._load_runtime_dependency_class_references(
+                    catalog, "com.vendor:target", jar_path, class_name,
+                    artifact_sha256="b" * 64, target_jdk="21", graph=graph,
+                )
+                with patch.object(
+                    tracer, "ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION",
+                    tracer.ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION + "-next",
+                ):
+                    fourth = tracer._load_runtime_dependency_class_references(
+                        catalog, "com.vendor:target", jar_path, class_name,
+                        artifact_sha256="b" * 64, target_jdk="21", graph=graph,
+                    )
+        finally:
+            tracer.clear_immutable_artifact_parse_cache()
+
+        self.assertEqual(mocked_javap.call_count, 4)
+        self.assertEqual(
+            [item["class_refs"][-1] for item in (first, second, third, fourth)],
+            ["com.vendor.First", "com.vendor.Second", "com.vendor.Third", "com.vendor.Fourth"],
+        )
+
+    def test_declaration_only_javap_reference_does_not_match_but_instruction_does(self):
+        api_row = {
+            "api_name": "com.vendor.Target.removed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+        }
+        declaration_only = """
+Constant pool:
+   #7 = Methodref #8.#9 // com/vendor/Target.removed:(Ljava/lang/String;)V
+public class com.example.TargetBridge {
+  public void use(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+}
+"""
+        executable = declaration_only.replace(
+            "    descriptor: (Ljava/lang/String;)V\n}",
+            "    descriptor: (Ljava/lang/String;)V\n    Code:\n"
+            "       0: invokestatic #7 // Method com/vendor/Target.removed:(Ljava/lang/String;)V\n}",
+        )
+
+        declaration_refs = tracer._parse_javap_bytecode_references(
+            declaration_only, "com.example.TargetBridge"
+        )
+        executable_refs = tracer._parse_javap_bytecode_references(
+            executable, "com.example.TargetBridge"
+        )
+
+        self.assertEqual(tracer._match_runtime_dependency_references(api_row, declaration_refs), [])
+        matches = tracer._match_runtime_dependency_references(api_row, executable_refs)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["opcode_family"], "invokestatic")
+        self.assertEqual(matches[0]["instruction_offset"], 0)
+
+    def test_class_topology_requires_executable_type_instruction(self):
+        api_row = {
+            "api_name": "com.vendor.TargetType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "analysis_scope": "class_usage",
+        }
+        declaration_only = '''
+public class com.example.TargetBridge {
+  public void use(com.vendor.TargetType);
+    descriptor: (Lcom/vendor/TargetType;)V
+}
+'''
+        executable = declaration_only.replace(
+            "    descriptor: (Lcom/vendor/TargetType;)V\n}",
+            "    descriptor: (Lcom/vendor/TargetType;)V\n    Code:\n"
+            "       0: checkcast #7 // class com/vendor/TargetType\n}",
+        )
+
+        declaration_refs = tracer._parse_javap_bytecode_references(
+            declaration_only, "com.example.TargetBridge"
+        )
+        executable_refs = tracer._parse_javap_bytecode_references(
+            executable, "com.example.TargetBridge"
+        )
+
+        self.assertEqual(tracer._match_runtime_dependency_references(api_row, declaration_refs), [])
+        matches = tracer._match_runtime_dependency_references(api_row, executable_refs)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["opcode_family"], "checkcast")
+        self.assertEqual(matches[0]["instruction_offset"], 0)
+
+    def test_batch_runtime_scan_ignores_constant_pool_match_without_instruction(self):
+        api_row = {
+            "coord": "com.vendor:api",
+            "api_name": "com.vendor.Target.removed",
+            "api_simple": "removed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        unsafe_summary = {
+            "class_internal_names": {"com/vendor/Target"},
+            "ref_internal_names": {"com/vendor/Target"},
+            "ref_member_names": {"removed"},
+            "ref_member_descriptors": {"(Ljava/lang/String;)V"},
+            "ref_members": [{
+                "tag": 10,
+                "owner": "com/vendor/Target",
+                "name": "removed",
+                "descriptor": "(Ljava/lang/String;)V",
+            }],
+            "has_dynamic_reference": False,
+            "utf8_values": set(),
+        }
+        declaration_only = """
+Constant pool:
+   #7 = Methodref #8.#9 // com/vendor/Target.removed:(Ljava/lang/String;)V
+public class com.example.TargetBridge {
+  public void use(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+}
+"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr(
+                    "com/example/TargetBridge.class",
+                    b"com/vendor/Target removed fixture-class-bytes",
+                )
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=self._runtime_catalog((("sample:consumer", jar_path),)),
+            )
+
+            tracer.clear_immutable_artifact_parse_cache()
+            with patch.object(
+                tracer, "_parse_classfile_constant_pool_summary", return_value=unsafe_summary,
+            ) as mocked_constant_pool, patch.object(
+                tracer, "_run_javap_bytecode_dump", return_value=declaration_only,
+            ) as mocked_javap:
+                scans = tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+
+        self.assertEqual(scans[tracer.build_api_identity_key(api_row)]["status"], "miss")
+        mocked_constant_pool.assert_not_called()
+        mocked_javap.assert_called_once()
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertEqual(perf["class_entries_parsed"], 1)
+        self.assertEqual(perf["duplicate_class_scans"], 0)
+
+    def test_artifact_hash_parse_cache_clear_does_not_store_preclear_result_in_same_catalog(self):
+        graph = SimpleNamespace()
+        catalog = {}
+        parse_started = threading.Event()
+        release_first_parse = threading.Event()
+        calls = 0
+
+        def delayed_javap(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                parse_started.set()
+                self.assertTrue(release_first_parse.wait(timeout=1))
+            return "public class com.example.TargetBridge {}"
+
+        def load_references():
+            return tracer._load_runtime_dependency_class_references(
+                catalog, "com.vendor:target", "/tmp/target.jar", "com.example.TargetBridge",
+                artifact_sha256="a" * 64, target_jdk="17", graph=graph,
+            )
+
+        tracer.clear_immutable_artifact_parse_cache()
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            with patch.object(tracer, "_run_javap_bytecode_dump", side_effect=delayed_javap):
+                preclear_owner = executor.submit(load_references)
+                self.assertTrue(parse_started.wait(timeout=1))
+                tracer.clear_immutable_artifact_parse_cache()
+                release_first_parse.set()
+                preclear_owner.result(timeout=1)
+                load_references()
+        finally:
+            release_first_parse.set()
+            executor.shutdown(wait=True)
+            tracer.clear_immutable_artifact_parse_cache()
+
+        self.assertEqual(calls, 2)
+
+    def test_duplicate_class_scans_requires_a_physical_artifact_identity(self):
+        javap_output = """
+public class com.example.TargetBridge {
+  public void use(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+    Code:
+       0: invokestatic #7 // Method com/vendor/Target.removed:(Ljava/lang/String;)V
+}
+"""
+        graph = SimpleNamespace()
+
+        def load_references(jar_path):
+            return tracer._load_runtime_dependency_class_references(
+                {}, "com.vendor:target", jar_path, "com.example.TargetBridge",
+                target_jdk="17", graph=graph,
+            )
+
+        tracer.clear_immutable_artifact_parse_cache()
+        with patch.object(tracer, "_run_javap_bytecode_dump", return_value=javap_output):
+            load_references("/tmp/first.jar")
+            load_references("/tmp/second.jar")
+
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertEqual(perf["class_entries_parsed"], 2)
+        self.assertEqual(perf.get("duplicate_class_scans", 0), 0)
+
+    def test_artifact_hash_parse_cache_clear_releases_inflight_waiters(self):
+        javap_output = """
+public class com.example.TargetBridge {
+  public void use(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+    Code:
+       0: invokestatic #7 // Method com/vendor/Target.removed:(Ljava/lang/String;)V
+}
+"""
+        graph = SimpleNamespace()
+        parse_started = threading.Event()
+        release_first_parse = threading.Event()
+        waiter_waiting = threading.Event()
+        created_events = []
+        calls = 0
+
+        class TrackingEvent:
+            def __init__(self):
+                self.event = threading.Event()
+                created_events.append(self)
+
+            def set(self):
+                self.event.set()
+
+            def wait(self, timeout=None):
+                waiter_waiting.set()
+                return self.event.wait(timeout)
+
+        def load_references():
+            return tracer._load_runtime_dependency_class_references(
+                {}, "com.vendor:target", "/tmp/target.jar", "com.example.TargetBridge",
+                artifact_sha256="a" * 64, target_jdk="17", graph=graph,
+            )
+
+        def delayed_javap(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                parse_started.set()
+                self.assertTrue(release_first_parse.wait(timeout=1))
+            return javap_output
+
+        tracer.clear_immutable_artifact_parse_cache()
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
+            with patch.object(tracer, "Event", TrackingEvent), patch.object(
+                tracer, "_run_javap_bytecode_dump", side_effect=delayed_javap
+            ):
+                first_future = executor.submit(load_references)
+                self.assertTrue(parse_started.wait(timeout=1))
+                second_future = executor.submit(load_references)
+                self.assertTrue(waiter_waiting.wait(timeout=1))
+
+                tracer.clear_immutable_artifact_parse_cache()
+                release_first_parse.set()
+                first = first_future.result(timeout=1)
+                second = second_future.result(timeout=1)
+
+            self.assertEqual(first, second)
+        finally:
+            release_first_parse.set()
+            for event in created_events:
+                event.set()
+            executor.shutdown(wait=True)
+            tracer.clear_immutable_artifact_parse_cache()
+
+    def test_step5_perf_counters_are_thread_safe_and_tie_sorted_deterministically(self):
+        graph = SimpleNamespace()
+        worker_count = 8
+        ready = threading.Barrier(worker_count)
+
+        def update_counters(sequence):
+            ready.wait(timeout=1)
+            for _ in range(500):
+                tracer._perf_add(graph, "bytecode_scan", "concurrent_updates", 1)
+            tracer._perf_max(graph, "bytecode_scan", "concurrent_max", sequence)
+            time.sleep((worker_count - sequence) * 0.01)
+            tracer._perf_record_top(
+                graph,
+                "bytecode_scan",
+                "equal_elapsed_items",
+                {"sequence": sequence, "elapsed_sec": 1.0},
+            )
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(update_counters, range(worker_count)))
+
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertEqual(perf["concurrent_updates"], worker_count * 500)
+        self.assertEqual(perf["concurrent_max"], worker_count - 1)
+        self.assertEqual(
+            [item["sequence"] for item in perf["equal_elapsed_items"]],
+            list(range(worker_count)),
+        )
+
+    def test_scan_role_metrics_are_classified_for_each_matched_api_coordinate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_root = root / "src"
+            target_a = source_root / "com/vendor/TargetA.java"
+            target_b = source_root / "com/other/TargetB.java"
+            bridge = source_root / "com/example/TargetBridge.java"
+            for source in (target_a, target_b, bridge):
+                source.parent.mkdir(parents=True, exist_ok=True)
+            target_a.write_text(
+                "package com.vendor; public class TargetA { public static void removed() {} }",
+                encoding="utf-8",
+            )
+            target_b.write_text(
+                "package com.other; public class TargetB { public static void removed() {} }",
+                encoding="utf-8",
+            )
+            bridge.write_text(
+                "package com.example; public class TargetBridge { public void use() { "
+                "com.vendor.TargetA.removed(); com.other.TargetB.removed(); } }",
+                encoding="utf-8",
+            )
+            classes = self._compile_java_files(root / "classes", [target_a, target_b, bridge])
+            jar_path = root / "targets.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            api_a = {
+                "coord": "com.vendor:target-a",
+                "api_name": "com.vendor.TargetA.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            api_b = {
+                "coord": "com.other:target-b",
+                "api_name": "com.other.TargetB.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            item = {
+                "coord": api_a["coord"],
+                "jar_path": str(jar_path),
+                "artifact_entry": "BOOT-INF/lib/targets.jar",
+            }
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={"force_javap_path": []},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": [item],
+                    "by_coord": {item["coord"]: item},
+                    "target_jdk": "17",
+                },
+            )
+            javap_output = """
+public class com.example.TargetBridge {
+  public void use();
+    descriptor: ()V
+    Code:
+       0: invokestatic #7 // Method com/vendor/TargetA.removed:()V
+       3: invokestatic #9 // Method com/other/TargetB.removed:()V
+}
+"""
+
+            def javap_for_class(_jar_path, class_binary_name, **_kwargs):
+                if class_binary_name == "com.example.TargetBridge":
+                    return javap_output
+                return f"public class {class_binary_name} {{}}"
+
+            tracer.clear_immutable_artifact_parse_cache()
+            with patch.object(tracer, "_run_javap_bytecode_dump", side_effect=javap_for_class):
+                results = tracer._build_packaged_runtime_dependency_scan_cache([api_a, api_b], graph)
+
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertEqual(results[tracer.build_api_identity_key(api_a)]["hits"][0]["edge_role"], "internal_bridge")
+        self.assertEqual(results[tracer.build_api_identity_key(api_b)]["hits"][0]["edge_role"], "external_consumer")
+        self.assertEqual(perf["internal_bridge_class_scans"], 1)
+        self.assertEqual(perf["direct_consumer_class_scans"], 1)
 
     def test_many_packaged_hits_enable_runtime_member_index_preference(self):
         graph = SimpleNamespace(methods_by_id={}, reverse_edges={}, runtime_dependency_catalog={})
@@ -13720,7 +14443,7 @@ public class com.example.consumer.Adapter {
             self.assertEqual([item.analysis_status for item in results], ["uncertain", "not_found_in_static_analysis"])
             self.assertEqual(results[0].reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
 
-    def test_batch_packaged_bytecode_skips_owner_and_member_string_constants_without_reflection(self):
+    def test_batch_packaged_bytecode_javaps_string_candidate_but_emits_no_hit(self):
         with tempfile.TemporaryDirectory() as tmp:
             classes_root = self._compile_java_fixture(
                 tmp,
@@ -13765,11 +14488,23 @@ public class StringOnly {
                 "change_type": "REMOVED",
             }]
 
-            with patch.object(tracer, "run_cmd", side_effect=AssertionError("javap should be skipped")):
+            javap_output = """
+public class com.example.consumer.StringOnly {
+  public java.lang.String describe();
+    descriptor: ()Ljava/lang/String;
+    Code:
+       0: ldc #7 // String com/vendor/Targetcom.vendor.Targetremoved
+       2: areturn
+}
+"""
+            with patch.object(
+                tracer, "run_cmd", return_value=(javap_output, "", 0)
+            ) as mocked_javap:
                 tracer._build_packaged_runtime_dependency_scan_cache(apis, graph)
 
             cached = graph.runtime_dependency_catalog["_packaged_api_scan_results"]
             self.assertEqual(cached[tracer.build_api_identity_key(apis[0])]["status"], "miss")
+            mocked_javap.assert_called_once()
 
     def test_batch_packaged_bytecode_keeps_reflection_string_candidates_for_javap(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -14254,7 +14989,8 @@ public class com.example.consumer.ReflectiveCall {
             )
 
             reachable = self._trace_packaged_fixture(api_row, graph)
-            perf = tracer._finalize_step5_perf_stats(graph)["bytecode_expand"]
+            all_perf = tracer._finalize_step5_perf_stats(graph)
+            perf = all_perf["bytecode_expand"]
 
         self.assertEqual(reachable.analysis_status, "reachable")
         self.assertEqual(reachable.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
@@ -14277,6 +15013,8 @@ public class com.example.consumer.ReflectiveCall {
             item.get("candidate_source") == "member_index"
             for item in perf.get("slow_runtime_lookups", [])
         ))
+        self.assertGreater(all_perf["bytecode_scan"]["class_entries_parsed"], 0)
+        self.assertEqual(all_perf["bytecode_scan"]["duplicate_class_scans"], 0)
 
     def test_packaged_runtime_scan_javap_handles_base_classes_without_multi_release_flag(self):
         with tempfile.TemporaryDirectory() as tmp:

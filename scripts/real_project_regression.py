@@ -105,6 +105,9 @@ class RealProjectCase:
     case_mode: str = "guard"
     ground_truth_status: str = "reviewed"
     max_potential_pairs_per_api: float = 0.0
+    max_duplicate_class_scans: int = -1
+    max_seconds_per_100k_edges: float = 0.0
+    min_classes_per_second: float = 0.0
     oracle_manifest: Path | None = None
     enable_jdk_oracle: bool = False
     bytecode_owner_prefixes: tuple[str, ...] = field(default_factory=tuple)
@@ -115,6 +118,43 @@ class RealProjectCase:
     target_owner_entries: dict[str, tuple[str, ...]] = field(default_factory=dict)
     source_attestation: Path | None = None
     prior_topology_matrix: Path | None = None
+
+
+REAL_CASE_PERFORMANCE_BUDGET = {
+    # The mall full-artifact baseline took about 63.7 seconds for 8 reconciled
+    # edges, or about 796,250 seconds per 100k edges. Keep a conservative 1M
+    # ceiling, require at least one parsed class per second, and permit no
+    # duplicate physical class scans so these remain enforceable regression gates.
+    "max_elapsed_seconds": 300.0,
+    "max_potential_pairs_per_api": 100000.0,
+    "max_duplicate_class_scans": 0,
+    "max_seconds_per_100k_edges": 1000000.0,
+    "min_classes_per_second": 1.0,
+}
+
+
+def apply_real_case_performance_budget(case: RealProjectCase) -> RealProjectCase:
+    return replace(
+        case,
+        max_elapsed_seconds=case.max_elapsed_seconds or REAL_CASE_PERFORMANCE_BUDGET["max_elapsed_seconds"],
+        max_potential_pairs_per_api=(
+            case.max_potential_pairs_per_api
+            or REAL_CASE_PERFORMANCE_BUDGET["max_potential_pairs_per_api"]
+        ),
+        max_duplicate_class_scans=(
+            case.max_duplicate_class_scans
+            if case.max_duplicate_class_scans >= 0
+            else REAL_CASE_PERFORMANCE_BUDGET["max_duplicate_class_scans"]
+        ),
+        max_seconds_per_100k_edges=(
+            case.max_seconds_per_100k_edges
+            or REAL_CASE_PERFORMANCE_BUDGET["max_seconds_per_100k_edges"]
+        ),
+        min_classes_per_second=(
+            case.min_classes_per_second
+            or REAL_CASE_PERFORMANCE_BUDGET["min_classes_per_second"]
+        ),
+    )
 
 
 CASES = {
@@ -647,6 +687,11 @@ CASES["mall"] = RealProjectCase(
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
 )
 
+CASES = {
+    name: apply_real_case_performance_budget(case)
+    for name, case in CASES.items()
+}
+
 
 def is_test_source(path: Path) -> bool:
     normalized = path.as_posix()
@@ -1149,6 +1194,7 @@ def collect_performance_envelope(summary: dict, elapsed: float, selected: int) -
     graph_stats = meta.get("graph_stats") if isinstance(meta.get("graph_stats"), dict) else {}
     step5_perf = graph_stats.get("step5_perf") if isinstance(graph_stats.get("step5_perf"), dict) else {}
     perf_main = step5_perf.get("main") if isinstance(step5_perf.get("main"), dict) else {}
+    bytecode_scan = step5_perf.get("bytecode_scan") if isinstance(step5_perf.get("bytecode_scan"), dict) else {}
     pairs = int(perf_main.get("indirect_usage_potential_legacy_method_target_pairs") or 0)
     owner_scans = int(perf_main.get("indirect_usage_owner_presence_scans") or 0)
     selected = int(selected or 0)
@@ -1158,7 +1204,37 @@ def collect_performance_envelope(summary: dict, elapsed: float, selected: int) -
         "potential_method_target_pairs": pairs,
         "potential_pairs_per_api": pairs / selected if selected else 0.0,
         "owner_presence_scans": owner_scans,
+        "artifact_bytes": int(bytecode_scan.get("artifact_bytes") or 0),
+        "class_count": int(bytecode_scan.get("class_entries_scoped") or bytecode_scan.get("visited_classes") or 0),
+        "parsed_class_count": int(bytecode_scan.get("class_entries_parsed") or 0),
+        "parse_seconds": float(bytecode_scan.get("class_parse_elapsed_sec") or 0.0),
+        "artifact_cache_hits": int(bytecode_scan.get("artifact_cache_hits") or 0),
+        "javap_fallbacks": int(bytecode_scan.get("javap_fallbacks") or 0),
+        "duplicate_class_scans": int(bytecode_scan.get("duplicate_class_scans") or 0),
     }
+
+
+def finalize_performance_envelope(envelope: dict) -> dict:
+    """Derive normalized rates after exhaustive edge reconciliation adds its counts."""
+    parsed_class_count = int(envelope.get("parsed_class_count") or 0)
+    parse_seconds = float(envelope.get("parse_seconds") or 0.0)
+    oracle_edges = int(envelope.get("oracle_edge_count") or 0)
+    analyzer_edges = int(envelope.get("analyzer_edge_count") or 0)
+    edge_count = max(oracle_edges, analyzer_edges)
+    reconcile_seconds = float(envelope.get("reconcile_seconds") or 0.0)
+    elapsed_seconds = float(envelope.get("elapsed_seconds") or 0.0)
+    envelope["parse_rate_available"] = parsed_class_count > 0 and parse_seconds > 0
+    envelope["parse_classes_per_second"] = (
+        parsed_class_count / parse_seconds if envelope["parse_rate_available"] else None
+    )
+    envelope["edge_rate_available"] = edge_count > 0
+    envelope["reconcile_edges_per_second"] = (
+        edge_count / reconcile_seconds if edge_count and reconcile_seconds else None
+    )
+    envelope["elapsed_seconds_per_100k_edges"] = (
+        elapsed_seconds * 100000.0 / edge_count if edge_count else None
+    )
+    return envelope
 
 
 def serialized_api_identity(api_row: dict) -> str:
@@ -1351,6 +1427,7 @@ def reconcile_selected_api_edges(
     oracle_scan: dict,
 ) -> dict:
     """Reconcile all selected API runtime edges, never a sampled subset."""
+    reconcile_started_at = time.perf_counter()
     report_dir = Path(report_dir)
     oracle_rows = [dict(row) for row in (oracle_scan.get("edges") or [])]
     retained_oracle_rows, path_errors = _retain_authoritative_api_path(selected_rows, oracle_rows)
@@ -1394,6 +1471,7 @@ def reconcile_selected_api_edges(
         "oracle_edge_count": len(retained_oracle_rows),
         "analyzer_edge_count": len(retained_analyzer_rows),
         "edge_reconciliation_row_count": len(reconciliation["ledger"]),
+        "reconcile_seconds": time.perf_counter() - reconcile_started_at,
         **{f"edge_truth_{verdict}_count": int(count) for verdict, count in reconciliation["verdict_counts"].items()},
     }
     return {
@@ -2067,6 +2145,78 @@ def build_policy_signals(
             actual=str(pairs_per_api),
             evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
         ))
+    duplicate_class_scans = int(performance.get("duplicate_class_scans") or 0)
+    if case.max_duplicate_class_scans >= 0 and duplicate_class_scans > case.max_duplicate_class_scans:
+        signals.append(make_signal(
+            "performance_regression", "P1", case.name, step="step5",
+            message=(
+                f"duplicate_class_scans={duplicate_class_scans} "
+                f"over_budget={case.max_duplicate_class_scans}"
+            ),
+            expected="immutable artifact-hash cache prevents duplicate class parsing",
+            actual=str(duplicate_class_scans),
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+        ))
+    seconds_per_100k_edges = performance.get("elapsed_seconds_per_100k_edges")
+    edge_rate_available = performance.get("edge_rate_available")
+    if edge_rate_available is None:
+        edge_rate_available = seconds_per_100k_edges is not None
+    edge_rate_available = bool(edge_rate_available)
+    if case.max_seconds_per_100k_edges and not edge_rate_available:
+        signals.append(make_signal(
+            "performance_regression", "P1", case.name, step="step5",
+            message=(
+                "elapsed_seconds_per_100k_edges=unavailable because "
+                "oracle_edge_count and analyzer_edge_count are both zero"
+            ),
+            expected="normalized edge analysis time has a nonzero exhaustive edge denominator",
+            actual="unavailable",
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+        ))
+    elif (
+        case.max_seconds_per_100k_edges
+        and seconds_per_100k_edges is not None
+        and float(seconds_per_100k_edges) > case.max_seconds_per_100k_edges
+    ):
+        signals.append(make_signal(
+            "performance_regression", "P1", case.name, step="step5",
+            message=(
+                f"elapsed_seconds_per_100k_edges={float(seconds_per_100k_edges):.2f} "
+                f"over_budget={case.max_seconds_per_100k_edges:.2f}"
+            ),
+            expected="normalized edge analysis time stays within budget",
+            actual=str(seconds_per_100k_edges),
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+        ))
+    classes_per_second = performance.get("parse_classes_per_second")
+    parse_rate_available = performance.get("parse_rate_available")
+    if parse_rate_available is None:
+        parse_rate_available = classes_per_second is not None
+    if case.min_classes_per_second and not parse_rate_available:
+        signals.append(make_signal(
+            "performance_regression", "P1", case.name, step="step5",
+            message=(
+                "parse_classes_per_second=unavailable because "
+                "class_entries_parsed is zero or parse time is unavailable"
+            ),
+            expected="artifact parse throughput has parsed classes and measured parse time",
+            actual="unavailable",
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+        ))
+    elif (
+        case.min_classes_per_second
+        and float(classes_per_second) < case.min_classes_per_second
+    ):
+        signals.append(make_signal(
+            "performance_regression", "P1", case.name, step="step5",
+            message=(
+                f"parse_classes_per_second={float(classes_per_second):.2f} "
+                f"below_budget={case.min_classes_per_second:.2f}"
+            ),
+            expected="artifact parse throughput meets minimum classes per second",
+            actual=str(classes_per_second),
+            evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
+        ))
     return signals
 
 
@@ -2505,6 +2655,7 @@ def run_case(
     source_conflicts = validate_source_bytecode_conflicts(summary, edge_truth)
     performance_envelope = collect_performance_envelope(summary, elapsed, selected_count)
     performance_envelope.update(edge_truth["counts"])
+    finalize_performance_envelope(performance_envelope)
     oracle_audit = None
     oracle_ledger = ""
     effective_ground_truth_status = case.ground_truth_status
