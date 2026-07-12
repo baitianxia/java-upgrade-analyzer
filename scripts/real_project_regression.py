@@ -20,15 +20,18 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib
 import io
 import json
 import re
 import subprocess
 import sys
 import time
+import unittest
 import zipfile
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
@@ -63,6 +66,10 @@ EDGE_RECONCILIATION_FIELDS = (
 EDGE_COMPARISON_FIELDS = EDGE_IDENTITY_FIELDS[1:]
 EDGE_RECONCILIATION_VERDICTS = (
     "correct", "missing", "extra", "identity_mismatch", "provenance_invalid", "oracle_conflict",
+)
+V3_GATE_NAMES = (
+    "asset", "api_coverage", "topology_coverage", "edge_truth",
+    "conclusion", "performance", "fixture_debt",
 )
 
 
@@ -118,6 +125,7 @@ class RealProjectCase:
     target_owner_entries: dict[str, tuple[str, ...]] = field(default_factory=dict)
     source_attestation: Path | None = None
     prior_topology_matrix: Path | None = None
+    fixture_manifest: Path | None = None
 
 
 REAL_CASE_PERFORMANCE_BUDGET = {
@@ -687,10 +695,467 @@ CASES["mall"] = RealProjectCase(
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
 )
 
+CASES["gs-multi-module"] = RealProjectCase(
+    name="gs-multi-module",
+    default_project=Path("/private/tmp/gs-multi-module/complete"),
+    default_changed_apis=Path(""),
+    baseline_specs=(),
+    changed_api_rows=(
+        {
+            "coord": "com.example:library",
+            "old_version": "0.0.1-SNAPSHOT",
+            "new_version": "-",
+            "change_type": "REMOVED",
+            "api_name": "com.example.multimodule.service.ServiceProperties.getMessage",
+            "api_simple": "getMessage",
+            "symbol_kind": "method",
+            "api_signature": "()",
+            "confirmed": "true",
+            "severity": "P1",
+            "source": "pinned_real_project_guard",
+        },
+    ),
+    prefer_embedded_changed_api_rows=True,
+    require_valid_git=True,
+    min_project_java_files=3,
+    min_main_java_files=3,
+    case_mode="guard",
+    ground_truth_status="reviewed",
+    enable_jdk_oracle=True,
+    bytecode_coord="com.example:library",
+    final_artifact=Path(
+        "/private/tmp/gs-multi-module/complete/application/target/application-0.0.1-SNAPSHOT.jar"
+    ),
+    required_topologies=("business_to_same_jar_bridge", "same_coord_multimodule"),
+    fixture_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+    ),
+)
+
 CASES = {
     name: apply_real_case_performance_budget(case)
     for name, case in CASES.items()
 }
+
+
+_CHANGE_API_MARKER_RE = re.compile(r"变更\s*API\s*[：:]")
+
+
+def _expected_target_signature(expected_api: dict) -> str:
+    descriptor = str((expected_api or {}).get("descriptor") or "").strip()
+    if not descriptor.startswith("("):
+        return ""
+    try:
+        return normalize_signature_for_lookup(_source_signature(descriptor))
+    except (IndexError, ValueError):
+        return ""
+
+
+def _matches_expected_call_chain(path_text: str, expected_chain: list[str], expected_api: dict) -> bool:
+    nodes = [node.strip() for node in re.split(r"\s*(?:->|→)\s*", str(path_text or "").strip())]
+    if not nodes or any(not node for node in nodes) or len(nodes) != len(expected_chain):
+        return False
+    marker_indexes = [index for index, node in enumerate(nodes) if _CHANGE_API_MARKER_RE.search(node)]
+    if any(index != len(nodes) - 1 for index in marker_indexes) or len(marker_indexes) > 1:
+        return False
+    if nodes[:-1] != expected_chain[:-1]:
+        return False
+
+    target_identity = ".".join(
+        item for item in (
+            str((expected_api or {}).get("owner") or "").strip(),
+            str((expected_api or {}).get("member") or "").strip(),
+        ) if item
+    )
+    expected_signature = _expected_target_signature(expected_api)
+    if not target_identity or expected_chain[-1] != target_identity or not expected_signature:
+        return False
+    terminal = nodes[-1]
+    if marker_indexes:
+        terminal = _CHANGE_API_MARKER_RE.sub("", terminal, count=1).strip()
+    terminal_match = re.fullmatch(r"(.+?)(\(.*\))", terminal)
+    if not terminal_match or terminal_match.group(1).strip() != target_identity:
+        return False
+    return normalize_signature_for_lookup(terminal_match.group(2)) == expected_signature
+
+
+def _reachable_call_paths(row: dict) -> list[str]:
+    paths = [str(path) for path in (row.get("call_paths") or []) if str(path).strip()]
+    paths.extend(
+        str(detail.get("path_text") or "")
+        for detail in (row.get("path_details") or [])
+        if str(detail.get("path_text") or "").strip()
+    )
+    return paths
+
+
+def _correct_reconciled_physical_edges(ledger: list[dict]) -> set[str]:
+    matched_sides: dict[str, set[str]] = defaultdict(set)
+    for entry in ledger or []:
+        side = str(entry.get("side") or "")
+        nested_key = "analyzer_row" if side == "analyzer" else "oracle_row"
+        row = entry.get(nested_key)
+        if side not in {"analyzer", "oracle"} or not isinstance(row, dict):
+            continue
+        identity = canonical_edge_identity(row)
+        occurrence = physical_edge_occurrence(row)
+        if (
+            str(entry.get("verdict") or "") != "correct"
+            or str(entry.get("identity") or "") != identity
+            or str(entry.get("physical_occurrence") or "") != occurrence
+        ):
+            continue
+        matched_sides[occurrence].add(side)
+    return {occurrence for occurrence, sides in matched_sides.items() if sides == {"analyzer", "oracle"}}
+
+
+def _expected_physical_occurrence(edge: dict) -> str:
+    identity = canonical_edge_identity(edge)
+    entry = str((edge or {}).get("artifact_entry") or "").strip()
+    explicit = str((edge or {}).get("physical_occurrence") or "").strip()
+    prefix = f"{identity}|{entry}|"
+    if explicit.startswith(prefix) and len(explicit) > len(prefix):
+        return explicit
+    offset = str((edge or {}).get("instruction_offset") or "").strip()
+    return physical_edge_occurrence(edge) if identity and entry and offset else ""
+
+
+def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
+    errors: list[str] = []
+    summary = result.get("summary") or {}
+    conclusion_rows = []
+    for bucket in ("reachable_apis", "uncertain_apis", "not_analyzed_apis", "not_found_apis"):
+        conclusion_rows.extend(summary.get(bucket) or [])
+    if any(str(item.get("reason_code") or "") == "SOURCE_BYTECODE_EDGE_CONFLICT"
+           for item in conclusion_rows):
+        errors.append("SOURCE_BYTECODE_EDGE_CONFLICT")
+
+    expected_api = manifest.get("api") or {}
+    expected_name = ".".join(
+        item for item in (str(expected_api.get("owner") or ""), str(expected_api.get("member") or ""))
+        if item
+    )
+    reachable_rows = [
+        row for row in (summary.get("reachable_apis") or [])
+        if str(row.get("api") or row.get("api_name") or "") == expected_name
+        and str(row.get("analysis_status") or "reachable") == str(manifest.get("expected_conclusion") or "")
+    ]
+    if not reachable_rows:
+        errors.append("expected_conclusion_missing")
+    expected_chain = [str(item) for item in (manifest.get("expected_chain") or [])]
+    if reachable_rows and expected_chain:
+        call_paths = [path for row in reachable_rows for path in _reachable_call_paths(row)]
+        if not any(_matches_expected_call_chain(path, expected_chain, expected_api) for path in call_paths):
+            errors.append("expected_chain_missing")
+
+    topology = result.get("topology_coverage") or {}
+    required = set(manifest.get("required_topologies") or [])
+    if not topology.get("complete") or not required.issubset(set(topology.get("observed") or [])):
+        errors.append("required_topology_missing")
+
+    edge_truth = result.get("edge_truth") or {}
+    if not edge_truth.get("complete") or edge_truth.get("blocking"):
+        errors.append("edge_truth_failed")
+    correct_physical_edges = _correct_reconciled_physical_edges(edge_truth.get("ledger") or [])
+    expected_physical_edges = {
+        _expected_physical_occurrence(row)
+        for row in (manifest.get("canonical_edges") or [])
+    }
+    if not expected_physical_edges or "" in expected_physical_edges or not expected_physical_edges.issubset(correct_physical_edges):
+        errors.append("expected_physical_edge_missing")
+    return {"passed": not errors, "errors": errors}
+
+
+def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
+    errors: list[str] = []
+    expected_revision = str(manifest.get("git_revision") or "")
+    expected_sha = str(manifest.get("artifact_sha256") or "")
+    artifact = project_root / str(manifest.get("artifact_path") or "")
+    actual_revision = ""
+    actual_sha = ""
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_revision):
+        errors.append("git_revision_pin_invalid")
+    if not _valid_sha256(expected_sha):
+        errors.append("final_artifact_sha256_pin_invalid")
+    if not project_root.is_dir():
+        errors.append("project_checkout_missing")
+    else:
+        completed = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode == 0:
+            actual_revision = completed.stdout.strip()
+        if actual_revision != expected_revision:
+            errors.append("git_revision_mismatch")
+    if not artifact.is_file():
+        errors.append("final_artifact_missing")
+    else:
+        actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if actual_sha != expected_sha:
+            errors.append("final_artifact_sha256_mismatch")
+        try:
+            with zipfile.ZipFile(artifact) as archive:
+                if not any(name.endswith(".class") for name in archive.namelist()):
+                    errors.append("final_artifact_has_no_classes")
+        except zipfile.BadZipFile:
+            errors.append("final_artifact_invalid_zip")
+    return {
+        "name": "asset",
+        "passed": not errors,
+        "errors": errors,
+        "expected_git_revision": expected_revision,
+        "actual_git_revision": actual_revision,
+        "artifact_path": str(artifact),
+        "expected_artifact_sha256": expected_sha,
+        "actual_artifact_sha256": actual_sha,
+    }
+
+
+def _fixture_debt_id(signal: dict) -> str:
+    explicit = str(signal.get("fixture_debt_id") or "").strip()
+    if explicit:
+        return explicit
+    return ":".join(filter(None, (
+        str(signal.get("signal_type") or ""),
+        str(signal.get("reason_code") or ""),
+        str(signal.get("symbol") or ""),
+    )))
+
+
+def _resolves_to_unittest(reference: str) -> bool:
+    try:
+        module_name, class_name, method_name = str(reference or "").rsplit(".", 2)
+        module = importlib.import_module(module_name)
+        case_class = getattr(module, class_name)
+    except (ImportError, AttributeError, ValueError):
+        return False
+    return bool(
+        isinstance(case_class, type)
+        and issubclass(case_class, unittest.TestCase)
+        and method_name in unittest.defaultTestLoader.getTestCaseNames(case_class)
+    )
+
+
+def evaluate_finding_lifecycle(
+    signals: list[dict], declarations: list[dict], *, today: str | None = None
+) -> dict:
+    current_date = date.fromisoformat(today) if today else date.today()
+    declarations_by_id = {
+        str(row.get("finding_id") or ""): dict(row)
+        for row in declarations
+        if str(row.get("finding_id") or "")
+    }
+    active = {
+        _fixture_debt_id(signal): signal
+        for signal in signals
+        if str(signal.get("severity") or "") in {"P0", "P1"}
+    }
+    rows = [dict(row) for row in declarations]
+    errors: list[str] = []
+    for finding_id in sorted(active):
+        if finding_id not in declarations_by_id:
+            rows.append({
+                "finding_id": finding_id,
+                "state": "missing",
+                "lifecycle_result": "untriaged",
+            })
+            errors.append(f"{finding_id}:missing_state")
+    for row in rows:
+        finding_id = str(row.get("finding_id") or "")
+        state = str(row.get("state") or "")
+        row["lifecycle_result"] = "satisfied"
+        if state not in {"fixed", "planned", "waived_until"}:
+            row["lifecycle_result"] = "invalid"
+            if state != "missing":
+                errors.append(f"{finding_id}:invalid_state")
+            continue
+        if state == "fixed":
+            fixture = str(row.get("fixture") or "")
+            if not fixture:
+                row["lifecycle_result"] = "invalid"
+                errors.append(f"{finding_id}:fixed_fixture_missing")
+            elif not _resolves_to_unittest(fixture):
+                row["lifecycle_result"] = "invalid"
+                errors.append(f"{finding_id}:fixed_fixture_not_unittest")
+            if finding_id in active:
+                row["lifecycle_result"] = "recurred"
+                errors.append(f"{finding_id}:finding_recurred_after_fixed")
+        elif state == "planned":
+            if not str(row.get("target_fixture") or ""):
+                row["lifecycle_result"] = "invalid"
+                errors.append(f"{finding_id}:planned_target_missing")
+        elif state == "waived_until":
+            if not str(row.get("reason") or ""):
+                row["lifecycle_result"] = "invalid"
+                errors.append(f"{finding_id}:waiver_reason_missing")
+            try:
+                expires = date.fromisoformat(str(row.get("expires") or ""))
+            except ValueError:
+                row["lifecycle_result"] = "invalid"
+                errors.append(f"{finding_id}:waiver_expiry_missing")
+            else:
+                if expires < current_date:
+                    row["lifecycle_result"] = "expired"
+                    errors.append(f"{finding_id}:waiver_expired")
+    return {"passed": not errors, "blocking": bool(errors), "errors": errors, "rows": rows}
+
+
+def evaluate_fixture_debt(lifecycle: dict, gate_states: dict[str, bool]) -> dict:
+    rows = [dict(row) for row in (lifecycle.get("rows") or [])]
+    errors = list(lifecycle.get("errors") or [])
+    missing_gates = [name for name in V3_GATE_NAMES if name not in gate_states]
+    failed_gates = [name for name in V3_GATE_NAMES if not bool(gate_states.get(name))]
+    for row in rows:
+        if str(row.get("state") or "") != "fixed":
+            continue
+        finding_id = str(row.get("finding_id") or "")
+        if missing_gates:
+            errors.append(f"{finding_id}:fixed_gate_state_missing:{','.join(missing_gates)}")
+        elif failed_gates:
+            errors.append(f"{finding_id}:fixed_gates_incomplete:{','.join(failed_gates)}")
+    errors = list(dict.fromkeys(errors))
+    return {"passed": not errors, "blocking": bool(errors), "errors": errors, "rows": rows}
+
+
+def build_v3_gates(
+    manifest: dict, result: dict, asset_gate: dict, fixture_debt: dict
+) -> dict[str, dict]:
+    topology = result.get("topology_coverage") or {}
+    edge_truth = result.get("edge_truth") or {}
+    contract = evaluate_pinned_guard_contract(manifest, result)
+    contract_errors = set(contract.get("errors") or [])
+    edge_errors = sorted(contract_errors & {"edge_truth_failed", "expected_physical_edge_missing"})
+    conclusion_errors = sorted(contract_errors & {
+        "SOURCE_BYTECODE_EDGE_CONFLICT", "expected_conclusion_missing", "expected_chain_missing",
+    })
+    performance_errors = [
+        str(signal.get("message") or signal.get("signal_type") or "performance_regression")
+        for signal in (result.get("quality_signals") or [])
+        if signal.get("blocking") and signal.get("signal_type") == "performance_regression"
+    ]
+    api_complete = bool(result.get("api_coverage_complete", result.get("complete", False)))
+    topology_errors: list[str] = []
+    required_topologies = set(manifest.get("required_topologies") or [])
+    observed_topologies = set(topology.get("observed") or [])
+    missing_topologies = sorted(required_topologies - observed_topologies)
+    if "required_topology_missing" in contract_errors:
+        topology_errors.append("required_topology_missing")
+    if not topology.get("complete"):
+        topology_errors.append("topology_coverage_incomplete")
+    topology_errors.extend(missing_topologies)
+    return {
+        "asset": dict(asset_gate),
+        "api_coverage": {
+            "name": "api_coverage", "passed": api_complete,
+            "errors": [] if api_complete else ["api_coverage_incomplete"],
+        },
+        "topology_coverage": {
+            "name": "topology_coverage", "passed": not topology_errors,
+            "errors": topology_errors,
+        },
+        "edge_truth": {
+            "name": "edge_truth", "passed": not edge_errors, "errors": edge_errors,
+        },
+        "conclusion": {
+            "name": "conclusion", "passed": not conclusion_errors, "errors": conclusion_errors,
+        },
+        "performance": {
+            "name": "performance", "passed": not performance_errors, "errors": performance_errors,
+        },
+        "fixture_debt": {
+            "name": "fixture_debt", "passed": bool(fixture_debt.get("passed")),
+            "errors": list(fixture_debt.get("errors") or []),
+        },
+    }
+
+
+def write_v3_guard_outputs(
+    report_dir: Path, gates: dict[str, dict], fixture_debt: dict
+) -> dict[str, str]:
+    quality_dir = report_dir / "evidence" / "quality"
+    quality_dir.mkdir(parents=True, exist_ok=True)
+    gates_path = quality_dir / "v3_gates.json"
+    debt_json_path = quality_dir / "fixture_debt.json"
+    debt_csv_path = quality_dir / "fixture_debt.csv"
+    gates_path.write_text(json.dumps(gates, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    debt_json_path.write_text(
+        json.dumps(fixture_debt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    fields = ("finding_id", "state", "fixture", "target_fixture", "reason", "expires")
+    with debt_csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(fixture_debt.get("rows") or [])
+    return {
+        "gates": str(gates_path),
+        "fixture_debt_json": str(debt_json_path),
+        "fixture_debt_csv": str(debt_csv_path),
+    }
+
+
+def load_pinned_guard_manifest(case: RealProjectCase) -> dict:
+    if case.fixture_manifest is None:
+        return {}
+    return json.loads(case.fixture_manifest.read_text(encoding="utf-8"))
+
+
+def write_pinned_final_artifact_provenance(
+    report_dir: Path, asset_gate: dict
+) -> Path:
+    output = report_dir / "evidence" / "dependencies" / "build_provenance.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps({
+        "sides": [{
+            "side": "current",
+            "artifact_path": asset_gate.get("artifact_path") or "",
+            "artifact_sha256": asset_gate.get("actual_artifact_sha256") or "",
+            "authority": "pinned-real-project-manifest",
+        }],
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return output
+
+
+def _resolve_fixture_debt(
+    manifest: dict,
+    result: dict,
+    asset_gate: dict,
+    signals: list[dict],
+) -> tuple[dict, dict[str, dict]]:
+    lifecycle = evaluate_finding_lifecycle(
+        signals, list(manifest.get("fixture_debt") or [])
+    )
+    provisional_gates = build_v3_gates(manifest, result, asset_gate, lifecycle)
+    gate_states = {
+        name: bool(provisional_gates[name].get("passed"))
+        for name in V3_GATE_NAMES
+    }
+    fixture_debt = evaluate_fixture_debt(lifecycle, gate_states)
+    return fixture_debt, build_v3_gates(manifest, result, asset_gate, fixture_debt)
+
+
+def finalize_pinned_guard(
+    manifest: dict, result: dict, asset_gate: dict, report_dir: Path
+) -> dict:
+    debt_signals = [
+        *list(result.get("quality_signals") or []),
+        *list(result.get("finding_lifecycle") or []),
+    ]
+    fixture_debt, gates = _resolve_fixture_debt(
+        manifest, result, asset_gate, debt_signals
+    )
+    output_files = write_v3_guard_outputs(report_dir, gates, fixture_debt)
+    result.update({
+        "asset": asset_gate,
+        "gates": gates,
+        "fixture_debt": fixture_debt,
+        "v3_output_files": output_files,
+    })
+    if any(not gate.get("passed") for gate in gates.values()):
+        result["status"] = "failed"
+    return result
 
 
 def is_test_source(path: Path) -> bool:
@@ -2366,6 +2831,60 @@ def run_case(
     *,
     full_step4_apis: bool = False,
 ) -> dict:
+    pinned_manifest: dict = {}
+    pinned_asset_gate: dict = {}
+    if case.fixture_manifest is not None:
+        report_dir = report_root / case.name
+        report_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            pinned_manifest = load_pinned_guard_manifest(case)
+            pinned_asset_gate = validate_pinned_asset(pinned_manifest, project_root)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            pinned_asset_gate = {
+                "name": "asset", "passed": False,
+                "errors": [f"pinned_manifest_invalid:{error}"],
+            }
+        if not pinned_asset_gate.get("passed"):
+            asset_signal = make_signal(
+                "project_asset_invalid", "P1", case.name,
+                message="; ".join(pinned_asset_gate.get("errors") or []),
+                expected="pinned Git revision and SHA-verified final artifact",
+                actual=json.dumps(pinned_asset_gate, sort_keys=True),
+                evidence=[project_root, case.fixture_manifest],
+                fixture_status="missing",
+                blocking=True,
+            )
+            asset_signal["fixture_debt_id"] = "pinned_asset_unavailable"
+            skeleton = {
+                "api_coverage_complete": False,
+                "summary": {},
+                "topology_coverage": {
+                    "complete": False,
+                    "observed": [],
+                    "missing": list(case.required_topologies),
+                },
+                "edge_truth": {"complete": False, "blocking": True, "ledger": []},
+                "quality_signals": [asset_signal],
+            }
+            fixture_debt, gates = _resolve_fixture_debt(
+                pinned_manifest, skeleton, pinned_asset_gate, [asset_signal]
+            )
+            output_files = write_v3_guard_outputs(report_dir, gates, fixture_debt)
+            return {
+                "case": case.name,
+                "status": "failed",
+                "reason": "pinned project asset invalid",
+                "project_root": str(project_root),
+                "report_dir": str(report_dir),
+                "asset": pinned_asset_gate,
+                "gates": gates,
+                "fixture_debt": fixture_debt,
+                "v3_output_files": output_files,
+                "matrix_policy": real_project_matrix_policy(),
+                "quality_signals": [asset_signal],
+            }
+        case = replace(case, final_artifact=Path(str(pinned_asset_gate["artifact_path"])))
+        write_pinned_final_artifact_provenance(report_dir, pinned_asset_gate)
     if not project_root.exists():
         reason = f"project root missing: {project_root}"
         return {
@@ -2736,7 +3255,7 @@ def run_case(
     if status == "passed" and case.case_mode in {"guard", "convergence"}:
         update_prior_topology_matrix(report_root, case.name, case.case_mode, observed_topologies)
 
-    return {
+    result = {
         "case": case.name,
         "status": status,
         "project_root": str(project_root),
@@ -2751,6 +3270,7 @@ def run_case(
             "errors": edge_truth["errors"],
             "counts": edge_truth["counts"],
             "verdict_counts": edge_truth["reconciliation"]["verdict_counts"],
+            "ledger": edge_truth["reconciliation"].get("ledger") or [],
             "oracle_edges": edge_truth["oracle_edges"],
             "edge_reconciliation": edge_truth["edge_reconciliation"],
         },
@@ -2781,6 +3301,10 @@ def run_case(
             "uncertain": summary.get("uncertain"),
             "not_analyzed": summary.get("not_analyzed"),
             "not_found_in_static_analysis": summary.get("not_found_in_static_analysis"),
+            "reachable_apis": summary.get("reachable_apis") or [],
+            "uncertain_apis": summary.get("uncertain_apis") or [],
+            "not_analyzed_apis": summary.get("not_analyzed_apis") or [],
+            "not_found_apis": summary.get("not_found_apis") or [],
         },
         "graph_stats": graph_stats,
         "source_shape_metrics": source_shape_metrics,
@@ -2794,6 +3318,12 @@ def run_case(
         "matrix_policy": real_project_matrix_policy(),
         "quality_signals": quality_signals,
     }
+    if pinned_manifest:
+        result["api_coverage_complete"] = bool(coverage.get("complete"))
+        return finalize_pinned_guard(
+            pinned_manifest, result, pinned_asset_gate, report_dir
+        )
+    return result
 
 
 def parse_args(argv=None):
@@ -2848,6 +3378,10 @@ def main(argv=None):
     else:
         for item in results:
             print(f"\nREAL PROJECT {item['case']}: {item['status']}")
+            for gate_name, gate in (item.get("gates") or {}).items():
+                verdict = "passed" if gate.get("passed") else "failed"
+                errors = "; ".join(str(error) for error in (gate.get("errors") or []))
+                print(f"  gate {gate_name}: {verdict}" + (f" ({errors})" if errors else ""))
             if item.get("reason"):
                 print(f"  reason: {item['reason']}")
                 continue

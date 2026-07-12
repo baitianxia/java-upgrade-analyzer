@@ -1568,5 +1568,464 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(result["queries"][0]["returncode"], 0)
 
 
+class RealProjectRegressionTests(unittest.TestCase):
+    def _manifest_with_expected_physical_edges(self, manifest):
+        return {
+            **manifest,
+            "canonical_edges": [
+                {**edge, "instruction_offset": str(edge.get("instruction_offset", index * 4))}
+                for index, edge in enumerate(manifest["canonical_edges"])
+            ],
+        }
+
+    def _passing_gs_guard_result(self, manifest, *, ledger=None):
+        if ledger is None:
+            ledger = []
+            for index, edge in enumerate(manifest["canonical_edges"]):
+                production_edge = {
+                    **edge,
+                    "instruction_offset": str(edge.get("instruction_offset", index * 4)),
+                }
+                occurrence = realreg.physical_edge_occurrence(production_edge)
+                for side, nested_key in (("analyzer", "analyzer_row"), ("oracle", "oracle_row")):
+                    ledger.append({
+                        "side": side,
+                        "verdict": "correct",
+                        "identity": realreg.canonical_edge_identity(production_edge),
+                        "physical_occurrence": occurrence,
+                        nested_key: production_edge,
+                    })
+        return {
+            "api_coverage_complete": True,
+            "summary": {
+                "reachable": 1,
+                "uncertain": 0,
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": 0,
+                "reachable_apis": [{
+                    "api": "com.example.multimodule.service.ServiceProperties.getMessage",
+                    "analysis_status": "reachable",
+                    "call_paths": [],
+                    "path_details": [{
+                        "path_text": " → ".join(manifest["expected_chain"][:-1])
+                        + " → 变更 API： " + manifest["expected_chain"][-1] + "()",
+                    }],
+                }],
+                "uncertain_apis": [],
+            },
+            "topology_coverage": {
+                "complete": True,
+                "observed": manifest["required_topologies"],
+            },
+            "edge_truth": {
+                "complete": True,
+                "blocking": False,
+                "ledger": ledger,
+            },
+            "quality_signals": [],
+        }
+
+    def test_gs_multi_module_same_coordinate_guard(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        case = realreg.CASES["gs-multi-module"]
+
+        self.assertEqual(manifest["git_revision"], "d88a2b721bda3798a6a934987157498e66da06c5")
+        self.assertEqual(
+            manifest["artifact_sha256"],
+            "ea61c71eb0bd0ce669e4ecbe32c60317a9df49df2cf31a2248d5f71296ead2d7",
+        )
+        self.assertEqual(case.required_topologies, (
+            "business_to_same_jar_bridge",
+            "same_coord_multimodule",
+        ))
+        self.assertEqual(manifest["api"]["descriptor"], "()Ljava/lang/String;")
+        self.assertEqual(manifest["expected_conclusion"], "reachable")
+        self.assertEqual(manifest["expected_chain"], [
+            "com.example.multimodule.application.DemoApplication.home",
+            "com.example.multimodule.service.MyService.message",
+            "com.example.multimodule.service.ServiceProperties.getMessage",
+        ])
+        self.assertEqual(len(manifest["canonical_edges"]), 2)
+        self.assertEqual(
+            [edge["instruction_offset"] for edge in manifest["canonical_edges"]], [4, 4]
+        )
+        self.assertEqual(
+            [realreg.canonical_edge_identity(row) for row in manifest["canonical_edges"]],
+            [
+                "ea61c71eb0bd0ce669e4ecbe32c60317a9df49df2cf31a2248d5f71296ead2d7|"
+                "com.example.multimodule.application.DemoApplication|home|()Ljava/lang/String;|"
+                "com.example.multimodule.service.MyService|message|()Ljava/lang/String;|invokevirtual",
+                "ea61c71eb0bd0ce669e4ecbe32c60317a9df49df2cf31a2248d5f71296ead2d7|"
+                "com.example.multimodule.service.MyService|message|()Ljava/lang/String;|"
+                "com.example.multimodule.service.ServiceProperties|getMessage|()Ljava/lang/String;|invokevirtual",
+            ],
+        )
+
+        guard = realreg.evaluate_pinned_guard_contract(manifest, {
+            "summary": {
+                "reachable": 0,
+                "uncertain_apis": [{"reason_code": "SOURCE_BYTECODE_EDGE_CONFLICT"}],
+            },
+            "topology_coverage": {"complete": True, "observed": list(case.required_topologies)},
+            "edge_truth": {"complete": True, "blocking": False, "ledger": []},
+        })
+
+        self.assertFalse(guard["passed"])
+        self.assertIn("SOURCE_BYTECODE_EDGE_CONFLICT", guard["errors"])
+
+    def test_pinned_asset_gate_rejects_revision_and_final_artifact_sha_mismatch(self):
+        manifest = {
+            "git_revision": "a" * 40,
+            "artifact_path": "application/target/application.jar",
+            "artifact_sha256": "b" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / manifest["artifact_path"]
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"wrong artifact")
+            completed = realreg.subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="c" * 40 + "\n", stderr=""
+            )
+            with patch.object(realreg.subprocess, "run", return_value=completed):
+                gate = realreg.validate_pinned_asset(manifest, root)
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("git_revision_mismatch", gate["errors"])
+        self.assertIn("final_artifact_sha256_mismatch", gate["errors"])
+
+    def test_pinned_guard_requires_reachable_exact_chain_and_two_correct_physical_edges(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        result = self._passing_gs_guard_result(manifest)
+        ledger = result["edge_truth"]["ledger"]
+
+        passing = realreg.evaluate_pinned_guard_contract(manifest, result)
+        missing_edge = realreg.evaluate_pinned_guard_contract(
+            manifest,
+            {**result, "edge_truth": {**result["edge_truth"], "ledger": ledger[:2]}},
+        )
+
+        self.assertTrue(passing["passed"], passing["errors"])
+        self.assertFalse(missing_edge["passed"])
+        self.assertIn("expected_physical_edge_missing", missing_edge["errors"])
+
+    def test_pinned_guard_rejects_nested_reconciliation_rows_at_wrong_instruction_offset(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        result = self._passing_gs_guard_result(manifest)
+        expected = manifest["canonical_edges"][1]
+        for entry in result["edge_truth"]["ledger"]:
+            nested_key = "analyzer_row" if entry["side"] == "analyzer" else "oracle_row"
+            row = entry[nested_key]
+            if realreg.canonical_edge_identity(row) != realreg.canonical_edge_identity(expected):
+                continue
+            mismatched = {**row, "instruction_offset": "999"}
+            entry[nested_key] = mismatched
+            entry["physical_occurrence"] = realreg.physical_edge_occurrence(mismatched)
+
+        guard = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+        self.assertFalse(guard["passed"])
+        self.assertIn("expected_physical_edge_missing", guard["errors"])
+
+    def test_pinned_guard_accepts_production_reconciliation_ledger_shape(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        ledger = []
+        for index, edge in enumerate(manifest["canonical_edges"]):
+            production_edge = {
+                **edge,
+                "instruction_offset": str(edge.get("instruction_offset", index * 4)),
+            }
+            occurrence = realreg.physical_edge_occurrence(production_edge)
+            for side, nested_key in (("analyzer", "analyzer_row"), ("oracle", "oracle_row")):
+                ledger.append({
+                    "side": side,
+                    "index": index,
+                    "verdict": "correct",
+                    "identity": realreg.canonical_edge_identity(production_edge),
+                    "artifact_sha256": production_edge["artifact_sha256"],
+                    "artifact_entry": production_edge["artifact_entry"],
+                    "api_identity": "selected-api",
+                    "physical_occurrence": occurrence,
+                    nested_key: production_edge,
+                })
+        result = self._passing_gs_guard_result(manifest, ledger=ledger)
+
+        guard = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+        self.assertTrue(guard["passed"], guard["errors"])
+
+    def test_pinned_guard_rejects_reordered_or_extra_chain_nodes(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected = manifest["expected_chain"]
+        cases = (
+            [expected[1], expected[0], expected[2]],
+            [expected[0], "com.example.Unrelated.extra", expected[1], expected[2]],
+        )
+        for nodes in cases:
+            with self.subTest(nodes=nodes):
+                result = self._passing_gs_guard_result(manifest)
+                result["summary"]["reachable_apis"][0]["path_details"] = [{
+                    "path_text": " → ".join(nodes[:-1])
+                    + " → 变更 API： " + nodes[-1] + "()",
+                }]
+                result["summary"]["reachable_apis"][0]["call_paths"] = [
+                    " → ".join(nodes)
+                ]
+
+                guard = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+                self.assertFalse(guard["passed"])
+                self.assertIn("expected_chain_missing", guard["errors"])
+
+    def test_pinned_guard_rejects_marker_before_terminal_or_terminal_without_target_descriptor(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        expected = manifest["expected_chain"]
+        paths = (
+            " → ".join((expected[0], f"变更 API： {expected[1]}", expected[2] + "()")),
+            " → ".join((expected[0], expected[1], f"变更 API： {expected[2]}")),
+        )
+        for path_text in paths:
+            with self.subTest(path_text=path_text):
+                result = self._passing_gs_guard_result(manifest)
+                result["summary"]["reachable_apis"][0]["path_details"] = [{
+                    "path_text": path_text,
+                }]
+
+                guard = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+                self.assertFalse(guard["passed"])
+                self.assertIn("expected_chain_missing", guard["errors"])
+
+    def test_topology_gate_propagates_incomplete_and_missing_required_contract_errors(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        asset = {"name": "asset", "passed": True, "errors": []}
+        lifecycle = realreg.evaluate_finding_lifecycle([], [])
+        for topology in (
+            {"complete": False, "observed": manifest["required_topologies"]},
+            {"complete": True, "observed": manifest["required_topologies"][:1]},
+        ):
+            with self.subTest(topology=topology):
+                result = self._passing_gs_guard_result(manifest)
+                result["topology_coverage"] = topology
+
+                gates = realreg.build_v3_gates(manifest, result, asset, lifecycle)
+
+                self.assertFalse(gates["topology_coverage"]["passed"])
+                self.assertIn("required_topology_missing", gates["topology_coverage"]["errors"])
+
+    def test_fixture_debt_accepts_fixed_planned_and_unexpired_waiver_states(self):
+        signals = [
+            {"signal_type": "capability_gap", "severity": "P1", "blocking": True,
+             "fixture_debt_id": "planned-gap"},
+            {"signal_type": "evidence_weakness", "severity": "P0", "blocking": True,
+             "fixture_debt_id": "waived-gap"},
+        ]
+        declarations = [
+            {"finding_id": "fixed-gap", "state": "fixed", "fixture":
+             "tests.test_real_project_regression.RealProjectRegressionTests."
+             "test_gs_multi_module_same_coordinate_guard"},
+            {"finding_id": "planned-gap", "state": "planned", "target_fixture": "L1 nested jar"},
+            {"finding_id": "waived-gap", "state": "waived_until", "reason": "JDK variance",
+             "expires": "2026-07-13"},
+        ]
+
+        lifecycle = realreg.evaluate_finding_lifecycle(signals, declarations, today="2026-07-12")
+        result = realreg.evaluate_fixture_debt(
+            lifecycle, {name: True for name in realreg.V3_GATE_NAMES}
+        )
+
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual({row["state"] for row in result["rows"]}, {
+            "fixed", "planned", "waived_until"
+        })
+
+    def test_fixture_debt_blocks_missing_and_expired_states(self):
+        signals = [
+            {"signal_type": "capability_gap", "severity": "P1", "blocking": True,
+             "fixture_debt_id": "missing-gap"},
+            {"signal_type": "evidence_weakness", "severity": "P0", "blocking": True,
+             "fixture_debt_id": "expired-gap"},
+        ]
+        declarations = [{
+            "finding_id": "expired-gap", "state": "waived_until", "reason": "temporary",
+            "expires": "2026-07-11",
+        }]
+
+        lifecycle = realreg.evaluate_finding_lifecycle(signals, declarations, today="2026-07-12")
+        result = realreg.evaluate_fixture_debt(
+            lifecycle, {name: True for name in realreg.V3_GATE_NAMES}
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertIn("missing-gap:missing_state", result["errors"])
+        self.assertIn("expired-gap:waiver_expired", result["errors"])
+
+    def test_fixed_fixture_debt_requires_real_unittest_and_all_seven_gates(self):
+        declarations = [{
+            "finding_id": "fixed-gap",
+            "state": "fixed",
+            "fixture": "tests.test_real_project_regression.RealProjectRegressionTests.not_a_test",
+        }]
+        invalid_fixture = realreg.evaluate_finding_lifecycle([], declarations)
+        valid_declarations = [{
+            **declarations[0],
+            "fixture": "tests.test_real_project_regression.RealProjectRegressionTests."
+                       "test_gs_multi_module_same_coordinate_guard",
+        }]
+        valid_lifecycle = realreg.evaluate_finding_lifecycle([], valid_declarations)
+        gate_states = {name: True for name in realreg.V3_GATE_NAMES}
+        gate_states["performance"] = False
+
+        unresolved = realreg.evaluate_fixture_debt(
+            invalid_fixture, {name: True for name in realreg.V3_GATE_NAMES}
+        )
+        incomplete = realreg.evaluate_fixture_debt(valid_lifecycle, gate_states)
+
+        self.assertIn("fixed-gap:fixed_fixture_not_unittest", unresolved["errors"])
+        self.assertIn("fixed-gap:fixed_gates_incomplete:performance", incomplete["errors"])
+
+    def test_fixed_fixture_debt_reopens_only_from_explicit_finding_recurrence(self):
+        declaration = [{
+            "finding_id": "same_coordinate_multimodule_bridge",
+            "state": "fixed",
+            "fixture": "tests.test_real_project_regression.RealProjectRegressionTests."
+                       "test_gs_multi_module_same_coordinate_guard",
+        }]
+        recurrence = [{
+            "fixture_debt_id": "same_coordinate_multimodule_bridge",
+            "severity": "P1",
+            "lifecycle_result": "recurred",
+        }]
+
+        lifecycle = realreg.evaluate_finding_lifecycle(recurrence, declaration)
+        result = realreg.evaluate_fixture_debt(
+            lifecycle, {name: True for name in realreg.V3_GATE_NAMES}
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertIn(
+            "same_coordinate_multimodule_bridge:finding_recurred_after_fixed",
+            result["errors"],
+        )
+
+    def test_v3_guard_reports_all_seven_independent_gates(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        result = self._passing_gs_guard_result(manifest)
+        asset = {"name": "asset", "passed": True, "errors": []}
+        lifecycle = realreg.evaluate_finding_lifecycle(
+            [], manifest["fixture_debt"], today="2026-07-12"
+        )
+        debt = realreg.evaluate_fixture_debt(
+            lifecycle, {name: True for name in realreg.V3_GATE_NAMES}
+        )
+
+        gates = realreg.build_v3_gates(manifest, result, asset, debt)
+
+        self.assertEqual(list(gates), [
+            "asset", "api_coverage", "topology_coverage", "edge_truth",
+            "conclusion", "performance", "fixture_debt",
+        ])
+        self.assertTrue(all(gate["passed"] for gate in gates.values()), gates)
+
+    def test_run_case_checks_pinned_final_artifact_before_step5_and_writes_gate_outputs(self):
+        case = realreg.CASES["gs-multi-module"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "missing-checkout"
+            report_root = Path(tmp) / "reports"
+            with patch.object(realreg, "run_step5") as run_step5:
+                result = realreg.run_case(case, root, Path(""), report_root)
+
+            gates_path = report_root / case.name / "evidence" / "quality" / "v3_gates.json"
+            debt_json = report_root / case.name / "evidence" / "quality" / "fixture_debt.json"
+            debt_csv = report_root / case.name / "evidence" / "quality" / "fixture_debt.csv"
+
+            self.assertTrue(gates_path.is_file())
+            self.assertTrue(debt_json.is_file())
+            self.assertTrue(debt_csv.is_file())
+
+        run_step5.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(set(result["gates"]), {
+            "asset", "api_coverage", "topology_coverage", "edge_truth",
+            "conclusion", "performance", "fixture_debt",
+        })
+        self.assertFalse(result["gates"]["asset"]["passed"])
+        self.assertIn("project_checkout_missing", result["gates"]["asset"]["errors"])
+
+    def test_pinned_guard_marks_original_finding_fixed_only_while_contract_passes(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        base = {"status": "passed", **self._passing_gs_guard_result(manifest)}
+        asset = {"name": "asset", "passed": True, "errors": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            passing = realreg.finalize_pinned_guard(manifest, dict(base), asset, Path(tmp) / "pass")
+            conflict = json.loads(json.dumps(base))
+            conflict["summary"]["reachable"] = 0
+            conflict["summary"]["reachable_apis"] = []
+            conflict["summary"]["uncertain"] = 1
+            conflict["summary"]["uncertain_apis"] = [{
+                "reason_code": "SOURCE_BYTECODE_EDGE_CONFLICT"
+            }]
+            failing = realreg.finalize_pinned_guard(
+                manifest, conflict, asset, Path(tmp) / "fail"
+            )
+
+        self.assertEqual(passing["status"], "passed")
+        self.assertTrue(passing["gates"]["fixture_debt"]["passed"])
+        self.assertEqual(failing["status"], "failed")
+        self.assertFalse(failing["gates"]["conclusion"]["passed"])
+        self.assertFalse(failing["gates"]["fixture_debt"]["passed"])
+        self.assertIn(
+            "same_coordinate_multimodule_bridge:fixed_gates_incomplete:conclusion",
+            failing["fixture_debt"]["errors"],
+        )
+
+    def test_cli_prints_all_seven_gate_results_on_asset_failure(self):
+        gate_names = (
+            "asset", "api_coverage", "topology_coverage", "edge_truth",
+            "conclusion", "performance", "fixture_debt",
+        )
+        result = {
+            "case": "gs-multi-module",
+            "status": "failed",
+            "reason": "pinned project asset invalid",
+            "gates": {
+                name: {"name": name, "passed": name != "asset", "errors": ["missing"] if name == "asset" else []}
+                for name in gate_names
+            },
+        }
+        output = __import__("io").StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(realreg, "run_case", return_value=result), patch("sys.stdout", output):
+                returncode = realreg.main([
+                    "--case", "gs-multi-module", "--report-root", tmp,
+                ])
+
+        self.assertEqual(returncode, 1)
+        for name in gate_names:
+            self.assertIn(f"gate {name}:", output.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

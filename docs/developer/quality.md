@@ -248,6 +248,44 @@ Spring Boot repackage 的 `mall-admin` fat jar，并在远程 Docker goal 之前
 
 Release 门禁会统计 blocking signal 中尚未沉淀的 `fixture_debt`。不能让真实项目反复发现同一类问题，却只保留一次性运行记录。
 
+Fixture debt 的机器状态只有三种：`fixed`、`planned`、`waived_until`。`fixed` 必须指向已存在的
+L0/L1/L2 回归测试；`planned` 必须填写目标 fixture 形态；`waived_until` 必须同时填写原因和
+ISO 日期。缺失状态、缺失必填字段和已过期 waiver 都会让 `fixture_debt` gate 阻塞。
+
+### `gs-multi-module` pinned guard
+
+`tests/fixtures/real_projects/gs-multi-module.json` 固定了 `spring-guides/gs-multi-module` 的 Git
+revision、最终 application artifact 的相对路径和 SHA-256。runner 在启动 Step5 之前校验 HEAD、
+ZIP/class 完整性和 artifact SHA；任何不一致都会直接返回 `failed`，不会读取 `target/classes`、
+IDE 输出或其他 jar 作为替代真值。允许的本地 checkout 位置是
+`/private/tmp/gs-multi-module/complete`，最终制品是
+`application/target/application-0.0.1-SNAPSHOT.jar`。
+
+守护链必须精确为 `DemoApplication.home -> MyService.message ->
+ServiceProperties.getMessage()`，目标 descriptor 为 `()Ljava/lang/String;`。两个 manifest 中固定的
+physical edge 必须都以 `correct` 完成 reconciliation，并同时观察到
+`business_to_same_jar_bridge` 和 `same_coord_multimodule`。出现
+`SOURCE_BYTECODE_EDGE_CONFLICT` 时 `conclusion` gate 必须失败。
+
+执行命令：
+
+```bash
+python3 scripts/real_project_regression.py --case gs-multi-module
+```
+
+命令逐项打印 `asset`、`api_coverage`、`topology_coverage`、`edge_truth`、`conclusion`、
+`performance`、`fixture_debt` 七个独立 gate。证据写入 case report 的
+`evidence/quality/v3_gates.json`、`fixture_debt.json` 和 `fixture_debt.csv`。原始
+same-coordinate finding 只有在完整守护契约通过时才保持 `fixed`；任一精确边、拓扑、链或结论
+回归都会重新打开该 debt 并阻塞。
+
+精确边校验读取 reconciliation ledger 的 `analyzer_row` / `oracle_row` 生产结构，
+同时校验 `correct` verdict 和 `physical_occurrence`；调用链按实际节点分隔后精确比较，
+仅对末节点的 `变更 API：` 标记做归一化。Fixture debt 先独立计算 finding lifecycle；
+`fixed` 行的 fixture 必须能由 unittest loader 解析到真实测试，且 `asset`、`api_coverage`、
+`topology_coverage`、`edge_truth`、`conclusion`、`performance`、`fixture_debt` 七个显式门禁状态
+全部通过后才算满足。Finding 再现由显式 lifecycle 结果判定，不从同一组边、拓扑或结论门禁反推。
+
 ## 打包前最低要求
 
 打包给使用者验证前至少执行：
