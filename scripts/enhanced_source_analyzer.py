@@ -2116,6 +2116,13 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
                 resolved_receiver = infer_receiver_type_enhanced(receiver_expr, method_def, site_local_var_types)
                 confidence = 'high' if resolved_receiver else 'medium'
             resolved_receiver_type = resolved_receiver or ''
+            # Java spells constructor references as `Type::new`, while the
+            # source/bytecode symbol model identifies a constructor by its
+            # declaring class name (`Type.Type`).  Preserve the reference
+            # evidence type but normalize its member so overload lookup and
+            # Step4 constructor targets use the same identity.
+            if method_name == 'new' and resolved_receiver:
+                method_name = resolved_receiver.rsplit('.', 1)[-1]
             callee_key = f"{resolved_receiver}.{method_name}" if resolved_receiver else f"method:{method_name}"
             callee_simple_key = f"method:{method_name}"
             evidence_type = 'method_reference'

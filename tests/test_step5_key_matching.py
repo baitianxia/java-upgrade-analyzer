@@ -56,6 +56,26 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertIn("com.acme.Base.Base(String)", graph.reverse_edges)
         self.assertIn("com.acme.Child.Child()", graph.reverse_edges)
+
+    def test_source_graph_normalizes_constructor_method_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Target.java").write_text(
+                "package com.acme;\nclass Target { Target() {} }\n", encoding="utf-8"
+            )
+            (source_root / "Use.java").write_text(
+                "package com.acme;\nimport java.util.function.Supplier; "
+                "class Use { Supplier<Target> create() { return Target::new; } }\n",
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        self.assertIn("com.acme.Target.Target()", graph_result["graph"].reverse_edges)
     def test_exact_business_bytecode_call_beats_missing_runtime_dependency_jars(self):
         api_row = {
             "coord": "cn.hutool:hutool-all",
