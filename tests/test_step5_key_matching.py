@@ -8620,7 +8620,7 @@ public class com.example.TargetBridge {
         self.assertEqual("未发现静态调用路径", rows[0]["conclusion"])
         self.assertEqual("依赖 a:b 删除了方法 com.acme.Api.gone()（严重级别 P0）", rows[0]["change_summary"])
         self.assertIn("未形成完整链路", rows[0]["chain_summary"])
-        self.assertEqual("com.acme.Api.gone", rows[0]["chain_target"])
+        self.assertEqual("com.acme.Api.gone()", rows[0]["chain_target"])
         self.assertEqual(rows[0]["conclusion_level"], "no_static_path")
         self.assertEqual(rows[0]["path_text"], "")
 
