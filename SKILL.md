@@ -187,7 +187,7 @@ python3 -m pip install tree-sitter tree-sitter-java
 6. 若某一侧 Maven 需要特定 JDK：补该侧 `base_jdk_home/current_jdk_home`；未提供时各侧默认回落主机 `JAVA_HOME`
 7. 本次唯一的 `target_module`；确认后由 Maven reactor 自动推导系统源码范围
 8. 依赖源码目录或仓库根目录（可选但强烈推荐；仅表示依赖源码，字段为 `dependency_source_dirs`）
-9. `max_depth`（默认 5，表示最大累计追踪代价；全高置信度边时最多约 5 跳）
+9. `max_depth`（默认 5，表示最大累计追踪代价；全高置信度边时最多约 5 跳；同一节点保留“更短”和“更可信”的 Pareto 最优路径）
 10. 是否包含 test 作用域（默认 false）
 11. 是否允许降级执行（默认 false；缺少关键源码映射时将阻塞以避免漏分析）
 
@@ -461,7 +461,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
 - 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`
 - 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中保留 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` / `RUNTIME_DEPENDENCY_USES_REMOVED_API` 事实，但若该依赖存在源码映射，Step5 必须先继续尝试回溯到业务代码，只有未能证明业务入口时才收敛为 `uncertain`
-- 规则：若依赖源码或资源配置中存在明确运行时主动入口（如 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle、Quartz `Job.execute`、Spring XML `task:scheduled`、`init-method`、`MethodInvokingJobDetailFactoryBean`），且该入口链路触达变更 API，即使没有业务源码显式调用方，也应作为 Step5 影响链路处理，不得仅因未回溯到业务源码而降为静态未找到
+- 规则：若依赖源码或资源配置中存在明确运行时主动入口（如 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle、Quartz `Job.execute`、Spring XML `task:scheduled`、`init-method`、`MethodInvokingJobDetailFactoryBean`），且该入口链路触达变更 API，即使没有业务源码显式调用方，也应作为 Step5 影响链路处理，不得仅因未回溯到业务源码而降为静态未找到。JPA `@PrePersist` / `@PostUpdate` 等生命周期回调必须进入框架证据，但在没有实体生命周期激活证据时保留为条件入口；`@Async` 只改变执行线程，不得单独伪造成调用入口
 - 规则：验收测试必须包含真实 `jdeps` 对照；`jdeps` 能发现的静态跨 JAR 类依赖，本 Skill 不得漏报，并继续提供成员级方法/字段匹配
 - 规则：业务源码图与当前业务字节码图使用统一 owner/name/signature 身份；冲突时保留两类 provenance，不得用字节码静默覆盖源码证据
 - 规则：`evidence/call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条唯一终止链路独立一行，禁止只保留第一条路径或静默截断；同一终止链路重复命中时合并为一行并用 `path_occurrence_count` 表示次数
