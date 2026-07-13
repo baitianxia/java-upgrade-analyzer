@@ -1091,14 +1091,16 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         user_conclusion_summary[user_view['user_conclusion']] += 1
         decision_bucket_summary[user_view['decision_bucket']] += 1
 
-    # uncertain 原因分类
-    uncertain_reason_summary = defaultdict(int)
-    for r in uncertain:
-        uncertain_reason_summary[r.reason_code] += 1
-    uncertain_reason_summary = dict(sorted(
-        uncertain_reason_summary.items(),
-        key=lambda x: -x[1]
-    ))
+    def reason_summary(results):
+        grouped = defaultdict(int)
+        for item in results:
+            grouped[str(getattr(item, 'reason_code', '') or 'UNKNOWN')] += 1
+        return dict(sorted(grouped.items(), key=lambda x: (-x[1], x[0])))
+
+    # Keep the two states separate: an uncertain candidate has different
+    # remediation from an API that could not be analysed at all.
+    uncertain_reason_summary = reason_summary(uncertain)
+    not_analyzed_reason_summary = reason_summary(not_analyzed)
 
     summary = {
         'meta': {
@@ -1126,6 +1128,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         'not_analyzed_apis':  [trace_result_to_api_entry(r) for r in not_analyzed],
         'not_found_apis':     [trace_result_to_api_entry(r) for r in not_found],
         'uncertain_reason_summary': uncertain_reason_summary,
+        'not_analyzed_reason_summary': not_analyzed_reason_summary,
         'user_conclusion_summary': dict(sorted(user_conclusion_summary.items(), key=lambda x: x[0])),
         'quality_gate': {
             'confirmed_impact': decision_bucket_summary.get('confirmed_impact', 0),

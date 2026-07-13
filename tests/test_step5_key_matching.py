@@ -8645,6 +8645,26 @@ public class com.example.TargetBridge {
         self.assertEqual(0, row["path_occurrence_count"])
         self.assertEqual("", row["path_id"])
 
+    def test_summary_json_groups_not_analyzed_reasons_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = tracer.TraceResult(
+                coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+                api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+                confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+                reachable_note="运行时依赖 jar 缺失", business_reach_depth=0,
+                dependency_chain_coords=[], call_paths=[], evidence_paths=[],
+                reason_code="RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", verification_commands=[], hops=[],
+                confidence_score=0.0, critical_nodes_hit=[],
+            )
+            summary_path = formatter.write_summary_json([result], tmp)
+            summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            {"RUNTIME_DEPENDENCY_JARS_UNAVAILABLE": 1},
+            summary["not_analyzed_reason_summary"],
+        )
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
