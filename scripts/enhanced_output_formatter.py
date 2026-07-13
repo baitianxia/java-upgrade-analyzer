@@ -1317,11 +1317,16 @@ def _alert_rows_for_result(result):
             }
             for item in evidence
         ]
+        raw_path_text = str(detail.get('path_text') or '').strip()
+        has_chain = (
+            len(_split_chain_nodes(raw_path_text)) >= 2
+            or len(_nodes_from_evidence(evidence)) >= 2
+        )
         path_identity = json.dumps({
             'api_id': api_id, 'status': path_status, 'stop_reason': stop_reason,
-            'path_text': detail.get('path_text') or '', 'evidence': semantic_evidence,
+            'path_text': raw_path_text, 'evidence': semantic_evidence,
         }, ensure_ascii=False, sort_keys=True)
-        path_id = 'PATH-' + hashlib.sha1(path_identity.encode('utf-8')).hexdigest()[:12]
+        path_id = ('PATH-' + hashlib.sha1(path_identity.encode('utf-8')).hexdigest()[:12]) if has_chain else ''
         conclusion_level, action_type = _path_conclusion(path_status)
         reachable = detail.get('business_reachable')
         capability_coverage = dict(getattr(result, 'capability_coverage', {}) or {})
@@ -1329,6 +1334,14 @@ def _alert_rows_for_result(result):
         business_entry = humanize_user_text(detail.get('business_entry') or '')
         changed_symbol = result.api_name or ''
         chain_view = _alert_chain_view(path_text, business_entry, changed_symbol, evidence)
+        if not has_chain:
+            chain_view = {
+                'summary': f"未形成完整链路；目标 API：{changed_symbol}" if changed_symbol else '未形成完整链路',
+                'entry': '',
+                'target': changed_symbol,
+                'hop_count': '',
+                'detail': '无已发现调用链',
+            }
         review_reason = _alert_review_reason(result, detail, evidence, explanation, stop_reason)
         rows.append({
             'conclusion': _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_reason),
@@ -1366,9 +1379,9 @@ def _alert_rows_for_result(result):
             'stop_reason': stop_reason,
             'reason': explanation['reason'],
             'action': explanation['action'] or '',
-            'confidence': f"{float(detail.get('confidence') or 0.0):.2f}",
-            'depth': int(detail.get('depth') or 0),
-            'path_occurrence_count': int(detail.get('_path_occurrence_count') or 1),
+            'confidence': f"{float(detail.get('confidence') or 0.0):.2f}" if has_chain else '0.00',
+            'depth': int(detail.get('depth') or 0) if has_chain else -1,
+            'path_occurrence_count': int(detail.get('_path_occurrence_count') or 1) if has_chain else 0,
             'coverage_status': capability_coverage.get('status') or '',
             'coverage_details': json.dumps(
                 {

@@ -8624,6 +8624,27 @@ public class com.example.TargetBridge {
         self.assertEqual(rows[0]["conclusion_level"], "no_static_path")
         self.assertEqual(rows[0]["path_text"], "")
 
+    def test_alert_row_marks_absent_path_without_fake_entry_or_confidence(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+            reachable_note="运行时依赖 jar 缺失", business_reach_depth=0,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[],
+            reason_code="RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", verification_commands=[], hops=[],
+            confidence_score=1.0, critical_nodes_hit=[],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("", row["chain_entry"])
+        self.assertEqual("无已发现调用链", row["chain_detail"])
+        self.assertEqual("0.00", row["confidence"])
+        self.assertEqual(-1, row["depth"])
+        self.assertEqual(0, row["path_occurrence_count"])
+        self.assertEqual("", row["path_id"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
