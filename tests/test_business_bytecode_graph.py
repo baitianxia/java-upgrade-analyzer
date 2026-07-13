@@ -169,6 +169,84 @@ public class Service {
             for edge in edges
         ))
 
+    def test_try_with_resources_emits_implicit_close_edge_from_bytecode(self):
+        if not shutil.which("javac"):
+            self.skipTest("javac not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src" / "com" / "acme"
+            src.mkdir(parents=True)
+            (src / "Resource.java").write_text(
+                "package com.acme; public class Resource implements AutoCloseable { "
+                "public void close() {} }",
+                encoding="utf-8",
+            )
+            (src / "Service.java").write_text(
+                "package com.acme; public class Service { void run() throws Exception { "
+                "try (Resource resource = new Resource()) { } } }",
+                encoding="utf-8",
+            )
+            out = root / "classes"
+            out.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(out)] + [str(path) for path in src.glob("*.java")],
+                check=True,
+                capture_output=True,
+            )
+
+            edges = parse_classfile_calls(
+                (out / "com/acme/Service.class").read_bytes(),
+                "com.acme.Service",
+            )
+
+        self.assertTrue(any(
+            edge.get("caller_name") == "run"
+            and edge.get("callee_key") == "com.acme.Resource.close()"
+            and edge.get("evidence_type") == "bytecode_method_invocation"
+            for edge in edges
+        ))
+
+    def test_generic_bridge_keeps_connectivity_without_duplicate_target_edge(self):
+        if not shutil.which("javac"):
+            self.skipTest("javac not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src" / "com" / "acme"
+            src.mkdir(parents=True)
+            (src / "Target.java").write_text(
+                "package com.acme; public class Target { static String changed() { return \"x\"; } }",
+                encoding="utf-8",
+            )
+            (src / "Base.java").write_text(
+                "package com.acme; interface Base<T> { T get(); }",
+                encoding="utf-8",
+            )
+            (src / "Impl.java").write_text(
+                "package com.acme; class Impl implements Base<String> { "
+                "public String get() { return Target.changed(); } }",
+                encoding="utf-8",
+            )
+            out = root / "classes"
+            out.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(out)] + [str(path) for path in src.glob("*.java")],
+                check=True,
+                capture_output=True,
+            )
+
+            edges = parse_classfile_calls(
+                (out / "com/acme/Impl.class").read_bytes(),
+                "com.acme.Impl",
+            )
+
+        target_edges = [edge for edge in edges if edge.get("callee_key") == "com.acme.Target.changed()"]
+        self.assertEqual(len(target_edges), 1)
+        self.assertTrue(any(
+            edge.get("caller_descriptor") == "()Ljava/lang/Object;"
+            and edge.get("callee_key") == "com.acme.Impl.get()"
+            for edge in edges
+        ))
+
     def test_parse_classfile_calls_keeps_calls_after_dense_and_sparse_switches(self):
         if not shutil.which("javac"):
             self.skipTest("javac not available")
