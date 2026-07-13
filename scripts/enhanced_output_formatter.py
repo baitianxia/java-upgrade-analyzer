@@ -28,6 +28,8 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from signature_utils import split_signature_params
+
 try:
     from s4_contract import PER_DEPENDENCY_SUMMARY_FILE, get_per_dependency_dir
 except ImportError:
@@ -212,10 +214,19 @@ def trace_result_to_api_entry(r):
 
 def _api_display_name(result):
     api_name = str(getattr(result, 'api_name', '') or '').strip()
-    signature = str(getattr(result, 'api_signature', '') or '').strip()
+    signature = _display_api_signature(getattr(result, 'api_signature', '') or '')
     if api_name and signature and not api_name.endswith(signature):
         return f"{api_name}{signature}"
     return api_name or str(getattr(result, 'api_simple', '') or '').strip() or '<unknown-api>'
+
+
+def _display_api_signature(signature):
+    """Normalize spacing for presentation without changing lookup semantics."""
+    raw = str(signature or '').strip()
+    params = split_signature_params(raw)
+    if params is None:
+        return raw
+    return '(' + ', '.join(param.strip() for param in params) + ')'
 
 
 def _target_coord_display(result):
@@ -1481,7 +1492,7 @@ def _alert_rows_for_result(result):
             'path_id': path_id,
             'target_coord': _target_coord_display(result),
             'changed_symbol': changed_symbol,
-            'api_signature': getattr(result, 'api_signature', '') or '',
+            'api_signature': _display_api_signature(getattr(result, 'api_signature', '') or ''),
             'symbol_kind': getattr(result, 'symbol_kind', '') or '',
             'change_type': result.change_type,
             'severity': result.severity,

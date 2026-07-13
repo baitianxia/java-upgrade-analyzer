@@ -8851,6 +8851,22 @@ public class com.example.TargetBridge {
         self.assertEqual("not_analyzed", results[0].analysis_status)
         self.assertEqual("MISSING_API_NAME", results[0].reason_code)
 
+    def test_alert_signature_uses_one_consistent_parameter_separator(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.call", api_simple="call",
+            api_signature="(java.lang.String,java.lang.String...)", symbol_kind="method",
+            change_type="REMOVED", severity="P0", confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="not_found_in_static_analysis", direct_callers=0, is_reachable=False,
+            reachable_note="未找到", business_reach_depth=0, dependency_chain_coords=[],
+            call_paths=[], evidence_paths=[], reason_code="NO_STATIC_PATH", verification_commands=[], hops=[],
+            confidence_score=0.0, critical_nodes_hit=[],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("(java.lang.String, java.lang.String...)", row["api_signature"])
+        self.assertEqual("com.acme.Api.call(java.lang.String, java.lang.String...)", row["changed_symbol"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
