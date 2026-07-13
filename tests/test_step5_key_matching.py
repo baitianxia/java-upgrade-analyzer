@@ -8872,6 +8872,15 @@ public class com.example.TargetBridge {
         self.assertEqual("人工复核", formatter._path_conclusion("uncertain")[1])
         self.assertEqual("补齐输入后重跑", formatter._path_conclusion("not_analyzed")[1])
 
+    def test_unknown_reason_code_does_not_leak_into_user_reason(self):
+        outcome = formatter.summarize_user_facing_outcome(SimpleNamespace(
+            analysis_status="not_analyzed", reason_code="UNRECOGNIZED_INTERNAL_STOP",
+            severity="P1", call_paths=[], evidence_paths=[], dependency_chain_coords=[],
+        ))
+
+        self.assertNotIn("UNRECOGNIZED_INTERNAL_STOP", outcome["user_reason"])
+        self.assertIn("静态分析", outcome["user_reason"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

@@ -767,8 +767,11 @@ def explain_reason_code(reason_code, trace_result):
         {'reason': str, 'action': str}
     """
     explanation = dict(REASON_CODE_EXPLANATIONS.get(reason_code, {
-        'reason': reason_code,
-        'action': '未知原因，需人工审查'
+        # Reason codes are diagnostic state, not a user explanation.  Keep an
+        # unknown future code in structured diagnostics, but never surface it
+        # as if it were readable guidance in reports or CSVs.
+        'reason': '当前静态分析未记录可用于确认结论的具体原因。',
+        'action': '查看本条的证据与停止原因；如关键输入不完整，补齐后重跑分析。'
     }))
 
     # 补充上下文信息
