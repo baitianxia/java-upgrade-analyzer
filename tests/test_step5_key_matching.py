@@ -255,7 +255,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 all_changed_apis="",
                 source_dirs=[str(source_dir)],
                 dependency_source_mappings=[],
-                allow_degraded=False,
+                # The production contract must ignore this stale/manual bypass
+                # and still stop until tree-sitter is available.
+                allow_degraded=True,
                 jdk_scan_dir="",
                 max_depth=5,
                 max_methods=None,
@@ -281,8 +283,12 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertEqual(rc, step5.EXIT_AWAITING_USER)
             payload = json.loads(stdout.getvalue().split(step5.STEP_INTERACTION_PREFIX, 1)[1].strip())
             self.assertEqual(payload["reason_code"], "step5_tree_sitter_missing_need_resolution")
-            self.assertIn("allow_degraded", payload["response_schema"]["properties"])
+            self.assertNotIn("allow_degraded", payload["response_schema"]["properties"])
             self.assertIn("tree_sitter_installed", payload["response_schema"]["properties"])
+            self.assertEqual(
+                payload["action_requirements"]["rerun_current_step"]["required_fields"],
+                ["tree_sitter_installed"],
+            )
             self.assertTrue((output_dir / "tree_sitter_preflight.json").exists())
 
     def _compile_java_fixture(self, tmp, relative_path, source):

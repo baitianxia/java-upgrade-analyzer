@@ -245,8 +245,12 @@ class Step4StabilityTest(unittest.TestCase):
             self.assertIn(step4.INTERACTION_PREFIX, output)
             payload = json.loads(output.split(step4.INTERACTION_PREFIX, 1)[1].strip())
             self.assertEqual(payload["reason_code"], "step4_japicmp_missing_need_resolution")
-            self.assertIn("allow_degraded", payload["response_schema"]["properties"])
+            self.assertNotIn("allow_degraded", payload["response_schema"]["properties"])
             self.assertIn("japicmp_jar", payload["response_schema"]["properties"])
+            self.assertEqual(
+                payload["action_requirements"]["rerun_current_step"]["required_fields"],
+                ["japicmp_jar"],
+            )
             self.assertTrue((output_dir / "japicmp_preflight.json").exists())
 
     def test_parse_japicmp_xml_preserves_binary_and_source_compatibility(self):

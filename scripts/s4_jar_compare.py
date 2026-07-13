@@ -1268,7 +1268,7 @@ def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, pl
         "impact": [
             "Step4 无法执行 JApiCmp 二进制 API 对比。",
             "这会漏掉仅通过 jar 二进制对比才能发现的删除、签名变化、字段变化、源码重编译不兼容等 API 变化。",
-            "如果确认降级继续，后续 Step5/Step6 的结论必须视为二进制 API 证据不完整。",
+            "JApiCmp 是 Java 升级分析的必需工具；未安装时不会生成后续分析结论。",
         ],
         "manual_install": [
             f"mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}",
@@ -1286,8 +1286,7 @@ def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, pl
         "title": "step4 缺少 JApiCmp，二进制 API 对比不可用",
         "question": (
             "Step4 需要 JApiCmp 执行依赖 jar 的二进制 API 对比。系统已尝试自动安装但失败。"
-            "请优先安装 JApiCmp 或提供 japicmp_jar 后重跑 Step4；"
-            "只有在你明确接受二进制 API 证据缺失的风险时，才允许 allow_degraded=true 降级继续。"
+            "请安装 JApiCmp 或提供 japicmp_jar 后重跑 Step4。"
         ),
         "summary": f"共有 {len(planned_dependencies)} 个升级依赖需要 JApiCmp；当前工具不可用。",
         "reason_code": "step4_japicmp_missing_need_resolution",
@@ -1297,7 +1296,7 @@ def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, pl
             {
                 "id": "rerun_current_step",
                 "label": "处理 JApiCmp 后重跑",
-                "description": "安装/提供 japicmp_jar 后重跑；或显式 allow_degraded=true 接受二进制 API 证据缺失后重跑。",
+                "description": "安装或提供 japicmp_jar 后重跑。",
             },
             {
                 "id": "restart_from_step",
@@ -1322,10 +1321,6 @@ def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, pl
                     "type": "string",
                     "description": "可选。JApiCmp jar-with-dependencies 的绝对路径。",
                 },
-                "allow_degraded": {
-                    "type": "boolean",
-                    "description": "可选。若设为 true，表示用户明确接受缺少 JApiCmp 二进制 API 对比证据后降级继续。",
-                },
                 "restart_step_id": {
                     "type": "string",
                     "enum": ["step1", "step2", "step4"],
@@ -1335,8 +1330,8 @@ def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, pl
         },
         "action_requirements": {
             "rerun_current_step": {
-                "at_least_one_of": ["japicmp_jar", "allow_degraded"],
-                "description": "重跑 Step4 时，要么提供 japicmp_jar，要么明确 allow_degraded=true。",
+                "required_fields": ["japicmp_jar"],
+                "description": "重跑 Step4 时必须提供可用的 japicmp_jar。",
             },
             "restart_from_step": {
                 "required_fields": ["restart_step_id"],
@@ -1354,8 +1349,7 @@ def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, pl
             "manual_install": f"mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}",
         },
         "resume_hint": (
-            "优先安装 JApiCmp 或提供 japicmp_jar 后 action=rerun_current_step；"
-            "若用户确认风险，也可 action=rerun_current_step 且 allow_degraded=true。"
+            "安装 JApiCmp 或提供 japicmp_jar 后，使用 action=rerun_current_step 重跑。"
         ),
         "next_action_rule": "只能先处理 JApiCmp 缺失并等待用户回复，不得直接继续进入 Step5。",
         "must_wait_for_user_reply": True,
@@ -4488,7 +4482,7 @@ def main():
                 "install_error": install_error or "",
             },
         )
-        if (not installed) and (not args.allow_degraded):
+        if not installed:
             planned_dependencies = [
                 {
                     "coord": row.get("coord", ""),
@@ -4509,20 +4503,13 @@ def main():
                 timing.flush()
                 emit_interaction(interaction)
                 return 0
-            print("\n❌ JApiCmp 不可用，且未确认 allow_degraded=true。", file=sys.stderr)
+            print("\n❌ JApiCmp 不可用，无法执行 Java 升级分析。", file=sys.stderr)
             print(f"   自动安装失败原因：{install_error}", file=sys.stderr)
             print(f"   请执行：mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}", file=sys.stderr)
-            print("   或提供 --japicmp-jar 后重跑 Step4；若确认降级，请显式设置 --allow-degraded。", file=sys.stderr)
+            print("   或提供 --japicmp-jar 后重跑 Step4。", file=sys.stderr)
             timing.record("step4.total", status="japicmp_missing", elapsed=step_timer.elapsed())
             timing.flush()
             return 2
-        if (not installed) and args.allow_degraded:
-            print(
-                "⚠️  JApiCmp 自动安装失败，但已显式 allow_degraded=true；"
-                "Step4 将缺少二进制 API 对比证据。",
-                file=sys.stderr,
-            )
-
     all_apis            = []
     jar_missing_deps    = []
     japicmp_missing_deps = []

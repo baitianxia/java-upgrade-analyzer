@@ -480,8 +480,7 @@ def write_tree_sitter_preflight_details(output_dir, status, source_dirs):
         "source_dirs_checked": [str(item) for item in (source_dirs or [])],
         "impact": [
             "Step5 无法使用 tree-sitter Java AST 主链路。",
-            "如果降级到增强正则，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。",
-            "降级不会阻止字节码扫描，但源码图相关结论的漏报/误报风险会上升。",
+            "tree-sitter 是 Java 源码调用链分析的必需工具；未安装时不会生成后续分析结论。",
         ],
         "manual_install": [
             (status or {}).get("install_command") or "python -m pip install tree-sitter tree-sitter-java",
@@ -504,10 +503,9 @@ def build_tree_sitter_missing_interaction(output_dir, details_path, status):
         "title": "step5 缺少 tree-sitter，Java AST 主链路不可用",
         "question": (
             "Step5 需要 tree-sitter/tree-sitter-java 提升 Java 源码调用链分析准确性。"
-            "系统已尝试自动安装但失败。请优先安装 tree-sitter 后重跑 Step5；"
-            "只有在你明确接受源码 AST 证据降级风险时，才允许 allow_degraded=true 继续。"
+            "系统已尝试自动安装但失败。请安装 tree-sitter 后重跑 Step5。"
         ),
-        "summary": "tree-sitter 不可用；如果降级，Step5 将使用增强正则分析 Java 源码。",
+        "summary": "tree-sitter 不可用；Step5 已停止，未使用增强正则生成分析结论。",
         "reason_code": "step5_tree_sitter_missing_need_resolution",
         "files_to_review": [os.path.abspath(details_path)],
         "required_fields": ["action"],
@@ -515,7 +513,7 @@ def build_tree_sitter_missing_interaction(output_dir, details_path, status):
             {
                 "id": "rerun_current_step",
                 "label": "处理 tree-sitter 后重跑",
-                "description": "安装 tree-sitter/tree-sitter-java 后重跑；或显式 allow_degraded=true 接受源码 AST 降级后重跑。",
+                "description": "安装 tree-sitter/tree-sitter-java 后重跑。",
             },
             {
                 "id": "restart_from_step",
@@ -535,10 +533,6 @@ def build_tree_sitter_missing_interaction(output_dir, details_path, status):
                 "action": {
                     "type": "string",
                     "enum": ["rerun_current_step", "restart_from_step", "cancel"],
-                },
-                "allow_degraded": {
-                    "type": "boolean",
-                    "description": "可选。设为 true 时允许 tree-sitter 缺失情况下用增强正则降级分析 Java 源码。",
                 },
                 "tree_sitter_installed": {
                     "type": "boolean",
@@ -560,8 +554,8 @@ def build_tree_sitter_missing_interaction(output_dir, details_path, status):
         },
         "action_requirements": {
             "rerun_current_step": {
-                "at_least_one_of": ["tree_sitter_installed", "allow_degraded"],
-                "description": "重跑 Step5 时，需要先安装 tree-sitter 并声明 tree_sitter_installed=true；若仍不可用，则必须显式 allow_degraded=true。",
+                "required_fields": ["tree_sitter_installed"],
+                "description": "重跑 Step5 时，必须先安装 tree-sitter 并声明 tree_sitter_installed=true。",
             },
             "restart_from_step": {
                 "required_fields": ["restart_step_id"],
@@ -576,7 +570,6 @@ def build_tree_sitter_missing_interaction(output_dir, details_path, status):
         "resume_hint": (
             f"请优先执行或让环境具备：{install_command}；"
             "安装完成后 action=rerun_current_step 且 tree_sitter_installed=true。"
-            "若用户接受风险，可 action=rerun_current_step 且 allow_degraded=true。"
         ),
         "next_action_rule": "只能先处理 tree-sitter 缺失并等待用户回复，不得直接继续生成 Step6。",
         "must_wait_for_user_reply": True,
@@ -766,31 +759,24 @@ def _step5_integrated_main_impl(args):
 
     # Phase 2.6: Java AST parser preflight.
     # tree-sitter 不是“可有可无”的小优化：它直接影响 Step5 源码图的准确性。
-    # 因此正式流程中，若存在 Java 源码但自动安装失败，必须让用户确认后才允许 regex 降级。
+    # 因此正式流程中，若存在 Java 源码但自动安装失败，必须停止；不允许 regex 降级。
     tree_sitter_source_dirs = list(business_source_dirs or []) + _dependency_mapping_source_dirs(dependency_source_mappings)
     if has_java_source_file(tree_sitter_source_dirs):
         if not ensure_tree_sitter_available():
             status = tree_sitter_status()
-            if not allow_degraded:
-                print("\n❌ tree-sitter 不可用，且未确认 allow_degraded=true。", file=sys.stderr)
-                print("影响：Step5 将无法使用 Java AST 主链路，源码调用链准确性会下降。", file=sys.stderr)
-                if status.get("auto_install_error"):
-                    print(f"自动安装失败原因：{status.get('auto_install_error')}", file=sys.stderr)
-                print(f"请优先安装：{status.get('install_command')}", file=sys.stderr)
-                details_path = write_tree_sitter_preflight_details(
-                    output_dir,
-                    status,
-                    tree_sitter_source_dirs,
-                )
-                emit_step_interaction(
-                    build_tree_sitter_missing_interaction(output_dir, details_path, status)
-                )
-                return EXIT_AWAITING_USER
-            print(
-                "⚠️  tree-sitter 不可用，但已显式 allow_degraded=true；"
-                "Step5 将使用增强正则降级分析 Java 源码。",
-                file=sys.stderr,
+            print("\n❌ tree-sitter 不可用，无法执行 Java 源码调用链分析。", file=sys.stderr)
+            if status.get("auto_install_error"):
+                print(f"自动安装失败原因：{status.get('auto_install_error')}", file=sys.stderr)
+            print(f"请安装：{status.get('install_command')}", file=sys.stderr)
+            details_path = write_tree_sitter_preflight_details(
+                output_dir,
+                status,
+                tree_sitter_source_dirs,
             )
+            emit_step_interaction(
+                build_tree_sitter_missing_interaction(output_dir, details_path, status)
+            )
+            return EXIT_AWAITING_USER
     else:
         _step5_debug(
             'tree_sitter_preflight',
