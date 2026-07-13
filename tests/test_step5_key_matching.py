@@ -2320,7 +2320,7 @@ public class com.example.TargetBridge {
             )
 
             self.assertEqual(methods, [])
-            self.assertEqual(parser_info["actual_parser"], "regex")
+            self.assertEqual(parser_info["actual_parser"], "skipped")
             self.assertTrue(parser_info["fallback_reason"].startswith("tree_sitter_runtime_error:"))
 
     def test_analyze_file_ignores_block_commented_structure_but_keeps_real_method(self):
@@ -2360,7 +2360,7 @@ public class com.example.TargetBridge {
                 [("com.example.Demo", "live")],
             )
 
-    def test_analyze_file_auto_installs_tree_sitter_before_regex_fallback(self):
+    def test_analyze_file_auto_installs_tree_sitter_before_java_analysis(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"
             java_file.write_text(
@@ -2426,7 +2426,7 @@ public class com.example.TargetBridge {
             self.assertTrue(parser_info["tree_sitter_auto_install_attempted"])
             self.assertEqual(parser_info["tree_sitter_auto_install_error"], "")
 
-    def test_analyze_file_records_tree_sitter_auto_install_failure_before_degrading(self):
+    def test_analyze_file_records_tree_sitter_auto_install_failure_without_degrading(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"
             java_file.write_text(
@@ -2459,8 +2459,8 @@ public class com.example.TargetBridge {
                 )
 
             ensure_mock.assert_called_once()
-            self.assertIsInstance(methods, list)
-            self.assertEqual(parser_info["actual_parser"], "regex")
+            self.assertEqual(methods, [])
+            self.assertEqual(parser_info["actual_parser"], "skipped")
             self.assertEqual(parser_info["fallback_reason"], "tree_sitter_unavailable")
             self.assertTrue(parser_info["tree_sitter_auto_install_attempted"])
             self.assertEqual(parser_info["tree_sitter_auto_install_error"], "pip_returncode=1")

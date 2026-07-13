@@ -1935,7 +1935,7 @@ def analyze_file(file_path, source_root, prefer_tree_sitter=True, return_diagnos
 
     Auto-selects:
       - tree-sitter (installed and prefer_tree_sitter=True and language=java)
-      - Enhanced regex (fallback, or Kotlin sources)
+      - Enhanced regex (Kotlin sources only)
 
     Args:
         file_path: Source file path
@@ -1988,18 +1988,23 @@ def analyze_file(file_path, source_root, prefer_tree_sitter=True, return_diagnos
             if analyzer.non_empty_source and not methods and not has_valid_methodless_java:
                 raise RuntimeError('tree_sitter_empty_result')
         except Exception as exc:
-            parser_info['actual_parser'] = 'regex'
+            # Java AST analysis is mandatory for formal Step5 results.  A
+            # regex pass here would look like a completed graph while silently
+            # changing the matching semantics, so keep the file explicitly
+            # unanalysed and let the graph completeness gate report it.
+            parser_info['actual_parser'] = 'skipped'
             parser_info['fallback_reason'] = f"tree_sitter_runtime_error:{exc.__class__.__name__}"
+            methods = []
+    else:
+        if is_kotlin:
             analyzer = EnhancedRegexAnalyzer(file_path, source_root)
             methods = analyzer.analyze()
-    else:
-        analyzer = EnhancedRegexAnalyzer(file_path, source_root)
-        methods = analyzer.analyze()
-        if is_kotlin:
             parser_info['fallback_reason'] = 'unsupported_language_kotlin'
         elif not TREE_SITTER_AVAILABLE and prefer_tree_sitter:
+            parser_info['actual_parser'] = 'skipped'
             parser_info['fallback_reason'] = 'tree_sitter_unavailable'
         elif not prefer_tree_sitter:
+            parser_info['actual_parser'] = 'skipped'
             parser_info['fallback_reason'] = 'prefer_tree_sitter_disabled'
 
     if return_diagnostics:
