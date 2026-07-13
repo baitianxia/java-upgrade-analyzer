@@ -240,6 +240,27 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertIn("com.acme.Use.changed(String)", graph_result["graph"].reverse_edges)
 
+    def test_source_graph_keeps_executor_lambda_calls_on_submitter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Target.java").write_text(
+                "package com.acme;\nclass Target { static void changed() {} }\n",
+                encoding="utf-8",
+            )
+            (source_root / "Use.java").write_text(
+                "package com.acme;\nimport java.util.concurrent.ExecutorService;\n"
+                "class Use { void submit(ExecutorService executor) { executor.submit(() -> Target.changed()); } }\n",
+                encoding="utf-8",
+            )
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        target_edges = graph_result["graph"].reverse_edges["com.acme.Target.changed()"]
+        self.assertEqual(["com.acme.Use.submit"], [edge.caller_qualified_key for edge in target_edges])
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
