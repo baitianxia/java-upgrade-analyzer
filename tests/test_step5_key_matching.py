@@ -8773,6 +8773,28 @@ public class com.example.TargetBridge {
         self.assertFalse(Path(row["evidence_files"]).is_absolute())
         self.assertEqual("../../project/src/App.java", row["evidence_files"])
 
+    def test_summary_declares_all_primary_step5_review_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "evidence" / "call_chain"
+            output.mkdir(parents=True)
+            result = tracer.TraceResult(
+                coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+                api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+                confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="not_found_in_static_analysis", direct_callers=0, is_reachable=False,
+                reachable_note="未找到", business_reach_depth=0,
+                dependency_chain_coords=[], call_paths=[], evidence_paths=[], reason_code="NO_STATIC_PATH",
+                verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[],
+            )
+            formatter.generate_enhanced_summary([result], str(output), graph_stats={})
+            (output / "step5_timing.csv").write_text("section,metric,value\n", encoding="utf-8")
+            formatter.register_step5_summary_artifacts(str(output))
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("alerts.csv", summary["artifacts"]["alerts_csv"])
+        self.assertEqual("step5_timing.csv", summary["artifacts"]["timing_csv"])
+        self.assertEqual("by_api", summary["artifacts"]["api_detail_dir"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

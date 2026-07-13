@@ -53,7 +53,7 @@ from confidence_weighted_tracer import (
     build_api_target_keys,
     trace_all_apis_with_confidence_weighting,
 )
-from enhanced_output_formatter import generate_enhanced_summary
+from enhanced_output_formatter import generate_enhanced_summary, register_step5_summary_artifacts
 from compat import maven_repo_dir, run_cmd
 from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_edges, merge_business_bytecode_edges
@@ -1334,6 +1334,7 @@ def _step5_integrated_main_impl(args):
     timing_csv = _write_step5_timing_csv(output_dir, graph_stats)
     if timing_csv:
         print(f"  耗时明细 → {timing_csv}", file=sys.stderr)
+    register_step5_summary_artifacts(output_dir)
 
     # 统计
     reachable_count = sum(1 for r in all_results if r.analysis_status == 'reachable')

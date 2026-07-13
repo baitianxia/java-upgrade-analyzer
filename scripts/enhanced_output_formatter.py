@@ -1185,6 +1185,39 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     return summary_json_path
 
 
+def register_step5_summary_artifacts(output_dir):
+    """Declare the review files actually emitted beside ``summary.json``.
+
+    Consumers should not have to infer that a timing file or the detailed API
+    directory exists from console output.  Paths are deliberately relative to
+    ``call_chain`` so a complete report remains portable after archiving.
+    """
+    output_path = Path(output_dir)
+    summary_path = output_path / 'summary.json'
+    try:
+        with summary_path.open('r', encoding='utf-8') as handle:
+            summary = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(summary, dict):
+        return False
+    artifacts = dict(summary.get('artifacts') or {})
+    known = {
+        'summary_json': 'summary.json',
+        'alerts_csv': 'alerts.csv',
+        'api_detail_dir': 'by_api',
+        'module_summary_dir': 'by_module',
+        'timing_csv': 'step5_timing.csv',
+    }
+    for key, relative_path in known.items():
+        if (output_path / relative_path).exists():
+            artifacts[key] = relative_path
+    summary['artifacts'] = artifacts
+    with summary_path.open('w', encoding='utf-8', newline='\n') as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    return True
+
+
 def generate_alerts_csv(all_results, output_path):
     """生成完整、无抽样的人工链路台账；每个 API 至少一行，每条链路独立一行。"""
     rows = []
