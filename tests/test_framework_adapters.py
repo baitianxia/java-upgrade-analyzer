@@ -38,6 +38,44 @@ class FrameworkAdaptersTest(unittest.TestCase):
             for edge in spi["edges"]
         ))
 
+    def test_dubbo_spi_provider_is_attached_only_to_known_interface_method(self):
+        interface_method = SimpleNamespace(
+            symbol_id="filter-api", class_fqcn="org.apache.dubbo.rpc.Filter",
+            method_name="invoke", qualified_key="org.apache.dubbo.rpc.Filter.invoke(java.lang.Object)",
+        )
+        provider_method = SimpleNamespace(
+            symbol_id="demo-filter", class_fqcn="com.acme.DemoFilter",
+            method_name="invoke", qualified_key="com.acme.DemoFilter.invoke(java.lang.Object)",
+        )
+        unrelated_method = SimpleNamespace(
+            symbol_id="unrelated", class_fqcn="com.acme.DemoFilter",
+            method_name="helper", qualified_key="com.acme.DemoFilter.helper()",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={
+                "filter-api": interface_method,
+                "demo-filter": provider_method,
+                "unrelated": unrelated_method,
+            },
+            reverse_edges={},
+        )
+        payload = {"adapters": [{
+            "adapter": "java_spi", "version": "1",
+            "edges": [{
+                "source": "org.apache.dubbo.rpc.Filter",
+                "target": "com.acme.DemoFilter",
+                "edge_kind": "dubbo_spi_registration",
+                "confidence": "high",
+                "conditions": [], "ambiguity": False,
+            }],
+        }]}
+
+        stats = attach_framework_edges_to_graph(graph, payload)
+
+        self.assertEqual(stats["matched_callback_edges"], 1)
+        self.assertIn("demo-filter", graph.framework_entry_symbols)
+        self.assertNotIn("unrelated", graph.framework_entry_symbols)
+
     def test_java_text_block_content_does_not_create_framework_edge(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "src/main/java/com/acme"

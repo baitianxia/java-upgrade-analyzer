@@ -1419,6 +1419,11 @@ def attach_framework_edges_to_graph(graph, payload):
         'spring_factories_registration', 'spring_runtime_registered_callback',
         'spring_runtime_autoconfiguration_registration',
     }
+
+    def method_signature(method):
+        qualified = str(getattr(method, 'qualified_key', '') or '')
+        return qualified[qualified.find('('):] if '(' in qualified else ''
+
     for adapter in (payload or {}).get('adapters') or []:
         for edge in adapter.get('edges') or []:
             if edge.get('edge_kind') not in supported_kinds:
@@ -1427,6 +1432,41 @@ def attach_framework_edges_to_graph(graph, payload):
             if not target:
                 unmatched_edges += 1
                 continue
+            if edge.get('edge_kind') == 'dubbo_spi_registration':
+                # A Dubbo resource registers a provider class, not a concrete
+                # method.  Connect only implementations of interface methods
+                # already present in the graph; attaching every provider method
+                # would manufacture false business entries.
+                interface_methods = [
+                    method for method in methods
+                    if str(getattr(method, 'class_fqcn', '') or '') == str(edge.get('source') or '')
+                ]
+                candidates = []
+                for interface_method in interface_methods:
+                    interface_name = str(getattr(interface_method, 'method_name', '') or '')
+                    interface_signature = method_signature(interface_method)
+                    for method in methods:
+                        if str(getattr(method, 'class_fqcn', '') or '') != target:
+                            continue
+                        if str(getattr(method, 'method_name', '') or '') != interface_name:
+                            continue
+                        if interface_signature and method_signature(method) != interface_signature:
+                            continue
+                        candidates.append(method)
+                if not candidates:
+                    unmatched_edges += 1
+                    continue
+            else:
+                target_unsigned = target.split('(', 1)[0]
+                candidates = list(methods_by_qualified.get(target) or [])
+                if target_unsigned != target:
+                    for method in methods_by_unsigned.get(target_unsigned) or []:
+                        if method not in candidates:
+                            candidates.append(method)
+                else:
+                    for method in methods_by_unsigned.get(target) or []:
+                        if method not in candidates:
+                            candidates.append(method)
             if (
                 edge.get('edge_kind') == 'spring_runtime_registered_callback'
                 and edge.get('runtime_activation') == 'active'
@@ -1436,19 +1476,6 @@ def attach_framework_edges_to_graph(graph, payload):
                     'adapter': adapter.get('adapter'),
                     'adapter_version': adapter.get('version'),
                 })
-            target_unsigned = target.split('(', 1)[0]
-            candidates = list(methods_by_qualified.get(target) or [])
-            if target_unsigned != target:
-                for method in methods_by_unsigned.get(target_unsigned) or []:
-                    if method not in candidates:
-                        candidates.append(method)
-            else:
-                for method in methods_by_unsigned.get(target) or []:
-                    if method not in candidates:
-                        candidates.append(method)
-            if not candidates:
-                unmatched_edges += 1
-                continue
             for method in candidates:
                 entries.setdefault(method.symbol_id, []).append({
                     **edge,
