@@ -213,6 +213,42 @@ public class Switches {
         }
         self.assertEqual(callers, {"dense", "sparse"})
 
+    def test_synthetic_generic_bridge_does_not_duplicate_target_invocation(self):
+        if not shutil.which("javac"):
+            self.skipTest("javac not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src" / "com" / "acme"
+            src.mkdir(parents=True)
+            (src / "Box.java").write_text(
+                "package com.acme; interface Box<T> { T get(); }\n", encoding="utf-8"
+            )
+            (src / "Target.java").write_text(
+                "package com.acme; final class Target { static String removed() { return \"\"; } }\n",
+                encoding="utf-8",
+            )
+            (src / "StringBox.java").write_text(
+                "package com.acme; final class StringBox implements Box<String> { "
+                "public String get() { return Target.removed(); } }\n",
+                encoding="utf-8",
+            )
+            out = root / "classes"
+            out.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(out)] + [str(path) for path in src.glob("*.java")],
+                check=True, capture_output=True,
+            )
+            edges = parse_classfile_calls(
+                (out / "com/acme/StringBox.class").read_bytes(), "com.acme.StringBox"
+            )
+
+        target_edges = [
+            edge for edge in edges
+            if edge.get("callee_key") == "com.acme.Target.removed()"
+        ]
+        self.assertEqual(len(target_edges), 1)
+        self.assertEqual(target_edges[0]["caller_name"], "get")
+
     def test_parse_classfile_calls_falls_back_for_reflection_markers(self):
         if not shutil.which("javac"):
             self.skipTest("javac not available")
