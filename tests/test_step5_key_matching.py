@@ -54,6 +54,26 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertIn("com.acme.Target.changed()", graph_result["graph"].reverse_edges)
 
+    def test_source_graph_keeps_record_accessor_calls_as_exact_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Event.java").write_text(
+                "package com.acme;\npublic record Event(String id) {}\n",
+                encoding="utf-8",
+            )
+            (source_root / "Use.java").write_text(
+                "package com.acme;\nclass Use { String read(Event event) { return event.id(); } }\n",
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        self.assertIn("com.acme.Event.id()", graph_result["graph"].reverse_edges)
+
     def test_source_graph_keeps_sealed_interface_implementations(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
