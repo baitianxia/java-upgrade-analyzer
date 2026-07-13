@@ -1874,13 +1874,13 @@ def _result_business_entry(result):
 
 def _path_conclusion(path_status):
     return {
-        'reachable': ('confirmed', 'fix'),
-        'uncertain': ('candidate', 'review'),
-        'not_impacted': ('confirmed_no_impact', 'none'),
-        'not_analyzed': ('incomplete', 'rerun_analysis'),
-        'not_found_in_static_analysis': ('no_static_path', 'review'),
-        'not_reachable': ('no_static_path', 'review'),
-    }.get(path_status, ('incomplete', 'review'))
+        'reachable': ('confirmed', '修复并验证'),
+        'uncertain': ('candidate', '人工复核'),
+        'not_impacted': ('confirmed_no_impact', '无需动作'),
+        'not_analyzed': ('incomplete', '补齐输入后重跑'),
+        'not_found_in_static_analysis': ('no_static_path', '人工复核'),
+        'not_reachable': ('no_static_path', '人工复核'),
+    }.get(path_status, ('incomplete', '人工复核'))
 
 
 def severity_rank(sev):
