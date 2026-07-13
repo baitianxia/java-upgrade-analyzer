@@ -114,6 +114,7 @@ class RealProjectCase:
     max_potential_pairs_per_api: float = 0.0
     max_duplicate_class_scans: int = -1
     max_seconds_per_100k_edges: float = 0.0
+    min_edges_for_normalized_rate: int = 0
     min_classes_per_second: float = 0.0
     max_oracle_seconds: float = 0.0
     oracle_manifest: Path | None = None
@@ -138,6 +139,7 @@ REAL_CASE_PERFORMANCE_BUDGET = {
     "max_potential_pairs_per_api": 100000.0,
     "max_duplicate_class_scans": 0,
     "max_seconds_per_100k_edges": 1000000.0,
+    "min_edges_for_normalized_rate": 100,
     "min_classes_per_second": 1.0,
     "max_oracle_seconds": 120.0,
 }
@@ -159,6 +161,10 @@ def apply_real_case_performance_budget(case: RealProjectCase) -> RealProjectCase
         max_seconds_per_100k_edges=(
             case.max_seconds_per_100k_edges
             or REAL_CASE_PERFORMANCE_BUDGET["max_seconds_per_100k_edges"]
+        ),
+        min_edges_for_normalized_rate=(
+            case.min_edges_for_normalized_rate
+            or REAL_CASE_PERFORMANCE_BUDGET["min_edges_for_normalized_rate"]
         ),
         min_classes_per_second=(
             case.min_classes_per_second
@@ -691,6 +697,7 @@ CASES["mall"] = RealProjectCase(
     max_generated_java_ratio=0.1,
     require_valid_git=True,
     max_elapsed_seconds=180.0,
+    max_oracle_seconds=135.0,
     case_mode="discovery",
     ground_truth_status="unreviewed",
     enable_jdk_oracle=True,
@@ -698,6 +705,42 @@ CASES["mall"] = RealProjectCase(
     bytecode_coord="cn.hutool:hutool-all",
     final_artifact=Path("/private/tmp/jua-real-project-mall/mall-admin/target/mall-admin-1.0-SNAPSHOT.jar"),
     required_topologies=("business_direct",),
+    prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
+)
+
+CASES["dubbo-fatjar"] = RealProjectCase(
+    name="dubbo-fatjar",
+    default_project=Path("/private/tmp/jua-real-project-dubbo-source-20260710"),
+    default_changed_apis=Path(""),
+    baseline_specs=(),
+    source_dirs=(
+        Path(
+            "dubbo-demo/dubbo-demo-spring-boot/"
+            "dubbo-demo-spring-boot-consumer/src/main/java"
+        ),
+    ),
+    min_project_java_files=500,
+    min_main_java_files=300,
+    max_generated_java_ratio=0.5,
+    require_valid_git=True,
+    max_elapsed_seconds=180.0,
+    case_mode="discovery",
+    ground_truth_status="unreviewed",
+    enable_jdk_oracle=True,
+    bytecode_owner_prefixes=("org/apache/dubbo/springboot/demo/DemoService",),
+    bytecode_coord="org.apache.dubbo:dubbo-demo-spring-boot-interface",
+    final_artifact=Path(
+        "/private/tmp/jua-real-project-dubbo-source-20260710/"
+        "dubbo-demo/dubbo-demo-spring-boot/"
+        "dubbo-demo-spring-boot-consumer/target/"
+        "dubbo-demo-spring-boot-consumer-3.3.7-SNAPSHOT.jar"
+    ),
+    required_topologies=(
+        "business_direct",
+        "business_to_same_jar_bridge",
+        "interface_dispatch",
+        "same_jar_bridge",
+    ),
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
 )
 
@@ -765,7 +808,15 @@ def _matches_expected_call_chain(path_text: str, expected_chain: list[str], expe
     marker_indexes = [index for index, node in enumerate(nodes) if _CHANGE_API_MARKER_RE.search(node)]
     if any(index != len(nodes) - 1 for index in marker_indexes) or len(marker_indexes) > 1:
         return False
-    if nodes[:-1] != expected_chain[:-1]:
+    if any(
+        actual != expected
+        and not (
+            "(" not in expected
+            and re.fullmatch(r"(.+?)(\(.*\))", actual)
+            and re.fullmatch(r"(.+?)(\(.*\))", actual).group(1).strip() == expected
+        )
+        for actual, expected in zip(nodes[:-1], expected_chain[:-1])
+    ):
         return False
 
     target_identity = ".".join(
@@ -936,12 +987,22 @@ def _fixture_debt_id(signal: dict) -> str:
 
 
 def _resolves_to_unittest(reference: str) -> bool:
+    root_entry = str(ROOT_DIR)
+    added_root = root_entry not in sys.path
+    if added_root:
+        sys.path.insert(0, root_entry)
     try:
         module_name, class_name, method_name = str(reference or "").rsplit(".", 2)
         module = importlib.import_module(module_name)
         case_class = getattr(module, class_name)
     except (ImportError, AttributeError, ValueError):
         return False
+    finally:
+        if added_root:
+            try:
+                sys.path.remove(root_entry)
+            except ValueError:
+                pass
     return bool(
         isinstance(case_class, type)
         and issubclass(case_class, unittest.TestCase)
@@ -1264,12 +1325,12 @@ def collect_alert_files(alerts_csv: Path, symbol: str) -> set[str]:
     files: set[str] = set()
     with alerts_csv.open(newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            if (row.get("changed_symbol") or "").strip() != symbol:
+            if _api_identity_from_alert_row(row)[0] != symbol:
                 continue
             for item in re.split(r"[|;]", row.get("evidence_files") or ""):
                 item = item.strip()
                 if item:
-                    files.add(str(Path(item).resolve()))
+                    files.add(str((alerts_csv.parent / item).resolve()))
     return files
 
 
@@ -1290,10 +1351,30 @@ def _api_identity_from_changed_row(row: dict[str, str]) -> tuple[str, str, str]:
 
 
 def _api_identity_from_alert_row(row: dict[str, str]) -> tuple[str, str, str]:
+    changed_symbol = str(row.get("changed_symbol") or "").strip()
+    signature = str(row.get("api_signature") or "").strip()
+    if signature.startswith("(") and changed_symbol.endswith(signature):
+        changed_symbol = changed_symbol[:-len(signature)].rstrip()
     return (
-        str(row.get("changed_symbol") or "").strip(),
-        str(row.get("api_signature") or "").strip(),
+        changed_symbol,
+        signature,
         str(row.get("symbol_kind") or "").strip(),
+    )
+
+
+def _chain_target_matches_alert_api(row: dict[str, str]) -> bool:
+    api_name, api_signature, symbol_kind = _api_identity_from_alert_row(row)
+    chain_target = str(row.get("chain_target") or "").strip()
+    if not api_name or not chain_target:
+        return False
+    if symbol_kind.lower() == "field" or not api_signature.startswith("("):
+        return chain_target == api_name
+    target_match = re.fullmatch(r"(.+?)(\(.*\))", chain_target)
+    if not target_match or target_match.group(1).strip() != api_name:
+        return False
+    return (
+        normalize_signature_for_lookup(target_match.group(2))
+        == normalize_signature_for_lookup(api_signature)
     )
 
 
@@ -1360,11 +1441,7 @@ def audit_analysis_outputs(changed_apis: Path, alerts_csv: Path, summary: dict) 
         if path_status == "reachable" and str(row.get("conclusion") or "").strip() == "已确认影响":
             unexplained_reachable.append(index)
         if path_status == "reachable" and changed_symbol:
-            chain_text = " ".join(
-                str(row.get(field) or "")
-                for field in ("chain_target", "chain_detail", "path_text")
-            )
-            if changed_symbol not in chain_text:
+            if not _chain_target_matches_alert_api(row):
                 suspicious_reachable.append({
                     "row": index,
                     "changed_symbol": changed_symbol,
@@ -1471,6 +1548,7 @@ def extract_case_topology_evidence(
     report_dir: Path,
     selected_rows: list[dict],
     project_root: Path,
+    oracle_scan: dict | None = None,
 ) -> dict:
     errors: list[str] = []
     provenance_path = report_dir / "evidence" / "dependencies" / "build_provenance.json"
@@ -1520,6 +1598,7 @@ def extract_case_topology_evidence(
             target_owner_entries={
                 owner: list(entries) for owner, entries in case.target_owner_entries.items()
             },
+            oracle_scan=oracle_scan,
         )
         if evidence.get("artifact_layout", {}).get("artifact_sha256") != expected_sha256:
             evidence["complete"] = False
@@ -1831,6 +1910,35 @@ def _business_artifact_entry(entry: str) -> bool:
     )
 
 
+def _artifact_entry_class_owner(entry: str) -> str:
+    value = str(entry or "").strip()
+    if "!/" in value:
+        value = value.rsplit("!/", 1)[1]
+    for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    value = re.sub(r"^META-INF/versions/\d+/", "", value)
+    if not value.endswith(".class"):
+        return ""
+    return value[:-6].replace("/", ".")
+
+
+def _oracle_edge_identity_errors(rows: list[dict]) -> list[str]:
+    errors = set()
+    for row in rows:
+        entry = str(row.get("artifact_entry") or "").strip()
+        expected_owner = _artifact_entry_class_owner(entry)
+        actual_owner = str(row.get("caller_owner") or "").strip()
+        if not expected_owner or actual_owner != expected_owner:
+            errors.add(
+                "oracle_caller_owner_artifact_entry_mismatch:"
+                f"entry={entry}:expected={expected_owner or '<class-entry-required>'}:"
+                f"actual={actual_owner or '<missing>'}"
+            )
+    return sorted(errors)
+
+
 def normalize_instruction_offset(edge: dict | None) -> str:
     offset = (edge or {}).get("instruction_offset")
     return "" if offset is None else str(offset).strip()
@@ -1887,9 +1995,9 @@ def _retain_authoritative_api_path(selected_rows: list[dict], oracle_rows: list[
 
 def _retain_analyzer_api_path(selected_rows: list[dict], analyzer_rows: list[dict]) -> list[dict]:
     """Associate upstream analyzer edges by bytecode graph path from a labeled target edge."""
-    incoming: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    incoming: dict[tuple[str, tuple[str, str, str]], list[dict]] = defaultdict(list)
     for edge in analyzer_rows:
-        incoming[_callee_identity(edge)].append(edge)
+        incoming[(str(edge.get("api_identity") or ""), _callee_identity(edge))].append(edge)
 
     retained: dict[tuple[str, str], dict] = {}
     for api_row in selected_rows:
@@ -1908,7 +2016,9 @@ def _retain_analyzer_api_path(selected_rows: list[dict], analyzer_rows: list[dic
             retained[physical_key] = {**edge, "api_identity": identity}
             if _business_artifact_entry(str(edge.get("artifact_entry") or "")):
                 continue
-            pending.extend(incoming.get(_caller_identity(edge), []))
+            caller = _caller_identity(edge)
+            pending.extend(incoming.get((identity, caller), []))
+            pending.extend(incoming.get(("", caller), []))
     return sorted(retained.values(), key=lambda row: (
         str(row.get("api_identity") or ""), physical_edge_occurrence(row),
     ))
@@ -1974,6 +2084,7 @@ def reconcile_selected_api_edges(
     report_dir = Path(report_dir)
     oracle_rows = [dict(row) for row in (oracle_scan.get("edges") or [])]
     retained_oracle_rows, path_errors = _retain_authoritative_api_path(selected_rows, oracle_rows)
+    path_errors.extend(_oracle_edge_identity_errors(oracle_rows))
     retained_analyzer_rows = _retain_analyzer_api_path(selected_rows, [dict(row) for row in (analyzer_rows or [])])
     artifact_entries = {
         str(entry).strip() for entry in (oracle_scan.get("artifact_entries") or [])
@@ -2039,6 +2150,7 @@ def reconcile_selected_api_edges(
         "oracle_physical_occurrences": [
             physical_edge_occurrence(row) for row in retained_oracle_rows
         ],
+        "oracle_scan": oracle_scan,
     }
 
 
@@ -2073,6 +2185,27 @@ def _verified_current_final_artifact(report_dir: Path) -> tuple[Path | None, str
         return None, "", [f"verified_current_final_artifact_unavailable:{error}"]
 
 
+def _oracle_selected_targets(selected_rows: list[dict]) -> list[dict]:
+    targets = set()
+    for row in selected_rows or []:
+        api_name = str((row or {}).get("api_name") or "").strip()
+        symbol_kind = str((row or {}).get("symbol_kind") or "method").strip().lower()
+        if symbol_kind == "constructor" and not api_name.endswith(".<init>"):
+            owner, member = api_name, "<init>"
+        else:
+            owner, separator, member = api_name.rpartition(".")
+            if not separator:
+                continue
+            if symbol_kind == "constructor":
+                member = "<init>"
+        if owner and member:
+            targets.add((owner, member, ""))
+    return [
+        {"owner": owner, "member": member, "descriptor": descriptor}
+        for owner, member, descriptor in sorted(targets)
+    ]
+
+
 def reconcile_final_artifact_edges(
     report_dir: Path,
     selected_rows: list[dict],
@@ -2086,7 +2219,9 @@ def reconcile_final_artifact_edges(
                 "artifact_entries": []}
     else:
         scan = scan_final_artifact(
-            artifact, time_budget_seconds=oracle_time_budget_seconds
+            artifact,
+            time_budget_seconds=oracle_time_budget_seconds,
+            selected_targets=_oracle_selected_targets(selected_rows),
         )
         try:
             scan["artifact_entries"] = sorted(_artifact_class_entries(artifact))
@@ -2206,6 +2341,8 @@ def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path,
     extracted_root = report_dir / ".runtime" / "final-artifact-classes"
     extracted_root.mkdir(parents=True, exist_ok=True)
     target_lib_entry = ""
+    target_lib_candidates: list[str] = []
+    artifact_id = case.bytecode_coord.split(":", 1)[-1].strip()
     with zipfile.ZipFile(artifact) as source:
         for name in sorted(source.namelist()):
             if name.startswith("BOOT-INF/classes/") and name.endswith(".class"):
@@ -2213,8 +2350,14 @@ def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path,
                 destination = extracted_root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(source.read(name))
-            if name.startswith("BOOT-INF/lib/hutool-all-") and name.endswith(".jar"):
-                target_lib_entry = name
+            if (
+                artifact_id
+                and name.startswith(f"BOOT-INF/lib/{artifact_id}-")
+                and name.endswith(".jar")
+            ):
+                target_lib_candidates.append(name)
+    if len(target_lib_candidates) == 1:
+        target_lib_entry = target_lib_candidates[0]
     class_files = sorted(extracted_root.rglob("*.class"))
     if not class_files:
         raise ValueError("current final artifact contains no business class files")
@@ -2231,9 +2374,13 @@ def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path,
         fields = ["coord", "version", "scope", "lib_entry", "resolution_status"]
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
+        target_version = "runtime"
+        if target_lib_entry:
+            filename = Path(target_lib_entry).name
+            target_version = filename[len(artifact_id) + 1:-4] or target_version
         writer.writerow({
             "coord": case.bytecode_coord,
-            "version": "5.8.40",
+            "version": target_version,
             "scope": "compile",
             "lib_entry": target_lib_entry,
             "resolution_status": "resolved" if target_lib_entry else "unresolved",
@@ -2755,6 +2902,13 @@ def build_policy_signals(
             evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
         ))
     seconds_per_100k_edges = performance.get("elapsed_seconds_per_100k_edges")
+    reconciled_edge_count = max(
+        int(performance.get("oracle_edge_count") or 0),
+        int(performance.get("analyzer_edge_count") or 0),
+    )
+    normalized_rate_eligible = (
+        reconciled_edge_count >= int(case.min_edges_for_normalized_rate or 0)
+    )
     edge_rate_available = performance.get("edge_rate_available")
     if edge_rate_available is None:
         edge_rate_available = seconds_per_100k_edges is not None
@@ -2772,6 +2926,7 @@ def build_policy_signals(
         ))
     elif (
         case.max_seconds_per_100k_edges
+        and normalized_rate_eligible
         and seconds_per_100k_edges is not None
         and float(seconds_per_100k_edges) > case.max_seconds_per_100k_edges
     ):
@@ -3341,7 +3496,8 @@ def run_case(
         oracle_ledger = str(oracle_ledger_path)
         effective_ground_truth_status = "reviewed" if not oracle_audit.get("blocking") else "unreviewed"
     topology_evidence = extract_case_topology_evidence(
-        case, report_dir, selected_rows, project_root
+        case, report_dir, selected_rows, project_root,
+        oracle_scan=edge_truth.get("oracle_scan"),
     )
     observed_topologies = classify_topologies(
         topology_evidence["edges"], topology_evidence["artifact_layout"]

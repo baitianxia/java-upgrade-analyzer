@@ -56,6 +56,29 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
     def setUp(self):
         oracle.clear_immutable_oracle_cache()
 
+    def test_boot_archive_ignores_duplicate_root_class_entries(self):
+        """Only BOOT-INF/classes is on a Spring Boot archive's application classpath."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = Path(temp_dir) / "boot.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("sample/App.class", b"root-copy")
+                archive.writestr("BOOT-INF/classes/sample/App.class", b"runtime-copy")
+                archive.writestr("BOOT-INF/classes/sample/OnlyRuntime.class", b"runtime-only")
+
+            with tempfile.TemporaryDirectory() as extracted:
+                entries, failures = oracle._extract_packaged_classes(
+                    artifact.read_bytes(), Path(extracted), target_major=21
+                )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            [entry.artifact_entry for entry in entries],
+            [
+                "BOOT-INF/classes/sample/App.class",
+                "BOOT-INF/classes/sample/OnlyRuntime.class",
+            ],
+        )
+
     def test_sequential_concurrent_and_cached_scans_are_edge_equivalent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact = _fake_artifact(
@@ -123,6 +146,34 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
 
         self.assertEqual(result["worker_count"], oracle.MAX_JAVAP_WORKERS)
 
+    def test_selected_target_frontier_uses_requested_bounded_workers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(
+                Path(temp_dir) / "targeted.jar",
+                [f"fixture/Caller{index}.class" for index in range(4)],
+                marker=b"fixture/Targetchanged()V",
+            )
+
+            def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
+                return _fake_parse_result(entry, artifact_sha256)
+
+            with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+            ):
+                result = oracle.scan_final_artifact(
+                    artifact,
+                    max_workers=4,
+                    selected_targets=[{
+                        "owner": "fixture.Target",
+                        "member": "changed",
+                        "descriptor": "()V",
+                    }],
+                )
+
+        self.assertTrue(result["complete"], result["failures"])
+        self.assertEqual(result["parsed_class_count"], 4)
+        self.assertEqual(result["worker_count"], 4)
+
     def test_immutable_cache_does_not_cross_artifact_sha(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -169,14 +220,17 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
                 [f"fixture/Slow{index}.class" for index in range(4)],
             )
 
-            def parse_entry(entry, artifact_sha256, _javap, _version, cancellation_event, deadline):
+            def parse_group(entries, artifact_sha256, _javap, _version, cancellation_event, deadline):
                 while not cancellation_event.is_set() and time.perf_counter() < deadline:
                     time.sleep(0.005)
-                return {"rows": [], "failures": [], "completed": False, "parsed": False}
+                return [
+                    {"rows": [], "failures": [], "completed": False, "parsed": False}
+                    for _entry in entries
+                ]
 
             started_at = time.perf_counter()
             with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
-                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+                oracle, "_parse_entry_group_with_javap", side_effect=parse_group
             ):
                 result = oracle.scan_final_artifact(
                     artifact, max_workers=2, time_budget_seconds=0.05
@@ -374,6 +428,176 @@ class FinalArtifactEdgeOracleTest(unittest.TestCase):
             archive.write(dependency_jar, "BOOT-INF/lib/dependency.jar")
         return artifact
 
+    def test_selected_api_scan_exhausts_reverse_callers_without_parsing_unrelated_classes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "src"
+            sources = [
+                _write_source(
+                    source_root,
+                    "fixture/Target.java",
+                    "package fixture; public class Target { public void changed() {} }",
+                ),
+                _write_source(
+                    source_root,
+                    "fixture/Bridge.java",
+                    "package fixture; public class Bridge { public void call(Target target) { target.changed(); } }",
+                ),
+                _write_source(
+                    source_root,
+                    "fixture/App.java",
+                    "package fixture; public class App { public void run(Bridge bridge, Target target) { bridge.call(target); } }",
+                ),
+                _write_source(
+                    source_root,
+                    "fixture/Unrelated.java",
+                    "package fixture; public class Unrelated { public String text() { return String.valueOf(1); } }",
+                ),
+            ]
+            classes = root / "classes"
+            classes.mkdir()
+            _compile(classes, sources)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                for class_file in sorted(classes.rglob("*.class")):
+                    archive.write(
+                        class_file,
+                        "BOOT-INF/classes/" + class_file.relative_to(classes).as_posix(),
+                    )
+
+            result = oracle.scan_final_artifact(
+                artifact,
+                selected_targets=[{
+                    "owner": "fixture.Target",
+                    "member": "changed",
+                    "descriptor": "()V",
+                }],
+            )
+
+        self.assertTrue(result["complete"], result["failures"])
+        self.assertEqual(result["inventory_class_count"], 4)
+        self.assertLess(result["parsed_class_count"], result["inventory_class_count"])
+        relations = {
+            (
+                row["caller_owner"], row["caller_member"],
+                row["callee_owner"], row["callee_member"],
+            )
+            for row in result["edges"]
+        }
+        self.assertIn(("fixture.Bridge", "call", "fixture.Target", "changed"), relations)
+        self.assertIn(("fixture.App", "run", "fixture.Bridge", "call"), relations)
+        self.assertFalse(any(row["caller_owner"] == "fixture.Unrelated" for row in result["edges"]))
+
+    def test_selected_api_scan_reuses_prior_class_edges_for_intra_class_reverse_hops(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "src"
+            sources = [
+                _write_source(
+                    source_root, "fixture/Target.java",
+                    "package fixture; public class Target { public static void changed() {} }",
+                ),
+                _write_source(
+                    source_root, "fixture/Bridge.java",
+                    "package fixture; public class Bridge { public static void top() { middle(); } public static void middle() { Target.changed(); } }",
+                ),
+                _write_source(
+                    source_root, "fixture/App.java",
+                    "package fixture; public class App { public void run() { Bridge.top(); } }",
+                ),
+            ]
+            classes = root / "classes"
+            classes.mkdir()
+            _compile(classes, sources)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                for class_file in sorted(classes.rglob("*.class")):
+                    archive.write(
+                        class_file,
+                        "BOOT-INF/classes/" + class_file.relative_to(classes).as_posix(),
+                    )
+
+            result = oracle.scan_final_artifact(
+                artifact,
+                selected_targets=[{
+                    "owner": "fixture.Target", "member": "changed", "descriptor": "()V",
+                }],
+            )
+
+        self.assertTrue(result["complete"], result["failures"])
+        relations = {
+            (row["caller_owner"], row["caller_member"], row["callee_owner"], row["callee_member"])
+            for row in result["edges"]
+        }
+        self.assertIn(("fixture.Bridge", "middle", "fixture.Target", "changed"), relations)
+        self.assertIn(("fixture.Bridge", "top", "fixture.Bridge", "middle"), relations)
+        self.assertIn(("fixture.App", "run", "fixture.Bridge", "top"), relations)
+
+    def test_batched_javap_keeps_each_class_bound_to_its_artifact_entry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sources = [
+                _write_source(
+                    root / "src", "fixture/First.java",
+                    "package fixture; public class First { public String call() { return String.valueOf(1); } }",
+                ),
+                _write_source(
+                    root / "src", "fixture/Second.java",
+                    "package fixture; public class Second { public String call() { return String.valueOf(2); } }",
+                ),
+            ]
+            classes = root / "classes"
+            classes.mkdir()
+            _compile(classes, sources)
+            entries = [
+                oracle.PackagedClass(
+                    f"BOOT-INF/classes/fixture/{name}.class",
+                    classes / f"fixture/{name}.class",
+                )
+                for name in ("First", "Second")
+            ]
+            results = oracle._parse_entry_group_with_javap(
+                entries, "a" * 64, "javap", "24.0.2", oracle.Event(), None
+            )
+
+        self.assertTrue(all(result["completed"] and result["parsed"] for result in results))
+        self.assertTrue(all(not result["failures"] for result in results))
+        for name, result in zip(("First", "Second"), results):
+            self.assertTrue(result["rows"])
+            self.assertEqual(
+                {row["caller_owner"] for row in result["rows"]},
+                {f"fixture.{name}"},
+            )
+            self.assertEqual(
+                {row["artifact_entry"] for row in result["rows"]},
+                {f"BOOT-INF/classes/fixture/{name}.class"},
+            )
+
+    def test_only_invokedynamic_classes_require_verbose_javap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sources = [
+                _write_source(
+                    root / "src", "fixture/Plain.java",
+                    "package fixture; public class Plain { public int value() { return 1; } }",
+                ),
+                _write_source(
+                    root / "src", "fixture/Lambda.java",
+                    "package fixture; public class Lambda { public Runnable value() { return () -> {}; } }",
+                ),
+            ]
+            classes = root / "classes"
+            classes.mkdir()
+            _compile(classes, sources)
+            plain = classes / "fixture/Plain.class"
+            dynamic = classes / "fixture/Lambda.class"
+
+            plain_entry = oracle.PackagedClass("fixture/Plain.class", plain, plain.read_bytes())
+            dynamic_entry = oracle.PackagedClass("fixture/Lambda.class", dynamic, dynamic.read_bytes())
+
+        self.assertFalse(oracle._entry_requires_verbose_javap(plain_entry))
+        self.assertTrue(oracle._entry_requires_verbose_javap(dynamic_entry))
+
     def test_scans_each_jvm_instruction_family_from_final_artifact(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact = self._build_artifact(Path(temp_dir))
@@ -395,12 +619,6 @@ class FinalArtifactEdgeOracleTest(unittest.TestCase):
             )
             for row in app_edges
         ]
-        lambda_descriptor = (
-            "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;"
-            "Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;"
-            "Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)"
-            "Ljava/lang/invoke/CallSite;"
-        )
         expected = [
             ("(Lfixture/Worker;)V", "fixture.App", "dependency", "Lfixture/Dependency;", "getfield", "BOOT-INF/classes/fixture/App.class", 1),
             ("(Lfixture/Worker;)V", "fixture.Dependency", "<init>", "()V", "invokespecial", "BOOT-INF/classes/fixture/App.class", 20),
@@ -412,7 +630,7 @@ class FinalArtifactEdgeOracleTest(unittest.TestCase):
             ("(Lfixture/Worker;)V", "fixture.Dependency", "virtualCall", "()V", "invokevirtual", "BOOT-INF/classes/fixture/App.class", 4),
             ("(Lfixture/Worker;)V", "fixture.Worker", "run", "()V", "invokeinterface", "BOOT-INF/classes/fixture/App.class", 8),
             ("(Lfixture/Worker;)V", "java.lang.Runnable", "run", "()V", "invokeinterface", "BOOT-INF/classes/fixture/App.class", 57),
-            ("(Lfixture/Worker;)V", "java.lang.invoke.LambdaMetafactory", "metafactory", lambda_descriptor, "invokedynamic", "BOOT-INF/classes/fixture/App.class", 48),
+            ("(Lfixture/Worker;)V", "fixture.App", "lambda$use$0", "()V", "invokedynamic", "BOOT-INF/classes/fixture/App.class", 48),
             ("(Lfixture/Worker;)V", "fixture.App", "dependency", "Lfixture/Dependency;", "getfield", "BOOT-INF/classes/fixture/App.class", 25),
             ("(Lfixture/Worker;)V", "fixture.App", "dependency", "Lfixture/Dependency;", "getfield", "BOOT-INF/classes/fixture/App.class", 33),
         ]
@@ -465,6 +683,97 @@ public class fixture.Dynamic {
 
         self.assertEqual(rows, [])
         self.assertTrue(any("unresolved invokedynamic bootstrap" in failure for failure in failures))
+
+    def test_invokedynamic_uses_lambda_implementation_handle_not_metafactory(self):
+        output = """
+public class fixture.LambdaCaller {
+  java.lang.Runnable call();
+    descriptor: ()Ljava/lang/Runnable;
+    Code:
+       0: invokedynamic #7,  0 // InvokeDynamic #0:run:()Ljava/lang/Runnable;
+       5: areturn
+}
+BootstrapMethods:
+  0: #20 REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+    Method arguments:
+      #27 REF_invokeStatic fixture/LambdaCaller.lambda$call$0:()V
+"""
+
+        rows, failures = oracle._parse_javap_output(
+            output,
+            "a" * 64,
+            "BOOT-INF/classes/fixture/LambdaCaller.class",
+            "24.0.2",
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["callee_owner"], "fixture.LambdaCaller")
+        self.assertEqual(rows[0]["callee_member"], "lambda$call$0")
+        self.assertEqual(rows[0]["callee_descriptor"], "()V")
+
+    def test_invokedynamic_linker_without_method_handle_is_a_valid_empty_edge(self):
+        output = """
+public class fixture.ConcatCaller {
+  java.lang.String call(java.lang.String);
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+    Code:
+       0: invokedynamic #7,  0 // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       5: areturn
+}
+BootstrapMethods:
+  0: #20 REF_invokeStatic java/lang/invoke/StringConcatFactory.makeConcatWithConstants:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+    Method arguments:
+      #27 value=\u0001
+"""
+
+        rows, failures = oracle._parse_javap_output(
+            output, "a" * 64, "fixture/ConcatCaller.class", "24.0.2"
+        )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(failures, [])
+
+    def test_local_variable_named_record_cannot_replace_the_declared_caller_owner(self):
+        output = """
+public class com.example.Application {
+  public void run();
+    descriptor: ()V
+    Code:
+      LocalVariableTable:
+        Start  Length  Slot  Name   Signature
+            8      41     2 record   Lcom/example/Dependency;
+       0: invokestatic #7 // Method com/example/Dependency.call:()V
+}
+"""
+
+        rows, failures = oracle._parse_javap_output(
+            output, "a" * 64, "BOOT-INF/classes/com/example/Application.class", "24.0.2"
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["caller_owner"], "com.example.Application")
+
+    def test_array_clone_instruction_is_a_valid_method_edge(self):
+        output = """
+public class com.example.ArrayOwner {
+  public java.lang.Object[] copy(java.lang.Object[]);
+    descriptor: ([Ljava/lang/Object;)[Ljava/lang/Object;
+    Code:
+       0: invokevirtual #7 // Method "[Ljava/lang/Object;".clone:()Ljava/lang/Object;
+}
+"""
+
+        rows, failures = oracle._parse_javap_output(
+            output, "a" * 64, "BOOT-INF/classes/com/example/ArrayOwner.class", "24.0.2"
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["callee_owner"], "[Ljava.lang.Object;")
+        self.assertEqual(rows[0]["callee_member"], "clone")
+        self.assertEqual(rows[0]["callee_descriptor"], "()Ljava/lang/Object;")
 
     def test_duplicate_nested_class_entry_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:

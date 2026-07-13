@@ -26,12 +26,14 @@ EDGE_OPCODES = INVOKE_OPCODES | FIELD_OPCODES
 NESTED_JAR_PREFIXES = ("BOOT-INF/lib/", "WEB-INF/lib/")
 VERSIONED_CLASS_RE = re.compile(r"^META-INF/versions/(?P<version>\d+)/(?P<logical>.+)$")
 CLASS_DECLARATION_RE = re.compile(
-    r"^\s*(?:[\w$]+\s+)*(?:class|interface|enum|record)\s+([\w.$]+)"
+    r"^(?:[\w$]+\s+)*(?:class|interface|enum|record)\s+([\w.$]+)"
 )
 HEADER_LINE_RE = re.compile(r"^ {2}(?! )(?P<header>.+);\s*$")
 INSTRUCTION_RE = re.compile(r"^\s*(\d+):\s+([a-z][a-z0-9_]*)\b(.*)$")
 METHOD_COMMENT_RE = re.compile(
-    r"^(?:InterfaceMethod|Method)\s+(?:(?P<owner>[\w/$]+)\.)?\"?(?P<member>[^\":]+)\"?:(?P<descriptor>\(.*)$"
+    r"^(?:InterfaceMethod|Method)\s+"
+    r"(?:(?P<owner>\"\[[^\"]+\"|[\w/$]+)\.)?"
+    r"\"?(?P<member>[^\":]+)\"?:(?P<descriptor>\(.*)$"
 )
 FIELD_COMMENT_RE = re.compile(
     r"^Field\s+(?:(?P<owner>[\w/$]+)\.)?(?P<member>[^:]+):(?P<descriptor>.+)$"
@@ -47,11 +49,22 @@ BOOTSTRAP_REFERENCE_RE = re.compile(
     r"^\s*(?P<index>\d+):\s+#\d+\s+REF_\w+\s+(?P<owner>[\w/$]+)\."
     r"\"?(?P<member>[^\":]+)\"?:(?P<descriptor>\(.*)$"
 )
-PROCEDURE = "javap -v -c -p -s <extracted-class-file>; enumerate executable final-artifact edges"
-ORACLE_PROCEDURE_VERSION = "java-upgrade-analyzer.final-artifact-javap.v2"
+BOOTSTRAP_HANDLE_RE = re.compile(
+    r"(?:#\d+\s+)?REF_\w+\s+(?P<owner>[\w/$]+)\."
+    r'"?(?P<member>[^":]+)"?:(?P<descriptor>\(.*)$'
+)
+LINKER_BOOTSTRAP_OWNERS = {
+    "java.lang.invoke.LambdaMetafactory",
+    "java.lang.invoke.StringConcatFactory",
+}
+PROCEDURE = (
+    "javap -c -p -s <extracted-class-file>; add -v for classes with BootstrapMethods; "
+    "enumerate executable final-artifact edges"
+)
+ORACLE_PROCEDURE_VERSION = "java-upgrade-analyzer.final-artifact-javap.v4"
 MAX_JAVAP_WORKERS = 8
 JAVAP_VERSION_TIMEOUT_SECONDS = 5.0
-_IMMUTABLE_ORACLE_CACHE: dict[tuple[str, str, str, str], str] = {}
+_IMMUTABLE_ORACLE_CACHE: dict[tuple[str, str, str, str, str], str] = {}
 _IMMUTABLE_ORACLE_CACHE_LOCK = Lock()
 
 
@@ -59,6 +72,7 @@ _IMMUTABLE_ORACLE_CACHE_LOCK = Lock()
 class PackagedClass:
     artifact_entry: str
     extracted_path: Path
+    content: bytes | None = None
 
 
 def clear_immutable_oracle_cache() -> None:
@@ -67,8 +81,52 @@ def clear_immutable_oracle_cache() -> None:
         _IMMUTABLE_ORACLE_CACHE.clear()
 
 
-def _oracle_cache_key(artifact_sha256: str, jdk_version: str) -> tuple[str, str, str, str]:
-    return artifact_sha256, ORACLE_PROCEDURE_VERSION, PROCEDURE, jdk_version
+def _oracle_cache_key(
+    artifact_sha256: str, jdk_version: str, selected_targets: tuple[tuple[str, str, str], ...]
+) -> tuple[str, str, str, str, str]:
+    target_scope = json.dumps(selected_targets, separators=(",", ":"))
+    return artifact_sha256, ORACLE_PROCEDURE_VERSION, PROCEDURE, jdk_version, target_scope
+
+
+def _normalize_selected_targets(selected_targets: list[dict] | None) -> tuple[tuple[str, str, str], ...]:
+    normalized = set()
+    for target in selected_targets or []:
+        owner = str((target or {}).get("owner") or "").strip().replace("/", ".")
+        member = str((target or {}).get("member") or "").strip()
+        descriptor = str((target or {}).get("descriptor") or "").strip()
+        if owner and member:
+            normalized.add((owner, member, descriptor))
+    return tuple(sorted(normalized))
+
+
+def _entry_might_reference(entry: PackagedClass, targets: set[tuple[str, str, str]]) -> bool:
+    content = entry.content
+    if content is None:
+        try:
+            content = entry.extracted_path.read_bytes()
+        except OSError:
+            return True
+    for owner, member, descriptor in targets:
+        if owner.replace(".", "/").encode() not in content:
+            continue
+        if member.encode() not in content:
+            continue
+        if descriptor and descriptor.encode() not in content:
+            continue
+        return True
+    return False
+
+
+def _edge_targets(edge: dict, targets: set[tuple[str, str, str]]) -> bool:
+    owner = str(edge.get("callee_owner") or "")
+    member = str(edge.get("callee_member") or "")
+    descriptor = str(edge.get("callee_descriptor") or "")
+    return any(
+        owner == target_owner
+        and member == target_member
+        and (not target_descriptor or descriptor == target_descriptor)
+        for target_owner, target_member, target_descriptor in targets
+    )
 
 
 def _is_runtime_class(entry: str) -> bool:
@@ -162,25 +220,45 @@ def _write_extracted_class(destination: Path, index: int, content: bytes) -> Pat
 
 
 def _extract_packaged_classes(
-    snapshot: bytes, destination: Path, target_major: int | None
+    snapshot: bytes, destination: Path, target_major: int | None, *, defer_writes: bool = False
 ) -> tuple[list[PackagedClass], list[str]]:
     entries: list[PackagedClass] = []
     failures: list[str] = []
     try:
         with zipfile.ZipFile(io.BytesIO(snapshot)) as outer:
+            outer_infos = outer.infolist()
+            # A Spring Boot executable archive runs application classes from
+            # BOOT-INF/classes. Root-level class files are packaging byproducts,
+            # not an additional runtime classpath, so scanning them would invent
+            # duplicate executable edges and inflate the independent audit.
+            boot_classes_prefix = "BOOT-INF/classes/"
+            if any(
+                not info.is_dir() and info.filename.startswith(boot_classes_prefix)
+                for info in outer_infos
+            ):
+                direct_candidates = [
+                    info for info in outer_infos if info.filename.startswith(boot_classes_prefix)
+                ]
+            else:
+                direct_candidates = outer_infos
             direct_infos, direct_failures = _select_effective_classes(
-                outer.infolist(), target_major, "final-artifact", _is_multi_release_archive(outer)
+                direct_candidates, target_major, "final-artifact", _is_multi_release_archive(outer)
             )
             failures.extend(direct_failures)
             for info in direct_infos:
                 try:
-                    path = _write_extracted_class(destination, len(entries), outer.read(info))
-                    entries.append(PackagedClass(info.filename, path))
+                    content = outer.read(info)
+                    path = destination / f"class-{len(entries):06d}.class"
+                    if not defer_writes:
+                        path = _write_extracted_class(destination, len(entries), content)
+                    entries.append(PackagedClass(
+                        info.filename, path, content if defer_writes else None
+                    ))
                 except (OSError, zipfile.BadZipFile) as error:
                     failures.append(f"{info.filename}: extract failed: {error}")
 
             nested_by_name: dict[str, list[zipfile.ZipInfo]] = {}
-            for info in outer.infolist():
+            for info in outer_infos:
                 if not info.is_dir() and _is_nested_jar(info.filename):
                     nested_by_name.setdefault(info.filename, []).append(info)
             for nested_name in sorted(nested_by_name):
@@ -196,8 +274,15 @@ def _extract_packaged_classes(
                         )
                         failures.extend(nested_failures)
                         for class_info in class_infos:
-                            path = _write_extracted_class(destination, len(entries), nested.read(class_info))
-                            entries.append(PackagedClass(f"{nested_name}!/{class_info.filename}", path))
+                            content = nested.read(class_info)
+                            path = destination / f"class-{len(entries):06d}.class"
+                            if not defer_writes:
+                                path = _write_extracted_class(destination, len(entries), content)
+                            entries.append(PackagedClass(
+                                f"{nested_name}!/{class_info.filename}",
+                                path,
+                                content if defer_writes else None,
+                            ))
                 except (OSError, zipfile.BadZipFile) as error:
                     failures.append(f"{nested_name}: nested JAR read failed: {error}")
     except (OSError, zipfile.BadZipFile) as error:
@@ -235,7 +320,7 @@ def _parse_member_reference(comment: str, caller_owner: str) -> tuple[str, str, 
     match = METHOD_COMMENT_RE.match(comment)
     if not match:
         return None
-    owner = (match.group("owner") or caller_owner.replace(".", "/")).replace("/", ".")
+    owner = (match.group("owner") or caller_owner.replace(".", "/")).strip('"').replace("/", ".")
     return owner, match.group("member"), match.group("descriptor")
 
 
@@ -247,23 +332,35 @@ def _parse_field_reference(comment: str, caller_owner: str) -> tuple[str, str, s
     return owner, match.group("member"), match.group("descriptor")
 
 
-def _bootstrap_references(output: str) -> dict[int, tuple[str, str, str]]:
+def _bootstrap_references(output: str) -> dict[int, tuple[tuple[str, str, str], ...]]:
     in_bootstrap_section = False
-    references: dict[int, tuple[str, str, str]] = {}
+    current_bootstrap: int | None = None
+    references: dict[int, list[tuple[str, str, str]]] = {}
     for line in output.splitlines():
         if line.strip() == "BootstrapMethods:":
             in_bootstrap_section = True
             continue
         if not in_bootstrap_section:
             continue
-        match = BOOTSTRAP_REFERENCE_RE.match(line)
-        if match:
-            references[int(match.group("index"))] = (
-                match.group("owner").replace("/", "."),
-                match.group("member"),
-                match.group("descriptor"),
-            )
-    return references
+        start = BOOTSTRAP_REFERENCE_RE.match(line)
+        if start:
+            current_bootstrap = int(start.group("index"))
+            references.setdefault(current_bootstrap, [])
+            match = start
+        else:
+            match = BOOTSTRAP_HANDLE_RE.search(line)
+        if match is None or current_bootstrap is None:
+            continue
+        target = (
+            match.group("owner").replace("/", "."),
+            match.group("member"),
+            match.group("descriptor"),
+        )
+        if target[0] in LINKER_BOOTSTRAP_OWNERS:
+            continue
+        if target not in references[current_bootstrap]:
+            references[current_bootstrap].append(target)
+    return {index: tuple(targets) for index, targets in references.items()}
 
 
 def _dynamic_references(output: str) -> dict[int, tuple[int, str, str]]:
@@ -281,8 +378,8 @@ def _parse_dynamic_reference(
     rest: str,
     comment: str,
     dynamic_references: dict[int, tuple[int, str, str]],
-    bootstrap_references: dict[int, tuple[str, str, str]],
-) -> tuple[tuple[str, str, str] | None, str | None]:
+    bootstrap_references: dict[int, tuple[tuple[str, str, str], ...]],
+) -> tuple[tuple[tuple[str, str, str], ...], str | None]:
     constant_match = re.search(r"#(\d+)", rest)
     comment_match = DYNAMIC_COMMENT_RE.match(comment)
     dynamic_reference = dynamic_references.get(int(constant_match.group(1))) if constant_match else None
@@ -291,12 +388,11 @@ def _parse_dynamic_reference(
             int(comment_match.group("bootstrap")), comment_match.group("member"), comment_match.group("descriptor")
         )
     if dynamic_reference is None:
-        return None, "unresolved invokedynamic bootstrap or constant-pool reference"
+        return (), "unresolved invokedynamic bootstrap or constant-pool reference"
     bootstrap_index, _, _ = dynamic_reference
-    callee = bootstrap_references.get(bootstrap_index)
-    if callee is None:
-        return None, f"unresolved invokedynamic bootstrap {bootstrap_index}"
-    return callee, None
+    if bootstrap_index not in bootstrap_references:
+        return (), f"unresolved invokedynamic bootstrap {bootstrap_index}"
+    return bootstrap_references[bootstrap_index], None
 
 
 def _edge_row(
@@ -394,30 +490,35 @@ def _parse_javap_output(
             failures.append(f"{artifact_entry}: missing constant-pool comment for {opcode} at {offset}")
             continue
         if opcode == "invokedynamic":
-            callee, dynamic_failure = _parse_dynamic_reference(
+            callees, dynamic_failure = _parse_dynamic_reference(
                 rest, comment.strip(), dynamic_references, bootstrap_references
             )
             if dynamic_failure:
                 failures.append(f"{artifact_entry}: {dynamic_failure} at {offset}")
                 continue
+            if not callees:
+                continue
         elif opcode in FIELD_OPCODES:
             callee = _parse_field_reference(comment.strip(), caller_owner)
+            callees = (callee,) if callee is not None else ()
         else:
             callee = _parse_member_reference(comment.strip(), caller_owner)
-        if callee is None:
+            callees = (callee,) if callee is not None else ()
+        if not callees:
             failures.append(f"{artifact_entry}: unparseable {opcode} comment at {offset}: {comment.strip()}")
             continue
-        rows.append(_edge_row(
-            artifact_sha256,
-            artifact_entry,
-            authority_version,
-            caller_owner,
-            caller_member,
-            caller_descriptor,
-            callee,
-            opcode,
-            int(offset),
-        ))
+        for callee in callees:
+            rows.append(_edge_row(
+                artifact_sha256,
+                artifact_entry,
+                authority_version,
+                caller_owner,
+                caller_member,
+                caller_descriptor,
+                callee,
+                opcode,
+                int(offset),
+            ))
     if not caller_owner:
         failures.append(f"{artifact_entry}: javap output had no class declaration")
     return rows, failures
@@ -441,6 +542,26 @@ def _cancel_process(process: subprocess.Popen) -> None:
     process.communicate()
 
 
+def _materialize_packaged_class(entry: PackagedClass) -> str:
+    if entry.content is None or entry.extracted_path.exists():
+        return ""
+    try:
+        entry.extracted_path.write_bytes(entry.content)
+        return ""
+    except OSError as error:
+        return str(error)
+
+
+def _entry_requires_verbose_javap(entry: PackagedClass) -> bool:
+    content = entry.content
+    if content is None:
+        try:
+            content = entry.extracted_path.read_bytes()
+        except OSError:
+            return True
+    return b"BootstrapMethods" in content
+
+
 def _parse_entry_with_javap(
     entry: PackagedClass,
     artifact_sha256: str,
@@ -448,14 +569,30 @@ def _parse_entry_with_javap(
     version: str,
     cancellation_event: Event,
     deadline: float | None,
+    *,
+    verbose: bool | None = None,
 ) -> dict:
+    materialize_error = _materialize_packaged_class(entry)
+    if materialize_error:
+        return {
+            "rows": [],
+            "failures": [
+                f"{entry.artifact_entry}: class materialization failed: {materialize_error}"
+            ],
+            "completed": True,
+            "parsed": False,
+        }
     per_class_deadline = time.perf_counter() + 30.0
     deadline = min(deadline, per_class_deadline) if deadline is not None else per_class_deadline
     if cancellation_event.is_set() or (deadline is not None and time.perf_counter() >= deadline):
         return {"rows": [], "failures": [], "completed": False, "parsed": False}
     try:
+        command = [javap]
+        if _entry_requires_verbose_javap(entry) if verbose is None else verbose:
+            command.append("-v")
+        command.extend(("-c", "-p", "-s", str(entry.extracted_path)))
         process = subprocess.Popen(
-            [javap, "-v", "-c", "-p", "-s", str(entry.extracted_path)],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -501,6 +638,157 @@ def _parse_entry_with_javap(
     return {"rows": rows, "failures": failures, "completed": True, "parsed": True}
 
 
+def _parse_entry_group_with_javap(
+    entries: list[PackagedClass],
+    artifact_sha256: str,
+    javap: str,
+    version: str,
+    cancellation_event: Event,
+    deadline: float | None,
+    *,
+    force_verbose: bool | None = None,
+) -> list[dict]:
+    if force_verbose is None:
+        verbose_entries = [entry for entry in entries if _entry_requires_verbose_javap(entry)]
+        plain_entries = [entry for entry in entries if not _entry_requires_verbose_javap(entry)]
+        if verbose_entries and plain_entries:
+            by_path = {}
+            for group, verbose in ((plain_entries, False), (verbose_entries, True)):
+                group_results = _parse_entry_group_with_javap(
+                    group,
+                    artifact_sha256,
+                    javap,
+                    version,
+                    cancellation_event,
+                    deadline,
+                    force_verbose=verbose,
+                )
+                by_path.update(
+                    (entry.extracted_path, result)
+                    for entry, result in zip(group, group_results)
+                )
+            return [by_path[entry.extracted_path] for entry in entries]
+        force_verbose = bool(verbose_entries)
+    if len(entries) == 1:
+        return [
+            _parse_entry_with_javap(
+                entries[0], artifact_sha256, javap, version, cancellation_event, deadline,
+                verbose=force_verbose,
+            )
+        ]
+    materialize_errors = {
+        entry.extracted_path: error
+        for entry in entries
+        if (error := _materialize_packaged_class(entry))
+    }
+    if materialize_errors:
+        return [
+            {
+                "rows": [],
+                "failures": [
+                    f"{entry.artifact_entry}: class materialization failed: "
+                    f"{materialize_errors[entry.extracted_path]}"
+                ] if entry.extracted_path in materialize_errors else [],
+                "completed": entry.extracted_path in materialize_errors,
+                "parsed": False,
+            }
+            for entry in entries
+        ]
+    group_deadline = time.perf_counter() + 30.0
+    deadline = min(deadline, group_deadline) if deadline is not None else group_deadline
+    if cancellation_event.is_set() or time.perf_counter() >= deadline:
+        return [
+            {"rows": [], "failures": [], "completed": False, "parsed": False}
+            for _entry in entries
+        ]
+    try:
+        command = [javap]
+        if force_verbose:
+            command.append("-v")
+        command.extend(("-c", "-p", "-s"))
+        command.extend(str(entry.extracted_path) for entry in entries)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as error:
+        return [
+            {
+                "rows": [],
+                "failures": [f"{entry.artifact_entry}: {javap} execution failed: {error}"],
+                "completed": True,
+                "parsed": False,
+            }
+            for entry in entries
+        ]
+
+    while True:
+        remaining = deadline - time.perf_counter()
+        if cancellation_event.is_set() or remaining <= 0:
+            _cancel_process(process)
+            return [
+                {"rows": [], "failures": [], "completed": False, "parsed": False}
+                for _entry in entries
+            ]
+        try:
+            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if process.returncode != 0:
+        detail = (stderr or stdout).strip().replace("\n", " ")
+        return [
+            {
+                "rows": [],
+                "failures": [f"{entry.artifact_entry}: javap failed: {detail}"],
+                "completed": True,
+                "parsed": False,
+            }
+            for entry in entries
+        ]
+
+    sections: dict[Path, str] = {}
+    if force_verbose:
+        markers = list(re.finditer(r"(?m)^Classfile (?P<path>.+)\n", stdout))
+        for index, marker in enumerate(markers):
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(stdout)
+            sections[Path(marker.group("path").strip()).resolve()] = stdout[marker.start():end]
+    else:
+        declaration_markers = list(re.finditer(
+            r"(?m)^(?:[\w$]+\s+)*(?:class|interface|enum|record)\s+[\w.$]+[^\n]*\{\s*$",
+            stdout,
+        ))
+        if len(declaration_markers) == len(entries):
+            for index, (entry, marker) in enumerate(zip(entries, declaration_markers)):
+                start = stdout.rfind("Compiled from ", 0, marker.start())
+                if start < 0 or (index and start < declaration_markers[index - 1].start()):
+                    start = marker.start()
+                end = declaration_markers[index + 1].start() if index + 1 < len(declaration_markers) else len(stdout)
+                sections[entry.extracted_path.resolve()] = stdout[start:end]
+    results = []
+    for entry in entries:
+        section = sections.get(entry.extracted_path.resolve())
+        if section is None:
+            results.append({
+                "rows": [],
+                "failures": [f"{entry.artifact_entry}: javap batch output missing class section"],
+                "completed": True,
+                "parsed": False,
+            })
+            continue
+        rows, failures = _parse_javap_output(
+            section, artifact_sha256, entry.artifact_entry, version
+        )
+        results.append({
+            "rows": rows, "failures": failures, "completed": True, "parsed": True,
+        })
+    return results
+
+
 def _parse_entries_with_javap(
     entries: list[PackagedClass], artifact_sha256: str, javap: str, version: str
 ) -> tuple[list[dict], list[str]]:
@@ -527,10 +815,95 @@ def _worker_exception_result(entry: PackagedClass, error: BaseException) -> dict
     }
 
 
+def _parse_entry_batch(
+    entries: list[PackagedClass],
+    artifact_sha256: str,
+    javap: str,
+    version: str,
+    cancellation_event: Event,
+    deadline: float | None,
+    max_workers: int | None,
+    *,
+    batch_javap: bool = False,
+) -> tuple[list[dict | None], int, bool, bool]:
+    if not entries:
+        return [], 0, False, False
+    requested_workers = max_workers if max_workers is not None else min(
+        MAX_JAVAP_WORKERS, max(1, os.cpu_count() or 1)
+    )
+    requested_workers = min(MAX_JAVAP_WORKERS, max(1, int(requested_workers)))
+    if batch_javap:
+        group_size = min(32, max(1, (len(entries) + requested_workers - 1) // requested_workers))
+        groups = [entries[index:index + group_size] for index in range(0, len(entries), group_size)]
+    else:
+        groups = [[entry] for entry in entries]
+    worker_count = min(len(groups), requested_workers)
+    timed_out = False
+    interrupted = False
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix="final-artifact-javap"
+    )
+    futures = [
+        executor.submit(
+            _parse_entry_group_with_javap,
+            group,
+            artifact_sha256,
+            javap,
+            version,
+            cancellation_event,
+            deadline,
+        )
+        for group in groups
+    ]
+    try:
+        for future in futures:
+            remaining = deadline - time.perf_counter() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                timed_out = True
+                cancellation_event.set()
+                break
+            try:
+                future.result(timeout=remaining)
+            except FutureTimeoutError:
+                timed_out = True
+                cancellation_event.set()
+                break
+            except BaseException:
+                continue
+    except KeyboardInterrupt:
+        interrupted = True
+        cancellation_event.set()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    result_by_path: dict[Path, dict | None] = {}
+    for group, future in zip(groups, futures):
+        if future.cancelled():
+            for entry in group:
+                result_by_path[entry.extracted_path] = None
+            continue
+        try:
+            group_results = future.result()
+            for entry, result in zip(group, group_results):
+                result_by_path[entry.extracted_path] = result
+        except KeyboardInterrupt:
+            interrupted = True
+            cancellation_event.set()
+            for entry in group:
+                result_by_path[entry.extracted_path] = None
+        except BaseException as error:
+            for entry in group:
+                result_by_path[entry.extracted_path] = _worker_exception_result(entry, error)
+    results = [result_by_path.get(entry.extracted_path) for entry in entries]
+    return results, worker_count, timed_out, interrupted
+
+
 def _base_result(artifact_sha256: str, *, elapsed_seconds: float, **values) -> dict:
+    class_count = int(values.get("class_count") or 0)
     return {
         "artifact_sha256": artifact_sha256,
-        "class_count": int(values.get("class_count") or 0),
+        "class_count": class_count,
+        "inventory_class_count": int(values.get("inventory_class_count") or class_count),
         "completed_class_count": int(values.get("completed_class_count") or 0),
         "parsed_class_count": int(values.get("parsed_class_count") or 0),
         "cached_class_count": int(values.get("cached_class_count") or 0),
@@ -554,6 +927,7 @@ def scan_final_artifact(
     *,
     max_workers: int | None = None,
     time_budget_seconds: float | None = None,
+    selected_targets: list[dict] | None = None,
 ) -> dict:
     """Return every executable edge found in the final artifact and nested runtime JARs."""
     artifact = Path(artifact)
@@ -619,7 +993,8 @@ def scan_final_artifact(
             cache_misses=1,
             complete=False,
         )
-    cache_key = _oracle_cache_key(digest, version)
+    normalized_targets = _normalize_selected_targets(selected_targets)
+    cache_key = _oracle_cache_key(digest, version, normalized_targets)
     with _IMMUTABLE_ORACLE_CACHE_LOCK:
         cached_serialized = _IMMUTABLE_ORACLE_CACHE.get(cache_key)
     if cached_serialized is not None:
@@ -628,6 +1003,7 @@ def scan_final_artifact(
             digest,
             elapsed_seconds=time.perf_counter() - started_at,
             class_count=cached["class_count"],
+            inventory_class_count=cached.get("inventory_class_count", cached["class_count"]),
             completed_class_count=cached["class_count"],
             cached_class_count=cached["class_count"],
             parse_failure_count=cached["parse_failure_count"],
@@ -645,66 +1021,95 @@ def scan_final_artifact(
     failures: list[str] = []
     results: list[dict | None] = []
     worker_count = 0
+    inventory_class_count = 0
     try:
         with tempfile.TemporaryDirectory(prefix="final-artifact-edge-oracle-") as temporary_directory:
-            entries, failures = _extract_packaged_classes(snapshot, Path(temporary_directory), target_major)
+            entries, failures = _extract_packaged_classes(
+                snapshot,
+                Path(temporary_directory),
+                target_major,
+                defer_writes=bool(normalized_targets),
+            )
+            inventory_class_count = len(entries)
             if deadline is not None and time.perf_counter() >= deadline:
                 timed_out = True
-            if entries and not timed_out:
-                requested_workers = max_workers if max_workers is not None else min(
-                    MAX_JAVAP_WORKERS, max(1, os.cpu_count() or 1)
-                )
-                worker_count = min(
-                    len(entries), MAX_JAVAP_WORKERS, max(1, int(requested_workers))
-                )
-                executor = ThreadPoolExecutor(
-                    max_workers=worker_count, thread_name_prefix="final-artifact-javap"
-                )
-                futures = [
-                    executor.submit(
-                        _parse_entry_with_javap,
-                        entry,
-                        digest,
-                        javap,
-                        version,
-                        cancellation_event,
-                        deadline,
-                    )
-                    for entry in entries
-                ]
-                try:
-                    for future in futures:
-                        remaining = deadline - time.perf_counter() if deadline is not None else None
-                        if remaining is not None and remaining <= 0:
-                            timed_out = True
-                            cancellation_event.set()
-                            break
-                        try:
-                            future.result(timeout=remaining)
-                        except FutureTimeoutError:
-                            timed_out = True
-                            cancellation_event.set()
-                            break
-                        except BaseException:
-                            # Record this failure after all submitted classes have finished.
-                            continue
-                except KeyboardInterrupt:
-                    interrupted = True
-                    cancellation_event.set()
-                finally:
-                    executor.shutdown(wait=True, cancel_futures=True)
-                for entry, future in zip(entries, futures):
-                    if future.cancelled():
-                        results.append(None)
+            if normalized_targets and entries and not timed_out:
+                remaining_entries = list(entries)
+                selected_entries: list[PackagedClass] = []
+                frontier = set(normalized_targets)
+                expanded_targets: set[tuple[str, str, str]] = set()
+                closure_rows: list[dict] = []
+                while frontier and not timed_out and not interrupted:
+                    pending_targets = frontier - expanded_targets
+                    if not pending_targets:
+                        break
+                    active_targets: set[tuple[str, str, str]] = set()
+                    while pending_targets:
+                        active_targets.update(pending_targets)
+                        expanded_targets.update(pending_targets)
+                        historical_callers = {
+                            (
+                                str(edge.get("caller_owner") or ""),
+                                str(edge.get("caller_member") or ""),
+                                str(edge.get("caller_descriptor") or ""),
+                            )
+                            for edge in closure_rows
+                            if _edge_targets(edge, pending_targets)
+                        }
+                        frontier.update(historical_callers)
+                        pending_targets = historical_callers - expanded_targets
+                    candidates = [
+                        entry for entry in remaining_entries
+                        if _entry_might_reference(entry, active_targets)
+                    ]
+                    if not candidates:
                         continue
-                    try:
-                        results.append(future.result())
-                    except KeyboardInterrupt:
-                        interrupted = True
+                    candidate_paths = {entry.extracted_path for entry in candidates}
+                    remaining_entries = [
+                        entry for entry in remaining_entries
+                        if entry.extracted_path not in candidate_paths
+                    ]
+                    selected_entries.extend(candidates)
+                    batch_results, batch_workers, batch_timed_out, batch_interrupted = (
+                        _parse_entry_batch(
+                            candidates, digest, javap, version, cancellation_event,
+                            deadline, max_workers, batch_javap=True,
+                        )
+                    )
+                    results.extend(batch_results)
+                    worker_count = max(worker_count, batch_workers)
+                    timed_out = timed_out or batch_timed_out
+                    interrupted = interrupted or batch_interrupted
+                    batch_rows = [
+                        row
+                        for result in batch_results if result is not None
+                        for row in (result.get("rows") or [])
+                    ]
+                    closure_rows.extend(batch_rows)
+                    if any(
+                        result is None or not result.get("completed")
+                        for result in batch_results
+                    ):
+                        if not timed_out and not interrupted:
+                            failures.append("oracle_parse_incomplete")
+                    if timed_out or interrupted:
                         cancellation_event.set()
-                        results.append(None)
-                    except BaseException as error:
-                        results.append(_worker_exception_result(entry, error))
+                        break
+                    frontier.update({
+                        (
+                            str(edge.get("caller_owner") or ""),
+                            str(edge.get("caller_member") or ""),
+                            str(edge.get("caller_descriptor") or ""),
+                        )
+                        for edge in closure_rows
+                        if _edge_targets(edge, active_targets)
+                    })
+                entries = selected_entries
+            elif entries and not timed_out:
+                results, worker_count, timed_out, interrupted = _parse_entry_batch(
+                    entries, digest, javap, version, cancellation_event,
+                    deadline, max_workers,
+                )
                 if any(result is None or not result.get("completed") for result in results):
                     if deadline is not None and time.perf_counter() >= deadline:
                         timed_out = True
@@ -739,6 +1144,7 @@ def scan_final_artifact(
         digest,
         elapsed_seconds=time.perf_counter() - started_at,
         class_count=len(entries),
+        inventory_class_count=inventory_class_count,
         completed_class_count=completed_class_count,
         parsed_class_count=parsed_class_count,
         parse_failure_count=len(parse_failures),
@@ -755,6 +1161,7 @@ def scan_final_artifact(
         serialized = json.dumps(
             {
                 "class_count": len(entries),
+                "inventory_class_count": inventory_class_count,
                 "parse_failure_count": len(parse_failures),
                 "edges": rows,
                 "failures": failures,

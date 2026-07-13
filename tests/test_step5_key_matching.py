@@ -34,6 +34,97 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def test_classfile_fast_path_preserves_dollar_in_nested_jvm_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes = self._compile_java_fixture(
+                tmp,
+                "fixture/Outer.java",
+                """
+                package fixture;
+                public class Outer {
+                    static class Inner { static void target() {} }
+                    public void call() { Inner.target(); }
+                }
+                """,
+            )
+            edges = business_bytecode_graph.parse_classfile_calls(
+                (classes / "fixture/Outer.class").read_bytes(), "fixture.Outer"
+            )
+
+        target_edge = next(
+            edge for edge in edges
+            if edge.get("caller_name") == "call" and "target(" in edge.get("callee_key", "")
+        )
+        self.assertEqual(target_edge["callee_jvm_owner"], "fixture.Outer$Inner")
+        references = tracer._references_from_executable_classfile_edges(
+            [target_edge], class_binary_name="fixture.Outer"
+        )
+        self.assertEqual(
+            references["method_refs"][0]["jvm_owner"], "fixture.Outer$Inner"
+        )
+
+    def test_classfile_fast_path_normalizes_constructor_caller_to_jvm_init(self):
+        references = tracer._references_from_executable_classfile_edges(
+            [{
+                "evidence_type": "bytecode_method_invocation",
+                "content": "opcode 0xb8",
+                "line": 5,
+                "callee_key": "cn.hutool.core.collection.CollUtil.isNotEmpty(java.util.Collection)",
+                "caller_name": "BoolArrayMatcher",
+                "caller_descriptor": "(Ljava/util/List;)V",
+                "callee_descriptor": "(Ljava/util/Collection;)Z",
+            }],
+            class_binary_name="cn.hutool.cron.pattern.matcher.BoolArrayMatcher",
+        )
+
+        self.assertEqual(
+            references["method_refs"][0]["consumer_method"], "<init>"
+        )
+
+    def test_exhaustive_runtime_closure_keeps_every_business_path_and_drops_unrelated_edges(self):
+        api = {
+            "coord": "vendor:target",
+            "api_name": "vendor.Target.changed",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+
+        def edge(coord, caller, callee, member="call", offset=1):
+            caller_owner, caller_member = caller.rsplit(".", 1)
+            callee_owner, callee_member = callee.rsplit(".", 1)
+            return {
+                "coord": coord,
+                "caller_owner": caller_owner,
+                "consumer_method": caller_member,
+                "consumer_descriptor": "()V",
+                "callee_owner": callee_owner,
+                "callee_member": callee_member,
+                "callee_descriptor": "()V",
+                "opcode_family": "invokestatic",
+                "instruction_offset": offset,
+                "class_entry": caller_owner.replace(".", "/") + ".class",
+                "jar_path": "/tmp/runtime.jar",
+                "artifact_container_entry": "" if coord == "__business__" else "BOOT-INF/lib/target.jar",
+            }
+
+        edges = [
+            edge("vendor:target", "vendor.Bridge.call", "vendor.Target.changed", offset=3),
+            edge("vendor:target", "vendor.Middle.call", "vendor.Bridge.call", offset=5),
+            edge("__business__", "app.First.run", "vendor.Middle.call", offset=7),
+            edge("__business__", "app.Second.run", "vendor.Middle.call", offset=9),
+            edge("vendor:target", "vendor.Middle.unrelated", "vendor.Other.call", offset=11),
+        ]
+
+        retained = tracer._retain_exhaustive_runtime_reference_edges([api], edges)
+
+        self.assertEqual(len(retained), 4)
+        self.assertEqual(
+            {item["edge"]["caller_owner"] for item in retained},
+            {"vendor.Bridge", "vendor.Middle", "app.First", "app.Second"},
+        )
+        self.assertTrue(all(item["api_row"] is api for item in retained))
+
     def test_source_graph_keeps_methods_declared_in_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
@@ -730,6 +821,89 @@ class Step5KeyMatchingTest(unittest.TestCase):
             },
         }
 
+    def test_runtime_catalog_uses_only_boot_application_classpath(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "report"
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("app/App.class", b"root-copy")
+                archive.writestr("BOOT-INF/classes/app/App.class", b"runtime-copy")
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self._write_text(
+                self._dependencies_dir(report_dir) / "deps_current_resolved.csv",
+                "coord,version,scope,lib_entry,resolution_status\n",
+                encoding="utf-8",
+            )
+            self._write_text(
+                self._dependencies_dir(report_dir) / "build_provenance.json",
+                json.dumps({"sides": [{
+                    "side": "current",
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": artifact_sha256,
+                }]}),
+                encoding="utf-8",
+            )
+
+            catalog = step5.build_runtime_dependency_catalog(report_dir)
+            with zipfile.ZipFile(catalog["by_coord"]["__business__"]["jar_path"]) as business_jar:
+                class_entries = [name for name in business_jar.namelist() if name.endswith(".class")]
+
+        self.assertEqual(class_entries, ["app/App.class"])
+
+    def test_runtime_catalog_discovers_same_group_internal_modules_inside_boot_lib(self):
+        def nested_jar(group_id, artifact_id):
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr(
+                    f"META-INF/maven/{group_id}/{artifact_id}/pom.properties",
+                    f"groupId={group_id}\nartifactId={artifact_id}\nversion=1.0-SNAPSHOT\n",
+                )
+                archive.writestr(
+                    artifact_id.replace("-", "/") + "/Module.class", b"class"
+                )
+            return payload.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "report"
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "META-INF/maven/com.acme/application/pom.properties",
+                    "groupId=com.acme\nartifactId=application\nversion=1.0-SNAPSHOT\n",
+                )
+                archive.writestr("BOOT-INF/classes/app/App.class", b"class")
+                archive.writestr(
+                    "BOOT-INF/lib/library-1.0-SNAPSHOT.jar",
+                    nested_jar("com.acme", "library"),
+                )
+                archive.writestr(
+                    "BOOT-INF/lib/external-1.0.jar",
+                    nested_jar("org.external", "external"),
+                )
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self._write_text(
+                self._dependencies_dir(report_dir) / "deps_current_resolved.csv",
+                "coord,version,scope,lib_entry,resolution_status\n",
+                encoding="utf-8",
+            )
+            self._write_text(
+                self._dependencies_dir(report_dir) / "build_provenance.json",
+                json.dumps({"sides": [{
+                    "side": "current", "artifact_path": str(artifact),
+                    "artifact_sha256": artifact_sha256,
+                }]}),
+                encoding="utf-8",
+            )
+
+            catalog = step5.build_runtime_dependency_catalog(report_dir)
+
+        self.assertIn("com.acme:library", catalog["by_coord"])
+        self.assertTrue(catalog["by_coord"]["com.acme:library"]["application_owned"])
+        self.assertNotIn("org.external:external", catalog["by_coord"])
+        self.assertEqual(catalog["metrics"]["application_owned_nested_dependencies"], 1)
+
     def _graph_with_business_edge(self, catalog, callee_key, root):
         business_method = SimpleNamespace(
             symbol_id="app_run",
@@ -854,6 +1028,25 @@ class Step5KeyMatchingTest(unittest.TestCase):
         bridge = next(hit for hit in scan["hits"] if hit["class_fqcn"] == "com.vendor.InternalBridge")
         self.assertEqual(bridge["edge_role"], "internal_bridge")
         self.assertFalse(bridge["direct_consumer"])
+
+    def test_light_expansion_reuses_batch_classfile_parse_for_same_physical_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+            tracer.clear_immutable_artifact_parse_cache()
+
+            tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+            with patch.object(tracer, "run_cmd", side_effect=AssertionError("javap must be cached")):
+                tracer._ensure_runtime_dependency_callers_for_key(
+                    graph, "com.vendor.InternalBridge.use(java.lang.String)"
+                )
+            perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+
+        self.assertEqual(perf["duplicate_class_scans"], 0)
 
     def test_packaged_executable_scan_records_exact_ledger_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1149,6 +1342,45 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(graph_stats["duplicate_edge_count"], 1)
         self.assertEqual(graph_stats["edge_ledger_failure_count"], 0)
         self.assertTrue(graph_stats["edge_ledger_complete"])
+
+    def test_analyzer_ledger_keeps_one_physical_edge_for_each_selected_api_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            evidence_jar = graph.runtime_dependency_catalog["by_coord"][
+                "com.vendor:target"
+            ]["jar_path"]
+            edge = {
+                "coord": "com.vendor:target",
+                "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                "edge_role": "internal_bridge",
+                "jar_path": evidence_jar,
+                "class_entry": "com/vendor/Bridge.class",
+                "class_fqcn": "com.vendor.Bridge",
+                "consumer_method": "use",
+                "consumer_descriptor": "()V",
+                "callee_owner": "com.vendor.Target",
+                "callee_member": "first",
+                "callee_descriptor": "()V",
+                "opcode_family": "invokestatic",
+                "instruction_offset": 7,
+            }
+            first = {
+                "coord": "com.vendor:target", "api_name": "com.vendor.Target.first",
+                "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            }
+            second = {
+                "coord": "com.vendor:target", "api_name": "com.vendor.Target.second",
+                "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            }
+
+            tracer.record_analyzer_edge(graph, first, edge)
+            tracer.record_analyzer_edge(graph, second, edge)
+
+        self.assertEqual(len(graph.analyzer_edges), 2)
+        self.assertEqual(
+            {row["api_identity"] for row in graph.analyzer_edges.values()},
+            {tracer.build_api_identity_key(first), tracer.build_api_identity_key(second)},
+        )
 
     def test_analyzer_edge_ledger_is_incomplete_without_final_artifact_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1648,13 +1880,11 @@ BootstrapMethods:
                 wraps=tracer._load_runtime_dependency_class_references,
             ) as mocked_loader:
                 tracer.collect_graph_analyzer_edges(graph, [api_row])
-            loader_kwargs = mocked_loader.call_args.kwargs
-            self.assertEqual(loader_kwargs["artifact_sha256"], business_sha256)
-            self.assertEqual(loader_kwargs["target_jdk"], "17")
-            self.assertIs(loader_kwargs["graph"], graph)
+            mocked_loader.assert_not_called()
             bytecode_scan = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
             self.assertEqual(bytecode_scan["artifact_cache_misses"], 1)
             self.assertEqual(bytecode_scan["class_entries_parsed"], 1)
+            self.assertEqual(bytecode_scan.get("duplicate_class_scans", 0), 0)
             graph_stats = {}
             ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
             with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
@@ -1680,6 +1910,43 @@ BootstrapMethods:
 
         self.assertEqual(graph_stats["edge_ledger_failure_count"], 0)
         self.assertTrue(graph_stats["edge_ledger_complete"])
+
+    def test_multimodule_project_root_cannot_add_non_artifact_business_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            application_source = root / "application-src" / "app" / "Application.java"
+            library_source = root / "library-src" / "lib" / "LibraryBridge.java"
+            application_source.parent.mkdir(parents=True)
+            library_source.parent.mkdir(parents=True)
+            application_source.write_text(
+                "package app; public class Application { public void run() {} }",
+                encoding="utf-8",
+            )
+            library_source.write_text(
+                "package lib; public class LibraryBridge { public void hidden() {} }",
+                encoding="utf-8",
+            )
+            classes = self._compile_java_files(
+                root / "project" / "target" / "classes",
+                [application_source, library_source],
+            )
+            business_jar = root / "business-classes.jar"
+            with zipfile.ZipFile(business_jar, "w") as archive:
+                archive.write(classes / "app" / "Application.class", "app/Application.class")
+            catalog = {
+                "by_coord": {"__business__": {
+                    "jar_path": str(business_jar),
+                    "sha256": hashlib.sha256(business_jar.read_bytes()).hexdigest(),
+                }},
+            }
+
+            edges, metrics = business_bytecode_graph.collect_business_bytecode_edges(
+                [root / "project"], artifact_catalog=catalog
+            )
+
+        self.assertEqual(metrics["classes_scanned"], 1)
+        self.assertTrue(all(edge["caller_owner"] == "app.Application" for edge in edges))
+        self.assertFalse(any(edge["caller_owner"] == "lib.LibraryBridge" for edge in edges))
 
     def test_user_output_documents_analyzer_edge_ledger_contract(self):
         text = (ROOT_DIR / "docs" / "user" / "outputs.md").read_text(encoding="utf-8")

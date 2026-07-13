@@ -303,7 +303,8 @@ def parse_classfile_calls(data, class_name):
                         if opcode in (0xb2, 0xb3, 0xb4, 0xb5) and offset + 2 < len(code):
                             cp_idx = struct.unpack_from('>H', code, offset + 1)[0]
                             owner, member, _desc, _tag = _classfile_ref(cp, cp_idx)
-                            owner = owner.replace('/', '.').replace('$', '.')
+                            jvm_owner = owner.replace('/', '.')
+                            owner = jvm_owner.replace('$', '.')
                             if owner and member:
                                 edges.append({
                                     'caller_owner': class_name,
@@ -311,6 +312,7 @@ def parse_classfile_calls(data, class_name):
                                     'caller_signature': caller_signature,
                                     'caller_descriptor': descriptor,
                                     'callee_key': f'{owner}.{member}',
+                                    'callee_jvm_owner': jvm_owner,
                                     'callee_descriptor': _desc,
                                     'callee_simple_key': f'field:{member}',
                                     'evidence_type': 'bytecode_field_access',
@@ -320,7 +322,8 @@ def parse_classfile_calls(data, class_name):
                         elif opcode in (0xb6, 0xb7, 0xb8, 0xb9) and offset + 2 < len(code):
                             cp_idx = struct.unpack_from('>H', code, offset + 1)[0]
                             owner, member, desc, _tag = _classfile_ref(cp, cp_idx)
-                            owner = owner.replace('/', '.').replace('$', '.')
+                            jvm_owner = owner.replace('/', '.')
+                            owner = jvm_owner.replace('$', '.')
                             if owner and member:
                                 signature = method_descriptor_signature(desc)
                                 display_member = owner.rsplit('.', 1)[-1] if member == '<init>' else member
@@ -330,6 +333,7 @@ def parse_classfile_calls(data, class_name):
                                     'caller_signature': caller_signature,
                                     'caller_descriptor': descriptor,
                                     'callee_key': f'{owner}.{display_member}{signature}',
+                                    'callee_jvm_owner': jvm_owner,
                                     'callee_descriptor': desc,
                                     'callee_simple_key': f'method:{display_member}{signature}',
                                     'evidence_type': 'bytecode_constructor_invocation' if member == '<init>' else 'bytecode_method_invocation',
@@ -476,7 +480,8 @@ def parse_classfile_calls(data, class_name):
                 )
                 if tag not in (10, 11) or not owner or not member:
                     continue
-                owner = owner.replace('/', '.').replace('$', '.')
+                jvm_owner = owner.replace('/', '.')
+                owner = jvm_owner.replace('$', '.')
                 signature = method_descriptor_signature(descriptor)
                 display_member = owner.rsplit('.', 1)[-1] if member == '<init>' else member
                 edges.append({
@@ -485,6 +490,7 @@ def parse_classfile_calls(data, class_name):
                     'caller_signature': pending['caller_signature'],
                     'caller_descriptor': pending['caller_descriptor'],
                     'callee_key': f'{owner}.{display_member}{signature}',
+                    'callee_jvm_owner': jvm_owner,
                     'callee_descriptor': descriptor,
                     'callee_simple_key': f'method:{display_member}{signature}',
                     'evidence_type': (

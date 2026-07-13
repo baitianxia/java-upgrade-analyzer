@@ -99,12 +99,19 @@ def _archive_inventory(artifact: Path) -> dict:
     resources: dict[str, bytes] = {}
     containers: set[str] = set()
     with zipfile.ZipFile(artifact) as outer:
-        for info in outer.infolist():
+        outer_infos = outer.infolist()
+        application_prefixes = ("BOOT-INF/classes/", "WEB-INF/classes/")
+        has_packaged_application_classes = any(
+            not info.is_dir() and info.filename.startswith(application_prefixes)
+            for info in outer_infos
+        )
+        for info in outer_infos:
             if info.is_dir():
                 continue
             data = outer.read(info)
             if info.filename.endswith(".class"):
-                classes[info.filename] = data
+                if not has_packaged_application_classes or info.filename.startswith(application_prefixes):
+                    classes[info.filename] = data
             elif info.filename.startswith("META-INF/"):
                 resources[info.filename] = data
             if info.filename.startswith(("BOOT-INF/lib/", "WEB-INF/lib/")) and info.filename.endswith(".jar"):
@@ -484,6 +491,27 @@ def _selected_target_identities(rows: list[dict], edges: list[dict]) -> tuple[li
     return sorted(targets.values(), key=_target_identity), sorted(unresolved)
 
 
+def _oracle_targets_from_rows(rows: list[dict]) -> list[dict]:
+    targets = set()
+    for row in rows or []:
+        api_name = str((row or {}).get("api_name") or "").strip()
+        kind = str((row or {}).get("symbol_kind") or "method").strip().lower()
+        if kind == "constructor" and not api_name.endswith(".<init>"):
+            owner, member = api_name, "<init>"
+        else:
+            owner, separator, member = api_name.rpartition(".")
+            if not separator:
+                continue
+            if kind == "constructor":
+                member = "<init>"
+        if owner and member:
+            targets.add((owner, member, ""))
+    return [
+        {"owner": owner, "member": member, "descriptor": descriptor}
+        for owner, member, descriptor in sorted(targets)
+    ]
+
+
 def _target_reachable_from_provider(
     provider: str, provider_entry: str, targets: set[tuple[str, str, str]],
     target_entries: set[str], edges: list[dict],
@@ -617,8 +645,16 @@ def _resource_evidence(
 
 def _reflection_evidence(inventory: dict, targets: set[tuple[str, str, str]], edges: list[dict]) -> list[dict]:
     results = []
-    oracle_callers = {_method_node(edge, "caller") for edge in edges}
+    target_owner_markers = {
+        marker
+        for owner, _member, _descriptor in targets
+        for marker in (owner.encode(), owner.replace(".", "/").encode())
+    }
     for entry, content in inventory["classes"].items():
+        if not any(marker in content for marker in target_owner_markers):
+            continue
+        if b"java/lang/reflect/Method" not in content or b"java/lang/Class" not in content:
+            continue
         owner = _class_binary_name(entry)
         output = _javap_text(content, "-c", "-p", "-s")
         member = None
@@ -627,8 +663,6 @@ def _reflection_evidence(inventory: dict, targets: set[tuple[str, str, str]], ed
 
         def inspect_method():
             caller = (owner, member or "", descriptor)
-            if caller not in oracle_callers:
-                return
             stack = []
             locals_map = {}
 
@@ -912,11 +946,14 @@ def extract_artifact_topology_evidence(
     target_owner_entries: dict[str, list[str]] | None = None,
     hierarchy_scan_timeout_sec: float = HIERARCHY_SCAN_TIMEOUT_SEC,
     hierarchy_scan_max_workers: int = HIERARCHY_SCAN_MAX_WORKERS,
+    oracle_scan: dict | None = None,
 ) -> dict:
     artifact = Path(artifact)
     errors = []
     try:
-        scan = scan_final_artifact(artifact)
+        scan = oracle_scan if oracle_scan is not None else scan_final_artifact(
+            artifact, selected_targets=_oracle_targets_from_rows(changed_api_rows)
+        )
         inventory = _archive_inventory(artifact)
     except (OSError, zipfile.BadZipFile, ValueError) as error:
         scan = {"edges": [], "complete": False, "artifact_sha256": "", "failures": [str(error)]}
@@ -1049,8 +1086,23 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
         elif role == "dependency":
             cross_jar.append(edge)
             observed.add("cross_jar_bridge")
-    if any(_business_reaches(_method_node(edge, "caller"), incoming, caller_roles) for edge in same_jar + same_coord):
+    business_reached_same_jar = [
+        edge for edge in same_jar
+        if _business_reaches(_method_node(edge, "caller"), incoming, caller_roles)
+    ]
+    if business_reached_same_jar or any(
+        _business_reaches(_method_node(edge, "caller"), incoming, caller_roles)
+        for edge in same_coord
+    ):
         observed.add("business_to_same_jar_bridge")
+    if any(
+        _container(str(edge.get("artifact_entry") or ""))
+        and str(_entry_metadata(
+            str(edge.get("artifact_entry") or ""), artifact_layout
+        ).get("coordinate") or "") in target_coordinates
+        for edge in business_reached_same_jar
+    ):
+        observed.add("same_coord_multimodule")
     if any(_business_reaches(_method_node(edge, "caller"), incoming, caller_roles) for edge in cross_jar):
         observed.add("business_to_cross_jar_bridge")
     overloads = defaultdict(set)

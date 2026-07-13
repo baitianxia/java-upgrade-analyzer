@@ -25,6 +25,7 @@ import argparse
 import csv
 import gc
 import hashlib
+import io
 import json
 import os
 import re
@@ -1529,6 +1530,31 @@ def _load_coord_versions(report_dir):
     return result
 
 
+def _maven_coordinates_from_archive(archive):
+    coordinates = []
+    for name in archive.namelist():
+        if not re.fullmatch(r'META-INF/maven/[^/]+/[^/]+/pom\.properties', name):
+            continue
+        try:
+            text = archive.read(name).decode('utf-8', errors='strict')
+        except (KeyError, UnicodeDecodeError):
+            continue
+        properties = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(('#', '!')):
+                continue
+            key, separator, value = stripped.partition('=')
+            if separator:
+                properties[key.strip()] = value.strip()
+        group_id = properties.get('groupId', '')
+        artifact_id = properties.get('artifactId', '')
+        version = properties.get('version', '')
+        if group_id and artifact_id and version:
+            coordinates.append((group_id, artifact_id, version))
+    return sorted(set(coordinates))
+
+
 def build_runtime_dependency_catalog(report_dir):
     current_resolved_path = str(_current_resolved_path(report_dir))
     catalog = {
@@ -1603,6 +1629,11 @@ def build_runtime_dependency_catalog(report_dir):
         try:
             with zipfile.ZipFile(artifact_path) as outer:
                 names = set(outer.namelist())
+                application_group_ids = {
+                    group_id
+                    for group_id, _artifact_id, _version
+                    in _maven_coordinates_from_archive(outer)
+                }
                 for row in rows:
                     coord = str((row or {}).get('coord') or '').strip()
                     version = str((row or {}).get('version') or '').strip()
@@ -1641,12 +1672,58 @@ def build_runtime_dependency_catalog(report_dir):
                     except Exception as exc:
                         extraction_failures.append({'coord': coord, 'lib_entry': lib_entry, 'reason': f'extract_failed:{exc}'})
 
+                cataloged_entries = {
+                    str(item.get('artifact_entry') or '') for item in catalog['entries']
+                }
+                for lib_entry in sorted(
+                    name for name in names
+                    if name.startswith(('BOOT-INF/lib/', 'WEB-INF/lib/'))
+                    and name.endswith('.jar')
+                    and name not in cataloged_entries
+                ):
+                    try:
+                        blob = outer.read(lib_entry)
+                        with zipfile.ZipFile(io.BytesIO(blob)) as nested:
+                            internal_coordinates = [
+                                coordinate
+                                for coordinate in _maven_coordinates_from_archive(nested)
+                                if coordinate[0] in application_group_ids
+                            ]
+                        if len(internal_coordinates) != 1:
+                            continue
+                        group_id, artifact_id, version = internal_coordinates[0]
+                        coord = f'{group_id}:{artifact_id}'
+                        if coord in catalog['by_coord']:
+                            continue
+                        digest = hashlib.sha256(blob).hexdigest()
+                        jar_path = cache_dir / f'{digest[:16]}-{Path(lib_entry).name}'
+                        if not jar_path.exists() or sha256_file(jar_path) != digest:
+                            jar_path.write_bytes(blob)
+                        item = {
+                            'coord': coord, 'version': version, 'scope': 'runtime',
+                            'jar_path': str(jar_path), 'artifact_entry': lib_entry,
+                            'sha256': digest, 'evidence_source': 'current_final_artifact',
+                            'application_owned': True,
+                        }
+                        catalog['by_coord'][coord] = item
+                        catalog['entries'].append(item)
+                        catalog['jar_paths'][coord] = str(jar_path)
+                        exact_count += 1
+                    except (OSError, KeyError, zipfile.BadZipFile):
+                        continue
+
                 business_entries = []
+                application_class_prefixes = ('BOOT-INF/classes/', 'WEB-INF/classes/')
+                has_packaged_application_classes = any(
+                    name.startswith(application_class_prefixes) for name in names
+                )
                 for name in sorted(names):
                     if not name.endswith('.class') or name.startswith('META-INF/'):
                         continue
+                    if has_packaged_application_classes and not name.startswith(application_class_prefixes):
+                        continue
                     stripped = name
-                    for prefix in ('BOOT-INF/classes/', 'WEB-INF/classes/'):
+                    for prefix in application_class_prefixes:
                         if name.startswith(prefix):
                             stripped = name[len(prefix):]
                             break

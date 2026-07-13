@@ -1,8 +1,10 @@
 import csv
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +16,38 @@ import real_project_regression as realreg  # noqa: E402
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_fixture_reference_resolves_when_runner_is_loaded_from_scripts_directory(self):
+        reference = (
+            "tests.test_real_project_regression.RealProjectRegressionTests."
+            "test_gs_multi_module_same_coordinate_guard"
+        )
+        command = [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import sys;"
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r});"
+                "import real_project_regression as module;"
+                f"print(module._resolves_to_unittest({reference!r}))"
+            ),
+        ]
+
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "True")
+
+    def test_alert_identity_does_not_duplicate_rendered_method_signature(self):
+        self.assertEqual(
+            realreg._api_identity_from_alert_row({
+                "changed_symbol": "fixture.Target.changed()",
+                "api_signature": "()",
+                "symbol_kind": "method",
+            }),
+            ("fixture.Target.changed", "()", "method"),
+        )
+
     def test_all_real_cases_have_active_measurable_performance_budgets(self):
         self.assertTrue(realreg.CASES)
         for name, case in realreg.CASES.items():
@@ -22,6 +56,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 self.assertGreater(case.max_potential_pairs_per_api, 0.0)
                 self.assertGreaterEqual(case.max_duplicate_class_scans, 0)
                 self.assertGreater(case.max_seconds_per_100k_edges, 0.0)
+                self.assertGreater(case.min_edges_for_normalized_rate, 0)
                 self.assertGreater(case.min_classes_per_second, 0.0)
                 self.assertGreater(case.max_oracle_seconds, 0.0)
 
@@ -33,6 +68,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "max_potential_pairs_per_api": 100000.0,
                 "max_duplicate_class_scans": 0,
                 "max_seconds_per_100k_edges": 1000000.0,
+                "min_edges_for_normalized_rate": 100,
                 "min_classes_per_second": 1.0,
                 "max_oracle_seconds": 120.0,
             },
@@ -361,10 +397,23 @@ class RealProjectRegressionTest(unittest.TestCase):
             realreg, "_artifact_class_entries", return_value={"fixture/A.class"}
         ), patch.object(realreg, "scan_final_artifact", return_value=scan) as scan_oracle:
             result = realreg.reconcile_final_artifact_edges(
-                Path(tmp), [], oracle_time_budget_seconds=12.5
+                Path(tmp), [{
+                    "api_name": "fixture.Target.changed",
+                    "api_simple": "changed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                }], oracle_time_budget_seconds=12.5
             )
 
-        scan_oracle.assert_called_once_with(Path("artifact.jar"), time_budget_seconds=12.5)
+        scan_oracle.assert_called_once_with(
+            Path("artifact.jar"),
+            time_budget_seconds=12.5,
+            selected_targets=[{
+                "owner": "fixture.Target",
+                "member": "changed",
+                "descriptor": "",
+            }],
+        )
         self.assertEqual(result["oracle_metrics"]["class_count"], 9)
         self.assertEqual(result["oracle_metrics"]["parse_seconds"], 1.25)
 
@@ -497,6 +546,30 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(all(item["blocking"] for item in regressions))
         self.assertTrue(any("elapsed_seconds_per_100k_edges=101.00" in item["message"] for item in regressions))
 
+    def test_sparse_edge_case_uses_absolute_and_class_rate_budgets(self):
+        case = realreg.RealProjectCase(
+            name="sparse",
+            default_project=Path("."),
+            default_changed_apis=Path(""),
+            baseline_specs=(),
+            max_seconds_per_100k_edges=100.0,
+            min_edges_for_normalized_rate=100,
+        )
+
+        signals = realreg.build_policy_signals(
+            case,
+            coverage={"complete": True},
+            performance={
+                "oracle_edge_count": 4,
+                "analyzer_edge_count": 4,
+                "edge_rate_available": True,
+                "elapsed_seconds_per_100k_edges": 2_840_000.0,
+            },
+            report_dir=Path("/tmp/report"),
+        )
+
+        self.assertFalse(any(item["signal_type"] == "performance_regression" for item in signals))
+
     def test_edge_truth_reconciliation_fails_when_an_intermediate_oracle_edge_is_missing(self):
         artifact_sha256 = "a" * 64
         target = {
@@ -617,6 +690,69 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertFalse(result["blocking"])
         self.assertEqual(result["reconciliation"]["verdict_counts"]["correct"], 4)
+
+    def test_analyzer_path_cannot_import_an_edge_labeled_for_another_api(self):
+        artifact_sha256 = "e" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        direct = self._edge_row(
+            artifact_sha256, "bridge.Adapter", "call", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/bridge.jar!/bridge/Adapter.class",
+        )
+        contaminated = self._edge_row(
+            artifact_sha256, "other.Entry", "run", "()V",
+            "bridge.Adapter", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/other/Entry.class",
+        )
+        direct["api_identity"] = realreg.serialized_api_identity(target)
+        contaminated["api_identity"] = "different-api-identity"
+
+        retained = realreg._retain_analyzer_api_path(
+            [target], [direct, contaminated]
+        )
+
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]["caller_owner"], "bridge.Adapter")
+
+    def test_edge_truth_rejects_caller_owner_that_disagrees_with_artifact_entry(self):
+        artifact_sha256 = "f" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        malformed = self._edge_row(
+            artifact_sha256, "Lapp", "run", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+        malformed["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [malformed], {
+                    "artifact_sha256": artifact_sha256,
+                    "complete": True,
+                    "edges": [malformed],
+                    "failures": [],
+                    "artifact_entries": [malformed["artifact_entry"]],
+                },
+            )
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["blocking"])
+        self.assertTrue(any(
+            error.startswith("oracle_caller_owner_artifact_entry_mismatch:")
+            for error in result["errors"]
+        ))
 
     def test_source_bytecode_conflict_rejects_stale_or_fabricated_final_evidence(self):
         artifact_sha256 = "f" * 64
@@ -891,6 +1027,87 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "evidence_files": str(evidence_file),
             })
 
+    def test_collect_alert_files_matches_rendered_signature_and_report_relative_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_file = root / "project/src/main/java/demo/App.java"
+            project_file.parent.mkdir(parents=True)
+            project_file.write_text("class App {}\n", encoding="utf-8")
+            alerts = root / "report/evidence/call_chain/alerts.csv"
+            relative_evidence = Path("../../../project/src/main/java/demo/App.java")
+            self._write_readable_alerts(
+                alerts,
+                "vendor.Api.call(java.lang.String)",
+                relative_evidence,
+                signature="(java.lang.String)",
+            )
+
+            files = realreg.collect_alert_files(alerts, "vendor.Api.call")
+
+            self.assertEqual(files, {str(project_file.resolve())})
+
+    def test_bytecode_materialization_selects_nested_dependency_from_target_coordinate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/demo/App.class", b"class")
+                archive.writestr(
+                    "BOOT-INF/lib/dubbo-demo-spring-boot-interface-3.3.7-SNAPSHOT.jar",
+                    b"jar",
+                )
+                archive.writestr("BOOT-INF/lib/unrelated-1.0.jar", b"jar")
+            case = realreg.RealProjectCase(
+                name="dubbo-fatjar",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                bytecode_owner_prefixes=("org/apache/dubbo/springboot/demo/DemoService",),
+                bytecode_coord="org.apache.dubbo:dubbo-demo-spring-boot-interface",
+                final_artifact=artifact,
+            )
+            report = root / "report"
+
+            with patch.object(realreg, "discover_calls", return_value=[]):
+                realreg.materialize_bytecode_changed_apis(case, root, report)
+
+            _, rows = realreg._csv_rows(
+                report / "evidence/dependencies/deps_current_resolved.csv"
+            )
+            self.assertEqual(
+                rows[0]["lib_entry"],
+                "BOOT-INF/lib/dubbo-demo-spring-boot-interface-3.3.7-SNAPSHOT.jar",
+            )
+            self.assertEqual(rows[0]["resolution_status"], "resolved")
+
+    def test_bytecode_materialization_rejects_ambiguous_artifact_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/demo/App.class", b"class")
+                archive.writestr("BOOT-INF/lib/dubbo-3.3.7.jar", b"jar")
+                archive.writestr("BOOT-INF/lib/dubbo-common-3.3.7.jar", b"jar")
+            case = realreg.RealProjectCase(
+                name="ambiguous",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                bytecode_owner_prefixes=("org/apache/dubbo/",),
+                bytecode_coord="org.apache.dubbo:dubbo",
+                final_artifact=artifact,
+            )
+            report = root / "report"
+
+            with patch.object(realreg, "discover_calls", return_value=[]):
+                realreg.materialize_bytecode_changed_apis(case, root, report)
+
+            _, rows = realreg._csv_rows(
+                report / "evidence/dependencies/deps_current_resolved.csv"
+            )
+            self.assertEqual(rows[0]["lib_entry"], "")
+            self.assertEqual(rows[0]["resolution_status"], "unresolved")
+
     def test_collect_source_shape_metrics_counts_files_and_occurrences(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -948,6 +1165,84 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(len(production), 1)
         self.assertIn("Included.java", next(iter(production)))
         self.assertEqual(tests, set())
+
+    def test_output_audit_matches_qualified_changed_symbol_to_simple_chain_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            changed.write_text(
+                "api_name,api_signature,symbol_kind\n"
+                "cn.hutool.core.collection.CollUtil.isEmpty,(java.util.Collection),method\n",
+                encoding="utf-8",
+            )
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "conclusion", "change_summary", "review_reason", "chain_summary",
+                    "chain_target", "chain_detail", "path_text", "changed_symbol",
+                    "api_signature", "symbol_kind", "path_status",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "conclusion": "已确认影响：存在业务路径",
+                    "change_summary": "删除方法",
+                    "review_reason": "业务制品直接调用",
+                    "chain_summary": "一跳调用",
+                    "chain_target": "cn.hutool.core.collection.CollUtil.isEmpty(Collection)",
+                    "chain_detail": "app.Entry.run() -> cn.hutool.core.collection.CollUtil.isEmpty(Collection)",
+                    "path_text": "app.Entry.run() -> cn.hutool.core.collection.CollUtil.isEmpty(Collection)",
+                    "changed_symbol": "cn.hutool.core.collection.CollUtil.isEmpty(java.util.Collection)",
+                    "api_signature": "(java.util.Collection)",
+                    "symbol_kind": "method",
+                    "path_status": "reachable",
+                })
+
+            result = realreg.audit_analysis_outputs(
+                changed, alerts, {"total_apis": 1}
+            )
+
+        self.assertNotIn(
+            "reachable_chain_missing_target_symbol:1", result["failures"]
+        )
+
+    def test_output_audit_rejects_reachable_chain_with_a_different_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            changed.write_text(
+                "api_name,api_signature,symbol_kind\n"
+                "vendor.Api.call,(java.lang.String),method\n",
+                encoding="utf-8",
+            )
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "conclusion", "change_summary", "review_reason", "chain_summary",
+                    "chain_target", "chain_detail", "path_text", "changed_symbol",
+                    "api_signature", "symbol_kind", "path_status",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "conclusion": "已确认影响：存在业务路径",
+                    "change_summary": "删除方法",
+                    "review_reason": "业务制品直接调用",
+                    "chain_summary": "一跳调用",
+                    "chain_target": "vendor.Api.other(String)",
+                    "chain_detail": "app.Entry.run() -> vendor.Api.other(String)",
+                    "path_text": "app.Entry.run() -> vendor.Api.other(String)",
+                    "changed_symbol": "vendor.Api.call(java.lang.String)",
+                    "api_signature": "(java.lang.String)",
+                    "symbol_kind": "method",
+                    "path_status": "reachable",
+                })
+
+            result = realreg.audit_analysis_outputs(
+                changed, alerts, {"total_apis": 1}
+            )
+
+        self.assertIn(
+            "reachable_chain_missing_target_symbol:1", result["failures"]
+        )
 
     def test_extract_graph_stats_is_stable_when_summary_is_partial(self):
         stats = realreg.extract_graph_stats(
@@ -1732,6 +2027,7 @@ class RealProjectRegressionTests(unittest.TestCase):
             manifest["artifact_sha256"],
             "ea61c71eb0bd0ce669e4ecbe32c60317a9df49df2cf31a2248d5f71296ead2d7",
         )
+
         self.assertEqual(case.required_topologies, (
             "business_to_same_jar_bridge",
             "same_coord_multimodule",
@@ -1770,6 +2066,23 @@ class RealProjectRegressionTests(unittest.TestCase):
 
         self.assertFalse(guard["passed"])
         self.assertIn("SOURCE_BYTECODE_EDGE_CONFLICT", guard["errors"])
+
+    def test_pinned_guard_accepts_runtime_rendered_signature_on_bridge_node(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        result = self._passing_gs_guard_result(manifest)
+        expected = manifest["expected_chain"]
+        result["summary"]["reachable_apis"][0]["path_details"] = [{
+            "path_text": " -> ".join((
+                expected[0], expected[1] + "()", expected[2] + "()",
+            )),
+        }]
+
+        guard = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+        self.assertTrue(guard["passed"], guard["errors"])
 
     def test_gs_multi_module_limits_business_sources_to_the_packaged_application_module(self):
         case = realreg.CASES["gs-multi-module"]

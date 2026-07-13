@@ -42,6 +42,115 @@ def _jar_classes(path: Path, classes: Path) -> None:
 
 @unittest.skipUnless(JDK_TOOLS, "JDK tools required")
 class TopologyCoverageTest(unittest.TestCase):
+    def test_artifact_topology_reuses_precomputed_oracle_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            changed_rows = self._selected_api_rows(expectations)
+            scan = oracle.scan_final_artifact(
+                artifact,
+                selected_targets=topology_coverage._oracle_targets_from_rows(changed_rows),
+            )
+
+            with mock.patch.object(
+                topology_coverage,
+                "scan_final_artifact",
+                side_effect=AssertionError("oracle scan was repeated"),
+            ):
+                evidence = topology_coverage.extract_artifact_topology_evidence(
+                    artifact,
+                    changed_rows,
+                    {
+                        "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                        "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                    },
+                    oracle_scan=scan,
+                )
+
+        self.assertTrue(evidence["complete"], evidence["errors"])
+
+    def test_nested_target_module_with_business_upstream_is_same_coordinate_multimodule(self):
+        target = ("fixture.Target", "changed", "()V")
+        layout = {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [{
+                "owner": target[0], "member": target[1], "descriptor": target[2],
+                "coordinate": "fixture:library",
+            }],
+            "entry_layout": [
+                {
+                    "prefix": "BOOT-INF/lib/library.jar!/",
+                    "role": "target",
+                    "coordinate": "fixture:library",
+                },
+                {"prefix": "BOOT-INF/classes/", "role": "business", "coordinate": "__business__"},
+            ],
+        }
+        edges = [
+            {
+                "artifact_entry": "BOOT-INF/lib/library.jar!/fixture/Bridge.class",
+                "caller_owner": "fixture.Bridge", "caller_member": "call", "caller_descriptor": "()V",
+                "callee_owner": target[0], "callee_member": target[1], "callee_descriptor": target[2],
+                "opcode_family": "invokevirtual",
+            },
+            {
+                "artifact_entry": "BOOT-INF/classes/fixture/App.class",
+                "caller_owner": "fixture.App", "caller_member": "run", "caller_descriptor": "()V",
+                "callee_owner": "fixture.Bridge", "callee_member": "call", "callee_descriptor": "()V",
+                "opcode_family": "invokevirtual",
+            },
+        ]
+
+        observed = topology_coverage.classify_topologies(edges, layout)
+
+        self.assertIn("same_coord_multimodule", observed)
+
+    def test_topology_oracle_is_scoped_to_every_selected_api(self):
+        scan_result = {
+            "edges": [], "complete": True, "artifact_sha256": "a" * 64, "failures": [],
+        }
+        inventory = {"classes": {}, "resources": {}, "containers": set()}
+        with mock.patch.object(
+            topology_coverage, "scan_final_artifact", return_value=scan_result
+        ) as scan_oracle, mock.patch.object(
+            topology_coverage, "_archive_inventory", return_value=inventory
+        ):
+            topology_coverage.extract_artifact_topology_evidence(
+                Path("artifact.jar"),
+                [{
+                    "api_name": "fixture.Target.changed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                }],
+                {},
+            )
+
+        scan_oracle.assert_called_once_with(
+            Path("artifact.jar"),
+            selected_targets=[{
+                "owner": "fixture.Target", "member": "changed", "descriptor": "",
+            }],
+        )
+
+    def test_boot_inventory_ignores_duplicate_root_class_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "boot.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("sample/App.class", b"root-copy")
+                archive.writestr("BOOT-INF/classes/sample/App.class", b"runtime-copy")
+                archive.writestr("BOOT-INF/classes/sample/OnlyRuntime.class", b"runtime-only")
+
+            inventory = topology_coverage._archive_inventory(artifact)
+
+        self.assertEqual(
+            sorted(inventory["classes"]),
+            [
+                "BOOT-INF/classes/sample/App.class",
+                "BOOT-INF/classes/sample/OnlyRuntime.class",
+            ],
+        )
+
     def test_classfile_hierarchy_fast_path_avoids_javap_process(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -184,10 +293,14 @@ class TopologyCoverageTest(unittest.TestCase):
             root = Path(temp_dir)
             artifact, expectations = self._build_fixture(root)
             source_root, source_attestation = self._source_attestation(root, artifact, expectations)
-            scan = oracle.scan_final_artifact(artifact)
+            selected_rows = self._selected_api_rows(expectations)
+            scan = oracle.scan_final_artifact(
+                artifact,
+                selected_targets=topology_coverage._oracle_targets_from_rows(selected_rows),
+            )
             evidence = topology_coverage.extract_artifact_topology_evidence(
                 artifact,
-                self._selected_api_rows(expectations),
+                selected_rows,
                 {
                     "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
                     "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
@@ -413,8 +526,8 @@ class TopologyCoverageTest(unittest.TestCase):
         wrong_contract_provider = "topology.business.WrongContractProvider"
         colocated_reflection = "topology.business.CoLocatedReflection"
         adversarial_reflection = "topology.business.AdversarialReflection"
-        self.assertTrue(any(row["caller_owner"] == unrelated_dynamic and row["opcode_family"] == "invokedynamic" for row in evidence["edges"]))
-        self.assertTrue(any(row["caller_owner"] == unrelated_reflection and row["callee_member"] == "forName" for row in evidence["edges"]))
+        self.assertFalse(any(row["caller_owner"] == unrelated_dynamic for row in evidence["edges"]))
+        self.assertFalse(any(row["caller_owner"] == unrelated_reflection for row in evidence["edges"]))
         self.assertFalse(any(item.get("caller", [None])[0] in {unrelated_dynamic, unrelated_reflection} for item in evidence["artifact_layout"]["bootstrap_target_links"] + evidence["artifact_layout"]["reflection_target_links"]))
         self.assertFalse(any(item.get("provider") == unrelated_provider for item in evidence["artifact_layout"]["registrations"]))
         self.assertFalse(any(item.get("provider") == wrong_contract_provider for item in evidence["artifact_layout"]["registrations"]))
@@ -468,9 +581,9 @@ class TopologyCoverageTest(unittest.TestCase):
             artifact, expectations = self._build_fixture(Path(temp_dir))
             selected = self._selected_api_rows(expectations)
             exact_entries = {
-                "topology.target.TargetApi": ["topology/target/TargetApi.class"],
-                "topology.target.TargetInterface": ["topology/target/TargetInterface.class"],
-                "topology.target.SameJarBridge": ["topology/target/SameJarBridge.class"],
+                "topology.target.TargetApi": ["BOOT-INF/lib/target.jar!/topology/target/TargetApi.class"],
+                "topology.target.TargetInterface": ["BOOT-INF/lib/target.jar!/topology/target/TargetInterface.class"],
+                "topology.target.SameJarBridge": ["BOOT-INF/lib/target.jar!/topology/target/SameJarBridge.class"],
             }
             positive = topology_coverage.extract_artifact_topology_evidence(
                 artifact, selected, {}, target_owner_entries=exact_entries,
@@ -480,8 +593,13 @@ class TopologyCoverageTest(unittest.TestCase):
             )
 
         roles = {item.get("entry"): item["role"] for item in positive["artifact_layout"]["entry_layout"] if item.get("entry")}
-        self.assertEqual(roles["topology/business/App.class"], "business")
-        self.assertEqual(roles["topology/target/TargetApi.class"], "target")
+        prefix_roles = {
+            item.get("prefix"): item["role"]
+            for item in positive["artifact_layout"]["entry_layout"]
+            if item.get("prefix")
+        }
+        self.assertEqual(roles["BOOT-INF/classes/topology/business/App.class"], "business")
+        self.assertEqual(prefix_roles["BOOT-INF/lib/target.jar!/"], "target")
         self.assertFalse(negative["complete"])
 
     def test_virtual_dispatch_requires_parsed_target_hierarchy_relation(self):
