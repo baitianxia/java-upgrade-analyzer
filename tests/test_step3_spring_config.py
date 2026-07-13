@@ -14,6 +14,16 @@ import s3_scan as step3  # noqa: E402
 
 
 class Step3SpringConfigTest(unittest.TestCase):
+    def test_dependency_source_dirs_invalid_shape_is_rejected_with_diagnostic(self):
+        step3.reset_scan_diagnostics()
+
+        normalized = step3.normalize_dependency_source_dirs(42)
+
+        self.assertEqual(normalized, [])
+        diagnostics = step3.get_scan_diagnostics()
+        self.assertEqual(diagnostics[0]["stage"], "dependency_source_dirs_input")
+        self.assertEqual(diagnostics[0]["error_type"], "TypeError")
+
     def test_orchestrated_state_parse_failure_is_retained_in_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

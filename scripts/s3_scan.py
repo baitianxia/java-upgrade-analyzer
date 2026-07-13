@@ -71,6 +71,27 @@ def record_scan_diagnostic(*, stage, path, error):
     })
 
 
+def normalize_dependency_source_dirs(value):
+    """Accept only the documented JSON-array form for dependency source roots.
+
+    Step3 state is persisted outside this process.  Do not let a malformed
+    state value (for example a number or a string) turn into an unhandled
+    ``list(value)`` error, or worse, a list of characters that is later treated
+    as source roots.  The diagnostic becomes part of Step3 coverage so the
+    incomplete input is visible to the user.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        record_scan_diagnostic(
+            stage='dependency_source_dirs_input',
+            path='orchestrated_input.dependency_source_dirs',
+            error=TypeError('dependency_source_dirs must be a JSON array'),
+        )
+        return []
+    return [str(item) for item in value if isinstance(item, (str, os.PathLike)) and str(item).strip()]
+
+
 def runtime_state_path(report_dir):
     return Path(report_dir) / RUNTIME_DIRNAME / RUNTIME_STATE_DIRNAME / MAIN_STATE_FILE_NAME
 
@@ -1821,7 +1842,9 @@ def main():
         if not args.include_test_scope and orchestrated_input.get("include_test_scope"):
             args.include_test_scope = True
     global STEP3_DEPENDENCY_SOURCE_DIRS
-    STEP3_DEPENDENCY_SOURCE_DIRS = list(orchestrated_input.get("dependency_source_dirs") or []) if orchestrated_input else []
+    STEP3_DEPENDENCY_SOURCE_DIRS = normalize_dependency_source_dirs(
+        orchestrated_input.get("dependency_source_dirs") if orchestrated_input else None
+    )
     global STEP3_REPORT_DIR
     STEP3_REPORT_DIR = report_dir
     if orchestrated_context:
