@@ -261,6 +261,31 @@ class Step5KeyMatchingTest(unittest.TestCase):
         target_edges = graph_result["graph"].reverse_edges["com.acme.Target.changed()"]
         self.assertEqual(["com.acme.Use.submit"], [edge.caller_qualified_key for edge in target_edges])
 
+    def test_source_graph_binds_hidden_static_method_to_declaring_subclass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Parent.java").write_text(
+                "package com.acme;\nclass Parent { static void changed() {} }\n",
+                encoding="utf-8",
+            )
+            (source_root / "Child.java").write_text(
+                "package com.acme;\nclass Child extends Parent { static void changed() {} }\n",
+                encoding="utf-8",
+            )
+            (source_root / "Use.java").write_text(
+                "package com.acme;\nclass Use { void run() { Child.changed(); } }\n",
+                encoding="utf-8",
+            )
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        graph = graph_result["graph"]
+        self.assertIn("com.acme.Child.changed()", graph.reverse_edges)
+        self.assertNotIn("com.acme.Parent.changed()", graph.reverse_edges)
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
