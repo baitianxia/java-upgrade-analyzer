@@ -2761,6 +2761,37 @@ public class com.example.TargetBridge {
         self.assertIsNone(updated.is_reachable)
         self.assertEqual(updated.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
 
+    def test_complete_bytecode_miss_cannot_clear_changed_inlined_constant(self):
+        api_row = {
+            "coord": "com.vendor:flags",
+            "api_name": "com.vendor.Flags.RETRY_LIMIT",
+            "api_simple": "RETRY_LIMIT",
+            "api_signature": "int",
+            "symbol_kind": "field",
+            "change_type": "CONSTANT_VALUE_CHANGED",
+            "old_value": "3",
+            "new_value": "5",
+            "severity": "P1",
+            "confirmed": "true",
+        }
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+
+        with patch.object(
+            tracer,
+            "_scan_packaged_runtime_dependencies_for_api",
+            return_value={"status": "miss", "hits": []},
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertIsNone(result.is_reachable)
+        self.assertEqual(result.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
+
     def test_path_dominance_keeps_longer_high_confidence_alternative(self):
         frontier = [(1, 0.35)]
 
