@@ -51,6 +51,24 @@ from s4_contract import (
 MAIN_STATE_FILE_NAME = "main_state.json"
 STEP3_DEPENDENCY_SOURCE_DIRS = []
 STEP3_REPORT_DIR = ""
+STEP3_SCAN_DIAGNOSTICS = []
+
+
+def reset_scan_diagnostics():
+    STEP3_SCAN_DIAGNOSTICS.clear()
+
+
+def get_scan_diagnostics():
+    return [dict(item) for item in STEP3_SCAN_DIAGNOSTICS]
+
+
+def record_scan_diagnostic(*, stage, path, error):
+    STEP3_SCAN_DIAGNOSTICS.append({
+        'stage': str(stage),
+        'path': str(path),
+        'error_type': type(error).__name__,
+        'message': str(error),
+    })
 
 
 def runtime_state_path(report_dir):
@@ -194,7 +212,10 @@ def scan_pattern(source_dir, pattern, extensions=('.java',),
                         count += 1
                         if max_per_file and count >= max_per_file:
                             break
-        except Exception:
+        except (OSError, UnicodeError) as exc:
+            record_scan_diagnostic(
+                stage='source_pattern_scan', path=fpath, error=exc,
+            )
             continue
     return results
 
@@ -1704,12 +1725,16 @@ def write_step3_coverage(output_dir, source_roots, planned_scans, executed_scans
     executed = list(dict.fromkeys(executed_scans or []))
     missing = [item for item in planned if item not in executed]
     status = 'complete' if not missing and not read_failures else ('partial' if executed else 'insufficient')
+    scan_diagnostics = get_scan_diagnostics()
+    if scan_diagnostics:
+        status = 'partial' if executed else 'insufficient'
     payload = {
         'schema': 'java-upgrade-analyzer.step3-coverage.v1',
         'status': status,
         'reason_codes': (
             (['planned_scan_not_executed'] if missing else [])
             + (['source_file_read_failures'] if read_failures else [])
+            + (['scan_operation_failures'] if scan_diagnostics else [])
         ),
         'source_roots': list(source_roots or []),
         'planned_scans': planned,
@@ -1722,6 +1747,7 @@ def write_step3_coverage(output_dir, source_roots, planned_scans, executed_scans
             'read_failures': len(read_failures),
         },
         'failures': read_failures,
+        'scan_diagnostics': scan_diagnostics,
     }
     packs = []
     for pack_id in ('jdk', 'jakarta', 'spring-boot'):
@@ -1836,6 +1862,7 @@ def main():
             # 没有指定升级类型，运行全部
             to_run = list(SCAN_FUNCS.keys())
 
+        reset_scan_diagnostics()
         cleanup_step3_outputs(args.output_dir)
         os.makedirs(args.output_dir, exist_ok=True)
         emit_progress(
@@ -1881,6 +1908,7 @@ def main():
         )
 
     else:
+        reset_scan_diagnostics()
         func, default_fname = SCAN_FUNCS[args.type]
         output = args.output or os.path.join(args.output_dir, default_fname)
         emit_progress("step3", "scan", f"开始执行 {args.type}", item=default_fname)

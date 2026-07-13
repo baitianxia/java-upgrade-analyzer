@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -12,6 +13,20 @@ import s3_scan as step3  # noqa: E402
 
 
 class Step3SpringConfigTest(unittest.TestCase):
+    def test_source_read_failure_is_retained_in_step3_scan_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "Broken.java"
+            source.write_text("class Broken {}", encoding="utf-8")
+            step3.reset_scan_diagnostics()
+            with patch.object(step3, "open_text", side_effect=OSError("denied")):
+                hits = step3.scan_pattern(str(source.parent), r"Broken")
+
+        self.assertEqual(hits, [])
+        diagnostics = step3.get_scan_diagnostics()
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["stage"], "source_pattern_scan")
+        self.assertEqual(diagnostics[0]["error_type"], "OSError")
+
     def test_yaml_anchor_on_mapping_keeps_nested_key_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
