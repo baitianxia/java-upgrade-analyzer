@@ -370,6 +370,25 @@ class S5QueryCallChainTest(unittest.TestCase):
             ],
         )
 
+    def test_query_falls_back_to_alerts_when_changed_symbol_includes_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            alerts = report_dir / "evidence" / "call_chain" / "alerts.csv"
+            alerts.parent.mkdir(parents=True)
+            alerts.write_text(
+                "changed_symbol,api_signature,path_status,path_text\n"
+                "com.vendor.LegacyApi.removed(String),(String),reachable,"
+                "com.app.App.run -> com.vendor.LegacyApi.removed(String)\n",
+                encoding="utf-8",
+            )
+
+            chains = query_alert_chains(report_dir, "com.vendor.LegacyApi.removed(String)")
+
+        self.assertEqual(
+            chains,
+            ["com.app.App.run → com.vendor.LegacyApi.removed(String)"],
+        )
+
     def test_alert_fallback_rejects_exact_symbol_with_wrong_path_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

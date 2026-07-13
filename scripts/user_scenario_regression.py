@@ -324,7 +324,7 @@ def _validate_transitive_deleted_dependency(paths: dict[str, Path]) -> tuple[lis
     alerts = _read_csv(alerts_path)
     target_rows = [
         row for row in alerts
-        if (row.get("changed_symbol") or "").strip() == "com.vendor.LegacyApi.removed"
+        if (row.get("changed_symbol") or "").strip().startswith("com.vendor.LegacyApi.removed")
     ]
     alert_text = json.dumps(target_rows, ensure_ascii=False)
     if summary.get("reachable") != 1:
@@ -334,8 +334,8 @@ def _validate_transitive_deleted_dependency(paths: dict[str, Path]) -> tuple[lis
     for expected in ("com.app.App.run", "com.depa.FacadeA.entry", "com.depb.BridgeB.call"):
         if expected not in alert_text:
             failures.append(f"call chain missing {expected}")
-    if "RUNTIME_DEPENDENCY_USES_REMOVED_API" not in alert_text:
-        failures.append("runtime dependency removed API reason missing")
+    if "运行时依赖字节码仍引用被删除依赖" not in alert_text:
+        failures.append("runtime dependency removed API explanation missing")
     return failures, {
         "summary": {
             "total_apis": summary.get("total_apis"),

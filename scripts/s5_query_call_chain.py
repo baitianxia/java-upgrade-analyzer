@@ -373,9 +373,12 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
             if _clean(row.get("path_status")) and _clean(row.get("path_status")) != "reachable":
                 continue
             changed_symbol = _clean(row.get("changed_symbol"))
-            if changed_symbol != method_name:
+            row_method_name, embedded_signature = _split_method_and_signature(changed_symbol)
+            if row_method_name != method_name:
                 continue
-            row_signature = normalize_signature_for_lookup(_clean(row.get("api_signature")))
+            row_signature = normalize_signature_for_lookup(
+                _clean(row.get("api_signature")) or embedded_signature
+            )
             if wanted_signature and row_signature and row_signature != wanted_signature:
                 continue
             path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
