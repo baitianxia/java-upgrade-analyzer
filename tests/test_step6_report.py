@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import csv
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,19 @@ import s6_report  # noqa: E402
 
 
 class Step6ReportObjectivityTest(unittest.TestCase):
+    def test_csv_rows_can_be_consumed_without_materializing_a_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "alerts.csv"
+            path.write_text("api,path_status\na,reached\nb,uncertain\n", encoding="utf-8")
+
+            rows = s6_report.iter_csv_rows(path)
+            first = next(rows)
+            remaining = list(rows)
+
+        self.assertNotIsInstance(rows, list)
+        self.assertEqual(first["api"], "a")
+        self.assertEqual([row["api"] for row in remaining], ["b"])
+
     def test_invalid_json_input_is_reported_as_a_findings_diagnostic(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "broken.json"

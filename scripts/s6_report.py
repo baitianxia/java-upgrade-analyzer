@@ -271,6 +271,22 @@ def load_csv(path, *, diagnostics=None, artifact=""):
     return rows
 
 
+def iter_csv_rows(path, *, diagnostics=None, artifact=""):
+    """Yield normalized CSV rows without retaining the full file in memory."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open_text(path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row:
+                    yield {key: (value or '').strip() for key, value in row.items()}
+    except (OSError, UnicodeError, csv.Error) as exc:
+        _record_diagnostic(
+            diagnostics, artifact=artifact, stage="csv_stream", path=path, error=exc
+        )
+
+
 def count_lines(path):
     if not os.path.exists(path):
         return -1
@@ -730,24 +746,38 @@ def write_changed_api_split_artifacts(report_dir):
             pass
 
     try:
-        with source_path.open(encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            fieldnames = list(reader.fieldnames or [])
-            rows = list(reader)
+        source = source_path.open(encoding="utf-8-sig", newline="")
     except OSError:
         return artifacts
 
-    if not fieldnames or not rows:
-        return artifacts
-
     part_count = 0
-    for start in range(0, len(rows), S6_CHANGED_API_SPLIT_ROWS):
-        part_count += 1
-        part_path = split_dir / f"all_changed_apis_part_{part_count:03d}.csv"
-        with part_path.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows[start:start + S6_CHANGED_API_SPLIT_ROWS])
+    row_count = 0
+    output = None
+    try:
+        with source:
+            reader = csv.DictReader(source)
+            fieldnames = list(reader.fieldnames or [])
+            if not fieldnames:
+                return artifacts
+            for row in reader:
+                if row_count % S6_CHANGED_API_SPLIT_ROWS == 0:
+                    if output is not None:
+                        output.close()
+                    part_count += 1
+                    part_path = split_dir / f"all_changed_apis_part_{part_count:03d}.csv"
+                    output = part_path.open("w", encoding="utf-8", newline="")
+                    writer = csv.DictWriter(output, fieldnames=fieldnames)
+                    writer.writeheader()
+                writer.writerow(row)
+                row_count += 1
+    except (OSError, csv.Error):
+        return artifacts
+    finally:
+        if output is not None:
+            output.close()
+
+    if not row_count:
+        return artifacts
 
     artifacts["changed_apis_split_pattern"] = "evidence/api_changes/all_changed_apis_part_*.csv"
     artifacts["changed_apis_split_count"] = part_count
@@ -1110,7 +1140,7 @@ def collect_findings(d):
     findings['scan_stats']['changed_apis_p0'] = sum(
         1 for r in changed_apis if r.get('severity') == 'P0')
     findings['impact_overview'] = build_impact_overview(
-        load_csv(
+        iter_csv_rows(
             _call_chain_dir(d) / "alerts.csv",
             diagnostics=diagnostics,
             artifact='call_chain_alerts',
