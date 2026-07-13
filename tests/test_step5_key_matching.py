@@ -141,6 +141,27 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertIn("com.acme.Target.changed(Object[])", graph_result["graph"].reverse_edges)
 
+    def test_source_graph_resolves_dubbo_reference_interface_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "RemoteApi.java").write_text(
+                "package com.acme;\ninterface RemoteApi { String changed(String value); }\n",
+                encoding="utf-8",
+            )
+            (source_root / "Consumer.java").write_text(
+                "package com.acme; import org.apache.dubbo.config.annotation.DubboReference; "
+                "class Consumer { @DubboReference RemoteApi api; String run(String value) { return api.changed(value); } }\n",
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        self.assertIn("com.acme.RemoteApi.changed(String)", graph_result["graph"].reverse_edges)
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"

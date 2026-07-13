@@ -1288,6 +1288,7 @@ class TreeSitterAnalyzer:
         # 构建AST
         tree = self.parser.parse(source_code)
         self.error_nodes = self._count_error_nodes(tree.root_node)
+        self._merge_ast_field_types(tree.root_node, source_code)
 
         # 提取方法定义
         methods = self._extract_methods_from_ast(tree.root_node, source_code, lines)
@@ -1343,6 +1344,35 @@ class TreeSitterAnalyzer:
                     methods.append(method_def)
 
         return methods
+
+    def _merge_ast_field_types(self, root_node, source_code):
+        """Add AST field declarations to the legacy line-based field index.
+
+        The AST is authoritative for Java structure.  Keeping this small
+        extraction alongside the compatibility scanner avoids losing a field
+        declaration merely because valid Java statements share a physical line
+        (a common shape in generated sources).
+        """
+        for node in self._walk_ast(root_node):
+            if node.type != 'field_declaration':
+                continue
+            type_node = node.child_by_field_name('type')
+            if type_node is None:
+                continue
+            raw_type = self._node_text(type_node, source_code).strip()
+            if not raw_type:
+                continue
+            resolved_type = self.helper._resolve_type(raw_type)
+            for declarator in node.children:
+                if declarator.type != 'variable_declarator':
+                    continue
+                name_node = declarator.child_by_field_name('name')
+                if name_node is None:
+                    continue
+                field_name = self._node_text(name_node, source_code).strip()
+                if field_name:
+                    self.helper.field_types[field_name] = resolved_type
+                    self.helper.field_declared_types[field_name] = raw_type
 
     def _count_error_nodes(self, root_node):
         return sum(1 for node in self._walk_ast(root_node) if node.type == 'ERROR')
