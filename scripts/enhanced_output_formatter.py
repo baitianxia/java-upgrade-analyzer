@@ -175,6 +175,8 @@ def trace_result_to_api_entry(r):
 
     return {
         'coord':               r.coord,
+        'old_version':         getattr(r, 'old_version', '') or '',
+        'new_version':         getattr(r, 'new_version', '') or '',
         'api':                 r.api_name,
         'api_name':            r.api_name,
         'api_simple':          r.api_simple,
@@ -214,6 +216,15 @@ def _api_display_name(result):
     if api_name and signature and not api_name.endswith(signature):
         return f"{api_name}{signature}"
     return api_name or str(getattr(result, 'api_simple', '') or '').strip() or '<unknown-api>'
+
+
+def _target_coord_display(result):
+    coord = str(getattr(result, 'coord', '') or '').strip()
+    old_version = str(getattr(result, 'old_version', '') or '').strip()
+    new_version = str(getattr(result, 'new_version', '') or '').strip()
+    if coord and (old_version or new_version):
+        return f"{coord}（{old_version or '?'} → {new_version or '?'}）"
+    return coord
 
 
 def _short_api_name(result):
@@ -1463,7 +1474,7 @@ def _alert_rows_for_result(result):
             'chain_detail': chain_view['detail'],
             'api_id': api_id,
             'path_id': path_id,
-            'target_coord': result.coord,
+            'target_coord': _target_coord_display(result),
             'changed_symbol': changed_symbol,
             'api_signature': getattr(result, 'api_signature', '') or '',
             'symbol_kind': getattr(result, 'symbol_kind', '') or '',

@@ -681,6 +681,10 @@ class TraceResult:
     critical_nodes_hit: list
     match_provenance: str = ''
     match_tier: int = -1
+    # Step4's compared versions are carried into user-facing evidence instead
+    # of forcing reviewers to look up the coordinate in a separate file.
+    old_version: str = ''
+    new_version: str = ''
     # 全部终止链路的人工复核视图；call_paths/evidence_paths 保留兼容语义。
     path_details: list = field(default_factory=list)
     capability_coverage: dict = field(default_factory=dict)
@@ -4531,6 +4535,8 @@ def trace_api_with_confidence_weighting(
         critical_nodes_hit=[],
         match_provenance='',
         match_tier=-1,
+        old_version=str(api_row.get('old_version') or '').strip(),
+        new_version=str(api_row.get('new_version') or '').strip(),
         capability_coverage=_capability_coverage_for_api(api_row, graph),
     )
     _step5_debug(

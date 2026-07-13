@@ -8820,6 +8820,22 @@ public class com.example.TargetBridge {
         self.assertEqual("com.vendor.Bridge.call()", row["chain_entry"])
         self.assertNotIn("com.vendor:consumer:1.0:com.vendor.Bridge", row["chain_detail"])
 
+    def test_alert_target_coordinate_retains_compared_versions(self):
+        result = tracer.TraceResult(
+            coord="com.acme:library", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="not_found_in_static_analysis", direct_callers=0, is_reachable=False,
+            reachable_note="未找到", business_reach_depth=0,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[], reason_code="NO_STATIC_PATH",
+            verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[],
+            old_version="1.0.0", new_version="2.0.0",
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("com.acme:library（1.0.0 → 2.0.0）", row["target_coord"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
