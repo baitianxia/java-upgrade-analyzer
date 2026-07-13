@@ -8665,6 +8665,20 @@ public class com.example.TargetBridge {
             summary["not_analyzed_reason_summary"],
         )
 
+    def test_summary_api_entry_hides_unmatched_internal_tier(self):
+        entry = formatter.trace_result_to_api_entry(
+            tracer.TraceResult(
+                coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+                api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+                confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+                reachable_note="缺少输入", business_reach_depth=0,
+                dependency_chain_coords=[], call_paths=[], evidence_paths=[], reason_code="INPUT_MISSING",
+                verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[], match_tier=-1,
+            )
+        )
+        self.assertIsNone(entry["match_tier"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

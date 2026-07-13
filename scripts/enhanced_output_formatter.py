@@ -162,6 +162,11 @@ def trace_result_to_api_entry(r):
 
 
     user_view = summarize_user_facing_outcome(r)
+    raw_match_tier = getattr(r, 'match_tier', -1)
+    try:
+        public_match_tier = int(raw_match_tier) if raw_match_tier is not None and int(raw_match_tier) >= 0 else None
+    except (TypeError, ValueError):
+        public_match_tier = None
 
     return {
         'coord':               r.coord,
@@ -188,7 +193,7 @@ def trace_result_to_api_entry(r):
         'verification_commands': r.verification_commands or [],
         'confidence_score':    round(r.confidence_score, 3),
         'match_provenance':    getattr(r, 'match_provenance', '') or '',
-        'match_tier':          getattr(r, 'match_tier', -1),
+        'match_tier':          public_match_tier,
         'critical_nodes_hit':  r.critical_nodes_hit or [],
         'user_conclusion':     user_view['user_conclusion'],
         'decision_bucket':     user_view['decision_bucket'],
