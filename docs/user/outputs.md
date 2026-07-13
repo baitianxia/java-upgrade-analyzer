@@ -86,6 +86,8 @@ Step3 用于识别 JDK、Jakarta、Spring 等框架升级带来的背景风险�
 
 这些结果不能直接证明业务受影响；是否影响当前系统，需要结合 Step5。
 
+如果 Step6 的 `findings` 中存在 `diagnostics`，说明某个前序 JSON 或 CSV 无法读取或格式损坏。该文件对应的数据不会被当作“没有风险”；请先按 `artifact`、`path` 和 `error_type` 排查输入。
+
 常见文件：
 
 | 文件 | 说明 |

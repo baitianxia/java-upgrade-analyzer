@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,6 +11,20 @@ import s6_report  # noqa: E402
 
 
 class Step6ReportObjectivityTest(unittest.TestCase):
+    def test_invalid_json_input_is_reported_as_a_findings_diagnostic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "broken.json"
+            path.write_text("{not-json", encoding="utf-8")
+            diagnostics = []
+
+            value = s6_report.load_json(path, diagnostics=diagnostics, artifact="step5_summary")
+
+        self.assertEqual(value, {})
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["artifact"], "step5_summary")
+        self.assertEqual(diagnostics[0]["stage"], "json_load")
+        self.assertEqual(diagnostics[0]["error_type"], "JSONDecodeError")
+
     def test_report_template_does_not_use_prescriptive_action_words(self):
         forbidden = [
             "建议修改",

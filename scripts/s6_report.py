@@ -229,17 +229,32 @@ S6_DETAIL_BUCKETS = {
 }
 
 
-def load_json(path):
+def _record_diagnostic(diagnostics, *, artifact, stage, path, error):
+    if diagnostics is None:
+        return
+    diagnostics.append({
+        "artifact": str(artifact or Path(path).name),
+        "stage": stage,
+        "path": str(path),
+        "error_type": type(error).__name__,
+        "message": str(error),
+    })
+
+
+def load_json(path, *, diagnostics=None, artifact=""):
     if not os.path.exists(path):
         return {}
     try:
         with open_text(path) as f:
             return json.load(f)
-    except Exception:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        _record_diagnostic(
+            diagnostics, artifact=artifact, stage="json_load", path=path, error=exc
+        )
         return {}
 
 
-def load_csv(path):
+def load_csv(path, *, diagnostics=None, artifact=""):
     if not os.path.exists(path):
         return []
     rows = []
@@ -249,8 +264,10 @@ def load_csv(path):
             for row in reader:
                 if row:
                     rows.append({k: (v or '').strip() for k, v in row.items()})
-    except Exception:
-        pass
+    except (OSError, UnicodeError, csv.Error) as exc:
+        _record_diagnostic(
+            diagnostics, artifact=artifact, stage="csv_load", path=path, error=exc
+        )
     return rows
 
 
@@ -259,11 +276,11 @@ def count_lines(path):
         return -1
     try:
         with open_text(path) as f:
-            lines = [l for l in f if l.strip() and not l.startswith('#')]
+            line_count = sum(1 for line in f if line.strip() and not line.startswith('#'))
         if path.endswith('.csv'):
-            return max(len(lines) - 1, 0)  # 排除 CSV 表头
-        return len(lines)
-    except Exception:
+            return max(line_count - 1, 0)  # 排除 CSV 表头
+        return line_count
+    except (OSError, UnicodeError):
         return -1
 
 
@@ -1015,12 +1032,16 @@ def collect_findings(d):
             'business_entries': [],
         },
         'coverage': {},
+        'diagnostics': [],
     }
+    diagnostics = findings['diagnostics']
 
-    findings['coverage'] = load_json(_coverage_path(d))
+    findings['coverage'] = load_json(
+        _coverage_path(d), diagnostics=diagnostics, artifact='coverage'
+    )
 
     # Step 2 上下文
-    ctx = load_json(_context_path(d))
+    ctx = load_json(_context_path(d), diagnostics=diagnostics, artifact='context')
     findings['context'] = {
         'jdk':        f"{ctx.get('jdk_base','?')} → {ctx.get('jdk_current','?')}",
         'springboot': f"{ctx.get('springboot_base','?')} → {ctx.get('springboot_current','?')}",
@@ -1031,7 +1052,9 @@ def collect_findings(d):
     }
 
     # Step 1 依赖变更统计
-    dep_rows = load_csv(_dep_changes_path(d))
+    dep_rows = load_csv(
+        _dep_changes_path(d), diagnostics=diagnostics, artifact='dependency_changes'
+    )
     dep_change_lookup = {}
     dep_counts = defaultdict(int)
     for row in dep_rows:
@@ -1054,7 +1077,11 @@ def collect_findings(d):
     ]:
         findings['scan_stats'][name] = count_lines(path)
 
-    dep_compat_rows = load_csv(static_dir / "s3_dependency_compat.csv")
+    dep_compat_rows = load_csv(
+        static_dir / "s3_dependency_compat.csv",
+        diagnostics=diagnostics,
+        artifact='step3_dependency_compat',
+    )
     findings['scan_stats']['dep_compat'] = len(dep_compat_rows)
     if dep_compat_rows:
         by_type = defaultdict(int)
@@ -1074,16 +1101,28 @@ def collect_findings(d):
         }
 
     # Step 4 jar 变更
-    changed_apis = load_csv(_api_changes_dir(d) / "all_changed_apis.csv")
+    changed_apis = load_csv(
+        _api_changes_dir(d) / "all_changed_apis.csv",
+        diagnostics=diagnostics,
+        artifact='changed_apis',
+    )
     findings['scan_stats']['changed_apis_total'] = len(changed_apis)
     findings['scan_stats']['changed_apis_p0'] = sum(
         1 for r in changed_apis if r.get('severity') == 'P0')
     findings['impact_overview'] = build_impact_overview(
-        load_csv(_call_chain_dir(d) / "alerts.csv")
+        load_csv(
+            _call_chain_dir(d) / "alerts.csv",
+            diagnostics=diagnostics,
+            artifact='call_chain_alerts',
+        )
     )
 
     # Step 5 调用链
-    call_summary = load_json(_call_chain_dir(d) / "summary.json")
+    call_summary = load_json(
+        _call_chain_dir(d) / "summary.json",
+        diagnostics=diagnostics,
+        artifact='call_chain_summary',
+    )
     impacted_coords = set()
     if call_summary:
         if not findings.get('coverage'):
@@ -1242,7 +1281,11 @@ def collect_findings(d):
         for fname in os.listdir(by_api_dir):
             if not fname.endswith('.json'):
                 continue
-            payload = load_json(os.path.join(by_api_dir, fname))
+            payload = load_json(
+                os.path.join(by_api_dir, fname),
+                diagnostics=diagnostics,
+                artifact=f'call_chain_by_api:{fname}',
+            )
             identity_key = build_api_identity_key(payload)
             if identity_key[0] and identity_key[1]:
                 by_api_lookup[identity_key] = payload
@@ -1286,7 +1329,11 @@ def collect_findings(d):
         for fname in sorted(os.listdir(module_dir)):
             if not fname.endswith('_impacts.json'):
                 continue
-            data = load_json(os.path.join(module_dir, fname))
+            data = load_json(
+                os.path.join(module_dir, fname),
+                diagnostics=diagnostics,
+                artifact=f'call_chain_by_module:{fname}',
+            )
             if data.get('impacts'):
                 mod = data.get('module', fname.replace('_impacts.json', ''))
                 findings['module_impacts'][mod] = {
