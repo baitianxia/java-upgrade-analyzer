@@ -8744,6 +8744,35 @@ public class com.example.TargetBridge {
 
         self.assertEqual("com.acme.Api.gone(java.lang.String, boolean)", row["changed_symbol"])
 
+    def test_alert_evidence_paths_are_relative_to_the_alert_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "evidence" / "call_chain"
+            report_dir.mkdir(parents=True)
+            source_file = Path(tmp) / "project" / "src" / "App.java"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("class App {}", encoding="utf-8")
+            result = tracer.TraceResult(
+                coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+                api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+                confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="reachable", direct_callers=1, is_reachable=True,
+                reachable_note="已命中", business_reach_depth=1,
+                dependency_chain_coords=[], call_paths=["com.acme.App.run() -> com.acme.Api.gone()"],
+                evidence_paths=[[{
+                    "caller_symbol": "com.acme.App.run()", "callee_key": "com.acme.Api.gone()",
+                    "evidence_type": "ast_method_invocation", "owner_coord": "__business__",
+                    "file": str(source_file),
+                }]], reason_code="SYSTEM_CODE_REACHABLE", verification_commands=[], hops=[],
+                confidence_score=1.0, critical_nodes_hit=[],
+            )
+            output = report_dir / "alerts.csv"
+            formatter.generate_alerts_csv([result], output)
+            with output.open(encoding="utf-8") as handle:
+                row = next(csv.DictReader(handle))
+
+        self.assertFalse(Path(row["evidence_files"]).is_absolute())
+        self.assertEqual("../../project/src/App.java", row["evidence_files"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

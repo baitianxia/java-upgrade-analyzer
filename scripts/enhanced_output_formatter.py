@@ -1196,12 +1196,40 @@ def generate_alerts_csv(all_results, output_path):
         ),
         severity_rank(row['severity']), row['target_coord'], row['changed_symbol'], row['path_id'],
     ))
+    _relativize_alert_evidence_paths(rows, os.path.dirname(os.path.abspath(output_path)))
 
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
     write_alerts_review_splits(rows, os.path.dirname(os.path.abspath(output_path)))
+
+
+def _relativize_alert_evidence_paths(rows, report_dir):
+    """Keep every file reference in alerts.csv portable and consistently relative.
+
+    A report is commonly copied to a CI artifact or sent for review.  Mixing
+    absolute source paths with the relative ``detail_file`` path both leaks
+    machine-specific directories and makes the CSV impossible to relocate.
+    ``jar!/entry.class`` references retain their archive entry suffix.
+    """
+    base = os.path.abspath(report_dir or os.curdir)
+    for row in rows or []:
+        values = []
+        for raw in str(row.get('evidence_files') or '').split('|'):
+            value = raw.strip()
+            if not value:
+                continue
+            path_part, separator, suffix = value.partition('!/')
+            if os.path.isabs(path_part):
+                try:
+                    path_part = os.path.relpath(path_part, base)
+                except ValueError:
+                    # Different Windows drive letters cannot be relativized;
+                    # retain the original path rather than emitting a wrong one.
+                    pass
+            values.append(path_part + (separator + suffix if separator else ''))
+        row['evidence_files'] = '|'.join(dict.fromkeys(values))
 
 
 def write_alerts_review_splits(rows, output_dir, max_rows=None):
