@@ -173,14 +173,13 @@ def build_dep_graph(deps):
             'note': '未找到发生版本变化的依赖，关系图为空',
         }
 
+    # Do not infer effective dependency edges from an artifact's raw POM.  The
+    # consuming project's exclusions and dependencyManagement/BOM mediation
+    # live outside that POM, so such edges can describe a relationship Maven
+    # explicitly removed.  Step1's packaged artifacts remain authoritative for
+    # dependency presence/version; until a resolved dependency:tree is supplied
+    # this contextual graph deliberately leaves relationships unknown.
     edges = []
-    for coord, dep in changed_deps.items():
-        version = dep['new_version'] if dep['new_version'] != '-' else dep['old_version']
-        if version == '-':
-            continue
-        for sub_coord in get_pom_deps_from_m2(dep['group_id'], dep['artifact_id'], version):
-            if sub_coord in changed_deps:
-                edges.append({'from': coord, 'to': sub_coord})
 
     analysis_order = topological_sort(
         list(changed_deps.keys()),
@@ -209,13 +208,17 @@ def build_dep_graph(deps):
         'edges': edges,
         'analysis_order': analysis_order,
         'total_dependencies': len(changed_deps),
-        'note': f'分析顺序从叶节点（底层依赖）到根节点（主项目直接依赖），共 {len(changed_deps)} 个',
+        'relationship_status': 'not_inferred_without_resolved_tree',
+        'note': (
+            f'共 {len(changed_deps)} 个变更依赖；未获得 Maven/Gradle 最终解析的依赖树，'
+            '不从原始 POM 推测父子边，以避免 BOM 仲裁或 exclusions 造成幽灵关系'
+        ),
         'meta': {
             'what': '升级依赖关系图（只关注发生版本变化的依赖之间的关系）',
             'why': '用于理解升级依赖之间的传播关系与推荐分析顺序（叶→根）',
             'how_to_read': [
-                'analysis_order 表示推荐的分析顺序：先叶子库，再根库',
-                'edges 表示升级依赖之间的依赖边：from 依赖 to',
+                'analysis_order 仅是稳定的变更依赖顺序，不表示未经证明的传递关系',
+                'edges 只能承载构建工具最终解析后的关系；当前无该证据时保持为空',
                 'dependencies 只包含发生版本变化的依赖，不再区分内部库/第三方库',
             ],
         },

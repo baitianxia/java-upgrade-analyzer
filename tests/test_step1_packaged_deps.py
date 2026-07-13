@@ -96,6 +96,32 @@ class Step1PackagedDepsTest(unittest.TestCase):
             ["org.example:demo-lib"],
         )
 
+    def test_final_artifact_is_authoritative_for_bom_and_exclusion_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_path = Path(tmp) / "app.jar"
+            selected = self._nested_jar_bytes([
+                (
+                    "META-INF/maven/org.example/selected/pom.properties",
+                    "groupId=org.example\nartifactId=selected\nversion=2.0.0\n",
+                )
+            ])
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                # selected:2.0.0 represents the BOM-arbitrated runtime version.
+                # An excluded transitive dependency and selected:1.0.0 are not
+                # physically packaged and therefore must not enter analysis.
+                outer.writestr("BOOT-INF/lib/selected-2.0.0.jar", selected)
+
+            packaged_deps, _meta = s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                str(artifact_path),
+                runtime_deps={
+                    "org.example:selected": {"version": "1.0.0", "scope": "runtime"},
+                    "org.example:excluded": {"version": "9.9.9", "scope": "runtime"},
+                },
+            )
+
+        self.assertEqual(set(packaged_deps), {"org.example:selected"})
+        self.assertEqual(packaged_deps["org.example:selected"]["version"], "2.0.0")
+
     def test_filename_only_nested_jar_uses_unique_local_m2_sha_match(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

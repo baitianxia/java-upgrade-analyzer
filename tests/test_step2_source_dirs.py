@@ -15,6 +15,29 @@ import gate  # noqa: E402
 
 
 class Step2SourceDirsTest(unittest.TestCase):
+    def test_dependency_graph_does_not_infer_edges_from_raw_dependency_poms(self):
+        deps = {
+            "org.example:parent": {
+                "coord": "org.example:parent", "old_version": "1", "new_version": "2",
+                "change_type": "升级", "scope": "packaged",
+            },
+            "org.example:excluded": {
+                "coord": "org.example:excluded", "old_version": "1", "new_version": "2",
+                "change_type": "升级", "scope": "packaged",
+            },
+        }
+
+        with patch.object(
+            step2,
+            "get_pom_deps_from_m2",
+            return_value=["org.example:excluded"],
+        ) as raw_pom_lookup:
+            graph = step2.build_dep_graph(deps)
+
+        self.assertEqual(graph["edges"], [])
+        self.assertEqual(graph["relationship_status"], "not_inferred_without_resolved_tree")
+        raw_pom_lookup.assert_not_called()
+
     def test_explicit_source_dirs_override_auto_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
