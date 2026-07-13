@@ -317,6 +317,23 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertNotEqual("not_found_in_static_analysis", result.analysis_status)
 
+    def test_source_graph_keeps_optional_method_reference_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Use.java").write_text(
+                "package com.acme;\nimport java.util.Optional;\n"
+                "class Use { void changed(String value) {} "
+                "void run(String value) { Optional.ofNullable(value).ifPresent(this::changed); } }\n",
+                encoding="utf-8",
+            )
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        self.assertIn("com.acme.Use.changed(String)", graph_result["graph"].reverse_edges)
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
