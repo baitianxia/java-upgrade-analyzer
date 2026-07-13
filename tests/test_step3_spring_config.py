@@ -1,4 +1,5 @@
 import csv
+import os
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,23 @@ import s3_scan as step3  # noqa: E402
 
 
 class Step3SpringConfigTest(unittest.TestCase):
+    def test_orchestrated_state_parse_failure_is_retained_in_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            state = step3.runtime_state_path(report_dir)
+            state.parent.mkdir(parents=True)
+            state.write_text("{bad-json", encoding="utf-8")
+            step3.reset_scan_diagnostics()
+
+            with patch.dict(os.environ, {"JUA_ORCHESTRATED": "1"}):
+                step_input, context = step3.load_orchestrated_step3_input(str(report_dir))
+
+        self.assertEqual(step_input, {})
+        self.assertEqual(context, {})
+        diagnostics = step3.get_scan_diagnostics()
+        self.assertEqual(diagnostics[0]["stage"], "orchestrated_state_load")
+        self.assertEqual(diagnostics[0]["error_type"], "JSONDecodeError")
+
     def test_source_read_failure_is_retained_in_step3_scan_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "Broken.java"

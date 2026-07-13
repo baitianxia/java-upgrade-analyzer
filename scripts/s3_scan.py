@@ -91,13 +91,19 @@ def load_orchestrated_step3_input(report_dir):
         try:
             with open(state_path, "r", encoding="utf-8") as f:
                 main_state = json.load(f)
-        except Exception:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            record_scan_diagnostic(
+                stage='orchestrated_state_load', path=state_path, error=exc,
+            )
             main_state = {}
     if context_file.exists():
         try:
             with open(context_file, "r", encoding="utf-8") as f:
                 context = json.load(f)
-        except Exception:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            record_scan_diagnostic(
+                stage='orchestrated_context_load', path=context_file, error=exc,
+            )
             context = {}
     step_input = dict((((main_state or {}).get("step3") or {}).get("input")) or {})
     return step_input, dict(context or {})
@@ -254,7 +260,8 @@ def load_dep_changes(csv_path):
                     continue
                 if normalized.get('coord'):
                     rows.append(normalized)
-    except Exception:
+    except (OSError, UnicodeError, csv.Error) as exc:
+        record_scan_diagnostic(stage='dependency_changes_load', path=csv_path, error=exc)
         return []
     return rows
 
@@ -305,7 +312,8 @@ def load_current_deps(csv_path):
                 if not version or version == '-':
                     continue
                 deps.append({'coord': coord, 'version': version, 'scope': scope})
-    except Exception:
+    except (OSError, UnicodeError, csv.Error) as exc:
+        record_scan_diagnostic(stage='current_dependencies_load', path=csv_path, error=exc)
         return []
     return deps
 
@@ -362,7 +370,8 @@ def _safe_read_lines(path, limit=500):
                 text = line.rstrip('\r\n')
                 if text.strip():
                     rows.append((lineno, text[:300]))
-    except Exception:
+    except (OSError, UnicodeError) as exc:
+        record_scan_diagnostic(stage='safe_line_read', path=path, error=exc)
         return []
     return rows
 
