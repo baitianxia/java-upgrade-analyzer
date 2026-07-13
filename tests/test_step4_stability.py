@@ -281,6 +281,30 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertIn("METHOD_NEW_DEFAULT", source_only["compatibility_flags"])
         self.assertEqual(by_name["com.acme.Api.gone"]["change_type"], "REMOVED")
 
+    def test_parse_japicmp_xml_keeps_all_compatibility_flags_without_downgrading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "diff.xml"
+            xml_path.write_text(
+                """<japicmp><classes>
+                <class name="com.acme.Api" changeStatus="MODIFIED" binaryCompatible="false" sourceCompatible="false">
+                  <methods><method name="call" changeStatus="MODIFIED" binaryCompatible="false" sourceCompatible="false">
+                    <compatibilityChanges>
+                      <compatibilityChange type="METHOD_LESS_ACCESSIBLE"/>
+                      <compatibilityChange type="METHOD_REMOVED_IN_SUPERCLASS"/>
+                    </compatibilityChanges>
+                  </method></methods>
+                </class></classes></japicmp>""",
+                encoding="utf-8",
+            )
+            rows = step4.parse_japicmp_xml(xml_path, "com.acme:api", "1", "2")
+
+        self.assertEqual("SIGNATURE_CHANGED", rows[0]["change_type"])
+        self.assertEqual("P0", rows[0]["severity"])
+        self.assertEqual(
+            "METHOD_LESS_ACCESSIBLE|METHOD_REMOVED_IN_SUPERCLASS",
+            rows[0]["compatibility_flags"],
+        )
+
     def test_parse_japicmp_xml_preserves_constant_value_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml_path = Path(tmp) / "diff.xml"
