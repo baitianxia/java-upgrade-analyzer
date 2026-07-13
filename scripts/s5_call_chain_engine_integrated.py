@@ -3317,6 +3317,36 @@ def build_enhanced_source_graph(
         if getattr(method_def, 'method_name', '') == '<class-init>':
             continue
         edges = extract_call_edges_enhanced(method_def, include_low_confidence=False)
+        # Annotation members with a changed default are semantically consumed
+        # even when a source use omits that member (`@TargetAnno`).  Index the
+        # annotation-owner usage separately; the tracer only consults this key
+        # for a concrete changed member of the same annotation type.
+        annotation_names = list(dict.fromkeys(
+            list(getattr(method_def, 'class_annotations', []) or [])
+            + list(getattr(method_def, 'annotations', []) or [])
+        ))
+        for annotation_name in annotation_names:
+            annotation_fqcn = resolve_type_name(annotation_name, {
+                'imports': getattr(method_def, 'imports', {}) or {},
+                'package_name': getattr(method_def, 'package_name', '') or '',
+            })
+            if not annotation_fqcn:
+                continue
+            edges.append(CallEdge(
+                caller_symbol_id=method_def.symbol_id,
+                caller_qualified_key=method_def.qualified_key,
+                callee_key=f"annotation:{annotation_fqcn}",
+                callee_simple_key=f"annotation:{annotation_name}",
+                evidence_type='annotation_default_usage',
+                confidence='medium',
+                file=method_def.file,
+                line=method_def.line,
+                content=f"@{annotation_name}",
+                owner_type=method_def.owner_type,
+                owner_coord=method_def.owner_coord,
+                module=method_def.module,
+                is_test=method_def.is_test,
+            ))
         for edge in edges:
             edge_keys = build_reverse_edge_keys(edge)
 

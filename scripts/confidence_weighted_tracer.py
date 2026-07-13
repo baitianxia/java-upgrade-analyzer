@@ -6999,6 +6999,13 @@ def build_api_target_key_groups(api_row, graph=None, type_metadata=None):
                     exact_keys.append(f"{api_name}{normalized_signature}")
             append_key_group(groups, 'exact_signature', exact_keys)
             append_key_group(groups, 'exact_name', [api_name])
+            # A changed annotation member default affects every source use of
+            # that annotation which omits the member.  Annotation usage is
+            # indexed by owner rather than guessed member name, and stays in a
+            # separate group so it cannot weaken exact method matching.
+            if '.' in api_name:
+                annotation_owner = api_name.rsplit('.', 1)[0]
+                append_key_group(groups, 'annotation_default_usage', [f"annotation:{annotation_owner}"])
         else:
             append_key_group(groups, 'exact_name', [api_name])
             if '.' in api_name:

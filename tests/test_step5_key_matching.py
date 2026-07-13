@@ -186,6 +186,41 @@ class Step5KeyMatchingTest(unittest.TestCase):
             graph_result["graph"].reverse_edges,
         )
 
+    def test_annotation_default_member_change_is_not_silently_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "TargetAnno.java").write_text(
+                "package com.acme;\npublic @interface TargetAnno { int timeout() default 10; }\n",
+                encoding="utf-8",
+            )
+            (source_root / "Use.java").write_text(
+                "package com.acme;\n@TargetAnno class Use { void run() {} }\n",
+                encoding="utf-8",
+            )
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+            result = tracer.trace_api_with_confidence_weighting(
+                {
+                    "coord": "com.acme:annotation-api",
+                    "api_name": "com.acme.TargetAnno.timeout",
+                    "api_simple": "timeout",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "SIGNATURE_CHANGED",
+                    "severity": "P1",
+                    "confirmed": "true",
+                },
+                graph_result["graph"],
+                graph_result["type_metadata"],
+            )
+
+        self.assertNotEqual("not_found_in_static_analysis", result.analysis_status)
+        self.assertTrue(result.call_paths)
+        self.assertEqual("annotation_default_usage", result.evidence_paths[0][0]["evidence_type"])
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
