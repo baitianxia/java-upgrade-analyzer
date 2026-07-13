@@ -221,6 +221,25 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertTrue(result.call_paths)
         self.assertEqual("annotation_default_usage", result.evidence_paths[0][0]["evidence_type"])
 
+    def test_source_graph_keeps_reactive_method_reference_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Use.java").write_text(
+                "package com.acme;\n"
+                "class Use {\n"
+                "  String changed(String value) { return value; }\n"
+                "  void run(reactor.core.publisher.Mono<String> mono) { mono.map(this::changed).subscribe(); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        self.assertIn("com.acme.Use.changed(String)", graph_result["graph"].reverse_edges)
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
