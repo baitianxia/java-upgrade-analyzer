@@ -53,6 +53,20 @@ DEFAULT_MANIFEST = SCRIPT_DIR / "step_manifest.json"
 CHECKPOINT_RULES_FILE = SKILL_DIR / "CHECKPOINT_RULES.md"
 EXIT_AWAITING_USER = 4
 MAIN_STATE_FILE_NAME = "main_state.json"
+USER_TASK_NAMES = {
+    "step1": "分析对象与依赖范围",
+    "step2": "升级上下文",
+    "step3": "兼容性线索",
+    "step4": "依赖 API 变化",
+    "step5": "系统触达证据",
+    "step6": "分析报告",
+}
+USER_ACTION_LABELS = {
+    "continue": "接受当前结果并继续",
+    "rerun_current_step": "补充信息后重新分析",
+    "restart_from_step": "从指定任务重新分析",
+    "cancel": "暂时停止分析",
+}
 STEP1_MAVEN_MODULE_SEP = re.compile(r"\[INFO\]\s*---.*@\s*(\S+)\s*---")
 INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "allow_degraded",
@@ -237,224 +251,91 @@ def _write_text_file(path, text):
     path.write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
-def write_report_landing_docs(report_dir):
+def _landing_status_lines(state):
+    state_view = dict((state or {}).get("state") or {})
+    status = str(state_view.get("status") or "idle").strip()
+    current_step = str(state_view.get("current_step") or "step1").strip()
+    completed_step = str(state_view.get("completed_step") or "").strip()
+    task_name = USER_TASK_NAMES.get(current_step, "准备分析")
+    reason = _humanize_interaction_text(state_view.get("blocking_reason") or "").strip()
+
+    if current_step == "done":
+        return [
+            "当前状态：分析已完成",
+            "",
+            "最终分析结果：`deliverables/report.md`。",
+        ]
+    if status in INTERACTIVE_STATUS or status.startswith("awaiting_"):
+        lines = ["当前状态：等待你确认", f"当前任务：{task_name}"]
+        if reason:
+            lines.extend(["", f"暂停原因：{reason}"])
+        lines.extend(["", "下一步：按终端中的任务卡直接回复；系统会根据回复继续或重新分析。"])
+        return lines
+    if status == "paused_by_user":
+        return [
+            "当前状态：已暂停",
+            f"当前任务：{task_name}",
+            "",
+            "下一步：再次运行分析时，会回到当前确认任务。",
+        ]
+    if status == "blocked_by_system":
+        lines = ["当前状态：分析未完成", f"当前任务：{task_name}"]
+        if reason:
+            lines.extend(["", f"未完成原因：{reason}"])
+        lines.extend(["", "下一步：修正上述原因后，重新执行当前任务。"])
+        return lines
+    if completed_step:
+        completed_name = USER_TASK_NAMES.get(completed_step, completed_step)
+        return [
+            f"当前状态：{completed_name}已完成",
+            f"下一项：{task_name}",
+        ]
+    return ["当前状态：尚未开始", "当前任务：准备分析对象与版本范围。"]
+
+
+def write_report_landing_docs(report_dir, state=None):
     report_dir = Path(report_dir)
-    deliverables = deliverables_dir(report_dir)
-    evidence = evidence_dir(report_dir)
-    runtime = runtime_dir(report_dir)
-    evidence_dependencies = evidence_dependencies_dir(report_dir)
-    evidence_context = evidence_context_dir(report_dir)
-    evidence_static_scan = evidence_static_scan_dir(report_dir)
-    evidence_api_changes = evidence_api_changes_dir(report_dir)
-    evidence_call_chain = evidence_call_chain_dir(report_dir)
-    for path in (report_dir, deliverables, evidence, runtime):
+    for path in (report_dir, deliverables_dir(report_dir), evidence_dir(report_dir), runtime_dir(report_dir)):
         path.mkdir(parents=True, exist_ok=True)
 
-    _write_text_file(
-        report_dir / "README.md",
-        """# 升级分析产物阅读入口
-
-这个目录是本次分析结果的阅读入口。它分成三层，避免把给人看的报告、深入复核证据和程序状态混在一起。
-
-| 目录 | 谁看 | 用途 |
-|---|---|---|
-| `deliverables/` | 普通使用者、评审人 | 给用户看的交付物。先看 `deliverables/report.md`。 |
-| `evidence/` | 需要深入复核的人 | Step1-Step5 的事实证据和完整台账。 |
-| `.runtime/` | 程序和 Agent | 状态、缓存、索引、恢复信息；普通用户不需要阅读。 |
-
-## 推荐阅读顺序
-
-1. 先看 `deliverables/report.md`。
-2. 如果主报告提示需要看完整分类清单，再打开对应的 `deliverables/s6_*_apis.md/csv`。
-3. 如果要解释某条结论来自哪里，再进入 `evidence/call_chain/alerts.csv` 或 `evidence/call_chain/by_api/`。
-4. 如果要确认 Step5 分析范围，使用 `evidence/api_changes/changed_dependencies.md` 的依赖包维度候选。
-5. 如果要核对完整 API 变化事实，再看 `evidence/api_changes/all_changed_apis.csv` 或拆分文件。
-
-## 不同阶段的第一入口
-
-| 阶段 | 先看 | 读完能判断什么 |
-|---|---|---|
-| Step1 依赖识别后 | `evidence/dependencies/dep_summary.txt` | 本次比较的模块、构建产物和依赖范围是否符合预期。 |
-| Step4 API 对比后 | `evidence/api_changes/changed_dependencies.md` | 哪些依赖包发生 API 变化，以及 Step5 是否需要全量或定向分析。 |
-| Step5 调用链分析后 | `evidence/call_chain/alerts.csv` | 每条变更 API 的调用链证据、状态和原因。 |
-| Step6 报告生成后 | `deliverables/report.md` | 本次客观分析结果、证据和结论限制。 |
-
-## 按问题找文件
-
-| 想确认的问题 | 先看 | 继续深入 |
-|---|---|---|
-| 最终分析结果是什么 | `deliverables/report.md` | `deliverables/s6_*_apis.md/csv` |
-| 哪些依赖包发生 API 变化 | `evidence/api_changes/changed_dependencies.md` | `evidence/api_changes/changed_dependencies.csv` |
-| 完整变更 API 有哪些 | `evidence/api_changes/all_changed_apis.csv` | `evidence/api_changes/all_changed_apis_part_*.csv` |
-| 变更 API 是否触达当前系统 | `evidence/call_chain/alerts.csv` | `evidence/call_chain/alerts_<status>.csv` |
-| 依赖范围是否正确 | `evidence/dependencies/dep_changes.csv` | `evidence/dependencies/build_provenance.json` |
-| 为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/alerts.csv`、`evidence/call_chain/by_api/` |
-""",
-    )
-    _write_text_file(
-        deliverables / "README.md",
-        """# deliverables/
-
-这个目录放给人看的交付结果。先看 `report.md`，只有需要核对某个分类全集时，再看拆分清单。
-
-| 文件 | 什么时候看 | 说明 |
-|---|---|---|
-| `report.md` | 第一入口 | 最终报告；呈现客观分析结果、证据和结论限制。 |
-| `s6_probable_impact_apis.md/csv` | 主报告提示存在可能影响时 | 可能影响清单。 |
-| `s6_uncertain_apis.md/csv` | 需要人工判断候选链路时 | 当前证据不足以确认的清单。 |
-| `s6_not_impacted_apis.md/csv` | 要核对“已确认不受影响”来源时 | 有直接制品证据的清单。 |
-| `s6_needs_input_apis.md/csv` | 主报告提示缺少输入时 | 缺依赖源码、构建产物或其他输入的清单。 |
-| `s6_not_analyzed_apis.md/csv` | 要看本轮未完成分析的项时 | 未完成分析清单。 |
-| `s6_not_found_apis.md/csv` | 要看未发现调用路径的项时 | 静态分析未找到调用路径的清单。 |
-
-这些文件只描述分析结果。它们不直接告诉用户修改什么，也不作为程序恢复状态的来源。
-""",
-    )
-    _write_text_file(
-        evidence / "README.md",
-        """# evidence/
-
-这个目录放深入复核证据。只有当主报告或交付清单需要追溯来源时，才需要进入这里。
-
-| 目录 | 主要文件 | 用途 |
-|---|---|---|
-| `dependencies/` | `dep_changes.csv`、`build_provenance.json` | 依赖变更和构建产物来源。 |
-| `context/` | `context.json`、`dep_graph.json` | 分析上下文和依赖关系。 |
-| `static_scan/` | `s3_*.csv/.txt` | JDK、Spring、Jakarta 等背景线索。 |
-| `api_changes/` | `changed_dependencies.md`、`changed_dependencies.csv`、`all_changed_apis.csv` | 依赖包维度选择入口和完整 API 变化事实。 |
-| `call_chain/` | `alerts.csv`、`alerts_<status>.csv`、`by_api/` | 调用链完整台账、拆分阅读视图和单 API 证据。 |
-
-普通选择 Step5 分析范围时优先使用 `api_changes/changed_dependencies.md` 中的 `selection_key`；`all_changed_apis.csv` 是完整 API 明细，不作为普通选择入口。
-""",
-    )
-    _write_text_file(
-        runtime / "README.md",
-        """# .runtime/
-
-程序使用的状态和缓存目录。普通用户不需要阅读这里。
-
-| 目录 | 用途 |
-|---|---|
-| `state/` | `main_state.json`、`interaction.json`，用于恢复流程和 checkpoint。 |
-| `coverage/` | 各步骤覆盖情况，用于 Step6 结论限制。 |
-| `indexes/` | Step5 查询索引。 |
-| `findings/` | Step6 结构化结果，供程序读取。 |
-| `cache/` | 中间缓存和筛选后的输入。 |
-
-不要把这里的 JSON 当作用户报告；需要给人看的结论在 `../deliverables/`，需要复核的证据在 `../evidence/`。
-""",
-    )
-    if evidence_dependencies.exists():
-        _write_text_file(
-            evidence_dependencies / "README.md",
-            """# evidence/dependencies/
-
-这个目录回答“本次分析到底比较了哪些依赖变化”。
-
-| 文件 | 回答的问题 |
-|---|---|
-| `dep_changes.csv` | base/current 的依赖差异明细。 |
-| `dep_summary.txt` | 依赖变化规模、目标模块和构建来源摘要。 |
-| `dep_alerts.csv` | 需要优先复核的依赖变化，如删除、降级、无法解析。 |
-| `deps_current_resolved.csv` | 当前版本解析后的依赖集合。 |
-| `build_provenance.json` | base/current 构建产物来源、留存路径和摘要。 |
-| `s1_artifacts/` | 留存的构建产物，后续字节码分析以这里记录的产物为依据。 |
-
-先看 `dep_summary.txt` 和 `dep_changes.csv`。如果后续结果看起来范围不对，再核对 `build_provenance.json`。
-""",
-        )
-    if evidence_context.exists():
-        _write_text_file(
-            evidence_context / "README.md",
-            """# evidence/context/
-
-这个目录回答“后续分析使用了什么升级上下文”。
-
-| 文件 | 回答的问题 |
-|---|---|
-| `context.json` | JDK、Spring、目标模块、源码目录、依赖源码目录等上下文。 |
-| `dep_graph.json` | 当前依赖关系和传播关系。 |
-| `source_mapping_summary.json` | 依赖源码目录自动识别和映射结果。 |
-
-如果 Step4 或 Step5 提示依赖源码覆盖不足，先看 `source_mapping_summary.json`。
-""",
-        )
-    if evidence_static_scan.exists():
-        _write_text_file(
-            evidence_static_scan / "README.md",
-            """# evidence/static_scan/
-
-这个目录保存背景风险扫描结果。这里的命中只说明存在升级相关线索，不直接证明当前系统一定受影响。
-
-| 文件 | 说明 |
-|---|---|
-| `s3_jdk_removed_api.csv` | JDK 移除 API 命中。 |
-| `s3_jdk_javax_refs.csv` | `javax.*` 引用。 |
-| `s3_jdk_internal_api.csv` | JDK 内部 API 引用。 |
-| `s3_jdk_reflection.csv` | 反射相关线索。 |
-| `s3_jdk_runtime_flags.csv` | JDK 运行参数线索。 |
-| `s3_springboot_config.csv` | Spring Boot 配置键线索。 |
-| `s3_springboot_autoconfig.txt` | Spring Boot 自动装配线索。 |
-| `s3_dependency_compat.csv` | 依赖兼容性规则命中。 |
-| `s3_dependency_classfile.csv` | classfile 版本等字节码线索。 |
-
-需要判断是否影响当前系统时，继续看 `../call_chain/alerts.csv` 和最终报告。
-""",
-        )
-    if evidence_api_changes.exists():
-        _write_text_file(
-            evidence_api_changes / "README.md",
-            """# evidence/api_changes/
-
-这个目录回答“哪些依赖包和 API 发生了变化”。
-
-| 文件 | 什么时候看 | 说明 |
-|---|---|---|
-| `changed_dependencies.md` | 第一入口 | 给人看的依赖包维度变化摘要，也是 Step5 选择分析范围的入口。 |
-| `changed_dependencies.csv` | 需要筛选或自动化时 | 结构化依赖包清单，包含 `selection_key`。 |
-| `all_changed_apis.csv` | 需要核对完整 API 事实时 | 每行一个变更 API 或候选目标。文件可能很大。 |
-| `all_changed_apis_part_*.csv` | `all_changed_apis.csv` 太大时 | API 明细拆分文件，便于打开和分段复核。 |
-| `all_changed_apis_alerts.csv` | 只想先看高风险变化时 | 删除、签名变化、行为变化等高风险子集。 |
-| `summary.txt` | 判断 Step4 覆盖情况时 | jar 获取、JApiCmp、git diff、removed jar 导出等摘要。 |
-| `git_ref_matches.txt/json` | 依赖源码 ref 需要复核时 | old_version/new_version 到 git ref 的匹配证据。 |
-| `s4_per_dependency/` | 追某个依赖包细节时 | 每个依赖包的原始比较证据和摘要。 |
-| `step4_timing.csv` | 排查 Step4 慢在哪里时 | 各阶段耗时拆解。 |
-
-如果只是决定 Step5 分析范围，不要从 `all_changed_apis.csv` 逐行挑 API；使用 `changed_dependencies.md` 或 `changed_dependencies.csv` 的依赖包维度候选。
-""",
-        )
-    if evidence_call_chain.exists():
-        _write_text_file(
-            evidence_call_chain / "README.md",
-            """# evidence/call_chain/
-
-这个目录回答“变更 API 有没有调用链触达当前系统或运行时依赖入口”。
-
-## 人工优先看的文件
-
-| 文件 | 什么时候看 | 说明 |
-|---|---|---|
-| `alerts.csv` | 第一入口 | 完整逐链路台账。每条变更 API 至少保留一行。 |
-| `alerts_<status>.csv` | 只看某类结论时 | 按链路状态拆分的台账。 |
-| `alerts_<status>_NNN.csv` | 单个状态文件过大时 | 分片阅读视图。 |
-| `by_api/` | 追单条 API 证据时 | 单个 API 的逐边证据、路径和中断原因。 |
-
-## 深度排查或程序使用的文件
-
-这些文件不是普通阅读入口。只有当主报告、`alerts.csv` 或 Agent 明确指向它们时再打开。
-
-| 文件 | 类型 | 说明 |
-|---|---|---|
-| `summary.json` | 程序使用 | Step6 读取的结构化汇总、原因码和覆盖状态。 |
-| `framework_adapters.json` | 复核框架隐式入口时 | SPI、Spring、MyBatis 等 Adapter 输出。 |
-| `source_artifact_alignment.json` | 复核源码与制品是否对齐时 | 源码、依赖和构建产物对齐情况。 |
-| `step5_timing.csv` | 排查 Step5 慢在哪里时 | 调用链分析耗时拆解。 |
-
-先看 `alerts.csv`。只有当某一行的状态、原因或证据路径需要追溯时，再进入 `by_api/`。
-""",
-        )
+    lines = [
+        "# 升级分析",
+        "",
+        *_landing_status_lines(state),
+        "",
+        "## 按问题找文件",
+        "",
+        "| 想确认的问题 | 打开文件 |",
+        "|---|---|",
+        "| 最终分析结果 | `deliverables/report.md` |",
+        "| 哪些依赖包发生 API 变化，或确认依赖包范围 | `evidence/api_changes/changed_dependencies.md` |",
+        "| 完整变更 API | `evidence/api_changes/all_changed_apis.csv` 或拆分文件 |",
+        "| 变更 API 是否触达当前系统 | `evidence/call_chain/alerts.csv` |",
+        "| 依赖变化和构建来源 | `evidence/dependencies/dep_changes.csv`、`evidence/dependencies/build_provenance.json` |",
+        "| 为什么部分结论不能确认 | `deliverables/report.md` 的“结论限制”及 `evidence/call_chain/alerts.csv` |",
+        "",
+        "`.runtime/` 仅供程序恢复、缓存和索引使用，不是人工阅读入口。",
+    ]
+    _write_text_file(report_dir / "README.md", "\n".join(lines))
 
 
+def build_user_runtime_message(event, step_id, reason=""):
+    task_name = USER_TASK_NAMES.get(str(step_id or "").strip(), "当前分析")
+    if event == "start":
+        return [f"正在分析：{task_name}"]
+    if event == "failed":
+        lines = [f"{task_name}未完成"]
+        if str(reason or "").strip():
+            lines.append(f"原因：{_humanize_interaction_text(reason)}")
+        lines.append("下一步：修正上述原因后重新分析。")
+        return lines
+    if str(step_id or "").strip() == "step6":
+        return ["分析已完成。", "最终报告：deliverables/report.md"]
+    next_step = next_step_id_for(step_id)
+    lines = [f"{task_name}已完成。"]
+    if next_step:
+        lines.append(f"接下来：{USER_TASK_NAMES.get(next_step, next_step)}")
+    return lines
 def read_csv_rows(path):
     import csv
 
@@ -538,10 +419,10 @@ def load_main_state(report_dir, manifest_path=""):
 
 
 def save_main_state(report_dir, state):
-    write_report_landing_docs(report_dir)
     normalized = ensure_main_state_structure(state, report_dir, manifest_path=(state.get("state") or {}).get("manifest_path", ""))
     normalized["state"]["saved_at"] = datetime.now().isoformat()
     write_json(main_state_path(report_dir), normalized)
+    write_report_landing_docs(report_dir, normalized)
     return normalized
 
 
@@ -2723,6 +2604,57 @@ def write_step2_source_mapping_summary(report_dir, run_context, ctx):
     return output_path, summary
 
 
+def write_step2_review(report_dir, ctx, mapping_summary, runtime_view=None):
+    output_path = evidence_context_dir(report_dir) / "review.md"
+    counts = dict((mapping_summary or {}).get("counts") or {})
+    source_dirs = list((mapping_summary or {}).get("source_dirs") or [])
+    mapped = list((mapping_summary or {}).get("confirmed_target_mappings") or [])
+    unmapped = list((mapping_summary or {}).get("unmapped_target_coords") or [])
+    runtime_view = runtime_view or {}
+    target_module = (
+        runtime_view.get("target_module")
+        or runtime_view.get("primary_module")
+        or ctx.get("target_module")
+        or ctx.get("primary_module")
+        or "未指定"
+    )
+    lines = [
+        "# 升级上下文确认",
+        "",
+        "本文件回答：本次升级分析使用了什么范围和版本信息。",
+        "",
+        "## 分析范围",
+        "",
+        "| 项目 | 当前识别结果 |",
+        "|---|---|",
+        f"| 目标模块 | `{target_module}` |",
+        f"| 比较版本 | `{ctx.get('base_branch') or '未识别'}` → `{ctx.get('current_branch') or '未识别'}` |",
+        f"| JDK | {ctx.get('jdk_base') or '未识别'} → {ctx.get('jdk_current') or '未识别'} |",
+        f"| Spring Boot | {ctx.get('springboot_base') or '未识别'} → {ctx.get('springboot_current') or '未识别'} |",
+        f"| 发生变化的依赖包 | {len(ctx.get('changed_dependencies') or [])} 个 |",
+        f"| 业务源码目录 | {len(source_dirs)} 个 |",
+        f"| 已匹配依赖源码 | {counts.get('confirmed_target_mappings', len(mapped))} / {counts.get('target_dependency_coords', 0)} 个目标依赖 |",
+    ]
+    if source_dirs:
+        lines.extend(["", "## 业务源码范围", ""])
+        lines.extend(f"- `{item}`" for item in source_dirs)
+    if mapped:
+        lines.extend(["", "## 已匹配的依赖源码", "", "| 依赖包 | 源码目录 |", "|---|---|"])
+        for item in mapped:
+            lines.append(f"| `{item.get('coord') or '-'}` | `{item.get('repo_path') or '-'}` |")
+    if unmapped:
+        lines.extend(["", "## 尚未匹配源码的依赖包", ""])
+        lines.extend(f"- `{item}`" for item in unmapped)
+    lines.extend(
+        [
+            "",
+            "完整结构化证据保存在同目录的 `context.json`、`dep_graph.json` 和 `source_mapping_summary.json`。",
+        ]
+    )
+    _write_text_file(output_path, "\n".join(lines))
+    return output_path
+
+
 def _expand_coord_path_by_repo(coord, normalized_path, config_key, expand_all_inferred=False):
     inferred_coords = [item for item in infer_maven_coords(normalized_path) if item]
     coord = _validate_coord_or_prefix_or_empty(coord, config_key)
@@ -3247,19 +3179,6 @@ def detect_base_branch(project_dir, current_branch):
         if local or remote:
             return candidate if local else f"origin/{candidate}"
     return current_branch
-
-
-def _print_confirmation_json(event, payload):
-    try:
-        body = {
-            "schema": "java-upgrade-analyzer.confirmation.v1",
-            "event": event,
-            **(payload or {}),
-        }
-        sys.stderr.write("JUA_CONFIRMATION_JSON:" + json.dumps(body, ensure_ascii=False) + "\n")
-        sys.stderr.flush()
-    except Exception:
-        return
 
 
 def _response_payload_example(action_id, required_fields, properties):
@@ -4013,13 +3932,13 @@ def _user_field_label(field):
         "dependency_source_dirs": "依赖源码目录",
         "source_repo_hints": "源码仓库线索",
         "dependency_git_ref_overrides": "依赖 git ref 确认",
-        "step5_selected_coords": "Step5 选择的依赖坐标",
-        "step5_selected_names": "Step5 选择的依赖名称",
+        "step5_selected_coords": "系统触达证据要分析的依赖坐标",
+        "step5_selected_names": "系统触达证据要分析的依赖名称",
         "selected_targets": "选择的依赖包",
         "strict_risk_gate": "严格门控",
-        "step4_git_diff_timeout": "Step4 git diff 超时秒数",
-        "step4_japicmp_timeout": "Step4 JApiCmp 超时秒数",
-        "step4_fetch_timeout": "Step4 拉取依赖超时秒数",
+        "step4_git_diff_timeout": "源码差异对比超时秒数",
+        "step4_japicmp_timeout": "JApiCmp 对比超时秒数",
+        "step4_fetch_timeout": "拉取依赖超时秒数",
         "restart_step_id": "重跑起点",
         "notes": "备注",
     }
@@ -4040,8 +3959,8 @@ def _user_field_description(field, meta=None):
         "dependency_source_dirs": "相关依赖源码仓库或多模块仓库根目录。",
         "dependency_git_ref_overrides": "当依赖版本无法自动匹配 git ref 时，显式给出 old_ref/new_ref。",
         "selected_targets": "来自 changed_dependencies.md/csv 的 selection_key、依赖坐标或依赖名称。",
-        "step5_selected_coords": "只让 Step5 分析这些依赖坐标。",
-        "step5_selected_names": "只让 Step5 分析这些依赖名称。",
+        "step5_selected_coords": "只分析这些依赖坐标的系统触达证据。",
+        "step5_selected_names": "只分析这些依赖名称的系统触达证据。",
         "strict_risk_gate": "要求存在未确认项时不要继续产出无盲区结论。",
     }
     return descriptions.get(str(field or "").strip(), description)
@@ -4058,13 +3977,14 @@ def _format_user_field(field, meta=None):
 def _humanize_interaction_text(text):
     value = str(text or "")
     replacements = {
+        "Step5 是全量分析": "系统触达证据是覆盖全部依赖",
         "dependency_source_dirs": "依赖源码目录",
         "dependency_git_ref_overrides": "依赖 old_ref/new_ref",
         "source_dirs": "业务源码目录",
         "target_module": "目标模块",
         "project_scope": "项目范围",
-        "step5_selected_coords": "Step5 选择的依赖坐标",
-        "step5_selected_names": "Step5 选择的依赖名称",
+        "step5_selected_coords": "系统触达证据要分析的依赖坐标",
+        "step5_selected_names": "系统触达证据要分析的依赖名称",
         "selected_targets": "选择的依赖包",
         "restart_step_id": "重跑起始步骤",
         "not_analyzed": "本次未完成分析",
@@ -4072,6 +3992,8 @@ def _humanize_interaction_text(text):
     }
     for old, new in replacements.items():
         value = value.replace(old, new)
+    for step_id, task_name in USER_TASK_NAMES.items():
+        value = re.sub(rf"\b{re.escape(step_id)}\b", task_name, value, flags=re.IGNORECASE)
     value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value)
     return value
 
@@ -4092,7 +4014,7 @@ def _decision_card_reply_examples(interaction, selection_options, options):
     examples = []
     option_ids = {str((item or {}).get("id") or "").strip() for item in options}
     if selection_options:
-        first_key = selection_options[0].get("selection_key") or "<selection_key>"
+        first_key = selection_options[0].get("coord") or selection_options[0].get("name") or "指定依赖包"
         examples.append("全量继续")
         examples.append(f"只分析 {first_key}")
     elif "continue" in option_ids:
@@ -4109,9 +4031,9 @@ def _decision_card_reply_examples(interaction, selection_options, options):
     if "dependency_git_ref_overrides" in fields:
         examples.append('依赖 com.acme:lib 的 old_ref 是 v1.0.0，new_ref 是 v2.0.0，补充后重跑')
     if {"step4_git_diff_timeout", "step4_japicmp_timeout", "step4_fetch_timeout"} & fields:
-        examples.append("把 Step4 JApiCmp 超时放宽到 1800 秒后重跑")
+        examples.append("把 JApiCmp 对比超时放宽到 1800 秒后重新分析")
     if "restart_from_step" in option_ids:
-        examples.append("从 step2 重跑")
+        examples.append("从升级上下文重新分析")
 
     unique = []
     for item in examples:
@@ -4127,8 +4049,9 @@ def build_user_decision_card(interaction):
     lines.append(f"当前需要确认：{question}")
 
     reason = _humanize_interaction_text(interaction.get("user_reason") or interaction.get("reason") or "").strip()
-    if reason:
-        lines.append(f"为什么停下：{reason}")
+    if not reason:
+        reason = "分析已暂停，等待你确认当前结果或补充信息。"
+    lines.append(f"为什么暂停：{reason}")
 
     recommended = _humanize_interaction_text(interaction.get("recommended_action") or "").strip()
     if recommended:
@@ -4171,33 +4094,51 @@ def build_user_decision_card(interaction):
 
     options = list(interaction.get("options") or [])
     if options:
-        lines.append("可选动作：")
+        lines.append("你可以选择：")
         for option in options:
-            label = option.get("label") or option.get("id")
+            option_id = str(option.get("id") or "").strip()
+            label = option.get("label") or USER_ACTION_LABELS.get(option_id, "选择此处理方式")
             desc = _humanize_interaction_text(option.get("description") or "").strip()
             suffix = f" - {desc}" if desc else ""
-            lines.append(f"- `{option.get('id')}`：{label}{suffix}")
+            lines.append(f"- {label}{suffix}")
 
     selection_options = list(interaction.get("selection_options") or [])
     if selection_options:
+        selection_resolution = interaction.get("selection_resolution") or {}
+        all_selection_options = list(selection_resolution.get("options") or [])
+        total_candidates = len(all_selection_options) or len(selection_options)
+        displayed_candidates = min(10, len(selection_options))
+        full_candidate_file = next(
+            (
+                str(path)
+                for path in (interaction.get("files_to_review") or [])
+                if str(path).endswith("changed_dependencies.md")
+            ),
+            "",
+        )
+        if not full_candidate_file:
+            full_candidate_file = str(selection_resolution.get("source_file") or "").strip()
         lines.append("候选依赖包：")
-        lines.append("| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 |")
-        lines.append("|---|---|---:|---:|")
+        lines.append(f"展示 {displayed_candidates} / {total_candidates} 个候选依赖包。")
+        lines.append("| 依赖包 | 变化 API 数 | 高风险 API 数 |")
+        lines.append("|---|---:|---:|")
         for item in selection_options[:10]:
             lines.append(
-                f"| `{item.get('selection_key')}` | `{item.get('coord') or ''}` | "
+                f"| `{item.get('coord') or item.get('name') or ''}` | "
                 f"{item.get('api_count') or 0} | {item.get('high_risk_api_count') or 0} |"
             )
-        if len(selection_options) > 10:
-            lines.append(f"这里只展示前 10 个候选；完整候选请看下面的文件。")
+        if total_candidates > displayed_candidates:
+            remaining = total_candidates - displayed_candidates
+            if full_candidate_file:
+                lines.append(f"其余 {remaining} 个候选依赖包见 `{full_candidate_file}`。")
+            else:
+                lines.append(f"其余 {remaining} 个候选依赖包见完整依赖包清单。")
 
     files_to_review = list(interaction.get("files_to_review") or [])
     if files_to_review:
         lines.append("完整候选或证据文件：")
-        for path in files_to_review[:5]:
+        for path in files_to_review:
             lines.append(f"- `{path}`")
-        if len(files_to_review) > 5:
-            lines.append(f"- 其余 {len(files_to_review) - 5} 个文件见 interaction.json 的 files_to_review。")
 
     checklist_lines = [
         _humanize_interaction_text(item).strip()
@@ -4263,32 +4204,12 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
     if not interaction:
         return
     sys.stderr.write("\n")
-    sys.stderr.write("╔════════════════════════════════════════════════════════════╗\n")
-    sys.stderr.write("║                    AWAITING USER INPUT                    ║\n")
-    sys.stderr.write("╚════════════════════════════════════════════════════════════╝\n")
-    if interaction.get("hard_stop", True):
-        sys.stderr.write("HARD STOP: 在用户明确回复前，禁止继续执行后续步骤。\n")
+    sys.stderr.write("【分析已暂停，等待你的确认】\n")
     runtime_rules = interaction.get("runtime_rules", []) or []
-    if runtime_rules:
-        sys.stderr.write("RULE: awaiting_* -> ask user -> wait -> resume with --response-json/--response-file\n")
-        for idx, rule in enumerate(runtime_rules[:5], 1):
-            sys.stderr.write(f"  {idx}. {rule}\n")
     next_action_rule = interaction.get("next_action_rule")
-    if next_action_rule:
-        sys.stderr.write(f"NEXT ACTION ONLY: {next_action_rule}\n")
     resume_examples = interaction.get("resume_command_examples", []) or []
-    if resume_examples:
-        sys.stderr.write("恢复命令模板：\n")
-        for item in resume_examples[:2]:
-            if isinstance(item, dict):
-                label = item.get("label") or item.get("action") or "resume"
-                command = item.get("command") or ""
-                sys.stderr.write(f"  - {label}: {command}\n")
-            else:
-                sys.stderr.write(f"  {item}\n")
-    sys.stderr.write("\n" + "=" * 60 + "\n")
-    sys.stderr.write(f"【待用户交互】{interaction.get('title') or ''}\n")
-    sys.stderr.write("=" * 60 + "\n")
+    task_name = USER_TASK_NAMES.get(str(interaction.get("step_id") or "").lower(), interaction.get("title") or "当前分析")
+    sys.stderr.write(f"当前任务：{task_name}\n")
     for line in build_user_decision_card(interaction):
         sys.stderr.write(f"{line}\n")
     missing_inputs = interaction.get("missing_inputs", []) or []
@@ -4298,25 +4219,13 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
     options = interaction.get("options", []) or []
     action_requirements = interaction.get("action_requirements") or {}
     selection_options = interaction.get("selection_options", []) or []
-    sys.stderr.write(f"完整交互协议：{(runtime_state_dir(report_dir) / 'interaction.json').resolve()}\n")
-    sys.stderr.write("=" * 60 + "\n")
+    sys.stderr.write("\n")
     sys.stderr.flush()
-    body = {
-        "stop": interaction.get("hard_stop", True),
-        "must_wait_for_user_reply": interaction.get("must_wait_for_user_reply", True),
-        "exit_code": EXIT_AWAITING_USER,
-        "next_action_rule": interaction.get("next_action_rule"),
-        "runtime_rules": runtime_rules,
-        "rules_file": interaction.get("rules_file"),
-        "resume_command_examples": resume_examples,
-        "interaction": interaction,
-        "report_dir": str(Path(report_dir).resolve()),
-        "interaction_file": str((runtime_state_dir(report_dir) / "interaction.json").resolve()),
-    }
-    _print_confirmation_json(event, body)
     sys.stdout.write(
-        json.dumps(
+        "JUA_CONFIRMATION_JSON:" + json.dumps(
             {
+                "schema": "java-upgrade-analyzer.confirmation.v1",
+                "event": event,
                 "status": normalize_interaction_status(interaction.get("status")),
                 "exit_code": EXIT_AWAITING_USER,
                 "step_id": interaction.get("step_id"),
@@ -4343,7 +4252,7 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
                 "checkpoint": interaction.get("checkpoint", True),
                 "hard_stop": interaction.get("hard_stop", True),
                 "awaiting_user_input": True,
-                "interaction_file": body["interaction_file"],
+                "interaction_file": str((runtime_state_dir(report_dir) / "interaction.json").resolve()),
             },
             ensure_ascii=False,
         )
@@ -4610,6 +4519,25 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             if proposed_paths:
                 checklist_lines.append("注意：选择 continue 不会自动接受建议映射。")
                 checklist_lines.append("若要接受建议，请提供 accept_suggested_mappings=true 参数。")
+        review_path = write_step2_review(report_dir, ctx, mapping_summary, runtime_view)
+        target_module = (
+            runtime_view.get("target_module")
+            or runtime_view.get("primary_module")
+            or ctx.get("target_module")
+            or ctx.get("primary_module")
+            or "未指定"
+        )
+        files_to_review = [str(review_path.resolve())]
+        checklist_lines = [
+            "请确认以下信息是否符合本次升级范围：",
+            f"  - 目标模块：{target_module}",
+            f"  - 比较版本：{ctx.get('base_branch') or '未识别'} → {ctx.get('current_branch') or '未识别'}",
+            f"  - JDK：{ctx.get('jdk_base') or '未识别'} → {ctx.get('jdk_current') or '未识别'}",
+            f"  - Spring Boot：{ctx.get('springboot_base') or '未识别'} → {ctx.get('springboot_current') or '未识别'}",
+            f"  - 发生变化的依赖包：{len(ctx.get('changed_dependencies') or [])} 个",
+            f"  - 已匹配依赖源码：{mapping_counts.get('confirmed_target_mappings', 0)} / {mapping_counts.get('target_dependency_coords', 0)} 个目标依赖",
+            f"完整确认页：{review_path.resolve()}",
+        ]
     if step_id == "step4":
         all_changed_apis = step4_api_changes_dir(report_dir) / "all_changed_apis.csv"
         available_rows = read_csv_rows(all_changed_apis)
@@ -4674,6 +4602,22 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 checklist_lines.append(
                     "  - 未匹配名称: " + ", ".join(existing_selection.get("unmatched_names")[:10])
                 )
+        files_to_review = [
+            str((step4_api_changes_dir(report_dir) / "changed_dependencies.md").resolve()),
+            str((step4_api_changes_dir(report_dir) / "summary.txt").resolve()),
+            str((step4_api_changes_dir(report_dir) / "git_ref_matches.txt").resolve()),
+            str((step4_api_changes_dir(report_dir) / "all_changed_apis.csv").resolve()),
+        ]
+        checklist_lines = [
+            "请选择系统触达证据的分析范围：",
+            f"  - 全部分析：覆盖 {target_summary.get('available_target_count', 0)} 个发生 API 变化的依赖包。",
+            "  - 定向分析：从下面的候选依赖包中选择一个或多个。",
+            "  - 完整依赖包清单见 changed_dependencies.md；API 级明细不作为普通选择入口。",
+        ]
+        if existing_selection.get("matched_coords"):
+            checklist_lines.append(
+                "  - 当前已选：" + "、".join(existing_selection.get("matched_coords")[:10])
+            )
     if step_id == "step5":
         summary_json = step5_call_chain_dir(report_dir) / "summary.json"
         # Checkpoint is user-facing: point readers to the complete ledger,
@@ -4703,6 +4647,9 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 f"  - 需人工复核={user_conclusion_summary.get('当前无法确认', 0)}",
                 f"  - 缺少依赖源码/构建产物={user_conclusion_summary.get('需要补充输入', 0)}",
                 f"  - 已提供依赖源码目录={len(dependency_source_dirs)} 个",
+                "覆盖缺口（可能与上面的结论重叠，不要相加）：",
+                f"  - 本次未完成分析={len(not_analyzed_apis)}",
+                f"  - 未发现调用路径={len(not_found_apis)}",
             ]
         )
         if step5_selected_coords:
@@ -4710,7 +4657,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         if step5_selected_names:
             checklist_lines.append("  - 本轮按名称定向分析: " + ", ".join(step5_selected_names[:10]))
         if quality_gate.get("needs_input", 0):
-            checklist_lines.append("推荐动作：先补充 checkpoint 中点名的源码、构建产物或映射信息，再重跑 Step5。")
+            checklist_lines.append("推荐动作：先补充上面点名的源码、构建产物或映射信息，再重新分析系统触达证据。")
         elif quality_gate.get("inconclusive", 0):
             checklist_lines.append("推荐动作：优先抽查“需人工复核”的高风险项，再决定是否继续。")
         elif quality_gate.get("probable_impact", 0):
@@ -5290,7 +5237,7 @@ def apply_non_pending_structured_response(args, project_dir, report_dir, main_st
     )
     save_main_state(report_dir, main_state)
     print(
-        f"🔁 当前没有 pending interaction；已将结构化用户意图桥接为从 {target_step_id} 重跑。",
+        f"将从{USER_TASK_NAMES.get(target_step_id, '指定任务')}重新分析。",
         file=sys.stderr,
     )
     return {
@@ -5327,7 +5274,16 @@ def apply_structured_user_response_if_present(args, project_dir, report_dir, mai
         else:
             validate_pending_interaction_response(pending_interaction, user_response)
             if response_action == "cancel":
-                print("⏹ 用户选择取消，保持当前主状态，不继续执行。", file=sys.stderr)
+                update_main_state_state(
+                    main_state,
+                    current_step=resumed_interaction_step_id or (main_state.get("state") or {}).get("current_step"),
+                    completed_step=(main_state.get("state") or {}).get("completed_step"),
+                    status="paused_by_user",
+                    blocking_reason="用户选择稍后处理",
+                    pending_interaction=dict(pending_interaction),
+                )
+                save_main_state(report_dir, main_state)
+                print("分析已暂停；再次运行时会回到当前确认任务。", file=sys.stderr)
                 early_exit_code = 0
             else:
                 step_id = resolve_resume_step_id(step_id, pending_interaction, response_action, user_response=user_response)
@@ -5378,11 +5334,7 @@ def maybe_return_pending_interaction(report_dir, pending_interaction):
     if not pending_interaction:
         return None
     print_interaction_to_streams(pending_interaction, report_dir)
-    print(
-        "⏸ 检测到待用户交互状态。请由 Agent 读取 interaction.json 并向用户发问；"
-        f"当前退出码={EXIT_AWAITING_USER}；收到答复后，使用 --response-json / --response-file 继续。",
-        file=sys.stderr,
-    )
+    print("分析仍在等待你的确认，请直接回复上面的任一选择。", file=sys.stderr)
     return EXIT_AWAITING_USER
 
 
@@ -5495,10 +5447,7 @@ def maybe_emit_step1_preflight_interaction(step_id, main_state, report_dir, pref
     save_main_state(report_dir, main_state)
     save_interaction_file(report_dir, preflight_interaction)
     print_interaction_to_streams(preflight_interaction, report_dir)
-    print(
-        f"⏸ {step_id} 执行前需要先补齐输入方式和关键字段；当前退出码={EXIT_AWAITING_USER}",
-        file=sys.stderr,
-    )
+    print(f"{USER_TASK_NAMES.get(step_id, '当前分析')}需要先补齐上面的信息。", file=sys.stderr)
     return EXIT_AWAITING_USER
 
 
@@ -6012,9 +5961,10 @@ def main():
     if preflight_exit is not None:
         return preflight_exit
 
-    print(f"\n=== 执行 {step_id} ===", file=sys.stderr)
-    print(f"项目目录：{project_dir}", file=sys.stderr)
-    print(f"报告目录：{report_dir}", file=sys.stderr)
+    task_name = USER_TASK_NAMES.get(step_id, "当前分析")
+    print("", file=sys.stderr)
+    for line in build_user_runtime_message("start", step_id):
+        print(line, file=sys.stderr)
 
     try:
         interaction = execute_step(step_id, args, manifest_steps, run_context, main_state=main_state)
@@ -6024,30 +5974,22 @@ def main():
         if interaction:
             interaction = persist_step_interaction(main_state, step_id, report_dir, run_context, interaction)
             print_interaction_to_streams(interaction, report_dir)
-            print(
-                f"⏸ {step_id} 已执行完成，进入待用户交互状态。用户答复后执行："
-                f" python3 {SCRIPT_DIR / 'run_step.py'} --step auto --project-dir {project_dir} "
-                f"--report-dir {report_dir} --response-json "
-                f"'{{\"action\":\"{default_interaction_action(interaction)}\"}}'"
-                f"；当前退出码={EXIT_AWAITING_USER}",
-                file=sys.stderr,
-            )
+            print(f"{task_name}已完成，分析正在等待你的确认。", file=sys.stderr)
             return EXIT_AWAITING_USER
         persist_completed_step(main_state, step_id, report_dir, run_context)
-        print(f"✅ {step_id} 执行完成，main_state 已更新：{main_state_path(report_dir)}", file=sys.stderr)
+        for line in build_user_runtime_message("complete", step_id):
+            print(line, file=sys.stderr)
         return 0
     except StepInteractionRequired as exc:
         interaction = exc.interaction or {}
         interaction = persist_interaction_required_error(main_state, step_id, report_dir, interaction)
         print_interaction_to_streams(interaction, report_dir)
-        print(
-            f"⏸ {step_id} 需要补充业务信息后才能继续；当前退出码={EXIT_AWAITING_USER}",
-            file=sys.stderr,
-        )
+        print(f"{task_name}需要补充上面的信息后才能继续。", file=sys.stderr)
         return EXIT_AWAITING_USER
     except StepError as exc:
         persist_step_error(main_state, step_id, report_dir, exc)
-        print(f"❌ {step_id} 执行失败：{exc}", file=sys.stderr)
+        for line in build_user_runtime_message("failed", step_id, reason=exc):
+            print(line, file=sys.stderr)
         return 1
 
 

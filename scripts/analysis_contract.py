@@ -8,7 +8,7 @@ import csv
 import json
 import subprocess
 import re
-import xml.etree.ElementTree as ET
+import safe_xml as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -274,6 +274,7 @@ def build_project_scope(project_dir, target_module):
         "target_module": target["module"],
         "target_coord": target.get("coord", ""),
         "included_modules": [item["module"] for item in included],
+        "included_module_coords": sorted({item.get("coord", "") for item in included if item.get("coord")}),
         "source_roots": sorted(set(source_roots)),
         "resource_roots": sorted(set(resource_roots)),
         "excluded_modules": sorted(item["module"] for item in modules if item["module"] not in seen),

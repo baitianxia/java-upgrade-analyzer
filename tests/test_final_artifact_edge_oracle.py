@@ -5,9 +5,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +22,258 @@ import final_artifact_edge_oracle as oracle  # noqa: E402
 
 
 JDK_TOOLS = shutil.which("javac") and shutil.which("jar") and shutil.which("javap")
+
+
+def _fake_artifact(path: Path, class_entries: list[str], marker: bytes = b"class") -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        for index, entry in enumerate(class_entries):
+            archive.writestr(entry, marker + str(index).encode("ascii"))
+    return path
+
+
+def _fake_parse_result(entry, artifact_sha256, *, failure: str = "") -> dict:
+    member = Path(entry.artifact_entry).stem.lower()
+    row = oracle._edge_row(
+        artifact_sha256,
+        entry.artifact_entry,
+        "21.0.1",
+        "fixture.Caller",
+        member,
+        "()V",
+        ("fixture.Dependency", member, "()V"),
+        "invokestatic",
+        0,
+    )
+    return {
+        "rows": [row],
+        "failures": [f"{entry.artifact_entry}: {failure}"] if failure else [],
+        "completed": True,
+        "parsed": True,
+    }
+
+
+class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
+    def setUp(self):
+        oracle.clear_immutable_oracle_cache()
+
+    def test_sequential_concurrent_and_cached_scans_are_edge_equivalent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(
+                Path(temp_dir) / "fixture.jar",
+                ["fixture/C.class", "fixture/A.class", "fixture/B.class"],
+            )
+
+            def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
+                return _fake_parse_result(entry, artifact_sha256)
+
+            with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+            ):
+                sequential = oracle.scan_final_artifact(artifact, max_workers=1)
+                oracle.clear_immutable_oracle_cache()
+                concurrent = oracle.scan_final_artifact(artifact, max_workers=3)
+                cached = oracle.scan_final_artifact(artifact, max_workers=3)
+
+        self.assertEqual(sequential["edges"], concurrent["edges"])
+        self.assertEqual(sequential["failures"], concurrent["failures"])
+        self.assertEqual(concurrent["edges"], cached["edges"])
+        self.assertEqual(concurrent["failures"], cached["failures"])
+        self.assertEqual(sequential["parsed_class_count"], 3)
+        self.assertEqual(concurrent["parsed_class_count"], 3)
+        self.assertEqual(cached["parsed_class_count"], 0)
+        self.assertEqual(cached["cached_class_count"], 3)
+        self.assertEqual(cached["cache_hits"], 1)
+
+    def test_concurrent_scan_retains_every_class_parse_failure_in_entry_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            entries = [f"fixture/Bad{index}.class" for index in range(4)]
+            artifact = _fake_artifact(Path(temp_dir) / "broken.jar", entries)
+
+            def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
+                time.sleep(0.01 if entry.artifact_entry.endswith("0.class") else 0.001)
+                return _fake_parse_result(entry, artifact_sha256, failure="synthetic parse failure")
+
+            with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+            ):
+                result = oracle.scan_final_artifact(artifact, max_workers=4)
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["parsed_class_count"], 4)
+        self.assertEqual(result["parse_failure_count"], 4)
+        self.assertEqual(
+            result["failures"],
+            [f"{entry}: synthetic parse failure" for entry in entries],
+        )
+
+    def test_explicit_worker_count_is_capped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(
+                Path(temp_dir) / "many.jar",
+                [f"fixture/Class{index}.class" for index in range(oracle.MAX_JAVAP_WORKERS + 2)],
+            )
+
+            def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
+                return _fake_parse_result(entry, artifact_sha256)
+
+            with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+            ):
+                result = oracle.scan_final_artifact(artifact, max_workers=999)
+
+        self.assertEqual(result["worker_count"], oracle.MAX_JAVAP_WORKERS)
+
+    def test_immutable_cache_does_not_cross_artifact_sha(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_artifact = _fake_artifact(root / "first.jar", ["fixture/A.class"], b"first")
+            second_artifact = _fake_artifact(root / "second.jar", ["fixture/A.class"], b"second")
+            parsed_shas = []
+
+            def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
+                parsed_shas.append(artifact_sha256)
+                return _fake_parse_result(entry, artifact_sha256)
+
+            with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+            ):
+                first = oracle.scan_final_artifact(first_artifact, max_workers=1)
+                second = oracle.scan_final_artifact(second_artifact, max_workers=1)
+
+        self.assertNotEqual(first["artifact_sha256"], second["artifact_sha256"])
+        self.assertEqual(parsed_shas, [first["artifact_sha256"], second["artifact_sha256"]])
+        self.assertEqual(first["cache_hits"], 0)
+        self.assertEqual(second["cache_hits"], 0)
+        self.assertTrue(all(row["artifact_sha256"] == first["artifact_sha256"] for row in first["edges"]))
+        self.assertTrue(all(row["artifact_sha256"] == second["artifact_sha256"] for row in second["edges"]))
+
+    def test_missing_javap_command_does_not_reuse_another_command_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(Path(temp_dir) / "fixture.jar", ["fixture/A.class"])
+
+            first = oracle.scan_final_artifact(artifact, javap="missing-javap-first-command")
+            second = oracle.scan_final_artifact(artifact, javap="missing-javap-second-command")
+
+        self.assertFalse(first["complete"])
+        self.assertFalse(second["complete"])
+        self.assertEqual(first["cache_hits"], 0)
+        self.assertEqual(second["cache_hits"], 0)
+        self.assertTrue(all("missing-javap-first-command" in failure for failure in first["failures"]))
+        self.assertTrue(all("missing-javap-second-command" in failure for failure in second["failures"]))
+        self.assertFalse(any("missing-javap-first-command" in failure for failure in second["failures"]))
+
+    def test_time_budget_cancels_concurrent_scan_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(
+                Path(temp_dir) / "slow.jar",
+                [f"fixture/Slow{index}.class" for index in range(4)],
+            )
+
+            def parse_entry(entry, artifact_sha256, _javap, _version, cancellation_event, deadline):
+                while not cancellation_event.is_set() and time.perf_counter() < deadline:
+                    time.sleep(0.005)
+                return {"rows": [], "failures": [], "completed": False, "parsed": False}
+
+            started_at = time.perf_counter()
+            with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+            ):
+                result = oracle.scan_final_artifact(
+                    artifact, max_workers=2, time_budget_seconds=0.05
+                )
+            elapsed = time.perf_counter() - started_at
+
+        self.assertLess(elapsed, 1.0)
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["timed_out"])
+        self.assertFalse(result["interrupted"])
+        self.assertEqual(result["cache_hits"], 0)
+        self.assertTrue(any("oracle_time_budget_exceeded" in failure for failure in result["failures"]))
+
+    def test_hung_javap_version_probe_returns_a_structured_incomplete_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(Path(temp_dir) / "version-hang.jar", ["fixture/A.class"])
+            with patch.object(
+                oracle.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["javap", "-version"], 0.05),
+            ) as mocked_run:
+                result = oracle.scan_final_artifact(artifact, time_budget_seconds=0.05)
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["timed_out"])
+        self.assertFalse(result["interrupted"])
+        self.assertEqual(result["class_count"], 0)
+        self.assertEqual(result["failures"], ["oracle_javap_version_timeout"])
+        timeout = mocked_run.call_args.kwargs["timeout"]
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, 0.05)
+
+    def test_version_probe_exception_returns_a_non_cacheable_incomplete_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(Path(temp_dir) / "version-error.jar", ["fixture/A.class"])
+            with patch.object(
+                oracle, "_javap_version", side_effect=ValueError("synthetic version failure")
+            ) as probe:
+                first = oracle.scan_final_artifact(artifact)
+                second = oracle.scan_final_artifact(artifact)
+
+        for result in (first, second):
+            self.assertFalse(result["complete"])
+            self.assertFalse(result["timed_out"])
+            self.assertFalse(result["interrupted"])
+            self.assertEqual(result["cache_hits"], 0)
+            self.assertEqual(result["cache_misses"], 1)
+            self.assertEqual(
+                result["failures"],
+                ["oracle_javap_version_failed:ValueError: synthetic version failure"],
+            )
+        self.assertEqual(probe.call_count, 2)
+
+    def test_concurrent_worker_exception_is_class_specific_and_does_not_stop_peers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            entries = ["fixture/A.class", "fixture/B.class", "fixture/C.class"]
+            artifact = _fake_artifact(Path(temp_dir) / "worker-error.jar", entries)
+
+            def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
+                if entry.artifact_entry == "fixture/B.class":
+                    raise ValueError("synthetic worker failure")
+                return _fake_parse_result(entry, artifact_sha256)
+
+            with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+            ):
+                result = oracle.scan_final_artifact(artifact, max_workers=3)
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["completed_class_count"], 3)
+        self.assertEqual(result["parsed_class_count"], 2)
+        self.assertEqual(result["parse_failure_count"], 1)
+        self.assertEqual(
+            result["failures"],
+            ["fixture/B.class: oracle worker failed: ValueError: synthetic worker failure"],
+        )
+        self.assertEqual(
+            [row["artifact_entry"] for row in result["edges"]],
+            ["fixture/A.class", "fixture/C.class"],
+        )
+
+    def test_interrupted_worker_returns_incomplete_result_without_propagating(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(Path(temp_dir) / "interrupted.jar", ["fixture/A.class"])
+
+            def interrupt(*_args, **_kwargs):
+                raise KeyboardInterrupt()
+
+            with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=interrupt
+            ):
+                result = oracle.scan_final_artifact(artifact, max_workers=1)
+
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["timed_out"])
+        self.assertTrue(result["interrupted"])
+        self.assertIn("oracle_interrupted", result["failures"])
 
 
 def _write_source(root: Path, relative_path: str, text: str) -> Path:
@@ -354,9 +608,11 @@ public class fixture.Dynamic {
             result = oracle.scan_final_artifact(artifact, javap="missing-javap-command")
 
         self.assertFalse(result["complete"])
-        self.assertEqual(result["class_count"], 3)
-        self.assertEqual(len(result["failures"]), 3)
-        self.assertTrue(all("missing-javap-command" in failure for failure in result["failures"]))
+        self.assertEqual(result["class_count"], 0)
+        self.assertEqual(result["cache_hits"], 0)
+        self.assertEqual(len(result["failures"]), 1)
+        self.assertTrue(result["failures"][0].startswith("oracle_javap_version_failed:OSError:"))
+        self.assertIn("missing-javap-command", result["failures"][0])
 
 
 if __name__ == "__main__":

@@ -250,8 +250,8 @@ def gate_jar_compare(d):
                     content = open(jar_dir / f, encoding="utf-8", errors="replace").read(200)
                     if '未找到' in content or 'jar 未找到' in content:
                         jar_missing.append(f)
-                except Exception:
-                    pass
+                except (OSError, UnicodeError) as exc:
+                    jar_missing.append(f"{f}:unreadable:{type(exc).__name__}")
     if jar_missing:
         fail(
             f"以下依赖 jar 未找到，Step4 证据池不完整：{jar_missing[:5]}",

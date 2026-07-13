@@ -69,6 +69,7 @@ def discover_calls(
                 ["javap", "-c", "-s", "-p", str(class_file)],
                 capture_output=True,
                 text=True,
+                timeout=30,
             )
             evidence.write(f"===== {class_file} =====\n")
             evidence.write(completed.stdout)
@@ -92,7 +93,9 @@ def discover_calls(
                 })
 
     digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
-    version = subprocess.run(["javap", "-version"], capture_output=True, text=True).stdout.strip()
+    version = subprocess.run(
+        ["javap", "-version"], capture_output=True, text=True, timeout=30
+    ).stdout.strip()
     generated_at = datetime.now(timezone.utc).isoformat()
     for row in discovered.values():
         row.update({
@@ -213,6 +216,7 @@ def scan_class_files(changed_rows: list[dict], class_files: list[Path], evidence
                 ["javap", "-c", "-s", "-p", *(str(path) for path in batch)],
                 capture_output=True,
                 text=True,
+                timeout=60,
             )
             evidence.write(f"===== batch {offset // 100 + 1}: {len(batch)} class files =====\n")
             evidence.write(completed.stdout)
@@ -224,7 +228,9 @@ def scan_class_files(changed_rows: list[dict], class_files: list[Path], evidence
                     matched[key] = targets[key][0]
 
     digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
-    version = subprocess.run(["javap", "-version"], capture_output=True, text=True).stdout.strip()
+    version = subprocess.run(
+        ["javap", "-version"], capture_output=True, text=True, timeout=30
+    ).stdout.strip()
     generated_at = datetime.now(timezone.utc).isoformat()
     records = []
     for row in matched.values():

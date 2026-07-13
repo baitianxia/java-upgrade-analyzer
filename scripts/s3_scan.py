@@ -418,15 +418,21 @@ def _class_usage_match_kind(file_path, line_text, fqcn, simple_name):
         return 'resource_reference', 'RESOURCE_OR_REFLECTION', 'weak'
     if re.search(r'Class\.forName\s*\(\s*"[^"]*' + re.escape(fqcn) + r'[^"]*"', text):
         return 'reflection_string', 'RESOURCE_OR_REFLECTION', 'weak'
-    if re.search(r'\bimport\s+static\s+' + re.escape(fqcn) + r'\.', text):
+    identifier_boundary = r'[A-Za-z0-9_$]'
+    source_fqcn = str(fqcn or '').replace('$', '.')
+    source_simple = str(simple_name or '').replace('$', '.')
+    fqcn_pattern = '(?:' + '|'.join({re.escape(fqcn), re.escape(source_fqcn)}) + ')'
+    simple_pattern = '(?:' + '|'.join({re.escape(simple_name), re.escape(source_simple)}) + ')'
+    if re.search(r'\bimport\s+static\s+' + fqcn_pattern + r'\.', text):
         return 'static_import', 'CLASS_USAGE_ONLY', 'medium'
-    if re.search(r'\bimport\s+' + re.escape(fqcn) + r'\b', text):
+    if re.search(r'\bimport\s+' + fqcn_pattern + r'(?!' + identifier_boundary + r')', text):
         return 'import_reference', 'CLASS_USAGE_ONLY', 'medium'
-    if re.search(r'\b(?:new|extends|implements|instanceof)\s+' + re.escape(simple_name) + r'\b', text):
+    if re.search(r'\b(?:new|extends|implements|instanceof)\s+' + simple_pattern
+                 + r'(?!' + identifier_boundary + r')', text):
         return 'class_reference', 'CLASS_USAGE_ONLY', 'strong'
-    if re.search(r'\b' + re.escape(simple_name) + r'\s*\.class\b', text):
+    if re.search(r'(?<!' + identifier_boundary + r')' + simple_pattern + r'\s*\.class\b', text):
         return 'class_literal', 'CLASS_USAGE_ONLY', 'strong'
-    if re.search(r'\b' + re.escape(simple_name) + r'\s*\.', text):
+    if re.search(r'(?<!' + identifier_boundary + r')' + simple_pattern + r'\s*\.', text):
         return 'qualified_reference', 'CLASS_USAGE_ONLY', 'medium'
     return 'string_reference', 'RESOURCE_OR_REFLECTION', 'weak'
 
@@ -843,16 +849,13 @@ def scan_thread_lifecycle_calls(source_dir):
         except Exception:
             continue
 
-        extends_thread = any(extends_re.search((ln or '')) for _, ln in lines)
+        full_text = ''.join(line for _, line in lines)
+        extends_thread = bool(extends_re.search(full_text))
         thread_vars = set()
-        for _, ln in lines:
-            stripped = (ln or '').strip()
-            if stripped.startswith('//') or stripped.startswith('*') or stripped.startswith('/*'):
-                continue
-            for m in decl_re.finditer(ln or ''):
-                name = (m.group(1) or '').strip()
-                if name:
-                    thread_vars.add(name)
+        for m in decl_re.finditer(full_text):
+            name = (m.group(1) or '').strip()
+            if name:
+                thread_vars.add(name)
 
         for lineno, ln in lines:
             raw = (ln or '').rstrip('\r\n')
@@ -986,8 +989,13 @@ def scan_javax(source_dir, output_path, _dep_changes_path=None):
                                     '引用类型': 'spi',
                                     '需迁移': 'Y',
                                 })
-                except Exception:
-                    pass
+                except (OSError, UnicodeError) as exc:
+                    rows.append({
+                        '文件': fpath, '行号': 0,
+                        '内容': f'读取失败：{type(exc).__name__}',
+                        '引用类型': 'spi_scan_incomplete',
+                        '需迁移': 'UNKNOWN',
+                    })
 
     # spring.factories
     for fpath in walk_files(source_dir, {'.factories'}):
@@ -1001,8 +1009,13 @@ def scan_javax(source_dir, output_path, _dep_changes_path=None):
                             '引用类型': 'spring_factories',
                             '需迁移': 'Y',
                         })
-        except Exception:
-            pass
+        except (OSError, UnicodeError) as exc:
+            rows.append({
+                '文件': fpath, '行号': 0,
+                '内容': f'读取失败：{type(exc).__name__}',
+                '引用类型': 'spring_factories_scan_incomplete',
+                '需迁移': 'UNKNOWN',
+            })
 
     try:
         jakarta_pack = load_rule_pack('jakarta')
@@ -1227,18 +1240,39 @@ def scan_sb_config(source_dir, output_path, _dep_changes_path=None):
     for fpath in walk_files(source_dir, {'.yml', '.yaml'}):
         try:
             with open_text(fpath) as f:
+                key_stack = []
+                block_scalar_indent = None
                 for lineno, line in enumerate(f, 1):
                     raw = line.rstrip('\r\n')
-                    m = re.match(r'^(\s*)([a-zA-Z][\w.\-]*)\s*:', raw)
+                    if not raw.strip() or raw.lstrip().startswith('#'):
+                        continue
+                    indent = len(raw) - len(raw.lstrip(' '))
+                    if block_scalar_indent is not None:
+                        if indent > block_scalar_indent:
+                            continue
+                        block_scalar_indent = None
+                    content = raw.lstrip(' ')
+                    if content.startswith('- '):
+                        content = content[2:].lstrip()
+                        indent += 2
+                    m = re.match(r'(?P<key>[a-zA-Z_][\w.\-]*|"[^"]+"|\'[^\']+\')\s*:', content)
                     if not m:
                         continue
-                    key = m.group(2)
-                    val_part = raw[m.end():].strip()
+                    key = m.group('key').strip('"\'')
+                    val_part = content[m.end():].strip()
+                    while key_stack and key_stack[-1][0] >= indent:
+                        key_stack.pop()
+                    full_key = '.'.join([item[1] for item in key_stack] + [key])
                     # 只记录叶节点（有值的行）
                     if val_part and not val_part.startswith('#'):
+                        if val_part in {'|', '>', '|-', '>-', '|+', '>+'}:
+                            block_scalar_indent = indent
+                            continue
                         rows.append({'文件': fpath, '行号': lineno,
-                                     '配置键': key,
+                                     '配置键': full_key,
                                      '当前值': val_part[:100].replace(',', ';')})
+                    else:
+                        key_stack.append((indent, key))
         except Exception:
             continue
 
@@ -1286,8 +1320,8 @@ def scan_sb_autoconfig(source_dir, output_path, _dep_changes_path=None):
                             'ApplicationListener', 'EnvironmentPostProcessor'
                         ]):
                             lines.append(f"    {line[:120]}")
-            except Exception:
-                pass
+            except (OSError, UnicodeError) as exc:
+                lines.append(f"    无法读取：{type(exc).__name__}；该文件未完成分析")
     else:
         lines.append("  ✅ 无 spring.factories 文件")
 

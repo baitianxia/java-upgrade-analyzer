@@ -118,8 +118,21 @@ def _parse_classfile_constant_pool(data):
         elif tag == 8:  # String
             idx += 2
         elif tag == 15:  # MethodHandle
+            if idx + 3 > len(data):
+                return None, 0
+            cp[cp_index] = {
+                'tag': tag,
+                'reference_kind': data[idx],
+                'reference_index': struct.unpack_from('>H', data, idx + 1)[0],
+            }
             idx += 3
         elif tag == 16:  # MethodType
+            if idx + 2 > len(data):
+                return None, 0
+            cp[cp_index] = {
+                'tag': tag,
+                'descriptor_index': struct.unpack_from('>H', data, idx)[0],
+            }
             idx += 2
         elif tag in (17, 18):  # Dynamic / InvokeDynamic
             if idx + 4 > len(data):
@@ -189,21 +202,29 @@ def _next_instruction_offset(code, offset):
     opcode = code[offset]
     if opcode == 0xaa:  # tableswitch
         pos = offset + 1
-        while (pos - offset) % 4:
+        # JVM padding aligns the first operand to a four-byte boundary relative
+        # to the beginning of the method's code array, not relative to opcode.
+        while pos % 4:
             pos += 1
         if pos + 12 > len(code):
-            return len(code)
+            return -1
         low = struct.unpack_from('>i', code, pos + 4)[0]
         high = struct.unpack_from('>i', code, pos + 8)[0]
-        return pos + 12 + max(0, high - low + 1) * 4
+        if high < low:
+            return -1
+        end = pos + 12 + (high - low + 1) * 4
+        return end if end <= len(code) else -1
     if opcode == 0xab:  # lookupswitch
         pos = offset + 1
-        while (pos - offset) % 4:
+        while pos % 4:
             pos += 1
         if pos + 8 > len(code):
-            return len(code)
+            return -1
         npairs = struct.unpack_from('>i', code, pos + 4)[0]
-        return pos + 8 + max(0, npairs) * 8
+        if npairs < 0:
+            return -1
+        end = pos + 8 + npairs * 8
+        return end if end <= len(code) else -1
     if opcode == 0xc4:  # wide
         if offset + 1 >= len(code):
             return len(code)
@@ -232,6 +253,7 @@ def parse_classfile_calls(data, class_name):
             return None
         class_simple = class_name.rsplit('.', 1)[-1]
         edges = []
+        pending_invokedynamic = []
         class_refs = {
             _cp_class_name(cp, cp_index).replace('/', '.').replace('$', '.')
             for cp_index, item in cp.items()
@@ -287,7 +309,9 @@ def parse_classfile_calls(data, class_name):
                                     'caller_owner': class_name,
                                     'caller_name': caller_name,
                                     'caller_signature': caller_signature,
+                                    'caller_descriptor': descriptor,
                                     'callee_key': f'{owner}.{member}',
+                                    'callee_descriptor': _desc,
                                     'callee_simple_key': f'field:{member}',
                                     'evidence_type': 'bytecode_field_access',
                                     'line': offset,
@@ -304,7 +328,9 @@ def parse_classfile_calls(data, class_name):
                                     'caller_owner': class_name,
                                     'caller_name': caller_name,
                                     'caller_signature': caller_signature,
+                                    'caller_descriptor': descriptor,
                                     'callee_key': f'{owner}.{display_member}{signature}',
+                                    'callee_descriptor': desc,
                                     'callee_simple_key': f'method:{display_member}{signature}',
                                     'evidence_type': 'bytecode_constructor_invocation' if member == '<init>' else 'bytecode_method_invocation',
                                     'line': offset,
@@ -319,11 +345,20 @@ def parse_classfile_calls(data, class_name):
                                 'caller_owner': class_name,
                                 'caller_name': caller_name,
                                 'caller_signature': caller_signature,
+                                'caller_descriptor': descriptor,
                                 'callee_key': f'invokedynamic:{indy_name}{signature}',
                                 'callee_simple_key': f'invokedynamic:{indy_name}',
                                 'evidence_type': 'bytecode_invokedynamic',
                                 'line': offset,
                                 'content': 'classfile invokedynamic',
+                            })
+                            pending_invokedynamic.append({
+                                'bootstrap_index': indy.get('bootstrap_method_attr_index'),
+                                'caller_owner': class_name,
+                                'caller_name': caller_name,
+                                'caller_signature': caller_signature,
+                                'caller_descriptor': descriptor,
+                                'line': offset,
                             })
                         elif opcode in (0xbb, 0xbd, 0xc0, 0xc1) and offset + 2 < len(code):
                             cp_idx = struct.unpack_from('>H', code, offset + 1)[0]
@@ -358,6 +393,75 @@ def parse_classfile_calls(data, class_name):
                             return None
                         offset = next_offset
                 idx = attr_end
+        # Resolve lambda/method-reference implementation handles from the
+        # class-level BootstrapMethods attribute.  The InvokeDynamic entry stores
+        # a zero-based bootstrap table index; LambdaMetafactory arguments include
+        # the actual MethodHandle that must become a call-graph edge.
+        bootstrap_methods = []
+        if idx + 2 > len(data):
+            return None
+        class_attr_count = struct.unpack_from('>H', data, idx)[0]
+        idx += 2
+        for _ in range(class_attr_count):
+            if idx + 6 > len(data):
+                return None
+            attr_name = _cp_utf8(cp, struct.unpack_from('>H', data, idx)[0])
+            attr_len = struct.unpack_from('>I', data, idx + 2)[0]
+            attr_start = idx + 6
+            attr_end = attr_start + attr_len
+            if attr_end > len(data):
+                return None
+            if attr_name == 'BootstrapMethods':
+                if attr_start + 2 > attr_end:
+                    return None
+                pos = attr_start
+                count = struct.unpack_from('>H', data, pos)[0]
+                pos += 2
+                for _bootstrap in range(count):
+                    if pos + 4 > attr_end:
+                        return None
+                    method_ref = struct.unpack_from('>H', data, pos)[0]
+                    arg_count = struct.unpack_from('>H', data, pos + 2)[0]
+                    pos += 4
+                    if pos + arg_count * 2 > attr_end:
+                        return None
+                    arguments = list(struct.unpack_from(f'>{arg_count}H', data, pos)) if arg_count else []
+                    pos += arg_count * 2
+                    bootstrap_methods.append((method_ref, arguments))
+            idx = attr_end
+
+        for pending in pending_invokedynamic:
+            bootstrap_index = pending.get('bootstrap_index')
+            if not isinstance(bootstrap_index, int) or bootstrap_index >= len(bootstrap_methods):
+                return None
+            _bootstrap_ref, arguments = bootstrap_methods[bootstrap_index]
+            for argument_index in arguments:
+                handle = cp.get(argument_index) or {}
+                if handle.get('tag') != 15:
+                    continue
+                owner, member, descriptor, tag = _classfile_ref(
+                    cp, handle.get('reference_index')
+                )
+                if tag not in (10, 11) or not owner or not member:
+                    continue
+                owner = owner.replace('/', '.').replace('$', '.')
+                signature = method_descriptor_signature(descriptor)
+                display_member = owner.rsplit('.', 1)[-1] if member == '<init>' else member
+                edges.append({
+                    'caller_owner': pending['caller_owner'],
+                    'caller_name': pending['caller_name'],
+                    'caller_signature': pending['caller_signature'],
+                    'caller_descriptor': pending['caller_descriptor'],
+                    'callee_key': f'{owner}.{display_member}{signature}',
+                    'callee_descriptor': descriptor,
+                    'callee_simple_key': f'method:{display_member}{signature}',
+                    'evidence_type': (
+                        'bytecode_constructor_invocation'
+                        if member == '<init>' else 'bytecode_invokedynamic_method_reference'
+                    ),
+                    'line': pending['line'],
+                    'content': 'classfile BootstrapMethods method handle',
+                })
         existing_type_refs = {
             item['callee_key'] for item in edges
             if item.get('evidence_type') == 'bytecode_type_reference'
@@ -608,7 +712,10 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
             metrics = {
                 'classes_scanned': scanned,
                 'edges_found': len(evidence),
-                'method_edges': sum(item.get('evidence_type') == 'bytecode_method_invocation' for item in evidence),
+                'method_edges': sum(item.get('evidence_type') in {
+                    'bytecode_method_invocation', 'bytecode_constructor_invocation',
+                    'bytecode_invokedynamic_method_reference',
+                } for item in evidence),
                 'field_edges': sum(item.get('evidence_type') == 'bytecode_field_access' for item in evidence),
                 'type_edges': sum(item.get('evidence_type') in {'bytecode_type_reference', 'bytecode_class_reference'} for item in evidence),
                 'invokedynamic_edges': sum(item.get('evidence_type') == 'bytecode_invokedynamic' for item in evidence),
@@ -699,7 +806,10 @@ def merge_business_bytecode_edges(graph, evidence):
             or ('.' in callee_key.split('(', 1)[0] and not callee_key.startswith(('method:', 'field:')))
         )
         edge.callee_signature_complete = bool(
-            edge.evidence_type not in {'bytecode_method_invocation', 'bytecode_constructor_invocation'}
+            edge.evidence_type not in {
+                'bytecode_method_invocation', 'bytecode_constructor_invocation',
+                'bytecode_invokedynamic_method_reference',
+            }
             or ('(' in callee_key and callee_key.endswith(')'))
         )
         if edge.callee_fqcn_complete and edge.callee_signature_complete:

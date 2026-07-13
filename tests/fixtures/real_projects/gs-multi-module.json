@@ -19,7 +19,7 @@
   ],
   "expected_chain": [
     "com.example.multimodule.application.DemoApplication.home",
-    "com.example.multimodule.service.MyService.message",
+    "com.example:library:com.example.multimodule.service.MyService.message",
     "com.example.multimodule.service.ServiceProperties.getMessage"
   ],
   "canonical_edges": [

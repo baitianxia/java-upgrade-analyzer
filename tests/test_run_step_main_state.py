@@ -1,5 +1,7 @@
 import csv
+import io
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -430,7 +432,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(selection_resolution["options"][0]["api_count"], 42)
             self.assertEqual(selection_resolution["options"][0]["high_risk_api_count"], 5)
 
-    def test_report_landing_docs_separate_user_evidence_and_runtime_layers(self):
+    def test_report_landing_doc_is_single_dynamic_user_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / ".upgrade-report"
             for relative in (
@@ -442,40 +444,160 @@ class RunStepMainStateTest(unittest.TestCase):
             ):
                 (report_dir / relative).mkdir(parents=True, exist_ok=True)
 
-            run_step.write_report_landing_docs(report_dir)
+            for relative in (
+                "deliverables/README.md",
+                "evidence/README.md",
+                ".runtime/README.md",
+                "evidence/dependencies/README.md",
+            ):
+                path = report_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("旧导航\n", encoding="utf-8")
+
+            state = run_step.new_main_state(report_dir)
+            state["state"].update(
+                {
+                    "current_step": "step5",
+                    "completed_step": "step4",
+                    "status": "awaiting_user_input",
+                    "blocking_reason": "请确认系统触达证据的分析范围。",
+                }
+            )
+            run_step.write_report_landing_docs(report_dir, state)
 
             root_readme = (report_dir / "README.md").read_text(encoding="utf-8")
-            deliverables_readme = (report_dir / "deliverables" / "README.md").read_text(encoding="utf-8")
-            evidence_readme = (report_dir / "evidence" / "README.md").read_text(encoding="utf-8")
-            runtime_readme = (report_dir / ".runtime" / "README.md").read_text(encoding="utf-8")
-            dependencies_readme = (report_dir / "evidence" / "dependencies" / "README.md").read_text(encoding="utf-8")
-            context_readme = (report_dir / "evidence" / "context" / "README.md").read_text(encoding="utf-8")
-            static_scan_readme = (report_dir / "evidence" / "static_scan" / "README.md").read_text(encoding="utf-8")
-            api_changes_readme = (report_dir / "evidence" / "api_changes" / "README.md").read_text(encoding="utf-8")
-            call_chain_readme = (report_dir / "evidence" / "call_chain" / "README.md").read_text(encoding="utf-8")
+            self.assertIn("当前状态：等待你确认", root_readme)
+            self.assertIn("当前任务：系统触达证据", root_readme)
+            self.assertIn("请确认系统触达证据的分析范围", root_readme)
+            self.assertIn("依赖包范围", root_readme)
+            self.assertIn("最终分析结果", root_readme)
+            self.assertNotIn("Step1", root_readme)
+            self.assertNotIn("Step5", root_readme)
+            self.assertEqual((report_dir / "deliverables" / "README.md").read_text(encoding="utf-8"), "旧导航\n")
+            self.assertEqual((report_dir / "evidence" / "README.md").read_text(encoding="utf-8"), "旧导航\n")
+            self.assertEqual((report_dir / ".runtime" / "README.md").read_text(encoding="utf-8"), "旧导航\n")
+            self.assertEqual((report_dir / "evidence" / "dependencies" / "README.md").read_text(encoding="utf-8"), "旧导航\n")
 
-            self.assertIn("先看 `deliverables/report.md`", root_readme)
-            self.assertIn("按问题找文件", root_readme)
-            self.assertIn("推荐阅读顺序", root_readme)
-            self.assertIn("不同阶段的第一入口", root_readme)
-            self.assertNotIn("为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/summary.json`", root_readme)
-            self.assertIn("为什么有些项不能确认 | `deliverables/report.md` 的“结论限制” | `evidence/call_chain/alerts.csv`", root_readme)
-            self.assertNotIn("不建议先看的文件", root_readme)
-            self.assertIn("给人看的交付结果", deliverables_readme)
-            self.assertIn("深入复核证据", evidence_readme)
-            self.assertIn("程序使用的状态和缓存", runtime_readme)
-            self.assertIn("普通用户不需要阅读", runtime_readme)
-            self.assertIn("changed_dependencies.md", evidence_readme)
-            self.assertIn("all_changed_apis.csv", evidence_readme)
-            self.assertIn("本次分析到底比较了哪些依赖变化", dependencies_readme)
-            self.assertIn("后续分析使用了什么升级上下文", context_readme)
-            self.assertIn("背景风险扫描结果", static_scan_readme)
-            self.assertIn("依赖包维度变化摘要", api_changes_readme)
-            self.assertIn("不要从 `all_changed_apis.csv` 逐行挑 API", api_changes_readme)
-            self.assertIn("完整逐链路台账", call_chain_readme)
-            self.assertIn("人工优先看的文件", call_chain_readme)
-            self.assertIn("深度排查或程序使用的文件", call_chain_readme)
-            self.assertLess(call_chain_readme.index("`alerts.csv`"), call_chain_readme.index("`summary.json`"))
+    def test_user_runtime_messages_cover_start_completion_and_failure_without_internal_state(self):
+        start = "\n".join(run_step.build_user_runtime_message("start", "step3"))
+        complete = "\n".join(run_step.build_user_runtime_message("complete", "step3"))
+        finished = "\n".join(run_step.build_user_runtime_message("complete", "step6"))
+        failed = "\n".join(run_step.build_user_runtime_message("failed", "step4", reason="无法读取依赖包"))
+
+        self.assertIn("正在分析：兼容性线索", start)
+        self.assertIn("兼容性线索已完成", complete)
+        self.assertIn("接下来：依赖 API 变化", complete)
+        self.assertIn("分析已完成", finished)
+        self.assertIn("deliverables/report.md", finished)
+        self.assertIn("依赖 API 变化未完成", failed)
+        self.assertIn("无法读取依赖包", failed)
+        self.assertIn("修正上述原因后重新分析", failed)
+        for text in (start, complete, finished, failed):
+            self.assertNotRegex(text, r"\b[Ss]tep\d+\b")
+            self.assertNotIn("main_state", text)
+            self.assertNotIn("退出码", text)
+
+    def test_upgrade_context_checkpoint_generates_one_human_review_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            context_dir = report_dir / "evidence" / "context"
+            context_dir.mkdir(parents=True)
+            (context_dir / "context.json").write_text(
+                json.dumps(
+                    {
+                        "base_branch": "release/1.x",
+                        "current_branch": "feature/upgrade",
+                        "jdk_base": "8",
+                        "jdk_current": "17",
+                        "springboot_base": "2.7.18",
+                        "springboot_current": "3.3.1",
+                        "changed_dependencies": [{"coord": "com.acme:demo"}],
+                        "source_dirs": ["src/main/java"],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (context_dir / "dep_graph.json").write_text("{}\n", encoding="utf-8")
+            manifest_steps = {
+                "step2": {
+                    "title": "升级上下文",
+                    "interaction": {
+                        "type": "review",
+                        "question": "请确认升级上下文。",
+                        "options": [{"id": "continue", "label": "确认范围"}],
+                    },
+                    "outputs": ["evidence/context/context.json", "evidence/context/dep_graph.json"],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step2",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={"target_module": "app"},
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+            review_path = context_dir / "review.md"
+            review = review_path.read_text(encoding="utf-8")
+            files = payload.get("files_to_review") or []
+            card = "\n".join(run_step.build_user_decision_card(payload))
+
+        self.assertEqual(files, [str(review_path.resolve())])
+        self.assertIn("本文件回答：本次升级分析使用了什么范围和版本信息。", review)
+        self.assertIn("release/1.x", review)
+        self.assertIn("feature/upgrade", review)
+        self.assertIn("8 → 17", review)
+        self.assertIn("2.7.18 → 3.3.1", review)
+        self.assertIn("app", review)
+        self.assertIn("目标模块：app", card)
+        self.assertNotIn("context.json", card)
+        self.assertNotIn("dep_graph.json", card)
+        self.assertNotIn("source_dirs_status", card)
+        self.assertNotIn("base_branch=", card)
+
+    def test_later_action_persists_paused_user_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            interaction = {
+                "step_id": "step4",
+                "status": "awaiting_user_input",
+                "options": [{"id": "cancel", "label": "稍后处理"}],
+            }
+            state["state"].update(
+                {
+                    "current_step": "step5",
+                    "completed_step": "step4",
+                    "status": "awaiting_user_input",
+                    "pending_interaction": interaction,
+                }
+            )
+            run_step.save_main_state(report_dir, state)
+            args = SimpleNamespace(
+                response_json=json.dumps({"action": "cancel"}, ensure_ascii=False),
+                response_file="",
+            )
+
+            result = run_step.apply_structured_user_response_if_present(
+                args,
+                project_dir,
+                report_dir,
+                state,
+                "step5",
+            )
+            saved = run_step.load_main_state(report_dir)
+            landing = (report_dir / "README.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result["early_exit_code"], 0)
+        self.assertEqual(saved["state"]["status"], "paused_by_user")
+        self.assertEqual(saved["state"]["pending_interaction"]["step_id"], "step4")
+        self.assertIn("当前状态：已暂停", landing)
+        self.assertIn("再次运行分析时，会回到当前确认任务", landing)
 
     def test_user_decision_card_hides_internal_fields_and_shows_direct_replies(self):
         interaction = {
@@ -502,12 +624,128 @@ class RunStepMainStateTest(unittest.TestCase):
         lines = run_step.build_user_decision_card(interaction)
         text = "\n".join(lines)
 
-        self.assertIn("当前需要确认：Step5 是全量分析，还是只分析部分依赖包？", text)
+        self.assertIn("当前需要确认：系统触达证据是覆盖全部依赖，还是只分析部分依赖包？", text)
         self.assertIn("推荐动作：依赖包数量不多时，选择全量继续。", text)
-        self.assertIn("`coord:com.acme:alpha`", text)
+        self.assertIn("`com.acme:alpha`", text)
         self.assertIn("你可以直接回复：", text)
+        self.assertNotIn("Step5", text)
+        self.assertNotIn("`continue`", text)
+        self.assertNotIn("`rerun_current_step`", text)
+        self.assertNotIn("coord:com.acme:alpha", text)
         self.assertNotIn("action_requirements", text)
         self.assertNotIn("selection_resolution", text)
+
+    def test_dependency_selection_card_names_full_list_when_candidates_are_truncated(self):
+        all_candidates = [
+            {
+                "selection_key": f"coord:com.acme:lib-{index}",
+                "coord": f"com.acme:lib-{index}",
+                "api_count": index + 1,
+                "high_risk_api_count": index % 3,
+            }
+            for index in range(37)
+        ]
+        interaction = {
+            "step_id": "step4",
+            "question": "请选择系统触达证据的分析范围。",
+            "options": [{"id": "continue", "label": "全部分析"}],
+            "selection_options": all_candidates[:20],
+            "selection_resolution": {
+                "enabled": True,
+                "options": all_candidates,
+                "source_file": "/project/.upgrade-report/evidence/api_changes/changed_dependencies.md",
+            },
+            "files_to_review": [
+                "/project/.upgrade-report/evidence/api_changes/changed_dependencies.md",
+                "/project/.upgrade-report/evidence/api_changes/all_changed_apis.csv",
+                "/project/.upgrade-report/evidence/api_changes/summary.txt",
+                "/project/.upgrade-report/evidence/api_changes/git_ref_matches.txt",
+                "/project/.upgrade-report/evidence/api_changes/timeouts.json",
+                "/project/.upgrade-report/evidence/api_changes/all_changed_apis_part_001.csv",
+                "/project/.upgrade-report/evidence/api_changes/all_changed_apis_part_002.csv",
+            ],
+        }
+
+        text = "\n".join(run_step.build_user_decision_card(interaction))
+
+        self.assertIn("展示 10 / 37 个候选依赖包", text)
+        self.assertIn(
+            "其余 27 个候选依赖包见 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md`",
+            text,
+        )
+        self.assertNotIn("完整候选请看下面的文件", text)
+        self.assertNotIn("interaction.json", text)
+        self.assertIn("all_changed_apis_part_002.csv", text)
+
+    def test_terminal_pause_message_only_shows_user_facing_decision_information(self):
+        interaction = {
+            "step_id": "step4",
+            "title": "jar 包变更对比",
+            "question": "请确认依赖 API 变化是否完整。",
+            "hard_stop": True,
+            "runtime_rules": ["must_wait_for_user_reply"],
+            "next_action_rule": "resume_only",
+            "resume_command_examples": [{"label": "continue", "command": "python run_step.py --response-json ..."}],
+            "options": [
+                {"id": "continue", "label": "结果完整，继续分析"},
+                {"id": "rerun_current_step"},
+            ],
+            "files_to_review": ["/tmp/.upgrade-report/evidence/api_changes/changed_dependencies.md"],
+        }
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        with patch.object(sys, "stderr", stderr), patch.object(sys, "stdout", stdout):
+            run_step.print_interaction_to_streams(interaction, Path("/tmp/.upgrade-report"))
+
+        text = stderr.getvalue()
+        self.assertIn("依赖 API 变化", text)
+        self.assertIn("为什么暂停", text)
+        self.assertIn("结果完整，继续分析", text)
+        self.assertIn("补充信息后重新分析", text)
+        self.assertIn("你可以直接回复", text)
+        self.assertIn("changed_dependencies.md", text)
+        for internal_text in (
+            "AWAITING USER INPUT",
+            "HARD STOP",
+            "RULE:",
+            "NEXT ACTION ONLY",
+            "continue`",
+            "rerun_current_step",
+            "interaction.json",
+            "main_state",
+            "response_schema",
+            "--response-json",
+        ):
+            self.assertNotIn(internal_text, text)
+        machine_line = next(line for line in stdout.getvalue().splitlines() if line.startswith("JUA_CONFIRMATION_JSON:"))
+        machine_event = json.loads(machine_line.split(":", 1)[1])
+        self.assertEqual(machine_event["schema"], "java-upgrade-analyzer.confirmation.v1")
+        self.assertEqual(machine_event["event"], "interaction_required")
+
+    def test_user_task_names_and_manifest_checkpoint_copy_are_human_facing(self):
+        expected_names = {
+            "step1": "分析对象与依赖范围",
+            "step2": "升级上下文",
+            "step3": "兼容性线索",
+            "step4": "依赖 API 变化",
+            "step5": "系统触达证据",
+            "step6": "分析报告",
+        }
+        self.assertEqual(run_step.USER_TASK_NAMES, expected_names)
+
+        manifest = json.loads((ROOT_DIR / "scripts" / "step_manifest.json").read_text(encoding="utf-8"))
+        for step in manifest["steps"]:
+            self.assertEqual(step["title"], expected_names[step["id"]])
+            interaction = step.get("interaction")
+            if not interaction:
+                continue
+            visible_copy = [interaction.get("question", "")]
+            visible_copy.extend(option.get("description", "") for option in interaction.get("options", []))
+            for copy in visible_copy:
+                self.assertIsNone(re.search(r"\bStep\d+\b|\bstep\d+\b", copy), copy)
+                self.assertNotIn("action=", copy)
+                self.assertNotIn("_step", copy)
 
     def test_step4_checkpoint_points_dependency_selection_to_markdown_first(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -558,8 +796,13 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
         checklist_text = "\n".join(payload.get("checklist_lines") or [])
-        self.assertIn("先看 evidence/api_changes/changed_dependencies.md", checklist_text)
-        self.assertIn("需要筛选或自动化时再用 changed_dependencies.csv", checklist_text)
+        review_files = "\n".join(payload.get("files_to_review") or [])
+        self.assertIn("完整依赖包清单见 changed_dependencies.md", checklist_text)
+        self.assertIn("API 级明细不作为普通选择入口", checklist_text)
+        self.assertIn("changed_dependencies.md", review_files)
+        self.assertIn("summary.txt", review_files)
+        self.assertIn("git_ref_matches.txt", review_files)
+        self.assertIn("all_changed_apis.csv", review_files)
 
     def test_user_decision_card_covers_step1_missing_input_request(self):
         interaction = run_step.build_step1_preflight_interaction({})
@@ -1366,6 +1609,14 @@ class RunStepMainStateTest(unittest.TestCase):
                                 "reason": "缺少依赖源码目录",
                             }
                         ],
+                        "not_found_apis": [
+                            {
+                                "severity": "P2",
+                                "coord": "com.example:not-found",
+                                "api": "com.example.NotFound.changed",
+                                "reason": "静态分析没有发现调用路径",
+                            }
+                        ],
                     },
                     ensure_ascii=False,
                 ),
@@ -1395,6 +1646,8 @@ class RunStepMainStateTest(unittest.TestCase):
         checklist_text = "\n".join(payload.get("checklist_lines") or [])
         self.assertIn("需人工复核=3", checklist_text)
         self.assertIn("缺少依赖源码/构建产物=4", checklist_text)
+        self.assertIn("本次未完成分析=1", checklist_text)
+        self.assertIn("未发现调用路径=1", checklist_text)
         self.assertIn("需人工复核示例", checklist_text)
         self.assertIn("缺少依赖源码/构建产物示例", checklist_text)
         self.assertNotIn("当前无法确认=", checklist_text)

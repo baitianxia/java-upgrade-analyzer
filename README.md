@@ -19,7 +19,7 @@
 - 分析 JDK、Spring、Jakarta 等框架级迁移风险；
 - 追踪变化 API 是否被业务源码、业务字节码或运行时依赖 jar 使用；
 - 尽量给出完整调用链，例如“业务代码 A → 依赖 B → 依赖 C → 变更 API D”；
-- 在 Step5 完成后，支持按指定方法即时查询调用链，直接返回链路文本；
+- 在系统触达证据分析完成后，支持按指定方法即时查询调用链，直接返回链路文本；
 - 输出人工可复核的明细和最终汇总报告。
 
 它不是自动修代码工具。默认只分析风险、输出证据和结论。
@@ -101,9 +101,9 @@ Claude Code 会负责：
 - 目标模块不明确；
 - 输入方式不完整；
 - 依赖坐标或版本无法安全补齐；
-- Step4 证据不完整，是否继续；
-- Step5 缺少依赖源码映射，是否补充后重跑；
-- 是否从某一步重新分析。
+- 依赖 API 变化证据不完整，是否补充材料后重新分析；
+- 系统触达证据缺少依赖源码，是否补充后重新分析；
+- 是否从某项任务重新分析。
 
 你只需要用自然语言回答即可，例如：
 
@@ -112,11 +112,11 @@ Claude Code 会负责：
 ```
 
 ```text
-依赖源码目录是 /abs/path/to/dependency-source-repo，补充后重跑 Step5。
+依赖源码目录是 /abs/path/to/dependency-source-repo，补充后重新分析系统触达证据。
 ```
 
 ```text
-从 Step4 重新跑。
+从依赖 API 变化重新分析。
 ```
 
 Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢复执行。
@@ -133,7 +133,7 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 4. 如果需要核对调用链证据，看 `.upgrade-report/evidence/call_chain/alerts.csv`。
 5. `.upgrade-report/.runtime/` 是程序状态目录，普通阅读不需要进入。
 
-Step4 后如果 Claude Code 询问 Step5 是全量分析还是只分析部分依赖包，候选项来自 `changed_dependencies.md/csv` 的依赖包维度清单，不需要从 `all_changed_apis.csv` 逐行挑 API。
+依赖 API 变化分析完成后，如果 Claude Code 询问系统触达证据是全量分析还是只分析部分依赖包，候选项来自 `changed_dependencies.md/csv` 的依赖包维度清单，不需要从 `all_changed_apis.csv` 逐行挑 API。
 
 ---
 
@@ -213,11 +213,11 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 | 文件 | 用途 |
 |---|---|
-| `.upgrade-report/README.md` | 解释产物目录分层和推荐阅读顺序 |
-| `.upgrade-report/deliverables/README.md` | 解释给用户看的交付物 |
-| `.upgrade-report/evidence/README.md` | 解释深入复核证据 |
-| `.upgrade-report/evidence/*/README.md` | 解释各步骤证据目录的阅读入口和复核路径 |
-| `.upgrade-report/.runtime/README.md` | 解释程序状态和缓存；普通用户不需要阅读 |
+| `.upgrade-report/README.md` | 唯一产物入口；显示当前任务、暂停原因、下一步和按问题找文件 |
+| `.upgrade-report/deliverables/report.md` | 最终客观分析结果、证据和结论限制 |
+| `.upgrade-report/evidence/context/review.md` | 给人看的升级上下文确认页 |
+| `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 依赖包维度的 API 变化和范围选择入口 |
+| `.upgrade-report/evidence/call_chain/alerts.csv` | 完整系统触达证据台账 |
 
 人工阅读优先按这个顺序：
 
@@ -346,6 +346,6 @@ Step4 需要 JApiCmp 做 jar API 对比。
 
 默认会先阻断确认，不会静默降级。
 
-Step5 默认会先使用运行 Skill 的同一个 Python 环境自动安装 `tree-sitter` 和 `tree-sitter-java`。如果自动安装失败，Claude Code 会停下来提示你手动安装；只有你明确确认接受降级后，才会继续使用增强正则。
+Step5 默认会把 `tree-sitter` 和 `tree-sitter-java` 自动安装到工具自己的缓存目录，不修改系统 Python 或项目虚拟环境，并设置安装超时。如果自动安装失败，Claude Code 会停下来提示你手动安装；只有你明确确认接受降级后，才会继续使用增强正则。
 
 不安装 tree-sitter 的后果是：Java AST 主链路不可用，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。

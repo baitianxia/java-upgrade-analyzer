@@ -63,27 +63,28 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ### tree-sitter 安装
 
-- Step5 默认会在缺少 `tree-sitter` / `tree-sitter-java` 时，使用**执行本 Skill 的同一个解释器**自动尝试安装一次。
+- Step5 默认会在缺少 `tree-sitter` / `tree-sitter-java` 时，使用执行本 Skill 的解释器把依赖安装到工具专用缓存目录（默认 `~/.cache/java-upgrade-analyzer/python/pyXY`），不会修改系统 Python 或当前项目虚拟环境。
+- 自动安装有超时限制；可用 `JUA_TREE_SITTER_TOOL_DIR` 指定隔离目录，用 `JUA_TREE_SITTER_AUTO_INSTALL_TIMEOUT` 调整超时。
 - 自动安装成功后，Java 源码走 AST 主链路；自动安装失败后，Step5 会进入 checkpoint，不允许静默降级。
 - 用户手动安装完成后，恢复时传回 `action=rerun_current_step` 与 `tree_sitter_installed=true`；若用户明确接受准确性下降，才传回 `allow_degraded=true` 继续增强正则降级。
 - 不要在正式流程开始前要求用户手动安装；只有自动安装失败、网络/权限受限，或用户明确要提前准备环境时，才使用下面命令。
 - 不要直接使用裸 `pip install`，否则很容易安装到错误的 Python 环境：
 
 ```bash
-python3 -m pip install tree-sitter tree-sitter-java
+python3 -m pip install --target ~/.cache/java-upgrade-analyzer/python/pyXY tree-sitter tree-sitter-java
 ```
 
 - 若机器上有多个 Python / venv，先确认当前解释器：
 
 ```bash
 python3 -c "import sys; print(sys.executable)"
-python3 -m pip install tree-sitter tree-sitter-java
+python3 -m pip install --target ~/.cache/java-upgrade-analyzer/python/pyXY tree-sitter tree-sitter-java
 ```
 
 - 若已知 `run_step.py` 实际由某个绝对路径的解释器执行，直接对该解释器安装最稳：
 
 ```bash
-"/abs/path/to/python" -m pip install tree-sitter tree-sitter-java
+"/abs/path/to/python" -m pip install --target ~/.cache/java-upgrade-analyzer/python/pyXY tree-sitter tree-sitter-java
 ```
 
 - 如需在离线 CI 或严格无网络环境关闭自动安装：
@@ -260,12 +261,9 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 .upgrade-report/
   README.md
   deliverables/
-    README.md
     report.md
   evidence/
-    README.md
     dependencies/
-      README.md
       dep_changes.csv
       dep_alerts.csv
       dep_summary.txt
@@ -273,12 +271,11 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
       build_provenance.json
       s1_artifacts/
     context/
-      README.md
+      review.md
       context.json
       dep_graph.json
       source_mapping_summary.json
     static_scan/
-      README.md
       s3_jdk_removed_api.csv
       s3_jdk_javax_refs.csv
       s3_jdk_internal_api.csv
@@ -290,7 +287,6 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
       s3_dependency_compat.csv
       s3_dependency_classfile.csv
     api_changes/
-      README.md
       changed_dependencies.md
       changed_dependencies.csv
       all_changed_apis.csv
@@ -301,13 +297,11 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
           resolved_targets.csv
           summary.json
     call_chain/
-      README.md
       alerts.csv
       summary.json
       by_api/
       by_module/
   .runtime/
-    README.md
     state/
       main_state.json
       interaction.json

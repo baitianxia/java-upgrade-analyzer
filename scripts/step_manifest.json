@@ -11,13 +11,13 @@
     {
       "id": "step1",
       "order": 1,
-      "title": "获取真实依赖结果",
+      "title": "分析对象与依赖范围",
       "script": "s1_dep_diff.py",
       "gate": "step1_scope",
       "interaction": {
         "type": "review",
         "status": "awaiting_user_input",
-        "question": "请确认真实构建来源和依赖变更范围是否可信；如果用户首轮已明确模块但这里仍是 root 范围，说明前置输入遗漏，应改为携带 primary_module/modules 重跑 Step1，而不是直接继续。",
+        "question": "请确认构建来源、目标模块和依赖变化范围是否正确。如果原本只想分析某个模块，但结果覆盖了整个项目，请补充正确的模块范围后重新分析。",
         "required_fields": [
           "action"
         ],
@@ -68,17 +68,17 @@
           {
             "id": "continue",
             "label": "继续",
-            "description": "真实构建结果和差异范围可信，继续执行 Step2。"
+            "description": "构建结果和依赖变化范围正确，继续整理升级上下文。"
           },
           {
             "id": "rerun_current_step",
             "label": "按模块重跑",
-            "description": "根据用户指定的模块范围重跑 Step1，重新获取模块级依赖结果；若首轮漏传模块，也应选择该动作。"
+            "description": "补充一个或多个目标模块，并重新获取这些模块的依赖变化。"
           },
           {
             "id": "cancel",
-            "label": "取消",
-            "description": "先人工复核真实构建方式与构建结果，稍后再继续。"
+            "label": "稍后处理",
+            "description": "保留当前分析现场，完成复核后再继续。"
           }
         ],
         "action_requirements": {
@@ -107,7 +107,7 @@
     {
       "id": "step2",
       "order": 2,
-      "title": "从依赖树推断上下文",
+      "title": "升级上下文",
       "script": "s2_context_from_deps.py",
       "gate": "context",
       "interaction": {
@@ -176,8 +176,8 @@
           },
           {
             "id": "cancel",
-            "label": "取消",
-            "description": "当前上下文有误，先调整配置后再继续。"
+            "label": "稍后处理",
+            "description": "保留当前分析现场，调整范围或版本信息后再继续。"
           }
         ],
         "action_requirements": {
@@ -204,7 +204,7 @@
     {
       "id": "step3",
       "order": 3,
-      "title": "静态扫描",
+      "title": "兼容性线索",
       "script": "s3_scan.py",
       "gate": "scan",
       "interaction": null,
@@ -235,7 +235,7 @@
     {
       "id": "step4",
       "order": 4,
-      "title": "jar 包变更对比",
+      "title": "依赖 API 变化",
       "script": "s4_jar_compare.py",
       "gate": "jar_compare",
       "interaction": {
@@ -253,7 +253,7 @@
             "cancel"
           ]
         },
-        "question": "请复核 jar 对比结果是否完整，尤其确认依赖源码目录是否覆盖相关仓库、自动识别出的模块坐标是否正确，以及 old_version/new_version 命中的 git refs 是否需要人工确认；若源码仓库已识别但 git refs 无法自动确定，应补充依赖 old_ref/new_ref 后重跑 Step4；若映射有误，可补充或修正依赖源码目录；若只想让 Step5 分析部分变更 jar，请从 changed_dependencies.md/csv 的依赖包候选中选择；若 JApiCmp / git diff / dependency:get 出现超时，应补充 Step4 超时参数后重跑，而不是直接继续。",
+        "question": "请确认依赖 API 变化是否完整：源码目录应覆盖相关仓库，自动识别的模块坐标和新旧版本引用应正确。若有缺失、匹配错误或对比超时，请补充信息后重新分析；若只关心部分依赖，也可以从依赖变化清单中选择。",
         "response_schema": {
           "type": "object",
           "required": [
@@ -307,17 +307,17 @@
           {
             "id": "continue",
             "label": "继续",
-            "description": "证据池基本可用，继续进入反向调用链分析。"
+            "description": "依赖 API 变化完整可信，继续判断这些变化是否触达当前系统。"
           },
           {
             "id": "rerun_current_step",
             "label": "修正映射后重跑",
-            "description": "用户补充依赖源码目录或修正源码映射后，重跑 Step4 重新生成源码 diff 与 git ref 匹配结果。"
+            "description": "补充依赖源码目录、修正新旧版本引用或放宽超时后，重新生成 API 变化结果。"
           },
           {
             "id": "cancel",
-            "label": "取消",
-            "description": "先补齐 jar 或源码映射，再继续。"
+            "label": "稍后处理",
+            "description": "保留当前分析现场，补齐依赖包或源码信息后再继续。"
           }
         ],
         "action_requirements": {
@@ -360,7 +360,7 @@
     {
       "id": "step5",
       "order": 5,
-      "title": "调用链影响分析",
+      "title": "系统触达证据",
       "script": "s5_call_chain_engine_integrated.py",
       "gate": "call_chain",
       "interaction": {
@@ -378,7 +378,7 @@
             "cancel"
           ]
         },
-        "question": "请确认本轮 Step5 的五类结论是否符合预期：已确认影响、可能影响、已确认不受影响、当前无法确认、需要补充输入。完整结果见 evidence/call_chain/alerts.csv；确认后可继续生成最终报告，也可以补充信息后重跑 Step5。",
+        "question": "请确认系统触达证据的分析结果。结论分为已确认影响、可能影响、已确认不受影响、需人工复核、缺少依赖源码或构建产物；本次未完成分析和未发现调用路径会另列为覆盖缺口。可以基于当前证据生成报告，也可以补充材料后重新分析。",
         "response_schema": {
           "type": "object",
           "required": [
@@ -416,12 +416,12 @@
           {
             "id": "rerun_current_step",
             "label": "补源码后重跑",
-            "description": "用户补充依赖源码目录后，重跑 Step5 重新生成 reachable / uncertain 结论。"
+            "description": "补充依赖源码目录后，重新判断变更是否触达当前系统以及哪些项目仍无法确认。"
           },
           {
             "id": "cancel",
-            "label": "取消",
-            "description": "先补齐调用链证据，再重新执行 Step5。"
+            "label": "稍后处理",
+            "description": "保留当前分析现场，补齐系统调用关系证据后再继续。"
           }
         ],
         "action_requirements": {
@@ -462,7 +462,7 @@
     {
       "id": "step6",
       "order": 6,
-      "title": "汇总报告",
+      "title": "分析报告",
       "script": "s6_report.py",
       "interaction": null,
       "depends_on": [

@@ -192,6 +192,7 @@ def summarize_step4(report_dir):
             if confirmed != 'true':
                 unconfirmed.append(api)
 
+    compression_warnings = []
     # 检查 jar 未找到情况
     if os.path.isdir(jar_dir):
         for f in os.listdir(jar_dir):
@@ -201,8 +202,10 @@ def summarize_step4(report_dir):
                         encoding='utf-8', errors='replace')[:300]
                     if '未找到' in content or 'jar 未找到' in content:
                         jar_missing.append(f)
-                except Exception:
-                    pass
+                except (OSError, UnicodeError) as exc:
+                    compression_warnings.append(
+                        f"step4_binary_summary_unreadable:{f}:{type(exc).__name__}"
+                    )
 
     # 从 main_state.json 读取派生出的依赖仓库映射（用于 Step5 自动发现）
     dependency_repo_mappings = []
@@ -222,8 +225,10 @@ def summarize_step4(report_dir):
                         break
                 if found:
                     break
-        except Exception:
-            pass
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+            compression_warnings.append(
+                f"main_state_unreadable:{type(exc).__name__}"
+            )
 
     return {
         'status': 'done',
@@ -238,6 +243,7 @@ def summarize_step4(report_dir):
         # 只保留 P0 清单（最重要），P1/P2 只保留计数
         'p0_apis': p0[:30],
         'jar_missing': jar_missing[:10],
+        'compression_warnings': compression_warnings,
         'note': f'完整清单在 {csv_path}'
     }
 

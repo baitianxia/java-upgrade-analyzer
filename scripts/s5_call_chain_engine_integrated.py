@@ -842,6 +842,7 @@ def _step5_integrated_main_impl(args):
         },
     )
     runtime_dependency_catalog = build_runtime_dependency_catalog(report_dir)
+    allowed_business_classes = runtime_business_class_index(runtime_dependency_catalog)
     dependency_source_mappings, skipped_dependency_source_mappings = (
         filter_dependency_source_mappings_for_runtime(
             dependency_source_mappings,
@@ -917,6 +918,7 @@ def _step5_integrated_main_impl(args):
         max_methods=getattr(args, 'max_methods', None),
         jar_metadata=business_jar_metadata,
         retain_analysis_cache=bool(dependency_source_mappings),
+        allowed_business_classes=allowed_business_classes,
     )
     business_graph_elapsed = time.perf_counter() - business_graph_timer
     emit_progress(
@@ -1108,6 +1110,7 @@ def _step5_integrated_main_impl(args):
             reused_analysis=reused_analysis,
             retain_analysis_cache=False,
             allowed_dependency_classes_by_coord=allowed_dependency_classes_by_coord,
+            allowed_business_classes=allowed_business_classes,
         )
         full_graph_elapsed = time.perf_counter() - full_graph_timer
         business_graph_result = None
@@ -1550,6 +1553,21 @@ def build_runtime_dependency_catalog(report_dir):
         'metrics': {},
         'target_jdk': '',
     }
+    application_module_coords = set()
+    state_path = _state_path(report_dir)
+    if state_path.is_file():
+        try:
+            state_payload = json.loads(state_path.read_text(encoding='utf-8'))
+            for step in ('step5', 'step4', 'step3', 'step2', 'step1'):
+                section = state_payload.get(step) or {}
+                for view in ('input', 'output', 'derived'):
+                    scope = (section.get(view) or {}).get('project_scope') or {}
+                    application_module_coords.update(
+                        str(item).strip() for item in scope.get('included_module_coords') or []
+                        if str(item).strip()
+                    )
+        except (OSError, json.JSONDecodeError, AttributeError):
+            catalog['reason_codes'].append('project_scope_unreadable')
     context_path = str(_context_path(report_dir))
     if os.path.exists(context_path):
         try:
@@ -1627,6 +1645,7 @@ def build_runtime_dependency_catalog(report_dir):
                             'coord': coord, 'version': version, 'scope': scope,
                             'jar_path': str(jar_path), 'artifact_entry': lib_entry,
                             'sha256': digest, 'evidence_source': 'current_final_artifact',
+                            'application_owned': coord in application_module_coords,
                         }
                         catalog['by_coord'][coord] = item
                         catalog['entries'].append(item)
@@ -1713,6 +1732,9 @@ def build_runtime_dependency_catalog(report_dir):
         'missing_dependencies': len(missing_coords),
         'business_classes': business_class_count,
         'extraction_failures': len(extraction_failures),
+        'application_owned_nested_dependencies': sum(
+            1 for item in catalog['entries'] if item.get('application_owned')
+        ),
     }
     catalog['extraction_failures'] = extraction_failures
     serializable = {key: value for key, value in catalog.items() if not key.startswith('_')}
@@ -1722,6 +1744,26 @@ def build_runtime_dependency_catalog(report_dir):
         json.dumps(serializable, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
     return catalog
+
+
+def runtime_business_class_index(runtime_dependency_catalog):
+    """Return the classes physically packaged as application code, or None if unknown."""
+    business_item = ((runtime_dependency_catalog or {}).get('by_coord') or {}).get('__business__') or {}
+    jar_path = str(business_item.get('jar_path') or '').strip()
+    if not jar_path or not os.path.isfile(jar_path):
+        return None
+    try:
+        with zipfile.ZipFile(jar_path) as jar:
+            classes = {
+                entry[:-6].replace('/', '.')
+                for entry in jar.namelist()
+                if entry.endswith('.class')
+                and not entry.startswith('META-INF/')
+                and not entry.endswith('module-info.class')
+            }
+    except (OSError, zipfile.BadZipFile):
+        return None
+    return classes
 
 
 def assess_source_artifact_alignment(report_dir, business_source_dirs):
@@ -2350,10 +2392,44 @@ def _filter_dependency_source_entry(entry, allowed_dependency_classes_by_coord):
     return filtered
 
 
+def _filter_source_entry(
+    entry,
+    allowed_business_classes=None,
+    allowed_dependency_classes_by_coord=None,
+):
+    root = (entry or {}).get('root') or {}
+    owner_type = str(root.get('owner_type') or '').strip()
+    if owner_type == 'business' and allowed_business_classes is not None:
+        allowed = set(allowed_business_classes)
+        kept_methods = [
+            method for method in (entry.get('methods') or [])
+            if _source_class_in_allowed_jar(getattr(method, 'class_fqcn', ''), allowed)
+        ]
+        package_name = str(entry.get('package_name') or '').strip()
+        kept_declared_types = {
+            class_name: metadata
+            for class_name, metadata in (entry.get('declared_types') or {}).items()
+            if _source_class_in_allowed_jar(
+                f"{package_name}.{class_name}" if package_name else str(class_name),
+                allowed,
+            )
+        }
+        if not kept_methods and not kept_declared_types:
+            return None
+        filtered = dict(entry)
+        filtered['methods'] = kept_methods
+        filtered['declared_types'] = kept_declared_types
+        return filtered
+    if owner_type == 'dependency' and allowed_dependency_classes_by_coord is not None:
+        return _filter_dependency_source_entry(entry, allowed_dependency_classes_by_coord)
+    return entry
+
+
 def _collect_source_file_entries(
     source_roots,
     reused_analysis=None,
     allowed_dependency_classes_by_coord=None,
+    allowed_business_classes=None,
 ):
     skip_dirs = {
         '.git', 'target', 'build', '.gradle', 'out', 'bin',
@@ -2374,17 +2450,19 @@ def _collect_source_file_entries(
             copied = dict(entry)
             copied['file_path'] = file_path
             copied['root'] = dict(entry.get('root') or {})
-            filtered = _filter_dependency_source_entry(
+            filtered = _filter_source_entry(
                 copied,
-                allowed_dependency_classes_by_coord,
-            ) if allowed_dependency_classes_by_coord is not None else copied
+                allowed_business_classes=allowed_business_classes,
+                allowed_dependency_classes_by_coord=allowed_dependency_classes_by_coord,
+            ) if (allowed_business_classes is not None or allowed_dependency_classes_by_coord is not None) else copied
             if filtered is not None:
                 entries.append(filtered)
         else:
-            filtered = _filter_dependency_source_entry(
+            filtered = _filter_source_entry(
                 entry,
-                allowed_dependency_classes_by_coord,
-            ) if allowed_dependency_classes_by_coord is not None else entry
+                allowed_business_classes=allowed_business_classes,
+                allowed_dependency_classes_by_coord=allowed_dependency_classes_by_coord,
+            ) if (allowed_business_classes is not None or allowed_dependency_classes_by_coord is not None) else entry
             if filtered is not None:
                 entries.append(filtered)
         seen_files.add(file_path)
@@ -2417,10 +2495,11 @@ def _collect_source_file_entries(
                     continue
                 entry = _analyze_source_file_entry(file_path, root)
                 parser_info = entry.get('parser_info') or {}
-                if allowed_dependency_classes_by_coord is not None:
-                    entry = _filter_dependency_source_entry(
+                if allowed_business_classes is not None or allowed_dependency_classes_by_coord is not None:
+                    entry = _filter_source_entry(
                         entry,
-                        allowed_dependency_classes_by_coord,
+                        allowed_business_classes=allowed_business_classes,
+                        allowed_dependency_classes_by_coord=allowed_dependency_classes_by_coord,
                     )
                 if entry is not None:
                     entries.append(entry)
@@ -2446,6 +2525,7 @@ def build_enhanced_source_graph(
     reused_analysis=None,
     retain_analysis_cache=True,
     allowed_dependency_classes_by_coord=None,
+    allowed_business_classes=None,
 ):
     """
     构建增强型源码图
@@ -2484,6 +2564,7 @@ def build_enhanced_source_graph(
         source_roots,
         reused_analysis=reused_analysis,
         allowed_dependency_classes_by_coord=allowed_dependency_classes_by_coord,
+        allowed_business_classes=allowed_business_classes,
     )
     _step5_debug(
         'graph_build_start',
@@ -2518,8 +2599,10 @@ def build_enhanced_source_graph(
         try:
             method_def.declared_signature = signature
             method_def.declared_qualified_key = declared_key
-        except Exception:
-            pass
+        except (AttributeError, TypeError):
+            stats['method_identity_annotation_failures'] = (
+                stats.get('method_identity_annotation_failures', 0) + 1
+            )
         return signature, declared_key
 
     def method_lookup_keys(method_def):
@@ -2584,8 +2667,10 @@ def build_enhanced_source_graph(
                 edge.callee_resolution_note = '缺少调用目标方法参数签名'
             else:
                 edge.callee_resolution_note = '调用目标已解析到全限定名和签名'
-        except Exception:
-            pass
+        except (AttributeError, TypeError):
+            stats['edge_resolution_annotation_failures'] = (
+                stats.get('edge_resolution_annotation_failures', 0) + 1
+            )
 
     def build_reverse_edge_keys(edge):
         annotate_edge_resolution(edge)

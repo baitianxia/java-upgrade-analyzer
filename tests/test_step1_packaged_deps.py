@@ -17,6 +17,27 @@ from pipeline_constants import STEP1_ARTIFACTS_DIRNAME  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
+    def test_dependency_list_parser_preserves_custom_scope_and_classifier(self):
+        parsed = s1_dep_diff._parse_maven_dependency_list_line(
+            "[INFO] org.example:native-lib:jar:linux-x86_64:1.2.3:company-runtime"
+        )
+
+        self.assertEqual(parsed["key"], "org.example:native-lib:linux-x86_64")
+        self.assertEqual(parsed["version"], "1.2.3")
+        self.assertEqual(parsed["scope"], "company-runtime")
+        self.assertEqual(parsed["classifier"], "linux-x86_64")
+        optional = s1_dep_diff._parse_maven_dependency_list_line(
+            "org.example:helper:jar:2.0:compile (optional)"
+        )
+        self.assertEqual(optional["scope"], "compile")
+
+    def test_dependency_list_parser_rejects_log_prose_with_colons(self):
+        self.assertIsNone(
+            s1_dep_diff._parse_maven_dependency_list_line(
+                "[WARNING] Failed to resolve: artifact: because: repository unavailable"
+            )
+        )
+
     def _nested_jar_bytes(self, entries):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as nested:

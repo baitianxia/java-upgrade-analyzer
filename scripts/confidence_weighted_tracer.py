@@ -1534,9 +1534,16 @@ def _references_from_executable_classfile_edges(edges):
         if not opcode_family or instruction_offset is None:
             continue
         callee_key = str(edge.get('callee_key') or '')
-        caller_method = '<unknown>'
-        caller_signature = ''
-        if evidence_type in {'bytecode_method_invocation', 'bytecode_constructor_invocation'}:
+        caller_method = str(edge.get('caller_name') or '<unknown>')
+        caller_descriptor = str(edge.get('caller_descriptor') or '')
+        caller_signature = (
+            _method_descriptor_to_lookup_signature(caller_descriptor)
+            if caller_descriptor else str(edge.get('caller_signature') or '')
+        )
+        if evidence_type in {
+            'bytecode_method_invocation', 'bytecode_constructor_invocation',
+            'bytecode_invokedynamic_method_reference',
+        }:
             owner_and_member, _, signature_tail = callee_key.partition('(')
             owner, _, member = owner_and_member.rpartition('.')
             signature = normalize_signature_for_lookup(
@@ -1547,15 +1554,17 @@ def _references_from_executable_classfile_edges(edges):
                 'owner': owner,
                 'jvm_owner': owner,
                 'name': jvm_member,
-                'descriptor': '',
+                'descriptor': str(edge.get('callee_descriptor') or ''),
                 'signature': signature,
                 'consumer_method': caller_method,
                 'consumer_signature': caller_signature,
-                'consumer_descriptor': '',
+                'consumer_descriptor': caller_descriptor,
                 'opcode_family': opcode_family,
                 'instruction_offset': instruction_offset,
                 'reference_kind': 'classfile_methodref',
             })
+            if evidence_type == 'bytecode_invokedynamic_method_reference':
+                references['method_refs'][-1]['reference_kind'] = 'invokedynamic_method_handle'
             references['class_refs'].add(owner)
         elif evidence_type == 'bytecode_field_access':
             owner, _, member = callee_key.rpartition('.')
@@ -1563,11 +1572,11 @@ def _references_from_executable_classfile_edges(edges):
                 'owner': owner,
                 'jvm_owner': owner,
                 'name': member,
-                'descriptor': '',
+                'descriptor': str(edge.get('callee_descriptor') or ''),
                 'signature': '',
                 'consumer_method': caller_method,
                 'consumer_signature': caller_signature,
-                'consumer_descriptor': '',
+                'consumer_descriptor': caller_descriptor,
                 'opcode_family': opcode_family,
                 'instruction_offset': instruction_offset,
                 'reference_kind': 'classfile_fieldref',
@@ -1581,7 +1590,7 @@ def _references_from_executable_classfile_edges(edges):
             'owner': owner,
             'consumer_method': caller_method,
             'consumer_signature': caller_signature,
-            'consumer_descriptor': '',
+            'consumer_descriptor': caller_descriptor,
             'reference_kind': 'classfile_type_reference',
             'opcode_family': opcode_family,
             'instruction_offset': instruction_offset,
@@ -1939,7 +1948,53 @@ def _load_runtime_dependency_class_references(
     return parsed
 
 
+def _load_direct_classfile_references(
+    data, artifact_sha256, target_jdk, class_binary_name,
+    multi_release_version=None, class_entry='', graph=None,
+):
+    """Cache the complete non-reflective/non-dynamic classfile fast path.
+
+    The namespace prevents a shallow direct result from colliding with the
+    authoritative javap cache introduced by the immutable artifact cache.
+    """
+    base_key = _immutable_artifact_parse_cache_key(
+        artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        class_entry=class_entry,
+    )
+    cache_key = ('classfile-executable-v2', *base_key)
+    generation = _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
+    if _valid_sha256(artifact_sha256):
+        with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+            cached = _IMMUTABLE_ARTIFACT_PARSE_CACHE.get(cache_key)
+        if isinstance(cached, str):
+            _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
+            return json.loads(cached)
+
+    direct_edges = parse_classfile_calls(data, class_binary_name)
+    if direct_edges is None:
+        return None
+    summary = _parse_classfile_constant_pool_summary(data)
+    if summary is None or summary.get('has_dynamic_reference'):
+        return None
+    references = _references_from_executable_classfile_edges(direct_edges)
+    _perf_add(graph, 'bytecode_scan', 'artifact_cache_misses', 1)
+    _record_actual_artifact_class_parse(
+        graph, artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+    )
+    if _valid_sha256(artifact_sha256):
+        serialized = json.dumps(references, sort_keys=True, separators=(',', ':'))
+        with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+            if _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION == generation:
+                _IMMUTABLE_ARTIFACT_PARSE_CACHE[cache_key] = serialized
+    return references
+
+
 def _load_runtime_dependency_class_references_for_task(task):
+    # A valid direct classfile parse is authoritative for ordinary bytecode and
+    # avoids spawning a JVM per class.  Reflection and unresolved invokedynamic
+    # classes deliberately do not populate this field and retain the javap path.
+    if task.get('preparsed_references') is not None:
+        return task, task.get('preparsed_references')
     references = _load_runtime_dependency_class_references(
         task['catalog'],
         task['coord'],
@@ -2410,6 +2465,7 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                     for matched in matches:
                         hit = {
                             'coord': coord,
+                            'application_owned': bool(item.get('application_owned')),
                             'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
                             'direct_consumer': not same_coord,
                             'jar_path': jar_path,
@@ -2558,6 +2614,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     hits_by_key = defaultdict(list)
     javap_tasks = []
     scanned_classes = 0
+    actual_javap_classes = 0
+    direct_classfile_classes = 0
     visited_classes = 0
     multi_release_seen = False
     multi_release_target_resolved = False
@@ -2684,6 +2742,13 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     if not candidate_owners:
                         continue
                     class_binary_name = logical_name[:-6].replace('/', '.')
+                    preparsed_references = _load_direct_classfile_references(
+                        data, artifact_sha256, target_jdk, class_binary_name,
+                        multi_release_version=selected_version, class_entry=entry, graph=graph,
+                    )
+                    if preparsed_references is not None:
+                        jar_constant_pool_hits += 1
+                        _perf_add(graph, 'bytecode_scan', 'classfile_fast_path_hits', 1)
                     javap_tasks.append({
                         'catalog': catalog,
                         'coord': coord,
@@ -2698,6 +2763,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         'target_jdk': target_jdk,
                         'graph': graph,
                         'candidate_owners': sorted(set(candidate_owners)),
+                        'preparsed_references': preparsed_references,
+                        'application_owned': bool(item.get('application_owned')),
                     })
                     jar_candidate_classes += 1
         except Exception as exc:
@@ -2731,7 +2798,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         )
 
         def handle_javap_result(task, references):
-            nonlocal scanned_classes
+            nonlocal scanned_classes, actual_javap_classes, direct_classfile_classes
             coord = task.get('coord') or ''
             jar_path = task.get('jar_path') or ''
             class_binary_name = task.get('class_binary_name') or ''
@@ -2756,11 +2823,16 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     'class_binary_name': class_binary_name,
                     'multi_release_version': selected_version,
                 }
+                failure.update(task.get('parse_failure') or {})
                 for owner in set(candidate_owners):
                     for api_row in target_rows_by_owner.get(owner, []):
                         candidate_failures_by_key[build_api_identity_key(api_row)].append(failure)
                 return
             scanned_classes += 1
+            if task.get('preparsed_references') is not None:
+                direct_classfile_classes += 1
+            else:
+                actual_javap_classes += 1
             _perf_record_top(graph, 'bytecode_scan', 'slow_javap_tasks', {
                 'coord': coord,
                 'jar_path': jar_path,
@@ -2795,6 +2867,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     for matched in matches:
                         hit = {
                             'coord': coord,
+                            'application_owned': bool(task.get('application_owned')),
                             'edge_role': 'internal_bridge' if same_coord else 'external_consumer',
                             'direct_consumer': not same_coord,
                             'jar_path': jar_path,
@@ -2827,7 +2900,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     emit_progress(
                         "step5",
                         "bytecode-scan",
-                        "运行时依赖候选 class javap 解析进度",
+                        "运行时依赖候选 class 解析进度",
                         current=done_count,
                         total=len(javap_tasks),
                         elapsed=time.perf_counter() - javap_started_at,
@@ -2847,14 +2920,19 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     task = future_map[future]
                     try:
                         _task, references = future.result()
-                    except Exception:
+                    except Exception as exc:
                         _task, references = task, None
+                        _task['parse_failure'] = {
+                            'reason': 'BYTECODE_WORKER_FAILED',
+                            'error_type': type(exc).__name__,
+                            'error': str(exc),
+                        }
                     handle_javap_result(_task, references)
                     if should_log_progress(done_count, len(future_map), progress_interval):
                         emit_progress(
                             "step5",
                             "bytecode-scan",
-                            "运行时依赖候选 class javap 解析进度",
+                            "运行时依赖候选 class 解析进度",
                             current=done_count,
                             total=len(future_map),
                             elapsed=time.perf_counter() - javap_started_at,
@@ -2944,7 +3022,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         "bytecode-scan",
         (
             "运行时依赖字节码批量扫描完成，"
-            f"visited_classes={visited_classes}，javap_classes={scanned_classes}，"
+            f"visited_classes={visited_classes}，classfile_fast_path={direct_classfile_classes}，"
+            f"javap_classes={actual_javap_classes}，"
             f"hit_apis={sum(1 for key in hits_by_key if hits_by_key.get(key))}"
         ),
         current=len(catalog_entries),
@@ -2953,8 +3032,10 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     )
     _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
     _perf_add(graph, 'bytecode_scan', 'visited_classes', visited_classes)
-    _perf_add(graph, 'bytecode_scan', 'javap_tasks', len(javap_tasks))
-    _perf_add(graph, 'bytecode_scan', 'javap_classes', scanned_classes)
+    _perf_add(graph, 'bytecode_scan', 'candidate_parse_tasks', len(javap_tasks))
+    _perf_add(graph, 'bytecode_scan', 'javap_tasks', actual_javap_classes)
+    _perf_add(graph, 'bytecode_scan', 'classfile_fast_path_classes', direct_classfile_classes)
+    _perf_add(graph, 'bytecode_scan', 'javap_classes', actual_javap_classes)
     _perf_add(graph, 'bytecode_scan', 'hit_apis', sum(1 for key in hits_by_key if hits_by_key.get(key)))
     _perf_add(graph, 'bytecode_scan', 'scan_failures', len(scan_failures))
     return existing
@@ -3172,16 +3253,24 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         'target_jdk': target_jdk,
                         'graph': graph,
                     }
-                    references = _load_runtime_dependency_class_references(
-                        catalog, coord, jar_path, class_binary_name,
+                    data = zf.read(entry)
+                    references = _load_direct_classfile_references(
+                        data, artifact_sha256, target_jdk, class_binary_name,
                         multi_release_version=selected_version,
-                        artifact_sha256=artifact_sha256, target_jdk=target_jdk, graph=graph,
-                        class_entry=entry,
+                        class_entry=entry, graph=graph,
                     )
+                    if references is None:
+                        references = _load_runtime_dependency_class_references(
+                            catalog, coord, jar_path, class_binary_name,
+                            multi_release_version=selected_version,
+                            artifact_sha256=artifact_sha256, target_jdk=target_jdk, graph=graph,
+                            class_entry=entry,
+                        )
                     if references is None:
                         parse_failures += 1
                         unparsed_tasks.append(task)
                         continue
+                    task['preparsed_references'] = references
                     task_id = len(tasks)
                     tasks.append(task)
                     member_refs = list(references.get('method_refs') or [])
@@ -3315,6 +3404,7 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
     visited_classes = 0
     javap_classes = 0
     edges_added = 0
+    expansion_failures = []
     target_jdk = catalog.get('target_jdk')
     candidate_cache = getattr(graph, '_runtime_dependency_caller_candidate_cache', None)
     if candidate_cache is None:
@@ -3426,8 +3516,15 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                                 'target_jdk': target_jdk,
                                 'graph': graph,
                             })
-                except Exception:
+                except Exception as exc:
                     _perf_add(graph, 'bytecode_expand', 'light_scan_failures', 1)
+                    expansion_failures.append({
+                        'reason': 'BYTECODE_EXPAND_ARCHIVE_FAILED',
+                        'coord': coord,
+                        'jar_path': jar_path,
+                        'error_type': type(exc).__name__,
+                        'error': str(exc),
+                    })
                     continue
             _perf_add(graph, 'bytecode_expand', 'light_scan_elapsed_sec', time.perf_counter() - scan_started_at)
         candidate_cache[candidate_cache_key] = {
@@ -3438,6 +3535,13 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
     def handle_javap_result(task, references):
         nonlocal javap_classes, edges_added
         if references is None:
+            expansion_failures.append({
+                'reason': 'BYTECODE_EXPAND_PARSE_FAILED',
+                'coord': task.get('coord') or '',
+                'jar_path': task.get('jar_path') or '',
+                'class_binary_name': task.get('class_binary_name') or '',
+                **(task.get('parse_failure') or {}),
+            })
             return
         javap_classes += 1
         matches = _match_runtime_dependency_references(api_row, references)
@@ -3481,8 +3585,12 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                     task = future_map[future]
                     try:
                         _task, references = future.result()
-                    except Exception:
+                    except Exception as exc:
                         _task, references = task, None
+                        _task['parse_failure'] = {
+                            'error_type': type(exc).__name__,
+                            'error': str(exc),
+                        }
                     handle_javap_result(_task, references)
                     if log_lookup_progress and should_log_progress(done_count, len(future_map), progress_interval):
                         emit_progress(
@@ -3496,6 +3604,17 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
         _perf_add(graph, 'bytecode_expand', 'javap_elapsed_sec', time.perf_counter() - javap_started_at)
     _perf_add(graph, 'bytecode_expand', 'elapsed_sec', time.perf_counter() - expand_started_at)
     _perf_add(graph, 'bytecode_expand', 'candidate_classes', len(javap_tasks))
+    if expansion_failures:
+        expanded.discard(lookup_key)
+        failures = getattr(graph, '_runtime_dependency_expand_failures', None)
+        if failures is None:
+            failures = []
+            setattr(graph, '_runtime_dependency_expand_failures', failures)
+        failures.extend(expansion_failures)
+        _record_analyzer_ledger_failure(
+            graph, 'BYTECODE_EXPANSION_INCOMPLETE', lookup_key=lookup_key,
+            failure_count=len(expansion_failures),
+        )
     _perf_add(graph, 'bytecode_expand', 'javap_classes', javap_classes)
     _perf_add(graph, 'bytecode_expand', 'edges_added', edges_added)
     _perf_add(graph, 'bytecode_expand', 'visited_classes', visited_classes)
@@ -3564,13 +3683,17 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
     cache_key = (lookup_keys, int(max_depth or 0))
     if cache_key in path_cache:
         return list(path_cache.get(cache_key) or [])
-    queue = []
+    queue = deque()
+    queued = set()
     for key in lookup_keys:
-        queue.append((key, []))
+        if key not in queued:
+            queue.append((key, []))
+            queued.add(key)
     visited = set()
     paths = []
     while queue:
-        current_key, path = queue.pop(0)
+        current_key, path = queue.popleft()
+        queued.discard(current_key)
         if current_key in visited or len(path) >= max_depth:
             continue
         visited.add(current_key)
@@ -3590,7 +3713,9 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
             caller_key = getattr(method_def, 'qualified_key', '') or getattr(edge, 'caller_qualified_key', '')
             if caller_key:
                 for variant in _method_lookup_key_variants(caller_key):
-                    queue.append((variant, next_path))
+                    if variant not in visited and variant not in queued:
+                        queue.append((variant, next_path))
+                        queued.add(variant)
     path_cache[cache_key] = list(paths)
     return paths
 
@@ -3646,12 +3771,15 @@ def _apply_removed_dependency_packaged_impact(result, hits):
 
 
 def _build_packaged_dependency_hit_result(result, hits, graph=None):
-    business_hits = [item for item in hits if item.get('coord') == '__business__']
-    if graph is not None and len([item for item in hits if item.get('coord') != '__business__']) >= 8:
+    business_hits = [
+        item for item in hits
+        if item.get('coord') == '__business__' or item.get('application_owned') is True
+    ]
+    if graph is not None and len([item for item in hits if item not in business_hits]) >= 8:
         setattr(graph, '_prefer_runtime_dependency_member_candidate_index', True)
     bridged_hits = []
     for item in hits:
-        if item.get('coord') == '__business__':
+        if item in business_hits:
             continue
         runtime_entry, framework_entries = _packaged_hit_runtime_framework_entry(item, graph)
         if runtime_entry is not None:
@@ -3723,10 +3851,10 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         }]
         result.evidence_paths.append(evidence)
         result.path_details.append({
-            'path_status': 'reachable' if hit.get('coord') == '__business__' else 'uncertain',
-            'stop_reason': '' if hit.get('coord') == '__business__' else 'BUSINESS_ENTRY_NOT_CONFIRMED',
-            'business_entry': consumer_symbol if hit.get('coord') == '__business__' else '',
-            'business_reachable': hit.get('coord') == '__business__',
+            'path_status': 'reachable' if hit in business_hits else 'uncertain',
+            'stop_reason': '' if hit in business_hits else 'BUSINESS_ENTRY_NOT_CONFIRMED',
+            'business_entry': consumer_symbol if hit in business_hits else '',
+            'business_reachable': hit in business_hits,
             'consumer_coord': hit.get('coord', ''),
             'consumer_class': hit.get('class_fqcn', ''),
             'consumer_method': consumer_member,
@@ -4441,7 +4569,10 @@ def trace_api_with_confidence_weighting(
         scan_status = str((scan_result or {}).get('status') or '').strip()
         if scan_status == 'hit':
             scan_hits = scan_result.get('hits') or []
-            if any(item.get('coord') == '__business__' for item in scan_hits):
+            if any(
+                item.get('coord') == '__business__' or item.get('application_owned') is True
+                for item in scan_hits
+            ):
                 packaged_dependency_result = _build_packaged_dependency_hit_result(result, scan_hits, graph)
                 _debug_trace_result('trace_api_result', packaged_dependency_result)
                 return packaged_dependency_result

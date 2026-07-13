@@ -4,9 +4,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +42,27 @@ def _jar_classes(path: Path, classes: Path) -> None:
 
 @unittest.skipUnless(JDK_TOOLS, "JDK tools required")
 class TopologyCoverageTest(unittest.TestCase):
+    def test_classfile_hierarchy_fast_path_avoids_javap_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "Child.java"
+            source.write_text(
+                "interface Contract {} class Parent {} class Child extends Parent implements Contract {}\n",
+                encoding="utf-8",
+            )
+            output = root / "classes"
+            _compile(output, [source])
+            content = (output / "Child.class").read_bytes()
+
+            with mock.patch.object(
+                topology_coverage.subprocess, "run",
+                side_effect=AssertionError("javap must not run for a valid classfile header"),
+            ):
+                parents, error = topology_coverage._class_header_parents(content, 1.0)
+
+        self.assertEqual(error, "")
+        self.assertEqual(parents, ("Parent", "Contract"))
+
     def _build_fixture(
         self,
         root: Path,
@@ -475,6 +499,217 @@ class TopologyCoverageTest(unittest.TestCase):
             {"child": "java.lang.String", "parent": "java.lang.Object", "authority": "javap_class_header"}
         ]
         self.assertNotIn("virtual_dispatch", topology_coverage.classify_topologies(evidence["edges"], evidence["artifact_layout"]))
+
+    def test_class_header_parents_erases_generics_and_keeps_every_interface(self):
+        completed = subprocess.CompletedProcess(
+            ["javap"],
+            0,
+            stdout=(
+                "public class sample.Impl extends sample.Base<java.lang.String> "
+                "implements sample.First<java.lang.String, java.lang.Integer>, "
+                "sample.Second<java.util.Map<java.lang.String, java.lang.Integer>>, "
+                "sample.Third {\n"
+            ),
+            stderr="",
+        )
+
+        with mock.patch.object(topology_coverage.subprocess, "run", return_value=completed):
+            parents, error = topology_coverage._class_header_parents(b"class", 1.0)
+
+        self.assertEqual(error, "")
+        self.assertEqual(
+            parents,
+            ("sample.Base", "sample.First", "sample.Second", "sample.Third"),
+        )
+
+    def test_hierarchy_scan_reuses_sha_headers_with_sequential_equivalent_relations(self):
+        inventory = {
+            "classes": {
+                "sample/Impl.class": b"impl",
+                "sample/Contract.class": b"contract",
+                "BOOT-INF/lib/duplicate.jar!/sample/Impl.class": b"impl",
+                "BOOT-INF/lib/duplicate.jar!/sample/Contract.class": b"contract",
+            },
+            "resources": {},
+            "containers": {"BOOT-INF/lib/duplicate.jar"},
+        }
+        calls = []
+
+        def read_header(content, timeout_sec):
+            calls.append((content, timeout_sec))
+            if content == b"impl":
+                return ("sample.Contract",), ""
+            return (), ""
+
+        with mock.patch.object(topology_coverage, "_class_header_parents", side_effect=read_header):
+            scan = topology_coverage._scan_class_hierarchy(
+                inventory, timeout_sec=1.0, max_workers=2,
+            )
+
+        expected = [
+            {
+                "child_entry": "BOOT-INF/lib/duplicate.jar!/sample/Impl.class",
+                "child": "sample.Impl",
+                "parent_entry": "BOOT-INF/lib/duplicate.jar!/sample/Contract.class",
+                "parent": "sample.Contract",
+                "authority": "javap_class_header",
+            },
+            {
+                "child_entry": "sample/Impl.class",
+                "child": "sample.Impl",
+                "parent_entry": "sample/Contract.class",
+                "parent": "sample.Contract",
+                "authority": "javap_class_header",
+            },
+        ]
+        self.assertEqual(scan["relations"], expected)
+        self.assertEqual(scan["errors"], [])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(scan["metrics"]["class_entries"], 4)
+        self.assertEqual(scan["metrics"]["unique_class_headers"], 2)
+        self.assertEqual(scan["metrics"]["cache_hits"], 2)
+
+    def test_hierarchy_scan_retains_every_header_failure(self):
+        inventory = {
+            "classes": {
+                "sample/First.class": b"bad-first",
+                "sample/Second.class": b"bad-second",
+                "sample/Duplicate.class": b"bad-first",
+            },
+            "resources": {},
+            "containers": set(),
+        }
+
+        def read_header(content, timeout_sec):
+            return (), f"cannot read {content.decode('ascii')}"
+
+        with mock.patch.object(topology_coverage, "_class_header_parents", side_effect=read_header):
+            scan = topology_coverage._scan_class_hierarchy(inventory, timeout_sec=1.0)
+
+        self.assertFalse(scan["complete"])
+        self.assertEqual(len(scan["errors"]), 3)
+        self.assertTrue(any("sample/First.class" in error and "bad-first" in error for error in scan["errors"]))
+        self.assertTrue(any("sample/Second.class" in error and "bad-second" in error for error in scan["errors"]))
+        self.assertTrue(any("sample/Duplicate.class" in error and "bad-first" in error for error in scan["errors"]))
+
+    def test_hierarchy_scan_cache_is_isolated_between_artifacts(self):
+        inventory = {
+            "classes": {"sample/Contract.class": b"shared"},
+            "resources": {},
+            "containers": set(),
+        }
+        calls = []
+
+        def read_header(content, timeout_sec):
+            calls.append(content)
+            return (), ""
+
+        with mock.patch.object(topology_coverage, "_class_header_parents", side_effect=read_header):
+            topology_coverage._scan_class_hierarchy(inventory, timeout_sec=1.0)
+            topology_coverage._scan_class_hierarchy(inventory, timeout_sec=1.0)
+
+        self.assertEqual(calls, [b"shared", b"shared"])
+
+    def test_hierarchy_scan_deadline_fails_closed_and_exposes_metrics(self):
+        inventory = {
+            "classes": {"sample/Slow.class": b"slow"},
+            "resources": {},
+            "containers": set(),
+        }
+
+        def read_header(content, timeout_sec):
+            time.sleep(0.1)
+            return (), ""
+
+        with (
+            mock.patch.object(topology_coverage, "scan_final_artifact", return_value={
+                "edges": [], "complete": True, "artifact_sha256": "a" * 64, "failures": [],
+            }),
+            mock.patch.object(topology_coverage, "_archive_inventory", return_value=inventory),
+            mock.patch.object(topology_coverage, "_class_header_parents", side_effect=read_header),
+        ):
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                Path("ignored.jar"), [], {}, hierarchy_scan_timeout_sec=0.01,
+            )
+
+        self.assertFalse(evidence["complete"])
+        self.assertTrue(any("deadline exceeded" in error for error in evidence["errors"]))
+        metrics = evidence["artifact_layout"]["hierarchy_scan"]
+        self.assertEqual(metrics["class_entries"], 1)
+        self.assertEqual(metrics["timed_out_class_entries"], 1)
+        self.assertGreaterEqual(metrics["elapsed_sec"], 0.0)
+
+    def test_hierarchy_scan_deadline_joins_active_workers_before_returning(self):
+        inventory = {
+            "classes": {"sample/Slow.class": b"slow"},
+            "resources": {},
+            "containers": set(),
+        }
+        worker_started = threading.Event()
+        worker_finished = threading.Event()
+        release_worker = threading.Event()
+
+        def read_header(content, timeout_sec):
+            worker_started.set()
+            release_worker.wait(timeout=1.0)
+            worker_finished.set()
+            return (), ""
+
+        def release_after_deadline():
+            worker_started.wait(timeout=1.0)
+            time.sleep(0.03)
+            release_worker.set()
+
+        releaser = threading.Thread(target=release_after_deadline)
+        releaser.start()
+        try:
+            with mock.patch.object(topology_coverage, "_class_header_parents", side_effect=read_header):
+                scan = topology_coverage._scan_class_hierarchy(
+                    inventory, timeout_sec=0.01, max_workers=1,
+                )
+
+            self.assertTrue(worker_started.is_set())
+            self.assertTrue(worker_finished.is_set())
+            self.assertFalse(scan["complete"])
+            self.assertTrue(any("deadline exceeded" in error for error in scan["errors"]))
+        finally:
+            release_worker.set()
+            releaser.join(timeout=1.0)
+
+    def test_hierarchy_scan_returns_incomplete_error_when_wait_is_interrupted(self):
+        inventory = {
+            "classes": {"sample/Impl.class": b"impl"},
+            "resources": {},
+            "containers": set(),
+        }
+
+        with (
+            mock.patch.object(topology_coverage, "_class_header_parents", return_value=((), "")),
+            mock.patch.object(topology_coverage, "wait", side_effect=KeyboardInterrupt("stop")),
+        ):
+            scan = topology_coverage._scan_class_hierarchy(inventory, timeout_sec=1.0)
+
+        self.assertFalse(scan["complete"])
+        self.assertEqual(len(scan["errors"]), 1)
+        self.assertIn("hierarchy scan interrupted: KeyboardInterrupt", scan["errors"][0])
+
+    def test_hierarchy_scan_returns_incomplete_error_when_worker_exits(self):
+        inventory = {
+            "classes": {"sample/Impl.class": b"impl"},
+            "resources": {},
+            "containers": set(),
+        }
+
+        with mock.patch.object(
+            topology_coverage,
+            "_class_header_parents",
+            side_effect=SystemExit("stop"),
+        ):
+            scan = topology_coverage._scan_class_hierarchy(inventory, timeout_sec=1.0)
+
+        self.assertFalse(scan["complete"])
+        self.assertEqual(len(scan["errors"]), 1)
+        self.assertIn("header worker failed: SystemExit", scan["errors"][0])
 
     def test_stale_source_tree_and_fake_revision_reject_source_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:

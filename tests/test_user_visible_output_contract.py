@@ -40,7 +40,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         text = self.read("docs/user/outputs.md")
         self.assertIn("人工优先看的文件", text)
         self.assertIn("深度排查或程序使用的文件", text)
-        step5_text = text[text.index("## Step5：调用链影响证明") : text.index("## Step5 五态结论")]
+        step5_text = text[text.index("## 系统触达证据") : text.index("## 系统触达证据结论")]
         self.assertLess(step5_text.index("`alerts.csv` | 人工优先入口"), step5_text.index("`summary.json`"))
         self.assertIn("`.runtime/indexes/s5_query_index.json` | 程序使用", text)
         self.assertIn("`.runtime/findings/s6_findings.json` | 程序使用", text)
@@ -67,14 +67,15 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         manifest = self.read("scripts/step_manifest.json")
 
         self.assertIn(".upgrade-report/README.md", readme)
-        self.assertIn(".upgrade-report/evidence/*/README.md", readme)
+        self.assertIn(".upgrade-report/evidence/context/review.md", readme)
+        self.assertNotIn(".upgrade-report/evidence/*/README.md", readme)
         self.assertLess(
             readme.index(".upgrade-report/deliverables/report.md"),
             readme.index(".upgrade-report/evidence/api_changes/changed_dependencies.md"),
         )
         self.assertIn("README.md", runbook)
-        self.assertIn("api_changes/\n      README.md", runbook)
-        self.assertIn("call_chain/\n      README.md", runbook)
+        self.assertNotIn("api_changes/\n      README.md", runbook)
+        self.assertNotIn("call_chain/\n      README.md", runbook)
         self.assertIn("changed_dependencies.md", runbook)
         self.assertIn("changed_dependencies.csv", manifest)
         self.assertIn("selection_key", manifest)

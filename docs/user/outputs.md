@@ -20,7 +20,7 @@
 | 目录 | 谁主要阅读 | 用途 |
 |---|---|---|
 | `deliverables/` | 普通使用者、评审人 | 交付报告和分类清单 |
-| `evidence/` | 需要深入复核的人 | Step1-Step5 的事实证据 |
+| `evidence/` | 需要深入复核的人 | 依赖、上下文、API 变化和系统触达证据 |
 | `.runtime/` | 程序和 Agent | 状态、索引、恢复信息；普通阅读不需要进入 |
 
 建议按这个顺序阅读：
@@ -47,7 +47,7 @@
 |---:|---|---|
 | 1 | `deliverables/report.md` | 面向评审和交付的最终摘要 |
 | 2 | `evidence/api_changes/changed_dependencies.md` | 依赖包维度的 API 变化摘要 |
-| 3 | `evidence/call_chain/alerts.csv` | Step5 完整链路台账 |
+| 3 | `evidence/call_chain/alerts.csv` | 完整系统触达证据台账 |
 
 如果结果存在疑问，再回到对应步骤的原始证据文件继续追溯。
 
@@ -58,7 +58,7 @@
 - `alerts.csv` 回答“这些变更 API 有没有调用链影响”；
 - `deliverables/report.md` 回答“最终应该如何理解本次分析结果”。
 
-## Step1：依赖变化范围
+## 分析对象与依赖范围
 
 Step1 的职责是确定本次分析实际采用的 base/current 构建产物和依赖变化范围。
 
@@ -72,14 +72,15 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 
 注意：Step1 当前以真实构建结果或用户提供的构建产物为准，不把手工 dependency tree 当作正式事实源。
 
-## Step2：上下文
+## 升级上下文
 
 | 文件 | 说明 | 复核重点 |
 |---|---|---|
-| `evidence/context/context.json` | 升级上下文，如 JDK、Spring、依赖变化等 | 后续规则为什么启用或跳过 |
-| `evidence/context/dep_graph.json` | 依赖关系和分析顺序 | 依赖升级传播关系 |
+| `evidence/context/review.md` | 给人看的升级范围和版本确认页 | 目标模块、比较版本、JDK、Spring Boot 和依赖源码覆盖是否正确 |
+| `evidence/context/context.json` | 程序使用的完整升级上下文 | 只有深入排查时查看 |
+| `evidence/context/dep_graph.json` | 程序使用的依赖关系 | 只有深入排查依赖传播时查看 |
 
-## Step3：背景风险扫描
+## 兼容性线索
 
 Step3 用于识别 JDK、Jakarta、Spring 等框架升级带来的背景风险。
 
@@ -97,7 +98,7 @@ Step3 用于识别 JDK、Jakarta、Spring 等框架升级带来的背景风险�
 | `evidence/static_scan/s3_dependency_compat.csv` | 依赖兼容性规则命中 |
 | `evidence/static_scan/s3_dependency_classfile.csv` | classfile 版本等字节码线索 |
 
-## Step4：依赖 API 变化事实
+## 依赖 API 变化事实
 
 Step4 的核心输出目录：
 
@@ -119,7 +120,7 @@ evidence/api_changes/
 
 ### 依赖包维度选择入口
 
-Step4 完成后，如果要决定 Step5 是全量分析还是只分析部分依赖包，优先看：
+依赖 API 变化分析完成后，如果要决定系统触达证据是全量分析还是只分析部分依赖包，优先看：
 
 | 文件 | 用途 |
 |---|---|
@@ -146,7 +147,7 @@ evidence/api_changes/s4_per_dependency/<coord>/
 | `resolved_targets.csv` | 单依赖最终进入 Step5 的目标 |
 | `summary.json` | 单依赖 Step4/Step5 摘要 |
 
-## Step5：调用链影响证明
+## 系统触达证据
 
 Step5 的核心输出目录：
 
@@ -240,7 +241,7 @@ alerts_reachable_002.csv
 
 拆分文件只是人工阅读视图，不是索引、抽样或替代结论。
 
-## Step5 五态结论
+## 系统触达证据结论
 
 | 人工结论 | 含义 | 程序状态（排查时使用） |
 |---|---|---|
@@ -250,7 +251,7 @@ alerts_reachable_002.csv
 | 静态分析未找到路径 | 已完成静态分析，但没有找到路径；不能解释为确定不影响 | `not_found_in_static_analysis` |
 | 本次未完成分析 | 输入或工具能力不足，无法完成本项分析 | `not_analyzed` |
 
-## Step6：最终报告
+## 最终报告
 
 | 文件 | 说明 |
 |---|---|

@@ -119,7 +119,9 @@ def parse_javap_indirect_references(text, class_binary_name=''):
                     result.append({
                         'owner': owner, 'name': '', 'signature': '', 'kind': 'class',
                         'consumer_method': method['name'], 'consumer_signature': method['signature'],
-                        'reference_kind': 'reflection_class', 'line': owner_offset,
+                        'reference_kind': 'reflection_class', 'line': offset,
+                        'opcode_family': insn.split(None, 1)[0],
+                        'instruction_offset': offset,
                     })
                 continue
             lookup = re.search(
@@ -172,6 +174,8 @@ def parse_javap_indirect_references(text, class_binary_name=''):
                         'consumer_signature': method['signature'],
                         'reference_kind': f'reflection_{active_member["kind"]}',
                         'line': offset,
+                        'opcode_family': insn.split(None, 1)[0],
+                        'instruction_offset': offset,
                     })
                 active_member = None
                 produced = None

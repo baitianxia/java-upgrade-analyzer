@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -41,7 +42,10 @@ def _current_python_pip_install_cmd():
     python_exe = sys.executable or "python"
     if " " in python_exe:
         python_exe = f'"{python_exe}"'
-    return f"{python_exe} -m pip install tree-sitter tree-sitter-java"
+    return (
+        f"{python_exe} -m pip install --target {_tree_sitter_tool_dir()} "
+        "tree-sitter tree-sitter-java"
+    )
 
 
 def _env_flag_enabled(name):
@@ -225,6 +229,18 @@ def resolve_invocation_signature_from_partial_hints(receiver_type, method_name, 
 # 降级方案：如果 tree-sitter 未安装，Step5 首次需要 Java AST 时会先尝试自动安装；
 # 正式流程应在 Step5 入口处先做 preflight，安装失败时由 checkpoint 要求用户确认后才降级。
 # analyze_file() 仍保留兜底降级能力，避免调试脚本或单文件分析直接崩溃。
+def _tree_sitter_tool_dir():
+    configured = str(os.environ.get('JUA_TREE_SITTER_TOOL_DIR') or '').strip()
+    if configured:
+        return Path(configured).expanduser()
+    version = f"py{sys.version_info.major}{sys.version_info.minor}"
+    return Path.home() / '.cache' / 'java-upgrade-analyzer' / 'python' / version
+
+
+_TREE_SITTER_TOOL_DIR = _tree_sitter_tool_dir()
+if _TREE_SITTER_TOOL_DIR.is_dir() and str(_TREE_SITTER_TOOL_DIR) not in sys.path:
+    sys.path.insert(0, str(_TREE_SITTER_TOOL_DIR))
+
 try:
     import tree_sitter_java as tsjava
     from tree_sitter import Language, Parser
@@ -279,6 +295,9 @@ def _ensure_tree_sitter_available():
         "-m",
         "pip",
         "install",
+        "--target",
+        str(_TREE_SITTER_TOOL_DIR),
+        "--disable-pip-version-check",
         "tree-sitter",
         "tree-sitter-java",
     ]
@@ -300,7 +319,7 @@ def _ensure_tree_sitter_available():
             details = (result.stderr or result.stdout or '').strip().splitlines()
             TREE_SITTER_AUTO_INSTALL_ERROR = details[-1] if details else f"pip_returncode={result.returncode}"
             print(
-                "⚠️  tree-sitter 自动安装失败，将降级使用增强正则方案；"
+                "⚠️  tree-sitter 自动安装失败；正式分析会暂停并要求确认，未经确认不会降级；"
                 f"如需手动处理，请使用当前解释器安装：{_current_python_pip_install_cmd()}",
                 file=sys.stderr,
             )
@@ -308,11 +327,14 @@ def _ensure_tree_sitter_available():
                 print(f"   安装失败原因：{TREE_SITTER_AUTO_INSTALL_ERROR}", file=sys.stderr)
             return False
         try:
+            if str(_TREE_SITTER_TOOL_DIR) not in sys.path:
+                sys.path.insert(0, str(_TREE_SITTER_TOOL_DIR))
+            importlib.invalidate_caches()
             _reload_tree_sitter_modules()
         except Exception as exc:
             TREE_SITTER_AUTO_INSTALL_ERROR = f"reload_failed:{exc.__class__.__name__}"
             print(
-                "⚠️  tree-sitter 已安装但当前进程加载失败，将降级使用增强正则方案；"
+                "⚠️  tree-sitter 已安装但当前进程加载失败；正式分析会暂停并要求确认；"
                 f"原因：{TREE_SITTER_AUTO_INSTALL_ERROR}",
                 file=sys.stderr,
             )
@@ -323,7 +345,7 @@ def _ensure_tree_sitter_available():
     except Exception as exc:
         TREE_SITTER_AUTO_INSTALL_ERROR = f"{exc.__class__.__name__}: {exc}"
         print(
-            "⚠️  tree-sitter 自动安装失败，将降级使用增强正则方案；"
+            "⚠️  tree-sitter 自动安装失败；正式分析会暂停并要求确认，未经确认不会降级；"
             f"如需手动处理，请使用当前解释器安装：{_current_python_pip_install_cmd()}",
             file=sys.stderr,
         )
@@ -343,6 +365,7 @@ def tree_sitter_status():
         "auto_install_error": TREE_SITTER_AUTO_INSTALL_ERROR,
         "auto_install_enabled": bool(_tree_sitter_auto_install_enabled()),
         "install_command": _current_python_pip_install_cmd(),
+        "isolated_install_dir": str(_TREE_SITTER_TOOL_DIR),
         "python_executable": sys.executable or "python",
     }
 
@@ -1092,8 +1115,8 @@ class EnhancedRegexAnalyzer:
     def _extract_annotations(self, line):
         """提取注解"""
         annotations = []
-        for m in re.finditer(r'@(\w+)', line):
-            annotations.append(m.group(1))
+        for m in re.finditer(r'@([A-Za-z_][\w.]*)', line):
+            annotations.append(m.group(1).rsplit('.', 1)[-1])
         return annotations
 
     def _extract_leading_annotations(self, lines, anchor_idx, max_search=10):
@@ -1776,9 +1799,9 @@ class TreeSitterAnalyzer:
         for child in modifiers_node.children:
             if child.type in ('marker_annotation', 'annotation'):
                 annotation_text = self._node_text(child, source_code).strip()
-                match = re.match(r'@([A-Za-z_]\w*)', annotation_text)
+                match = re.match(r'@([A-Za-z_][\w.]*)', annotation_text)
                 if match:
-                    annotations.append(match.group(1))
+                    annotations.append(match.group(1).rsplit('.', 1)[-1])
         return annotations
 
     def _collect_node_modifiers(self, node, source_code):

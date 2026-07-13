@@ -118,6 +118,10 @@ class DependencySourceAlignmentTest(unittest.TestCase):
                 "status": self._git(repo, "status", "--porcelain"),
             }
             self.assertEqual(after, before)
+            self.assertNotIn(
+                ".runtime/source_snapshots",
+                self._git(repo, "worktree", "list", "--porcelain"),
+            )
             self.assertEqual(len(result["mappings"]), 1)
             snapshot_source = Path(result["mappings"][0].split("=", 1)[1])
             self.assertIn(".runtime/source_snapshots", snapshot_source.as_posix())

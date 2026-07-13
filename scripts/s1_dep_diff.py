@@ -17,7 +17,7 @@ Windows 兼容：通过 compat.py 统一处理编码，不会因 GBK/UTF-8 不�
 """
 
 import argparse, csv, hashlib, io, json, os, re, shutil, sys, tempfile, zipfile
-import xml.etree.ElementTree as ET
+import safe_xml as ET
 from collections import defaultdict
 from pathlib import Path
 
@@ -1011,8 +1011,8 @@ def resolve_primary_module_id(primary_module, work_dir):
             for child in list(root):
                 if strip_ns(child.tag) == "artifactId" and (child.text or "").strip():
                     return (child.text or "").strip()
-    except Exception:
-        pass
+    except (OSError, ET.ParseError, UnicodeError) as exc:
+        print(f"⚠️ 无法读取目标模块 POM {pom_path}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     try:
         return pom_path.parent.name or None
@@ -1441,8 +1441,8 @@ def _normalize_maven_pl_with_workdir(primary_module, work_dir):
             if candidate.is_dir():
                 item = candidate.resolve().relative_to(Path(work_dir).resolve()).as_posix()
                 is_path_selector = True
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            print(f"⚠️ 无法解析 Maven 模块选择器 {item}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     item = (item or "").strip()
     if item in (".", "./"):
@@ -1472,6 +1472,7 @@ def _detect_archive_packaging_type(artifact_path):
 MAVEN_DEPENDENCY_SCOPES = {
     'compile', 'runtime', 'provided', 'test', 'system', 'import',
 }
+MAVEN_COORD_TOKEN_RE = re.compile(r'^[^\s:\[\]]+$')
 
 
 def _parse_maven_dependency_list_line(raw_line):
@@ -1489,15 +1490,12 @@ def _parse_maven_dependency_list_line(raw_line):
     if len(parts) < 4:
         return None
 
-    scope_idx = -1
-    for idx in range(len(parts) - 1, 1, -1):
-        token = (parts[idx] or '').strip().lower()
-        if token in MAVEN_DEPENDENCY_SCOPES:
-            scope_idx = idx
-            break
-    if scope_idx < 0:
+    # dependency:list always emits scope as the final coordinate token.  Scope
+    # is extensible; using a fixed allow-list silently discarded valid custom
+    # scopes.  Structural validation below still rejects Maven log prose.
+    if len(parts) < 4:
         return None
-
+    scope_idx = len(parts) - 1
     version_idx = scope_idx - 1
     if version_idx < 2:
         return None
@@ -1505,7 +1503,9 @@ def _parse_maven_dependency_list_line(raw_line):
     group_id = (parts[0] or '').strip()
     artifact_id = (parts[1] or '').strip()
     version = (parts[version_idx] or '').strip()
-    scope = (parts[scope_idx] or '').strip().lower() or 'runtime'
+    raw_scope = (parts[scope_idx] or '').strip().lower()
+    scope_match = re.match(r'^([^\s]+)(?:\s+\((?:optional|omitted[^)]*)\))?$', raw_scope)
+    scope = scope_match.group(1) if scope_match else raw_scope
     middle = parts[2:version_idx]
     dep_type = (middle[0] or '').strip() if middle else ''
     classifier = ':'.join(part for part in middle[1:] if part.strip()) if len(middle) > 1 else ''
@@ -1514,7 +1514,12 @@ def _parse_maven_dependency_list_line(raw_line):
         dep_type = 'jar'
     if dep_type.lower() == 'pom':
         return None
-    if not group_id or not artifact_id or not version:
+    if (
+        not group_id or not artifact_id or not version or not scope
+        or not all(MAVEN_COORD_TOKEN_RE.match(value) for value in (
+            group_id, artifact_id, dep_type, version, scope
+        ))
+    ):
         return None
 
     key = f"{group_id}:{artifact_id}" + (f":{classifier}" if classifier else "")

@@ -115,6 +115,7 @@ class RealProjectCase:
     max_duplicate_class_scans: int = -1
     max_seconds_per_100k_edges: float = 0.0
     min_classes_per_second: float = 0.0
+    max_oracle_seconds: float = 0.0
     oracle_manifest: Path | None = None
     enable_jdk_oracle: bool = False
     bytecode_owner_prefixes: tuple[str, ...] = field(default_factory=tuple)
@@ -138,6 +139,7 @@ REAL_CASE_PERFORMANCE_BUDGET = {
     "max_duplicate_class_scans": 0,
     "max_seconds_per_100k_edges": 1000000.0,
     "min_classes_per_second": 1.0,
+    "max_oracle_seconds": 120.0,
 }
 
 
@@ -161,6 +163,10 @@ def apply_real_case_performance_budget(case: RealProjectCase) -> RealProjectCase
         min_classes_per_second=(
             case.min_classes_per_second
             or REAL_CASE_PERFORMANCE_BUDGET["min_classes_per_second"]
+        ),
+        max_oracle_seconds=(
+            case.max_oracle_seconds
+            or REAL_CASE_PERFORMANCE_BUDGET["max_oracle_seconds"]
         ),
     )
 
@@ -715,6 +721,7 @@ CASES["gs-multi-module"] = RealProjectCase(
             "source": "pinned_real_project_guard",
         },
     ),
+    source_dirs=(Path("application/src/main/java"),),
     prefer_embedded_changed_api_rows=True,
     require_valid_git=True,
     min_project_java_files=3,
@@ -816,7 +823,7 @@ def _expected_physical_occurrence(edge: dict) -> str:
     prefix = f"{identity}|{entry}|"
     if explicit.startswith(prefix) and len(explicit) > len(prefix):
         return explicit
-    offset = str((edge or {}).get("instruction_offset") or "").strip()
+    offset = normalize_instruction_offset(edge)
     return physical_edge_occurrence(edge) if identity and entry and offset else ""
 
 
@@ -885,6 +892,7 @@ def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=30,
         )
         if completed.returncode == 0:
             actual_revision = completed.stdout.strip()
@@ -1103,18 +1111,63 @@ def load_pinned_guard_manifest(case: RealProjectCase) -> dict:
 
 
 def write_pinned_final_artifact_provenance(
-    report_dir: Path, asset_gate: dict
+    report_dir: Path, asset_gate: dict, case: RealProjectCase
 ) -> Path:
     output = report_dir / "evidence" / "dependencies" / "build_provenance.json"
     output.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path = Path(str(asset_gate.get("artifact_path") or ""))
+    artifact_sha256 = (
+        asset_gate.get("actual_artifact_sha256")
+        or asset_gate.get("artifact_sha256")
+        or ""
+    )
     output.write_text(json.dumps({
         "sides": [{
             "side": "current",
-            "artifact_path": asset_gate.get("artifact_path") or "",
-            "artifact_sha256": asset_gate.get("actual_artifact_sha256") or "",
+            "artifact_path": str(artifact_path),
+            "artifact_sha256": artifact_sha256,
             "authority": "pinned-real-project-manifest",
         }],
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    coordinate = str(case.bytecode_coord or "").strip()
+    artifact_id = coordinate.split(":", 1)[-1] if ":" in coordinate else ""
+    nested_entry = ""
+    if artifact_id and artifact_path.is_file():
+        try:
+            with zipfile.ZipFile(artifact_path) as archive:
+                candidates = [
+                    name for name in archive.namelist()
+                    if name.startswith("BOOT-INF/lib/")
+                    and name.endswith(".jar")
+                    and Path(name).name.startswith(f"{artifact_id}-")
+                ]
+                if len(candidates) == 1:
+                    nested_entry = candidates[0]
+        except (OSError, zipfile.BadZipFile):
+            pass
+    version = next(
+        (
+            str(row.get("old_version") or "").strip()
+            for row in case.changed_api_rows
+            if str(row.get("old_version") or "").strip() not in {"", "-"}
+        ),
+        "pinned",
+    )
+    with (output.parent / "deps_current_resolved.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"],
+        )
+        writer.writeheader()
+        writer.writerow({
+            "coord": coordinate,
+            "version": version,
+            "scope": "compile",
+            "lib_entry": nested_entry,
+            "resolution_status": "resolved" if nested_entry else "unresolved",
+        })
     return output
 
 
@@ -1654,7 +1707,12 @@ def derive_case_status(executed: bool, signals: list[dict], ground_truth_status:
     return "passed"
 
 
-def collect_performance_envelope(summary: dict, elapsed: float, selected: int) -> dict:
+def collect_performance_envelope(
+    summary: dict,
+    elapsed: float,
+    selected: int,
+    oracle_metrics: dict | None = None,
+) -> dict:
     meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
     graph_stats = meta.get("graph_stats") if isinstance(meta.get("graph_stats"), dict) else {}
     step5_perf = graph_stats.get("step5_perf") if isinstance(graph_stats.get("step5_perf"), dict) else {}
@@ -1663,6 +1721,7 @@ def collect_performance_envelope(summary: dict, elapsed: float, selected: int) -
     pairs = int(perf_main.get("indirect_usage_potential_legacy_method_target_pairs") or 0)
     owner_scans = int(perf_main.get("indirect_usage_owner_presence_scans") or 0)
     selected = int(selected or 0)
+    oracle_metrics = oracle_metrics or {}
     return {
         "elapsed_seconds": float(elapsed or 0.0),
         "elapsed_seconds_per_1000_apis": float(elapsed or 0.0) / (selected / 1000.0) if selected else 0.0,
@@ -1676,6 +1735,18 @@ def collect_performance_envelope(summary: dict, elapsed: float, selected: int) -
         "artifact_cache_hits": int(bytecode_scan.get("artifact_cache_hits") or 0),
         "javap_fallbacks": int(bytecode_scan.get("javap_fallbacks") or 0),
         "duplicate_class_scans": int(bytecode_scan.get("duplicate_class_scans") or 0),
+        "oracle_class_count": int(oracle_metrics.get("class_count") or 0),
+        "oracle_completed_class_count": int(oracle_metrics.get("completed_class_count") or 0),
+        "oracle_parsed_class_count": int(oracle_metrics.get("parsed_class_count") or 0),
+        "oracle_cached_class_count": int(oracle_metrics.get("cached_class_count") or 0),
+        "oracle_parse_failure_count": int(oracle_metrics.get("parse_failure_count") or 0),
+        "oracle_parse_seconds": float(oracle_metrics.get("parse_seconds") or 0.0),
+        "oracle_elapsed_seconds": float(oracle_metrics.get("elapsed_seconds") or 0.0),
+        "oracle_worker_count": int(oracle_metrics.get("worker_count") or 0),
+        "oracle_cache_hits": int(oracle_metrics.get("cache_hits") or 0),
+        "oracle_cache_misses": int(oracle_metrics.get("cache_misses") or 0),
+        "oracle_timed_out": bool(oracle_metrics.get("timed_out")),
+        "oracle_interrupted": bool(oracle_metrics.get("interrupted")),
     }
 
 
@@ -1758,12 +1829,17 @@ def _business_artifact_entry(entry: str) -> bool:
     )
 
 
+def normalize_instruction_offset(edge: dict | None) -> str:
+    offset = (edge or {}).get("instruction_offset")
+    return "" if offset is None else str(offset).strip()
+
+
 def physical_edge_occurrence(edge: dict) -> str:
     """Identify one bytecode instruction without changing canonical edge identity."""
     return "|".join((
         canonical_edge_identity(edge),
         str((edge or {}).get("artifact_entry") or "").strip(),
-        str((edge or {}).get("instruction_offset") or "").strip(),
+        normalize_instruction_offset(edge),
     ))
 
 
@@ -1803,7 +1879,7 @@ def _retain_authoritative_api_path(selected_rows: list[dict], oracle_rows: list[
             errors.append(f"selected_api_unreached_business_boundary:{identity}")
     return sorted(retained.values(), key=lambda row: (
         str(row.get("api_identity") or ""), canonical_edge_identity(row),
-        str(row.get("artifact_entry") or ""), str(row.get("instruction_offset") or ""),
+        str(row.get("artifact_entry") or ""), normalize_instruction_offset(row),
     )), sorted(errors)
 
 
@@ -1939,6 +2015,15 @@ def reconcile_selected_api_edges(
         "reconcile_seconds": time.perf_counter() - reconcile_started_at,
         **{f"edge_truth_{verdict}_count": int(count) for verdict, count in reconciliation["verdict_counts"].items()},
     }
+    oracle_metrics = {
+        key: oracle_scan.get(key)
+        for key in (
+            "class_count", "completed_class_count", "parsed_class_count",
+            "cached_class_count", "parse_failure_count", "parse_seconds",
+            "elapsed_seconds", "worker_count", "cache_hits", "cache_misses",
+            "timed_out", "interrupted",
+        )
+    }
     return {
         "complete": complete,
         "errors": sorted(path_errors + [str(item) for item in (oracle_scan.get("failures") or [])]),
@@ -1948,6 +2033,7 @@ def reconcile_selected_api_edges(
         "oracle_edges": oracle_path,
         "edge_reconciliation": reconciliation_path,
         "trusted_artifact_sha": str(oracle_scan.get("artifact_sha256") or ""),
+        "oracle_metrics": oracle_metrics,
         "oracle_physical_occurrences": [
             physical_edge_occurrence(row) for row in retained_oracle_rows
         ],
@@ -1985,7 +2071,11 @@ def _verified_current_final_artifact(report_dir: Path) -> tuple[Path | None, str
         return None, "", [f"verified_current_final_artifact_unavailable:{error}"]
 
 
-def reconcile_final_artifact_edges(report_dir: Path, selected_rows: list[dict]) -> dict:
+def reconcile_final_artifact_edges(
+    report_dir: Path,
+    selected_rows: list[dict],
+    oracle_time_budget_seconds: float | None = None,
+) -> dict:
     artifact, expected_sha, errors = _verified_current_final_artifact(report_dir)
     analyzer_path = Path(report_dir) / "evidence" / "call_chain" / "analyzer_edges.csv"
     _fields, analyzer_rows = _csv_rows(analyzer_path)
@@ -1993,7 +2083,9 @@ def reconcile_final_artifact_edges(report_dir: Path, selected_rows: list[dict]) 
         scan = {"artifact_sha256": "", "complete": False, "edges": [], "failures": errors,
                 "artifact_entries": []}
     else:
-        scan = scan_final_artifact(artifact)
+        scan = scan_final_artifact(
+            artifact, time_budget_seconds=oracle_time_budget_seconds
+        )
         try:
             scan["artifact_entries"] = sorted(_artifact_class_entries(artifact))
         except (OSError, zipfile.BadZipFile) as error:
@@ -2037,7 +2129,7 @@ def validate_source_bytecode_conflicts(summary: dict, edge_truth: dict | None = 
         if not isinstance(final_edge, dict) or not all(str(final_edge.get(field) or "").strip() for field in EDGE_IDENTITY_FIELDS):
             errors.append(f"{prefix}:normalized_final_artifact_edge_missing")
             continue
-        if not str(final_edge.get("instruction_offset") or "").strip():
+        if not normalize_instruction_offset(final_edge):
             errors.append(f"{prefix}:final_artifact_instruction_offset_missing")
         final_sha = str(final_edge.get("artifact_sha256") or "")
         if not _valid_sha256(final_sha):
@@ -2235,7 +2327,7 @@ def run_step4(case: RealProjectCase, report_dir: Path) -> dict:
         "30",
     ]
     start = time.time()
-    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True)
+    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, timeout=900)
     elapsed = time.time() - start
     return {
         "returncode": proc.returncode,
@@ -2282,13 +2374,18 @@ def select_step4_changed_apis(step4_all_changed_apis: Path, selected_names: Iter
 
 def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, report_dir: Path) -> tuple[int, float]:
     output_dir = report_dir / "evidence" / "call_chain"
+    configured_source_dirs = case.source_dirs or (Path("."),)
+    source_dirs = [
+        source_dir if source_dir.is_absolute() else project_root / source_dir
+        for source_dir in configured_source_dirs
+    ]
     cmd = [
         sys.executable,
         str(ROOT_DIR / "scripts" / "s5_call_chain.py"),
         "--all-changed-apis",
         str(changed_apis),
         "--source-dirs",
-        str(project_root),
+        *(str(source_dir) for source_dir in source_dirs),
         "--report-dir",
         str(report_dir),
         "--output-dir",
@@ -2298,7 +2395,7 @@ def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, rep
         "--allow-degraded",
     ]
     start = time.time()
-    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True)
+    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, timeout=900)
     return proc.returncode, time.time() - start
 
 
@@ -2316,7 +2413,10 @@ def run_step6(report_dir: Path) -> dict:
         str(output_report),
     ]
     start = time.time()
-    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.run(
+        cmd, cwd=ROOT_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=900,
+    )
     elapsed = time.time() - start
     return {
         "returncode": proc.returncode,
@@ -2339,7 +2439,10 @@ def query_step5(report_dir: Path, method: str) -> dict:
         "--limit",
         "5",
     ]
-    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.run(
+        cmd, cwd=ROOT_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=900,
+    )
     return {
         "method": method,
         "returncode": proc.returncode,
@@ -2391,6 +2494,7 @@ def collect_project_asset_health(project_root: Path) -> dict:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=30,
     )
     generated_ratio = (len(generated_java_files) / len(java_files)) if java_files else 0.0
     return {
@@ -2458,6 +2562,7 @@ def make_signal(
             "ground_truth_insufficient",
             "conclusion_gap",
             "topology_coverage_gap",
+            "oracle_incomplete",
         }
     return {
         "signal_type": signal_type,
@@ -2598,6 +2703,29 @@ def build_policy_signals(
                 }, sort_keys=True),
                 evidence=[report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"],
             ))
+    oracle_timed_out = bool(performance.get("oracle_timed_out"))
+    oracle_interrupted = bool(performance.get("oracle_interrupted"))
+    if oracle_timed_out or oracle_interrupted:
+        reason = "time budget exceeded" if oracle_timed_out else "scan interrupted"
+        signals.append(make_signal(
+            "performance_regression", "P1", case.name, step="step5",
+            message=(
+                f"final-artifact oracle {reason}: "
+                f"elapsed={float(performance.get('oracle_elapsed_seconds') or 0.0):.3f}s "
+                f"budget={case.max_oracle_seconds:.3f}s "
+                f"completed={int(performance.get('oracle_completed_class_count') or 0)}/"
+                f"{int(performance.get('oracle_class_count') or 0)} classes"
+            ),
+            expected="exhaustive final-artifact oracle completes within its per-case time budget",
+            actual=json.dumps({
+                "timed_out": oracle_timed_out,
+                "interrupted": oracle_interrupted,
+                "elapsed_seconds": float(performance.get("oracle_elapsed_seconds") or 0.0),
+                "class_count": int(performance.get("oracle_class_count") or 0),
+                "completed_class_count": int(performance.get("oracle_completed_class_count") or 0),
+            }, sort_keys=True),
+            evidence=[report_dir / "evidence" / "call_chain" / "oracle_edges.csv"],
+        ))
     pairs_per_api = float(performance.get("potential_pairs_per_api") or 0.0)
     if case.max_potential_pairs_per_api and pairs_per_api > case.max_potential_pairs_per_api:
         signals.append(make_signal(
@@ -2884,7 +3012,7 @@ def run_case(
                 "quality_signals": [asset_signal],
             }
         case = replace(case, final_artifact=Path(str(pinned_asset_gate["artifact_path"])))
-        write_pinned_final_artifact_provenance(report_dir, pinned_asset_gate)
+        write_pinned_final_artifact_provenance(report_dir, pinned_asset_gate, case)
     if not project_root.exists():
         reason = f"project root missing: {project_root}"
         return {
@@ -3170,9 +3298,16 @@ def run_case(
         selected_count,
         int(summary.get("total_apis") or 0),
     )
-    edge_truth = reconcile_final_artifact_edges(report_dir, selected_rows)
+    edge_truth = reconcile_final_artifact_edges(
+        report_dir, selected_rows, oracle_time_budget_seconds=case.max_oracle_seconds
+    )
     source_conflicts = validate_source_bytecode_conflicts(summary, edge_truth)
-    performance_envelope = collect_performance_envelope(summary, elapsed, selected_count)
+    performance_envelope = collect_performance_envelope(
+        summary,
+        elapsed,
+        selected_count,
+        oracle_metrics=edge_truth.get("oracle_metrics"),
+    )
     performance_envelope.update(edge_truth["counts"])
     finalize_performance_envelope(performance_envelope)
     oracle_audit = None
@@ -3273,6 +3408,7 @@ def run_case(
             "ledger": edge_truth["reconciliation"].get("ledger") or [],
             "oracle_edges": edge_truth["oracle_edges"],
             "edge_reconciliation": edge_truth["edge_reconciliation"],
+            "oracle_metrics": edge_truth.get("oracle_metrics") or {},
         },
         "ground_truth_status": effective_ground_truth_status,
         "oracle_audit": {

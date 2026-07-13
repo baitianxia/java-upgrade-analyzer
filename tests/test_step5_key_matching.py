@@ -1483,7 +1483,7 @@ public class com.example.TargetBridge {
             first_perf = tracer._finalize_step5_perf_stats(first_graph)["bytecode_scan"]
             second_perf = tracer._finalize_step5_perf_stats(second_graph)["bytecode_scan"]
 
-        self.assertEqual(mocked_run.call_count, 2)
+        self.assertEqual(mocked_run.call_count, 0)
         self.assertEqual(first["visited_classes"], second["visited_classes"])
         self.assertEqual(first["status"], second["status"])
         self.assertEqual(second["hits"][0]["edge_role"], "internal_bridge")
@@ -1493,7 +1493,7 @@ public class com.example.TargetBridge {
         self.assertEqual(second_perf["class_entries_parsed"], 0)
         self.assertEqual(second_perf["duplicate_class_scans"], 0)
         self.assertEqual(second_perf["direct_consumer_class_scans"], 0)
-        self.assertEqual(second_perf["internal_bridge_class_scans"], 2)
+        self.assertEqual(second_perf["internal_bridge_class_scans"], 1)
 
     def test_artifact_hash_parse_cache_deduplicates_concurrent_class_parses(self):
         javap_output = """
@@ -8965,7 +8965,7 @@ public class com.example.TargetBridge {
         self.assertEqual(summary_payload["not_impacted"], 1)
         self.assertEqual(alert_rows[0]["api_status"], "not_impacted")
         self.assertEqual(alert_rows[0]["conclusion_level"], "confirmed_no_impact")
-        self.assertIn("已确认不受影响", summary_text)
+        self.assertIn("已确认不受影响", final_report)
         self.assertIn("### 3.1 符号保留证据", final_report)
         self.assertIn("com.vendor:aggregate", final_report)
         self.assertIn("不包含被删除 JAR 中的 SPI 配置、资源文件、清单等非 API 内容", final_report)
@@ -10726,6 +10726,29 @@ public class com.example.TargetBridge {
                     [f"com.example:used={used_dep_dir}"],
                 ],
             )
+
+    def test_business_source_graph_excludes_classes_absent_from_final_business_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "checkout"
+            app = source_root / "application" / "src" / "main" / "java" / "app" / "App.java"
+            library = source_root / "library" / "src" / "main" / "java" / "library" / "Library.java"
+            app.parent.mkdir(parents=True)
+            library.parent.mkdir(parents=True)
+            app.write_text("package app; public class App { void run() {} }", encoding="utf-8")
+            library.write_text("package library; public class Library { void removed() {} }", encoding="utf-8")
+
+            graph_result = step5.build_enhanced_source_graph(
+                [{
+                    "root": str(source_root),
+                    "owner_type": "business",
+                    "owner_coord": "BUSINESS",
+                    "module": "checkout",
+                }],
+                allowed_business_classes={"app.App"},
+            )
+
+        classes = {method.class_fqcn for method in graph_result["graph"].methods_by_id.values()}
+        self.assertEqual(classes, {"app.App"})
 
     def test_build_enhanced_source_graph_can_drop_analysis_cache_for_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -14443,7 +14466,7 @@ public class com.example.consumer.Adapter {
             self.assertEqual([item.analysis_status for item in results], ["uncertain", "not_found_in_static_analysis"])
             self.assertEqual(results[0].reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
 
-    def test_batch_packaged_bytecode_javaps_string_candidate_but_emits_no_hit(self):
+    def test_batch_packaged_bytecode_skips_javap_for_string_only_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             classes_root = self._compile_java_fixture(
                 tmp,
@@ -14504,7 +14527,9 @@ public class com.example.consumer.StringOnly {
 
             cached = graph.runtime_dependency_catalog["_packaged_api_scan_results"]
             self.assertEqual(cached[tracer.build_api_identity_key(apis[0])]["status"], "miss")
-            mocked_javap.assert_called_once()
+            # A valid direct classfile parse proves this is only a string
+            # literal, so the constant-pool fast path must avoid javap.
+            mocked_javap.assert_not_called()
 
     def test_batch_packaged_bytecode_keeps_reflection_string_candidates_for_javap(self):
         with tempfile.TemporaryDirectory() as tmp:

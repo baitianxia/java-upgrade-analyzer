@@ -21,6 +21,23 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_japicmp_xml_signature_erases_nested_generic_arguments_only_for_binary_identity(self):
+        element = step4.ET.fromstring(
+            '<method name="consume">'
+            '<parameter type="java.util.Map&lt;java.lang.String, java.util.List&lt;java.lang.Long&gt;&gt;" />'
+            '<parameter type="java.util.List&lt;? extends com.acme.Value&gt;[]" />'
+            '</method>'
+        )
+
+        self.assertEqual(
+            step4._xml_member_signature(element),
+            '(java.util.Map, java.util.List[])',
+        )
+        self.assertEqual(
+            step4.build_api_signature_from_types(['java.util.List<java.lang.String>']),
+            '(java.util.List<java.lang.String>)',
+        )
+
     def test_changed_dependencies_view_groups_api_rows_by_coord(self):
         rows = [
             {

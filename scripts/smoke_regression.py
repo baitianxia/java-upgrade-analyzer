@@ -2607,8 +2607,12 @@ return ExtraApi.callLegacy();
     assert_true(interactive_step4_json.get("step_id") == "step4", "Step4 interaction.json 未写入正确 step_id")
     assert_true(interactive_step4_json.get("files_to_review"), "Step4 待交互未提供 files_to_review")
     assert_true(
+        any(str(item).endswith("evidence/api_changes/changed_dependencies.md") for item in interactive_step4_json.get("files_to_review", [])),
+        "依赖 API 变化确认未提供依赖包维度的人读选择页",
+    )
+    assert_true(
         any(str(item).endswith("evidence/api_changes/all_changed_apis.csv") for item in interactive_step4_json.get("files_to_review", [])),
-        "Step4 files_to_review 未包含 all_changed_apis.csv",
+        "依赖 API 变化确认未提供完整 API 事实文件",
     )
     assert_true(
         ((interactive_step4_json.get("response_schema") or {}).get("properties") or {}).get("action"),
@@ -2648,10 +2652,14 @@ return ExtraApi.callLegacy();
     )
     assert_true('"files_to_review"' in stdout, "stdout 未输出 files_to_review")
     assert_true('"runtime_rules"' in stdout, "stdout 未输出 runtime_rules")
-    assert_true("AWAITING USER INPUT" in stderr, "Step4 待交互未输出醒目待输入 banner")
-    assert_true("RULE: awaiting_* -> ask user -> wait -> resume with --response-json/--response-file" in stderr, "Step4 待交互未输出短规则提醒")
-    assert_true("JUA_CONFIRMATION_JSON:" in stderr, "Step4 待交互未输出结构化 confirmation JSON")
-    assert_true('"must_wait_for_user_reply": true' in stderr, "Step4 confirmation JSON 未暴露 must_wait_for_user_reply")
+    assert_true("【分析已暂停，等待你的确认】" in stderr, "依赖 API 变化确认未输出用户任务卡")
+    assert_true("为什么暂停" in stderr, "依赖 API 变化确认未解释暂停原因")
+    assert_true("AWAITING USER INPUT" not in stderr, "用户任务卡仍暴露英文状态机提示")
+    assert_true("awaiting_*" not in stderr, "用户任务卡仍暴露内部运行规则")
+    step4_event_line = next(line for line in stdout.splitlines() if line.startswith("JUA_CONFIRMATION_JSON:"))
+    step4_stdout_event = json.loads(step4_event_line.split(":", 1)[1])
+    assert_true(step4_stdout_event.get("schema") == "java-upgrade-analyzer.confirmation.v1", "机器输出不是单个 confirmation JSON")
+    assert_true(step4_stdout_event.get("must_wait_for_user_reply") is True, "机器 confirmation JSON 未暴露 must_wait_for_user_reply")
     assert_true('"input_normalization"' in stdout, "Step4 stdout 未输出 input_normalization")
     stdout, stderr, rc = run_script_with_rc(
         "run_step.py",
@@ -2792,7 +2800,7 @@ return ExtraApi.callLegacy();
         cwd=project_dir,
     )
     assert_true(strict_gate_rc == 1, "严格模式下，存在 uncertain 的调用链结果应阻断")
-    assert_true("严格模式下调用链仍存在盲区" in strict_gate_stderr, "严格模式门控失败原因不明确")
+    assert_true("严格模式下调用链仍存在未完成项" in strict_gate_stderr, "严格模式门控失败原因不明确")
 
     summary = read_json(report_dir / "evidence" / "call_chain" / "summary.json")
     # 该 fixture 在 Step1 最终制品生成后才追加 App.java，因此源码与已留存制品并不对齐。
@@ -4617,8 +4625,8 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             f"Step1 前置输入契约交互未向 agent 暴露 {field_name}",
         )
     assert_true(
-        "支持输入方式" in stderr and "checkout_build" in stderr,
-        "Step1 前置输入契约交互未在提示中明确展示输入方式和关键字段",
+        "可选输入方式" in stderr and "自动切分支构建" in stderr,
+        "分析对象前置交互未向用户说明可选输入方式",
     )
 
     artifact_input_dir = project_dir / "artifact-inputs"
@@ -5073,7 +5081,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "Step1 缺业务信息后补充分支，首次恢复不应直接执行 step2",
     )
     assert_true(
-        "=== 执行 step1 ===" in stderr and "=== 执行 step2 ===" not in stderr,
+        "正在分析：分析对象与依赖范围" in stderr and "正在分析：升级上下文" not in stderr,
         "Step1 缺业务信息后补充分支，恢复日志应只显示 step1，不能直接跳到 step2",
     )
     artifact_branch_fallback_report = project_dir / ".upgrade-report-artifact-branch-fallback"
@@ -5147,8 +5155,9 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true('"hard_stop": true' in stdout, "stdout 未输出 hard_stop 标记")
     assert_true('"must_wait_for_user_reply": true' in stdout, "stdout 未输出 must_wait_for_user_reply")
     assert_true(interaction_json.get("hard_stop") is True, "interaction.json 未标记 hard_stop")
-    assert_true("待用户交互" in stderr, "stderr 未提示待用户交互")
-    assert_true("AWAITING USER INPUT" in stderr, "stderr 未输出醒目待输入 banner")
+    assert_true("【分析已暂停，等待你的确认】" in stderr, "stderr 未输出用户任务卡")
+    assert_true("为什么暂停" in stderr, "stderr 未说明暂停原因")
+    assert_true("AWAITING USER INPUT" not in stderr, "stderr 仍暴露英文状态机提示")
     assert_true(interaction_json.get("runtime_rules"), "interaction.json 未写入 runtime_rules")
     assert_true(
         (interaction_json.get("input_normalization") or {}).get("enabled") is True,
@@ -5168,9 +5177,11 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true("rerun_current_step" in resume_actions, "step1 恢复模板未包含 rerun_current_step")
     assert_true("restart_from_step" in resume_actions, "step1 恢复模板未包含 restart_from_step")
     assert_true("cancel" in resume_actions, "step1 恢复模板未包含 cancel")
-    assert_true("NEXT ACTION ONLY" in stderr, "stderr 未输出 next action 硬约束")
-    assert_true("JUA_CONFIRMATION_JSON:" in stderr, "stderr 未输出 confirmation JSON")
-    assert_true('"next_action_rule":' in stderr, "confirmation JSON 未暴露 next_action_rule")
+    assert_true("NEXT ACTION ONLY" not in stderr, "stderr 仍暴露内部 next action 规则")
+    step1_event_line = next(line for line in stdout.splitlines() if line.startswith("JUA_CONFIRMATION_JSON:"))
+    step1_stdout_event = json.loads(step1_event_line.split(":", 1)[1])
+    assert_true(step1_stdout_event.get("schema") == "java-upgrade-analyzer.confirmation.v1", "stdout 未输出单个 confirmation JSON")
+    assert_true("next_action_rule" in step1_stdout_event, "confirmation JSON 未暴露 next_action_rule")
     assert_true('"input_normalization"' in stdout, "stdout 未输出 input_normalization")
     assert_true(
         "rerun_current_step" in {item.get("id") for item in interaction_json.get("options", [])},

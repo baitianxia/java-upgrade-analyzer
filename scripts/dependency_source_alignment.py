@@ -2,9 +2,12 @@
 """Pin dependency source mappings to Step4-confirmed current-version commits."""
 
 import hashlib
+import io
 import json
 import re
+import shutil
 import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -138,26 +141,53 @@ def materialize_detached_snapshot(report_dir, coord, repo_path, ref, module_rel_
         / _safe_coord(coord)
         / commit[:12]
     )
+    marker_name = ".jua-source-snapshot.json"
     reused = False
     if snapshot.exists():
-        existing_head, _stderr, head_rc = _run_git(snapshot, "rev-parse", "HEAD")
-        inside, _stderr, inside_rc = _run_git(snapshot, "rev-parse", "--is-inside-work-tree")
-        if head_rc or inside_rc or inside != "true" or existing_head != commit:
+        marker = snapshot / marker_name
+        try:
+            marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            marker_payload = {}
+        if marker_payload.get("commit") != commit:
             raise RuntimeError("dependency_source_snapshot_conflict")
         reused = True
     else:
         snapshot.parent.mkdir(parents=True, exist_ok=True)
+        # `git worktree add` leaves a reverse registration in the user's
+        # repository.  Report cleanup by `rm -rf` then creates a stale worktree
+        # record.  Archive the exact commit instead: the source bytes are the
+        # same tracked revision and the user's repository is never mutated.
         completed = subprocess.run(
-            ["git", "-C", str(repo_path), "worktree", "add", "--detach", str(snapshot), commit],
-            text=True,
+            ["git", "-C", str(repo_path), "archive", "--format=zip", commit],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
         if completed.returncode != 0:
             raise RuntimeError(
-                f"dependency_source_snapshot_create_failed:{completed.stderr.strip() or completed.stdout.strip()}"
+                "dependency_source_snapshot_create_failed:"
+                + completed.stderr.decode("utf-8", errors="replace").strip()
             )
+        temporary = Path(tempfile.mkdtemp(prefix=".jua-source-", dir=str(snapshot.parent)))
+        try:
+            with zipfile.ZipFile(io.BytesIO(completed.stdout)) as archive:
+                root = temporary.resolve()
+                for member in archive.infolist():
+                    destination = (temporary / member.filename).resolve()
+                    try:
+                        destination.relative_to(root)
+                    except ValueError as exc:
+                        raise RuntimeError("dependency_source_snapshot_archive_escapes_root") from exc
+                archive.extractall(temporary)
+            (temporary / marker_name).write_text(
+                json.dumps({"schema": 1, "commit": commit}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temporary.rename(snapshot)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
 
     snapshot_root = snapshot.resolve()
     module_root = (snapshot / (module_rel_path or ".")).resolve()

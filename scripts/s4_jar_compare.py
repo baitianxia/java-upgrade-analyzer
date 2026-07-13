@@ -30,7 +30,7 @@ from collections import Counter
 from pathlib import Path
 from datetime import datetime
 import hashlib, zipfile
-import xml.etree.ElementTree as ET
+import safe_xml as ET
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import (
@@ -2149,7 +2149,7 @@ def _xml_member_signature(element):
         value = _xml_attr(child, 'type', 'newType', 'oldType', 'name')
         if value:
             params.append(value)
-    return build_api_signature_from_types(params)
+    return build_api_signature_from_types(params, erase_generics=True)
 
 
 def parse_japicmp_output(output, coord, old_ver, new_ver):
@@ -2576,10 +2576,25 @@ def strip_parameter_name(param_decl):
     return param_decl
 
 
-def build_api_signature_from_types(type_exprs):
+def _erase_generic_arguments(type_expr):
+    erased = []
+    depth = 0
+    for char in str(type_expr or ''):
+        if char == '<':
+            depth += 1
+        elif char == '>' and depth:
+            depth -= 1
+        elif depth == 0:
+            erased.append(char)
+    return ''.join(erased).strip()
+
+
+def build_api_signature_from_types(type_exprs, erase_generics=False):
     normalized_params = []
     for type_expr in type_exprs or []:
         normalized = normalize_type_expression(type_expr)
+        if erase_generics:
+            normalized = _erase_generic_arguments(normalized)
         if normalized:
             normalized_params.append(normalized)
     return '(' + ', '.join(normalized_params) + ')' if normalized_params else '()'

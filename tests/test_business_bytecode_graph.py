@@ -132,6 +132,86 @@ public class Service {
         self.assertIn("com.acme.Dto.Dto()", by_type["bytecode_constructor_invocation"])
         self.assertIn("com.acme.Client", by_type["bytecode_type_reference"])
         self.assertIn("bytecode_invokedynamic", by_type)
+        self.assertTrue(
+            any(key.startswith("com.acme.Service.lambda$execute$0")
+                for key in by_type["bytecode_invokedynamic_method_reference"])
+        )
+
+    def test_parse_classfile_calls_resolves_method_reference_bootstrap_target(self):
+        if not shutil.which("javac"):
+            self.skipTest("javac not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src" / "com" / "acme"
+            src.mkdir(parents=True)
+            (src / "Target.java").write_text(
+                "package com.acme; public class Target { public static String map(String v) { return v; } }\n",
+                encoding="utf-8",
+            )
+            (src / "Service.java").write_text(
+                "package com.acme; import java.util.function.Function; "
+                "public class Service { Function<String,String> mapper() { return Target::map; } }\n",
+                encoding="utf-8",
+            )
+            out = root / "classes"
+            out.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(out)] + [str(path) for path in src.glob("*.java")],
+                check=True, capture_output=True,
+            )
+            edges = parse_classfile_calls(
+                (out / "com/acme/Service.class").read_bytes(), "com.acme.Service"
+            )
+
+        self.assertTrue(any(
+            edge.get("evidence_type") == "bytecode_invokedynamic_method_reference"
+            and edge.get("callee_key") == "com.acme.Target.map(java.lang.String)"
+            for edge in edges
+        ))
+
+    def test_parse_classfile_calls_keeps_calls_after_dense_and_sparse_switches(self):
+        if not shutil.which("javac"):
+            self.skipTest("javac not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src" / "com" / "acme"
+            src.mkdir(parents=True)
+            (src / "Target.java").write_text(
+                "package com.acme; public class Target { public static void hit() {} }\n",
+                encoding="utf-8",
+            )
+            (src / "Switches.java").write_text(
+                """
+package com.acme;
+public class Switches {
+  public void dense(int value) {
+    switch (value) { case 1: break; case 2: break; case 3: break; default: break; }
+    Target.hit();
+  }
+  public void sparse(int value) {
+    switch (value) { case 1: break; case 100: break; default: break; }
+    Target.hit();
+  }
+}
+""",
+                encoding="utf-8",
+            )
+            out = root / "classes"
+            out.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(out)] + [str(path) for path in src.glob("*.java")],
+                check=True,
+                capture_output=True,
+            )
+            edges = parse_classfile_calls(
+                (out / "com/acme/Switches.class").read_bytes(), "com.acme.Switches"
+            )
+
+        callers = {
+            edge["caller_name"] for edge in edges
+            if edge.get("callee_key") == "com.acme.Target.hit()"
+        }
+        self.assertEqual(callers, {"dense", "sparse"})
 
     def test_parse_classfile_calls_falls_back_for_reflection_markers(self):
         if not shutil.which("javac"):

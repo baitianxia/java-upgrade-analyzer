@@ -14,6 +14,58 @@ from framework_adapters import run_framework_adapters, attach_framework_edges_to
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
+    def test_dynamic_proxy_text_inside_string_does_not_create_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "Documentation.java").write_text(
+                'package com.acme; class Documentation { String sample = '
+                '"Proxy.newProxyInstance(loader, new Class[]{Api.class}, handler)"; }\n',
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        proxy = next(item for item in payload["adapters"] if item["adapter"] == "dynamic_proxy_basic")
+        self.assertEqual(proxy["status"], "not_applicable")
+        self.assertEqual(proxy["edges"], [])
+
+    def test_multiline_mybatis_annotation_is_bound_by_ast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "DemoMapper.java").write_text(
+                "package com.acme; interface DemoMapper {\n"
+                "  @org.apache.ibatis.annotations.Select(\n"
+                "    {\"select 1\"}\n"
+                "  )\n"
+                "  int find();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        mybatis = next(item for item in payload["adapters"] if item["adapter"] == "mybatis")
+        self.assertTrue(any(
+            edge.get("target") == "com.acme.DemoMapper.find"
+            and (edge.get("provenance") or {}).get("parser") == "tree_sitter"
+            for edge in mybatis["edges"]
+        ))
+
+    def test_commented_spring_annotations_do_not_create_edges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "Disabled.java").write_text(
+                "package com.acme; class Disabled { /* @EventListener public void ghost(Object e) {} */ "
+                "// @Scheduled(fixedDelay=1) public void task() {}\n"
+                "public void live() {} }",
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertFalse(any("ghost" in str(edge) or "task" in str(edge) for edge in spring["edges"]))
+
     def test_spi_spring_and_mybatis_emit_independent_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = Path(tmp)

@@ -140,6 +140,22 @@ python3 scripts/smoke_regression.py --group orchestrator
 
 每次执行真实项目矩阵时，性能也必须作为质量信号审计。超过 Step4/Step5 配置预算、图规模异常下降、边截断、edge cap 命中，都不能只作为日志观察；其中耗时超预算应输出 `performance_regression`，P1 阻塞 release。性能优化只能降低重复计算和资源消耗，不能通过缩小分析范围换取通过。
 
+最终制品 edge oracle 对每个有效 class 独立执行 JDK `javap`，最多并发 8 个进程；结果必须按制品 entry 和物理指令身份确定性汇总。并发不能抽样、跳过 nested JAR、合并物理 occurrence，或丢弃任一 class 的解析失败。
+
+oracle 使用进程内不可变缓存，key 必须同时包含最终制品 SHA-256、oracle procedure/version 和完整 JDK `javap` version。缓存值采用序列化快照，命中时返回独立副本；不同 SHA、procedure 或 JDK 之间禁止复用。只有已经穷举结束的扫描可以写缓存；超时或中断结果禁止缓存。
+
+每个真实项目 case 必须配置 `max_oracle_seconds`，默认预算为 120 秒。超过预算或收到中断时，oracle 必须终止在途 `javap`、禁止 traceback、标记结果不完整，并同时输出 blocking `oracle_incomplete` 和 `performance_regression`。禁止为了满足预算减少 class、edge 或 failure 范围。
+
+runner 的 `performance_envelope` 至少保留以下 oracle 指标：
+
+- `oracle_class_count` / `oracle_completed_class_count`；
+- `oracle_parsed_class_count` / `oracle_cached_class_count`；
+- `oracle_parse_failure_count`；
+- `oracle_parse_seconds` / `oracle_elapsed_seconds`；
+- `oracle_worker_count`；
+- `oracle_cache_hits` / `oracle_cache_misses`；
+- `oracle_timed_out` / `oracle_interrupted`。
+
 Step4 性能验证优先看：
 
 ```text
@@ -285,6 +301,18 @@ same-coordinate finding 只有在完整守护契约通过时才保持 `fixed`；
 `fixed` 行的 fixture 必须能由 unittest loader 解析到真实测试，且 `asset`、`api_coverage`、
 `topology_coverage`、`edge_truth`、`conclusion`、`performance`、`fixture_debt` 七个显式门禁状态
 全部通过后才算满足。Finding 再现由显式 lifecycle 结果判定，不从同一组边、拓扑或结论门禁反推。
+
+## 打包前最低要求
+
+## 解析器兼容性规则
+
+- Classfile 快路径只能跳过常量池中不存在目标 owner/member 的 class，或输出已经逐指令验证的调用边；反射和无法完整解析的 `invokedynamic` 必须回退 `javap`。
+- 直接解析缓存与 `javap` 缓存使用不同能力命名空间，禁止把常量池摘要当成完整指令证据。
+- `tableswitch` / `lookupswitch` 按方法 Code 数组绝对偏移对齐；Lambda 和方法引用必须解析 `BootstrapMethods` 中的实现 MethodHandle。
+- 类层级优先读取 classfile 的 `super_class` 和 `interfaces`；解析失败才允许有限并发调用 `javap`。层级覆盖不完整必须 fail closed。
+- 并发 worker、归档读取或字节码解析失败必须保留 artifact、class、异常类型和覆盖影响；不得缓存为正常空结果。
+- Fat Jar 内部模块只能由项目范围中的 reactor 坐标和最终制品条目共同证明，不允许用 groupId/package 前缀猜测。
+- 依赖源码快照使用 commit archive，不注册 Git Worktree；删除报告目录不得改变用户仓库的 `.git/worktrees`。
 
 ## 打包前最低要求
 

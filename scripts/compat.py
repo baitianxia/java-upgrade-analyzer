@@ -19,7 +19,7 @@ import subprocess
 import locale
 import io
 import re
-import xml.etree.ElementTree as ET
+import safe_xml as ET
 from pathlib import Path
 
 # ── 平台检测 ──────────────────────────────────────────────────────

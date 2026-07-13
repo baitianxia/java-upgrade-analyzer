@@ -298,6 +298,45 @@ class IndirectUsageAnalyzerTest(unittest.TestCase):
         self.assertEqual([(item["owner"], item["name"]) for item in method_refs], [("com.example.A", "x")])
         self.assertEqual(class_refs, {"com.example.A", "com.example.B"})
 
+    def test_javap_reflection_preserves_originating_invocation_opcode_and_offset(self):
+        javap = '''
+  public void f();
+    descriptor: ()V
+    Code:
+       0: ldc           #1                  // String com.example.Target
+       2: invokestatic  #2                  // Method java/lang/Class.forName:(Ljava/lang/String;)Ljava/lang/Class;
+       5: ldc           #3                  // String removed
+       7: iconst_0
+       8: anewarray     #4                  // class java/lang/Class
+      11: invokevirtual #5                  // Method java/lang/Class.getMethod:(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
+      14: aconst_null
+      15: iconst_0
+      16: anewarray     #6                  // class java/lang/Object
+      19: invokevirtual #7                  // Method java/lang/reflect/Method.invoke:(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
+'''
+
+        references = parse_javap_indirect_references(javap)
+
+        class_ref = next(item for item in references if item["kind"] == "class")
+        method_ref = next(item for item in references if item["kind"] == "method")
+        self.assertEqual((class_ref["opcode_family"], class_ref["instruction_offset"]), ("invokestatic", 2))
+        self.assertEqual((method_ref["opcode_family"], method_ref["instruction_offset"]), ("invokevirtual", 19))
+
+    def test_incomplete_reflection_reference_cannot_emit_runtime_hit(self):
+        target = api_row_for("com.example.Target", signature="()")
+        references = {
+            "method_refs": [{
+                "owner": "com.example.Target",
+                "name": "removed",
+                "signature": "()",
+                "signature_resolved": True,
+                "reference_kind": "reflection_method",
+                "consumer_method": "f",
+            }],
+        }
+
+        self.assertEqual(tracer._match_runtime_dependency_references(target, references), [])
+
     def test_static_method_handle_is_merged_when_target_is_exact(self):
         method = business_method('''
             return (boolean) MethodHandles.lookup()

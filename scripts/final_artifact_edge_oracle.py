@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import hashlib
 import io
+import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+from threading import Event, Lock
 import time
 import zipfile
 
@@ -44,12 +48,27 @@ BOOTSTRAP_REFERENCE_RE = re.compile(
     r"\"?(?P<member>[^\":]+)\"?:(?P<descriptor>\(.*)$"
 )
 PROCEDURE = "javap -v -c -p -s <extracted-class-file>; enumerate executable final-artifact edges"
+ORACLE_PROCEDURE_VERSION = "java-upgrade-analyzer.final-artifact-javap.v2"
+MAX_JAVAP_WORKERS = 8
+JAVAP_VERSION_TIMEOUT_SECONDS = 5.0
+_IMMUTABLE_ORACLE_CACHE: dict[tuple[str, str, str, str], str] = {}
+_IMMUTABLE_ORACLE_CACHE_LOCK = Lock()
 
 
 @dataclass(frozen=True)
 class PackagedClass:
     artifact_entry: str
     extracted_path: Path
+
+
+def clear_immutable_oracle_cache() -> None:
+    """Reset process-local immutable oracle results for isolated tests."""
+    with _IMMUTABLE_ORACLE_CACHE_LOCK:
+        _IMMUTABLE_ORACLE_CACHE.clear()
+
+
+def _oracle_cache_key(artifact_sha256: str, jdk_version: str) -> tuple[str, str, str, str]:
+    return artifact_sha256, ORACLE_PROCEDURE_VERSION, PROCEDURE, jdk_version
 
 
 def _is_runtime_class(entry: str) -> bool:
@@ -404,8 +423,10 @@ def _parse_javap_output(
     return rows, failures
 
 
-def _javap_version(javap: str) -> str:
-    completed = subprocess.run([javap, "-version"], capture_output=True, text=True, check=False)
+def _javap_version(javap: str, *, timeout: float) -> str:
+    completed = subprocess.run(
+        [javap, "-version"], capture_output=True, text=True, check=False, timeout=timeout
+    )
     return (completed.stdout or completed.stderr).strip()
 
 
@@ -414,70 +435,332 @@ def _javap_major(version: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _cancel_process(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.kill()
+    process.communicate()
+
+
+def _parse_entry_with_javap(
+    entry: PackagedClass,
+    artifact_sha256: str,
+    javap: str,
+    version: str,
+    cancellation_event: Event,
+    deadline: float | None,
+) -> dict:
+    per_class_deadline = time.perf_counter() + 30.0
+    deadline = min(deadline, per_class_deadline) if deadline is not None else per_class_deadline
+    if cancellation_event.is_set() or (deadline is not None and time.perf_counter() >= deadline):
+        return {"rows": [], "failures": [], "completed": False, "parsed": False}
+    try:
+        process = subprocess.Popen(
+            [javap, "-v", "-c", "-p", "-s", str(entry.extracted_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        return {
+            "rows": [],
+            "failures": [f"{entry.artifact_entry}: {javap} execution failed: {error}"],
+            "completed": True,
+            "parsed": False,
+        }
+
+    while True:
+        remaining = deadline - time.perf_counter() if deadline is not None else None
+        if cancellation_event.is_set() or (remaining is not None and remaining <= 0):
+            _cancel_process(process)
+            return {"rows": [], "failures": [], "completed": False, "parsed": False}
+        wait_seconds = min(0.1, remaining) if remaining is not None else 0.1
+        try:
+            stdout, stderr = process.communicate(timeout=wait_seconds)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+    if process.returncode != 0:
+        detail = (stderr or stdout).strip().replace("\n", " ")
+        return {
+            "rows": [],
+            "failures": [f"{entry.artifact_entry}: javap failed: {detail}"],
+            "completed": True,
+            "parsed": False,
+        }
+    if not version:
+        return {
+            "rows": [],
+            "failures": [f"{entry.artifact_entry}: javap version was empty"],
+            "completed": True,
+            "parsed": False,
+        }
+    rows, failures = _parse_javap_output(stdout, artifact_sha256, entry.artifact_entry, version)
+    return {"rows": rows, "failures": failures, "completed": True, "parsed": True}
+
+
 def _parse_entries_with_javap(
     entries: list[PackagedClass], artifact_sha256: str, javap: str, version: str
 ) -> tuple[list[dict], list[str]]:
     rows: list[dict] = []
     failures: list[str] = []
+    cancellation_event = Event()
     for entry in entries:
-        try:
-            completed = subprocess.run(
-                [javap, "-v", "-c", "-p", "-s", str(entry.extracted_path)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError as error:
-            failures.append(f"{entry.artifact_entry}: {javap} execution failed: {error}")
-            continue
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip().replace("\n", " ")
-            failures.append(f"{entry.artifact_entry}: javap failed: {detail}")
-            continue
-        if not version:
-            failures.append(f"{entry.artifact_entry}: javap version was empty")
-            continue
-        parsed_rows, parsed_failures = _parse_javap_output(
-            completed.stdout, artifact_sha256, entry.artifact_entry, version
+        result = _parse_entry_with_javap(
+            entry, artifact_sha256, javap, version, cancellation_event, None
         )
-        rows.extend(parsed_rows)
-        failures.extend(parsed_failures)
+        rows.extend(result["rows"])
+        failures.extend(result["failures"])
     return rows, failures
 
 
-def scan_final_artifact(artifact: Path, javap: str = "javap") -> dict:
+def _worker_exception_result(entry: PackagedClass, error: BaseException) -> dict:
+    return {
+        "rows": [],
+        "failures": [
+            f"{entry.artifact_entry}: oracle worker failed: {type(error).__name__}: {error}"
+        ],
+        "completed": True,
+        "parsed": False,
+    }
+
+
+def _base_result(artifact_sha256: str, *, elapsed_seconds: float, **values) -> dict:
+    return {
+        "artifact_sha256": artifact_sha256,
+        "class_count": int(values.get("class_count") or 0),
+        "completed_class_count": int(values.get("completed_class_count") or 0),
+        "parsed_class_count": int(values.get("parsed_class_count") or 0),
+        "cached_class_count": int(values.get("cached_class_count") or 0),
+        "parse_failure_count": int(values.get("parse_failure_count") or 0),
+        "parse_seconds": float(values.get("parse_seconds") or 0.0),
+        "elapsed_seconds": elapsed_seconds,
+        "worker_count": int(values.get("worker_count") or 0),
+        "cache_hits": int(values.get("cache_hits") or 0),
+        "cache_misses": int(values.get("cache_misses") or 0),
+        "timed_out": bool(values.get("timed_out")),
+        "interrupted": bool(values.get("interrupted")),
+        "edges": list(values.get("edges") or []),
+        "failures": list(values.get("failures") or []),
+        "complete": bool(values.get("complete")),
+    }
+
+
+def scan_final_artifact(
+    artifact: Path,
+    javap: str = "javap",
+    *,
+    max_workers: int | None = None,
+    time_budget_seconds: float | None = None,
+) -> dict:
     """Return every executable edge found in the final artifact and nested runtime JARs."""
     artifact = Path(artifact)
     started_at = time.perf_counter()
+    budget = float(time_budget_seconds or 0.0)
+    deadline = started_at + budget if budget > 0 else None
     try:
         snapshot = artifact.read_bytes()
     except OSError as error:
-        return {
-            "artifact_sha256": "",
-            "class_count": 0,
-            "parse_seconds": time.perf_counter() - started_at,
-            "edges": [],
-            "failures": [f"{artifact}: artifact snapshot read failed: {error}"],
-            "complete": False,
-        }
+        return _base_result(
+            "",
+            elapsed_seconds=time.perf_counter() - started_at,
+            failures=[f"{artifact}: artifact snapshot read failed: {error}"],
+            complete=False,
+        )
     digest = hashlib.sha256(snapshot).hexdigest()
+    version_timeout = JAVAP_VERSION_TIMEOUT_SECONDS
+    if deadline is not None:
+        version_timeout = deadline - time.perf_counter()
+        if version_timeout <= 0:
+            return _base_result(
+                digest,
+                elapsed_seconds=time.perf_counter() - started_at,
+                failures=[f"oracle_time_budget_exceeded:{budget:.3f}s"],
+                timed_out=True,
+                cache_misses=1,
+                complete=False,
+            )
+        version_timeout = min(version_timeout, JAVAP_VERSION_TIMEOUT_SECONDS)
     try:
-        version = _javap_version(javap)
-    except OSError:
-        version = ""
+        version = _javap_version(javap, timeout=version_timeout)
+    except subprocess.TimeoutExpired:
+        return _base_result(
+            digest,
+            elapsed_seconds=time.perf_counter() - started_at,
+            failures=["oracle_javap_version_timeout"],
+            timed_out=True,
+            cache_misses=1,
+            complete=False,
+        )
+    except OSError as error:
+        return _base_result(
+            digest,
+            elapsed_seconds=time.perf_counter() - started_at,
+            failures=[f"oracle_javap_version_failed:OSError: {error}"],
+            cache_misses=1,
+            complete=False,
+        )
+    except KeyboardInterrupt:
+        return _base_result(
+            digest,
+            elapsed_seconds=time.perf_counter() - started_at,
+            failures=["oracle_interrupted"],
+            interrupted=True,
+            cache_misses=1,
+            complete=False,
+        )
+    except Exception as error:
+        return _base_result(
+            digest,
+            elapsed_seconds=time.perf_counter() - started_at,
+            failures=[f"oracle_javap_version_failed:{type(error).__name__}: {error}"],
+            cache_misses=1,
+            complete=False,
+        )
+    cache_key = _oracle_cache_key(digest, version)
+    with _IMMUTABLE_ORACLE_CACHE_LOCK:
+        cached_serialized = _IMMUTABLE_ORACLE_CACHE.get(cache_key)
+    if cached_serialized is not None:
+        cached = json.loads(cached_serialized)
+        return _base_result(
+            digest,
+            elapsed_seconds=time.perf_counter() - started_at,
+            class_count=cached["class_count"],
+            completed_class_count=cached["class_count"],
+            cached_class_count=cached["class_count"],
+            parse_failure_count=cached["parse_failure_count"],
+            cache_hits=1,
+            edges=cached["edges"],
+            failures=cached["failures"],
+            complete=cached["complete"],
+        )
     target_major = _javap_major(version)
-    with tempfile.TemporaryDirectory(prefix="final-artifact-edge-oracle-") as temporary_directory:
-        entries, failures = _extract_packaged_classes(snapshot, Path(temporary_directory), target_major)
-        rows, parse_failures = _parse_entries_with_javap(entries, digest, javap, version)
+    cancellation_event = Event()
+    timed_out = False
+    interrupted = False
+    parse_started_at = time.perf_counter()
+    entries: list[PackagedClass] = []
+    failures: list[str] = []
+    results: list[dict | None] = []
+    worker_count = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix="final-artifact-edge-oracle-") as temporary_directory:
+            entries, failures = _extract_packaged_classes(snapshot, Path(temporary_directory), target_major)
+            if deadline is not None and time.perf_counter() >= deadline:
+                timed_out = True
+            if entries and not timed_out:
+                requested_workers = max_workers if max_workers is not None else min(
+                    MAX_JAVAP_WORKERS, max(1, os.cpu_count() or 1)
+                )
+                worker_count = min(
+                    len(entries), MAX_JAVAP_WORKERS, max(1, int(requested_workers))
+                )
+                executor = ThreadPoolExecutor(
+                    max_workers=worker_count, thread_name_prefix="final-artifact-javap"
+                )
+                futures = [
+                    executor.submit(
+                        _parse_entry_with_javap,
+                        entry,
+                        digest,
+                        javap,
+                        version,
+                        cancellation_event,
+                        deadline,
+                    )
+                    for entry in entries
+                ]
+                try:
+                    for future in futures:
+                        remaining = deadline - time.perf_counter() if deadline is not None else None
+                        if remaining is not None and remaining <= 0:
+                            timed_out = True
+                            cancellation_event.set()
+                            break
+                        try:
+                            future.result(timeout=remaining)
+                        except FutureTimeoutError:
+                            timed_out = True
+                            cancellation_event.set()
+                            break
+                        except BaseException:
+                            # Record this failure after all submitted classes have finished.
+                            continue
+                except KeyboardInterrupt:
+                    interrupted = True
+                    cancellation_event.set()
+                finally:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                for entry, future in zip(entries, futures):
+                    if future.cancelled():
+                        results.append(None)
+                        continue
+                    try:
+                        results.append(future.result())
+                    except KeyboardInterrupt:
+                        interrupted = True
+                        cancellation_event.set()
+                        results.append(None)
+                    except BaseException as error:
+                        results.append(_worker_exception_result(entry, error))
+                if any(result is None or not result.get("completed") for result in results):
+                    if deadline is not None and time.perf_counter() >= deadline:
+                        timed_out = True
+                    elif not interrupted:
+                        failures.append("oracle_parse_incomplete")
+    except KeyboardInterrupt:
+        interrupted = True
+        cancellation_event.set()
+
+    rows: list[dict] = []
+    parse_failures: list[str] = []
+    completed_class_count = 0
+    parsed_class_count = 0
+    for result in results:
+        if result is None:
+            continue
+        rows.extend(result["rows"])
+        parse_failures.extend(result["failures"])
+        completed_class_count += int(bool(result.get("completed")))
+        parsed_class_count += int(bool(result.get("parsed")))
     failures.extend(parse_failures)
+    if timed_out:
+        failures.append(f"oracle_time_budget_exceeded:{budget:.3f}s")
+    if interrupted:
+        failures.append("oracle_interrupted")
     rows.sort(key=lambda row: (
         canonical_edge_identity(row), row["artifact_entry"], row["instruction_offset"]
     ))
-    return {
-        "artifact_sha256": digest,
-        "class_count": len(entries),
-        "parse_seconds": time.perf_counter() - started_at,
-        "edges": rows,
-        "failures": failures,
-        "complete": not failures,
-    }
+    parse_seconds = time.perf_counter() - parse_started_at
+    complete = not failures and completed_class_count == len(entries)
+    result = _base_result(
+        digest,
+        elapsed_seconds=time.perf_counter() - started_at,
+        class_count=len(entries),
+        completed_class_count=completed_class_count,
+        parsed_class_count=parsed_class_count,
+        parse_failure_count=len(parse_failures),
+        parse_seconds=parse_seconds,
+        worker_count=worker_count,
+        cache_misses=1,
+        timed_out=timed_out,
+        interrupted=interrupted,
+        edges=rows,
+        failures=failures,
+        complete=complete,
+    )
+    if complete and not timed_out and not interrupted and completed_class_count == len(entries):
+        serialized = json.dumps(
+            {
+                "class_count": len(entries),
+                "parse_failure_count": len(parse_failures),
+                "edges": rows,
+                "failures": failures,
+                "complete": complete,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with _IMMUTABLE_ORACLE_CACHE_LOCK:
+            _IMMUTABLE_ORACLE_CACHE.setdefault(cache_key, serialized)
+    return result

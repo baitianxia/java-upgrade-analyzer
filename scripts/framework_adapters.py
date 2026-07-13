@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import json
 import re
-import xml.etree.ElementTree as ET
+import safe_xml as ET
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol
+
+from enhanced_source_analyzer import analyze_file
 
 
 class FrameworkAdapter(Protocol):
@@ -52,6 +54,71 @@ def _production_java_files(source_roots):
                 continue
             seen.add(resolved)
             yield resolved
+
+
+def _mask_java_comments(text):
+    """Remove comments while preserving offsets, newlines, and string literals."""
+    chars = list(str(text or ''))
+    index = 0
+    state = 'code'
+    while index < len(chars):
+        current = chars[index]
+        following = chars[index + 1] if index + 1 < len(chars) else ''
+        if state == 'code':
+            if current == '"':
+                state = 'string'
+            elif current == "'":
+                state = 'char'
+            elif current == '/' and following == '/':
+                chars[index] = chars[index + 1] = ' '
+                index += 1
+                state = 'line_comment'
+            elif current == '/' and following == '*':
+                chars[index] = chars[index + 1] = ' '
+                index += 1
+                state = 'block_comment'
+        elif state in {'string', 'char'}:
+            quote = '"' if state == 'string' else "'"
+            if current == '\\':
+                index += 1
+            elif current == quote:
+                state = 'code'
+        elif state == 'line_comment':
+            if current in '\r\n':
+                state = 'code'
+            else:
+                chars[index] = ' '
+        elif state == 'block_comment':
+            if current == '*' and following == '/':
+                chars[index] = chars[index + 1] = ' '
+                index += 1
+                state = 'code'
+            elif current not in '\r\n':
+                chars[index] = ' '
+        index += 1
+    return ''.join(chars)
+
+
+def _mask_java_literals(text):
+    """Mask string/character bodies after comments have been removed."""
+    chars = list(str(text or ''))
+    index = 0
+    quote = ''
+    while index < len(chars):
+        current = chars[index]
+        if not quote and current in {'"', "'"}:
+            quote = current
+        elif quote:
+            if current == '\\':
+                if index + 1 < len(chars) and chars[index + 1] not in '\r\n':
+                    chars[index + 1] = ' '
+                    index += 1
+            elif current == quote:
+                quote = ''
+            elif current not in '\r\n':
+                chars[index] = ' '
+        index += 1
+    return ''.join(chars)
 
 
 def _resource_roots(source_roots):
@@ -105,7 +172,9 @@ def run_spi_adapter(source_roots):
     load_points = []
     for java_file in _production_java_files(source_roots):
         try:
-            source_text = java_file.read_text(encoding='utf-8', errors='replace')
+            source_text = _mask_java_comments(
+                java_file.read_text(encoding='utf-8', errors='replace')
+            )
         except OSError as exc:
             errors.append(f'{java_file}:{type(exc).__name__}')
             continue
@@ -272,7 +341,7 @@ def run_spring_adapter(source_roots):
     for path in _production_java_files(source_roots):
             scanned += 1
             try:
-                text = path.read_text(encoding='utf-8', errors='replace')
+                text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
             except OSError as exc:
                 errors.append(f'{path}:{type(exc).__name__}')
                 continue
@@ -297,6 +366,18 @@ def run_spring_adapter(source_roots):
                 {'annotation': match.group(1), 'expression': (match.group(2) or '').strip()}
                 for match in condition_pattern.finditer(text)
             ]
+            ast_methods = []
+            ast_authoritative = False
+            try:
+                ast_methods, parser_info = analyze_file(
+                    str(path),
+                    {"root": str(path.parent), "owner_type": "business", "owner_coord": "BUSINESS"},
+                    prefer_tree_sitter=True,
+                    return_diagnostics=True,
+                )
+                ast_authoritative = parser_info.get('actual_parser') == 'tree_sitter'
+            except (OSError, RuntimeError, ValueError) as exc:
+                errors.append(f'{path}:spring_ast:{type(exc).__name__}')
             class_match = re.search(
                 rf'\bclass\s+{re.escape(owner_simple)}'
                 r'(?:\s+extends\s+[\w.<>]+)?\s+implements\s+([^\{]+)',
@@ -373,18 +454,39 @@ def run_spring_adapter(source_roots):
                     'subject': owner,
                     'file': str(path),
                 })
-            for match in listener_pattern.finditer(text):
-                target = f'{owner}.{match.group(1)}'
+            listener_targets = []
+            active_targets = []
+            if ast_authoritative:
+                for method in ast_methods:
+                    annotations = {str(item).rsplit('.', 1)[-1] for item in method.annotations or []}
+                    method_owner = str(getattr(method, 'class_fqcn', '') or owner)
+                    method_name = str(getattr(method, 'method_name', '') or '')
+                    if method_name and 'EventListener' in annotations:
+                        listener_targets.append((f'{method_owner}.{method_name}', '@EventListener'))
+                    for annotation in ('Scheduled', 'PostConstruct'):
+                        if method_name and annotation in annotations:
+                            active_targets.append((f'{method_owner}.{method_name}', annotation))
+            else:
+                listener_targets.extend(
+                    (f'{owner}.{match.group(1)}', '@EventListener')
+                    for match in listener_pattern.finditer(text)
+                )
+                active_targets.extend(
+                    (f'{owner}.{match.group(2)}', match.group(1))
+                    for match in active_method_pattern.finditer(text)
+                )
+            for target, annotation in listener_targets:
                 nodes.append({'id': target, 'kind': 'spring_event_listener'})
                 edges.append({
                     'source': 'framework:spring-event-dispatch', 'target': target,
                     'edge_kind': 'spring_event_listener', 'confidence': 'high',
                     'conditions': conditions, 'ambiguity': False,
-                    'provenance': {'file': str(path), 'annotation': '@EventListener'},
+                    'provenance': {
+                        'file': str(path), 'annotation': annotation,
+                        'parser': 'tree_sitter' if ast_authoritative else 'masked_text_fallback',
+                    },
                 })
-            for match in active_method_pattern.finditer(text):
-                annotation = match.group(1)
-                target = f'{owner}.{match.group(2)}'
+            for target, annotation in active_targets:
                 nodes.append({'id': target, 'kind': 'spring_runtime_active_entry'})
                 edges.append({
                     'source': f'framework:spring-active-entry:{annotation}',
@@ -393,7 +495,10 @@ def run_spring_adapter(source_roots):
                     'confidence': 'high',
                     'conditions': conditions,
                     'ambiguity': False,
-                    'provenance': {'file': str(path), 'annotation': f'@{annotation}'},
+                    'provenance': {
+                        'file': str(path), 'annotation': f'@{annotation}',
+                        'parser': 'tree_sitter' if ast_authoritative else 'masked_text_fallback',
+                    },
                 })
             if conditions:
                 findings.append({
@@ -652,10 +757,17 @@ def run_mybatis_adapter(source_roots):
                             'conditions': [], 'ambiguity': False,
                             'provenance': {'file': str(path)},
                         })
-    annotation_pattern = re.compile(r'@(Select|Insert|Update|Delete|SelectProvider|InsertProvider|UpdateProvider|DeleteProvider)\b')
+    annotation_pattern = re.compile(
+        r'@(?:[A-Za-z_][\w.]*\.)?'
+        r'(Select|Insert|Update|Delete|SelectProvider|InsertProvider|UpdateProvider|DeleteProvider)\b'
+    )
+    mybatis_annotations = {
+        'Select', 'Insert', 'Update', 'Delete',
+        'SelectProvider', 'InsertProvider', 'UpdateProvider', 'DeleteProvider',
+    }
     for path in _production_java_files(source_roots):
             try:
-                text = path.read_text(encoding='utf-8', errors='replace')
+                text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
             except OSError as exc:
                 errors.append(f'{path}:{type(exc).__name__}')
                 continue
@@ -663,13 +775,42 @@ def run_mybatis_adapter(source_roots):
                 continue
             annotation_files += 1
             owner = _java_package_and_class(text, path.stem)
-            for match in re.finditer(r'@(Select|Insert|Update|Delete|\w+Provider)\b[^\n]*\n?\s*(?:public\s+)?[\w.$<>\[\],?]+\s+(\w+)\s*\(', text):
-                target = f'{owner}.{match.group(2)}'
+            bindings = []
+            try:
+                methods, parser_info = analyze_file(
+                    str(path),
+                    {"root": str(path.parent), "owner_type": "business", "owner_coord": "BUSINESS"},
+                    prefer_tree_sitter=True,
+                    return_diagnostics=True,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                methods, parser_info = [], {'actual_parser': 'unavailable'}
+                errors.append(f'{path}:mybatis_ast:{type(exc).__name__}')
+            if parser_info.get('actual_parser') == 'tree_sitter':
+                for method in methods:
+                    annotations = {
+                        str(item).rsplit('.', 1)[-1] for item in method.annotations or []
+                    }
+                    for annotation in sorted(annotations & mybatis_annotations):
+                        bindings.append((
+                            f"{getattr(method, 'class_fqcn', '') or owner}.{method.method_name}",
+                            annotation,
+                            'tree_sitter',
+                        ))
+            else:
+                for match in re.finditer(
+                    r'@(Select|Insert|Update|Delete|\w+Provider)\b[^\n]*\n?\s*'
+                    r'(?:public\s+)?[\w.$<>\[\],?]+\s+(\w+)\s*\(', text
+                ):
+                    bindings.append((f'{owner}.{match.group(2)}', match.group(1), 'masked_text_fallback'))
+            for target, annotation, parser in bindings:
                 edges.append({
                     'source': f'framework:mybatis-proxy:{owner}', 'target': target,
                     'edge_kind': 'mybatis_annotation_binding', 'confidence': 'high',
                     'conditions': [], 'ambiguity': False,
-                    'provenance': {'file': str(path), 'annotation': '@' + match.group(1)},
+                    'provenance': {
+                        'file': str(path), 'annotation': '@' + annotation, 'parser': parser,
+                    },
                 })
                 nodes.append({'id': target, 'kind': 'mybatis_mapper_method'})
     return {
@@ -692,24 +833,25 @@ def run_dynamic_proxy_adapter(source_roots):
     for path in _production_java_files(source_roots):
             scanned += 1
             try:
-                text = path.read_text(encoding='utf-8', errors='replace')
+                text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
             except OSError as exc:
                 errors.append(f'{path}:{type(exc).__name__}')
                 continue
-            source_files.append((path, text))
-            if not any(marker in text for marker in (
+            code_text = _mask_java_literals(text)
+            source_files.append((path, code_text))
+            if not any(marker in code_text for marker in (
                 'InvocationHandler', 'MethodInterceptor', 'Proxy.newProxyInstance', 'Enhancer.create',
             )):
                 continue
-            owner = _java_package_and_class(text, path.stem)
+            owner = _java_package_and_class(code_text, path.stem)
             imports = {
                 item.rsplit('.', 1)[-1]: item
-                for item in re.findall(r'\bimport\s+([\w.]+)\s*;', text)
+                for item in re.findall(r'\bimport\s+([\w.]+)\s*;', code_text)
             }
             class_match = re.search(
                 rf'\bclass\s+{re.escape(owner.rsplit(".", 1)[-1])}'
                 r'(?:\s+extends\s+[\w.<>]+)?(?:\s+implements\s+([^\{]+))?',
-                text,
+                code_text,
             )
             implemented = []
             if class_match and class_match.group(1):
@@ -718,7 +860,7 @@ def run_dynamic_proxy_adapter(source_roots):
                     implemented.append(imports.get(simple, simple))
             method_names = set(re.findall(
                 r'\b(?:public|protected)\s+(?:[\w.$<>\[\],?]+\s+)+([A-Za-z_]\w*)\s*\(',
-                text,
+                code_text,
             ))
             for raw_interface in implemented:
                 simple = raw_interface.rsplit('.', 1)[-1]
@@ -867,7 +1009,7 @@ def run_declarative_http_client_adapter(source_roots):
     for path in _production_java_files(source_roots):
             scanned += 1
             try:
-                text = path.read_text(encoding='utf-8', errors='replace')
+                text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
             except OSError as exc:
                 errors.append(f'{path}:{type(exc).__name__}')
                 continue
@@ -982,7 +1124,7 @@ def _spring_boot_business_activation(source_roots):
             if '/src/test/' in normalized_path or '/test/' in normalized_path:
                 continue
             try:
-                text = path.read_text(encoding='utf-8', errors='replace')
+                text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
             except OSError:
                 continue
             if not (

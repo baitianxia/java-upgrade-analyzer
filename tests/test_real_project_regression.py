@@ -23,6 +23,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 self.assertGreaterEqual(case.max_duplicate_class_scans, 0)
                 self.assertGreater(case.max_seconds_per_100k_edges, 0.0)
                 self.assertGreater(case.min_classes_per_second, 0.0)
+                self.assertGreater(case.max_oracle_seconds, 0.0)
 
     def test_real_case_performance_defaults_and_mall_policy_match_the_measured_baseline(self):
         self.assertEqual(
@@ -33,6 +34,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "max_duplicate_class_scans": 0,
                 "max_seconds_per_100k_edges": 1000000.0,
                 "min_classes_per_second": 1.0,
+                "max_oracle_seconds": 120.0,
             },
         )
         mall = realreg.CASES["mall"]
@@ -286,6 +288,20 @@ class RealProjectRegressionTest(unittest.TestCase):
             }}}}},
             elapsed=8.0,
             selected=2,
+            oracle_metrics={
+                "class_count": 120,
+                "completed_class_count": 120,
+                "parsed_class_count": 116,
+                "cached_class_count": 4,
+                "parse_failure_count": 2,
+                "parse_seconds": 3.5,
+                "elapsed_seconds": 3.75,
+                "worker_count": 8,
+                "cache_hits": 1,
+                "cache_misses": 0,
+                "timed_out": False,
+                "interrupted": False,
+            },
         )
         envelope.update({
             "oracle_edge_count": 10,
@@ -308,6 +324,87 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(envelope["reconcile_edges_per_second"], 20.0)
         self.assertEqual(envelope["elapsed_seconds_per_100k_edges"], 80000.0)
         self.assertTrue(envelope["edge_rate_available"])
+        self.assertEqual(envelope["oracle_class_count"], 120)
+        self.assertEqual(envelope["oracle_completed_class_count"], 120)
+        self.assertEqual(envelope["oracle_parsed_class_count"], 116)
+        self.assertEqual(envelope["oracle_cached_class_count"], 4)
+        self.assertEqual(envelope["oracle_parse_failure_count"], 2)
+        self.assertEqual(envelope["oracle_parse_seconds"], 3.5)
+        self.assertEqual(envelope["oracle_elapsed_seconds"], 3.75)
+        self.assertEqual(envelope["oracle_worker_count"], 8)
+        self.assertEqual(envelope["oracle_cache_hits"], 1)
+        self.assertFalse(envelope["oracle_timed_out"])
+        self.assertFalse(envelope["oracle_interrupted"])
+
+    def test_final_artifact_reconciliation_passes_budget_and_exposes_oracle_metrics(self):
+        scan = {
+            "artifact_sha256": "a" * 64,
+            "complete": True,
+            "edges": [],
+            "failures": [],
+            "class_count": 9,
+            "completed_class_count": 9,
+            "parsed_class_count": 9,
+            "cached_class_count": 0,
+            "parse_failure_count": 0,
+            "parse_seconds": 1.25,
+            "elapsed_seconds": 1.5,
+            "worker_count": 4,
+            "cache_hits": 0,
+            "cache_misses": 1,
+            "timed_out": False,
+            "interrupted": False,
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg, "_verified_current_final_artifact", return_value=(Path("artifact.jar"), "a" * 64, [])
+        ), patch.object(realreg, "_csv_rows", return_value=([], [])), patch.object(
+            realreg, "_artifact_class_entries", return_value={"fixture/A.class"}
+        ), patch.object(realreg, "scan_final_artifact", return_value=scan) as scan_oracle:
+            result = realreg.reconcile_final_artifact_edges(
+                Path(tmp), [], oracle_time_budget_seconds=12.5
+            )
+
+        scan_oracle.assert_called_once_with(Path("artifact.jar"), time_budget_seconds=12.5)
+        self.assertEqual(result["oracle_metrics"]["class_count"], 9)
+        self.assertEqual(result["oracle_metrics"]["parse_seconds"], 1.25)
+
+    def test_oracle_budget_failure_emits_blocking_incomplete_and_performance_signals(self):
+        case = realreg.RealProjectCase(
+            name="oracle-budgeted",
+            default_project=Path("."),
+            default_changed_apis=Path(""),
+            baseline_specs=(),
+            max_oracle_seconds=0.05,
+        )
+        edge_truth = {
+            "complete": False,
+            "errors": ["oracle_time_budget_exceeded:0.050s"],
+            "oracle_edges": "oracle.csv",
+            "edge_reconciliation": "reconciliation.csv",
+            "reconciliation": {"blocking": False},
+        }
+        performance = {
+            "oracle_timed_out": True,
+            "oracle_interrupted": False,
+            "oracle_elapsed_seconds": 0.051,
+            "oracle_class_count": 100,
+            "oracle_completed_class_count": 8,
+        }
+
+        signals = realreg.build_edge_truth_signals(case, edge_truth, {"valid": True})
+        signals.extend(realreg.build_policy_signals(
+            case,
+            coverage={"complete": True},
+            performance=performance,
+            report_dir=Path("/tmp/report"),
+        ))
+
+        by_type = {signal["signal_type"]: signal for signal in signals}
+        self.assertIn("oracle_incomplete", by_type)
+        self.assertIn("performance_regression", by_type)
+        self.assertTrue(by_type["oracle_incomplete"]["blocking"])
+        self.assertTrue(by_type["performance_regression"]["blocking"])
+        self.assertIn("time budget", by_type["performance_regression"]["message"])
 
     def test_zero_edge_rate_is_unavailable_and_blocks_a_configured_budget(self):
         envelope = realreg.collect_performance_envelope({}, elapsed=8.0, selected=2)
@@ -1643,7 +1740,7 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(manifest["expected_conclusion"], "reachable")
         self.assertEqual(manifest["expected_chain"], [
             "com.example.multimodule.application.DemoApplication.home",
-            "com.example.multimodule.service.MyService.message",
+            "com.example:library:com.example.multimodule.service.MyService.message",
             "com.example.multimodule.service.ServiceProperties.getMessage",
         ])
         self.assertEqual(len(manifest["canonical_edges"]), 2)
@@ -1673,6 +1770,58 @@ class RealProjectRegressionTests(unittest.TestCase):
 
         self.assertFalse(guard["passed"])
         self.assertIn("SOURCE_BYTECODE_EDGE_CONFLICT", guard["errors"])
+
+    def test_gs_multi_module_limits_business_sources_to_the_packaged_application_module(self):
+        case = realreg.CASES["gs-multi-module"]
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "checkout"
+            changed_apis = Path(tmp) / "changed.csv"
+            report_dir = Path(tmp) / "report"
+            checkout.mkdir()
+            changed_apis.write_text("api_name\n", encoding="utf-8")
+            captured = {}
+
+            def fake_run(command, **_kwargs):
+                captured["command"] = command
+                return type("Completed", (), {"returncode": 0})()
+
+            with patch.object(realreg.subprocess, "run", side_effect=fake_run):
+                realreg.run_step5(case, checkout, changed_apis, report_dir)
+
+        source_index = captured["command"].index("--source-dirs") + 1
+        self.assertEqual(
+            captured["command"][source_index],
+            str(checkout / "application" / "src" / "main" / "java"),
+        )
+        self.assertNotIn(str(checkout / "library" / "src" / "main" / "java"), captured["command"])
+
+    def test_pinned_asset_preparation_maps_same_coordinate_nested_library_to_runtime_catalog(self):
+        case = realreg.CASES["gs-multi-module"]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            artifact = Path(tmp) / "application.jar"
+            with realreg.zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/app/App.class", b"class")
+                archive.writestr("BOOT-INF/lib/library-0.0.1-SNAPSHOT.jar", b"nested")
+            asset_gate = {
+                "artifact_path": str(artifact),
+                "artifact_sha256": realreg.hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+
+            realreg.write_pinned_final_artifact_provenance(report_dir, asset_gate, case)
+
+            with (report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(rows, [{
+            "coord": "com.example:library",
+            "version": "0.0.1-SNAPSHOT",
+            "scope": "compile",
+            "lib_entry": "BOOT-INF/lib/library-0.0.1-SNAPSHOT.jar",
+            "resolution_status": "resolved",
+        }])
 
     def test_pinned_asset_gate_rejects_revision_and_final_artifact_sha_mismatch(self):
         manifest = {
@@ -1712,6 +1861,19 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertTrue(passing["passed"], passing["errors"])
         self.assertFalse(missing_edge["passed"])
         self.assertIn("expected_physical_edge_missing", missing_edge["errors"])
+
+    def test_pinned_guard_accepts_a_zero_instruction_offset_physical_edge(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        manifest["canonical_edges"][0]["instruction_offset"] = 0
+        result = self._passing_gs_guard_result(manifest)
+
+        guard = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+        self.assertTrue(guard["passed"], guard["errors"])
+        self.assertIn("|0", realreg.physical_edge_occurrence(manifest["canonical_edges"][0]))
 
     def test_pinned_guard_rejects_nested_reconciliation_rows_at_wrong_instruction_offset(self):
         manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"

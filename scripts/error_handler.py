@@ -151,8 +151,13 @@ def load_errors(report_dir, step_filter=None):
             with open(os.path.join(error_dir, fname),
                       encoding='utf-8', errors='replace', newline='') as f:
                 errors.append(json.load(f))
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            errors.append({
+                "step": "error_handler",
+                "category": "error_record_unreadable",
+                "file": fname,
+                "message": f"{type(exc).__name__}: {exc}",
+            })
     return errors
 
 

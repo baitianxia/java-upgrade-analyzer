@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, wait
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import struct
 import tempfile
+import time
 import zipfile
 
 from final_artifact_edge_oracle import (
@@ -40,6 +44,8 @@ INVOKE_OPCODES = {
 FIELD_OPCODES = {"getfield", "putfield", "getstatic", "putstatic"}
 REFLECTION_REGISTRATION_RESOURCE = "META-INF/jua/authoritative-reflection-registration.json"
 FRAMEWORK_PROXY_REGISTRATION_RESOURCE = "META-INF/jua/authoritative-framework-proxy-registration.json"
+HIERARCHY_SCAN_TIMEOUT_SEC = 120.0
+HIERARCHY_SCAN_MAX_WORKERS = max(1, min(8, os.cpu_count() or 1))
 
 
 def descriptor_source_signature(descriptor: str) -> str:
@@ -141,27 +147,248 @@ def _javap_text(content: bytes, *options: str) -> str:
         class_path = Path(temporary) / "target.class"
         class_path.write_bytes(content)
         completed = subprocess.run(
-            ["javap", *options, str(class_path)], capture_output=True, text=True, check=False
+            ["javap", *options, str(class_path)], capture_output=True, text=True, check=False,
+            timeout=30,
         )
     return completed.stdout if completed.returncode == 0 else ""
 
 
-def _class_hierarchy(inventory: dict) -> list[dict]:
+def _classfile_header_parents(content: bytes) -> tuple[tuple[str, ...], str]:
+    """Read erased superclass/interfaces without starting a JVM."""
+    try:
+        if len(content) < 10 or content[:4] != b"\xca\xfe\xba\xbe":
+            return (), "not a classfile"
+        count = struct.unpack_from(">H", content, 8)[0]
+        utf8 = {}
+        classes = {}
+        index = 10
+        slot = 1
+        while slot < count:
+            if index >= len(content):
+                return (), "truncated constant pool"
+            tag = content[index]
+            index += 1
+            if tag == 1:
+                length = struct.unpack_from(">H", content, index)[0]
+                index += 2
+                utf8[slot] = content[index:index + length].decode("utf-8", errors="replace")
+                index += length
+            elif tag == 7:
+                classes[slot] = struct.unpack_from(">H", content, index)[0]
+                index += 2
+            elif tag in (9, 10, 11, 12, 17, 18):
+                index += 4
+            elif tag in (3, 4):
+                index += 4
+            elif tag in (5, 6):
+                index += 8
+                slot += 1
+            elif tag in (8, 16, 19, 20):
+                index += 2
+            elif tag == 15:
+                index += 3
+            else:
+                return (), f"unsupported constant-pool tag {tag}"
+            if index > len(content):
+                return (), "truncated constant-pool payload"
+            slot += 1
+        if index + 8 > len(content):
+            return (), "truncated class header"
+        _access, _this_class, super_class, interface_count = struct.unpack_from(">HHHH", content, index)
+        index += 8
+        if index + interface_count * 2 > len(content):
+            return (), "truncated interface table"
+        interface_indexes = struct.unpack_from(f">{interface_count}H", content, index) if interface_count else ()
+
+        def class_name(class_index):
+            return utf8.get(classes.get(class_index), "").replace("/", ".")
+
+        parents = []
+        if super_class:
+            parents.append(class_name(super_class))
+        parents.extend(class_name(item) for item in interface_indexes)
+        if any(not item for item in parents):
+            return (), "unresolved class name in header"
+        return tuple(parents), ""
+    except (IndexError, struct.error, ValueError) as exc:
+        return (), f"classfile header parse failed: {type(exc).__name__}: {exc}"
+
+
+def _class_header_parents(content: bytes, timeout_sec: float) -> tuple[tuple[str, ...], str]:
+    direct, direct_error = _classfile_header_parents(content)
+    if not direct_error:
+        return direct, ""
+    if timeout_sec <= 0:
+        return (), f"hierarchy scan deadline exceeded before javap started; {direct_error}"
+    try:
+        with tempfile.TemporaryDirectory(prefix="topology-javap-") as temporary:
+            class_path = Path(temporary) / "target.class"
+            class_path.write_bytes(content)
+            completed = subprocess.run(
+                ["javap", "-p", str(class_path)], capture_output=True, text=True,
+                check=False, timeout=timeout_sec,
+            )
+    except subprocess.TimeoutExpired:
+        return (), "javap timed out before the hierarchy scan deadline"
+    except OSError as error:
+        return (), f"direct parse failed ({direct_error}); javap unavailable: {error}"
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+        return (), f"javap exited {completed.returncode}: {detail}"
+    declaration = next(
+        (line.strip() for line in completed.stdout.splitlines() if re.search(r"\b(class|interface)\b", line)),
+        "",
+    )
+    return _class_header_relation_types(declaration), ""
+
+
+def _class_header_relation_types(declaration: str) -> tuple[str, ...]:
+    class_name = re.search(r"\b(?:class|interface)\s+[\w.$]+", declaration)
+    if not class_name:
+        return ()
+    remainder = declaration[class_name.end():].lstrip()
+    if remainder.startswith("<"):
+        remainder = _strip_leading_generic_arguments(remainder)
+
+    parents = []
+    extends = re.search(r"\bextends\s+(.+?)(?=\s+implements\b|\s*\{|$)", remainder)
+    implements = re.search(r"\bimplements\s+(.+?)(?=\s*\{|$)", remainder)
+    if extends:
+        parents.extend(_header_type_names(extends.group(1)))
+    if implements:
+        parents.extend(_header_type_names(implements.group(1)))
+    return tuple(parents)
+
+
+def _strip_leading_generic_arguments(value: str) -> str:
+    depth = 0
+    for index, character in enumerate(value):
+        if character == "<":
+            depth += 1
+        elif character == ">":
+            depth -= 1
+            if depth == 0:
+                return value[index + 1:].lstrip()
+    return value
+
+
+def _header_type_names(value: str) -> list[str]:
+    names = []
+    depth = 0
+    start = 0
+    for index, character in enumerate(value):
+        if character == "<":
+            depth += 1
+        elif character == ">":
+            depth = max(0, depth - 1)
+        elif character == "," and depth == 0:
+            names.append(value[start:index])
+            start = index + 1
+    names.append(value[start:])
+    return [name.split("<", 1)[0].strip() for name in names if name.split("<", 1)[0].strip()]
+
+
+def _class_header_before_deadline(
+    content: bytes, deadline: float,
+) -> tuple[tuple[str, ...], str]:
+    return _class_header_parents(content, deadline - time.perf_counter())
+
+
+def _scan_class_hierarchy(
+    inventory: dict,
+    *,
+    timeout_sec: float = HIERARCHY_SCAN_TIMEOUT_SEC,
+    max_workers: int = HIERARCHY_SCAN_MAX_WORKERS,
+) -> dict:
+    started_at = time.perf_counter()
+    timeout_sec = max(0.0, float(timeout_sec))
+    workers = max(1, min(HIERARCHY_SCAN_MAX_WORKERS, int(max_workers)))
+    deadline = started_at + timeout_sec
+    class_entries = sorted((inventory.get("classes") or {}).items())
+    entries_by_sha: dict[str, list[str]] = defaultdict(list)
+    content_by_sha: dict[str, bytes] = {}
+    for entry, content in class_entries:
+        fingerprint = hashlib.sha256(content).hexdigest()
+        entries_by_sha[fingerprint].append(entry)
+        content_by_sha.setdefault(fingerprint, content)
+
+    futures = {}
+    pending_fingerprints = set()
+    interrupted_fingerprints = set()
+    interruption_error = ""
+    completed = set()
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="topology-javap")
+    try:
+        for fingerprint in sorted(content_by_sha):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                pending_fingerprints.add(fingerprint)
+                continue
+            futures[executor.submit(
+                _class_header_before_deadline, content_by_sha[fingerprint], deadline,
+            )] = fingerprint
+        if futures:
+            completed, pending = wait(futures, timeout=max(0.0, deadline - time.perf_counter()))
+            pending_fingerprints.update(futures[future] for future in pending)
+    except BaseException as exc:  # KeyboardInterrupt/SystemExit must fail closed.
+        interruption_error = f"hierarchy scan interrupted: {type(exc).__name__}: {exc}"
+        interrupted_fingerprints.update(content_by_sha)
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    futures_by_fingerprint = {fingerprint: future for future, fingerprint in futures.items()}
+    parents_by_sha: dict[str, tuple[str, ...]] = {}
+    errors_by_sha: dict[str, str] = {}
+    for future in completed:
+        fingerprint = futures[future]
+        try:
+            parents, error = future.result()
+        except BaseException as exc:  # KeyboardInterrupt/SystemExit must fail closed.
+            parents, error = (), f"header worker failed: {type(exc).__name__}: {exc}"
+        if error:
+            errors_by_sha[fingerprint] = str(error)
+        else:
+            parents_by_sha[fingerprint] = tuple(parents)
+    for fingerprint in pending_fingerprints:
+        future = futures_by_fingerprint[fingerprint]
+        if future.cancelled():
+            error = "header worker cancelled before the hierarchy scan deadline"
+        else:
+            try:
+                _, error = future.result()
+            except BaseException as exc:  # KeyboardInterrupt/SystemExit must fail closed.
+                error = f"header worker failed: {type(exc).__name__}: {exc}"
+        detail = f"; {error}" if error else ""
+        errors_by_sha[fingerprint] = f"hierarchy scan deadline exceeded{detail}"
+    for fingerprint in interrupted_fingerprints:
+        future = futures_by_fingerprint.get(fingerprint)
+        detail = ""
+        if future is not None and not future.cancelled():
+            try:
+                _, error = future.result()
+            except BaseException as exc:  # KeyboardInterrupt/SystemExit must fail closed.
+                error = f"header worker failed: {type(exc).__name__}: {exc}"
+            if error:
+                detail = f"; {error}"
+        errors_by_sha[fingerprint] = f"{interruption_error}{detail}"
+
+    errors = []
+    for fingerprint in sorted(errors_by_sha):
+        for entry in sorted(entries_by_sha[fingerprint]):
+            errors.append(
+                f"hierarchy header unavailable entry={entry} sha256={fingerprint}: "
+                f"{errors_by_sha[fingerprint]}"
+            )
+
     relations = set()
     owner_entries = defaultdict(set)
     for entry in inventory["classes"]:
         owner_entries[_class_binary_name(entry)].add(entry)
-    for entry, content in inventory["classes"].items():
+    for entry, content in class_entries:
         child = _class_binary_name(entry)
-        output = _javap_text(content, "-p")
-        declaration = next((line.strip() for line in output.splitlines() if re.search(r"\b(class|interface)\b", line)), "")
-        extends = re.search(r"\bextends\s+([\w.$]+)", declaration)
-        implements = re.search(r"\bimplements\s+([^\{]+)", declaration)
-        parents = []
-        if extends:
-            parents.append(extends.group(1))
-        if implements:
-            parents.extend(item.strip() for item in implements.group(1).split(","))
+        parents = parents_by_sha.get(hashlib.sha256(content).hexdigest(), ())
         for parent in parents:
             same_scope = [
                 parent_entry for parent_entry in owner_entries.get(parent, set())
@@ -170,14 +397,37 @@ def _class_hierarchy(inventory: dict) -> list[dict]:
             for parent_entry in same_scope:
                 if child and parent and child != parent:
                     relations.add((entry, child, parent_entry, parent))
-    return [
+    elapsed_sec = time.perf_counter() - started_at
+    metrics = {
+        "elapsed_sec": round(elapsed_sec, 3),
+        "deadline_sec": timeout_sec,
+        "max_workers": workers,
+        "class_entries": len(class_entries),
+        "unique_class_headers": len(content_by_sha),
+        "cache_hits": len(class_entries) - len(content_by_sha),
+        "completed_unique_headers": len(completed),
+        "failed_class_entries": len(errors),
+        "timed_out_class_entries": sum(
+            len(entries_by_sha[fingerprint]) for fingerprint in pending_fingerprints
+        ),
+    }
+    return {
+        "complete": not errors,
+        "relations": [
         {
             "child_entry": child_entry, "child": child,
             "parent_entry": parent_entry, "parent": parent,
             "authority": "javap_class_header",
         }
         for child_entry, child, parent_entry, parent in sorted(relations)
-    ]
+        ],
+        "errors": errors,
+        "metrics": metrics,
+    }
+
+
+def _class_hierarchy(inventory: dict) -> list[dict]:
+    return _scan_class_hierarchy(inventory)["relations"]
 
 
 def _entry_scope(entry: str) -> str:
@@ -470,7 +720,7 @@ def _bootstrap_links(inventory: dict, targets: set[tuple[str, str, str]], edges:
             class_path.write_bytes(content)
             completed = subprocess.run(
                 ["javap", "-v", "-c", "-p", "-s", str(class_path)],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, check=False, timeout=30,
             )
         if completed.returncode != 0:
             continue
@@ -570,7 +820,7 @@ def _source_attestation_evidence(
         revision = str(attestation.get("git_revision") or "")
         tree = subprocess.run(
             ["git", "-C", str(source_root), "rev-parse", f"{revision}^{{tree}}"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=30,
         )
         source_path = Path(source_root) / str(attestation.get("source_path") or ".")
         source_root_resolved = Path(source_root).resolve()
@@ -578,11 +828,11 @@ def _source_attestation_evidence(
         source_path_text = str(attestation.get("source_path") or "")
         tracked = subprocess.run(
             ["git", "-C", str(source_root), "ls-tree", "-d", revision, "--", source_path_text],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=30,
         )
         git_entries = subprocess.run(
             ["git", "-C", str(source_root), "ls-tree", "-r", "-z", revision, "--", source_path_text],
-            capture_output=True, check=False,
+            capture_output=True, check=False, timeout=30,
         )
         revision_digest = hashlib.sha256()
         for record in git_entries.stdout.split(b"\0"):
@@ -597,22 +847,22 @@ def _source_attestation_evidence(
                 raise ValueError("Git source tree entry escapes declared source path")
             blob = subprocess.run(
                 ["git", "-C", str(source_root), "cat-file", "blob", fields[2].decode("ascii")],
-                capture_output=True, check=False,
+                capture_output=True, check=False, timeout=30,
             )
             if blob.returncode != 0:
                 raise ValueError("Git source tree blob unreadable")
             revision_digest.update(relative_path.encode() + b"\0" + blob.stdout)
         worktree_diff = subprocess.run(
             ["git", "-C", str(source_root), "diff", "--quiet", revision, "--", source_path_text],
-            capture_output=True, check=False,
+            capture_output=True, check=False, timeout=30,
         )
         index_diff = subprocess.run(
             ["git", "-C", str(source_root), "diff", "--cached", "--quiet", revision, "--", source_path_text],
-            capture_output=True, check=False,
+            capture_output=True, check=False, timeout=30,
         )
         status = subprocess.run(
             ["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=all", "--", source_path_text],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=30,
         )
         live_digest = compute_source_tree_sha256(source_path_resolved)
         valid = bool(
@@ -637,7 +887,7 @@ def _source_attestation_evidence(
             and attestation.get("artifact_sha256") == artifact_sha256
             and attestation.get("evidence_sha256") == evidence_sha
         )
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
         return [], [], {"valid": False, "authority": "external_source_attestation"}
     return (
         list(evidence.get("source_edges") or []) if valid else [],
@@ -660,6 +910,8 @@ def extract_artifact_topology_evidence(
     source_root: Path | None = None,
     source_attestation: Path | None = None,
     target_owner_entries: dict[str, list[str]] | None = None,
+    hierarchy_scan_timeout_sec: float = HIERARCHY_SCAN_TIMEOUT_SEC,
+    hierarchy_scan_max_workers: int = HIERARCHY_SCAN_MAX_WORKERS,
 ) -> dict:
     artifact = Path(artifact)
     errors = []
@@ -728,7 +980,13 @@ def extract_artifact_topology_evidence(
             root_coordinate = next((str(item.get("coordinate") or "") for item in targets if str(item.get("owner") or "") == _class_binary_name(entry)), "") if root_role == "target" else "__business__"
             entry_layout.append({"entry": entry, "role": root_role, "coordinate": root_coordinate})
 
-    hierarchy = _class_hierarchy(inventory)
+    hierarchy_scan = _scan_class_hierarchy(
+        inventory,
+        timeout_sec=hierarchy_scan_timeout_sec,
+        max_workers=hierarchy_scan_max_workers,
+    )
+    hierarchy = hierarchy_scan["relations"]
+    errors.extend(hierarchy_scan["errors"])
     registrations = _resource_evidence(
         inventory, target_set, target_class_entries,
         scan.get("edges") or [], hierarchy,
@@ -748,6 +1006,7 @@ def extract_artifact_topology_evidence(
         "reflection_target_links": reflection,
         "bootstrap_target_links": bootstrap,
         "hierarchy_evidence": hierarchy,
+        "hierarchy_scan": hierarchy_scan["metrics"],
         "source_edges": source_edges,
         "source_conflicts": source_conflicts,
         "source_provenance": verified_source_provenance,

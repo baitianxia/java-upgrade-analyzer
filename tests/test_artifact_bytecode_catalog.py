@@ -21,6 +21,75 @@ import confidence_weighted_tracer as tracer
 
 
 class ArtifactBytecodeCatalogTest(unittest.TestCase):
+    def test_application_owned_nested_module_hit_is_a_business_path(self):
+        result = tracer.TraceResult(
+            api_name="com.vendor.Legacy.removed", api_simple="removed", api_signature="()",
+            symbol_kind="method", change_type="REMOVED", coord="com.vendor:legacy",
+            severity="P0", confirmed=True, source="japicmp", analysis_scope="api",
+            analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+            reachable_note="", business_reach_depth=0, dependency_chain_coords=[],
+            call_paths=[], evidence_paths=[], reason_code="", verification_commands=[],
+            hops=[], confidence_score=1.0, critical_nodes_hit=[],
+        )
+        hit = {
+            "coord": "com.acme:library", "application_owned": True,
+            "jar_path": "/artifact/BOOT-INF/lib/library.jar",
+            "class_fqcn": "com.acme.library.Job", "consumer_method": "run",
+            "consumer_signature": "()", "target_display": "com.vendor.Legacy.removed()",
+            "evidence_type": "bytecode_method_invocation",
+        }
+
+        built = tracer._build_packaged_dependency_hit_result(result, [hit])
+
+        self.assertEqual(built.analysis_status, "reachable")
+        self.assertTrue(built.is_reachable)
+        self.assertTrue(built.path_details[0]["business_reachable"])
+        self.assertEqual(built.path_details[0]["business_entry"], "com.acme.library.Job.run()")
+
+    def test_fat_jar_reactor_library_is_marked_application_owned_from_project_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            nested = root / "library.jar"
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr("com/acme/library/Helper.class", b"fixture")
+            application = root / "application.jar"
+            with zipfile.ZipFile(application, "w") as archive:
+                archive.writestr("BOOT-INF/lib/library-1.0.jar", nested.read_bytes())
+                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"fixture")
+            dependency_dir = report / "evidence/dependencies"
+            dependency_dir.mkdir(parents=True)
+            with (dependency_dir / "deps_current_resolved.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "coord": "com.acme:library", "version": "1.0", "scope": "runtime",
+                    "lib_entry": "BOOT-INF/lib/library-1.0.jar", "resolution_status": "resolved",
+                })
+            (dependency_dir / "build_provenance.json").write_text(json.dumps({
+                "sides": [{
+                    "side": "current", "artifact_path": str(application),
+                    "artifact_sha256": hashlib.sha256(application.read_bytes()).hexdigest(),
+                }]
+            }), encoding="utf-8")
+            state = report / ".runtime/state/main_state.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "step5": {"input": {"project_scope": {
+                    "included_module_coords": ["com.acme:application", "com.acme:library"]
+                }}}
+            }), encoding="utf-8")
+
+            catalog = step5.build_runtime_dependency_catalog(str(report))
+
+        self.assertTrue(catalog["by_coord"]["com.acme:library"]["application_owned"])
+        self.assertEqual(catalog["metrics"]["application_owned_nested_dependencies"], 1)
+
     @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
     def test_reflection_bytecode_is_visible_to_upgrade_scanner(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -160,7 +229,7 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
                 }, graph)
 
         self.assertEqual(scan["status"], "hit")
-        self.assertEqual(scan["hits"][0]["consumer_method"], "<unknown>")
+        self.assertEqual(scan["hits"][0]["consumer_method"], "check")
         self.assertEqual(scan["hits"][0]["evidence_type"], "bytecode_constant_pool_method_reference")
 
     def test_javap_parser_attributes_throws_and_static_initializer_correctly(self):
