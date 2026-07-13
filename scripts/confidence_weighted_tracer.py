@@ -7756,8 +7756,36 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
 
     for idx, api_row in enumerate(all_apis, 1):
         api_started_at = time.perf_counter()
-        api_name = api_row.get('api_name', '')
+        api_name = str(api_row.get('api_name', '') or '').strip()
         if not api_name:
+            # A malformed Step4 row must never disappear from the denominator:
+            # users need to see why an API could not be traced, rather than a
+            # deceptively smaller ``total_apis`` in summary.json.
+            result = TraceResult(
+                api_name='',
+                api_simple=str(api_row.get('api_simple') or ''),
+                api_signature=str(api_row.get('api_signature') or ''),
+                symbol_kind=str(api_row.get('symbol_kind') or ''),
+                change_type=str(api_row.get('change_type') or ''),
+                coord=str(api_row.get('coord') or ''),
+                severity=str(api_row.get('severity') or ''),
+                confirmed=str(api_row.get('confirmed') or '').lower() == 'true',
+                source=str(api_row.get('source') or ''),
+                analysis_scope=str(api_row.get('analysis_scope') or 'api'),
+                analysis_status='not_analyzed',
+                direct_callers=0,
+                is_reachable=None,
+                reachable_note='变更 API 清单缺少 api_name，无法建立精确目标符号。',
+                business_reach_depth=0,
+                dependency_chain_coords=[],
+                call_paths=[], evidence_paths=[],
+                reason_code='MISSING_API_NAME', verification_commands=[], hops=[],
+                confidence_score=0.0, critical_nodes_hit=[],
+                old_version=str(api_row.get('old_version') or '').strip(),
+                new_version=str(api_row.get('new_version') or '').strip(),
+            )
+            results.append(result)
+            status_counts['not_analyzed'] += 1
             continue
 
         # 检查该 API 是否需要依赖源码映射

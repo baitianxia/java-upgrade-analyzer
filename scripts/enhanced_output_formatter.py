@@ -599,6 +599,10 @@ REASON_CODE_EXPLANATIONS = {
         'reason': '方法级变更缺少参数签名，无法精确区分重载方法',
         'action': '回到 Step 4 重新生成包含 api_signature 的变更 API 清单'
     },
+    'MISSING_API_NAME': {
+        'reason': '变更 API 清单缺少完整 API 名称，无法建立精确调用目标',
+        'action': '回到 Step4 重新生成包含 api_name 的变更 API 清单后重跑 Step5'
+    },
     'MISSING_SYMBOL_KIND': {
         'reason': '变更清单缺少 symbol_kind，无法判断当前符号是方法、字段、类还是构造器',
         'action': '回到 Step 4 重新生成包含 symbol_kind 的变更 API 清单'
@@ -648,6 +652,7 @@ REASON_CODE_EXPLANATIONS = {
 INPUT_REQUIRED_REASON_CODES = {
     'DEPENDENCY_SOURCE_MAPPING_MISSING',
     'MISSING_API_SIGNATURE',
+    'MISSING_API_NAME',
     'MISSING_SYMBOL_KIND',
     'ANALYSIS_INCOMPLETE',
     'NO_TARGET_KEYS',

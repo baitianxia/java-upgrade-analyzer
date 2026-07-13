@@ -8836,6 +8836,21 @@ public class com.example.TargetBridge {
 
         self.assertEqual("com.acme:library（1.0.0 → 2.0.0）", row["target_coord"])
 
+    def test_trace_keeps_malformed_api_rows_visible_as_not_analyzed(self):
+        rows = [{
+            "coord": "a:b", "api_name": "", "api_simple": "", "api_signature": "",
+            "symbol_kind": "method", "change_type": "REMOVED", "severity": "P0",
+        }]
+
+        with patch.object(tracer, "collect_graph_analyzer_edges"), \
+             patch.object(tracer, "write_analyzer_edge_ledger"), \
+             patch.object(tracer, "_emit_step5_perf_summary"):
+            results = tracer.trace_all_apis_with_confidence_weighting(rows, None, {})
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("not_analyzed", results[0].analysis_status)
+        self.assertEqual("MISSING_API_NAME", results[0].reason_code)
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
