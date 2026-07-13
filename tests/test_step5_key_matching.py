@@ -54,6 +54,33 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertIn("com.acme.Target.changed()", graph_result["graph"].reverse_edges)
 
+    def test_source_graph_keeps_sealed_interface_implementations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Shape.java").write_text(
+                "package com.acme;\nsealed interface Shape permits Circle, Square {}\n",
+                encoding="utf-8",
+            )
+            (source_root / "Circle.java").write_text(
+                "package com.acme;\nfinal class Circle implements Shape {}\n",
+                encoding="utf-8",
+            )
+            (source_root / "Square.java").write_text(
+                "package com.acme;\nfinal class Square implements Shape {}\n",
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        self.assertEqual(
+            ["com.acme.Circle", "com.acme.Square"],
+            graph_result["type_metadata"]["com.acme.Shape"]["implementations"],
+        )
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
