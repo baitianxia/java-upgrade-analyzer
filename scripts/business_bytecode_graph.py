@@ -392,6 +392,38 @@ def parse_classfile_calls(data, class_name):
                         if next_offset <= offset:
                             return None
                         offset = next_offset
+                    # Code_attribute.exception_table entries retain the exact
+                    # exception type handled by this method.  A catch type is a
+                    # direct binary dependency even when no instruction creates
+                    # or casts that exception, so do not leave it as a vague
+                    # class-level constant-pool reference.
+                    exception_pos = code_end
+                    if exception_pos + 2 > attr_end:
+                        return None
+                    exception_count = struct.unpack_from('>H', data, exception_pos)[0]
+                    exception_pos += 2
+                    if exception_pos + exception_count * 8 > attr_end:
+                        return None
+                    for _exception in range(exception_count):
+                        _start_pc, _end_pc, handler_pc, catch_type = struct.unpack_from(
+                            '>HHHH', data, exception_pos
+                        )
+                        exception_pos += 8
+                        if not catch_type:
+                            continue  # finally/catch-all has no API type
+                        owner = _cp_class_name(cp, catch_type).replace('/', '.').replace('$', '.')
+                        if owner:
+                            edges.append({
+                                'caller_owner': class_name,
+                                'caller_name': caller_name,
+                                'caller_signature': caller_signature,
+                                'caller_descriptor': descriptor,
+                                'callee_key': owner,
+                                'callee_simple_key': f'class:{owner.rsplit(".", 1)[-1]}',
+                                'evidence_type': 'bytecode_exception_handler_reference',
+                                'line': handler_pc,
+                                'content': 'classfile exception-table catch type',
+                            })
                 idx = attr_end
         # Resolve lambda/method-reference implementation handles from the
         # class-level BootstrapMethods attribute.  The InvokeDynamic entry stores

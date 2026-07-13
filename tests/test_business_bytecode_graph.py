@@ -249,6 +249,39 @@ public class Switches {
         self.assertEqual(len(target_edges), 1)
         self.assertEqual(target_edges[0]["caller_name"], "get")
 
+    def test_parse_classfile_calls_emits_catch_type_reference_on_handling_method(self):
+        if not shutil.which("javac"):
+            self.skipTest("javac not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src" / "com" / "acme"
+            src.mkdir(parents=True)
+            (src / "OldException.java").write_text(
+                "package com.acme; class OldException extends RuntimeException {}\n",
+                encoding="utf-8",
+            )
+            (src / "Service.java").write_text(
+                "package com.acme; class Service { void run() { "
+                "try { System.nanoTime(); } catch (OldException error) {} } }\n",
+                encoding="utf-8",
+            )
+            out = root / "classes"
+            out.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(out)] + [str(path) for path in src.glob("*.java")],
+                check=True, capture_output=True,
+            )
+            edges = parse_classfile_calls(
+                (out / "com/acme/Service.class").read_bytes(), "com.acme.Service"
+            )
+
+        self.assertTrue(any(
+            edge["caller_name"] == "run"
+            and edge["callee_key"] == "com.acme.OldException"
+            and edge["evidence_type"] == "bytecode_exception_handler_reference"
+            for edge in edges
+        ))
+
     def test_parse_classfile_calls_falls_back_for_reflection_markers(self):
         if not shutil.which("javac"):
             self.skipTest("javac not available")
