@@ -2073,7 +2073,20 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
                 'CLASS_', 'SUPERCLASS_', 'INTERFACE_', 'GENERIC_TEMPLATE_',
                 'TYPE_', 'ANNOTATION_', 'ENUM_', 'RECORD_',
             )
-            if not any(str(flag).upper().startswith(class_level_prefixes) for flag in flags):
+            explicit_class_flag = any(
+                str(flag).upper().startswith(class_level_prefixes) for flag in flags
+            )
+            changed_type_relation = any(
+                _xml_local_name(descendant) in {'interface', 'superclass'}
+                and _xml_attr(descendant, 'changeStatus', 'change_status', 'status').upper()
+                not in {'', 'NEW', 'UNCHANGED'}
+                and not is_jdk_standard_owner(
+                    _xml_attr(descendant, 'fullyQualifiedName', 'fully_qualified_name', 'name')
+                )
+                for descendant in element.iter()
+                if descendant is not element
+            )
+            if not explicit_class_flag and not changed_type_relation:
                 return
         if symbol_kind == 'field' and old_value and new_value and old_value != new_value:
             change_type = 'CONSTANT_VALUE_CHANGED'
