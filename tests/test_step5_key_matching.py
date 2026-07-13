@@ -34,6 +34,28 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Base.java").write_text(
+                "package com.acme;\nclass Base { Base(String value) {} }\n",
+                encoding="utf-8",
+            )
+            (source_root / "Child.java").write_text(
+                "package com.acme;\nclass Child extends Base { "
+                "Child() { super(\"value\"); } Child(int ignored) { this(); } }\n",
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+            graph = graph_result["graph"]
+
+        self.assertIn("com.acme.Base.Base(String)", graph.reverse_edges)
+        self.assertIn("com.acme.Child.Child()", graph.reverse_edges)
     def test_exact_business_bytecode_call_beats_missing_runtime_dependency_jars(self):
         api_row = {
             "coord": "cn.hutool:hutool-all",

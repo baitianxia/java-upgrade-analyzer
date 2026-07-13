@@ -1628,6 +1628,26 @@ class TreeSitterAnalyzer:
                         'content': self._node_text(node, source_code).strip()[:200],
                         'scope_local_var_types': dict(scoped_local_types),
                     })
+            elif node.type == 'explicit_constructor_invocation':
+                constructor_node = node.child_by_field_name('constructor')
+                arguments_node = node.child_by_field_name('arguments')
+                delegation = self._node_text(constructor_node, source_code).strip() if constructor_node else ''
+                arg_exprs = []
+                if arguments_node:
+                    for child in arguments_node.children:
+                        if child.type in {',', '(', ')'}:
+                            continue
+                        arg_exprs.append(self._node_text(child, source_code).strip())
+                if delegation in {'this', 'super'}:
+                    call_sites.append({
+                        'kind': 'constructor_delegation',
+                        'receiver_expr': delegation,
+                        'method_name': '',
+                        'arg_exprs': arg_exprs,
+                        'line': node.start_point.row + 1,
+                        'content': self._node_text(node, source_code).strip()[:200],
+                        'scope_local_var_types': dict(scoped_local_types),
+                    })
 
             for child in node.children:
                 collect(child, scoped_local_types, scoped_declared_types)
@@ -2067,6 +2087,18 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
             callee_key = f"{receiver_type}.{method_name}" if receiver_type and method_name else f"method:{method_name}"
             callee_simple_key = f"method:{method_name}"
             evidence_type = 'constructor_invocation'
+        elif kind == 'constructor_delegation':
+            receiver_type = (
+                method_def.class_fqcn
+                if receiver_expr == 'this'
+                else _resolve_super_type(method_def)
+            )
+            resolved_receiver_type = receiver_type or ''
+            method_name = receiver_type.rsplit('.', 1)[-1] if receiver_type else ''
+            confidence = 'high' if receiver_type else 'medium'
+            callee_key = f"{receiver_type}.{method_name}" if receiver_type and method_name else 'constructor:unknown'
+            callee_simple_key = f"method:{method_name}" if method_name else 'constructor:unknown'
+            evidence_type = 'constructor_delegation'
         elif kind == 'method_reference':
             if receiver_expr == 'this':
                 resolved_receiver = method_def.class_fqcn
