@@ -8795,6 +8795,13 @@ public class com.example.TargetBridge {
         self.assertEqual("step5_timing.csv", summary["artifacts"]["timing_csv"])
         self.assertEqual("by_api", summary["artifacts"]["api_detail_dir"])
 
+    def test_alert_review_focus_names_the_missing_runtime_input(self):
+        focus = formatter._alert_review_focus(
+            "not_analyzed", "incomplete", "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE"
+        )
+        self.assertIn("运行时依赖 JAR", focus)
+        self.assertIn("Step5", focus)
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

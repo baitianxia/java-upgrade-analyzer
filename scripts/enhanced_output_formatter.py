@@ -1585,6 +1585,14 @@ def _alert_review_focus(path_status, conclusion_level, stop_reason):
     if status == 'not_analyzed':
         if reason == 'DEPENDENCY_SOURCE_MAPPING_MISSING':
             return "补充缺失依赖源码目录后重跑 Step5。"
+        if reason == 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE':
+            return "补齐本次部署制品的运行时依赖 JAR 后重跑 Step5。"
+        if reason == 'MISSING_API_SIGNATURE':
+            return "从 Step4 重新生成带完整参数签名的变更 API 清单后重跑 Step5。"
+        if reason == 'MISSING_SYMBOL_KIND':
+            return "从 Step4 重新生成带符号类型的变更 API 清单后重跑 Step5。"
+        if reason == 'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE':
+            return "补齐业务制品或运行时依赖字节码后重跑 Step5；当前未命中不能视为无影响。"
         return "查看原因并补齐本轮未完成分析所需输入。"
     level = str(conclusion_level or '').strip()
     if level == 'candidate':
