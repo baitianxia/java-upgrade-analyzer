@@ -228,6 +228,52 @@ def run_spi_adapter(source_roots):
                     })
             except (OSError, UnicodeError) as exc:
                 errors.append(f'{path}:{type(exc).__name__}')
+        # Dubbo SPI registrations use the same interface-to-provider shape as
+        # ServiceLoader but live under META-INF/dubbo[/internal|/external] and
+        # optionally prefix the implementation with `name=`.  Treat them as
+        # deterministic provider registrations so a provider method can be a
+        # framework-reachable graph entry rather than an isolated class.
+        for relative_dir in ('META-INF/dubbo', 'META-INF/dubbo/internal', 'META-INF/dubbo/external'):
+            registry_dir = root / relative_dir
+            registry_files = (
+                sorted(item for item in registry_dir.iterdir() if item.is_file())
+                if registry_dir.is_dir() else []
+            )
+            for path in registry_files:
+                files.append(str(path))
+                interface = path.name.strip()
+                try:
+                    providers = []
+                    for raw in path.read_text(encoding='utf-8').splitlines():
+                        value = raw.split('#', 1)[0].strip()
+                        if not value:
+                            continue
+                        provider = value.split('=', 1)[-1].strip()
+                        if provider:
+                            providers.append(provider)
+                    for provider in providers:
+                        nodes.extend([
+                            {'id': interface, 'kind': 'dubbo_spi_interface'},
+                            {'id': provider, 'kind': 'dubbo_spi_provider'},
+                        ])
+                        edges.append({
+                            'source': interface, 'target': provider,
+                            'edge_kind': 'dubbo_spi_registration', 'confidence': 'high',
+                            'conditions': [], 'ambiguity': len(providers) > 1,
+                            'provenance': {'file': str(path)},
+                        })
+                        if provider not in source_classes:
+                            findings.append({
+                                'reason_code': 'dubbo_spi_provider_class_unverified',
+                                'subject': provider, 'interface': interface, 'file': str(path),
+                            })
+                    if len(providers) > 1:
+                        findings.append({
+                            'reason_code': 'dubbo_spi_multiple_providers',
+                            'subject': interface, 'candidates': providers,
+                        })
+                except (OSError, UnicodeError) as exc:
+                    errors.append(f'{path}:{type(exc).__name__}')
         imports_path = root / 'META-INF' / 'spring' / 'org.springframework.boot.autoconfigure.AutoConfiguration.imports'
         if imports_path.is_file():
             files.append(str(imports_path))
@@ -1365,7 +1411,7 @@ def attach_framework_edges_to_graph(graph, payload):
     supported_kinds = {
         'spring_event_listener', 'spring_framework_callback', 'spring_bean_dispatch',
         'spring_runtime_active_entry',
-        'java_spi_load_point', 'java_spi_registration',
+        'java_spi_load_point', 'java_spi_registration', 'dubbo_spi_registration',
         'mybatis_mapper_binding', 'mybatis_annotation_binding',
         'mybatis_type_reference',
         'mybatis_type_handler_binding', 'mybatis_type_handler_registration',

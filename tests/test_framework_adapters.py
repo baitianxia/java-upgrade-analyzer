@@ -14,6 +14,30 @@ from framework_adapters import run_framework_adapters, attach_framework_edges_to
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
+    def test_dubbo_spi_resource_registration_is_discovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            dubbo = module / "src/main/resources/META-INF/dubbo"
+            java.mkdir(parents=True)
+            dubbo.mkdir(parents=True)
+            (java / "DemoFilter.java").write_text(
+                "package com.acme; class DemoFilter {}", encoding="utf-8"
+            )
+            (dubbo / "org.apache.dubbo.rpc.Filter").write_text(
+                "demo=com.acme.DemoFilter\n", encoding="utf-8"
+            )
+
+            payload = run_framework_adapters([{"root": str(module / "src/main/java")}])
+
+        spi = next(item for item in payload["adapters"] if item["adapter"] == "java_spi")
+        self.assertTrue(any(
+            edge["edge_kind"] == "dubbo_spi_registration"
+            and edge["source"] == "org.apache.dubbo.rpc.Filter"
+            and edge["target"] == "com.acme.DemoFilter"
+            for edge in spi["edges"]
+        ))
+
     def test_java_text_block_content_does_not_create_framework_edge(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "src/main/java/com/acme"
