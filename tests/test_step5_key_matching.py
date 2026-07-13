@@ -2761,6 +2761,28 @@ public class com.example.TargetBridge {
         self.assertIsNone(updated.is_reachable)
         self.assertEqual(updated.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
 
+    def test_path_dominance_keeps_longer_high_confidence_alternative(self):
+        frontier = [(1, 0.35)]
+
+        dominated, updated = tracer.update_path_frontier(
+            frontier,
+            cost=3,
+            confidence=1.0,
+        )
+
+        self.assertFalse(dominated)
+        self.assertEqual(updated, [(1, 0.35), (3, 1.0)])
+
+    def test_path_dominance_rejects_strictly_worse_alternative(self):
+        dominated, updated = tracer.update_path_frontier(
+            [(2, 0.8)],
+            cost=3,
+            confidence=0.7,
+        )
+
+        self.assertTrue(dominated)
+        self.assertEqual(updated, [(2, 0.8)])
+
     def test_is_system_code_touched_allows_business_service_impl(self):
         method_def = SimpleNamespace(
             owner_type="business",

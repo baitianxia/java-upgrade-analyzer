@@ -4423,6 +4423,27 @@ def calculate_depth_cost(confidence):
         return 5
 
 
+def update_path_frontier(frontier, *, cost, confidence):
+    """Maintain the non-dominated (cost, confidence) states for one symbol.
+
+    Cost and confidence are independent dimensions: a shorter path may be less
+    trustworthy, while a longer path may consist entirely of exact bytecode or
+    AST edges.  Collapsing both into a cost-first tuple can discard the latter
+    before candidate selection gets a chance to prefer its stronger evidence.
+    """
+    states = list(frontier or [])
+    if any(old_cost <= cost and old_confidence >= confidence for old_cost, old_confidence in states):
+        return True, states
+    states = [
+        (old_cost, old_confidence)
+        for old_cost, old_confidence in states
+        if not (cost <= old_cost and confidence >= old_confidence)
+    ]
+    states.append((cost, confidence))
+    states.sort(key=lambda item: (item[0], -item[1]))
+    return False, states
+
+
 def should_stop_tracing(current_cost, max_cost, confidence_score, critical_node_hit, last_edge_confidence=''):
     """
     判断是否应该停止追踪
@@ -4702,7 +4723,10 @@ def trace_api_with_confidence_weighting(
 
     # BFS反向追踪（置信度加权）
     queue = deque()
-    visited = {}  # (symbol_id, provenance_family) -> best(cost, -confidence)
+    # A symbol can have multiple Pareto-optimal states.  Keeping only the
+    # cheapest state would let a short low-confidence guess suppress a longer
+    # exact path before final candidate ranking.
+    visited = {}  # (symbol_id, provenance_family) -> [(cost, confidence), ...]
 
     trace_cache = ensure_trace_cache(trace_cache)
     reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
@@ -4872,20 +4896,23 @@ def trace_api_with_confidence_weighting(
             new_depth = current_depth + 1
 
             visited_key = (method_def.symbol_id, frontier.get('provenance_family', 'exact'))
-            path_score = (new_cost, -new_confidence)
-            existing_score = visited.get(visited_key)
-            if existing_score is not None and path_score >= existing_score:
+            dominated, updated_frontier = update_path_frontier(
+                visited.get(visited_key),
+                cost=new_cost,
+                confidence=new_confidence,
+            )
+            if dominated:
                 _step5_debug(
                     'trace_pruned',
-                    'skipped path because an equal or better path already exists',
+                    'skipped path because an equal or Pareto-better path already exists',
                     api_name=api_name,
                     current_key=current_key,
                     caller=method_def.qualified_key,
-                    existing_score=existing_score,
-                    candidate_score=path_score,
+                    existing_frontier=visited.get(visited_key),
+                    candidate_score=(new_cost, new_confidence),
                 )
                 continue  # 已有更优路径，跳过
-            visited[visited_key] = path_score
+            visited[visited_key] = updated_frontier
 
             # 必须记录“到达该节点后的总代价”，否则后续更优路径会被错误剪枝。
             # 这里同时保留 provenance_family，避免 exact / polymorphic / fallback 互相误剪枝。
