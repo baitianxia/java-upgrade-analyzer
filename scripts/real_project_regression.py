@@ -890,6 +890,8 @@ def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
         completed = subprocess.run(
             ["git", "-C", str(project_root), "rev-parse", "HEAD"],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=30,
@@ -2327,7 +2329,7 @@ def run_step4(case: RealProjectCase, report_dir: Path) -> dict:
         "30",
     ]
     start = time.time()
-    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, timeout=900)
+    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", timeout=900)
     elapsed = time.time() - start
     return {
         "returncode": proc.returncode,
@@ -2395,7 +2397,7 @@ def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, rep
         "--allow-degraded",
     ]
     start = time.time()
-    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, timeout=900)
+    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", timeout=900)
     return proc.returncode, time.time() - start
 
 
@@ -2414,7 +2416,7 @@ def run_step6(report_dir: Path) -> dict:
     ]
     start = time.time()
     proc = subprocess.run(
-        cmd, cwd=ROOT_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=900,
     )
     elapsed = time.time() - start
@@ -2440,7 +2442,7 @@ def query_step5(report_dir: Path, method: str) -> dict:
         "5",
     ]
     proc = subprocess.run(
-        cmd, cwd=ROOT_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=900,
     )
     return {
@@ -2492,6 +2494,8 @@ def collect_project_asset_health(project_root: Path) -> dict:
     git_result = subprocess.run(
         ["git", "-C", str(project_root), "rev-parse", "--is-inside-work-tree"],
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=30,

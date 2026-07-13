@@ -278,6 +278,28 @@ def _reload_tree_sitter_modules():
     return True
 
 
+def decode_java_source_bytes(source_code):
+    """Decode Java source conservatively before handing bytes to tree-sitter.
+
+    Tree-sitter-java consumes UTF-8 bytes.  Java projects created on Windows
+    can still contain GBK/GB18030 files, while UTF-16 files are normally BOM
+    marked.  Returning replacement characters for those sources loses type and
+    method identifiers, so prefer a successful strict decode before the final
+    loss-tolerant fallback.
+    """
+    data = bytes(source_code or b'')
+    if data.startswith((b'\xff\xfe', b'\xfe\xff')):
+        candidates = ('utf-16', 'utf-8', 'gb18030')
+    else:
+        candidates = ('utf-8-sig', 'utf-8', 'gb18030', 'utf-16')
+    for encoding in candidates:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode('utf-8', errors='replace')
+
+
 def _ensure_tree_sitter_available():
     """Ensure tree-sitter is available; by default try installing once before regex fallback."""
     global TREE_SITTER_AUTO_INSTALL_ATTEMPTED, TREE_SITTER_AUTO_INSTALL_ERROR
@@ -312,6 +334,8 @@ def _ensure_tree_sitter_available():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=False,
             timeout=_tree_sitter_auto_install_timeout(),
         )
@@ -1218,9 +1242,12 @@ class TreeSitterAnalyzer:
             return []
 
         try:
-            text = source_code.decode('utf-8', errors='replace')
-        except Exception:
+            text = decode_java_source_bytes(source_code)
+        except (TypeError, UnicodeError):
             text = ""
+        # Keep tree-sitter offsets and all later byte slicing in one encoding.
+        # The original bytes are retained only long enough to select a decoder.
+        source_code = text.encode('utf-8')
         lines = text.splitlines(keepends=True)
         self.non_empty_source = bool(text.strip())
 

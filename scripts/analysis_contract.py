@@ -303,7 +303,7 @@ def sha256_file(path):
 
 def git_revision(project_dir, ref="HEAD"):
     result = subprocess.run(
-        ["git", "rev-parse", str(ref)], cwd=str(project_dir), text=True,
+        ["git", "rev-parse", str(ref)], cwd=str(project_dir), text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
     )
     return result.stdout.strip() if result.returncode == 0 else ""

@@ -6,21 +6,60 @@ import io
 import json
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 def _run_git(repo_path, *args):
     completed = subprocess.run(
         ["git", "-C", str(repo_path), *args],
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
     return completed.stdout.strip(), completed.stderr.strip(), completed.returncode
+
+
+def extract_zip_safely(archive, destination_root):
+    """Extract only regular, root-contained ZIP members.
+
+    `ZipFile.extractall` accepts archive-controlled path names.  Source
+    snapshots must never let a Git/archive member create files outside the
+    temporary snapshot directory or materialize an unexpected symlink.
+    """
+    destination_root = Path(destination_root).resolve()
+    for member in archive.infolist():
+        raw_name = str(member.filename or "")
+        normalized_name = raw_name.replace("\\", "/")
+        relative = Path(normalized_name)
+        windows_relative = PureWindowsPath(raw_name)
+        if (
+            not raw_name
+            or "\x00" in raw_name
+            or relative.is_absolute()
+            or windows_relative.is_absolute()
+            or bool(windows_relative.drive)
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or stat.S_ISLNK(member.external_attr >> 16)
+        ):
+            raise RuntimeError("dependency_source_snapshot_archive_escapes_root")
+        target = (destination_root / relative).resolve()
+        try:
+            target.relative_to(destination_root)
+        except ValueError as exc:
+            raise RuntimeError("dependency_source_snapshot_archive_escapes_root") from exc
+        if member.is_dir() or raw_name.endswith("/"):
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(member, "r") as source, target.open("wb") as output:
+            shutil.copyfileobj(source, output)
 
 
 def _coord_ga(coord):
@@ -172,14 +211,7 @@ def materialize_detached_snapshot(report_dir, coord, repo_path, ref, module_rel_
         temporary = Path(tempfile.mkdtemp(prefix=".jua-source-", dir=str(snapshot.parent)))
         try:
             with zipfile.ZipFile(io.BytesIO(completed.stdout)) as archive:
-                root = temporary.resolve()
-                for member in archive.infolist():
-                    destination = (temporary / member.filename).resolve()
-                    try:
-                        destination.relative_to(root)
-                    except ValueError as exc:
-                        raise RuntimeError("dependency_source_snapshot_archive_escapes_root") from exc
-                archive.extractall(temporary)
+                extract_zip_safely(archive, temporary)
             (temporary / marker_name).write_text(
                 json.dumps({"schema": 1, "commit": commit}, sort_keys=True) + "\n",
                 encoding="utf-8",

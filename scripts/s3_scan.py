@@ -1218,6 +1218,15 @@ def scan_sb_config(source_dir, output_path, _dep_changes_path=None):
     """扫描 Spring Boot 配置属性键"""
     rows = []
 
+    def add_incomplete(fpath, lineno, reason):
+        rows.append({
+            '文件': fpath,
+            '行号': lineno,
+            '配置键': '',
+            '当前值': f'未完成：{reason}',
+            '扫描状态': '未完成',
+        })
+
     # .properties 文件
     for fpath in walk_files(source_dir, {'.properties'}):
         try:
@@ -1233,7 +1242,8 @@ def scan_sb_config(source_dir, output_path, _dep_changes_path=None):
                             rows.append({'文件': fpath, '行号': lineno,
                                          '配置键': key,
                                          '当前值': val[:100].replace(',', ';')})
-        except Exception:
+        except (OSError, UnicodeError) as exc:
+            add_incomplete(fpath, 0, f'properties 文件无法读取（{type(exc).__name__}）')
             continue
 
     # .yml / .yaml 文件
@@ -1242,9 +1252,16 @@ def scan_sb_config(source_dir, output_path, _dep_changes_path=None):
             with open_text(fpath) as f:
                 key_stack = []
                 block_scalar_indent = None
+                incomplete_reported = False
                 for lineno, line in enumerate(f, 1):
                     raw = line.rstrip('\r\n')
                     if not raw.strip() or raw.lstrip().startswith('#'):
+                        continue
+                    leading = raw[:len(raw) - len(raw.lstrip(' \t'))]
+                    if '\t' in leading:
+                        if not incomplete_reported:
+                            add_incomplete(fpath, lineno, 'YAML 缩进包含 Tab，无法可靠计算层级')
+                            incomplete_reported = True
                         continue
                     indent = len(raw) - len(raw.lstrip(' '))
                     if block_scalar_indent is not None:
@@ -1252,6 +1269,11 @@ def scan_sb_config(source_dir, output_path, _dep_changes_path=None):
                             continue
                         block_scalar_indent = None
                     content = raw.lstrip(' ')
+                    if '{' in content or '[' in content:
+                        if not incomplete_reported:
+                            add_incomplete(fpath, lineno, 'YAML flow-style 映射或列表未完成层级展开')
+                            incomplete_reported = True
+                        continue
                     if content.startswith('- '):
                         content = content[2:].lstrip()
                         indent += 2
@@ -1263,21 +1285,32 @@ def scan_sb_config(source_dir, output_path, _dep_changes_path=None):
                     while key_stack and key_stack[-1][0] >= indent:
                         key_stack.pop()
                     full_key = '.'.join([item[1] for item in key_stack] + [key])
+                    # YAML anchors may decorate a mapping node, e.g.
+                    # `profiles: &profiles`.  The anchor itself is not this
+                    # key's scalar value; retain the node so nested keys keep
+                    # their full configuration path.
+                    anchor_only = bool(re.fullmatch(
+                        r'&[A-Za-z0-9_-]+(?:\s+#.*)?', val_part
+                    ))
                     # 只记录叶节点（有值的行）
                     if val_part and not val_part.startswith('#'):
                         if val_part in {'|', '>', '|-', '>-', '|+', '>+'}:
                             block_scalar_indent = indent
+                            continue
+                        if anchor_only:
+                            key_stack.append((indent, key))
                             continue
                         rows.append({'文件': fpath, '行号': lineno,
                                      '配置键': full_key,
                                      '当前值': val_part[:100].replace(',', ';')})
                     else:
                         key_stack.append((indent, key))
-        except Exception:
+        except (OSError, UnicodeError) as exc:
+            add_incomplete(fpath, 0, f'YAML 文件无法读取（{type(exc).__name__}）')
             continue
 
     total = write_csv_results(rows,
-                              ['文件', '行号', '配置键', '当前值'],
+                              ['文件', '行号', '配置键', '当前值', '扫描状态'],
                               output_path)
     print(f"  sb_config: {total} 个配置键 → {output_path}", file=sys.stderr)
     return total

@@ -1,5 +1,7 @@
 import json
+import io
 import subprocess
+import stat
 import sys
 import tempfile
 import unittest
@@ -15,6 +17,30 @@ import s5_call_chain_engine_integrated as step5  # noqa: E402
 
 
 class DependencySourceAlignmentTest(unittest.TestCase):
+    def test_safe_zip_extraction_rejects_traversal_and_symlink_members(self):
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("src/main/java/Ok.java", "class Ok {}")
+            archive.writestr("../../escaped.txt", "must not escape")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with zipfile.ZipFile(io.BytesIO(payload.getvalue())) as archive:
+                with self.assertRaises(RuntimeError):
+                    alignment.extract_zip_safely(archive, Path(tmp))
+
+            self.assertFalse((Path(tmp).parent / "escaped.txt").exists())
+
+        symlink_payload = io.BytesIO()
+        with zipfile.ZipFile(symlink_payload, "w") as archive:
+            link = zipfile.ZipInfo("src/link")
+            link.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(link, "../../escaped.txt")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with zipfile.ZipFile(io.BytesIO(symlink_payload.getvalue())) as archive:
+                with self.assertRaises(RuntimeError):
+                    alignment.extract_zip_safely(archive, Path(tmp))
+
     def _git(self, repo, *args):
         result = subprocess.run(
             ["git", "-C", str(repo), *args],

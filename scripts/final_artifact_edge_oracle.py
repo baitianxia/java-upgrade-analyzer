@@ -425,7 +425,7 @@ def _parse_javap_output(
 
 def _javap_version(javap: str, *, timeout: float) -> str:
     completed = subprocess.run(
-        [javap, "-version"], capture_output=True, text=True, check=False, timeout=timeout
+        [javap, "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=timeout
     )
     return (completed.stdout or completed.stderr).strip()
 
@@ -459,6 +459,8 @@ def _parse_entry_with_javap(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except OSError as error:
         return {

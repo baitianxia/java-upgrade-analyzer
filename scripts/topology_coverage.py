@@ -147,7 +147,7 @@ def _javap_text(content: bytes, *options: str) -> str:
         class_path = Path(temporary) / "target.class"
         class_path.write_bytes(content)
         completed = subprocess.run(
-            ["javap", *options, str(class_path)], capture_output=True, text=True, check=False,
+            ["javap", *options, str(class_path)], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             timeout=30,
         )
     return completed.stdout if completed.returncode == 0 else ""
@@ -225,7 +225,7 @@ def _class_header_parents(content: bytes, timeout_sec: float) -> tuple[tuple[str
             class_path = Path(temporary) / "target.class"
             class_path.write_bytes(content)
             completed = subprocess.run(
-                ["javap", "-p", str(class_path)], capture_output=True, text=True,
+                ["javap", "-p", str(class_path)], capture_output=True, text=True, encoding="utf-8", errors="replace",
                 check=False, timeout=timeout_sec,
             )
     except subprocess.TimeoutExpired:
@@ -720,7 +720,7 @@ def _bootstrap_links(inventory: dict, targets: set[tuple[str, str, str]], edges:
             class_path.write_bytes(content)
             completed = subprocess.run(
                 ["javap", "-v", "-c", "-p", "-s", str(class_path)],
-                capture_output=True, text=True, check=False, timeout=30,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
             )
         if completed.returncode != 0:
             continue
@@ -820,7 +820,7 @@ def _source_attestation_evidence(
         revision = str(attestation.get("git_revision") or "")
         tree = subprocess.run(
             ["git", "-C", str(source_root), "rev-parse", f"{revision}^{{tree}}"],
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
         )
         source_path = Path(source_root) / str(attestation.get("source_path") or ".")
         source_root_resolved = Path(source_root).resolve()
@@ -828,7 +828,7 @@ def _source_attestation_evidence(
         source_path_text = str(attestation.get("source_path") or "")
         tracked = subprocess.run(
             ["git", "-C", str(source_root), "ls-tree", "-d", revision, "--", source_path_text],
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
         )
         git_entries = subprocess.run(
             ["git", "-C", str(source_root), "ls-tree", "-r", "-z", revision, "--", source_path_text],
@@ -862,7 +862,7 @@ def _source_attestation_evidence(
         )
         status = subprocess.run(
             ["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=all", "--", source_path_text],
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
         )
         live_digest = compute_source_tree_sha256(source_path_resolved)
         valid = bool(

@@ -67,6 +67,8 @@ def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess
         cmd,
         cwd=str(cwd or ROOT_DIR),
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )

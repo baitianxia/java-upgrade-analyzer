@@ -14,6 +14,21 @@ from framework_adapters import run_framework_adapters, attach_framework_edges_to
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
+    def test_java_text_block_content_does_not_create_framework_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "Documentation.java").write_text(
+                'package com.acme; class Documentation { String sample = """\n'
+                '@EventListener public void ghost(Object event) {}\n'
+                '"""; }\n',
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertFalse(any("ghost" in str(edge) for edge in spring["edges"]))
+
     def test_dynamic_proxy_text_inside_string_does_not_create_registration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "src/main/java/com/acme"
