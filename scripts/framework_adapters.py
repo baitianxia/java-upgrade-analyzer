@@ -357,7 +357,7 @@ def run_spring_adapter(source_roots):
     bean_candidates = []
     listener_pattern = re.compile(r'@EventListener(?:\([^)]*\))?[\s\S]{0,500}?\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{')
     active_method_pattern = re.compile(
-        r'@(?:[\w.]+\.)?(Scheduled|PostConstruct)(?:\([^)]*\))?'
+        r'@(?:[\w.]+\.)?(Scheduled|PostConstruct|KafkaListener|RabbitListener|JmsListener)(?:\([^)]*\))?'
         r'[\s\S]{0,500}?'
         r'\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{'
     )
@@ -509,7 +509,7 @@ def run_spring_adapter(source_roots):
                     method_name = str(getattr(method, 'method_name', '') or '')
                     if method_name and 'EventListener' in annotations:
                         listener_targets.append((f'{method_owner}.{method_name}', '@EventListener'))
-                    for annotation in ('Scheduled', 'PostConstruct'):
+                    for annotation in ('Scheduled', 'PostConstruct', 'KafkaListener', 'RabbitListener', 'JmsListener'):
                         if method_name and annotation in annotations:
                             active_targets.append((f'{method_owner}.{method_name}', annotation))
             else:

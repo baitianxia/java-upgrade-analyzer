@@ -14,6 +14,32 @@ from framework_adapters import run_framework_adapters, attach_framework_edges_to
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
+    def test_spring_message_listener_annotations_emit_runtime_active_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "Listeners.java").write_text(
+                "package com.acme; "
+                "class Listeners { "
+                "@org.springframework.kafka.annotation.KafkaListener(topics=\"orders\") void kafka(String value) {} "
+                "@org.springframework.amqp.rabbit.annotation.RabbitListener(queues=\"orders\") void rabbit(String value) {} "
+                "@org.springframework.jms.annotation.JmsListener(destination=\"orders\") void jms(Object value) {} "
+                "}",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        active_targets = {
+            edge["target"] for edge in spring["edges"]
+            if edge["edge_kind"] == "spring_runtime_active_entry"
+        }
+        self.assertEqual(
+            active_targets,
+            {"com.acme.Listeners.kafka", "com.acme.Listeners.rabbit", "com.acme.Listeners.jms"},
+        )
+
     def test_dubbo_spi_resource_registration_is_discovered(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = Path(tmp)
