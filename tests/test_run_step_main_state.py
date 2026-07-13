@@ -1306,7 +1306,7 @@ class RunStepMainStateTest(unittest.TestCase):
             },
         )
 
-    def test_validate_pending_interaction_response_requires_japicmp_or_degraded_confirmation(self):
+    def test_validate_pending_interaction_response_requires_japicmp_confirmation(self):
         interaction = {
             "step_id": "step4",
             "reason_code": "step4_japicmp_missing_need_resolution",
@@ -1316,6 +1316,9 @@ class RunStepMainStateTest(unittest.TestCase):
                 "properties": {
                     "action": {"type": "string"},
                     "japicmp_jar": {"type": "string"},
+                    # Simulate a stale checkpoint produced before the strict
+                    # parser policy. Validation itself must still reject this
+                    # bypass rather than relying on the schema omission.
                     "allow_degraded": {"type": "boolean"},
                 },
             },
@@ -1331,12 +1334,13 @@ class RunStepMainStateTest(unittest.TestCase):
             interaction,
             {"action": "rerun_current_step", "japicmp_jar": "/tmp/japicmp.jar"},
         )
-        run_step.validate_pending_interaction_response(
-            interaction,
-            {"action": "rerun_current_step", "allow_degraded": True},
-        )
+        with self.assertRaises(run_step.StepError):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "rerun_current_step", "allow_degraded": True},
+            )
 
-    def test_validate_pending_interaction_response_requires_tree_sitter_install_or_degraded_confirmation(self):
+    def test_validate_pending_interaction_response_requires_tree_sitter_install_confirmation(self):
         interaction = {
             "step_id": "step5",
             "reason_code": "step5_tree_sitter_missing_need_resolution",
@@ -1346,6 +1350,8 @@ class RunStepMainStateTest(unittest.TestCase):
                 "properties": {
                     "action": {"type": "string"},
                     "tree_sitter_installed": {"type": "boolean"},
+                    # A hand-crafted or stale response cannot re-enable the
+                    # removed parser-degradation path.
                     "allow_degraded": {"type": "boolean"},
                 },
             },
@@ -1361,10 +1367,11 @@ class RunStepMainStateTest(unittest.TestCase):
             interaction,
             {"action": "rerun_current_step", "tree_sitter_installed": True},
         )
-        run_step.validate_pending_interaction_response(
-            interaction,
-            {"action": "rerun_current_step", "allow_degraded": True},
-        )
+        with self.assertRaises(run_step.StepError):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "rerun_current_step", "allow_degraded": True},
+            )
 
     def test_build_resume_command_examples_uses_intent_patch_payload(self):
         examples = run_step.build_resume_command_examples(

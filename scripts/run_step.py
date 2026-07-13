@@ -5049,24 +5049,22 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         and action == "rerun_current_step"
     ):
         japicmp_jar = str(user_response.get("japicmp_jar") or "").strip()
-        allow_degraded = bool(user_response.get("allow_degraded"))
-        if not japicmp_jar and not allow_degraded:
+        if not japicmp_jar:
             raise StepError(
-                "Step4 当前检查点要求先安装/提供 japicmp_jar，或显式设置 "
-                "allow_degraded=true 确认降级后，再使用 action=rerun_current_step 重跑。"
+                "Step4 当前检查点要求先安装或提供 japicmp_jar，再使用 "
+                "action=rerun_current_step 重跑；不允许缺少 JApiCmp 时降级执行。"
             )
     if (
         step_id == "step5"
         and reason_code == "step5_tree_sitter_missing_need_resolution"
         and action == "rerun_current_step"
     ):
-        allow_degraded = bool(user_response.get("allow_degraded"))
         tree_sitter_installed = bool(user_response.get("tree_sitter_installed"))
-        if not tree_sitter_installed and not allow_degraded:
+        if not tree_sitter_installed:
             raise StepError(
                 "Step5 当前检查点要求先安装 tree-sitter/tree-sitter-java，"
-                "并设置 tree_sitter_installed=true；或显式设置 allow_degraded=true 确认源码 AST 降级后，再使用 "
-                "action=rerun_current_step 重跑。"
+                "并设置 tree_sitter_installed=true 后，再使用 action=rerun_current_step 重跑；"
+                "不允许源码 AST 降级执行。"
             )
 
 
