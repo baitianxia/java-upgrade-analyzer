@@ -8963,6 +8963,25 @@ public class com.example.TargetBridge {
         self.assertEqual("b.jar!/B.class", entry["evidence_paths"][0][1]["file"])
         self.assertEqual("bytecode_method_invocation", entry["evidence_paths"][0][1]["evidence_type"])
 
+    def test_api_id_is_stable_across_runtime_paths_and_result_order(self):
+        def make_result(path):
+            return tracer.TraceResult(
+                coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+                api_signature="(java.lang.String)", symbol_kind="method", change_type="REMOVED", severity="P0",
+                confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="reachable", direct_callers=1, is_reachable=True,
+                reachable_note="已命中", business_reach_depth=1, dependency_chain_coords=[],
+                call_paths=["App.run() -> com.acme.Api.gone(java.lang.String)"],
+                evidence_paths=[[{"caller_symbol": "App.run()", "callee_key": "com.acme.Api.gone(java.lang.String)", "evidence_type": "ast_method_invocation", "file": path}]],
+                reason_code="SYSTEM_CODE_REACHABLE", verification_commands=[], hops=[],
+                confidence_score=1.0, critical_nodes_hit=[],
+            )
+
+        first = formatter._alert_rows_for_result(make_result("/one/App.java"))[0]
+        second = formatter._alert_rows_for_result(make_result("/other/App.java"))[0]
+
+        self.assertEqual(first["api_id"], second["api_id"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

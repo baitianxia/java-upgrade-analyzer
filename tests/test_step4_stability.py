@@ -305,6 +305,29 @@ class Step4StabilityTest(unittest.TestCase):
             rows[0]["compatibility_flags"],
         )
 
+    def test_removed_overload_remains_removed_when_sibling_overload_is_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "diff.xml"
+            xml_path.write_text(
+                """<japicmp><classes><class name="org.apache.dubbo.common.URL" changeStatus="MODIFIED"
+                binaryCompatible="false" sourceCompatible="false"><methods>
+                <method name="valueOf" changeStatus="REMOVED" binaryCompatible="false" sourceCompatible="false">
+                  <parameters><parameter type="java.lang.String"/></parameters>
+                </method>
+                <method name="valueOf" changeStatus="NEW" binaryCompatible="true" sourceCompatible="true">
+                  <parameters><parameter type="java.net.URI"/></parameters>
+                </method>
+                </methods></class></classes></japicmp>""",
+                encoding="utf-8",
+            )
+            rows = step4.parse_japicmp_xml(xml_path, "org.apache.dubbo:dubbo-common", "3.2", "3.3")
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("method", rows[0]["symbol_kind"])
+        self.assertEqual("REMOVED", rows[0]["change_type"])
+        self.assertEqual("(java.lang.String)", rows[0]["api_signature"])
+        self.assertEqual("P0", rows[0]["severity"])
+
     def test_parse_japicmp_xml_preserves_constant_value_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml_path = Path(tmp) / "diff.xml"

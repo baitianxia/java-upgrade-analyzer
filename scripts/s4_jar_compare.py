@@ -2055,8 +2055,26 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
                 old_value = (child.text or '').strip() or _xml_attr(child, 'value')
             elif local_name in {'newvalue', 'new-value'} and not new_value:
                 new_value = (child.text or '').strip() or _xml_attr(child, 'value')
+        flags = []
+        for child in element.iter():
+            if _xml_local_name(child) not in ('compatibilitychange', 'compatibility-change'):
+                continue
+            flag = _xml_attr(child, 'type', 'name') or (child.text or '').strip()
+            if flag and flag not in flags:
+                flags.append(flag)
         if status in ('NEW', 'UNCHANGED'):
             return
+        if symbol_kind == 'class' and status == 'MODIFIED':
+            # JApiCmp marks the containing class MODIFIED whenever a member is
+            # changed.  Emitting a second class-level API row in that case is a
+            # false structural change.  Keep a class row only when JApiCmp
+            # provides an explicit class/supertype contract flag.
+            class_level_prefixes = (
+                'CLASS_', 'SUPERCLASS_', 'INTERFACE_', 'GENERIC_TEMPLATE_',
+                'TYPE_', 'ANNOTATION_', 'ENUM_', 'RECORD_',
+            )
+            if not any(str(flag).upper().startswith(class_level_prefixes) for flag in flags):
+                return
         if symbol_kind == 'field' and old_value and new_value and old_value != new_value:
             change_type = 'CONSTANT_VALUE_CHANGED'
             reason_code = 'field_constant_value_changed'
@@ -2087,13 +2105,6 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
                 return
             api_name = f"{owner}.{raw_name}"
             signature = _xml_member_signature(element) if symbol_kind == 'method' else ''
-        flags = []
-        for child in element.iter():
-            if _xml_local_name(child) not in ('compatibilitychange', 'compatibility-change'):
-                continue
-            flag = _xml_attr(child, 'type', 'name') or (child.text or '').strip()
-            if flag and flag not in flags:
-                flags.append(flag)
         row = {
             'coord': coord,
             'old_version': old_ver,
