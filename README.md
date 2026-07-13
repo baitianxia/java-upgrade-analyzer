@@ -338,7 +338,7 @@ Step5 慢时，让 Claude Code 查看：
 
 Step4 需要 JApiCmp 做 jar API 对比。
 
-如果缺失，Skill 会先自动尝试安装 JApiCmp。自动安装失败时，Claude Code 会停下来提示你手动安装或提供 JApiCmp 工具路径；只有你明确确认接受降级后，才会继续。
+如果缺失，Skill 会先自动尝试安装 JApiCmp。自动安装失败时，Claude Code 会停下来提示你手动安装或提供 JApiCmp 工具路径；安装完成前不会继续分析。
 
 不安装 JApiCmp 的后果是：二进制 API 对比证据不完整，可能漏掉删除方法、签名变化、字段变化、源码重编译不兼容等风险。
 
@@ -346,6 +346,6 @@ Step4 需要 JApiCmp 做 jar API 对比。
 
 默认会先阻断确认，不会静默降级。
 
-Step5 默认会把 `tree-sitter` 和 `tree-sitter-java` 自动安装到工具自己的缓存目录，不修改系统 Python 或项目虚拟环境，并设置安装超时。如果自动安装失败，Claude Code 会停下来提示你手动安装；只有你明确确认接受降级后，才会继续使用增强正则。
+Step5 会把 `tree-sitter` 和 `tree-sitter-java` 自动安装到工具自己的缓存目录，不修改系统 Python 或项目虚拟环境，并设置安装超时。如果自动安装或加载失败，Claude Code 会停下来提示你手动安装；安装完成前不会使用增强正则继续分析。
 
 不安装 tree-sitter 的后果是：Java AST 主链路不可用，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。

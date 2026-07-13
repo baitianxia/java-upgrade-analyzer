@@ -75,7 +75,7 @@ python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
 6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
 8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
-9. **关键工具不可静默降级**：JApiCmp 缺失时，Step4 会先自动尝试安装；若安装失败，必须 checkpoint 让用户安装/提供 `japicmp_jar`，或明确 `allow_degraded=true` 接受二进制 API 对比缺失后才能继续。tree-sitter 缺失时，Step5 也必须先自动尝试安装；若安装失败，必须 checkpoint 让用户安装并声明 `tree_sitter_installed=true` 后重跑，或明确 `allow_degraded=true` 接受 Java AST 主链路降级后才能继续。
+9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。缺失时会先自动尝试安装；安装或加载失败后必须 checkpoint，安装/提供工具后重跑。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
 
 ## 执行模式
 
@@ -153,7 +153,7 @@ if gate failed or step blocked:
 4. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本仅用于开发调试，不等价于完整主状态流程。
 5. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
 
-Step5 默认优先使用 `tree-sitter` 做 Java AST 分析。若当前 Python 环境缺少 `tree-sitter` / `tree-sitter-java`，正式流程会先用**当前实际执行 Skill 的 Python 解释器**自动尝试安装一次；安装失败后必须进入 checkpoint，提示用户手动安装。只有用户明确 `allow_degraded=true` 接受 Java AST 主链路降级风险后，才允许继续用增强正则。
+Step5 必须使用 `tree-sitter` 做 Java AST 分析。若当前 Python 环境缺少 `tree-sitter` / `tree-sitter-java`，正式流程会先用**当前实际执行 Skill 的 Python 解释器**自动尝试安装一次；安装或加载失败后必须进入 checkpoint，提示用户手动安装并重跑。正式流程不允许继续用增强正则生成分析结论。
 
 不要在用户未要求时先让用户手动安装。只有自动安装失败、网络/权限受限，或用户明确要提前准备环境时，才提示手动安装命令：
 
