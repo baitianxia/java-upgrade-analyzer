@@ -8922,7 +8922,7 @@ public class com.example.TargetBridge {
         self.assertEqual(2, summary["meta"]["graph_stats"]["parser_usage"]["regex"])
 
     def test_alerts_csv_is_a_focused_human_review_table(self):
-        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 28)
+        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 29)
         self.assertIn("chain_detail", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("path_text", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("conclusion_level", formatter.ALERTS_CSV_FIELDNAMES)
@@ -8940,6 +8940,15 @@ public class com.example.TargetBridge {
             "com.acme.DemoApplication.home(java.lang.String)",
             tracer.critical_node_method_label(method),
         )
+
+    def test_critical_node_entry_kind_recognizes_spring_web_annotation(self):
+        method = SimpleNamespace(
+            annotations=["GetMapping(path = \"/home\")"],
+            class_annotations=["RestController"],
+            owner_type="business",
+        )
+
+        self.assertEqual("spring_web_endpoint", tracer.critical_node_entry_kind(method))
 
     def test_structured_api_detail_keeps_evidence_file_and_type_per_hop(self):
         result = tracer.TraceResult(
@@ -8981,6 +8990,29 @@ public class com.example.TargetBridge {
         second = formatter._alert_rows_for_result(make_result("/other/App.java"))[0]
 
         self.assertEqual(first["api_id"], second["api_id"])
+
+    def test_alert_distinguishes_framework_entry_and_indirect_reachability(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="reachable", direct_callers=0, is_reachable=True,
+            reachable_note="已命中", business_reach_depth=2, dependency_chain_coords=[],
+            call_paths=[], evidence_paths=[], reason_code="SYSTEM_CODE_REACHED",
+            verification_commands=[], hops=[], confidence_score=1.0, critical_nodes_hit=[],
+            path_details=[{
+                "path_status": "reachable", "stop_reason": "SYSTEM_CODE_REACHED",
+                "business_reachable": True, "business_entry": "com.acme.Demo.home()",
+                "entry_kind": "spring_web_endpoint",
+                "path_text": "com.acme.Demo.home() -> com.acme.Library.message() -> com.acme.Api.gone()",
+                "confidence": 1.0, "depth": 2, "evidence": [],
+            }],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("Spring Web 业务入口", row["entry_kind"])
+        self.assertEqual("间接调用", row["reach_kind"])
 
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:

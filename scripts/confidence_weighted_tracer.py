@@ -5516,6 +5516,30 @@ def critical_node_method_label(method_def):
     return qualified_key
 
 
+def critical_node_entry_kind(method_def, framework_edge_kind=''):
+    annotations = list(getattr(method_def, 'annotations', []) or [])
+    annotations.extend(list(getattr(method_def, 'class_annotations', []) or []))
+    names = {
+        str(annotation or '').strip().lstrip('@').split('(', 1)[0].rsplit('.', 1)[-1]
+        for annotation in annotations
+        if str(annotation or '').strip()
+    }
+    if names & {'RequestMapping', 'GetMapping', 'PostMapping', 'PutMapping', 'DeleteMapping', 'PatchMapping'}:
+        return 'spring_web_endpoint'
+    if 'Scheduled' in names:
+        return 'spring_scheduled_entry'
+    if 'EventListener' in names:
+        return 'spring_event_listener'
+    if names & {'KafkaListener', 'RabbitListener', 'JmsListener', 'RocketMQMessageListener'}:
+        return 'spring_message_listener'
+    edge_kind = str(framework_edge_kind or '').strip()
+    if edge_kind == 'spring_event_listener':
+        return 'spring_event_listener'
+    if edge_kind:
+        return edge_kind
+    return 'business_method' if getattr(method_def, 'owner_type', '') == 'business' else 'runtime_dependency_entry'
+
+
 def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None):
     trace_cache = ensure_trace_cache(trace_cache)
     cache = trace_cache['critical_node_by_symbol_id']
@@ -5548,6 +5572,7 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
             'file': method_def.file,
             'line': method_def.line,
             'framework_edge_kind': first_framework_entry.get('edge_kind'),
+            'entry_kind': critical_node_entry_kind(method_def, first_framework_entry.get('edge_kind')),
             'framework_adapter': first_framework_entry.get('adapter'),
             'framework_runtime_registration': True,
         }
@@ -5582,6 +5607,7 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
                     'method': critical_node_method_label(method_def),
                     'file': method_def.file,
                     'line': method_def.line,
+                    'entry_kind': critical_node_entry_kind(method_def),
                 }
             else:
                 critical_node = {
@@ -5602,6 +5628,7 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
                 'file': method_def.file,
                 'line': method_def.line,
                 'framework_edge_kind': first_framework_entry.get('edge_kind'),
+                'entry_kind': critical_node_entry_kind(method_def, first_framework_entry.get('edge_kind')),
                 'framework_adapter': first_framework_entry.get('adapter'),
             }
     elif is_system_code_touched(method_def, type_metadata):
@@ -5610,7 +5637,8 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
             'entry_scope': 'business',
             'method': critical_node_method_label(method_def),
             'file': method_def.file,
-            'line': method_def.line
+            'line': method_def.line,
+            'entry_kind': critical_node_entry_kind(method_def),
         }
     elif (
         getattr(method_def, 'owner_type', '') != 'business'
@@ -5763,6 +5791,7 @@ def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph, 
                 'stop_reason': effective_stop_reason,
                 'business_entry': business_entry,
                 'business_reachable': business_reachable,
+                'entry_kind': str(entry.get('entry_kind') or ''),
                 'consumer_coord': str(first.get('owner_coord') or ''),
                 'consumer_class': consumer_class,
                 'consumer_method': consumer_method,

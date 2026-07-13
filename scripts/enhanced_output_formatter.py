@@ -48,7 +48,7 @@ ALERTS_CSV_FIELDNAMES = [
     'review_focus', 'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
     'api_id', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
     'symbol_kind', 'change_type', 'severity', 'path_status',
-    'business_reachable', 'consumer_coord', 'consumer_class',
+    'business_reachable', 'entry_kind', 'reach_kind', 'consumer_coord', 'consumer_class',
     'consumer_method', 'consumer_signature', 'path_text',
     'path_occurrence_count', 'evidence_files', 'detail_file',
 ]
@@ -1506,6 +1506,8 @@ def _alert_rows_for_result(result):
             'conclusion_level': conclusion_level,
             'action_type': action_type,
             'business_reachable': 'true' if reachable is True else ('false' if reachable is False else 'unknown'),
+            'entry_kind': _alert_entry_kind(detail),
+            'reach_kind': _alert_reach_kind(has_chain, reachable, chain_view.get('hop_count')),
             'business_entry': business_entry,
             'consumer_coord': (
                 '业务制品'
@@ -1529,6 +1531,29 @@ def _alert_rows_for_result(result):
             'detail_file': detail_file,
         })
     return rows
+
+
+def _alert_entry_kind(detail):
+    value = str((detail or {}).get('entry_kind') or '').strip()
+    return {
+        'spring_web_endpoint': 'Spring Web 业务入口',
+        'spring_message_listener': 'Spring 消息监听入口',
+        'spring_scheduled_entry': 'Spring 定时任务入口',
+        'spring_event_listener': 'Spring 事件监听入口',
+        'dubbo_service_entry': 'Dubbo 服务入口',
+        'runtime_dependency_entry': '运行时依赖入口',
+        'business_method': '业务方法',
+    }.get(value, value or ('业务方法' if (detail or {}).get('business_reachable') is True else ''))
+
+
+def _alert_reach_kind(has_chain, reachable, hop_count):
+    if not has_chain or reachable is not True:
+        return '未确认'
+    try:
+        hops = int(hop_count)
+    except (TypeError, ValueError):
+        return '已确认调用'
+    return '直接调用' if hops == 1 else '间接调用'
 
 
 def _alert_conclusion_label(path_status, conclusion_level):
