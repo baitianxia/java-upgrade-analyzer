@@ -8218,10 +8218,10 @@ public class com.example.TargetBridge {
         self.assertEqual(len(rows), 2)
         self.assertEqual({row["consumer_coord"] for row in rows}, {"a:consumer", "b:consumer"})
         self.assertEqual({row["consumer_method"] for row in rows}, {"validate", "convert"})
-        self.assertTrue(all(row["conclusion_level"] == "candidate" for row in rows))
+        self.assertTrue(all(row["path_status"] == "uncertain" for row in rows))
         self.assertTrue(all(row["business_reachable"] == "unknown" for row in rows))
         self.assertTrue(all(row["api_id"] and row["path_id"] for row in rows))
-        self.assertTrue(all("尚未证明" in row["reason"] for row in rows))
+        self.assertTrue(all("尚缺少从业务入口" in row["review_reason"] for row in rows))
         self.assertEqual(original_path_ids, [row["path_id"] for row in relocated_rows])
 
     def test_alerts_csv_suppresses_only_suffix_paths_covered_by_longer_paths(self):
@@ -8512,7 +8512,7 @@ public class com.example.TargetBridge {
 
         self.assertEqual("需要人工复核", row["conclusion"])
         self.assertEqual("依赖 a:b 变更了方法 com.acme.Api.changed()（严重级别 P1）", row["change_summary"])
-        self.assertEqual("入口：A.call；终点：B.call；1 跳", row["chain_summary"])
+        self.assertEqual("入口：A.call；终点：B.call；1 次调用（2 个节点）", row["chain_summary"])
         self.assertEqual("A.call", row["chain_entry"])
         self.assertEqual("B.call", row["chain_target"])
         self.assertEqual("1", row["chain_hop_count"])
@@ -8621,7 +8621,7 @@ public class com.example.TargetBridge {
         self.assertEqual("依赖 a:b 删除了方法 com.acme.Api.gone()（严重级别 P0）", rows[0]["change_summary"])
         self.assertIn("未形成完整链路", rows[0]["chain_summary"])
         self.assertEqual("com.acme.Api.gone()", rows[0]["chain_target"])
-        self.assertEqual(rows[0]["conclusion_level"], "no_static_path")
+        self.assertEqual(rows[0]["path_status"], "not_found_in_static_analysis")
         self.assertEqual(rows[0]["path_text"], "")
 
     def test_alert_row_marks_absent_path_without_fake_entry_or_confidence(self):
@@ -8920,6 +8920,48 @@ public class com.example.TargetBridge {
 
         self.assertEqual(["max_methods"], summary["meta"]["graph_stats"]["truncation_reasons"])
         self.assertEqual(2, summary["meta"]["graph_stats"]["parser_usage"]["regex"])
+
+    def test_alerts_csv_is_a_focused_human_review_table(self):
+        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 28)
+        self.assertIn("chain_detail", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertIn("path_text", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertNotIn("conclusion_level", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertNotIn("action_type", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertNotIn("coverage_details", formatter.ALERTS_CSV_FIELDNAMES)
+
+    def test_business_entry_label_includes_declared_method_signature(self):
+        method = SimpleNamespace(
+            qualified_key="com.acme.DemoApplication.home",
+            declared_signature="(java.lang.String)",
+            param_declared_types={},
+        )
+
+        self.assertEqual(
+            "com.acme.DemoApplication.home(java.lang.String)",
+            tracer.critical_node_method_label(method),
+        )
+
+    def test_structured_api_detail_keeps_evidence_file_and_type_per_hop(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="reachable", direct_callers=1, is_reachable=True,
+            reachable_note="已命中", business_reach_depth=2, dependency_chain_coords=[],
+            call_paths=["A.run() -> B.call() -> com.acme.Api.gone()"],
+            evidence_paths=[[
+                {"caller_symbol": "A.run()", "callee_key": "B.call()", "evidence_type": "ast_method_invocation", "file": "A.java"},
+                {"caller_symbol": "B.call()", "callee_key": "com.acme.Api.gone()", "evidence_type": "bytecode_method_invocation", "file": "b.jar!/B.class"},
+            ]], reason_code="SYSTEM_CODE_REACHABLE", verification_commands=[], hops=[],
+            confidence_score=1.0, critical_nodes_hit=[],
+        )
+
+        entry = formatter.trace_result_to_api_entry(result)
+
+        self.assertEqual("A.java", entry["evidence_paths"][0][0]["file"])
+        self.assertEqual("ast_method_invocation", entry["evidence_paths"][0][0]["evidence_type"])
+        self.assertEqual("b.jar!/B.class", entry["evidence_paths"][0][1]["file"])
+        self.assertEqual("bytecode_method_invocation", entry["evidence_paths"][0][1]["evidence_type"])
 
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -9645,8 +9687,7 @@ public class com.example.TargetBridge {
             "identical_current_class_provider",
         )
         self.assertEqual(summary_payload["not_impacted"], 1)
-        self.assertEqual(alert_rows[0]["api_status"], "not_impacted")
-        self.assertEqual(alert_rows[0]["conclusion_level"], "confirmed_no_impact")
+        self.assertEqual(alert_rows[0]["path_status"], "not_impacted")
         self.assertIn("已确认不受影响", final_report)
         self.assertIn("### 3.1 符号保留证据", final_report)
         self.assertIn("com.vendor:aggregate", final_report)
@@ -9933,7 +9974,7 @@ public class com.example.TargetBridge {
         self.assertIn("chain_summary", not_found_csv)
         self.assertIn("chain_detail", not_found_csv)
         self.assertIn("未发现静态调用路径", not_found_csv)
-        self.assertIn("入口：Other.run；终点：com.example.Demo.call(Long)；1 跳", not_found_csv)
+        self.assertIn("入口：Other.run；终点：com.example.Demo.call(Long)；1 次调用（2 个节点）", not_found_csv)
         self.assertIn("删除方法，call，参数：Long，严重级别：P1", not_found_csv)
 
     def test_s6_report_starts_with_concrete_impact_overview_from_alerts(self):

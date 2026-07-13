@@ -666,7 +666,10 @@ def _csv_chain_view(item):
     target = _strip_changed_api_marker(nodes[-1])
     hop_count = max(0, len(nodes) - 1)
     return {
-        "summary": f"入口：{entry}；终点：{target}；{hop_count} 跳" if len(nodes) >= 2 else f"未形成完整链路；目标 API：{target}",
+        "summary": (
+            f"入口：{entry}；终点：{target}；{hop_count} 次调用（{len(nodes)} 个节点）"
+            if len(nodes) >= 2 else f"未形成完整链路；目标 API：{target}"
+        ),
         "entry": entry if len(nodes) >= 2 else "",
         "target": target,
         "hop_count": str(hop_count) if len(nodes) >= 2 else "",
@@ -914,7 +917,7 @@ def build_impact_overview(alert_rows):
         if api_id:
             item["api_ids"].add(api_id)
 
-        entry = str(row.get("business_entry") or "").strip()
+        entry = str(row.get("business_entry") or row.get("chain_entry") or "").strip()
         if not entry:
             consumer_class = str(row.get("consumer_class") or "").strip()
             consumer_method = str(row.get("consumer_method") or "").strip()
@@ -934,10 +937,12 @@ def build_impact_overview(alert_rows):
                 module = _module_from_evidence_file(raw_file)
                 if module:
                     item["modules"].add(module)
-        action = str(row.get("action") or "").strip()
+        action = str(row.get("action") or row.get("review_focus") or "").strip()
         if action:
             item["actions"].add(action)
-        reason = str(row.get("reason") or row.get("stop_reason") or "").strip()
+        reason = str(
+            row.get("reason") or row.get("review_reason") or row.get("stop_reason") or ""
+        ).strip()
         if reason:
             item["reasons"].add(reason)
 

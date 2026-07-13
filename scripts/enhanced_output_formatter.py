@@ -47,12 +47,10 @@ ALERTS_CSV_FIELDNAMES = [
     'conclusion', 'change_summary', 'review_reason', 'chain_summary',
     'review_focus', 'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
     'api_id', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
-    'symbol_kind', 'change_type', 'severity', 'api_status', 'path_status',
-    'conclusion_level', 'action_type', 'business_reachable', 'business_entry',
-    'consumer_coord', 'consumer_class', 'consumer_method', 'consumer_signature',
-    'path_text', 'stop_reason', 'reason', 'action', 'confidence', 'depth',
-    'path_occurrence_count', 'coverage_status', 'coverage_details',
-    'evidence_types', 'evidence_files', 'detail_file',
+    'symbol_kind', 'change_type', 'severity', 'path_status',
+    'business_reachable', 'consumer_coord', 'consumer_class',
+    'consumer_method', 'consumer_signature', 'path_text',
+    'path_occurrence_count', 'evidence_files', 'detail_file',
 ]
 
 ALERTS_SPLIT_MAX_ROWS = 50000
@@ -549,6 +547,10 @@ REASON_CODE_EXPLANATIONS = {
     'FRAMEWORK_BOUNDARY': {
         'reason': '调用链停在由框架、反射或运行时配置决定的入口，当前静态证据不足以确认该入口会执行',
         'action': '核对当前制品中的框架注册、启用条件、反射参数或实际实现类'
+    },
+    'BUSINESS_ENTRY_NOT_CONFIRMED': {
+        'reason': '已确认依赖内部引用目标 API，但尚未证明该依赖方法会由当前系统的业务入口触发',
+        'action': '核对消费依赖的注册方式、配置入口或业务调用方，确认运行时是否会进入该方法'
     },
     'NO_CALLERS': {
         'reason': '未找到方法的调用者',
@@ -1262,7 +1264,7 @@ def generate_alerts_csv(all_results, output_path):
     _relativize_alert_evidence_paths(rows, os.path.dirname(os.path.abspath(output_path)))
 
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(rows)
     write_alerts_review_splits(rows, os.path.dirname(os.path.abspath(output_path)))
@@ -1379,7 +1381,7 @@ def _write_alerts_review_bucket(output_dir, bucket_name, rows, max_rows):
 
 def _write_alert_rows_csv(path, rows):
     with open(path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1692,7 +1694,7 @@ def _alert_chain_view(path_text, business_entry, changed_symbol, evidence):
         summary = f"类型引用：{entry} 依赖 {target}"
         detail = f"1. {entry} --类加载/链接时需要--> 2. {target}"
     elif nodes and len(nodes) >= 2:
-        summary = f"入口：{entry}；终点：{target}；{hop_count} 跳"
+        summary = f"入口：{entry}；终点：{target}；{hop_count} 次调用（{len(nodes)} 个节点）"
         detail = ' -> '.join(f"{idx}. {node}" for idx, node in enumerate(nodes, 1))
     elif changed_symbol:
         summary = f"未形成完整链路；目标 API：{changed_symbol}"

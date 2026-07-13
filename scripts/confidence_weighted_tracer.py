@@ -5078,7 +5078,7 @@ def trace_api_with_confidence_weighting(
                     'path': new_path,
                     'reason': 'OVERLOAD_AMBIGUOUS_INTERMEDIATE',
                     'boundary': {
-                        'method': method_def.qualified_key,
+                        'method': critical_node_method_label(method_def),
                         'reason': build_intermediate_overload_reason(method_def, method_overload_block),
                     },
                     'provenance': frontier.get('provenance', ''),
@@ -5504,6 +5504,18 @@ def get_cached_sorted_incoming_edges(reverse_edges, current_key, trace_cache=Non
     return incoming_edges
 
 
+def critical_node_method_label(method_def):
+    """Return an IDE-locatable entry method including its overload signature."""
+    qualified_key = str(getattr(method_def, 'qualified_key', '') or '').strip()
+    signature = str(getattr(method_def, 'declared_signature', '') or '').strip()
+    if not signature:
+        declared_types = getattr(method_def, 'param_declared_types', {}) or {}
+        signature = _build_signature_from_params(declared_types.values())
+    if signature and qualified_key and not qualified_key.endswith(signature):
+        return f"{qualified_key}{signature}"
+    return qualified_key
+
+
 def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None):
     trace_cache = ensure_trace_cache(trace_cache)
     cache = trace_cache['critical_node_by_symbol_id']
@@ -5532,7 +5544,7 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
         critical_node = {
             'type': 'system_code_touched',
             'entry_scope': entry_scope,
-            'method': method_def.qualified_key,
+            'method': critical_node_method_label(method_def),
             'file': method_def.file,
             'line': method_def.line,
             'framework_edge_kind': first_framework_entry.get('edge_kind'),
@@ -5567,14 +5579,14 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
                 critical_node = {
                     'type': 'system_code_touched',
                     'entry_scope': 'business',
-                    'method': method_def.qualified_key,
+                    'method': critical_node_method_label(method_def),
                     'file': method_def.file,
                     'line': method_def.line,
                 }
             else:
                 critical_node = {
                     'type': 'framework_boundary',
-                    'method': method_def.qualified_key,
+                    'method': critical_node_method_label(method_def),
                     'reason': '框架入口存在运行条件，当前制品证据尚未证明该入口会被激活',
                 }
         else:
@@ -5586,7 +5598,7 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
             critical_node = {
                 'type': 'system_code_touched',
                 'entry_scope': entry_scope,
-                'method': method_def.qualified_key,
+                'method': critical_node_method_label(method_def),
                 'file': method_def.file,
                 'line': method_def.line,
                 'framework_edge_kind': first_framework_entry.get('edge_kind'),
@@ -5596,7 +5608,7 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
         critical_node = {
             'type': 'system_code_touched',
             'entry_scope': 'business',
-            'method': method_def.qualified_key,
+            'method': critical_node_method_label(method_def),
             'file': method_def.file,
             'line': method_def.line
         }
@@ -5615,7 +5627,7 @@ def get_cached_critical_node(method_def, graph, type_metadata, trace_cache=None)
     elif is_framework_boundary(method_def, type_metadata):
         critical_node = {
             'type': 'framework_boundary',
-            'method': method_def.qualified_key,
+            'method': critical_node_method_label(method_def),
             'reason': '动态代理或框架注入'
         }
     cache[symbol_id] = critical_node
@@ -6600,7 +6612,7 @@ def filter_method_lookup_groups_for_overload_safety(method_def, matched_groups, 
         return safe_groups, None
 
     overload_block = {
-        'method': method_def.qualified_key,
+        'method': critical_node_method_label(method_def),
         'expected_signatures': sorted(allowed_signatures),
         'overload_signatures': combined_overload_signatures,
     }
