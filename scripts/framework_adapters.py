@@ -591,6 +591,7 @@ def run_spring_adapter(source_roots):
             bean_classes = {}
             bean_factory_methods = {}
             xml_active_entries = []
+            xml_property_edges = []
             for element in root_element.iter():
                 tag = _xml_local_name(element.tag)
                 if tag != 'bean':
@@ -646,6 +647,45 @@ def run_spring_adapter(source_roots):
                             'subject': bean_id,
                             'file': str(path),
                         })
+            # Resolve ordinary `<property ref="...">` injection only after
+            # collecting every bean class, so forward references are handled
+            # as reliably as backward references.  This is a component
+            # association, not an executable method call, therefore it is kept
+            # as separate framework evidence.
+            for element in root_element.iter():
+                if _xml_local_name(element.tag) != 'bean':
+                    continue
+                source_id = _xml_attr(element, 'id', 'name')
+                source_class = bean_classes.get(source_id, '')
+                if not source_class:
+                    continue
+                for child in list(element):
+                    if _xml_local_name(child.tag) != 'property':
+                        continue
+                    target_id = _xml_attr(child, 'ref', 'bean')
+                    if not target_id:
+                        for nested in list(child):
+                            if _xml_local_name(nested.tag) == 'ref':
+                                target_id = _xml_attr(nested, 'bean', 'local')
+                                if target_id:
+                                    break
+                    target_class = bean_classes.get(target_id, '')
+                    if target_class:
+                        xml_property_edges.append({
+                            'source': source_class,
+                            'target': target_class,
+                            'property': _xml_attr(child, 'name'),
+                            'bean_id': source_id,
+                            'target_bean_id': target_id,
+                        })
+                    elif target_id:
+                        findings.append({
+                            'reason_code': 'spring_xml_property_ref_unresolved',
+                            'subject': source_id,
+                            'property': _xml_attr(child, 'name'),
+                            'target_bean_id': target_id,
+                            'file': str(path),
+                        })
             for element in root_element.iter():
                 tag = _xml_local_name(element.tag)
                 if tag != 'scheduled':
@@ -670,7 +710,7 @@ def run_spring_adapter(source_roots):
                         'method': method,
                         'file': str(path),
                     })
-            if xml_active_entries:
+            if xml_active_entries or xml_property_edges:
                 xml_files += 1
                 applicable = True
             for item in xml_active_entries:
@@ -689,11 +729,27 @@ def run_spring_adapter(source_roots):
                         'bean_id': item.get('bean_id', ''),
                     },
                 })
+            for item in xml_property_edges:
+                nodes.extend([
+                    {'id': item['source'], 'kind': 'spring_xml_bean'},
+                    {'id': item['target'], 'kind': 'spring_xml_bean'},
+                ])
+                edges.append({
+                    'source': item['source'], 'target': item['target'],
+                    'edge_kind': 'spring_xml_property_injection', 'confidence': 'high',
+                    'conditions': [], 'ambiguity': False,
+                    'provenance': {
+                        'file': str(path),
+                        'bean_id': item['bean_id'],
+                        'target_bean_id': item['target_bean_id'],
+                        'property': item['property'],
+                    },
+                })
     unresolved = any(
         finding.get('reason_code') in {
             'spring_conditions_require_runtime_evaluation', 'AMBIGUOUS_FRAMEWORK_DISPATCH',
             'spring_bean_method_unresolved', 'spring_xml_scheduled_task_unresolved',
-            'spring_xml_quartz_job_unresolved',
+            'spring_xml_quartz_job_unresolved', 'spring_xml_property_ref_unresolved',
         }
         for finding in findings
     )

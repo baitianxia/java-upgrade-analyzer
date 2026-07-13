@@ -14,6 +14,30 @@ from framework_adapters import run_framework_adapters, attach_framework_edges_to
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
+    def test_spring_xml_property_ref_emits_component_injection_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java"
+            resources = module / "src/main/resources"
+            java.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            (resources / "beans.xml").write_text(
+                "<beans><bean id=\"service\" class=\"com.acme.Service\">"
+                "<property name=\"client\" ref=\"client\"/></bean>"
+                "<bean id=\"client\" class=\"com.acme.Client\"/></beans>",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{"root": str(java)}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertTrue(any(
+            edge["edge_kind"] == "spring_xml_property_injection"
+            and edge["source"] == "com.acme.Service"
+            and edge["target"] == "com.acme.Client"
+            for edge in spring["edges"]
+        ))
+
     def test_spring_message_listener_annotations_emit_runtime_active_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "src/main/java/com/acme"
