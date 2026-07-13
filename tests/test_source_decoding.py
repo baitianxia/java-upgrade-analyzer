@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,6 +19,23 @@ class SourceDecodingTest(unittest.TestCase):
         self.assertIn("中文服务", text)
         self.assertIn("调用", text)
         self.assertNotIn("\ufffd", text)
+
+    def test_oversized_java_file_is_marked_incomplete_instead_of_parsed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "Huge.java"
+            source.write_text("class Huge {}\n" * 3, encoding="utf-8")
+            previous = analyzer.MAX_TREE_SITTER_SOURCE_LINES
+            analyzer.MAX_TREE_SITTER_SOURCE_LINES = 2
+            try:
+                methods, info = analyzer.analyze_file(
+                    str(source), str(source.parent), return_diagnostics=True
+                )
+            finally:
+                analyzer.MAX_TREE_SITTER_SOURCE_LINES = previous
+
+        self.assertEqual(methods, [])
+        self.assertEqual(info["actual_parser"], "skipped")
+        self.assertEqual(info["fallback_reason"], "source_file_line_limit_exceeded")
 
 
 if __name__ == "__main__":

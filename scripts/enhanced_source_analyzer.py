@@ -251,6 +251,14 @@ except ImportError:
 
 TREE_SITTER_AUTO_INSTALL_ATTEMPTED = False
 TREE_SITTER_AUTO_INSTALL_ERROR = ""
+MAX_TREE_SITTER_SOURCE_LINES = max(
+    1,
+    int(os.environ.get("JUA_MAX_TREE_SITTER_SOURCE_LINES", "50000") or "50000"),
+)
+MAX_TREE_SITTER_SOURCE_BYTES = max(
+    1,
+    int(os.environ.get("JUA_MAX_TREE_SITTER_SOURCE_BYTES", str(32 * 1024 * 1024)) or str(32 * 1024 * 1024)),
+)
 
 
 def _tree_sitter_auto_install_enabled():
@@ -298,6 +306,25 @@ def decode_java_source_bytes(source_code):
         except UnicodeDecodeError:
             continue
     return data.decode('utf-8', errors='replace')
+
+
+def tree_sitter_source_limit_reason(file_path):
+    """Return a stable incomplete-analysis reason without loading a huge file."""
+    try:
+        if os.path.getsize(file_path) > MAX_TREE_SITTER_SOURCE_BYTES:
+            return 'source_file_byte_limit_exceeded'
+        line_count = 0
+        with open(file_path, 'rb') as handle:
+            while True:
+                block = handle.read(1024 * 1024)
+                if not block:
+                    break
+                line_count += block.count(b'\n')
+                if line_count > MAX_TREE_SITTER_SOURCE_LINES:
+                    return 'source_file_line_limit_exceeded'
+    except OSError:
+        return 'source_file_unreadable'
+    return ''
 
 
 def _ensure_tree_sitter_available():
@@ -1882,6 +1909,14 @@ def analyze_file(file_path, source_root, prefer_tree_sitter=True, return_diagnos
     }
 
     methods = []
+    if prefer_tree_sitter and not is_kotlin:
+        limit_reason = tree_sitter_source_limit_reason(file_path)
+        if limit_reason:
+            parser_info['actual_parser'] = 'skipped'
+            parser_info['fallback_reason'] = limit_reason
+            if return_diagnostics:
+                return methods, parser_info
+            return methods
     if prefer_tree_sitter and not is_kotlin and not TREE_SITTER_AVAILABLE:
         _ensure_tree_sitter_available()
         parser_info['tree_sitter_available'] = TREE_SITTER_AVAILABLE
