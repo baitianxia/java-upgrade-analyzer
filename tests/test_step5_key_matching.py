@@ -286,6 +286,37 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("com.acme.Child.changed()", graph.reverse_edges)
         self.assertNotIn("com.acme.Parent.changed()", graph.reverse_edges)
 
+    def test_low_confidence_direct_business_edge_is_not_silently_not_found(self):
+        method = SimpleNamespace(
+            symbol_id="business", qualified_key="com.acme.Use.run", owner_type="business",
+            owner_coord="BUSINESS", is_test=False, file="Use.java", line=1,
+            annotations=[], class_annotations=[], class_name="Use", class_fqcn="com.acme.Use",
+            modifiers=["public"], is_interface=False,
+        )
+        edge = SimpleNamespace(
+            caller_symbol_id="business", caller_qualified_key=method.qualified_key,
+            callee_key="com.vendor.Target.changed()", callee_simple_key="method:changed()",
+            confidence="low", evidence_type="unresolved_dynamic_receiver", file="Use.java", line=2,
+            owner_type="business", owner_coord="BUSINESS", module="app", is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business": method},
+            reverse_edges={"com.vendor.Target.changed()": [edge]},
+            runtime_dependency_catalog={},
+        )
+        result = tracer.trace_api_with_confidence_weighting(
+            {
+                "coord": "com.vendor:target", "api_name": "com.vendor.Target.changed",
+                "api_simple": "changed", "api_signature": "()", "symbol_kind": "method",
+                "change_type": "REMOVED", "severity": "P0", "confirmed": "true",
+            },
+            graph,
+            {},
+            max_total_cost=5,
+        )
+
+        self.assertNotEqual("not_found_in_static_analysis", result.analysis_status)
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
