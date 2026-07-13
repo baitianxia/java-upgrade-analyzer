@@ -2141,6 +2141,13 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
                 if receiver_expr == 'super':
                     receiver_type = _resolve_super_type(method_def)
                     confidence = 'high' if receiver_type else 'medium'
+                elif receiver_expr.endswith('.this'):
+                    # An inner class may explicitly select its enclosing
+                    # instance (`Outer.this.call()`).  It is neither a local
+                    # variable nor the current inner-class receiver.
+                    outer_type = receiver_expr[:-len('.this')].strip()
+                    receiver_type = resolve_type_fqn(outer_type, method_def)
+                    confidence = 'high' if receiver_type else 'medium'
                 elif _looks_like_static_receiver_expr(receiver_expr, method_def, site_local_var_types):
                     receiver_type = resolve_type_fqn(receiver_expr, method_def)
                     confidence = 'high'
