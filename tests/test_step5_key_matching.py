@@ -8644,6 +8644,23 @@ public class com.example.TargetBridge {
         self.assertEqual(-1, row["depth"])
         self.assertEqual(0, row["path_occurrence_count"])
         self.assertEqual("", row["path_id"])
+        self.assertEqual("unknown", row["business_reachable"])
+
+    def test_not_analyzed_alert_retains_known_consumer_coordinate(self):
+        result = tracer.TraceResult(
+            coord="target:api", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+            reachable_note="缺少业务入口", business_reach_depth=0,
+            dependency_chain_coords=["consumer:bridge:1.0"], call_paths=[], evidence_paths=[],
+            reason_code="RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", verification_commands=[], hops=[],
+            confidence_score=0.0, critical_nodes_hit=[],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("consumer:bridge:1.0", row["consumer_coord"])
 
     def test_summary_json_groups_not_analyzed_reasons_separately(self):
         with tempfile.TemporaryDirectory() as tmp:
