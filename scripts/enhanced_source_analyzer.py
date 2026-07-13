@@ -1564,6 +1564,33 @@ class TreeSitterAnalyzer:
         }
 
         def collect(node, scoped_local_types, scoped_declared_types):
+            # Pattern variables are scoped to a switch rule (for example
+            # `case Target target -> target.changed()`).  They are not local
+            # variable declarations, so without this branch calls made through
+            # them degrade to a simple-name edge and may be lost or misbound.
+            if node.type == 'switch_rule':
+                pattern_types = {}
+                for descendant in self._walk_ast(node):
+                    if descendant.type != 'type_pattern':
+                        continue
+                    identifier_nodes = [
+                        child for child in descendant.children
+                        if child.type in {'identifier', 'type_identifier', 'scoped_type_identifier', 'generic_type'}
+                    ]
+                    if len(identifier_nodes) < 2:
+                        continue
+                    type_node, name_node = identifier_nodes[0], identifier_nodes[-1]
+                    var_name = self._node_text(name_node, source_code).strip()
+                    raw_type = self._node_text(type_node, source_code).strip()
+                    resolved_type = self.helper._resolve_type(raw_type)
+                    if var_name and resolved_type:
+                        pattern_types[var_name] = resolved_type
+                if pattern_types:
+                    scoped_local_types = dict(scoped_local_types)
+                    scoped_local_types.update(pattern_types)
+                    scoped_declared_types = dict(scoped_declared_types)
+                    scoped_declared_types.update(pattern_types)
+
             if node.type == 'lambda_expression':
                 lambda_local_types, lambda_declared_types = self._infer_lambda_parameter_types(
                     node,
