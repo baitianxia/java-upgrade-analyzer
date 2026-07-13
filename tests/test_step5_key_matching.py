@@ -121,6 +121,26 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertIn("com.acme.Target.changed()", graph_result["graph"].reverse_edges)
 
+    def test_source_graph_keeps_explicit_array_argument_for_varargs_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Target.java").write_text(
+                "package com.acme;\nclass Target { static void changed(Object... values) {} }\n",
+                encoding="utf-8",
+            )
+            (source_root / "Use.java").write_text(
+                "package com.acme;\nclass Use { void run() { Target.changed(new Object[] { \"value\" }); } }\n",
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        self.assertIn("com.acme.Target.changed(Object[])", graph_result["graph"].reverse_edges)
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"

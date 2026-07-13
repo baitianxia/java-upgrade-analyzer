@@ -3066,6 +3066,22 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         resolved = resolve_type_fqn(cast_type, method_def)
         return resolved.rsplit('.', 1)[-1] if resolved else cast_type.rsplit('.', 1)[-1]
 
+    # An explicit array passed to a varargs method is one argument whose type
+    # is `T[]`; it must not be treated as an unknown expression (or as the
+    # individual varargs elements).  Keep every array dimension so overloaded
+    # varargs signatures remain distinguishable.
+    array_creation_match = re.match(
+        r'^new\s+(?P<type>[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\s*<[^{}()]*>)?)'
+        r'(?P<dimensions>(?:\s*\[[^\]]*\])+)',
+        expr,
+    )
+    if array_creation_match:
+        raw_type = re.sub(r'\s*<.*>\s*$', '', array_creation_match.group('type')).strip()
+        dimensions = re.sub(r'\[[^\]]*\]', '[]', array_creation_match.group('dimensions'))
+        resolved = resolve_type_fqn(raw_type, method_def)
+        simple_type = resolved.rsplit('.', 1)[-1] if resolved else raw_type.rsplit('.', 1)[-1]
+        return f"{simple_type}{dimensions}"
+
     # String literal
     if expr.startswith('"') and expr.endswith('"'):
         return 'String'
