@@ -162,6 +162,30 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertIn("com.acme.RemoteApi.changed(String)", graph_result["graph"].reverse_edges)
 
+    def test_source_graph_resolves_spring_data_derived_repository_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "UserRepository.java").write_text(
+                "package com.acme;\ninterface UserRepository { Object findByUsernameAndEmail(String user, String email); }\n",
+                encoding="utf-8",
+            )
+            (source_root / "UserService.java").write_text(
+                "package com.acme;\nclass UserService { UserRepository repository; "
+                "Object load(String user, String email) { return repository.findByUsernameAndEmail(user, email); } }\n",
+                encoding="utf-8",
+            )
+
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": str(source_root.parent.parent.parent),
+                "owner_type": "business", "owner_coord": "BUSINESS", "module": "app",
+            }])
+
+        self.assertIn(
+            "com.acme.UserRepository.findByUsernameAndEmail(String, String)",
+            graph_result["graph"].reverse_edges,
+        )
+
     def test_source_graph_keeps_explicit_this_and_super_constructor_delegation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "src/main/java/com/acme"
