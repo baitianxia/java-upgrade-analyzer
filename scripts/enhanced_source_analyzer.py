@@ -1443,7 +1443,13 @@ class TreeSitterAnalyzer:
         classes = []
         current = node.parent
         while current:
-            if current.type in ('class_declaration', 'interface_declaration', 'enum_declaration'):
+            if current.type in (
+                'class_declaration',
+                'interface_declaration',
+                'enum_declaration',
+                'annotation_type_declaration',
+                'record_declaration',
+            ):
                 classes.append(current)
             current = current.parent
         return list(reversed(classes))  # 恢复从外到内的顺序
@@ -1470,7 +1476,7 @@ class TreeSitterAnalyzer:
         class_annotations = self._collect_node_annotations(innermost, source_code)
         if not class_annotations and lines:
             class_annotations = self.helper._extract_leading_annotations(lines, innermost.start_point.row)
-        is_interface = innermost.type == 'interface_declaration'
+        is_interface = innermost.type in ('interface_declaration', 'annotation_type_declaration')
 
         class_name = parts[-1]
         fqcn = '.'.join([package_name] + parts) if package_name else '.'.join(parts)
