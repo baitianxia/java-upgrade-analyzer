@@ -8802,6 +8802,24 @@ public class com.example.TargetBridge {
         self.assertIn("运行时依赖 JAR", focus)
         self.assertIn("Step5", focus)
 
+    def test_alert_chain_keeps_maven_coordinate_out_of_java_symbol(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="reachable", direct_callers=1, is_reachable=True,
+            reachable_note="已命中", business_reach_depth=2,
+            dependency_chain_coords=[],
+            call_paths=["com.vendor:consumer:1.0:com.vendor.Bridge.call() -> com.acme.Api.gone()"],
+            evidence_paths=[], reason_code="SYSTEM_CODE_REACHABLE", verification_commands=[], hops=[],
+            confidence_score=1.0, critical_nodes_hit=[],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("com.vendor.Bridge.call()", row["chain_entry"])
+        self.assertNotIn("com.vendor:consumer:1.0:com.vendor.Bridge", row["chain_detail"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

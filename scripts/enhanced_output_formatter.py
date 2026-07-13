@@ -1692,15 +1692,30 @@ def _split_chain_nodes(path_text):
     if not text:
         return []
     normalized = text.replace('→', '->')
-    parts = [part.strip() for part in normalized.split('->') if part.strip()]
+    parts = [_strip_maven_coordinate_prefix(part.strip()) for part in normalized.split('->') if part.strip()]
     return parts if len(parts) >= 2 else ([text] if text else [])
+
+
+def _strip_maven_coordinate_prefix(symbol):
+    """Remove transport-only ``group:artifact:version:`` prefixes from a node.
+
+    The coordinate is exposed separately in ``consumer_coord``.  Leaving it
+    in a Java symbol makes the value impossible to paste into an IDE or use as
+    a fully-qualified class/method name.
+    """
+    value = str(symbol or '').strip()
+    return re.sub(
+        r'^(?:[A-Za-z0-9_.-]+:){2,4}(?=[A-Za-z_$][A-Za-z0-9_$.]*(?:\.|\(|$))',
+        '',
+        value,
+    )
 
 
 def _nodes_from_evidence(evidence):
     nodes = []
     for edge in evidence or []:
-        caller = humanize_user_text(edge.get('caller_symbol'))
-        callee = humanize_user_text(edge.get('callee_key'))
+        caller = _strip_maven_coordinate_prefix(humanize_user_text(edge.get('caller_symbol')))
+        callee = _strip_maven_coordinate_prefix(humanize_user_text(edge.get('callee_key')))
         if caller and (not nodes or nodes[-1] != caller):
             nodes.append(caller)
         if callee and (not nodes or nodes[-1] != callee):
