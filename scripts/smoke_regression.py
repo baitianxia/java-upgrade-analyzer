@@ -2122,8 +2122,8 @@ public interface com.example.service.DemoService extends java.lang.Object {
         if source_analyzer_module.TREE_SITTER_AVAILABLE:
             assert_true(parser_info.get("actual_parser") == "tree_sitter", "tree-sitter 可用时 Java 文件应优先走 AST 主链路")
         else:
-            assert_true(parser_info.get("actual_parser") == "regex", "tree-sitter 不可用时应自动降级到增强正则")
-            assert_true(parser_info.get("fallback_reason") == "tree_sitter_unavailable", "tree-sitter 缺失时应记录明确降级原因")
+            assert_true(parser_info.get("actual_parser") == "skipped", "tree-sitter 不可用时不得用正则生成 Java 分析结论")
+            assert_true(parser_info.get("fallback_reason") == "tree_sitter_unavailable", "tree-sitter 缺失时应记录明确未分析原因")
 
         with mock.patch.object(source_analyzer_module, "TREE_SITTER_AVAILABLE", False), mock.patch.object(
             source_analyzer_module,
@@ -2136,7 +2136,7 @@ public interface com.example.service.DemoService extends java.lang.Object {
                 prefer_tree_sitter=True,
                 return_diagnostics=True,
             )
-        assert_true(forced_regex_info.get("actual_parser") == "regex", "强制关闭 tree-sitter 后应降级到增强正则")
+        assert_true(forced_regex_info.get("actual_parser") == "skipped", "强制关闭 tree-sitter 后不得用正则生成 Java 分析结论")
         assert_true(forced_regex_info.get("fallback_reason") == "tree_sitter_unavailable", "强制关闭 tree-sitter 时应记录 unavailable")
         if source_analyzer_module.TREE_SITTER_AVAILABLE:
             with mock.patch.object(source_analyzer_module.TreeSitterAnalyzer, "analyze", side_effect=RuntimeError("boom")):
@@ -2146,7 +2146,7 @@ public interface com.example.service.DemoService extends java.lang.Object {
                     prefer_tree_sitter=True,
                     return_diagnostics=True,
                 )
-            assert_true(forced_fallback_info.get("actual_parser") == "regex", "tree-sitter 运行异常时应回退到增强正则")
+            assert_true(forced_fallback_info.get("actual_parser") == "skipped", "tree-sitter 运行异常时不得用正则生成 Java 分析结论")
             assert_true(
                 forced_fallback_info.get("fallback_reason", "").startswith("tree_sitter_runtime_error"),
                 "tree-sitter 运行异常时应记录 runtime_error 原因",

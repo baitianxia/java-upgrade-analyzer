@@ -227,7 +227,7 @@ class IndirectUsageAnalyzerTest(unittest.TestCase):
         self.assertEqual(result.reason_code, "RESOURCE_TARGET_REFERENCE")
         alert = formatter._alert_rows_for_result(result)[0]
         self.assertEqual(alert["coverage_status"], "complete")
-        self.assertIn("resource_reference", alert["coverage_details"])
+        self.assertIn("资源引用", alert["coverage_details"])
 
     def test_partial_target_specific_coverage_blocks_static_not_found(self):
         method = business_method('''
