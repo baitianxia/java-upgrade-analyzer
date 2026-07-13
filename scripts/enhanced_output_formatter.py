@@ -1277,6 +1277,29 @@ def _write_alert_rows_csv(path, rows):
         writer.writerows(rows)
 
 
+def _compact_coverage_details(capability_coverage):
+    """Return a spreadsheet-friendly coverage summary for alerts.csv.
+
+    The complete structured coverage remains in summary.json and by_api JSON;
+    putting nested JSON in a human review CSV makes ordinary spreadsheet tools
+    needlessly hard to use.
+    """
+    labels = {
+        'reflection_source': '反射源码',
+        'reflection_bytecode': '反射字节码',
+        'method_handle_source': '方法句柄源码',
+        'expression_language': '表达式语言',
+        'resource_reference': '资源引用',
+    }
+    analyzers = dict((capability_coverage or {}).get('analyzers') or {})
+    items = [
+        f"{labels.get(name, name)}：{status}"
+        for name, status in sorted(analyzers.items())
+        if str(status or '').strip() and str(status).strip() != 'not_applicable'
+    ]
+    return '；'.join(items)
+
+
 def _alert_rows_for_result(result):
     identity = '|'.join([
         result.coord or '', result.api_name or '',
@@ -1391,14 +1414,7 @@ def _alert_rows_for_result(result):
             'depth': int(detail.get('depth') or 0) if has_chain else -1,
             'path_occurrence_count': int(detail.get('_path_occurrence_count') or 1) if has_chain else 0,
             'coverage_status': capability_coverage.get('status') or '',
-            'coverage_details': json.dumps(
-                {
-                    'analyzers': capability_coverage.get('analyzers') or {},
-                    'matrix': capability_coverage.get('matrix') or {},
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
+            'coverage_details': _compact_coverage_details(capability_coverage),
             'evidence_types': '|'.join(sorted({str(item.get('evidence_type') or '') for item in evidence if item.get('evidence_type')})),
             'evidence_files': '|'.join(sorted({str(item.get('file') or '') for item in evidence if item.get('file')})),
             'detail_file': detail_file,

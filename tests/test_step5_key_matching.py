@@ -8679,6 +8679,23 @@ public class com.example.TargetBridge {
         )
         self.assertIsNone(entry["match_tier"])
 
+    def test_alert_coverage_details_are_compact_human_readable_text(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+            reachable_note="缺少输入", business_reach_depth=0,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[], reason_code="INPUT_MISSING",
+            verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[],
+            capability_coverage={
+                "status": "partial",
+                "analyzers": {"reflection_source": "partial", "resource_reference": "not_applicable"},
+            },
+        )
+        row = formatter._alert_rows_for_result(result)[0]
+        self.assertEqual("反射源码：partial", row["coverage_details"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
