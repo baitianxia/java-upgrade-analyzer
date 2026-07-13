@@ -576,6 +576,10 @@ REASON_CODE_EXPLANATIONS = {
         'reason': '当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号',
         'action': '优先检查命中的消费依赖及其业务入口，并执行覆盖该路径的启动/集成测试；存在 NoClassDefFoundError/NoSuchMethodError 风险'
     },
+    'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE': {
+        'reason': '缺少当前最终制品的运行时依赖 JAR，无法完成从依赖调用到业务入口的回溯',
+        'action': '补齐本次部署制品的运行时依赖 JAR 后重跑 Step5；未完成分析不能视为未受影响'
+    },
     'RUNTIME_SYMBOL_PRESERVED_IDENTICALLY': {
         'reason': '依赖坐标虽被删除，但当前最终制品中的另一个运行时 JAR 仍提供完全相同的 class 字节码；该 API 没有从运行时类路径消失',
         'action': ''
@@ -645,7 +649,7 @@ def _get_trace_attr(obj, name, default=None):
     return getattr(obj, name, default)
 
 
-def build_key_evidence(call_paths=None, evidence_paths=None):
+def build_key_evidence(call_paths=None, evidence_paths=None, dependency_chain_coords=None):
     call_paths = list(call_paths or [])
     if call_paths:
         return humanize_user_text(call_paths[0])
@@ -655,6 +659,9 @@ def build_key_evidence(call_paths=None, evidence_paths=None):
         caller = edge.get('caller_symbol', '?')
         callee = edge.get('callee_key', '?')
         return f"{humanize_user_text(caller)} -> {humanize_user_text(callee)}"
+    coords = [str(coord).strip() for coord in (dependency_chain_coords or []) if str(coord).strip()]
+    if coords:
+        return f"待补齐或核对的依赖：{', '.join(coords[:3])}"
     return ""
 
 
@@ -713,7 +720,11 @@ def summarize_user_facing_outcome(trace_like):
         'decision_bucket': decision_bucket,
         'user_reason': user_reason,
         'recommended_action': recommended_action,
-        'key_evidence': build_key_evidence(call_paths=call_paths, evidence_paths=evidence_paths),
+        'key_evidence': build_key_evidence(
+            call_paths=call_paths,
+            evidence_paths=evidence_paths,
+            dependency_chain_coords=_get_trace_attr(trace_like, 'dependency_chain_coords', []) or [],
+        ),
     }
 
 
@@ -1368,7 +1379,7 @@ def _alert_rows_for_result(result):
         capability_coverage = dict(getattr(result, 'capability_coverage', {}) or {})
         path_text = humanize_user_text(detail.get('path_text') or '')
         business_entry = humanize_user_text(detail.get('business_entry') or '')
-        changed_symbol = result.api_name or ''
+        changed_symbol = _api_display_name(result)
         chain_view = _alert_chain_view(path_text, business_entry, changed_symbol, evidence)
         if not has_chain:
             chain_view = {

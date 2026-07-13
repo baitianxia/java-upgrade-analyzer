@@ -8711,6 +8711,39 @@ public class com.example.TargetBridge {
         )
         self.assertEqual(["补充 jar", "重新运行"], entry["verification_commands"])
 
+    def test_not_analyzed_reason_is_human_readable_and_names_missing_dependency(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+            reachable_note="运行时依赖 jar 缺失", business_reach_depth=0,
+            dependency_chain_coords=["com.vendor:consumer-lib:1.2.3"], call_paths=[], evidence_paths=[],
+            reason_code="RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", verification_commands=[], hops=[],
+            confidence_score=0.0, critical_nodes_hit=[],
+        )
+
+        entry = formatter.trace_result_to_api_entry(result)
+
+        self.assertNotEqual("RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", entry["user_reason"])
+        self.assertIn("运行时依赖 JAR", entry["user_reason"])
+        self.assertIn("com.vendor:consumer-lib:1.2.3", entry["key_evidence"])
+
+    def test_alert_identifies_a_method_with_its_signature(self):
+        result = tracer.TraceResult(
+            coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+            api_signature="(java.lang.String, boolean)", symbol_kind="method", change_type="REMOVED", severity="P0",
+            confirmed=True, source="japicmp", analysis_scope="method",
+            analysis_status="not_found_in_static_analysis", direct_callers=0, is_reachable=False,
+            reachable_note="未找到", business_reach_depth=0,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[], reason_code="NO_STATIC_PATH",
+            verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[],
+        )
+
+        row = formatter._alert_rows_for_result(result)[0]
+
+        self.assertEqual("com.acme.Api.gone(java.lang.String, boolean)", row["changed_symbol"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
