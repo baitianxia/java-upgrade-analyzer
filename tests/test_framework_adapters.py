@@ -288,6 +288,40 @@ class FrameworkAdaptersTest(unittest.TestCase):
             for edge in spring["edges"]
         ))
 
+    def test_jpa_lifecycle_method_emits_conditional_framework_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "AuditEntity.java").write_text(
+                "package com.acme; import jakarta.persistence.Entity; "
+                "import jakarta.persistence.PrePersist; @Entity class AuditEntity { "
+                "@PrePersist public void beforeInsert() {} }",
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        lifecycle = next(
+            edge for edge in spring["edges"]
+            if edge["target"] == "com.acme.AuditEntity.beforeInsert"
+        )
+        self.assertEqual(lifecycle["edge_kind"], "jpa_lifecycle_callback")
+        self.assertEqual(lifecycle["runtime_activation"], "conditional")
+
+    def test_async_annotation_alone_does_not_fabricate_runtime_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "AsyncWorker.java").write_text(
+                "package com.acme; import org.springframework.scheduling.annotation.Async; "
+                "class AsyncWorker { @Async public void work() {} }",
+                encoding="utf-8",
+            )
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        spring = next(item for item in payload["adapters"] if item["adapter"] == "spring_basic")
+        self.assertFalse(any(edge.get("target") == "com.acme.AsyncWorker.work" for edge in spring["edges"]))
+
     def test_spring_post_construct_method_emits_runtime_active_entry_without_spring_import(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "src/main/java/com/acme"

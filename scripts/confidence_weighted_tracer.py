@@ -5559,6 +5559,11 @@ def critical_node_entry_kind(method_def, framework_edge_kind=''):
         return 'spring_event_listener'
     if names & {'KafkaListener', 'RabbitListener', 'JmsListener', 'RocketMQMessageListener'}:
         return 'spring_message_listener'
+    if names & {
+        'PrePersist', 'PostPersist', 'PreUpdate', 'PostUpdate',
+        'PreRemove', 'PostRemove', 'PostLoad',
+    }:
+        return 'jpa_lifecycle_callback'
     edge_kind = str(framework_edge_kind or '').strip()
     if edge_kind == 'spring_event_listener':
         return 'spring_event_listener'

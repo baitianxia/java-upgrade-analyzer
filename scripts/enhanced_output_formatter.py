@@ -1540,6 +1540,7 @@ def _alert_entry_kind(detail):
         'spring_message_listener': 'Spring 消息监听入口',
         'spring_scheduled_entry': 'Spring 定时任务入口',
         'spring_event_listener': 'Spring 事件监听入口',
+        'jpa_lifecycle_callback': 'JPA 实体生命周期回调',
         'dubbo_service_entry': 'Dubbo 服务入口',
         'runtime_dependency_entry': '运行时依赖入口',
         'business_method': '业务方法',

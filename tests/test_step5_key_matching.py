@@ -2783,6 +2783,21 @@ public class com.example.TargetBridge {
         self.assertTrue(dominated)
         self.assertEqual(updated, [(2, 0.8)])
 
+    def test_jpa_lifecycle_entry_has_human_readable_kind(self):
+        method_def = SimpleNamespace(
+            annotations=["PrePersist"],
+            class_annotations=["Entity"],
+            owner_type="business",
+        )
+
+        kind = tracer.critical_node_entry_kind(method_def)
+
+        self.assertEqual(kind, "jpa_lifecycle_callback")
+        self.assertEqual(
+            formatter._alert_entry_kind({"entry_kind": kind, "business_reachable": True}),
+            "JPA 实体生命周期回调",
+        )
+
     def test_is_system_code_touched_allows_business_service_impl(self):
         method_def = SimpleNamespace(
             owner_type="business",

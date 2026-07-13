@@ -361,6 +361,12 @@ def run_spring_adapter(source_roots):
         r'[\s\S]{0,500}?'
         r'\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{'
     )
+    jpa_lifecycle_pattern = re.compile(
+        r'@(?:[\w.]+\.)?(PrePersist|PostPersist|PreUpdate|PostUpdate|PreRemove|PostRemove|PostLoad)'
+        r'(?:\([^)]*\))?'
+        r'[\s\S]{0,500}?'
+        r'\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{'
+    )
     bean_pattern = re.compile(r'@(Component|Service|Repository|Controller|Configuration|Bean)\b')
     bean_method_pattern = re.compile(
         r'@Bean(?:\s*\([^)]*\))?\s*'
@@ -397,6 +403,9 @@ def run_spring_adapter(source_roots):
                 or '@EventListener' in text
                 or '@Scheduled' in text
                 or '@PostConstruct' in text
+                or 'jakarta.persistence' in text
+                or 'javax.persistence' in text
+                or re.search(r'@(PrePersist|PostPersist|PreUpdate|PostUpdate|PreRemove|PostRemove|PostLoad)\b', text)
                 or bean_pattern.search(text)
             ):
                 continue
@@ -502,6 +511,7 @@ def run_spring_adapter(source_roots):
                 })
             listener_targets = []
             active_targets = []
+            jpa_lifecycle_targets = []
             if ast_authoritative:
                 for method in ast_methods:
                     annotations = {str(item).rsplit('.', 1)[-1] for item in method.annotations or []}
@@ -512,6 +522,12 @@ def run_spring_adapter(source_roots):
                     for annotation in ('Scheduled', 'PostConstruct', 'KafkaListener', 'RabbitListener', 'JmsListener'):
                         if method_name and annotation in annotations:
                             active_targets.append((f'{method_owner}.{method_name}', annotation))
+                    for annotation in (
+                        'PrePersist', 'PostPersist', 'PreUpdate', 'PostUpdate',
+                        'PreRemove', 'PostRemove', 'PostLoad',
+                    ):
+                        if method_name and annotation in annotations:
+                            jpa_lifecycle_targets.append((f'{method_owner}.{method_name}', annotation))
             else:
                 listener_targets.extend(
                     (f'{owner}.{match.group(1)}', '@EventListener')
@@ -520,6 +536,10 @@ def run_spring_adapter(source_roots):
                 active_targets.extend(
                     (f'{owner}.{match.group(2)}', match.group(1))
                     for match in active_method_pattern.finditer(text)
+                )
+                jpa_lifecycle_targets.extend(
+                    (f'{owner}.{match.group(2)}', match.group(1))
+                    for match in jpa_lifecycle_pattern.finditer(text)
                 )
             for target, annotation in listener_targets:
                 nodes.append({'id': target, 'kind': 'spring_event_listener'})
@@ -540,6 +560,24 @@ def run_spring_adapter(source_roots):
                     'edge_kind': 'spring_runtime_active_entry',
                     'confidence': 'high',
                     'conditions': conditions,
+                    'ambiguity': False,
+                    'provenance': {
+                        'file': str(path), 'annotation': f'@{annotation}',
+                        'parser': 'tree_sitter' if ast_authoritative else 'masked_text_fallback',
+                    },
+                })
+            for target, annotation in jpa_lifecycle_targets:
+                nodes.append({'id': target, 'kind': 'jpa_lifecycle_callback'})
+                edges.append({
+                    'source': f'framework:jpa-lifecycle:{annotation}',
+                    'target': target,
+                    'edge_kind': 'jpa_lifecycle_callback',
+                    'confidence': 'high',
+                    # The annotation proves callback semantics, but static
+                    # analysis alone cannot prove that this entity lifecycle is
+                    # exercised in the current runtime profile.
+                    'runtime_activation': 'conditional',
+                    'conditions': [{'annotation': annotation, 'requires': 'entity_lifecycle'}],
                     'ambiguity': False,
                     'provenance': {
                         'file': str(path), 'annotation': f'@{annotation}',
