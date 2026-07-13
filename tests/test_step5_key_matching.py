@@ -8881,6 +8881,29 @@ public class com.example.TargetBridge {
         self.assertNotIn("UNRECOGNIZED_INTERNAL_STOP", outcome["user_reason"])
         self.assertIn("静态分析", outcome["user_reason"])
 
+    def test_summary_preserves_graph_truncation_and_parser_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = tracer.TraceResult(
+                coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+                api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+                confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+                reachable_note="图不完整", business_reach_depth=0, dependency_chain_coords=[],
+                call_paths=[], evidence_paths=[], reason_code="ANALYSIS_INCOMPLETE",
+                verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[],
+            )
+            graph_stats = {
+                "truncated": True,
+                "truncation_reasons": ["max_methods"],
+                "parser_usage": {"tree_sitter": 7, "regex": 2},
+                "parser_fallback_reasons": {"unsupported_language_kotlin": 2},
+            }
+            path = formatter.write_summary_json([result], tmp, graph_stats=graph_stats)
+            summary = json.loads(Path(path).read_text(encoding="utf-8"))
+
+        self.assertEqual(["max_methods"], summary["meta"]["graph_stats"]["truncation_reasons"])
+        self.assertEqual(2, summary["meta"]["graph_stats"]["parser_usage"]["regex"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
