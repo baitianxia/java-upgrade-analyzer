@@ -1108,6 +1108,23 @@ def run_declarative_http_client_adapter(source_roots):
         r'(?P<method_name>[A-Za-z_$]\w*)\s*\([^;{}]*\)\s*;',
         re.S,
     )
+
+    def mapping_path(expression):
+        text = str(expression or '').strip()
+        if not text:
+            return ''
+        match = re.search(r'(?:\bvalue|\bpath)\s*=\s*["\']([^"\']+)["\']', text)
+        if not match:
+            match = re.search(r'["\']([^"\']+)["\']', text)
+        return match.group(1).strip() if match else ''
+
+    def combine_mapping_paths(class_path, method_path):
+        if not class_path:
+            return method_path
+        if not method_path:
+            return class_path
+        return '/' + '/'.join((class_path.strip('/'), method_path.strip('/')))
+
     for path in _production_java_files(source_roots):
             scanned += 1
             try:
@@ -1130,6 +1147,9 @@ def run_declarative_http_client_adapter(source_roots):
                 if '@FeignClient' in class_annotations
                 else 'http_exchange'
             )
+            class_mapping_match = re.search(r'@RequestMapping\s*(?:\(([^)]*)\))?', class_annotations)
+            class_mapping_expr = class_mapping_match.group(1) if class_mapping_match else ''
+            class_mapping = mapping_path(class_mapping_expr)
             client_edges = 0
             for match in interface_method_pattern.finditer(text):
                 annotations = match.group('annotations') or ''
@@ -1142,6 +1162,7 @@ def run_declarative_http_client_adapter(source_roots):
                 request_expr = (request_match.group(2) or '').strip() if request_match else ''
                 if request_expr and re.search(r'[@$]\{[^}]+\}', request_expr):
                     dynamic_endpoint = True
+                request_mapping = combine_mapping_paths(class_mapping, mapping_path(request_expr))
                 nodes.append({'id': target, 'kind': 'declarative_http_client_method'})
                 edges.append({
                     'source': target,
@@ -1154,7 +1175,7 @@ def run_declarative_http_client_adapter(source_roots):
                         'file': str(path),
                         'client_kind': client_kind,
                         'request_annotation': request_annotation,
-                        'request_mapping': request_expr,
+                        'request_mapping': request_mapping,
                     },
                 })
                 client_edges += 1

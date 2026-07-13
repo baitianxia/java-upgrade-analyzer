@@ -702,6 +702,26 @@ class FrameworkAdaptersTest(unittest.TestCase):
         attach_framework_edges_to_graph(graph, payload)
         self.assertEqual(graph.framework_entry_symbols, {})
 
+    def test_feign_route_combines_class_and_method_request_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src/main/java/com/acme"
+            root.mkdir(parents=True)
+            (root / "RemoteApi.java").write_text(
+                "package com.acme; "
+                "import org.springframework.cloud.openfeign.FeignClient; "
+                "import org.springframework.web.bind.annotation.RequestMapping; "
+                "import org.springframework.web.bind.annotation.GetMapping; "
+                "@FeignClient(name=\"demo\") @RequestMapping(\"/api\") "
+                "interface RemoteApi { @GetMapping(\"/orders\") String fetch(); }",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters([{"root": str(Path(tmp) / "src/main/java")}])
+
+        adapter = next(item for item in payload["adapters"] if item["adapter"] == "declarative_http_client_basic")
+        edge = next(item for item in adapter["edges"] if item["source"] == "com.acme.RemoteApi.fetch")
+        self.assertEqual(edge["provenance"]["request_mapping"], "/api/orders")
+
 
 if __name__ == '__main__':
     unittest.main()
