@@ -8696,6 +8696,21 @@ public class com.example.TargetBridge {
         row = formatter._alert_rows_for_result(result)[0]
         self.assertEqual("反射源码：partial", row["coverage_details"])
 
+    def test_summary_api_entry_deduplicates_verification_commands(self):
+        entry = formatter.trace_result_to_api_entry(
+            tracer.TraceResult(
+                coord="a:b", api_name="com.acme.Api.gone", api_simple="gone",
+                api_signature="()", symbol_kind="method", change_type="REMOVED", severity="P0",
+                confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
+                reachable_note="缺少输入", business_reach_depth=0,
+                dependency_chain_coords=[], call_paths=[], evidence_paths=[], reason_code="INPUT_MISSING",
+                verification_commands=["补充 jar", "补充 jar", "重新运行"], hops=[],
+                confidence_score=0.0, critical_nodes_hit=[],
+            )
+        )
+        self.assertEqual(["补充 jar", "重新运行"], entry["verification_commands"])
+
     def test_generate_enhanced_summary_writes_per_dependency_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

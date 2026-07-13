@@ -162,6 +162,11 @@ def trace_result_to_api_entry(r):
 
 
     user_view = summarize_user_facing_outcome(r)
+    verification_commands = list(dict.fromkeys(
+        str(command).strip()
+        for command in (r.verification_commands or [])
+        if str(command).strip()
+    ))
     raw_match_tier = getattr(r, 'match_tier', -1)
     try:
         public_match_tier = int(raw_match_tier) if raw_match_tier is not None and int(raw_match_tier) >= 0 else None
@@ -189,8 +194,8 @@ def trace_result_to_api_entry(r):
         'call_paths':          [humanize_user_text(path) for path in (r.call_paths or [])],
         'evidence_paths':      _edges_for_s6(r.evidence_paths),
         'path_details':        _humanize_path_details(getattr(r, 'path_details', []) or []),
-        'verification':        r.verification_commands or [],
-        'verification_commands': r.verification_commands or [],
+        'verification':        verification_commands,
+        'verification_commands': verification_commands,
         'confidence_score':    round(r.confidence_score, 3),
         'match_provenance':    getattr(r, 'match_provenance', '') or '',
         'match_tier':          public_match_tier,
