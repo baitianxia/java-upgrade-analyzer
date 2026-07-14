@@ -834,6 +834,53 @@ CASES["gs-messaging-rabbitmq"] = RealProjectCase(
     ),
 )
 
+CASES["gs-managing-transactions"] = RealProjectCase(
+    name="gs-managing-transactions",
+    default_project=Path("/private/tmp/jua-real-project-gs-managing-transactions/complete"),
+    default_changed_apis=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "gs-managing-transactions-changed-apis.csv"
+    ),
+    baseline_specs=(),
+    source_dirs=(Path("src/main/java"),),
+    require_valid_git=True,
+    min_project_java_files=3,
+    min_main_java_files=3,
+    case_mode="convergence",
+    ground_truth_status="reviewed",
+    oracle_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "gs-managing-transactions-oracle.csv"
+    ),
+    bytecode_coord="org.springframework:spring-tx",
+    final_artifact=Path(
+        "/private/tmp/jua-real-project-gs-managing-transactions/complete/target/"
+        "managing-transactions-complete-0.0.1-SNAPSHOT.jar"
+    ),
+    required_topologies=("framework_proxy",),
+    target_owner_entries={
+        "org.springframework.transaction.interceptor.TransactionInterceptor": (
+            "BOOT-INF/lib/spring-tx-7.0.8.jar!/org/springframework/transaction/"
+            "interceptor/TransactionInterceptor.class",
+        ),
+        "org.springframework.transaction.interceptor.TransactionAspectSupport": (
+            "BOOT-INF/lib/spring-tx-7.0.8.jar!/org/springframework/transaction/"
+            "interceptor/TransactionAspectSupport.class",
+        ),
+        "org.springframework.aop.framework.ReflectiveMethodInvocation": (
+            "BOOT-INF/lib/spring-aop-7.0.8.jar!/org/springframework/aop/framework/"
+            "ReflectiveMethodInvocation.class",
+        ),
+    },
+    fixture_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "gs-managing-transactions.json"
+    ),
+    prior_topology_matrix=(
+        ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json"
+    ),
+)
+
 CASES = {
     name: apply_real_case_performance_budget(case)
     for name, case in CASES.items()
@@ -849,7 +896,7 @@ def _expected_target_signature(expected_api: dict) -> str:
     if not descriptor.startswith("("):
         return ""
     try:
-        return normalize_signature_for_lookup(_source_signature(descriptor))
+        return normalize_signature_for_lookup(_source_signature(descriptor).replace("$", "."))
     except (IndexError, ValueError):
         return ""
 
@@ -1250,6 +1297,34 @@ def load_pinned_guard_manifest(case: RealProjectCase) -> dict:
     return json.loads(case.fixture_manifest.read_text(encoding="utf-8"))
 
 
+def infer_final_artifact_java_version(artifact_path: Path) -> str:
+    versions: list[int] = []
+    try:
+        with zipfile.ZipFile(artifact_path) as archive:
+            try:
+                manifest = archive.read("META-INF/MANIFEST.MF").decode(
+                    "utf-8", errors="replace"
+                )
+            except KeyError:
+                manifest = ""
+            declared = re.search(r"(?im)^Java-Version\s*:\s*([^\s]+)\s*$", manifest)
+            if declared:
+                return declared.group(1).strip()
+            for name in archive.namelist():
+                if not name.startswith(("BOOT-INF/classes/", "WEB-INF/classes/")):
+                    continue
+                if not name.endswith(".class"):
+                    continue
+                content = archive.read(name)
+                if len(content) >= 8 and content[:4] == b"\xca\xfe\xba\xbe":
+                    major = int.from_bytes(content[6:8], byteorder="big")
+                    if major >= 45:
+                        versions.append(major - 44)
+    except (OSError, zipfile.BadZipFile):
+        return ""
+    return str(max(versions)) if versions else ""
+
+
 def write_pinned_final_artifact_provenance(
     report_dir: Path, asset_gate: dict, case: RealProjectCase
 ) -> Path:
@@ -1269,6 +1344,11 @@ def write_pinned_final_artifact_provenance(
             "authority": "pinned-real-project-manifest",
         }],
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    context_path = report_dir / "evidence" / "context" / "context.json"
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    context_path.write_text(json.dumps({
+        "jdk_current": infer_final_artifact_java_version(artifact_path) or "unknown",
+    }, indent=2) + "\n", encoding="utf-8")
     coordinate = str(case.bytecode_coord or "").strip()
     artifact_id = coordinate.split(":", 1)[-1] if ":" in coordinate else ""
     nested_entry = ""
@@ -2110,7 +2190,8 @@ def physical_edge_occurrence(edge: dict) -> str:
 
 
 def _retain_authoritative_api_path(
-    selected_rows: list[dict], oracle_rows: list[dict]
+    selected_rows: list[dict], oracle_rows: list[dict],
+    semantic_targets: set[str] | None = None,
 ) -> tuple[list[dict], dict[str, str], list[str]]:
     """Keep every physical path and classify whether it reaches packaged business code."""
     incoming: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
@@ -2123,6 +2204,9 @@ def _retain_authoritative_api_path(
         identity = serialized_api_identity(api_row)
         direct = [edge for edge in oracle_rows if _api_target_matches(api_row, edge)]
         if not direct:
+            if identity in (semantic_targets or set()):
+                api_reachability[identity] = "uncertain"
+                continue
             errors.append(f"selected_api_unresolved:{identity}")
             api_reachability[identity] = "not_analyzed"
             continue
@@ -2232,6 +2316,33 @@ def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict]) -> str:
     return str(path)
 
 
+def _verified_framework_semantic_targets(
+    report_dir: Path, selected_rows: list[dict]
+) -> set[str]:
+    path = Path(report_dir) / "evidence" / "call_chain" / "framework_adapters.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    verified_targets = set()
+    for adapter in payload.get("adapters") or []:
+        for edge in adapter.get("edges") or []:
+            provenance = edge.get("provenance") or edge.get("evidence") or {}
+            if (
+                edge.get("edge_kind") == "spring_transaction_proxy_dispatch"
+                and provenance.get("authority") == "final_artifact_javap"
+                and _valid_sha256(str(provenance.get("artifact_sha256") or ""))
+                and _valid_sha256(str(provenance.get("business_artifact_sha256") or ""))
+            ):
+                verified_targets.add(str(edge.get("target") or ""))
+    identities = set()
+    for row in selected_rows:
+        target = f"{row.get('api_name') or ''}{row.get('api_signature') or ''}"
+        if target in verified_targets:
+            identities.add(serialized_api_identity(row))
+    return identities
+
+
 def reconcile_selected_api_edges(
     report_dir: Path,
     selected_rows: list[dict],
@@ -2242,8 +2353,9 @@ def reconcile_selected_api_edges(
     reconcile_started_at = time.perf_counter()
     report_dir = Path(report_dir)
     oracle_rows = [dict(row) for row in (oracle_scan.get("edges") or [])]
+    semantic_targets = _verified_framework_semantic_targets(report_dir, selected_rows)
     retained_oracle_rows, api_reachability, path_errors = _retain_authoritative_api_path(
-        selected_rows, oracle_rows
+        selected_rows, oracle_rows, semantic_targets
     )
     path_errors.extend(_oracle_edge_identity_errors(oracle_rows))
     retained_analyzer_rows = _retain_analyzer_api_path(selected_rows, [dict(row) for row in (analyzer_rows or [])])
@@ -2547,23 +2659,17 @@ def materialize_bytecode_changed_apis(
     target_lib_entry = ""
     target_lib_candidates: list[str] = []
     runtime_lib_entries: list[dict[str, str]] = []
-    artifact_java_version = ""
+    artifact_java_version = infer_final_artifact_java_version(artifact)
     owner_prefix_bytes = tuple(prefix.encode("utf-8") for prefix in case.bytecode_owner_prefixes)
     artifact_id = case.bytecode_coord.split(":", 1)[-1].strip()
     with zipfile.ZipFile(artifact) as source:
-        try:
-            manifest = source.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
-        except KeyError:
-            manifest = ""
-        java_version_match = re.search(r"(?im)^Java-Version\s*:\s*([^\s]+)\s*$", manifest)
-        if java_version_match:
-            artifact_java_version = java_version_match.group(1).strip()
         for name in sorted(source.namelist()):
             if name.startswith("BOOT-INF/classes/") and name.endswith(".class"):
                 relative = name[len("BOOT-INF/classes/"):]
                 destination = extracted_root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(source.read(name))
+                class_bytes = source.read(name)
+                destination.write_bytes(class_bytes)
             if (
                 name.startswith("BOOT-INF/lib/")
                 and name.endswith(".jar")

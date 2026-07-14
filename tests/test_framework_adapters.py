@@ -16,6 +16,210 @@ from framework_adapters import run_framework_adapters, attach_framework_edges_to
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
+    def test_spring_transaction_adapter_requires_packaged_business_annotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            (java / "BookingService.java").write_text(
+                "package com.acme; import org.springframework.transaction.annotation.Transactional; "
+                "class BookingService { @Transactional public void book(String... names) {} }",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog={"entries": []},
+            )
+
+        adapter = next(
+            item for item in payload["adapters"]
+            if item["adapter"] == "spring_transaction_proxy"
+        )
+        self.assertEqual(adapter["status"], "partial")
+        self.assertEqual(adapter["edges"], [])
+        self.assertTrue(any(
+            finding["reason_code"] == "spring_transaction_business_annotation_unverified"
+            for finding in adapter["findings"]
+        ))
+
+    def test_spring_transaction_adapter_uses_packaged_aop_implementation_methods(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            framework = module / "framework"
+            classes = module / "classes"
+            business_classes = module / "business-classes"
+            java.mkdir(parents=True)
+            classes.mkdir()
+            business_classes.mkdir()
+            sources = {
+                "org/aopalliance/intercept/MethodInvocation.java": (
+                    "package org.aopalliance.intercept; public interface MethodInvocation {}"
+                ),
+                "org/springframework/transaction/interceptor/TransactionInterceptor.java": (
+                    "package org.springframework.transaction.interceptor; "
+                    "public class TransactionInterceptor { public Object invoke("
+                    "org.aopalliance.intercept.MethodInvocation invocation) { return null; } }"
+                ),
+                "org/springframework/transaction/interceptor/TransactionAspectSupport.java": (
+                    "package org.springframework.transaction.interceptor; "
+                    "public abstract class TransactionAspectSupport { public interface InvocationCallback {} "
+                    "protected Object invokeWithinTransaction(java.lang.reflect.Method method, "
+                    "Class<?> owner, InvocationCallback callback) { return null; } }"
+                ),
+                "org/springframework/aop/framework/ReflectiveMethodInvocation.java": (
+                    "package org.springframework.aop.framework; public class "
+                    "ReflectiveMethodInvocation { public Object proceed() { return null; } }"
+                ),
+                "org/springframework/transaction/annotation/Transactional.java": (
+                    "package org.springframework.transaction.annotation; "
+                    "@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) "
+                    "@java.lang.annotation.Target({java.lang.annotation.ElementType.TYPE, "
+                    "java.lang.annotation.ElementType.METHOD}) public @interface Transactional {}"
+                ),
+            }
+            source_paths = []
+            for relative, content in sources.items():
+                path = framework / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                source_paths.append(str(path))
+            subprocess.run(
+                ["javac", "-d", str(classes), *source_paths],
+                check=True, capture_output=True, text=True,
+            )
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            (java / "BookingService.java").write_text(
+                "package com.acme; class BookingService { "
+                "@org.springframework.transaction.annotation.Transactional "
+                "public void book(String... names) {} public void read() {} }",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "javac", "-cp", str(classes), "-d", str(business_classes),
+                    str(java / "BookingService.java"),
+                ],
+                check=True, capture_output=True, text=True,
+            )
+            tx_jar = module / "spring-tx-7.0.8.jar"
+            aop_jar = module / "spring-aop-7.0.8.jar"
+            business_jar = module / "business-classes.jar"
+            with zipfile.ZipFile(tx_jar, "w") as jar:
+                for class_file in classes.rglob("*.class"):
+                    relative = class_file.relative_to(classes).as_posix()
+                    if relative.startswith(("org/springframework/transaction/", "org/aopalliance/")):
+                        jar.write(class_file, relative)
+            with zipfile.ZipFile(aop_jar, "w") as jar:
+                for class_file in classes.rglob("org/springframework/aop/**/*.class"):
+                    jar.write(class_file, class_file.relative_to(classes).as_posix())
+            with zipfile.ZipFile(business_jar, "w") as jar:
+                for class_file in business_classes.rglob("*.class"):
+                    jar.write(class_file, class_file.relative_to(business_classes).as_posix())
+
+            payload = run_framework_adapters(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog={"entries": [
+                    {
+                        "coord": "org.springframework:spring-tx", "jar_path": str(tx_jar),
+                        "artifact_entry": "BOOT-INF/lib/spring-tx-7.0.8.jar", "sha256": "a" * 64,
+                    },
+                    {
+                        "coord": "runtime:spring-aop-7.0.8", "jar_path": str(aop_jar),
+                        "artifact_entry": "BOOT-INF/lib/spring-aop-7.0.8.jar", "sha256": "b" * 64,
+                    },
+                    {
+                        "coord": "__business__", "jar_path": str(business_jar),
+                        "artifact_entry": "<business-classes>", "sha256": "c" * 64,
+                    },
+                ]},
+            )
+
+        adapter = next(
+            item for item in payload["adapters"]
+            if item["adapter"] == "spring_transaction_proxy"
+        )
+        self.assertEqual(adapter["status"], "complete", adapter)
+        self.assertEqual({edge["source"] for edge in adapter["edges"]}, {
+            "com.acme.BookingService.book/1",
+        })
+        self.assertEqual({edge["target"] for edge in adapter["edges"]}, {
+            "org.springframework.transaction.interceptor.TransactionInterceptor.invoke(org.aopalliance.intercept.MethodInvocation)",
+            "org.springframework.transaction.interceptor.TransactionAspectSupport.invokeWithinTransaction(java.lang.reflect.Method,java.lang.Class,org.springframework.transaction.interceptor.TransactionAspectSupport.InvocationCallback)",
+            "org.springframework.aop.framework.ReflectiveMethodInvocation.proceed()",
+        })
+        self.assertTrue(all(
+            edge["provenance"]["authority"] == "final_artifact_javap"
+            and edge["provenance"]["business_artifact_sha256"] == "c" * 64
+            and edge["provenance"]["business_activation"]
+            for edge in adapter["edges"]
+        ))
+
+    def test_spring_transaction_proxy_links_only_callers_of_annotated_method(self):
+        caller = SimpleNamespace(
+            caller_symbol_id="runner", caller_qualified_key="com.acme.AppRunner.run()",
+            callee_key="com.acme.BookingService.book(String[])",
+            callee_simple_key="book(String[])", evidence_type="bytecode_method_invocation",
+            evidence_source="current_final_artifact", confidence="high",
+            file="business.jar!/AppRunner.class", line=12, content="invoke book",
+            owner_type="business", owner_coord="BUSINESS", module="app", is_test=False,
+        )
+        unrelated = SimpleNamespace(
+            caller_symbol_id="other", caller_qualified_key="com.acme.Other.run()",
+            callee_key="com.acme.BookingService.read()", callee_simple_key="read()",
+            evidence_type="bytecode_method_invocation", evidence_source="current_final_artifact",
+            confidence="high", file="business.jar!/Other.class", line=4, content="invoke read",
+            owner_type="business", owner_coord="BUSINESS", module="app", is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={}, reverse_edges={
+                "com.acme.BookingService.book(String[])": [caller],
+                "com.acme.BookingService.read()": [unrelated],
+            },
+        )
+        target = (
+            "org.springframework.transaction.interceptor.TransactionInterceptor."
+            "invoke(org.aopalliance.intercept.MethodInvocation)"
+        )
+        payload = {"adapters": [{
+            "adapter": "spring_transaction_proxy", "version": "1",
+            "edges": [{
+                "source": "com.acme.BookingService.book/1", "target": target,
+                "source_owner": "com.acme.BookingService", "source_member": "book",
+                "parameter_count": 1, "edge_kind": "spring_transaction_proxy_dispatch",
+                "confidence": "high", "conditions": [], "ambiguity": False,
+                "provenance": {
+                    "jar": "/runtime/spring-tx.jar", "authority": "final_artifact_javap",
+                    "artifact_sha256": "a" * 64, "business_artifact_sha256": "b" * 64,
+                },
+            }],
+        }]}
+
+        stats = attach_framework_edges_to_graph(graph, payload)
+
+        self.assertEqual(stats["framework_transaction_proxy_edges"], 1)
+        self.assertEqual(len(graph.reverse_edges[target]), 1)
+        self.assertEqual(graph.reverse_edges[target][0].caller_symbol_id, "runner")
+        self.assertEqual(
+            graph.reverse_edges[target][0].evidence_type,
+            "spring_transaction_proxy_dispatch",
+        )
+        self.assertTrue(
+            graph.reverse_edges[target][0].framework_final_artifact_verified
+        )
+
     def test_spring_data_repository_adapter_refuses_custom_repository_factory(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = Path(tmp)

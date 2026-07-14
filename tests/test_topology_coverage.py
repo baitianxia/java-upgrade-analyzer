@@ -42,6 +42,91 @@ def _jar_classes(path: Path, classes: Path) -> None:
 
 @unittest.skipUnless(JDK_TOOLS, "JDK tools required")
 class TopologyCoverageTest(unittest.TestCase):
+    def test_transaction_proxy_topology_requires_packaged_runtime_annotation(self):
+        target = (
+            "org.springframework.transaction.interceptor.TransactionInterceptor",
+            "invoke",
+            "(Lorg/aopalliance/intercept/MethodInvocation;)Ljava/lang/Object;",
+        )
+        inventory = {
+            "classes": {
+                "BOOT-INF/classes/example/BookingService.class": (
+                    b"org/springframework/transaction/annotation/Transactional"
+                ),
+                "BOOT-INF/lib/spring-tx.jar!/org/springframework/transaction/"
+                "interceptor/TransactionInterceptor.class": b"tx",
+                "BOOT-INF/lib/spring-aop.jar!/org/springframework/aop/framework/"
+                "ReflectiveMethodInvocation.class": b"aop",
+            }
+        }
+        annotation = (
+            "RuntimeVisibleAnnotations:\n"
+            "  org.springframework.transaction.annotation.Transactional\n"
+        )
+
+        with mock.patch.object(topology_coverage, "_javap_text", return_value=annotation):
+            links = topology_coverage._spring_transaction_proxy_evidence(
+                inventory, {target}
+            )
+
+        layout = {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [{
+                "owner": target[0], "member": target[1], "descriptor": target[2],
+            }],
+            "entry_layout": [],
+            "framework_proxy_links": links,
+        }
+        self.assertIn("framework_proxy", topology_coverage.classify_topologies([], layout))
+
+        with mock.patch.object(topology_coverage, "_javap_text", return_value=""):
+            self.assertEqual(
+                topology_coverage._spring_transaction_proxy_evidence(inventory, {target}),
+                [],
+            )
+
+    def test_target_identity_can_be_resolved_from_packaged_declaration(self):
+        row = {
+            "coord": "org.springframework:spring-tx",
+            "api_name": (
+                "org.springframework.transaction.interceptor.TransactionInterceptor.invoke"
+            ),
+            "api_signature": "(org.aopalliance.intercept.MethodInvocation)",
+            "symbol_kind": "method",
+        }
+        entry = (
+            "BOOT-INF/lib/spring-tx.jar!/org/springframework/transaction/"
+            "interceptor/TransactionInterceptor.class"
+        )
+        method = {
+            "member": "invoke",
+            "descriptor": (
+                "(Lorg/aopalliance/intercept/MethodInvocation;)Ljava/lang/Object;"
+            ),
+        }
+        with mock.patch.object(
+            topology_coverage, "_topology_javap_methods",
+            return_value=(
+                "org.springframework.transaction.interceptor.TransactionInterceptor",
+                [method],
+            ),
+        ):
+            targets, unresolved = topology_coverage._selected_target_identities(
+                [row], [], {"classes": {entry: b"class"}}
+            )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(targets[0]["descriptor"], method["descriptor"])
+
+    def test_descriptor_source_signature_uses_source_nested_class_notation(self):
+        self.assertEqual(
+            topology_coverage.descriptor_source_signature(
+                "(Lexample/Outer$Callback;)Ljava/lang/Object;"
+            ),
+            "(example.Outer.Callback)",
+        )
+
     def test_artifact_topology_reuses_precomputed_oracle_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -1409,6 +1409,34 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(context["jdk_current"], "17")
 
+    def test_bytecode_materialization_infers_java_version_from_business_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "application.jar"
+            class_header = b"\xca\xfe\xba\xbe\x00\x00\x00="
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "META-INF/MANIFEST.MF",
+                    "Manifest-Version: 1.0\nBuild-Jdk-Spec: 24\n",
+                )
+                archive.writestr("BOOT-INF/classes/demo/App.class", class_header)
+            case = realreg.RealProjectCase(
+                name="classfile-jdk-context", default_project=root,
+                default_changed_apis=Path(""), baseline_specs=(),
+                bytecode_owner_prefixes=("vendor/Api",),
+                bytecode_coord="vendor:api", final_artifact=artifact,
+            )
+            report = root / "report"
+
+            with patch.object(realreg, "discover_calls", return_value=[]):
+                realreg.materialize_bytecode_changed_apis(case, root, report)
+
+            context = json.loads(
+                (report / "evidence/context/context.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(context["jdk_current"], "17")
+
     def test_bytecode_materialization_rejects_ambiguous_artifact_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2290,6 +2318,21 @@ class RealProjectRegressionTest(unittest.TestCase):
 
 
 class RealProjectRegressionTests(unittest.TestCase):
+    def test_edge_oracle_abstains_for_final_artifact_verified_framework_target(self):
+        selected = [{
+            "coord": "g:a", "api_name": "p.Proxy.invoke", "api_signature": "()",
+            "symbol_kind": "method", "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+
+        retained, reachability, errors = realreg._retain_authoritative_api_path(
+            selected, [], {identity}
+        )
+
+        self.assertEqual(retained, [])
+        self.assertEqual(reachability[identity], "uncertain")
+        self.assertEqual(errors, [])
+
     def _manifest_with_expected_physical_edges(self, manifest):
         return {
             **manifest,
@@ -2473,6 +2516,44 @@ class RealProjectRegressionTests(unittest.TestCase):
                 ("java.io.PrintStream", "println", 5),
             },
         )
+
+    def test_gs_managing_transactions_proxy_guard(self):
+        fixture_dir = ROOT / "tests" / "fixtures" / "real_projects"
+        manifest = json.loads(
+            (fixture_dir / "gs-managing-transactions.json").read_text(encoding="utf-8")
+        )
+        with (fixture_dir / "gs-managing-transactions-changed-apis.csv").open(
+            newline="", encoding="utf-8"
+        ) as handle:
+            changed_rows = list(csv.DictReader(handle))
+        with (fixture_dir / "gs-managing-transactions-oracle.csv").open(
+            newline="", encoding="utf-8"
+        ) as handle:
+            oracle_rows = list(csv.DictReader(handle))
+        case = realreg.CASES["gs-managing-transactions"]
+
+        self.assertEqual(
+            manifest["git_revision"],
+            "efa693451b6a6ca123476c9c6e65eedab9048e2c",
+        )
+        self.assertEqual(
+            manifest["artifact_sha256"],
+            "fd0b8883214c641685ab8f0e7b583ec2f8150112f9679161908eb6829bd98b90",
+        )
+        self.assertEqual(case.case_mode, "convergence")
+        self.assertEqual(case.required_topologies, ("framework_proxy",))
+        self.assertEqual(len(changed_rows), 3)
+        self.assertEqual(len(oracle_rows), len(changed_rows))
+        self.assertTrue(all(row["oracle_conclusion"] == "reachable" for row in oracle_rows))
+        self.assertTrue(all(row["evidence_mode"] == "project_test" for row in oracle_rows))
+        identity = lambda row: (
+            row["coord"], row["api_name"], row["symbol_kind"], row["api_signature"]
+        )
+        self.assertEqual(
+            {identity(row) for row in changed_rows},
+            {identity(row) for row in oracle_rows},
+        )
+        self.assertEqual(len(manifest["canonical_edges"]), 1)
 
     def test_pinned_guard_evaluates_every_api_in_callback_manifest(self):
         manifest = json.loads((
@@ -2705,7 +2786,10 @@ class RealProjectRegressionTests(unittest.TestCase):
                 )
             artifact = Path(tmp) / "application.jar"
             with realreg.zipfile.ZipFile(artifact, "w") as archive:
-                archive.writestr("BOOT-INF/classes/app/App.class", b"class")
+                archive.writestr(
+                    "BOOT-INF/classes/app/App.class",
+                    b"\xca\xfe\xba\xbe\x00\x00\x00=",
+                )
                 archive.writestr("BOOT-INF/lib/runtime-1.2.3.jar", nested.getvalue())
             asset_gate = {
                 "artifact_path": str(artifact),
@@ -2718,6 +2802,9 @@ class RealProjectRegressionTests(unittest.TestCase):
                 newline="", encoding="utf-8"
             ) as handle:
                 rows = list(csv.DictReader(handle))
+            context = json.loads(
+                (report_dir / "evidence/context/context.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(rows, [{
             "coord": "org.example:runtime",
@@ -2726,6 +2813,7 @@ class RealProjectRegressionTests(unittest.TestCase):
             "lib_entry": "BOOT-INF/lib/runtime-1.2.3.jar",
             "resolution_status": "resolved",
         }])
+        self.assertEqual(context["jdk_current"], "17")
 
     def test_pinned_asset_gate_rejects_revision_and_final_artifact_sha_mismatch(self):
         manifest = {

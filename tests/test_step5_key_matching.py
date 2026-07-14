@@ -34,6 +34,20 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def test_verified_final_artifact_framework_path_can_explain_static_scan_miss(self):
+        candidate = {"path": [SimpleNamespace(
+            evidence_source="current_final_artifact",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            is_test=False,
+            framework_registration=True,
+            framework_final_artifact_verified=True,
+        )]}
+
+        self.assertTrue(
+            tracer.has_verified_final_artifact_framework_path(candidate)
+        )
+
     def test_graph_field_edge_keeps_selected_changed_api_identity(self):
         api_row = {
             "coord": "jdk:java.base",

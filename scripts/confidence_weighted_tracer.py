@@ -5432,7 +5432,9 @@ def trace_api_with_confidence_weighting(
 
     direct_usage_result = _try_build_direct_usage_result(api_row, result, graph, trace_cache=trace_cache)
     if direct_usage_result is not None:
-        if artifact_scan_miss:
+        if artifact_scan_miss and not _has_verified_final_artifact_framework_target(
+            api_row, graph
+        ):
             _apply_source_artifact_miss(direct_usage_result, graph, (
                 '源码中发现了目标调用，但当前打包产物的字节码扫描没有发现对应引用；'
                 '可能是源码、构建参数或目标模块与本次打包产物不一致，当前不能确认影响'
@@ -6034,7 +6036,7 @@ def trace_api_with_confidence_weighting(
     # 选择最优结果
     if reachable_candidates:
         best = select_best_candidate(reachable_candidates)
-        if artifact_scan_miss:
+        if artifact_scan_miss and not has_verified_final_artifact_framework_path(best):
             built = build_reachable_result(result, best, graph)
             _apply_source_artifact_miss(built, graph, (
                 '源码中发现了可达调用链，但当前打包产物的字节码扫描没有发现对应引用；'
@@ -6714,6 +6716,60 @@ def has_verified_final_artifact_business_path(candidate):
         ):
             has_business_edge = True
     return has_business_edge
+
+
+def has_verified_final_artifact_framework_path(candidate):
+    path_edges = list(candidate.get('path') or [])
+    if not path_edges:
+        return False
+    has_business_edge = False
+    has_framework_edge = False
+    for edge in path_edges:
+        runtime_hit = getattr(edge, 'runtime_analyzer_hit', None)
+        final_artifact_edge = (
+            str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
+        )
+        if not runtime_hit and not final_artifact_edge:
+            return False
+        if getattr(edge, 'framework_registration', False):
+            if not getattr(edge, 'framework_final_artifact_verified', False):
+                return False
+            has_framework_edge = True
+        if (
+            str(getattr(edge, 'owner_type', '') or '') == 'business'
+            and (
+                final_artifact_edge
+                or str((runtime_hit or {}).get('coord') or '') == '__business__'
+            )
+        ):
+            has_business_edge = True
+    return has_business_edge and has_framework_edge
+
+
+def _has_verified_final_artifact_framework_target(api_row, graph):
+    api_name = str((api_row or {}).get('api_name') or '').strip()
+    target_signature = normalize_signature_for_lookup(
+        str((api_row or {}).get('api_signature') or '').strip()
+    )
+    if not api_name or target_signature is None:
+        return False
+    for key, edges in (getattr(graph, 'reverse_edges', {}) or {}).items():
+        key = str(key or '')
+        if not key.startswith(api_name):
+            continue
+        signature = extract_signature_suffix_from_key(key)
+        if normalize_signature_for_lookup(signature) != target_signature:
+            continue
+        if any(
+            getattr(edge, 'framework_registration', False)
+            and getattr(edge, 'framework_final_artifact_verified', False)
+            and str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
+            and str(getattr(edge, 'owner_type', '') or '') == 'business'
+            and not bool(getattr(edge, 'is_test', False))
+            for edge in (edges or [])
+        ):
+            return True
+    return False
 
 
 def select_confirmable_reachable_candidate(result, candidates):

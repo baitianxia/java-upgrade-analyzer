@@ -1,0 +1,4 @@
+coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source
+org.springframework:spring-tx,7.0.8,-,REMOVED,org.springframework.transaction.interceptor.TransactionInterceptor.invoke,invoke,method,(org.aopalliance.intercept.MethodInvocation),true,P1,pinned_transaction_proxy_probe
+org.springframework:spring-tx,7.0.8,-,REMOVED,org.springframework.transaction.interceptor.TransactionAspectSupport.invokeWithinTransaction,invokeWithinTransaction,method,"(java.lang.reflect.Method,java.lang.Class,org.springframework.transaction.interceptor.TransactionAspectSupport.InvocationCallback)",true,P1,pinned_transaction_proxy_probe
+org.springframework:spring-aop,7.0.8,-,REMOVED,org.springframework.aop.framework.ReflectiveMethodInvocation.proceed,proceed,method,(),true,P1,pinned_transaction_proxy_probe

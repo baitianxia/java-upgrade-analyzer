@@ -52,7 +52,7 @@ HIERARCHY_SCAN_MAX_WORKERS = max(1, min(8, os.cpu_count() or 1))
 def descriptor_source_signature(descriptor: str) -> str:
     if not str(descriptor or "").startswith("("):
         return ""
-    return _source_signature(str(descriptor).split(")", 1)[0] + ")")
+    return _source_signature(str(descriptor).split(")", 1)[0] + ")").replace("$", ".")
 
 
 def _edge_identity(edge: dict) -> tuple[str, ...]:
@@ -464,7 +464,9 @@ def _is_assignable(
     return False
 
 
-def _selected_target_identities(rows: list[dict], edges: list[dict]) -> tuple[list[dict], list[str]]:
+def _selected_target_identities(
+    rows: list[dict], edges: list[dict], inventory: dict | None = None
+) -> tuple[list[dict], list[str]]:
     targets: dict[tuple[str, str, str], dict] = {}
     unresolved: list[str] = []
     for row in rows:
@@ -481,6 +483,20 @@ def _selected_target_identities(rows: list[dict], edges: list[dict]) -> tuple[li
                 continue
             matches.append(edge)
         identities = {_method_node(edge, "callee") for edge in matches}
+        if not identities and inventory:
+            for entry, content in (inventory.get("classes") or {}).items():
+                if _class_binary_name(entry) != owner:
+                    continue
+                _parsed_owner, methods = _topology_javap_methods(entry, content)
+                for method in methods:
+                    descriptor = str(method.get("descriptor") or "")
+                    if method.get("member") != member:
+                        continue
+                    if kind != "field" and normalize_signature_for_lookup(
+                        descriptor_source_signature(descriptor)
+                    ) != signature:
+                        continue
+                    identities.add((owner, member, descriptor))
         if not separator or not identities:
             unresolved.append(f"{api_name}{row.get('api_signature') or ''}")
             continue
@@ -952,6 +968,58 @@ def _framework_callback_evidence(
     return results
 
 
+def _spring_transaction_proxy_evidence(
+    inventory: dict, targets: set[tuple[str, str, str]]
+) -> list[dict]:
+    spring_targets = {
+        target for target in targets
+        if target[:2] in {
+            (
+                "org.springframework.transaction.interceptor.TransactionInterceptor",
+                "invoke",
+            ),
+            (
+                "org.springframework.transaction.interceptor.TransactionAspectSupport",
+                "invokeWithinTransaction",
+            ),
+            ("org.springframework.aop.framework.ReflectiveMethodInvocation", "proceed"),
+        }
+    }
+    if not spring_targets:
+        return []
+    owners = {_class_binary_name(entry) for entry in (inventory.get("classes") or {})}
+    if not {
+        "org.springframework.transaction.interceptor.TransactionInterceptor",
+        "org.springframework.aop.framework.ReflectiveMethodInvocation",
+    }.issubset(owners):
+        return []
+    annotated_business_entries = []
+    for entry, content in (inventory.get("classes") or {}).items():
+        if _container(entry):
+            continue
+        if b"org/springframework/transaction/annotation/Transactional" not in content:
+            continue
+        output = _javap_text(content, "-v", "-p")
+        if (
+            "RuntimeVisibleAnnotations:" in output
+            and "org.springframework.transaction.annotation.Transactional" in output
+        ):
+            annotated_business_entries.append(entry)
+    if not annotated_business_entries:
+        return []
+    return [{
+        "target": list(target),
+        "business_annotation_entries": sorted(annotated_business_entries),
+        "evidence_authority": "final_artifact_javap_transaction_annotation",
+        "authority": "jdk-javap",
+        "authority_version": "classfile-runtime-visible-annotation-v1",
+        "procedure": (
+            "verify packaged RuntimeVisible @Transactional annotation and exact "
+            "Spring transaction/AOP implementation declarations"
+        ),
+    } for target in sorted(spring_targets)]
+
+
 def _bootstrap_links(inventory: dict, targets: set[tuple[str, str, str]], edges: list[dict]) -> list[dict]:
     links = []
     dynamic_edges = {
@@ -1172,7 +1240,9 @@ def extract_artifact_topology_evidence(
         scan = {"edges": [], "complete": False, "artifact_sha256": "", "failures": [str(error)]}
         inventory = {"classes": {}, "resources": {}, "containers": set()}
     errors.extend(str(item) for item in scan.get("failures") or [])
-    targets, unresolved = _selected_target_identities(changed_api_rows, scan.get("edges") or [])
+    targets, unresolved = _selected_target_identities(
+        changed_api_rows, scan.get("edges") or [], inventory
+    )
     errors.extend(f"unresolved exact changed API identity: {item}" for item in unresolved)
     target_set = {_target_identity(item) for item in targets}
 
@@ -1252,6 +1322,7 @@ def extract_artifact_topology_evidence(
     framework_callbacks = _framework_callback_evidence(
         inventory, target_set, scan.get("edges") or []
     )
+    spring_transaction_proxies = _spring_transaction_proxy_evidence(inventory, target_set)
     bootstrap = _bootstrap_links(inventory, target_set, scan.get("edges") or [])
     source_edges, source_conflicts, verified_source_provenance = _source_attestation_evidence(
         source_root, source_attestation, str(scan.get("artifact_sha256") or ""),
@@ -1265,6 +1336,7 @@ def extract_artifact_topology_evidence(
         "registrations": registrations,
         "reflection_target_links": reflection,
         "framework_callback_links": framework_callbacks,
+        "framework_proxy_links": spring_transaction_proxies,
         "bootstrap_target_links": bootstrap,
         "hierarchy_evidence": hierarchy,
         "hierarchy_scan": hierarchy_scan["metrics"],
@@ -1387,6 +1459,16 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
         for item in artifact_layout.get("framework_callback_links") or []
     ):
         observed.add("framework_callback")
+    if any(
+        item.get("evidence_authority") == "final_artifact_javap_transaction_annotation"
+        and item.get("authority") == "jdk-javap"
+        and item.get("authority_version")
+        and item.get("procedure")
+        and tuple(item.get("target") or []) in targets
+        and item.get("business_annotation_entries")
+        for item in artifact_layout.get("framework_proxy_links") or []
+    ):
+        observed.add("framework_proxy")
     for item in artifact_layout.get("registrations") or []:
         if item.get("kind") == "spi" and item.get("evidence_authority") == "parsed_service_resource":
             observed.add("spi")

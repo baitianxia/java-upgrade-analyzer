@@ -1365,7 +1365,12 @@ def _descriptor_reference_slots(descriptor, is_static):
 
 
 def _parse_javap_methods(text):
-    owner_match = re.search(r'^(?:public\s+)?(?:class|interface|enum|record)\s+([\w.$]+)', text, re.MULTILINE)
+    owner_match = re.search(
+        r'^(?:(?:public|protected|private|abstract|final|sealed|non-sealed|static)\s+)*'
+        r'(?:class|interface|enum|record)\s+([\w.$]+)',
+        text,
+        re.MULTILINE,
+    )
     owner = owner_match.group(1) if owner_match else ''
     methods = []
     current = None
@@ -1438,6 +1443,26 @@ _SPRING_DATA_REPOSITORY_CONTRACTS = {
 }
 _SIMPLE_JPA_REPOSITORY = (
     'org.springframework.data.jpa.repository.support.SimpleJpaRepository'
+)
+_SPRING_TRANSACTION_TARGETS = (
+    (
+        'spring-tx',
+        'org.springframework.transaction.interceptor.TransactionInterceptor',
+        'invoke',
+        1,
+    ),
+    (
+        'spring-tx',
+        'org.springframework.transaction.interceptor.TransactionAspectSupport',
+        'invokeWithinTransaction',
+        3,
+    ),
+    (
+        'spring-aop',
+        'org.springframework.aop.framework.ReflectiveMethodInvocation',
+        'proceed',
+        0,
+    ),
 )
 
 
@@ -1523,6 +1548,326 @@ def _spring_data_custom_repository_configuration(source_roots):
         if attributes:
             custom.append({'file': str(path), 'attributes': attributes})
     return custom
+
+
+def _spring_transactional_business_methods(source_roots):
+    methods = []
+    errors = []
+    for path in _production_java_files(source_roots):
+        try:
+            text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
+        except OSError as exc:
+            errors.append(f'{path}:{type(exc).__name__}')
+            continue
+        spring_annotation = bool(
+            re.search(
+                r'\bimport\s+org\.springframework\.transaction\.annotation\.Transactional\s*;',
+                text,
+            )
+            or '@org.springframework.transaction.annotation.Transactional' in text
+        )
+        if not spring_annotation:
+            continue
+        try:
+            parsed, parser_info = analyze_file(
+                str(path),
+                {'root': str(path.parent), 'owner_type': 'business', 'owner_coord': 'BUSINESS'},
+                prefer_tree_sitter=True,
+                return_diagnostics=True,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f'{path}:transaction_ast:{type(exc).__name__}')
+            continue
+        if parser_info.get('actual_parser') != 'tree_sitter':
+            errors.append(f'{path}:transaction_ast_unavailable')
+            continue
+        for method in parsed:
+            annotations = {
+                str(item).rsplit('.', 1)[-1]
+                for item in (method.annotations or [])
+            }
+            class_annotations = {
+                str(item).rsplit('.', 1)[-1]
+                for item in (method.class_annotations or [])
+            }
+            if 'Transactional' not in annotations and 'Transactional' not in class_annotations:
+                continue
+            if 'public' not in (method.modifiers or []):
+                continue
+            methods.append({
+                'owner': str(method.class_fqcn or ''),
+                'member': str(method.method_name or ''),
+                'parameter_count': len(method.param_types or {}),
+                'file': str(path),
+                'line': int(method.line or 0),
+                'annotation_scope': (
+                    'method' if 'Transactional' in annotations else 'class'
+                ),
+            })
+    unique = {}
+    for method in methods:
+        identity = (
+            method['owner'], method['member'], method['parameter_count']
+        )
+        unique.setdefault(identity, method)
+    return list(unique.values()), errors
+
+
+def _spring_transaction_custom_mode(source_roots):
+    findings = []
+    for path in _production_java_files(source_roots):
+        try:
+            text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
+        except OSError:
+            continue
+        if (
+            re.search(r'@(?:[\w.]+\.)?EnableTransactionManagement\b', text)
+            and re.search(r'\bmode\s*=\s*(?:AdviceMode\s*\.\s*)?ASPECTJ\b', text)
+        ):
+            findings.append({
+                'reason_code': 'spring_transaction_aspectj_mode',
+                'subject': str(path),
+            })
+    return findings
+
+
+def _packaged_transactional_methods(jar_path, owners):
+    verified = {}
+    errors = []
+    for owner in sorted(set(owners)):
+        try:
+            completed = subprocess.run(
+                ['javap', '-v', '-p', '-classpath', str(jar_path), owner],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f'{jar_path}:{owner}:{type(exc).__name__}')
+            continue
+        if completed.returncode != 0:
+            errors.append(f'{jar_path}:{owner}:javap_exit_{completed.returncode}')
+            continue
+        parsed_owner, _methods = _parse_javap_methods(completed.stdout)
+        if parsed_owner != owner:
+            errors.append(f'{jar_path}:{owner}:owner_mismatch:{parsed_owner}')
+            continue
+        closing = completed.stdout.find('\n}')
+        class_tail = completed.stdout[closing + 2:] if closing >= 0 else ''
+        class_transactional = (
+            'org.springframework.transaction.annotation.Transactional' in class_tail
+        )
+        matches = list(re.finditer(
+            r'^  (?P<header>[^\n]+?\([^\n;]*\))(?: throws [^\n;]+)?;$',
+            completed.stdout,
+            re.MULTILINE,
+        ))
+        matches = [
+            match for match in matches
+            if ':' not in match.group('header').split('(', 1)[0]
+        ]
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(completed.stdout)
+            block = completed.stdout[match.start():end]
+            if '\n}' in block:
+                block = block.split('\n}', 1)[0]
+            descriptor_match = re.search(r'^\s+descriptor:\s+(\S+)\s*$', block, re.MULTILINE)
+            parameters = _descriptor_parameter_types(
+                descriptor_match.group(1) if descriptor_match else ''
+            )
+            if parameters is None:
+                continue
+            header = match.group('header')
+            prefix = header.split('(', 1)[0].strip()
+            member = prefix.rsplit(' ', 1)[-1].rsplit('.', 1)[-1]
+            method_transactional = (
+                'org.springframework.transaction.annotation.Transactional' in block
+            )
+            if not method_transactional and not (
+                class_transactional and header.startswith('public ')
+            ):
+                continue
+            verified[(owner, member, len(parameters))] = {
+                'descriptor': descriptor_match.group(1),
+                'annotation_scope': 'method' if method_transactional else 'class',
+            }
+    return verified, errors
+
+
+def run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=None):
+    """Resolve @Transactional business calls through exact packaged Spring AOP methods."""
+    transactional_methods, errors = _spring_transactional_business_methods(source_roots)
+    activation_evidence = _spring_boot_business_activation(source_roots)
+    custom_mode_findings = _spring_transaction_custom_mode(source_roots)
+    findings = list(custom_mode_findings)
+    business_entries = [
+        item for item in (artifact_catalog or {}).get('entries') or []
+        if str(item.get('coord') or '') == '__business__'
+        and Path(str(item.get('jar_path') or '')).is_file()
+    ]
+    verified_methods = []
+    if transactional_methods and len(business_entries) == 1:
+        business_entry = business_entries[0]
+        packaged, packaged_errors = _packaged_transactional_methods(
+            business_entry.get('jar_path'),
+            [item['owner'] for item in transactional_methods],
+        )
+        errors.extend(packaged_errors)
+        for method in transactional_methods:
+            identity = (method['owner'], method['member'], method['parameter_count'])
+            packaged_method = packaged.get(identity)
+            if not packaged_method:
+                findings.append({
+                    'reason_code': 'spring_transaction_business_annotation_unverified',
+                    'subject': f"{method['owner']}.{method['member']}/{method['parameter_count']}",
+                })
+                continue
+            verified_methods.append({
+                **method,
+                'business_descriptor': packaged_method['descriptor'],
+                'annotation_scope': packaged_method['annotation_scope'],
+                'business_artifact': business_entry,
+            })
+    elif transactional_methods:
+        findings.append({
+            'reason_code': 'spring_transaction_business_annotation_unverified',
+            'subject': '__business__',
+            'candidate_count': len(business_entries),
+        })
+    entries_by_role = {}
+    for role in ('spring-tx', 'spring-aop'):
+        entries_by_role[role] = [
+            item for item in (artifact_catalog or {}).get('entries') or []
+            if Path(str(item.get('artifact_entry') or item.get('jar_path') or '')).name.startswith(
+                role + '-'
+            )
+            and Path(str(item.get('jar_path') or '')).is_file()
+        ]
+    if transactional_methods and not activation_evidence:
+        findings.append({
+            'reason_code': 'spring_transaction_activation_unproven',
+            'subject': ','.join(
+                f"{item['owner']}.{item['member']}" for item in transactional_methods
+            ),
+        })
+    for role, entries in entries_by_role.items():
+        if transactional_methods and len(entries) != 1:
+            findings.append({
+                'reason_code': 'spring_transaction_runtime_implementation_unresolved',
+                'subject': role,
+                'candidate_count': len(entries),
+            })
+
+    implementation_targets = []
+    can_resolve = bool(
+        verified_methods
+        and activation_evidence
+        and not custom_mode_findings
+        and all(len(entries_by_role[role]) == 1 for role in entries_by_role)
+    )
+    if can_resolve:
+        for role, owner, member, parameter_count in _SPRING_TRANSACTION_TARGETS:
+            entry = entries_by_role[role][0]
+            jar_path = str(entry.get('jar_path') or '')
+            try:
+                completed = subprocess.run(
+                    ['javap', '-p', '-s', '-classpath', jar_path, owner],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                errors.append(f'{jar_path}:{owner}:{type(exc).__name__}')
+                continue
+            if completed.returncode != 0:
+                errors.append(f'{jar_path}:{owner}:javap_exit_{completed.returncode}')
+                continue
+            parsed_owner, parsed_methods = _parse_javap_methods(completed.stdout)
+            candidates = []
+            if parsed_owner == owner:
+                for parsed in parsed_methods:
+                    parameters = _descriptor_parameter_types(parsed.get('descriptor'))
+                    if (
+                        parsed.get('member') == member
+                        and parameters is not None
+                        and len(parameters) == parameter_count
+                    ):
+                        candidates.append((parsed, parameters))
+            if len(candidates) != 1:
+                errors.append(f'{jar_path}:{owner}.{member}/{parameter_count}:candidate_count_{len(candidates)}')
+                continue
+            parsed, parameters = candidates[0]
+            implementation_targets.append({
+                'target': f"{owner}.{member}({','.join(parameters)})",
+                'descriptor': parsed['descriptor'],
+                'entry': entry,
+                'owner': owner,
+            })
+
+    edges = []
+    nodes = []
+    if len(implementation_targets) == len(_SPRING_TRANSACTION_TARGETS):
+        for method in verified_methods:
+            source = f"{method['owner']}.{method['member']}/{method['parameter_count']}"
+            for implementation in implementation_targets:
+                entry = implementation['entry']
+                nodes.append({
+                    'id': implementation['target'],
+                    'kind': 'spring_transaction_proxy_implementation',
+                })
+                edges.append({
+                    'source': source,
+                    'source_owner': method['owner'],
+                    'source_member': method['member'],
+                    'parameter_count': method['parameter_count'],
+                    'target': implementation['target'],
+                    'target_descriptor': implementation['descriptor'],
+                    'edge_kind': 'spring_transaction_proxy_dispatch',
+                    'confidence': 'high',
+                    'conditions': [],
+                    'ambiguity': False,
+                    'provenance': {
+                        'file': method['file'],
+                        'line': method['line'],
+                        'annotation_scope': method['annotation_scope'],
+                        'business_descriptor': method['business_descriptor'],
+                        'business_artifact_entry': method['business_artifact'].get('artifact_entry'),
+                        'business_artifact_sha256': method['business_artifact'].get('sha256'),
+                        'coord': entry.get('coord'),
+                        'jar': entry.get('jar_path'),
+                        'artifact_entry': entry.get('artifact_entry'),
+                        'artifact_sha256': entry.get('sha256'),
+                        'implementation_class': implementation['owner'],
+                        'implementation_descriptor': implementation['descriptor'],
+                        'business_activation': activation_evidence,
+                        'authority': 'final_artifact_javap',
+                    },
+                })
+    applicable = bool(transactional_methods)
+    unresolved = bool(applicable and (
+        findings or errors
+        or len(verified_methods) != len(transactional_methods)
+        or len(implementation_targets) != len(_SPRING_TRANSACTION_TARGETS)
+    ))
+    return {
+        'adapter': 'spring_transaction_proxy',
+        'version': '1',
+        'status': 'partial' if unresolved else _status(applicable, errors),
+        'nodes': nodes,
+        'edges': edges,
+        'findings': findings,
+        'errors': errors,
+        'metrics': {
+            'transactional_methods': len(transactional_methods),
+            'packaged_transactional_methods': len(verified_methods),
+            'implementation_methods': len(implementation_targets),
+            'edges': len(edges),
+        },
+    }
 
 
 def run_spring_data_repository_adapter(source_roots, artifact_catalog=None):
@@ -1979,6 +2324,7 @@ def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
         run_spi_adapter(source_roots),
         run_spring_adapter(source_roots),
         run_runtime_spring_registration_adapter(source_roots, artifact_catalog=artifact_catalog),
+        run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_spring_data_repository_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_mybatis_adapter(source_roots),
         run_dynamic_proxy_adapter(source_roots),
@@ -2036,6 +2382,7 @@ def attach_framework_edges_to_graph(graph, payload):
     matched_edges = 0
     unmatched_edges = 0
     proxy_dispatch_edges = 0
+    transaction_proxy_edges = 0
     ambiguous_proxy_dispatches = 0
     supported_kinds = {
         'spring_event_listener', 'spring_framework_callback', 'spring_bean_dispatch',
@@ -2065,6 +2412,93 @@ def attach_framework_edges_to_graph(graph, payload):
         return match.group('owner'), match.group('member'), count
 
     reverse_edge_snapshot = dict(graph.reverse_edges)
+    for adapter in (payload or {}).get('adapters') or []:
+        for edge in adapter.get('edges') or []:
+            if edge.get('edge_kind') != 'spring_transaction_proxy_dispatch':
+                continue
+            source_identity = (
+                str(edge.get('source_owner') or ''),
+                str(edge.get('source_member') or ''),
+                int(edge.get('parameter_count') or 0),
+            )
+            source_keys = [
+                lookup_key for lookup_key, callers in reverse_edge_snapshot.items()
+                if callers and method_key_parts(lookup_key) == source_identity
+            ]
+            target = str(edge.get('target') or '').strip()
+            if not source_keys or not target:
+                continue
+            target_lookup_keys = [target]
+            if '(' in target and target.endswith(')'):
+                unsigned, signature_body = target.rsplit('(', 1)
+                normalized = normalize_signature_for_lookup('(' + signature_body)
+                compact = normalized.replace(', ', ',') if normalized else ''
+                for signature in (normalized, compact):
+                    alias = unsigned + signature if signature else ''
+                    if alias and alias not in target_lookup_keys:
+                        target_lookup_keys.append(alias)
+            callers_by_symbol = {}
+            for source_key in source_keys:
+                for caller in reverse_edge_snapshot.get(source_key) or []:
+                    caller_symbol = str(getattr(caller, 'caller_symbol_id', '') or '')
+                    rank = (
+                        3 if str(getattr(caller, 'evidence_source', '') or '') == 'current_final_artifact'
+                        else 2 if getattr(caller, 'runtime_analyzer_hit', None)
+                        else 1 if str(getattr(caller, 'evidence_type', '') or '').startswith('bytecode_')
+                        else 0
+                    )
+                    existing = callers_by_symbol.get(caller_symbol)
+                    if existing is None or rank > existing[0]:
+                        callers_by_symbol[caller_symbol] = (rank, caller)
+            provenance = edge.get('provenance') or {}
+            framework_final_artifact_verified = bool(
+                str(provenance.get('authority') or '') == 'final_artifact_javap'
+                and re.fullmatch(r'[0-9a-fA-F]{64}', str(provenance.get('artifact_sha256') or ''))
+                and re.fullmatch(
+                    r'[0-9a-fA-F]{64}',
+                    str(provenance.get('business_artifact_sha256') or ''),
+                )
+            )
+            for _rank, caller in callers_by_symbol.values():
+                values = dict(vars(caller))
+                values.update({
+                    'callee_key': target,
+                    'callee_simple_key': target.rsplit('.', 1)[-1],
+                    'evidence_type': 'spring_transaction_proxy_dispatch',
+                    'confidence': 'high',
+                    'file': str(provenance.get('jar') or values.get('file') or ''),
+                    'line': int(provenance.get('line') or values.get('line') or 0),
+                    'content': f"Spring transaction proxy dispatch: {source_keys[0]} -> {target}",
+                    'framework_registration': True,
+                    'framework_source': str(edge.get('source') or ''),
+                    'framework_target': target,
+                    'framework_provenance': dict(provenance),
+                    'framework_final_artifact_verified': framework_final_artifact_verified,
+                    'runtime_activation': 'active',
+                })
+                synthetic = SimpleNamespace(**values)
+                identity = (
+                    synthetic.caller_symbol_id,
+                    synthetic.callee_key,
+                    synthetic.evidence_type,
+                )
+                attached = False
+                for target_lookup_key in target_lookup_keys:
+                    bucket = graph.reverse_edges.setdefault(target_lookup_key, [])
+                    if any(
+                        (
+                            getattr(existing, 'caller_symbol_id', ''),
+                            getattr(existing, 'callee_key', ''),
+                            getattr(existing, 'evidence_type', ''),
+                        ) == identity
+                        for existing in bucket
+                    ):
+                        continue
+                    bucket.append(synthetic)
+                    attached = True
+                if attached:
+                    transaction_proxy_edges += 1
+
     for adapter in (payload or {}).get('adapters') or []:
         dispatch_edges = [
             edge for edge in adapter.get('edges') or []
@@ -2315,5 +2749,6 @@ def attach_framework_edges_to_graph(graph, payload):
         'runtime_framework_entry_methods': len(runtime_entries),
         'framework_activation_linked_methods': len(activation_linked_symbols),
         'framework_proxy_dispatch_edges': proxy_dispatch_edges,
+        'framework_transaction_proxy_edges': transaction_proxy_edges,
         'ambiguous_framework_proxy_dispatches': ambiguous_proxy_dispatches,
     }
