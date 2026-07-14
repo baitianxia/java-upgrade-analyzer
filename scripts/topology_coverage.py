@@ -471,9 +471,15 @@ def _selected_target_identities(
     unresolved: list[str] = []
     for row in rows:
         api_name = str(row.get("api_name") or "").strip()
-        owner, separator, member = api_name.rpartition(".")
         signature = normalize_signature_for_lookup(str(row.get("api_signature") or ""))
         kind = str(row.get("symbol_kind") or "method").strip()
+        if kind == "class" and api_name:
+            targets[(api_name, "", "")] = {
+                "owner": api_name, "member": "", "descriptor": "",
+                "coordinate": str(row.get("coord") or ""),
+            }
+            continue
+        owner, separator, member = api_name.rpartition(".")
         matches = []
         for edge in edges:
             if edge.get("callee_owner") != owner or edge.get("callee_member") != member:
@@ -513,6 +519,8 @@ def _oracle_targets_from_rows(rows: list[dict]) -> list[dict]:
     for row in rows or []:
         api_name = str((row or {}).get("api_name") or "").strip()
         kind = str((row or {}).get("symbol_kind") or "method").strip().lower()
+        if kind == "class":
+            continue
         if kind == "constructor" and not api_name.endswith(".<init>"):
             owner, member = api_name, "<init>"
         else:
@@ -1343,6 +1351,7 @@ def extract_artifact_topology_evidence(
         "source_edges": source_edges,
         "source_conflicts": source_conflicts,
         "source_provenance": verified_source_provenance,
+        "semantic_references": list(scan.get("semantic_references") or []),
         "errors": errors,
     }
     return {"complete": layout["complete"], "errors": errors, "edges": scan.get("edges") or [], "artifact_layout": layout}
@@ -1450,6 +1459,17 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
         item.get("evidence_authority") == "bounded_jvm_instruction_dataflow"
         and tuple(item.get("target") or []) in unambiguous_reflection_targets
         for item in artifact_layout.get("reflection_target_links") or []
+    ):
+        observed.add("reflection")
+    semantic_target_classes = {
+        target[0] for target in targets if not target[1] and not target[2]
+    }
+    if any(
+        item.get("authority") == "final-artifact-classfile-constants"
+        and item.get("target_class") in semantic_target_classes
+        and re.fullmatch(r"[0-9a-f]{64}", str(item.get("artifact_sha256") or ""))
+        and str(item.get("artifact_entry") or "").endswith(".class")
+        for item in artifact_layout.get("semantic_references") or []
     ):
         observed.add("reflection")
     if any(

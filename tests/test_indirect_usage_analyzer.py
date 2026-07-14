@@ -64,6 +64,15 @@ def business_method_with_id(symbol_id, body, imports=None):
     return method
 
 
+def business_method_with_params(symbol_id, method_name, params, body):
+    method = business_method_with_id(symbol_id, body)
+    method.method_name = method_name
+    method.qualified_key = f"com.acme.OrderService.{method_name}()"
+    method.param_types = dict(params)
+    method.param_declared_types = dict(params)
+    return method
+
+
 def graph_for(method):
     return SimpleNamespace(
         methods_by_id={method.symbol_id: method}, reverse_edges={},
@@ -185,6 +194,80 @@ class IndirectUsageAnalyzerTest(unittest.TestCase):
         stats = analyze_and_merge_indirect_usages(graph, [api_row()], [])
 
         self.assertEqual(stats["merged_edges"], 1)
+
+    def test_class_utils_for_name_is_a_reflective_class_usage(self):
+        method = business_method('''
+            return ClassUtils.forName(
+                "org.springframework.security.oauth2.core.OAuth2AuthenticatedPrincipal",
+                getClass().getClassLoader());
+        ''')
+        target = {
+            "coord": "org.springframework.security:spring-security-oauth2-core",
+            "api_name": "org.springframework.security.oauth2.core.OAuth2AuthenticatedPrincipal",
+            "api_simple": "OAuth2AuthenticatedPrincipal",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "analysis_scope": "class_usage",
+        }
+        graph = graph_for(method)
+
+        stats = analyze_and_merge_indirect_usages(graph, [target], [])
+
+        self.assertEqual(stats["merged_edges"], 1)
+        edge = graph.reverse_edges[
+            "class:org.springframework.security.oauth2.core.OAuth2AuthenticatedPrincipal"
+        ][0]
+        self.assertEqual(edge.evidence_type, "reflection_class_lookup")
+
+    def test_reflective_class_name_flows_through_local_wrapper_methods(self):
+        methods = [
+            business_method_with_params(
+                "setup", "setup", {},
+                'register("com.vendor.OptionalSecurityType", Object.class);',
+            ),
+            business_method_with_params(
+                "register", "register",
+                {"className": "String", "mixin": "Class"},
+                "loadIfPresent(className);",
+            ),
+            business_method_with_params(
+                "load", "loadIfPresent", {"className": "String"},
+                "return ClassUtils.forName(className, getClass().getClassLoader());",
+            ),
+        ]
+        graph = SimpleNamespace(
+            methods_by_id={method.symbol_id: method for method in methods},
+            reverse_edges={}, lookup_keys_by_symbol={}, type_metadata={},
+            runtime_dependency_catalog={},
+        )
+        target = {
+            "coord": "com.vendor:security-api",
+            "api_name": "com.vendor.OptionalSecurityType",
+            "api_simple": "OptionalSecurityType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "analysis_scope": "class_usage",
+        }
+
+        stats = analyze_and_merge_indirect_usages(graph, [target], [])
+
+        self.assertEqual(stats["merged_edges"], 1)
+        edge = graph.reverse_edges["class:com.vendor.OptionalSecurityType"][0]
+        self.assertEqual(edge.caller_symbol_id, "setup")
+        self.assertEqual(edge.evidence_type, "reflection_class_lookup")
+
+        graph.require_current_final_artifact_business_edges = True
+        result = tracer.trace_api_with_confidence_weighting(
+            target, graph, {}, has_packaged_bytecode_fallback=False,
+            has_dependency_source_mapping=True,
+        )
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "REFLECTION_CLASS_LOOKUP")
+        user_view = formatter.summarize_user_facing_outcome(result)
+        self.assertIn("反射", user_view["user_reason"])
+        self.assertNotIn("未记录", user_view["user_reason"])
 
     def test_dynamic_member_for_known_owner_is_uncertain_not_static_miss(self):
         method = business_method('''
@@ -321,6 +404,47 @@ class IndirectUsageAnalyzerTest(unittest.TestCase):
         method_ref = next(item for item in references if item["kind"] == "method")
         self.assertEqual((class_ref["opcode_family"], class_ref["instruction_offset"]), ("invokestatic", 2))
         self.assertEqual((method_ref["opcode_family"], method_ref["instruction_offset"]), ("invokevirtual", 19))
+
+    def test_javap_class_utils_for_name_emits_reflective_class_reference(self):
+        javap = '''
+  private java.lang.Class<?> load(java.lang.String);
+    descriptor: (Ljava/lang/String;)Ljava/lang/Class;
+    Code:
+       0: aload_1
+       1: aload_0
+       2: invokevirtual #1                  // Method java/lang/Object.getClass:()Ljava/lang/Class;
+       5: invokevirtual #2                  // Method java/lang/Class.getClassLoader:()Ljava/lang/ClassLoader;
+       8: invokestatic  #3                  // Method org/apache/dubbo/common/utils/ClassUtils.forName:(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Class;
+      11: areturn
+'''
+
+        references = parse_javap_indirect_references(
+            javap.replace("aload_1", "ldc #4 // String com.example.DynamicTarget")
+        )
+
+        class_ref = next(item for item in references if item["kind"] == "class")
+        self.assertEqual(class_ref["owner"], "com.example.DynamicTarget")
+        self.assertEqual(class_ref["reference_kind"], "reflection_class")
+        self.assertEqual(class_ref["instruction_offset"], 8)
+
+    def test_javap_class_utils_does_not_reuse_a_discarded_string_constant(self):
+        javap = '''
+  private java.lang.Class<?> load(java.lang.String);
+    descriptor: (Ljava/lang/String;)Ljava/lang/Class;
+    Code:
+       0: ldc           #1                  // String com.example.Unrelated
+       2: pop
+       3: aload_1
+       4: aload_0
+       5: invokevirtual #2                  // Method java/lang/Object.getClass:()Ljava/lang/Class;
+       8: invokevirtual #3                  // Method java/lang/Class.getClassLoader:()Ljava/lang/ClassLoader;
+      11: invokestatic  #4                  // Method org/apache/dubbo/common/utils/ClassUtils.forName:(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Class;
+      14: areturn
+'''
+
+        references = parse_javap_indirect_references(javap)
+
+        self.assertFalse(any(item["kind"] == "class" for item in references))
 
     def test_incomplete_reflection_reference_cannot_emit_runtime_hit(self):
         target = api_row_for("com.example.Target", signature="()")

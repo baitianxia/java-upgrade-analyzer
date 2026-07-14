@@ -35,7 +35,7 @@ from compat import run_cmd
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import normalize_signature_for_lookup, split_signature_params
-from enhanced_source_analyzer import CallEdge, MethodDef
+from enhanced_source_analyzer import CallEdge, MethodDef, _strip_strings_and_comments
 from business_bytecode_graph import parse_classfile_calls
 from indirect_usage_analyzer import (
     api_key as indirect_api_key,
@@ -926,17 +926,18 @@ def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
         imports = getattr(method_def, 'imports', {}) or {}
         wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
         body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
+        code_text = _strip_strings_and_comments(body_text)
         import_matches_target = imports.get(simple_name) == target_class
         wildcard_matches_target = any(f"{pkg}.{simple_name}" == target_class for pkg in wildcard_imports)
         if (import_matches_target or wildcard_matches_target) and any(
-            pattern.search(body_text) for pattern in simple_name_patterns
+            pattern.search(code_text) for pattern in simple_name_patterns
         ):
             cache[target_class] = (method_def, 'imported_type')
             _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
             _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
             _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
             return cache[target_class]
-        if fqcn_pattern.search(body_text):
+        if fqcn_pattern.search(code_text):
             cache[target_class] = (method_def, 'body_reference')
             _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
             _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
@@ -5467,6 +5468,12 @@ def trace_api_with_confidence_weighting(
         packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits, graph)
         _debug_trace_result('trace_api_result', packaged_dependency_result)
         return packaged_dependency_result
+
+    if result.analysis_scope == 'class_usage' or result.symbol_kind == 'class':
+        indirect_result = _build_indirect_usage_result(result, api_row, graph)
+        if indirect_result is not None:
+            _debug_trace_result('trace_api_result', indirect_result)
+            return indirect_result
 
     if (
         artifact_scan_incomplete

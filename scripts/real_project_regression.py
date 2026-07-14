@@ -24,6 +24,7 @@ import importlib
 import io
 import json
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -32,7 +33,7 @@ import zipfile
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from exhaustive_api_oracle import (
@@ -881,6 +882,34 @@ CASES["gs-managing-transactions"] = RealProjectCase(
     ),
 )
 
+CASES["dubbo-spring6-security"] = RealProjectCase(
+    name="dubbo-spring6-security",
+    default_project=Path("/private/tmp/jua-real-project-dubbo-source-20260710"),
+    default_changed_apis=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "dubbo-spring6-security-changed-apis.csv"
+    ),
+    baseline_specs=(),
+    source_dirs=(Path("dubbo-plugin/dubbo-spring6-security/src/main/java"),),
+    require_valid_git=True,
+    min_project_java_files=500,
+    min_main_java_files=300,
+    max_generated_java_ratio=0.5,
+    case_mode="guard",
+    ground_truth_status="reviewed",
+    bytecode_owner_prefixes=("org/springframework/security/oauth2/core/",),
+    bytecode_coord="org.springframework.security:spring-security-oauth2-core",
+    final_artifact=Path(
+        "/private/tmp/jua-real-project-dubbo-source-20260710/dubbo-plugin/"
+        "dubbo-spring6-security/target/dubbo-spring6-security-3.3.7-SNAPSHOT.jar"
+    ),
+    required_topologies=("reflection",),
+    fixture_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "dubbo-spring6-security.json"
+    ),
+)
+
 CASES = {
     name: apply_real_case_performance_budget(case)
     for name, case in CASES.items()
@@ -933,6 +962,8 @@ def _matches_expected_call_chain(path_text: str, expected_chain: list[str], expe
     if marker_indexes:
         terminal = _CHANGE_API_MARKER_RE.sub("", terminal, count=1).strip()
     if str((expected_api or {}).get("symbol_kind") or "").strip() == "field":
+        return terminal == target_identity
+    if str((expected_api or {}).get("symbol_kind") or "").strip() == "class":
         return terminal == target_identity
     if not expected_signature:
         return False
@@ -1012,18 +1043,18 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
             or manifest.get("expected_conclusion")
             or ""
         )
-        reachable_rows = [
-            row for row in (summary.get("reachable_apis") or [])
+        matching_rows = [
+            row for row in conclusion_rows
             if str(row.get("api") or row.get("api_name") or "") == expected_name
-            and str(row.get("analysis_status") or "reachable") == expected_conclusion
+            and str(row.get("analysis_status") or "") == expected_conclusion
         ]
-        if not reachable_rows:
+        if not matching_rows:
             if "expected_conclusion_missing" not in errors:
                 errors.append("expected_conclusion_missing")
             continue
         expected_chain = [str(item) for item in (expected_api.get("expected_chain") or [])]
         if expected_chain:
-            call_paths = [path for row in reachable_rows for path in _reachable_call_paths(row)]
+            call_paths = [path for row in matching_rows for path in _reachable_call_paths(row)]
             if not any(
                 _matches_expected_call_chain(path, expected_chain, expected_api)
                 for path in call_paths
@@ -1043,7 +1074,29 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
         _expected_physical_occurrence(row)
         for row in (manifest.get("canonical_edges") or [])
     }
-    if not expected_physical_edges or "" in expected_physical_edges or not expected_physical_edges.issubset(correct_physical_edges):
+    expected_semantic = list(manifest.get("canonical_semantic_references") or [])
+    actual_semantic = list(edge_truth.get("semantic_references") or [])
+    semantic_fields = (
+        "api_identity", "target_class", "artifact_sha256", "artifact_entry", "authority",
+    )
+    actual_semantic_identities = {
+        tuple(str(row.get(field) or "") for field in semantic_fields)
+        for row in actual_semantic
+    }
+    expected_semantic_identities = {
+        tuple(str(row.get(field) or "") for field in semantic_fields)
+        for row in expected_semantic
+    }
+    if expected_physical_edges and (
+        "" in expected_physical_edges
+        or not expected_physical_edges.issubset(correct_physical_edges)
+    ):
+        errors.append("expected_physical_edge_missing")
+    if expected_semantic_identities and not expected_semantic_identities.issubset(
+        actual_semantic_identities
+    ):
+        errors.append("expected_semantic_reference_missing")
+    if not expected_physical_edges and not expected_semantic_identities:
         errors.append("expected_physical_edge_missing")
     return {"passed": not errors, "errors": errors}
 
@@ -2073,7 +2126,8 @@ def finalize_performance_envelope(envelope: dict) -> dict:
     parse_seconds = float(envelope.get("parse_seconds") or 0.0)
     oracle_edges = int(envelope.get("oracle_edge_count") or 0)
     analyzer_edges = int(envelope.get("analyzer_edge_count") or 0)
-    edge_count = max(oracle_edges, analyzer_edges)
+    semantic_references = int(envelope.get("semantic_reference_count") or 0)
+    edge_count = max(oracle_edges, analyzer_edges) + semantic_references
     reconcile_seconds = float(envelope.get("reconcile_seconds") or 0.0)
     elapsed_seconds = float(envelope.get("elapsed_seconds") or 0.0)
     envelope["parse_rate_available"] = parsed_class_count > 0 and parse_seconds > 0
@@ -2081,6 +2135,7 @@ def finalize_performance_envelope(envelope: dict) -> dict:
         parsed_class_count / parse_seconds if envelope["parse_rate_available"] else None
     )
     envelope["edge_rate_available"] = edge_count > 0
+    envelope["audit_evidence_count"] = edge_count
     envelope["reconcile_edges_per_second"] = (
         edge_count / reconcile_seconds if edge_count and reconcile_seconds else None
     )
@@ -2343,6 +2398,113 @@ def _verified_framework_semantic_targets(
     return identities
 
 
+def _classfile_utf8_constants(content: bytes) -> set[bytes]:
+    if len(content) < 10 or content[:4] != b"\xca\xfe\xba\xbe":
+        raise ValueError("not a classfile")
+    constant_count = struct.unpack_from(">H", content, 8)[0]
+    constants: set[bytes] = set()
+    index = 10
+    slot = 1
+    while slot < constant_count:
+        if index >= len(content):
+            raise ValueError("truncated constant pool")
+        tag = content[index]
+        index += 1
+        if tag == 1:
+            if index + 2 > len(content):
+                raise ValueError("truncated UTF8 constant length")
+            length = struct.unpack_from(">H", content, index)[0]
+            index += 2
+            if index + length > len(content):
+                raise ValueError("truncated UTF8 constant")
+            constants.add(content[index:index + length])
+            index += length
+        elif tag in {3, 4}:
+            index += 4
+        elif tag in {5, 6}:
+            index += 8
+            slot += 1
+        elif tag in {7, 8, 16, 19, 20}:
+            index += 2
+        elif tag in {9, 10, 11, 12, 17, 18}:
+            index += 4
+        elif tag == 15:
+            index += 3
+        else:
+            raise ValueError(f"unsupported constant-pool tag {tag}")
+        if index > len(content):
+            raise ValueError("truncated constant-pool payload")
+        slot += 1
+    return constants
+
+
+def scan_final_artifact_dynamic_class_references(
+    artifact: Path, selected_rows: list[dict]
+) -> list[dict]:
+    """Independently identify exact class-name constants coupled to a loader API.
+
+    This is intentionally weaker than an executable edge oracle. It can prove a
+    packaged dynamic class reference exists, but its semantic ceiling is
+    ``uncertain`` because activation and successful loading remain runtime facts.
+    """
+    class_targets = [
+        row for row in selected_rows
+        if str((row or {}).get("symbol_kind") or "").strip().lower() == "class"
+        and str((row or {}).get("api_name") or "").strip()
+    ]
+    if not class_targets:
+        return []
+    snapshot = Path(artifact).read_bytes()
+    artifact_sha256 = hashlib.sha256(snapshot).hexdigest()
+    references = []
+    with zipfile.ZipFile(io.BytesIO(snapshot)) as archive:
+        names = archive.namelist()
+        business_prefix = next(
+            (
+                prefix for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/")
+                if any(name.startswith(prefix) and name.endswith(".class") for name in names)
+            ),
+            "",
+        )
+        for name in sorted(names):
+            if not name.endswith(".class") or name.startswith("META-INF/"):
+                continue
+            if business_prefix and not name.startswith(business_prefix):
+                continue
+            content = archive.read(name)
+            try:
+                constants = _classfile_utf8_constants(content)
+            except ValueError:
+                continue
+            has_loader = (
+                (b"java/lang/Class" in constants and b"forName" in constants)
+                or (
+                    b"forName" in constants
+                    and any(value == b"ClassUtils" or value.endswith(b"/ClassUtils") for value in constants)
+                )
+                or (b"java/lang/ClassLoader" in constants and b"loadClass" in constants)
+            )
+            if not has_loader:
+                continue
+            for row in class_targets:
+                api_name = str(row.get("api_name") or "").strip()
+                if api_name.encode("utf-8") not in constants:
+                    continue
+                references.append({
+                    "api_identity": serialized_api_identity(row),
+                    "target_class": api_name,
+                    "artifact_sha256": artifact_sha256,
+                    "artifact_entry": name,
+                    "authority": "final-artifact-classfile-constants",
+                    "authority_version": "1",
+                    "procedure": (
+                        "SHA-verified business class contains the exact FQCN UTF8 constant "
+                        "and a Class.forName, ClassUtils.forName, or ClassLoader.loadClass marker"
+                    ),
+                })
+    return references
+
+
 def reconcile_selected_api_edges(
     report_dir: Path,
     selected_rows: list[dict],
@@ -2353,7 +2515,12 @@ def reconcile_selected_api_edges(
     reconcile_started_at = time.perf_counter()
     report_dir = Path(report_dir)
     oracle_rows = [dict(row) for row in (oracle_scan.get("edges") or [])]
+    semantic_references = list(oracle_scan.get("semantic_references") or [])
     semantic_targets = _verified_framework_semantic_targets(report_dir, selected_rows)
+    semantic_targets.update(
+        str(item.get("api_identity") or "") for item in semantic_references
+        if str(item.get("api_identity") or "")
+    )
     retained_oracle_rows, api_reachability, path_errors = _retain_authoritative_api_path(
         selected_rows, oracle_rows, semantic_targets
     )
@@ -2394,10 +2561,16 @@ def reconcile_selected_api_edges(
         EDGE_RECONCILIATION_FIELDS,
         reconciliation["ledger"],
     )
+    semantic_path = report_dir / "evidence" / "call_chain" / "oracle_semantic_references.json"
+    semantic_path.write_text(
+        json.dumps(semantic_references, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     counts = {
         "oracle_edge_count": len(retained_oracle_rows),
         "analyzer_edge_count": len(retained_analyzer_rows),
         "edge_reconciliation_row_count": len(reconciliation["ledger"]),
+        "semantic_reference_count": len(semantic_references),
         "reconcile_seconds": time.perf_counter() - reconcile_started_at,
         **{f"edge_truth_{verdict}_count": int(count) for verdict, count in reconciliation["verdict_counts"].items()},
     }
@@ -2418,6 +2591,8 @@ def reconcile_selected_api_edges(
         "counts": counts,
         "oracle_edges": oracle_path,
         "edge_reconciliation": reconciliation_path,
+        "semantic_references": semantic_references,
+        "semantic_reference_evidence": str(semantic_path),
         "trusted_artifact_sha": str(oracle_scan.get("artifact_sha256") or ""),
         "oracle_metrics": oracle_metrics,
         "oracle_physical_occurrences": [
@@ -2464,6 +2639,8 @@ def _oracle_selected_targets(selected_rows: list[dict]) -> list[dict]:
     for row in selected_rows or []:
         api_name = str((row or {}).get("api_name") or "").strip()
         symbol_kind = str((row or {}).get("symbol_kind") or "method").strip().lower()
+        if symbol_kind == "class":
+            continue
         if symbol_kind == "constructor" and not api_name.endswith(".<init>"):
             owner, member = api_name, "<init>"
         else:
@@ -2497,6 +2674,15 @@ def reconcile_final_artifact_edges(
             time_budget_seconds=oracle_time_budget_seconds,
             selected_targets=_oracle_selected_targets(selected_rows),
         )
+        try:
+            scan["semantic_references"] = scan_final_artifact_dynamic_class_references(
+                artifact, selected_rows
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            scan["complete"] = False
+            scan.setdefault("failures", []).append(
+                f"dynamic_class_reference_scan_failed:{error}"
+            )
         try:
             scan["artifact_entries"] = sorted(_artifact_class_entries(artifact))
         except (OSError, zipfile.BadZipFile) as error:
@@ -2663,9 +2849,34 @@ def materialize_bytecode_changed_apis(
     owner_prefix_bytes = tuple(prefix.encode("utf-8") for prefix in case.bytecode_owner_prefixes)
     artifact_id = case.bytecode_coord.split(":", 1)[-1].strip()
     with zipfile.ZipFile(artifact) as source:
-        for name in sorted(source.namelist()):
-            if name.startswith("BOOT-INF/classes/") and name.endswith(".class"):
-                relative = name[len("BOOT-INF/classes/"):]
+        names = source.namelist()
+        application_prefix = next(
+            (
+                prefix for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/")
+                if any(name.startswith(prefix) and name.endswith(".class") for name in names)
+            ),
+            "",
+        )
+        business_entries: dict[str, str] = {}
+        for name in sorted(names):
+            if application_prefix:
+                is_business_class = name.startswith(application_prefix) and name.endswith(".class")
+                relative = name[len(application_prefix):] if is_business_class else ""
+            else:
+                is_business_class = bool(
+                    name.endswith(".class")
+                    and not name.startswith("META-INF/")
+                    and name != "module-info.class"
+                )
+                relative = name if is_business_class else ""
+            if is_business_class:
+                relative_path = PurePosixPath(relative)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    raise ValueError(f"unsafe business class entry: {name}")
+                logical_name = relative_path.as_posix()
+                if logical_name in business_entries:
+                    raise ValueError(f"duplicate business class entry: {logical_name}")
+                business_entries[logical_name] = name
                 destination = extracted_root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 class_bytes = source.read(name)
@@ -3319,7 +3530,7 @@ def build_policy_signals(
     reconciled_edge_count = max(
         int(performance.get("oracle_edge_count") or 0),
         int(performance.get("analyzer_edge_count") or 0),
-    )
+    ) + int(performance.get("semantic_reference_count") or 0)
     normalized_rate_eligible = (
         reconciled_edge_count >= int(case.min_edges_for_normalized_rate or 0)
     )
@@ -3332,9 +3543,9 @@ def build_policy_signals(
             "performance_regression", "P1", case.name, step="step5",
             message=(
                 "elapsed_seconds_per_100k_edges=unavailable because "
-                "oracle_edge_count and analyzer_edge_count are both zero"
+                "physical edge and semantic reference counts are all zero"
             ),
-            expected="normalized edge analysis time has a nonzero exhaustive edge denominator",
+            expected="normalized analysis time has a nonzero independently audited evidence denominator",
             actual="unavailable",
             evidence=[report_dir / "evidence" / "call_chain" / "summary.json"],
         ))

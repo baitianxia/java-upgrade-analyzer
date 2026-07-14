@@ -6203,6 +6203,56 @@ public class com.example.TargetBridge {
         self.assertIn("com.biz.Entry.handle", result.call_paths[0])
         self.assertIn("com.lib.TargetType", result.call_paths[0])
 
+    def test_trace_api_does_not_treat_fqcn_string_as_direct_class_usage(self):
+        api_row = {
+            "api_name": "com.lib.OptionalType",
+            "api_simple": "OptionalType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "coord": "lib:demo",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_scope": "class_usage",
+            "matched_class": "com.lib.OptionalType",
+        }
+        business_method = SimpleNamespace(
+            symbol_id="business_entry",
+            qualified_key="com.biz.Entry.configure",
+            simple_key="method:configure",
+            class_fqcn="com.biz.Entry",
+            class_name="Entry",
+            method_name="configure",
+            return_type="void",
+            file="Entry.java",
+            line=12,
+            owner_type="business",
+            is_test=False,
+            param_types={},
+            field_types={},
+            local_var_types={},
+            imports={},
+            wildcard_imports=[],
+            static_imports={},
+            get_body_text=lambda: (
+                'loader.load("com.lib.OptionalType"); '
+                '// com.lib.OptionalType\n'
+                'String note = "com.lib.OptionalType";'
+            ),
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"business_entry": business_method},
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(
+            api_row, graph, {}, max_total_cost=5
+        )
+
+        self.assertNotEqual(result.reason_code, "DIRECT_CLASS_USAGE")
+        self.assertNotEqual(result.analysis_status, "reachable")
+
     def test_trace_api_does_not_upgrade_class_usage_when_import_resolves_simple_name_to_other_type(self):
         api_row = {
             "api_name": "org.apache.commons.lang.time.StopWatch",

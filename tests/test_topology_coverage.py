@@ -42,6 +42,25 @@ def _jar_classes(path: Path, classes: Path) -> None:
 
 @unittest.skipUnless(JDK_TOOLS, "JDK tools required")
 class TopologyCoverageTest(unittest.TestCase):
+    def test_classfile_semantic_reference_counts_as_uncertain_reflection_topology(self):
+        target = "com.vendor.OptionalSecurityType"
+        layout = {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [{"owner": target, "member": "", "descriptor": ""}],
+            "entry_layout": [],
+            "semantic_references": [{
+                "target_class": target,
+                "authority": "final-artifact-classfile-constants",
+                "artifact_sha256": "a" * 64,
+                "artifact_entry": "app/SecurityModule.class",
+            }],
+        }
+
+        observed = topology_coverage.classify_topologies([], layout)
+
+        self.assertIn("reflection", observed)
+
     def test_transaction_proxy_topology_requires_packaged_runtime_annotation(self):
         target = (
             "org.springframework.transaction.interceptor.TransactionInterceptor",

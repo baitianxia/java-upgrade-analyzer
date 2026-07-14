@@ -16,6 +16,8 @@ REFLECTION_MEMBER_PATTERN = re.compile(r'\.get(?:Declared)?(?:Method|Field|Const
 OWNER_SIMPLE_TOKEN_PATTERN_CACHE = {}
 SOURCE_INDIRECT_MARKERS = (
     'Class.forName',
+    'ClassUtils.forName',
+    '.loadClass(',
     'getMethod',
     'getDeclaredMethod',
     'getField',
@@ -25,6 +27,10 @@ SOURCE_INDIRECT_MARKERS = (
     'MethodHandles',
 )
 EXPRESSION_MARKERS = ('T(', '#{', '${', '@')
+CLASS_LOOKUP_EXPR = (
+    r'(?:(?:Class|(?:[A-Za-z_$][\w.$]*\.)?ClassUtils)\s*\.\s*forName'
+    r'|[A-Za-z_$]\w*\s*\.\s*loadClass)'
+)
 
 
 def _descriptor_signature(descriptor):
@@ -51,6 +57,26 @@ def _descriptor_signature(descriptor):
             return ''
         params.append(_simple_type(value + '[]' * arrays))
     return '(' + ', '.join(params) + ')'
+
+
+def _descriptor_parameter_count(descriptor):
+    text = str(descriptor or '')
+    if not text.startswith('(') or ')' not in text:
+        return None
+    count = 0
+    index = 1
+    while index < len(text) and text[index] != ')':
+        while text[index:index + 1] == '[':
+            index += 1
+        if text[index:index + 1] == 'L':
+            end = text.find(';', index)
+            if end < 0:
+                return None
+            index = end + 1
+        else:
+            index += 1
+        count += 1
+    return count if index < len(text) and text[index] == ')' else None
 
 
 def parse_javap_indirect_references(text, class_binary_name=''):
@@ -91,6 +117,7 @@ def parse_javap_indirect_references(text, class_binary_name=''):
         produced = None
         active_class = None
         active_member = None
+        operand_stack = []
 
         def local_slot(instruction, opcode):
             match = re.match(rf'{opcode}(?:_(\d+)|\s+(\d+))\b', instruction)
@@ -101,21 +128,65 @@ def parse_javap_indirect_references(text, class_binary_name=''):
         for offset, insn in method['instructions']:
             string_match = re.search(r'\bldc(?:_w)?\b.*//\s+String\s+(.+)$', insn)
             if string_match:
-                strings.append((offset, string_match.group(1).strip()))
+                literal = string_match.group(1).strip()
+                strings.append((offset, literal))
+                operand_stack.append({'kind': 'string', 'value': literal, 'offset': offset})
+            elif re.search(r'\bldc(?:_w)?\b', insn):
+                operand_stack.append({'kind': 'unknown'})
             load_slot = local_slot(insn, 'aload')
-            if load_slot is not None and load_slot in locals_by_slot:
-                loaded = locals_by_slot[load_slot]
+            if load_slot is not None:
+                loaded = locals_by_slot.get(load_slot, {'kind': 'unknown'})
+                operand_stack.append(dict(loaded))
                 produced = loaded
                 if loaded.get('kind') == 'class_value':
                     active_class = loaded
                 elif loaded.get('kind') in {'method', 'field', 'constructor'}:
                     active_member = loaded
-            if re.search(r'//\s+Method\s+java/lang/Class\.forName:', insn):
-                if strings:
-                    owner_offset, owner = strings[-1]
+            if re.match(r'pop\b', insn):
+                if operand_stack:
+                    operand_stack.pop()
+                produced = None
+
+            invocation_args = []
+            invocation = re.search(
+                r'//\s+(?:InterfaceMethod|Method)\s+[^:]+:(\([^\s]*\)[^\s]+)', insn
+            )
+            if invocation:
+                descriptor = invocation.group(1)
+                argument_count = _descriptor_parameter_count(descriptor)
+                opcode = insn.split(None, 1)[0]
+                receiver_count = 0 if opcode in {'invokestatic', 'invokedynamic'} else 1
+                required = (argument_count or 0) + receiver_count
+                popped = (
+                    operand_stack[-required:] if required and len(operand_stack) >= required
+                    else [{'kind': 'unknown'}] * required
+                )
+                if required and len(operand_stack) >= required:
+                    del operand_stack[-required:]
+                invocation_args = popped[receiver_count:]
+                return_descriptor = descriptor.split(')', 1)[1]
+                if return_descriptor != 'V':
+                    operand_stack.append({'kind': 'unknown'})
+            if (
+                re.search(
+                    r'//\s+(?:InterfaceMethod|Method)\s+'
+                    r'(?:java/lang/Class|[\w/$]*ClassUtils)\.forName:',
+                    insn,
+                )
+                or re.search(
+                    r'//\s+(?:InterfaceMethod|Method)\s+[\w/$]*ClassLoader\.loadClass:',
+                    insn,
+                )
+            ):
+                owner_arg = invocation_args[0] if invocation_args else {}
+                if owner_arg.get('kind') == 'string':
+                    owner_offset = owner_arg['offset']
+                    owner = owner_arg['value']
                     owner = owner.replace('/', '.').replace('$', '.')
                     active_class = {'kind': 'class_value', 'owner': owner, 'offset': owner_offset}
                     produced = active_class
+                    if operand_stack:
+                        operand_stack[-1] = dict(active_class)
                     result.append({
                         'owner': owner, 'name': '', 'signature': '', 'kind': 'class',
                         'consumer_method': method['name'], 'consumer_signature': method['signature'],
@@ -184,6 +255,8 @@ def parse_javap_indirect_references(text, class_binary_name=''):
             if store_slot is not None and produced:
                 locals_by_slot[store_slot] = dict(produced)
                 produced = None
+            if store_slot is not None and operand_stack:
+                operand_stack.pop()
     return result
 
 
@@ -385,6 +458,138 @@ def _expression_matches_target(text, target):
     return bool(re.search(r'@' + re.escape(owner) + r'@' + re.escape(member) + r'\b', text))
 
 
+def _iter_local_invocations(body, method_names):
+    names = sorted({str(name or '') for name in method_names if name}, key=len, reverse=True)
+    if not names:
+        return
+    pattern = re.compile(
+        r'(?<![\w$])(?:this\s*\.\s*)?(' + '|'.join(re.escape(name) for name in names) + r')\s*\('
+    )
+    for match in pattern.finditer(body):
+        open_index = body.find('(', match.start(), match.end())
+        depth = 0
+        quote = ''
+        escape = False
+        for index in range(open_index, len(body)):
+            char = body[index]
+            if quote:
+                if escape:
+                    escape = False
+                elif char == '\\':
+                    escape = True
+                elif char == quote:
+                    quote = ''
+                continue
+            if char in {'"', "'"}:
+                quote = char
+            elif char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+                if depth == 0:
+                    yield match.group(1), _split_args(body[open_index + 1:index]), match.start(), body[match.start():index + 1]
+                    break
+
+
+def _method_param_names(method):
+    declared = getattr(method, 'param_declared_types', {}) or {}
+    resolved = getattr(method, 'param_types', {}) or {}
+    return list(declared or resolved)
+
+
+def _string_param_indices(method):
+    declared = getattr(method, 'param_declared_types', {}) or {}
+    resolved = getattr(method, 'param_types', {}) or {}
+    names = _method_param_names(method)
+    return {
+        index for index, name in enumerate(names)
+        if _simple_type(declared.get(name) or resolved.get(name)) == 'String'
+    }
+
+
+def _direct_class_lookup_param_indices(method):
+    body = method.get_body_text()
+    param_names = _method_param_names(method)
+    string_indices = _string_param_indices(method)
+    result = set()
+    for match in re.finditer(
+        CLASS_LOOKUP_EXPR + r'\s*\(\s*([A-Za-z_$]\w*)(?=\s*[,)]{1})',
+        body,
+    ):
+        if match.group(1) in param_names:
+            index = param_names.index(match.group(1))
+            if index in string_indices:
+                result.add(index)
+    return result
+
+
+def _interprocedural_reflection_candidates(methods):
+    methods = list(methods)
+    groups = {}
+    names_by_class = {}
+    for method in methods:
+        params = _method_param_names(method)
+        key = (method.class_fqcn, method.method_name, len(params))
+        groups.setdefault(key, []).append(method)
+        names_by_class.setdefault(method.class_fqcn, set()).add(method.method_name)
+
+    summaries = {
+        method.symbol_id: _direct_class_lookup_param_indices(method)
+        for method in methods
+    }
+    for _ in range(len(methods) + 1):
+        changed = False
+        for method in methods:
+            param_names = _method_param_names(method)
+            string_indices = _string_param_indices(method)
+            for name, args, _offset, _content in _iter_local_invocations(
+                method.get_body_text(), names_by_class.get(method.class_fqcn, ())
+            ):
+                callees = groups.get((method.class_fqcn, name, len(args)), [])
+                if not callees:
+                    continue
+                sink_positions = set(summaries[callees[0].symbol_id])
+                for callee in callees[1:]:
+                    sink_positions.intersection_update(summaries[callee.symbol_id])
+                for sink_position in sink_positions:
+                    if sink_position >= len(args) or args[sink_position] not in param_names:
+                        continue
+                    caller_index = param_names.index(args[sink_position])
+                    if caller_index in string_indices and caller_index not in summaries[method.symbol_id]:
+                        summaries[method.symbol_id].add(caller_index)
+                        changed = True
+        if not changed:
+            break
+
+    result = {method.symbol_id: [] for method in methods}
+    for method in methods:
+        body = method.get_body_text()
+        string_vars = {
+            match.group(1): match.group(2)
+            for match in re.finditer(
+                r'\bString\s+([A-Za-z_$]\w*)\s*=\s*"((?:\\.|[^"\\])*)"\s*;', body
+            )
+        }
+        for name, args, offset, content in _iter_local_invocations(
+            body, names_by_class.get(method.class_fqcn, ())
+        ):
+            callees = groups.get((method.class_fqcn, name, len(args)), [])
+            if not callees:
+                continue
+            sink_positions = set(summaries[callees[0].symbol_id])
+            for callee in callees[1:]:
+                sink_positions.intersection_update(summaries[callee.symbol_id])
+            for sink_position in sink_positions:
+                if sink_position >= len(args):
+                    continue
+                owner = _literal_or_var(args[sink_position], string_vars).replace('$', '.')
+                if owner:
+                    result[method.symbol_id].append((
+                        'class', owner, '', (), offset, content, 'reflection_class_lookup',
+                    ))
+    return result
+
+
 def _source_candidates(method):
     body = method.get_body_text()
     if not any(marker in body for marker in SOURCE_INDIRECT_MARKERS):
@@ -408,7 +613,8 @@ def _source_candidates(method):
     ):
         lookup_vars.add(match.group(1))
     for match in re.finditer(
-        rf'\bClass(?:\s*<[^;=]+>)?\s+([A-Za-z_$]\w*)\s*=\s*Class\.forName\s*\(\s*({class_expr})\s*\)',
+        rf'\bClass(?:\s*<[^;=]+>)?\s+([A-Za-z_$]\w*)\s*=\s*'
+        rf'{CLASS_LOOKUP_EXPR}\s*\(\s*({class_expr})(?=\s*[,)]{{1}})',
         body, re.S,
     ):
         owner = _literal_or_var(match.group(2), string_vars)
@@ -507,7 +713,11 @@ def _source_candidates(method):
         elif owner:
             unresolved.append({'owner': owner, 'member': member, 'reason_code': 'REFLECTION_TARGET_DYNAMIC', 'offset': match.start()})
 
-    for match in re.finditer(r'Class\.forName\s*\(\s*(' + class_expr + r')\s*\)', body, re.S):
+    for match in re.finditer(
+        CLASS_LOOKUP_EXPR + r'\s*\(\s*(' + class_expr + r')(?=\s*[,)]{1})',
+        body,
+        re.S,
+    ):
         owner = _literal_or_var(match.group(1), string_vars)
         if owner:
             candidates.append(('class', owner, '', (), match.start(), match.group(0), 'reflection_class_lookup'))
@@ -683,11 +893,18 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
     source_methods = 0
     owner_presence_scans = 0
     source_methods_with_indirect_markers = 0
+    methods = list((getattr(graph, 'methods_by_id', {}) or {}).values())
+    propagated_reflection_candidates = _interprocedural_reflection_candidates(methods)
 
-    for method in (getattr(graph, 'methods_by_id', {}) or {}).values():
+    for method in methods:
         source_methods += 1
         body, candidates, unresolved = _source_candidates(method)
-        has_reflection_source = 'Class.forName' in body or bool(REFLECTION_MEMBER_PATTERN.search(body))
+        candidates.extend(propagated_reflection_candidates.get(method.symbol_id, ()))
+        has_reflection_source = (
+            any(marker in body for marker in ('Class.forName', 'ClassUtils.forName', '.loadClass('))
+            or bool(REFLECTION_MEMBER_PATTERN.search(body))
+            or any(item[6].startswith('reflection_') for item in candidates)
+        )
         has_method_handle_source = 'MethodHandles' in body
         has_expression_markers = any(marker in body for marker in EXPRESSION_MARKERS)
         present_owners = []
@@ -714,6 +931,15 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
                     if not any((old.caller_symbol_id, old.callee_key, old.evidence_type, old.line) == identity for old in bucket):
                         bucket.append(edge)
                 merged_edges += 1
+                if evidence_type.startswith('reflection_'):
+                    findings[target['api_key']].append({
+                        'evidence_type': evidence_type,
+                        'reason_code': evidence_type.upper(),
+                        'file': method.file,
+                        'line': _line_for_offset(method, body, offset),
+                        'caller_symbol': method.qualified_key,
+                        'owner_coord': method.owner_coord,
+                    })
         for item in unresolved:
             owner = item.get('owner') or ''
             if not owner:

@@ -1,6 +1,7 @@
 import csv
 import json
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import real_project_regression as realreg  # noqa: E402
+
+
+def minimal_classfile_with_utf8(*values):
+    entries = []
+    for value in values:
+        encoded = value.encode("utf-8")
+        entries.append(b"\x01" + struct.pack(">H", len(encoded)) + encoded)
+    return (
+        b"\xca\xfe\xba\xbe"
+        + struct.pack(">HHH", 0, 61, len(entries) + 1)
+        + b"".join(entries)
+    )
 
 
 class RealProjectRegressionTest(unittest.TestCase):
@@ -209,6 +222,24 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "business_direct", "cross_jar_bridge",
                 "interface_dispatch", "static_dispatch",
             },
+        )
+
+    def test_dubbo_spring6_security_guard_declares_independent_reflection_api(self):
+        case = realreg.CASES["dubbo-spring6-security"]
+
+        self.assertEqual(case.case_mode, "guard")
+        self.assertEqual(case.required_topologies, ("reflection",))
+        self.assertEqual(
+            case.default_changed_apis,
+            ROOT / "tests" / "fixtures" / "real_projects" /
+            "dubbo-spring6-security-changed-apis.csv",
+        )
+        self.assertEqual(
+            case.final_artifact,
+            Path(
+                "/private/tmp/jua-real-project-dubbo-source-20260710/dubbo-plugin/"
+                "dubbo-spring6-security/target/dubbo-spring6-security-3.3.7-SNAPSHOT.jar"
+            ),
         )
 
     def test_all_executable_real_cases_declare_nonempty_topology_requirements(self):
@@ -621,6 +652,21 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(regressions[0]["blocking"])
         self.assertIn("unavailable", regressions[0]["message"])
 
+    def test_semantic_reference_is_a_valid_normalized_audit_denominator(self):
+        envelope = realreg.collect_performance_envelope({}, elapsed=0.8, selected=1)
+        envelope.update({
+            "oracle_edge_count": 0,
+            "analyzer_edge_count": 0,
+            "semantic_reference_count": 1,
+            "reconcile_seconds": 0.01,
+        })
+
+        realreg.finalize_performance_envelope(envelope)
+
+        self.assertTrue(envelope["edge_rate_available"])
+        self.assertEqual(envelope["audit_evidence_count"], 1)
+        self.assertEqual(envelope["elapsed_seconds_per_100k_edges"], 80000.0)
+
     def test_zero_parsed_class_rate_is_unavailable_and_blocks_a_configured_budget(self):
         envelope = realreg.collect_performance_envelope(
             {"meta": {"graph_stats": {"step5_perf": {"bytecode_scan": {
@@ -861,6 +907,128 @@ class RealProjectRegressionTest(unittest.TestCase):
             f"selected_api_unreached_business_boundary:{identity}",
             result["errors"],
         )
+
+    def test_class_api_is_not_misrepresented_as_an_executable_member_target(self):
+        targets = realreg._oracle_selected_targets([{
+            "api_name": "com.vendor.OptionalSecurityType",
+            "api_signature": "",
+            "symbol_kind": "class",
+        }])
+
+        self.assertEqual(targets, [])
+
+    def test_final_artifact_dynamic_class_oracle_requires_loader_and_exact_name(self):
+        target = {
+            "coord": "com.vendor:security-api",
+            "api_name": "com.vendor.OptionalSecurityType",
+            "api_signature": "",
+            "symbol_kind": "class",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/app/SecurityModule.class",
+                    minimal_classfile_with_utf8(
+                        "com.vendor.OptionalSecurityType",
+                        "org/apache/dubbo/common/utils/ClassUtils",
+                        "forName",
+                    ),
+                )
+                archive.writestr(
+                    "BOOT-INF/classes/app/Unrelated.class",
+                    minimal_classfile_with_utf8("com.vendor.OptionalSecurityType"),
+                )
+                archive.writestr(
+                    "BOOT-INF/classes/app/Invalid.class",
+                    b"com.vendor.OptionalSecurityType\x00ClassUtils\x00forName",
+                )
+
+            references = realreg.scan_final_artifact_dynamic_class_references(
+                artifact, [target]
+            )
+
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0]["api_identity"], realreg.serialized_api_identity(target))
+        self.assertEqual(references[0]["artifact_entry"], "BOOT-INF/classes/app/SecurityModule.class")
+        self.assertEqual(references[0]["authority"], "final-artifact-classfile-constants")
+
+    def test_dynamic_class_semantic_reference_resolves_oracle_as_uncertain(self):
+        artifact_sha256 = "a" * 64
+        target = {
+            "coord": "com.vendor:security-api",
+            "api_name": "com.vendor.OptionalSecurityType",
+            "api_signature": "",
+            "symbol_kind": "class",
+        }
+        identity = realreg.serialized_api_identity(target)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [], {
+                    "artifact_sha256": artifact_sha256,
+                    "complete": True,
+                    "edges": [],
+                    "failures": [],
+                    "artifact_entries": ["BOOT-INF/classes/app/SecurityModule.class"],
+                    "semantic_references": [{
+                        "api_identity": identity,
+                        "artifact_entry": "BOOT-INF/classes/app/SecurityModule.class",
+                    }],
+                },
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["api_reachability"][identity], "uncertain")
+
+    def test_pinned_guard_accepts_uncertain_class_with_canonical_semantic_reference(self):
+        target = {
+            "coord": "com.vendor:security-api",
+            "api_name": "com.vendor.OptionalSecurityType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+        }
+        identity = realreg.serialized_api_identity(target)
+        semantic = {
+            "api_identity": identity,
+            "target_class": target["api_name"],
+            "artifact_sha256": "a" * 64,
+            "artifact_entry": "app/SecurityModule.class",
+            "authority": "final-artifact-classfile-constants",
+        }
+        manifest = {
+            "required_topologies": ["reflection"],
+            "apis": [{
+                "owner": target["api_name"],
+                "member": "",
+                "symbol_kind": "class",
+                "expected_conclusion": "uncertain",
+                "expected_chain": ["app.SecurityModule.setup", target["api_name"]],
+            }],
+            "canonical_edges": [],
+            "canonical_semantic_references": [semantic],
+        }
+        result = {
+            "summary": {
+                "uncertain_apis": [{
+                    "api_name": target["api_name"],
+                    "analysis_status": "uncertain",
+                    "call_paths": [
+                        f"app.SecurityModule.setup -> {target['api_name']}"
+                    ],
+                }],
+            },
+            "topology_coverage": {"complete": True, "observed": ["reflection"]},
+            "edge_truth": {
+                "complete": True, "blocking": False, "ledger": [],
+                "semantic_references": [semantic],
+            },
+        }
+
+        evaluation = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+        self.assertTrue(evaluation["passed"], evaluation["errors"])
 
     def test_final_artifact_oracle_records_preserve_per_api_reachability(self):
         reachable = {
@@ -1310,6 +1478,44 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(selected, explicit)
         discover.assert_not_called()
+
+    def test_bytecode_materialization_discovers_business_classes_from_plain_jar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "library.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "org/example/security/SecurityBridge.class",
+                    b"class-bytes org/springframework/security/core/Authentication",
+                )
+                archive.writestr(
+                    "META-INF/versions/17/org/example/security/SecurityBridge.class",
+                    b"versioned-class-bytes",
+                )
+                archive.writestr("module-info.class", b"module")
+            case = realreg.RealProjectCase(
+                name="plain-jar",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                bytecode_owner_prefixes=("org/springframework/security/",),
+                bytecode_coord="org.springframework.security:spring-security-core",
+                final_artifact=artifact,
+            )
+            captured = []
+
+            def capture(class_files, **_kwargs):
+                captured.extend(class_files)
+                return []
+
+            report = root / "report"
+            with patch.object(realreg, "discover_calls", side_effect=capture):
+                realreg.materialize_bytecode_changed_apis(case, root, report)
+
+        self.assertEqual(
+            [path.relative_to(path.parents[3]).as_posix() for path in captured],
+            ["org/example/security/SecurityBridge.class"],
+        )
 
     def test_output_audit_rejects_explicit_source_provenance_for_reachable_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2332,6 +2538,25 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(retained, [])
         self.assertEqual(reachability[identity], "uncertain")
         self.assertEqual(errors, [])
+
+    def test_dubbo_spring6_security_reflection_guard(self):
+        fixture_dir = ROOT / "tests" / "fixtures" / "real_projects"
+        manifest = json.loads(
+            (fixture_dir / "dubbo-spring6-security.json").read_text(encoding="utf-8")
+        )
+        with (fixture_dir / "dubbo-spring6-security-changed-apis.csv").open(
+            newline="", encoding="utf-8"
+        ) as handle:
+            changed_rows = list(csv.DictReader(handle))
+        case = realreg.CASES["dubbo-spring6-security"]
+
+        self.assertEqual(len(changed_rows), 1)
+        self.assertEqual(changed_rows[0]["symbol_kind"], "class")
+        self.assertEqual(manifest["required_topologies"], ["reflection"])
+        self.assertEqual(manifest["apis"][0]["expected_conclusion"], "uncertain")
+        self.assertEqual(len(manifest["canonical_semantic_references"]), 1)
+        self.assertEqual(manifest["canonical_edges"], [])
+        self.assertEqual(case.fixture_manifest, fixture_dir / "dubbo-spring6-security.json")
 
     def _manifest_with_expected_physical_edges(self, manifest):
         return {

@@ -1,0 +1,2 @@
+coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source
+org.springframework.security:spring-security-oauth2-core,bytecode-observed,-,REMOVED,org.springframework.security.oauth2.core.DefaultOAuth2AuthenticatedPrincipal,DefaultOAuth2AuthenticatedPrincipal,class,,true,P1,independent_reviewed_dynamic_api_inventory
