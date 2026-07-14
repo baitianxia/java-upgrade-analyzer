@@ -29,6 +29,28 @@ def minimal_classfile_with_utf8(*values):
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_mybatis_sample_fixtures_pin_two_distinct_published_artifacts(self):
+        fixture_dir = ROOT / "tests" / "fixtures" / "real_projects"
+        annotation = json.loads(
+            (fixture_dir / "mybatis-sample-annotation.json").read_text(encoding="utf-8")
+        )
+        xml = json.loads(
+            (fixture_dir / "mybatis-sample-xml.json").read_text(encoding="utf-8")
+        )
+
+        expected_revision = "bb8bac144e4677cf1bab5a6d27ced2521972adfc"
+        self.assertEqual(annotation["git_revision"], expected_revision)
+        self.assertEqual(xml["git_revision"], expected_revision)
+        self.assertEqual(annotation["release_version"], "4.0.1")
+        self.assertEqual(xml["release_version"], "4.0.1")
+        self.assertNotEqual(annotation["artifact_sha256"], xml["artifact_sha256"])
+        self.assertEqual(annotation["ground_truth_status"], "reviewed")
+        self.assertEqual(xml["ground_truth_status"], "reviewed")
+        self.assertEqual(annotation["runtime_verification"]["exit_code"], 0)
+        self.assertEqual(xml["runtime_verification"]["exit_code"], 0)
+        self.assertEqual(annotation["unverified_apis"], [])
+        self.assertEqual(xml["unverified_apis"], [])
+
     def test_real_fat_jar_cases_require_cross_jar_bridge_topologies(self):
         self.assertIn(
             "cross_jar_bridge",

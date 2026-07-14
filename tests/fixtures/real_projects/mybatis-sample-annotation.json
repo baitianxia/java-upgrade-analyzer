@@ -1,0 +1,43 @@
+{
+  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "case": "mybatis-sample-annotation",
+  "repository": "mybatis/spring-boot-starter",
+  "checkout_root": "/private/tmp/jua-real-project-mybatis-spring-boot-4.0.1",
+  "git_revision": "bb8bac144e4677cf1bab5a6d27ced2521972adfc",
+  "release_version": "4.0.1",
+  "published_repository": "Maven Central",
+  "artifact_path": "/private/tmp/mybatis-spring-boot-sample-annotation-4.0.1.jar",
+  "artifact_sha1": "da2fc38bf3f4a27cf718bc17ec61a3d551ab0256",
+  "artifact_sha256": "898f440dd1ff83071855523ec1efb174e5d69ac6fff04f669141d53866bb2b8f",
+  "ground_truth_status": "reviewed",
+  "required_topologies": [
+    "business_direct",
+    "framework_callback",
+    "mybatis_mapper_proxy"
+  ],
+  "application_entries": [
+    "BOOT-INF/classes/sample/mybatis/annotation/SampleAnnotationApplication.class",
+    "BOOT-INF/classes/sample/mybatis/annotation/mapper/CityMapper.class"
+  ],
+  "mapper_entries": [
+    "BOOT-INF/classes/sample/mybatis/annotation/mapper/CityMapper.class"
+  ],
+  "mapper_resources": [],
+  "framework_entries": [
+    "BOOT-INF/lib/mybatis-3.5.19.jar",
+    "BOOT-INF/lib/mybatis-spring-4.0.0.jar"
+  ],
+  "runtime_verification": {
+    "command": "java -jar /private/tmp/mybatis-spring-boot-sample-annotation-4.0.1.jar",
+    "exit_code": 0,
+    "required_output": [
+      "CityMapper.findByState",
+      "1,San Francisco,CA,US"
+    ]
+  },
+  "apis": [],
+  "canonical_edges": [],
+  "canonical_semantic_references": [],
+  "unverified_apis": [],
+  "fixture_debt": []
+}
