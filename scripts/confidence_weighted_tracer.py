@@ -42,8 +42,11 @@ from indirect_usage_analyzer import (
     parse_javap_indirect_references,
 )
 from step5_evidence_model import (
+    EvidenceConcern,
+    EvidenceFailure,
     ModuleScope,
     PhysicalCallEdge,
+    PreservationEvidence,
     ReachabilityPath,
     classify_module_scope,
     decide_analysis,
@@ -752,6 +755,46 @@ class TraceResult:
     capability_coverage: dict = field(default_factory=dict)
 
 
+def _apply_evidence_decision(
+    result,
+    paths=(),
+    failures=(),
+    *,
+    concerns=(),
+    preservation=None,
+    complete_scan=False,
+):
+    decision = decide_analysis(
+        paths,
+        failures,
+        concerns=concerns,
+        preservation=preservation,
+        complete_scan=complete_scan,
+    )
+    for field_name, value in decision_to_trace_patch(decision).items():
+        setattr(result, field_name, value)
+    return result
+
+
+def _apply_blocking_failure(result, stage, reason_code, note, paths=()):
+    return _apply_evidence_decision(result, paths=paths, failures=(EvidenceFailure(
+        stage=stage,
+        reason_code=reason_code,
+        blocking=True,
+        api_identity=changed_api_display_target(result),
+        detail=note,
+    ),))
+
+
+def _apply_uncertainty(result, stage, reason_code, note, paths=()):
+    return _apply_evidence_decision(result, paths=paths, concerns=(EvidenceConcern(
+        stage=stage,
+        reason_code=reason_code,
+        detail=note,
+        api_identity=changed_api_display_target(result),
+    ),))
+
+
 def _iter_business_methods(graph):
     for method_def in (getattr(graph, 'methods_by_id', {}) or {}).values():
         if getattr(method_def, 'owner_type', '') == 'business' and not getattr(method_def, 'is_test', False):
@@ -759,12 +802,6 @@ def _iter_business_methods(graph):
 
 
 def _build_direct_usage_result(result, method_def, reason_code, note, evidence_type, display_target):
-    result.analysis_status = 'reachable'
-    result.is_reachable = True
-    result.reason_code = reason_code
-    result.reachable_note = note
-    result.direct_callers = 1
-    result.business_reach_depth = 1
     caller_name = getattr(method_def, 'qualified_key', '') or getattr(method_def, 'symbol_id', '')
     result.call_paths = [f"{caller_name} -> {display_target}"]
     result.evidence_paths = [[
@@ -777,7 +814,14 @@ def _build_direct_usage_result(result, method_def, reason_code, note, evidence_t
             'line': getattr(method_def, 'line', 0),
         }
     ]]
-    return result
+    return _apply_evidence_decision(result, paths=(ReachabilityPath(
+        path_text=result.call_paths[0],
+        entry_scope=ModuleScope.BUSINESS_CLASSES,
+        complete=True,
+        reason_code=reason_code,
+        note=note,
+        depth=1,
+    ),))
 
 
 def _build_direct_usage_results(result, matches, reason_code, note, display_target):
@@ -799,12 +843,6 @@ def _build_direct_usage_results(result, matches, reason_code, note, display_targ
     if not unique_matches:
         return result
 
-    result.analysis_status = 'reachable'
-    result.is_reachable = True
-    result.reason_code = reason_code
-    result.reachable_note = note
-    result.direct_callers = len(unique_matches)
-    result.business_reach_depth = 1
     result.call_paths = []
     result.evidence_paths = []
     result.path_details = []
@@ -838,7 +876,17 @@ def _build_direct_usage_results(result, matches, reason_code, note, display_targ
             'evidence': evidence,
             'terminal_symbol': caller_name,
         })
-    return result
+    return _apply_evidence_decision(result, paths=tuple(
+        ReachabilityPath(
+            path_text=path_text,
+            entry_scope=ModuleScope.BUSINESS_CLASSES,
+            complete=True,
+            reason_code=reason_code,
+            note=note,
+            depth=1,
+        )
+        for path_text in result.call_paths
+    ))
 
 
 def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
@@ -1192,10 +1240,7 @@ def _build_runtime_symbol_preserved_result(result, api_row, graph):
         'old_class_entry': provider.get('old_class_entry') or '',
         'provider_class_entry': provider.get('provider_class_entry') or '',
     }]
-    result.analysis_status = 'not_impacted'
-    result.is_reachable = False
-    result.reason_code = 'RUNTIME_SYMBOL_PRESERVED_IDENTICALLY'
-    result.reachable_note = (
+    preservation_note = (
         f'当前最终制品中的 {provider_coord} 仍提供 {owner}，且 class 字节码与删除前完全一致；'
         '该变更 API 没有从运行时类路径消失。'
     )
@@ -1216,28 +1261,62 @@ def _build_runtime_symbol_preserved_result(result, api_row, graph):
         'depth': 0,
         'evidence': evidence,
     }]
-    result.direct_callers = 0
-    result.business_reach_depth = 0
     result.verification_commands = []
-    return result
+    return _apply_evidence_decision(
+        result,
+        preservation=PreservationEvidence(
+            reason_code='RUNTIME_SYMBOL_PRESERVED_IDENTICALLY',
+            detail=preservation_note,
+            api_identity=target,
+            artifact=str(provider.get('provider_jar') or ''),
+        ),
+    )
 
 
 def _apply_source_artifact_miss(result, graph, reachable_note):
     alignment = getattr(graph, 'source_artifact_alignment', {}) or {}
     alignment_status = str(alignment.get('status') or '').strip()
-    result.analysis_status = 'uncertain'
-    result.is_reachable = None
     if alignment_status in {'', 'aligned', 'conflict'}:
-        result.reason_code = 'SOURCE_BYTECODE_EDGE_CONFLICT'
-        result.reachable_note = reachable_note
+        reason_code = 'SOURCE_BYTECODE_EDGE_CONFLICT'
+        note = reachable_note
     else:
-        result.reason_code = 'SOURCE_ARTIFACT_ALIGNMENT_UNVERIFIED'
-        result.reachable_note = (
+        reason_code = 'SOURCE_ARTIFACT_ALIGNMENT_UNVERIFIED'
+        note = (
             '源码中发现了目标调用，但无法确认这份源码就是本次打包产物对应的源码；'
             '因此不能用打包产物未命中来否定这条源码调用线索'
         )
-    _downgrade_reachable_path_details(result, 'uncertain', result.reason_code)
-    return result
+    _downgrade_reachable_path_details(result, 'uncertain', reason_code)
+    candidate_paths = tuple(
+        ReachabilityPath(
+            path_text=str(detail.get('path_text') or ''),
+            entry_scope=ModuleScope.BUSINESS_CLASSES,
+            complete=False,
+            stop_reason=reason_code,
+            depth=int(detail.get('depth') or 1),
+        )
+        for detail in (result.path_details or [])
+        if detail.get('business_entry') or detail.get('business_reachable') is not False
+    )
+    if not candidate_paths and result.call_paths:
+        candidate_paths = tuple(
+            ReachabilityPath(
+                path_text=str(path_text),
+                entry_scope=ModuleScope.BUSINESS_CLASSES,
+                complete=False,
+                stop_reason=reason_code,
+                depth=int(result.business_reach_depth or 1),
+            )
+            for path_text in result.call_paths
+        )
+    return _apply_evidence_decision(
+        result,
+        paths=candidate_paths,
+        concerns=(EvidenceConcern(
+            stage='source-artifact-reconciliation',
+            reason_code=reason_code,
+            detail=note,
+        ),),
+    )
 
 
 def _build_source_only_artifact_conflict_result(result, graph, matched_key_groups):
@@ -1266,10 +1345,6 @@ def _build_source_only_artifact_conflict_result(result, graph, matched_key_group
     if not source_edges:
         return None
 
-    result.analysis_status = 'reachable'
-    result.is_reachable = True
-    result.direct_callers = len(source_edges)
-    result.business_reach_depth = 1
     result.call_paths = []
     result.evidence_paths = []
     result.path_details = []
@@ -1334,10 +1409,7 @@ def _is_inlined_constant_change(api_row):
 
 
 def _build_inlined_constant_result(result):
-    result.analysis_status = 'uncertain'
-    result.is_reachable = None
-    result.reason_code = 'INLINED_CONSTANT_USAGE_UNDETECTABLE'
-    result.reachable_note = (
+    note = (
         '编译期常量值已变化，但调用方 class 可能只保留内联旧值而没有字段访问指令；'
         '字节码未发现 getstatic/getfield 不能解释为未使用'
     )
@@ -1345,7 +1417,11 @@ def _build_inlined_constant_result(result):
         '搜索业务及依赖源码中的常量字段引用，并执行覆盖该常量语义的回归测试',
         '必要时比较调用方 class 常量池与 old/new 常量值，但不要仅凭字面量命中确认调用关系',
     ]
-    return result
+    return _apply_evidence_decision(result, concerns=(EvidenceConcern(
+        stage='constant-bytecode-analysis',
+        reason_code='INLINED_CONSTANT_USAGE_UNDETECTABLE',
+        detail=note,
+    ),))
 
 
 def _normalize_descriptor_type(descriptor, preserve_array=False):
@@ -4451,20 +4527,6 @@ def _packaged_hit_is_external_consumer(hit):
     return True
 
 
-def _apply_removed_dependency_packaged_impact(result, hits):
-    has_direct_impact = result.is_reachable is True or any(
-        _packaged_hit_is_external_consumer(hit) for hit in hits or []
-    )
-    if not has_direct_impact:
-        return result
-    result.reason_code = 'RUNTIME_DEPENDENCY_USES_REMOVED_API'
-    result.reachable_note = (
-        '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
-        '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
-    )
-    return result
-
-
 def _build_packaged_dependency_hit_result(result, hits, graph=None):
     ambiguous_hits = [item for item in hits if item.get('signature_ambiguous')]
     business_hits = [
@@ -4671,6 +4733,10 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             )
             for edge in detail.get('evidence') or []
         )
+        dependency_removed_impact = (
+            str(result.new_version or '').strip() == '-'
+            and _packaged_hit_is_external_consumer(hit)
+        )
         typed_paths.append(ReachabilityPath(
             path_text=str(detail.get('path_text') or ''),
             entry_scope=entry_scope,
@@ -4681,12 +4747,21 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             ambiguous=stop_reason == 'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS',
             truncated=stop_reason in {'MAX_DEPTH_REACHED', 'PATH_TRUNCATED'},
             stop_reason=stop_reason,
+            reason_code=(
+                'RUNTIME_DEPENDENCY_USES_REMOVED_API'
+                if dependency_removed_impact
+                else ''
+            ),
+            note=(
+                '已确认当前最终制品中的其他运行时依赖字节码仍引用被删除依赖的目标符号；'
+                '加载或执行该路径时存在 NoClassDefFoundError/NoSuchMethodError 风险'
+                if dependency_removed_impact
+                else ''
+            ),
             depth=int(detail.get('depth') or 1),
             evidence=typed_evidence,
         ))
-    decision = decide_analysis(tuple(typed_paths))
-    for field_name, value in decision_to_trace_patch(decision).items():
-        setattr(result, field_name, value)
+    _apply_evidence_decision(result, paths=tuple(typed_paths))
     result.verification_commands = [
         '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
         '优先审查命中的无源码依赖及其对外暴露入口'
@@ -4756,9 +4831,15 @@ def _merge_runtime_framework_paths(result, hits, graph):
     for coord in packaged.dependency_chain_coords or []:
         if coord not in result.dependency_chain_coords:
             result.dependency_chain_coords.append(coord)
-    result.reason_code = 'RUNTIME_FRAMEWORK_ENTRY_REACHED'
-    result.reachable_note = packaged.reachable_note
-    return result
+    return _apply_evidence_decision(result, paths=(ReachabilityPath(
+        path_text=str(confirmed_details[0].get('path_text') or ''),
+        entry_scope=ModuleScope.BUSINESS_CLASSES,
+        complete=True,
+        stop_reason='RUNTIME_FRAMEWORK_ENTRY_REACHED',
+        reason_code='RUNTIME_FRAMEWORK_ENTRY_REACHED',
+        note=packaged.reachable_note,
+        depth=int(confirmed_details[0].get('depth') or 1),
+    ),))
 
 
 def _format_bridge_edge_caller(edge):
@@ -4771,13 +4852,7 @@ def _format_bridge_edge_caller(edge):
 
 
 def _build_packaged_dependency_not_found_result(result):
-    result.analysis_status = 'not_found_in_static_analysis'
-    result.is_reachable = False
-    result.reason_code = 'NO_STATIC_PATH'
-    result.reachable_note = (
-        '已对当前最终制品的业务 class 和运行时依赖 jar 执行字节码扫描，未发现目标符号引用。'
-        '这不代表运行时一定安全。'
-    )
+    _apply_evidence_decision(result, complete_scan=True)
     result.verification_commands = [
         '检查是否存在反射、字符串、配置文件或 SPI 间接引用',
         '必要时结合运行验证确认该依赖变更是否会在实际路径触发'
@@ -4786,10 +4861,13 @@ def _build_packaged_dependency_not_found_result(result):
 
 
 def _build_packaged_dependency_incomplete_result(result, scan_result):
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.reason_code = str((scan_result or {}).get('reason') or 'ANALYSIS_INCOMPLETE').strip() or 'ANALYSIS_INCOMPLETE'
-    result.reachable_note = '最终制品字节码分析未完整覆盖，当前无法把未命中解释为安全'
+    reason_code = str((scan_result or {}).get('reason') or 'ANALYSIS_INCOMPLETE').strip() or 'ANALYSIS_INCOMPLETE'
+    _apply_evidence_decision(result, failures=(EvidenceFailure(
+        stage='packaged-bytecode-scan',
+        reason_code=reason_code,
+        blocking=True,
+        detail='最终制品字节码分析未完整覆盖，当前无法把未命中解释为安全',
+    ),))
     result.verification_commands = [
         '检查当前环境是否可执行 javap，并确认 Step1 留存制品及其中的嵌套依赖 JAR 完整可读',
         '必要时补充 dependency_source_dirs 或重新准备依赖产物后重跑 Step 5',
@@ -4804,10 +4882,8 @@ def _build_indirect_usage_result(result, api_row, graph):
     findings = exact_findings + unresolved
     if not findings:
         return None
-    result.analysis_status = 'uncertain'
-    result.is_reachable = None
-    result.reason_code = str(findings[0].get('reason_code') or 'INDIRECT_TARGET_REFERENCE')
-    result.reachable_note = (
+    reason_code = str(findings[0].get('reason_code') or 'INDIRECT_TARGET_REFERENCE')
+    note = (
         '已发现与变更 API 相关的间接引用证据，但当前证据不能唯一证明该路径触达并执行目标 API'
     )
     result.call_paths = []
@@ -4829,7 +4905,7 @@ def _build_indirect_usage_result(result, api_row, graph):
         result.evidence_paths.append(evidence)
         result.path_details.append({
             'path_status': 'uncertain',
-            'stop_reason': finding.get('reason_code') or result.reason_code,
+            'stop_reason': finding.get('reason_code') or reason_code,
             'business_reachable': None,
             'consumer_coord': finding.get('owner_coord') or '',
             'consumer_class': '', 'consumer_method': caller,
@@ -4840,7 +4916,12 @@ def _build_indirect_usage_result(result, api_row, graph):
         '核对间接引用中的动态类名、成员名和参数类型',
         '结合实际配置或运行测试确认目标 API 是否会被调用',
     ]
-    return result
+    return _apply_evidence_decision(result, concerns=(EvidenceConcern(
+        stage='indirect-usage-analysis',
+        reason_code=reason_code,
+        detail=note,
+        api_identity=key,
+    ),))
 
 
 def _capability_coverage_for_api(api_row, graph):
@@ -4861,10 +4942,7 @@ def _capability_coverage_for_api(api_row, graph):
 def _build_indirect_coverage_incomplete_result(result):
     coverage = dict(result.capability_coverage or {})
     reasons = list(coverage.get('reason_codes') or [])
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.reason_code = 'INDIRECT_ANALYSIS_INCOMPLETE'
-    result.reachable_note = (
+    note = (
         '目标 API 存在适用但未完整覆盖的间接调用机制，不能把静态未命中解释为未发现引用。'
         + (f"未完整能力：{', '.join(reasons)}" if reasons else '')
     )
@@ -4872,7 +4950,12 @@ def _build_indirect_coverage_incomplete_result(result):
         '查看 alerts.csv 的 coverage_details，定位 partial/insufficient 的间接分析能力',
         '补充对应源码、制品或框架证据后重新运行 Step 5',
     ]
-    return result
+    return _apply_evidence_decision(result, failures=(EvidenceFailure(
+        stage='indirect-usage-analysis',
+        reason_code='INDIRECT_ANALYSIS_INCOMPLETE',
+        blocking=True,
+        detail=note,
+    ),))
 
 
 def critical_parser_fallback_reasons(graph_stats):
@@ -5279,9 +5362,9 @@ def trace_api_with_confidence_weighting(
         confirmed=api_row.get('confirmed') == 'true',
         source=api_row.get('source', ''),
         analysis_scope=api_row.get('analysis_scope', 'api'),
-        analysis_status='not_analyzed',
+        analysis_status='pending',
         direct_callers=0,
-        is_reachable=False,
+        is_reachable=None,
         reachable_note='',
         business_reach_depth=0,
         dependency_chain_coords=[],
@@ -5395,9 +5478,10 @@ def trace_api_with_confidence_weighting(
 
     # 类级fallback：不追踪
     if result.analysis_scope == 'class_usage':
-        result.analysis_status = 'not_analyzed'
-        result.reason_code = 'CLASS_USAGE_ONLY'
-        result.reachable_note = '类级候选只能证明类型使用，无法确认具体API影响'
+        _apply_blocking_failure(
+            result, 'input-validation', 'CLASS_USAGE_ONLY',
+            '类级候选只能证明类型使用，无法确认具体API影响',
+        )
         result.verification_commands = [
             f"审查 {api_row.get('matched_class')} 的具体使用场景"
         ]
@@ -5405,9 +5489,10 @@ def trace_api_with_confidence_weighting(
         return result
 
     if not get_symbol_kind(api_row):
-        result.analysis_status = 'not_analyzed'
-        result.reason_code = 'MISSING_SYMBOL_KIND'
-        result.reachable_note = 'Step 5 需要 symbol_kind 才能判断当前变更是方法、字段、类还是构造器'
+        _apply_blocking_failure(
+            result, 'input-validation', 'MISSING_SYMBOL_KIND',
+            'Step 5 需要 symbol_kind 才能判断当前变更是方法、字段、类还是构造器',
+        )
         result.verification_commands = [
             '回到 Step 4 重新生成包含 symbol_kind 的变更 API 清单',
             '确认 all_changed_apis.csv 每一行都明确标注 symbol_kind',
@@ -5416,13 +5501,12 @@ def trace_api_with_confidence_weighting(
         return result
 
     if method_api_requires_signature(api_row) and not (api_row.get('api_name') or '').strip():
-        result.analysis_status = 'not_analyzed'
-        result.reason_code = 'MISSING_API_NAME'
-        result.reachable_note = (
+        note = (
             '方法级调用链分析要求目标 API 具备全限定名；'
             '当前输入只有简单名/签名时，Step5 不会使用 method:* 回退键生成结论，'
             '以避免跨类同名方法误匹配'
         )
+        _apply_blocking_failure(result, 'input-validation', 'MISSING_API_NAME', note)
         result.verification_commands = [
             '回到 Step 4 重新生成包含 api_name 全限定名的变更 API 清单',
             '确认 all_changed_apis.csv 中方法/构造器行的 api_name 不是空值',
@@ -5431,9 +5515,10 @@ def trace_api_with_confidence_weighting(
         return result
 
     if method_api_requires_signature(api_row) and not has_precise_api_signature(api_row):
-        result.analysis_status = 'not_analyzed'
-        result.reason_code = 'MISSING_API_SIGNATURE'
-        result.reachable_note = '方法级调用链分析要求精确参数签名；当前输入缺少 api_signature，无法区分重载方法'
+        _apply_blocking_failure(
+            result, 'input-validation', 'MISSING_API_SIGNATURE',
+            '方法级调用链分析要求精确参数签名；当前输入缺少 api_signature，无法区分重载方法',
+        )
         result.verification_commands = [
             '回到 Step 4 重新生成包含 api_signature 的变更 API 清单',
             '确认变更方法的参数类型已被精确提取',
@@ -5445,9 +5530,9 @@ def trace_api_with_confidence_weighting(
     target_key_groups = build_api_target_key_groups(api_row, graph=graph, type_metadata=type_metadata)
     target_keys = flatten_key_groups(target_key_groups)
     if not target_keys:
-        result.analysis_status = 'not_analyzed'
-        result.reason_code = 'NO_TARGET_KEYS'
-        result.reachable_note = '无法从输入提取可追踪目标'
+        _apply_blocking_failure(
+            result, 'target-key-construction', 'NO_TARGET_KEYS', '无法从输入提取可追踪目标',
+        )
         _debug_trace_result('trace_api_result', result)
         return result
     _step5_debug(
@@ -5519,11 +5604,6 @@ def trace_api_with_confidence_weighting(
                 artifact_dependency_hits,
                 graph,
             )
-            if dependency_removed:
-                _apply_removed_dependency_packaged_impact(
-                    packaged_dependency_result,
-                    artifact_dependency_hits,
-                )
             _debug_trace_result(
                 'trace_api_result',
                 packaged_dependency_result,
@@ -6011,11 +6091,6 @@ def trace_api_with_confidence_weighting(
     # 只有在源码图没有产出更强结论时，才回退为打包依赖字节码命中结论。
     if artifact_dependency_hits:
         packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits, graph)
-        if dependency_removed:
-            _apply_removed_dependency_packaged_impact(
-                packaged_dependency_result,
-                artifact_dependency_hits,
-            )
         _debug_trace_result('trace_api_result', packaged_dependency_result, candidate_counts={
             'reachable': len(reachable_candidates),
             'uncertain': len(uncertain_candidates),
@@ -6092,9 +6167,10 @@ def trace_api_with_confidence_weighting(
     if needs_bridge and (not has_dependency_source_mapping) and not allow_degraded:
         # 需要依赖源码映射但不允许降级 → 不应该走到这里（应该在前面就报错）
         # 如果走到了这里，说明图搜索空间不足，而非映射问题
-        result.analysis_status = 'not_analyzed'
-        result.reason_code = 'ANALYSIS_INCOMPLETE'
-        result.reachable_note = '分析不完整，可能需要补充依赖源码映射或调整分析参数'
+        _apply_blocking_failure(
+            result, 'source-graph-analysis', 'ANALYSIS_INCOMPLETE',
+            '分析不完整，可能需要补充依赖源码映射或调整分析参数',
+        )
         result.verification_commands = [
             '检查是否需要补充依赖源码映射',
             '或调整 max_depth 参数重新分析'
@@ -6120,12 +6196,7 @@ def trace_api_with_confidence_weighting(
 
     # 只有当不需要依赖源码映射，且搜索空间完整时，才输出 not_found_in_static_analysis
     # 注意：这不代表"确定未影响"，只表示"静态分析未找到"
-    result.analysis_status = 'not_found_in_static_analysis'
-    result.reason_code = 'NO_STATIC_PATH'
-    result.reachable_note = (
-        '静态分析未找到调用路径。这不代表确定未影响系统。'
-        '可能原因：反射调用、动态代理、配置文件引用、测试代码引用等。'
-    )
+    _apply_evidence_decision(result, complete_scan=True)
     result.verification_commands = [
         '搜索项目中是否包含该API名称的字符串引用',
         '检查是否有反射调用: Class.forName/Method.invoke',
@@ -7308,15 +7379,15 @@ def filter_target_match_groups_for_overload_safety(api_row, matched_groups, grap
 
 
 def build_overload_ambiguous_result(result, overload_info):
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.reason_code = 'OVERLOAD_AMBIGUOUS_TARGET'
     overload_signatures = overload_info.get('overload_signatures') or []
     overload_text = ', '.join(overload_signatures[:5])
-    result.reachable_note = (
+    note = (
         '目标 API 存在重载，当前仅命中了无签名回退键，'
         f'无法安全确认是否是目标签名 {overload_info.get("api_signature")}'
         + (f'；已知重载：{overload_text}' if overload_text else '')
+    )
+    _apply_blocking_failure(
+        result, 'overload-resolution', 'OVERLOAD_AMBIGUOUS_TARGET', note,
     )
     result.verification_commands = [
         '优先补全/保留精确 api_signature，并确认调用点参数类型推断成功',
@@ -7563,14 +7634,14 @@ def assess_graph_completeness(graph_stats, api_row=None):
 
 
 def build_analysis_incomplete_result(result, graph_completeness):
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.reason_code = 'ANALYSIS_INCOMPLETE'
     reasons = graph_completeness.get('reasons') or []
     if reasons:
-        result.reachable_note = f"分析不完整：{'；'.join(reasons)}"
+        note = f"分析不完整：{'；'.join(reasons)}"
     else:
-        result.reachable_note = '分析不完整，当前无法把静态未找到解释为未影响'
+        note = '分析不完整，当前无法把静态未找到解释为未影响'
+    _apply_blocking_failure(
+        result, 'source-graph-analysis', 'ANALYSIS_INCOMPLETE', note,
+    )
     result.verification_commands = (
         graph_completeness.get('verification_commands') or []
     ) + [
@@ -7580,14 +7651,14 @@ def build_analysis_incomplete_result(result, graph_completeness):
 
 
 def build_call_graph_limited_symbol_result(result):
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.reason_code = 'CALL_GRAPH_LIMITATION_SYMBOL_KIND'
     symbol_kind = (result.symbol_kind or 'unknown').strip() or 'unknown'
-    result.reachable_note = (
+    note = (
         '当前 Step5 主要基于方法反向调用图；'
         f'对 {symbol_kind} 符号的静态证明能力有限，'
         '当前结果不能解释为静态未找到调用路径'
+    )
+    _apply_blocking_failure(
+        result, 'call-graph-analysis', 'CALL_GRAPH_LIMITATION_SYMBOL_KIND', note,
     )
     result.verification_commands = [
         '结合类型引用、字段访问、构造调用等非方法证据继续复核',
@@ -8214,30 +8285,50 @@ def select_matching_keys_from_tiers(key_tiers, reverse_edges):
     return []
 
 
+def _candidate_reachability_path(result, candidate, complete, reason_code, note):
+    path_edges = list(candidate.get('path') or [])
+    path_text = (
+        (result.call_paths or [""])[0]
+        or format_call_chain(path_edges, changed_api_display_target(result))
+    )
+    has_business_entry = bool(candidate.get('entry_point')) or any(
+        getattr(edge, 'owner_coord', '') == 'BUSINESS' for edge in path_edges
+    )
+    return ReachabilityPath(
+        path_text=path_text,
+        entry_scope=(
+            ModuleScope.BUSINESS_CLASSES
+            if has_business_entry
+            else ModuleScope.EXTERNAL_DEPENDENCY
+        ),
+        complete=complete,
+        truncated=reason_code in {'DEPTH_LIMIT_REACHED', 'MAX_DEPTH_REACHED', 'PATH_TRUNCATED'},
+        stop_reason=reason_code,
+        reason_code=reason_code,
+        note=note,
+        depth=int(candidate.get('depth') or len(path_edges) or 1),
+    )
+
+
 def build_reachable_result(result, candidate, graph):
     """构建reachable结果"""
-    result.analysis_status = 'reachable'
-    result.is_reachable = True
-    result.business_reach_depth = candidate['depth']
     result.confidence_score = candidate['confidence']
     entry_point = candidate['entry_point']
     if entry_point.get('entry_scope') == 'runtime_dependency_entry':
-        result.reason_code = 'RUNTIME_DEPENDENCY_ENTRY_REACHED'
-        result.reachable_note = (
+        reason_code = 'RUNTIME_DEPENDENCY_ENTRY_REACHED'
+        note = (
             f"已触达当前制品中会由框架或运行时机制触发的依赖入口"
             f"（置信度{candidate['confidence']:.2f}）"
         )
     else:
-        result.reason_code = 'SYSTEM_CODE_REACHED'
-        result.reachable_note = f"触达系统代码（置信度{candidate['confidence']:.2f}）"
+        reason_code = 'SYSTEM_CODE_REACHED'
+        note = f"触达系统代码（置信度{candidate['confidence']:.2f}）"
 
     # 构建调用链
     path_edges = candidate['path']
     result.call_paths = [
         format_call_chain(path_edges, changed_api_display_target(result))
     ]
-    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
-
     # 追踪跨越的依赖边界（dependency_chain_coords）
     # 检查路径中是否经过dependency-owned源码
     crossed_coords = set()
@@ -8253,7 +8344,9 @@ def build_reachable_result(result, candidate, graph):
     result.match_provenance = candidate.get('provenance', '')
     result.match_tier = candidate.get('match_tier', -1)
 
-    return result
+    return _apply_evidence_decision(result, paths=(
+        _candidate_reachability_path(result, candidate, True, reason_code, note),
+    ))
 
 
 def build_behavior_changed_result(result, candidate, graph):
@@ -8265,12 +8358,9 @@ def build_behavior_changed_result(result, candidate, graph):
     """
     # 注意：change_type == 'BEHAVIOR_CHANGED' 的语义是"需要运行时验证"
     # 即使找到了调用链，analysis_status 应该是 not_analyzed
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.business_reach_depth = candidate['depth']
     result.confidence_score = candidate['confidence']
-    result.reason_code = 'BEHAVIOR_CHANGED_RUNTIME_VERIFICATION'
-    result.reachable_note = '找到调用链，但签名未变的情况下行为可能变化，需运行时验证'
+    reason_code = 'BEHAVIOR_CHANGED_RUNTIME_VERIFICATION'
+    note = '找到调用链，但签名未变的情况下行为可能变化，需运行时验证'
 
     # 构建调用链（用于人工审查）
     path_edges = candidate['path']
@@ -8279,8 +8369,6 @@ def build_behavior_changed_result(result, candidate, graph):
     result.call_paths = [
         format_call_chain(path_edges, changed_api_display_target(result))
     ]
-    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
-
     # 追踪跨越的依赖边界
     crossed_coords = set()
     for edge in path_edges:
@@ -8300,18 +8388,15 @@ def build_behavior_changed_result(result, candidate, graph):
         '建议执行相关单元测试或集成测试',
         f'调用链已定位，需确认运行时行为是否受影响'
     ]
-    _downgrade_reachable_path_details(result, 'not_analyzed', result.reason_code)
-
-    return result
+    _downgrade_reachable_path_details(result, 'not_analyzed', reason_code)
+    path = _candidate_reachability_path(result, candidate, False, reason_code, note)
+    return _apply_blocking_failure(result, 'behavior-change-analysis', reason_code, note, (path,))
 
 
 def build_behavior_changed_fallback_simple_result(result, candidate, graph):
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.business_reach_depth = candidate['depth']
     result.confidence_score = candidate['confidence']
-    result.reason_code = 'BEHAVIOR_CHANGED_PRECISE_TARGET_NOT_CONFIRMED'
-    result.reachable_note = (
+    reason_code = 'BEHAVIOR_CHANGED_PRECISE_TARGET_NOT_CONFIRMED'
+    note = (
         '找到调用链，但当前命中依赖 fallback_simple 回退；'
         '对于已有完整签名的行为变更，这不足以安全确认目标 API'
     )
@@ -8322,8 +8407,6 @@ def build_behavior_changed_fallback_simple_result(result, candidate, graph):
     result.call_paths = [
         format_call_chain(path_edges, changed_api_display_target(result))
     ]
-    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
-
     crossed_coords = set()
     for edge in path_edges:
         if getattr(edge, 'owner_coord', None) and edge.owner_coord != 'BUSINESS':
@@ -8340,18 +8423,16 @@ def build_behavior_changed_fallback_simple_result(result, candidate, graph):
         '人工复核该调用链是否真的落在目标 API，而不是同名 sibling 方法',
         '确认后再执行相关单元测试或集成测试验证行为变化',
     ]
-    _downgrade_reachable_path_details(result, 'not_analyzed', result.reason_code)
-    return result
+    _downgrade_reachable_path_details(result, 'not_analyzed', reason_code)
+    path = _candidate_reachability_path(result, candidate, False, reason_code, note)
+    return _apply_blocking_failure(result, 'signature-resolution', reason_code, note, (path,))
 
 
 def build_fallback_simple_unconfirmed_result(result, candidate, graph):
     _ = graph
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.business_reach_depth = candidate['depth']
     result.confidence_score = candidate['confidence']
-    result.reason_code = 'FALLBACK_SIMPLE_PATH_UNCONFIRMED'
-    result.reachable_note = (
+    reason_code = 'FALLBACK_SIMPLE_PATH_UNCONFIRMED'
+    note = (
         '找到候选调用链，但其中依赖 fallback_simple 回退；'
         '当前证据不足以安全确认命中的就是目标 API'
     )
@@ -8362,8 +8443,6 @@ def build_fallback_simple_unconfirmed_result(result, candidate, graph):
     result.call_paths = [
         format_call_chain(path_edges, changed_api_display_target(result))
     ]
-    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
-
     crossed_coords = set()
     for edge in path_edges:
         coord = getattr(edge, 'owner_coord', '')
@@ -8379,18 +8458,16 @@ def build_fallback_simple_unconfirmed_result(result, candidate, graph):
         '人工复核该候选链路是否真的落在目标 API，而不是同名 sibling 方法',
         '若目标属于 SPI/回调接口，请继续确认业务代码是否实现、注册或显式引用了该类型',
     ]
-    _downgrade_reachable_path_details(result, 'not_analyzed', result.reason_code)
-    return result
+    _downgrade_reachable_path_details(result, 'not_analyzed', reason_code)
+    path = _candidate_reachability_path(result, candidate, False, reason_code, note)
+    return _apply_blocking_failure(result, 'signature-resolution', reason_code, note, (path,))
 
 
 def build_internal_only_direct_consumer_result(result, candidate, graph):
     _ = graph
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.business_reach_depth = candidate['depth']
     result.confidence_score = candidate['confidence']
-    result.reason_code = 'INTERNAL_ONLY_DIRECT_CONSUMER'
-    result.reachable_note = (
+    reason_code = 'INTERNAL_ONLY_DIRECT_CONSUMER'
+    note = (
         '找到候选调用链，但变更 API 的直接调用者仍位于同一依赖内部；'
         '当前证据不足以证明外部消费者真实依赖了这个变更 API'
     )
@@ -8401,8 +8478,6 @@ def build_internal_only_direct_consumer_result(result, candidate, graph):
     result.call_paths = [
         format_call_chain(path_edges, changed_api_display_target(result))
     ]
-    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
-
     crossed_coords = set()
     for edge in path_edges:
         coord = getattr(edge, 'owner_coord', '')
@@ -8418,25 +8493,22 @@ def build_internal_only_direct_consumer_result(result, candidate, graph):
         '若当前路径只证明同坐标依赖内部自调用，请不要直接判定为已确认影响',
         '若目标属于 SPI/回调接口，还需继续确认业务代码是否实现、注册或显式引用了该类型',
     ]
-    _downgrade_reachable_path_details(result, 'not_analyzed', result.reason_code)
-    return result
+    _downgrade_reachable_path_details(result, 'not_analyzed', reason_code)
+    path = _candidate_reachability_path(result, candidate, False, reason_code, note)
+    return _apply_blocking_failure(result, 'consumer-ownership', reason_code, note, (path,))
 
 
 def build_uncertain_result(result, candidate):
     """构建uncertain结果"""
-    result.analysis_status = 'uncertain'
-    result.is_reachable = None
     result.confidence_score = candidate['confidence']
-    result.reason_code = candidate['reason']
-    result.reachable_note = f"链路置信度{candidate['confidence']:.2f}，需人工确认"
+    reason_code = candidate['reason']
+    note = f"链路置信度{candidate['confidence']:.2f}，需人工确认"
 
     path_edges = candidate['path']
 
     result.call_paths = [
         format_call_chain(path_edges, changed_api_display_target(result) or "未找到业务入口")
     ]
-    result.direct_callers = 1 if path_edges and getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
-
     result.verification_commands = [
         "审查链路中的低置信度边",
         f"确认 {getattr(path_edges[-1], 'file', '?')}:{getattr(path_edges[-1], 'line', '?')} 的调用上下文"
@@ -8455,15 +8527,14 @@ def build_uncertain_result(result, candidate):
     result.match_provenance = candidate.get('provenance', '')
     result.match_tier = candidate.get('match_tier', -1)
 
-    return result
+    path = _candidate_reachability_path(result, candidate, False, reason_code, note)
+    return _apply_uncertainty(result, 'confidence-analysis', reason_code, note, (path,))
 
 
 def build_not_analyzed_result(result, candidate):
     """构建not_analyzed结果"""
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.reason_code = candidate.get('reason', 'UNKNOWN')
-    result.reachable_note = candidate.get('boundary', {}).get('reason', '无法静态分析')
+    reason_code = candidate.get('reason', 'UNKNOWN')
+    note = candidate.get('boundary', {}).get('reason', '无法静态分析')
 
     # 关键修复：填充 call_paths / evidence_paths（s6_report.py 依赖这些字段）
     path_edges = candidate.get('path', [])
@@ -8477,8 +8548,6 @@ def build_not_analyzed_result(result, candidate):
             parts.append(f"{method_name}()")
         parts.append('变更API')
         result.call_paths = [" -> ".join(parts)]
-        result.direct_callers = 1 if getattr(path_edges[0], 'owner_coord', '') == 'BUSINESS' else 0
-
         result.evidence_paths = [[edge_to_evidence(e) for e in path_edges]]
     else:
         result.call_paths = []
@@ -8496,15 +8565,16 @@ def build_not_analyzed_result(result, candidate):
     elif candidate.get('verification_commands'):
         result.verification_commands = candidate.get('verification_commands') or []
 
-    return result
+    path = _candidate_reachability_path(result, candidate, False, reason_code, note)
+    return _apply_blocking_failure(result, 'call-graph-boundary', reason_code, note, (path,))
 
 
 def build_missing_dependency_source_mapping_result(result):
     """构建缺少依赖源码映射导致的 not_analyzed 结果"""
-    result.analysis_status = 'not_analyzed'
-    result.is_reachable = None
-    result.reason_code = 'DEPENDENCY_SOURCE_MAPPING_MISSING'
-    result.reachable_note = '需要可用的依赖源码映射才能完成分析，当前分析能力受限'
+    _apply_blocking_failure(
+        result, 'dependency-source-discovery', 'DEPENDENCY_SOURCE_MAPPING_MISSING',
+        '需要可用的依赖源码映射才能完成分析，当前分析能力受限',
+    )
     result.verification_commands = [
         '补充 dependency_source_dirs 指向依赖源码工程或仓库根目录',
         '确认系统能够从依赖源码中解析出目标模块坐标与源码目录',
@@ -8628,17 +8698,23 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                 confirmed=str(api_row.get('confirmed') or '').lower() == 'true',
                 source=str(api_row.get('source') or ''),
                 analysis_scope=str(api_row.get('analysis_scope') or 'api'),
-                analysis_status='not_analyzed',
+                analysis_status='pending',
                 direct_callers=0,
                 is_reachable=None,
-                reachable_note='变更 API 清单缺少 api_name，无法建立精确目标符号。',
+                reachable_note='',
                 business_reach_depth=0,
                 dependency_chain_coords=[],
                 call_paths=[], evidence_paths=[],
-                reason_code='MISSING_API_NAME', verification_commands=[], hops=[],
+                reason_code='', verification_commands=[], hops=[],
                 confidence_score=0.0, critical_nodes_hit=[],
                 old_version=str(api_row.get('old_version') or '').strip(),
                 new_version=str(api_row.get('new_version') or '').strip(),
+            )
+            _apply_blocking_failure(
+                result,
+                'input-validation',
+                'MISSING_API_NAME',
+                '变更 API 清单缺少 api_name，无法建立精确目标符号。',
             )
             results.append(result)
             status_counts['not_analyzed'] += 1

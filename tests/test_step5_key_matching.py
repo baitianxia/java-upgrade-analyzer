@@ -17664,6 +17664,7 @@ public class com.example.consumer.Adapter {
         self.assertEqual(result.reason_code, "SOURCE_BYTECODE_EDGE_CONFLICT")
         self.assertIsNone(result.is_reachable)
         self.assertTrue(result.call_paths)
+        self.assertEqual(result.direct_callers, 1)
         self.assertEqual(result.evidence_paths[0][0]["evidence_type"], "ast_method_invocation")
 
     def test_target_runtime_closure_continues_upstream_from_field_consumer(self):
