@@ -704,7 +704,7 @@ CASES["mall"] = RealProjectCase(
     bytecode_owner_prefixes=("cn/hutool/",),
     bytecode_coord="cn.hutool:hutool-all",
     final_artifact=Path("/private/tmp/jua-real-project-mall/mall-admin/target/mall-admin-1.0-SNAPSHOT.jar"),
-    required_topologies=("business_direct",),
+    required_topologies=("business_direct", "business_to_cross_jar_bridge"),
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
 )
 
@@ -740,6 +740,31 @@ CASES["dubbo-fatjar"] = RealProjectCase(
         "business_to_same_jar_bridge",
         "interface_dispatch",
         "same_jar_bridge",
+    ),
+    prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
+)
+
+CASES["spring-petclinic"] = RealProjectCase(
+    name="spring-petclinic",
+    default_project=Path("/private/tmp/jua-real-project-spring-petclinic"),
+    default_changed_apis=Path(""),
+    baseline_specs=(),
+    source_dirs=(Path("src/main/java"),),
+    min_project_java_files=45,
+    min_main_java_files=30,
+    max_generated_java_ratio=0.1,
+    require_valid_git=True,
+    case_mode="discovery",
+    ground_truth_status="unreviewed",
+    enable_jdk_oracle=True,
+    bytecode_owner_prefixes=("org/springframework/data/domain/",),
+    bytecode_coord="org.springframework.data:spring-data-commons",
+    final_artifact=Path(
+        "/private/tmp/jua-real-project-spring-petclinic/target/"
+        "spring-petclinic-4.0.0-SNAPSHOT.jar"
+    ),
+    required_topologies=(
+        "business_direct", "cross_jar_bridge", "interface_dispatch", "static_dispatch",
     ),
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
 )
@@ -1343,9 +1368,12 @@ def _csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
 
 
 def _api_identity_from_changed_row(row: dict[str, str]) -> tuple[str, str, str]:
+    signature = str(row.get("api_signature") or "").strip()
+    if signature.startswith("("):
+        signature = normalize_signature_for_lookup(signature)
     return (
         str(row.get("api_name") or "").strip(),
-        str(row.get("api_signature") or "").strip(),
+        signature,
         str(row.get("symbol_kind") or "").strip(),
     )
 
@@ -1353,8 +1381,13 @@ def _api_identity_from_changed_row(row: dict[str, str]) -> tuple[str, str, str]:
 def _api_identity_from_alert_row(row: dict[str, str]) -> tuple[str, str, str]:
     changed_symbol = str(row.get("changed_symbol") or "").strip()
     signature = str(row.get("api_signature") or "").strip()
-    if signature.startswith("(") and changed_symbol.endswith(signature):
-        changed_symbol = changed_symbol[:-len(signature)].rstrip()
+    if signature.startswith("("):
+        signature = normalize_signature_for_lookup(signature)
+        rendered_offset = changed_symbol.rfind("(")
+        if rendered_offset >= 0:
+            rendered_signature = normalize_signature_for_lookup(changed_symbol[rendered_offset:])
+            if rendered_signature == signature:
+                changed_symbol = changed_symbol[:rendered_offset].rstrip()
     return (
         changed_symbol,
         signature,
@@ -1421,6 +1454,7 @@ def audit_analysis_outputs(changed_apis: Path, alerts_csv: Path, summary: dict) 
     unreadable_markers = []
     unexplained_reachable = []
     suspicious_reachable = []
+    source_edges_in_final_paths = []
     human_fields = (
         "conclusion", "change_summary", "review_reason", "chain_summary",
         "chain_entry", "chain_target", "chain_detail", "path_text",
@@ -1456,6 +1490,21 @@ def audit_analysis_outputs(changed_apis: Path, alerts_csv: Path, summary: dict) 
         failures.append(f"alerts_reachable_conclusion_without_explanation:{len(unexplained_reachable)}")
     if suspicious_reachable:
         failures.append(f"reachable_chain_missing_target_symbol:{len(suspicious_reachable)}")
+
+    source_edge_types = {
+        "ast_method_invocation", "instance_call", "lambda_call", "method_reference",
+        "constructor_invocation", "field_access", "static_import",
+    }
+    for api_row in summary.get("reachable_apis") or []:
+        for path in api_row.get("evidence_paths") or []:
+            for edge in path or []:
+                evidence_source = str(edge.get("evidence_source") or "").strip()
+                if (
+                    evidence_source and evidence_source != "current_final_artifact"
+                ) or str(edge.get("evidence_type") or "") in source_edge_types:
+                    source_edges_in_final_paths.append(edge)
+    if source_edges_in_final_paths:
+        failures.append(f"source_edges_in_final_artifact_paths:{len(source_edges_in_final_paths)}")
 
     status_counts: dict[str, int] = {}
     for row in alert_rows:
@@ -2333,23 +2382,91 @@ def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_
     return changed_apis
 
 
-def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path, report_dir: Path) -> Path:
+def materialize_bytecode_changed_apis(
+    case: RealProjectCase,
+    project_root: Path,
+    report_dir: Path,
+    selected_changed_apis: Path | None = None,
+) -> Path:
     artifact = case.final_artifact
     if artifact is None or not artifact.is_file():
         raise ValueError("current final artifact is required for bytecode discovery")
     artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    extracted_root = report_dir / ".runtime" / "final-artifact-classes"
+    extracted_root = report_dir / ".runtime" / "final-artifact-classes" / artifact_sha256[:16]
     extracted_root.mkdir(parents=True, exist_ok=True)
     target_lib_entry = ""
     target_lib_candidates: list[str] = []
+    runtime_lib_entries: list[dict[str, str]] = []
+    artifact_java_version = ""
+    owner_prefix_bytes = tuple(prefix.encode("utf-8") for prefix in case.bytecode_owner_prefixes)
     artifact_id = case.bytecode_coord.split(":", 1)[-1].strip()
     with zipfile.ZipFile(artifact) as source:
+        try:
+            manifest = source.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
+        except KeyError:
+            manifest = ""
+        java_version_match = re.search(r"(?im)^Java-Version\s*:\s*([^\s]+)\s*$", manifest)
+        if java_version_match:
+            artifact_java_version = java_version_match.group(1).strip()
         for name in sorted(source.namelist()):
             if name.startswith("BOOT-INF/classes/") and name.endswith(".class"):
                 relative = name[len("BOOT-INF/classes/"):]
                 destination = extracted_root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(source.read(name))
+            if (
+                name.startswith("BOOT-INF/lib/")
+                and name.endswith(".jar")
+            ):
+                try:
+                    nested_blob = source.read(name)
+                    with zipfile.ZipFile(io.BytesIO(nested_blob)) as nested:
+                        nested_coordinates = []
+                        for metadata_name in nested.namelist():
+                            if not re.fullmatch(
+                                r"META-INF/maven/[^/]+/[^/]+/pom\.properties",
+                                metadata_name,
+                            ):
+                                continue
+                            properties = {}
+                            for line in nested.read(metadata_name).decode(
+                                "utf-8", errors="replace"
+                            ).splitlines():
+                                key, separator, value = line.strip().partition("=")
+                                if separator:
+                                    properties[key.strip()] = value.strip()
+                            if all(properties.get(key) for key in ("groupId", "artifactId", "version")):
+                                nested_coordinates.append(properties)
+                        if len(nested_coordinates) == 1:
+                            coordinate = nested_coordinates[0]
+                            runtime_lib_entries.append({
+                                "coord": f"{coordinate['groupId']}:{coordinate['artifactId']}",
+                                "version": coordinate["version"],
+                                "lib_entry": name,
+                            })
+                        else:
+                            runtime_lib_entries.append({
+                                "coord": f"runtime:{Path(name).stem}",
+                                "version": "runtime",
+                                "lib_entry": name,
+                            })
+                        nested_root = (
+                            extracted_root / "nested" /
+                            f"{hashlib.sha256(name.encode('utf-8')).hexdigest()[:12]}-{Path(name).stem}"
+                        )
+                        for class_entry in sorted(nested.namelist()):
+                            if not class_entry.endswith(".class") or class_entry.startswith("META-INF/"):
+                                continue
+                            class_bytes = nested.read(class_entry)
+                            if owner_prefix_bytes and not any(
+                                prefix in class_bytes for prefix in owner_prefix_bytes
+                            ):
+                                continue
+                            destination = nested_root / class_entry
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            destination.write_bytes(class_bytes)
+                except (KeyError, OSError, ValueError, zipfile.BadZipFile):
+                    pass
             if (
                 artifact_id
                 and name.startswith(f"BOOT-INF/lib/{artifact_id}-")
@@ -2363,6 +2480,12 @@ def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path,
         raise ValueError("current final artifact contains no business class files")
     dependencies_dir = report_dir / "evidence" / "dependencies"
     dependencies_dir.mkdir(parents=True, exist_ok=True)
+    context_dir = report_dir / "evidence" / "context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    (context_dir / "context.json").write_text(
+        json.dumps({"jdk_current": artifact_java_version or "unknown"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
     (dependencies_dir / "build_provenance.json").write_text(json.dumps({
         "sides": [{
             "side": "current",
@@ -2385,6 +2508,18 @@ def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path,
             "lib_entry": target_lib_entry,
             "resolution_status": "resolved" if target_lib_entry else "unresolved",
         })
+        for runtime_item in runtime_lib_entries:
+            if runtime_item["lib_entry"] == target_lib_entry:
+                continue
+            writer.writerow({
+                "coord": runtime_item["coord"],
+                "version": runtime_item["version"],
+                "scope": "runtime",
+                "lib_entry": runtime_item["lib_entry"],
+                "resolution_status": "resolved",
+            })
+    if selected_changed_apis is not None and selected_changed_apis.is_file():
+        return selected_changed_apis
     discovered = discover_calls(
         class_files,
         owner_prefixes=case.bytecode_owner_prefixes,
@@ -2407,11 +2542,14 @@ def materialize_bytecode_changed_apis(case: RealProjectCase, project_root: Path,
             "source": "third_party_jdk_bytecode_discovery",
         })
     generated_case = replace(case, changed_api_rows=tuple(rows), prefer_embedded_changed_api_rows=True)
-    return ensure_changed_apis(
+    generated_changed_apis = ensure_changed_apis(
         generated_case,
         Path(""),
         report_dir / "evidence" / "api_changes" / "all_changed_apis.csv",
     )
+    if selected_changed_apis is not None and selected_changed_apis.is_file():
+        return selected_changed_apis
+    return generated_changed_apis
 
 
 def materialize_step4_inputs(case: RealProjectCase, report_dir: Path) -> tuple[Path, Path]:
@@ -2544,8 +2682,28 @@ def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, rep
         "--allow-degraded",
     ]
     start = time.time()
-    proc = subprocess.run(cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", timeout=900)
-    return proc.returncode, time.time() - start
+    timeout_seconds = float(case.max_elapsed_seconds or 900.0)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=ROOT_DIR,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+        )
+        return proc.returncode, time.time() - start
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - start
+        timeout_path = report_dir / "evidence" / "quality" / "step5_timeout.json"
+        timeout_path.parent.mkdir(parents=True, exist_ok=True)
+        timeout_path.write_text(json.dumps({
+            "reason": "STEP5_PERFORMANCE_BUDGET_EXCEEDED",
+            "timeout_seconds": timeout_seconds,
+            "elapsed_seconds": round(elapsed, 3),
+            "command": cmd,
+        }, indent=2) + "\n", encoding="utf-8")
+        return 124, elapsed
 
 
 def run_step6(report_dir: Path) -> dict:
@@ -3218,7 +3376,13 @@ def run_case(
     report_dir = report_root / case.name
     report_dir.mkdir(parents=True, exist_ok=True)
     if case.bytecode_owner_prefixes:
-        changed_apis = materialize_bytecode_changed_apis(case, project_root, report_dir)
+        explicit_changed_apis = changed_apis if changed_apis.is_file() else None
+        changed_apis = materialize_bytecode_changed_apis(
+            case,
+            project_root,
+            report_dir,
+            selected_changed_apis=explicit_changed_apis,
+        )
     step4_result = {}
     step4_selection = {}
     failures = []
@@ -3344,7 +3508,12 @@ def run_case(
             ],
         }
 
-    returncode, elapsed = run_step5(case, project_root, changed_apis, report_dir)
+    execution_case = (
+        replace(case, max_elapsed_seconds=performance_budget)
+        if performance_budget != case.max_elapsed_seconds
+        else case
+    )
+    returncode, elapsed = run_step5(execution_case, project_root, changed_apis, report_dir)
     summary = load_summary(report_dir)
     graph_stats = extract_graph_stats(summary)
     source_shape_metrics = collect_source_shape_metrics(project_root, case.source_shape_patterns)

@@ -631,6 +631,10 @@ def _report_step5_debug_event(hypothesis_id, location, msg, data=None, run_id='p
     # #endregion
 
 
+def _requires_current_final_artifact_edges(bytecode_stats):
+    return str((bytecode_stats or {}).get('evidence_source') or '') == 'current_final_artifact'
+
+
 def _step5_integrated_main_impl(args):
     """
     Step 5集成版主流程
@@ -1135,6 +1139,9 @@ def _step5_integrated_main_impl(args):
         cache_path=str(_runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE),
     )
     bytecode_merge = merge_business_bytecode_edges(graph, bytecode_evidence)
+    graph.require_current_final_artifact_business_edges = (
+        _requires_current_final_artifact_edges(bytecode_stats)
+    )
     graph_stats['business_bytecode'] = {
         **bytecode_stats,
         **bytecode_merge,
@@ -1255,21 +1262,6 @@ def _step5_integrated_main_impl(args):
         graph_stats=graph_stats,
         type_metadata_count=len(type_metadata or {}),
     )
-    query_index_timer = time.perf_counter()
-    query_index_path = write_query_index(
-        graph,
-        str(Path(getattr(args, 'query_index', '') or _default_query_index_path(report_dir))),
-        graph_stats={
-            'methods_indexed': len(graph.methods_by_id),
-            'reverse_edge_keys': len(graph.reverse_edges),
-        },
-    )
-    graph_stats['step5_perf']['main']['query_index_elapsed_sec'] = round(
-        time.perf_counter() - query_index_timer,
-        3,
-    )
-    print(f"  调用链查询索引 → {query_index_path}", file=sys.stderr)
-
     # Phase 5: 置信度加权反向追踪（核心改进）
     print("\n反向追踪调用链（置信度加权）...", file=sys.stderr)
     emit_progress("step5", "trace", f"开始反向追踪，共 {len(all_apis)} 个 API")
@@ -1297,6 +1289,22 @@ def _step5_integrated_main_impl(args):
         allow_degraded=allow_degraded,
         graph_stats=graph_stats,
     )
+    # Runtime bytecode closure can add methods and reverse edges while tracing.
+    # Refresh the persisted query index so it describes the same graph as the report.
+    query_index_refresh_timer = time.perf_counter()
+    query_index_path = write_query_index(
+        graph,
+        str(Path(getattr(args, 'query_index', '') or _default_query_index_path(report_dir))),
+        graph_stats={
+            'methods_indexed': len(graph.methods_by_id),
+            'reverse_edge_keys': len(graph.reverse_edges),
+        },
+    )
+    graph_stats['step5_perf']['main']['query_index_elapsed_sec'] = round(
+        time.perf_counter() - query_index_refresh_timer,
+        3,
+    )
+    print(f"  调用链查询索引 → {query_index_path}", file=sys.stderr)
     _step5_debug(
         'trace_batch_summary',
         'completed tracing all apis',
@@ -1663,7 +1671,10 @@ def build_runtime_dependency_catalog(report_dir):
                             'coord': coord, 'version': version, 'scope': scope,
                             'jar_path': str(jar_path), 'artifact_entry': lib_entry,
                             'sha256': digest, 'evidence_source': 'current_final_artifact',
-                            'application_owned': coord in application_module_coords,
+                            'application_owned': (
+                                coord in application_module_coords
+                                or coord.split(':', 1)[0] in application_group_ids
+                            ),
                         }
                         catalog['by_coord'][coord] = item
                         catalog['entries'].append(item)

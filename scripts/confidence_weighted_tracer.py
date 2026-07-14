@@ -113,13 +113,21 @@ def _immutable_artifact_parse_cache_key(
     artifact_sha256, target_jdk, class_binary_name, multi_release_version,
     class_entry='',
 ):
+    normalized_entry = str(class_entry or '').strip().lstrip('/')
+    if not normalized_entry and class_binary_name:
+        logical_entry = str(class_binary_name).replace('.', '/') + '.class'
+        normalized_entry = (
+            f'META-INF/versions/{multi_release_version}/{logical_entry}'
+            if str(multi_release_version or '').isdigit()
+            else logical_entry
+        )
     return (
         str(artifact_sha256 or '').strip(),
         ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION,
         str(target_jdk or '').strip(),
         str(class_binary_name or '').strip(),
         str(multi_release_version or '').strip(),
-        str(class_entry or '').strip(),
+        normalized_entry,
     )
 
 
@@ -457,12 +465,43 @@ def _step5_runtime_member_index_min_jars():
     return 50
 
 
+def _step5_runtime_member_index_max_bytes():
+    value = str(os.environ.get('JUA_STEP5_RUNTIME_MEMBER_INDEX_MAX_BYTES') or '').strip()
+    if value:
+        try:
+            return max(1, int(value))
+        except ValueError:
+            return 32 * 1024 * 1024
+    return 32 * 1024 * 1024
+
+
+def _runtime_member_index_catalog_bytes(graph, catalog_entries):
+    cached = getattr(graph, '_runtime_member_index_catalog_bytes', None)
+    if cached is not None:
+        return int(cached)
+    total = 0
+    for item in catalog_entries or []:
+        jar_path = str(item.get('jar_path') or '').strip()
+        if not jar_path:
+            continue
+        try:
+            total += int(os.path.getsize(jar_path))
+        except OSError:
+            continue
+    setattr(graph, '_runtime_member_index_catalog_bytes', total)
+    return total
+
+
 def _should_prefer_runtime_member_candidate_index(graph, catalog_entries):
     if bool(getattr(graph, '_prefer_runtime_dependency_member_candidate_index', False)):
         return True, 'explicit'
     entry_count = len(catalog_entries or [])
     threshold = _step5_runtime_member_index_min_jars()
     if entry_count >= threshold:
+        catalog_bytes = _runtime_member_index_catalog_bytes(graph, catalog_entries)
+        max_bytes = _step5_runtime_member_index_max_bytes()
+        if catalog_bytes > max_bytes:
+            return True, f'large_artifact_catalog:{catalog_bytes}>{max_bytes}'
         return True, f'large_runtime_catalog:{entry_count}>={threshold}'
     return False, ''
 
@@ -528,6 +567,7 @@ def _perf_record_top(graph, section, key, item, elapsed_key='elapsed_sec', limit
 
 def _record_actual_artifact_class_parse(
     graph, artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+    class_entry='', parser_kind='',
 ):
     stats, lock = _step5_perf_state(graph)
     if stats is None:
@@ -550,6 +590,16 @@ def _record_actual_artifact_class_parse(
             setattr(graph, '_step5_parsed_artifact_classes', parsed_classes)
         if physical_class_key in parsed_classes:
             bucket['duplicate_class_scans'] += 1
+            samples = bucket.setdefault('duplicate_class_scan_samples', [])
+            if len(samples) < 20:
+                samples.append({
+                    'artifact_sha256': physical_class_key[0],
+                    'target_jdk': physical_class_key[2],
+                    'class_binary_name': physical_class_key[3],
+                    'multi_release_version': physical_class_key[4],
+                    'class_entry': str(class_entry or ''),
+                    'parser_kind': str(parser_kind or ''),
+                })
         parsed_classes.add(physical_class_key)
 
 
@@ -580,7 +630,10 @@ def _finalize_step5_perf_stats(graph):
     for section, values in snapshot.items():
         bucket = {}
         for key, value in dict(values or {}).items():
-            bucket[key] = _round_perf_value(value)
+            if section == 'bytecode_scan' and key == 'class_parse_elapsed_sec':
+                bucket[key] = round(float(value or 0.0), 6)
+            else:
+                bucket[key] = _round_perf_value(value)
         finalized[section] = bucket
     return finalized
 
@@ -1179,6 +1232,75 @@ def _apply_source_artifact_miss(result, graph, reachable_note):
     return result
 
 
+def _build_source_only_artifact_conflict_result(result, graph, matched_key_groups):
+    if not bool(getattr(graph, 'require_current_final_artifact_business_edges', False)):
+        return None
+
+    reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    source_edges = []
+    seen = set()
+    for group in matched_key_groups or []:
+        for key in group.get('matched_keys', []) or []:
+            for edge in reverse_edges.get(key, []) or []:
+                if _edge_allowed_for_trace(edge, graph) or bool(getattr(edge, 'is_test', False)):
+                    continue
+                identity = (
+                    str(getattr(edge, 'caller_symbol_id', '') or ''),
+                    str(getattr(edge, 'callee_key', '') or key),
+                    str(getattr(edge, 'file', '') or ''),
+                    int(getattr(edge, 'line', 0) or 0),
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                source_edges.append((key, edge))
+
+    if not source_edges:
+        return None
+
+    result.analysis_status = 'reachable'
+    result.is_reachable = True
+    result.direct_callers = len(source_edges)
+    result.business_reach_depth = 1
+    result.call_paths = []
+    result.evidence_paths = []
+    result.path_details = []
+    for key, edge in source_edges:
+        caller = str(
+            getattr(edge, 'caller_qualified_key', '')
+            or getattr(edge, 'caller_symbol_id', '')
+            or '?'
+        )
+        callee = str(getattr(edge, 'callee_key', '') or key)
+        path_text = f'{caller} -> {callee}'
+        evidence = [{
+            'caller_symbol': caller,
+            'callee_key': callee,
+            'evidence_type': str(getattr(edge, 'evidence_type', '') or 'source_reference'),
+            'evidence_source': str(getattr(edge, 'evidence_source', '') or 'source_worktree'),
+            'confidence': str(getattr(edge, 'confidence', '') or 'medium'),
+            'file': str(getattr(edge, 'file', '') or ''),
+            'line': int(getattr(edge, 'line', 0) or 0),
+        }]
+        result.call_paths.append(path_text)
+        result.evidence_paths.append(evidence)
+        result.path_details.append({
+            'path_status': 'reachable',
+            'stop_reason': 'SOURCE_ONLY_ARTIFACT_CONFLICT',
+            'business_entry': caller,
+            'business_reachable': True,
+            'path_text': path_text,
+            'confidence': result.confidence_score,
+            'depth': 1,
+            'evidence': evidence,
+        })
+
+    return _apply_source_artifact_miss(result, graph, (
+        '源码中发现了目标调用，但当前最终制品的字节码扫描没有发现对应引用；'
+        '源码线索仅用于报告源码与制品冲突，不能作为运行时可达证据'
+    ))
+
+
 def _downgrade_reachable_path_details(result, path_status, stop_reason):
     for detail in getattr(result, 'path_details', []) or []:
         if detail.get('path_status') != 'reachable':
@@ -1554,15 +1676,20 @@ def _references_from_executable_classfile_edges(edges, class_binary_name=''):
         }:
             owner_and_member, _, signature_tail = callee_key.partition('(')
             owner, _, member = owner_and_member.rpartition('.')
-            signature = normalize_signature_for_lookup(
-                f'({signature_tail}' if signature_tail else ''
+            callee_descriptor = str(edge.get('callee_descriptor') or '')
+            signature = (
+                _method_descriptor_to_lookup_signature(callee_descriptor)
+                if callee_descriptor.startswith('(')
+                else normalize_signature_for_lookup(
+                    f'({signature_tail}' if signature_tail else ''
+                )
             )
             jvm_member = '<init>' if evidence_type == 'bytecode_constructor_invocation' else member
             references['method_refs'].append({
                 'owner': owner,
                 'jvm_owner': str(edge.get('callee_jvm_owner') or owner),
                 'name': jvm_member,
-                'descriptor': str(edge.get('callee_descriptor') or ''),
+                'descriptor': callee_descriptor,
                 'signature': signature,
                 'consumer_method': caller_method,
                 'consumer_signature': caller_signature,
@@ -1630,7 +1757,7 @@ def _parse_javap_bytecode_references(text, class_binary_name=''):
     class_pattern = re.compile(r'//\s+class\s+([A-Za-z0-9_/$]+)')
     descriptor_pattern = re.compile(r'L([A-Za-z0-9_/$]+);')
     method_header_pattern = re.compile(
-        r'^\s*(?:[\w.$<>\[\],?]+\s+)+([\w$<>.]+)\([^;]*\)'
+        r'^\s*(?:[\w.$<>\[\],?]+\s+)*([\w$<>.]+)\([^;]*\)'
         r'(?:\s+throws\s+[^;]+)?;\s*$'
     )
     bootstrap_start_pattern = re.compile(r'^\s*(\d+):\s+#\d+\s+REF_\w+')
@@ -1940,6 +2067,7 @@ def _load_runtime_dependency_class_references(
         parsed = _parse_javap_bytecode_references(text, class_binary_name)
         _record_actual_artifact_class_parse(
             graph, artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+            class_entry=class_entry, parser_kind='javap',
         )
         return parsed
 
@@ -1978,10 +2106,20 @@ def _load_direct_classfile_references(
             _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
             return json.loads(cached)
 
-    direct_edges = parse_classfile_calls(data, class_binary_name)
+    parse_started_at = time.perf_counter()
+    direct_edges = None
+    summary = None
+    try:
+        direct_edges = parse_classfile_calls(data, class_binary_name)
+        if direct_edges is not None:
+            summary = _parse_classfile_constant_pool_summary(data)
+    finally:
+        _perf_add(
+            graph, 'bytecode_scan', 'class_parse_elapsed_sec',
+            time.perf_counter() - parse_started_at,
+        )
     if direct_edges is None:
         return None
-    summary = _parse_classfile_constant_pool_summary(data)
     if summary is None or summary.get('has_dynamic_reference'):
         return None
     references = _references_from_executable_classfile_edges(
@@ -1990,6 +2128,7 @@ def _load_direct_classfile_references(
     _perf_add(graph, 'bytecode_scan', 'artifact_cache_misses', 1)
     _record_actual_artifact_class_parse(
         graph, artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        class_entry=class_entry, parser_kind='classfile',
     )
     if _valid_sha256(artifact_sha256):
         serialized = json.dumps(references, sort_keys=True, separators=(',', ':'))
@@ -2005,6 +2144,22 @@ def _load_runtime_dependency_class_references_for_task(task):
     # classes deliberately do not populate this field and retain the javap path.
     if task.get('preparsed_references') is not None:
         return task, task.get('preparsed_references')
+    jar_path = str(task.get('jar_path') or '')
+    class_entry = str(task.get('class_entry') or '')
+    if jar_path and class_entry:
+        with zipfile.ZipFile(jar_path) as archive:
+            class_bytes = archive.read(class_entry)
+        references = _load_direct_classfile_references(
+            class_bytes,
+            task.get('artifact_sha256') or '',
+            task.get('target_jdk'),
+            task.get('class_binary_name') or '',
+            multi_release_version=task.get('multi_release_version'),
+            class_entry=class_entry,
+            graph=task.get('graph'),
+        )
+        if references is not None:
+            return task, references
     references = _load_runtime_dependency_class_references(
         task['catalog'],
         task['coord'],
@@ -2017,6 +2172,65 @@ def _load_runtime_dependency_class_references_for_task(task):
         class_entry=task.get('class_entry') or '',
     )
     return task, references
+
+
+def _runtime_reference_signature_matches(
+    target_signature, reference, target_owner='', allow_ambiguous_unqualified=False
+):
+    target_signature = str(target_signature or '').strip()
+    reference_signature = str((reference or {}).get('signature') or '').strip()
+    if not target_signature:
+        return True
+    if reference_signature == target_signature:
+        return True
+    target_params = split_signature_params(target_signature)
+    descriptor_params, _return_type = _parse_method_descriptor(
+        str((reference or {}).get('descriptor') or '')
+    )
+    if target_params is None or len(target_params) != len(descriptor_params):
+        return False
+
+    target_internal_owner = _jvm_internal_owner_name(target_owner)
+    target_package = (
+        target_internal_owner.rsplit('/', 1)[0].replace('/', '.')
+        if '/' in target_internal_owner else ''
+    )
+
+    def type_matches(target_type, descriptor_type):
+        target_type = str(target_type or '').strip().replace('...', '[]').replace('/', '.')
+        descriptor_type = str(descriptor_type or '').strip().replace('/', '.').replace('$', '.')
+        while '<' in target_type:
+            target_type = target_type.split('<', 1)[0].strip()
+        target_arrays = 0
+        descriptor_arrays = 0
+        while target_type.endswith('[]'):
+            target_arrays += 1
+            target_type = target_type[:-2].strip()
+        while descriptor_type.endswith('[]'):
+            descriptor_arrays += 1
+            descriptor_type = descriptor_type[:-2].strip()
+        if target_arrays != descriptor_arrays:
+            return False
+        target_type = target_type.replace('$', '.')
+        if target_type == descriptor_type:
+            return True
+        if '.' not in target_type:
+            if target_type in _JAVA_LANG_SIMPLE_TYPES:
+                return descriptor_type == f'java.lang.{target_type}'
+            if target_package and descriptor_type == f'{target_package}.{target_type}':
+                return True
+            return bool(
+                allow_ambiguous_unqualified
+                and descriptor_type.rsplit('.', 1)[-1] == target_type
+            )
+        if target_package and target_type[:1].isupper():
+            return descriptor_type == f'{target_package}.{target_type}'
+        return False
+
+    return all(
+        type_matches(target_type, descriptor_type)
+        for target_type, descriptor_type in zip(target_params, descriptor_params)
+    )
 
 
 def _match_runtime_dependency_references(api_row, references):
@@ -2068,8 +2282,16 @@ def _match_runtime_dependency_references(api_row, references):
             if target_lookup_signature:
                 if item.get('reference_kind', '').startswith('reflection_') and not item.get('signature_resolved'):
                     continue
-                if item.get('signature') and item.get('signature') != target_lookup_signature:
-                    continue
+                signature_ambiguous = False
+                if not _runtime_reference_signature_matches(target_signature, item, owner):
+                    signature_ambiguous = _runtime_reference_signature_matches(
+                        target_signature, item, owner,
+                        allow_ambiguous_unqualified=True,
+                    )
+                    if not signature_ambiguous:
+                        continue
+            else:
+                signature_ambiguous = False
             matches.append({
                 'evidence_type': (
                     'bytecode_invokedynamic_method_reference'
@@ -2089,6 +2311,7 @@ def _match_runtime_dependency_references(api_row, references):
                 'callee_descriptor': item.get('descriptor') or '',
                 'opcode_family': item.get('opcode_family') or '',
                 'instruction_offset': item.get('instruction_offset'),
+                'signature_ambiguous': signature_ambiguous,
             })
         return _dedupe_runtime_matches(matches)
 
@@ -2137,6 +2360,7 @@ def _dedupe_runtime_matches(matches):
             item.get('consumer_method'), item.get('consumer_signature'),
             item.get('consumer_descriptor'), item.get('callee_descriptor'),
             item.get('opcode_family'), item.get('instruction_offset'),
+            bool(item.get('signature_ambiguous')),
         )
         if identity in seen:
             continue
@@ -2358,27 +2582,14 @@ def _collect_exhaustive_runtime_reference_edges(graph):
 
 
 def collect_graph_analyzer_edges(graph, api_rows):
-    """Collect verified business bytecode instructions already merged into reverse_edges."""
+    """Complete the ledger from verified edges already found during target tracing."""
     if graph is None:
         return 0
     provenance = _verified_final_artifact_provenance(graph)
     if not provenance.get('complete'):
         _record_analyzer_ledger_failure(graph, 'final_artifact_provenance_invalid')
         return 0
-    collected = 0
-    runtime_edges = _collect_exhaustive_runtime_reference_edges(graph)
-    retained_runtime_edges = _retain_exhaustive_runtime_reference_edges(api_rows, runtime_edges)
-    for retained in retained_runtime_edges:
-        api_row = retained['api_row']
-        hit = dict(retained['edge'])
-        hit['edge_role'] = (
-            'external_consumer'
-            if hit.get('coord') == '__business__'
-            or hit.get('coord') != str(api_row.get('coord') or '')
-            else 'internal_bridge'
-        )
-        if record_analyzer_edge(graph, api_row, hit) is not None:
-            collected += 1
+    collected = _collect_target_runtime_reference_closure(graph, api_rows)
     candidate_edges = []
     seen_edges = set()
     for edges in (getattr(graph, 'reverse_edges', {}) or {}).values():
@@ -2450,7 +2661,10 @@ def collect_graph_analyzer_edges(graph, api_rows):
                 evidence_path=getattr(edge, 'file', ''),
             )
             continue
-        class_binary_name = class_entry[:-6].replace('/', '.')
+        versioned_entry = re.match(r'^META-INF/versions/(\d+)/(.*\.class)$', class_entry)
+        selected_version = int(versioned_entry.group(1)) if versioned_entry else 'base'
+        logical_class_entry = versioned_entry.group(2) if versioned_entry else class_entry
+        class_binary_name = logical_class_entry[:-6].replace('/', '.')
         target_row = _graph_edge_target_row(edge, api_rows)
         if target_row is None:
             _record_analyzer_ledger_failure(
@@ -2461,27 +2675,33 @@ def collect_graph_analyzer_edges(graph, api_rows):
             continue
         caller = methods_by_id.get(getattr(edge, 'caller_symbol_id', ''))
         caller_member = str(getattr(caller, 'method_name', '') or '').strip()
-        if any(
-            str(item['edge'].get('coord') or '') == '__business__'
-            and str(item['edge'].get('class_entry') or '') == class_entry
-            and (
-                not caller_member
-                or str(item['edge'].get('consumer_method') or '') == caller_member
+        references = None
+        try:
+            with zipfile.ZipFile(business_jar) as archive:
+                class_bytes = archive.read(class_entry)
+            references = _load_direct_classfile_references(
+                class_bytes,
+                business_jar_sha256,
+                catalog.get('target_jdk'),
+                class_binary_name,
+                multi_release_version=selected_version,
+                class_entry=class_entry,
+                graph=graph,
             )
-            and _runtime_reference_edge_matches_api(target_row, item['edge'])
-            for item in retained_runtime_edges
-        ):
-            continue
-        references = _load_runtime_dependency_class_references(
-            catalog,
-            '__business__',
-            business_jar,
-            class_binary_name,
-            artifact_sha256=business_jar_sha256,
-            target_jdk=catalog.get('target_jdk'),
-            graph=graph,
-            class_entry=class_entry,
-        )
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            references = None
+        if references is None:
+            references = _load_runtime_dependency_class_references(
+                catalog,
+                '__business__',
+                business_jar,
+                class_binary_name,
+                artifact_sha256=business_jar_sha256,
+                target_jdk=catalog.get('target_jdk'),
+                multi_release_version=selected_version,
+                graph=graph,
+                class_entry=class_entry,
+            )
         if references is None:
             _record_analyzer_ledger_failure(
                 graph,
@@ -2682,6 +2902,7 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                             'opcode_family': matched.get('opcode_family') or '',
                             'instruction_offset': matched.get('instruction_offset'),
                             'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
+                            'signature_ambiguous': bool(matched.get('signature_ambiguous')),
                             'target_display': matched.get('target_display') or owner,
                             'class_entry': entry,
                             'multi_release_version': selected_version,
@@ -2797,8 +3018,9 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 'visited_classes': 0,
             }
             continue
-        target_rows_by_owner[owner].append(row)
-        owner_internal_names[owner] = _jvm_internal_owner_name(owner)
+        canonical_owner = owner.replace('$', '.')
+        target_rows_by_owner[canonical_owner].append(row)
+        owner_internal_names[canonical_owner] = _jvm_internal_owner_name(owner)
 
     if not target_rows_by_owner:
         _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
@@ -3042,12 +3264,20 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 'elapsed_sec': task_elapsed,
                 'failed': False,
             })
-            referenced_owners = set(references.get('class_refs') or [])
+            referenced_owners = {
+                str(value or '').replace('$', '.')
+                for value in (references.get('class_refs') or [])
+                if value
+            }
             referenced_owners.update(
-                item.get('owner') for item in references.get('method_refs') or []
+                str(item.get('owner') or '').replace('$', '.')
+                for item in references.get('method_refs') or []
+                if item.get('owner')
             )
             referenced_owners.update(
-                item.get('owner') for item in references.get('field_refs') or []
+                str(item.get('owner') or '').replace('$', '.')
+                for item in references.get('field_refs') or []
+                if item.get('owner')
             )
             matched_api_keys = set()
             for owner in set(candidate_owners) & {item for item in referenced_owners if item}:
@@ -3084,6 +3314,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                             'opcode_family': matched.get('opcode_family') or '',
                             'instruction_offset': matched.get('instruction_offset'),
                             'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
+                            'signature_ambiguous': bool(matched.get('signature_ambiguous')),
                             'target_display': matched.get('target_display') or owner,
                             'class_entry': task.get('class_entry') or '',
                             'multi_release_version': selected_version,
@@ -3318,7 +3549,9 @@ def _runtime_method_def_for_packaged_caller(coord, jar_path, class_fqcn, method_
     normalized_class = str(class_fqcn or '').replace('$', '.')
     method_name = str(method_name or '').strip() or '<unknown>'
     signature = str(signature or '').strip()
-    display_method = normalized_class.rsplit('.', 1)[-1] if method_name == '<init>' else method_name
+    # Runtime reverse expansion must retain the JVM constructor member name.
+    # Replacing it with the class name creates a key no classfile can call.
+    display_method = method_name
     qualified_key = f'{normalized_class}.{display_method}{signature}'
     return MethodDef(
         symbol_id=f'runtime:{coord}:{qualified_key}',
@@ -3332,7 +3565,7 @@ def _runtime_method_def_for_packaged_caller(coord, jar_path, class_fqcn, method_
         line=0,
         end_line=0,
         package_name=normalized_class.rsplit('.', 1)[0] if '.' in normalized_class else '',
-        owner_type='dependency',
+        owner_type='business' if str(coord or '') == '__business__' else 'dependency',
         owner_coord=str(coord or ''),
         module='',
         source_root='',
@@ -3341,7 +3574,9 @@ def _runtime_method_def_for_packaged_caller(coord, jar_path, class_fqcn, method_
     )
 
 
-def _add_runtime_dependency_caller_edge(graph, lookup_key, coord, jar_path, class_fqcn, matched):
+def _add_runtime_dependency_caller_edge(
+    graph, lookup_key, coord, jar_path, class_fqcn, matched, analyzer_hit=None
+):
     methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
     reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
     consumer_method = matched.get('consumer_method') or '<unknown>'
@@ -3364,7 +3599,7 @@ def _add_runtime_dependency_caller_edge(graph, lookup_key, coord, jar_path, clas
         file=str(jar_path or ''),
         line=0,
         content='runtime dependency bytecode caller',
-        owner_type='dependency',
+        owner_type='business' if str(coord or '') == '__business__' else 'dependency',
         owner_coord=str(coord or ''),
         module='',
         is_test=False,
@@ -3382,10 +3617,26 @@ def _add_runtime_dependency_caller_edge(graph, lookup_key, coord, jar_path, clas
         edge.callee_resolution_note = '缺少调用目标所属类全限定名'
     else:
         edge.callee_resolution_note = '缺少调用目标方法参数签名'
+    if analyzer_hit:
+        edge.runtime_analyzer_hit = dict(analyzer_hit)
+    if str(coord or '') == '__business__':
+        edge.evidence_source = 'current_final_artifact'
     for key in (lookup_key, edge.callee_simple_key):
         bucket = reverse_edges.setdefault(key, [])
-        identity = (edge.caller_symbol_id, edge.callee_key, edge.evidence_type)
-        if any((old.caller_symbol_id, old.callee_key, old.evidence_type) == identity for old in bucket):
+        identity = (
+            edge.caller_symbol_id, edge.callee_key, edge.evidence_type,
+            _normalized_instruction_offset((analyzer_hit or {}).get('instruction_offset')),
+            str((analyzer_hit or {}).get('consumer_descriptor') or ''),
+            str((analyzer_hit or {}).get('callee_descriptor') or ''),
+        )
+        if any((
+            old.caller_symbol_id, old.callee_key, old.evidence_type,
+            _normalized_instruction_offset(
+                (getattr(old, 'runtime_analyzer_hit', {}) or {}).get('instruction_offset')
+            ),
+            str((getattr(old, 'runtime_analyzer_hit', {}) or {}).get('consumer_descriptor') or ''),
+            str((getattr(old, 'runtime_analyzer_hit', {}) or {}).get('callee_descriptor') or ''),
+        ) == identity for old in bucket):
             continue
         bucket.append(edge)
     graph.methods_by_id = methods_by_id
@@ -3404,6 +3655,7 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
     reflection_ids = set()
     visited_classes = 0
     parse_failures = 0
+    failures = []
     started_at = time.perf_counter()
     progress_interval = suggest_log_interval(len(catalog_entries), target_updates=6, minimum=1)
     for idx, item in enumerate(catalog_entries or [], 1):
@@ -3418,7 +3670,7 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                 elapsed=time.perf_counter() - started_at,
                 item=coord or str(item.get('jar_path') or '')[:120],
             )
-        if not coord or coord == '__business__':
+        if not coord:
             continue
         jar_path = str(item.get('jar_path') or '').strip()
         if not jar_path or not os.path.exists(jar_path):
@@ -3446,6 +3698,7 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         'catalog': catalog,
                         'coord': coord,
                         'jar_path': jar_path,
+                        'artifact_container_entry': item.get('artifact_entry') or '',
                         'class_entry': entry,
                         'class_binary_name': class_binary_name,
                         'class_fqcn': class_binary_name.replace('$', '.'),
@@ -3455,34 +3708,50 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         'graph': graph,
                     }
                     data = zf.read(entry)
-                    references = _load_direct_classfile_references(
-                        data, artifact_sha256, target_jdk, class_binary_name,
-                        multi_release_version=selected_version,
-                        class_entry=entry, graph=graph,
-                    )
-                    if references is None:
-                        references = _load_runtime_dependency_class_references(
-                            catalog, coord, jar_path, class_binary_name,
-                            multi_release_version=selected_version,
-                            artifact_sha256=artifact_sha256, target_jdk=target_jdk, graph=graph,
-                            class_entry=entry,
-                        )
-                    if references is None:
+                    summary = _parse_classfile_constant_pool_summary(data)
+                    if summary is None:
                         parse_failures += 1
                         unparsed_tasks.append(task)
                         continue
-                    task['preparsed_references'] = references
                     task_id = len(tasks)
                     tasks.append(task)
-                    member_refs = list(references.get('method_refs') or [])
-                    member_refs.extend(references.get('field_refs') or [])
+                    member_refs = list(summary.get('ref_members') or [])
                     for ref in member_refs:
-                        owner = str(ref.get('owner') or '')
+                        owner = str(ref.get('owner') or '').replace('/', '.').replace('$', '.')
                         member = str(ref.get('name') or '')
                         if owner and member:
                             direct_by_owner_member[(owner, member)].add(task_id)
-        except Exception:
+                    utf8_values = {
+                        str(value or '') for value in (summary.get('utf8_values') or set())
+                        if value
+                    }
+                    for value in utf8_values:
+                        if re.fullmatch(r'[A-Za-z_$][\w$]*(?:[/.][A-Za-z_$][\w$]*)+', value):
+                            owner_string_ids[value].add(task_id)
+                            dotted_owner = value.replace('/', '.').replace('$', '.')
+                            owner_string_ids[dotted_owner].add(task_id)
+                            owner_string_ids[dotted_owner.replace('.', '/')].add(task_id)
+                        if re.fullmatch(r'[A-Za-z_$][\w$]*', value):
+                            member_string_ids[value].add(task_id)
+                    if summary.get('has_dynamic_reference') or any(
+                        marker in utf8_values
+                        for marker in (
+                            'java/lang/Class', 'java/lang/reflect/Method',
+                            'java/lang/reflect/Constructor', 'java/lang/invoke/MethodHandles',
+                        )
+                    ):
+                        reflection_ids.add(task_id)
+        except Exception as exc:
             parse_failures += 1
+            failure = {
+                'reason': 'BYTECODE_MEMBER_INDEX_ARCHIVE_FAILED',
+                'coord': coord,
+                'jar_path': jar_path,
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+            }
+            failures.append(failure)
+            _record_analyzer_ledger_failure(graph, **failure)
             continue
     _perf_add(graph, 'bytecode_expand', 'member_index_elapsed_sec', time.perf_counter() - index_started_at)
     _perf_add(graph, 'bytecode_expand', 'member_index_visited_classes', visited_classes)
@@ -3498,6 +3767,8 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
         'reflection_ids': reflection_ids,
         'visited_classes': visited_classes,
         'parse_failures': parse_failures,
+        'complete': not failures,
+        'failures': failures,
     }
 
 
@@ -3525,6 +3796,8 @@ def _get_runtime_dependency_member_candidate_index(graph, catalog_entries, targe
 def _candidate_tasks_from_runtime_member_index(index, owner, member):
     if not index:
         return None
+    if not bool(index.get('complete', True)):
+        return None
     task_ids = set((index.get('direct_by_owner_member') or {}).get((owner, member), set()))
     owner_ids = set((index.get('owner_string_ids') or {}).get(owner, set()))
     owner_ids.update((index.get('owner_string_ids') or {}).get(_jvm_internal_owner_name(owner), set()))
@@ -3550,9 +3823,17 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
         if _class_bytes_might_reference_target(data, owner_internal, member):
             unparsed_selected += 1
             candidates.append(task)
+    unique_candidates = []
+    seen_candidates = set()
+    for task in candidates:
+        identity = (str(task.get('jar_path') or ''), str(task.get('class_entry') or ''))
+        if identity in seen_candidates:
+            continue
+        seen_candidates.add(identity)
+        unique_candidates.append(task)
     index['last_unparsed_checked'] = unparsed_checked
     index['last_unparsed_selected'] = unparsed_selected
-    return candidates
+    return unique_candidates
 
 
 def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
@@ -3633,21 +3914,24 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
             graph,
             catalog_entries,
         )
-        use_member_index = prefer_member_index or prior_light_scans >= 3
+        large_artifact_catalog = prefer_member_index_reason.startswith('large_artifact_catalog:')
+        use_member_index = bool(prefer_member_index_reason) or prior_light_scans >= 3
         indexed_tasks = None
         member_index = None
+        if large_artifact_catalog:
+            _perf_add(graph, 'bytecode_expand', 'member_index_large_artifact_catalog', 1)
         if use_member_index:
             _perf_add(graph, 'bytecode_expand', 'member_index_uses', 1)
             if prefer_member_index_reason:
                 _perf_add(graph, 'bytecode_expand', 'member_index_preferred', 1)
-                if prefer_member_index_reason.startswith('large_runtime_catalog:'):
+                if prefer_member_index_reason.startswith(('large_runtime_catalog:', 'large_artifact_catalog:')):
                     _perf_add(graph, 'bytecode_expand', 'member_index_auto_large_catalog', 1)
                     if not bool(getattr(graph, '_runtime_member_index_large_catalog_logged', False)):
                         setattr(graph, '_runtime_member_index_large_catalog_logged', True)
                         emit_progress(
                             "step5",
                             "bytecode-expand",
-                            f"运行时依赖数量较大，直接启用 member 候选索引：{prefer_member_index_reason}",
+                            f"运行时依赖规模较大，直接启用轻量 member 候选索引：{prefer_member_index_reason}",
                         )
             member_index = _get_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk)
             indexed_tasks = _candidate_tasks_from_runtime_member_index(member_index, owner, member)
@@ -3679,7 +3963,7 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                         elapsed=time.perf_counter() - scan_started_at,
                         item=coord or str(item.get('jar_path') or '')[:120],
                     )
-                if not coord or coord == '__business__':
+                if not coord:
                     continue
                 jar_path = str(item.get('jar_path') or '').strip()
                 if not jar_path or not os.path.exists(jar_path):
@@ -3714,6 +3998,7 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
                                 'catalog': catalog,
                                 'coord': coord,
                                 'jar_path': jar_path,
+                                'artifact_container_entry': item.get('artifact_entry') or '',
                                 'class_entry': entry,
                                 'class_binary_name': class_binary_name,
                                 'class_fqcn': class_binary_name.replace('$', '.'),
@@ -3753,12 +4038,32 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
         javap_classes += 1
         matches = _match_runtime_dependency_references(api_row, references)
         for matched in matches:
+            analyzer_hit = {
+                'coord': task.get('coord') or '',
+                'jar_path': task.get('jar_path') or '',
+                'artifact_container_entry': (
+                    '' if str(task.get('coord') or '') == '__business__'
+                    else task.get('artifact_container_entry') or ''
+                ),
+                'class_entry': task.get('class_entry') or '',
+                'caller_owner': task.get('class_binary_name') or '',
+                'class_fqcn': task.get('class_fqcn') or '',
+                'consumer_method': matched.get('consumer_method') or '<unknown>',
+                'consumer_signature': matched.get('consumer_signature') or '',
+                'consumer_descriptor': matched.get('consumer_descriptor') or '',
+                'callee_owner': matched.get('callee_owner') or '',
+                'callee_member': matched.get('callee_member') or '',
+                'callee_descriptor': matched.get('callee_descriptor') or '',
+                'opcode_family': matched.get('opcode_family') or '',
+                'instruction_offset': matched.get('instruction_offset'),
+            }
             _add_runtime_dependency_caller_edge(
                 graph, lookup_key,
                 task.get('coord') or '',
                 task.get('jar_path') or '',
                 task.get('class_fqcn') or (task.get('class_binary_name') or '').replace('$', '.'),
                 matched,
+                analyzer_hit=analyzer_hit,
             )
             edges_added += 1
 
@@ -3848,6 +4153,164 @@ def _ensure_runtime_dependency_callers_for_key(graph, lookup_key):
     }
 
 
+def _collect_target_runtime_reference_closure(graph, api_rows):
+    """Record the complete runtime caller closure for each original target API."""
+    collected = 0
+    catalog = _get_runtime_dependency_catalog(graph)
+    scan_results = catalog.get('_packaged_api_scan_results') or {}
+    for api_row in api_rows or []:
+        api_name = str(api_row.get('api_name') or '').strip()
+        api_signature = normalize_signature_for_lookup(
+            str(api_row.get('api_signature') or '')
+        )
+        if not api_name:
+            continue
+        queue = deque()
+        symbol_kind = str(api_row.get('symbol_kind') or 'method')
+        if symbol_kind in {'method', 'constructor'} and api_signature:
+            queue.extend(_method_lookup_key_variants(f'{api_name}{api_signature}'))
+        scan = scan_results.get(build_api_identity_key(api_row)) or {}
+        for hit in scan.get('hits') or []:
+            queue.extend(_packaged_hit_consumer_lookup_keys(hit))
+        visited = set()
+        while queue:
+            lookup_key = queue.popleft()
+            if lookup_key in visited:
+                continue
+            visited.add(lookup_key)
+            _ensure_runtime_dependency_callers_for_key(graph, lookup_key)
+            reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+            methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+            for edge in list(reverse_edges.get(lookup_key, []) or []):
+                hit = getattr(edge, 'runtime_analyzer_hit', None)
+                if not hit:
+                    if (
+                        str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
+                        and str(getattr(edge, 'owner_type', '') or '') == 'business'
+                        and not bool(getattr(edge, 'is_test', False))
+                    ):
+                        collected += _record_business_closure_edge(
+                            graph, api_row, lookup_key, edge
+                        )
+                    continue
+                ledger_hit = dict(hit)
+                ledger_hit['edge_role'] = (
+                    'internal_bridge'
+                    if str(ledger_hit.get('coord') or '') == str(api_row.get('coord') or '')
+                    else 'external_consumer'
+                )
+                if record_analyzer_edge(graph, api_row, ledger_hit) is not None:
+                    collected += 1
+                caller = methods_by_id.get(getattr(edge, 'caller_symbol_id', ''))
+                caller_key = str(getattr(caller, 'qualified_key', '') or '').strip()
+                for variant in _method_lookup_key_variants(caller_key):
+                    if variant not in visited:
+                        queue.append(variant)
+    return collected
+
+
+def _record_business_closure_edge(graph, root_api_row, lookup_key, edge):
+    parsed = _parse_runtime_method_lookup_key(lookup_key)
+    if not parsed:
+        return 0
+    owner, member, signature = parsed
+    target_row = {
+        'api_name': f'{owner}.{member}',
+        'api_simple': member,
+        'api_signature': normalize_signature_for_lookup(signature) or signature,
+        'symbol_kind': 'method',
+    }
+    catalog = _get_runtime_dependency_catalog(graph)
+    business_item = (catalog.get('by_coord') or {}).get('__business__') or next(
+        (
+            item for item in (catalog.get('entries') or [])
+            if str(item.get('coord') or '') == '__business__'
+        ),
+        {},
+    )
+    business_jar = str(business_item.get('jar_path') or '').strip()
+    business_sha256 = str(business_item.get('sha256') or '').strip()
+    _jar_path, separator, class_entry = str(getattr(edge, 'file', '') or '').partition('!/')
+    if (
+        not separator
+        or not class_entry.endswith('.class')
+        or not business_jar
+        or not os.path.isfile(business_jar)
+        or not _valid_sha256(business_sha256)
+    ):
+        _record_analyzer_ledger_failure(
+            graph, 'BUSINESS_CLOSURE_EVIDENCE_INVALID', lookup_key=lookup_key
+        )
+        return 0
+    versioned_entry = re.match(r'^META-INF/versions/(\d+)/(.*\.class)$', class_entry)
+    selected_version = int(versioned_entry.group(1)) if versioned_entry else 'base'
+    logical_class_entry = versioned_entry.group(2) if versioned_entry else class_entry
+    class_binary_name = logical_class_entry[:-6].replace('/', '.')
+    references = None
+    try:
+        with zipfile.ZipFile(business_jar) as archive:
+            class_bytes = archive.read(class_entry)
+        references = _load_direct_classfile_references(
+            class_bytes,
+            business_sha256,
+            catalog.get('target_jdk'),
+            class_binary_name,
+            multi_release_version=selected_version,
+            class_entry=class_entry,
+            graph=graph,
+        )
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        references = None
+    if references is None:
+        references = _load_runtime_dependency_class_references(
+            catalog,
+            '__business__',
+            business_jar,
+            class_binary_name,
+            artifact_sha256=business_sha256,
+            target_jdk=catalog.get('target_jdk'),
+            multi_release_version=selected_version,
+            graph=graph,
+            class_entry=class_entry,
+        )
+    if references is None:
+        _record_analyzer_ledger_failure(
+            graph, 'BUSINESS_CLOSURE_CLASS_PARSE_FAILED', class_entry=class_entry
+        )
+        return 0
+    caller = (getattr(graph, 'methods_by_id', {}) or {}).get(
+        getattr(edge, 'caller_symbol_id', '')
+    )
+    caller_member = str(getattr(caller, 'method_name', '') or '').strip()
+    matches = _match_runtime_dependency_references(target_row, references)
+    if caller_member:
+        matches = [
+            match for match in matches
+            if str(match.get('consumer_method') or '') == caller_member
+        ]
+    collected = 0
+    for matched in matches:
+        hit = {
+            'coord': '__business__',
+            'artifact_container_entry': '',
+            'edge_role': 'external_consumer',
+            'jar_path': business_jar,
+            'class_entry': class_entry,
+            'caller_owner': class_binary_name,
+            'class_fqcn': class_binary_name.replace('$', '.'),
+            'consumer_method': matched.get('consumer_method') or '<unknown>',
+            'consumer_descriptor': matched.get('consumer_descriptor') or '',
+            'callee_owner': matched.get('callee_owner') or '',
+            'callee_member': matched.get('callee_member') or '',
+            'callee_descriptor': matched.get('callee_descriptor') or '',
+            'opcode_family': matched.get('opcode_family') or '',
+            'instruction_offset': matched.get('instruction_offset'),
+        }
+        if record_analyzer_edge(graph, root_api_row, hit) is not None:
+            collected += 1
+    return collected
+
+
 def _method_lookup_key_variants(key):
     value = str(key or '').strip()
     if not value or '(' not in value:
@@ -3864,9 +4327,11 @@ def _method_lookup_key_variants(key):
     return list(dict.fromkeys(item for item in variants if item))
 
 
-def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
+def _find_business_callers_for_packaged_hit(hit, graph, max_depth=None):
     if not graph:
         return []
+    if max_depth is None:
+        max_depth = int(getattr(graph, '_trace_max_total_cost', 5) or 5)
     reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
     methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
     if not reverse_edges:
@@ -3905,7 +4370,11 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=4):
             continue
         visited.add(current_key)
         _ensure_runtime_dependency_callers_for_key(graph, current_key)
-        for edge in sorted(reverse_edges.get(current_key, []) or [], key=stable_edge_sort_key):
+        incoming_edges = (
+            edge for edge in (reverse_edges.get(current_key, []) or [])
+            if _edge_allowed_for_trace(edge, graph)
+        )
+        for edge in sorted(incoming_edges, key=stable_edge_sort_key):
             method_def = methods_by_id.get(getattr(edge, 'caller_symbol_id', ''))
             if method_def is None:
                 continue
@@ -3978,15 +4447,16 @@ def _apply_removed_dependency_packaged_impact(result, hits):
 
 
 def _build_packaged_dependency_hit_result(result, hits, graph=None):
+    ambiguous_hits = [item for item in hits if item.get('signature_ambiguous')]
     business_hits = [
         item for item in hits
-        if item.get('coord') == '__business__' or item.get('application_owned') is True
+        if item.get('coord') == '__business__' and not item.get('signature_ambiguous')
     ]
     if graph is not None and len([item for item in hits if item not in business_hits]) >= 8:
         setattr(graph, '_prefer_runtime_dependency_member_candidate_index', True)
     bridged_hits = []
     for item in hits:
-        if item in business_hits:
+        if item in business_hits or item.get('signature_ambiguous'):
             continue
         runtime_entry, framework_entries = _packaged_hit_runtime_framework_entry(item, graph)
         if runtime_entry is not None:
@@ -4012,7 +4482,11 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
     for bridged in bridged_hits:
         for edge in bridged.get('bridge_edges') or []:
             coord = str(getattr(edge, 'owner_coord', '') or '').strip()
-            if coord and coord != '__business__' and coord not in dependency_chain:
+            if (
+                coord
+                and coord not in {'__business__', 'BUSINESS', '业务制品'}
+                and coord not in dependency_chain
+            ):
                 dependency_chain.append(coord)
     has_business_path = bool(business_hits or bridged_hits)
     result.analysis_status = 'reachable' if has_business_path else 'uncertain'
@@ -4150,8 +4624,24 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         })
     reachable_details = [item for item in result.path_details if item.get('path_status') == 'reachable']
     if reachable_details:
-        result.direct_callers = len(reachable_details)
+        result.direct_callers = sum(
+            1 for item in reachable_details if int(item.get('depth') or 1) == 1
+        )
         result.business_reach_depth = min(int(item.get('depth') or 1) for item in reachable_details)
+    if ambiguous_hits and not has_business_path:
+        result.analysis_status = 'uncertain'
+        result.is_reachable = None
+        result.reason_code = 'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS'
+        result.reachable_note = (
+            '目标签名包含无法从 Step4 输入解析包名的简写类型；字节码中存在同名参数类型候选，'
+            '但不能据此确认具体重载'
+        )
+        result.direct_callers = 0
+        result.business_reach_depth = 0
+        for detail in result.path_details:
+            detail['path_status'] = 'uncertain'
+            detail['business_reachable'] = None
+            detail['stop_reason'] = 'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS'
     result.verification_commands = [
         '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
         '优先审查命中的无源码依赖及其对外暴露入口'
@@ -4800,7 +5290,7 @@ def trace_api_with_confidence_weighting(
         if scan_status == 'hit':
             scan_hits = scan_result.get('hits') or []
             if any(
-                item.get('coord') == '__business__' or item.get('application_owned') is True
+                item.get('coord') == '__business__'
                 for item in scan_hits
             ):
                 packaged_dependency_result = _build_packaged_dependency_hit_result(result, scan_hits, graph)
@@ -5537,6 +6027,14 @@ def trace_api_with_confidence_weighting(
             built = _build_inlined_constant_result(result)
             _debug_trace_result('trace_api_result', built)
             return built
+        source_conflict = _build_source_only_artifact_conflict_result(
+            result,
+            graph,
+            target_match_groups,
+        )
+        if source_conflict is not None:
+            _debug_trace_result('trace_api_result', source_conflict)
+            return source_conflict
         built = _build_packaged_dependency_not_found_result(result)
         _debug_trace_result('trace_api_result', built)
         return built
@@ -5721,6 +6219,15 @@ def ensure_trace_cache(trace_cache=None):
     return trace_cache
 
 
+def _edge_allowed_for_trace(edge, graph):
+    if not bool(getattr(graph, 'require_current_final_artifact_business_edges', False)):
+        return True
+    return bool(
+        str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
+        or getattr(edge, 'runtime_analyzer_hit', None)
+    )
+
+
 def get_cached_sorted_incoming_edges(reverse_edges, current_key, trace_cache=None, graph=None):
     trace_cache = ensure_trace_cache(trace_cache)
     cache = trace_cache['sorted_incoming_edges_by_key']
@@ -5728,7 +6235,9 @@ def get_cached_sorted_incoming_edges(reverse_edges, current_key, trace_cache=Non
         _perf_add(graph, 'trace', 'incoming_edges_cache_hits', 1)
         return cache[current_key]
     _perf_add(graph, 'trace', 'incoming_edges_cache_misses', 1)
-    incoming_edges = tuple(sorted(reverse_edges.get(current_key, []) or [], key=stable_edge_sort_key))
+    incoming_edges = list(reverse_edges.get(current_key, []) or [])
+    incoming_edges = [edge for edge in incoming_edges if _edge_allowed_for_trace(edge, graph)]
+    incoming_edges = tuple(sorted(incoming_edges, key=stable_edge_sort_key))
     cache[current_key] = incoming_edges
     _perf_max(graph, 'trace', 'incoming_edges_cache_size', len(cache))
     return incoming_edges
@@ -6068,6 +6577,29 @@ def has_external_direct_consumer(target_coord, candidate):
     return bool(owner_coord) and bool(target_coord) and owner_coord != target_coord
 
 
+def has_verified_final_artifact_business_path(candidate):
+    path_edges = list(candidate.get('path') or [])
+    if not path_edges:
+        return False
+    has_business_edge = False
+    for edge in path_edges:
+        runtime_hit = getattr(edge, 'runtime_analyzer_hit', None)
+        final_artifact_edge = (
+            str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
+        )
+        if not runtime_hit and not final_artifact_edge:
+            return False
+        if (
+            str(getattr(edge, 'owner_type', '') or '') == 'business'
+            and (
+                final_artifact_edge
+                or str((runtime_hit or {}).get('coord') or '') == '__business__'
+            )
+        ):
+            has_business_edge = True
+    return has_business_edge
+
+
 def select_confirmable_reachable_candidate(result, candidates):
     safe_candidates = []
     fallback_only_candidates = []
@@ -6078,6 +6610,9 @@ def select_confirmable_reachable_candidate(result, candidates):
         provenance = (candidate.get('provenance') or '').strip()
         if provenance == 'fallback_simple':
             fallback_only_candidates.append(candidate)
+            continue
+        if has_verified_final_artifact_business_path(candidate):
+            safe_candidates.append(candidate)
             continue
         if not has_external_direct_consumer(result.coord, candidate):
             if provenance in {'exact_signature', 'compatible_signature', 'polymorphic'}:
@@ -8007,6 +8542,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         graph_stats=graph_stats or {},
     )
     if graph is not None and all_apis:
+        graph._trace_max_total_cost = int(max_total_cost or 5)
         changed_api_overload_signatures = defaultdict(set)
         for row in all_apis:
             if not method_api_requires_signature(row):

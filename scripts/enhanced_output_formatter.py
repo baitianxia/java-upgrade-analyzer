@@ -636,6 +636,10 @@ REASON_CODE_EXPLANATIONS = {
         'reason': '中间方法存在重载，当前路径只命中了无签名回退键，无法安全继续反向追踪',
         'action': '审查中间调用点的参数类型，确认是否命中了正确重载后再继续分析'
     },
+    'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS': {
+        'reason': 'Step4 签名包含无法确定包名的简写参数类型，字节码中只找到同名类型候选，不能确认具体重载',
+        'action': '核对源码 import，并让 Step4 输出带限定包名的 api_signature 后重新分析'
+    },
     'INTERFACE_IMPLEMENTATION': {
         'reason': '接口多态调用，无法确定实现类',
         'action': '审查接口的所有实现类，确认实际运行时的实现'
@@ -667,6 +671,7 @@ INPUT_REQUIRED_REASON_CODES = {
     'MISSING_API_SIGNATURE',
     'MISSING_API_NAME',
     'MISSING_SYMBOL_KIND',
+    'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS',
     'ANALYSIS_INCOMPLETE',
     'NO_TARGET_KEYS',
 }
@@ -678,8 +683,17 @@ def _get_trace_attr(obj, name, default=None):
     return getattr(obj, name, default)
 
 
-def build_key_evidence(call_paths=None, evidence_paths=None, dependency_chain_coords=None):
+def build_key_evidence(
+    call_paths=None, evidence_paths=None, dependency_chain_coords=None, path_details=None
+):
     call_paths = list(call_paths or [])
+    confirmed_paths = [
+        str(item.get('path_text') or '').strip()
+        for item in (path_details or [])
+        if item.get('path_status') == 'reachable' and str(item.get('path_text') or '').strip()
+    ]
+    if confirmed_paths:
+        return humanize_user_text(confirmed_paths[0])
     if call_paths:
         return humanize_user_text(call_paths[0])
     evidence_paths = list(evidence_paths or [])
@@ -753,6 +767,7 @@ def summarize_user_facing_outcome(trace_like):
             call_paths=call_paths,
             evidence_paths=evidence_paths,
             dependency_chain_coords=_get_trace_attr(trace_like, 'dependency_chain_coords', []) or [],
+            path_details=_get_trace_attr(trace_like, 'path_details', []) or [],
         ),
     }
 

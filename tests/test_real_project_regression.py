@@ -16,6 +16,16 @@ import real_project_regression as realreg  # noqa: E402
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_real_fat_jar_cases_require_cross_jar_bridge_topologies(self):
+        self.assertIn(
+            "cross_jar_bridge",
+            realreg.CASES["spring-petclinic"].required_topologies,
+        )
+        self.assertIn(
+            "business_to_cross_jar_bridge",
+            realreg.CASES["mall"].required_topologies,
+        )
+
     def test_fixture_reference_resolves_when_runner_is_loaded_from_scripts_directory(self):
         reference = (
             "tests.test_real_project_regression.RealProjectRegressionTests."
@@ -48,6 +58,109 @@ class RealProjectRegressionTest(unittest.TestCase):
             ("fixture.Target.changed", "()", "method"),
         )
 
+    def test_api_identity_normalizes_signature_whitespace_across_changed_and_alert_rows(self):
+        changed = realreg._api_identity_from_changed_row({
+            "api_name": "fixture.Target.call",
+            "api_signature": "(int,int)",
+            "symbol_kind": "method",
+        })
+        alert = realreg._api_identity_from_alert_row({
+            "changed_symbol": "fixture.Target.call(int, int)",
+            "api_signature": "(int, int)",
+            "symbol_kind": "method",
+        })
+
+        self.assertEqual(changed, alert)
+
+    def test_alert_identity_strips_rendered_signature_after_normalizing_whitespace(self):
+        changed = realreg._api_identity_from_changed_row({
+            "api_name": "fixture.Target.call",
+            "api_signature": "(int, int)",
+            "symbol_kind": "method",
+        })
+        alert = realreg._api_identity_from_alert_row({
+            "changed_symbol": "fixture.Target.call(int,int)",
+            "api_signature": "(int, int)",
+            "symbol_kind": "method",
+        })
+
+        self.assertEqual(changed, alert)
+
+    def test_output_audit_rejects_source_call_edges_in_final_artifact_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            with changed.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["api_name", "api_signature", "symbol_kind"])
+                writer.writeheader()
+                writer.writerow({"api_name": "lib.Api.call", "api_signature": "()", "symbol_kind": "method"})
+            fields = [
+                "conclusion", "change_summary", "review_reason", "chain_summary",
+                "chain_target", "changed_symbol", "api_signature", "symbol_kind",
+                "path_status", "path_text",
+            ]
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow({
+                    "conclusion": "已确认影响", "change_summary": "removed",
+                    "review_reason": "path", "chain_summary": "path",
+                    "chain_target": "lib.Api.call()", "changed_symbol": "lib.Api.call()",
+                    "api_signature": "()", "symbol_kind": "method",
+                    "path_status": "reachable", "path_text": "app.App.run -> lib.Api.call()",
+                })
+            summary = {
+                "total_apis": 1,
+                "reachable_apis": [{
+                    "evidence_paths": [[{
+                        "evidence_type": "ast_method_invocation", "file": "App.java"
+                    }]]
+                }],
+            }
+
+            audit = realreg.audit_analysis_outputs(changed, alerts, summary)
+
+        self.assertIn("source_edges_in_final_artifact_paths:1", audit["failures"])
+
+    def test_output_audit_allows_source_clues_for_artifact_conflict_uncertainty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            with changed.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["api_name", "api_signature", "symbol_kind"])
+                writer.writeheader()
+                writer.writerow({"api_name": "lib.Api.call", "api_signature": "()", "symbol_kind": "method"})
+            fields = [
+                "conclusion", "change_summary", "review_reason", "chain_summary",
+                "chain_target", "changed_symbol", "api_signature", "symbol_kind",
+                "path_status", "path_text",
+            ]
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow({
+                    "conclusion": "需人工复核", "change_summary": "removed",
+                    "review_reason": "source artifact conflict", "chain_summary": "source clue",
+                    "chain_target": "lib.Api.call()", "changed_symbol": "lib.Api.call()",
+                    "api_signature": "()", "symbol_kind": "method",
+                    "path_status": "uncertain", "path_text": "app.App.run -> lib.Api.call()",
+                })
+            summary = {
+                "total_apis": 1,
+                "uncertain_apis": [{
+                    "reason_code": "SOURCE_BYTECODE_EDGE_CONFLICT",
+                    "evidence_paths": [[{
+                        "evidence_type": "ast_method_invocation", "file": "App.java"
+                    }]],
+                }],
+            }
+
+            audit = realreg.audit_analysis_outputs(changed, alerts, summary)
+
+        self.assertNotIn("source_edges_in_final_artifact_paths:1", audit["failures"])
+
     def test_all_real_cases_have_active_measurable_performance_budgets(self):
         self.assertTrue(realreg.CASES)
         for name, case in realreg.CASES.items():
@@ -78,6 +191,26 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(mall.max_seconds_per_100k_edges, 1000000.0)
         self.assertEqual(mall.min_classes_per_second, 1.0)
 
+    def test_spring_petclinic_case_uses_final_artifact_spring_data_api_discovery(self):
+        case = realreg.CASES["spring-petclinic"]
+
+        self.assertEqual(case.bytecode_coord, "org.springframework.data:spring-data-commons")
+        self.assertEqual(case.bytecode_owner_prefixes, ("org/springframework/data/domain/",))
+        self.assertEqual(
+            case.final_artifact,
+            Path(
+                "/private/tmp/jua-real-project-spring-petclinic/target/"
+                "spring-petclinic-4.0.0-SNAPSHOT.jar"
+            ),
+        )
+        self.assertEqual(
+            set(case.required_topologies),
+            {
+                "business_direct", "cross_jar_bridge",
+                "interface_dispatch", "static_dispatch",
+            },
+        )
+
     def test_all_executable_real_cases_declare_nonempty_topology_requirements(self):
         self.assertTrue(realreg.CASES)
         for name, case in realreg.CASES.items():
@@ -107,7 +240,8 @@ class RealProjectRegressionTest(unittest.TestCase):
             mall.required_topologies, set(mall.required_topologies),
             prior_covered=set(matrix["covered_ids"]), case_mode=mall.case_mode,
         )
-        self.assertTrue(coverage["rotation_required"])
+        self.assertTrue(coverage["discovery_target_eligible"])
+        self.assertFalse(coverage["rotation_required"])
 
     def test_actual_discovery_case_rejects_missing_and_corrupt_prior_matrix(self):
         actual = realreg.CASES["mall"]
@@ -1079,6 +1213,133 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "BOOT-INF/lib/dubbo-demo-spring-boot-interface-3.3.7-SNAPSHOT.jar",
             )
             self.assertEqual(rows[0]["resolution_status"], "resolved")
+            self.assertEqual(
+                {row["lib_entry"] for row in rows},
+                {
+                    "BOOT-INF/lib/dubbo-demo-spring-boot-interface-3.3.7-SNAPSHOT.jar",
+                },
+            )
+
+    def test_bytecode_materialization_preserves_explicit_changed_api_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/demo/App.class", b"class")
+            explicit = root / "selected.csv"
+            explicit.write_text("api_name\ncn.hutool.StrUtil.isEmpty\n", encoding="utf-8")
+            case = realreg.RealProjectCase(
+                name="explicit", default_project=root, default_changed_apis=Path(""),
+                baseline_specs=(), bytecode_owner_prefixes=("cn/hutool/",),
+                bytecode_coord="cn.hutool:hutool-all", final_artifact=artifact,
+            )
+            report = root / "report"
+
+            with patch.object(realreg, "discover_calls", return_value=[]) as discover:
+                selected = realreg.materialize_bytecode_changed_apis(
+                    case, root, report, selected_changed_apis=explicit
+                )
+
+        self.assertEqual(selected, explicit)
+        discover.assert_not_called()
+
+    def test_output_audit_rejects_explicit_source_provenance_for_reachable_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            with changed.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=["api_name", "api_signature", "symbol_kind"]
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "api_name": "lib.Api.call", "api_signature": "()", "symbol_kind": "method",
+                })
+            self._write_readable_alerts(alerts, "lib.Api.call()", Path("App.java"))
+            summary = {
+                "total_apis": 1,
+                "reachable_apis": [{
+                    "evidence_paths": [[{
+                        "evidence_type": "constructor_delegation",
+                        "evidence_source": "source_worktree",
+                    }]],
+                }],
+            }
+
+            audit = realreg.audit_analysis_outputs(changed, alerts, summary)
+
+        self.assertIn("source_edges_in_final_artifact_paths:1", audit["failures"])
+
+    def test_bytecode_discovery_includes_nested_jar_bridge_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "bridge.jar"
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr(
+                    "bridge/InternalBridge.class",
+                    b"class-bytes org/apache/dubbo/springboot/demo/DemoService",
+                )
+                archive.writestr("bridge/Unrelated.class", b"class-bytes")
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/demo/App.class", b"class")
+                archive.writestr("BOOT-INF/lib/bridge-1.0.jar", nested.read_bytes())
+            case = realreg.RealProjectCase(
+                name="nested-bridge",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                bytecode_owner_prefixes=("org/apache/dubbo/springboot/demo/DemoService",),
+                bytecode_coord="org.apache.dubbo:interface",
+                final_artifact=artifact,
+            )
+            captured = []
+
+            def capture(class_files, **_kwargs):
+                captured.extend(class_files)
+                return []
+
+            report = root / "report"
+            with patch.object(realreg, "discover_calls", side_effect=capture):
+                realreg.materialize_bytecode_changed_apis(case, root, report)
+            _, runtime_rows = realreg._csv_rows(
+                report / "evidence/dependencies/deps_current_resolved.csv"
+            )
+
+        self.assertTrue(any("InternalBridge.class" in str(path) for path in captured))
+        self.assertFalse(any("Unrelated.class" in str(path) for path in captured))
+        self.assertTrue(any(
+            row["coord"] == "runtime:bridge-1.0"
+            and row["lib_entry"] == "BOOT-INF/lib/bridge-1.0.jar"
+            for row in runtime_rows
+        ))
+
+    def test_bytecode_materialization_writes_artifact_java_version_for_multi_release_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "META-INF/MANIFEST.MF",
+                    "Manifest-Version: 1.0\nJava-Version: 17\nBuild-Jdk-Spec: 24\n",
+                )
+                archive.writestr("BOOT-INF/classes/demo/App.class", b"class")
+            case = realreg.RealProjectCase(
+                name="jdk-context", default_project=root, default_changed_apis=Path(""),
+                baseline_specs=(), bytecode_owner_prefixes=("vendor/Api",),
+                bytecode_coord="vendor:api", final_artifact=artifact,
+            )
+            report = root / "report"
+
+            with patch.object(realreg, "discover_calls", return_value=[]):
+                realreg.materialize_bytecode_changed_apis(case, root, report)
+
+            context = json.loads(
+                (report / "evidence/context/context.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(context["jdk_current"], "17")
 
     def test_bytecode_materialization_rejects_ambiguous_artifact_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2107,6 +2368,74 @@ class RealProjectRegressionTests(unittest.TestCase):
             str(checkout / "application" / "src" / "main" / "java"),
         )
         self.assertNotIn(str(checkout / "library" / "src" / "main" / "java"), captured["command"])
+
+    def test_run_step5_enforces_case_budget_and_records_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed_apis = root / "changed.csv"
+            changed_apis.write_text("api_name\n", encoding="utf-8")
+            report_dir = root / "report"
+            case = realreg.RealProjectCase(
+                name="budgeted", default_project=root, default_changed_apis=changed_apis,
+                baseline_specs=(), max_elapsed_seconds=1.5,
+            )
+            captured = {}
+
+            def timeout_run(command, **kwargs):
+                captured["timeout"] = kwargs.get("timeout")
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+            with patch.object(realreg.subprocess, "run", side_effect=timeout_run):
+                returncode, elapsed = realreg.run_step5(
+                    case, root, changed_apis, report_dir
+                )
+
+            timeout_record = json.loads(
+                (report_dir / "evidence/quality/step5_timeout.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(captured["timeout"], 1.5)
+        self.assertEqual(returncode, 124)
+        self.assertGreaterEqual(elapsed, 0.0)
+        self.assertEqual(timeout_record["reason"], "STEP5_PERFORMANCE_BUDGET_EXCEEDED")
+        self.assertEqual(timeout_record["timeout_seconds"], 1.5)
+
+    def test_full_step4_run_uses_full_api_budget_for_step5_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            root.mkdir()
+            changed_apis = Path(tmp) / "all_changed_apis.csv"
+            changed_apis.write_text("api_name\ncom.example.Target.call\n", encoding="utf-8")
+            case = realreg.RealProjectCase(
+                name="full-budget",
+                default_project=root,
+                default_changed_apis=changed_apis,
+                baseline_specs=(),
+                max_elapsed_seconds=1.0,
+                max_full_step4_api_elapsed_seconds=7.5,
+            )
+            captured = {}
+
+            def fake_run_step5(execution_case, _project_root, _changed_apis, report_dir):
+                captured["budget"] = execution_case.max_elapsed_seconds
+                output = report_dir / "evidence" / "call_chain"
+                output.mkdir(parents=True)
+                (output / "summary.json").write_text(
+                    json.dumps({"total_apis": 1, "meta": {"graph_stats": {}}}),
+                    encoding="utf-8",
+                )
+                return 0, 0.1
+
+            with patch.object(realreg, "run_step5", side_effect=fake_run_step5):
+                result = realreg.run_case(
+                    case, root, changed_apis, report_root, full_step4_apis=True
+                )
+
+        self.assertEqual(captured["budget"], 7.5)
+        self.assertEqual(result["performance_budget_seconds"], 7.5)
 
     def test_pinned_asset_preparation_maps_same_coordinate_nested_library_to_runtime_catalog(self):
         case = realreg.CASES["gs-multi-module"]

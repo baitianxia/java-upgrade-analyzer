@@ -21,7 +21,7 @@ import confidence_weighted_tracer as tracer
 
 
 class ArtifactBytecodeCatalogTest(unittest.TestCase):
-    def test_application_owned_nested_module_hit_is_a_business_path(self):
+    def test_application_owned_nested_module_requires_a_business_entry_path(self):
         result = tracer.TraceResult(
             api_name="com.vendor.Legacy.removed", api_simple="removed", api_signature="()",
             symbol_kind="method", change_type="REMOVED", coord="com.vendor:legacy",
@@ -41,10 +41,13 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
 
         built = tracer._build_packaged_dependency_hit_result(result, [hit])
 
-        self.assertEqual(built.analysis_status, "reachable")
-        self.assertTrue(built.is_reachable)
-        self.assertTrue(built.path_details[0]["business_reachable"])
-        self.assertEqual(built.path_details[0]["business_entry"], "com.acme.library.Job.run()")
+        self.assertEqual(built.analysis_status, "uncertain")
+        self.assertIsNone(built.is_reachable)
+        self.assertFalse(built.path_details[0]["business_reachable"])
+        self.assertEqual(built.path_details[0]["business_entry"], "")
+        self.assertEqual(
+            built.path_details[0]["stop_reason"], "BUSINESS_ENTRY_NOT_CONFIRMED"
+        )
 
     def test_fat_jar_reactor_library_is_marked_application_owned_from_project_scope(self):
         with tempfile.TemporaryDirectory() as tmp:

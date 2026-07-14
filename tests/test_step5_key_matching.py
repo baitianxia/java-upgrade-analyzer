@@ -81,6 +81,26 @@ class Step5KeyMatchingTest(unittest.TestCase):
             references["method_refs"][0]["consumer_method"], "<init>"
         )
 
+    def test_classfile_fast_path_uses_descriptor_for_nested_parameter_signature(self):
+        references = tracer._references_from_executable_classfile_edges(
+            [{
+                "evidence_type": "bytecode_method_invocation",
+                "content": "opcode 0xb8", "line": 4,
+                "callee_key": "org.example.ScrollPosition.of(Map, Direction)",
+                "caller_name": "forward", "caller_descriptor": "(Ljava/util/Map;)V",
+                "callee_descriptor": (
+                    "(Ljava/util/Map;Lorg/example/ScrollPosition$Direction;)"
+                    "Lorg/example/ScrollPosition;"
+                ),
+            }],
+            class_binary_name="org.example.ScrollPosition",
+        )
+
+        self.assertEqual(
+            references["method_refs"][0]["signature"],
+            "(Map, ScrollPosition$Direction)",
+        )
+
     def test_exhaustive_runtime_closure_keeps_every_business_path_and_drops_unrelated_edges(self):
         api = {
             "coord": "vendor:target",
@@ -885,7 +905,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
             artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
             self._write_text(
                 self._dependencies_dir(report_dir) / "deps_current_resolved.csv",
-                "coord,version,scope,lib_entry,resolution_status\n",
+                "coord,version,scope,lib_entry,resolution_status\n"
+                "com.acme:library,1.0-SNAPSHOT,runtime,"
+                "BOOT-INF/lib/library-1.0-SNAPSHOT.jar,resolved\n",
                 encoding="utf-8",
             )
             self._write_text(
@@ -1110,6 +1132,162 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(bridge["opcode_family"], "invokestatic")
         self.assertTrue(bridge["instruction_offset"].isdigit())
         self.assertTrue(graph_stats["edge_ledger_complete"])
+
+    def test_target_runtime_closure_records_every_internal_bridge_for_original_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src" / "com" / "vendor"
+            src.mkdir(parents=True)
+            sources = {
+                "Adapter.java": (
+                    "package com.vendor; interface Adapter<T> { Object unmarshal(T value); }"
+                ),
+                "Types.java": (
+                    "package com.vendor; class Types { static class RequestDto { "
+                    "final String value; RequestDto(String value) { this.value = value; } } }"
+                ),
+                "Target.java": (
+                    "package com.vendor; public class Target { "
+                    "public static String removed(String value) { return value; } }"
+                ),
+                "InternalBridge.java": (
+                    "package com.vendor; public class InternalBridge "
+                    "implements Adapter<Types.RequestDto> { "
+                    "public String use(String value) { return Target.removed(value); } "
+                    "public Object unmarshal(Types.RequestDto value) { "
+                    "return use(value.value); } }"
+                ),
+                "OuterBridge.java": (
+                    "package com.vendor; public class OuterBridge { "
+                    "public String invoke(String value) { "
+                    "return new InternalBridge().use(value); } }"
+                ),
+            }
+            java_files = []
+            for name, source in sources.items():
+                path = src / name
+                path.write_text(source, encoding="utf-8")
+                java_files.append(path)
+            classes = self._compile_java_files(root / "classes", java_files)
+            runtime_jar = root / "target.jar"
+            self._jar_compiled_classes(runtime_jar, classes)
+            application_source = root / "business-src" / "app" / "Application.java"
+            application_source.parent.mkdir(parents=True)
+            application_source.write_text(
+                "package app; public class Application { public String run(String value) { "
+                "return new com.vendor.OuterBridge().invoke(value); } }",
+                encoding="utf-8",
+            )
+            business_classes = self._compile_java_files(
+                root / "business-classes", [application_source], classpath=runtime_jar
+            )
+            business_jar = root / "business.jar"
+            self._jar_compiled_classes(business_jar, business_classes)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/target.jar", runtime_jar.read_bytes())
+                archive.write(
+                    business_classes / "app" / "Application.class",
+                    "BOOT-INF/classes/app/Application.class",
+                )
+            report_dir = root / "report"
+            self._write_text(
+                report_dir / "evidence" / "dependencies" / "build_provenance.json",
+                json.dumps({"sides": [{
+                    "side": "current",
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                }]}),
+                encoding="utf-8",
+            )
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }
+            item = {
+                "coord": api_row["coord"],
+                "jar_path": str(runtime_jar),
+                "artifact_entry": "BOOT-INF/lib/target.jar",
+                "evidence_source": "current_final_artifact",
+            }
+            business_item = {
+                "coord": "__business__",
+                "jar_path": str(business_jar),
+                "artifact_entry": "<business-classes>",
+                "sha256": hashlib.sha256(business_jar.read_bytes()).hexdigest(),
+                "evidence_source": "current_final_artifact",
+            }
+            application_method = SimpleNamespace(
+                symbol_id="application_run",
+                qualified_key="app.Application.run(java.lang.String)",
+                class_fqcn="app.Application",
+                method_name="run",
+                owner_type="business",
+                owner_coord="__business__",
+                module="app",
+                is_test=False,
+            )
+            graph = SimpleNamespace(
+                report_dir=str(report_dir),
+                methods_by_id={application_method.symbol_id: application_method},
+                methods_by_qualified={
+                    "app.Application.run": [application_method.symbol_id]
+                },
+                lookup_keys_by_symbol={application_method.symbol_id: [
+                    application_method.qualified_key
+                ]},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": [item, business_item],
+                    "by_coord": {
+                        api_row["coord"]: item,
+                        "__business__": business_item,
+                    },
+                    "target_jdk": "17",
+                },
+            )
+
+            business_edges, _metrics = business_bytecode_graph.collect_business_bytecode_edges(
+                [], artifact_catalog=graph.runtime_dependency_catalog
+            )
+            business_bytecode_graph.merge_business_bytecode_edges(graph, business_edges)
+            self.assertIn(
+                "com.vendor.OuterBridge.invoke(java.lang.String)", graph.reverse_edges
+            )
+            tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+            added = tracer._collect_target_runtime_reference_closure(graph, [api_row])
+
+        identity = tracer.build_api_identity_key(api_row)
+        rows = [
+            row for row in graph.analyzer_edges.values()
+            if row["api_identity"] == identity
+        ]
+        self.assertGreaterEqual(added, 1)
+        self.assertEqual(
+            {row["caller_owner"] for row in rows},
+            {"app.Application", "com.vendor.InternalBridge", "com.vendor.OuterBridge"},
+        )
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(any(
+            row["caller_member"] == "unmarshal"
+            and row["caller_descriptor"] == "(Ljava/lang/Object;)Ljava/lang/Object;"
+            for row in rows
+        ))
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertGreater(perf["class_parse_elapsed_sec"], 0)
+
+    def test_perf_stats_preserve_submillisecond_parse_time(self):
+        graph = SimpleNamespace()
+        tracer._perf_add(graph, "bytecode_scan", "class_parse_elapsed_sec", 0.0004)
+
+        stats = tracer._finalize_step5_perf_stats(graph)
+
+        self.assertGreater(stats["bytecode_scan"]["class_parse_elapsed_sec"], 0)
 
     def test_same_coordinate_declaration_only_is_not_an_executable_edge(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1911,6 +2089,46 @@ BootstrapMethods:
         self.assertEqual(graph_stats["edge_ledger_failure_count"], 0)
         self.assertTrue(graph_stats["edge_ledger_complete"])
 
+    def test_collect_uses_target_closure_edges_without_rescanning_all_runtime_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            graph.methods_by_id = {}
+            graph.reverse_edges = {}
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.call",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+            }
+            edge = {
+                "coord": "com.vendor:target",
+                "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                "jar_path": graph.runtime_dependency_catalog["by_coord"][
+                    "com.vendor:target"
+                ]["jar_path"],
+                "class_entry": "com/vendor/Bridge.class",
+                "caller_owner": "com.vendor.Bridge",
+                "consumer_method": "run",
+                "consumer_descriptor": "()V",
+                "callee_owner": "com.vendor.Target",
+                "callee_member": "call",
+                "callee_descriptor": "()V",
+                "opcode_family": "invokestatic",
+                "instruction_offset": 1,
+            }
+            tracer.record_analyzer_edge(graph, api_row, edge)
+
+            with patch.object(
+                tracer,
+                "_collect_exhaustive_runtime_reference_edges",
+                side_effect=AssertionError("target closure must not trigger a full runtime rescan"),
+            ):
+                collected = tracer.collect_graph_analyzer_edges(graph, [api_row])
+
+        self.assertEqual(collected, 0)
+        self.assertEqual(len(graph.analyzer_edges), 1)
+
     def test_multimodule_project_root_cannot_add_non_artifact_business_classes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2063,6 +2281,84 @@ BootstrapMethods:
         self.assertEqual(len(second), 1)
         self.assertEqual(calls, calls_after_first)
 
+    def test_application_owned_internal_module_must_reach_real_business_entry(self):
+        result = tracer.TraceResult(
+            api_name="com.example.ServiceProperties.getMessage",
+            api_simple="getMessage",
+            api_signature="()",
+            symbol_kind="method",
+            change_type="REMOVED",
+            coord="com.example:library",
+            severity="P1",
+            confirmed=True,
+            source="test",
+            analysis_scope="method",
+            analysis_status="not_analyzed",
+            direct_callers=0,
+            is_reachable=False,
+            reachable_note="",
+            business_reach_depth=0,
+            dependency_chain_coords=[],
+            call_paths=[],
+            evidence_paths=[],
+            reason_code="",
+            verification_commands=[],
+            hops=[],
+            confidence_score=1.0,
+            critical_nodes_hit=[],
+        )
+        business_method = SimpleNamespace(
+            symbol_id="app_home",
+            qualified_key="com.example.DemoApplication.home",
+            owner_type="business",
+            is_test=False,
+        )
+        edge = source_analyzer.CallEdge(
+            caller_symbol_id="app_home",
+            caller_qualified_key="com.example.DemoApplication.home",
+            callee_key="com.example.MyService.message()",
+            callee_simple_key="method:message",
+            evidence_type="bytecode_method_invocation",
+            confidence="high",
+            file="/tmp/application.jar!/BOOT-INF/classes/com/example/DemoApplication.class",
+            line=0,
+            content="business bytecode calls internal module",
+            owner_type="business",
+            owner_coord="__business__",
+            module="application",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"app_home": business_method},
+            reverse_edges={"com.example.MyService.message()": [edge]},
+            runtime_dependency_catalog={},
+        )
+        hit = {
+            "coord": "com.example:library",
+            "application_owned": True,
+            "edge_role": "internal_bridge",
+            "direct_consumer": False,
+            "class_fqcn": "com.example.MyService",
+            "consumer_method": "message",
+            "consumer_signature": "()",
+            "target_display": "com.example.ServiceProperties.getMessage()",
+            "evidence_type": "bytecode_method_invocation",
+            "jar_path": "/tmp/application.jar!/BOOT-INF/lib/library.jar",
+        }
+
+        built = tracer._build_packaged_dependency_hit_result(result, [hit], graph)
+
+        self.assertEqual(built.analysis_status, "reachable")
+        self.assertEqual(built.business_reach_depth, 2)
+        self.assertIn(
+            "com.example.DemoApplication.home -> "
+            "com.example:library:com.example.MyService.message() -> "
+            "com.example.ServiceProperties.getMessage()",
+            built.call_paths,
+        )
+        self.assertFalse(built.path_details[0]["business_reachable"])
+        self.assertTrue(built.path_details[-1]["business_reachable"])
+
     def test_artifact_hash_parse_cache_preserves_scope_and_target_internal_role(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "target.jar"
@@ -2212,6 +2508,78 @@ public class com.example.TargetBridge {
         self.assertEqual(mocked_javap.call_count, 2)
         self.assertEqual(perf["class_entries_parsed"], 2)
         self.assertEqual(perf["duplicate_class_scans"], 1)
+        self.assertEqual(len(perf["duplicate_class_scan_samples"]), 1)
+        self.assertEqual(
+            perf["duplicate_class_scan_samples"][0]["class_binary_name"],
+            "com.example.TargetBridge",
+        )
+        self.assertEqual(
+            perf["duplicate_class_scan_samples"][0]["parser_kind"], "javap"
+        )
+
+    def test_artifact_cache_normalizes_missing_base_class_entry(self):
+        graph = SimpleNamespace()
+        artifact_sha256 = "b" * 64
+        javap_output = "public class com.example.TargetBridge {}"
+        tracer.clear_immutable_artifact_parse_cache()
+        with patch.object(
+            tracer, "_run_javap_bytecode_dump", return_value=javap_output
+        ) as mocked_javap:
+            tracer._load_runtime_dependency_class_references(
+                {}, "com.vendor:target", "/tmp/target.jar",
+                "com.example.TargetBridge", artifact_sha256=artifact_sha256,
+                target_jdk="17", multi_release_version="base", graph=graph,
+            )
+            tracer._load_runtime_dependency_class_references(
+                {}, "com.vendor:target", "/tmp/target.jar",
+                "com.example.TargetBridge", artifact_sha256=artifact_sha256,
+                target_jdk="17", multi_release_version="base", graph=graph,
+                class_entry="com/example/TargetBridge.class",
+            )
+
+        self.assertEqual(mocked_javap.call_count, 1)
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertEqual(perf.get("duplicate_class_scans", 0), 0)
+
+    def test_member_index_task_reuses_cached_classfile_fast_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes = self._compile_java_fixture(
+                tmp, "fixture/Consumer.java", """
+                package fixture;
+                public class Consumer {
+                    public void run() { System.nanoTime(); }
+                }
+                """,
+            )
+            jar_path = Path(tmp) / "consumer.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            class_entry = "fixture/Consumer.class"
+            class_binary_name = "fixture.Consumer"
+            artifact_sha256 = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            graph = SimpleNamespace()
+            tracer.clear_immutable_artifact_parse_cache()
+            with zipfile.ZipFile(jar_path) as archive:
+                class_bytes = archive.read(class_entry)
+            expected = tracer._load_direct_classfile_references(
+                class_bytes, artifact_sha256, "17", class_binary_name,
+                multi_release_version="base", class_entry=class_entry, graph=graph,
+            )
+            task = {
+                "catalog": {}, "coord": "fixture:consumer",
+                "jar_path": str(jar_path), "class_binary_name": class_binary_name,
+                "class_entry": class_entry, "artifact_sha256": artifact_sha256,
+                "target_jdk": "17", "multi_release_version": "base", "graph": graph,
+            }
+
+            with patch.object(
+                tracer, "_run_javap_bytecode_dump",
+                side_effect=AssertionError("cached classfile parse must be reused"),
+            ):
+                _task, actual = tracer._load_runtime_dependency_class_references_for_task(task)
+
+        self.assertEqual(actual, expected)
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
+        self.assertEqual(perf.get("duplicate_class_scans", 0), 0)
 
     def test_artifact_hash_parse_cache_never_decodes_an_invalidated_none_value(self):
         graph = SimpleNamespace()
@@ -7773,6 +8141,36 @@ public class com.example.TargetBridge {
         self.assertEqual(formatter.summarize_user_facing_outcome(runtime_check)["user_conclusion"], "可能影响")
         self.assertEqual(formatter.summarize_user_facing_outcome(missing_input)["user_conclusion"], "需要补充输入")
 
+    def test_reachable_key_evidence_prefers_confirmed_business_path(self):
+        outcome = formatter.summarize_user_facing_outcome(SimpleNamespace(
+            analysis_status="reachable",
+            reason_code="RUNTIME_DEPENDENCY_USES_REMOVED_API",
+            severity="P1",
+            call_paths=[
+                "library.Bridge.call() -> target.Api.removed()",
+                "app.Entry.run() -> library.Bridge.call() -> target.Api.removed()",
+            ],
+            evidence_paths=[[], []],
+            path_details=[
+                {
+                    "path_status": "uncertain",
+                    "path_text": "library.Bridge.call() -> target.Api.removed()",
+                },
+                {
+                    "path_status": "reachable",
+                    "path_text": (
+                        "app.Entry.run() -> library.Bridge.call() -> target.Api.removed()"
+                    ),
+                },
+            ],
+            dependency_chain_coords=["sample:library"],
+        ))
+
+        self.assertEqual(
+            outcome["key_evidence"],
+            "app.Entry.run() -> library.Bridge.call() -> target.Api.removed()",
+        )
+
     def test_summarize_user_facing_outcome_treats_behavior_changed_fallback_simple_as_inconclusive(self):
         fallback_simple_runtime = SimpleNamespace(
             analysis_status="not_analyzed",
@@ -8504,6 +8902,86 @@ public class com.example.TargetBridge {
         self.assertEqual(perf["member_index_candidate_queries"], 1.0)
         self.assertNotIn("light_scans", perf)
         self.assertEqual(perf["slow_runtime_lookups"][0]["candidate_source"], "member_index")
+
+    def test_large_runtime_catalog_uses_lightweight_member_index_for_large_artifacts(self):
+        entries = [
+            {
+                "coord": f"com.example:dep-{idx}",
+                "jar_path": f"/missing/dep-{idx}.jar",
+            }
+            for idx in range(50)
+        ]
+        graph = SimpleNamespace(
+            runtime_dependency_catalog={
+                "status": "complete",
+                "entries": entries,
+            }
+        )
+
+        fake_index = {
+            "complete": True, "failures": [], "tasks": [], "unparsed_tasks": [],
+            "direct_by_owner_member": {}, "owner_string_ids": {},
+            "member_string_ids": {}, "reflection_ids": set(), "visited_classes": 0,
+        }
+        with (
+            patch.object(tracer.os.path, "getsize", return_value=1024 * 1024),
+            patch.object(
+                tracer, "_get_runtime_dependency_member_candidate_index", return_value=fake_index
+            ) as mocked_index,
+        ):
+            result = tracer._ensure_runtime_dependency_callers_for_key(
+                graph,
+                "com.example.Target.run()",
+            )
+
+        self.assertTrue(result["expanded"])
+        mocked_index.assert_called_once()
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_expand"]
+        self.assertEqual(perf["member_index_large_artifact_catalog"], 1.0)
+        self.assertNotIn("light_scans", perf)
+        self.assertEqual(perf["slow_runtime_lookups"][0]["candidate_source"], "member_index")
+
+    def test_large_real_jar_catalog_builds_member_index_once_for_many_lookups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes = self._compile_java_fixture(
+                tmp,
+                "com/example/Consumer.java",
+                """
+                package com.example;
+                public class Consumer { public void call() { Target.run(); } }
+                class Target { static void run() {} }
+                """,
+            )
+            jar_path = Path(tmp) / "consumer.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            entries = [{"coord": "com.example:consumer", "jar_path": str(jar_path)}]
+            graph = SimpleNamespace(runtime_dependency_catalog={
+                "status": "complete", "entries": entries,
+            })
+
+            with (
+                patch.object(tracer, "_step5_runtime_member_index_min_jars", return_value=1),
+                patch.object(tracer, "_step5_runtime_member_index_max_bytes", return_value=1),
+            ):
+                preferred, reason = tracer._should_prefer_runtime_member_candidate_index(
+                    graph, entries
+                )
+                tracer._ensure_runtime_dependency_callers_for_key(
+                    graph, "com.example.Target.run()"
+                )
+                tracer._ensure_runtime_dependency_callers_for_key(
+                    graph, "com.example.Missing.first()"
+                )
+                tracer._ensure_runtime_dependency_callers_for_key(
+                    graph, "com.example.Missing.second()"
+                )
+
+        self.assertTrue(preferred)
+        self.assertTrue(reason.startswith("large_artifact_catalog:"))
+        perf = tracer._finalize_step5_perf_stats(graph)["bytecode_expand"]
+        self.assertEqual(perf["member_index_builds"], 1.0)
+        self.assertEqual(perf["member_index_candidate_queries"], 3.0)
+        self.assertNotIn("light_scans", perf)
 
     def test_alerts_csv_is_complete_path_ledger_with_explicit_consumers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -9949,6 +10427,30 @@ public class com.example.TargetBridge {
         self.assertEqual(local_method["consumer_method"], "onApplicationEvent")
         self.assertEqual(local_method["consumer_signature"], "(Object)")
         self.assertEqual(local_field["owner"], "com.vendor.RuntimeListener")
+
+    def test_javap_parser_recognizes_package_private_nested_constructor(self):
+        javap = """
+org.example.Outer$Inner(org.example.Outer, java.lang.String);
+  descriptor: (Lorg/example/Outer;Ljava/lang/String;)V
+  Code:
+       0: aload_0
+       1: invokespecial #7 // Method java/lang/Object."<init>":()V
+       4: invokestatic #8 // Method com/vendor/Target.call:()V
+       7: return
+"""
+
+        parsed = tracer._parse_javap_bytecode_references(
+            javap, "org.example.Outer$Inner"
+        )
+        target = next(
+            item for item in parsed["method_refs"]
+            if item["owner"] == "com.vendor.Target"
+        )
+        self.assertEqual(target["consumer_method"], "<init>")
+        self.assertEqual(
+            target["consumer_descriptor"],
+            "(Lorg/example/Outer;Ljava/lang/String;)V",
+        )
 
     def test_packaged_hit_reaches_registered_callback_through_intra_class_method(self):
         callback = tracer._runtime_method_def_for_packaged_caller(
@@ -15311,6 +15813,16 @@ public class com.example.TargetBridge {
                 debug_break=False,
             )
 
+            query_index_edge_counts = []
+
+            def fake_trace(*_args, **_kwargs):
+                fake_graph.reverse_edges["runtime.Target.call()"] = [SimpleNamespace()]
+                return [fake_result]
+
+            def fake_write_query_index(graph, path, graph_stats=None):
+                query_index_edge_counts.append(len(graph.reverse_edges))
+                return path
+
             with patch.object(step5, "auto_discover_bridge_sources", return_value={
                 "dependency_source_mappings": [],
                 "matched_coords": [],
@@ -15330,8 +15842,10 @@ public class com.example.TargetBridge {
             ), patch.object(step5, "build_jar_metadata_for_source_roots", return_value={"by_class": {}, "jar_paths": {}}), patch.object(
                 step5,
                 "trace_all_apis_with_confidence_weighting",
-                return_value=[fake_result],
-            ), patch.object(step5, "generate_enhanced_summary", return_value=None):
+                side_effect=fake_trace,
+            ), patch.object(step5, "write_query_index", side_effect=fake_write_query_index), patch.object(
+                step5, "generate_enhanced_summary", return_value=None
+            ):
                 stderr = io.StringIO()
                 with redirect_stderr(stderr):
                     exit_code = step5.step5_integrated_main(args)
@@ -15345,6 +15859,7 @@ public class com.example.TargetBridge {
             self.assertIn('"topic": "trace_batch_summary"', output)
             self.assertIn('"topic": "step5_done"', output)
             self.assertFalse(os.environ.get("JUA_STEP5_DEBUG"))
+            self.assertEqual(query_index_edge_counts, [1])
 
     def test_trace_api_uses_packaged_bytecode_fallback_when_dependency_source_mapping_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15840,6 +16355,9 @@ public class com.example.consumer.ReflectiveCall {
             for path in built.call_paths
         ))
         self.assertTrue(any(detail.get("business_reachable") for detail in built.path_details))
+        self.assertEqual(built.direct_callers, 0)
+        self.assertEqual(built.business_reach_depth, 2)
+        self.assertEqual(built.dependency_chain_coords, ["com.acme:consumer-lib"])
 
     def test_runtime_dependency_bytecode_graph_connects_business_to_transitive_packaged_hit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -16632,10 +17150,14 @@ public class com.example.consumer.Adapter {
                 }],
                 "field_refs": [], "class_refs": [],
             }
+
+            def load_references(_catalog, coord, *_args, **_kwargs):
+                return None if coord == "a:broken" else refs
+
             with patch.object(
                 tracer,
                 "_load_runtime_dependency_class_references",
-                side_effect=[None, refs],
+                side_effect=load_references,
             ):
                 scan = tracer._scan_packaged_runtime_dependencies_for_api(api_row, graph)
 
@@ -16829,6 +17351,616 @@ public class com.example.consumer.Adapter {
         self.assertTrue(info["needs_bridge"])
         self.assertFalse(info["has_dependency_source_mapping"])
         self.assertTrue(info["has_packaged_bytecode_fallback"])
+
+    def test_runtime_reference_signature_rejects_ambiguous_unqualified_imported_type(self):
+        reference = {
+            "signature": "(com.wrong.Request)",
+            "descriptor": "(Lcom/wrong/Request;)V",
+        }
+
+        self.assertFalse(
+            tracer._runtime_reference_signature_matches("(com.right.Request)", reference)
+        )
+        self.assertFalse(
+            tracer._runtime_reference_signature_matches(
+                "(Request)", reference, "com.right.Target"
+            )
+        )
+        self.assertTrue(
+            tracer._runtime_reference_signature_matches(
+                "(Request)", reference, "com.wrong.Target"
+            )
+        )
+
+        matches = tracer._match_runtime_dependency_references(
+            {
+                "api_name": "com.right.Target.call",
+                "api_signature": "(Request)",
+                "symbol_kind": "method",
+            },
+            {"method_refs": [{
+                **reference,
+                "owner": "com.right.Target",
+                "name": "call",
+                "consumer_method": "invoke",
+                "consumer_signature": "()",
+                "opcode_family": "invokevirtual",
+                "instruction_offset": 1,
+                "reference_kind": "classfile_methodref",
+            }]},
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertTrue(matches[0]["signature_ambiguous"])
+
+    def test_packaged_ambiguous_unqualified_signature_cannot_confirm_impact(self):
+        result = tracer.TraceResult(
+            api_name="com.right.Target.call", api_simple="call", api_signature="(Request)",
+            symbol_kind="method", change_type="REMOVED", coord="com.right:target",
+            severity="P1", confirmed=True, source="git_diff", analysis_scope="method",
+            analysis_status="not_analyzed", direct_callers=0, is_reachable=False,
+            reachable_note="", business_reach_depth=0, dependency_chain_coords=[],
+            call_paths=[], evidence_paths=[], reason_code="", verification_commands=[],
+            hops=[], confidence_score=1.0, critical_nodes_hit=[],
+        )
+        hit = {
+            "coord": "__business__", "class_fqcn": "app.Entry",
+            "consumer_method": "run", "consumer_signature": "()",
+            "target_display": "com.right.Target.call(com.shared.Request)",
+            "signature_ambiguous": True, "evidence_type": "bytecode_method_invocation",
+        }
+
+        built = tracer._build_packaged_dependency_hit_result(result, [hit])
+
+        self.assertEqual(built.analysis_status, "uncertain")
+        self.assertIsNone(built.is_reachable)
+        self.assertEqual(built.reason_code, "UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS")
+        user_view = formatter.summarize_user_facing_outcome(built)
+        self.assertIn("简写参数类型", user_view["user_reason"])
+        self.assertIn("限定包名", user_view["recommended_action"])
+
+    def test_ambiguous_business_hit_cannot_promote_exact_internal_hit(self):
+        result = tracer.TraceResult(
+            api_name="com.right.Target.call", api_simple="call", api_signature="(Request)",
+            symbol_kind="method", change_type="REMOVED", coord="com.right:target",
+            severity="P1", confirmed=True, source="git_diff", analysis_scope="method",
+            analysis_status="not_analyzed", direct_callers=0, is_reachable=False,
+            reachable_note="", business_reach_depth=0, dependency_chain_coords=[],
+            call_paths=[], evidence_paths=[], reason_code="", verification_commands=[],
+            hops=[], confidence_score=1.0, critical_nodes_hit=[],
+        )
+        hits = [
+            {
+                "coord": "com.right:target", "class_fqcn": "com.right.Internal",
+                "consumer_method": "bridge", "consumer_signature": "()",
+                "target_display": "com.right.Target.call(com.right.Request)",
+                "signature_ambiguous": False, "evidence_type": "bytecode_method_invocation",
+            },
+            {
+                "coord": "__business__", "class_fqcn": "app.Entry",
+                "consumer_method": "run", "consumer_signature": "()",
+                "target_display": "com.right.Target.call(com.shared.Request)",
+                "signature_ambiguous": True, "evidence_type": "bytecode_method_invocation",
+            },
+        ]
+
+        built = tracer._build_packaged_dependency_hit_result(result, hits)
+
+        self.assertEqual(built.analysis_status, "uncertain")
+        self.assertIsNone(built.is_reachable)
+        self.assertEqual(built.reason_code, "UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS")
+
+    def test_packaged_business_lookup_honors_five_edge_trace_budget(self):
+        methods = {}
+        reverse_edges = {}
+        for index in range(1, 6):
+            symbol_id = f"m{index}"
+            qualified = "app.Entry.run" if index == 5 else f"lib.Bridge{index}.call"
+            methods[symbol_id] = SimpleNamespace(
+                symbol_id=symbol_id, qualified_key=qualified,
+                owner_type="business" if index == 5 else "dependency",
+                is_test=False,
+            )
+            callee = "lib.Consumer.use()" if index == 1 else f"lib.Bridge{index - 1}.call"
+            reverse_edges[callee] = [source_analyzer.CallEdge(
+                caller_symbol_id=symbol_id, caller_qualified_key=qualified,
+                callee_key=callee, callee_simple_key="method:call",
+                evidence_type="bytecode_method_invocation", confidence="high",
+                file="/tmp/app.jar", line=0, content="call",
+                owner_type=methods[symbol_id].owner_type, owner_coord="", module="", is_test=False,
+            )]
+        graph = SimpleNamespace(methods_by_id=methods, reverse_edges=reverse_edges)
+        hit = {
+            "coord": "sample:lib", "class_fqcn": "lib.Consumer",
+            "consumer_method": "use", "consumer_signature": "()",
+        }
+
+        paths = tracer._find_business_callers_for_packaged_hit(hit, graph)
+
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0][0].qualified_key, "app.Entry.run")
+        graph._trace_max_total_cost = 1
+        self.assertEqual(tracer._find_business_callers_for_packaged_hit(hit, graph), [])
+
+    def test_member_index_selects_dotted_reflection_owner_string(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes = self._compile_java_fixture(
+                tmp, "com/example/Reflective.java", """
+                package com.example;
+                public class Reflective {
+                    public void call() throws Exception {
+                        Class.forName("com.vendor.Target").getDeclaredMethod("removed");
+                    }
+                }
+                """,
+            )
+            jar_path = Path(tmp) / "reflective.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            graph = SimpleNamespace()
+            index = tracer._build_runtime_dependency_member_candidate_index(
+                graph, [{"coord": "sample:reflective", "jar_path": str(jar_path)}], 17
+            )
+
+        candidates = tracer._candidate_tasks_from_runtime_member_index(
+            index, "com.vendor.Target", "removed"
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["class_fqcn"], "com.example.Reflective")
+
+    def test_runtime_reference_signature_resolves_nested_type_from_owner_package(self):
+        range_reference = {
+            "signature": "(Bound)",
+            "descriptor": "(Lorg/springframework/data/domain/Range$Bound;)V",
+        }
+        direction_reference = {
+            "signature": "(Map, Direction)",
+            "descriptor": "(Ljava/util/Map;Lorg/springframework/data/domain/ScrollPosition$Direction;)V",
+        }
+
+        self.assertTrue(tracer._runtime_reference_signature_matches(
+            "(Range$Bound)", range_reference,
+            "org.springframework.data.domain.Range$RangeBuilder",
+        ))
+        self.assertTrue(tracer._runtime_reference_signature_matches(
+            "(java.util.Map,ScrollPosition$Direction)", direction_reference,
+            "org.springframework.data.domain.KeysetScrollPosition",
+        ))
+        matches = tracer._match_runtime_dependency_references(
+            {
+                "api_name": "org.springframework.data.domain.KeysetScrollPosition.of",
+                "api_simple": "of",
+                "api_signature": (
+                    "(java.util.Map,"
+                    "org.springframework.data.domain.ScrollPosition$Direction)"
+                ),
+                "symbol_kind": "method",
+            },
+            {"method_refs": [{
+                **direction_reference,
+                "owner": "org.springframework.data.domain.KeysetScrollPosition",
+                "name": "of",
+                "consumer_method": "forward",
+                "consumer_descriptor": "()V",
+                "opcode_family": "invokestatic",
+                "instruction_offset": 4,
+                "reference_kind": "classfile_methodref",
+            }]},
+        )
+        self.assertEqual(len(matches), 1)
+
+    def test_member_index_archive_failure_is_recorded_and_not_queried_as_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "broken.jar"
+            broken.write_bytes(b"not-a-zip")
+            graph = SimpleNamespace()
+
+            index = tracer._build_runtime_dependency_member_candidate_index(
+                graph,
+                [{"coord": "com.acme:broken", "jar_path": str(broken)}],
+                17,
+            )
+
+        self.assertFalse(index["complete"])
+        self.assertTrue(index["failures"])
+        self.assertIsNone(
+            tracer._candidate_tasks_from_runtime_member_index(index, "com.acme.Api", "call")
+        )
+        self.assertTrue(graph._analyzer_edge_failures)
+
+    def test_final_artifact_trace_filters_source_business_edges(self):
+        source_edge = tracer.CallEdge(
+            caller_symbol_id="source", caller_qualified_key="app.App.run",
+            callee_key="lib.Api.call()", callee_simple_key="method:call()",
+            evidence_type="ast_method_invocation", confidence="high",
+            file="App.java", line=1, content="call", owner_type="business",
+            owner_coord="", module="", is_test=False,
+        )
+        bytecode_edge = tracer.CallEdge(
+            caller_symbol_id="bytecode", caller_qualified_key="app.App.run",
+            callee_key="lib.Api.call()", callee_simple_key="method:call()",
+            evidence_type="bytecode_method_invocation", confidence="high",
+            file="business.jar!/app/App.class", line=0, content="call",
+            owner_type="business", owner_coord="", module="", is_test=False,
+        )
+        bytecode_edge.evidence_source = "current_final_artifact"
+        graph = SimpleNamespace(require_current_final_artifact_business_edges=True)
+
+        incoming = tracer.get_cached_sorted_incoming_edges(
+            {"lib.Api.call()": [source_edge, bytecode_edge]},
+            "lib.Api.call()",
+            graph=graph,
+        )
+
+        self.assertEqual(incoming, (bytecode_edge,))
+
+    def test_partial_business_bytecode_failure_keeps_final_artifact_purity_enabled(self):
+        stats = {
+            "evidence_source": "current_final_artifact",
+            "classes_scanned": 12,
+            "failures": [{"class_entry": "app/Broken.class"}],
+        }
+
+        self.assertTrue(step5._requires_current_final_artifact_edges(stats))
+
+    def test_final_artifact_miss_preserves_stale_source_conflict_signal(self):
+        method = SimpleNamespace(
+            symbol_id="source", qualified_key="app.App.run", owner_type="business",
+            owner_coord="__business__", is_test=False, file="App.java", line=4,
+            annotations=[], class_annotations=[], class_name="App", class_fqcn="app.App",
+            modifiers=["public"], is_interface=False,
+        )
+        source_edge = tracer.CallEdge(
+            caller_symbol_id="source", caller_qualified_key=method.qualified_key,
+            callee_key="lib.Api.call()", callee_simple_key="method:call()",
+            evidence_type="ast_method_invocation", confidence="high",
+            file="App.java", line=5, content="Api.call()", owner_type="business",
+            owner_coord="__business__", module="app", is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"source": method},
+            reverse_edges={"lib.Api.call()": [source_edge]},
+            runtime_dependency_catalog={},
+            require_current_final_artifact_business_edges=True,
+            source_artifact_alignment={
+                "status": "conflict",
+                "reason_codes": ["source_worktree_has_unbuilt_changes"],
+            },
+        )
+        api_row = {
+            "coord": "lib:api", "api_name": "lib.Api.call", "api_simple": "call",
+            "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            "severity": "P0", "confirmed": "true",
+        }
+
+        with patch.object(
+            tracer, "_scan_packaged_runtime_dependencies_for_api", return_value={"status": "miss"}
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "SOURCE_BYTECODE_EDGE_CONFLICT")
+        self.assertIsNone(result.is_reachable)
+        self.assertTrue(result.call_paths)
+        self.assertEqual(result.evidence_paths[0][0]["evidence_type"], "ast_method_invocation")
+
+    def test_target_runtime_closure_continues_upstream_from_field_consumer(self):
+        api_row = {
+            "coord": "com.vendor:target",
+            "api_name": "com.vendor.Target.FLAG",
+            "api_simple": "FLAG",
+            "api_signature": "",
+            "symbol_kind": "field",
+        }
+        identity = tracer.build_api_identity_key(api_row)
+        caller = SimpleNamespace(
+            symbol_id="outer", qualified_key="com.vendor.Outer.invoke()"
+        )
+        edge = tracer.CallEdge(
+            caller_symbol_id=caller.symbol_id,
+            caller_qualified_key=caller.qualified_key,
+            callee_key="com.vendor.InternalBridge.use()",
+            callee_simple_key="method:use()",
+            evidence_type="bytecode_method_invocation", confidence="high",
+            file="target.jar", line=0, content="invoke", owner_type="dependency",
+            owner_coord="com.vendor:target", module="", is_test=False,
+        )
+        edge.runtime_analyzer_hit = {"coord": "com.vendor:target", "caller_owner": "com.vendor.Outer"}
+        graph = SimpleNamespace(
+            methods_by_id={caller.symbol_id: caller},
+            reverse_edges={"com.vendor.InternalBridge.use()": [edge]},
+            runtime_dependency_catalog={
+                "_packaged_api_scan_results": {
+                    identity: {
+                        "status": "hit",
+                        "hits": [{
+                            "coord": "com.vendor:target",
+                            "class_fqcn": "com.vendor.InternalBridge",
+                            "consumer_method": "use",
+                            "consumer_signature": "()",
+                        }],
+                    }
+                }
+            },
+        )
+
+        with patch.object(tracer, "_ensure_runtime_dependency_callers_for_key"), patch.object(
+            tracer, "record_analyzer_edge", return_value={"recorded": True}
+        ) as record:
+            added = tracer._collect_target_runtime_reference_closure(graph, [api_row])
+
+        self.assertEqual(added, 1)
+        self.assertEqual(record.call_args.args[1], api_row)
+
+    def test_target_runtime_closure_continues_upstream_from_class_consumer(self):
+        api_row = {
+            "coord": "com.vendor:target",
+            "api_name": "com.vendor.RemovedType",
+            "api_simple": "RemovedType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "analysis_scope": "class_usage",
+        }
+        identity = tracer.build_api_identity_key(api_row)
+        caller = SimpleNamespace(
+            symbol_id="outer", qualified_key="com.vendor.Outer.invoke()"
+        )
+        edge = tracer.CallEdge(
+            caller_symbol_id=caller.symbol_id,
+            caller_qualified_key=caller.qualified_key,
+            callee_key="com.vendor.InternalBridge.use()",
+            callee_simple_key="method:use()",
+            evidence_type="bytecode_method_invocation", confidence="high",
+            file="target.jar", line=0, content="invoke", owner_type="dependency",
+            owner_coord="com.vendor:target", module="", is_test=False,
+        )
+        edge.runtime_analyzer_hit = {
+            "coord": "com.vendor:target", "caller_owner": "com.vendor.Outer"
+        }
+        graph = SimpleNamespace(
+            methods_by_id={caller.symbol_id: caller},
+            reverse_edges={"com.vendor.InternalBridge.use()": [edge]},
+            runtime_dependency_catalog={
+                "_packaged_api_scan_results": {
+                    identity: {
+                        "status": "hit",
+                        "hits": [{
+                            "coord": "com.vendor:target",
+                            "class_fqcn": "com.vendor.InternalBridge",
+                            "consumer_method": "use",
+                            "consumer_signature": "()",
+                        }],
+                    }
+                }
+            },
+        )
+
+        with patch.object(tracer, "_ensure_runtime_dependency_callers_for_key"), patch.object(
+            tracer, "record_analyzer_edge", return_value={"recorded": True}
+        ) as record:
+            added = tracer._collect_target_runtime_reference_closure(graph, [api_row])
+
+        self.assertEqual(added, 1)
+        self.assertEqual(record.call_args.args[1], api_row)
+
+    def test_verified_final_artifact_inner_bridge_is_confirmable(self):
+        internal = tracer.CallEdge(
+            caller_symbol_id="bridge", caller_qualified_key="lib.Bridge.call()",
+            callee_key="lib.Target.changed()", callee_simple_key="method:changed()",
+            evidence_type="bytecode_method_invocation", confidence="high",
+            file="target.jar!/lib/Bridge.class", line=0, content="invoke",
+            owner_type="dependency", owner_coord="com.acme:library", module="",
+            is_test=False,
+        )
+        internal.runtime_analyzer_hit = {"coord": "com.acme:library"}
+        business = tracer.CallEdge(
+            caller_symbol_id="app", caller_qualified_key="app.Application.run()",
+            callee_key="lib.Bridge.call()", callee_simple_key="method:call()",
+            evidence_type="bytecode_method_invocation", confidence="high",
+            file="business.jar!/app/Application.class", line=0, content="invoke",
+            owner_type="business", owner_coord="__business__", module="",
+            is_test=False,
+        )
+        business.evidence_source = "current_final_artifact"
+        business.runtime_analyzer_hit = {"coord": "__business__"}
+        candidate = {
+            "path": [internal, business], "provenance": "exact_name",
+            "confidence": 1.0, "depth": 2,
+        }
+        result = SimpleNamespace(coord="com.acme:library")
+
+        confirmed, fallback, reason = tracer.select_confirmable_reachable_candidate(
+            result, [candidate]
+        )
+
+        self.assertIs(confirmed, candidate)
+        self.assertIsNone(fallback)
+        self.assertEqual(reason, "")
+
+    def test_dependency_source_inner_bridge_cannot_confirm_final_artifact_path(self):
+        internal_source = tracer.CallEdge(
+            caller_symbol_id="bridge", caller_qualified_key="lib.Bridge.call()",
+            callee_key="lib.Target.changed()", callee_simple_key="method:changed()",
+            evidence_type="ast_method_invocation", confidence="high",
+            file="Bridge.java", line=5, content="changed()",
+            owner_type="dependency", owner_coord="com.acme:library", module="library",
+            is_test=False,
+        )
+        business = tracer.CallEdge(
+            caller_symbol_id="app", caller_qualified_key="app.Application.run()",
+            callee_key="lib.Bridge.call()", callee_simple_key="method:call()",
+            evidence_type="bytecode_method_invocation", confidence="high",
+            file="business.jar!/app/Application.class", line=0, content="invoke",
+            owner_type="business", owner_coord="__business__", module="app",
+            is_test=False,
+        )
+        business.evidence_source = "current_final_artifact"
+        candidate = {
+            "path": [internal_source, business], "provenance": "exact_signature",
+            "confidence": 1.0, "depth": 2,
+        }
+
+        self.assertFalse(tracer._edge_allowed_for_trace(
+            internal_source,
+            SimpleNamespace(require_current_final_artifact_business_edges=True),
+        ))
+        incoming = tracer.get_cached_sorted_incoming_edges(
+            {"lib.Target.changed()": [internal_source]},
+            "lib.Target.changed()",
+            graph=SimpleNamespace(require_current_final_artifact_business_edges=True),
+        )
+        self.assertEqual(incoming, ())
+
+    def test_runtime_reverse_edges_preserve_distinct_instruction_offsets(self):
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+        matched = {
+            "consumer_method": "run", "consumer_signature": "()",
+            "evidence_type": "bytecode_method_invocation",
+        }
+        for offset in (6, 18):
+            tracer._add_runtime_dependency_caller_edge(
+                graph, "com.vendor.Target.call()", "com.acme:consumer",
+                "/tmp/consumer.jar", "com.acme.Consumer", matched,
+                analyzer_hit={"instruction_offset": offset},
+            )
+
+        edges = graph.reverse_edges["com.vendor.Target.call()"]
+        self.assertEqual(len(edges), 2)
+        self.assertEqual(
+            {edge.runtime_analyzer_hit["instruction_offset"] for edge in edges},
+            {6, 18},
+        )
+
+    def test_runtime_reverse_edges_preserve_bridge_descriptors_at_same_offset(self):
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+        matched = {
+            "consumer_method": "apply", "consumer_signature": "(java.lang.Object)",
+            "evidence_type": "bytecode_method_invocation",
+        }
+        for descriptor in (
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            "(Ljava/lang/Object;)Ljava/lang/String;",
+        ):
+            tracer._add_runtime_dependency_caller_edge(
+                graph, "com.vendor.Target.call()", "com.acme:consumer",
+                "/tmp/consumer.jar", "com.acme.Consumer", matched,
+                analyzer_hit={
+                    "instruction_offset": 2,
+                    "consumer_descriptor": descriptor,
+                    "callee_descriptor": "()V",
+                },
+            )
+
+        edges = graph.reverse_edges["com.vendor.Target.call()"]
+        self.assertEqual(len(edges), 2)
+        self.assertEqual(
+            {edge.runtime_analyzer_hit["consumer_descriptor"] for edge in edges},
+            {
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                "(Ljava/lang/Object;)Ljava/lang/String;",
+            },
+        )
+
+    def test_runtime_constructor_caller_keeps_jvm_init_lookup_key(self):
+        caller = tracer._runtime_method_def_for_packaged_caller(
+            "com.acme:consumer", "/tmp/consumer.jar", "com.acme.Widget",
+            "<init>", "(java.lang.String)",
+        )
+
+        self.assertEqual(
+            caller.qualified_key,
+            "com.acme.Widget.<init>(java.lang.String)",
+        )
+        self.assertEqual(caller.method_name, "<init>")
+
+    def test_runtime_caller_expansion_scans_final_artifact_business_jar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_source = root / "target-src/com/vendor/Target.java"
+            target_source.parent.mkdir(parents=True)
+            target_source.write_text(
+                "package com.vendor; public class Target { public static void call() {} }",
+                encoding="utf-8",
+            )
+            target_classes = self._compile_java_files(
+                root / "target-classes", [target_source]
+            )
+            target_jar = root / "target.jar"
+            self._jar_compiled_classes(target_jar, target_classes)
+
+            app_source = root / "app-src/app/Application.java"
+            app_source.parent.mkdir(parents=True)
+            app_source.write_text(
+                "package app; public class Application { "
+                "public void run() { com.vendor.Target.call(); } }",
+                encoding="utf-8",
+            )
+            app_classes = self._compile_java_files(
+                root / "app-classes", [app_source], classpath=target_jar
+            )
+            business_jar = root / "business-classes.jar"
+            self._jar_compiled_classes(business_jar, app_classes)
+            graph = SimpleNamespace(
+                methods_by_id={}, reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete", "target_jdk": 17,
+                    "by_coord": {
+                        "__business__": {
+                            "coord": "__business__", "version": "current",
+                            "scope": "runtime", "jar_path": str(business_jar),
+                            "artifact_entry": "<business-classes>",
+                            "evidence_source": "current_final_artifact",
+                        },
+                    },
+                },
+            )
+
+            result = tracer._ensure_runtime_dependency_callers_for_key(
+                graph, "com.vendor.Target.call()"
+            )
+
+        self.assertEqual(result["edges_added"], 1)
+        edge = graph.reverse_edges["com.vendor.Target.call()"][0]
+        self.assertEqual(edge.owner_type, "business")
+        self.assertEqual(edge.runtime_analyzer_hit["coord"], "__business__")
+        self.assertEqual(edge.runtime_analyzer_hit["artifact_container_entry"], "")
+        self.assertEqual(edge.runtime_analyzer_hit["caller_owner"], "app.Application")
+
+    def test_batch_runtime_scan_matches_nested_owner_dollar_and_dot_forms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "src/com/acme/Target.java"
+            consumer = root / "src/com/acme/Consumer.java"
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                "package com.acme; public class Target { public static class Nested { "
+                "public void call() {} } }",
+                encoding="utf-8",
+            )
+            consumer.write_text(
+                "package com.acme; public class Consumer { public void run() { "
+                "new Target.Nested().call(); } }",
+                encoding="utf-8",
+            )
+            classes = self._compile_java_files(root / "classes", [target, consumer])
+            jar_path = root / "runtime.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            api_row = {
+                "coord": "com.acme:target", "api_name": "com.acme.Target$Nested.call",
+                "api_simple": "call", "api_signature": "()", "symbol_kind": "method",
+            }
+            graph = SimpleNamespace(
+                runtime_dependency_catalog=self._runtime_catalog((("com.acme:target", jar_path),))
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+
+        scan = scans[tracer.build_api_identity_key(api_row)]
+        self.assertEqual(scan["status"], "hit")
+        self.assertTrue(any(hit["class_fqcn"] == "com.acme.Consumer" for hit in scan["hits"]))
 
 
 if __name__ == "__main__":
