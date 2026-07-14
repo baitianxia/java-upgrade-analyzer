@@ -11,8 +11,6 @@
   "artifact_sha256": "898f440dd1ff83071855523ec1efb174e5d69ac6fff04f669141d53866bb2b8f",
   "ground_truth_status": "reviewed",
   "required_topologies": [
-    "business_direct",
-    "framework_callback",
     "mybatis_mapper_proxy"
   ],
   "application_entries": [
@@ -35,9 +33,81 @@
       "1,San Francisco,CA,US"
     ]
   },
-  "apis": [],
+  "apis": [
+    {
+      "owner": "org.apache.ibatis.binding.MapperProxy",
+      "member": "invoke",
+      "descriptor": "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable",
+      "expected_chain": [
+        "sample.mybatis.annotation.SampleAnnotationApplication.run",
+        "Spring Boot框架注册",
+        "org.apache.ibatis.binding.MapperProxy.invoke"
+      ]
+    },
+    {
+      "owner": "org.apache.ibatis.binding.MapperMethod",
+      "member": "execute",
+      "descriptor": "(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)Ljava/lang/Object;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable",
+      "expected_chain": [
+        "sample.mybatis.annotation.SampleAnnotationApplication.run",
+        "Spring Boot框架注册",
+        "org.apache.ibatis.binding.MapperMethod.execute"
+      ]
+    },
+    {
+      "owner": "org.apache.ibatis.session.SqlSession",
+      "member": "selectOne",
+      "descriptor": "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable",
+      "expected_chain": [
+        "sample.mybatis.annotation.SampleAnnotationApplication.run",
+        "Spring Boot框架注册",
+        "org.apache.ibatis.session.SqlSession.selectOne"
+      ]
+    }
+  ],
   "canonical_edges": [],
-  "canonical_semantic_references": [],
+  "canonical_semantic_references": [
+    {
+      "api_identity": "('org.mybatis:mybatis', 'org.apache.ibatis.binding.MapperProxy.invoke', '(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])', 'method', 'REMOVED')",
+      "target_class": "org.apache.ibatis.binding.MapperProxy.invoke",
+      "artifact_sha256": "898f440dd1ff83071855523ec1efb174e5d69ac6fff04f669141d53866bb2b8f",
+      "artifact_entry": "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/binding/MapperProxy.class",
+      "authority": "final-artifact-mybatis-proxy-runtime"
+    },
+    {
+      "api_identity": "('org.mybatis:mybatis', 'org.apache.ibatis.binding.MapperMethod.execute', '(org.apache.ibatis.session.SqlSession,java.lang.Object[])', 'method', 'REMOVED')",
+      "target_class": "org.apache.ibatis.binding.MapperMethod.execute",
+      "artifact_sha256": "898f440dd1ff83071855523ec1efb174e5d69ac6fff04f669141d53866bb2b8f",
+      "artifact_entry": "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/binding/MapperMethod.class",
+      "authority": "final-artifact-mybatis-proxy-runtime"
+    },
+    {
+      "api_identity": "('org.mybatis:mybatis', 'org.apache.ibatis.session.SqlSession.selectOne', '(java.lang.String,java.lang.Object)', 'method', 'REMOVED')",
+      "target_class": "org.apache.ibatis.session.SqlSession.selectOne",
+      "artifact_sha256": "898f440dd1ff83071855523ec1efb174e5d69ac6fff04f669141d53866bb2b8f",
+      "artifact_entry": "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/session/SqlSession.class",
+      "authority": "final-artifact-mybatis-proxy-runtime"
+    }
+  ],
   "unverified_apis": [],
-  "fixture_debt": []
+  "fixture_debt": [
+    {
+      "finding_id": "mybatis_mapper_proxy_dispatch",
+      "state": "fixed",
+      "fixture": "tests.test_framework_adapters.FrameworkAdaptersTest.test_mybatis_proxy_adapter_requires_registration_and_packaged_dispatch_chain",
+      "reason": "Registered mapper calls must be expanded only through a dispatch chain verified in the current final artifact."
+    },
+    {
+      "finding_id": "mybatis_known_dtd_parser",
+      "state": "fixed",
+      "fixture": "tests.test_framework_adapters.FrameworkAdaptersTest.test_mybatis_proxy_adapter_accepts_only_known_external_dtd",
+      "reason": "Official MyBatis DTDs must parse locally while unknown DTDs and entity declarations remain rejected."
+    }
+  ]
 }

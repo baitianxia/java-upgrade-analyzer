@@ -122,6 +122,15 @@ def complete_scan_edges():
             "callee_descriptor": "(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)Ljava/lang/Object;",
             "opcode_family": "invokevirtual",
         },
+        {
+            "caller_owner": "org.apache.ibatis.binding.MapperMethod",
+            "caller_member": "execute",
+            "caller_descriptor": "(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)Ljava/lang/Object;",
+            "callee_owner": "org.apache.ibatis.session.SqlSession",
+            "callee_member": "selectOne",
+            "callee_descriptor": "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;",
+            "opcode_family": "invokeinterface",
+        },
     ]
 
 
@@ -137,6 +146,46 @@ def complete_scan_result(edges=None):
 
 
 class MybatisMapperOracleTest(unittest.TestCase):
+    @patch("mybatis_mapper_oracle.subprocess.run")
+    def test_runtime_activation_refuses_empty_review_expectation(self, run):
+        result = oracle.verify_runtime_activation(Path("sample.jar"), [])
+
+        self.assertFalse(result["active"])
+        self.assertEqual(
+            result["failures"], ["MYBATIS_RUNTIME_EXPECTATION_MISSING"]
+        )
+        run.assert_not_called()
+
+    @patch("mybatis_mapper_oracle.subprocess.run")
+    def test_runtime_activation_requires_exit_zero_and_every_expected_output(
+        self, run
+    ):
+        run.return_value = subprocess.CompletedProcess(
+            ["java", "-jar", "sample.jar"],
+            0,
+            stdout="CityMapper.findByState\n1,San Francisco,CA,US\n",
+            stderr="",
+        )
+
+        result = oracle.verify_runtime_activation(
+            Path("sample.jar"),
+            ["CityMapper.findByState", "1,San Francisco,CA,US"],
+            timeout_seconds=5.0,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["failures"], [])
+        self.assertRegex(result["output_sha256"], r"^[0-9a-f]{64}$")
+        run.assert_called_once_with(
+            ["java", "-jar", "sample.jar"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            check=False,
+        )
+
     def test_parse_mapper_javap_reads_exact_contract_and_annotations(self):
         parsed = oracle.parse_mapper_javap(
             MAPPER_JAVAP,
@@ -197,10 +246,47 @@ class MybatisMapperOracleTest(unittest.TestCase):
             [
                 "org.apache.ibatis.binding.MapperProxy",
                 "org.apache.ibatis.binding.MapperProxy$PlainMethodInvoker",
+                "org.apache.ibatis.binding.MapperMethod",
             ],
         )
         self.assertEqual(result["metrics"]["mapper_classes"], 1)
         self.assertEqual(result["metrics"]["mapper_resources"], 1)
+
+    @patch("mybatis_mapper_oracle.scan_final_artifact")
+    @patch("mybatis_mapper_oracle._run_javap", return_value=XML_MAPPER_JAVAP)
+    def test_inspect_requires_select_one_physical_dispatch_for_scalar_select(
+        self, _run_javap, scan_final_artifact
+    ):
+        scan_final_artifact.return_value = complete_scan_result(
+            complete_scan_edges()[:-1]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "sample.jar"
+            write_fake_fat_jar(artifact)
+
+            result = oracle.inspect_mybatis_artifact(artifact, timeout_seconds=5.0)
+
+        self.assertFalse(result["complete"])
+        self.assertIn("MYBATIS_SELECT_ONE_DISPATCH_MISSING", result["failures"])
+
+    @patch("mybatis_mapper_oracle.scan_final_artifact")
+    @patch("mybatis_mapper_oracle._run_javap", return_value=XML_MAPPER_JAVAP)
+    def test_precomputed_physical_scan_prevents_duplicate_artifact_scan(
+        self, _run_javap, scan_final_artifact
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "sample.jar"
+            write_fake_fat_jar(artifact)
+
+            result = oracle.inspect_mybatis_artifact(
+                artifact,
+                timeout_seconds=5.0,
+                physical_scan=complete_scan_result(),
+            )
+
+        self.assertTrue(result["complete"])
+        scan_final_artifact.assert_not_called()
+        self.assertEqual(result["metrics"]["duplicate_artifact_scans"], 0)
 
     @patch("mybatis_mapper_oracle.scan_final_artifact", return_value=complete_scan_result([]))
     @patch("mybatis_mapper_oracle._run_javap", return_value=XML_MAPPER_JAVAP)

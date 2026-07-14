@@ -172,6 +172,8 @@ def _run_javap(content: bytes, artifact_entry: str, timeout_seconds: float) -> s
             ["javap", "-v", "-p", "-s", str(class_path)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=max(0.1, timeout_seconds),
             check=False,
         )
@@ -179,6 +181,65 @@ def _run_javap(content: bytes, artifact_entry: str, timeout_seconds: float) -> s
         detail = (completed.stderr or completed.stdout or "javap failed").strip()
         raise RuntimeError(f"{artifact_entry}: {detail}")
     return completed.stdout
+
+
+def verify_runtime_activation(
+    artifact: Path, required_output: list[str], timeout_seconds: float = 30.0
+) -> dict:
+    """Run one pinned executable Jar and verify its reviewed observable outputs."""
+    started = time.perf_counter()
+    if not required_output:
+        return {
+            "active": False,
+            "failures": ["MYBATIS_RUNTIME_EXPECTATION_MISSING"],
+            "output_sha256": "",
+            "elapsed_seconds": time.perf_counter() - started,
+        }
+    command = ["java", "-jar", str(Path(artifact))]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "active": False,
+            "failures": ["MYBATIS_RUNTIME_TIMEOUT"],
+            "output_sha256": "",
+            "elapsed_seconds": time.perf_counter() - started,
+        }
+    except OSError as error:
+        return {
+            "active": False,
+            "failures": [f"MYBATIS_RUNTIME_FAILED:{type(error).__name__}:{error}"],
+            "output_sha256": "",
+            "elapsed_seconds": time.perf_counter() - started,
+        }
+    output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    failures = []
+    if completed.returncode != 0:
+        failures.append(f"MYBATIS_RUNTIME_EXIT:{completed.returncode}")
+    failures.extend(
+        f"MYBATIS_RUNTIME_OUTPUT_MISSING:{expected}"
+        for expected in required_output
+        if expected not in output
+    )
+    return {
+        "active": not failures,
+        "failures": failures,
+        "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
+def mybatis_physical_targets() -> list[dict]:
+    """Targets needed to prove the complete packaged mapper dispatch chain."""
+    return [dict(target) for target in FRAMEWORK_TARGETS] + [dict(PROXY_ENTRY_TARGET)]
 
 
 def _edge_target(edge: dict) -> tuple[str, str, str]:
@@ -193,7 +254,12 @@ def _contract_target(contract: dict) -> tuple[str, str, str]:
     return contract["owner"], contract["member"], contract["descriptor"]
 
 
-def inspect_mybatis_artifact(path: Path, timeout_seconds: float = 120.0) -> dict:
+def inspect_mybatis_artifact(
+    path: Path,
+    timeout_seconds: float = 120.0,
+    *,
+    physical_scan: dict | None = None,
+) -> dict:
     """Inventory mapper contracts and proxy evidence from one executable Jar."""
     artifact = Path(path)
     started = time.perf_counter()
@@ -288,7 +354,7 @@ def inspect_mybatis_artifact(path: Path, timeout_seconds: float = 120.0) -> dict
     ] + [dict(target) for target in FRAMEWORK_TARGETS] + [dict(PROXY_ENTRY_TARGET)]
     elapsed = time.perf_counter() - started
     scan_budget = max(0.1, timeout_seconds - elapsed)
-    scan = scan_final_artifact(
+    scan = physical_scan if physical_scan is not None else scan_final_artifact(
         artifact,
         time_budget_seconds=scan_budget,
         selected_targets=selected_targets,
@@ -365,13 +431,26 @@ def inspect_mybatis_artifact(path: Path, timeout_seconds: float = 120.0) -> dict
     )
     proxy_entry_edges = [edge for edge in edges if _edge_target(edge) == proxy_invoker]
     dispatch_edges = [edge for edge in edges if _edge_target(edge) == mapper_execute]
+    select_one = (
+        FRAMEWORK_TARGETS[1]["owner"],
+        FRAMEWORK_TARGETS[1]["member"],
+        FRAMEWORK_TARGETS[1]["descriptor"],
+    )
+    select_one_edges = [edge for edge in edges if _edge_target(edge) == select_one]
     proxy_dispatch_links: list[dict] = []
     if contracts and not proxy_entry_edges:
         failures.append("MYBATIS_PROXY_ENTRY_DISPATCH_MISSING")
     if contracts and not dispatch_edges:
         failures.append("MYBATIS_PROXY_DISPATCH_MISSING")
+    if contracts and not select_one_edges:
+        failures.append("MYBATIS_SELECT_ONE_DISPATCH_MISSING")
+    framework_api_evidence = {
+        "org.apache.ibatis.binding.MapperProxy.invoke": proxy_entry_edges,
+        "org.apache.ibatis.binding.MapperMethod.execute": dispatch_edges,
+        "org.apache.ibatis.session.SqlSession.selectOne": select_one_edges,
+    }
     for contract in contracts:
-        if not proxy_entry_edges or not dispatch_edges:
+        if not proxy_entry_edges or not dispatch_edges or not select_one_edges:
             break
         proxy_dispatch_links.append({
             "target": {
@@ -383,7 +462,9 @@ def inspect_mybatis_artifact(path: Path, timeout_seconds: float = 120.0) -> dict
             "artifact_sha256": artifact_sha256,
             "registration_entry": contract["artifact_entry"],
             "binding_entry": contract["binding_entry"],
-            "physical_dispatch_edges": [proxy_entry_edges[0], dispatch_edges[0]],
+            "physical_dispatch_edges": [
+                proxy_entry_edges[0], dispatch_edges[0], select_one_edges[0]
+            ],
             "evidence_authority": "final-artifact-javap-plus-mapper-registration",
         })
 
@@ -416,6 +497,8 @@ def inspect_mybatis_artifact(path: Path, timeout_seconds: float = 120.0) -> dict
         ),
         "physical_edges": edges,
         "proxy_dispatch_links": proxy_dispatch_links,
+        "framework_api_evidence": framework_api_evidence,
+        "physical_scan": scan,
         "failures": sorted(set(failures)),
         "metrics": metrics,
         "complete": not failures and bool(scan.get("complete")),
@@ -426,4 +509,6 @@ __all__ = [
     "inspect_mybatis_artifact",
     "parse_mapper_javap",
     "parse_mapper_xml",
+    "mybatis_physical_targets",
+    "verify_runtime_activation",
 ]

@@ -51,6 +51,192 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(annotation["unverified_apis"], [])
         self.assertEqual(xml["unverified_apis"], [])
 
+    def test_mybatis_cases_audit_dependency_apis_not_business_mapper_contracts(self):
+        expected = {
+            "org.apache.ibatis.binding.MapperProxy.invoke",
+            "org.apache.ibatis.binding.MapperMethod.execute",
+            "org.apache.ibatis.session.SqlSession.selectOne",
+        }
+        for case_name in ("mybatis-sample-annotation", "mybatis-sample-xml"):
+            with self.subTest(case=case_name):
+                case = realreg.CASES[case_name]
+                with case.default_changed_apis.open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual({row["api_name"] for row in rows}, expected)
+                self.assertNotIn(
+                    "sample.mybatis", " ".join(row["api_name"] for row in rows)
+                )
+                self.assertEqual(case.bytecode_coord, "org.mybatis:mybatis")
+                self.assertIn("mybatis_mapper_proxy", case.required_topologies)
+                self.assertEqual(case.case_mode, "guard")
+
+    def test_mybatis_semantic_references_require_complete_oracle_and_runtime(self):
+        selected = [
+            {
+                "coord": "org.mybatis:mybatis",
+                "api_name": api_name,
+                "api_signature": signature,
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            for api_name, signature in (
+                (
+                    "org.apache.ibatis.binding.MapperProxy.invoke",
+                    "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])",
+                ),
+                (
+                    "org.apache.ibatis.binding.MapperMethod.execute",
+                    "(org.apache.ibatis.session.SqlSession,java.lang.Object[])",
+                ),
+                (
+                    "org.apache.ibatis.session.SqlSession.selectOne",
+                    "(java.lang.String,java.lang.Object)",
+                ),
+            )
+        ]
+        mapper_oracle = {
+            "complete": True,
+            "proxy_dispatch_links": [{
+                "registration_entry": "BOOT-INF/classes/sample/Mapper.class",
+                "physical_dispatch_edges": [{}, {}],
+            }],
+            "physical_edges": [{
+                "artifact_entry": (
+                    "BOOT-INF/lib/mybatis-9.9.9.jar!/"
+                    "org/apache/ibatis/binding/MapperProxy.class"
+                ),
+            }],
+            "framework_api_evidence": {
+                "org.apache.ibatis.binding.MapperProxy.invoke": [{}],
+                "org.apache.ibatis.binding.MapperMethod.execute": [{}],
+                "org.apache.ibatis.session.SqlSession.selectOne": [{}],
+            },
+        }
+        runtime = {"active": True, "output_sha256": "b" * 64, "failures": []}
+
+        references = realreg.build_mybatis_semantic_references(
+            selected, mapper_oracle, runtime, "a" * 64
+        )
+
+        self.assertEqual(len(references), 3)
+        self.assertTrue(all(
+            item["authority"] == "final-artifact-mybatis-proxy-runtime"
+            for item in references
+        ))
+        self.assertEqual(
+            {item["api_identity"] for item in references},
+            {realreg.serialized_api_identity(row) for row in selected},
+        )
+        self.assertTrue(all(
+            item["artifact_entry"].startswith(
+                "BOOT-INF/lib/mybatis-9.9.9.jar!/"
+            )
+            for item in references
+        ))
+        self.assertEqual(
+            realreg.build_mybatis_semantic_references(
+                selected, {**mapper_oracle, "complete": False}, runtime, "a" * 64
+            ),
+            [],
+        )
+        self.assertEqual(
+            realreg.build_mybatis_semantic_references(
+                selected, mapper_oracle, {**runtime, "active": False}, "a" * 64
+            ),
+            [],
+        )
+        without_select_one = {
+            **mapper_oracle,
+            "framework_api_evidence": {
+                **mapper_oracle["framework_api_evidence"],
+                "org.apache.ibatis.session.SqlSession.selectOne": [],
+            },
+        }
+        self.assertEqual(
+            {
+                item["target_class"]
+                for item in realreg.build_mybatis_semantic_references(
+                    selected, without_select_one, runtime, "a" * 64
+                )
+            },
+            {
+                "org.apache.ibatis.binding.MapperProxy.invoke",
+                "org.apache.ibatis.binding.MapperMethod.execute",
+            },
+        )
+
+    def test_v3_edge_gate_propagates_missing_semantic_reference(self):
+        semantic = {
+            "api_identity": "api",
+            "target_class": "com.acme.Target",
+            "artifact_sha256": "a" * 64,
+            "artifact_entry": "BOOT-INF/classes/com/acme/Target.class",
+            "authority": "test-authority",
+        }
+        manifest = {
+            "required_topologies": [],
+            "apis": [],
+            "canonical_edges": [],
+            "canonical_semantic_references": [semantic],
+        }
+        result = {
+            "api_coverage_complete": True,
+            "summary": {},
+            "topology_coverage": {"complete": True, "observed": []},
+            "edge_truth": {
+                "complete": True,
+                "blocking": False,
+                "ledger": [],
+                "semantic_references": [],
+            },
+            "quality_signals": [],
+        }
+
+        gates = realreg.build_v3_gates(
+            manifest,
+            result,
+            {"name": "asset", "passed": True, "errors": []},
+            {"passed": True, "errors": []},
+        )
+
+        self.assertFalse(gates["edge_truth"]["passed"])
+        self.assertIn(
+            "expected_semantic_reference_missing",
+            gates["edge_truth"]["errors"],
+        )
+
+    def test_v3_edge_gate_rejects_unexpected_semantic_reference(self):
+        semantic = {
+            "api_identity": "api",
+            "target_class": "com.acme.Target",
+            "artifact_sha256": "a" * 64,
+            "artifact_entry": "BOOT-INF/classes/com/acme/Target.class",
+            "authority": "test-authority",
+        }
+        result = {
+            "api_coverage_complete": True,
+            "summary": {},
+            "topology_coverage": {"complete": True, "observed": []},
+            "edge_truth": {
+                "complete": True,
+                "blocking": False,
+                "ledger": [],
+                "semantic_references": [semantic],
+            },
+            "quality_signals": [],
+        }
+
+        gates = realreg.build_v3_gates(
+            {"required_topologies": [], "apis": [], "canonical_edges": [],
+             "canonical_semantic_references": []},
+            result,
+            {"name": "asset", "passed": True, "errors": []},
+            {"passed": True, "errors": []},
+        )
+
+        self.assertFalse(gates["edge_truth"]["passed"])
+        self.assertIn("unexpected_semantic_reference", gates["edge_truth"]["errors"])
+
     def test_real_fat_jar_cases_require_cross_jar_bridge_topologies(self):
         self.assertIn(
             "cross_jar_bridge",

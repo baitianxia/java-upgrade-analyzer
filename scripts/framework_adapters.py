@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import re
 import safe_xml as ET
 import subprocess
@@ -802,6 +804,37 @@ def run_spring_adapter(source_roots):
     }
 
 
+_MYBATIS_DOCTYPE_RE = re.compile(br'<!DOCTYPE\s+[^>]+>', re.IGNORECASE | re.DOTALL)
+
+
+def _looks_like_mybatis_xml(path):
+    raw = Path(path).read_bytes().lower()
+    return b'<mapper' in raw or (
+        b'<configuration' in raw
+        and any(marker in raw for marker in (b'mybatis', b'<mappers', b'<typealiases'))
+    )
+
+
+def _parse_mybatis_xml(path):
+    return _parse_mybatis_xml_bytes(Path(path).read_bytes())
+
+
+def _parse_mybatis_xml_bytes(raw):
+    upper = raw.upper()
+    doctype = _MYBATIS_DOCTYPE_RE.search(raw)
+    if b'<!ENTITY' in upper or (doctype and b'[' in doctype.group(0)):
+        raise ET.ParseError('XML entities and internal DTD subsets are not allowed')
+    if doctype:
+        declaration = doctype.group(0).lower()
+        if not any(marker in declaration for marker in (
+            b'mybatis.org/dtd/mybatis-3-mapper.dtd',
+            b'mybatis.org/dtd/mybatis-3-config.dtd',
+        )):
+            raise ET.ParseError('unrecognized external DTD')
+        raw = raw[:doctype.start()] + raw[doctype.end():]
+    return ET.fromstring(raw)
+
+
 def run_mybatis_adapter(source_roots):
     edges, nodes, findings, errors = [], [], [], []
     files = []
@@ -810,13 +843,15 @@ def run_mybatis_adapter(source_roots):
     for root in _resource_roots(source_roots):
         for path in sorted(root.rglob('*.xml')):
             try:
-                tree = ET.parse(str(path))
-            except ET.ParseError:
+                if not _looks_like_mybatis_xml(path):
+                    continue
+                mapper = _parse_mybatis_xml(path)
+            except ET.ParseError as exc:
+                errors.append(f'{path}:mybatis_xml:{type(exc).__name__}')
                 continue
             except OSError as exc:
                 errors.append(f'{path}:{type(exc).__name__}')
                 continue
-            mapper = tree.getroot()
             root_tag = str(mapper.tag).rsplit('}', 1)[-1]
             if root_tag == 'configuration':
                 files.append(str(path))
@@ -960,6 +995,481 @@ def run_mybatis_adapter(source_roots):
         'adapter': 'mybatis', 'version': '1', 'status': _status(bool(files or annotation_files), errors),
         'nodes': nodes, 'edges': edges, 'findings': findings, 'errors': errors,
         'metrics': {'xml_files': len(files), 'annotation_files': annotation_files, 'edges': len(edges)},
+    }
+
+
+_MYBATIS_PROXY_RUNTIME_CLASSES = {
+    'org/apache/ibatis/binding/MapperProxy.class',
+    'org/apache/ibatis/binding/MapperProxy$PlainMethodInvoker.class',
+    'org/apache/ibatis/binding/MapperMethod.class',
+    'org/apache/ibatis/session/SqlSession.class',
+}
+
+_MYBATIS_PROXY_TARGETS = (
+    (
+        'org.apache.ibatis.binding.MapperProxy.invoke'
+        '(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])',
+        'proxy_entry',
+    ),
+    (
+        'org.apache.ibatis.binding.MapperMethod.execute'
+        '(org.apache.ibatis.session.SqlSession,java.lang.Object[])',
+        'mapper_execute',
+    ),
+)
+
+
+def _mybatis_xml_statements(source_roots):
+    statements = {}
+    errors = []
+    for root in _resource_roots(source_roots):
+        for path in sorted(root.rglob('*.xml')):
+            try:
+                if not _looks_like_mybatis_xml(path):
+                    continue
+                mapper = _parse_mybatis_xml(path)
+            except (ET.ParseError, OSError) as exc:
+                errors.append(f'{path}:mybatis_xml:{type(exc).__name__}')
+                continue
+            if str(mapper.tag).rsplit('}', 1)[-1] != 'mapper':
+                continue
+            namespace = str(mapper.attrib.get('namespace') or '').strip()
+            if not namespace:
+                errors.append(f'{path}:mybatis_mapper_namespace_missing')
+                continue
+            for child in mapper:
+                command = str(child.tag).rsplit('}', 1)[-1]
+                member = str(child.attrib.get('id') or '').strip()
+                if command in {'select', 'insert', 'update', 'delete'} and member:
+                    statements[(namespace, member)] = {
+                        'command': command,
+                        'file': str(path),
+                    }
+    return statements, errors
+
+
+def _mybatis_mapper_contracts(source_roots):
+    statements, errors = _mybatis_xml_statements(source_roots)
+    annotation_commands = {
+        'Select': 'select', 'SelectProvider': 'select',
+        'Insert': 'insert', 'InsertProvider': 'insert',
+        'Update': 'update', 'UpdateProvider': 'update',
+        'Delete': 'delete', 'DeleteProvider': 'delete',
+    }
+    contracts = []
+    unregistered = []
+    for path in _production_java_files(source_roots):
+        try:
+            source_text = _mask_java_comments(
+                path.read_text(encoding='utf-8', errors='replace')
+            )
+        except OSError as exc:
+            errors.append(f'{path}:mybatis_proxy_source:{type(exc).__name__}')
+            continue
+        if 'interface' not in source_text or 'Mapper' not in source_text:
+            continue
+        exact_mapper_annotation = bool(
+            re.search(r'@org\.apache\.ibatis\.annotations\.Mapper\b', source_text)
+            or (
+                re.search(
+                    r'\bimport\s+org\.apache\.ibatis\.annotations\.Mapper\s*;',
+                    source_text,
+                )
+                and re.search(r'@Mapper\b', source_text)
+            )
+        )
+        exact_sql_annotations = set(re.findall(
+            r'@org\.apache\.ibatis\.annotations\.(\w+)\b', source_text
+        ))
+        exact_sql_annotations.update(re.findall(
+            r'\bimport\s+org\.apache\.ibatis\.annotations\.(\w+)\s*;',
+            source_text,
+        ))
+        try:
+            methods, parser_info = analyze_file(
+                str(path),
+                {'root': str(path.parent), 'owner_type': 'business', 'owner_coord': 'BUSINESS'},
+                prefer_tree_sitter=True,
+                return_diagnostics=True,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f'{path}:mybatis_proxy_ast:{type(exc).__name__}')
+            continue
+        if parser_info.get('actual_parser') != 'tree_sitter':
+            continue
+        overloads = {}
+        candidates = []
+        for method in methods:
+            if not getattr(method, 'is_interface', False):
+                continue
+            owner = str(getattr(method, 'class_fqcn', '') or '')
+            member = str(getattr(method, 'method_name', '') or '')
+            annotations = {
+                str(item).rsplit('.', 1)[-1]
+                for item in (getattr(method, 'annotations', None) or [])
+            }
+            command = next(
+                (
+                    annotation_commands[item]
+                    for item in sorted(annotations)
+                    if item in annotation_commands and item in exact_sql_annotations
+                ),
+                '',
+            )
+            binding = {'command': command, 'file': str(path)} if command else statements.get((owner, member))
+            if not binding:
+                continue
+            registered = exact_mapper_annotation and 'Mapper' in {
+                str(item).rsplit('.', 1)[-1]
+                for item in (getattr(method, 'class_annotations', None) or [])
+            }
+            identity = (owner, member, len(getattr(method, 'param_types', None) or {}))
+            overloads[identity] = overloads.get(identity, 0) + 1
+            candidates.append((method, binding, registered, identity))
+        for method, binding, registered, identity in candidates:
+            item = {
+                'owner': identity[0],
+                'member': identity[1],
+                'parameter_count': identity[2],
+                'declared_method_count': overloads[identity],
+                'parameters': list((getattr(method, 'param_types', None) or {}).values()),
+                'return_type': str(getattr(method, 'return_type', '') or ''),
+                'command': binding['command'],
+                'file': str(path),
+                'binding_file': binding['file'],
+            }
+            if registered:
+                contracts.append(item)
+            else:
+                unregistered.append(item)
+    return contracts, unregistered, errors
+
+
+def _mybatis_runtime_entry(artifact_catalog):
+    matches = []
+    errors = []
+    for entry in (artifact_catalog or {}).get('entries') or []:
+        if (
+            str(entry.get('evidence_source') or '') != 'current_final_artifact'
+            or not re.fullmatch(r'[0-9a-fA-F]{64}', str(entry.get('sha256') or ''))
+        ):
+            continue
+        jar_path = Path(str(entry.get('jar_path') or ''))
+        if not jar_path.is_file():
+            continue
+        try:
+            with zipfile.ZipFile(jar_path) as archive:
+                names = set(archive.namelist())
+        except (OSError, zipfile.BadZipFile) as exc:
+            errors.append(f'{jar_path}:mybatis_runtime:{type(exc).__name__}')
+            continue
+        if _MYBATIS_PROXY_RUNTIME_CLASSES.issubset(names):
+            matches.append(entry)
+    if len(matches) != 1:
+        return None, errors, len(matches)
+    return matches[0], errors, 1
+
+
+def _verified_final_artifact(artifact_catalog):
+    path = Path(str((artifact_catalog or {}).get('final_artifact_path') or ''))
+    expected = str((artifact_catalog or {}).get('final_artifact_sha256') or '').lower()
+    if not path.is_file() or not re.fullmatch(r'[0-9a-f]{64}', expected):
+        return None, 'mybatis_final_artifact_unavailable'
+    try:
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        return None, f'mybatis_final_artifact:{type(exc).__name__}'
+    if actual != expected:
+        return None, 'mybatis_final_artifact_sha256_mismatch'
+    return path, ''
+
+
+def _packaged_mybatis_contracts(candidates, artifact_catalog):
+    """Validate mapper registration, binding, and activation in one SHA-bound artifact."""
+    artifact, artifact_error = _verified_final_artifact(artifact_catalog)
+    if not artifact:
+        return [], list(candidates), [], [artifact_error]
+    packaged = []
+    unregistered = []
+    activation = []
+    errors = []
+    try:
+        with zipfile.ZipFile(artifact) as outer:
+            names = set(outer.namelist())
+            class_entries = {
+                name: outer.read(name) for name in names
+                if name.endswith('.class')
+                and name.startswith(('BOOT-INF/classes/', 'WEB-INF/classes/'))
+            }
+            xml_entries = {
+                name: outer.read(name) for name in names
+                if name.endswith('.xml')
+                and name.startswith(('BOOT-INF/classes/', 'WEB-INF/classes/'))
+            }
+            for entry in (artifact_catalog or {}).get('entries') or []:
+                if not (
+                    entry.get('application_owned')
+                    and str(entry.get('evidence_source') or '') == 'current_final_artifact'
+                ):
+                    continue
+                nested_entry = str(entry.get('artifact_entry') or '')
+                expected_sha = str(entry.get('sha256') or '').lower()
+                if nested_entry not in names or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+                    continue
+                nested_blob = outer.read(nested_entry)
+                if hashlib.sha256(nested_blob).hexdigest() != expected_sha:
+                    errors.append(f'{nested_entry}:mybatis_internal_module_sha256_mismatch')
+                    continue
+                try:
+                    with zipfile.ZipFile(io.BytesIO(nested_blob)) as nested:
+                        for name in nested.namelist():
+                            qualified = f'{nested_entry}!/{name}'
+                            if name.endswith('.class'):
+                                class_entries[qualified] = nested.read(name)
+                            elif name.endswith('.xml'):
+                                xml_entries[qualified] = nested.read(name)
+                except zipfile.BadZipFile:
+                    errors.append(f'{nested_entry}:mybatis_internal_module_bad_zip')
+            xml_statements = {}
+            for name, xml_content in sorted(xml_entries.items()):
+                try:
+                    root = _parse_mybatis_xml_bytes(xml_content)
+                except ET.ParseError:
+                    continue
+                if str(root.tag).rsplit('}', 1)[-1] != 'mapper':
+                    continue
+                namespace = str(root.attrib.get('namespace') or '').strip()
+                for child in root:
+                    command = str(child.tag).rsplit('}', 1)[-1]
+                    member = str(child.attrib.get('id') or '').strip()
+                    if namespace and member and command in {'select', 'insert', 'update', 'delete'}:
+                        xml_statements[(namespace, member)] = (command, name)
+            for name, content in sorted(class_entries.items()):
+                if (
+                    b'Lorg/springframework/boot/autoconfigure/SpringBootApplication;' in content
+                    or b'Lorg/springframework/boot/autoconfigure/EnableAutoConfiguration;' in content
+                ) and b'org/springframework/boot/SpringApplication' in content and b'run' in content:
+                    activation.append({
+                        'artifact_entry': name,
+                        'artifact_sha256': str(artifact_catalog.get('final_artifact_sha256') or ''),
+                        'authority': 'current_final_artifact_classfile',
+                    })
+            for item in candidates:
+                class_suffix = item['owner'].replace('.', '/') + '.class'
+                class_entry = next(
+                    (name for name in class_entries if name.endswith('/' + class_suffix)), ''
+                )
+                if not class_entry:
+                    unregistered.append(item)
+                    continue
+                content = class_entries[class_entry]
+                registered = b'Lorg/apache/ibatis/annotations/Mapper;' in content
+                annotation_markers = {
+                    'select': (b'Lorg/apache/ibatis/annotations/Select;', b'Lorg/apache/ibatis/annotations/SelectProvider;'),
+                    'insert': (b'Lorg/apache/ibatis/annotations/Insert;', b'Lorg/apache/ibatis/annotations/InsertProvider;'),
+                    'update': (b'Lorg/apache/ibatis/annotations/Update;', b'Lorg/apache/ibatis/annotations/UpdateProvider;'),
+                    'delete': (b'Lorg/apache/ibatis/annotations/Delete;', b'Lorg/apache/ibatis/annotations/DeleteProvider;'),
+                }
+                xml_binding = xml_statements.get((item['owner'], item['member']))
+                annotation_binding = any(
+                    marker in content for marker in annotation_markers.get(item['command'], ())
+                ) and item['member'].encode('utf-8') in content
+                if not registered or not (annotation_binding or xml_binding):
+                    unregistered.append(item)
+                    continue
+                verified = dict(item)
+                verified['file'] = f'{artifact}!/{class_entry}'
+                if xml_binding:
+                    verified['command'], binding_entry = xml_binding
+                    verified['binding_file'] = f'{artifact}!/{binding_entry}'
+                else:
+                    verified['binding_file'] = f'{artifact}!/{class_entry}'
+                verified['artifact_entry'] = class_entry
+                packaged.append(verified)
+    except (OSError, zipfile.BadZipFile) as exc:
+        errors.append(f'{artifact}:mybatis_final_artifact:{type(exc).__name__}')
+        return [], list(candidates), [], errors
+    return packaged, unregistered, activation, errors
+
+
+def _verify_mybatis_runtime_dispatch(entry):
+    jar_path = str(entry.get('jar_path') or '')
+    classes = (
+        'org.apache.ibatis.binding.MapperProxy',
+        'org.apache.ibatis.binding.MapperProxy$PlainMethodInvoker',
+        'org.apache.ibatis.binding.MapperMethod',
+    )
+    outputs = {}
+    errors = []
+    for owner in classes:
+        try:
+            completed = subprocess.run(
+                ['javap', '-c', '-p', '-s', '-classpath', jar_path, owner],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f'{jar_path}:{owner}:{type(exc).__name__}')
+            continue
+        if completed.returncode != 0:
+            errors.append(f'{jar_path}:{owner}:javap_exit_{completed.returncode}')
+            continue
+        outputs[owner] = completed.stdout
+    checks = {
+        'proxy_entry_dispatch': (
+            'org.apache.ibatis.binding.MapperProxy',
+            'InterfaceMethod org/apache/ibatis/binding/MapperProxy$MapperMethodInvoker.invoke:',
+        ),
+        'plain_invoker_dispatch': (
+            'org.apache.ibatis.binding.MapperProxy$PlainMethodInvoker',
+            'Method org/apache/ibatis/binding/MapperMethod.execute:',
+        ),
+        'select_one_dispatch': (
+            'org.apache.ibatis.binding.MapperMethod',
+            'InterfaceMethod org/apache/ibatis/session/SqlSession.selectOne:',
+        ),
+    }
+    verified = {
+        name: marker in outputs.get(owner, '')
+        for name, (owner, marker) in checks.items()
+    }
+    return verified, errors
+
+
+def _mybatis_select_runtime_target(contract):
+    if contract.get('command') != 'select':
+        return ''
+    return_type = str(contract.get('return_type') or '')
+    collection_markers = ('[]', 'java.util.List', 'java.util.Collection', 'java.util.Set', 'Cursor')
+    if any(marker in return_type for marker in collection_markers):
+        return ''
+    return (
+        'org.apache.ibatis.session.SqlSession.selectOne'
+        '(java.lang.String,java.lang.Object)'
+    )
+
+
+def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
+    """Resolve registered mapper calls through the exact packaged MyBatis proxy runtime."""
+    runtime_entry, runtime_errors, runtime_matches = _mybatis_runtime_entry(artifact_catalog)
+    if not runtime_entry:
+        untrusted_runtime_hint = any(
+            'mybatis' in (
+                Path(str(entry.get('jar_path') or '')).name
+                + str(entry.get('artifact_entry') or '')
+            ).lower()
+            for entry in (artifact_catalog or {}).get('entries') or []
+        )
+        findings = ([{
+            'reason_code': 'mybatis_runtime_implementation_unresolved',
+            'subject': 'org.apache.ibatis.binding.MapperProxy',
+            'candidate_count': runtime_matches,
+        }] if untrusted_runtime_hint else [])
+        return {
+            'adapter': 'mybatis_mapper_proxy', 'version': '2',
+            'status': 'partial' if runtime_errors or findings else 'not_applicable',
+            'nodes': [], 'edges': [], 'findings': findings, 'errors': runtime_errors,
+            'metrics': {'registered_mapper_methods': 0, 'unregistered_mapper_methods': 0,
+                        'runtime_candidates': runtime_matches, 'verified_dispatch_stages': 0,
+                        'edges': 0},
+        }
+    source_contracts, source_unregistered, errors = _mybatis_mapper_contracts(source_roots)
+    contracts, unregistered, activation_evidence, packaged_errors = _packaged_mybatis_contracts(
+        source_contracts + source_unregistered, artifact_catalog
+    )
+    errors.extend(runtime_errors)
+    errors.extend(packaged_errors)
+    findings = [{
+        'reason_code': 'mybatis_mapper_registration_unproven',
+        'subject': f"{item['owner']}.{item['member']}",
+        'file': item['file'],
+    } for item in unregistered]
+    if contracts and not activation_evidence:
+        findings.append({
+            'reason_code': 'mybatis_runtime_activation_unproven',
+            'subject': ','.join(sorted({item['owner'] for item in contracts})),
+        })
+    if contracts and runtime_matches != 1:
+        findings.append({
+            'reason_code': 'mybatis_runtime_implementation_unresolved',
+            'subject': 'org.apache.ibatis.binding.MapperProxy',
+            'candidate_count': runtime_matches,
+        })
+    dispatch = {}
+    if runtime_entry:
+        dispatch, dispatch_errors = _verify_mybatis_runtime_dispatch(runtime_entry)
+        errors.extend(dispatch_errors)
+        missing = sorted(name for name, present in dispatch.items() if not present)
+        if missing:
+            findings.append({
+                'reason_code': 'mybatis_runtime_dispatch_incomplete',
+                'subject': ','.join(missing),
+            })
+    edges = []
+    nodes = []
+    runtime_complete = bool(dispatch and all(dispatch.values()))
+    if contracts and activation_evidence and runtime_entry and runtime_complete:
+        for contract in contracts:
+            if contract['declared_method_count'] != 1:
+                findings.append({
+                    'reason_code': 'mybatis_mapper_overload_ambiguous',
+                    'subject': f"{contract['owner']}.{contract['member']}/{contract['parameter_count']}",
+                })
+                continue
+            targets = list(_MYBATIS_PROXY_TARGETS)
+            select_target = _mybatis_select_runtime_target(contract)
+            if select_target:
+                targets.append((select_target, 'sql_session_select_one'))
+            for target, stage in targets:
+                provenance = {
+                    'file': contract['file'],
+                    'binding_file': contract['binding_file'],
+                    'command': contract['command'],
+                    'jar': str(runtime_entry.get('jar_path') or ''),
+                    'artifact_entry': runtime_entry.get('artifact_entry'),
+                    'artifact_sha256': runtime_entry.get('sha256'),
+                    'coord': runtime_entry.get('coord'),
+                    'business_activation': activation_evidence,
+                    'dispatch_stage': stage,
+                    'verified_dispatch': dict(dispatch),
+                    'authority': 'final_artifact_javap',
+                }
+                edges.append({
+                    'source': f"{contract['owner']}.{contract['member']}",
+                    'source_owner': contract['owner'],
+                    'source_member': contract['member'],
+                    'source_parameters': contract['parameters'],
+                    'parameter_count': contract['parameter_count'],
+                    'target': target,
+                    'edge_kind': 'mybatis_mapper_proxy_dispatch',
+                    'confidence': 'high',
+                    'conditions': [],
+                    'ambiguity': False,
+                    'provenance': provenance,
+                })
+                nodes.append({'id': target, 'kind': 'mybatis_proxy_runtime_method'})
+    applicable = bool(contracts or unregistered)
+    unresolved = bool(applicable and (
+        not contracts or not activation_evidence or not runtime_entry or not runtime_complete
+    ))
+    return {
+        'adapter': 'mybatis_mapper_proxy',
+        'version': '2',
+        'status': 'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
+        'nodes': nodes,
+        'edges': edges,
+        'findings': findings,
+        'errors': errors,
+        'metrics': {
+            'registered_mapper_methods': len(contracts),
+            'unregistered_mapper_methods': len(unregistered),
+            'runtime_candidates': runtime_matches,
+            'verified_dispatch_stages': sum(bool(value) for value in dispatch.values()),
+            'edges': len(edges),
+        },
     }
 
 
@@ -2327,6 +2837,7 @@ def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
         run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_spring_data_repository_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_mybatis_adapter(source_roots),
+        run_mybatis_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_dynamic_proxy_adapter(source_roots),
         run_declarative_http_client_adapter(source_roots),
     ]
@@ -2382,6 +2893,7 @@ def attach_framework_edges_to_graph(graph, payload):
     matched_edges = 0
     unmatched_edges = 0
     proxy_dispatch_edges = 0
+    mybatis_proxy_dispatch_edges = 0
     transaction_proxy_edges = 0
     ambiguous_proxy_dispatches = 0
     supported_kinds = {
@@ -2412,6 +2924,86 @@ def attach_framework_edges_to_graph(graph, payload):
         return match.group('owner'), match.group('member'), count
 
     reverse_edge_snapshot = dict(graph.reverse_edges)
+    for adapter in (payload or {}).get('adapters') or []:
+        dispatch_edges = [
+            edge for edge in adapter.get('edges') or []
+            if edge.get('edge_kind') == 'mybatis_mapper_proxy_dispatch'
+        ]
+        for edge in dispatch_edges:
+            source_identity = (
+                str(edge.get('source_owner') or ''),
+                str(edge.get('source_member') or ''),
+                int(edge.get('parameter_count') or 0),
+            )
+            source_keys = [
+                lookup_key for lookup_key, callers in reverse_edge_snapshot.items()
+                if callers and method_key_parts(lookup_key) == source_identity
+            ]
+            target = str(edge.get('target') or '').strip()
+            if not source_keys or not target:
+                continue
+            callers_by_symbol = {}
+            for source_key in source_keys:
+                for caller in reverse_edge_snapshot.get(source_key) or []:
+                    if (
+                        str(getattr(caller, 'evidence_source', '') or '')
+                        != 'current_final_artifact'
+                        and not getattr(caller, 'runtime_analyzer_hit', None)
+                    ):
+                        continue
+                    caller_symbol = str(getattr(caller, 'caller_symbol_id', '') or '')
+                    rank = (
+                        3 if str(getattr(caller, 'evidence_source', '') or '') == 'current_final_artifact'
+                        else 2 if getattr(caller, 'runtime_analyzer_hit', None)
+                        else 1 if str(getattr(caller, 'evidence_type', '') or '').startswith('bytecode_')
+                        else 0
+                    )
+                    existing = callers_by_symbol.get(caller_symbol)
+                    if existing is None or rank > existing[0]:
+                        callers_by_symbol[caller_symbol] = (rank, caller)
+            provenance = edge.get('provenance') or {}
+            for _rank, caller in callers_by_symbol.values():
+                values = dict(vars(caller))
+                values.update({
+                    'callee_key': target,
+                    'callee_simple_key': target.rsplit('.', 1)[-1],
+                    'evidence_type': 'mybatis_mapper_proxy_dispatch',
+                    'evidence_source': 'current_final_artifact',
+                    'confidence': 'high',
+                    'file': str(provenance.get('jar') or values.get('file') or ''),
+                    'content': f"MyBatis mapper proxy dispatch: {source_keys[0]} -> {target}",
+                    'framework_registration': True,
+                    'framework_source': str(edge.get('source') or ''),
+                    'framework_target': target,
+                    'framework_provenance': dict(provenance),
+                    'framework_final_artifact_verified': bool(
+                        str(provenance.get('authority') or '') == 'final_artifact_javap'
+                        and re.fullmatch(
+                            r'[0-9a-fA-F]{64}',
+                            str(provenance.get('artifact_sha256') or ''),
+                        )
+                    ),
+                    'runtime_activation': 'active',
+                })
+                synthetic = SimpleNamespace(**values)
+                identity = (
+                    synthetic.caller_symbol_id,
+                    synthetic.callee_key,
+                    synthetic.evidence_type,
+                )
+                bucket = graph.reverse_edges.setdefault(target, [])
+                if any(
+                    (
+                        getattr(existing, 'caller_symbol_id', ''),
+                        getattr(existing, 'callee_key', ''),
+                        getattr(existing, 'evidence_type', ''),
+                    ) == identity
+                    for existing in bucket
+                ):
+                    continue
+                bucket.append(synthetic)
+                mybatis_proxy_dispatch_edges += 1
+
     for adapter in (payload or {}).get('adapters') or []:
         for edge in adapter.get('edges') or []:
             if edge.get('edge_kind') != 'spring_transaction_proxy_dispatch':
@@ -2749,6 +3341,7 @@ def attach_framework_edges_to_graph(graph, payload):
         'runtime_framework_entry_methods': len(runtime_entries),
         'framework_activation_linked_methods': len(activation_linked_symbols),
         'framework_proxy_dispatch_edges': proxy_dispatch_edges,
+        'framework_mybatis_proxy_dispatch_edges': mybatis_proxy_dispatch_edges,
         'framework_transaction_proxy_edges': transaction_proxy_edges,
         'ambiguous_framework_proxy_dispatches': ambiguous_proxy_dispatches,
     }

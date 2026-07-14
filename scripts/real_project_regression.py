@@ -44,6 +44,10 @@ from exhaustive_api_oracle import (
 )
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity, reconcile_edges
 from final_artifact_edge_oracle import scan_final_artifact
+from mybatis_mapper_oracle import (
+    inspect_mybatis_artifact,
+    verify_runtime_activation,
+)
 from signature_utils import normalize_signature_for_lookup
 from third_party_jdk_oracle import _source_signature
 from third_party_jdk_oracle import discover_calls, scan_class_files
@@ -910,6 +914,88 @@ CASES["dubbo-spring6-security"] = RealProjectCase(
     ),
 )
 
+CASES["mybatis-sample-annotation"] = RealProjectCase(
+    name="mybatis-sample-annotation",
+    default_project=Path("/private/tmp/jua-real-project-mybatis-spring-boot-4.0.1"),
+    default_changed_apis=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "mybatis-sample-annotation-changed-apis.csv"
+    ),
+    baseline_specs=(),
+    source_dirs=(
+        Path(
+            "mybatis-spring-boot-samples/mybatis-spring-boot-sample-annotation/"
+            "src/main/java"
+        ),
+    ),
+    require_valid_git=True,
+    min_project_java_files=100,
+    min_main_java_files=3,
+    max_generated_java_ratio=0.1,
+    case_mode="guard",
+    ground_truth_status="reviewed",
+    bytecode_coord="org.mybatis:mybatis",
+    final_artifact=Path(
+        "/private/tmp/mybatis-spring-boot-sample-annotation-4.0.1.jar"
+    ),
+    required_topologies=("mybatis_mapper_proxy",),
+    target_owner_entries={
+        "org.apache.ibatis.binding.MapperProxy": (
+            "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/binding/MapperProxy.class",
+        ),
+        "org.apache.ibatis.binding.MapperMethod": (
+            "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/binding/MapperMethod.class",
+        ),
+        "org.apache.ibatis.session.SqlSession": (
+            "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/session/SqlSession.class",
+        ),
+    },
+    fixture_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "mybatis-sample-annotation.json"
+    ),
+)
+
+CASES["mybatis-sample-xml"] = RealProjectCase(
+    name="mybatis-sample-xml",
+    default_project=Path("/private/tmp/jua-real-project-mybatis-spring-boot-4.0.1"),
+    default_changed_apis=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "mybatis-sample-xml-changed-apis.csv"
+    ),
+    baseline_specs=(),
+    source_dirs=(
+        Path(
+            "mybatis-spring-boot-samples/mybatis-spring-boot-sample-xml/"
+            "src/main/java"
+        ),
+    ),
+    require_valid_git=True,
+    min_project_java_files=100,
+    min_main_java_files=6,
+    max_generated_java_ratio=0.1,
+    case_mode="guard",
+    ground_truth_status="reviewed",
+    bytecode_coord="org.mybatis:mybatis",
+    final_artifact=Path("/private/tmp/mybatis-spring-boot-sample-xml-4.0.1.jar"),
+    required_topologies=("business_direct", "mybatis_mapper_proxy"),
+    target_owner_entries={
+        "org.apache.ibatis.binding.MapperProxy": (
+            "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/binding/MapperProxy.class",
+        ),
+        "org.apache.ibatis.binding.MapperMethod": (
+            "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/binding/MapperMethod.class",
+        ),
+        "org.apache.ibatis.session.SqlSession": (
+            "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/session/SqlSession.class",
+        ),
+    },
+    fixture_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "mybatis-sample-xml.json"
+    ),
+)
+
 CASES = {
     name: apply_real_case_performance_budget(case)
     for name, case in CASES.items()
@@ -1096,6 +1182,8 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
         actual_semantic_identities
     ):
         errors.append("expected_semantic_reference_missing")
+    if actual_semantic_identities - expected_semantic_identities:
+        errors.append("unexpected_semantic_reference")
     if not expected_physical_edges and not expected_semantic_identities:
         errors.append("expected_physical_edge_missing")
     return {"passed": not errors, "errors": errors}
@@ -1275,7 +1363,12 @@ def build_v3_gates(
     edge_truth = result.get("edge_truth") or {}
     contract = evaluate_pinned_guard_contract(manifest, result)
     contract_errors = set(contract.get("errors") or [])
-    edge_errors = sorted(contract_errors & {"edge_truth_failed", "expected_physical_edge_missing"})
+    edge_errors = sorted(contract_errors & {
+        "edge_truth_failed",
+        "expected_physical_edge_missing",
+        "expected_semantic_reference_missing",
+        "unexpected_semantic_reference",
+    })
     conclusion_errors = sorted(contract_errors & {
         "SOURCE_BYTECODE_EDGE_CONFLICT", "expected_conclusion_missing", "expected_chain_missing",
     })
@@ -2505,6 +2598,88 @@ def scan_final_artifact_dynamic_class_references(
     return references
 
 
+MYBATIS_SEMANTIC_APIS = {
+    "org.apache.ibatis.binding.MapperProxy.invoke": {
+        "signature": "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])",
+        "class_entry": "org/apache/ibatis/binding/MapperProxy.class",
+    },
+    "org.apache.ibatis.binding.MapperMethod.execute": {
+        "signature": "(org.apache.ibatis.session.SqlSession,java.lang.Object[])",
+        "class_entry": "org/apache/ibatis/binding/MapperMethod.class",
+    },
+    "org.apache.ibatis.session.SqlSession.selectOne": {
+        "signature": "(java.lang.String,java.lang.Object)",
+        "class_entry": "org/apache/ibatis/session/SqlSession.class",
+    },
+}
+
+
+def build_mybatis_semantic_references(
+    selected_rows: list[dict],
+    mapper_oracle: dict,
+    runtime_activation: dict,
+    artifact_sha256: str,
+) -> list[dict]:
+    """Bind reviewed runtime activation to independently proven mapper dispatch."""
+    links = list(mapper_oracle.get("proxy_dispatch_links") or [])
+    if (
+        not mapper_oracle.get("complete")
+        or not runtime_activation.get("active")
+        or not _valid_sha256(artifact_sha256)
+        or not _valid_sha256(str(runtime_activation.get("output_sha256") or ""))
+        or not links
+    ):
+        return []
+    dispatch_count = min(
+        len(link.get("physical_dispatch_edges") or []) for link in links
+    )
+    if dispatch_count < 2:
+        return []
+    runtime_prefixes = {
+        str(edge.get("artifact_entry") or "").split("!/", 1)[0] + "!/"
+        for edge in (mapper_oracle.get("physical_edges") or [])
+        if str(edge.get("artifact_entry") or "").startswith((
+            "BOOT-INF/lib/", "WEB-INF/lib/",
+        ))
+        and "!/org/apache/ibatis/" in str(edge.get("artifact_entry") or "")
+    }
+    if len(runtime_prefixes) != 1:
+        return []
+    runtime_prefix = next(iter(runtime_prefixes))
+    references = []
+    framework_api_evidence = dict(mapper_oracle.get("framework_api_evidence") or {})
+    for row in selected_rows:
+        api_name = str(row.get("api_name") or "").strip()
+        expected = MYBATIS_SEMANTIC_APIS.get(api_name)
+        if (
+            expected is None
+            or str(row.get("coord") or "").strip() != "org.mybatis:mybatis"
+            or normalize_signature_for_lookup(str(row.get("api_signature") or ""))
+            != normalize_signature_for_lookup(expected["signature"])
+        ):
+            continue
+        physical_evidence = list(framework_api_evidence.get(api_name) or [])
+        if not physical_evidence:
+            continue
+        references.append({
+            "api_identity": serialized_api_identity(row),
+            "target_class": api_name,
+            "artifact_sha256": artifact_sha256,
+            "artifact_entry": runtime_prefix + expected["class_entry"],
+            "authority": "final-artifact-mybatis-proxy-runtime",
+            "authority_version": "1",
+            "runtime_output_sha256": runtime_activation["output_sha256"],
+            "proxy_dispatch_edge_count": dispatch_count,
+            "physical_evidence_count": len(physical_evidence),
+            "mapper_contract_count": len(mapper_oracle.get("mapper_contracts") or []),
+            "procedure": (
+                "SHA-bound mapper registration and statement binding; packaged javap "
+                "proxy dispatch; successful pinned runtime query"
+            ),
+        })
+    return references
+
+
 def reconcile_selected_api_edges(
     report_dir: Path,
     selected_rows: list[dict],
@@ -2661,6 +2836,7 @@ def reconcile_final_artifact_edges(
     report_dir: Path,
     selected_rows: list[dict],
     oracle_time_budget_seconds: float | None = None,
+    pinned_manifest: dict | None = None,
 ) -> dict:
     artifact, expected_sha, errors = _verified_current_final_artifact(report_dir)
     analyzer_path = Path(report_dir) / "evidence" / "call_chain" / "analyzer_edges.csv"
@@ -2669,11 +2845,57 @@ def reconcile_final_artifact_edges(
         scan = {"artifact_sha256": "", "complete": False, "edges": [], "failures": errors,
                 "artifact_entries": []}
     else:
-        scan = scan_final_artifact(
-            artifact,
-            time_budget_seconds=oracle_time_budget_seconds,
-            selected_targets=_oracle_selected_targets(selected_rows),
+        mybatis_selected = any(
+            str(row.get("coord") or "").strip() == "org.mybatis:mybatis"
+            and str(row.get("api_name") or "").strip() in MYBATIS_SEMANTIC_APIS
+            for row in selected_rows
         )
+        mapper_oracle = None
+        runtime_activation = None
+        if mybatis_selected:
+            mapper_oracle = inspect_mybatis_artifact(
+                artifact,
+                timeout_seconds=float(oracle_time_budget_seconds or 120.0),
+            )
+            scan = dict(mapper_oracle.get("physical_scan") or {})
+            runtime_spec = dict((pinned_manifest or {}).get("runtime_verification") or {})
+            required_output = [
+                str(item) for item in (runtime_spec.get("required_output") or [])
+                if str(item)
+            ]
+            runtime_activation = verify_runtime_activation(
+                artifact,
+                required_output,
+                timeout_seconds=min(float(oracle_time_budget_seconds or 120.0), 30.0),
+            )
+            scan.setdefault("failures", [])
+            if not mapper_oracle.get("complete"):
+                scan["complete"] = False
+                scan["failures"].extend(
+                    f"mybatis_oracle:{item}"
+                    for item in (mapper_oracle.get("failures") or [])
+                )
+            if not runtime_activation.get("active"):
+                scan["complete"] = False
+                scan["failures"].extend(
+                    f"mybatis_runtime:{item}"
+                    for item in (runtime_activation.get("failures") or [])
+                )
+            scan["elapsed_seconds"] = (
+                float((mapper_oracle.get("metrics") or {}).get("elapsed_seconds") or 0.0)
+                + float(runtime_activation.get("elapsed_seconds") or 0.0)
+            )
+            scan["mybatis_oracle"] = {
+                key: value for key, value in mapper_oracle.items()
+                if key != "physical_scan"
+            }
+            scan["mybatis_runtime_activation"] = runtime_activation
+        else:
+            scan = scan_final_artifact(
+                artifact,
+                time_budget_seconds=oracle_time_budget_seconds,
+                selected_targets=_oracle_selected_targets(selected_rows),
+            )
         try:
             scan["semantic_references"] = scan_final_artifact_dynamic_class_references(
                 artifact, selected_rows
@@ -2682,6 +2904,15 @@ def reconcile_final_artifact_edges(
             scan["complete"] = False
             scan.setdefault("failures", []).append(
                 f"dynamic_class_reference_scan_failed:{error}"
+            )
+        if mapper_oracle is not None and runtime_activation is not None:
+            scan.setdefault("semantic_references", []).extend(
+                build_mybatis_semantic_references(
+                    selected_rows,
+                    mapper_oracle,
+                    runtime_activation,
+                    str(scan.get("artifact_sha256") or ""),
+                )
             )
         try:
             scan["artifact_entries"] = sorted(_artifact_class_entries(artifact))
@@ -4095,7 +4326,10 @@ def run_case(
         int(summary.get("total_apis") or 0),
     )
     edge_truth = reconcile_final_artifact_edges(
-        report_dir, selected_rows, oracle_time_budget_seconds=case.max_oracle_seconds
+        report_dir,
+        selected_rows,
+        oracle_time_budget_seconds=case.max_oracle_seconds,
+        pinned_manifest=pinned_manifest,
     )
     source_conflicts = validate_source_bytecode_conflicts(summary, edge_truth)
     performance_envelope = collect_performance_envelope(
@@ -4209,6 +4443,10 @@ def run_case(
             "ledger": edge_truth["reconciliation"].get("ledger") or [],
             "oracle_edges": edge_truth["oracle_edges"],
             "edge_reconciliation": edge_truth["edge_reconciliation"],
+            "semantic_references": edge_truth.get("semantic_references") or [],
+            "semantic_reference_evidence": edge_truth.get(
+                "semantic_reference_evidence"
+            ) or "",
             "oracle_metrics": edge_truth.get("oracle_metrics") or {},
         },
         "ground_truth_status": effective_ground_truth_status,

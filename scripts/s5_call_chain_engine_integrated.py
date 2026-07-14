@@ -278,7 +278,7 @@ def load_orchestrated_step5_input(report_dir):
     try:
         with state_path.open("r", encoding="utf-8") as f:
             main_state = json.load(f)
-    except Exception:
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
         return {}
     return dict((((main_state or {}).get("step5") or {}).get("input")) or {})
 
@@ -1626,6 +1626,9 @@ def build_runtime_dependency_catalog(report_dir):
             catalog['reason_codes'].append('current_artifact_hash_mismatch')
     elif not artifact_ok:
         catalog['reason_codes'].append('current_artifact_unavailable')
+    if artifact_ok:
+        catalog['final_artifact_path'] = artifact_path
+        catalog['final_artifact_sha256'] = sha256_file(artifact_path)
 
     exact_count = 0
     fallback_count = 0
@@ -1680,7 +1683,7 @@ def build_runtime_dependency_catalog(report_dir):
                         catalog['entries'].append(item)
                         catalog['jar_paths'][coord] = str(jar_path)
                         exact_count += 1
-                    except Exception as exc:
+                    except (OSError, KeyError, zipfile.BadZipFile) as exc:
                         extraction_failures.append({'coord': coord, 'lib_entry': lib_entry, 'reason': f'extract_failed:{exc}'})
 
                 cataloged_entries = {
@@ -2411,7 +2414,7 @@ def _analyze_source_file_entry(file_path, root):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             file_content = f.read()
-    except Exception:
+    except OSError:
         file_content = ''
     package_name, imports, declared_types = _extract_declared_types(file_content)
     return {
@@ -3046,7 +3049,7 @@ def build_enhanced_source_graph(
             module = root_info.get('module') or Path(file_path).parent.name
             try:
                 lines = Path(file_path).read_text(encoding='utf-8', errors='replace').splitlines()
-            except Exception:
+            except OSError:
                 continue
             static_imports = {}
             for raw_line in lines[:200]:
@@ -3365,7 +3368,7 @@ def build_enhanced_source_graph(
         }
         try:
             lines = Path(file_path).read_text(encoding='utf-8', errors='replace').splitlines()
-        except Exception:
+        except OSError:
             continue
         class_name = next(iter(declared_types.keys()))
         class_fqcn = f"{package_name}.{class_name}" if package_name else class_name
@@ -3670,7 +3673,7 @@ def check_if_needs_bridge_sources(all_apis_path, report_dir, source_dirs=None, b
                 api_name = row.get('api_name', '')
                 if coord and api_name:
                     changed_apis.append(dict(row))
-    except Exception as e:
+    except (OSError, UnicodeError, csv.Error) as e:
         print(f"Error checking APIs: {e}", file=sys.stderr)
         return False
 
@@ -3741,7 +3744,7 @@ def check_apis_that_need_bridge(
         try:
             with open(all_apis_input, 'r', encoding='utf-8') as f:
                 all_apis = list(csv.DictReader(f))
-        except Exception as e:
+        except (OSError, UnicodeError, csv.Error) as e:
             print(f"Error checking APIs: {e}", file=sys.stderr)
             return result
     else:

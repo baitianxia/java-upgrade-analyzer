@@ -91,7 +91,8 @@ an authority label. They cannot be rendered as physical bytecode edges.
 
 ## Decision Rules
 
-- A physical business call to a mapper method is `reachable` for that mapper API.
+- A physical business call to a mapper method is activation evidence for selected
+  MyBatis dependency APIs; the mapper method is not part of the changed denominator.
 - A framework-internal MyBatis API is `reachable` only when the complete physical
   business call, registration, binding, proxy dispatch, and runtime activation
   evidence all agree.
@@ -107,9 +108,9 @@ and topology extractors only report facts and failures.
 
 ## Exhaustive API Denominator
 
-The selected denominator is declared before reading analyzer output. It includes
-every production mapper method invoked by the two sample entry points and the
-chosen MyBatis runtime methods reached by those invocations. Constructors,
+The selected denominator is declared before reading analyzer output. It contains
+only the chosen dependency-owned MyBatis runtime methods. Production mapper
+methods invoked by the two sample entry points remain activation evidence. Constructors,
 compiler scaffolding, logging, model accessors, and unrelated startup calls are
 excluded explicitly in the fixture.
 
@@ -160,3 +161,17 @@ against the pinned fixture baseline unless the fixture is deliberately re-review
 - Existing real-project guards and the full unit suite continue to pass.
 - Performance remains within the declared budgets.
 - The final commit contains no target-project or generated-report files.
+
+## Validated Outcome
+
+The implementation keeps source parsing as candidate discovery only. A confirmed
+mapper-proxy edge now requires registration, annotation/XML binding, and Spring
+activation evidence from the SHA-verified final Fat Jar. Application-owned nested
+modules under `BOOT-INF/lib` are inspected only after their outer entry and nested
+Jar SHA agree; ordinary runtime dependencies are not promoted to business code.
+
+The independent Oracle requires a distinct physical edge for each selected
+framework API, including `MapperMethod.execute -> SqlSession.selectOne`. V3 guard
+comparison is exact in both directions, so missing and extra semantic references
+both fail. Core evidence functions are structurally prohibited from using broad
+`except Exception` handlers.

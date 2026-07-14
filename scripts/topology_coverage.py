@@ -32,7 +32,7 @@ STABLE_TOPOLOGY_IDS = frozenset({
     "same_coord_multimodule", "overloaded_method", "constructor",
     "interface_dispatch", "virtual_dispatch", "static_dispatch", "field_access",
     "invokedynamic", "reflection", "spi", "framework_proxy",
-    "framework_callback",
+    "framework_callback", "mybatis_mapper_proxy",
     "source_bytecode_agree", "source_bytecode_true_conflict",
 })
 EDGE_FIELDS = (
@@ -1472,6 +1472,20 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
         for item in artifact_layout.get("semantic_references") or []
     ):
         observed.add("reflection")
+    selected_method_targets = {
+        f"{target[0]}.{target[1]}" for target in targets if target[0] and target[1]
+    }
+    if any(
+        item.get("authority") == "final-artifact-mybatis-proxy-runtime"
+        and item.get("target_class") in selected_method_targets
+        and re.fullmatch(r"[0-9a-f]{64}", str(item.get("artifact_sha256") or ""))
+        and re.fullmatch(r"[0-9a-f]{64}", str(item.get("runtime_output_sha256") or ""))
+        and str(item.get("artifact_entry") or "").endswith(".class")
+        and int(item.get("proxy_dispatch_edge_count") or 0) >= 3
+        and int(item.get("physical_evidence_count") or 0) >= 1
+        for item in artifact_layout.get("semantic_references") or []
+    ):
+        observed.add("mybatis_mapper_proxy")
     if any(
         item.get("evidence_authority") == "final_artifact_javap_bounded_dataflow"
         and item.get("start_class")

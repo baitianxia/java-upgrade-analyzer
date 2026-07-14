@@ -42,6 +42,62 @@ def _jar_classes(path: Path, classes: Path) -> None:
 
 @unittest.skipUnless(JDK_TOOLS, "JDK tools required")
 class TopologyCoverageTest(unittest.TestCase):
+    def test_sha_bound_runtime_verified_mybatis_semantics_define_proxy_topology(self):
+        target = "org.apache.ibatis.binding.MapperMethod.execute"
+        layout = {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [{
+                "owner": "org.apache.ibatis.binding.MapperMethod",
+                "member": "execute",
+                "descriptor": (
+                    "(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)"
+                    "Ljava/lang/Object;"
+                ),
+            }],
+            "entry_layout": [],
+            "semantic_references": [{
+                "target_class": target,
+                "authority": "final-artifact-mybatis-proxy-runtime",
+                "artifact_sha256": "a" * 64,
+                "artifact_entry": (
+                    "BOOT-INF/lib/mybatis-3.5.19.jar!/"
+                    "org/apache/ibatis/binding/MapperMethod.class"
+                ),
+                "runtime_output_sha256": "b" * 64,
+                "proxy_dispatch_edge_count": 3,
+                "physical_evidence_count": 1,
+            }],
+        }
+
+        observed = topology_coverage.classify_topologies([], layout)
+
+        self.assertIn("mybatis_mapper_proxy", observed)
+
+    def test_mybatis_semantic_for_unselected_api_does_not_define_proxy_topology(self):
+        layout = {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [{
+                "owner": "org.apache.ibatis.binding.MapperMethod",
+                "member": "execute",
+                "descriptor": "()V",
+            }],
+            "entry_layout": [],
+            "semantic_references": [{
+                "target_class": "org.apache.ibatis.session.SqlSession.selectOne",
+                "authority": "final-artifact-mybatis-proxy-runtime",
+                "artifact_sha256": "a" * 64,
+                "artifact_entry": "BOOT-INF/lib/mybatis.jar!/org/apache/ibatis/session/SqlSession.class",
+                "runtime_output_sha256": "b" * 64,
+                "proxy_dispatch_edge_count": 3,
+            }],
+        }
+
+        observed = topology_coverage.classify_topologies([], layout)
+
+        self.assertNotIn("mybatis_mapper_proxy", observed)
+
     def test_classfile_semantic_reference_counts_as_uncertain_reflection_topology(self):
         target = "com.vendor.OptionalSecurityType"
         layout = {

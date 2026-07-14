@@ -180,12 +180,10 @@ git commit -m "test: add independent MyBatis mapper oracle"
 
 - [ ] **Step 1: Declare the API rows before analyzer execution**
 
-The annotation denominator contains the invoked
-`sample.mybatis.annotation.mapper.CityMapper.findByState(String)` mapper contract
-and the selected framework dispatch APIs. The XML denominator contains
-`sample.mybatis.xml.mapper.HotelMapper.selectByCityId(int)`, direct
-`org.apache.ibatis.session.SqlSession.selectOne(String,Object)`, and the selected
-framework dispatch APIs. Every row includes exact descriptor, symbol kind,
+The mapper contracts are system-owned activation evidence, not changed dependency
+APIs. Both denominators contain only `MapperProxy.invoke`, `MapperMethod.execute`,
+and `SqlSession.selectOne`. The annotation and XML contracts independently prove
+whether those framework methods are activated. Every row includes exact descriptor, symbol kind,
 coordinate, expected status, and required evidence authority.
 
 - [ ] **Step 2: Write failing denominator tests**
@@ -337,3 +335,18 @@ Expected: zero failures and zero formatting errors.
 Verify the external checkout is clean and generated reports are absent from this
 repository. Commit the implementation and push
 `codex/step5-bytecode-index-optimization` only after all evidence gates pass.
+
+## Execution Record
+
+- Audited the published MyBatis Spring Boot 4.0.1 annotation and XML sample Fat
+  Jars against three predeclared MyBatis APIs each; all six API conclusions were
+  independently reconciled as reachable.
+- Required SHA-bound packaged registration, binding, Spring activation, three
+  physical MyBatis dispatch stages, and reviewed runtime output.
+- Added negative regressions for source/final-artifact disagreement, missing
+  `SqlSession.selectOne` dispatch, unexpected semantic evidence, unselected
+  semantic topology, absent runtime fast exit, and an internal business module in
+  `BOOT-INF/lib`.
+- Final real-project runs passed all seven gates in 5.89s and 6.25s.
+- Final focused suite: 219 tests passed. Final full suite: 1011 tests passed in
+  125.760s. `py_compile` and `git diff --check` passed.

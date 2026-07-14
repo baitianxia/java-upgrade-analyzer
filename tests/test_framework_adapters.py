@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -6,16 +7,400 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
+from framework_adapters import (
+    attach_framework_edges_to_graph,
+    run_framework_adapters,
+    run_mybatis_proxy_adapter,
+)
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
+    @patch("framework_adapters._mybatis_mapper_contracts")
+    def test_mybatis_proxy_adapter_skips_source_scan_without_packaged_runtime(
+        self, mapper_contracts
+    ):
+        adapter = run_mybatis_proxy_adapter([], artifact_catalog={"entries": []})
+
+        self.assertEqual(adapter["status"], "not_applicable")
+        self.assertEqual(adapter["edges"], [])
+        mapper_contracts.assert_not_called()
+
+    def _mybatis_runtime_catalog(self, module):
+        source_root = module / "mybatis-runtime"
+        classes = module / "mybatis-runtime-classes"
+        sources = {
+            "org/apache/ibatis/session/SqlSession.java": (
+                "package org.apache.ibatis.session; public interface SqlSession { "
+                "Object selectOne(String statement, Object parameter); }"
+            ),
+            "org/apache/ibatis/binding/MapperMethod.java": (
+                "package org.apache.ibatis.binding; import org.apache.ibatis.session.SqlSession; "
+                "public class MapperMethod { public Object execute(SqlSession session, Object[] args) { "
+                "return session.selectOne(\"statement\", args[0]); } }"
+            ),
+            "org/apache/ibatis/binding/MapperProxy.java": (
+                "package org.apache.ibatis.binding; import java.lang.reflect.Method; "
+                "import org.apache.ibatis.session.SqlSession; public class MapperProxy { "
+                "public interface MapperMethodInvoker { Object invoke(Object proxy, Method method, "
+                "Object[] args, SqlSession session); } public Object invoke(Object proxy, Method method, "
+                "Object[] args) { return ((MapperMethodInvoker) null).invoke(proxy, method, args, null); } "
+                "public static class PlainMethodInvoker implements MapperMethodInvoker { "
+                "private final MapperMethod mapperMethod = new MapperMethod(); "
+                "public Object invoke(Object proxy, Method method, Object[] args, SqlSession session) { "
+                "return mapperMethod.execute(session, args); } } }"
+            ),
+        }
+        for relative, content in sources.items():
+            path = source_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        classes.mkdir(exist_ok=True)
+        subprocess.run(
+            ["javac", "-d", str(classes)]
+            + [str(source_root / relative) for relative in sorted(sources)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        jar_path = module / "mybatis-runtime.jar"
+        with zipfile.ZipFile(jar_path, "w") as jar:
+            for class_file in classes.rglob("*.class"):
+                jar.write(class_file, class_file.relative_to(classes).as_posix())
+        artifact = module / "application.jar"
+        mapper_source = (module / "src/main/java/com/acme/CityMapper.java").read_text(
+            encoding="utf-8", errors="replace"
+        ) if (module / "src/main/java/com/acme/CityMapper.java").is_file() else ""
+        application_source = (module / "src/main/java/com/acme/Application.java").read_text(
+            encoding="utf-8", errors="replace"
+        ) if (module / "src/main/java/com/acme/Application.java").is_file() else ""
+        mapper_bytes = mapper_source.encode("utf-8")
+        if "org.apache.ibatis.annotations.Mapper" in mapper_source:
+            mapper_bytes += b"Lorg/apache/ibatis/annotations/Mapper;"
+        for annotation in ("Select", "Insert", "Update", "Delete"):
+            if f"org.apache.ibatis.annotations.{annotation}" in mapper_source:
+                mapper_bytes += f"Lorg/apache/ibatis/annotations/{annotation};".encode("ascii")
+        application_bytes = application_source.encode("utf-8")
+        if "SpringBootApplication" in application_source:
+            application_bytes += b"Lorg/springframework/boot/autoconfigure/SpringBootApplication;"
+        if "SpringApplication.run" in application_source:
+            application_bytes += b"org/springframework/boot/SpringApplication run"
+        with zipfile.ZipFile(artifact, "w") as outer:
+            outer.writestr("BOOT-INF/classes/com/acme/CityMapper.class", mapper_bytes)
+            outer.writestr("BOOT-INF/classes/com/acme/Application.class", application_bytes)
+            outer.writestr("BOOT-INF/lib/mybatis-test.jar", jar_path.read_bytes())
+            resources = module / "src/main/resources"
+            if resources.is_dir():
+                for resource in resources.rglob("*.xml"):
+                    outer.write(resource, "BOOT-INF/classes/" + resource.relative_to(resources).as_posix())
+        return {
+            "final_artifact_path": str(artifact),
+            "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "entries": [{
+                "coord": "runtime:mybatis-test",
+                "version": "test",
+                "jar_path": str(jar_path),
+                "artifact_entry": "BOOT-INF/lib/mybatis-test.jar",
+                "sha256": "a" * 64,
+                "evidence_source": "current_final_artifact",
+            }]
+        }
+
+    def test_mybatis_proxy_adapter_requires_registration_and_packaged_dispatch_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            mapper = java / "CityMapper.java"
+            mapper_source = (
+                "package com.acme; @org.apache.ibatis.annotations.Mapper public interface CityMapper { "
+                "@org.apache.ibatis.annotations.Select(\"select 1\") Object find(String state); }"
+            )
+            mapper.write_text(
+                mapper_source,
+                encoding="utf-8",
+            )
+            catalog = self._mybatis_runtime_catalog(module)
+
+            adapter = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=catalog,
+            )
+            mapper.write_text(
+                mapper.read_text(encoding="utf-8").replace(
+                    "@org.apache.ibatis.annotations.Mapper ", ""
+                ),
+                encoding="utf-8",
+            )
+            unregistered_catalog = self._mybatis_runtime_catalog(module)
+            unregistered = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=unregistered_catalog,
+            )
+            mapper.write_text(mapper_source, encoding="utf-8")
+            catalog = self._mybatis_runtime_catalog(module)
+            fallback_catalog = {
+                "entries": [{
+                    **catalog["entries"][0],
+                    "evidence_source": "local_maven_fallback",
+                }]
+            }
+            fallback = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=fallback_catalog,
+            )
+
+        self.assertEqual(adapter["status"], "complete")
+        self.assertEqual(
+            {edge["target"] for edge in adapter["edges"]},
+            {
+                "org.apache.ibatis.binding.MapperProxy.invoke(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])",
+                "org.apache.ibatis.binding.MapperMethod.execute(org.apache.ibatis.session.SqlSession,java.lang.Object[])",
+                "org.apache.ibatis.session.SqlSession.selectOne(java.lang.String,java.lang.Object)",
+            },
+        )
+        self.assertTrue(all(
+            edge["source_owner"] == "com.acme.CityMapper"
+            and edge["source_member"] == "find"
+            and edge["parameter_count"] == 1
+            and edge["provenance"]["authority"] == "final_artifact_javap"
+            for edge in adapter["edges"]
+        ))
+        self.assertEqual(unregistered["edges"], [])
+        self.assertTrue(any(
+            finding["reason_code"] == "mybatis_mapper_registration_unproven"
+            for finding in unregistered["findings"]
+        ))
+        self.assertEqual(fallback["edges"], [])
+        self.assertTrue(any(
+            finding["reason_code"] == "mybatis_runtime_implementation_unresolved"
+            for finding in fallback["findings"]
+        ))
+
+    def test_mybatis_proxy_adapter_rejects_source_registration_missing_from_final_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            (java / "CityMapper.java").write_text(
+                "package com.acme; @org.apache.ibatis.annotations.Mapper public interface CityMapper { "
+                "@org.apache.ibatis.annotations.Select(\"select 1\") Object find(String state); }",
+                encoding="utf-8",
+            )
+            catalog = self._mybatis_runtime_catalog(module)
+            artifact = module / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/com/acme/Application.class", b"no activation")
+            catalog.update({
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": "b" * 64,
+            })
+
+            adapter = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=catalog,
+            )
+
+        self.assertEqual(adapter["edges"], [])
+        self.assertTrue(any(
+            finding["reason_code"] == "mybatis_mapper_registration_unproven"
+            for finding in adapter["findings"]
+        ))
+
+    def test_mybatis_proxy_adapter_reads_mapper_from_packaged_internal_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            (java / "CityMapper.java").write_text(
+                "package com.acme; @org.apache.ibatis.annotations.Mapper public interface CityMapper { "
+                "@org.apache.ibatis.annotations.Select(\"select 1\") Object find(String state); }",
+                encoding="utf-8",
+            )
+            catalog = self._mybatis_runtime_catalog(module)
+            artifact = Path(catalog["final_artifact_path"])
+            with zipfile.ZipFile(artifact) as outer:
+                entries = {
+                    item.filename: outer.read(item)
+                    for item in outer.infolist()
+                    if not item.is_dir()
+                }
+            mapper_entry = "BOOT-INF/classes/com/acme/CityMapper.class"
+            internal_jar = module / "library.jar"
+            with zipfile.ZipFile(internal_jar, "w") as nested:
+                nested.writestr("com/acme/CityMapper.class", entries.pop(mapper_entry))
+            with zipfile.ZipFile(artifact, "w") as outer:
+                for name, content in entries.items():
+                    outer.writestr(name, content)
+                outer.writestr("BOOT-INF/lib/library.jar", internal_jar.read_bytes())
+            catalog["final_artifact_sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            catalog["entries"].append({
+                "coord": "com.acme:library",
+                "version": "1.0.0",
+                "jar_path": str(internal_jar),
+                "artifact_entry": "BOOT-INF/lib/library.jar",
+                "sha256": hashlib.sha256(internal_jar.read_bytes()).hexdigest(),
+                "evidence_source": "current_final_artifact",
+                "application_owned": True,
+            })
+
+            adapter = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=catalog,
+            )
+
+        self.assertEqual(len(adapter["edges"]), 3)
+        self.assertTrue(all(
+            "BOOT-INF/lib/library.jar!/com/acme/CityMapper.class"
+            in edge["provenance"]["file"]
+            for edge in adapter["edges"]
+        ))
+
+    def test_mybatis_proxy_dispatch_links_final_artifact_business_caller_to_runtime_targets(self):
+        caller = SimpleNamespace(
+            caller_symbol_id="app-run",
+            caller_qualified_key="com.acme.Application.run()",
+            callee_key="com.acme.CityMapper.find(java.lang.String)",
+            callee_simple_key="find(String)",
+            evidence_type="bytecode_invokeinterface",
+            evidence_source="current_final_artifact",
+            confidence="high",
+            file="business.jar!/com/acme/Application.class",
+            line=21,
+            content="invokeinterface CityMapper.find",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            module="app",
+            is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={"com.acme.CityMapper.find(java.lang.String)": [caller]},
+        )
+        target = (
+            "org.apache.ibatis.binding.MapperProxy.invoke"
+            "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])"
+        )
+        payload = {"adapters": [{
+            "adapter": "mybatis_mapper_proxy",
+            "version": "1",
+            "edges": [{
+                "source": "com.acme.CityMapper.find",
+                "source_owner": "com.acme.CityMapper",
+                "source_member": "find",
+                "parameter_count": 1,
+                "target": target,
+                "edge_kind": "mybatis_mapper_proxy_dispatch",
+                "confidence": "high",
+                "conditions": [],
+                "ambiguity": False,
+                "provenance": {
+                    "authority": "final_artifact_javap",
+                    "artifact_sha256": "a" * 64,
+                },
+            }],
+        }]}
+
+        stats = attach_framework_edges_to_graph(graph, payload)
+
+        self.assertEqual(stats["framework_mybatis_proxy_dispatch_edges"], 1)
+        self.assertEqual(len(graph.reverse_edges[target]), 1)
+        self.assertEqual(graph.reverse_edges[target][0].caller_symbol_id, "app-run")
+        self.assertEqual(
+            graph.reverse_edges[target][0].evidence_type,
+            "mybatis_mapper_proxy_dispatch",
+        )
+        self.assertEqual(
+            graph.reverse_edges[target][0].evidence_source,
+            "current_final_artifact",
+        )
+
+        source_only = SimpleNamespace(**{
+            **vars(caller),
+            "evidence_type": "source_ast",
+            "evidence_source": "source",
+        })
+        source_graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={"com.acme.CityMapper.find(java.lang.String)": [source_only]},
+        )
+        source_stats = attach_framework_edges_to_graph(source_graph, payload)
+        self.assertNotIn(target, source_graph.reverse_edges)
+        self.assertEqual(source_stats["framework_mybatis_proxy_dispatch_edges"], 0)
+
+    def test_mybatis_proxy_adapter_accepts_only_known_external_dtd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            resources = module / "src/main/resources/mappers"
+            java.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            (java / "CityMapper.java").write_text(
+                "package com.acme; @org.apache.ibatis.annotations.Mapper public interface CityMapper { "
+                "Object find(String state); }",
+                encoding="utf-8",
+            )
+            mapper_xml = resources / "CityMapper.xml"
+            mapper_xml.write_text(
+                '<?xml version="1.0"?><!DOCTYPE mapper PUBLIC '
+                '"-//mybatis.org//DTD Mapper 3.0//EN" '
+                '"http://mybatis.org/dtd/mybatis-3-mapper.dtd">'
+                '<mapper namespace="com.acme.CityMapper">'
+                '<select id="find">select 1</select></mapper>',
+                encoding="utf-8",
+            )
+            catalog = self._mybatis_runtime_catalog(module)
+
+            known = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=catalog,
+            )
+            mapper_xml.write_text(
+                mapper_xml.read_text(encoding="utf-8").replace(
+                    "mybatis.org/dtd/mybatis-3-mapper.dtd",
+                    "example.invalid/unknown.dtd",
+                ),
+                encoding="utf-8",
+            )
+            unknown = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=catalog,
+            )
+
+        self.assertEqual(len(known["edges"]), 3)
+        self.assertEqual(unknown["edges"], [])
+        self.assertTrue(any("mybatis_xml:ParseError" in item for item in unknown["errors"]))
+
     def test_spring_transaction_adapter_requires_packaged_business_annotation(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = Path(tmp)
