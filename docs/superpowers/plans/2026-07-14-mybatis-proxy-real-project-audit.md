@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Do not install a runtime dependency or non-Codex plugin.
-- Pin Git revision `92431b4231a59a87a9408658d4b1740892a4a0ab` and exact artifact SHA-256 values.
+- Pin Git revision `bb8bac144e4677cf1bab5a6d27ced2521972adfc`, Maven Central version `4.0.1`, official SHA-1 sidecars, and exact artifact SHA-256 values.
 - Inspect final executable Jars; source and `target/classes` are not runtime truth.
 - Declare the selected API denominator before reading analyzer output; no sampling.
 - Keep semantic proxy/configuration links separate from physical JVM call edges.
@@ -30,7 +30,7 @@
 - Modify: `tests/test_real_project_regression.py`
 
 **Interfaces:**
-- Consumes: checkout `/private/tmp/jua-real-project-mybatis-spring-boot-starter-3`.
+- Consumes: checkout `/private/tmp/jua-real-project-mybatis-spring-boot-4.0.1` and the two Maven Central `4.0.1` executable Jars.
 - Produces: two fixture manifests with revision, artifact path, artifact SHA, expected runtime output, and explicit source/resource inventory.
 
 - [ ] **Step 1: Write failing fixture-contract tests**
@@ -52,19 +52,23 @@ Run: `python3 -m unittest tests.test_real_project_regression.RealProjectRegressi
 
 Expected: `FileNotFoundError` for the new fixture.
 
-- [ ] **Step 3: Build the pinned samples**
+- [ ] **Step 3: Verify the pinned published samples**
 
-Run from the target checkout:
+Download the two `4.0.1` executable Jars, POMs, and Jar SHA-1 sidecars directly
+from Maven Central. Verify each SHA-1 before inspection and record SHA-256:
 
 ```bash
-mvn -q -DskipTests -pl mybatis-spring-boot-samples/mybatis-spring-boot-sample-annotation,mybatis-spring-boot-samples/mybatis-spring-boot-sample-xml -am package
+shasum -a 1 /private/tmp/mybatis-spring-boot-sample-annotation-4.0.1.jar
+shasum -a 1 /private/tmp/mybatis-spring-boot-sample-xml-4.0.1.jar
+shasum -a 256 /private/tmp/mybatis-spring-boot-sample-annotation-4.0.1.jar
+shasum -a 256 /private/tmp/mybatis-spring-boot-sample-xml-4.0.1.jar
 ```
 
-Record SHA-256 for:
+Use these artifact paths:
 
 ```text
-mybatis-spring-boot-samples/mybatis-spring-boot-sample-annotation/target/mybatis-spring-boot-sample-annotation-4.0.2-SNAPSHOT.jar
-mybatis-spring-boot-samples/mybatis-spring-boot-sample-xml/target/mybatis-spring-boot-sample-xml-4.0.2-SNAPSHOT.jar
+/private/tmp/mybatis-spring-boot-sample-annotation-4.0.1.jar
+/private/tmp/mybatis-spring-boot-sample-xml-4.0.1.jar
 ```
 
 - [ ] **Step 4: Execute both artifacts**

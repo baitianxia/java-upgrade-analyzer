@@ -10,9 +10,9 @@ before changing production code.
 
 ## Target Project
 
-Use `mybatis/spring-boot-starter` at Git revision
-`92431b4231a59a87a9408658d4b1740892a4a0ab`. Build and audit both executable
-sample artifacts:
+Use the `mybatis-spring-boot-4.0.1` release of `mybatis/spring-boot-starter` at
+Git revision `bb8bac144e4677cf1bab5a6d27ced2521972adfc`. Audit the two executable
+sample artifacts published by the same release to Maven Central:
 
 - `mybatis-spring-boot-sample-annotation`: mapper registration and SQL statement
   binding through `@Mapper` and `@Select` classfile annotations.
@@ -20,8 +20,11 @@ sample artifacts:
   configuration resources, XML namespace/id statement binding, a direct
   `SqlSession` call, and a mapper proxy call.
 
-Using two artifacts from one pinned repository keeps source and dependency
-versions aligned while covering two different registration mechanisms.
+Using two artifacts from one pinned repository and release keeps source,
+dependencies, and distributed runtime bytes aligned while covering two different
+registration mechanisms. The Maven Central SHA-1 sidecars and locally recorded
+SHA-256 values authenticate the exact inputs without executing third-party build
+logic.
 
 ## Considered Approaches
 
@@ -69,7 +72,7 @@ from classfile attributes or `javap -v`, not source text.
 
 ### Runtime Evidence
 
-Run each built sample against its embedded H2 database and require a successful
+Run each published sample against its embedded H2 database and require a successful
 exit plus the expected query result. Runtime success proves the proxy and mapping
 are activatable for the pinned artifact; it does not replace physical edge or
 registration evidence.
@@ -148,7 +151,8 @@ against the pinned fixture baseline unless the fixture is deliberately re-review
 
 ## Acceptance Criteria
 
-- Both pinned sample artifacts build and execute successfully.
+- Both pinned published sample artifacts pass repository checksum verification and
+  execute successfully.
 - Every selected API is independently verified; sampling is forbidden.
 - Annotation and XML mapper-proxy topologies are both observed.
 - Every required fault injection causes a deterministic guard failure.
