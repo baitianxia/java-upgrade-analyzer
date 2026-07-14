@@ -34,6 +34,25 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def test_graph_field_edge_keeps_selected_changed_api_identity(self):
+        api_row = {
+            "coord": "jdk:java.base",
+            "api_name": "java.lang.System.out",
+            "api_simple": "out",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "REMOVED",
+        }
+        edge = SimpleNamespace(
+            callee_key="java.lang.System.out",
+            evidence_type="bytecode_field_access",
+            owner_coord="__business__",
+        )
+
+        matched = tracer._graph_edge_target_row(edge, [api_row])
+
+        self.assertIs(matched, api_row)
+
     def test_classfile_fast_path_preserves_dollar_in_nested_jvm_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
             classes = self._compile_java_fixture(

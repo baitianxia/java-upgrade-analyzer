@@ -2328,6 +2328,165 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertFalse(guard["passed"])
         self.assertIn("SOURCE_BYTECODE_EDGE_CONFLICT", guard["errors"])
 
+    def test_gs_messaging_rabbitmq_reflection_callback_guard(self):
+        manifest_path = (
+            ROOT / "tests" / "fixtures" / "real_projects" /
+            "gs-messaging-rabbitmq.json"
+        )
+        changed_path = (
+            ROOT / "tests" / "fixtures" / "real_projects" /
+            "gs-messaging-rabbitmq-changed-apis.csv"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        with changed_path.open(newline="", encoding="utf-8") as handle:
+            changed_rows = list(csv.DictReader(handle))
+        case = realreg.CASES["gs-messaging-rabbitmq"]
+
+        self.assertEqual(
+            manifest["git_revision"],
+            "3e112f5e956bf61e6cc1ec92c8a5a9a96f738d86",
+        )
+        self.assertEqual(
+            manifest["artifact_sha256"],
+            "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+        )
+        self.assertEqual(case.default_changed_apis, changed_path)
+        self.assertEqual(
+            case.required_topologies,
+            ("business_direct", "framework_callback"),
+        )
+        self.assertEqual(len(changed_rows), 3)
+        self.assertEqual(len(manifest["apis"]), len(changed_rows))
+        self.assertEqual(len(manifest["canonical_edges"]), 5)
+        self.assertEqual(
+            {
+                (row["api_name"], row["api_signature"], row["symbol_kind"])
+                for row in changed_rows
+            },
+            {
+                ("java.lang.System.out", "", "field"),
+                ("java.io.PrintStream.println", "(String)", "method"),
+                ("java.util.concurrent.CountDownLatch.countDown", "()", "method"),
+            },
+        )
+        self.assertEqual(manifest["framework_callback"], {
+            "registration_owner": "com.example.messagingrabbitmq.MessagingRabbitmqApplication",
+            "registration_member": "listenerAdapter",
+            "callback_owner": "com.example.messagingrabbitmq.Receiver",
+            "callback_member": "receiveMessage",
+            "callback_descriptor": "(Ljava/lang/String;)V",
+            "adapter_owner": (
+                "org.springframework.amqp.rabbit.listener.adapter.MessageListenerAdapter"
+            ),
+            "registration_instruction_offset": 7,
+        })
+        self.assertTrue(all(
+            expected["expected_chain"][1] == "Spring Boot框架注册"
+            for expected in manifest["apis"]
+        ))
+        callback_edges = [
+            edge for edge in manifest["canonical_edges"]
+            if edge["caller_member"] == "receiveMessage"
+        ]
+        self.assertEqual(len(callback_edges), len(changed_rows))
+        self.assertEqual(
+            {edge["instruction_offset"] for edge in callback_edges},
+            {0, 9, 16},
+        )
+        runner_edges = [
+            edge for edge in manifest["canonical_edges"]
+            if edge["caller_member"] == "run"
+        ]
+        self.assertEqual(
+            {(edge["callee_owner"], edge["callee_member"], edge["instruction_offset"])
+             for edge in runner_edges},
+            {
+                ("java.lang.System", "out", 0),
+                ("java.io.PrintStream", "println", 5),
+            },
+        )
+
+    def test_pinned_guard_evaluates_every_api_in_callback_manifest(self):
+        manifest = json.loads((
+            ROOT / "tests" / "fixtures" / "real_projects" /
+            "gs-messaging-rabbitmq.json"
+        ).read_text(encoding="utf-8"))
+        reachable = []
+        for expected in manifest["apis"]:
+            target = f"{expected['owner']}.{expected['member']}"
+            signature = {
+                "java.lang.System.out": "",
+                "java.io.PrintStream.println": "(String)",
+                "java.util.concurrent.CountDownLatch.countDown": "()",
+            }[target]
+            reachable.append({
+                "api": target,
+                "analysis_status": expected["expected_conclusion"],
+                "path_details": [{
+                    "path_text": " -> ".join([
+                        *expected["expected_chain"][:-1],
+                        target + signature,
+                    ]),
+                }],
+            })
+        ledger = []
+        for edge in manifest["canonical_edges"]:
+            occurrence = realreg.physical_edge_occurrence(edge)
+            identity = realreg.canonical_edge_identity(edge)
+            for side, row_key in (("analyzer", "analyzer_row"), ("oracle", "oracle_row")):
+                ledger.append({
+                    "side": side,
+                    "verdict": "correct",
+                    "identity": identity,
+                    "physical_occurrence": occurrence,
+                    row_key: edge,
+                })
+        result = {
+            "summary": {
+                "reachable_apis": reachable,
+                "uncertain_apis": [],
+                "not_analyzed_apis": [],
+                "not_found_apis": [],
+            },
+            "topology_coverage": {
+                "complete": True,
+                "observed": manifest["required_topologies"],
+            },
+            "edge_truth": {
+                "complete": True,
+                "blocking": False,
+                "ledger": ledger,
+            },
+        }
+
+        guard = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+        self.assertEqual(guard, {"passed": True, "errors": []})
+
+    def test_callback_chain_match_ignores_business_artifact_display_prefix(self):
+        expected_api = {
+            "owner": "java.util.concurrent.CountDownLatch",
+            "member": "countDown",
+            "descriptor": "()V",
+            "symbol_kind": "method",
+        }
+        expected_chain = [
+            "com.example.messagingrabbitmq.MessagingRabbitmqApplication.main",
+            "Spring Boot框架注册",
+            "com.example.messagingrabbitmq.Receiver.receiveMessage",
+            "java.util.concurrent.CountDownLatch.countDown",
+        ]
+        rendered_path = (
+            "com.example.messagingrabbitmq.MessagingRabbitmqApplication.main -> "
+            "Spring Boot框架注册 -> "
+            "业务制品：com.example.messagingrabbitmq.Receiver.receiveMessage(String) -> "
+            "java.util.concurrent.CountDownLatch.countDown()"
+        )
+
+        self.assertTrue(realreg._matches_expected_call_chain(
+            rendered_path, expected_chain, expected_api
+        ))
+
     def test_pinned_guard_accepts_runtime_rendered_signature_on_bridge_node(self):
         manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
         manifest = self._manifest_with_expected_physical_edges(
@@ -2462,6 +2621,41 @@ class RealProjectRegressionTests(unittest.TestCase):
             "version": "0.0.1-SNAPSHOT",
             "scope": "compile",
             "lib_entry": "BOOT-INF/lib/library-0.0.1-SNAPSHOT.jar",
+            "resolution_status": "resolved",
+        }])
+
+    def test_pinned_fat_jar_preparation_enumerates_all_runtime_libraries(self):
+        case = realreg.CASES["gs-messaging-rabbitmq"]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            nested = realreg.io.BytesIO()
+            with realreg.zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr("org/example/Runtime.class", b"class")
+                archive.writestr(
+                    "META-INF/maven/org.example/runtime/pom.properties",
+                    "groupId=org.example\nartifactId=runtime\nversion=1.2.3\n",
+                )
+            artifact = Path(tmp) / "application.jar"
+            with realreg.zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/app/App.class", b"class")
+                archive.writestr("BOOT-INF/lib/runtime-1.2.3.jar", nested.getvalue())
+            asset_gate = {
+                "artifact_path": str(artifact),
+                "artifact_sha256": realreg.hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+
+            realreg.write_pinned_final_artifact_provenance(report_dir, asset_gate, case)
+
+            with (report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(rows, [{
+            "coord": "org.example:runtime",
+            "version": "1.2.3",
+            "scope": "runtime",
+            "lib_entry": "BOOT-INF/lib/runtime-1.2.3.jar",
             "resolution_status": "resolved",
         }])
 

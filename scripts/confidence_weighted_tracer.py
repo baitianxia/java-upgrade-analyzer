@@ -2406,11 +2406,22 @@ def _graph_edge_target_row(edge, api_rows):
     matched_api = _api_row_for_graph_callee(callee_key, api_rows)
     if matched_api is not None:
         return matched_api
+    evidence_type = str(getattr(edge, 'evidence_type', '') or '')
+    if 'field' in evidence_type:
+        field_owner, separator, field_member = callee_key.rpartition('.')
+        for api_row in api_rows or []:
+            owner, member, symbol_kind = _extract_target_owner_and_member(api_row)
+            if (
+                separator
+                and symbol_kind == 'field'
+                and str(owner or '').replace('$', '.') == field_owner.replace('$', '.')
+                and member == field_member
+            ):
+                return api_row
     parsed = _parse_runtime_method_lookup_key(callee_key)
     if not parsed:
         return None
     owner, member, signature = parsed
-    evidence_type = str(getattr(edge, 'evidence_type', '') or '')
     symbol_kind = 'field' if 'field' in evidence_type else 'method'
     return {
         'coord': str(getattr(edge, 'owner_coord', '') or ''),
@@ -4464,7 +4475,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         setattr(graph, '_prefer_runtime_dependency_member_candidate_index', True)
     bridged_hits = []
     for item in hits:
-        if item in business_hits or item.get('signature_ambiguous'):
+        if item.get('signature_ambiguous'):
             continue
         runtime_entry, framework_entries = _packaged_hit_runtime_framework_entry(item, graph)
         if runtime_entry is not None:
@@ -4474,6 +4485,8 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
                 'bridge_edges': [],
                 'framework_entries': framework_entries,
             })
+            continue
+        if item in business_hits:
             continue
         for business_entry, bridge_edges, framework_entries in _find_business_callers_for_packaged_hit(item, graph):
             bridged_hits.append({

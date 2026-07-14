@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import re
 import safe_xml as ET
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -1326,6 +1328,248 @@ def _logical_properties(text):
         yield line_no, key.strip(), [item.strip() for item in values.split(',') if item.strip()]
 
 
+_JAVAP_METHOD_HEADER = re.compile(
+    r'^  (?P<header>.+?\([^;]*\))(?: throws [^;]+)?;$'
+)
+_JAVAP_INSTRUCTION = re.compile(r'^\s*(?P<offset>\d+):\s+(?P<opcode>[a-z][a-z0-9_]*)\b(?P<rest>.*)$')
+_MESSAGE_LISTENER_ADAPTER_INIT = (
+    'org/springframework/amqp/rabbit/listener/adapter/MessageListenerAdapter."<init>":'
+    '(Ljava/lang/Object;Ljava/lang/String;)V'
+)
+
+
+def _descriptor_reference_slots(descriptor, is_static):
+    slots = {}
+    slot = 0 if is_static else 1
+    index = 1
+    while index < len(descriptor) and descriptor[index] != ')':
+        start = index
+        while descriptor[index] == '[':
+            index += 1
+        code = descriptor[index]
+        reference = ''
+        width = 1
+        if code == 'L':
+            end = descriptor.index(';', index)
+            reference = descriptor[index + 1:end].replace('/', '.')
+            index = end + 1
+        else:
+            if code in {'J', 'D'} and start == index:
+                width = 2
+            index += 1
+        if reference and start == index - len(reference) - 2:
+            slots[slot] = reference
+        slot += width
+    return slots
+
+
+def _parse_javap_methods(text):
+    owner_match = re.search(r'^(?:public\s+)?(?:class|interface|enum|record)\s+([\w.$]+)', text, re.MULTILINE)
+    owner = owner_match.group(1) if owner_match else ''
+    methods = []
+    current = None
+    for line in text.splitlines():
+        header_match = _JAVAP_METHOD_HEADER.match(line)
+        if header_match:
+            header = header_match.group('header')
+            prefix = header.split('(', 1)[0].strip()
+            current = {
+                'owner': owner,
+                'member': prefix.rsplit(' ', 1)[-1].rsplit('.', 1)[-1],
+                'header': header,
+                'descriptor': '',
+                'instructions': [],
+            }
+            methods.append(current)
+            continue
+        if current is None:
+            continue
+        descriptor_match = re.match(r'^\s+descriptor:\s+(\S+)\s*$', line)
+        if descriptor_match:
+            current['descriptor'] = descriptor_match.group(1)
+            continue
+        instruction_match = _JAVAP_INSTRUCTION.match(line)
+        if instruction_match:
+            current['instructions'].append({
+                'offset': int(instruction_match.group('offset')),
+                'opcode': instruction_match.group('opcode'),
+                'rest': instruction_match.group('rest'),
+            })
+    return owner, methods
+
+
+def _aload_slot(instruction):
+    opcode = str(instruction.get('opcode') or '')
+    if re.fullmatch(r'aload_[0-3]', opcode):
+        return int(opcode[-1])
+    if opcode == 'aload':
+        match = re.match(r'\s+(\d+)', str(instruction.get('rest') or ''))
+        return int(match.group(1)) if match else None
+    return None
+
+
+def _message_listener_adapter_callbacks(jar_path, coord, activation_evidence):
+    parsed = []
+    errors = []
+    try:
+        with zipfile.ZipFile(jar_path) as jar, tempfile.TemporaryDirectory(
+            prefix='spring-message-listener-adapter-'
+        ) as temporary:
+            class_names = sorted(
+                name for name in jar.namelist()
+                if name.endswith('.class') and not name.startswith('META-INF/')
+            )
+            parsed_entries = set()
+
+            def parse_entry(name):
+                if name in parsed_entries:
+                    return
+                parsed_entries.add(name)
+                content = jar.read(name)
+                class_file = Path(temporary) / f'class-{len(parsed_entries):06d}.class'
+                class_file.write_bytes(content)
+                completed = subprocess.run(
+                    ['javap', '-c', '-p', '-s', str(class_file)],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=30,
+                )
+                if completed.returncode != 0:
+                    errors.append(f'{jar_path}!/{name}:javap_exit_{completed.returncode}')
+                    return
+                owner, methods = _parse_javap_methods(completed.stdout)
+                parsed.append({'owner': owner, 'entry': name, 'methods': methods})
+
+            for name in class_names:
+                if b'MessageListenerAdapter' in jar.read(name):
+                    parse_entry(name)
+
+            callback_owners = set()
+            for item in parsed:
+                for method in item['methods']:
+                    instructions = method['instructions']
+                    for index, instruction in enumerate(instructions):
+                        if (
+                            instruction['opcode'] != 'invokespecial'
+                            or _MESSAGE_LISTENER_ADAPTER_INIT not in instruction['rest']
+                        ):
+                            continue
+                        window = instructions[max(0, index - 4):index]
+                        string_instruction = next((
+                            candidate for candidate in reversed(window)
+                            if candidate['opcode'] in {'ldc', 'ldc_w'}
+                            and re.search(r'//\s+String\s+\S+', candidate['rest'])
+                        ), None)
+                        aload_instruction = next((
+                            candidate for candidate in reversed(window)
+                            if _aload_slot(candidate) is not None
+                            and (
+                                string_instruction is None
+                                or candidate['offset'] < string_instruction['offset']
+                            )
+                        ), None)
+                        if string_instruction is None or aload_instruction is None:
+                            continue
+                        slots = _descriptor_reference_slots(
+                            method['descriptor'], ' static ' in f" {method['header']} "
+                        )
+                        callback_owner = slots.get(_aload_slot(aload_instruction), '')
+                        if callback_owner:
+                            callback_owners.add(callback_owner)
+
+            class_name_set = set(class_names)
+            for callback_owner in sorted(callback_owners):
+                callback_entry = callback_owner.replace('.', '/') + '.class'
+                if callback_entry in class_name_set:
+                    parse_entry(callback_entry)
+    except (OSError, zipfile.BadZipFile, subprocess.TimeoutExpired) as exc:
+        return [], [f'{jar_path}:{type(exc).__name__}']
+
+    descriptors = {}
+    for item in parsed:
+        for method in item['methods']:
+            descriptors.setdefault((item['owner'], method['member']), set()).add(
+                method['descriptor']
+            )
+    callbacks = []
+    seen = set()
+    for item in parsed:
+        for method in item['methods']:
+            instructions = method['instructions']
+            for index, instruction in enumerate(instructions):
+                if (
+                    instruction['opcode'] != 'invokespecial'
+                    or _MESSAGE_LISTENER_ADAPTER_INIT not in instruction['rest']
+                ):
+                    continue
+                window = instructions[max(0, index - 4):index]
+                string_instruction = next((
+                    candidate for candidate in reversed(window)
+                    if candidate['opcode'] in {'ldc', 'ldc_w'}
+                    and re.search(r'//\s+String\s+\S+', candidate['rest'])
+                ), None)
+                aload_instruction = next((
+                    candidate for candidate in reversed(window)
+                    if _aload_slot(candidate) is not None
+                    and (
+                        string_instruction is None
+                        or candidate['offset'] < string_instruction['offset']
+                    )
+                ), None)
+                if string_instruction is None or aload_instruction is None:
+                    continue
+                callback_name_match = re.search(
+                    r'//\s+String\s+(\S+)', string_instruction['rest']
+                )
+                slots = _descriptor_reference_slots(
+                    method['descriptor'], ' static ' in f" {method['header']} "
+                )
+                callback_owner = slots.get(_aload_slot(aload_instruction), '')
+                callback_name = callback_name_match.group(1) if callback_name_match else ''
+                callback_descriptors = descriptors.get((callback_owner, callback_name), set())
+                if not callback_owner or not callback_name or len(callback_descriptors) != 1:
+                    continue
+                callback_descriptor = next(iter(callback_descriptors))
+                identity = (
+                    item['owner'], method['member'], callback_owner,
+                    callback_name, callback_descriptor, instruction['offset'],
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                callbacks.append({
+                    'source': 'framework:spring-amqp-message-listener-adapter',
+                    'target': f'{callback_owner}.{callback_name}',
+                    'target_descriptor': callback_descriptor,
+                    'edge_kind': 'spring_runtime_registered_callback',
+                    'confidence': 'high' if activation_evidence else 'medium',
+                    'conditions': [] if activation_evidence else ['spring_boot_activation_unproven'],
+                    'ambiguity': False,
+                    'runtime_activation': 'active' if activation_evidence else 'unproven',
+                    'provenance': {
+                        'coord': coord,
+                        'jar': str(jar_path),
+                        'artifact_entry': item['entry'],
+                        'line': instruction['offset'],
+                        'registration_owner': item['owner'],
+                        'registration_member': method['member'],
+                        'registration_descriptor': method['descriptor'],
+                        'registration_instruction_offset': instruction['offset'],
+                        'adapter_owner': (
+                            'org.springframework.amqp.rabbit.listener.adapter.MessageListenerAdapter'
+                        ),
+                        'callback_owner': callback_owner,
+                        'callback_member': callback_name,
+                        'callback_descriptor': callback_descriptor,
+                        'business_activation': activation_evidence,
+                        'authority': 'final_artifact_javap_dataflow',
+                    },
+                })
+    return callbacks, errors
+
+
 def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None):
     """Read Spring registrations from the exact packaged runtime jars.
 
@@ -1342,10 +1586,29 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
     seen = set()
     for item in (artifact_catalog or {}).get('entries') or []:
         coord = str(item.get('coord') or '').strip()
-        if coord == '__business__':
-            continue
         jar_path = str(item.get('jar_path') or '').strip()
         if not jar_path or not Path(jar_path).is_file():
+            continue
+        if coord == '__business__':
+            callbacks, callback_errors = _message_listener_adapter_callbacks(
+                jar_path, coord, activation_evidence
+            )
+            errors.extend(callback_errors)
+            for edge in callbacks:
+                identity = (
+                    'message_listener_adapter', edge['target'],
+                    edge.get('target_descriptor'), jar_path,
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                nodes.append({
+                    'id': edge['target'],
+                    'kind': 'spring_runtime_registered_callback',
+                })
+                edges.append(edge)
+                if edge['runtime_activation'] == 'active':
+                    active_callbacks += 1
             continue
         try:
             with zipfile.ZipFile(jar_path) as jar:

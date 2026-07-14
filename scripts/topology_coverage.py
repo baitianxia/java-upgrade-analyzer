@@ -32,6 +32,7 @@ STABLE_TOPOLOGY_IDS = frozenset({
     "same_coord_multimodule", "overloaded_method", "constructor",
     "interface_dispatch", "virtual_dispatch", "static_dispatch", "field_access",
     "invokedynamic", "reflection", "spi", "framework_proxy",
+    "framework_callback",
     "source_bytecode_agree", "source_bytecode_true_conflict",
 })
 EDGE_FIELDS = (
@@ -739,6 +740,218 @@ def _reflection_evidence(inventory: dict, targets: set[tuple[str, str, str]], ed
     return results
 
 
+def _topology_descriptor_reference_slots(descriptor: str, is_static: bool) -> dict[int, str]:
+    slots = {}
+    slot = 0 if is_static else 1
+    index = 1
+    while index < len(descriptor) and descriptor[index] != ")":
+        start = index
+        while descriptor[index] == "[":
+            index += 1
+        code = descriptor[index]
+        width = 1
+        if code == "L":
+            end = descriptor.index(";", index)
+            if start == index:
+                slots[slot] = descriptor[index + 1:end].replace("/", ".")
+            index = end + 1
+        else:
+            if code in {"J", "D"} and start == index:
+                width = 2
+            index += 1
+        slot += width
+    return slots
+
+
+def _topology_aload_slot(opcode: str, rest: str) -> int | None:
+    if re.fullmatch(r"aload_[0-3]", opcode):
+        return int(opcode[-1])
+    if opcode == "aload":
+        match = re.search(r"\b(\d+)\b", rest)
+        return int(match.group(1)) if match else None
+    return None
+
+
+def _topology_javap_methods(entry: str, content: bytes) -> tuple[str, list[dict]]:
+    owner = _class_binary_name(entry)
+    output = _javap_text(content, "-c", "-p", "-s")
+    methods = []
+    current = None
+    for line in output.splitlines():
+        member, kind = _parse_member_header(line, owner)
+        if kind == "method" and member:
+            current = {
+                "owner": owner,
+                "member": member,
+                "header": line.strip(),
+                "descriptor": "",
+                "instructions": [],
+                "artifact_entry": entry,
+            }
+            methods.append(current)
+            continue
+        if current is None:
+            continue
+        descriptor_match = re.match(r"^\s+descriptor:\s+(\S+)\s*$", line)
+        if descriptor_match:
+            current["descriptor"] = descriptor_match.group(1)
+        elif INSTRUCTION_RE.match(line):
+            current["instructions"].append(line)
+    return owner, methods
+
+
+def _framework_callback_evidence(
+    inventory: dict,
+    targets: set[tuple[str, str, str]],
+    edges: list[dict],
+) -> list[dict]:
+    manifest = next((
+        data.decode("utf-8", errors="replace")
+        for name, data in (inventory.get("resources") or {}).items()
+        if name == "META-INF/MANIFEST.MF"
+    ), "")
+    start_match = re.search(r"(?im)^Start-Class:\s*([^\s]+)\s*$", manifest)
+    start_class = start_match.group(1).strip() if start_match else ""
+    if not start_class:
+        return []
+
+    parsed = []
+    method_descriptors: dict[tuple[str, str], set[str]] = defaultdict(set)
+    application_classes = {
+        entry: content
+        for entry, content in (inventory.get("classes") or {}).items()
+        if not _container(entry)
+    }
+    parsed_entries = set()
+
+    def parse_entry(entry: str) -> None:
+        if entry in parsed_entries:
+            return
+        parsed_entries.add(entry)
+        content = application_classes[entry]
+        owner, methods = _topology_javap_methods(entry, content)
+        parsed.extend(methods)
+        for method in methods:
+            method_descriptors[(owner, method["member"])].add(method["descriptor"])
+
+    for entry, content in application_classes.items():
+        if b"MessageListenerAdapter" in content:
+            parse_entry(entry)
+
+    callback_owners = set()
+    for method in parsed:
+        instructions = method["instructions"]
+        for instruction_index, line in enumerate(instructions):
+            match = INSTRUCTION_RE.match(line)
+            if not match:
+                continue
+            _offset, opcode, rest = match.groups()
+            if (
+                opcode != "invokespecial"
+                or "org/springframework/amqp/rabbit/listener/adapter/MessageListenerAdapter.\"<init>\":"
+                "(Ljava/lang/Object;Ljava/lang/String;)V" not in rest
+            ):
+                continue
+            prior = [
+                prior_match.groups()
+                for prior_line in instructions[max(0, instruction_index - 4):instruction_index]
+                if (prior_match := INSTRUCTION_RE.match(prior_line))
+            ]
+            string_item = next((
+                item for item in reversed(prior)
+                if item[1] in {"ldc", "ldc_w"}
+                and re.search(r"//\s+String\s+\S+", item[2])
+            ), None)
+            aload_item = next((
+                item for item in reversed(prior)
+                if _topology_aload_slot(item[1], item[2]) is not None
+                and (string_item is None or int(item[0]) < int(string_item[0]))
+            ), None)
+            if string_item is None or aload_item is None:
+                continue
+            slots = _topology_descriptor_reference_slots(
+                method["descriptor"], " static " in f" {method['header']} "
+            )
+            callback_owner = slots.get(
+                _topology_aload_slot(aload_item[1], aload_item[2]), ""
+            )
+            if callback_owner:
+                callback_owners.add(callback_owner)
+
+    owner_entries = {
+        _class_binary_name(entry): entry for entry in application_classes
+    }
+    for callback_owner in sorted(callback_owners):
+        callback_entry = owner_entries.get(callback_owner)
+        if callback_entry:
+            parse_entry(callback_entry)
+
+    target_edges = [edge for edge in edges if _method_node(edge, "callee") in targets]
+    results = []
+    for method in parsed:
+        instructions = method["instructions"]
+        for instruction_index, line in enumerate(instructions):
+            match = INSTRUCTION_RE.match(line)
+            if not match:
+                continue
+            offset, opcode, rest = match.groups()
+            if (
+                opcode != "invokespecial"
+                or "org/springframework/amqp/rabbit/listener/adapter/MessageListenerAdapter.\"<init>\":"
+                "(Ljava/lang/Object;Ljava/lang/String;)V" not in rest
+            ):
+                continue
+            prior = []
+            for prior_line in instructions[max(0, instruction_index - 4):instruction_index]:
+                prior_match = INSTRUCTION_RE.match(prior_line)
+                if prior_match:
+                    prior.append(prior_match.groups())
+            string_item = next((
+                item for item in reversed(prior)
+                if item[1] in {"ldc", "ldc_w"}
+                and re.search(r"//\s+String\s+\S+", item[2])
+            ), None)
+            aload_item = next((
+                item for item in reversed(prior)
+                if _topology_aload_slot(item[1], item[2]) is not None
+                and (string_item is None or int(item[0]) < int(string_item[0]))
+            ), None)
+            if string_item is None or aload_item is None:
+                continue
+            callback_name_match = re.search(r"//\s+String\s+(\S+)", string_item[2])
+            callback_name = callback_name_match.group(1) if callback_name_match else ""
+            slots = _topology_descriptor_reference_slots(
+                method["descriptor"], " static " in f" {method['header']} "
+            )
+            callback_owner = slots.get(
+                _topology_aload_slot(aload_item[1], aload_item[2]), ""
+            )
+            descriptors = method_descriptors.get((callback_owner, callback_name), set())
+            if not callback_owner or not callback_name or len(descriptors) != 1:
+                continue
+            callback = (callback_owner, callback_name, next(iter(descriptors)))
+            linked_targets = sorted({
+                _method_node(edge, "callee")
+                for edge in target_edges
+                if _method_node(edge, "caller") == callback
+            })
+            if not linked_targets:
+                continue
+            results.append({
+                "registration": [method["owner"], method["member"], method["descriptor"]],
+                "registration_artifact_entry": method["artifact_entry"],
+                "registration_instruction_offset": int(offset),
+                "adapter_owner": (
+                    "org.springframework.amqp.rabbit.listener.adapter.MessageListenerAdapter"
+                ),
+                "callback": list(callback),
+                "targets": [list(target) for target in linked_targets],
+                "start_class": start_class,
+                "evidence_authority": "final_artifact_javap_bounded_dataflow",
+            })
+    return results
+
+
 def _bootstrap_links(inventory: dict, targets: set[tuple[str, str, str]], edges: list[dict]) -> list[dict]:
     links = []
     dynamic_edges = {
@@ -976,8 +1189,15 @@ def extract_artifact_topology_evidence(
         nested = {_container(entry) for entry in candidates if _container(entry)}
         explicit = set(exact_owner_entries.get(str(target.get("owner") or ""), []))
         if not candidates:
-            errors.append(f"target class absent from final artifact: {target.get('owner')}")
-        elif explicit:
+            # JDK and provided dependencies are valid external targets when the
+            # final-artifact Oracle has already proven an exact executable edge.
+            if allowed or explicit:
+                errors.append(
+                    "target class absent from mapped final artifact: "
+                    f"{target.get('owner')}"
+                )
+            continue
+        if explicit:
             if not explicit.issubset(candidates):
                 errors.append(f"exact target owner entry mismatch: {target.get('owner')} expected={sorted(explicit)}")
             else:
@@ -1029,6 +1249,9 @@ def extract_artifact_topology_evidence(
         scan.get("edges") or [], hierarchy,
     )
     reflection = _reflection_evidence(inventory, target_set, scan.get("edges") or [])
+    framework_callbacks = _framework_callback_evidence(
+        inventory, target_set, scan.get("edges") or []
+    )
     bootstrap = _bootstrap_links(inventory, target_set, scan.get("edges") or [])
     source_edges, source_conflicts, verified_source_provenance = _source_attestation_evidence(
         source_root, source_attestation, str(scan.get("artifact_sha256") or ""),
@@ -1041,6 +1264,7 @@ def extract_artifact_topology_evidence(
         "target_apis": targets,
         "registrations": registrations,
         "reflection_target_links": reflection,
+        "framework_callback_links": framework_callbacks,
         "bootstrap_target_links": bootstrap,
         "hierarchy_evidence": hierarchy,
         "hierarchy_scan": hierarchy_scan["metrics"],
@@ -1156,6 +1380,13 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
         for item in artifact_layout.get("reflection_target_links") or []
     ):
         observed.add("reflection")
+    if any(
+        item.get("evidence_authority") == "final_artifact_javap_bounded_dataflow"
+        and item.get("start_class")
+        and item.get("targets")
+        for item in artifact_layout.get("framework_callback_links") or []
+    ):
+        observed.add("framework_callback")
     for item in artifact_layout.get("registrations") or []:
         if item.get("kind") == "spi" and item.get("evidence_authority") == "parsed_service_resource":
             observed.add("spi")

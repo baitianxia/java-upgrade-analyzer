@@ -237,6 +237,71 @@ class EvidenceModelTest(unittest.TestCase):
 
         self.assertEqual(assignments, [])
 
+    def test_registered_business_callback_keeps_framework_activation_path(self):
+        result = tracer.TraceResult(
+            api_name="java.util.concurrent.CountDownLatch.countDown",
+            api_simple="countDown",
+            api_signature="()",
+            symbol_kind="method",
+            change_type="REMOVED",
+            coord="jdk:java.base",
+            severity="P1",
+            confirmed=True,
+            source="fixture",
+            analysis_scope="api",
+            analysis_status="not_analyzed",
+            direct_callers=0,
+            is_reachable=None,
+            reachable_note="",
+            business_reach_depth=0,
+            dependency_chain_coords=[],
+            call_paths=[],
+            evidence_paths=[],
+            reason_code="",
+            verification_commands=[],
+            hops=[],
+            confidence_score=1.0,
+            critical_nodes_hit=[],
+        )
+        hit = {
+            "coord": "__business__",
+            "jar_path": "/artifact/application.jar",
+            "class_fqcn": "com.example.Receiver",
+            "consumer_method": "receiveMessage",
+            "consumer_signature": "(String)",
+            "target_display": "java.util.concurrent.CountDownLatch.countDown()",
+            "evidence_type": "bytecode_method_invocation",
+        }
+        graph = type("Graph", (), {})()
+        graph.framework_runtime_entry_methods = {
+            "com.example.Receiver.receiveMessage": [{
+                "adapter": "spring_runtime_artifact",
+                "source": "framework:spring-amqp-message-listener-adapter",
+                "edge_kind": "spring_runtime_registered_callback",
+                "runtime_activation": "active",
+                "confidence": "high",
+                "provenance": {
+                    "coord": "__business__",
+                    "jar": "/artifact/application.jar",
+                    "line": 7,
+                    "business_activation": [{
+                        "business_entry": "com.example.Application.main",
+                        "spring_application_run": True,
+                    }],
+                },
+            }],
+        }
+
+        built = tracer._build_packaged_dependency_hit_result(result, [hit], graph)
+
+        self.assertEqual(built.analysis_status, "reachable")
+        self.assertEqual(built.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
+        self.assertTrue(any(
+            "com.example.Application.main -> Spring Boot框架注册" in path
+            and "com.example.Receiver.receiveMessage(String)" in path
+            for path in built.call_paths
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

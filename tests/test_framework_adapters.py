@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -521,6 +523,85 @@ class FrameworkAdaptersTest(unittest.TestCase):
         stats = attach_framework_edges_to_graph(graph, payload)
         self.assertEqual(stats["runtime_framework_entry_methods"], 1)
         self.assertIn("com.vendor.RuntimeListener.onApplicationEvent", graph.framework_runtime_entry_methods)
+
+    @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
+    def test_packaged_message_listener_adapter_registers_exact_business_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            source = module / "compile-src"
+            adapter = (
+                source / "org/springframework/amqp/rabbit/listener/adapter/"
+                "MessageListenerAdapter.java"
+            )
+            receiver = source / "com/acme/Receiver.java"
+            application = source / "com/acme/Application.java"
+            for path in (adapter, receiver, application):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            adapter.write_text(
+                "package org.springframework.amqp.rabbit.listener.adapter; "
+                "public class MessageListenerAdapter { "
+                "public MessageListenerAdapter(Object target, String method) {} }",
+                encoding="utf-8",
+            )
+            receiver.write_text(
+                "package com.acme; public class Receiver { "
+                "public void handlePayload(String value) {} }",
+                encoding="utf-8",
+            )
+            application.write_text(
+                "package com.acme; "
+                "import org.springframework.amqp.rabbit.listener.adapter.MessageListenerAdapter; "
+                "public class Application { MessageListenerAdapter listenerAdapter(Receiver receiver) { "
+                "return new MessageListenerAdapter(receiver, \"handlePayload\"); } }",
+                encoding="utf-8",
+            )
+            classes = module / "classes"
+            classes.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(classes), str(adapter), str(receiver), str(application)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            business_jar = module / "business.jar"
+            with zipfile.ZipFile(business_jar, "w") as jar:
+                for class_file in sorted(classes.rglob("*.class")):
+                    relative = class_file.relative_to(classes).as_posix()
+                    if relative.startswith("com/acme/"):
+                        jar.write(class_file, relative)
+            source_root = module / "src/main/java/com/acme"
+            source_root.mkdir(parents=True)
+            (source_root / "Boot.java").write_text(
+                "package com.acme; import org.springframework.boot.SpringApplication; "
+                "class Boot { public static void main(String[] args) { "
+                "SpringApplication.run(Boot.class, args); } }",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters(
+                [{"root": str(module / "src/main/java")}],
+                artifact_catalog={"entries": [{
+                    "coord": "__business__",
+                    "jar_path": str(business_jar),
+                    "evidence_source": "current_final_artifact",
+                }]},
+            )
+
+        runtime = next(
+            item for item in payload["adapters"]
+            if item["adapter"] == "spring_runtime_artifact"
+        )
+        callback = next(
+            edge for edge in runtime["edges"]
+            if edge["edge_kind"] == "spring_runtime_registered_callback"
+        )
+        self.assertEqual(callback["target"], "com.acme.Receiver.handlePayload")
+        self.assertEqual(callback["target_descriptor"], "(Ljava/lang/String;)V")
+        self.assertEqual(callback["runtime_activation"], "active")
+        self.assertEqual(callback["provenance"]["coord"], "__business__")
+        self.assertEqual(callback["provenance"]["registration_owner"], "com.acme.Application")
+        self.assertEqual(callback["provenance"]["registration_member"], "listenerAdapter")
+        self.assertEqual(callback["provenance"]["registration_instruction_offset"], 7)
 
     def test_dependency_test_source_does_not_activate_spring_boot_runtime_callbacks(self):
         with tempfile.TemporaryDirectory() as tmp:

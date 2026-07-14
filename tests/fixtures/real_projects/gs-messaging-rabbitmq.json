@@ -1,0 +1,137 @@
+{
+  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "case": "gs-messaging-rabbitmq",
+  "repository": "spring-guides/gs-messaging-rabbitmq",
+  "checkout_root": "/private/tmp/gs-messaging-rabbitmq/complete",
+  "git_revision": "3e112f5e956bf61e6cc1ec92c8a5a9a96f738d86",
+  "artifact_path": "target/messaging-rabbitmq-complete-0.0.1-SNAPSHOT.jar",
+  "artifact_sha256": "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+  "required_topologies": [
+    "business_direct",
+    "framework_callback"
+  ],
+  "framework_callback": {
+    "registration_owner": "com.example.messagingrabbitmq.MessagingRabbitmqApplication",
+    "registration_member": "listenerAdapter",
+    "callback_owner": "com.example.messagingrabbitmq.Receiver",
+    "callback_member": "receiveMessage",
+    "callback_descriptor": "(Ljava/lang/String;)V",
+    "adapter_owner": "org.springframework.amqp.rabbit.listener.adapter.MessageListenerAdapter",
+    "registration_instruction_offset": 7
+  },
+  "apis": [
+    {
+      "coord": "jdk:java.base",
+      "owner": "java.lang.System",
+      "member": "out",
+      "descriptor": "Ljava/io/PrintStream;",
+      "symbol_kind": "field",
+      "expected_conclusion": "reachable",
+      "expected_chain": [
+        "com.example.messagingrabbitmq.MessagingRabbitmqApplication.main",
+        "Spring Boot框架注册",
+        "com.example.messagingrabbitmq.Receiver.receiveMessage",
+        "java.lang.System.out"
+      ]
+    },
+    {
+      "coord": "jdk:java.base",
+      "owner": "java.io.PrintStream",
+      "member": "println",
+      "descriptor": "(Ljava/lang/String;)V",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable",
+      "expected_chain": [
+        "com.example.messagingrabbitmq.MessagingRabbitmqApplication.main",
+        "Spring Boot框架注册",
+        "com.example.messagingrabbitmq.Receiver.receiveMessage",
+        "java.io.PrintStream.println"
+      ]
+    },
+    {
+      "coord": "jdk:java.base",
+      "owner": "java.util.concurrent.CountDownLatch",
+      "member": "countDown",
+      "descriptor": "()V",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable",
+      "expected_chain": [
+        "com.example.messagingrabbitmq.MessagingRabbitmqApplication.main",
+        "Spring Boot框架注册",
+        "com.example.messagingrabbitmq.Receiver.receiveMessage",
+        "java.util.concurrent.CountDownLatch.countDown"
+      ]
+    }
+  ],
+  "canonical_edges": [
+    {
+      "artifact_sha256": "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+      "artifact_entry": "BOOT-INF/classes/com/example/messagingrabbitmq/Runner.class",
+      "caller_owner": "com.example.messagingrabbitmq.Runner",
+      "caller_member": "run",
+      "caller_descriptor": "([Ljava/lang/String;)V",
+      "callee_owner": "java.lang.System",
+      "callee_member": "out",
+      "callee_descriptor": "Ljava/io/PrintStream;",
+      "opcode_family": "getstatic",
+      "instruction_offset": 0
+    },
+    {
+      "artifact_sha256": "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+      "artifact_entry": "BOOT-INF/classes/com/example/messagingrabbitmq/Runner.class",
+      "caller_owner": "com.example.messagingrabbitmq.Runner",
+      "caller_member": "run",
+      "caller_descriptor": "([Ljava/lang/String;)V",
+      "callee_owner": "java.io.PrintStream",
+      "callee_member": "println",
+      "callee_descriptor": "(Ljava/lang/String;)V",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 5
+    },
+    {
+      "artifact_sha256": "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+      "artifact_entry": "BOOT-INF/classes/com/example/messagingrabbitmq/Receiver.class",
+      "caller_owner": "com.example.messagingrabbitmq.Receiver",
+      "caller_member": "receiveMessage",
+      "caller_descriptor": "(Ljava/lang/String;)V",
+      "callee_owner": "java.lang.System",
+      "callee_member": "out",
+      "callee_descriptor": "Ljava/io/PrintStream;",
+      "opcode_family": "getstatic",
+      "instruction_offset": 0
+    },
+    {
+      "artifact_sha256": "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+      "artifact_entry": "BOOT-INF/classes/com/example/messagingrabbitmq/Receiver.class",
+      "caller_owner": "com.example.messagingrabbitmq.Receiver",
+      "caller_member": "receiveMessage",
+      "caller_descriptor": "(Ljava/lang/String;)V",
+      "callee_owner": "java.io.PrintStream",
+      "callee_member": "println",
+      "callee_descriptor": "(Ljava/lang/String;)V",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 9
+    },
+    {
+      "artifact_sha256": "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+      "artifact_entry": "BOOT-INF/classes/com/example/messagingrabbitmq/Receiver.class",
+      "caller_owner": "com.example.messagingrabbitmq.Receiver",
+      "caller_member": "receiveMessage",
+      "caller_descriptor": "(Ljava/lang/String;)V",
+      "callee_owner": "java.util.concurrent.CountDownLatch",
+      "callee_member": "countDown",
+      "callee_descriptor": "()V",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 16
+    }
+  ],
+  "expected_conclusion": "reachable",
+  "fixture_debt": [
+    {
+      "finding_id": "spring_message_listener_adapter_reflection_callback",
+      "state": "fixed",
+      "fixture": "tests.test_real_project_regression.RealProjectRegressionTests.test_gs_messaging_rabbitmq_reflection_callback_guard",
+      "reason": "Real final-artifact audit must prove the string-selected callback before all API conclusions can pass."
+    }
+  ]
+}

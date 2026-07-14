@@ -129,6 +129,34 @@ def _edge_targets(edge: dict, targets: set[tuple[str, str, str]]) -> bool:
     )
 
 
+def _reverse_target_closure(
+    rows: list[dict], targets: set[tuple[str, str, str]]
+) -> list[dict]:
+    """Keep only physical edges that participate in the selected reverse closure."""
+    frontier = set(targets)
+    expanded: set[tuple[str, str, str]] = set()
+    selected_indexes: set[int] = set()
+    while frontier:
+        pending = frontier - expanded
+        if not pending:
+            break
+        expanded.update(pending)
+        matched_indexes = {
+            index for index, edge in enumerate(rows)
+            if _edge_targets(edge, pending)
+        }
+        selected_indexes.update(matched_indexes)
+        frontier.update({
+            (
+                str(rows[index].get("caller_owner") or ""),
+                str(rows[index].get("caller_member") or ""),
+                str(rows[index].get("caller_descriptor") or ""),
+            )
+            for index in matched_indexes
+        })
+    return [row for index, row in enumerate(rows) if index in selected_indexes]
+
+
 def _is_runtime_class(entry: str) -> bool:
     return entry.endswith(".class") and not entry.startswith("META-INF/") and not entry.endswith("module-info.class")
 
@@ -1135,6 +1163,8 @@ def scan_final_artifact(
         failures.append(f"oracle_time_budget_exceeded:{budget:.3f}s")
     if interrupted:
         failures.append("oracle_interrupted")
+    if normalized_targets:
+        rows = _reverse_target_closure(rows, set(normalized_targets))
     rows.sort(key=lambda row: (
         canonical_edge_identity(row), row["artifact_entry"], row["instruction_offset"]
     ))

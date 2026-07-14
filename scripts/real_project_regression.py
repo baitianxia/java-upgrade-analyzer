@@ -807,6 +807,33 @@ CASES["gs-multi-module"] = RealProjectCase(
     ),
 )
 
+CASES["gs-messaging-rabbitmq"] = RealProjectCase(
+    name="gs-messaging-rabbitmq",
+    default_project=Path("/private/tmp/gs-messaging-rabbitmq/complete"),
+    default_changed_apis=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "gs-messaging-rabbitmq-changed-apis.csv"
+    ),
+    baseline_specs=(),
+    source_dirs=(Path("src/main/java"),),
+    require_valid_git=True,
+    min_project_java_files=3,
+    min_main_java_files=3,
+    case_mode="guard",
+    ground_truth_status="reviewed",
+    enable_jdk_oracle=True,
+    bytecode_coord="jdk:java.base",
+    final_artifact=Path(
+        "/private/tmp/gs-messaging-rabbitmq/complete/target/"
+        "messaging-rabbitmq-complete-0.0.1-SNAPSHOT.jar"
+    ),
+    required_topologies=("business_direct", "framework_callback"),
+    fixture_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "gs-messaging-rabbitmq.json"
+    ),
+)
+
 CASES = {
     name: apply_real_case_performance_budget(case)
     for name, case in CASES.items()
@@ -814,6 +841,7 @@ CASES = {
 
 
 _CHANGE_API_MARKER_RE = re.compile(r"变更\s*API\s*[：:]")
+_BUSINESS_ARTIFACT_NODE_PREFIX_RE = re.compile(r"^(?:业务制品|BUSINESS)\s*[：:]\s*")
 
 
 def _expected_target_signature(expected_api: dict) -> str:
@@ -833,16 +861,17 @@ def _matches_expected_call_chain(path_text: str, expected_chain: list[str], expe
     marker_indexes = [index for index, node in enumerate(nodes) if _CHANGE_API_MARKER_RE.search(node)]
     if any(index != len(nodes) - 1 for index in marker_indexes) or len(marker_indexes) > 1:
         return False
-    if any(
-        actual != expected
-        and not (
-            "(" not in expected
-            and re.fullmatch(r"(.+?)(\(.*\))", actual)
-            and re.fullmatch(r"(.+?)(\(.*\))", actual).group(1).strip() == expected
+    for actual, expected in zip(nodes[:-1], expected_chain[:-1]):
+        normalized_actual = _BUSINESS_ARTIFACT_NODE_PREFIX_RE.sub(
+            "", actual, count=1
         )
-        for actual, expected in zip(nodes[:-1], expected_chain[:-1])
-    ):
-        return False
+        signature_match = re.fullmatch(r"(.+?)(\(.*\))", normalized_actual)
+        if normalized_actual != expected and not (
+            "(" not in expected
+            and signature_match
+            and signature_match.group(1).strip() == expected
+        ):
+            return False
 
     target_identity = ".".join(
         item for item in (
@@ -851,11 +880,15 @@ def _matches_expected_call_chain(path_text: str, expected_chain: list[str], expe
         ) if item
     )
     expected_signature = _expected_target_signature(expected_api)
-    if not target_identity or expected_chain[-1] != target_identity or not expected_signature:
+    if not target_identity or expected_chain[-1] != target_identity:
         return False
     terminal = nodes[-1]
     if marker_indexes:
         terminal = _CHANGE_API_MARKER_RE.sub("", terminal, count=1).strip()
+    if str((expected_api or {}).get("symbol_kind") or "").strip() == "field":
+        return terminal == target_identity
+    if not expected_signature:
+        return False
     terminal_match = re.fullmatch(r"(.+?)(\(.*\))", terminal)
     if not terminal_match or terminal_match.group(1).strip() != target_identity:
         return False
@@ -913,23 +946,42 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
            for item in conclusion_rows):
         errors.append("SOURCE_BYTECODE_EDGE_CONFLICT")
 
-    expected_api = manifest.get("api") or {}
-    expected_name = ".".join(
-        item for item in (str(expected_api.get("owner") or ""), str(expected_api.get("member") or ""))
-        if item
-    )
-    reachable_rows = [
-        row for row in (summary.get("reachable_apis") or [])
-        if str(row.get("api") or row.get("api_name") or "") == expected_name
-        and str(row.get("analysis_status") or "reachable") == str(manifest.get("expected_conclusion") or "")
-    ]
-    if not reachable_rows:
-        errors.append("expected_conclusion_missing")
-    expected_chain = [str(item) for item in (manifest.get("expected_chain") or [])]
-    if reachable_rows and expected_chain:
-        call_paths = [path for row in reachable_rows for path in _reachable_call_paths(row)]
-        if not any(_matches_expected_call_chain(path, expected_chain, expected_api) for path in call_paths):
-            errors.append("expected_chain_missing")
+    expected_apis = list(manifest.get("apis") or [])
+    if not expected_apis and manifest.get("api"):
+        expected_apis = [{
+            **(manifest.get("api") or {}),
+            "expected_conclusion": manifest.get("expected_conclusion"),
+            "expected_chain": manifest.get("expected_chain"),
+        }]
+    for expected_api in expected_apis:
+        expected_name = ".".join(
+            item for item in (
+                str(expected_api.get("owner") or ""),
+                str(expected_api.get("member") or ""),
+            ) if item
+        )
+        expected_conclusion = str(
+            expected_api.get("expected_conclusion")
+            or manifest.get("expected_conclusion")
+            or ""
+        )
+        reachable_rows = [
+            row for row in (summary.get("reachable_apis") or [])
+            if str(row.get("api") or row.get("api_name") or "") == expected_name
+            and str(row.get("analysis_status") or "reachable") == expected_conclusion
+        ]
+        if not reachable_rows:
+            if "expected_conclusion_missing" not in errors:
+                errors.append("expected_conclusion_missing")
+            continue
+        expected_chain = [str(item) for item in (expected_api.get("expected_chain") or [])]
+        if expected_chain:
+            call_paths = [path for row in reachable_rows for path in _reachable_call_paths(row)]
+            if not any(
+                _matches_expected_call_chain(path, expected_chain, expected_api)
+                for path in call_paths
+            ) and "expected_chain_missing" not in errors:
+                errors.append("expected_chain_missing")
 
     topology = result.get("topology_coverage") or {}
     required = set(manifest.get("required_topologies") or [])
@@ -1220,6 +1272,7 @@ def write_pinned_final_artifact_provenance(
     coordinate = str(case.bytecode_coord or "").strip()
     artifact_id = coordinate.split(":", 1)[-1] if ":" in coordinate else ""
     nested_entry = ""
+    runtime_entries: list[dict[str, str]] = []
     if artifact_id and artifact_path.is_file():
         try:
             with zipfile.ZipFile(artifact_path) as archive:
@@ -1231,6 +1284,45 @@ def write_pinned_final_artifact_provenance(
                 ]
                 if len(candidates) == 1:
                     nested_entry = candidates[0]
+                for name in sorted(
+                    item for item in archive.namelist()
+                    if item.startswith("BOOT-INF/lib/") and item.endswith(".jar")
+                ):
+                    properties_rows = []
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(archive.read(name))) as nested:
+                            for metadata_name in nested.namelist():
+                                if not re.fullmatch(
+                                    r"META-INF/maven/[^/]+/[^/]+/pom\.properties",
+                                    metadata_name,
+                                ):
+                                    continue
+                                properties = {}
+                                for line in nested.read(metadata_name).decode(
+                                    "utf-8", errors="replace"
+                                ).splitlines():
+                                    key, separator, value = line.strip().partition("=")
+                                    if separator:
+                                        properties[key.strip()] = value.strip()
+                                if all(properties.get(key) for key in (
+                                    "groupId", "artifactId", "version"
+                                )):
+                                    properties_rows.append(properties)
+                    except (KeyError, OSError, zipfile.BadZipFile):
+                        properties_rows = []
+                    if len(properties_rows) == 1:
+                        properties = properties_rows[0]
+                        runtime_entries.append({
+                            "coord": f"{properties['groupId']}:{properties['artifactId']}",
+                            "version": properties["version"],
+                            "lib_entry": name,
+                        })
+                    else:
+                        runtime_entries.append({
+                            "coord": f"runtime:{Path(name).stem}",
+                            "version": "runtime",
+                            "lib_entry": name,
+                        })
         except (OSError, zipfile.BadZipFile):
             pass
     version = next(
@@ -1249,13 +1341,24 @@ def write_pinned_final_artifact_provenance(
             fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"],
         )
         writer.writeheader()
-        writer.writerow({
-            "coord": coordinate,
-            "version": version,
-            "scope": "compile",
-            "lib_entry": nested_entry,
-            "resolution_status": "resolved" if nested_entry else "unresolved",
-        })
+        if nested_entry:
+            writer.writerow({
+                "coord": coordinate,
+                "version": version,
+                "scope": "compile",
+                "lib_entry": nested_entry,
+                "resolution_status": "resolved",
+            })
+        for runtime_item in runtime_entries:
+            if runtime_item["lib_entry"] == nested_entry:
+                continue
+            writer.writerow({
+                "coord": runtime_item["coord"],
+                "version": runtime_item["version"],
+                "scope": "runtime",
+                "lib_entry": runtime_item["lib_entry"],
+                "resolution_status": "resolved",
+            })
     return output
 
 

@@ -553,6 +553,188 @@ class TopologyCoverageTest(unittest.TestCase):
         self.assertFalse(evidence["complete"])
         self.assertTrue(any("ambiguous target artifact entries" in item for item in evidence["errors"]))
 
+    def test_external_jdk_target_does_not_need_its_class_packaged_in_the_artifact(self):
+        target_edge = {
+            "artifact_sha256": "a" * 64,
+            "artifact_entry": "BOOT-INF/classes/sample/App.class",
+            "caller_owner": "sample.App",
+            "caller_member": "run",
+            "caller_descriptor": "()V",
+            "callee_owner": "java.util.concurrent.CountDownLatch",
+            "callee_member": "countDown",
+            "callee_descriptor": "()V",
+            "opcode_family": "invokevirtual",
+            "instruction_offset": 4,
+        }
+        inventory = {
+            "classes": {"BOOT-INF/classes/sample/App.class": b"fixture"},
+            "resources": {},
+            "containers": set(),
+        }
+        hierarchy = {
+            "relations": [],
+            "errors": [],
+            "metrics": {
+                "class_entries": 1,
+                "completed_class_entries": 1,
+                "timed_out_class_entries": 0,
+                "worker_count": 1,
+                "elapsed_sec": 0.0,
+            },
+        }
+        with mock.patch.object(
+            topology_coverage, "_archive_inventory", return_value=inventory
+        ), mock.patch.object(
+            topology_coverage, "_scan_class_hierarchy", return_value=hierarchy
+        ):
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                Path("application.jar"),
+                [{
+                    "coord": "jdk:java.base",
+                    "api_name": "java.util.concurrent.CountDownLatch.countDown",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                }],
+                {},
+                oracle_scan={
+                    "edges": [target_edge],
+                    "complete": True,
+                    "artifact_sha256": "a" * 64,
+                    "failures": [],
+                },
+            )
+
+        self.assertTrue(evidence["complete"], evidence["errors"])
+        self.assertIn(
+            "business_direct",
+            topology_coverage.classify_topologies(
+                evidence["edges"], evidence["artifact_layout"]
+            ),
+        )
+
+    def test_mapped_runtime_target_must_exist_in_the_final_artifact(self):
+        target_edge = {
+            "artifact_sha256": "a" * 64,
+            "artifact_entry": "BOOT-INF/classes/sample/App.class",
+            "caller_owner": "sample.App",
+            "caller_member": "run",
+            "caller_descriptor": "()V",
+            "callee_owner": "com.vendor.Target",
+            "callee_member": "removed",
+            "callee_descriptor": "()V",
+            "opcode_family": "invokevirtual",
+            "instruction_offset": 4,
+        }
+        inventory = {
+            "classes": {"BOOT-INF/classes/sample/App.class": b"fixture"},
+            "resources": {},
+            "containers": set(),
+        }
+        hierarchy = {
+            "relations": [],
+            "errors": [],
+            "metrics": {
+                "class_entries": 1,
+                "completed_class_entries": 1,
+                "timed_out_class_entries": 0,
+                "worker_count": 1,
+                "elapsed_sec": 0.0,
+            },
+        }
+        with mock.patch.object(
+            topology_coverage, "_archive_inventory", return_value=inventory
+        ), mock.patch.object(
+            topology_coverage, "_scan_class_hierarchy", return_value=hierarchy
+        ):
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                Path("application.jar"),
+                [{
+                    "coord": "com.vendor:target",
+                    "api_name": "com.vendor.Target.removed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                }],
+                {"com.vendor:target": ["BOOT-INF/lib/target.jar"]},
+                oracle_scan={
+                    "edges": [target_edge],
+                    "complete": True,
+                    "artifact_sha256": "a" * 64,
+                    "failures": [],
+                },
+            )
+
+        self.assertFalse(evidence["complete"])
+        self.assertIn(
+            "target class absent from mapped final artifact: com.vendor.Target",
+            evidence["errors"],
+        )
+
+    def test_message_listener_adapter_registration_is_framework_callback_topology(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "src"
+            adapter = (
+                source / "org/springframework/amqp/rabbit/listener/adapter/"
+                "MessageListenerAdapter.java"
+            )
+            receiver = source / "sample/Receiver.java"
+            application = source / "sample/Application.java"
+            for path in (adapter, receiver, application):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            adapter.write_text(
+                "package org.springframework.amqp.rabbit.listener.adapter; "
+                "public class MessageListenerAdapter { "
+                "public MessageListenerAdapter(Object target, String method) {} }",
+                encoding="utf-8",
+            )
+            receiver.write_text(
+                "package sample; import java.util.concurrent.CountDownLatch; "
+                "public class Receiver { public void handlePayload(String value) { "
+                "new CountDownLatch(1).countDown(); } }",
+                encoding="utf-8",
+            )
+            application.write_text(
+                "package sample; import org.springframework.amqp.rabbit.listener.adapter.MessageListenerAdapter; "
+                "public class Application { MessageListenerAdapter listenerAdapter(Receiver receiver) { "
+                "return new MessageListenerAdapter(receiver, \"handlePayload\"); } "
+                "public static void main(String[] args) {} }",
+                encoding="utf-8",
+            )
+            classes = root / "classes"
+            _compile(classes, [adapter, receiver, application])
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "META-INF/MANIFEST.MF",
+                    "Manifest-Version: 1.0\nStart-Class: sample.Application\n",
+                )
+                for class_file in sorted(classes.rglob("*.class")):
+                    relative = class_file.relative_to(classes).as_posix()
+                    if relative.startswith("sample/"):
+                        archive.write(class_file, "BOOT-INF/classes/" + relative)
+            changed_rows = [{
+                "coord": "jdk:java.base",
+                "api_name": "java.util.concurrent.CountDownLatch.countDown",
+                "api_signature": "()",
+                "symbol_kind": "method",
+            }]
+
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact, changed_rows, {}
+            )
+            observed = topology_coverage.classify_topologies(
+                evidence["edges"], evidence["artifact_layout"]
+            )
+
+        self.assertTrue(evidence["complete"], evidence["errors"])
+        self.assertIn("framework_callback", observed)
+        callback = evidence["artifact_layout"]["framework_callback_links"][0]
+        self.assertEqual(callback["callback"], [
+            "sample.Receiver", "handlePayload", "(Ljava/lang/String;)V",
+        ])
+        self.assertEqual(callback["registration_instruction_offset"], 7)
+        self.assertEqual(callback["start_class"], "sample.Application")
+
     def test_source_conflict_requires_verified_provenance_and_explicit_normalization(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

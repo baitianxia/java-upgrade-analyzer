@@ -533,6 +533,49 @@ class FinalArtifactEdgeOracleTest(unittest.TestCase):
         self.assertIn(("fixture.Bridge", "top", "fixture.Bridge", "middle"), relations)
         self.assertIn(("fixture.App", "run", "fixture.Bridge", "top"), relations)
 
+    def test_selected_api_scan_excludes_unrelated_edges_from_a_candidate_class(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "src"
+            sources = [
+                _write_source(
+                    source_root,
+                    "fixture/Target.java",
+                    "package fixture; public class Target { public static void changed() {} }",
+                ),
+                _write_source(
+                    source_root,
+                    "fixture/Bridge.java",
+                    "package fixture; public class Bridge { public String call() { "
+                    "Target.changed(); return String.valueOf(1); } }",
+                ),
+            ]
+            classes = root / "classes"
+            classes.mkdir()
+            _compile(classes, sources)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                for class_file in sorted(classes.rglob("*.class")):
+                    archive.write(
+                        class_file,
+                        "BOOT-INF/classes/" + class_file.relative_to(classes).as_posix(),
+                    )
+
+            result = oracle.scan_final_artifact(
+                artifact,
+                selected_targets=[{
+                    "owner": "fixture.Target", "member": "changed", "descriptor": "()V",
+                }],
+            )
+
+        self.assertTrue(result["complete"], result["failures"])
+        relations = {
+            (row["callee_owner"], row["callee_member"])
+            for row in result["edges"]
+        }
+        self.assertIn(("fixture.Target", "changed"), relations)
+        self.assertNotIn(("java.lang.String", "valueOf"), relations)
+
     def test_batched_javap_keeps_each_class_bound_to_its_artifact_entry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
