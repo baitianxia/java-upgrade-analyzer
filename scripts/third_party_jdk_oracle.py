@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections import defaultdict, deque
 import hashlib
 import re
 import subprocess
@@ -12,6 +13,15 @@ from pathlib import Path
 
 CALL_RE = re.compile(
     r"//\s+(?:InterfaceMethod|Method)\s+([\w/$]+)\.\"?([^\":]+)\"?:(\([^)]*\)).*"
+)
+GRAPH_CALL_RE = re.compile(
+    r"//\s+(?:InterfaceMethod|Method)\s+"
+    r"(?:(?P<owner>[\w/$]+)\.)?\"?(?P<member>[^\":.]+)\"?:"
+    r"(?P<descriptor>\([^)]*\)).*"
+)
+CLASS_HEADER_RE = re.compile(
+    r"^(?:public\s+|protected\s+|private\s+|abstract\s+|final\s+|sealed\s+)*"
+    r"(?:class|interface|enum)\s+([\w.$]+)(?:\s|\{|$)"
 )
 PRIMITIVES = {
     "boolean": "Z", "byte": "B", "char": "C", "short": "S",
@@ -199,7 +209,94 @@ def _target_key(row: dict) -> tuple[str, str, str] | None:
     return owner.replace(".", "/"), member, descriptor
 
 
-def scan_class_files(changed_rows: list[dict], class_files: list[Path], evidence_dir: Path) -> list[dict]:
+def _method_name(declaration: str, class_name: str) -> str:
+    value = declaration.strip()
+    if value == "static {};":
+        return "<clinit>"
+    if "(" not in value or not value.endswith(";"):
+        return ""
+    prefix = value[:value.index("(")].strip()
+    candidate = prefix.rsplit(" ", 1)[-1]
+    if candidate == class_name or candidate == class_name.rsplit(".", 1)[-1]:
+        return "<init>"
+    return candidate if re.fullmatch(r"[\w$]+", candidate) else ""
+
+
+def _parse_method_graph(output: str) -> tuple[set[tuple[str, str, str]], dict[tuple[str, str, str], set[tuple[str, str, str]]]]:
+    """Parse javap output into methods and reverse invocation edges."""
+    methods: set[tuple[str, str, str]] = set()
+    incoming: dict[tuple[str, str, str], set[tuple[str, str, str]]] = defaultdict(set)
+    class_name = ""
+    pending_member = ""
+    caller: tuple[str, str, str] | None = None
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        class_match = CLASS_HEADER_RE.match(stripped)
+        if class_match:
+            class_name = class_match.group(1)
+            pending_member = ""
+            caller = None
+            continue
+        if not class_name:
+            continue
+        member = _method_name(stripped, class_name)
+        if member:
+            pending_member = member
+            caller = None
+            continue
+        if pending_member and stripped.startswith("descriptor:"):
+            descriptor = stripped.split(":", 1)[1].strip()
+            if descriptor.startswith("(") and ")" in descriptor:
+                caller = (
+                    class_name.replace(".", "/"),
+                    pending_member,
+                    descriptor[:descriptor.index(")") + 1],
+                )
+                methods.add(caller)
+            pending_member = ""
+            continue
+        call_match = GRAPH_CALL_RE.search(raw_line)
+        if caller is None or call_match is None:
+            continue
+        callee = (
+            call_match.group("owner") or caller[0],
+            call_match.group("member"),
+            call_match.group("descriptor"),
+        )
+        incoming[callee].add(caller)
+    return methods, incoming
+
+
+def _owner_is_business(owner: str, business_class_files: list[Path]) -> bool:
+    suffix = "/" + owner + ".class"
+    return any(path.as_posix().endswith(suffix) for path in business_class_files)
+
+
+def _target_reaches_business(
+    target: tuple[str, str, str],
+    incoming: dict[tuple[str, str, str], set[tuple[str, str, str]]],
+    business_class_files: list[Path],
+) -> bool:
+    pending = deque(incoming.get(target, ()))
+    visited: set[tuple[str, str, str]] = set()
+    while pending:
+        caller = pending.popleft()
+        if caller in visited:
+            continue
+        visited.add(caller)
+        if _owner_is_business(caller[0], business_class_files):
+            return True
+        pending.extend(incoming.get(caller, ()))
+    return False
+
+
+def scan_class_files(
+    changed_rows: list[dict],
+    class_files: list[Path],
+    evidence_dir: Path,
+    *,
+    business_class_files: list[Path] | None = None,
+) -> list[dict]:
     targets: dict[tuple[str, str, str], list[dict]] = {}
     for row in changed_rows:
         if str(row.get("symbol_kind") or "") not in {"method", "constructor"}:
@@ -211,6 +308,7 @@ def scan_class_files(changed_rows: list[dict], class_files: list[Path], evidence
     evidence_dir.mkdir(parents=True, exist_ok=True)
     evidence_path = evidence_dir / "jdk_javap_calls.txt"
     matched: dict[tuple[str, str, str], dict] = {}
+    graph_incoming: dict[tuple[str, str, str], set[tuple[str, str, str]]] = defaultdict(set)
     with evidence_path.open("w", encoding="utf-8") as evidence:
         for offset in range(0, len(class_files), 100):
             batch = class_files[offset:offset + 100]
@@ -226,6 +324,9 @@ def scan_class_files(changed_rows: list[dict], class_files: list[Path], evidence
             evidence.write(completed.stdout)
             if completed.stderr:
                 evidence.write(completed.stderr)
+            _methods, batch_incoming = _parse_method_graph(completed.stdout)
+            for callee, callers in batch_incoming.items():
+                graph_incoming[callee].update(callers)
             for owner, member, descriptor in CALL_RE.findall(completed.stdout):
                 key = (owner, member, descriptor)
                 if key in targets:
@@ -236,14 +337,22 @@ def scan_class_files(changed_rows: list[dict], class_files: list[Path], evidence
         ["javap", "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30
     ).stdout.strip()
     generated_at = datetime.now(timezone.utc).isoformat()
+    business_files = list(class_files if business_class_files is None else business_class_files)
     records = []
-    for row in matched.values():
+    for key, row in matched.items():
         records.append({
             **{key: str(row.get(key) or "") for key in ("coord", "api_name", "api_signature", "symbol_kind")},
-            "oracle_conclusion": "reachable",
+            "oracle_conclusion": (
+                "reachable"
+                if _target_reaches_business(key, graph_incoming, business_files)
+                else "uncertain"
+            ),
             "authority": "jdk-javap",
             "authority_version": version,
-            "procedure": "javap -c -s -p <class-file>; exact owner/member/JVM parameter descriptor",
+            "procedure": (
+                "javap -c -s -p <class-file>; exact owner/member/JVM parameter descriptor; "
+                "reverse method graph to explicit business class boundary"
+            ),
             "evidence_path": str(evidence_path),
             "evidence_sha256": digest,
             "generated_at": generated_at,

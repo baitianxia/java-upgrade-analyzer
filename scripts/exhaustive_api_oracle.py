@@ -102,7 +102,10 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
                 valid_records.append(record)
             else:
                 invalid_provenance.append(identity)
-        conclusions = {str(item.get("oracle_conclusion") or "") for item in valid_records}
+        recorded_conclusions = {
+            str(item.get("oracle_conclusion") or "") for item in valid_records
+        }
+        conclusions = recorded_conclusions - {"uncertain"}
         analyzer_conclusion = str(analyzer.get("analysis_status") or "")
         if len(conclusions) > 1:
             verdict = "oracle_conflict"
@@ -110,8 +113,11 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
         elif not valid_records:
             verdict = "unverified"
             oracle_conclusion = ""
+        elif not conclusions and analyzer_conclusion != "uncertain":
+            verdict = "unverified"
+            oracle_conclusion = ""
         else:
-            oracle_conclusion = next(iter(conclusions))
+            oracle_conclusion = next(iter(conclusions), "uncertain")
             severity = str(changed_by_id[identity].get("severity") or "").upper()
             requires_two = severity in {"P0", "P1", "HIGH"} and analyzer_conclusion in {
                 "not_impacted", "not_found_in_static_analysis", "uncertain",

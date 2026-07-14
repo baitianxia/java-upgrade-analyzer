@@ -1870,11 +1870,15 @@ def update_prior_topology_matrix(
 def resolve_discovery_prior_coverage(case: RealProjectCase, report_root: Path) -> dict:
     pinned = load_pinned_prior_topology_matrix(case.prior_topology_matrix)
     accumulated = load_prior_topology_matrix(report_root)
+    accumulated_exists = _prior_topology_matrix_path(report_root).exists()
+    accumulated_acceptable = bool(accumulated.get("valid") or not accumulated_exists)
     covered = set(pinned.get("covered_ids") or [])
-    covered.update(accumulated.get("converged_guard_union") or [])
+    if accumulated.get("valid"):
+        covered.update(accumulated.get("converged_guard_union") or [])
+    valid = bool(pinned.get("valid") and accumulated_acceptable)
     return {
-        "valid": bool(pinned.get("valid") and accumulated.get("valid")),
-        "covered_ids": sorted(covered) if pinned.get("valid") and accumulated.get("valid") else [],
+        "valid": valid,
+        "covered_ids": sorted(covered) if valid else [],
         "pinned": pinned,
         "accumulated": accumulated,
     }
@@ -2105,18 +2109,22 @@ def physical_edge_occurrence(edge: dict) -> str:
     ))
 
 
-def _retain_authoritative_api_path(selected_rows: list[dict], oracle_rows: list[dict]) -> tuple[list[dict], list[str]]:
-    """Keep every oracle edge from a selected API back to a packaged business boundary."""
+def _retain_authoritative_api_path(
+    selected_rows: list[dict], oracle_rows: list[dict]
+) -> tuple[list[dict], dict[str, str], list[str]]:
+    """Keep every physical path and classify whether it reaches packaged business code."""
     incoming: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
     for edge in oracle_rows:
         incoming[_callee_identity(edge)].append(edge)
     selected: dict[str, list[dict]] = {}
+    api_reachability: dict[str, str] = {}
     errors: list[str] = []
     for api_row in selected_rows:
         identity = serialized_api_identity(api_row)
         direct = [edge for edge in oracle_rows if _api_target_matches(api_row, edge)]
         if not direct:
             errors.append(f"selected_api_unresolved:{identity}")
+            api_reachability[identity] = "not_analyzed"
             continue
         selected[identity] = direct
 
@@ -2137,12 +2145,11 @@ def _retain_authoritative_api_path(selected_rows: list[dict], oracle_rows: list[
                 continue
             for upstream in incoming.get(_caller_identity(edge), []):
                 pending.append(upstream)
-        if not reached_boundary:
-            errors.append(f"selected_api_unreached_business_boundary:{identity}")
+        api_reachability[identity] = "reachable" if reached_boundary else "uncertain"
     return sorted(retained.values(), key=lambda row: (
         str(row.get("api_identity") or ""), canonical_edge_identity(row),
         str(row.get("artifact_entry") or ""), normalize_instruction_offset(row),
-    )), sorted(errors)
+    )), api_reachability, sorted(errors)
 
 
 def _retain_analyzer_api_path(selected_rows: list[dict], analyzer_rows: list[dict]) -> list[dict]:
@@ -2235,7 +2242,9 @@ def reconcile_selected_api_edges(
     reconcile_started_at = time.perf_counter()
     report_dir = Path(report_dir)
     oracle_rows = [dict(row) for row in (oracle_scan.get("edges") or [])]
-    retained_oracle_rows, path_errors = _retain_authoritative_api_path(selected_rows, oracle_rows)
+    retained_oracle_rows, api_reachability, path_errors = _retain_authoritative_api_path(
+        selected_rows, oracle_rows
+    )
     path_errors.extend(_oracle_edge_identity_errors(oracle_rows))
     retained_analyzer_rows = _retain_analyzer_api_path(selected_rows, [dict(row) for row in (analyzer_rows or [])])
     artifact_entries = {
@@ -2303,6 +2312,7 @@ def reconcile_selected_api_edges(
             physical_edge_occurrence(row) for row in retained_oracle_rows
         ],
         "oracle_scan": oracle_scan,
+        "api_reachability": api_reachability,
     }
 
 
@@ -2385,6 +2395,43 @@ def reconcile_final_artifact_edges(
             scan["complete"] = False
             scan.setdefault("failures", []).append("oracle_artifact_sha_mismatch")
     return reconcile_selected_api_edges(report_dir, selected_rows, analyzer_rows, scan)
+
+
+def build_final_artifact_api_oracle_records(
+    selected_rows: list[dict], edge_truth: dict
+) -> list[dict]:
+    """Convert the independent classfile graph into per-API semantic verdicts."""
+    if not edge_truth.get("complete"):
+        return []
+    evidence_path = Path(str(edge_truth.get("oracle_edges") or ""))
+    try:
+        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    except OSError:
+        return []
+    reachability = edge_truth.get("api_reachability") or {}
+    records = []
+    for row in selected_rows:
+        conclusion = str(reachability.get(serialized_api_identity(row)) or "")
+        if conclusion not in {"reachable", "uncertain"}:
+            continue
+        records.append({
+            **{
+                key: str(row.get(key) or "")
+                for key in ("coord", "api_name", "api_signature", "symbol_kind")
+            },
+            "oracle_conclusion": conclusion,
+            "authority": "final-artifact-classfile",
+            "authority_version": "1",
+            "procedure": (
+                "SHA-verified final artifact classfile graph; exact target edge; "
+                "reverse traversal to packaged business class boundary"
+            ),
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": evidence_sha256,
+            "generated_at": date.today().isoformat(),
+            "evidence_mode": "bytecode",
+        })
+    return records
 
 
 def _valid_sha256(value: str) -> bool:
@@ -3378,6 +3425,7 @@ def run_case(
     report_root: Path,
     *,
     full_step4_apis: bool = False,
+    oracle_manifest: Path | None = None,
 ) -> dict:
     pinned_manifest: dict = {}
     pinned_asset_gate: dict = {}
@@ -3745,7 +3793,8 @@ def run_case(
     oracle_ledger = ""
     effective_ground_truth_status = case.ground_truth_status
     if case.case_mode in {"discovery", "convergence"}:
-        oracle_rows = load_oracle_manifest(case.oracle_manifest)
+        oracle_rows = load_oracle_manifest(oracle_manifest or case.oracle_manifest)
+        oracle_rows.extend(build_final_artifact_api_oracle_records(selected_rows, edge_truth))
         if case.enable_jdk_oracle:
             if case.final_artifact:
                 class_files = sorted(
@@ -3757,6 +3806,9 @@ def run_case(
                 selected_rows,
                 class_files,
                 report_dir / "evidence" / "quality" / "jdk-javap",
+                business_class_files=[
+                    path for path in class_files if "nested" not in path.parts
+                ],
             ))
         oracle_audit = audit_api_oracle(
             selected_rows,
@@ -3900,6 +3952,16 @@ def parse_args(argv=None):
     parser.add_argument("--project-root", help="Override project root for a single --case run.")
     parser.add_argument("--changed-apis", help="Override all_changed_apis.csv for a single --case run.")
     parser.add_argument(
+        "--oracle-manifest",
+        help="Override the independent per-API oracle CSV for a single --case run.",
+    )
+    parser.add_argument(
+        "--required-topology",
+        action="append",
+        default=[],
+        help="Override required topology IDs for a custom single-case probe; repeat as needed.",
+    )
+    parser.add_argument(
         "--full-step4-apis",
         action="store_true",
         help="For cases with Step4 enabled, feed the full Step4 all_changed_apis.csv into Step5 instead of probe selection.",
@@ -3921,8 +3983,14 @@ def main(argv=None):
     results = []
     for name in case_names:
         case = CASES[name]
-        if args.case == "all" and (args.project_root or args.changed_apis):
-            raise SystemExit("--project-root/--changed-apis can only be used with a single --case")
+        if args.case == "all" and (
+            args.project_root or args.changed_apis or args.oracle_manifest or args.required_topology
+        ):
+            raise SystemExit(
+                "single-case overrides cannot be used with --case all"
+            )
+        if args.required_topology:
+            case = replace(case, required_topologies=tuple(dict.fromkeys(args.required_topology)))
         project_root = Path(args.project_root) if args.project_root else case.default_project
         changed_apis = Path(args.changed_apis) if args.changed_apis else case.default_changed_apis
         results.append(
@@ -3932,6 +4000,7 @@ def main(argv=None):
                 changed_apis,
                 report_root,
                 full_step4_apis=args.full_step4_apis,
+                oracle_manifest=(Path(args.oracle_manifest) if args.oracle_manifest else None),
             )
         )
 

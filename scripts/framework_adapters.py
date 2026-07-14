@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Protocol
 
 from enhanced_source_analyzer import analyze_file
+from signature_utils import normalize_signature_for_lookup
 
 
 class FrameworkAdapter(Protocol):
@@ -1398,6 +1399,253 @@ def _parse_javap_methods(text):
     return owner, methods
 
 
+def _descriptor_parameter_types(descriptor):
+    primitives = {
+        'B': 'byte', 'C': 'char', 'D': 'double', 'F': 'float',
+        'I': 'int', 'J': 'long', 'S': 'short', 'Z': 'boolean',
+    }
+    if not str(descriptor or '').startswith('('):
+        return None
+    parameters = []
+    index = 1
+    while index < len(descriptor) and descriptor[index] != ')':
+        dimensions = 0
+        while index < len(descriptor) and descriptor[index] == '[':
+            dimensions += 1
+            index += 1
+        if index >= len(descriptor):
+            return None
+        marker = descriptor[index]
+        if marker == 'L':
+            end = descriptor.find(';', index)
+            if end < 0:
+                return None
+            value = descriptor[index + 1:end].replace('/', '.').replace('$', '.')
+            index = end + 1
+        else:
+            value = primitives.get(marker)
+            index += 1
+        if not value:
+            return None
+        parameters.append(value + '[]' * dimensions)
+    return parameters if index < len(descriptor) and descriptor[index] == ')' else None
+
+
+_SPRING_DATA_REPOSITORY_CONTRACTS = {
+    'Repository', 'CrudRepository', 'ListCrudRepository',
+    'PagingAndSortingRepository', 'ListPagingAndSortingRepository',
+    'JpaRepository',
+}
+_SIMPLE_JPA_REPOSITORY = (
+    'org.springframework.data.jpa.repository.support.SimpleJpaRepository'
+)
+
+
+def _split_java_type_list(value):
+    values = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(str(value or '')):
+        if character == '<':
+            depth += 1
+        elif character == '>':
+            depth = max(0, depth - 1)
+        elif character == ',' and depth == 0:
+            values.append(value[start:index].strip())
+            start = index + 1
+    tail = value[start:].strip()
+    if tail:
+        values.append(tail)
+    return values
+
+
+def _spring_data_business_repositories(source_roots):
+    repositories = []
+    for path in _production_java_files(source_roots):
+        try:
+            text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
+        except OSError:
+            continue
+        imports = {
+            value.rsplit('.', 1)[-1]: value
+            for value in re.findall(r'\bimport\s+([\w.]+)\s*;', text)
+        }
+        interface = re.search(
+            r'\binterface\s+([A-Za-z_$]\w*)\s+extends\s+([^\{]+)\{', text
+        )
+        if not interface:
+            continue
+        spring_contracts = []
+        for raw_parent in _split_java_type_list(interface.group(2)):
+            parent = re.sub(r'<[\s\S]*>', '', raw_parent).strip()
+            simple = parent.rsplit('.', 1)[-1]
+            resolved = imports.get(simple, parent)
+            if (
+                simple in _SPRING_DATA_REPOSITORY_CONTRACTS
+                and str(resolved).startswith('org.springframework.data.')
+            ):
+                spring_contracts.append(resolved)
+        if not spring_contracts:
+            continue
+        declared_method_counts = {}
+        body = text[interface.end():]
+        for declaration in re.finditer(
+            r'\b([A-Za-z_$]\w*)\s*\(([^;{}]*)\)\s*(?:throws\s+[^;{}]+)?;', body
+        ):
+            parameter_text = declaration.group(2).strip()
+            parameter_count = (
+                0 if not parameter_text
+                else len(_split_java_type_list(parameter_text))
+            )
+            key = f'{declaration.group(1)}/{parameter_count}'
+            declared_method_counts[key] = declared_method_counts.get(key, 0) + 1
+        repositories.append({
+            'owner': _java_package_and_class(text, interface.group(1)),
+            'file': str(path),
+            'contracts': sorted(set(spring_contracts)),
+            'declared_method_counts': declared_method_counts,
+        })
+    return repositories
+
+
+def _spring_data_custom_repository_configuration(source_roots):
+    custom = []
+    for path in _production_java_files(source_roots):
+        try:
+            text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
+        except OSError:
+            continue
+        if not re.search(r'@(?:[\w.]+\.)?EnableJpaRepositories\b', text):
+            continue
+        attributes = sorted(set(re.findall(
+            r'\b(repositoryBaseClass|repositoryFactoryBeanClass)\s*=', text
+        )))
+        if attributes:
+            custom.append({'file': str(path), 'attributes': attributes})
+    return custom
+
+
+def run_spring_data_repository_adapter(source_roots, artifact_catalog=None):
+    """Resolve Spring Data repository proxies from source contracts and packaged runtime code."""
+    repositories = _spring_data_business_repositories(source_roots)
+    custom_configuration = _spring_data_custom_repository_configuration(source_roots)
+    activation_evidence = _spring_boot_business_activation(source_roots)
+    entries = [
+        item for item in (artifact_catalog or {}).get('entries') or []
+        if str(item.get('coord') or '').strip() == 'org.springframework.data:spring-data-jpa'
+        and Path(str(item.get('jar_path') or '')).is_file()
+    ]
+    edges, nodes, findings, errors = [], [], [], []
+    if repositories and not activation_evidence:
+        findings.append({
+            'reason_code': 'spring_data_activation_unproven',
+            'subject': ','.join(item['owner'] for item in repositories),
+        })
+    if repositories and custom_configuration:
+        findings.extend({
+            'reason_code': 'spring_data_custom_repository_factory',
+            'subject': item['file'],
+            'attributes': item['attributes'],
+        } for item in custom_configuration)
+    if repositories and not entries and not custom_configuration:
+        findings.append({
+            'reason_code': 'spring_data_runtime_implementation_unresolved',
+            'subject': _SIMPLE_JPA_REPOSITORY,
+        })
+    implementation_methods = []
+    if (
+        repositories and activation_evidence and len(entries) == 1
+        and not custom_configuration
+    ):
+        entry = entries[0]
+        jar_path = str(entry.get('jar_path') or '')
+        try:
+            completed = subprocess.run(
+                ['javap', '-p', '-s', '-classpath', jar_path, _SIMPLE_JPA_REPOSITORY],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30,
+            )
+            if completed.returncode != 0:
+                errors.append(f'{jar_path}:{_SIMPLE_JPA_REPOSITORY}:javap_exit_{completed.returncode}')
+            else:
+                owner, methods = _parse_javap_methods(completed.stdout)
+                if owner != _SIMPLE_JPA_REPOSITORY:
+                    errors.append(f'{jar_path}:{_SIMPLE_JPA_REPOSITORY}:owner_mismatch:{owner}')
+                else:
+                    for method in methods:
+                        parameters = _descriptor_parameter_types(method.get('descriptor'))
+                        if (
+                            parameters is None
+                            or not str(method.get('header') or '').startswith('public ')
+                            or method.get('member') == _SIMPLE_JPA_REPOSITORY.rsplit('.', 1)[-1]
+                        ):
+                            continue
+                        implementation_methods.append({
+                            'member': method['member'],
+                            'parameters': parameters,
+                            'descriptor': method['descriptor'],
+                        })
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f'{jar_path}:{_SIMPLE_JPA_REPOSITORY}:{type(exc).__name__}')
+
+        for repository in repositories:
+            for method in implementation_methods:
+                target = (
+                    f"{_SIMPLE_JPA_REPOSITORY}.{method['member']}"
+                    f"({','.join(method['parameters'])})"
+                )
+                nodes.append({'id': target, 'kind': 'spring_data_repository_proxy_implementation'})
+                edges.append({
+                    'source': repository['owner'],
+                    'target': target,
+                    'target_member': method['member'],
+                    'target_descriptor': method['descriptor'],
+                    'parameter_count': len(method['parameters']),
+                    'repository_declared_method_count': repository[
+                        'declared_method_counts'
+                    ].get(f"{method['member']}/{len(method['parameters'])}", 0),
+                    'edge_kind': 'spring_data_repository_proxy_dispatch',
+                    'confidence': 'high',
+                    'conditions': [],
+                    'ambiguity': False,
+                    'provenance': {
+                        'file': repository['file'],
+                        'repository_contracts': repository['contracts'],
+                        'coord': entry.get('coord'),
+                        'jar': jar_path,
+                        'artifact_entry': entry.get('artifact_entry'),
+                        'artifact_sha256': entry.get('sha256'),
+                        'implementation_class': _SIMPLE_JPA_REPOSITORY,
+                        'implementation_descriptor': method['descriptor'],
+                        'business_activation': activation_evidence,
+                        'authority': 'final_artifact_javap',
+                    },
+                })
+    applicable = bool(repositories)
+    unresolved = bool(repositories and (
+        not activation_evidence or len(entries) != 1 or custom_configuration
+    ))
+    return {
+        'adapter': 'spring_data_repository_proxy',
+        'version': '1',
+        'status': 'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
+        'nodes': nodes,
+        'edges': edges,
+        'findings': findings,
+        'errors': errors,
+        'metrics': {
+            'repositories': len(repositories),
+            'runtime_implementations': len(entries),
+            'implementation_methods': len(implementation_methods),
+            'custom_repository_configurations': len(custom_configuration),
+            'edges': len(edges),
+        },
+    }
+
+
 def _aload_slot(instruction):
     opcode = str(instruction.get('opcode') or '')
     if re.fullmatch(r'aload_[0-3]', opcode):
@@ -1731,6 +1979,7 @@ def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
         run_spi_adapter(source_roots),
         run_spring_adapter(source_roots),
         run_runtime_spring_registration_adapter(source_roots, artifact_catalog=artifact_catalog),
+        run_spring_data_repository_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_mybatis_adapter(source_roots),
         run_dynamic_proxy_adapter(source_roots),
         run_declarative_http_client_adapter(source_roots),
@@ -1786,6 +2035,8 @@ def attach_framework_edges_to_graph(graph, payload):
     activation_linked_symbols = set()
     matched_edges = 0
     unmatched_edges = 0
+    proxy_dispatch_edges = 0
+    ambiguous_proxy_dispatches = 0
     supported_kinds = {
         'spring_event_listener', 'spring_framework_callback', 'spring_bean_dispatch',
         'spring_runtime_active_entry',
@@ -1801,6 +2052,121 @@ def attach_framework_edges_to_graph(graph, payload):
     def method_signature(method):
         qualified = str(getattr(method, 'qualified_key', '') or '')
         return qualified[qualified.find('('):] if '(' in qualified else ''
+
+    def method_key_parts(value):
+        match = re.match(
+            r'^(?P<owner>[\w.$]+)\.(?P<member>[\w$<>]+)\((?P<parameters>.*)\)$',
+            str(value or '').strip(),
+        )
+        if not match:
+            return None
+        parameters = match.group('parameters').strip()
+        count = 0 if not parameters else len(parameters.split(','))
+        return match.group('owner'), match.group('member'), count
+
+    reverse_edge_snapshot = dict(graph.reverse_edges)
+    for adapter in (payload or {}).get('adapters') or []:
+        dispatch_edges = [
+            edge for edge in adapter.get('edges') or []
+            if edge.get('edge_kind') == 'spring_data_repository_proxy_dispatch'
+        ]
+        grouped = {}
+        for edge in dispatch_edges:
+            identity = (
+                str(edge.get('source') or ''),
+                str(edge.get('target_member') or ''),
+                int(edge.get('parameter_count') or 0),
+            )
+            grouped.setdefault(identity, []).append(edge)
+        for (repository, member, parameter_count), implementation_edges in grouped.items():
+            source_keys = []
+            for lookup_key, callers in reverse_edge_snapshot.items():
+                parts = method_key_parts(lookup_key)
+                if (
+                    callers and parts
+                    and parts == (repository, member, parameter_count)
+                ):
+                    source_keys.append(lookup_key)
+            declared_method_count = max(
+                int(edge.get('repository_declared_method_count') or 0)
+                for edge in implementation_edges
+            )
+            if len(implementation_edges) != 1 or declared_method_count > 1:
+                if source_keys or declared_method_count > 1:
+                    ambiguous_proxy_dispatches += 1
+                continue
+            implementation = implementation_edges[0]
+            target = str(implementation.get('target') or '').strip()
+            if not target:
+                continue
+            provenance = implementation.get('provenance') or {}
+            target_lookup_keys = [target]
+            if '(' in target and target.endswith(')'):
+                unsigned, signature_body = target.rsplit('(', 1)
+                signature = '(' + signature_body
+                normalized = normalize_signature_for_lookup(signature)
+                compact_normalized = normalized.replace(', ', ',') if normalized else ''
+                for alias_signature in (normalized, compact_normalized):
+                    if alias_signature:
+                        alias = unsigned + alias_signature
+                        if alias not in target_lookup_keys:
+                            target_lookup_keys.append(alias)
+            callers_by_symbol = {}
+
+            def caller_evidence_rank(caller):
+                if str(getattr(caller, 'evidence_source', '') or '') == 'current_final_artifact':
+                    return 3
+                if getattr(caller, 'runtime_analyzer_hit', None):
+                    return 2
+                if str(getattr(caller, 'evidence_type', '') or '').startswith('bytecode_'):
+                    return 1
+                return 0
+
+            for source_key in source_keys:
+                for caller in reverse_edge_snapshot.get(source_key) or []:
+                    caller_symbol = str(getattr(caller, 'caller_symbol_id', '') or '')
+                    existing = callers_by_symbol.get(caller_symbol)
+                    if existing is None or caller_evidence_rank(caller) > caller_evidence_rank(existing):
+                        callers_by_symbol[caller_symbol] = caller
+            for caller in callers_by_symbol.values():
+                values = dict(vars(caller))
+                values.update({
+                    'callee_key': target,
+                    'callee_simple_key': target.rsplit('.', 1)[-1],
+                    'evidence_type': 'spring_data_repository_proxy_dispatch',
+                    'confidence': 'high',
+                    'file': str(provenance.get('jar') or values.get('file') or ''),
+                    'content': (
+                        f"Spring Data repository proxy dispatch: {source_keys[0]} -> {target}"
+                    ),
+                    'framework_registration': True,
+                    'framework_source': repository,
+                    'framework_target': target,
+                    'framework_provenance': dict(provenance),
+                    'runtime_activation': 'active',
+                })
+                synthetic = SimpleNamespace(**values)
+                identity = (
+                    synthetic.caller_symbol_id,
+                    synthetic.callee_key,
+                    synthetic.evidence_type,
+                )
+                attached = False
+                for target_lookup_key in target_lookup_keys:
+                    bucket = graph.reverse_edges.setdefault(target_lookup_key, [])
+                    if any(
+                        (
+                            getattr(existing, 'caller_symbol_id', ''),
+                            getattr(existing, 'callee_key', ''),
+                            getattr(existing, 'evidence_type', ''),
+                        ) == identity
+                        for existing in bucket
+                    ):
+                        continue
+                    bucket.append(synthetic)
+                    attached = True
+                if attached:
+                    proxy_dispatch_edges += 1
 
     for adapter in (payload or {}).get('adapters') or []:
         for edge in adapter.get('edges') or []:
@@ -1948,4 +2314,6 @@ def attach_framework_edges_to_graph(graph, payload):
         'framework_entry_methods': len(entries),
         'runtime_framework_entry_methods': len(runtime_entries),
         'framework_activation_linked_methods': len(activation_linked_symbols),
+        'framework_proxy_dispatch_edges': proxy_dispatch_edges,
+        'ambiguous_framework_proxy_dispatches': ambiguous_proxy_dispatches,
     }

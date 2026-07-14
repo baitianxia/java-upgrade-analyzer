@@ -104,6 +104,61 @@ class ThirdPartyJdkOracleTest(unittest.TestCase):
         self.assertEqual(records[0]["authority"], "jdk-javap")
         self.assertEqual(len(records[0]["evidence_sha256"]), 64)
 
+    def test_javap_distinguishes_business_reachability_from_internal_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src"
+            classes = root / "classes"
+            for package in ("app", "dep", "p"):
+                (source / package).mkdir(parents=True, exist_ok=True)
+            classes.mkdir()
+            (source / "p" / "Target.java").write_text(
+                "package p; public class Target { "
+                "public static void call(String value) {} "
+                "public static void call(int value) {} }",
+                encoding="utf-8",
+            )
+            (source / "dep" / "Bridge.java").write_text(
+                'package dep; public class Bridge { public static void entry() { '
+                'p.Target.call("x"); } }',
+                encoding="utf-8",
+            )
+            (source / "dep" / "Internal.java").write_text(
+                "package dep; public class Internal { public static void run() { "
+                "p.Target.call(1); } }",
+                encoding="utf-8",
+            )
+            (source / "app" / "Caller.java").write_text(
+                "package app; public class Caller { public void run() { "
+                "dep.Bridge.entry(); } }",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["javac", "-d", str(classes), *(str(path) for path in source.rglob("*.java"))],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            changed = [
+                {"coord": "g:a", "api_name": "p.Target.call", "api_signature": "(java.lang.String)", "symbol_kind": "method"},
+                {"coord": "g:a", "api_name": "p.Target.call", "api_signature": "(int)", "symbol_kind": "method"},
+            ]
+
+            records = jdk_oracle.scan_class_files(
+                changed,
+                sorted(classes.rglob("*.class")),
+                root / "evidence",
+                business_class_files=[classes / "app" / "Caller.class"],
+            )
+
+        conclusions = {
+            row["api_signature"]: row["oracle_conclusion"] for row in records
+        }
+        self.assertEqual(conclusions, {
+            "(java.lang.String)": "reachable",
+            "(int)": "uncertain",
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

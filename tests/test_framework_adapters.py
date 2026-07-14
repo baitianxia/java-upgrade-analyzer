@@ -16,6 +16,261 @@ from framework_adapters import run_framework_adapters, attach_framework_edges_to
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
+    def test_spring_data_repository_adapter_refuses_custom_repository_factory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "@org.springframework.data.jpa.repository.config.EnableJpaRepositories("
+                "repositoryFactoryBeanClass = CustomFactory.class) "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            (java / "OwnerRepository.java").write_text(
+                "package com.acme; import org.springframework.data.jpa.repository.JpaRepository; "
+                "public interface OwnerRepository extends JpaRepository<Owner, Integer> {}",
+                encoding="utf-8",
+            )
+
+            payload = run_framework_adapters(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog={"entries": []},
+            )
+
+        adapter = next(
+            item for item in payload["adapters"]
+            if item["adapter"] == "spring_data_repository_proxy"
+        )
+        self.assertEqual(adapter["status"], "partial")
+        self.assertEqual(adapter["edges"], [])
+        self.assertTrue(any(
+            finding["reason_code"] == "spring_data_custom_repository_factory"
+            and finding["subject"].endswith("Application.java")
+            for finding in adapter["findings"]
+        ))
+
+    def test_spring_data_repository_adapter_uses_packaged_implementation_bytecode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            implementation_source = module / "implementation/org/springframework/data/jpa/repository/support"
+            classes = module / "classes"
+            java.mkdir(parents=True)
+            implementation_source.mkdir(parents=True)
+            classes.mkdir()
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            (java / "OwnerRepository.java").write_text(
+                "package com.acme; import org.springframework.data.jpa.repository.JpaRepository; "
+                "public interface OwnerRepository extends JpaRepository<Owner, Integer> {}",
+                encoding="utf-8",
+            )
+            implementation = implementation_source / "SimpleJpaRepository.java"
+            implementation.write_text(
+                "package org.springframework.data.jpa.repository.support; "
+                "public class SimpleJpaRepository { "
+                "public Object save(Object value) { return value; } "
+                "public java.util.Optional findById(Object id) { return java.util.Optional.empty(); } }",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["javac", "-d", str(classes), str(implementation)],
+                check=True, capture_output=True, text=True,
+            )
+            jar_path = module / "spring-data-jpa.jar"
+            with zipfile.ZipFile(jar_path, "w") as jar:
+                for class_file in classes.rglob("*.class"):
+                    jar.write(class_file, class_file.relative_to(classes).as_posix())
+
+            payload = run_framework_adapters(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog={"entries": [{
+                    "coord": "org.springframework.data:spring-data-jpa",
+                    "jar_path": str(jar_path),
+                    "artifact_entry": "BOOT-INF/lib/spring-data-jpa.jar",
+                    "sha256": "a" * 64,
+                }]},
+            )
+
+        adapter = next(
+            item for item in payload["adapters"]
+            if item["adapter"] == "spring_data_repository_proxy"
+        )
+        self.assertEqual(adapter["status"], "complete")
+        self.assertEqual(
+            {edge["target"] for edge in adapter["edges"]},
+            {
+                "org.springframework.data.jpa.repository.support.SimpleJpaRepository.findById(java.lang.Object)",
+                "org.springframework.data.jpa.repository.support.SimpleJpaRepository.save(java.lang.Object)",
+            },
+        )
+        self.assertTrue(all(
+            edge["source"] == "com.acme.OwnerRepository"
+            and edge["provenance"]["artifact_entry"] == "BOOT-INF/lib/spring-data-jpa.jar"
+            and edge["provenance"]["authority"] == "final_artifact_javap"
+            for edge in adapter["edges"]
+        ))
+
+    def test_spring_data_proxy_dispatch_links_business_repository_call_to_implementation(self):
+        caller = SimpleNamespace(
+            caller_symbol_id="controller", caller_qualified_key="com.acme.OwnerController.show(Integer)",
+            callee_key="com.acme.OwnerRepository.findById(Integer)", callee_simple_key="findById(Integer)",
+            evidence_type="bytecode_invokeinterface", confidence="high", file="app.jar", line=19,
+            content="invokeinterface OwnerRepository.findById", owner_type="business",
+            owner_coord="BUSINESS", module="app", is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={"com.acme.OwnerRepository.findById(Integer)": [caller]},
+        )
+        payload = {"adapters": [{
+            "adapter": "spring_data_repository_proxy", "version": "1",
+            "edges": [{
+                "source": "com.acme.OwnerRepository",
+                "target": "org.springframework.data.jpa.repository.support.SimpleJpaRepository.findById(java.lang.Object)",
+                "target_member": "findById", "parameter_count": 1,
+                "edge_kind": "spring_data_repository_proxy_dispatch",
+                "confidence": "high", "conditions": [], "ambiguity": False,
+                "provenance": {"jar": "/runtime/spring-data-jpa.jar", "authority": "final_artifact_javap"},
+            }],
+        }]}
+
+        stats = attach_framework_edges_to_graph(graph, payload)
+
+        linked = graph.reverse_edges[
+            "org.springframework.data.jpa.repository.support.SimpleJpaRepository.findById(java.lang.Object)"
+        ]
+        normalized_linked = graph.reverse_edges[
+            "org.springframework.data.jpa.repository.support.SimpleJpaRepository.findById(Object)"
+        ]
+        self.assertEqual(stats["framework_proxy_dispatch_edges"], 1)
+        self.assertEqual(linked[0].caller_symbol_id, "controller")
+        self.assertEqual(normalized_linked[0].caller_symbol_id, "controller")
+        self.assertEqual(linked[0].evidence_type, "spring_data_repository_proxy_dispatch")
+        self.assertEqual(linked[0].callee_key, payload["adapters"][0]["edges"][0]["target"])
+
+    def test_spring_data_proxy_dispatch_refuses_ambiguous_repository_overloads(self):
+        def caller(symbol, signature):
+            return SimpleNamespace(
+                caller_symbol_id=symbol, caller_qualified_key=f"com.acme.Service.{symbol}()",
+                callee_key=f"com.acme.OwnerRepository.save({signature})",
+                callee_simple_key=f"save({signature})", evidence_type="source_ast",
+                confidence="high", file="Service.java", line=1, content="save",
+                owner_type="business", owner_coord="BUSINESS", module="app", is_test=False,
+            )
+
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={
+                "com.acme.OwnerRepository.save(Object)": [caller("one", "Object")],
+                "com.acme.OwnerRepository.save(String)": [caller("two", "String")],
+            },
+        )
+        target = "org.springframework.data.jpa.repository.support.SimpleJpaRepository.save(java.lang.Object)"
+        payload = {"adapters": [{
+            "adapter": "spring_data_repository_proxy", "version": "1",
+            "edges": [{
+                "source": "com.acme.OwnerRepository", "target": target,
+                "target_member": "save", "parameter_count": 1,
+                "repository_declared_method_count": 2,
+                "edge_kind": "spring_data_repository_proxy_dispatch",
+                "confidence": "high", "conditions": [], "ambiguity": False,
+                "provenance": {"jar": "/runtime/spring-data-jpa.jar"},
+            }],
+        }]}
+
+        stats = attach_framework_edges_to_graph(graph, payload)
+
+        self.assertNotIn(target, graph.reverse_edges)
+        self.assertEqual(stats["framework_proxy_dispatch_edges"], 0)
+        self.assertEqual(stats["ambiguous_framework_proxy_dispatches"], 1)
+
+    def test_spring_data_proxy_dispatch_deduplicates_equivalent_lookup_aliases(self):
+        caller = SimpleNamespace(
+            caller_symbol_id="controller", caller_qualified_key="com.acme.Controller.show(Integer)",
+            callee_key="com.acme.OwnerRepository.findById(Integer)",
+            callee_simple_key="findById(Integer)", evidence_type="source_ast",
+            confidence="high", file="Controller.java", line=1, content="findById",
+            owner_type="business", owner_coord="BUSINESS", module="app", is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={
+                "com.acme.OwnerRepository.findById(Integer)": [caller],
+                "com.acme.OwnerRepository.findById(java.lang.Integer)": [caller],
+            },
+        )
+        target = "org.springframework.data.jpa.repository.support.SimpleJpaRepository.findById(java.lang.Object)"
+        payload = {"adapters": [{
+            "adapter": "spring_data_repository_proxy", "version": "1",
+            "edges": [{
+                "source": "com.acme.OwnerRepository", "target": target,
+                "target_member": "findById", "parameter_count": 1,
+                "repository_declared_method_count": 0,
+                "edge_kind": "spring_data_repository_proxy_dispatch",
+                "confidence": "high", "conditions": [], "ambiguity": False,
+                "provenance": {"jar": "/runtime/spring-data-jpa.jar"},
+            }],
+        }]}
+
+        stats = attach_framework_edges_to_graph(graph, payload)
+
+        self.assertEqual(stats["framework_proxy_dispatch_edges"], 1)
+        self.assertEqual(stats["ambiguous_framework_proxy_dispatches"], 0)
+        self.assertEqual(len(graph.reverse_edges[target]), 1)
+
+    def test_spring_data_proxy_dispatch_prefers_final_artifact_business_edge(self):
+        common = {
+            "caller_symbol_id": "controller",
+            "caller_qualified_key": "com.acme.Controller.save()",
+            "callee_simple_key": "save(Object)",
+            "confidence": "high", "owner_type": "business",
+            "owner_coord": "BUSINESS", "module": "app", "is_test": False,
+        }
+        source_edge = SimpleNamespace(
+            **common, callee_key="com.acme.OwnerRepository.save(Owner)",
+            evidence_type="ast_method_invocation", file="Controller.java", line=10,
+            content="repository.save(owner)",
+        )
+        artifact_edge = SimpleNamespace(
+            **common, callee_key="com.acme.OwnerRepository.save(java.lang.Object)",
+            evidence_type="bytecode_method_invocation", file="business.jar!/Controller.class", line=28,
+            content="invokeinterface OwnerRepository.save", evidence_source="current_final_artifact",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={
+                "com.acme.OwnerRepository.save(Owner)": [source_edge],
+                "com.acme.OwnerRepository.save(java.lang.Object)": [artifact_edge],
+            },
+        )
+        target = "org.springframework.data.jpa.repository.support.SimpleJpaRepository.save(java.lang.Object)"
+        payload = {"adapters": [{
+            "adapter": "spring_data_repository_proxy", "version": "1",
+            "edges": [{
+                "source": "com.acme.OwnerRepository", "target": target,
+                "target_member": "save", "parameter_count": 1,
+                "repository_declared_method_count": 0,
+                "edge_kind": "spring_data_repository_proxy_dispatch",
+                "confidence": "high", "conditions": [], "ambiguity": False,
+                "provenance": {"jar": "/runtime/spring-data-jpa.jar"},
+            }],
+        }]}
+
+        attach_framework_edges_to_graph(graph, payload)
+
+        linked = graph.reverse_edges[target]
+        self.assertEqual(len(linked), 1)
+        self.assertEqual(linked[0].evidence_source, "current_final_artifact")
+        self.assertEqual(linked[0].line, 28)
+
     def test_spring_xml_property_ref_emits_component_injection_edge(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = Path(tmp)

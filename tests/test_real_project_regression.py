@@ -296,13 +296,14 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertFalse(prior["valid"])
         self.assertEqual(prior["covered_ids"], [])
 
-    def test_discovery_rejects_missing_report_root_prior_matrix(self):
+    def test_discovery_uses_pinned_prior_when_report_root_matrix_does_not_exist_yet(self):
         case = realreg.CASES["dubbo"]
         with tempfile.TemporaryDirectory() as tmp:
             prior = realreg.resolve_discovery_prior_coverage(case, Path(tmp))
 
-        self.assertFalse(prior["valid"])
-        self.assertEqual(prior["covered_ids"], [])
+        pinned = realreg.load_pinned_prior_topology_matrix(case.prior_topology_matrix)
+        self.assertTrue(prior["valid"])
+        self.assertEqual(prior["covered_ids"], pinned["covered_ids"])
 
     def test_discovery_case_rejects_empty_required_topology_policy(self):
         case = realreg.RealProjectCase(
@@ -824,6 +825,73 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertFalse(result["blocking"])
         self.assertEqual(result["reconciliation"]["verdict_counts"]["correct"], 4)
+
+    def test_dependency_internal_reference_is_complete_but_not_business_reachable(self):
+        artifact_sha256 = "e" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        internal = self._edge_row(
+            artifact_sha256, "vendor.Internal", "run", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/vendor.jar!/vendor/Internal.class",
+        )
+        internal["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [internal], {
+                    "artifact_sha256": artifact_sha256,
+                    "complete": True,
+                    "edges": [internal],
+                    "failures": [],
+                    "artifact_entries": [internal["artifact_entry"]],
+                },
+            )
+
+        identity = realreg.serialized_api_identity(target)
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["api_reachability"][identity], "uncertain")
+        self.assertNotIn(
+            f"selected_api_unreached_business_boundary:{identity}",
+            result["errors"],
+        )
+
+    def test_final_artifact_oracle_records_preserve_per_api_reachability(self):
+        reachable = {
+            "coord": "vendor:api", "api_name": "vendor.Api.call",
+            "api_signature": "()", "symbol_kind": "method",
+        }
+        internal = {
+            "coord": "vendor:api", "api_name": "vendor.Api.internal",
+            "api_signature": "()", "symbol_kind": "method",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "oracle_edges.csv"
+            evidence.write_text("header\nvalue\n", encoding="utf-8")
+            records = realreg.build_final_artifact_api_oracle_records(
+                [reachable, internal],
+                {
+                    "complete": True,
+                    "oracle_edges": str(evidence),
+                    "api_reachability": {
+                        realreg.serialized_api_identity(reachable): "reachable",
+                        realreg.serialized_api_identity(internal): "uncertain",
+                    },
+                },
+            )
+
+        self.assertEqual(
+            {row["api_name"]: row["oracle_conclusion"] for row in records},
+            {"vendor.Api.call": "reachable", "vendor.Api.internal": "uncertain"},
+        )
+        self.assertTrue(all(row["authority"] == "final-artifact-classfile" for row in records))
+        self.assertTrue(all(len(row["evidence_sha256"]) == 64 for row in records))
 
     def test_analyzer_path_cannot_import_an_edge_labeled_for_another_api(self):
         artifact_sha256 = "e" * 64
@@ -3023,6 +3091,32 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(returncode, 1)
         for name in gate_names:
             self.assertIn(f"gate {name}:", output.getvalue())
+
+    def test_cli_passes_custom_oracle_manifest_to_single_real_project_case(self):
+        result = {
+            "case": "spring-petclinic", "status": "passed",
+            "elapsed_seconds": 0.0, "report_dir": "/tmp/report",
+            "summary": {}, "failures": [], "warnings": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            oracle_manifest = Path(tmp) / "project-test-oracle.csv"
+            oracle_manifest.write_text("authority\nproject-tests\n", encoding="utf-8")
+            with patch.object(realreg, "run_case", return_value=result) as run_case:
+                returncode = realreg.main([
+                    "--case", "spring-petclinic",
+                    "--report-root", tmp,
+                    "--oracle-manifest", str(oracle_manifest),
+                    "--required-topology", "same_jar_bridge",
+                ])
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(
+            run_case.call_args.kwargs["oracle_manifest"], oracle_manifest
+        )
+        self.assertEqual(
+            run_case.call_args.args[0].required_topologies,
+            ("same_jar_bridge",),
+        )
 
 
 if __name__ == "__main__":

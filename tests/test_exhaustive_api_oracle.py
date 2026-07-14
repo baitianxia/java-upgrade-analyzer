@@ -92,6 +92,32 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
         self.assertEqual(result["ledger"][0]["verdict"], "oracle_conflict")
         self.assertTrue(result["blocking"])
 
+    def test_uncertain_static_authority_does_not_conflict_with_project_test_reachable(self):
+        changed = [{"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"}]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+        static = authority("p.A.one", "()", "uncertain", authority="final-artifact-classfile")
+        project_test = authority("p.A.one", "()", "reachable", authority="project-tests")
+        project_test["evidence_mode"] = "project_test"
+
+        result = oracle.audit_api_oracle(changed, analyzed, [static, project_test])
+
+        self.assertEqual(result["oracle_conflicts"], 0)
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(result["ledger"][0]["oracle_conclusion"], "reachable")
+
+    def test_uncertain_static_authority_alone_cannot_verify_reachable(self):
+        changed = [{"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"}]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+        records = [authority(
+            "p.A.one", "()", "uncertain", authority="final-artifact-classfile"
+        )]
+
+        result = oracle.audit_api_oracle(changed, analyzed, records)
+
+        self.assertEqual(result["oracle_conflicts"], 0)
+        self.assertEqual(result["unverified"], 1)
+        self.assertEqual(result["ledger"][0]["verdict"], "unverified")
+
     def test_negative_conclusion_requires_two_independent_authorities(self):
         changed = [{"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method", "severity": "P0"}]
         analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
