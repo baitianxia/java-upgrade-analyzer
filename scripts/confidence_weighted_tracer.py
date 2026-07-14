@@ -41,6 +41,14 @@ from indirect_usage_analyzer import (
     api_key as indirect_api_key,
     parse_javap_indirect_references,
 )
+from step5_evidence_model import (
+    ModuleScope,
+    PhysicalCallEdge,
+    ReachabilityPath,
+    classify_module_scope,
+    decide_analysis,
+    decision_to_trace_patch,
+)
 
 
 NON_BLOCKING_PARSER_FALLBACK_REASONS = {
@@ -4488,22 +4496,6 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
                 and coord not in dependency_chain
             ):
                 dependency_chain.append(coord)
-    has_business_path = bool(business_hits or bridged_hits)
-    result.analysis_status = 'reachable' if has_business_path else 'uncertain'
-    result.is_reachable = True if has_business_path else None
-    has_framework_path = any(item.get('framework_entries') for item in bridged_hits)
-    result.reason_code = (
-        'RUNTIME_FRAMEWORK_ENTRY_REACHED' if has_framework_path
-        else ('BUSINESS_ARTIFACT_BYTECODE_USAGE' if has_business_path else 'PACKAGED_DEPENDENCY_BYTECODE_USAGE')
-    )
-    result.reachable_note = (
-        '已通过业务启动代码、最终制品框架注册和依赖字节码确认目标符号会进入运行时调用路径'
-        if has_framework_path else
-        '已在当前最终制品中确认业务 class 可到达目标符号引用'
-        if has_business_path else
-        '已在当前最终制品的运行时依赖字节码中确认对目标符号的稳定引用，'
-        '但当前尚未证明这些依赖是否回到系统业务入口'
-    )
     result.dependency_chain_coords = dependency_chain
     ordered_hits = business_hits + [item for item in hits if item not in business_hits]
     result.call_paths = []
@@ -4622,26 +4614,66 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             'depth': len(evidence),
             'evidence': evidence,
         })
-    reachable_details = [item for item in result.path_details if item.get('path_status') == 'reachable']
-    if reachable_details:
-        result.direct_callers = sum(
-            1 for item in reachable_details if int(item.get('depth') or 1) == 1
-        )
-        result.business_reach_depth = min(int(item.get('depth') or 1) for item in reachable_details)
+    has_business_path = bool(business_hits or bridged_hits)
     if ambiguous_hits and not has_business_path:
-        result.analysis_status = 'uncertain'
-        result.is_reachable = None
-        result.reason_code = 'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS'
-        result.reachable_note = (
-            '目标签名包含无法从 Step4 输入解析包名的简写类型；字节码中存在同名参数类型候选，'
-            '但不能据此确认具体重载'
-        )
-        result.direct_callers = 0
-        result.business_reach_depth = 0
         for detail in result.path_details:
             detail['path_status'] = 'uncertain'
             detail['business_reachable'] = None
             detail['stop_reason'] = 'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS'
+
+    hit_by_consumer = {
+        (
+            str(hit.get('coord') or ''),
+            str(hit.get('class_fqcn') or ''),
+            str(hit.get('consumer_method') or '<unknown>'),
+            str(hit.get('consumer_signature') or ''),
+        ): hit
+        for hit in hits
+    }
+    typed_paths = []
+    for detail in result.path_details:
+        hit = hit_by_consumer.get((
+            str(detail.get('consumer_coord') or ''),
+            str(detail.get('consumer_class') or ''),
+            str(detail.get('consumer_method') or '<unknown>'),
+            str(detail.get('consumer_signature') or ''),
+        ), {})
+        if detail.get('business_reachable') is True:
+            entry_scope = ModuleScope.BUSINESS_CLASSES
+        else:
+            entry_scope = classify_module_scope(hit)
+        stop_reason = str(detail.get('stop_reason') or '')
+        typed_evidence = tuple(
+            PhysicalCallEdge(
+                caller_symbol=str(edge.get('caller_symbol') or ''),
+                callee_key=str(edge.get('callee_key') or ''),
+                evidence_type=str(edge.get('evidence_type') or ''),
+                owner_scope=classify_module_scope({
+                    'coord': edge.get('owner_coord'),
+                    'application_owned': hit.get('application_owned'),
+                }),
+                owner_coord=str(edge.get('owner_coord') or ''),
+                artifact=str(edge.get('file') or ''),
+                confidence=str(edge.get('confidence') or 'high'),
+            )
+            for edge in detail.get('evidence') or []
+        )
+        typed_paths.append(ReachabilityPath(
+            path_text=str(detail.get('path_text') or ''),
+            entry_scope=entry_scope,
+            complete=(
+                detail.get('path_status') == 'reachable'
+                and detail.get('business_reachable') is True
+            ),
+            ambiguous=stop_reason == 'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS',
+            truncated=stop_reason in {'MAX_DEPTH_REACHED', 'PATH_TRUNCATED'},
+            stop_reason=stop_reason,
+            depth=int(detail.get('depth') or 1),
+            evidence=typed_evidence,
+        ))
+    decision = decide_analysis(tuple(typed_paths))
+    for field_name, value in decision_to_trace_patch(decision).items():
+        setattr(result, field_name, value)
     result.verification_commands = [
         '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
         '优先审查命中的无源码依赖及其对外暴露入口'
