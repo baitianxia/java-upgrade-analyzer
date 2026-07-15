@@ -30,6 +30,7 @@ import gate  # noqa: E402
 import s4_jar_compare  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
 import s6_report  # noqa: E402
+from step5_evidence_ingestion import ingest_collector_batches  # noqa: E402
 from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
@@ -10301,10 +10302,12 @@ public class com.example.TargetBridge {
             reverse_edges={"com.vendor.LegacyApi.removed()": [target_edge]},
             runtime_dependency_catalog={},
         )
-        framework_adapters.attach_framework_edges_to_graph(graph, {"adapters": [{
-            "adapter": "spring_runtime_artifact",
-            "version": "1",
-            "edges": [{
+        framework_batch = framework_adapters._framework_batch(
+            "spring_runtime_artifact",
+            "1",
+            "complete",
+            (),
+            ({
                 "source": "framework:spring-factories:org.springframework.context.ApplicationListener",
                 "target": "com.vendor.RuntimeListener.onApplicationEvent",
                 "edge_kind": "spring_runtime_registered_callback",
@@ -10321,8 +10324,12 @@ public class com.example.TargetBridge {
                         "spring_application_run": True,
                     }],
                 },
-            }],
-        }]})
+            },),
+            (),
+            (),
+            {},
+        )
+        ingest_collector_batches(graph, (framework_batch,))
 
         result = tracer.trace_api_with_confidence_weighting(
             {

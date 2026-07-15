@@ -18,11 +18,11 @@ if str(SCRIPTS) not in sys.path:
 
 import framework_adapters as framework_adapter_module
 from framework_adapters import (
-    attach_framework_edges_to_graph,
     run_framework_adapters as _run_framework_adapters,
     run_mybatis_proxy_adapter as _run_mybatis_proxy_adapter,
     serialize_framework_batches,
 )
+from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import (
     CollectedEdge,
     CollectorBatch,
@@ -40,6 +40,38 @@ def run_framework_adapters(*args, **kwargs):
 
 def run_mybatis_proxy_adapter(*args, **kwargs):
     return serialize_framework_batches((_run_mybatis_proxy_adapter(*args, **kwargs),))["adapters"][0]
+
+
+def ingest_framework_payload(graph, payload):
+    """Build typed framework batches for projection-focused legacy fixtures."""
+    batches = tuple(
+        framework_adapter_module._framework_batch(
+            adapter["adapter"],
+            adapter["version"],
+            adapter.get("status", "complete"),
+            (),
+            adapter.get("edges", ()),
+            (),
+            (),
+            {},
+        )
+        for adapter in payload.get("adapters", ())
+    )
+    result = ingest_collector_batches(graph, batches)
+    return {
+        key: getattr(result, key)
+        for key in (
+            "matched_callback_edges",
+            "unmatched_callback_edges",
+            "framework_entry_methods",
+            "runtime_framework_entry_methods",
+            "framework_activation_linked_methods",
+            "framework_proxy_dispatch_edges",
+            "framework_mybatis_proxy_dispatch_edges",
+            "framework_transaction_proxy_edges",
+            "ambiguous_framework_proxy_dispatches",
+        )
+    }
 
 
 class FrameworkAdaptersTest(unittest.TestCase):
@@ -458,7 +490,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         self.assertEqual(stats["framework_mybatis_proxy_dispatch_edges"], 1)
         self.assertEqual(len(graph.reverse_edges[target]), 1)
@@ -481,7 +513,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             methods_by_id={},
             reverse_edges={"com.acme.CityMapper.find(java.lang.String)": [source_only]},
         )
-        source_stats = attach_framework_edges_to_graph(source_graph, payload)
+        source_stats = ingest_framework_payload(source_graph, payload)
         self.assertNotIn(target, source_graph.reverse_edges)
         self.assertEqual(source_stats["framework_mybatis_proxy_dispatch_edges"], 0)
 
@@ -725,7 +757,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         self.assertEqual(stats["framework_transaction_proxy_edges"], 1)
         self.assertEqual(len(graph.reverse_edges[target]), 1)
@@ -864,7 +896,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         linked = graph.reverse_edges[
             "org.springframework.data.jpa.repository.support.SimpleJpaRepository.findById(java.lang.Object)"
@@ -908,7 +940,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         self.assertNotIn(target, graph.reverse_edges)
         self.assertEqual(stats["framework_proxy_dispatch_edges"], 0)
@@ -942,7 +974,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         self.assertEqual(stats["framework_proxy_dispatch_edges"], 1)
         self.assertEqual(stats["ambiguous_framework_proxy_dispatches"], 0)
@@ -986,7 +1018,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        attach_framework_edges_to_graph(graph, payload)
+        ingest_framework_payload(graph, payload)
 
         linked = graph.reverse_edges[target]
         self.assertEqual(len(linked), 1)
@@ -1099,7 +1131,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         self.assertEqual(stats["matched_callback_edges"], 1)
         self.assertIn("demo-filter", graph.framework_entry_symbols)
@@ -1229,7 +1261,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         self.assertEqual(stats["matched_callback_edges"], 1)
         self.assertEqual(graph.framework_entry_symbols["m1"][0]["adapter"], "spring_basic")
@@ -1396,7 +1428,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         self.assertEqual(stats["matched_callback_edges"], 1)
         self.assertEqual(graph.framework_entry_symbols["m1"][0]["edge_kind"], "spring_runtime_active_entry")
@@ -1497,7 +1529,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
         self.assertEqual(autoconfig["runtime_activation"], "conditional")
 
         graph = SimpleNamespace(methods_by_id={})
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
         self.assertEqual(stats["runtime_framework_entry_methods"], 1)
         self.assertIn("com.vendor.RuntimeListener.onApplicationEvent", graph.framework_runtime_entry_methods)
 
@@ -1692,7 +1724,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             }],
         }]}
 
-        stats = attach_framework_edges_to_graph(graph, payload)
+        stats = ingest_framework_payload(graph, payload)
 
         self.assertEqual(stats["framework_activation_linked_methods"], 1)
         self.assertIn("listener", graph.framework_activation_linked_symbols)
@@ -1747,7 +1779,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
         graph = SimpleNamespace(
             methods_by_id={"m1": SimpleNamespace(symbol_id="m1", qualified_key="com.acme.Handler.invoke")}
         )
-        attach_framework_edges_to_graph(graph, payload)
+        ingest_framework_payload(graph, payload)
         self.assertEqual(graph.framework_entry_symbols, {})
 
     def test_unregistered_dynamic_proxy_handler_is_not_a_framework_entry(self):
@@ -1791,7 +1823,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
         graph = SimpleNamespace(
             methods_by_id={"m1": SimpleNamespace(symbol_id="m1", qualified_key="com.acme.RemoteApi.fetch")}
         )
-        attach_framework_edges_to_graph(graph, payload)
+        ingest_framework_payload(graph, payload)
         self.assertEqual(graph.framework_entry_symbols, {})
 
     def test_feign_route_combines_class_and_method_request_mapping(self):

@@ -64,7 +64,7 @@ from indirect_usage_analyzer import (
     api_key as indirect_api_key,
     collect_indirect_usage_batch,
 )
-from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
+from framework_adapters import run_framework_adapters, serialize_framework_batches
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import CoverageRecord
 from analysis_contract import sha256_file
@@ -1224,35 +1224,56 @@ def _step5_integrated_main_impl(args):
     )
     framework_output = str(_call_chain_dir(report_dir) / 'framework_adapters.json')
     framework_timer = time.perf_counter()
-    framework_evidence = run_framework_adapters(
+    framework_batches = run_framework_adapters(
         source_roots,
-        framework_output,
         artifact_catalog=runtime_dependency_catalog,
     )
+    serialize_framework_batches(framework_batches, framework_output)
     graph_stats['step5_perf']['main']['framework_adapters_elapsed_sec'] = round(
         time.perf_counter() - framework_timer, 3
     )
-    framework_merge_timer = time.perf_counter()
-    framework_merge = attach_framework_edges_to_graph(graph, framework_evidence)
-    graph_stats['step5_perf']['main']['framework_adapter_merge_elapsed_sec'] = round(
-        time.perf_counter() - framework_merge_timer, 3
-    )
     graph_stats['framework_adapters'] = {
-        item.get('adapter'): {
-            'status': item.get('status'),
-            **(item.get('metrics') or {}),
-            'error_count': len(item.get('errors') or []),
+        batch.collector: {
+            'status': next(
+                (coverage.status for coverage in batch.coverage
+                 if coverage.collector == batch.collector),
+                'partial',
+            ),
+            **{
+                key: value for key, value in batch.metrics
+                if not str(key).startswith('_legacy_')
+            },
+            'error_count': len(batch.failures),
         }
-        for item in framework_evidence.get('adapters') or []
+        for batch in framework_batches
     }
-    graph_stats['framework_adapter_merge'] = framework_merge
     indirect_timer = time.perf_counter()
     indirect_batch = collect_indirect_usage_batch(
         _graph_snapshot_with_bytecode_batch(graph, bytecode_batch),
         all_apis,
         source_roots,
     )
-    ingestion_result = ingest_collector_batches(graph, (bytecode_batch, indirect_batch))
+    framework_merge_timer = time.perf_counter()
+    ingestion_result = ingest_collector_batches(
+        graph, (bytecode_batch, *framework_batches, indirect_batch)
+    )
+    graph_stats['step5_perf']['main']['framework_adapter_merge_elapsed_sec'] = round(
+        time.perf_counter() - framework_merge_timer, 3
+    )
+    graph_stats['framework_adapter_merge'] = {
+        key: getattr(ingestion_result, key)
+        for key in (
+            'matched_callback_edges',
+            'unmatched_callback_edges',
+            'framework_entry_methods',
+            'runtime_framework_entry_methods',
+            'framework_activation_linked_methods',
+            'framework_proxy_dispatch_edges',
+            'framework_mybatis_proxy_dispatch_edges',
+            'framework_transaction_proxy_edges',
+            'ambiguous_framework_proxy_dispatches',
+        )
+    }
     ingestion_failures = [
         {
             'collector': collector,
