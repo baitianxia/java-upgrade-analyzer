@@ -187,6 +187,183 @@ class FrameworkAdaptersTest(unittest.TestCase):
         )
         self.assertTrue(any(failure.artifact == str(malformed) for failure in batch.failures))
 
+    def test_critical_source_scanners_record_stable_read_diagnostics(self):
+        scanners = (
+            (
+                framework_adapter_module._spring_boot_business_activation,
+                "spring_boot_activation_source",
+            ),
+            (
+                framework_adapter_module._spring_data_business_repositories,
+                "spring_data_repository_source",
+            ),
+            (
+                framework_adapter_module._spring_data_custom_repository_configuration,
+                "spring_data_custom_config_source",
+            ),
+            (
+                framework_adapter_module._spring_transaction_custom_mode,
+                "spring_transaction_mode_source",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            java = Path(tmp) / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            unreadable = java / "Unreadable.java"
+            unreadable.write_text("package com.acme; class Unreadable {}", encoding="utf-8")
+            original_read_text = Path.read_text
+
+            def fail_selected_read(path, *args, **kwargs):
+                if path.resolve() == unreadable.resolve():
+                    raise PermissionError("synthetic unreadable source")
+                return original_read_text(path, *args, **kwargs)
+
+            for scanner, marker in scanners:
+                with self.subTest(scanner=scanner.__name__), patch.object(
+                    Path, "read_text", autospec=True, side_effect=fail_selected_read
+                ):
+                    evidence, errors = scanner([{
+                        "root": str(Path(tmp) / "src/main/java"),
+                        "owner_type": "business",
+                    }])
+
+                self.assertEqual(evidence, [])
+                self.assertEqual(
+                    errors,
+                    [f"{unreadable.resolve()}:{marker}:PermissionError"],
+                )
+
+    def test_unreadable_activation_and_custom_configuration_fail_closed(self):
+        activation_error = "/src/Application.java:spring_boot_activation_source:PermissionError"
+        repository_error = "/src/OwnerRepository.java:spring_data_repository_source:PermissionError"
+        custom_error = "/src/JpaConfig.java:spring_data_custom_config_source:PermissionError"
+        transaction_error = "/src/TxConfig.java:spring_transaction_mode_source:PermissionError"
+        activation = [{
+            "file": "/src/Application.java",
+            "business_entry": "com.acme.Application.main",
+        }]
+        repository = {
+            "owner": "com.acme.OwnerRepository",
+            "file": "/src/OwnerRepository.java",
+            "contracts": ["org.springframework.data.jpa.repository.JpaRepository"],
+            "declared_method_counts": {},
+        }
+        transactional = {
+            "owner": "com.acme.BookingService",
+            "member": "book",
+            "parameter_count": 1,
+            "file": "/src/BookingService.java",
+            "line": 12,
+            "annotation_scope": "method",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "runtime.jar"
+            with zipfile.ZipFile(runtime, "w") as archive:
+                archive.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener=com.acme.Listener\n",
+                )
+            spring_data = root / "spring-data-jpa-1.jar"
+            spring_tx = root / "spring-tx-1.jar"
+            spring_aop = root / "spring-aop-1.jar"
+            business = root / "business.jar"
+            for artifact in (spring_data, spring_tx, spring_aop, business):
+                artifact.write_bytes(b"fixture")
+
+            with patch.object(
+                framework_adapter_module,
+                "_spring_boot_business_activation",
+                return_value=([], [activation_error]),
+            ):
+                runtime_batch = framework_adapter_module.run_runtime_spring_registration_adapter(
+                    [], artifact_catalog={"entries": [{
+                        "coord": "com.acme:runtime", "jar_path": str(runtime),
+                    }]}
+                )
+
+            with patch.object(
+                framework_adapter_module,
+                "_spring_data_business_repositories",
+                return_value=([repository], [repository_error]),
+            ), patch.object(
+                framework_adapter_module,
+                "_spring_data_custom_repository_configuration",
+                return_value=([], [custom_error]),
+            ), patch.object(
+                framework_adapter_module,
+                "_spring_boot_business_activation",
+                return_value=(activation, []),
+            ):
+                spring_data_batch = framework_adapter_module.run_spring_data_repository_adapter(
+                    [], artifact_catalog={"entries": [{
+                        "coord": "org.springframework.data:spring-data-jpa",
+                        "jar_path": str(spring_data),
+                    }]}
+                )
+
+            with patch.object(
+                framework_adapter_module,
+                "_spring_transactional_business_methods",
+                return_value=([transactional], []),
+            ), patch.object(
+                framework_adapter_module,
+                "_spring_boot_business_activation",
+                return_value=(activation, []),
+            ), patch.object(
+                framework_adapter_module,
+                "_spring_transaction_custom_mode",
+                return_value=([], [transaction_error]),
+            ), patch.object(
+                framework_adapter_module,
+                "_packaged_transactional_methods",
+                return_value=({
+                    ("com.acme.BookingService", "book", 1): {
+                        "descriptor": "(Ljava/lang/String;)V",
+                        "annotation_scope": "method",
+                    }
+                }, []),
+            ):
+                transaction_batch = framework_adapter_module.run_spring_transaction_proxy_adapter(
+                    [], artifact_catalog={"entries": [
+                        {"coord": "__business__", "jar_path": str(business)},
+                        {"coord": "org.springframework:spring-tx", "jar_path": str(spring_tx)},
+                        {"coord": "org.springframework:spring-aop", "jar_path": str(spring_aop)},
+                    ]}
+                )
+
+        runtime_edge = next(
+            edge for edge in runtime_batch.edges
+            if edge.edge_kind == "spring_runtime_registered_callback"
+        )
+        self.assertEqual(runtime_edge.confidence, "medium")
+        self.assertEqual(dict(runtime_edge.metadata)["runtime_activation"], "unproven")
+        self.assertTrue(runtime_batch.coverage[0].applicable)
+        self.assertEqual(runtime_batch.coverage[0].status, "partial")
+        self.assertEqual(
+            {failure.reason_code for failure in runtime_batch.failures},
+            {"SPRING_BOOT_ACTIVATION_SOURCE_READ_FAILED"},
+        )
+
+        self.assertEqual(spring_data_batch.edges, ())
+        self.assertTrue(spring_data_batch.coverage[0].applicable)
+        self.assertEqual(spring_data_batch.coverage[0].status, "partial")
+        self.assertEqual(
+            {failure.reason_code for failure in spring_data_batch.failures},
+            {
+                "SPRING_DATA_REPOSITORY_SOURCE_READ_FAILED",
+                "SPRING_DATA_CUSTOM_CONFIG_SOURCE_READ_FAILED",
+            },
+        )
+
+        self.assertEqual(transaction_batch.edges, ())
+        self.assertTrue(transaction_batch.coverage[0].applicable)
+        self.assertEqual(transaction_batch.coverage[0].status, "partial")
+        self.assertEqual(
+            {failure.reason_code for failure in transaction_batch.failures},
+            {"SPRING_TRANSACTION_MODE_SOURCE_READ_FAILED"},
+        )
+
     @patch("framework_adapters._mybatis_mapper_contracts")
     def test_mybatis_proxy_adapter_skips_source_scan_without_packaged_runtime(
         self, mapper_contracts
@@ -272,7 +449,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 "version": "test",
                 "jar_path": str(jar_path),
                 "artifact_entry": "BOOT-INF/lib/mybatis-test.jar",
-                "sha256": "a" * 64,
+                "sha256": hashlib.sha256(jar_path.read_bytes()).hexdigest(),
                 "evidence_source": "current_final_artifact",
             }]
         }
@@ -302,6 +479,15 @@ class FrameworkAdaptersTest(unittest.TestCase):
             adapter = run_mybatis_proxy_adapter(
                 [{"root": str(module / "src/main/java"), "owner_type": "business"}],
                 artifact_catalog=catalog,
+            )
+            verified_final_sha256 = catalog["final_artifact_sha256"]
+            corrupt_sha_catalog = {
+                **catalog,
+                "entries": [{**catalog["entries"][0], "sha256": "c" * 64}],
+            }
+            corrupt_sha = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=corrupt_sha_catalog,
             )
             mapper.write_text(
                 mapper.read_text(encoding="utf-8").replace(
@@ -341,7 +527,18 @@ class FrameworkAdaptersTest(unittest.TestCase):
             and edge["source_member"] == "find"
             and edge["parameter_count"] == 1
             and edge["provenance"]["authority"] == "final_artifact_javap"
+            and edge["provenance"]["mapper_registration"]["artifact_sha256"]
+            == verified_final_sha256
+            and edge["provenance"]["binding_evidence"]["artifact_sha256"]
+            == verified_final_sha256
+            and edge["provenance"]["physical_target_evidence"]["target"]
+            == edge["target"]
             for edge in adapter["edges"]
+        ))
+        self.assertEqual(corrupt_sha["edges"], [])
+        self.assertTrue(any(
+            "mybatis_runtime_sha256_mismatch" in error
+            for error in corrupt_sha["errors"]
         ))
         self.assertEqual(unregistered["edges"], [])
         self.assertTrue(any(
@@ -353,6 +550,67 @@ class FrameworkAdaptersTest(unittest.TestCase):
             finding["reason_code"] == "mybatis_runtime_implementation_unresolved"
             for finding in fallback["findings"]
         ))
+
+    def test_mybatis_source_mapper_and_xml_must_exist_in_final_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            resources = module / "src/main/resources/mappers"
+            java.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; @org.springframework.boot.autoconfigure.SpringBootApplication "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            (java / "CityMapper.java").write_text(
+                "package com.acme; @org.apache.ibatis.annotations.Mapper public interface CityMapper { "
+                "Object find(String state); }",
+                encoding="utf-8",
+            )
+            (resources / "CityMapper.xml").write_text(
+                '<mapper namespace="com.acme.CityMapper"><select id="find">select 1</select></mapper>',
+                encoding="utf-8",
+            )
+            catalog = self._mybatis_runtime_catalog(module)
+            artifact = Path(catalog["final_artifact_path"])
+            with zipfile.ZipFile(artifact) as archive:
+                original = {
+                    item.filename: archive.read(item)
+                    for item in archive.infolist() if not item.is_dir()
+                }
+
+            mutations = {
+                "mapper_absent": (
+                    "BOOT-INF/classes/com/acme/CityMapper.class",
+                    "mybatis_mapper_registration_unproven",
+                ),
+                "xml_absent": (
+                    "BOOT-INF/classes/mappers/CityMapper.xml",
+                    "mybatis_mapper_binding_unproven",
+                ),
+            }
+            for name, (removed_entry, reason_code) in mutations.items():
+                with self.subTest(mutation=name):
+                    with zipfile.ZipFile(artifact, "w") as archive:
+                        for entry, content in original.items():
+                            if entry != removed_entry:
+                                archive.writestr(entry, content)
+                    catalog["final_artifact_sha256"] = hashlib.sha256(
+                        artifact.read_bytes()
+                    ).hexdigest()
+
+                    adapter = run_mybatis_proxy_adapter(
+                        [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                        artifact_catalog=catalog,
+                    )
+
+                    self.assertEqual(adapter["edges"], [])
+                    self.assertTrue(any(
+                        finding["reason_code"] == reason_code
+                        for finding in adapter["findings"]
+                    ))
 
     def test_mybatis_proxy_adapter_rejects_source_registration_missing_from_final_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -501,6 +759,10 @@ class FrameworkAdaptersTest(unittest.TestCase):
         )
         self.assertEqual(
             graph.reverse_edges[target][0].evidence_source,
+            "framework_semantic",
+        )
+        self.assertEqual(
+            graph.reverse_edges[target][0].caller_evidence_source,
             "current_final_artifact",
         )
 
@@ -1022,7 +1284,8 @@ class FrameworkAdaptersTest(unittest.TestCase):
 
         linked = graph.reverse_edges[target]
         self.assertEqual(len(linked), 1)
-        self.assertEqual(linked[0].evidence_source, "current_final_artifact")
+        self.assertEqual(linked[0].evidence_source, "framework_semantic")
+        self.assertEqual(linked[0].caller_evidence_source, "current_final_artifact")
         self.assertEqual(linked[0].line, 28)
 
     def test_spring_xml_property_ref_emits_component_injection_edge(self):

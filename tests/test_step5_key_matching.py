@@ -35,19 +35,107 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
-    def test_verified_final_artifact_framework_path_can_explain_static_scan_miss(self):
-        candidate = {"path": [SimpleNamespace(
-            evidence_source="current_final_artifact",
-            owner_type="business",
-            owner_coord="BUSINESS",
-            is_test=False,
-            framework_registration=True,
-            framework_final_artifact_verified=True,
-        )]}
+    def _verified_composite_framework_edge(self, **changes):
+        artifact_entry = "BOOT-INF/classes/app/Application.class"
+        values = {
+            "callee_key": (
+                "org.springframework.transaction.interceptor.TransactionInterceptor."
+                "invoke(org.aopalliance.intercept.MethodInvocation)"
+            ),
+            "evidence_source": "framework_semantic",
+            "evidence_authority": "framework_semantic",
+            "semantic": True,
+            "framework_registration": True,
+            "framework_final_artifact_verified": True,
+            "framework_source": "app.BookingService.book/1",
+            "framework_target": (
+                "org.springframework.transaction.interceptor.TransactionInterceptor."
+                "invoke(org.aopalliance.intercept.MethodInvocation)"
+            ),
+            "framework_evidence_source": "framework_semantic",
+            "framework_evidence_authority": "framework_semantic",
+            "framework_evidence_artifact_sha256": "",
+            "framework_evidence_artifact_entry": "",
+            "collector": "spring_transaction_proxy",
+            "caller_evidence_source": "current_final_artifact",
+            "caller_evidence_authority": "current_final_artifact",
+            "caller_artifact_sha256": "a" * 64,
+            "caller_evidence_file": f"/artifact/application.jar!/{artifact_entry}",
+            "caller_artifact_entry": artifact_entry,
+            "owner_type": "business",
+            "owner_coord": "BUSINESS",
+            "is_test": False,
+            "runtime_analyzer_hit": True,
+        }
+        values.update(changes)
+        return SimpleNamespace(**values)
 
+    def test_verified_final_artifact_framework_path_can_explain_static_scan_miss(self):
+        edge = self._verified_composite_framework_edge()
+        candidate = {"path": [edge]}
+        graph = SimpleNamespace(
+            require_current_final_artifact_business_edges=True,
+            reverse_edges={edge.callee_key: [edge]},
+        )
+        api_row = {
+            "api_name": edge.callee_key.split("(", 1)[0],
+            "api_signature": "(org.aopalliance.intercept.MethodInvocation)",
+        }
+
+        self.assertTrue(tracer._edge_allowed_for_trace(edge, graph))
         self.assertTrue(
             tracer.has_verified_final_artifact_framework_path(candidate)
         )
+        self.assertTrue(
+            tracer._has_verified_final_artifact_framework_target(api_row, graph)
+        )
+
+    def test_composite_framework_trust_rejects_corrupt_nested_projection(self):
+        mutations = {
+            "framework_verification_missing": {
+                "framework_final_artifact_verified": False,
+            },
+            "top_level_authority_upgraded": {
+                "evidence_source": "current_final_artifact",
+            },
+            "caller_source_missing": {"caller_evidence_source": ""},
+            "caller_authority_missing": {"caller_evidence_authority": ""},
+            "caller_authority_invalid": {
+                "caller_evidence_authority": "source_ast",
+            },
+            "caller_sha_missing": {"caller_artifact_sha256": ""},
+            "caller_sha_invalid": {"caller_artifact_sha256": "corrupt"},
+            "caller_path_missing": {"caller_evidence_file": ""},
+            "caller_entry_missing": {"caller_artifact_entry": ""},
+            "framework_source_invalid": {
+                "framework_evidence_source": "current_final_artifact",
+            },
+            "framework_authority_missing": {
+                "framework_evidence_authority": "",
+            },
+            "framework_authority_invalid": {
+                "framework_evidence_authority": "current_final_artifact",
+            },
+        }
+        for name, changes in mutations.items():
+            with self.subTest(mutation=name):
+                edge = self._verified_composite_framework_edge(**changes)
+                graph = SimpleNamespace(
+                    require_current_final_artifact_business_edges=True,
+                    reverse_edges={edge.callee_key: [edge]},
+                )
+                api_row = {
+                    "api_name": edge.callee_key.split("(", 1)[0],
+                    "api_signature": "(org.aopalliance.intercept.MethodInvocation)",
+                }
+
+                self.assertFalse(tracer._edge_allowed_for_trace(edge, graph))
+                self.assertFalse(tracer.has_verified_final_artifact_framework_path({
+                    "path": [edge],
+                }))
+                self.assertFalse(
+                    tracer._has_verified_final_artifact_framework_target(api_row, graph)
+                )
 
     def test_graph_field_edge_keeps_selected_changed_api_identity(self):
         api_row = {

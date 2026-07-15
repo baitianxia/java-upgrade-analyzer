@@ -56,15 +56,34 @@ class EvidenceIngestionTest(unittest.TestCase):
             metadata=tuple(metadata),
         )
 
-    def _mybatis_framework_edge(self, **changes):
-        target = (
+    def _mybatis_framework_edge(self, target=None, **changes):
+        target = target or (
             "org.apache.ibatis.binding.MapperProxy.invoke"
             "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])"
         )
+        target_stages = {
+            "org.apache.ibatis.binding.MapperProxy.invoke"
+            "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])": "proxy_entry_dispatch",
+            "org.apache.ibatis.binding.MapperMethod.execute"
+            "(org.apache.ibatis.session.SqlSession,java.lang.Object[])": "plain_invoker_dispatch",
+            "org.apache.ibatis.session.SqlSession.selectOne"
+            "(java.lang.String,java.lang.Object)": "select_one_dispatch",
+        }
         provenance = {
             "authority": "final_artifact_javap",
             "file": "/artifact/application.jar!/BOOT-INF/classes/com/acme/CityMapper.class",
             "binding_file": "/artifact/application.jar!/BOOT-INF/classes/mappers/CityMapper.xml",
+            "final_artifact_sha256": "a" * 64,
+            "mapper_registration": {
+                "artifact_entry": "BOOT-INF/classes/com/acme/CityMapper.class",
+                "artifact_sha256": "a" * 64,
+                "authority": "current_final_artifact_classfile",
+            },
+            "binding_evidence": {
+                "artifact_entry": "BOOT-INF/classes/mappers/CityMapper.xml",
+                "artifact_sha256": "a" * 64,
+                "authority": "current_final_artifact_resource",
+            },
             "jar": "/artifact/mybatis.jar",
             "artifact_entry": "BOOT-INF/lib/mybatis.jar",
             "artifact_sha256": "b" * 64,
@@ -77,6 +96,13 @@ class EvidenceIngestionTest(unittest.TestCase):
                 "proxy_entry_dispatch": True,
                 "plain_invoker_dispatch": True,
                 "select_one_dispatch": True,
+            },
+            "physical_target_evidence": {
+                "target": target,
+                "dispatch_stage": target_stages[target],
+                "verified": True,
+                "artifact_entry": "BOOT-INF/lib/mybatis.jar",
+                "artifact_sha256": "b" * 64,
             },
         }
         metadata = {
@@ -107,6 +133,7 @@ class EvidenceIngestionTest(unittest.TestCase):
             callee_simple_key="find(String)",
             evidence_type="bytecode_invokeinterface",
             evidence_source=evidence_source,
+            evidence_authority=evidence_source,
             artifact_sha256=artifact_sha256,
             artifact_entry="BOOT-INF/classes/com/acme/Application.class",
             runtime_analyzer_hit=evidence_source != "current_final_artifact",
@@ -591,7 +618,7 @@ class EvidenceIngestionTest(unittest.TestCase):
         )
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].caller_symbol_id, "app-run")
-        self.assertEqual(merged[0].evidence_source, "current_final_artifact")
+        self.assertEqual(merged[0].evidence_source, "framework_semantic")
         self.assertEqual(merged[0].caller_evidence_source, "current_final_artifact")
         self.assertEqual(merged[0].caller_artifact_sha256, "a" * 64)
         self.assertEqual(
@@ -602,9 +629,25 @@ class EvidenceIngestionTest(unittest.TestCase):
 
     def test_mybatis_high_confidence_requires_one_sha_bound_complete_evidence_chain(self):
         mutations = {
-            "registration_missing": {"provenance_file": ""},
-            "binding_missing": {"provenance_binding_file": ""},
+            "registration_missing": {"provenance_mapper_registration": {}},
+            "registration_sha_corrupt": {"provenance_mapper_registration": {
+                "artifact_entry": "BOOT-INF/classes/com/acme/CityMapper.class",
+                "artifact_sha256": "corrupt",
+                "authority": "current_final_artifact_classfile",
+            }},
+            "binding_missing": {"provenance_binding_evidence": {}},
             "activation_missing": {"provenance_business_activation": []},
+            "activation_sha_corrupt": {"provenance_business_activation": [{
+                "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
+                "artifact_sha256": "corrupt",
+                "authority": "current_final_artifact_classfile",
+            }]},
+            "activation_entry_mismatch": {"provenance_business_activation": [{
+                "artifact_entry": "BOOT-INF/classes/com/acme/Other.class",
+                "artifact_sha256": "a" * 64,
+                "authority": "current_final_artifact_classfile",
+            }]},
+            "final_artifact_sha_corrupt": {"provenance_final_artifact_sha256": "corrupt"},
             "runtime_sha_corrupt": {"provenance_artifact_sha256": "corrupt"},
             "dispatch_incomplete": {"provenance_verified_dispatch": {
                 "proxy_entry_dispatch": True,
@@ -612,6 +655,24 @@ class EvidenceIngestionTest(unittest.TestCase):
                 "select_one_dispatch": True,
             }},
             "target_identity_mismatch": {"framework_target": "wrong.Target.invoke()"},
+            "physical_target_missing": {"provenance_physical_target_evidence": {}},
+            "physical_target_identity_mismatch": {"provenance_physical_target_evidence": {
+                "target": "wrong.Target.invoke()",
+                "dispatch_stage": "proxy_entry_dispatch",
+                "verified": True,
+                "artifact_entry": "BOOT-INF/lib/mybatis.jar",
+                "artifact_sha256": "b" * 64,
+            }},
+            "physical_target_sha_corrupt": {"provenance_physical_target_evidence": {
+                "target": (
+                    "org.apache.ibatis.binding.MapperProxy.invoke"
+                    "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])"
+                ),
+                "dispatch_stage": "proxy_entry_dispatch",
+                "verified": True,
+                "artifact_entry": "BOOT-INF/lib/mybatis.jar",
+                "artifact_sha256": "corrupt",
+            }},
         }
         for name, changes in mutations.items():
             with self.subTest(mutation=name):
@@ -629,6 +690,8 @@ class EvidenceIngestionTest(unittest.TestCase):
                 ))
 
         graph = self._proxy_graph(artifact_sha256="c" * 64)
+        caller = next(iter(graph.reverse_edges.values()))[0]
+        caller.artifact_entry = "BOOT-INF/classes/com/acme/Other.class"
         edge = self._mybatis_framework_edge()
         ingest_collector_batches(graph, (CollectorBatch(
             collector="mybatis_mapper_proxy", version="2", edges=(edge,),
@@ -638,6 +701,65 @@ class EvidenceIngestionTest(unittest.TestCase):
             and item.confidence == "high"
             for item in graph.reverse_edges.get(edge.callee_symbol, ())
         ))
+
+    def test_mybatis_accepts_sha_verified_extracted_caller_for_same_final_class(self):
+        graph = self._proxy_graph(artifact_sha256="c" * 64)
+        caller = next(iter(graph.reverse_edges.values()))[0]
+        caller.file = "/cache/business-classes.jar!/com/acme/Application.class"
+        caller.artifact_entry = "com/acme/Application.class"
+        edge = self._mybatis_framework_edge()
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+        ),))
+
+        projected = graph.reverse_edges[edge.callee_symbol]
+        self.assertTrue(any(
+            item.evidence_type == "mybatis_mapper_proxy_dispatch"
+            and item.confidence == "high"
+            and item.framework_final_artifact_verified
+            and item.caller_artifact_sha256 == "c" * 64
+            for item in projected
+        ))
+
+    def test_mybatis_each_api_requires_its_exact_physical_target_evidence(self):
+        targets = (
+            (
+                "org.apache.ibatis.binding.MapperProxy.invoke"
+                "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])"
+            ),
+            (
+                "org.apache.ibatis.binding.MapperMethod.execute"
+                "(org.apache.ibatis.session.SqlSession,java.lang.Object[])"
+            ),
+            (
+                "org.apache.ibatis.session.SqlSession.selectOne"
+                "(java.lang.String,java.lang.Object)"
+            ),
+        )
+        for target in targets:
+            with self.subTest(target=target):
+                graph = self._proxy_graph()
+                edge = self._mybatis_framework_edge(target=target)
+                physical = dict(
+                    dict(edge.metadata)["framework_provenance"]["physical_target_evidence"]
+                )
+                physical["dispatch_stage"] = "wrong_stage"
+                edge = self._mybatis_framework_edge(
+                    target=target,
+                    provenance_physical_target_evidence=physical,
+                )
+
+                ingest_collector_batches(graph, (CollectorBatch(
+                    collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+                ),))
+
+                projected = graph.reverse_edges.get(target, ())
+                self.assertFalse(any(
+                    item.evidence_type == "mybatis_mapper_proxy_dispatch"
+                    and item.confidence == "high"
+                    for item in projected
+                ))
 
     def test_transaction_proxy_keeps_runtime_observed_caller_authority(self):
         target = (
@@ -679,12 +801,67 @@ class EvidenceIngestionTest(unittest.TestCase):
         ),))
 
         merged = graph.reverse_edges[target][0]
-        self.assertEqual(merged.evidence_source, "runtime_observation")
+        self.assertEqual(merged.evidence_source, "framework_semantic")
         self.assertEqual(merged.caller_evidence_source, "runtime_observation")
         self.assertEqual(
             merged.framework_evidence_authority,
             EvidenceAuthority.FRAMEWORK_SEMANTIC.value,
         )
+
+    def test_composite_proxy_exposes_final_artifact_caller_without_claiming_its_authority(self):
+        from confidence_weighted_tracer import _edge_allowed_for_trace
+
+        target = (
+            "org.springframework.transaction.interceptor.TransactionInterceptor.invoke"
+            "(org.aopalliance.intercept.MethodInvocation)"
+        )
+        edge = self._framework_edge(
+            "spring_transaction_proxy_dispatch",
+            target=target,
+            metadata=(
+                ("framework_source", "com.acme.BookingService.book/1"),
+                ("framework_target", target),
+                ("source_owner", "com.acme.BookingService"),
+                ("source_member", "book"),
+                ("parameter_count", 1),
+                ("runtime_activation", "active"),
+                ("framework_provenance", {
+                    "authority": "final_artifact_javap",
+                    "artifact_sha256": "b" * 64,
+                    "business_artifact_sha256": "a" * 64,
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main"
+                    }],
+                }),
+            ),
+        )
+        caller = next(iter(self._proxy_graph().reverse_edges.values()))[0]
+        caller.callee_key = "com.acme.BookingService.book(java.lang.String)"
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={caller.callee_key: [caller]},
+            require_current_final_artifact_business_edges=True,
+        )
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_transaction_proxy", version="1", edges=(edge,),
+        ),))
+
+        merged = graph.reverse_edges[target][0]
+        self.assertEqual(merged.evidence_source, "framework_semantic")
+        self.assertEqual(merged.caller_evidence_source, "current_final_artifact")
+        self.assertEqual(merged.caller_evidence_authority, "current_final_artifact")
+        self.assertEqual(
+            merged.caller_evidence_file,
+            "/artifact/application.jar!/BOOT-INF/classes/com/acme/Application.class",
+        )
+        self.assertEqual(merged.runtime_analyzer_hit["coord"], "__business__")
+        self.assertEqual(merged.runtime_analyzer_hit["artifact_sha256"], "a" * 64)
+        self.assertEqual(
+            merged.runtime_analyzer_hit["artifact_entry"],
+            "BOOT-INF/classes/com/acme/Application.class",
+        )
+        self.assertTrue(_edge_allowed_for_trace(merged, graph))
 
     def test_runtime_callback_activation_is_linked_only_from_typed_business_evidence(self):
         callback = SimpleNamespace(

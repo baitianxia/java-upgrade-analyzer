@@ -25,6 +25,7 @@ import struct
 import sys
 import time
 import zipfile
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
@@ -6377,12 +6378,60 @@ def ensure_trace_cache(trace_cache=None):
     return trace_cache
 
 
+def _valid_projected_sha256(value):
+    return bool(re.fullmatch(r'[0-9a-fA-F]{64}', str(value or '')))
+
+
+def _inspectable_runtime_analyzer_hit(edge):
+    hit = getattr(edge, 'runtime_analyzer_hit', None)
+    return hit if isinstance(hit, Mapping) and bool(hit) else None
+
+
+def _verified_composite_framework_projection(edge):
+    caller_file = str(getattr(edge, 'caller_evidence_file', '') or '').strip()
+    caller_entry = str(getattr(edge, 'caller_artifact_entry', '') or '').strip()
+    if '!/' in caller_file and caller_file.split('!/', 1)[1] != caller_entry:
+        return False
+    return bool(
+        getattr(edge, 'framework_registration', False) is True
+        and getattr(edge, 'framework_final_artifact_verified', False) is True
+        and getattr(edge, 'semantic', False) is True
+        and str(getattr(edge, 'evidence_source', '') or '') == 'framework_semantic'
+        and str(getattr(edge, 'evidence_authority', '') or '') == 'framework_semantic'
+        and str(getattr(edge, 'framework_evidence_source', '') or '')
+        == 'framework_semantic'
+        and str(getattr(edge, 'framework_evidence_authority', '') or '')
+        == 'framework_semantic'
+        and not str(getattr(edge, 'framework_evidence_artifact_sha256', '') or '')
+        and not str(getattr(edge, 'framework_evidence_artifact_entry', '') or '')
+        and not str(getattr(edge, 'artifact_sha256', '') or '')
+        and not str(getattr(edge, 'artifact_entry', '') or '')
+        and str(getattr(edge, 'collector', '') or '').strip()
+        and str(getattr(edge, 'framework_source', '') or '').strip()
+        and str(getattr(edge, 'framework_target', '') or '').strip()
+        == str(getattr(edge, 'callee_key', '') or '').strip()
+        and str(getattr(edge, 'caller_evidence_source', '') or '')
+        == 'current_final_artifact'
+        and str(getattr(edge, 'caller_evidence_authority', '') or '')
+        == 'current_final_artifact'
+        and _valid_projected_sha256(
+            getattr(edge, 'caller_artifact_sha256', '')
+        )
+        and caller_file
+        and caller_entry
+        and str(getattr(edge, 'owner_type', '') or '') == 'business'
+        and not bool(getattr(edge, 'is_test', False))
+    )
+
+
 def _edge_allowed_for_trace(edge, graph):
     if not bool(getattr(graph, 'require_current_final_artifact_business_edges', False)):
         return True
+    if getattr(edge, 'framework_registration', False) or getattr(edge, 'semantic', False):
+        return _verified_composite_framework_projection(edge)
     return bool(
         str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
-        or getattr(edge, 'runtime_analyzer_hit', None)
+        or _inspectable_runtime_analyzer_hit(edge)
     )
 
 
@@ -6741,16 +6790,25 @@ def has_verified_final_artifact_business_path(candidate):
         return False
     has_business_edge = False
     for edge in path_edges:
-        runtime_hit = getattr(edge, 'runtime_analyzer_hit', None)
+        runtime_hit = _inspectable_runtime_analyzer_hit(edge)
+        framework_edge = bool(
+            getattr(edge, 'framework_registration', False)
+            or getattr(edge, 'semantic', False)
+        )
+        framework_verified = (
+            _verified_composite_framework_projection(edge)
+            if framework_edge else False
+        )
         final_artifact_edge = (
             str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
         )
-        if not runtime_hit and not final_artifact_edge:
+        if not runtime_hit and not final_artifact_edge and not framework_verified:
             return False
         if (
             str(getattr(edge, 'owner_type', '') or '') == 'business'
             and (
                 final_artifact_edge
+                or framework_verified
                 or str((runtime_hit or {}).get('coord') or '') == '__business__'
             )
         ):
@@ -6765,20 +6823,29 @@ def has_verified_final_artifact_framework_path(candidate):
     has_business_edge = False
     has_framework_edge = False
     for edge in path_edges:
-        runtime_hit = getattr(edge, 'runtime_analyzer_hit', None)
+        runtime_hit = _inspectable_runtime_analyzer_hit(edge)
+        framework_edge = bool(
+            getattr(edge, 'framework_registration', False)
+            or getattr(edge, 'semantic', False)
+        )
+        framework_verified = (
+            _verified_composite_framework_projection(edge)
+            if framework_edge else False
+        )
         final_artifact_edge = (
             str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
         )
-        if not runtime_hit and not final_artifact_edge:
+        if not runtime_hit and not final_artifact_edge and not framework_verified:
             return False
-        if getattr(edge, 'framework_registration', False):
-            if not getattr(edge, 'framework_final_artifact_verified', False):
+        if framework_edge:
+            if not framework_verified:
                 return False
             has_framework_edge = True
         if (
             str(getattr(edge, 'owner_type', '') or '') == 'business'
             and (
                 final_artifact_edge
+                or framework_verified
                 or str((runtime_hit or {}).get('coord') or '') == '__business__'
             )
         ):
@@ -6801,11 +6868,7 @@ def _has_verified_final_artifact_framework_target(api_row, graph):
         if normalize_signature_for_lookup(signature) != target_signature:
             continue
         if any(
-            getattr(edge, 'framework_registration', False)
-            and getattr(edge, 'framework_final_artifact_verified', False)
-            and str(getattr(edge, 'evidence_source', '') or '') == 'current_final_artifact'
-            and str(getattr(edge, 'owner_type', '') or '') == 'business'
-            and not bool(getattr(edge, 'is_test', False))
+            _verified_composite_framework_projection(edge)
             for edge in (edges or [])
         ):
             return True

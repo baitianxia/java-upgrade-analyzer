@@ -259,6 +259,14 @@ def _valid_sha256(value):
     return bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(value or "")))
 
 
+def _business_class_entry(value):
+    entry = str(value or "").strip()
+    for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/"):
+        if entry.startswith(prefix):
+            return entry[len(prefix):]
+    return entry
+
+
 def _caller_evidence_fields(caller):
     return {
         "caller_evidence_source": str(
@@ -310,7 +318,8 @@ def _proxy_call_edge(
 ):
     provenance = dict(edge_mapping.get("provenance") or {})
     values = dict(vars(caller))
-    values.update(_caller_evidence_fields(caller))
+    caller_evidence = _caller_evidence_fields(caller)
+    values.update(caller_evidence)
     values.update(_framework_evidence_fields(batch, edge))
     values.update({
         "callee_key": target,
@@ -326,7 +335,35 @@ def _proxy_call_edge(
         "runtime_activation": str(
             edge_mapping.get("runtime_activation") or "active"
         ),
+        "evidence_source": (
+            edge.provenance.evidence_source or edge.provenance.authority.value
+        ),
+        "evidence_authority": edge.provenance.authority.value,
+        "artifact_sha256": edge.provenance.artifact_sha256,
+        "artifact_entry": edge.provenance.artifact_entry,
     })
+    runtime_hit = getattr(caller, "runtime_analyzer_hit", None)
+    if isinstance(runtime_hit, Mapping):
+        runtime_hit = dict(runtime_hit)
+    elif (
+        caller_evidence["caller_evidence_source"] == "current_final_artifact"
+        and _valid_sha256(caller_evidence["caller_artifact_sha256"])
+        and caller_evidence["caller_evidence_file"]
+        and caller_evidence["caller_artifact_entry"]
+    ):
+        owner_coord = str(getattr(caller, "owner_coord", "") or "")
+        runtime_hit = {
+            "coord": (
+                "__business__"
+                if str(getattr(caller, "owner_type", "") or "") == "business"
+                or owner_coord in {"BUSINESS", "__business__"}
+                else owner_coord
+            ),
+            "artifact_sha256": caller_evidence["caller_artifact_sha256"],
+            "artifact_path": caller_evidence["caller_evidence_file"].split("!/", 1)[0],
+            "artifact_entry": caller_evidence["caller_artifact_entry"],
+        }
+    values["runtime_analyzer_hit"] = runtime_hit
     if use_framework_line:
         values["line"] = int(provenance.get("line") or values.get("line") or 0)
     if final_artifact_verified is not None:
@@ -489,6 +526,22 @@ def _to_call_edge(
     return converted
 
 
+_MYBATIS_PHYSICAL_TARGET_STAGES = {
+    (
+        "org.apache.ibatis.binding.MapperProxy.invoke"
+        "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])"
+    ): "proxy_entry_dispatch",
+    (
+        "org.apache.ibatis.binding.MapperMethod.execute"
+        "(org.apache.ibatis.session.SqlSession,java.lang.Object[])"
+    ): "plain_invoker_dispatch",
+    (
+        "org.apache.ibatis.session.SqlSession.selectOne"
+        "(java.lang.String,java.lang.Object)"
+    ): "select_one_dispatch",
+}
+
+
 def _mybatis_chain_is_complete(edge, edge_mapping, caller):
     metadata = _edge_metadata(edge)
     target = str(edge_mapping.get("target") or "").strip()
@@ -496,36 +549,79 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
     provenance = dict(edge_mapping.get("provenance") or {})
     dispatch = provenance.get("verified_dispatch")
     activations = provenance.get("business_activation")
+    registration = provenance.get("mapper_registration")
+    binding = provenance.get("binding_evidence")
+    physical_target = provenance.get("physical_target_evidence")
+    final_artifact_sha = str(
+        provenance.get("final_artifact_sha256") or ""
+    ).lower()
+    runtime_sha = str(provenance.get("artifact_sha256") or "").lower()
+    runtime_entry = str(provenance.get("artifact_entry") or "").strip()
+    expected_dispatch_stage = _MYBATIS_PHYSICAL_TARGET_STAGES.get(target, "")
     caller_sha = str(getattr(caller, "artifact_sha256", "") or "")
     caller_entry = str(getattr(caller, "artifact_entry", "") or "")
+    caller_file = str(getattr(caller, "file", "") or "")
     activation_matches_caller = any(
         isinstance(item, Mapping)
         and str(item.get("artifact_entry") or "").strip()
         and _valid_sha256(item.get("artifact_sha256"))
-        and str(item.get("artifact_sha256") or "").lower() == caller_sha.lower()
+        and str(item.get("artifact_sha256") or "").lower()
+        == final_artifact_sha
         and str(item.get("authority") or "") == "current_final_artifact_classfile"
+        and _business_class_entry(item.get("artifact_entry"))
+        == _business_class_entry(caller_entry)
         for item in (activations if isinstance(activations, (list, tuple)) else ())
     )
     return bool(
         target
+        and expected_dispatch_stage
         and declared_target == target
         and str(edge_mapping.get("source_owner") or "").strip()
         and str(edge_mapping.get("source_member") or "").strip()
         and str(provenance.get("file") or "").strip()
         and str(provenance.get("binding_file") or "").strip()
         and str(provenance.get("authority") or "") == "final_artifact_javap"
-        and str(provenance.get("artifact_entry") or "").strip()
-        and _valid_sha256(provenance.get("artifact_sha256"))
+        and _valid_sha256(final_artifact_sha)
+        and isinstance(registration, Mapping)
+        and str(registration.get("artifact_entry") or "").strip()
+        and str(registration.get("authority") or "")
+        == "current_final_artifact_classfile"
+        and str(registration.get("artifact_sha256") or "").lower()
+        == final_artifact_sha
+        and isinstance(binding, Mapping)
+        and str(binding.get("artifact_entry") or "").strip()
+        and str(binding.get("authority") or "") in {
+            "current_final_artifact_classfile",
+            "current_final_artifact_resource",
+        }
+        and str(binding.get("artifact_sha256") or "").lower()
+        == final_artifact_sha
+        and runtime_entry
+        and _valid_sha256(runtime_sha)
         and isinstance(dispatch, Mapping)
         and all(bool(dispatch.get(stage)) for stage in (
             "proxy_entry_dispatch",
             "plain_invoker_dispatch",
             "select_one_dispatch",
         ))
+        and isinstance(physical_target, Mapping)
+        and str(physical_target.get("target") or "").strip() == target
+        and str(physical_target.get("dispatch_stage") or "")
+        == expected_dispatch_stage
+        and physical_target.get("verified") is True
+        and str(physical_target.get("artifact_entry") or "").strip()
+        == runtime_entry
+        and str(physical_target.get("artifact_sha256") or "").lower()
+        == runtime_sha
         and str(getattr(caller, "evidence_source", "") or "")
         == "current_final_artifact"
         and caller_entry
         and _valid_sha256(caller_sha)
+        and caller_file
+        and (
+            "!/" not in caller_file
+            or caller_file.split("!/", 1)[1] == caller_entry
+        )
         and activation_matches_caller
     )
 
