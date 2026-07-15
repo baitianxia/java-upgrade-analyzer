@@ -19,6 +19,7 @@ from step5_evidence_model import (
     EvidenceFailure,
     EvidenceProvenance,
     ModuleScope,
+    classify_module_scope,
 )
 
 
@@ -518,8 +519,7 @@ def _string_param_indices(method):
     }
 
 
-def _direct_class_lookup_param_indices(method):
-    body = method.get_body_text()
+def _direct_class_lookup_param_indices(method, body):
     param_names = _method_param_names(method)
     string_indices = _string_param_indices(method)
     result = set()
@@ -534,7 +534,7 @@ def _direct_class_lookup_param_indices(method):
     return result
 
 
-def _interprocedural_reflection_candidates(methods):
+def _interprocedural_reflection_candidates(methods, bodies_by_symbol):
     methods = list(methods)
     groups = {}
     names_by_class = {}
@@ -545,7 +545,9 @@ def _interprocedural_reflection_candidates(methods):
         names_by_class.setdefault(method.class_fqcn, set()).add(method.method_name)
 
     summaries = {
-        method.symbol_id: _direct_class_lookup_param_indices(method)
+        method.symbol_id: _direct_class_lookup_param_indices(
+            method, bodies_by_symbol.get(method.symbol_id, '')
+        )
         for method in methods
     }
     for _ in range(len(methods) + 1):
@@ -554,7 +556,8 @@ def _interprocedural_reflection_candidates(methods):
             param_names = _method_param_names(method)
             string_indices = _string_param_indices(method)
             for name, args, _offset, _content in _iter_local_invocations(
-                method.get_body_text(), names_by_class.get(method.class_fqcn, ())
+                bodies_by_symbol.get(method.symbol_id, ''),
+                names_by_class.get(method.class_fqcn, ()),
             ):
                 callees = groups.get((method.class_fqcn, name, len(args)), [])
                 if not callees:
@@ -574,7 +577,7 @@ def _interprocedural_reflection_candidates(methods):
 
     result = {method.symbol_id: [] for method in methods}
     for method in methods:
-        body = method.get_body_text()
+        body = bodies_by_symbol.get(method.symbol_id, '')
         string_vars = {
             match.group(1): match.group(2)
             for match in re.finditer(
@@ -601,8 +604,7 @@ def _interprocedural_reflection_candidates(methods):
     return result
 
 
-def _source_candidates(method):
-    body = method.get_body_text()
+def _source_candidates(method, body):
     if not any(marker in body for marker in SOURCE_INDIRECT_MARKERS):
         return body, [], []
     string_vars = {
@@ -878,21 +880,25 @@ def _owners_present_in_source_body(body, method, owners, owners_by_simple):
     return [owner for owner in owners if owner in present]
 
 
-def _indirect_scope(owner_type):
-    if owner_type == 'business':
+def _indirect_scope(edge, runtime_catalog):
+    if edge.owner_type == 'business':
         return ModuleScope.BUSINESS_CLASSES
-    if owner_type == 'dependency':
+    catalog_item = ((runtime_catalog or {}).get('by_coord') or {}).get(edge.owner_coord)
+    catalog_scope = classify_module_scope(catalog_item)
+    if catalog_scope == ModuleScope.INTERNAL_MODULE:
+        return catalog_scope
+    if edge.owner_type == 'dependency':
         return ModuleScope.EXTERNAL_DEPENDENCY
     return ModuleScope.UNKNOWN
 
 
-def _collected_indirect_edge(edge, api_identity):
+def _collected_indirect_edge(edge, api_identity, runtime_catalog):
     return CollectedEdge(
         caller_symbol=edge.caller_symbol_id,
         callee_symbol=edge.callee_key,
         edge_kind=edge.evidence_type,
         semantic=True,
-        owner_scope=_indirect_scope(edge.owner_type),
+        owner_scope=_indirect_scope(edge, runtime_catalog),
         owner_coord=edge.owner_coord,
         provenance=EvidenceProvenance(
             authority=EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
@@ -907,8 +913,23 @@ def _collected_indirect_edge(edge, api_identity):
             ('callee_param_types', tuple(edge.callee_param_types)),
             ('content', edge.content),
             ('api_identity', api_identity),
+            ('owner_type', edge.owner_type),
+            ('owner_coord', edge.owner_coord),
+            ('module', edge.module),
+            ('is_test', edge.is_test),
         ),
     )
+
+
+def _read_method_body(method):
+    try:
+        body = method.get_body_text()
+    except Exception as exc:
+        return '', f'{exc.__class__.__name__}: {exc}'
+    read_error = str(getattr(method, '_body_text_read_error', '') or '')
+    if read_error:
+        return '', read_error
+    return str(body or ''), ''
 
 
 def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
@@ -939,12 +960,33 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
     owner_presence_scans = 0
     source_methods_with_indirect_markers = 0
     methods = list((getattr(graph_snapshot, 'methods_by_id', {}) or {}).values())
-    propagated_reflection_candidates = _interprocedural_reflection_candidates(methods)
+    source_methods = len(methods)
+    runtime_catalog = getattr(graph_snapshot, 'runtime_dependency_catalog', {}) or {}
+    source_failures = []
+    bodies_by_symbol = {}
+    readable_methods = []
+    for method in methods:
+        body, read_error = _read_method_body(method)
+        if read_error:
+            source_failures.append(EvidenceFailure(
+                stage='indirect-usage-analysis',
+                reason_code='SOURCE_METHOD_BODY_READ_FAILED',
+                blocking=True,
+                artifact=str(getattr(method, 'file', '') or ''),
+                class_name=str(getattr(method, 'class_fqcn', '') or ''),
+                detail=f'无法读取源码方法体：{read_error}',
+            ))
+            continue
+        bodies_by_symbol[method.symbol_id] = body
+        readable_methods.append(method)
+    propagated_reflection_candidates = _interprocedural_reflection_candidates(
+        readable_methods, bodies_by_symbol
+    )
     collected_edges = []
 
-    for method in methods:
-        source_methods += 1
-        body, candidates, unresolved = _source_candidates(method)
+    for method in readable_methods:
+        body = bodies_by_symbol.get(method.symbol_id, '')
+        body, candidates, unresolved = _source_candidates(method, body)
         candidates.extend(propagated_reflection_candidates.get(method.symbol_id, ()))
         has_reflection_source = (
             any(marker in body for marker in ('Class.forName', 'ClassUtils.forName', '.loadClass('))
@@ -971,7 +1013,9 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
                 if not _matches_target(target, owner, member, params, kind=kind):
                     continue
                 edge = _edge_for_target(method, target, evidence_type, body, offset, content)
-                collected_edges.append(_collected_indirect_edge(edge, target['api_key']))
+                collected_edges.append(_collected_indirect_edge(
+                    edge, target['api_key'], runtime_catalog
+                ))
                 merged_edges += 1
                 if evidence_type.startswith('reflection_'):
                     findings[target['api_key']].append({
@@ -1059,6 +1103,13 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
         for target in targets:
             coverage_by_api[target['api_key']]['resource_reference'] = resource_status
 
+    if source_failures:
+        for target in targets:
+            for analyzer in (
+                'reflection_source', 'method_handle_source', 'expression_language',
+            ):
+                coverage_by_api[target['api_key']][analyzer] = 'insufficient'
+
     for target in targets:
         target_keys = {target['callee_key']}
         if target['kind'] == 'class':
@@ -1089,6 +1140,8 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
             for name, analyzer_status in target_matrix.items()
             if analyzer_status == 'partial'
         ]
+        if source_failures:
+            reason_codes.append('SOURCE_METHOD_BODY_READ_FAILED')
         per_api_coverage[target['api_key']] = {
             'status': status,
             'reason_codes': reason_codes,
@@ -1128,6 +1181,7 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
             for reason in item.get('reason_codes') or []
         }),
         'source_methods_scanned': source_methods,
+        'source_method_read_failures': len(source_failures),
         'resource_files_scanned': resource_files,
         'merged_edges': merged_edges,
         'resource_findings': sum(len(items) for items in findings.values()),
@@ -1185,7 +1239,7 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
         collector='indirect_usage',
         version='2',
         edges=tuple(collected_edges),
-        failures=tuple(resource_failures),
+        failures=tuple([*source_failures, *resource_failures]),
         concerns=tuple(concerns),
         coverage=tuple(coverage),
         metrics=tuple(sorted({

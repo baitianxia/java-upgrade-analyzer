@@ -473,32 +473,38 @@ class MethodDef:
     body_text: str = ""  # 保留兼容，为空时使用延迟加载
     _body_text_cached: str = field(default="", repr=False)  # 缓存
     _body_lines: tuple = field(default_factory=lambda: (), repr=False)  # 原始行
+    _body_text_read_error: str = field(default="", repr=False)
 
     @property
     def body_text_lazy(self) -> str:
         """延迟加载方法体（按需读取文件）"""
         if self._body_text_cached:
+            self._body_text_read_error = ""
             return self._body_text_cached
 
         if self._body_lines:
+            self._body_text_read_error = ""
             self._body_text_cached = ''.join(self._body_lines)
             self._body_lines = ()  # 释放内存
             return self._body_text_cached
 
         # 回退：从文件读取
         try:
+            self._body_text_read_error = ""
             with open(self.file, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
                 start_idx = max(0, self.line - 1)
                 end_idx = min(len(lines), self.end_line)
                 self._body_text_cached = ''.join(lines[start_idx:end_idx])
                 return self._body_text_cached
-        except Exception:
+        except Exception as exc:
+            self._body_text_read_error = f"{exc.__class__.__name__}: {exc}"
             return ""
 
     def get_body_text(self) -> str:
         """获取方法体（优先使用缓存）"""
         if self.body_text:
+            self._body_text_read_error = ""
             return self.body_text
         return self.body_text_lazy
 

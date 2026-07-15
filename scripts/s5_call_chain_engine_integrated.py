@@ -61,10 +61,12 @@ from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_batch
 from indirect_usage_analyzer import (
     apply_indirect_usage_batch_compatibility,
+    api_key as indirect_api_key,
     collect_indirect_usage_batch,
 )
 from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
 from step5_evidence_ingestion import ingest_collector_batches
+from step5_evidence_model import CoverageRecord
 from analysis_contract import sha256_file
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -656,6 +658,35 @@ def _graph_snapshot_with_bytecode_batch(graph, batch):
     return snapshot
 
 
+def _build_business_bytecode_coverage(batch, ingestion_result, api_identities):
+    bytecode_stats = dict(batch.metrics)
+    business_failures = [
+        failure
+        for collector, failure in ingestion_result.failures_by_collector
+        if collector == 'business_bytecode'
+    ]
+    reason_codes = sorted({failure.reason_code for failure in business_failures})
+    applicable = bool(
+        bytecode_stats.get('classes_scanned')
+        and bytecode_stats.get('evidence_source') == 'current_final_artifact'
+    )
+    status = (
+        'partial' if applicable and reason_codes
+        else ('complete' if applicable else 'not_applicable')
+    )
+    coverage = tuple(
+        CoverageRecord(
+            collector='business_bytecode',
+            api_identity=api_identity,
+            status=status,
+            reason_codes=tuple(reason_codes),
+            applicable=applicable,
+        )
+        for api_identity in api_identities
+    )
+    return coverage, status, reason_codes
+
+
 def _step5_integrated_main_impl(args):
     """
     Step 5集成版主流程
@@ -1140,6 +1171,7 @@ def _step5_integrated_main_impl(args):
         graph_result = business_graph_result
 
     graph = graph_result['graph']
+    graph.runtime_dependency_catalog = runtime_dependency_catalog
     type_metadata = graph_result['type_metadata']
     graph_stats = graph_result['stats']
     graph_stats.setdefault('step5_perf', {})
@@ -1219,11 +1251,24 @@ def _step5_integrated_main_impl(args):
         source_roots,
     )
     ingestion_result = ingest_collector_batches(graph, (bytecode_batch, indirect_batch))
+    ingestion_failures = [
+        {
+            'collector': collector,
+            'reason_code': failure.reason_code,
+            'blocking': failure.blocking,
+            'api_identity': failure.api_identity,
+            'artifact': failure.artifact,
+            'class_name': failure.class_name,
+        }
+        for collector, failure in ingestion_result.failures_by_collector
+    ]
     graph_stats['evidence_ingestion'] = {
         'merged_edges': ingestion_result.merged_edges,
         'duplicate_edges': ingestion_result.duplicate_edges,
         'rejected_edges': ingestion_result.rejected_edges,
         'failure_count': len(ingestion_result.failures),
+        'failures': ingestion_failures,
+        'reason_codes': sorted({item['reason_code'] for item in ingestion_failures}),
     }
     bytecode_merge = {
         'merged_edges': dict(ingestion_result.merged_by_collector).get('business_bytecode', 0),
@@ -1231,17 +1276,30 @@ def _step5_integrated_main_impl(args):
             'business_bytecode', 0
         ),
     }
+    business_coverage, business_coverage_status, business_reason_codes = (
+        _build_business_bytecode_coverage(
+            bytecode_batch,
+            ingestion_result,
+            tuple(indirect_api_key(api_row) for api_row in all_apis),
+        )
+    )
+    graph.step5_collector_coverage = tuple(
+        getattr(graph, 'step5_collector_coverage', ()) or ()
+    ) + business_coverage
     graph_stats['business_bytecode'] = {
         **bytecode_stats,
         **bytecode_merge,
-        'status': (
-            'complete' if (
-                bytecode_stats.get('classes_scanned')
-                and not bytecode_batch.failures
-                and bytecode_stats.get('evidence_source') == 'current_final_artifact'
-            )
-            else ('partial' if bytecode_stats.get('classes_scanned') else 'not_applicable')
-        ),
+        'status': business_coverage_status,
+        'failures': business_reason_codes,
+        'reason_codes': business_reason_codes,
+        'coverage_by_api': {
+            item.api_identity: {
+                'status': item.status,
+                'reason_codes': list(item.reason_codes),
+                'applicable': item.applicable,
+            }
+            for item in business_coverage
+        },
     }
     graph_stats['indirect_usage'] = apply_indirect_usage_batch_compatibility(
         graph, indirect_batch
@@ -1274,7 +1332,6 @@ def _step5_integrated_main_impl(args):
             f"owner_presence_scans={graph_stats['step5_perf']['main']['indirect_usage_owner_presence_scans']}"
         ),
     )
-    graph.runtime_dependency_catalog = runtime_dependency_catalog
     graph.report_dir = str(report_dir)
 
     print(f"  方法数：{len(graph.methods_by_id)}", file=sys.stderr)

@@ -4940,6 +4940,47 @@ public class com.example.TargetBridge {
         self.assertTrue(completeness["incomplete"])
         self.assertIn("tree_sitter_unavailable=2", completeness["reasons"][0])
 
+    def test_assess_graph_completeness_keeps_business_bytecode_failure_codes(self):
+        completeness = tracer.assess_graph_completeness({
+            "truncated": False,
+            "parser_fallback_reasons": {},
+            "edge_cap_hits": 0,
+            "business_bytecode": {
+                "status": "partial",
+                "reason_codes": ["BYTECODE_CALLER_UNRESOLVED"],
+                "failures": ["BYTECODE_CALLER_UNRESOLVED"],
+            },
+        })
+
+        self.assertTrue(completeness["incomplete"])
+        self.assertEqual(completeness["reason_codes"], ["BYTECODE_CALLER_UNRESOLVED"])
+
+    def test_business_bytecode_partial_coverage_prevents_static_not_found(self):
+        api_row = {
+            "api_name": "com.vendor.TargetApi.call", "api_simple": "call",
+            "api_signature": "()", "symbol_kind": "method",
+            "change_type": "REMOVED", "coord": "vendor:demo",
+            "severity": "P1", "confirmed": "true", "source": "old_jar",
+            "analysis_scope": "method",
+        }
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+
+        result = tracer.trace_api_with_confidence_weighting(
+            api_row, graph, {}, has_packaged_bytecode_fallback=False,
+            has_dependency_source_mapping=True,
+            graph_stats={
+                "business_bytecode": {
+                    "status": "partial",
+                    "reason_codes": ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"],
+                    "failures": ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"],
+                },
+            },
+        )
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertNotEqual(result.analysis_status, "not_found_in_static_analysis")
+        self.assertIn("CURRENT_FINAL_ARTIFACT_SHA_INVALID", result.reachable_note)
+
     def test_assess_graph_completeness_ignores_unrelated_parser_fallback_files_for_api(self):
         with tempfile.TemporaryDirectory() as tmp:
             unrelated = Path(tmp) / "generated" / "MySqlParser.java"

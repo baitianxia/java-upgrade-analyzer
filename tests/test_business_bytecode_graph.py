@@ -78,7 +78,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         self.assertEqual(failed.edges, ())
         self.assertEqual(failed.failures[0].reason_code, "BYTECODE_PARSE_FAILED")
 
-    def test_collect_business_bytecode_batch_records_unresolved_caller_as_concern(self):
+    def test_collect_business_bytecode_batch_records_unresolved_caller_as_failure(self):
         import business_bytecode_graph as module
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,7 +100,73 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
                 module.parse_classfile_calls = original
 
         self.assertEqual(batch.edges, ())
-        self.assertEqual(batch.concerns[0].reason_code, "BYTECODE_CALLER_UNRESOLVED")
+        self.assertEqual(batch.failures[0].reason_code, "BYTECODE_CALLER_UNRESOLVED")
+        self.assertTrue(batch.failures[0].blocking)
+
+    def test_collect_business_bytecode_batch_rejects_invalid_sha_with_stable_failure(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            original = module.parse_classfile_calls
+            module.parse_classfile_calls = lambda _data, _name: [{
+                "caller_owner": "com.acme.Service", "caller_name": "run",
+                "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+                "callee_simple_key": "method:call()",
+                "evidence_type": "bytecode_method_invocation",
+            }]
+            try:
+                batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
+                    "jar_path": str(jar_path), "sha256": "not-a-sha",
+                }}}, None)
+            finally:
+                module.parse_classfile_calls = original
+
+        self.assertEqual(batch.edges, ())
+        self.assertEqual(
+            [failure.reason_code for failure in batch.failures],
+            ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"],
+        )
+        self.assertEqual(
+            dict(batch.metrics)["failures"],
+            ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"],
+        )
+
+    def test_collect_business_bytecode_batch_records_javap_parser_across_cache_hit(self):
+        import business_bytecode_graph as module
+
+        javap = """
+  public void run();
+    descriptor: ()V
+    Code:
+       1: invokestatic #7 // Method com/vendor/Legacy.call:()V
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "bytecode-index.json"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"reflection-class")
+            catalog = {"by_coord": {"__business__": {
+                "jar_path": str(jar_path), "sha256": "d" * 64,
+            }}}
+            original_parse, original_run = module.parse_classfile_calls, module.run_cmd
+            module.parse_classfile_calls = lambda _data, _name: None
+            module.run_cmd = lambda *_args, **_kwargs: (javap, "", 0)
+            try:
+                first = collect_business_bytecode_batch([], catalog, str(cache_path))
+                module.parse_classfile_calls = lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("cache miss")
+                )
+                second = collect_business_bytecode_batch([], catalog, str(cache_path))
+            finally:
+                module.parse_classfile_calls, module.run_cmd = original_parse, original_run
+
+        self.assertTrue(first.edges)
+        self.assertTrue(dict(second.metrics)["cache_hit"])
+        self.assertTrue(all(edge.provenance.parser == "javap" for edge in first.edges))
+        self.assertTrue(all(edge.provenance.parser == "javap" for edge in second.edges))
     def test_collect_business_bytecode_rejects_target_classes_without_final_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"

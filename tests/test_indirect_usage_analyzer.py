@@ -133,6 +133,27 @@ class IndirectUsageAnalyzerTest(unittest.TestCase):
 
         self.assertEqual(batch.failures[0].reason_code, "RESOURCE_READ_FAILED")
 
+    def test_collect_indirect_usage_batch_reports_method_body_read_failure(self):
+        method = business_method("")
+        method.file = "/missing/OrderService.java"
+
+        batch = collect_indirect_usage_batch(graph_for(method), [api_row()], [])
+
+        self.assertEqual(batch.failures[0].reason_code, "SOURCE_METHOD_BODY_READ_FAILED")
+        self.assertTrue(batch.failures[0].blocking)
+        self.assertEqual(batch.coverage[0].status, "insufficient")
+        self.assertIn("SOURCE_METHOD_BODY_READ_FAILED", batch.coverage[0].reason_codes)
+        self.assertEqual(dict(batch.metrics)["source_methods_scanned"], 1)
+
+    def test_collect_indirect_usage_batch_contains_raised_method_body_read_failure(self):
+        method = business_method("")
+        method.get_body_text = lambda: (_ for _ in ()).throw(OSError("denied"))
+
+        batch = collect_indirect_usage_batch(graph_for(method), [api_row()], [])
+
+        self.assertEqual(batch.failures[0].reason_code, "SOURCE_METHOD_BODY_READ_FAILED")
+        self.assertEqual(batch.coverage[0].status, "insufficient")
+
     def test_collect_indirect_usage_batch_returns_resource_reference_as_concern(self):
         method = business_method("return false;")
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,6 +186,46 @@ class IndirectUsageAnalyzerTest(unittest.TestCase):
         self.assertEqual(coverage.status, "partial")
         self.assertIn("method_handle_source_partial", coverage.reason_codes)
         self.assertIn("expression_language_partial", coverage.reason_codes)
+
+    def test_collect_indirect_usage_batch_classifies_application_owned_dependency_as_internal(self):
+        method = business_method('''
+            return (Boolean) Class.forName("org.apache.commons.lang.StringUtils")
+                .getMethod("isBlank", String.class).invoke(null, value);
+        ''')
+        method.owner_type = "dependency"
+        method.owner_coord = "com.acme:internal-module"
+        method.module = "internal-module"
+        graph = graph_for(method)
+        graph.runtime_dependency_catalog = {"by_coord": {
+            "com.acme:internal-module": {
+                "coord": "com.acme:internal-module", "application_owned": True,
+            }
+        }}
+
+        batch = collect_indirect_usage_batch(graph, [api_row()], [])
+
+        self.assertEqual(batch.edges[0].owner_scope.value, "internal_module")
+
+    def test_indirect_ingestion_preserves_legacy_caller_and_target_fields(self):
+        method = business_method('''
+            return (Boolean) Class.forName("org.apache.commons.lang.StringUtils")
+                .getMethod("isBlank", String.class).invoke(null, value);
+        ''')
+        method.owner_coord = "BUSINESS"
+        method.module = "orders"
+        graph = graph_for(method)
+
+        stats = analyze_and_merge_indirect_usages(graph, [api_row()], [])
+
+        self.assertEqual(stats["merged_edges"], 1)
+        edge = graph.reverse_edges["org.apache.commons.lang.StringUtils.isBlank(String)"][0]
+        self.assertEqual(
+            (edge.owner_type, edge.owner_coord, edge.module, edge.is_test),
+            ("business", "BUSINESS", "orders", False),
+        )
+        self.assertEqual(edge.callee_param_types, ["String"])
+        self.assertTrue(edge.callee_fqcn_complete)
+        self.assertTrue(edge.callee_signature_complete)
     def test_exact_reflection_chain_becomes_reachable_step5_edge(self):
         method = business_method('''
             return (Boolean) Class.forName("org.apache.commons.lang.StringUtils")

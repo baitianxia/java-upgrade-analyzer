@@ -4928,23 +4928,53 @@ def _build_indirect_usage_result(result, api_row, graph):
 def _capability_coverage_for_api(api_row, graph):
     coverage = dict(getattr(graph, 'indirect_analysis_coverage', {}) or {})
     per_api = dict(coverage.get('by_api') or {})
-    item = dict(per_api.get(indirect_api_key(api_row)) or {})
-    if not item:
+    identity = indirect_api_key(api_row)
+    item = dict(per_api.get(identity) or {})
+    collector_records = [
+        record
+        for record in (getattr(graph, 'step5_collector_coverage', ()) or ())
+        if record.api_identity == identity and record.applicable
+    ]
+    if not item and not collector_records:
         return coverage
+    statuses = [item.get('status') or 'not_applicable'] if item else []
+    statuses.extend(record.status for record in collector_records)
+    if 'insufficient' in statuses:
+        status = 'insufficient'
+    elif 'partial' in statuses:
+        status = 'partial'
+    elif 'complete' in statuses:
+        status = 'complete'
+    else:
+        status = 'not_applicable'
+    reason_codes = list(item.get('reason_codes') or [])
+    for record in collector_records:
+        for reason_code in record.reason_codes:
+            if reason_code not in reason_codes:
+                reason_codes.append(reason_code)
     symbol_kind = get_symbol_kind(api_row)
+    analyzers = dict(item.get('matrix') or {})
+    for record in collector_records:
+        analyzers[record.collector] = record.status
     return {
-        'status': item.get('status') or 'not_applicable',
-        'reason_codes': list(item.get('reason_codes') or []),
-        'analyzers': dict(item.get('matrix') or {}),
-        'matrix': {symbol_kind: dict(item.get('matrix') or {})},
+        'status': status,
+        'reason_codes': reason_codes,
+        'analyzers': analyzers,
+        'matrix': {symbol_kind: analyzers},
     }
 
 
 def _build_indirect_coverage_incomplete_result(result):
     coverage = dict(result.capability_coverage or {})
     reasons = list(coverage.get('reason_codes') or [])
+    business_incomplete = any(
+        reason.startswith(('BYTECODE_', 'CURRENT_FINAL_ARTIFACT_', 'EVIDENCE_'))
+        for reason in reasons
+    )
     note = (
-        '目标 API 存在适用但未完整覆盖的间接调用机制，不能把静态未命中解释为未发现引用。'
+        ('目标 API 存在适用但未完整覆盖的证据采集，不能把静态未命中解释为未发现引用。'
+         if business_incomplete else
+         '目标 API 存在适用但未完整覆盖的间接调用机制，不能把静态未命中解释为未发现引用。')
         + (f"未完整能力：{', '.join(reasons)}" if reasons else '')
     )
     result.verification_commands = [
@@ -4952,8 +4982,11 @@ def _build_indirect_coverage_incomplete_result(result):
         '补充对应源码、制品或框架证据后重新运行 Step 5',
     ]
     return _apply_evidence_decision(result, failures=(EvidenceFailure(
-        stage='indirect-usage-analysis',
-        reason_code='INDIRECT_ANALYSIS_INCOMPLETE',
+        stage='evidence-coverage' if business_incomplete else 'indirect-usage-analysis',
+        reason_code=(
+            'INCOMPLETE_EVIDENCE_COVERAGE'
+            if business_incomplete else 'INDIRECT_ANALYSIS_INCOMPLETE'
+        ),
         blocking=True,
         detail=note,
     ),))
@@ -7667,6 +7700,7 @@ def assess_graph_completeness(graph_stats, api_row=None):
     graph_stats = graph_stats or {}
     reasons = []
     verification = []
+    reason_codes = []
 
     if graph_stats.get('truncated'):
         truncation_reasons = graph_stats.get('truncation_reasons') or []
@@ -7689,9 +7723,27 @@ def assess_graph_completeness(graph_stats, api_row=None):
         reasons.append(f"反向边索引命中过载保护（edge_cap_hits={edge_cap_hits}）")
         verification.append('检查热点调用点，必要时提升边上限或拆分分析范围')
 
+    business_bytecode = graph_stats.get('business_bytecode') or {}
+    if business_bytecode.get('status') in {'partial', 'insufficient'}:
+        business_reason_codes = list(
+            business_bytecode.get('reason_codes')
+            or business_bytecode.get('failures')
+            or ['BUSINESS_BYTECODE_INCOMPLETE']
+        )
+        for reason_code in business_reason_codes:
+            if reason_code not in reason_codes:
+                reason_codes.append(reason_code)
+        reasons.append(
+            '业务字节码证据不完整（'
+            + ', '.join(business_reason_codes)
+            + '）'
+        )
+        verification.append('修复业务制品字节码采集或调用方解析失败后重跑 Step 5')
+
     return {
         'incomplete': bool(reasons),
         'reasons': reasons,
+        'reason_codes': reason_codes,
         'verification_commands': verification,
     }
 

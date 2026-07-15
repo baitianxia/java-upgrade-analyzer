@@ -17,7 +17,6 @@ from step5_evidence_model import (
     CollectedEdge,
     CollectorBatch,
     EvidenceAuthority,
-    EvidenceConcern,
     EvidenceFailure,
     EvidenceProvenance,
     ModuleScope,
@@ -718,8 +717,13 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
     if cache_path and cache_key:
         try:
             cached = json.loads(Path(cache_path).read_text(encoding='utf-8'))
-            if cached.get('schema') == 'java-upgrade-analyzer.bytecode-index.v1' and cached.get('artifact_sha256') == cache_key:
-                return list(cached.get('edges') or []), {**dict(cached.get('metrics') or {}), 'cache_hit': True}
+            cached_edges = list(cached.get('edges') or [])
+            if (
+                cached.get('schema') == 'java-upgrade-analyzer.bytecode-index.v1'
+                and cached.get('artifact_sha256') == cache_key
+                and all(item.get('parser') in {'classfile', 'javap'} for item in cached_edges)
+            ):
+                return cached_edges, {**dict(cached.get('metrics') or {}), 'cache_hit': True}
         except (OSError, ValueError, TypeError):
             pass
     if business_jar and os.path.isfile(business_jar):
@@ -740,6 +744,7 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                     scanned += 1
                     parsed_edges = parse_classfile_calls(data, class_name)
                     if parsed_edges is None:
+                        parser_kind = 'javap'
                         javap_fallback_classes += 1
                         stdout, stderr, rc = run_cmd(
                             ['javap', '-classpath', business_jar, '-c', '-s', '-p', '-v', class_name],
@@ -750,11 +755,13 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                             continue
                         parsed_edges = parse_javap_calls(stdout, class_name)
                     else:
+                        parser_kind = 'classfile'
                         fast_path_classes += 1
                     for item in parsed_edges:
                         item['class_file'] = f'{business_jar}!/{entry}'
                         item['artifact_sha256'] = business_item.get('sha256', '')
                         item['evidence_source'] = 'current_final_artifact'
+                        item['parser'] = parser_kind
                         evidence.append(item)
             metrics = {
                 'classes_scanned': scanned,
@@ -807,6 +814,7 @@ def _bytecode_failure(value):
     reason_code = {
         "current_final_artifact_required": "CURRENT_FINAL_ARTIFACT_REQUIRED",
         "class_scan_limit_reached": "BYTECODE_CLASS_SCAN_LIMIT_REACHED",
+        "current_final_artifact_sha_invalid": "CURRENT_FINAL_ARTIFACT_SHA_INVALID",
     }.get(text, "BYTECODE_COLLECTION_FAILED")
     return EvidenceFailure(
         stage="business-bytecode",
@@ -822,17 +830,18 @@ def _valid_sha256(value):
 
 def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
     metrics = dict(metrics or {})
-    failures = list(metrics.get("failures") or ())
-    concerns = []
+    failure_values = list(metrics.get("failures") or ())
+    typed_failures = []
     edges = []
     for item in evidence or ():
         owner = str(item.get("caller_owner") or "").strip()
         name = str(item.get("caller_name") or "").strip()
         signature = str(item.get("caller_signature") or "")
         if not owner or not name:
-            concerns.append(EvidenceConcern(
+            typed_failures.append(EvidenceFailure(
                 stage="business-bytecode",
                 reason_code="BYTECODE_CALLER_UNRESOLVED",
+                blocking=True,
                 detail=f"字节码调用缺少可解析调用方：{owner}.{name}",
                 artifact=str(item.get("class_file") or ""),
                 class_name=owner,
@@ -840,7 +849,7 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
             continue
         artifact_sha = str(item.get("artifact_sha256") or "")
         if strict_final_artifact and not _valid_sha256(artifact_sha):
-            failures.append("current_final_artifact_sha_invalid")
+            typed_failures.append(_bytecode_failure("current_final_artifact_sha_invalid"))
             continue
         class_file = str(item.get("class_file") or "")
         artifact_path, separator, artifact_entry = class_file.partition("!/")
@@ -862,7 +871,7 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
                 artifact_sha256=artifact_sha if authority == EvidenceAuthority.CURRENT_FINAL_ARTIFACT else "",
                 artifact_entry=artifact_entry if separator else "",
                 class_or_resource_entry=artifact_entry if separator else "",
-                parser="classfile",
+                parser=str(item.get("parser") or "classfile"),
                 evidence_source=str(item.get("evidence_source") or "current_final_artifact"),
                 line=int(item.get("line") or 0),
             ),
@@ -876,16 +885,22 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
                 ("artifact_sha256", artifact_sha),
             ),
         ))
+    typed_failures = [*(_bytecode_failure(item) for item in failure_values), *typed_failures]
+    stable_failure_codes = [failure.reason_code for failure in typed_failures]
     return CollectorBatch(
         collector="business_bytecode",
         version="2",
         edges=tuple(edges),
-        failures=tuple(_bytecode_failure(item) for item in failures),
-        concerns=tuple(concerns),
+        failures=tuple(typed_failures),
+        concerns=(),
         metrics=tuple(sorted({
             **metrics,
+            "failures": stable_failure_codes,
             "collected_edges": len(edges),
-            "unresolved_callers": len(concerns),
+            "unresolved_callers": sum(
+                failure.reason_code == "BYTECODE_CALLER_UNRESOLVED"
+                for failure in typed_failures
+            ),
         }.items())),
     )
 
