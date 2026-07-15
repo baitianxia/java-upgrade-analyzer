@@ -43,6 +43,7 @@ ALL_CHANGED_APIS_FIELDS = [
     "source_compatible", # true / false / unknown（JApiCmp XML）
     "compatibility_flags", # 以 | 分隔的结构化兼容性原因
     "reason_code",    # 稳定机器原因码
+    "data_contract_evidence", # DTO/数据对象识别依据；仅 DATA_FIELD_* 使用
     "evidence_path", # 产生该结论的证据文件
     "old_value",     # 字段/常量旧值（如 JApiCmp XML 可提供）
     "new_value",     # 字段/常量新值
@@ -52,7 +53,7 @@ OPTIONAL_FIELDS = {
     "conclusion", "change_summary", "review_reason",
     "api_signature", "binary_compatible", "source_compatible",
     "compatibility_flags", "reason_code", "evidence_path",
-    "old_value", "new_value",
+    "old_value", "new_value", "data_contract_evidence",
 }
 
 # change_type 枚举
@@ -63,6 +64,9 @@ CHANGE_TYPES = {
     "ACCESS_REDUCED":    "访问权限降低；若当前业务源码仍从不可见位置调用，重新编译将失败",
     "SOURCE_INCOMPATIBLE":"二进制兼容，但调用方重新编译可能失败",
     "CONSTANT_VALUE_CHANGED":"编译期常量值变化；已有调用方可能继续使用内联旧值",
+    "DATA_FIELD_ADDED": "实例数据字段新增；若该类型参与系统运行时链路，需要核对外部数据契约",
+    "DATA_FIELD_REMOVED": "实例数据字段删除；若该类型参与系统运行时链路，反射或序列化映射可能失效",
+    "DATA_FIELD_TYPE_CHANGED": "实例数据字段类型变化；若该类型参与系统运行时链路，数据转换可能失败",
 }
 
 # severity 与 change_type 的默认映射
@@ -73,10 +77,13 @@ DEFAULT_SEVERITY = {
     "BEHAVIOR_CHANGED":  "P2",  # 行为变更需运行时才能确认
     "SOURCE_INCOMPATIBLE":"P1",
     "CONSTANT_VALUE_CHANGED":"P1",
+    "DATA_FIELD_ADDED": "P2",
+    "DATA_FIELD_REMOVED": "P1",
+    "DATA_FIELD_TYPE_CHANGED": "P1",
 }
 
 # source 枚举
-SOURCES = ["japicmp", "gitdiff", "changelog", "old_jar"]
+SOURCES = ["japicmp", "gitdiff", "changelog", "old_jar", "classfile_contract"]
 
 SYMBOL_KINDS = {"method", "field", "class", "constructor"}
 

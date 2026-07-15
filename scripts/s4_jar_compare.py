@@ -24,7 +24,7 @@ s4_jar_compare.py — Step 4：jar 包变更全量对比
   "变更 API 数量 = 0 的依赖"仍需特别标出，便于后续交互时人工复核
 """
 
-import argparse, csv, json, os, re, shutil, sys, time, threading
+import argparse, csv, json, os, re, shutil, struct, sys, time, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from pathlib import Path
@@ -60,6 +60,7 @@ from pipeline_constants import (
     RUNTIME_STATE_DIRNAME,
 )
 from signature_utils import normalize_signature_for_lookup
+from data_contract_analysis import compare_jar_data_contracts
 
 INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -78,6 +79,9 @@ _CHANGE_TYPE_LABELS = {
     "ACCESS_REDUCED": "访问权限降低",
     "SOURCE_INCOMPATIBLE": "源码不兼容",
     "CONSTANT_VALUE_CHANGED": "常量值变更",
+    "DATA_FIELD_ADDED": "DTO 字段新增",
+    "DATA_FIELD_REMOVED": "DTO 字段删除",
+    "DATA_FIELD_TYPE_CHANGED": "DTO 字段类型变化",
 }
 
 _SYMBOL_KIND_LABELS = {
@@ -1398,6 +1402,37 @@ def compute_changed_classes(old_jar: str, new_jar: str) -> dict:
             "modified": len(modified),
         },
     }
+
+
+def _java_major_version(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    legacy = re.search(r"(?:^|[^0-9])1\.(\d+)(?:[^0-9]|$)", text)
+    if legacy:
+        return int(legacy.group(1))
+    match = re.search(r"(?:^|[^0-9])(\d+)(?:[^0-9]|$)", text)
+    return int(match.group(1)) if match else None
+
+
+def collect_data_contract_changes(
+    old_jar,
+    new_jar,
+    *,
+    coord,
+    old_version,
+    new_version,
+    jdk_current=None,
+):
+    """Build Step4 rows for instance-field contract changes from final JARs."""
+    return compare_jar_data_contracts(
+        old_jar,
+        new_jar,
+        coord=coord,
+        old_version=old_version,
+        new_version=new_version,
+        target_java_version=_java_major_version(jdk_current),
+    )
 
 
 def find_jar_in_m2(group_id, artifact_id, version, classifier=None):
@@ -3767,6 +3802,7 @@ def normalize_step5_input_rows(rows):
     source_rank = {
         'japicmp': 0,
         'old_jar': 0,
+        'classfile_contract': 0,
         'gitdiff': 1,
         'changelog': 2,
     }
@@ -4296,6 +4332,7 @@ def main():
         if str(row.get('change_type') or '').strip() != '未变'
     ]
     ctx      = load_json(args.context)
+    jdk_current = ctx.get("jdk_current")
     timing.record(
         "input.load",
         status="success",
@@ -5006,6 +5043,54 @@ def main():
             dependency_new_jar = str((jar_info or {}).get("new_jar") or "")
             dependency_raw_apis.extend(apis)
             result["all_apis"].extend(apis)
+
+        if dependency_old_jar and dependency_new_jar:
+            contract_timer = time.perf_counter()
+            try:
+                contract_apis = collect_data_contract_changes(
+                    dependency_old_jar,
+                    dependency_new_jar,
+                    coord=coord,
+                    old_version=old_ver,
+                    new_version=new_ver,
+                    jdk_current=jdk_current,
+                )
+            except (OSError, ValueError, zipfile.BadZipFile, struct.error) as exc:
+                contract_apis = []
+                result["other_failed_deps"].append(coord)
+                result["binary_runs"].append({
+                    "coord": coord,
+                    "status": "failed",
+                    "mode": "data_contract",
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                })
+                timing.record(
+                    "dependency.data_contract",
+                    coord=coord,
+                    old_version=old_ver,
+                    new_version=new_ver,
+                    status="error",
+                    elapsed=time.perf_counter() - contract_timer,
+                    details=f"{type(exc).__name__}: {str(exc)[:200]}",
+                )
+            else:
+                dependency_raw_apis.extend(contract_apis)
+                result["all_apis"].extend(contract_apis)
+                result["binary_runs"].append({
+                    "coord": coord,
+                    "status": "success",
+                    "mode": "data_contract",
+                    "api_changes": len(contract_apis),
+                })
+                timing.record(
+                    "dependency.data_contract",
+                    coord=coord,
+                    old_version=old_ver,
+                    new_version=new_ver,
+                    status="success",
+                    elapsed=time.perf_counter() - contract_timer,
+                    api_count=len(contract_apis),
+                )
 
         if dependency_gitdiff_apis:
             gitdiff_filter_timer = time.perf_counter()

@@ -410,6 +410,9 @@ def _human_change_type(change_type, symbol_kind=''):
         'FIELD_CHANGED': '修改字段',
         'BEHAVIOR_CHANGED': '行为变化',
         'CONSTANT_VALUE_CHANGED': '常量值变化',
+        'DATA_FIELD_ADDED': 'DTO 字段新增',
+        'DATA_FIELD_REMOVED': 'DTO 字段删除',
+        'DATA_FIELD_TYPE_CHANGED': 'DTO 字段类型变化',
         'SIGNATURE_CHANGED': '方法签名变化',
         'RETURN_TYPE_CHANGED': '返回类型变化',
         'ACCESS_MODIFIER_CHANGED': '访问权限变化',
@@ -436,6 +439,14 @@ def _change_summary(item, severity=''):
         pieces.append(api_short)
     if signature:
         pieces.append(f"参数：{signature}")
+    if str(item.get('change_type') or '').upper() == 'DATA_FIELD_ADDED' and item.get('new_value'):
+        pieces.append(f"字段类型：{item.get('new_value')}")
+    elif str(item.get('change_type') or '').upper() == 'DATA_FIELD_REMOVED' and item.get('old_value'):
+        pieces.append(f"原字段类型：{item.get('old_value')}")
+    elif str(item.get('change_type') or '').upper() == 'DATA_FIELD_TYPE_CHANGED':
+        old_value = str(item.get('old_value') or '').strip() or '未知'
+        new_value = str(item.get('new_value') or '').strip() or '未知'
+        pieces.append(f"字段类型：{old_value} → {new_value}")
     if sev:
         pieces.append(f"严重级别：{sev}")
     return "，".join(pieces)

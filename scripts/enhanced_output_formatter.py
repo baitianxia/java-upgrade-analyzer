@@ -118,6 +118,7 @@ def _human_evidence_type(value):
         'ast_method_invocation': '源码方法调用',
         'spring_runtime_registered_callback': 'Spring Boot 制品注册回调',
         'runtime_dependency_bytecode_invocation': '运行时依赖字节码方法调用',
+        'data_contract_owner_reachability': 'DTO 类型进入系统运行路径',
     }.get(str(value or ''), '静态分析证据')
 
 
@@ -1604,7 +1605,10 @@ def _alert_conclusion_label(path_status, conclusion_level):
 
 def _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_reason):
     symbol_kind = str(getattr(result, 'symbol_kind', '') or '')
+    change_type = str(getattr(result, 'change_type', '') or '').upper()
     if path_status == 'reachable':
+        if change_type.startswith('DATA_FIELD_'):
+            return '已确认影响：DTO 数据契约变化已进入系统运行路径'
         if stop_reason == 'RUNTIME_DEPENDENCY_ENTRY_REACHED':
             return '已确认影响：当前制品中已激活的运行时入口会使用该变更 API'
         if symbol_kind == 'class':
@@ -1633,7 +1637,13 @@ def _alert_change_summary(result):
         if symbol_kind in {'method', 'constructor'} else ''
     )
     target = f"{kind_label} {api_name}{signature}"
-    if normalized_change == 'SIGNATURE_CHANGED':
+    if normalized_change == 'DATA_FIELD_ADDED':
+        change_sentence = f"新增了 DTO {api_name.rsplit('.', 1)[0]} 的字段 {api_name.rsplit('.', 1)[-1]}"
+    elif normalized_change == 'DATA_FIELD_REMOVED':
+        change_sentence = f"删除了 DTO {api_name.rsplit('.', 1)[0]} 的字段 {api_name.rsplit('.', 1)[-1]}"
+    elif normalized_change == 'DATA_FIELD_TYPE_CHANGED':
+        change_sentence = f"修改了 DTO {api_name.rsplit('.', 1)[0]} 的字段 {api_name.rsplit('.', 1)[-1]} 类型"
+    elif normalized_change == 'SIGNATURE_CHANGED':
         change_sentence = f"修改了{target}的签名"
     elif normalized_change == 'BEHAVIOR_CHANGED':
         change_sentence = f"修改了{target}的行为"
@@ -1693,6 +1703,13 @@ def _alert_review_reason(result, detail, evidence, explanation, stop_reason):
     consumer = '.'.join(item for item in (consumer_class, consumer_method) if item)
     evidence_types = {str((item or {}).get('evidence_type') or '') for item in evidence or []}
     removed = str(getattr(result, 'change_type', '') or '').upper() == 'REMOVED'
+    data_contract_change = str(getattr(result, 'change_type', '') or '').upper().startswith('DATA_FIELD_')
+    if data_contract_change and 'data_contract_owner_reachability' in evidence_types:
+        return (
+            f"{consumer or consumer_class or '当前系统运行入口'} 的方法签名、局部变量或制品类型引用"
+            f"精确使用 DTO {api_name.rsplit('.', 1)[0]}。"
+            "本结论只证明 DTO 数据结构变化进入系统运行路径，未判断数据库字段是否同步或匹配。"
+        )
     if (detail or {}).get('path_status') == 'reachable' and symbol_kind == 'class' and 'bytecode_class_reference' in evidence_types:
         consequence = '；相关类被加载或链接时可能出现 NoClassDefFoundError' if removed else ''
         return f"业务制品中的 {consumer_class or '当前业务类'} 直接引用 {api_name}{consequence}。"

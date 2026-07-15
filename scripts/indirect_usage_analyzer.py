@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from enhanced_source_analyzer import CallEdge
 from signature_utils import normalize_signature_for_lookup, split_signature_params
@@ -921,6 +922,157 @@ def _collected_indirect_edge(edge, api_identity, runtime_catalog):
     )
 
 
+def _data_contract_targets(targets):
+    return [
+        target for target in targets
+        if str((target.get('row') or {}).get('change_type') or '').startswith('DATA_FIELD_')
+    ]
+
+
+def _type_tokens(value):
+    """Return Java type identifiers without treating a simple name as an FQCN."""
+    text = str(value or '').replace('$', '.').replace('...', '[]')
+    return re.findall(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', text)
+
+
+def _known_fqcns_for_simple(method, simple):
+    values = (getattr(method, 'known_classes_by_simple', {}) or {}).get(simple)
+    if isinstance(values, str):
+        values = [values]
+    elif not isinstance(values, (list, tuple, set, frozenset)):
+        values = []
+    candidates = {
+        str(value or '').replace('$', '.') for value in values if str(value or '').strip()
+    }
+    candidates.update(
+        str(value or '').replace('$', '.')
+        for value in (getattr(method, 'known_class_fqcns', set()) or set())
+        if str(value or '').replace('$', '.').rsplit('.', 1)[-1] == simple
+    )
+    return candidates
+
+
+def _resolve_type_token(token, method):
+    token = str(token or '').strip().replace('$', '.')
+    if not token or token in {
+        'extends', 'super', 'void', 'boolean', 'byte', 'char', 'short', 'int',
+        'long', 'float', 'double', 'var',
+    }:
+        return set()
+    if '.' in token:
+        return {token}
+    imported = str((getattr(method, 'imports', {}) or {}).get(token) or '').replace('$', '.')
+    if imported:
+        return {imported}
+    known = _known_fqcns_for_simple(method, token)
+    if len(known) == 1:
+        return known
+    package_name = str(getattr(method, 'package_name', '') or '').strip()
+    return {f'{package_name}.{token}'} if package_name else set()
+
+
+def _method_declared_fqcns(method):
+    """Resolve only declared/AST-known types; never join on a bare simple name."""
+    values = [getattr(method, 'return_type', '')]
+    for attribute in (
+        'param_types', 'param_declared_types', 'local_var_types',
+    ):
+        mapping = getattr(method, attribute, {}) or {}
+        values.extend(mapping.values() if hasattr(mapping, 'values') else ())
+    result = set()
+    for value in values:
+        for token in _type_tokens(value):
+            result.update(_resolve_type_token(token, method))
+    return result
+
+
+def _data_contract_scope(method, runtime_catalog):
+    edge = CallEdge(
+        caller_symbol_id=method.symbol_id,
+        caller_qualified_key=method.qualified_key,
+        callee_key='', callee_simple_key='', evidence_type='', confidence='high',
+        file=method.file, line=method.line, content='', owner_type=method.owner_type,
+        owner_coord=method.owner_coord, module=method.module, is_test=method.is_test,
+    )
+    return _indirect_scope(edge, runtime_catalog)
+
+
+def _collected_source_data_contract_edge(method, target, runtime_catalog):
+    owner = target['owner']
+    return CollectedEdge(
+        caller_symbol=method.symbol_id,
+        callee_symbol=target['callee_key'],
+        edge_kind='data_contract_owner_reachability',
+        semantic=False,
+        owner_scope=_data_contract_scope(method, runtime_catalog),
+        owner_coord=method.owner_coord,
+        provenance=EvidenceProvenance(
+            authority=EvidenceAuthority.SOURCE_AST,
+            artifact_path=method.file,
+            parser='tree-sitter-type-resolution',
+            evidence_source='source_ast',
+            line=int(method.line or 0),
+        ),
+        metadata=(
+            ('caller_qualified_key', method.qualified_key),
+            # Deliberately repeat the exact key so ingestion cannot create a
+            # package-blind field:<simple-name> lookup key.
+            ('callee_simple_key', target['callee_key']),
+            ('content', f'方法签名或局部类型精确引用 DTO {owner}'),
+            ('api_identity', target['api_key']),
+            ('contract_owner', owner),
+            ('owner_type', method.owner_type),
+            ('owner_coord', method.owner_coord),
+            ('module', method.module),
+            ('is_test', method.is_test),
+        ),
+    )
+
+
+def _collected_artifact_data_contract_edge(edge, target, runtime_catalog):
+    authority_value = str(getattr(edge, 'evidence_authority', '') or '')
+    try:
+        authority = EvidenceAuthority(authority_value)
+    except ValueError:
+        return None
+    artifact_sha = str(getattr(edge, 'artifact_sha256', '') or '')
+    if authority in {EvidenceAuthority.CURRENT_FINAL_ARTIFACT, EvidenceAuthority.PACKAGED_RUNTIME} and not artifact_sha:
+        return None
+    owner_type = str(getattr(edge, 'owner_type', '') or '')
+    owner_coord = str(getattr(edge, 'owner_coord', '') or '')
+    scope_probe = SimpleNamespace(owner_type=owner_type, owner_coord=owner_coord)
+    owner = target['owner']
+    return CollectedEdge(
+        caller_symbol=str(getattr(edge, 'caller_symbol_id', '') or ''),
+        callee_symbol=target['callee_key'],
+        edge_kind='data_contract_owner_reachability',
+        semantic=False,
+        owner_scope=_indirect_scope(scope_probe, runtime_catalog),
+        owner_coord=owner_coord,
+        provenance=EvidenceProvenance(
+            authority=authority,
+            artifact_path=str(getattr(edge, 'file', '') or ''),
+            artifact_sha256=artifact_sha,
+            artifact_entry=str(getattr(edge, 'artifact_entry', '') or ''),
+            parser=str(getattr(edge, 'parser', '') or 'classfile'),
+            evidence_source=str(getattr(edge, 'evidence_source', '') or authority.value),
+            line=max(int(getattr(edge, 'line', 0) or 0), 0),
+            instruction_offset=int(getattr(edge, 'instruction_offset', -1) or -1),
+        ),
+        metadata=(
+            ('caller_qualified_key', str(getattr(edge, 'caller_qualified_key', '') or '')),
+            ('callee_simple_key', target['callee_key']),
+            ('content', f'最终制品字节码精确引用 DTO {owner}'),
+            ('api_identity', target['api_key']),
+            ('contract_owner', owner),
+            ('owner_type', owner_type),
+            ('owner_coord', owner_coord),
+            ('module', str(getattr(edge, 'module', '') or '')),
+            ('is_test', bool(getattr(edge, 'is_test', False))),
+        ),
+    )
+
+
 def _read_method_body(method):
     try:
         body = method.get_body_text()
@@ -952,6 +1104,7 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
             'resource_reference': 'not_applicable',
             'expression_language': 'not_applicable',
             'reflection_bytecode': 'not_applicable',
+            'data_contract_owner': 'not_applicable',
         }
         for target in targets
     }
@@ -983,6 +1136,53 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
         readable_methods, bodies_by_symbol
     )
     collected_edges = []
+
+    # A DTO field change is a data-contract change, not a field-access claim.
+    # Connect it to methods that provably carry the DTO type, then let the
+    # ordinary reverse tracer decide whether those methods reach an actual
+    # system runtime entry (business code, scheduled jobs, listeners, SPI, ...).
+    # This is indexed by exact owner FQCN and therefore O(methods + matches), not
+    # methods x changed fields, and cannot collide across packages.
+    contract_targets = _data_contract_targets(targets)
+    contract_targets_by_owner = {}
+    for target in contract_targets:
+        contract_targets_by_owner.setdefault(target['owner'], []).append(target)
+    contract_owners = set(contract_targets_by_owner)
+    contract_edge_identities = set()
+    for method in readable_methods:
+        for owner in sorted(_method_declared_fqcns(method) & contract_owners):
+            for target in contract_targets_by_owner[owner]:
+                edge = _collected_source_data_contract_edge(method, target, runtime_catalog)
+                identity = (edge.caller_symbol, edge.callee_symbol, edge.edge_kind, edge.provenance.artifact_path)
+                if identity in contract_edge_identities:
+                    continue
+                contract_edge_identities.add(identity)
+                collected_edges.append(edge)
+                merged_edges += 1
+                coverage_by_api[target['api_key']]['data_contract_owner'] = 'complete'
+    reverse_edges = getattr(graph_snapshot, 'reverse_edges', {}) or {}
+    for owner, owner_targets in contract_targets_by_owner.items():
+        for lookup_key in (owner, f'class:{owner}'):
+            for existing in reverse_edges.get(lookup_key, ()) or ():
+                existing_target = str(getattr(existing, 'callee_key', '') or '').replace('$', '.')
+                if existing_target not in {owner, f'class:{owner}'}:
+                    continue
+                for target in owner_targets:
+                    edge = _collected_artifact_data_contract_edge(existing, target, runtime_catalog)
+                    if edge is None:
+                        continue
+                    identity = (edge.caller_symbol, edge.callee_symbol, edge.edge_kind, edge.provenance.artifact_path)
+                    if identity in contract_edge_identities:
+                        continue
+                    contract_edge_identities.add(identity)
+                    collected_edges.append(edge)
+                    merged_edges += 1
+                    coverage_by_api[target['api_key']]['data_contract_owner'] = 'complete'
+    for target in contract_targets:
+        # The exact declared-type/current-artifact reference scan has run even
+        # when it finds no owner use. A complete miss remains a static miss, not
+        # an unsupported field analysis.
+        coverage_by_api[target['api_key']]['data_contract_owner'] = 'complete'
 
     for method in readable_methods:
         body = bodies_by_symbol.get(method.symbol_id, '')
@@ -1157,7 +1357,7 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
             )
             for analyzer in (
                 'reflection_source', 'method_handle_source', 'resource_reference',
-                'expression_language', 'reflection_bytecode',
+                'expression_language', 'reflection_bytecode', 'data_contract_owner',
             )
         }
     analyzer_statuses = {
@@ -1166,7 +1366,7 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
         )
         for analyzer in (
             'reflection_source', 'method_handle_source', 'resource_reference',
-            'expression_language', 'reflection_bytecode',
+            'expression_language', 'reflection_bytecode', 'data_contract_owner',
         )
     }
     overall_status = aggregate_status(

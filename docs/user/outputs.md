@@ -120,6 +120,8 @@ evidence/api_changes/
 | `*_removed_symbols.txt` | removed jar 的旧版 public/protected 符号导出 | 删除依赖场景目标池是否完整 |
 | `step4_timing.csv` | Step4 耗时拆解 | 定位 jar 解析、git diff、JApiCmp、removed jar 导出、changed_classes 或汇总写文件等耗时点 |
 
+Step4 还会从 old/current 最终 JAR 识别 DTO/数据对象的实例字段新增、删除和类型变化。`all_changed_apis.csv` 中对应的 `change_type` 为 `DATA_FIELD_ADDED`、`DATA_FIELD_REMOVED` 或 `DATA_FIELD_TYPE_CHANGED`，`old_value` / `new_value` 展示字段类型变化，`data_contract_evidence` 展示为何把该类识别为数据对象。该事实不代表数据库字段已经同步或不匹配。
+
 ### 依赖包维度选择入口
 
 依赖 API 变化分析完成后，如果要决定系统触达证据是全量分析还是只分析部分依赖包，优先看：
@@ -214,6 +216,8 @@ Step5 结构化统计同时给出 `analyzer_edge_count`、`duplicate_edge_count`
 ### alerts.csv 的语义
 
 `alerts.csv` 是完整主文件，不是样例文件。
+
+报告中的“系统运行路径”包含普通业务代码，也包含有明确激活证据的定时任务、消息/事件监听、生命周期入口、Runner/Lifecycle、SPI 和框架回调。对于 DTO 字段变化，`reachable` 表示该 DTO/数据对象已经进入上述运行路径；它不表示工具检查过数据库表结构。只有条件声明但缺少当前制品激活证据的入口，不会被写成已确认影响。
 
 它的设计目标是方便人工复核完整分析过程：
 

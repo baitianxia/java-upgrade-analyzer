@@ -372,6 +372,7 @@ Step4 的职责是构建 Step5 可稳定消费的变化证据池。
 
 - 生成 JApiCmp 二进制兼容变化
 - 生成依赖源码 `git diff` 变化
+- 直接比较 old/current 最终 JAR 的实例字段，识别 DTO/数据对象字段新增、删除和类型变化
 - 对 `removed jar` 场景导出旧版 jar 的 public/protected 符号集合
 - 自动识别依赖源码目录与仓库映射
 - 聚合生成 `all_changed_apis.csv`
@@ -417,6 +418,12 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
   - Step6 汇总风险等级的基础字段
 - `source`
   - 变更来源，如 `japicmp` / `gitdiff` / `changelog`
+- `old_value` / `new_value`
+  - `DATA_FIELD_*` 行中的字段旧类型和新类型
+- `data_contract_evidence`
+  - DTO/数据对象识别依据，例如命名/包结构、JavaBean/record 访问器或 `Serializable` 状态
+
+`DATA_FIELD_ADDED`、`DATA_FIELD_REMOVED`、`DATA_FIELD_TYPE_CHANGED` 来自最终 JAR 的 classfile 成员表，包含 private 实例字段，排除 static、synthetic 和内部类 `this$` 字段。它们描述的是 DTO/数据对象结构变化，不等于数据库字段已经不匹配。
 
 #### Step4 的 per-dependency 中间产物
 
@@ -448,6 +455,8 @@ Step4 不仅产出变化 API 池，也为 Step5 提供依赖坐标、版本和�
 ### Step5：调用链影响证明
 
 Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系统。
+
+这里的“触达当前业务系统”不是狭义的 Controller 或普通业务方法。正式语义是触达任何有证据证明会影响系统运行的入口，包括业务制品代码、定时任务、消息/事件监听、生命周期入口、Runner/Lifecycle、SPI 与已激活的框架回调。只有条件声明、但当前制品尚未证明会激活的框架入口仍保留为 `uncertain` 或 `not_analyzed`。
 
 当前正式输入：
 
@@ -494,6 +503,11 @@ Step5 在保留原有 `summary.json`、`by_api/*.json`、`by_module/*.json` 的�
 - `symbol_kind=field`
   - 直接检查 `static import` 与限定名字段访问
   - 若命中，则输出 `DIRECT_STATIC_IMPORT_USAGE` 或 `DIRECT_FIELD_USAGE`
+- `change_type=DATA_FIELD_*`
+  - 不把 DTO 字段变化伪装成普通字段读写；先按全限定类型名查找方法参数、返回值、局部变量和最终制品 class 引用
+  - 再复用标准反向图，证明 DTO/数据对象是否进入业务制品或已激活运行入口
+  - current 最终制品字节码是正式证据，源码类型解析是辅助证据；不使用简单类名跨包匹配
+  - 结论只表示“数据契约变化进入系统运行路径”，不判断数据库 DDL、迁移脚本或真实表结构是否同步
 
 只有在这些直接证据也未命中时，`class_usage` 才继续回落到 `CLASS_USAGE_ONLY`，`field` 才继续回落到 `CALL_GRAPH_LIMITATION_SYMBOL_KIND`。
 
