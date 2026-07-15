@@ -83,7 +83,10 @@ def _resolve_caller(graph, edge: CollectedEdge):
         method = candidate if hasattr(candidate, "symbol_id") else methods_by_id.get(candidate)
         if method is not None:
             candidates.append(method)
-    if signature:
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        return candidate.symbol_id, getattr(candidate, "qualified_key", "") or qualified
+    if signature and len(candidates) > 1:
         candidates = [
             candidate for candidate in candidates
             if any(
@@ -107,6 +110,11 @@ def _to_call_edge(
     caller_qualified_key: str,
 ) -> CallEdge:
     metadata = _edge_metadata(edge)
+    evidence_path = edge.provenance.artifact_path or edge.provenance.artifact_entry
+    if edge.provenance.artifact_path and edge.provenance.artifact_entry:
+        evidence_path = (
+            f"{edge.provenance.artifact_path}!/{edge.provenance.artifact_entry}"
+        )
     converted = CallEdge(
         caller_symbol_id=caller_symbol,
         caller_qualified_key=caller_qualified_key,
@@ -117,7 +125,7 @@ def _to_call_edge(
         ),
         evidence_type=edge.edge_kind,
         confidence=edge.confidence,
-        file=edge.provenance.artifact_path or edge.provenance.artifact_entry,
+        file=evidence_path,
         line=max(int(edge.provenance.line or 0), 0),
         content=str(metadata.get("content") or ""),
         owner_type=_owner_type(edge.owner_scope),

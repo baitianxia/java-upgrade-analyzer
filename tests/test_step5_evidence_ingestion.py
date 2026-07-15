@@ -141,6 +141,48 @@ class EvidenceIngestionTest(unittest.TestCase):
             "source-id",
         )
 
+    def test_ingestion_keeps_unique_qualified_caller_without_lookup_keys(self):
+        edge = CollectedEdge(
+            caller_symbol="com.acme.Service.execute()",
+            callee_symbol="com.vendor.Legacy.call()",
+            edge_kind="bytecode_method_invocation",
+            semantic=False,
+            owner_scope=ModuleScope.BUSINESS_CLASSES,
+            owner_coord="__business__",
+            provenance=EvidenceProvenance(
+                authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+                artifact_path="/artifact/application.jar",
+                artifact_sha256="c" * 64,
+                artifact_entry="BOOT-INF/classes/com/acme/Service.class",
+                parser="classfile",
+            ),
+            metadata=(
+                ("caller_owner", "com.acme.Service"),
+                ("caller_name", "execute"),
+                ("caller_signature", "()"),
+            ),
+        )
+        method = SimpleNamespace(
+            symbol_id="source-id",
+            qualified_key="com.acme.Service.execute()",
+        )
+        graph = SimpleNamespace(
+            reverse_edges={},
+            methods_by_id={"source-id": method},
+            methods_by_qualified={"com.acme.Service.execute": ["source-id"]},
+            lookup_keys_by_symbol={},
+        )
+
+        result = ingest_collector_batches(graph, (CollectorBatch(
+            collector="business_bytecode", version="2", edges=(edge,),
+        ),))
+
+        self.assertEqual(result.merged_edges, 1)
+        self.assertEqual(
+            graph.reverse_edges["com.vendor.Legacy.call()"][0].caller_symbol_id,
+            "source-id",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
