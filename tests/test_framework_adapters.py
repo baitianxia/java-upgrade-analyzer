@@ -1,4 +1,6 @@
 import hashlib
+import inspect
+import json
 import shutil
 import subprocess
 import sys
@@ -14,14 +16,145 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import framework_adapters as framework_adapter_module
 from framework_adapters import (
     attach_framework_edges_to_graph,
-    run_framework_adapters,
-    run_mybatis_proxy_adapter,
+    run_framework_adapters as _run_framework_adapters,
+    run_mybatis_proxy_adapter as _run_mybatis_proxy_adapter,
+    serialize_framework_batches,
+)
+from step5_evidence_model import (
+    CollectedEdge,
+    CollectorBatch,
+    CoverageRecord,
+    EvidenceAuthority,
+    EvidenceConcern,
+    EvidenceFailure,
 )
 
 
+def run_framework_adapters(*args, **kwargs):
+    """Keep legacy behavior checks on the v1 serializer, not the batch API."""
+    return serialize_framework_batches(_run_framework_adapters(*args, **kwargs))
+
+
+def run_mybatis_proxy_adapter(*args, **kwargs):
+    return serialize_framework_batches((_run_mybatis_proxy_adapter(*args, **kwargs),))["adapters"][0]
+
+
 class FrameworkAdaptersTest(unittest.TestCase):
+    ADAPTER_ENTRY_POINTS = (
+        "run_spi_adapter",
+        "run_spring_adapter",
+        "run_runtime_spring_registration_adapter",
+        "run_spring_transaction_proxy_adapter",
+        "run_spring_data_repository_adapter",
+        "run_mybatis_adapter",
+        "run_mybatis_proxy_adapter",
+        "run_dynamic_proxy_adapter",
+        "run_declarative_http_client_adapter",
+    )
+
+    def test_all_nine_public_adapters_return_immutable_typed_batches(self):
+        for name in self.ADAPTER_ENTRY_POINTS:
+            with self.subTest(adapter=name):
+                entry_point = getattr(framework_adapter_module, name)
+                self.assertIn("artifact_catalog", inspect.signature(entry_point).parameters)
+
+                batch = entry_point([], artifact_catalog={"entries": []})
+
+                self.assertIsInstance(batch, CollectorBatch)
+                self.assertTrue(batch.collector)
+                self.assertTrue(batch.version)
+                self.assertIsInstance(batch.edges, tuple)
+                self.assertTrue(all(isinstance(edge, CollectedEdge) for edge in batch.edges))
+                self.assertIsInstance(batch.failures, tuple)
+                self.assertTrue(all(isinstance(item, EvidenceFailure) for item in batch.failures))
+                self.assertIsInstance(batch.concerns, tuple)
+                self.assertTrue(all(isinstance(item, EvidenceConcern) for item in batch.concerns))
+                self.assertIsInstance(batch.coverage, tuple)
+                self.assertTrue(all(isinstance(item, CoverageRecord) for item in batch.coverage))
+                self.assertEqual(len(batch.coverage), 1)
+                self.assertEqual(batch.coverage[0].status, "not_applicable")
+                self.assertFalse(batch.coverage[0].applicable)
+                self.assertIsInstance(batch.metrics, tuple)
+                with self.assertRaises((AttributeError, TypeError)):
+                    batch.collector = "mutated"
+
+    def test_framework_orchestrator_returns_tuple_and_serializer_alone_projects_v1(self):
+        batches = _run_framework_adapters([], artifact_catalog={"entries": []})
+
+        self.assertIsInstance(batches, tuple)
+        self.assertEqual(len(batches), 9)
+        self.assertTrue(all(isinstance(batch, CollectorBatch) for batch in batches))
+        serializer = getattr(framework_adapter_module, "serialize_framework_batches", None)
+        self.assertTrue(callable(serializer))
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "framework-adapters.json"
+            payload = serializer(batches, str(output))
+            persisted = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload, persisted)
+        self.assertEqual(
+            payload["schema"], "java-upgrade-analyzer.framework-adapters.v1"
+        )
+        self.assertEqual(
+            [item["adapter"] for item in payload["adapters"]],
+            [batch.collector for batch in batches],
+        )
+        self.assertTrue(all(item["status"] == "not_applicable" for item in payload["adapters"]))
+
+    def test_framework_semantic_edges_never_claim_physical_final_artifact_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            java = Path(tmp) / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Runner.java").write_text(
+                "package com.acme; class Runner implements "
+                "org.springframework.boot.CommandLineRunner { "
+                "public void run(String... args) {} }",
+                encoding="utf-8",
+            )
+
+            batch = framework_adapter_module.run_spring_adapter([
+                {"root": str(Path(tmp) / "src/main/java"), "owner_type": "business"}
+            ])
+
+        self.assertIsInstance(batch, CollectorBatch)
+        self.assertTrue(batch.edges)
+        self.assertTrue(all(edge.semantic for edge in batch.edges))
+        self.assertTrue(all(
+            edge.provenance.authority in {
+                EvidenceAuthority.FRAMEWORK_SEMANTIC,
+                EvidenceAuthority.RESOURCE_CONFIGURATION,
+                EvidenceAuthority.SOURCE_AST,
+            }
+            for edge in batch.edges
+        ))
+        self.assertTrue(all(
+            edge.provenance.authority != EvidenceAuthority.CURRENT_FINAL_ARTIFACT
+            for edge in batch.edges
+        ))
+
+    def test_malformed_spring_xml_is_a_stable_typed_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            java = Path(tmp) / "src/main/java"
+            resources = Path(tmp) / "src/main/resources"
+            java.mkdir(parents=True)
+            resources.mkdir(parents=True)
+            malformed = resources / "applicationContext.xml"
+            malformed.write_text("<beans><bean>", encoding="utf-8")
+
+            batch = framework_adapter_module.run_spring_adapter([
+                {"root": str(java), "owner_type": "business"}
+            ])
+
+        self.assertIsInstance(batch, CollectorBatch)
+        self.assertIn(
+            "SPRING_XML_PARSE_FAILED",
+            {failure.reason_code for failure in batch.failures},
+        )
+        self.assertTrue(any(failure.artifact == str(malformed) for failure in batch.failures))
+
     @patch("framework_adapters._mybatis_mapper_contracts")
     def test_mybatis_proxy_adapter_skips_source_scan_without_packaged_runtime(
         self, mapper_contracts

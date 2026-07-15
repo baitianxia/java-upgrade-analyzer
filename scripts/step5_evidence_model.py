@@ -64,6 +64,7 @@ class CollectedEdge:
         if not self.caller_symbol or not self.callee_symbol or not self.edge_kind:
             raise ValueError("collected edge requires caller, callee, and edge kind")
         if self.semantic and self.provenance.authority not in {
+            EvidenceAuthority.SOURCE_AST,
             EvidenceAuthority.FRAMEWORK_SEMANTIC,
             EvidenceAuthority.RESOURCE_CONFIGURATION,
             EvidenceAuthority.RUNTIME_OBSERVATION,
@@ -103,6 +104,15 @@ class CollectorBatch:
         for edge in self.edges:
             if not isinstance(edge, CollectedEdge):
                 raise ValueError("collector edges must be CollectedEdge values")
+        for failure in self.failures:
+            if not isinstance(failure, EvidenceFailure):
+                raise ValueError("collector failures must be EvidenceFailure values")
+        for concern in self.concerns:
+            if not isinstance(concern, EvidenceConcern):
+                raise ValueError("collector concerns must be EvidenceConcern values")
+        for coverage in self.coverage:
+            if not isinstance(coverage, CoverageRecord):
+                raise ValueError("collector coverage must be CoverageRecord values")
 
     def to_mapping(self) -> Mapping[str, Any]:
         def provenance_mapping(item):

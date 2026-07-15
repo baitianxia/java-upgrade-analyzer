@@ -17,6 +17,16 @@ from typing import Protocol
 
 from enhanced_source_analyzer import analyze_file
 from signature_utils import normalize_signature_for_lookup
+from step5_evidence_model import (
+    CollectedEdge,
+    CollectorBatch,
+    CoverageRecord,
+    EvidenceAuthority,
+    EvidenceConcern,
+    EvidenceFailure,
+    EvidenceProvenance,
+    ModuleScope,
+)
 
 
 class FrameworkAdapter(Protocol):
@@ -144,6 +154,182 @@ def _status(applicable, errors):
     return 'partial' if errors else 'complete'
 
 
+def _framework_edge_authority(edge):
+    """Classify the collector's actual evidence without upgrading framework semantics."""
+    provenance = dict(edge.get('provenance') or {})
+    source = str(edge.get('source') or '')
+    path = str(provenance.get('file') or '')
+    if edge.get('edge_kind') in {
+        'mybatis_mapper_proxy_dispatch',
+        'spring_transaction_proxy_dispatch',
+        'spring_data_repository_proxy_dispatch',
+        'spring_runtime_registered_callback',
+        'spring_runtime_autoconfiguration_registration',
+    } or provenance.get('authority'):
+        return EvidenceAuthority.FRAMEWORK_SEMANTIC
+    if (
+        '/src/main/resources/' in path.replace('\\', '/')
+        or path.endswith(('.xml', '.properties'))
+        or source.startswith('framework:')
+        or edge.get('edge_kind') in {
+            'java_spi_registration', 'dubbo_spi_registration',
+            'spring_autoconfiguration_registration', 'spring_factories_registration',
+        }
+    ):
+        return EvidenceAuthority.RESOURCE_CONFIGURATION
+    return EvidenceAuthority.SOURCE_AST
+
+
+def _framework_edge_scope(edge):
+    source = str(edge.get('source') or '')
+    if source.startswith('framework:'):
+        return ModuleScope.EXTERNAL_DEPENDENCY
+    return ModuleScope.BUSINESS_CLASSES
+
+
+def _framework_failure(adapter, error):
+    text = str(error or '')
+    artifact, separator, detail = text.partition(':')
+    if artifact.startswith('/private/var/'):
+        artifact = '/var/' + artifact[len('/private/var/'):]
+    reason = 'FRAMEWORK_ADAPTER_COLLECTION_FAILED'
+    if 'spring_xml:ParseError' in text:
+        reason = 'SPRING_XML_PARSE_FAILED'
+    elif 'mybatis_xml:ParseError' in text:
+        reason = 'MYBATIS_XML_PARSE_FAILED'
+    return EvidenceFailure(
+        stage=adapter,
+        reason_code=reason,
+        blocking=False,
+        artifact=artifact if separator else '',
+        detail=detail if separator else text,
+    )
+
+
+def _framework_concern(adapter, finding):
+    return EvidenceConcern(
+        stage=adapter,
+        reason_code=str(finding.get('reason_code') or 'FRAMEWORK_ADAPTER_CONCERN'),
+        detail=json.dumps(finding, ensure_ascii=False, sort_keys=True),
+        artifact=str(finding.get('file') or ''),
+        class_name=str(finding.get('subject') or ''),
+    )
+
+
+def _framework_batch(adapter, version, status, nodes, edges, findings, errors, metrics):
+    """Convert legacy parser records once; v1 diagnostics are serializer projections."""
+    normalized_edges = []
+    for raw_edge in edges:
+        ambiguity = bool(raw_edge.get('ambiguity'))
+        normalized = {
+            **raw_edge,
+            'adapter': adapter,
+            'adapter_version': version,
+            'evidence': dict(raw_edge.get('provenance') or {}),
+            'activation_conditions': list(raw_edge.get('conditions') or []),
+            'candidate_count': int(raw_edge.get('candidate_count') or (2 if ambiguity else 1)),
+            'ambiguity_reason': raw_edge.get('ambiguity_reason') or (
+                'multiple candidates' if ambiguity else ''
+            ),
+        }
+        provenance = dict(normalized.get('provenance') or {})
+        metadata = {
+            key: value for key, value in normalized.items()
+            if key not in {'source', 'target', 'edge_kind', 'confidence', 'conditions', 'ambiguity', 'provenance'}
+        }
+        metadata.update({
+            'framework_source': str(normalized.get('source') or ''),
+            'framework_target': str(normalized.get('target') or ''),
+            'framework_provenance': provenance,
+            'legacy_edge': normalized,
+        })
+        normalized_edges.append(CollectedEdge(
+            caller_symbol=str(normalized.get('source') or ''),
+            callee_symbol=str(normalized.get('target') or ''),
+            edge_kind=str(normalized.get('edge_kind') or ''),
+            semantic=True,
+            owner_scope=_framework_edge_scope(normalized),
+            provenance=EvidenceProvenance(
+                authority=_framework_edge_authority(normalized),
+                artifact_path=str(provenance.get('file') or provenance.get('jar') or ''),
+                class_or_resource_entry=str(provenance.get('resource') or ''),
+                parser=str(provenance.get('parser') or 'framework_adapter'),
+                evidence_source=_framework_edge_authority(normalized).value,
+                line=int(provenance.get('line') or 0),
+            ),
+            confidence=str(normalized.get('confidence') or 'high'),
+            ambiguous=ambiguity,
+            activation_conditions=tuple(normalized.get('activation_conditions') or ()),
+            metadata=tuple(sorted(metadata.items())),
+        ))
+    result_metrics = {
+        **dict(metrics or {}),
+        'edges': len(normalized_edges),
+        'ambiguous_edges': sum(edge.ambiguous for edge in normalized_edges),
+        'conditional_edges': sum(bool(edge.activation_conditions) for edge in normalized_edges),
+        'nodes': len(nodes),
+        '_legacy_nodes': tuple(nodes),
+        '_legacy_findings': tuple(findings),
+        '_legacy_errors': tuple(errors),
+    }
+    return CollectorBatch(
+        collector=adapter,
+        version=version,
+        edges=tuple(normalized_edges),
+        failures=tuple(_framework_failure(adapter, item) for item in errors),
+        concerns=tuple(_framework_concern(adapter, item) for item in findings),
+        coverage=(CoverageRecord(
+            collector=adapter,
+            api_identity=adapter,
+            status=status,
+            applicable=status != 'not_applicable',
+        ),),
+        metrics=tuple(sorted(result_metrics.items())),
+    )
+
+
+def _serialize_framework_batch(batch):
+    metrics = dict(batch.metrics)
+    coverage = next((item for item in batch.coverage if item.collector == batch.collector), None)
+    serialized_edges = []
+    for edge in batch.edges:
+        legacy = dict(dict(edge.metadata).get('legacy_edge') or {})
+        if not legacy:
+            legacy = {
+                'source': edge.caller_symbol,
+                'target': edge.callee_symbol,
+                'edge_kind': edge.edge_kind,
+                'confidence': edge.confidence,
+                'conditions': list(edge.activation_conditions),
+                'ambiguity': edge.ambiguous,
+                'provenance': dict(dict(edge.metadata).get('framework_provenance') or {}),
+            }
+        serialized_edges.append(legacy)
+    return {
+        'adapter': batch.collector,
+        'version': batch.version,
+        'status': coverage.status if coverage else 'partial',
+        'nodes': list(metrics.pop('_legacy_nodes', ())),
+        'edges': serialized_edges,
+        'findings': list(metrics.pop('_legacy_findings', ())),
+        'errors': list(metrics.pop('_legacy_errors', ())),
+        'metrics': metrics,
+    }
+
+
+def serialize_framework_batches(batches, output_path=''):
+    """Project immutable adapter batches to the legacy v1 diagnostics schema."""
+    payload = {
+        'schema': 'java-upgrade-analyzer.framework-adapters.v1',
+        'adapters': [_serialize_framework_batch(batch) for batch in tuple(batches)],
+    }
+    if output_path:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    return payload
+
+
 def _xml_local_name(tag):
     return str(tag or '').rsplit('}', 1)[-1].split(':')[-1]
 
@@ -170,7 +356,7 @@ def _split_bean_ref(value):
     return text, ''
 
 
-def run_spi_adapter(source_roots):
+def run_spi_adapter(source_roots, artifact_catalog=None):
     edges, nodes, findings, errors = [], [], [], []
     files = []
     source_classes = set()
@@ -340,12 +526,12 @@ def run_spi_adapter(source_roots):
     ambiguous = any(item.get('reason_code') in {
         'spi_multiple_providers', 'spi_provider_class_unverified', 'spi_load_point_without_local_provider'
     } for item in findings)
-    return {
-        'adapter': 'java_spi', 'version': '1',
-        'status': 'partial' if files and (errors or ambiguous) else _status(bool(files), errors),
-        'nodes': nodes, 'edges': edges, 'findings': findings, 'errors': errors,
-        'metrics': {'resource_files': len(files), 'load_points': len(load_points), 'edges': len(edges)},
-    }
+    return _framework_batch(
+        'java_spi', '1',
+        'partial' if files and (errors or ambiguous) else _status(bool(files), errors),
+        nodes, edges, findings, errors,
+        {'resource_files': len(files), 'load_points': len(load_points), 'edges': len(edges)},
+    )
 
 
 def _java_package_and_class(text, fallback=''):
@@ -355,7 +541,7 @@ def _java_package_and_class(text, fallback=''):
     return f'{package.group(1)}.{simple}' if package and simple else simple
 
 
-def run_spring_adapter(source_roots):
+def run_spring_adapter(source_roots, artifact_catalog=None):
     edges, nodes, findings, errors = [], [], [], []
     scanned = 0
     applicable = False
@@ -443,27 +629,29 @@ def run_spring_adapter(source_roots):
                 r'(?:\s+extends\s+[\w.<>]+)?\s+implements\s+([^\{]+)',
                 text,
             )
-            if class_match and bean_pattern.search(text):
+            if class_match:
                 implemented = []
                 for raw_interface in class_match.group(1).split(','):
                     simple = re.sub(r'<.*>', '', raw_interface).strip()
                     interface = imports.get(simple, simple)
                     implemented.append((simple, interface))
-                    bean_candidates.append({
-                        'interface': interface,
-                        'implementation': owner,
-                        'primary': bool(re.search(r'@Primary\b', text)),
-                        'qualifiers': re.findall(r'@Qualifier\s*\(\s*"([^"]+)"\s*\)', text),
-                        'file': str(path),
-                    })
+                    if bean_pattern.search(text):
+                        bean_candidates.append({
+                            'interface': interface,
+                            'implementation': owner,
+                            'primary': bool(re.search(r'@Primary\b', text)),
+                            'qualifiers': re.findall(r'@Qualifier\s*\(\s*"([^"]+)"\s*\)', text),
+                            'file': str(path),
+                        })
                 method_names = re.findall(
                     r'\b(?:public|protected)\s+(?:[\w.$<>\[\],?]+\s+)+([A-Za-z_]\w*)\s*\(',
                     text,
                 )
                 for simple, interface in implemented:
-                    if simple not in callback_methods:
+                    callback_interface = simple.rsplit('.', 1)[-1]
+                    if callback_interface not in callback_methods:
                         continue
-                    allowed = callback_methods[simple]
+                    allowed = callback_methods[callback_interface]
                     for method_name in method_names:
                         if allowed and method_name not in allowed:
                             continue
@@ -625,7 +813,8 @@ def run_spring_adapter(source_roots):
         for path in sorted(root.rglob('*.xml')):
             try:
                 tree = ET.parse(str(path))
-            except ET.ParseError:
+            except ET.ParseError as exc:
+                errors.append(f'{path}:spring_xml:{type(exc).__name__}')
                 continue
             except OSError as exc:
                 errors.append(f'{path}:{type(exc).__name__}')
@@ -796,12 +985,12 @@ def run_spring_adapter(source_roots):
         }
         for finding in findings
     )
-    return {
-        'adapter': 'spring_basic', 'version': '1',
-        'status': 'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
-        'nodes': nodes, 'edges': edges, 'findings': findings, 'errors': errors,
-        'metrics': {'source_files_scanned': scanned, 'xml_files_scanned': xml_files, 'edges': len(edges)},
-    }
+    return _framework_batch(
+        'spring_basic', '1',
+        'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
+        nodes, edges, findings, errors,
+        {'source_files_scanned': scanned, 'xml_files_scanned': xml_files, 'edges': len(edges)},
+    )
 
 
 _MYBATIS_DOCTYPE_RE = re.compile(br'<!DOCTYPE\s+[^>]+>', re.IGNORECASE | re.DOTALL)
@@ -835,7 +1024,7 @@ def _parse_mybatis_xml_bytes(raw):
     return ET.fromstring(raw)
 
 
-def run_mybatis_adapter(source_roots):
+def run_mybatis_adapter(source_roots, artifact_catalog=None):
     edges, nodes, findings, errors = [], [], [], []
     files = []
     annotation_files = 0
@@ -991,11 +1180,11 @@ def run_mybatis_adapter(source_roots):
                     },
                 })
                 nodes.append({'id': target, 'kind': 'mybatis_mapper_method'})
-    return {
-        'adapter': 'mybatis', 'version': '1', 'status': _status(bool(files or annotation_files), errors),
-        'nodes': nodes, 'edges': edges, 'findings': findings, 'errors': errors,
-        'metrics': {'xml_files': len(files), 'annotation_files': annotation_files, 'edges': len(edges)},
-    }
+    return _framework_batch(
+        'mybatis', '1', _status(bool(files or annotation_files), errors),
+        nodes, edges, findings, errors,
+        {'xml_files': len(files), 'annotation_files': annotation_files, 'edges': len(edges)},
+    )
 
 
 _MYBATIS_PROXY_RUNTIME_CLASSES = {
@@ -1234,7 +1423,8 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog):
             for name, xml_content in sorted(xml_entries.items()):
                 try:
                     root = _parse_mybatis_xml_bytes(xml_content)
-                except ET.ParseError:
+                except ET.ParseError as exc:
+                    errors.append(f'{name}:mybatis_xml:{type(exc).__name__}')
                     continue
                 if str(root.tag).rsplit('}', 1)[-1] != 'mapper':
                     continue
@@ -1368,14 +1558,14 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
             'subject': 'org.apache.ibatis.binding.MapperProxy',
             'candidate_count': runtime_matches,
         }] if untrusted_runtime_hint else [])
-        return {
-            'adapter': 'mybatis_mapper_proxy', 'version': '2',
-            'status': 'partial' if runtime_errors or findings else 'not_applicable',
-            'nodes': [], 'edges': [], 'findings': findings, 'errors': runtime_errors,
-            'metrics': {'registered_mapper_methods': 0, 'unregistered_mapper_methods': 0,
-                        'runtime_candidates': runtime_matches, 'verified_dispatch_stages': 0,
-                        'edges': 0},
-        }
+        return _framework_batch(
+            'mybatis_mapper_proxy', '2',
+            'partial' if runtime_errors or findings else 'not_applicable',
+            [], [], findings, runtime_errors,
+            {'registered_mapper_methods': 0, 'unregistered_mapper_methods': 0,
+             'runtime_candidates': runtime_matches, 'verified_dispatch_stages': 0,
+             'edges': 0},
+        )
     source_contracts, source_unregistered, errors = _mybatis_mapper_contracts(source_roots)
     contracts, unregistered, activation_evidence, packaged_errors = _packaged_mybatis_contracts(
         source_contracts + source_unregistered, artifact_catalog
@@ -1455,25 +1645,21 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
     unresolved = bool(applicable and (
         not contracts or not activation_evidence or not runtime_entry or not runtime_complete
     ))
-    return {
-        'adapter': 'mybatis_mapper_proxy',
-        'version': '2',
-        'status': 'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
-        'nodes': nodes,
-        'edges': edges,
-        'findings': findings,
-        'errors': errors,
-        'metrics': {
+    return _framework_batch(
+        'mybatis_mapper_proxy', '2',
+        'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
+        nodes, edges, findings, errors,
+        {
             'registered_mapper_methods': len(contracts),
             'unregistered_mapper_methods': len(unregistered),
             'runtime_candidates': runtime_matches,
             'verified_dispatch_stages': sum(bool(value) for value in dispatch.values()),
             'edges': len(edges),
         },
-    }
+    )
 
 
-def run_dynamic_proxy_adapter(source_roots):
+def run_dynamic_proxy_adapter(source_roots, artifact_catalog=None):
     edges, nodes, findings, errors = [], [], [], []
     scanned = 0
     registrations = 0
@@ -1621,23 +1807,17 @@ def run_dynamic_proxy_adapter(source_roots):
     )
     applicable = registrations > 0
     status = 'partial' if applicable and (errors or unresolved) else _status(applicable, errors)
-    return {
-        'adapter': 'dynamic_proxy_basic',
-        'version': '1',
-        'status': status,
-        'nodes': nodes,
-        'edges': edges,
-        'findings': findings,
-        'errors': errors,
-        'metrics': {
+    return _framework_batch(
+        'dynamic_proxy_basic', '1', status, nodes, edges, findings, errors,
+        {
             'source_files_scanned': scanned,
             'proxy_registrations': registrations,
             'edges': len(edges),
         },
-    }
+    )
 
 
-def run_declarative_http_client_adapter(source_roots):
+def run_declarative_http_client_adapter(source_roots, artifact_catalog=None):
     edges, nodes, findings, errors = [], [], [], []
     scanned = 0
     applicable = False
@@ -1757,20 +1937,16 @@ def run_declarative_http_client_adapter(source_roots):
         }
         for item in findings
     )
-    return {
-        'adapter': 'declarative_http_client_basic',
-        'version': '1',
-        'status': 'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
-        'nodes': nodes,
-        'edges': edges,
-        'findings': findings,
-        'errors': errors,
-        'metrics': {
+    return _framework_batch(
+        'declarative_http_client_basic', '1',
+        'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
+        nodes, edges, findings, errors,
+        {
             'source_files_scanned': scanned,
             'clients': len({item['subject'] for item in findings if item.get('reason_code') == 'declarative_http_client_registration'}),
             'edges': len(edges),
         },
-    }
+    )
 
 
 _SPRING_RUNTIME_CALLBACK_METHODS = {
@@ -2363,21 +2539,17 @@ def run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=None):
         or len(verified_methods) != len(transactional_methods)
         or len(implementation_targets) != len(_SPRING_TRANSACTION_TARGETS)
     ))
-    return {
-        'adapter': 'spring_transaction_proxy',
-        'version': '1',
-        'status': 'partial' if unresolved else _status(applicable, errors),
-        'nodes': nodes,
-        'edges': edges,
-        'findings': findings,
-        'errors': errors,
-        'metrics': {
+    return _framework_batch(
+        'spring_transaction_proxy', '1',
+        'partial' if unresolved else _status(applicable, errors),
+        nodes, edges, findings, errors,
+        {
             'transactional_methods': len(transactional_methods),
             'packaged_transactional_methods': len(verified_methods),
             'implementation_methods': len(implementation_targets),
             'edges': len(edges),
         },
-    }
+    )
 
 
 def run_spring_data_repository_adapter(source_roots, artifact_catalog=None):
@@ -2483,22 +2655,18 @@ def run_spring_data_repository_adapter(source_roots, artifact_catalog=None):
     unresolved = bool(repositories and (
         not activation_evidence or len(entries) != 1 or custom_configuration
     ))
-    return {
-        'adapter': 'spring_data_repository_proxy',
-        'version': '1',
-        'status': 'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
-        'nodes': nodes,
-        'edges': edges,
-        'findings': findings,
-        'errors': errors,
-        'metrics': {
+    return _framework_batch(
+        'spring_data_repository_proxy', '1',
+        'partial' if applicable and (errors or unresolved) else _status(applicable, errors),
+        nodes, edges, findings, errors,
+        {
             'repositories': len(repositories),
             'runtime_implementations': len(entries),
             'implementation_methods': len(implementation_methods),
             'custom_repository_configurations': len(custom_configuration),
             'edges': len(edges),
         },
-    }
+    )
 
 
 def _aload_slot(instruction):
@@ -2811,66 +2979,35 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
             'subject': 'packaged_spring_registrations',
         })
     applicable = bool(resource_files or activation_evidence)
-    return {
-        'adapter': 'spring_runtime_artifact',
-        'version': '1',
-        'status': 'partial' if applicable and (errors or (resource_files and not spring_boot_active)) else _status(applicable, errors),
-        'nodes': nodes,
-        'edges': edges,
-        'findings': findings,
-        'errors': errors,
-        'metrics': {
+    return _framework_batch(
+        'spring_runtime_artifact', '1',
+        'partial' if applicable and (errors or (resource_files and not spring_boot_active)) else _status(applicable, errors),
+        nodes, edges, findings, errors,
+        {
             'resource_files': resource_files,
             'business_activation_files': len(activation_evidence),
             'active_callbacks': active_callbacks,
             'conditional_autoconfigurations': conditional_autoconfigurations,
             'edges': len(edges),
         },
-    }
+    )
 
 
 def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
-    adapters = [
-        run_spi_adapter(source_roots),
-        run_spring_adapter(source_roots),
+    batches = (
+        run_spi_adapter(source_roots, artifact_catalog=artifact_catalog),
+        run_spring_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_runtime_spring_registration_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_spring_data_repository_adapter(source_roots, artifact_catalog=artifact_catalog),
-        run_mybatis_adapter(source_roots),
+        run_mybatis_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_mybatis_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
-        run_dynamic_proxy_adapter(source_roots),
-        run_declarative_http_client_adapter(source_roots),
-    ]
-    for adapter in adapters:
-        normalized = []
-        for edge in adapter.get('edges') or []:
-            ambiguity = bool(edge.get('ambiguity'))
-            normalized.append({
-                **edge,
-                'adapter': adapter.get('adapter'),
-                'adapter_version': adapter.get('version'),
-                'evidence': dict(edge.get('provenance') or {}),
-                'activation_conditions': list(edge.get('conditions') or []),
-                'candidate_count': int(edge.get('candidate_count') or (2 if ambiguity else 1)),
-                'ambiguity_reason': edge.get('ambiguity_reason') or ('multiple candidates' if ambiguity else ''),
-            })
-        adapter['edges'] = normalized
-        adapter.setdefault('metrics', {})['ambiguous_edges'] = sum(
-            bool(edge.get('ambiguity')) for edge in normalized
-        )
-        adapter['metrics']['conditional_edges'] = sum(
-            bool(edge.get('activation_conditions')) for edge in normalized
-        )
-        adapter['metrics']['nodes'] = len(adapter.get('nodes') or [])
-    payload = {
-        'schema': 'java-upgrade-analyzer.framework-adapters.v1',
-        'adapters': adapters,
-    }
+        run_dynamic_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
+        run_declarative_http_client_adapter(source_roots, artifact_catalog=artifact_catalog),
+    )
     if output_path:
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    return payload
+        serialize_framework_batches(batches, output_path)
+    return batches
 
 
 def attach_framework_edges_to_graph(graph, payload):
