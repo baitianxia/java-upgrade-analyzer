@@ -60,6 +60,7 @@ from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_edges, merge_business_bytecode_edges
 from indirect_usage_analyzer import analyze_and_merge_indirect_usages
 from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
+from step5_evidence_ingestion import ingest_collector_batches
 from analysis_contract import sha256_file
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -1132,6 +1133,13 @@ def _step5_integrated_main_impl(args):
         'dependency_source_alignment_rejected': len(rejected_source_records),
         'dependency_source_alignment_evidence': dependency_source_alignment.get('evidence_path') or '',
     })
+    ingestion_result = ingest_collector_batches(graph, ())
+    graph_stats['evidence_ingestion'] = {
+        'merged_edges': ingestion_result.merged_edges,
+        'duplicate_edges': ingestion_result.duplicate_edges,
+        'rejected_edges': ingestion_result.rejected_edges,
+        'failure_count': len(ingestion_result.failures),
+    }
     bytecode_timer = time.perf_counter()
     bytecode_evidence, bytecode_stats = collect_business_bytecode_edges(
         business_roots,
