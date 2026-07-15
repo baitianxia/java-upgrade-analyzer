@@ -312,7 +312,7 @@ creation to occur in the renderer.
 
 - [ ] **Step 6: Run tracer, formatter, query, and Step6 compatibility tests**
 
-Run: `python3 -m unittest tests.test_step5_evidence_model tests.test_step5_key_matching tests.test_s5_query_call_chain tests.test_s6_report -v`
+Run: `python3 -m unittest tests.test_step5_evidence_model tests.test_step5_key_matching tests.test_s5_query_call_chain tests.test_step6_report -v`
 
 - [ ] **Step 7: Commit Task 5**
 

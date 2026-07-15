@@ -26,6 +26,7 @@ from step5_evidence_model import (
     EvidenceFailure,
     EvidenceProvenance,
     ModuleScope,
+    thaw_evidence_value,
 )
 
 
@@ -261,7 +262,13 @@ def _framework_batch(adapter, version, status, nodes, edges, findings, errors, m
             owner_scope=_framework_edge_scope(normalized),
             provenance=EvidenceProvenance(
                 authority=_framework_edge_authority(normalized),
-                artifact_path=str(provenance.get('file') or provenance.get('jar') or ''),
+                artifact_path=str(provenance.get('jar') or provenance.get('file') or ''),
+                artifact_sha256=str(
+                    provenance.get('artifact_sha256')
+                    or provenance.get('final_artifact_sha256')
+                    or ''
+                ),
+                artifact_entry=str(provenance.get('artifact_entry') or ''),
                 class_or_resource_entry=str(provenance.get('resource') or ''),
                 parser=str(provenance.get('parser') or 'framework_adapter'),
                 evidence_source=_framework_edge_authority(normalized).value,
@@ -299,11 +306,13 @@ def _framework_batch(adapter, version, status, nodes, edges, findings, errors, m
 
 
 def _serialize_framework_batch(batch):
-    metrics = dict(batch.metrics)
+    metrics = thaw_evidence_value(dict(batch.metrics))
     coverage = next((item for item in batch.coverage if item.collector == batch.collector), None)
     serialized_edges = []
     for edge in batch.edges:
-        legacy = dict(dict(edge.metadata).get('legacy_edge') or {})
+        legacy = thaw_evidence_value(
+            dict(edge.metadata).get('legacy_edge') or {}
+        )
         if not legacy:
             legacy = {
                 'source': edge.caller_symbol,
@@ -312,7 +321,9 @@ def _serialize_framework_batch(batch):
                 'confidence': edge.confidence,
                 'conditions': list(edge.activation_conditions),
                 'ambiguity': edge.ambiguous,
-                'provenance': dict(dict(edge.metadata).get('framework_provenance') or {}),
+                'provenance': thaw_evidence_value(
+                    dict(edge.metadata).get('framework_provenance') or {}
+                ),
             }
         serialized_edges.append(legacy)
     return {
@@ -1546,15 +1557,19 @@ def _verify_mybatis_runtime_dispatch(entry):
     checks = {
         'proxy_entry_dispatch': (
             'org.apache.ibatis.binding.MapperProxy',
-            'InterfaceMethod org/apache/ibatis/binding/MapperProxy$MapperMethodInvoker.invoke:',
+            'InterfaceMethod org/apache/ibatis/binding/MapperProxy$MapperMethodInvoker.invoke:'
+            '(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;'
+            'Lorg/apache/ibatis/session/SqlSession;)Ljava/lang/Object;',
         ),
         'plain_invoker_dispatch': (
             'org.apache.ibatis.binding.MapperProxy$PlainMethodInvoker',
-            'Method org/apache/ibatis/binding/MapperMethod.execute:',
+            'Method org/apache/ibatis/binding/MapperMethod.execute:'
+            '(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)Ljava/lang/Object;',
         ),
         'select_one_dispatch': (
             'org.apache.ibatis.binding.MapperMethod',
-            'InterfaceMethod org/apache/ibatis/session/SqlSession.selectOne:',
+            'InterfaceMethod org/apache/ibatis/session/SqlSession.selectOne:'
+            '(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;',
         ),
     }
     verified = {

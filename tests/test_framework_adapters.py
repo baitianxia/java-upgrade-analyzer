@@ -113,6 +113,76 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 with self.assertRaises((AttributeError, TypeError)):
                     batch.collector = "mutated"
 
+    def test_framework_batch_is_deeply_immutable_and_keeps_typed_artifact_provenance(self):
+        raw_edge = {
+            "source": "com.acme.Repository.find",
+            "target": "framework.Proxy.invoke()",
+            "edge_kind": "spring_data_repository_proxy_dispatch",
+            "confidence": "high",
+            "conditions": ["repository_registered"],
+            "provenance": {
+                "authority": "final_artifact_javap",
+                "file": "/src/Repository.java",
+                "jar": "/artifact/application.jar",
+                "artifact_sha256": "a" * 64,
+                "artifact_entry": "BOOT-INF/classes/com/acme/Repository.class",
+                "nested": {"verified": True},
+            },
+        }
+        nodes = [{"id": "repository", "details": {"active": True}}]
+        batch = framework_adapter_module._framework_batch(
+            "spring_data_repository_proxy", "1", "complete",
+            nodes, [raw_edge], [], [], {},
+        )
+        before = serialize_framework_batches((batch,))
+
+        raw_edge["target"] = "mutated.Target.invoke()"
+        raw_edge["provenance"]["nested"]["verified"] = False
+        nodes[0]["details"]["active"] = False
+        after = serialize_framework_batches((batch,))
+
+        self.assertEqual(after, before)
+        typed = batch.edges[0]
+        self.assertEqual(typed.callee_symbol, "framework.Proxy.invoke()")
+        self.assertEqual(typed.provenance.artifact_path, "/artifact/application.jar")
+        self.assertEqual(typed.provenance.artifact_sha256, "a" * 64)
+        self.assertEqual(
+            typed.provenance.artifact_entry,
+            "BOOT-INF/classes/com/acme/Repository.class",
+        )
+
+    def test_mybatis_runtime_dispatch_requires_exact_jvm_descriptors(self):
+        wrong_outputs = {
+            "org.apache.ibatis.binding.MapperProxy": (
+                "InterfaceMethod org/apache/ibatis/binding/MapperProxy$MapperMethodInvoker."
+                "invoke:(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;"
+                "Lorg/apache/ibatis/session/SqlSession;)V"
+            ),
+            "org.apache.ibatis.binding.MapperProxy$PlainMethodInvoker": (
+                "Method org/apache/ibatis/binding/MapperMethod.execute:"
+                "(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)V"
+            ),
+            "org.apache.ibatis.binding.MapperMethod": (
+                "InterfaceMethod org/apache/ibatis/session/SqlSession.selectOne:"
+                "(Ljava/lang/String;Ljava/lang/Object;)V"
+            ),
+        }
+
+        def completed(command, **_kwargs):
+            return SimpleNamespace(returncode=0, stdout=wrong_outputs[command[-1]])
+
+        with patch.object(framework_adapter_module.subprocess, "run", side_effect=completed):
+            verified, errors = framework_adapter_module._verify_mybatis_runtime_dispatch({
+                "jar_path": "/artifact/mybatis.jar",
+            })
+
+        self.assertEqual(errors, [])
+        self.assertEqual(verified, {
+            "proxy_entry_dispatch": False,
+            "plain_invoker_dispatch": False,
+            "select_one_dispatch": False,
+        })
+
     def test_framework_orchestrator_returns_tuple_and_serializer_alone_projects_v1(self):
         batches = _run_framework_adapters([], artifact_catalog={"entries": []})
 
@@ -987,6 +1057,8 @@ class FrameworkAdaptersTest(unittest.TestCase):
             evidence_source="current_final_artifact", confidence="high",
             file="business.jar!/AppRunner.class", line=12, content="invoke book",
             owner_type="business", owner_coord="BUSINESS", module="app", is_test=False,
+            artifact_sha256="b" * 64,
+            artifact_entry="BOOT-INF/classes/com/acme/AppRunner.class",
         )
         unrelated = SimpleNamespace(
             caller_symbol_id="other", caller_qualified_key="com.acme.Other.run()",
@@ -1015,6 +1087,11 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 "provenance": {
                     "jar": "/runtime/spring-tx.jar", "authority": "final_artifact_javap",
                     "artifact_sha256": "a" * 64, "business_artifact_sha256": "b" * 64,
+                    "business_activation": [{
+                        "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
+                        "artifact_sha256": "b" * 64,
+                        "authority": "current_final_artifact_classfile",
+                    }],
                 },
             }],
         }]}

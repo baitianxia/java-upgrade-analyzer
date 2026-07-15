@@ -16,6 +16,7 @@ from step5_evidence_model import (
     CollectorBatch,
     EvidenceFailure,
     ModuleScope,
+    thaw_evidence_value,
 )
 
 
@@ -90,7 +91,7 @@ def _owner_type(scope: ModuleScope) -> str:
 
 
 def _edge_metadata(edge: CollectedEdge):
-    return dict(edge.metadata)
+    return thaw_evidence_value(dict(edge.metadata))
 
 
 def _call_edge_identity(edge, collector):
@@ -99,8 +100,20 @@ def _call_edge_identity(edge, collector):
         str(getattr(edge, "callee_key", "") or ""),
         str(getattr(edge, "evidence_type", "") or ""),
     )
-    if collector == "indirect_usage":
-        return (*identity, int(getattr(edge, "line", 0) or 0))
+    artifact_sha = str(getattr(edge, "artifact_sha256", "") or "")
+    artifact_entry = str(getattr(edge, "artifact_entry", "") or "")
+    raw_instruction_offset = getattr(edge, "instruction_offset", -1)
+    instruction_offset = (
+        -1 if raw_instruction_offset is None else int(raw_instruction_offset)
+    )
+    if artifact_sha or artifact_entry or instruction_offset >= 0 or collector == "indirect_usage":
+        return (
+            *identity,
+            artifact_sha,
+            artifact_entry,
+            int(getattr(edge, "line", 0) or 0),
+            instruction_offset,
+        )
     return identity
 
 
@@ -163,9 +176,6 @@ def _framework_edge_mapping(
     edge: CollectedEdge,
 ) -> Mapping[str, object]:
     metadata = _edge_metadata(edge)
-    legacy = metadata.get("legacy_edge")
-    if isinstance(legacy, Mapping):
-        return dict(legacy)
     provenance = metadata.get("framework_provenance")
     if not isinstance(provenance, Mapping):
         provenance = {}
@@ -180,13 +190,27 @@ def _framework_edge_mapping(
         }
     }
     result.update({
-        "source": str(metadata.get("framework_source") or edge.caller_symbol),
+        "source": edge.caller_symbol,
         "target": edge.callee_symbol,
         "edge_kind": edge.edge_kind,
         "confidence": edge.confidence,
-        "conditions": list(edge.activation_conditions),
+        "conditions": thaw_evidence_value(edge.activation_conditions),
         "ambiguity": edge.ambiguous,
-        "provenance": dict(provenance),
+        "provenance": {
+            **dict(provenance),
+            **({"artifact_path": edge.provenance.artifact_path}
+               if edge.provenance.artifact_path else {}),
+            **({"artifact_sha256": edge.provenance.artifact_sha256}
+               if edge.provenance.artifact_sha256 else {}),
+            **({"artifact_entry": edge.provenance.artifact_entry}
+               if edge.provenance.artifact_entry else {}),
+            **({"class_or_resource_entry": edge.provenance.class_or_resource_entry}
+               if edge.provenance.class_or_resource_entry else {}),
+            **({"parser": edge.provenance.parser}
+               if edge.provenance.parser else {}),
+            **({"evidence_source": edge.provenance.evidence_source}
+               if edge.provenance.evidence_source else {}),
+        },
         "adapter": batch.collector,
         "adapter_version": batch.version,
     })
@@ -516,11 +540,12 @@ def _to_call_edge(
     if not converted.artifact_sha256:
         converted.artifact_sha256 = str(metadata.get("artifact_sha256") or "")
     converted.artifact_entry = edge.provenance.artifact_entry
+    converted.instruction_offset = edge.provenance.instruction_offset
     converted.evidence_authority = edge.provenance.authority.value
     converted.semantic = edge.semantic
     converted.collector = collector
     converted.evidence_registry_identity = _edge_identity(edge)
-    converted.activation_conditions = list(edge.activation_conditions)
+    converted.activation_conditions = thaw_evidence_value(edge.activation_conditions)
     converted.ambiguity = edge.ambiguous
     converted.parser = edge.provenance.parser
     return converted
@@ -561,15 +586,14 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
     caller_sha = str(getattr(caller, "artifact_sha256", "") or "")
     caller_entry = str(getattr(caller, "artifact_entry", "") or "")
     caller_file = str(getattr(caller, "file", "") or "")
-    activation_matches_caller = any(
+    activation_is_verified = any(
         isinstance(item, Mapping)
         and str(item.get("artifact_entry") or "").strip()
         and _valid_sha256(item.get("artifact_sha256"))
         and str(item.get("artifact_sha256") or "").lower()
         == final_artifact_sha
         and str(item.get("authority") or "") == "current_final_artifact_classfile"
-        and _business_class_entry(item.get("artifact_entry"))
-        == _business_class_entry(caller_entry)
+        and bool(_business_class_entry(item.get("artifact_entry")))
         for item in (activations if isinstance(activations, (list, tuple)) else ())
     )
     return bool(
@@ -622,7 +646,41 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
             "!/" not in caller_file
             or caller_file.split("!/", 1)[1] == caller_entry
         )
-        and activation_matches_caller
+        and activation_is_verified
+    )
+
+
+def _proxy_final_artifact_verified(provenance, caller, *, require_business_sha):
+    caller_sha = str(getattr(caller, "artifact_sha256", "") or "").lower()
+    business_sha = str(
+        provenance.get("business_artifact_sha256") or caller_sha
+    ).lower()
+    activations = provenance.get("business_activation")
+    activation_verified = any(
+        isinstance(item, Mapping)
+        and (
+            bool(item.get("spring_application_run"))
+            or bool(item.get("spring_boot_annotation"))
+            or bool(str(item.get("business_entry") or "").strip())
+            or (
+                str(item.get("authority") or "")
+                == "current_final_artifact_classfile"
+                and str(item.get("artifact_entry") or "").strip()
+                and str(item.get("artifact_sha256") or "").lower()
+                == business_sha
+            )
+        )
+        for item in (activations if isinstance(activations, (list, tuple)) else ())
+    )
+    return bool(
+        str(provenance.get("authority") or "") == "final_artifact_javap"
+        and _valid_sha256(provenance.get("artifact_sha256"))
+        and _valid_sha256(caller_sha)
+        and (not require_business_sha or _valid_sha256(
+            provenance.get("business_artifact_sha256")
+        ))
+        and business_sha == caller_sha
+        and activation_verified
     )
 
 
@@ -703,13 +761,14 @@ def _project_transaction_proxy_edges(graph, records, reverse_edge_snapshot):
         if not source_keys or not target:
             continue
         provenance = dict(edge_mapping.get("provenance") or {})
-        verified = bool(
-            str(provenance.get("authority") or "") == "final_artifact_javap"
-            and _valid_sha256(provenance.get("artifact_sha256"))
-            and _valid_sha256(provenance.get("business_artifact_sha256"))
-        )
         callers = _ranked_proxy_callers(reverse_edge_snapshot, source_keys)
         for caller in callers:
+            verified = _proxy_final_artifact_verified(
+                provenance, caller, require_business_sha=True,
+            )
+            confidence = edge.confidence
+            if not verified and confidence == "high":
+                confidence = "medium"
             synthetic = _proxy_call_edge(
                 caller,
                 batch,
@@ -719,6 +778,7 @@ def _project_transaction_proxy_edges(graph, records, reverse_edge_snapshot):
                 target=target,
                 evidence_type="spring_transaction_proxy_dispatch",
                 content_prefix="Spring transaction proxy dispatch",
+                confidence=confidence,
                 final_artifact_verified=verified,
                 use_framework_line=True,
             )
@@ -771,6 +831,13 @@ def _project_spring_data_proxy_edges(graph, records, reverse_edge_snapshot):
             continue
         callers = _ranked_proxy_callers(reverse_edge_snapshot, source_keys)
         for caller in callers:
+            provenance = dict(edge_mapping.get("provenance") or {})
+            verified = _proxy_final_artifact_verified(
+                provenance, caller, require_business_sha=False,
+            )
+            confidence = edge.confidence
+            if not verified and confidence == "high":
+                confidence = "medium"
             synthetic = _proxy_call_edge(
                 caller,
                 batch,
@@ -780,6 +847,8 @@ def _project_spring_data_proxy_edges(graph, records, reverse_edge_snapshot):
                 target=target,
                 evidence_type="spring_data_repository_proxy_dispatch",
                 content_prefix="Spring Data repository proxy dispatch",
+                confidence=confidence,
+                final_artifact_verified=verified,
             )
             if _append_call_edge(graph, _target_lookup_keys(target), synthetic):
                 attached += 1

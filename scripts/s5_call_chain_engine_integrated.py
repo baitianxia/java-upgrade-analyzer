@@ -66,7 +66,7 @@ from indirect_usage_analyzer import (
 )
 from framework_adapters import run_framework_adapters, serialize_framework_batches
 from step5_evidence_ingestion import ingest_collector_batches
-from step5_evidence_model import CoverageRecord
+from step5_evidence_model import CoverageRecord, thaw_evidence_value
 from analysis_contract import sha256_file
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -158,7 +158,10 @@ def _step5_debug(topic, message, **fields):
         if value is None:
             continue
         payload[key] = value
-    print(f"[step5-debug] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}", file=sys.stderr)
+    print(
+        f"[step5-debug] {json.dumps(thaw_evidence_value(payload), ensure_ascii=False, sort_keys=True)}",
+        file=sys.stderr,
+    )
 
 
 def _write_step5_timing_csv(output_dir, graph_stats):
@@ -1240,7 +1243,7 @@ def _step5_integrated_main_impl(args):
                 'partial',
             ),
             **{
-                key: value for key, value in batch.metrics
+                key: thaw_evidence_value(value) for key, value in batch.metrics
                 if not str(key).startswith('_legacy_')
             },
             'error_count': len(batch.failures),

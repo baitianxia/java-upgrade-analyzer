@@ -37,6 +37,7 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 class Step5KeyMatchingTest(unittest.TestCase):
     def _verified_composite_framework_edge(self, **changes):
         artifact_entry = "BOOT-INF/classes/app/Application.class"
+        framework_entry = "BOOT-INF/lib/spring-tx.jar"
         values = {
             "callee_key": (
                 "org.springframework.transaction.interceptor.TransactionInterceptor."
@@ -54,8 +55,10 @@ class Step5KeyMatchingTest(unittest.TestCase):
             ),
             "framework_evidence_source": "framework_semantic",
             "framework_evidence_authority": "framework_semantic",
-            "framework_evidence_artifact_sha256": "",
-            "framework_evidence_artifact_entry": "",
+            "framework_evidence_artifact_sha256": "b" * 64,
+            "framework_evidence_artifact_entry": framework_entry,
+            "artifact_sha256": "b" * 64,
+            "artifact_entry": framework_entry,
             "collector": "spring_transaction_proxy",
             "caller_evidence_source": "current_final_artifact",
             "caller_evidence_authority": "current_final_artifact",
@@ -115,6 +118,15 @@ class Step5KeyMatchingTest(unittest.TestCase):
             },
             "framework_authority_invalid": {
                 "framework_evidence_authority": "current_final_artifact",
+            },
+            "framework_sha_missing": {
+                "framework_evidence_artifact_sha256": "",
+            },
+            "framework_sha_mismatch": {
+                "artifact_sha256": "c" * 64,
+            },
+            "framework_entry_mismatch": {
+                "artifact_entry": "BOOT-INF/lib/other.jar",
             },
         }
         for name, changes in mutations.items():

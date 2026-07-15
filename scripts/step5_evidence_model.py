@@ -6,6 +6,55 @@ import re
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
 
+class FrozenMapping(Mapping):
+    """Small recursively immutable mapping used inside frozen evidence records."""
+
+    __slots__ = ("_items", "_values")
+
+    def __init__(self, items=()):
+        normalized = tuple(sorted(items, key=lambda item: str(item[0])))
+        self._items = normalized
+        self._values = dict(normalized)
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+    def __iter__(self):
+        return (key for key, _value in self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def __repr__(self):
+        return f"FrozenMapping({self._items!r})"
+
+
+def freeze_evidence_value(value):
+    if isinstance(value, Mapping):
+        return FrozenMapping(
+            (key, freeze_evidence_value(item)) for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_evidence_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted(
+            (freeze_evidence_value(item) for item in value),
+            key=repr,
+        ))
+    return value
+
+
+def thaw_evidence_value(value):
+    if isinstance(value, Mapping):
+        return {
+            key: thaw_evidence_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [thaw_evidence_value(item) for item in value]
+    return value
+
+
 class ModuleScope(str, Enum):
     BUSINESS_CLASSES = "business_classes"
     INTERNAL_MODULE = "internal_module"
@@ -57,7 +106,7 @@ class CollectedEdge:
     owner_coord: str = ""
     confidence: str = "high"
     ambiguous: bool = False
-    activation_conditions: Tuple[str, ...] = field(default_factory=tuple)
+    activation_conditions: Tuple[Any, ...] = field(default_factory=tuple)
     metadata: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
 
     def __post_init__(self):
@@ -71,6 +120,14 @@ class CollectedEdge:
             EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
         }:
             raise ValueError("semantic edge authority must be semantic or runtime evidence")
+        object.__setattr__(self, "activation_conditions", tuple(
+            freeze_evidence_value(item)
+            for item in tuple(self.activation_conditions or ())
+        ))
+        object.__setattr__(self, "metadata", tuple(sorted(
+            (key, freeze_evidence_value(value))
+            for key, value in tuple(self.metadata or ())
+        )))
 
 
 @dataclass(frozen=True)
@@ -113,6 +170,10 @@ class CollectorBatch:
         for coverage in self.coverage:
             if not isinstance(coverage, CoverageRecord):
                 raise ValueError("collector coverage must be CoverageRecord values")
+        object.__setattr__(self, "metrics", tuple(sorted(
+            (key, freeze_evidence_value(value))
+            for key, value in tuple(self.metrics or ())
+        )))
 
     def to_mapping(self) -> Mapping[str, Any]:
         def provenance_mapping(item):
@@ -140,9 +201,9 @@ class CollectorBatch:
                 "owner_coord": edge.owner_coord,
                 "confidence": edge.confidence,
                 "ambiguous": edge.ambiguous,
-                "activation_conditions": list(edge.activation_conditions),
+                "activation_conditions": thaw_evidence_value(edge.activation_conditions),
                 "provenance": provenance_mapping(edge.provenance),
-                "metadata": dict(edge.metadata),
+                "metadata": thaw_evidence_value(dict(edge.metadata)),
             } for edge in self.edges],
             "failures": [failure.__dict__ for failure in self.failures],
             "concerns": [concern.__dict__ for concern in self.concerns],
@@ -153,7 +214,7 @@ class CollectorBatch:
                 "reason_codes": list(item.reason_codes),
                 "applicable": item.applicable,
             } for item in self.coverage],
-            "metrics": dict(self.metrics),
+            "metrics": thaw_evidence_value(dict(self.metrics)),
         }
 
 
@@ -240,6 +301,57 @@ class AnalysisDecision:
     reachable_note: str
     direct_callers: int = 0
     business_reach_depth: int = 0
+
+
+@dataclass(frozen=True)
+class TraceSeed:
+    """Stable API identity and comparison context for one trace operation."""
+    api_name: str
+    api_simple: str
+    api_signature: str
+    symbol_kind: str
+    change_type: str
+    coord: str
+    severity: str
+    confirmed: bool
+    source: str
+    analysis_scope: str
+    old_version: str = ""
+    new_version: str = ""
+
+
+@dataclass(frozen=True)
+class AnalysisOutcome:
+    """Immutable policy decision plus renderer-owned compatibility evidence."""
+    decision: AnalysisDecision
+    dependency_chain_coords: Tuple[str, ...] = field(default_factory=tuple)
+    call_paths: Tuple[str, ...] = field(default_factory=tuple)
+    evidence_paths: Tuple[Any, ...] = field(default_factory=tuple)
+    path_details: Tuple[Any, ...] = field(default_factory=tuple)
+    verification_commands: Tuple[str, ...] = field(default_factory=tuple)
+    hops: Tuple[Any, ...] = field(default_factory=tuple)
+    confidence_score: float = 1.0
+    critical_nodes_hit: Tuple[Any, ...] = field(default_factory=tuple)
+    match_provenance: str = ""
+    match_tier: int = -1
+    capability_coverage: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+
+    def __post_init__(self):
+        if not isinstance(self.decision, AnalysisDecision):
+            raise ValueError("analysis outcome requires an AnalysisDecision")
+        for field_name in (
+            "dependency_chain_coords", "call_paths", "evidence_paths",
+            "path_details", "verification_commands", "hops",
+            "critical_nodes_hit", "capability_coverage",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                tuple(
+                    freeze_evidence_value(item)
+                    for item in tuple(getattr(self, field_name) or ())
+                ),
+            )
 
 
 def classify_module_scope(item: Optional[Mapping[str, Any]]) -> ModuleScope:

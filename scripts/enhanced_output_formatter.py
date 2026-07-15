@@ -28,6 +28,8 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from step5_evidence_model import thaw_evidence_value
+
 from signature_utils import split_signature_params
 
 try:
@@ -1132,7 +1134,9 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
         try:
             with open(summary_json_path, 'r', encoding='utf-8') as f:
                 summary_payload = json.load(f)
-            summary_payload.setdefault('meta', {})['graph_stats'] = graph_stats or {}
+            summary_payload.setdefault('meta', {})['graph_stats'] = thaw_evidence_value(
+                graph_stats or {}
+            )
             with open(summary_json_path, 'w', encoding='utf-8', newline='\n') as f:
                 json.dump(summary_payload, f, ensure_ascii=False, indent=2)
         except (OSError, json.JSONDecodeError):
@@ -1184,7 +1188,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
             'not_analyzed': len(not_analyzed),
             'not_found_in_static_analysis': len(not_found),
             'tool':         's5_call_chain_engine_integrated.py (enhanced)',
-            'graph_stats':  graph_stats or {},
+            'graph_stats':  thaw_evidence_value(graph_stats or {}),
         },
         'status':           'done',
         'skip_reason':      '',

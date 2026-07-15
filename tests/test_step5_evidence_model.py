@@ -1,6 +1,8 @@
 import ast
 import inspect
+import json
 import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -13,6 +15,7 @@ if str(SCRIPTS) not in sys.path:
 
 from step5_evidence_model import (
     AnalysisDecision,
+    AnalysisOutcome,
     CollectedEdge,
     CollectorBatch,
     CoverageRecord,
@@ -24,12 +27,15 @@ from step5_evidence_model import (
     ModuleScope,
     PreservationEvidence,
     ReachabilityPath,
+    TraceSeed,
     classify_module_scope,
     decide_analysis,
     decide_envelope,
     decision_to_trace_patch,
+    freeze_evidence_value,
 )
 import confidence_weighted_tracer as tracer
+import enhanced_output_formatter as formatter
 
 
 class EvidenceModelTest(unittest.TestCase):
@@ -341,6 +347,103 @@ class EvidenceModelTest(unittest.TestCase):
         })
         self.assertEqual(patch["analysis_status"], "reachable")
 
+    def test_terminal_renderer_preserves_trace_result_contract(self):
+        seed = TraceSeed(
+            api_name="com.vendor.Legacy.removed",
+            api_simple="removed",
+            api_signature="(String)",
+            symbol_kind="method",
+            change_type="REMOVED",
+            coord="com.vendor:legacy",
+            severity="P0",
+            confirmed=True,
+            source="fixture",
+            analysis_scope="api",
+            old_version="1.0",
+            new_version="2.0",
+        )
+        outcome = AnalysisOutcome(
+            decision=AnalysisDecision(
+                analysis_status="reachable",
+                is_reachable=True,
+                reason_code="BUSINESS_ARTIFACT_BYTECODE_USAGE",
+                reachable_note="final artifact proves the path",
+                direct_callers=1,
+                business_reach_depth=2,
+            ),
+            dependency_chain_coords=("com.acme:application", "com.vendor:legacy"),
+            call_paths=("Application.run -> Legacy.removed",),
+            evidence_paths=(({"evidence_type": "bytecode_method_invocation"},),),
+            path_details=({"path_status": "reachable", "stop_reason": ""},),
+            verification_commands=("javap -c Application",),
+            hops=({"from": "Application.run", "to": "Legacy.removed"},),
+            confidence_score=0.95,
+            critical_nodes_hit=({"type": "system_code_touched"},),
+            match_provenance="descriptor-exact",
+            match_tier=0,
+            capability_coverage=(("business_bytecode", "complete"),),
+        )
+
+        result = tracer.render_trace_result(seed, outcome)
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertIs(result.is_reachable, True)
+        self.assertEqual(result.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
+        self.assertEqual(result.direct_callers, 1)
+        self.assertEqual(result.business_reach_depth, 2)
+        self.assertEqual(result.old_version, "1.0")
+        self.assertEqual(result.new_version, "2.0")
+        self.assertEqual(result.dependency_chain_coords, [
+            "com.acme:application", "com.vendor:legacy",
+        ])
+        self.assertEqual(result.evidence_paths[0][0]["evidence_type"], "bytecode_method_invocation")
+        self.assertEqual(result.path_details[0]["path_status"], "reachable")
+        self.assertEqual(result.verification_commands, ["javap -c Application"])
+        self.assertEqual(result.match_provenance, "descriptor-exact")
+        self.assertEqual(result.match_tier, 0)
+        self.assertEqual(result.capability_coverage, {"business_bytecode": "complete"})
+
+    def test_analysis_outcome_freezes_nested_rendering_evidence(self):
+        detail = {"path_status": "reachable", "evidence": [{"line": 7}]}
+        outcome = AnalysisOutcome(
+            decision=AnalysisDecision(
+                analysis_status="reachable", is_reachable=True,
+                reason_code="EXACT", reachable_note="exact",
+            ),
+            path_details=(detail,),
+        )
+
+        detail["path_status"] = "uncertain"
+        detail["evidence"][0]["line"] = 99
+        rendered = tracer.render_trace_result(
+            TraceSeed(
+                api_name="A.m", api_simple="m", api_signature="()",
+                symbol_kind="method", change_type="REMOVED", coord="g:a",
+                severity="P1", confirmed=True, source="fixture",
+                analysis_scope="api",
+            ),
+            outcome,
+        )
+
+        self.assertEqual(rendered.path_details[0]["path_status"], "reachable")
+        self.assertEqual(rendered.path_details[0]["evidence"][0]["line"], 7)
+
+    def test_summary_output_thaws_immutable_graph_statistics(self):
+        graph_stats = {
+            "framework_adapters": freeze_evidence_value({
+                "indirect_usage": {"analyzers": [{"name": "reflection"}]},
+            }),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = formatter.write_summary_json([], tmp, graph_stats=graph_stats)
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            payload["meta"]["graph_stats"]["framework_adapters"]
+            ["indirect_usage"]["analyzers"][0]["name"],
+            "reflection",
+        )
+
     def test_packaged_result_conclusion_comes_from_evidence_policy(self):
         result = tracer.TraceResult(
             api_name="com.vendor.Legacy.removed",
@@ -470,8 +573,11 @@ class EvidenceModelTest(unittest.TestCase):
                     None,
                 )
                 if not (
-                    isinstance(status, ast.Constant)
-                    and status.value == "pending"
+                    function.name == "render_trace_result"
+                    or (
+                        isinstance(status, ast.Constant)
+                        and status.value == "pending"
+                    )
                 ):
                     violations.append((function.name, "TraceResult.analysis_status", node.lineno))
 

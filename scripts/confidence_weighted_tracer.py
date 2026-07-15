@@ -43,15 +43,18 @@ from indirect_usage_analyzer import (
     parse_javap_indirect_references,
 )
 from step5_evidence_model import (
+    AnalysisOutcome,
     EvidenceConcern,
     EvidenceFailure,
     ModuleScope,
     PhysicalCallEdge,
     PreservationEvidence,
     ReachabilityPath,
+    TraceSeed,
     classify_module_scope,
     decide_analysis,
     decision_to_trace_patch,
+    thaw_evidence_value,
 )
 
 
@@ -754,6 +757,42 @@ class TraceResult:
     # 全部终止链路的人工复核视图；call_paths/evidence_paths 保留兼容语义。
     path_details: list = field(default_factory=list)
     capability_coverage: dict = field(default_factory=dict)
+
+
+def render_trace_result(seed: TraceSeed, outcome: AnalysisOutcome) -> TraceResult:
+    """Materialize the legacy result contract at the terminal policy boundary."""
+    decision = outcome.decision
+    return TraceResult(
+        api_name=seed.api_name,
+        api_simple=seed.api_simple,
+        api_signature=seed.api_signature,
+        symbol_kind=seed.symbol_kind,
+        change_type=seed.change_type,
+        coord=seed.coord,
+        severity=seed.severity,
+        confirmed=seed.confirmed,
+        source=seed.source,
+        analysis_scope=seed.analysis_scope,
+        analysis_status=decision.analysis_status,
+        direct_callers=decision.direct_callers,
+        is_reachable=decision.is_reachable,
+        reachable_note=decision.reachable_note,
+        business_reach_depth=decision.business_reach_depth,
+        dependency_chain_coords=thaw_evidence_value(outcome.dependency_chain_coords),
+        call_paths=thaw_evidence_value(outcome.call_paths),
+        evidence_paths=thaw_evidence_value(outcome.evidence_paths),
+        reason_code=decision.reason_code,
+        verification_commands=thaw_evidence_value(outcome.verification_commands),
+        hops=thaw_evidence_value(outcome.hops),
+        confidence_score=outcome.confidence_score,
+        critical_nodes_hit=thaw_evidence_value(outcome.critical_nodes_hit),
+        match_provenance=outcome.match_provenance,
+        match_tier=outcome.match_tier,
+        old_version=seed.old_version,
+        new_version=seed.new_version,
+        path_details=thaw_evidence_value(outcome.path_details),
+        capability_coverage=thaw_evidence_value(dict(outcome.capability_coverage)),
+    )
 
 
 def _apply_evidence_decision(
@@ -6402,10 +6441,14 @@ def _verified_composite_framework_projection(edge):
         == 'framework_semantic'
         and str(getattr(edge, 'framework_evidence_authority', '') or '')
         == 'framework_semantic'
-        and not str(getattr(edge, 'framework_evidence_artifact_sha256', '') or '')
-        and not str(getattr(edge, 'framework_evidence_artifact_entry', '') or '')
-        and not str(getattr(edge, 'artifact_sha256', '') or '')
-        and not str(getattr(edge, 'artifact_entry', '') or '')
+        and _valid_projected_sha256(
+            getattr(edge, 'framework_evidence_artifact_sha256', '')
+        )
+        and str(getattr(edge, 'framework_evidence_artifact_entry', '') or '').strip()
+        and str(getattr(edge, 'artifact_sha256', '') or '')
+        == str(getattr(edge, 'framework_evidence_artifact_sha256', '') or '')
+        and str(getattr(edge, 'artifact_entry', '') or '')
+        == str(getattr(edge, 'framework_evidence_artifact_entry', '') or '')
         and str(getattr(edge, 'collector', '') or '').strip()
         and str(getattr(edge, 'framework_source', '') or '').strip()
         and str(getattr(edge, 'framework_target', '') or '').strip()

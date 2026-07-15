@@ -1,5 +1,6 @@
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import step5_evidence_ingestion as ingestion_module
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import (
     CollectedEdge,
@@ -40,8 +42,17 @@ class EvidenceIngestionTest(unittest.TestCase):
         )
 
     def _framework_edge(self, edge_kind, *, metadata, target="framework.Target.invoke()"):
+        metadata_values = dict(metadata)
+        framework_provenance = dict(
+            metadata_values.get("framework_provenance") or {}
+        )
+        artifact_sha256 = str(framework_provenance.get("artifact_sha256") or "")
+        if len(artifact_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in artifact_sha256
+        ):
+            artifact_sha256 = ""
         return CollectedEdge(
-            caller_symbol=str(dict(metadata).get("framework_source") or "framework:dispatch"),
+            caller_symbol=str(metadata_values.get("framework_source") or "framework:dispatch"),
             callee_symbol=target,
             edge_kind=edge_kind,
             semantic=True,
@@ -49,7 +60,14 @@ class EvidenceIngestionTest(unittest.TestCase):
             owner_coord="__business__",
             provenance=EvidenceProvenance(
                 authority=EvidenceAuthority.FRAMEWORK_SEMANTIC,
-                artifact_path="/artifact/application.jar",
+                artifact_path=str(
+                    framework_provenance.get("jar")
+                    or "/artifact/application.jar"
+                ),
+                artifact_sha256=artifact_sha256,
+                artifact_entry=str(
+                    framework_provenance.get("artifact_entry") or ""
+                ),
                 parser="framework_adapter",
                 evidence_source="framework_semantic",
             ),
@@ -175,6 +193,82 @@ class EvidenceIngestionTest(unittest.TestCase):
             "com.vendor.Legacy.call()",
         )
 
+    def test_framework_projection_uses_typed_identity_over_legacy_shadow(self):
+        edge = self._framework_edge(
+            "dynamic_proxy_callback",
+            target="typed.Target.invoke()",
+            metadata=(("legacy_edge", {
+                "source": "legacy.Source.call",
+                "target": "legacy.Target.invoke()",
+                "edge_kind": "legacy_kind",
+                "confidence": "low",
+                "conditions": ["legacy"],
+                "provenance": {"authority": "legacy"},
+            }),),
+        )
+
+        projected = ingestion_module._framework_edge_mapping(
+            CollectorBatch(collector="dynamic_proxy_basic", version="1", edges=(edge,)),
+            edge,
+        )
+
+        self.assertEqual(projected["source"], edge.caller_symbol)
+        self.assertEqual(projected["target"], "typed.Target.invoke()")
+        self.assertEqual(projected["edge_kind"], "dynamic_proxy_callback")
+        self.assertEqual(projected["confidence"], "high")
+        self.assertNotEqual(projected["provenance"].get("authority"), "legacy")
+
+    def test_distinct_physical_instruction_offsets_are_not_deduplicated(self):
+        first = self._edge()
+        second = replace(first, provenance=replace(
+            first.provenance,
+            instruction_offset=9,
+        ))
+        first = replace(first, provenance=replace(
+            first.provenance,
+            instruction_offset=1,
+        ))
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+        graph.methods_by_id["caller"] = SimpleNamespace(
+            symbol_id="caller",
+            qualified_key=first.caller_symbol,
+            declared_qualified_key=first.caller_symbol,
+            owner_type="business",
+            owner_coord="__business__",
+            module="app",
+            is_test=False,
+            file="/artifact/application.jar",
+            line=12,
+        )
+
+        result = ingest_collector_batches(graph, (CollectorBatch(
+            collector="business_bytecode", version="1", edges=(first, second),
+        ),))
+
+        self.assertEqual(result.merged_edges, 2)
+        occurrences = graph.reverse_edges[first.callee_symbol]
+        self.assertEqual(
+            {item.instruction_offset for item in occurrences},
+            {1, 9},
+        )
+        self.assertEqual(len(graph.step5_evidence_registry), 2)
+
+    def test_instruction_offset_zero_does_not_collapse_into_unknown_offset(self):
+        edge = self._edge()
+        zero = replace(edge, provenance=replace(edge.provenance, instruction_offset=0))
+        unknown = replace(edge, provenance=replace(edge.provenance, instruction_offset=-1))
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+
+        result = ingest_collector_batches(graph, (CollectorBatch(
+            collector="business_bytecode", version="1", edges=(zero, unknown),
+        ),))
+
+        self.assertEqual(result.merged_edges, 2)
+        self.assertEqual(
+            {item.instruction_offset for item in graph.reverse_edges[edge.callee_symbol]},
+            {-1, 0},
+        )
+
     def test_ingestion_rejects_unknown_owner_scope(self):
         batch = CollectorBatch(
             collector="business_bytecode",
@@ -283,7 +377,7 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual(len(graph.step5_evidence_registry), 1)
         self.assertEqual(len(graph.reverse_edges["class:com.vendor.Legacy"]), 1)
 
-    def test_ingestion_deduplicates_edge_already_present_in_bucket(self):
+    def test_ingestion_keeps_typed_physical_edge_beside_unlocated_legacy_edge(self):
         edge = self._edge()
         existing = SimpleNamespace(
             caller_symbol_id=edge.caller_symbol,
@@ -298,12 +392,12 @@ class EvidenceIngestionTest(unittest.TestCase):
             collector="business_bytecode", version="2", edges=(edge,),
         ),))
 
-        self.assertEqual(result.merged_edges, 0)
-        self.assertEqual(result.duplicate_edges, 1)
-        self.assertEqual(graph.step5_evidence_registry, ())
-        self.assertEqual(graph.reverse_edges[edge.callee_symbol], [existing])
+        self.assertEqual(result.merged_edges, 1)
+        self.assertEqual(result.duplicate_edges, 0)
+        self.assertEqual(len(graph.step5_evidence_registry), 1)
+        self.assertEqual(len(graph.reverse_edges[edge.callee_symbol]), 2)
 
-    def test_ingestion_deduplicates_pending_legacy_bucket_identity(self):
+    def test_ingestion_keeps_distinct_physical_source_lines(self):
         first = self._edge()
         second = CollectedEdge(
             caller_symbol=first.caller_symbol,
@@ -327,10 +421,10 @@ class EvidenceIngestionTest(unittest.TestCase):
             collector="business_bytecode", version="2", edges=(first, second),
         ),))
 
-        self.assertEqual(result.merged_edges, 1)
-        self.assertEqual(result.duplicate_edges, 1)
-        self.assertEqual(len(graph.step5_evidence_registry), 1)
-        self.assertEqual(len(graph.reverse_edges[first.callee_symbol]), 1)
+        self.assertEqual(result.merged_edges, 2)
+        self.assertEqual(result.duplicate_edges, 0)
+        self.assertEqual(len(graph.step5_evidence_registry), 2)
+        self.assertEqual(len(graph.reverse_edges[first.callee_symbol]), 2)
 
     def test_ingestion_preserves_legacy_business_call_edge_fields(self):
         edge = CollectedEdge(
@@ -642,11 +736,6 @@ class EvidenceIngestionTest(unittest.TestCase):
                 "artifact_sha256": "corrupt",
                 "authority": "current_final_artifact_classfile",
             }]},
-            "activation_entry_mismatch": {"provenance_business_activation": [{
-                "artifact_entry": "BOOT-INF/classes/com/acme/Other.class",
-                "artifact_sha256": "a" * 64,
-                "authority": "current_final_artifact_classfile",
-            }]},
             "final_artifact_sha_corrupt": {"provenance_final_artifact_sha256": "corrupt"},
             "runtime_sha_corrupt": {"provenance_artifact_sha256": "corrupt"},
             "dispatch_incomplete": {"provenance_verified_dispatch": {
@@ -781,7 +870,12 @@ class EvidenceIngestionTest(unittest.TestCase):
                     "jar": "/artifact/spring-tx.jar",
                     "artifact_sha256": "b" * 64,
                     "business_artifact_sha256": "a" * 64,
-                    "business_activation": [{"business_entry": "com.acme.Application.main"}],
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
+                        "artifact_sha256": "a" * 64,
+                        "authority": "current_final_artifact_classfile",
+                    }],
                 }),
             ),
         )
@@ -827,10 +921,15 @@ class EvidenceIngestionTest(unittest.TestCase):
                 ("runtime_activation", "active"),
                 ("framework_provenance", {
                     "authority": "final_artifact_javap",
+                    "jar": "/artifact/spring-tx.jar",
+                    "artifact_entry": "BOOT-INF/lib/spring-tx.jar",
                     "artifact_sha256": "b" * 64,
                     "business_artifact_sha256": "a" * 64,
                     "business_activation": [{
-                        "business_entry": "com.acme.Application.main"
+                        "business_entry": "com.acme.Application.main",
+                        "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
+                        "artifact_sha256": "a" * 64,
+                        "authority": "current_final_artifact_classfile",
                     }],
                 }),
             ),
@@ -862,6 +961,69 @@ class EvidenceIngestionTest(unittest.TestCase):
             "BOOT-INF/classes/com/acme/Application.class",
         )
         self.assertTrue(_edge_allowed_for_trace(merged, graph))
+
+    def test_transaction_proxy_rejects_unrelated_business_artifact_sha(self):
+        target = "framework.TransactionInterceptor.invoke()"
+        edge = self._framework_edge(
+            "spring_transaction_proxy_dispatch",
+            target=target,
+            metadata=(
+                ("framework_source", "com.acme.CityMapper.find/1"),
+                ("source_owner", "com.acme.CityMapper"),
+                ("source_member", "find"),
+                ("parameter_count", 1),
+                ("framework_provenance", {
+                    "authority": "final_artifact_javap",
+                    "artifact_sha256": "b" * 64,
+                    "business_artifact_sha256": "d" * 64,
+                    "business_activation": [{
+                        "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
+                        "artifact_sha256": "d" * 64,
+                        "authority": "current_final_artifact_classfile",
+                    }],
+                }),
+            ),
+        )
+        graph = self._proxy_graph(artifact_sha256="a" * 64)
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_transaction_proxy", version="1", edges=(edge,),
+        ),))
+
+        projected = graph.reverse_edges[target][0]
+        self.assertFalse(projected.framework_final_artifact_verified)
+        self.assertNotEqual(projected.confidence, "high")
+
+    def test_spring_data_proxy_marks_matching_final_artifact_evidence_verified(self):
+        target = "org.springframework.data.jpa.repository.support.SimpleJpaRepository.find(String)"
+        edge = self._framework_edge(
+            "spring_data_repository_proxy_dispatch",
+            target=target,
+            metadata=(
+                ("framework_source", "com.acme.CityMapper"),
+                ("target_member", "find"),
+                ("parameter_count", 1),
+                ("repository_declared_method_count", 1),
+                ("framework_provenance", {
+                    "authority": "final_artifact_javap",
+                    "artifact_sha256": "b" * 64,
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "spring_application_run": True,
+                        "spring_boot_annotation": True,
+                    }],
+                }),
+            ),
+        )
+        graph = self._proxy_graph(artifact_sha256="a" * 64)
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_data_repository_proxy", version="1", edges=(edge,),
+        ),))
+
+        projected = graph.reverse_edges[target][0]
+        self.assertTrue(projected.framework_final_artifact_verified)
+        self.assertEqual(projected.confidence, "high")
 
     def test_runtime_callback_activation_is_linked_only_from_typed_business_evidence(self):
         callback = SimpleNamespace(
