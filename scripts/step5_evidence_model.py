@@ -15,6 +15,7 @@ class ModuleScope(str, Enum):
 
 class EvidenceAuthority(str, Enum):
     SOURCE_AST = "source_ast"
+    SOURCE_INDIRECT_INFERENCE = "source_indirect_inference"
     CURRENT_FINAL_ARTIFACT = "current_final_artifact"
     PACKAGED_RUNTIME = "packaged_runtime"
     FRAMEWORK_SEMANTIC = "framework_semantic"
@@ -66,6 +67,7 @@ class CollectedEdge:
             EvidenceAuthority.FRAMEWORK_SEMANTIC,
             EvidenceAuthority.RESOURCE_CONFIGURATION,
             EvidenceAuthority.RUNTIME_OBSERVATION,
+            EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
         }:
             raise ValueError("semantic edge authority must be semantic or runtime evidence")
 

@@ -13,6 +13,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from business_bytecode_graph import (
+    collect_business_bytecode_batch,
     collect_business_bytecode_edges,
     merge_business_bytecode_edges,
     method_descriptor_signature,
@@ -22,6 +23,84 @@ from business_bytecode_graph import (
 
 
 class BusinessBytecodeGraphTest(unittest.TestCase):
+    def test_collect_business_bytecode_batch_preserves_method_constructor_field_and_reflection_identities(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            original = module.parse_classfile_calls
+            module.parse_classfile_calls = lambda _data, _name: [
+                {"caller_owner": "com.acme.Service", "caller_name": "run", "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()", "callee_simple_key": "method:call()", "evidence_type": "bytecode_method_invocation", "line": 11},
+                {"caller_owner": "com.acme.Service", "caller_name": "run", "caller_signature": "()", "callee_key": "com.vendor.Dto.Dto()", "callee_simple_key": "method:Dto()", "evidence_type": "bytecode_constructor_invocation", "line": 12},
+                {"caller_owner": "com.acme.Service", "caller_name": "run", "caller_signature": "()", "callee_key": "com.vendor.Flags.ENABLED", "callee_simple_key": "field:ENABLED", "evidence_type": "bytecode_field_access", "line": 13},
+                {"caller_owner": "com.acme.Service", "caller_name": "run", "caller_signature": "()", "callee_key": "com.vendor.Legacy.reflect()", "callee_simple_key": "method:reflect()", "evidence_type": "bytecode_reflection_method_invocation", "line": 14},
+            ]
+            try:
+                batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
+                    "jar_path": str(jar_path), "sha256": "a" * 64,
+                }}}, None)
+            finally:
+                module.parse_classfile_calls = original
+
+        self.assertEqual(batch.collector, "business_bytecode")
+        self.assertEqual(
+            [(edge.caller_symbol, edge.callee_symbol, edge.edge_kind) for edge in batch.edges],
+            [
+                ("com.acme.Service.run()", "com.vendor.Legacy.call()", "bytecode_method_invocation"),
+                ("com.acme.Service.run()", "com.vendor.Dto.Dto()", "bytecode_constructor_invocation"),
+                ("com.acme.Service.run()", "com.vendor.Flags.ENABLED", "bytecode_field_access"),
+                ("com.acme.Service.run()", "com.vendor.Legacy.reflect()", "bytecode_reflection_method_invocation"),
+            ],
+        )
+        self.assertTrue(all(
+            edge.provenance.artifact_sha256 == "a" * 64 for edge in batch.edges
+        ))
+
+    def test_collect_business_bytecode_batch_reports_parse_failure(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            original_parse, original_run = module.parse_classfile_calls, module.run_cmd
+            module.parse_classfile_calls = lambda _data, _name: None
+            module.run_cmd = lambda *_args, **_kwargs: ("", "bad class", 1)
+            try:
+                failed = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
+                    "jar_path": str(jar_path), "sha256": "b" * 64,
+                }}}, None)
+            finally:
+                module.parse_classfile_calls, module.run_cmd = original_parse, original_run
+
+        self.assertEqual(failed.edges, ())
+        self.assertEqual(failed.failures[0].reason_code, "BYTECODE_PARSE_FAILED")
+
+    def test_collect_business_bytecode_batch_records_unresolved_caller_as_concern(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            original = module.parse_classfile_calls
+            module.parse_classfile_calls = lambda _data, _name: [{
+                "caller_owner": "com.acme.Service", "caller_name": "",
+                "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+                "callee_simple_key": "method:call()",
+                "evidence_type": "bytecode_method_invocation",
+            }]
+            try:
+                batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
+                    "jar_path": str(jar_path), "sha256": "c" * 64,
+                }}}, None)
+            finally:
+                module.parse_classfile_calls = original
+
+        self.assertEqual(batch.edges, ())
+        self.assertEqual(batch.concerns[0].reason_code, "BYTECODE_CALLER_UNRESOLVED")
     def test_collect_business_bytecode_rejects_target_classes_without_final_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"

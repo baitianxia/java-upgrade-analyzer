@@ -11,8 +11,17 @@ import zipfile
 from pathlib import Path
 
 from compat import run_cmd
-from enhanced_source_analyzer import CallEdge
 from indirect_usage_analyzer import parse_javap_indirect_references
+from step5_evidence_ingestion import ingest_collector_batches
+from step5_evidence_model import (
+    CollectedEdge,
+    CollectorBatch,
+    EvidenceAuthority,
+    EvidenceConcern,
+    EvidenceFailure,
+    EvidenceProvenance,
+    ModuleScope,
+)
 
 
 METHOD_REF_RE = re.compile(
@@ -785,82 +794,119 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
     }
 
 
-def _source_method_for_edge(graph, item):
-    qualified = f"{item['caller_owner']}.{item['caller_name']}"
-    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
-    raw_candidates = list((getattr(graph, 'methods_by_qualified', {}) or {}).get(qualified) or [])
-    candidates = []
-    for raw_candidate in raw_candidates:
-        if hasattr(raw_candidate, 'symbol_id'):
-            candidates.append(raw_candidate)
+def _bytecode_failure(value):
+    text = str(value or "")
+    if text.startswith("javap_failed:"):
+        return EvidenceFailure(
+            stage="business-bytecode",
+            reason_code="BYTECODE_PARSE_FAILED",
+            blocking=True,
+            class_name=text.split(":", 2)[1] if text.count(":") >= 2 else "",
+            detail=text,
+        )
+    reason_code = {
+        "current_final_artifact_required": "CURRENT_FINAL_ARTIFACT_REQUIRED",
+        "class_scan_limit_reached": "BYTECODE_CLASS_SCAN_LIMIT_REACHED",
+    }.get(text, "BYTECODE_COLLECTION_FAILED")
+    return EvidenceFailure(
+        stage="business-bytecode",
+        reason_code=reason_code,
+        blocking=True,
+        detail=text,
+    )
+
+
+def _valid_sha256(value):
+    return bool(re.fullmatch(r"[0-9a-f]{64}", str(value or "")))
+
+
+def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
+    metrics = dict(metrics or {})
+    failures = list(metrics.get("failures") or ())
+    concerns = []
+    edges = []
+    for item in evidence or ():
+        owner = str(item.get("caller_owner") or "").strip()
+        name = str(item.get("caller_name") or "").strip()
+        signature = str(item.get("caller_signature") or "")
+        if not owner or not name:
+            concerns.append(EvidenceConcern(
+                stage="business-bytecode",
+                reason_code="BYTECODE_CALLER_UNRESOLVED",
+                detail=f"字节码调用缺少可解析调用方：{owner}.{name}",
+                artifact=str(item.get("class_file") or ""),
+                class_name=owner,
+            ))
             continue
-        method_def = methods_by_id.get(raw_candidate)
-        if method_def is not None:
-            candidates.append(method_def)
-    if len(candidates) == 1:
-        return candidates[0]
-    signature = item.get('caller_signature') or ''
-    if signature:
-        matches = []
-        for candidate in candidates:
-            lookup_keys = (getattr(graph, 'lookup_keys_by_symbol', {}) or {}).get(candidate.symbol_id) or []
-            if any(str(key).endswith(signature) for key in lookup_keys):
-                matches.append(candidate)
-        if len(matches) == 1:
-            return matches[0]
-    return None
+        artifact_sha = str(item.get("artifact_sha256") or "")
+        if strict_final_artifact and not _valid_sha256(artifact_sha):
+            failures.append("current_final_artifact_sha_invalid")
+            continue
+        class_file = str(item.get("class_file") or "")
+        artifact_path, separator, artifact_entry = class_file.partition("!/")
+        authority = (
+            EvidenceAuthority.CURRENT_FINAL_ARTIFACT
+            if _valid_sha256(artifact_sha)
+            else EvidenceAuthority.SOURCE_AST
+        )
+        edges.append(CollectedEdge(
+            caller_symbol=f"{owner}.{name}{signature}",
+            callee_symbol=str(item.get("callee_key") or ""),
+            edge_kind=str(item.get("evidence_type") or "bytecode_reference"),
+            semantic=False,
+            owner_scope=ModuleScope.BUSINESS_CLASSES,
+            owner_coord="__business__",
+            provenance=EvidenceProvenance(
+                authority=authority,
+                artifact_path=artifact_path or class_file,
+                artifact_sha256=artifact_sha if authority == EvidenceAuthority.CURRENT_FINAL_ARTIFACT else "",
+                artifact_entry=artifact_entry if separator else "",
+                class_or_resource_entry=artifact_entry if separator else "",
+                parser="classfile",
+                evidence_source=str(item.get("evidence_source") or "current_final_artifact"),
+                line=int(item.get("line") or 0),
+            ),
+            metadata=(
+                ("caller_resolution_required", True),
+                ("caller_owner", owner),
+                ("caller_name", name),
+                ("caller_signature", signature),
+                ("callee_simple_key", str(item.get("callee_simple_key") or "")),
+                ("content", str(item.get("content") or "")[:100]),
+                ("artifact_sha256", artifact_sha),
+            ),
+        ))
+    return CollectorBatch(
+        collector="business_bytecode",
+        version="2",
+        edges=tuple(edges),
+        failures=tuple(_bytecode_failure(item) for item in failures),
+        concerns=tuple(concerns),
+        metrics=tuple(sorted({
+            **metrics,
+            "collected_edges": len(edges),
+            "unresolved_callers": len(concerns),
+        }.items())),
+    )
+
+
+def collect_business_bytecode_batch(source_roots, artifact_catalog, cache_path):
+    """Collect immutable current-final-artifact bytecode evidence without a graph."""
+    evidence, metrics = collect_business_bytecode_edges(
+        source_roots,
+        artifact_catalog=artifact_catalog,
+        cache_path=cache_path,
+    )
+    return _business_bytecode_batch(evidence, metrics, strict_final_artifact=True)
 
 
 def merge_business_bytecode_edges(graph, evidence):
-    reverse_edges = getattr(graph, 'reverse_edges', {})
-    merged = 0
-    skipped = 0
-    for item in evidence or []:
-        caller = _source_method_for_edge(graph, item)
-        if caller is None:
-            skipped += 1
-            continue
-        edge = CallEdge(
-            caller_symbol_id=caller.symbol_id,
-            caller_qualified_key=caller.qualified_key,
-            callee_key=item['callee_key'],
-            callee_simple_key=item['callee_simple_key'],
-            evidence_type=item['evidence_type'],
-            confidence='high',
-            file=item.get('class_file', ''),
-            line=item.get('line', 0),
-            content=item.get('content', '')[:100],
-            owner_type='business',
-            owner_coord=getattr(caller, 'owner_coord', ''),
-            module=getattr(caller, 'module', ''),
-            is_test=False,
-            callee_param_types=[],
-        )
-        edge.evidence_source = item.get('evidence_source', '')
-        edge.artifact_sha256 = item.get('artifact_sha256', '')
-        callee_key = str(edge.callee_key or '')
-        edge.callee_fqcn_complete = bool(
-            callee_key.startswith('class:')
-            or ('.' in callee_key.split('(', 1)[0] and not callee_key.startswith(('method:', 'field:')))
-        )
-        edge.callee_signature_complete = bool(
-            edge.evidence_type not in {
-                'bytecode_method_invocation', 'bytecode_constructor_invocation',
-                'bytecode_invokedynamic_method_reference',
-            }
-            or ('(' in callee_key and callee_key.endswith(')'))
-        )
-        if edge.callee_fqcn_complete and edge.callee_signature_complete:
-            edge.callee_resolution_note = '调用目标已解析到全限定名和签名'
-        elif not edge.callee_fqcn_complete:
-            edge.callee_resolution_note = '缺少调用目标所属类全限定名'
-        else:
-            edge.callee_resolution_note = '缺少调用目标方法参数签名'
-        for key in (edge.callee_key, edge.callee_simple_key):
-            bucket = reverse_edges.setdefault(key, [])
-            identity = (edge.caller_symbol_id, edge.callee_key, edge.evidence_type)
-            if any((old.caller_symbol_id, old.callee_key, old.evidence_type) == identity for old in bucket):
-                continue
-            bucket.append(edge)
-        merged += 1
-    return {'merged_edges': merged, 'skipped_unresolved_callers': skipped}
+    """Compatibility bridge for legacy callers; production uses batch ingestion."""
+    batch = _business_bytecode_batch(evidence, {}, strict_final_artifact=False)
+    result = ingest_collector_batches(graph, (batch,))
+    return {
+        "merged_edges": result.merged_edges,
+        "skipped_unresolved_callers": dict(result.rejected_by_collector).get(
+            "business_bytecode", 0
+        ),
+    }

@@ -9,6 +9,17 @@ from pathlib import Path
 
 from enhanced_source_analyzer import CallEdge
 from signature_utils import normalize_signature_for_lookup, split_signature_params
+from step5_evidence_ingestion import ingest_collector_batches
+from step5_evidence_model import (
+    CollectedEdge,
+    CollectorBatch,
+    CoverageRecord,
+    EvidenceAuthority,
+    EvidenceConcern,
+    EvidenceFailure,
+    EvidenceProvenance,
+    ModuleScope,
+)
 
 
 RESOURCE_SUFFIXES = {'.xml', '.properties', '.yml', '.yaml', '.json', '.conf', '.txt'}
@@ -867,7 +878,41 @@ def _owners_present_in_source_body(body, method, owners, owners_by_simple):
     return [owner for owner in owners if owner in present]
 
 
-def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
+def _indirect_scope(owner_type):
+    if owner_type == 'business':
+        return ModuleScope.BUSINESS_CLASSES
+    if owner_type == 'dependency':
+        return ModuleScope.EXTERNAL_DEPENDENCY
+    return ModuleScope.UNKNOWN
+
+
+def _collected_indirect_edge(edge, api_identity):
+    return CollectedEdge(
+        caller_symbol=edge.caller_symbol_id,
+        callee_symbol=edge.callee_key,
+        edge_kind=edge.evidence_type,
+        semantic=True,
+        owner_scope=_indirect_scope(edge.owner_type),
+        owner_coord=edge.owner_coord,
+        provenance=EvidenceProvenance(
+            authority=EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
+            artifact_path=edge.file,
+            parser='indirect_usage_analyzer',
+            evidence_source='source_indirect_inference',
+            line=edge.line,
+        ),
+        metadata=(
+            ('caller_qualified_key', edge.caller_qualified_key),
+            ('callee_simple_key', edge.callee_simple_key),
+            ('callee_param_types', tuple(edge.callee_param_types)),
+            ('content', edge.content),
+            ('api_identity', api_identity),
+        ),
+    )
+
+
+def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
+    """Collect target-driven indirect evidence without mutating the graph snapshot."""
     started_at = time.perf_counter()
     targets = [item for item in (_target(row) for row in api_rows or []) if item]
     by_owner = {}
@@ -893,8 +938,9 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
     source_methods = 0
     owner_presence_scans = 0
     source_methods_with_indirect_markers = 0
-    methods = list((getattr(graph, 'methods_by_id', {}) or {}).values())
+    methods = list((getattr(graph_snapshot, 'methods_by_id', {}) or {}).values())
     propagated_reflection_candidates = _interprocedural_reflection_candidates(methods)
+    collected_edges = []
 
     for method in methods:
         source_methods += 1
@@ -925,11 +971,7 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
                 if not _matches_target(target, owner, member, params, kind=kind):
                     continue
                 edge = _edge_for_target(method, target, evidence_type, body, offset, content)
-                for key in (edge.callee_key, edge.callee_simple_key):
-                    bucket = graph.reverse_edges.setdefault(key, [])
-                    identity = (edge.caller_symbol_id, edge.callee_key, edge.evidence_type, edge.line)
-                    if not any((old.caller_symbol_id, old.callee_key, old.evidence_type, old.line) == identity for old in bucket):
-                        bucket.append(edge)
+                collected_edges.append(_collected_indirect_edge(edge, target['api_key']))
                 merged_edges += 1
                 if evidence_type.startswith('reflection_'):
                     findings[target['api_key']].append({
@@ -975,6 +1017,7 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
     resource_files = 0
     expression_findings = 0
     resource_errors = 0
+    resource_failures = []
     resource_roots = list(_resource_roots(source_roots))
     for root in resource_roots:
         for path in root.rglob('*'):
@@ -985,6 +1028,13 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
                 text = path.read_text(encoding='utf-8', errors='replace')
             except OSError:
                 resource_errors += 1
+                resource_failures.append(EvidenceFailure(
+                    stage='indirect-usage-analysis',
+                    reason_code='RESOURCE_READ_FAILED',
+                    blocking=True,
+                    artifact=str(path),
+                    detail='无法读取资源文件以检查间接引用',
+                ))
                 continue
             for owner, owner_targets in by_owner.items():
                 if owner not in text and owner.replace('.', '/') not in text:
@@ -1014,7 +1064,7 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
         if target['kind'] == 'class':
             target_keys.add(f"class:{target['owner']}")
         for key in target_keys:
-            for edge in (getattr(graph, 'reverse_edges', {}) or {}).get(key, []):
+            for edge in (getattr(graph_snapshot, 'reverse_edges', {}) or {}).get(key, []):
                 if str(getattr(edge, 'evidence_type', '') or '').startswith('bytecode_reflection_'):
                     coverage_by_api[target['api_key']]['reflection_bytecode'] = 'partial'
 
@@ -1070,9 +1120,7 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
         (item['status'] for item in per_api_coverage.values()),
         empty='complete',
     )
-    graph.indirect_usage_findings = findings
-    graph.indirect_usage_unresolved = unresolved_by_api
-    graph.indirect_analysis_coverage = {
+    compatibility = {
         'status': overall_status,
         'reason_codes': sorted({
             reason
@@ -1095,7 +1143,76 @@ def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
         'matrix': matrix,
         'by_api': per_api_coverage,
     }
+    concerns = []
+    for api_identity, items in findings.items():
+        for item in items:
+            concerns.append(EvidenceConcern(
+                stage='indirect-usage-analysis',
+                reason_code=item['reason_code'],
+                detail='已发现间接调用候选，需要运行时或配置证据确认',
+                api_identity=api_identity,
+                artifact=item['file'],
+                class_name=item['caller_symbol'],
+            ))
+    for api_identity, items in unresolved_by_api.items():
+        for item in items:
+            concerns.append(EvidenceConcern(
+                stage='indirect-usage-analysis',
+                reason_code=item['reason_code'],
+                detail='间接调用成员或重载在源码中无法静态解析',
+                api_identity=api_identity,
+                artifact=item['file'],
+                class_name=item['caller_symbol'],
+            ))
+    coverage = []
+    for target in targets:
+        item = per_api_coverage[target['api_key']]
+        coverage.append(CoverageRecord(
+            collector='indirect_usage',
+            api_identity=target['api_key'],
+            status=item['status'],
+            reason_codes=tuple(item['reason_codes']),
+        ))
+        for analyzer, analyzer_status in item['matrix'].items():
+            coverage.append(CoverageRecord(
+                collector=f'indirect_usage:{analyzer}',
+                api_identity=target['api_key'],
+                status=analyzer_status,
+                reason_codes=(f'{analyzer}_{analyzer_status}',),
+                applicable=analyzer_status != 'not_applicable',
+            ))
+    return CollectorBatch(
+        collector='indirect_usage',
+        version='2',
+        edges=tuple(collected_edges),
+        failures=tuple(resource_failures),
+        concerns=tuple(concerns),
+        coverage=tuple(coverage),
+        metrics=tuple(sorted({
+            **compatibility,
+            'findings': findings,
+            'unresolved': unresolved_by_api,
+        }.items())),
+    )
+
+
+def apply_indirect_usage_batch_compatibility(graph, batch):
+    """Expose legacy tracer attributes from immutable collector output at the engine boundary."""
+    metrics = dict(batch.metrics)
+    graph.indirect_usage_findings = metrics.get('findings') or {}
+    graph.indirect_usage_unresolved = metrics.get('unresolved') or {}
+    graph.indirect_analysis_coverage = {
+        key: value for key, value in metrics.items()
+        if key not in {'findings', 'unresolved'}
+    }
     return dict(graph.indirect_analysis_coverage)
+
+
+def analyze_and_merge_indirect_usages(graph, api_rows, source_roots):
+    """Compatibility bridge for legacy callers; production uses batch ingestion."""
+    batch = collect_indirect_usage_batch(graph, api_rows, source_roots)
+    ingest_collector_batches(graph, (batch,))
+    return apply_indirect_usage_batch_compatibility(graph, batch)
 
 
 def api_key(row):

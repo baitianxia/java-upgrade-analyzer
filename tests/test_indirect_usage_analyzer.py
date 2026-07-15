@@ -13,7 +13,11 @@ import confidence_weighted_tracer as tracer
 import enhanced_output_formatter as formatter
 import indirect_usage_analyzer as indirect_module
 from enhanced_source_analyzer import MethodDef
-from indirect_usage_analyzer import analyze_and_merge_indirect_usages, parse_javap_indirect_references
+from indirect_usage_analyzer import (
+    analyze_and_merge_indirect_usages,
+    collect_indirect_usage_batch,
+    parse_javap_indirect_references,
+)
 
 
 def api_row():
@@ -82,6 +86,85 @@ def graph_for(method):
 
 
 class IndirectUsageAnalyzerTest(unittest.TestCase):
+    def test_collect_indirect_usage_batch_returns_exact_reflection_as_edge_and_concern(self):
+        method = business_method('''
+            return (Boolean) Class.forName("org.apache.commons.lang.StringUtils")
+                .getMethod("isBlank", String.class).invoke(null, value);
+        ''')
+        graph = graph_for(method)
+
+        batch = collect_indirect_usage_batch(graph, [api_row()], [])
+
+        self.assertEqual(len(batch.edges), 1)
+        self.assertEqual(batch.edges[0].edge_kind, "reflection_method_invocation")
+        self.assertEqual(batch.edges[0].provenance.authority.value, "source_indirect_inference")
+        self.assertEqual(batch.concerns[0].reason_code, "REFLECTION_METHOD_INVOCATION")
+        self.assertEqual(batch.coverage[0].api_identity, indirect_module.api_key(api_row()))
+
+    def test_collect_indirect_usage_batch_reports_dynamic_member_as_concern(self):
+        method = business_method('''
+            Class<?> type = Class.forName("org.apache.commons.lang.StringUtils");
+            Method target = type.getMethod(methodName, String.class);
+            return (Boolean) target.invoke(null, value);
+        ''')
+
+        batch = collect_indirect_usage_batch(graph_for(method), [api_row()], [])
+
+        self.assertEqual(batch.edges, ())
+        self.assertEqual(batch.concerns[0].reason_code, "REFLECTION_OVERLOAD_UNRESOLVED")
+
+    def test_collect_indirect_usage_batch_reports_resource_read_failure_as_evidence_failure(self):
+        method = business_method("return false;")
+        with tempfile.TemporaryDirectory() as tmp:
+            java_root = Path(tmp) / "src/main/java"
+            resource_root = Path(tmp) / "src/main/resources"
+            java_root.mkdir(parents=True)
+            resource_root.mkdir(parents=True)
+            resource = resource_root / "broken.xml"
+            resource.write_text("x", encoding="utf-8")
+            original = Path.read_text
+            Path.read_text = lambda path, *args, **kwargs: (_ for _ in ()).throw(OSError("denied")) if path.name == "broken.xml" else original(path, *args, **kwargs)
+            try:
+                batch = collect_indirect_usage_batch(
+                    graph_for(method), [api_row()], [{"root": str(java_root)}]
+                )
+            finally:
+                Path.read_text = original
+
+        self.assertEqual(batch.failures[0].reason_code, "RESOURCE_READ_FAILED")
+
+    def test_collect_indirect_usage_batch_returns_resource_reference_as_concern(self):
+        method = business_method("return false;")
+        with tempfile.TemporaryDirectory() as tmp:
+            java_root = Path(tmp) / "src/main/java"
+            resource_root = Path(tmp) / "src/main/resources"
+            java_root.mkdir(parents=True)
+            resource_root.mkdir(parents=True)
+            (resource_root / "handler.properties").write_text(
+                "target=org.apache.commons.lang.StringUtils#isBlank\n",
+                encoding="utf-8",
+            )
+
+            batch = collect_indirect_usage_batch(
+                graph_for(method), [api_row()], [{"root": str(java_root)}]
+            )
+
+        self.assertEqual(batch.edges, ())
+        self.assertEqual(batch.concerns[0].reason_code, "RESOURCE_TARGET_REFERENCE")
+
+    def test_collect_indirect_usage_batch_covers_method_handle_expression_and_resource_per_api(self):
+        method = business_method('''
+            MethodHandles.lookup().findStatic(StringUtils.class, "isBlank", MethodType.methodType(boolean.class, String.class)).invokeExact(value);
+            parser.parseExpression("T(org.apache.commons.lang.StringUtils).isBlank(#value)");
+        ''')
+        method.imports["StringUtils"] = "org.apache.commons.lang.StringUtils"
+
+        batch = collect_indirect_usage_batch(graph_for(method), [api_row()], [])
+
+        coverage = batch.coverage[0]
+        self.assertEqual(coverage.status, "partial")
+        self.assertIn("method_handle_source_partial", coverage.reason_codes)
+        self.assertIn("expression_language_partial", coverage.reason_codes)
     def test_exact_reflection_chain_becomes_reachable_step5_edge(self):
         method = business_method('''
             return (Boolean) Class.forName("org.apache.commons.lang.StringUtils")

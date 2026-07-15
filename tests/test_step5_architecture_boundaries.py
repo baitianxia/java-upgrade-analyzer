@@ -18,7 +18,7 @@ class Step5ArchitectureBoundaryTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
-    def test_post_source_graph_mutations_are_known_migration_debt(self):
+    def test_post_source_collectors_do_not_mutate_graphs_directly(self):
         files = {
             "scripts/framework_adapters.py",
             "scripts/indirect_usage_analyzer.py",
@@ -44,9 +44,17 @@ class Step5ArchitectureBoundaryTest(unittest.TestCase):
 
         self.assertEqual(observed, {
             ("scripts/framework_adapters.py", "attach_framework_edges_to_graph"),
-            ("scripts/indirect_usage_analyzer.py", "analyze_and_merge_indirect_usages"),
-            ("scripts/business_bytecode_graph.py", "merge_business_bytecode_edges"),
         })
+
+    def test_engine_uses_typed_collectors_not_legacy_mergers(self):
+        source = (ROOT / "scripts/s5_call_chain_engine_integrated.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("collect_business_bytecode_batch", source)
+        self.assertIn("collect_indirect_usage_batch", source)
+        self.assertNotIn("merge_business_bytecode_edges", source)
+        self.assertNotIn("analyze_and_merge_indirect_usages", source)
 
 
 if __name__ == "__main__":

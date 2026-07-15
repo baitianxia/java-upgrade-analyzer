@@ -36,6 +36,7 @@ import zipfile
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 # 引入新模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -57,8 +58,11 @@ from confidence_weighted_tracer import (
 from enhanced_output_formatter import generate_enhanced_summary, register_step5_summary_artifacts
 from compat import maven_repo_dir, run_cmd
 from progress_logging import PhaseTimer, emit_progress
-from business_bytecode_graph import collect_business_bytecode_edges, merge_business_bytecode_edges
-from indirect_usage_analyzer import analyze_and_merge_indirect_usages
+from business_bytecode_graph import collect_business_bytecode_batch
+from indirect_usage_analyzer import (
+    apply_indirect_usage_batch_compatibility,
+    collect_indirect_usage_batch,
+)
 from framework_adapters import run_framework_adapters, attach_framework_edges_to_graph
 from step5_evidence_ingestion import ingest_collector_batches
 from analysis_contract import sha256_file
@@ -636,6 +640,22 @@ def _requires_current_final_artifact_edges(bytecode_stats):
     return str((bytecode_stats or {}).get('evidence_source') or '') == 'current_final_artifact'
 
 
+def _graph_snapshot_with_bytecode_batch(graph, batch):
+    """Provide indirect coverage a read-only view of pending bytecode reflection evidence."""
+    snapshot = SimpleNamespace(**vars(graph))
+    snapshot.reverse_edges = {
+        key: list(edges)
+        for key, edges in (getattr(graph, 'reverse_edges', {}) or {}).items()
+    }
+    for edge in batch.edges:
+        if not edge.edge_kind.startswith('bytecode_reflection_'):
+            continue
+        snapshot.reverse_edges.setdefault(edge.callee_symbol, []).append(
+            SimpleNamespace(evidence_type=edge.edge_kind)
+        )
+    return snapshot
+
+
 def _step5_integrated_main_impl(args):
     """
     Step 5集成版主流程
@@ -1133,35 +1153,16 @@ def _step5_integrated_main_impl(args):
         'dependency_source_alignment_rejected': len(rejected_source_records),
         'dependency_source_alignment_evidence': dependency_source_alignment.get('evidence_path') or '',
     })
-    ingestion_result = ingest_collector_batches(graph, ())
-    graph_stats['evidence_ingestion'] = {
-        'merged_edges': ingestion_result.merged_edges,
-        'duplicate_edges': ingestion_result.duplicate_edges,
-        'rejected_edges': ingestion_result.rejected_edges,
-        'failure_count': len(ingestion_result.failures),
-    }
     bytecode_timer = time.perf_counter()
-    bytecode_evidence, bytecode_stats = collect_business_bytecode_edges(
+    bytecode_batch = collect_business_bytecode_batch(
         business_roots,
-        artifact_catalog=runtime_dependency_catalog,
-        cache_path=str(_runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE),
+        runtime_dependency_catalog,
+        str(_runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE),
     )
-    bytecode_merge = merge_business_bytecode_edges(graph, bytecode_evidence)
+    bytecode_stats = dict(bytecode_batch.metrics)
     graph.require_current_final_artifact_business_edges = (
         _requires_current_final_artifact_edges(bytecode_stats)
     )
-    graph_stats['business_bytecode'] = {
-        **bytecode_stats,
-        **bytecode_merge,
-        'status': (
-            'complete' if (
-                bytecode_stats.get('classes_scanned')
-                and not bytecode_stats.get('failures')
-                and bytecode_stats.get('evidence_source') == 'current_final_artifact'
-            )
-            else ('partial' if bytecode_stats.get('classes_scanned') else 'not_applicable')
-        ),
-    }
     graph_stats['step5_perf']['main']['business_bytecode_elapsed_sec'] = round(time.perf_counter() - bytecode_timer, 3)
     graph_stats['step5_perf']['main']['business_bytecode_classes_scanned'] = int(
         bytecode_stats.get('classes_scanned') or 0
@@ -1212,8 +1213,38 @@ def _step5_integrated_main_impl(args):
     }
     graph_stats['framework_adapter_merge'] = framework_merge
     indirect_timer = time.perf_counter()
-    graph_stats['indirect_usage'] = analyze_and_merge_indirect_usages(
-        graph, all_apis, source_roots
+    indirect_batch = collect_indirect_usage_batch(
+        _graph_snapshot_with_bytecode_batch(graph, bytecode_batch),
+        all_apis,
+        source_roots,
+    )
+    ingestion_result = ingest_collector_batches(graph, (bytecode_batch, indirect_batch))
+    graph_stats['evidence_ingestion'] = {
+        'merged_edges': ingestion_result.merged_edges,
+        'duplicate_edges': ingestion_result.duplicate_edges,
+        'rejected_edges': ingestion_result.rejected_edges,
+        'failure_count': len(ingestion_result.failures),
+    }
+    bytecode_merge = {
+        'merged_edges': dict(ingestion_result.merged_by_collector).get('business_bytecode', 0),
+        'skipped_unresolved_callers': dict(ingestion_result.rejected_by_collector).get(
+            'business_bytecode', 0
+        ),
+    }
+    graph_stats['business_bytecode'] = {
+        **bytecode_stats,
+        **bytecode_merge,
+        'status': (
+            'complete' if (
+                bytecode_stats.get('classes_scanned')
+                and not bytecode_batch.failures
+                and bytecode_stats.get('evidence_source') == 'current_final_artifact'
+            )
+            else ('partial' if bytecode_stats.get('classes_scanned') else 'not_applicable')
+        ),
+    }
+    graph_stats['indirect_usage'] = apply_indirect_usage_batch_compatibility(
+        graph, indirect_batch
     )
     indirect_elapsed = time.perf_counter() - indirect_timer
     indirect_stats = graph_stats.get('indirect_usage') or {}

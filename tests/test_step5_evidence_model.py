@@ -72,6 +72,17 @@ class EvidenceModelTest(unittest.TestCase):
                 authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
             )
 
+    def test_semantic_indirect_inference_has_its_own_authority(self):
+        edge = self._final_artifact_edge(
+            semantic=True,
+            authority=EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
+        )
+
+        self.assertEqual(
+            edge.provenance.authority,
+            EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
+        )
+
     def test_collector_batch_serialization_is_deterministic(self):
         batch = CollectorBatch(
             collector="business_bytecode",
