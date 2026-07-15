@@ -13,19 +13,101 @@ if str(SCRIPTS) not in sys.path:
 
 from step5_evidence_model import (
     AnalysisDecision,
+    CollectedEdge,
+    CollectorBatch,
+    CoverageRecord,
+    EvidenceAuthority,
     EvidenceConcern,
+    EvidenceEnvelope,
     EvidenceFailure,
+    EvidenceProvenance,
     ModuleScope,
     PreservationEvidence,
     ReachabilityPath,
     classify_module_scope,
     decide_analysis,
+    decide_envelope,
     decision_to_trace_patch,
 )
 import confidence_weighted_tracer as tracer
 
 
 class EvidenceModelTest(unittest.TestCase):
+    def _final_artifact_edge(self, *, semantic=False, authority=None):
+        return CollectedEdge(
+            caller_symbol="com.acme.Application.run()",
+            callee_symbol="com.vendor.Legacy.call()",
+            edge_kind=(
+                "framework_proxy_dispatch" if semantic
+                else "bytecode_method_invocation"
+            ),
+            semantic=semantic,
+            owner_scope=ModuleScope.BUSINESS_CLASSES,
+            provenance=EvidenceProvenance(
+                authority=authority or (
+                    EvidenceAuthority.FRAMEWORK_SEMANTIC
+                    if semantic else EvidenceAuthority.CURRENT_FINAL_ARTIFACT
+                ),
+                artifact_path="/artifact/application.jar",
+                artifact_sha256="a" * 64,
+                artifact_entry="BOOT-INF/classes/com/acme/Application.class",
+                parser="classfile",
+            ),
+        )
+
+    def test_collector_batch_requires_identity_and_valid_sha(self):
+        with self.assertRaisesRegex(ValueError, "collector identity"):
+            CollectorBatch(collector="", version="1")
+
+        with self.assertRaisesRegex(ValueError, "SHA-256"):
+            EvidenceProvenance(
+                authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+                artifact_sha256="bad",
+            )
+
+    def test_semantic_edge_cannot_claim_physical_bytecode_authority(self):
+        with self.assertRaisesRegex(ValueError, "semantic edge authority"):
+            self._final_artifact_edge(
+                semantic=True,
+                authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+            )
+
+    def test_collector_batch_serialization_is_deterministic(self):
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="1",
+            edges=(self._final_artifact_edge(),),
+            coverage=(CoverageRecord(
+                collector="business_bytecode",
+                api_identity="com.vendor.Legacy.call()",
+                status="complete",
+            ),),
+            metrics=(("visited_classes", 3),),
+        )
+
+        first = batch.to_mapping()
+        second = batch.to_mapping()
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["collector"], "business_bytecode")
+        self.assertEqual(first["edges"][0]["provenance"]["artifact_sha256"], "a" * 64)
+
+    def test_incomplete_applicable_coverage_blocks_static_miss(self):
+        envelope = EvidenceEnvelope(
+            target_identity="com.vendor.Legacy.call()",
+            coverage=(CoverageRecord(
+                collector="framework_adapters",
+                api_identity="com.vendor.Legacy.call()",
+                status="partial",
+                reason_codes=("framework_scan_incomplete",),
+            ),),
+        )
+
+        decision = decide_envelope(envelope)
+
+        self.assertEqual(decision.analysis_status, "not_analyzed")
+        self.assertEqual(decision.reason_code, "INCOMPLETE_EVIDENCE_COVERAGE")
+
     def test_module_scope_classification(self):
         cases = [
             ({"coord": "__business__"}, ModuleScope.BUSINESS_CLASSES),

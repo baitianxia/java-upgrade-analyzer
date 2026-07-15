@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
 
@@ -10,6 +11,138 @@ class ModuleScope(str, Enum):
     INTERNAL_MODULE = "internal_module"
     EXTERNAL_DEPENDENCY = "external_dependency"
     UNKNOWN = "unknown"
+
+
+class EvidenceAuthority(str, Enum):
+    SOURCE_AST = "source_ast"
+    CURRENT_FINAL_ARTIFACT = "current_final_artifact"
+    PACKAGED_RUNTIME = "packaged_runtime"
+    FRAMEWORK_SEMANTIC = "framework_semantic"
+    RESOURCE_CONFIGURATION = "resource_configuration"
+    RUNTIME_OBSERVATION = "runtime_observation"
+
+
+@dataclass(frozen=True)
+class EvidenceProvenance:
+    authority: EvidenceAuthority
+    artifact_path: str = ""
+    artifact_sha256: str = ""
+    artifact_entry: str = ""
+    class_or_resource_entry: str = ""
+    parser: str = ""
+    evidence_source: str = ""
+    line: int = 0
+    instruction_offset: int = -1
+
+    def __post_init__(self):
+        digest = str(self.artifact_sha256 or "")
+        if digest and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("artifact SHA-256 must contain 64 lowercase hex characters")
+        if self.authority in {
+            EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+            EvidenceAuthority.PACKAGED_RUNTIME,
+        } and not digest:
+            raise ValueError("final-artifact evidence requires artifact SHA-256")
+
+
+@dataclass(frozen=True)
+class CollectedEdge:
+    caller_symbol: str
+    callee_symbol: str
+    edge_kind: str
+    semantic: bool
+    owner_scope: ModuleScope
+    provenance: EvidenceProvenance
+    owner_coord: str = ""
+    confidence: str = "high"
+    ambiguous: bool = False
+    activation_conditions: Tuple[str, ...] = field(default_factory=tuple)
+    metadata: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+
+    def __post_init__(self):
+        if not self.caller_symbol or not self.callee_symbol or not self.edge_kind:
+            raise ValueError("collected edge requires caller, callee, and edge kind")
+        if self.semantic and self.provenance.authority not in {
+            EvidenceAuthority.FRAMEWORK_SEMANTIC,
+            EvidenceAuthority.RESOURCE_CONFIGURATION,
+            EvidenceAuthority.RUNTIME_OBSERVATION,
+        }:
+            raise ValueError("semantic edge authority must be semantic or runtime evidence")
+
+
+@dataclass(frozen=True)
+class CoverageRecord:
+    collector: str
+    api_identity: str
+    status: str
+    reason_codes: Tuple[str, ...] = field(default_factory=tuple)
+    applicable: bool = True
+
+    def __post_init__(self):
+        if not self.collector or not self.api_identity:
+            raise ValueError("coverage requires collector and API identity")
+        if self.status not in {"complete", "partial", "insufficient", "not_applicable"}:
+            raise ValueError(f"unsupported coverage status: {self.status}")
+
+
+@dataclass(frozen=True)
+class CollectorBatch:
+    collector: str
+    version: str
+    edges: Tuple[CollectedEdge, ...] = field(default_factory=tuple)
+    failures: Tuple["EvidenceFailure", ...] = field(default_factory=tuple)
+    concerns: Tuple["EvidenceConcern", ...] = field(default_factory=tuple)
+    coverage: Tuple[CoverageRecord, ...] = field(default_factory=tuple)
+    metrics: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+
+    def __post_init__(self):
+        if not str(self.collector or "").strip() or not str(self.version or "").strip():
+            raise ValueError("collector identity and version are required")
+        for edge in self.edges:
+            if not isinstance(edge, CollectedEdge):
+                raise ValueError("collector edges must be CollectedEdge values")
+
+    def to_mapping(self) -> Mapping[str, Any]:
+        def provenance_mapping(item):
+            return {
+                "authority": item.authority.value,
+                "artifact_path": item.artifact_path,
+                "artifact_sha256": item.artifact_sha256,
+                "artifact_entry": item.artifact_entry,
+                "class_or_resource_entry": item.class_or_resource_entry,
+                "parser": item.parser,
+                "evidence_source": item.evidence_source,
+                "line": item.line,
+                "instruction_offset": item.instruction_offset,
+            }
+
+        return {
+            "collector": self.collector,
+            "version": self.version,
+            "edges": [{
+                "caller_symbol": edge.caller_symbol,
+                "callee_symbol": edge.callee_symbol,
+                "edge_kind": edge.edge_kind,
+                "semantic": edge.semantic,
+                "owner_scope": edge.owner_scope.value,
+                "owner_coord": edge.owner_coord,
+                "confidence": edge.confidence,
+                "ambiguous": edge.ambiguous,
+                "activation_conditions": list(edge.activation_conditions),
+                "provenance": provenance_mapping(edge.provenance),
+                "metadata": dict(edge.metadata),
+            } for edge in self.edges],
+            "failures": [failure.__dict__ for failure in self.failures],
+            "concerns": [concern.__dict__ for concern in self.concerns],
+            "coverage": [{
+                "collector": item.collector,
+                "api_identity": item.api_identity,
+                "status": item.status,
+                "reason_codes": list(item.reason_codes),
+                "applicable": item.applicable,
+            } for item in self.coverage],
+            "metrics": dict(self.metrics),
+        }
 
 
 @dataclass(frozen=True)
@@ -65,6 +198,26 @@ class ReachabilityPath:
     note: str = ""
     depth: int = 0
     evidence: Tuple[PhysicalCallEdge, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class EvidenceEnvelope:
+    target_identity: str
+    paths: Tuple[ReachabilityPath, ...] = field(default_factory=tuple)
+    failures: Tuple[EvidenceFailure, ...] = field(default_factory=tuple)
+    concerns: Tuple[EvidenceConcern, ...] = field(default_factory=tuple)
+    preservation: Optional[PreservationEvidence] = None
+    coverage: Tuple[CoverageRecord, ...] = field(default_factory=tuple)
+
+    def __post_init__(self):
+        if not str(self.target_identity or "").strip():
+            raise ValueError("evidence envelope requires target identity")
+        if any(
+            item.api_identity != self.target_identity
+            for item in self.coverage
+            if item.applicable
+        ):
+            raise ValueError("coverage API identity must match envelope target")
 
 
 @dataclass(frozen=True)
@@ -250,6 +403,35 @@ def decide_analysis(
         reachable_note="证据采集未完成，无法形成可靠结论",
         direct_callers=direct_callers,
         business_reach_depth=business_reach_depth,
+    )
+
+
+def decide_envelope(envelope: EvidenceEnvelope) -> AnalysisDecision:
+    """Derive one decision after enforcing applicable per-API coverage."""
+    incomplete = tuple(
+        item for item in envelope.coverage
+        if item.applicable and item.status not in {"complete", "not_applicable"}
+    )
+    failures = envelope.failures
+    if incomplete:
+        detail = ", ".join(
+            f"{item.collector}:{item.status}"
+            for item in sorted(incomplete, key=lambda row: row.collector)
+        )
+        failures += (EvidenceFailure(
+            stage="coverage",
+            reason_code="INCOMPLETE_EVIDENCE_COVERAGE",
+            blocking=True,
+            api_identity=envelope.target_identity,
+            detail=f"适用的证据采集覆盖不完整：{detail}",
+        ),)
+    complete_scan = bool(envelope.coverage) and not incomplete
+    return decide_analysis(
+        envelope.paths,
+        failures,
+        concerns=envelope.concerns,
+        preservation=envelope.preservation,
+        complete_scan=complete_scan,
     )
 
 
