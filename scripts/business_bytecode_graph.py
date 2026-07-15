@@ -17,6 +17,7 @@ from step5_evidence_model import (
     CollectedEdge,
     CollectorBatch,
     EvidenceAuthority,
+    EvidenceConcern,
     EvidenceFailure,
     EvidenceProvenance,
     ModuleScope,
@@ -777,16 +778,21 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                 'javap_fallback_classes': javap_fallback_classes,
                 'failures': failures,
                 'evidence_source': 'current_final_artifact',
+                'cache_write_failed': False,
             }
             if cache_path and cache_key:
-                cache_file = Path(cache_path)
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                cache_file.write_text(json.dumps({
-                    'schema': 'java-upgrade-analyzer.bytecode-index.v1',
-                    'artifact_sha256': cache_key,
-                    'edges': evidence,
-                    'metrics': metrics,
-                }, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+                try:
+                    cache_file = Path(cache_path)
+                    cache_file.parent.mkdir(parents=True, exist_ok=True)
+                    cache_file.write_text(json.dumps({
+                        'schema': 'java-upgrade-analyzer.bytecode-index.v1',
+                        'artifact_sha256': cache_key,
+                        'edges': evidence,
+                        'metrics': metrics,
+                    }, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+                except OSError as exc:
+                    metrics['cache_write_failed'] = True
+                    metrics['cache_write_error'] = str(exc)
             return evidence, metrics
         except (OSError, zipfile.BadZipFile) as exc:
             failures.append(f'business_artifact_scan_failed:{exc}')
@@ -832,6 +838,7 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
     metrics = dict(metrics or {})
     failure_values = list(metrics.get("failures") or ())
     typed_failures = []
+    concerns = []
     edges = []
     for item in evidence or ():
         owner = str(item.get("caller_owner") or "").strip()
@@ -886,13 +893,19 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
             ),
         ))
     typed_failures = [*(_bytecode_failure(item) for item in failure_values), *typed_failures]
+    if metrics.get("cache_write_failed"):
+        concerns.append(EvidenceConcern(
+            stage="business-bytecode",
+            reason_code="BYTECODE_CACHE_WRITE_FAILED",
+            detail=str(metrics.get("cache_write_error") or "bytecode cache write failed"),
+        ))
     stable_failure_codes = [failure.reason_code for failure in typed_failures]
     return CollectorBatch(
         collector="business_bytecode",
         version="2",
         edges=tuple(edges),
         failures=tuple(typed_failures),
-        concerns=(),
+        concerns=tuple(concerns),
         metrics=tuple(sorted({
             **metrics,
             "failures": stable_failure_codes,

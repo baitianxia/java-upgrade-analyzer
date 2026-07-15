@@ -61,12 +61,15 @@ def _edge_metadata(edge: CollectedEdge):
     return dict(edge.metadata)
 
 
-def _call_edge_identity(edge):
-    return (
+def _call_edge_identity(edge, collector):
+    identity = (
         str(getattr(edge, "caller_symbol_id", "") or ""),
         str(getattr(edge, "callee_key", "") or ""),
         str(getattr(edge, "evidence_type", "") or ""),
     )
+    if collector == "indirect_usage":
+        return (*identity, int(getattr(edge, "line", 0) or 0))
+    return identity
 
 
 def _resolve_caller(graph, edge: CollectedEdge):
@@ -269,10 +272,10 @@ class EvidenceRegistry:
                     caller_qualified_key=caller_qualified_key,
                     caller_method=caller_method,
                 )
-                converted_identity = _call_edge_identity(converted)
+                converted_identity = _call_edge_identity(converted, batch.collector)
                 keys = tuple(dict.fromkeys((converted.callee_key, converted.callee_simple_key)))
                 if converted_identity in pending_identities or any(
-                    _call_edge_identity(existing) == converted_identity
+                    _call_edge_identity(existing, batch.collector) == converted_identity
                     for key in keys
                     for existing in graph.reverse_edges.get(key, ())
                 ):

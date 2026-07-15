@@ -167,6 +167,37 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         self.assertTrue(dict(second.metrics)["cache_hit"])
         self.assertTrue(all(edge.provenance.parser == "javap" for edge in first.edges))
         self.assertTrue(all(edge.provenance.parser == "javap" for edge in second.edges))
+
+    def test_collect_business_bytecode_batch_keeps_evidence_when_cache_write_fails(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "bytecode-index.json"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            original_parse, original_write = module.parse_classfile_calls, Path.write_text
+            module.parse_classfile_calls = lambda _data, _name: [{
+                "caller_owner": "com.acme.Service", "caller_name": "run",
+                "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+                "callee_simple_key": "method:call()",
+                "evidence_type": "bytecode_method_invocation",
+            }]
+            Path.write_text = lambda path, *args, **kwargs: (
+                (_ for _ in ()).throw(OSError("cache denied"))
+                if path == cache_path else original_write(path, *args, **kwargs)
+            )
+            try:
+                batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
+                    "jar_path": str(jar_path), "sha256": "e" * 64,
+                }}}, str(cache_path))
+            finally:
+                module.parse_classfile_calls, Path.write_text = original_parse, original_write
+
+        self.assertEqual(len(batch.edges), 1)
+        self.assertEqual(batch.failures, ())
+        self.assertEqual(batch.concerns[0].reason_code, "BYTECODE_CACHE_WRITE_FAILED")
+        self.assertTrue(dict(batch.metrics)["cache_write_failed"])
     def test_collect_business_bytecode_rejects_target_classes_without_final_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"

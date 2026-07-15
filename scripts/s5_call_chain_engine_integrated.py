@@ -666,14 +666,16 @@ def _build_business_bytecode_coverage(batch, ingestion_result, api_identities):
         if collector == 'business_bytecode'
     ]
     reason_codes = sorted({failure.reason_code for failure in business_failures})
-    applicable = bool(
+    blocking_failures = [failure for failure in business_failures if failure.blocking]
+    scan_applicable = bool(
         bytecode_stats.get('classes_scanned')
         and bytecode_stats.get('evidence_source') == 'current_final_artifact'
     )
-    status = (
-        'partial' if applicable and reason_codes
-        else ('complete' if applicable else 'not_applicable')
-    )
+    applicable = bool(blocking_failures) or scan_applicable
+    if blocking_failures:
+        status = 'partial' if bytecode_stats.get('classes_scanned') else 'insufficient'
+    else:
+        status = 'complete' if scan_applicable else 'not_applicable'
     coverage = tuple(
         CoverageRecord(
             collector='business_bytecode',

@@ -319,6 +319,77 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual([item.api_identity for item in coverage], ["api:a", "api:b"])
         self.assertTrue(all(item.applicable and item.status == "partial" for item in coverage))
 
+    def test_business_bytecode_zero_scan_failure_is_insufficient_for_each_api(self):
+        from s5_call_chain_engine_integrated import _build_business_bytecode_coverage
+        from step5_evidence_ingestion import IngestionResult
+
+        failure = EvidenceFailure(
+            stage="business-bytecode",
+            reason_code="CURRENT_FINAL_ARTIFACT_REQUIRED",
+            blocking=True,
+        )
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="2",
+            metrics=(("classes_scanned", 0), ("evidence_source", "unavailable")),
+        )
+        result = IngestionResult(
+            merged_edges=0,
+            duplicate_edges=0,
+            rejected_edges=0,
+            failures=(failure,),
+            failures_by_collector=(("business_bytecode", failure),),
+        )
+
+        coverage, status, reason_codes = _build_business_bytecode_coverage(
+            batch, result, ("api:a", "api:b")
+        )
+
+        self.assertEqual(status, "insufficient")
+        self.assertEqual(reason_codes, ["CURRENT_FINAL_ARTIFACT_REQUIRED"])
+        self.assertTrue(all(
+            item.applicable and item.status == "insufficient" for item in coverage
+        ))
+
+    def test_ingestion_preserves_indirect_occurrences_on_distinct_lines(self):
+        first = CollectedEdge(
+            caller_symbol="source-id",
+            callee_symbol="com.vendor.Legacy.call()",
+            edge_kind="reflection_method_invocation",
+            semantic=True,
+            owner_scope=ModuleScope.BUSINESS_CLASSES,
+            provenance=EvidenceProvenance(
+                authority=EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
+                artifact_path="/src/Application.java",
+                parser="indirect_usage_analyzer",
+                line=12,
+            ),
+        )
+        second = CollectedEdge(
+            caller_symbol=first.caller_symbol,
+            callee_symbol=first.callee_symbol,
+            edge_kind=first.edge_kind,
+            semantic=first.semantic,
+            owner_scope=first.owner_scope,
+            provenance=EvidenceProvenance(
+                authority=EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
+                artifact_path="/src/Application.java",
+                parser="indirect_usage_analyzer",
+                line=18,
+            ),
+        )
+        graph = SimpleNamespace(reverse_edges={})
+
+        result = ingest_collector_batches(graph, (CollectorBatch(
+            collector="indirect_usage", version="2", edges=(first, second),
+        ),))
+
+        self.assertEqual(result.merged_edges, 2)
+        self.assertEqual(result.duplicate_edges, 0)
+        self.assertEqual(
+            [edge.line for edge in graph.reverse_edges[first.callee_symbol]], [12, 18]
+        )
+
     def test_ingestion_retains_blocking_failure_on_graph(self):
         batch = CollectorBatch(
             collector="business_bytecode",
