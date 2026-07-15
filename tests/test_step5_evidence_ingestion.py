@@ -1,5 +1,9 @@
+import hashlib
+import subprocess
 import sys
+import tempfile
 import unittest
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +18,9 @@ from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import (
     CollectedEdge,
     CollectorBatch,
+    CoverageRecord,
     EvidenceAuthority,
+    EvidenceConcern,
     EvidenceFailure,
     EvidenceProvenance,
     ModuleScope,
@@ -22,6 +28,136 @@ from step5_evidence_model import (
 
 
 class EvidenceIngestionTest(unittest.TestCase):
+    def _compile_mybatis_fixture_classes(
+        self, root, *, misplaced_annotation=False, misplaced_activation=False,
+        mapper_return_type="String",
+    ):
+        mapper_methods = (
+            f"{mapper_return_type} find(String id); "
+            f"@Select(\"select other\") {mapper_return_type} other(String id);"
+            if misplaced_annotation
+            else (
+                "@Select(\"select name from city where id = #{id}\") "
+                f"{mapper_return_type} find(String id);"
+            )
+        )
+        application_methods = (
+            "public static void main(String[] args) {} "
+            "public static void unused(String[] args) { "
+            "SpringApplication.run(Application.class, args); }"
+            if misplaced_activation
+            else (
+                "public static void main(String[] args) { "
+                "SpringApplication.run(Application.class, args); }"
+            )
+        )
+        sources = {
+            "org/springframework/boot/autoconfigure/SpringBootApplication.java": """
+                package org.springframework.boot.autoconfigure;
+                public @interface SpringBootApplication {}
+            """,
+            "org/springframework/boot/SpringApplication.java": """
+                package org.springframework.boot;
+                import org.springframework.context.ConfigurableApplicationContext;
+                public final class SpringApplication {
+                    public static ConfigurableApplicationContext run(
+                        Class<?> type, String[] args
+                    ) { return null; }
+                }
+            """,
+            "org/springframework/context/ConfigurableApplicationContext.java": """
+                package org.springframework.context;
+                public interface ConfigurableApplicationContext {}
+            """,
+            "org/apache/ibatis/annotations/Mapper.java": """
+                package org.apache.ibatis.annotations;
+                public @interface Mapper {}
+            """,
+            "org/apache/ibatis/annotations/Select.java": """
+                package org.apache.ibatis.annotations;
+                public @interface Select { String[] value(); }
+            """,
+            "org/apache/ibatis/session/SqlSession.java": """
+                package org.apache.ibatis.session;
+                public interface SqlSession {
+                    Object selectOne(String statement, Object parameter);
+                }
+            """,
+            "org/apache/ibatis/binding/MapperMethod.java": """
+                package org.apache.ibatis.binding;
+                import org.apache.ibatis.session.SqlSession;
+                public class MapperMethod {
+                    public Object execute(SqlSession session, Object[] args) {
+                        return session.selectOne("com.acme.CityMapper.find", args[0]);
+                    }
+                }
+            """,
+            "org/apache/ibatis/binding/MapperProxy.java": """
+                package org.apache.ibatis.binding;
+                import java.lang.reflect.Method;
+                import org.apache.ibatis.session.SqlSession;
+                public class MapperProxy {
+                    interface MapperMethodInvoker {
+                        Object invoke(Object proxy, Method method, Object[] args,
+                                      SqlSession session);
+                    }
+                    static class PlainMethodInvoker implements MapperMethodInvoker {
+                        private final MapperMethod mapperMethod = new MapperMethod();
+                        public Object invoke(Object proxy, Method method, Object[] args,
+                                             SqlSession session) {
+                            return mapperMethod.execute(session, args);
+                        }
+                    }
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        MapperMethodInvoker invoker = new PlainMethodInvoker();
+                        return invoker.invoke(proxy, method, args, null);
+                    }
+                }
+            """,
+            "com/acme/CityMapper.java": f"""
+                package com.acme;
+                import org.apache.ibatis.annotations.Mapper;
+                import org.apache.ibatis.annotations.Select;
+                @Mapper
+                public interface CityMapper {{
+                    {mapper_methods}
+                }}
+            """,
+            "com/acme/OtherMapper.java": """
+                package com.acme;
+                import org.apache.ibatis.annotations.Mapper;
+                import org.apache.ibatis.annotations.Select;
+                @Mapper
+                public interface OtherMapper {
+                    @Select("select wrong") String find(String id);
+                }
+            """,
+            "com/acme/Application.java": f"""
+                package com.acme;
+                import org.springframework.boot.SpringApplication;
+                import org.springframework.boot.autoconfigure.SpringBootApplication;
+                @SpringBootApplication
+                public class Application {{
+                    private CityMapper mapper;
+                    {application_methods}
+                    public {mapper_return_type} run() {{ return mapper.find("1"); }}
+                }}
+            """,
+        }
+        source_root = Path(root) / "src"
+        classes = Path(root) / "classes"
+        for relative, content in sources.items():
+            path = source_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        completed = subprocess.run(
+            ["javac", "-d", str(classes), *map(str, source_root.rglob("*.java"))],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return classes
+
     def _edge(self, *, scope=ModuleScope.BUSINESS_CLASSES):
         return CollectedEdge(
             caller_symbol="com.acme.Application.run()",
@@ -89,6 +225,7 @@ class EvidenceIngestionTest(unittest.TestCase):
         }
         provenance = {
             "authority": "final_artifact_javap",
+            "command": "select",
             "file": "/artifact/application.jar!/BOOT-INF/classes/com/acme/CityMapper.class",
             "binding_file": "/artifact/application.jar!/BOOT-INF/classes/mappers/CityMapper.xml",
             "final_artifact_sha256": "a" * 64,
@@ -128,6 +265,8 @@ class EvidenceIngestionTest(unittest.TestCase):
             "framework_target": target,
             "source_owner": "com.acme.CityMapper",
             "source_member": "find",
+            "source_parameters": ["java.lang.String"],
+            "source_return_type": "java.lang.String",
             "parameter_count": 1,
             "runtime_activation": "active",
             "framework_provenance": provenance,
@@ -169,6 +308,128 @@ class EvidenceIngestionTest(unittest.TestCase):
             reverse_edges={"com.acme.CityMapper.find(java.lang.String)": [caller]},
         )
 
+    def _verified_mybatis_fixture(
+        self, *, target=None, extracted_caller=False,
+        binding_mode="xml", misplaced_annotation=False,
+        misplaced_activation=False,
+        caller_return_type=None,
+    ):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        final_jar = Path(temp_dir.name) / "application.jar"
+        caller_jar = Path(temp_dir.name) / "business-classes.jar"
+        runtime_jar = Path(temp_dir.name) / "mybatis.jar"
+        registration_entry = "BOOT-INF/classes/com/acme/CityMapper.class"
+        binding_entry = "BOOT-INF/classes/mappers/CityMapper.xml"
+        activation_entry = "BOOT-INF/classes/com/acme/Application.class"
+        caller_entry = (
+            "com/acme/Application.class" if extracted_caller else activation_entry
+        )
+        classes = self._compile_mybatis_fixture_classes(
+            temp_dir.name,
+            misplaced_annotation=misplaced_annotation,
+            misplaced_activation=misplaced_activation,
+        )
+        caller_classes = classes
+        if caller_return_type:
+            caller_classes = self._compile_mybatis_fixture_classes(
+                Path(temp_dir.name) / "caller",
+                mapper_return_type=caller_return_type,
+            )
+        with zipfile.ZipFile(final_jar, "w") as archive:
+            archive.write(classes / "com/acme/CityMapper.class", registration_entry)
+            archive.write(
+                classes / "com/acme/OtherMapper.class",
+                "BOOT-INF/classes/com/acme/OtherMapper.class",
+            )
+            archive.write(classes / "com/acme/Application.class", activation_entry)
+            if binding_mode == "xml":
+                archive.writestr(
+                    binding_entry,
+                    b'<mapper namespace="com.acme.CityMapper">'
+                    b'<select id="find">select name from city</select></mapper>',
+                )
+            else:
+                binding_entry = registration_entry
+        with zipfile.ZipFile(caller_jar, "w") as archive:
+            archive.write(caller_classes / "com/acme/Application.class", caller_entry)
+        runtime_classes = (
+            "org/apache/ibatis/binding/MapperProxy.class",
+            "org/apache/ibatis/binding/MapperMethod.class",
+            "org/apache/ibatis/session/SqlSession.class",
+        )
+        with zipfile.ZipFile(runtime_jar, "w") as archive:
+            for class_entry in runtime_classes:
+                archive.write(classes / class_entry, class_entry)
+            archive.write(
+                classes / "org/apache/ibatis/binding/MapperProxy$PlainMethodInvoker.class",
+                "org/apache/ibatis/binding/MapperProxy$PlainMethodInvoker.class",
+            )
+            archive.write(
+                classes / "org/apache/ibatis/binding/MapperProxy$MapperMethodInvoker.class",
+                "org/apache/ibatis/binding/MapperProxy$MapperMethodInvoker.class",
+            )
+        final_sha = hashlib.sha256(final_jar.read_bytes()).hexdigest()
+        caller_sha = hashlib.sha256(caller_jar.read_bytes()).hexdigest()
+        runtime_sha = hashlib.sha256(runtime_jar.read_bytes()).hexdigest()
+        target = target or (
+            "org.apache.ibatis.binding.MapperProxy.invoke"
+            "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])"
+        )
+        stage = {
+            "org.apache.ibatis.binding.MapperProxy.invoke": "proxy_entry_dispatch",
+            "org.apache.ibatis.binding.MapperMethod.execute": "plain_invoker_dispatch",
+            "org.apache.ibatis.session.SqlSession.selectOne": "select_one_dispatch",
+        }[target.split("(", 1)[0]]
+        target_class_entry = (
+            target.split("(", 1)[0].rsplit(".", 1)[0].replace(".", "/")
+            + ".class"
+        )
+        graph = self._proxy_graph(artifact_sha256=caller_sha)
+        caller = next(iter(graph.reverse_edges.values()))[0]
+        caller.file = f"{caller_jar}!/{caller_entry}"
+        caller.artifact_entry = caller_entry
+        edge = self._mybatis_framework_edge(
+            target=target,
+            provenance_file=f"{final_jar}!/{registration_entry}",
+            provenance_binding_file=f"{final_jar}!/{binding_entry}",
+            provenance_final_artifact_path=str(final_jar),
+            provenance_final_artifact_sha256=final_sha,
+            provenance_mapper_registration={
+                "artifact_path": str(final_jar),
+                "artifact_entry": registration_entry,
+                "artifact_sha256": final_sha,
+                "authority": "current_final_artifact_classfile",
+            },
+            provenance_binding_evidence={
+                "artifact_path": str(final_jar),
+                "artifact_entry": binding_entry,
+                "artifact_sha256": final_sha,
+                "authority": (
+                    "current_final_artifact_resource"
+                    if binding_mode == "xml"
+                    else "current_final_artifact_classfile"
+                ),
+            },
+            provenance_jar=str(runtime_jar),
+            provenance_artifact_sha256=runtime_sha,
+            provenance_business_activation=[{
+                "artifact_path": str(final_jar),
+                "artifact_entry": activation_entry,
+                "artifact_sha256": final_sha,
+                "authority": "current_final_artifact_classfile",
+            }],
+            provenance_physical_target_evidence={
+                "target": target,
+                "dispatch_stage": stage,
+                "verified": True,
+                "artifact_entry": "BOOT-INF/lib/mybatis.jar",
+                "artifact_sha256": runtime_sha,
+                "class_or_resource_entry": target_class_entry,
+            },
+        )
+        return graph, edge, caller_sha
+
     def test_ingestion_merges_once_and_registers_exact_evidence(self):
         edge = self._edge()
         batch = CollectorBatch(
@@ -192,6 +453,126 @@ class EvidenceIngestionTest(unittest.TestCase):
             graph.step5_evidence_registry[0].callee_symbol,
             "com.vendor.Legacy.call()",
         )
+
+    def test_incremental_ingestion_preserves_prior_diagnostics_and_coverage(self):
+        graph = SimpleNamespace(reverse_edges={})
+        first = CollectorBatch(
+            collector="indirect_usage",
+            version="1",
+            failures=(EvidenceFailure(
+                stage="indirect",
+                reason_code="FIRST_FAILURE",
+                blocking=True,
+            ),),
+            concerns=(EvidenceConcern(
+                stage="indirect",
+                reason_code="FIRST_CONCERN",
+                detail="first concern",
+            ),),
+            coverage=(CoverageRecord(
+                collector="indirect_usage",
+                api_identity="indirect_usage",
+                status="partial",
+            ),),
+        )
+        second = CollectorBatch(
+            collector="indirect_usage",
+            version="1",
+            coverage=(CoverageRecord(
+                collector="indirect_usage",
+                api_identity="vendor:demo|Target.call|()|method|REMOVED",
+                status="complete",
+            ),),
+        )
+
+        ingest_collector_batches(graph, (first,))
+        ingest_collector_batches(graph, (second,))
+
+        self.assertEqual(
+            [item.reason_code for item in graph.step5_evidence_failures],
+            ["FIRST_FAILURE"],
+        )
+        self.assertEqual(
+            [item.reason_code for item in graph.step5_evidence_concerns],
+            ["FIRST_CONCERN"],
+        )
+        self.assertEqual(
+            [(item.api_identity, item.status) for item in graph.step5_collector_coverage],
+            [
+                ("indirect_usage", "partial"),
+                ("vendor:demo|Target.call|()|method|REMOVED", "complete"),
+            ],
+        )
+
+    def test_incremental_non_framework_batch_preserves_framework_projection(self):
+        graph, edge, _caller_sha = self._verified_mybatis_fixture()
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+        ),))
+        projected_edges = tuple(graph.framework_edges)
+        projected_entries = tuple(graph.framework_entry_symbols)
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="business_bytecode", version="2", edges=(),
+        ),))
+
+        self.assertEqual(tuple(graph.framework_edges), projected_edges)
+        self.assertEqual(tuple(graph.framework_entry_symbols), projected_entries)
+
+    def test_framework_snapshot_replaces_old_diagnostics(self):
+        graph = SimpleNamespace(reverse_edges={})
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_runtime_artifact",
+            version="1",
+            failures=(EvidenceFailure(
+                stage="framework", reason_code="OLD_FAILURE", blocking=True,
+            ),),
+            concerns=(EvidenceConcern(
+                stage="framework", reason_code="OLD_CONCERN", detail="old",
+            ),),
+            coverage=(CoverageRecord(
+                collector="spring_runtime_artifact",
+                api_identity="spring_runtime_artifact",
+                status="partial",
+            ),),
+        ),))
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_runtime_artifact",
+            version="2",
+            coverage=(CoverageRecord(
+                collector="spring_runtime_artifact",
+                api_identity="spring_runtime_artifact",
+                status="complete",
+            ),),
+        ),))
+
+        self.assertEqual(graph.step5_evidence_failures, ())
+        self.assertEqual(graph.step5_evidence_concerns, ())
+        self.assertEqual(
+            [(item.api_identity, item.status) for item in graph.step5_collector_coverage],
+            [("spring_runtime_artifact", "complete")],
+        )
+
+    def test_new_framework_snapshot_replaces_and_invalidates_old_projection(self):
+        graph, edge, _caller_sha = self._verified_mybatis_fixture()
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+        ),))
+        self.assertTrue(any(
+            getattr(item, "evidence_type", "") == "mybatis_mapper_proxy_dispatch"
+            for item in graph.reverse_edges.get(edge.callee_symbol, ())
+        ))
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="3", edges=(),
+        ),))
+
+        self.assertEqual(graph.framework_edges, [])
+        self.assertFalse(any(
+            getattr(item, "evidence_type", "") == "mybatis_mapper_proxy_dispatch"
+            for item in graph.reverse_edges.get(edge.callee_symbol, ())
+        ))
 
     def test_framework_projection_uses_typed_identity_over_legacy_shadow(self):
         edge = self._framework_edge(
@@ -699,8 +1080,7 @@ class EvidenceIngestionTest(unittest.TestCase):
         )
 
     def test_mybatis_proxy_ingestion_preserves_caller_and_framework_authority_separately(self):
-        graph = self._proxy_graph()
-        edge = self._mybatis_framework_edge()
+        graph, edge, caller_sha = self._verified_mybatis_fixture()
 
         result = ingest_collector_batches(graph, (CollectorBatch(
             collector="mybatis_mapper_proxy", version="2", edges=(edge,),
@@ -714,12 +1094,196 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual(merged[0].caller_symbol_id, "app-run")
         self.assertEqual(merged[0].evidence_source, "framework_semantic")
         self.assertEqual(merged[0].caller_evidence_source, "current_final_artifact")
-        self.assertEqual(merged[0].caller_artifact_sha256, "a" * 64)
+        self.assertEqual(merged[0].caller_artifact_sha256, caller_sha)
         self.assertEqual(
             merged[0].framework_evidence_authority,
             EvidenceAuthority.FRAMEWORK_SEMANTIC.value,
         )
         self.assertTrue(merged[0].framework_final_artifact_verified)
+
+    def test_mybatis_rejects_self_asserted_missing_artifacts(self):
+        graph = self._proxy_graph()
+        edge = self._mybatis_framework_edge()
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+        ),))
+
+        self.assertFalse(any(
+            item.framework_final_artifact_verified
+            for item in graph.reverse_edges.get(edge.callee_symbol, ())
+        ))
+
+    def test_mybatis_rejects_same_named_entries_without_valid_semantics(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        final_jar = Path(temp_dir.name) / "fake-application.jar"
+        caller_jar = Path(temp_dir.name) / "fake-caller.jar"
+        runtime_jar = Path(temp_dir.name) / "fake-mybatis.jar"
+        registration_entry = "BOOT-INF/classes/com/acme/CityMapper.class"
+        binding_entry = "BOOT-INF/classes/mappers/CityMapper.xml"
+        activation_entry = "BOOT-INF/classes/com/acme/Application.class"
+        target_entry = "org/apache/ibatis/binding/MapperProxy.class"
+        with zipfile.ZipFile(final_jar, "w") as archive:
+            archive.writestr(registration_entry, b"mapper")
+            archive.writestr(binding_entry, b"<mapper/>")
+            archive.writestr(activation_entry, b"application")
+        with zipfile.ZipFile(caller_jar, "w") as archive:
+            archive.writestr(activation_entry, b"caller")
+        with zipfile.ZipFile(runtime_jar, "w") as archive:
+            archive.writestr(target_entry, b"runtime")
+        final_sha = hashlib.sha256(final_jar.read_bytes()).hexdigest()
+        caller_sha = hashlib.sha256(caller_jar.read_bytes()).hexdigest()
+        runtime_sha = hashlib.sha256(runtime_jar.read_bytes()).hexdigest()
+        graph = self._proxy_graph(artifact_sha256=caller_sha)
+        caller = next(iter(graph.reverse_edges.values()))[0]
+        caller.file = f"{caller_jar}!/{activation_entry}"
+        edge = self._mybatis_framework_edge(
+            provenance_final_artifact_path=str(final_jar),
+            provenance_final_artifact_sha256=final_sha,
+            provenance_mapper_registration={
+                "artifact_path": str(final_jar), "artifact_entry": registration_entry,
+                "artifact_sha256": final_sha,
+                "authority": "current_final_artifact_classfile",
+            },
+            provenance_binding_evidence={
+                "artifact_path": str(final_jar), "artifact_entry": binding_entry,
+                "artifact_sha256": final_sha,
+                "authority": "current_final_artifact_resource",
+            },
+            provenance_business_activation=[{
+                "artifact_path": str(final_jar), "artifact_entry": activation_entry,
+                "artifact_sha256": final_sha,
+                "authority": "current_final_artifact_classfile",
+            }],
+            provenance_jar=str(runtime_jar),
+            provenance_artifact_sha256=runtime_sha,
+            provenance_physical_target_evidence={
+                "target": (
+                    "org.apache.ibatis.binding.MapperProxy.invoke"
+                    "(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])"
+                ),
+                "dispatch_stage": "proxy_entry_dispatch",
+                "verified": True,
+                "artifact_entry": "BOOT-INF/lib/mybatis.jar",
+                "artifact_sha256": runtime_sha,
+                "class_or_resource_entry": target_entry,
+            },
+        )
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+        ),))
+
+        self.assertFalse(any(
+            item.evidence_type == "mybatis_mapper_proxy_dispatch"
+            and item.confidence == "high"
+            for item in graph.reverse_edges.get(edge.callee_symbol, ())
+        ))
+
+    def test_mybatis_rejects_mapper_descriptor_and_xml_command_mismatch(self):
+        mutations = (
+            {"provenance_command": "update"},
+        )
+        for changes in mutations:
+            with self.subTest(changes=changes):
+                graph, edge, _caller_sha = self._verified_mybatis_fixture()
+                metadata = dict(edge.metadata)
+                provenance = dict(metadata["framework_provenance"])
+                if "provenance_command" in changes:
+                    provenance["command"] = changes["provenance_command"]
+                metadata["framework_provenance"] = provenance
+                edge = replace(edge, metadata=tuple(metadata.items()))
+
+                ingest_collector_batches(graph, (CollectorBatch(
+                    collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+                ),))
+
+                self.assertFalse(any(
+                    item.evidence_type == "mybatis_mapper_proxy_dispatch"
+                    and item.confidence == "high"
+                    for item in graph.reverse_edges.get(edge.callee_symbol, ())
+                ))
+
+    def test_mybatis_annotation_binding_must_belong_to_exact_mapper_method(self):
+        for misplaced in (False, True):
+            with self.subTest(misplaced=misplaced):
+                graph, edge, _caller_sha = self._verified_mybatis_fixture(
+                    binding_mode="annotation", misplaced_annotation=misplaced
+                )
+
+                ingest_collector_batches(graph, (CollectorBatch(
+                    collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+                ),))
+
+                high = any(
+                    item.evidence_type == "mybatis_mapper_proxy_dispatch"
+                    and item.confidence == "high"
+                    for item in graph.reverse_edges.get(edge.callee_symbol, ())
+                )
+                self.assertEqual(high, not misplaced)
+
+    def test_mybatis_activation_call_must_belong_to_main_method(self):
+        graph, edge, _caller_sha = self._verified_mybatis_fixture(
+            misplaced_activation=True
+        )
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+        ),))
+
+        self.assertFalse(any(
+            item.evidence_type == "mybatis_mapper_proxy_dispatch"
+            and item.confidence == "high"
+            for item in graph.reverse_edges.get(edge.callee_symbol, ())
+        ))
+
+    def test_mybatis_mapper_and_caller_return_descriptors_must_match(self):
+        graph, edge, _caller_sha = self._verified_mybatis_fixture(
+            caller_return_type="Object"
+        )
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+        ),))
+
+        self.assertFalse(any(
+            item.evidence_type == "mybatis_mapper_proxy_dispatch"
+            and item.confidence == "high"
+            for item in graph.reverse_edges.get(edge.callee_symbol, ())
+        ))
+
+    def test_mybatis_registration_and_binding_must_match_mapper_owner(self):
+        graph, edge, _caller_sha = self._verified_mybatis_fixture(
+            binding_mode="annotation"
+        )
+        metadata = dict(edge.metadata)
+        provenance = dict(metadata["framework_provenance"])
+        wrong_entry = "BOOT-INF/classes/com/acme/OtherMapper.class"
+        provenance["mapper_registration"] = {
+            **dict(provenance["mapper_registration"]),
+            "artifact_entry": wrong_entry,
+        }
+        provenance["binding_evidence"] = {
+            **dict(provenance["binding_evidence"]),
+            "artifact_entry": wrong_entry,
+        }
+        provenance["file"] = (
+            provenance["final_artifact_path"] + "!/" + wrong_entry
+        )
+        provenance["binding_file"] = provenance["file"]
+        metadata["framework_provenance"] = provenance
+        edge = replace(edge, metadata=tuple(metadata.items()))
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="mybatis_mapper_proxy", version="2", edges=(edge,),
+        ),))
+
+        self.assertFalse(any(
+            item.evidence_type == "mybatis_mapper_proxy_dispatch"
+            and item.confidence == "high"
+            for item in graph.reverse_edges.get(edge.callee_symbol, ())
+        ))
 
     def test_mybatis_high_confidence_requires_one_sha_bound_complete_evidence_chain(self):
         mutations = {
@@ -792,11 +1356,9 @@ class EvidenceIngestionTest(unittest.TestCase):
         ))
 
     def test_mybatis_accepts_sha_verified_extracted_caller_for_same_final_class(self):
-        graph = self._proxy_graph(artifact_sha256="c" * 64)
-        caller = next(iter(graph.reverse_edges.values()))[0]
-        caller.file = "/cache/business-classes.jar!/com/acme/Application.class"
-        caller.artifact_entry = "com/acme/Application.class"
-        edge = self._mybatis_framework_edge()
+        graph, edge, caller_sha = self._verified_mybatis_fixture(
+            extracted_caller=True
+        )
 
         ingest_collector_batches(graph, (CollectorBatch(
             collector="mybatis_mapper_proxy", version="2", edges=(edge,),
@@ -807,7 +1369,7 @@ class EvidenceIngestionTest(unittest.TestCase):
             item.evidence_type == "mybatis_mapper_proxy_dispatch"
             and item.confidence == "high"
             and item.framework_final_artifact_verified
-            and item.caller_artifact_sha256 == "c" * 64
+            and item.caller_artifact_sha256 == caller_sha
             for item in projected
         ))
 
@@ -905,6 +1467,23 @@ class EvidenceIngestionTest(unittest.TestCase):
     def test_composite_proxy_exposes_final_artifact_caller_without_claiming_its_authority(self):
         from confidence_weighted_tracer import _edge_allowed_for_trace
 
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        business_jar = Path(temp_dir.name) / "application.jar"
+        framework_jar = Path(temp_dir.name) / "spring-tx.jar"
+        with zipfile.ZipFile(business_jar, "w") as archive:
+            archive.writestr(
+                "BOOT-INF/classes/com/acme/Application.class", b"application"
+            )
+        framework_class = (
+            "org/springframework/transaction/interceptor/"
+            "TransactionInterceptor.class"
+        )
+        with zipfile.ZipFile(framework_jar, "w") as archive:
+            archive.writestr(framework_class, b"transaction-interceptor")
+        business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+        framework_sha = hashlib.sha256(framework_jar.read_bytes()).hexdigest()
+
         target = (
             "org.springframework.transaction.interceptor.TransactionInterceptor.invoke"
             "(org.aopalliance.intercept.MethodInvocation)"
@@ -921,14 +1500,16 @@ class EvidenceIngestionTest(unittest.TestCase):
                 ("runtime_activation", "active"),
                 ("framework_provenance", {
                     "authority": "final_artifact_javap",
-                    "jar": "/artifact/spring-tx.jar",
+                    "jar": str(framework_jar),
                     "artifact_entry": "BOOT-INF/lib/spring-tx.jar",
-                    "artifact_sha256": "b" * 64,
-                    "business_artifact_sha256": "a" * 64,
+                    "artifact_sha256": framework_sha,
+                    "class_or_resource_entry": framework_class,
+                    "business_artifact_sha256": business_sha,
                     "business_activation": [{
                         "business_entry": "com.acme.Application.main",
+                        "artifact_path": str(business_jar),
                         "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
-                        "artifact_sha256": "a" * 64,
+                        "artifact_sha256": business_sha,
                         "authority": "current_final_artifact_classfile",
                     }],
                 }),
@@ -936,6 +1517,10 @@ class EvidenceIngestionTest(unittest.TestCase):
         )
         caller = next(iter(self._proxy_graph().reverse_edges.values()))[0]
         caller.callee_key = "com.acme.BookingService.book(java.lang.String)"
+        caller.artifact_sha256 = business_sha
+        caller.file = (
+            f"{business_jar}!/BOOT-INF/classes/com/acme/Application.class"
+        )
         graph = SimpleNamespace(
             methods_by_id={},
             reverse_edges={caller.callee_key: [caller]},
@@ -952,10 +1537,10 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual(merged.caller_evidence_authority, "current_final_artifact")
         self.assertEqual(
             merged.caller_evidence_file,
-            "/artifact/application.jar!/BOOT-INF/classes/com/acme/Application.class",
+            f"{business_jar}!/BOOT-INF/classes/com/acme/Application.class",
         )
         self.assertEqual(merged.runtime_analyzer_hit["coord"], "__business__")
-        self.assertEqual(merged.runtime_analyzer_hit["artifact_sha256"], "a" * 64)
+        self.assertEqual(merged.runtime_analyzer_hit["artifact_sha256"], business_sha)
         self.assertEqual(
             merged.runtime_analyzer_hit["artifact_entry"],
             "BOOT-INF/classes/com/acme/Application.class",
@@ -994,7 +1579,39 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertFalse(projected.framework_final_artifact_verified)
         self.assertNotEqual(projected.confidence, "high")
 
-    def test_spring_data_proxy_marks_matching_final_artifact_evidence_verified(self):
+    def test_transaction_proxy_rejects_source_only_truthy_activation(self):
+        target = "framework.TransactionInterceptor.invoke()"
+        edge = self._framework_edge(
+            "spring_transaction_proxy_dispatch",
+            target=target,
+            metadata=(
+                ("framework_source", "com.acme.CityMapper.find/1"),
+                ("source_owner", "com.acme.CityMapper"),
+                ("source_member", "find"),
+                ("parameter_count", 1),
+                ("framework_provenance", {
+                    "authority": "final_artifact_javap",
+                    "artifact_entry": "BOOT-INF/lib/spring-tx.jar",
+                    "artifact_sha256": "b" * 64,
+                    "business_artifact_sha256": "a" * 64,
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "spring_application_run": True,
+                    }],
+                }),
+            ),
+        )
+        graph = self._proxy_graph(artifact_sha256="a" * 64)
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_transaction_proxy", version="1", edges=(edge,),
+        ),))
+
+        projected = graph.reverse_edges[target][0]
+        self.assertFalse(projected.framework_final_artifact_verified)
+        self.assertEqual(projected.confidence, "medium")
+
+    def test_spring_data_proxy_rejects_source_only_truthy_activation(self):
         target = "org.springframework.data.jpa.repository.support.SimpleJpaRepository.find(String)"
         edge = self._framework_edge(
             "spring_data_repository_proxy_dispatch",
@@ -1022,8 +1639,8 @@ class EvidenceIngestionTest(unittest.TestCase):
         ),))
 
         projected = graph.reverse_edges[target][0]
-        self.assertTrue(projected.framework_final_artifact_verified)
-        self.assertEqual(projected.confidence, "high")
+        self.assertFalse(projected.framework_final_artifact_verified)
+        self.assertEqual(projected.confidence, "medium")
 
     def test_runtime_callback_activation_is_linked_only_from_typed_business_evidence(self):
         callback = SimpleNamespace(
@@ -1080,6 +1697,209 @@ class EvidenceIngestionTest(unittest.TestCase):
         linked = graph.reverse_edges[callback.declared_qualified_key]
         self.assertEqual(linked[0].caller_symbol_id, activation.symbol_id)
         self.assertEqual(linked[0].framework_evidence_authority, "framework_semantic")
+        self.assertEqual(linked[0].caller_evidence_source, "source_ast")
+        self.assertFalse(linked[0].framework_final_artifact_verified)
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_runtime_artifact", version="2", edges=(),
+        ),))
+        self.assertNotIn(callback.declared_qualified_key, graph.reverse_edges)
+        self.assertEqual(graph.framework_edges, [])
+
+    def test_runtime_callback_source_only_activation_is_not_linked_in_final_artifact_mode(self):
+        callback = SimpleNamespace(
+            symbol_id="listener-receive",
+            qualified_key="com.acme.Listener.receive",
+            declared_qualified_key="com.acme.Listener.receive(java.lang.String)",
+            declared_signature="(java.lang.String)",
+            class_fqcn="com.acme.Listener",
+            method_name="receive",
+            owner_type="dependency",
+            owner_coord="org.example:listener",
+            module="listener",
+            is_test=False,
+        )
+        activation = SimpleNamespace(
+            symbol_id="app-main",
+            qualified_key="com.acme.Application.main",
+            owner_type="business",
+            module="app",
+            is_test=False,
+        )
+        target = "com.acme.Listener.receive"
+        edge = self._framework_edge(
+            "spring_runtime_registered_callback",
+            target=target,
+            metadata=(
+                ("framework_source", "framework:spring-listener"),
+                ("framework_target", target),
+                ("runtime_activation", "active"),
+                ("framework_provenance", {
+                    "jar": "/artifact/listener.jar",
+                    "artifact_entry": "BOOT-INF/lib/listener.jar",
+                    "artifact_sha256": "b" * 64,
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "spring_application_run": True,
+                    }],
+                }),
+            ),
+        )
+        graph = SimpleNamespace(
+            methods_by_id={callback.symbol_id: callback, activation.symbol_id: activation},
+            reverse_edges={},
+            require_current_final_artifact_business_edges=True,
+        )
+
+        result = ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_runtime_artifact", version="1", edges=(edge,),
+        ),))
+
+        self.assertEqual(result.framework_activation_linked_methods, 0)
+        self.assertNotIn(callback.declared_qualified_key, graph.reverse_edges)
+
+    def test_runtime_callback_verified_activation_carries_traceable_composite_provenance(self):
+        from confidence_weighted_tracer import _edge_allowed_for_trace
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        business_jar = Path(temp_dir.name) / "application.jar"
+        framework_jar = Path(temp_dir.name) / "listener.jar"
+        with zipfile.ZipFile(business_jar, "w") as archive:
+            archive.writestr(
+                "BOOT-INF/classes/com/acme/Application.class", b"business-class"
+            )
+        with zipfile.ZipFile(framework_jar, "w") as archive:
+            archive.writestr("BOOT-INF/lib/listener.jar", b"registration-evidence")
+        business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+        framework_sha = hashlib.sha256(framework_jar.read_bytes()).hexdigest()
+
+        callback = SimpleNamespace(
+            symbol_id="listener-receive",
+            qualified_key="com.acme.Listener.receive",
+            declared_qualified_key="com.acme.Listener.receive(java.lang.String)",
+            declared_signature="(java.lang.String)",
+            class_fqcn="com.acme.Listener",
+            method_name="receive",
+            owner_type="dependency",
+            owner_coord="org.example:listener",
+            module="listener",
+            is_test=False,
+        )
+        activation = SimpleNamespace(
+            symbol_id="app-main",
+            qualified_key="com.acme.Application.main",
+            owner_type="business",
+            module="app",
+            is_test=False,
+        )
+        target = "com.acme.Listener.receive"
+        edge = self._framework_edge(
+            "spring_runtime_registered_callback",
+            target=target,
+            metadata=(
+                ("framework_source", "framework:spring-listener"),
+                ("framework_target", target),
+                ("runtime_activation", "active"),
+                ("framework_provenance", {
+                    "jar": str(framework_jar),
+                    "artifact_entry": "BOOT-INF/lib/listener.jar",
+                    "artifact_sha256": framework_sha,
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "artifact_path": str(business_jar),
+                        "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
+                        "artifact_sha256": business_sha,
+                        "authority": "current_final_artifact_classfile",
+                    }],
+                }),
+            ),
+        )
+        graph = SimpleNamespace(
+            methods_by_id={callback.symbol_id: callback, activation.symbol_id: activation},
+            reverse_edges={},
+            require_current_final_artifact_business_edges=True,
+        )
+
+        result = ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_runtime_artifact", version="1", edges=(edge,),
+        ),))
+
+        self.assertEqual(result.framework_activation_linked_methods, 1)
+        linked = graph.reverse_edges[callback.declared_qualified_key][0]
+        self.assertEqual(linked.caller_evidence_source, "current_final_artifact")
+        self.assertEqual(linked.caller_artifact_sha256, business_sha)
+        self.assertEqual(
+            linked.caller_artifact_entry,
+            "BOOT-INF/classes/com/acme/Application.class",
+        )
+        self.assertTrue(linked.framework_final_artifact_verified)
+        self.assertTrue(_edge_allowed_for_trace(linked, graph))
+
+    def test_runtime_activation_rejects_self_asserted_sha_without_artifact_bytes(self):
+        from step5_evidence_ingestion import _activation_matches_business_artifact
+
+        activation = {
+            "business_entry": "com.acme.Application.main",
+            "artifact_path": "/artifact/does-not-exist.jar",
+            "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
+            "artifact_sha256": "a" * 64,
+            "authority": "current_final_artifact_classfile",
+        }
+
+        self.assertFalse(
+            _activation_matches_business_artifact(activation, "a" * 64)
+        )
+
+    def test_proxy_verification_requires_framework_bytes_and_caller_class_entry(self):
+        from step5_evidence_ingestion import _proxy_final_artifact_verified
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        business_jar = Path(temp_dir.name) / "application.jar"
+        framework_jar = Path(temp_dir.name) / "spring-tx.jar"
+        with zipfile.ZipFile(business_jar, "w") as archive:
+            archive.writestr(
+                "BOOT-INF/classes/com/acme/Application.class", b"application"
+            )
+            archive.writestr(
+                "BOOT-INF/classes/com/acme/MissingCaller.class", b"caller"
+            )
+        framework_class = (
+            "org/springframework/transaction/interceptor/"
+            "TransactionInterceptor.class"
+        )
+        with zipfile.ZipFile(framework_jar, "w") as archive:
+            archive.writestr(framework_class, b"transaction-interceptor")
+        business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+        framework_sha = hashlib.sha256(framework_jar.read_bytes()).hexdigest()
+        activation = {
+            "business_entry": "com.acme.Application.main",
+            "artifact_path": str(business_jar),
+            "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
+            "artifact_sha256": business_sha,
+            "authority": "current_final_artifact_classfile",
+        }
+        caller = SimpleNamespace(
+            artifact_sha256=business_sha,
+            artifact_entry="BOOT-INF/classes/com/acme/MissingCaller.class",
+            file=(
+                "/artifact/forged-business.jar!/"
+                "BOOT-INF/classes/com/acme/MissingCaller.class"
+            ),
+        )
+        provenance = {
+            "authority": "final_artifact_javap",
+            "jar": str(framework_jar),
+            "artifact_sha256": framework_sha,
+            "class_or_resource_entry": framework_class,
+            "business_artifact_sha256": business_sha,
+            "business_activation": [activation],
+        }
+
+        self.assertFalse(_proxy_final_artifact_verified(
+            provenance, caller, require_business_sha=True,
+        ))
 
 
 if __name__ == "__main__":

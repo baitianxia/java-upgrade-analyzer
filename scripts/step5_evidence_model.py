@@ -139,10 +139,16 @@ class CoverageRecord:
     applicable: bool = True
 
     def __post_init__(self):
+        reason_codes = tuple(self.reason_codes or ())
+        if any(not isinstance(item, str) for item in reason_codes):
+            raise ValueError("coverage reason codes must be strings")
+        object.__setattr__(self, "reason_codes", reason_codes)
         if not self.collector or not self.api_identity:
             raise ValueError("coverage requires collector and API identity")
         if self.status not in {"complete", "partial", "insufficient", "not_applicable"}:
             raise ValueError(f"unsupported coverage status: {self.status}")
+        if self.status == "not_applicable":
+            object.__setattr__(self, "applicable", False)
 
 
 @dataclass(frozen=True)
@@ -156,6 +162,8 @@ class CollectorBatch:
     metrics: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
 
     def __post_init__(self):
+        for field_name in ("edges", "failures", "concerns", "coverage"):
+            object.__setattr__(self, field_name, tuple(getattr(self, field_name) or ()))
         if not str(self.collector or "").strip() or not str(self.version or "").strip():
             raise ValueError("collector identity and version are required")
         for edge in self.edges:
@@ -256,7 +264,20 @@ class PhysicalCallEdge:
     owner_coord: str = ""
     artifact: str = ""
     confidence: str = "high"
+    instruction_offset: int = -1
     metadata: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+
+    def __post_init__(self):
+        if (
+            isinstance(self.instruction_offset, bool)
+            or not isinstance(self.instruction_offset, int)
+            or self.instruction_offset < -1
+        ):
+            raise ValueError("physical instruction offset must be an integer >= -1")
+        object.__setattr__(self, "metadata", tuple(sorted(
+            (key, freeze_evidence_value(value))
+            for key, value in tuple(self.metadata or ())
+        )))
 
 
 @dataclass(frozen=True)
@@ -272,6 +293,12 @@ class ReachabilityPath:
     depth: int = 0
     evidence: Tuple[PhysicalCallEdge, ...] = field(default_factory=tuple)
 
+    def __post_init__(self):
+        evidence = tuple(self.evidence or ())
+        if any(not isinstance(item, PhysicalCallEdge) for item in evidence):
+            raise ValueError("reachability path evidence must be PhysicalCallEdge values")
+        object.__setattr__(self, "evidence", evidence)
+
 
 @dataclass(frozen=True)
 class EvidenceEnvelope:
@@ -283,6 +310,26 @@ class EvidenceEnvelope:
     coverage: Tuple[CoverageRecord, ...] = field(default_factory=tuple)
 
     def __post_init__(self):
+        expected_types = {
+            "paths": ReachabilityPath,
+            "failures": EvidenceFailure,
+            "concerns": EvidenceConcern,
+            "coverage": CoverageRecord,
+        }
+        for field_name, expected_type in expected_types.items():
+            values = tuple(getattr(self, field_name) or ())
+            if any(not isinstance(item, expected_type) for item in values):
+                raise ValueError(
+                    f"evidence envelope {field_name} must contain "
+                    f"{expected_type.__name__} values"
+                )
+            object.__setattr__(self, field_name, values)
+        if self.preservation is not None and not isinstance(
+            self.preservation, PreservationEvidence
+        ):
+            raise ValueError(
+                "evidence envelope preservation must be PreservationEvidence"
+            )
         if not str(self.target_identity or "").strip():
             raise ValueError("evidence envelope requires target identity")
         if any(
@@ -532,9 +579,10 @@ def decide_analysis(
 
 def decide_envelope(envelope: EvidenceEnvelope) -> AnalysisDecision:
     """Derive one decision after enforcing applicable per-API coverage."""
+    applicable = tuple(item for item in envelope.coverage if item.applicable)
     incomplete = tuple(
-        item for item in envelope.coverage
-        if item.applicable and item.status not in {"complete", "not_applicable"}
+        item for item in applicable
+        if item.status != "complete"
     )
     failures = envelope.failures
     if incomplete:
@@ -549,7 +597,7 @@ def decide_envelope(envelope: EvidenceEnvelope) -> AnalysisDecision:
             api_identity=envelope.target_identity,
             detail=f"适用的证据采集覆盖不完整：{detail}",
         ),)
-    complete_scan = bool(envelope.coverage) and not incomplete
+    complete_scan = bool(applicable) and not incomplete
     return decide_analysis(
         envelope.paths,
         failures,
@@ -557,15 +605,3 @@ def decide_envelope(envelope: EvidenceEnvelope) -> AnalysisDecision:
         preservation=envelope.preservation,
         complete_scan=complete_scan,
     )
-
-
-def decision_to_trace_patch(decision: AnalysisDecision) -> Mapping[str, Any]:
-    """Expose the legacy TraceResult conclusion fields during incremental migration."""
-    return {
-        "analysis_status": decision.analysis_status,
-        "is_reachable": decision.is_reachable,
-        "reason_code": decision.reason_code,
-        "reachable_note": decision.reachable_note,
-        "direct_callers": decision.direct_callers,
-        "business_reach_depth": decision.business_reach_depth,
-    }

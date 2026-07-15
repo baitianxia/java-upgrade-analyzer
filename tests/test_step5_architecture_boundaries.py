@@ -119,6 +119,65 @@ def _reverse_edge_mutations(tree):
 
 
 class Step5ArchitectureBoundaryTest(unittest.TestCase):
+    def test_tracer_materializes_conclusions_only_at_terminal_renderer(self):
+        path = ROOT / "scripts/confidence_weighted_tracer.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        violations = []
+        protected_fields = {
+            "analysis_status", "is_reachable", "reason_code", "reachable_note",
+            "direct_callers", "business_reach_depth",
+        }
+
+        class BoundaryVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.owners = ["<module>"]
+
+            def visit_FunctionDef(self, node):
+                self.owners.append(node.name)
+                self.generic_visit(node)
+                self.owners.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ImportFrom(self, node):
+                for alias in node.names:
+                    if alias.name == "decision_to_trace_patch":
+                        violations.append(("import", alias.name, node.lineno))
+
+            def visit_Call(self, node):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id == "decision_to_trace_patch":
+                        violations.append((self.owners[-1], node.func.id, node.lineno))
+                    if (
+                        node.func.id == "TraceResult"
+                        and self.owners[-1] != "render_trace_result"
+                    ):
+                        violations.append((self.owners[-1], node.func.id, node.lineno))
+                self.generic_visit(node)
+
+            def _visit_assignment(self, node, targets):
+                for target in targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and target.attr in protected_fields
+                        and self.owners[-1] != "render_trace_result"
+                    ):
+                        violations.append((self.owners[-1], target.attr, node.lineno))
+                self.generic_visit(node)
+
+            def visit_Assign(self, node):
+                self._visit_assignment(node, node.targets)
+
+            def visit_AnnAssign(self, node):
+                self._visit_assignment(node, [node.target])
+
+            def visit_AugAssign(self, node):
+                self._visit_assignment(node, [node.target])
+
+        BoundaryVisitor().visit(tree)
+
+        self.assertEqual(violations, [])
+
     def test_step5_engine_initializes_single_ingestion_boundary(self):
         path = ROOT / "scripts/s5_call_chain_engine_integrated.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))

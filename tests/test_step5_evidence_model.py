@@ -31,7 +31,6 @@ from step5_evidence_model import (
     classify_module_scope,
     decide_analysis,
     decide_envelope,
-    decision_to_trace_patch,
     freeze_evidence_value,
 )
 import confidence_weighted_tracer as tracer
@@ -39,6 +38,14 @@ import enhanced_output_formatter as formatter
 
 
 class EvidenceModelTest(unittest.TestCase):
+    def _draft_from_result(self, result):
+        values = {
+            name: getattr(result, name)
+            for name in tracer.TraceDraft.__dataclass_fields__
+            if hasattr(result, name)
+        }
+        return tracer.TraceDraft(**values)
+
     def _final_artifact_edge(self, *, semantic=False, authority=None):
         return CollectedEdge(
             caller_symbol="com.acme.Application.run()",
@@ -108,6 +115,92 @@ class EvidenceModelTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first["collector"], "business_bytecode")
         self.assertEqual(first["edges"][0]["provenance"]["artifact_sha256"], "a" * 64)
+
+    def test_typed_evidence_recursively_copies_mutable_input_containers(self):
+        edge = self._final_artifact_edge()
+        reason_codes = ["partial-scan"]
+        edges = [edge]
+        nested_metadata = {"locations": [{"offset": 7}]}
+        coverage = CoverageRecord(
+            collector="business_bytecode",
+            api_identity="com.vendor.Legacy.call()",
+            status="partial",
+            reason_codes=reason_codes,
+        )
+        physical = tracer.PhysicalCallEdge(
+            caller_symbol="com.acme.Application.run()",
+            callee_key="com.vendor.Legacy.call()",
+            evidence_type="bytecode_method_invocation",
+            metadata=(("details", nested_metadata),),
+        )
+        path_evidence = [physical]
+        path = ReachabilityPath(
+            path_text="Application.run -> Legacy.call",
+            entry_scope=ModuleScope.BUSINESS_CLASSES,
+            complete=True,
+            evidence=path_evidence,
+        )
+        paths = [path]
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="1",
+            edges=edges,
+            coverage=[coverage],
+        )
+        envelope = EvidenceEnvelope(
+            target_identity="com.vendor.Legacy.call()",
+            paths=paths,
+            coverage=[coverage],
+        )
+
+        reason_codes.append("mutated")
+        edges.clear()
+        nested_metadata["locations"][0]["offset"] = 99
+        path_evidence.clear()
+        paths.clear()
+
+        self.assertEqual(coverage.reason_codes, ("partial-scan",))
+        self.assertEqual(batch.edges, (edge,))
+        self.assertEqual(len(batch.coverage), 1)
+        self.assertEqual(len(envelope.paths), 1)
+        self.assertEqual(len(envelope.coverage), 1)
+        self.assertEqual(len(path.evidence), 1)
+        self.assertEqual(
+            physical.metadata[0][1]["locations"][0]["offset"],
+            7,
+        )
+
+        with self.assertRaises((AttributeError, TypeError)):
+            batch.edges.clear()
+        with self.assertRaises((AttributeError, TypeError)):
+            coverage.reason_codes.append("mutated-again")
+        with self.assertRaises((AttributeError, TypeError)):
+            physical.metadata[0][1]["locations"][0]["offset"] = 100
+
+    def test_coverage_rejects_non_string_reason_codes(self):
+        with self.assertRaisesRegex(ValueError, "reason codes"):
+            CoverageRecord(
+                collector="business_bytecode",
+                api_identity="com.vendor.Legacy.call()",
+                status="partial",
+                reason_codes=({"nested": ["mutable"]},),
+            )
+
+    def test_evidence_envelope_rejects_untyped_members(self):
+        invalid_values = {
+            "paths": ({"path_text": "forged"},),
+            "failures": ({"reason_code": "forged"},),
+            "concerns": ({"reason_code": "forged"},),
+            "coverage": ({"status": "complete"},),
+            "preservation": {"reason_code": "forged"},
+        }
+        for field_name, value in invalid_values.items():
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(ValueError, field_name):
+                    EvidenceEnvelope(
+                        target_identity="com.vendor.Legacy.call()",
+                        **{field_name: value},
+                    )
 
     def test_incomplete_applicable_coverage_blocks_static_miss(self):
         envelope = EvidenceEnvelope(
@@ -295,6 +388,29 @@ class EvidenceModelTest(unittest.TestCase):
         self.assertIs(decision.is_reachable, False)
         self.assertEqual(decision.reason_code, "NO_STATIC_PATH")
 
+    def test_envelope_with_only_not_applicable_coverage_is_not_analyzed(self):
+        decision = decide_envelope(EvidenceEnvelope(
+            target_identity="com.vendor.Legacy.call()",
+            coverage=(CoverageRecord(
+                collector="spring_runtime_artifact",
+                api_identity="com.vendor.Legacy.call()",
+                status="not_applicable",
+                applicable=False,
+            ),),
+        ))
+
+        self.assertEqual(decision.analysis_status, "not_analyzed")
+        self.assertEqual(decision.reason_code, "INCOMPLETE_EVIDENCE")
+
+    def test_not_applicable_coverage_is_structurally_non_applicable(self):
+        coverage = CoverageRecord(
+            collector="spring_runtime_artifact",
+            api_identity="com.vendor.Legacy.call()",
+            status="not_applicable",
+        )
+
+        self.assertFalse(coverage.applicable)
+
     def test_preserved_api_is_not_impacted(self):
         decision = decide_analysis((), preserved=True)
 
@@ -330,22 +446,6 @@ class EvidenceModelTest(unittest.TestCase):
 
         self.assertEqual(decision.analysis_status, "reachable")
         self.assertEqual(decision.direct_callers, 1)
-
-    def test_decision_patch_is_schema_compatible(self):
-        decision = decide_analysis((ReachabilityPath(
-            path_text="App.run -> Removed.api",
-            entry_scope=ModuleScope.BUSINESS_CLASSES,
-            complete=True,
-            depth=1,
-        ),))
-
-        patch = decision_to_trace_patch(decision)
-
-        self.assertEqual(set(patch), {
-            "analysis_status", "is_reachable", "reason_code", "reachable_note",
-            "direct_callers", "business_reach_depth",
-        })
-        self.assertEqual(patch["analysis_status"], "reachable")
 
     def test_terminal_renderer_preserves_trace_result_contract(self):
         seed = TraceSeed(
@@ -488,8 +588,10 @@ class EvidenceModelTest(unittest.TestCase):
             business_reach_depth=9,
         )
 
-        with patch.object(tracer, "decide_analysis", return_value=policy_decision) as decide:
-            built = tracer._build_packaged_dependency_hit_result(result, [hit])
+        draft = self._draft_from_result(result)
+        with patch.object(tracer, "decide_envelope", return_value=policy_decision) as decide:
+            tracer._build_packaged_dependency_hit_result(draft, [hit])
+            built = tracer._finalize_trace_draft(draft)
 
         decide.assert_called_once()
         self.assertEqual(built.analysis_status, "policy_status")
@@ -521,6 +623,71 @@ class EvidenceModelTest(unittest.TestCase):
                     assignments.append(target.attr)
 
         self.assertEqual(assignments, [])
+
+    def test_packaged_physical_evidence_preserves_instruction_offset_to_terminal_output(self):
+        draft = tracer._new_trace_draft({
+            "api_name": "com.vendor.Legacy.removed",
+            "api_simple": "removed",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "com.vendor:legacy",
+        })
+        hit = {
+            "coord": "__business__",
+            "jar_path": "/artifact/application.jar",
+            "class_fqcn": "com.acme.Application",
+            "consumer_method": "run",
+            "consumer_signature": "()",
+            "target_display": "com.vendor.Legacy.removed()",
+            "evidence_type": "bytecode_method_invocation",
+            "instruction_offset": 17,
+        }
+
+        with patch.object(
+            tracer, "decide_envelope", wraps=tracer.decide_envelope,
+        ) as decide:
+            tracer._build_packaged_dependency_hit_result(draft, [hit])
+            result = tracer._finalize_trace_draft(draft)
+
+        envelope = decide.call_args.args[0]
+        self.assertEqual(envelope.paths[0].evidence[-1].instruction_offset, 17)
+        self.assertEqual(result.evidence_paths[0][0]["instruction_offset"], 17)
+
+    def test_bfs_physical_evidence_preserves_instruction_offset(self):
+        edge = type("Edge", (), {
+            "caller_symbol_id": "app-run",
+            "caller_qualified_key": "com.acme.Application.run()",
+            "callee_key": "com.vendor.Legacy.removed()",
+            "confidence": "high",
+            "evidence_type": "bytecode_method_invocation",
+            "file": "/artifact/application.jar",
+            "line": 0,
+            "instruction_offset": 23,
+            "owner_coord": "BUSINESS",
+            "module": "app",
+        })()
+        draft = tracer._new_trace_draft({
+            "api_name": "com.vendor.Legacy.removed",
+            "api_simple": "removed",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "com.vendor:legacy",
+        })
+        candidate = {
+            "path": [edge],
+            "entry_point": {"method": "com.acme.Application.run()"},
+            "depth": 1,
+        }
+
+        path = tracer._candidate_reachability_path(
+            draft, candidate, True, "SYSTEM_CODE_REACHED", "reached"
+        )
+        rendered = tracer.edge_to_evidence(edge)
+
+        self.assertEqual(path.evidence[0].instruction_offset, 23)
+        self.assertEqual(rendered["instruction_offset"], 23)
 
     def test_trace_result_conclusions_have_one_policy_write_boundary(self):
         source_path = Path(inspect.getsourcefile(tracer))
@@ -583,6 +750,15 @@ class EvidenceModelTest(unittest.TestCase):
 
         self.assertEqual(violations, [])
 
+    def test_public_tracer_rejects_non_draft_collector_results(self):
+        with patch.object(
+            tracer,
+            "_collect_trace_api_with_confidence_weighting",
+            return_value=object(),
+        ):
+            with self.assertRaisesRegex(TypeError, "TraceDraft"):
+                tracer.trace_api_with_confidence_weighting({}, None, {})
+
     def test_policy_write_boundary_applies_only_policy_patch_fields(self):
         result = tracer.TraceResult(
             api_name="A.m", api_simple="m", api_signature="()",
@@ -599,13 +775,21 @@ class EvidenceModelTest(unittest.TestCase):
             direct_callers=3, business_reach_depth=4,
         )
 
-        with patch.object(tracer, "decide_analysis", return_value=policy_decision) as decide:
-            tracer._apply_evidence_decision(result, complete_scan=True)
+        draft = self._draft_from_result(result)
+        tracer._apply_evidence_decision(draft, complete_scan=True)
+        envelope = EvidenceEnvelope(
+            target_identity=tracer._trace_target_identity(draft),
+            coverage=draft.envelope_coverage,
+        )
+        with patch.object(tracer, "decide_envelope", return_value=policy_decision) as decide:
+            built = tracer._finalize_trace_draft(draft)
 
         decide.assert_called_once()
-        self.assertEqual(result.analysis_status, "policy_status")
-        self.assertEqual(result.reason_code, "POLICY_REASON")
-        self.assertEqual(result.direct_callers, 3)
+        self.assertEqual(envelope.coverage[0].collector, "legacy_complete_scan")
+        self.assertEqual(envelope.coverage[0].status, "complete")
+        self.assertEqual(built.analysis_status, "policy_status")
+        self.assertEqual(built.reason_code, "POLICY_REASON")
+        self.assertEqual(built.direct_callers, 3)
 
     def test_source_artifact_downgrade_preserves_direct_usage_metrics_without_details(self):
         result = tracer.TraceResult(
@@ -623,11 +807,13 @@ class EvidenceModelTest(unittest.TestCase):
             "source_artifact_alignment": {"status": "conflict"},
         })()
 
-        tracer._apply_source_artifact_miss(result, graph, "源码与制品冲突")
+        draft = self._draft_from_result(result)
+        tracer._apply_source_artifact_miss(draft, graph, "源码与制品冲突")
+        built = tracer._finalize_trace_draft(draft)
 
-        self.assertEqual(result.analysis_status, "uncertain")
-        self.assertEqual(result.direct_callers, 1)
-        self.assertEqual(result.business_reach_depth, 1)
+        self.assertEqual(built.analysis_status, "uncertain")
+        self.assertEqual(built.direct_callers, 1)
+        self.assertEqual(built.business_reach_depth, 1)
 
     def test_registered_business_callback_keeps_framework_activation_path(self):
         result = tracer.TraceResult(
@@ -684,7 +870,9 @@ class EvidenceModelTest(unittest.TestCase):
             }],
         }
 
-        built = tracer._build_packaged_dependency_hit_result(result, [hit], graph)
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit], graph)
+        built = tracer._finalize_trace_draft(draft)
 
         self.assertEqual(built.analysis_status, "reachable")
         self.assertEqual(built.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")

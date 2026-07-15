@@ -44,7 +44,9 @@ from indirect_usage_analyzer import (
 )
 from step5_evidence_model import (
     AnalysisOutcome,
+    CoverageRecord,
     EvidenceConcern,
+    EvidenceEnvelope,
     EvidenceFailure,
     ModuleScope,
     PhysicalCallEdge,
@@ -52,8 +54,7 @@ from step5_evidence_model import (
     ReachabilityPath,
     TraceSeed,
     classify_module_scope,
-    decide_analysis,
-    decision_to_trace_patch,
+    decide_envelope,
     thaw_evidence_value,
 )
 
@@ -759,6 +760,39 @@ class TraceResult:
     capability_coverage: dict = field(default_factory=dict)
 
 
+@dataclass
+class TraceDraft:
+    """Mutable rendering/evidence workspace with no provisional conclusion."""
+    api_name: str
+    api_simple: str
+    api_signature: str
+    symbol_kind: str
+    change_type: str
+    coord: str
+    severity: str
+    confirmed: bool
+    source: str
+    analysis_scope: str
+    dependency_chain_coords: list = field(default_factory=list)
+    call_paths: list = field(default_factory=list)
+    evidence_paths: list = field(default_factory=list)
+    verification_commands: list = field(default_factory=list)
+    hops: list = field(default_factory=list)
+    confidence_score: float = 1.0
+    critical_nodes_hit: list = field(default_factory=list)
+    match_provenance: str = ''
+    match_tier: int = -1
+    old_version: str = ''
+    new_version: str = ''
+    path_details: list = field(default_factory=list)
+    capability_coverage: dict = field(default_factory=dict)
+    envelope_paths: tuple = field(default_factory=tuple)
+    envelope_failures: tuple = field(default_factory=tuple)
+    envelope_concerns: tuple = field(default_factory=tuple)
+    envelope_preservation: object = None
+    envelope_coverage: tuple = field(default_factory=tuple)
+
+
 def render_trace_result(seed: TraceSeed, outcome: AnalysisOutcome) -> TraceResult:
     """Materialize the legacy result contract at the terminal policy boundary."""
     decision = outcome.decision
@@ -795,6 +829,130 @@ def render_trace_result(seed: TraceSeed, outcome: AnalysisOutcome) -> TraceResul
     )
 
 
+def _trace_target_identity(result):
+    return (
+        changed_api_display_target(result)
+        or str(getattr(result, "api_simple", "") or "").strip()
+        or "<invalid-api-row>"
+    )
+
+
+def _new_trace_draft(api_row, graph=None):
+    draft = TraceDraft(
+        api_name=str(api_row.get('api_name') or '').strip(),
+        api_simple=api_row.get('api_simple', ''),
+        api_signature=api_row.get('api_signature', ''),
+        symbol_kind=get_symbol_kind(api_row),
+        change_type=api_row.get('change_type', ''),
+        coord=api_row.get('coord', ''),
+        severity=api_row.get('severity', ''),
+        confirmed=api_row.get('confirmed') == 'true',
+        source=api_row.get('source', ''),
+        analysis_scope=api_row.get('analysis_scope', 'api'),
+        old_version=str(api_row.get('old_version') or '').strip(),
+        new_version=str(api_row.get('new_version') or '').strip(),
+        capability_coverage=_capability_coverage_for_api(api_row, graph),
+    )
+    source_identity = indirect_api_key(api_row)
+    target_identity = _trace_target_identity(draft)
+    coverage_by_collector = defaultdict(list)
+    for record in tuple(getattr(graph, 'step5_collector_coverage', ()) or ()):
+        if record.api_identity not in {
+            source_identity, target_identity, record.collector,
+        }:
+            continue
+        coverage_by_collector[record.collector].append(record)
+    coverage_status_rank = {
+        'not_applicable': 0,
+        'complete': 1,
+        'partial': 2,
+        'insufficient': 3,
+    }
+    merged_coverage = []
+    for collector in sorted(coverage_by_collector):
+        records = coverage_by_collector[collector]
+        applicable = [record for record in records if record.applicable]
+        candidates = applicable or records
+        selected = max(
+            candidates,
+            key=lambda record: coverage_status_rank.get(record.status, 4),
+        )
+        reason_codes = tuple(sorted({
+            reason_code
+            for record in records
+            for reason_code in record.reason_codes
+        }))
+        merged_coverage.append(replace(
+            selected,
+            api_identity=target_identity,
+            reason_codes=reason_codes,
+            applicable=bool(applicable),
+        ))
+    relevant_identities = {'', source_identity, target_identity}
+    draft.envelope_coverage = tuple(merged_coverage)
+    draft.envelope_failures = tuple(
+        failure
+        for failure in tuple(getattr(graph, 'step5_evidence_failures', ()) or ())
+        if failure.api_identity in relevant_identities
+    )
+    draft.envelope_concerns = tuple(
+        concern
+        for concern in tuple(getattr(graph, 'step5_evidence_concerns', ()) or ())
+        if concern.api_identity in relevant_identities
+    )
+    return draft
+
+
+def _merge_evidence_items(existing, additions):
+    merged = list(existing or ())
+    for item in tuple(additions or ()):
+        if item not in merged:
+            merged.append(item)
+    return tuple(merged)
+
+
+def _finalize_trace_draft(draft):
+    target_identity = _trace_target_identity(draft)
+    envelope = EvidenceEnvelope(
+        target_identity=target_identity,
+        paths=tuple(draft.envelope_paths),
+        failures=tuple(draft.envelope_failures),
+        concerns=tuple(draft.envelope_concerns),
+        preservation=draft.envelope_preservation,
+        coverage=tuple(draft.envelope_coverage),
+    )
+    decision = decide_envelope(envelope)
+    seed = TraceSeed(
+        api_name=draft.api_name,
+        api_simple=draft.api_simple,
+        api_signature=draft.api_signature,
+        symbol_kind=draft.symbol_kind,
+        change_type=draft.change_type,
+        coord=draft.coord,
+        severity=draft.severity,
+        confirmed=draft.confirmed,
+        source=draft.source,
+        analysis_scope=draft.analysis_scope,
+        old_version=draft.old_version,
+        new_version=draft.new_version,
+    )
+    outcome = AnalysisOutcome(
+        decision=decision,
+        dependency_chain_coords=tuple(draft.dependency_chain_coords),
+        call_paths=tuple(draft.call_paths),
+        evidence_paths=tuple(draft.evidence_paths),
+        path_details=tuple(draft.path_details),
+        verification_commands=tuple(draft.verification_commands),
+        hops=tuple(draft.hops),
+        confidence_score=draft.confidence_score,
+        critical_nodes_hit=tuple(draft.critical_nodes_hit),
+        match_provenance=draft.match_provenance,
+        match_tier=draft.match_tier,
+        capability_coverage=tuple(sorted(draft.capability_coverage.items())),
+    )
+    return render_trace_result(seed, outcome)
+
+
 def _apply_evidence_decision(
     result,
     paths=(),
@@ -803,17 +961,31 @@ def _apply_evidence_decision(
     concerns=(),
     preservation=None,
     complete_scan=False,
+    coverage=(),
 ):
-    decision = decide_analysis(
-        paths,
-        failures,
-        concerns=concerns,
-        preservation=preservation,
-        complete_scan=complete_scan,
-    )
-    for field_name, value in decision_to_trace_patch(decision).items():
-        setattr(result, field_name, value)
-    return result
+    target_identity = _trace_target_identity(result)
+    coverage_items = tuple(coverage)
+    if complete_scan and not coverage_items:
+        coverage_items = (CoverageRecord(
+            collector="legacy_complete_scan",
+            api_identity=target_identity,
+            status="complete",
+        ),)
+    if isinstance(result, TraceDraft):
+        result.envelope_paths = _merge_evidence_items(result.envelope_paths, paths)
+        result.envelope_failures = _merge_evidence_items(
+            result.envelope_failures, failures
+        )
+        result.envelope_concerns = _merge_evidence_items(
+            result.envelope_concerns, concerns
+        )
+        if preservation is not None:
+            result.envelope_preservation = preservation
+        result.envelope_coverage = _merge_evidence_items(
+            result.envelope_coverage, coverage_items
+        )
+        return result
+    raise TypeError("evidence builders require TraceDraft before terminal rendering")
 
 
 def _apply_blocking_failure(result, stage, reason_code, note, paths=()):
@@ -1345,7 +1517,7 @@ def _apply_source_artifact_miss(result, graph, reachable_note):
                 entry_scope=ModuleScope.BUSINESS_CLASSES,
                 complete=False,
                 stop_reason=reason_code,
-                depth=int(result.business_reach_depth or 1),
+                depth=1,
             )
             for path_text in result.call_paths
         )
@@ -3954,8 +4126,21 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
         try:
             with zipfile.ZipFile(jar_path) as zf:
                 data = zf.read(class_entry)
-        except Exception:
-            continue
+        except Exception as exc:
+            failure = {
+                'reason': 'BYTECODE_MEMBER_INDEX_LATE_ARCHIVE_FAILED',
+                'coord': str(task.get('coord') or ''),
+                'jar_path': jar_path,
+                'class_entry': class_entry,
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+            }
+            index.setdefault('failures', []).append(failure)
+            index['complete'] = False
+            graph = task.get('graph')
+            if graph is not None:
+                _record_analyzer_ledger_failure(graph, **failure)
+            return None
         if _class_bytes_might_reference_target(data, owner_internal, member):
             unparsed_selected += 1
             candidates.append(task)
@@ -4637,6 +4822,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             'consumer_class': hit.get('class_fqcn', ''),
             'consumer_method': consumer_member,
             'consumer_signature': consumer_signature,
+            'instruction_offset': hit.get('instruction_offset'),
         }]
         result.evidence_paths.append(evidence)
         result.path_details.append({
@@ -4698,6 +4884,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
                 'file': getattr(edge, 'file', ''),
                 'line': getattr(edge, 'line', 0),
                 'owner_coord': getattr(edge, 'owner_coord', ''),
+                'instruction_offset': getattr(edge, 'instruction_offset', None),
             })
         evidence.append({
             'caller_symbol': consumer_display,
@@ -4712,6 +4899,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             'consumer_class': hit.get('class_fqcn', ''),
             'consumer_method': consumer_member,
             'consumer_signature': consumer_signature,
+            'instruction_offset': hit.get('instruction_offset'),
         })
         result.evidence_paths.append(evidence)
         result.path_details.append({
@@ -4771,6 +4959,11 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
                 owner_coord=str(edge.get('owner_coord') or ''),
                 artifact=str(edge.get('file') or ''),
                 confidence=str(edge.get('confidence') or 'high'),
+                instruction_offset=(
+                    int(_normalized_instruction_offset(edge.get('instruction_offset')))
+                    if _normalized_instruction_offset(edge.get('instruction_offset')) is not None
+                    else -1
+                ),
             )
             for edge in detail.get('evidence') or []
         )
@@ -4832,8 +5025,6 @@ def _merge_runtime_framework_paths(result, hits, graph):
         critical_nodes_hit=list(result.critical_nodes_hit or []),
     )
     packaged = _build_packaged_dependency_hit_result(packaged_seed, hits, graph)
-    if packaged.reason_code != 'RUNTIME_FRAMEWORK_ENTRY_REACHED':
-        return result
     confirmed_details = [
         item for item in list(packaged.path_details or [])
         if item.get('path_status') == 'reachable'
@@ -4878,7 +5069,7 @@ def _merge_runtime_framework_paths(result, hits, graph):
         complete=True,
         stop_reason='RUNTIME_FRAMEWORK_ENTRY_REACHED',
         reason_code='RUNTIME_FRAMEWORK_ENTRY_REACHED',
-        note=packaged.reachable_note,
+        note='已通过最终制品中的框架注册确认目标符号会进入运行时调用路径',
         depth=int(confirmed_details[0].get('depth') or 1),
     ),))
 
@@ -5216,6 +5407,11 @@ def edge_to_evidence(edge, graph=None):
         'owner_coord': getattr(edge, 'owner_coord', ''),
         'module': getattr(edge, 'module', ''),
     }
+    instruction_offset = _normalized_instruction_offset(
+        getattr(edge, 'instruction_offset', None)
+    )
+    if instruction_offset is not None:
+        evidence['instruction_offset'] = int(instruction_offset)
     if getattr(edge, 'framework_registration', False):
         evidence.update({
             'framework_registration': True,
@@ -5391,7 +5587,7 @@ def calculate_confidence_decay(current_score, edge_confidence):
 # 核心追踪逻辑
 # ══════════════════════════════════════════════════════════════════
 
-def trace_api_with_confidence_weighting(
+def _collect_trace_api_with_confidence_weighting(
     api_row,
     graph,
     type_metadata,
@@ -5425,36 +5621,7 @@ def trace_api_with_confidence_weighting(
         TraceResult
     """
     api_name = api_row.get('api_name', '').strip()
-    result = TraceResult(
-        api_name=api_name,
-        api_simple=api_row.get('api_simple', ''),
-        api_signature=api_row.get('api_signature', ''),
-        symbol_kind=get_symbol_kind(api_row),
-        change_type=api_row.get('change_type', ''),
-        coord=api_row.get('coord', ''),
-        severity=api_row.get('severity', ''),
-        confirmed=api_row.get('confirmed') == 'true',
-        source=api_row.get('source', ''),
-        analysis_scope=api_row.get('analysis_scope', 'api'),
-        analysis_status='pending',
-        direct_callers=0,
-        is_reachable=None,
-        reachable_note='',
-        business_reach_depth=0,
-        dependency_chain_coords=[],
-        call_paths=[],
-        evidence_paths=[],
-        reason_code='',
-        verification_commands=[],
-        hops=[],
-        confidence_score=1.0,
-        critical_nodes_hit=[],
-        match_provenance='',
-        match_tier=-1,
-        old_version=str(api_row.get('old_version') or '').strip(),
-        new_version=str(api_row.get('new_version') or '').strip(),
-        capability_coverage=_capability_coverage_for_api(api_row, graph),
-    )
+    result = _new_trace_draft(api_row, graph)
     _step5_debug(
         'trace_api_start',
         'starting trace for api',
@@ -6291,6 +6458,37 @@ def trace_api_with_confidence_weighting(
         'not_analyzed': len(not_analyzed_candidates),
     })
     return result
+
+
+def trace_api_with_confidence_weighting(
+    api_row,
+    graph,
+    type_metadata,
+    max_total_cost=5,
+    needs_bridge=False,
+    has_dependency_source_mapping=True,
+    has_packaged_bytecode_fallback=False,
+    allow_degraded=False,
+    graph_stats=None,
+    trace_cache=None,
+):
+    draft = _collect_trace_api_with_confidence_weighting(
+        api_row,
+        graph,
+        type_metadata,
+        max_total_cost=max_total_cost,
+        needs_bridge=needs_bridge,
+        has_dependency_source_mapping=has_dependency_source_mapping,
+        has_packaged_bytecode_fallback=has_packaged_bytecode_fallback,
+        allow_degraded=allow_degraded,
+        graph_stats=graph_stats,
+        trace_cache=trace_cache,
+    )
+    if not isinstance(draft, TraceDraft):
+        raise TypeError(
+            "Step5 evidence collector must return TraceDraft before terminal rendering"
+        )
+    return _finalize_trace_draft(draft)
 
 
 def append_unique(keys, value):
@@ -8515,6 +8713,36 @@ def _candidate_reachability_path(result, candidate, complete, reason_code, note)
     has_business_entry = bool(candidate.get('entry_point')) or any(
         getattr(edge, 'owner_coord', '') == 'BUSINESS' for edge in path_edges
     )
+    typed_evidence = []
+    for edge in path_edges:
+        owner_coord = str(getattr(edge, 'owner_coord', '') or '')
+        instruction_offset = _normalized_instruction_offset(
+            getattr(edge, 'instruction_offset', None)
+        )
+        typed_evidence.append(PhysicalCallEdge(
+            caller_symbol=str(
+                getattr(edge, 'caller_qualified_key', '')
+                or getattr(edge, 'caller_symbol_id', '')
+            ),
+            callee_key=str(getattr(edge, 'callee_key', '') or ''),
+            evidence_type=str(getattr(edge, 'evidence_type', '') or ''),
+            owner_scope=classify_module_scope({
+                'coord': (
+                    '__business__'
+                    if owner_coord in {'BUSINESS', '业务制品'}
+                    else owner_coord
+                ),
+                'application_owned': bool(
+                    getattr(edge, 'application_owned', False)
+                ),
+            }),
+            owner_coord=owner_coord,
+            artifact=str(getattr(edge, 'file', '') or ''),
+            confidence=str(getattr(edge, 'confidence', 'high') or 'high'),
+            instruction_offset=(
+                int(instruction_offset) if instruction_offset is not None else -1
+            ),
+        ))
     return ReachabilityPath(
         path_text=path_text,
         entry_scope=(
@@ -8528,6 +8756,7 @@ def _candidate_reachability_path(result, candidate, complete, reason_code, note)
         reason_code=reason_code,
         note=note,
         depth=int(candidate.get('depth') or len(path_edges) or 1),
+        evidence=tuple(typed_evidence),
     )
 
 
@@ -8908,35 +9137,15 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
             # A malformed Step4 row must never disappear from the denominator:
             # users need to see why an API could not be traced, rather than a
             # deceptively smaller ``total_apis`` in summary.json.
-            result = TraceResult(
-                api_name='',
-                api_simple=str(api_row.get('api_simple') or ''),
-                api_signature=str(api_row.get('api_signature') or ''),
-                symbol_kind=str(api_row.get('symbol_kind') or ''),
-                change_type=str(api_row.get('change_type') or ''),
-                coord=str(api_row.get('coord') or ''),
-                severity=str(api_row.get('severity') or ''),
-                confirmed=str(api_row.get('confirmed') or '').lower() == 'true',
-                source=str(api_row.get('source') or ''),
-                analysis_scope=str(api_row.get('analysis_scope') or 'api'),
-                analysis_status='pending',
-                direct_callers=0,
-                is_reachable=None,
-                reachable_note='',
-                business_reach_depth=0,
-                dependency_chain_coords=[],
-                call_paths=[], evidence_paths=[],
-                reason_code='', verification_commands=[], hops=[],
-                confidence_score=0.0, critical_nodes_hit=[],
-                old_version=str(api_row.get('old_version') or '').strip(),
-                new_version=str(api_row.get('new_version') or '').strip(),
-            )
+            draft = _new_trace_draft(api_row, graph)
+            draft.confidence_score = 0.0
             _apply_blocking_failure(
-                result,
+                draft,
                 'input-validation',
                 'MISSING_API_NAME',
                 '变更 API 清单缺少 api_name，无法建立精确目标符号。',
             )
+            result = _finalize_trace_draft(draft)
             results.append(result)
             status_counts['not_analyzed'] += 1
             continue

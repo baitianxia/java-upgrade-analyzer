@@ -269,7 +269,11 @@ def _framework_batch(adapter, version, status, nodes, edges, findings, errors, m
                     or ''
                 ),
                 artifact_entry=str(provenance.get('artifact_entry') or ''),
-                class_or_resource_entry=str(provenance.get('resource') or ''),
+                class_or_resource_entry=str(
+                    provenance.get('class_or_resource_entry')
+                    or provenance.get('resource')
+                    or ''
+                ),
                 parser=str(provenance.get('parser') or 'framework_adapter'),
                 evidence_source=_framework_edge_authority(normalized).value,
                 line=int(provenance.get('line') or 0),
@@ -1355,6 +1359,32 @@ def _mybatis_mapper_contracts(source_roots):
     return contracts, unregistered, errors
 
 
+def _mybatis_mapper_scan_evidence(source_roots):
+    evidence = []
+    errors = []
+    for path in _production_java_files(source_roots):
+        try:
+            source_text = _mask_java_comments(
+                path.read_text(encoding='utf-8', errors='replace')
+            )
+        except OSError as exc:
+            errors.append(f'{path}:mybatis_mapper_scan:{type(exc).__name__}')
+            continue
+        exact_annotation = bool(
+            re.search(r'@org\.mybatis\.spring\.annotation\.MapperScan\b', source_text)
+            or (
+                re.search(
+                    r'\bimport\s+org\.mybatis\.spring\.annotation\.MapperScan\s*;',
+                    source_text,
+                )
+                and re.search(r'@MapperScan\b', source_text)
+            )
+        )
+        if exact_annotation:
+            evidence.append({'file': str(path), 'annotation': 'MapperScan'})
+    return evidence, errors
+
+
 def _mybatis_runtime_entry(artifact_catalog):
     matches = []
     errors = []
@@ -1465,6 +1495,7 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog):
                     or b'Lorg/springframework/boot/autoconfigure/EnableAutoConfiguration;' in content
                 ) and b'org/springframework/boot/SpringApplication' in content and b'run' in content:
                     activation.append({
+                        'artifact_path': str(artifact),
                         'artifact_entry': name,
                         'artifact_sha256': str(artifact_catalog.get('final_artifact_sha256') or ''),
                         'authority': 'current_final_artifact_classfile',
@@ -1509,11 +1540,13 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog):
                 verified['artifact_entry'] = class_entry
                 verified['final_artifact_sha256'] = final_artifact_sha256
                 verified['mapper_registration'] = {
+                    'artifact_path': str(artifact),
                     'artifact_entry': class_entry,
                     'artifact_sha256': final_artifact_sha256,
                     'authority': 'current_final_artifact_classfile',
                 }
                 verified['binding_evidence'] = {
+                    'artifact_path': str(artifact),
                     'artifact_entry': binding_entry,
                     'artifact_sha256': final_artifact_sha256,
                     'authority': (
@@ -1594,6 +1627,7 @@ def _mybatis_select_runtime_target(contract):
 
 def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
     """Resolve registered mapper calls through the exact packaged MyBatis proxy runtime."""
+    mapper_scan_evidence, mapper_scan_errors = _mybatis_mapper_scan_evidence(source_roots)
     runtime_entry, runtime_errors, runtime_matches = _mybatis_runtime_entry(artifact_catalog)
     if not runtime_entry:
         untrusted_runtime_hint = any(
@@ -1608,15 +1642,25 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
             'subject': 'org.apache.ibatis.binding.MapperProxy',
             'candidate_count': runtime_matches,
         }] if untrusted_runtime_hint else [])
+        if mapper_scan_evidence:
+            findings.append({
+                'reason_code': 'mybatis_mapper_scan_unresolved',
+                'subject': ','.join(
+                    sorted(item['file'] for item in mapper_scan_evidence)
+                ),
+                'candidate_count': len(mapper_scan_evidence),
+            })
+        early_errors = [*runtime_errors, *mapper_scan_errors]
         return _framework_batch(
             'mybatis_mapper_proxy', '2',
-            'partial' if runtime_errors or findings else 'not_applicable',
-            [], [], findings, runtime_errors,
+            'partial' if early_errors or findings else 'not_applicable',
+            [], [], findings, early_errors,
             {'registered_mapper_methods': 0, 'unregistered_mapper_methods': 0,
              'runtime_candidates': runtime_matches, 'verified_dispatch_stages': 0,
-             'edges': 0},
+             'mapper_scan_configurations': len(mapper_scan_evidence), 'edges': 0},
         )
     source_contracts, source_unregistered, errors = _mybatis_mapper_contracts(source_roots)
+    errors.extend(mapper_scan_errors)
     contracts, unregistered, activation_evidence, packaged_errors = _packaged_mybatis_contracts(
         source_contracts + source_unregistered, artifact_catalog
     )
@@ -1631,6 +1675,12 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
         'subject': f"{item['owner']}.{item['member']}",
         'file': item['file'],
     } for item in unregistered]
+    if mapper_scan_evidence:
+        findings.append({
+            'reason_code': 'mybatis_mapper_scan_unresolved',
+            'subject': ','.join(sorted(item['file'] for item in mapper_scan_evidence)),
+            'candidate_count': len(mapper_scan_evidence),
+        })
     if contracts and not activation_evidence:
         findings.append({
             'reason_code': 'mybatis_runtime_activation_unproven',
@@ -1673,6 +1723,9 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
                     'binding_file': contract['binding_file'],
                     'command': contract['command'],
                     'final_artifact_sha256': contract['final_artifact_sha256'],
+                    'final_artifact_path': str(
+                        contract['file'].split('!/', 1)[0]
+                    ),
                     'mapper_registration': contract['mapper_registration'],
                     'binding_evidence': contract['binding_evidence'],
                     'jar': str(runtime_entry.get('jar_path') or ''),
@@ -1696,6 +1749,10 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
                         }[stage])),
                         'artifact_entry': runtime_entry.get('artifact_entry'),
                         'artifact_sha256': runtime_entry.get('sha256'),
+                        'class_or_resource_entry': (
+                            target.split('(', 1)[0].rsplit('.', 1)[0]
+                            .replace('.', '/') + '.class'
+                        ),
                     },
                     'authority': 'final_artifact_javap',
                 }
@@ -1704,6 +1761,7 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
                     'source_owner': contract['owner'],
                     'source_member': contract['member'],
                     'source_parameters': contract['parameters'],
+                    'source_return_type': contract['return_type'],
                     'parameter_count': contract['parameter_count'],
                     'target': target,
                     'edge_kind': 'mybatis_mapper_proxy_dispatch',
@@ -1713,9 +1771,10 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
                     'provenance': provenance,
                 })
                 nodes.append({'id': target, 'kind': 'mybatis_proxy_runtime_method'})
-    applicable = bool(contracts or unregistered)
+    applicable = bool(contracts or unregistered or mapper_scan_evidence)
     unresolved = bool(applicable and (
         not contracts or not activation_evidence or not runtime_entry or not runtime_complete
+        or mapper_scan_evidence
     ))
     return _framework_batch(
         'mybatis_mapper_proxy', '2',
@@ -1726,6 +1785,7 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
             'unregistered_mapper_methods': len(unregistered),
             'runtime_candidates': runtime_matches,
             'verified_dispatch_stages': sum(bool(value) for value in dispatch.values()),
+            'mapper_scan_configurations': len(mapper_scan_evidence),
             'edges': len(edges),
         },
     )
@@ -2069,6 +2129,57 @@ def _spring_boot_business_activation(source_roots):
                 'business_entry': f'{owner}.main' if owner and spring_application_run else owner,
             })
     return evidence, errors
+
+
+def _verified_spring_boot_business_activation(activation_evidence, artifact_catalog):
+    business_entries = [
+        item for item in (artifact_catalog or {}).get('entries') or []
+        if str(item.get('coord') or '').strip() == '__business__'
+        and Path(str(item.get('jar_path') or '')).is_file()
+        and re.fullmatch(r'[0-9a-f]{64}', str(item.get('sha256') or ''))
+    ]
+    if len(business_entries) != 1:
+        return []
+    business = business_entries[0]
+    jar_path = Path(str(business.get('jar_path') or ''))
+    expected_sha256 = str(business.get('sha256') or '').lower()
+    try:
+        content = jar_path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != expected_sha256:
+            return []
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+    except (OSError, zipfile.BadZipFile):
+        return []
+    verified = []
+    for activation in activation_evidence or ():
+        business_entry = str(activation.get('business_entry') or '').strip()
+        owner = (
+            business_entry.rsplit('.', 1)[0]
+            if activation.get('spring_application_run') and business_entry.endswith('.main')
+            else business_entry
+        )
+        if not owner:
+            continue
+        logical_entry = owner.replace('.', '/') + '.class'
+        artifact_entry = next((
+            candidate for candidate in (
+                logical_entry,
+                f'BOOT-INF/classes/{logical_entry}',
+                f'WEB-INF/classes/{logical_entry}',
+            )
+            if candidate in names
+        ), '')
+        if not artifact_entry:
+            continue
+        verified.append({
+            **activation,
+            'artifact_path': str(jar_path),
+            'artifact_entry': artifact_entry,
+            'artifact_sha256': expected_sha256,
+            'authority': 'current_final_artifact_classfile',
+        })
+    return verified
 
 
 def _logical_properties(text):
@@ -2473,7 +2584,10 @@ def _packaged_transactional_methods(jar_path, owners):
 def run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=None):
     """Resolve @Transactional business calls through exact packaged Spring AOP methods."""
     transactional_methods, errors = _spring_transactional_business_methods(source_roots)
-    activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
+    source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
+    activation_evidence = _verified_spring_boot_business_activation(
+        source_activation_evidence, artifact_catalog,
+    )
     custom_mode_findings, custom_mode_errors = _spring_transaction_custom_mode(source_roots)
     errors.extend(activation_errors)
     errors.extend(custom_mode_errors)
@@ -2619,6 +2733,9 @@ def run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=None):
                         'jar': entry.get('jar_path'),
                         'artifact_entry': entry.get('artifact_entry'),
                         'artifact_sha256': entry.get('sha256'),
+                        'class_or_resource_entry': (
+                            implementation['owner'].replace('.', '/') + '.class'
+                        ),
                         'implementation_class': implementation['owner'],
                         'implementation_descriptor': implementation['descriptor'],
                         'business_activation': activation_evidence,
@@ -2650,7 +2767,15 @@ def run_spring_data_repository_adapter(source_roots, artifact_catalog=None):
     custom_configuration, custom_configuration_errors = (
         _spring_data_custom_repository_configuration(source_roots)
     )
-    activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
+    source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
+    activation_evidence = _verified_spring_boot_business_activation(
+        source_activation_evidence, artifact_catalog,
+    )
+    business_entries = [
+        item for item in (artifact_catalog or {}).get('entries') or []
+        if str(item.get('coord') or '').strip() == '__business__'
+        and Path(str(item.get('jar_path') or '')).is_file()
+    ]
     entries = [
         item for item in (artifact_catalog or {}).get('entries') or []
         if str(item.get('coord') or '').strip() == 'org.springframework.data:spring-data-jpa'
@@ -2747,8 +2872,15 @@ def run_spring_data_repository_adapter(source_roots, artifact_catalog=None):
                         'jar': jar_path,
                         'artifact_entry': entry.get('artifact_entry'),
                         'artifact_sha256': entry.get('sha256'),
+                        'class_or_resource_entry': (
+                            _SIMPLE_JPA_REPOSITORY.replace('.', '/') + '.class'
+                        ),
                         'implementation_class': _SIMPLE_JPA_REPOSITORY,
                         'implementation_descriptor': method['descriptor'],
+                        'business_artifact_sha256': (
+                            business_entries[0].get('sha256')
+                            if len(business_entries) == 1 else None
+                        ),
                         'business_activation': activation_evidence,
                         'authority': 'final_artifact_javap',
                     },
@@ -2951,7 +3083,10 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
     starts. Auto-configuration classes remain conditional: registration alone does not prove that
     a particular @Bean method executes.
     """
-    activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
+    source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
+    activation_evidence = _verified_spring_boot_business_activation(
+        source_activation_evidence, artifact_catalog,
+    )
     trusted_activation_evidence = activation_evidence if not activation_errors else []
     spring_boot_active = bool(trusted_activation_evidence)
     edges, nodes, findings = [], [], []
@@ -2971,6 +3106,8 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
             )
             errors.extend(callback_errors)
             for edge in callbacks:
+                edge_provenance = edge['provenance']
+                edge_provenance['artifact_sha256'] = item.get('sha256')
                 identity = (
                     'message_listener_adapter', edge['target'],
                     edge.get('target_descriptor'), jar_path,
@@ -3014,6 +3151,8 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
                                     'provenance': {
                                         'coord': coord,
                                         'jar': jar_path,
+                                        'artifact_entry': item.get('artifact_entry'),
+                                        'artifact_sha256': item.get('sha256'),
                                         'resource': factories_name,
                                         'line': line_no,
                                         'registration_type': registration_type,
@@ -3083,14 +3222,14 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
             'reason_code': 'spring_boot_activation_unproven',
             'subject': 'packaged_spring_registrations',
         })
-    applicable = bool(resource_files or activation_evidence or activation_errors)
+    applicable = bool(resource_files or source_activation_evidence or activation_errors)
     return _framework_batch(
         'spring_runtime_artifact', '1',
         'partial' if applicable and (errors or (resource_files and not spring_boot_active)) else _status(applicable, errors),
         nodes, edges, findings, errors,
         {
             'resource_files': resource_files,
-            'business_activation_files': len(activation_evidence),
+            'business_activation_files': len(source_activation_evidence),
             'active_callbacks': active_callbacks,
             'conditional_autoconfigurations': conditional_autoconfigurations,
             'edges': len(edges),

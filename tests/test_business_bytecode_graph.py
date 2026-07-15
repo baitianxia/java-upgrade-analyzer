@@ -131,7 +131,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         )
         self.assertEqual(
             dict(batch.metrics)["failures"],
-            ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"],
+            ("CURRENT_FINAL_ARTIFACT_SHA_INVALID",),
         )
 
     def test_collect_business_bytecode_batch_records_javap_parser_across_cache_hit(self):
@@ -237,6 +237,22 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         self.assertEqual(by_type["bytecode_field_access"]["callee_key"], "com.acme.Flags.ENABLED")
         self.assertTrue(all(edge["caller_name"] == "execute" for edge in edges))
 
+    def test_parse_javap_calls_retains_offsets_for_repeated_physical_calls(self):
+        text = """
+  public void execute();
+    descriptor: ()V
+    Code:
+       1: invokestatic #7 // Method com/acme/Target.hit:()V
+       4: invokestatic #7 // Method com/acme/Target.hit:()V
+"""
+
+        calls = [
+            edge for edge in parse_javap_calls(text, "com.acme.Service")
+            if edge["callee_key"] == "com.acme.Target.hit()"
+        ]
+
+        self.assertEqual([edge["instruction_offset"] for edge in calls], [1, 4])
+
     def test_parse_javap_verbose_emits_type_and_invokedynamic_edges(self):
         text = """
   #12 = Class #13 // com/acme/AnnotationType
@@ -312,6 +328,52 @@ public class Service {
             any(key.startswith("com.acme.Service.lambda$execute$0")
                 for key in by_type["bytecode_invokedynamic_method_reference"])
         )
+
+    def test_collected_physical_calls_retain_distinct_jvm_instruction_offsets(self):
+        if not shutil.which("javac"):
+            self.skipTest("javac not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src" / "com" / "acme"
+            source.mkdir(parents=True)
+            (source / "Target.java").write_text(
+                "package com.acme; public class Target { public static void hit() {} }\n",
+                encoding="utf-8",
+            )
+            (source / "Service.java").write_text(
+                "package com.acme; public class Service { public void run() { "
+                "Target.hit(); Target.hit(); } }\n",
+                encoding="utf-8",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(classes)] + [str(path) for path in source.glob("*.java")],
+                check=True,
+                capture_output=True,
+            )
+            jar_path = root / "application.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                for class_file in classes.rglob("*.class"):
+                    archive.write(class_file, class_file.relative_to(classes).as_posix())
+
+            batch = collect_business_bytecode_batch([], {
+                "by_coord": {"__business__": {
+                    "jar_path": str(jar_path),
+                    "sha256": "a" * 64,
+                }},
+            }, None)
+
+        calls = [
+            edge for edge in batch.edges
+            if edge.callee_symbol == "com.acme.Target.hit()"
+        ]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            len({edge.provenance.instruction_offset for edge in calls}),
+            2,
+        )
+        self.assertTrue(all(edge.provenance.instruction_offset >= 0 for edge in calls))
 
     def test_parse_classfile_calls_resolves_method_reference_bootstrap_target(self):
         if not shutil.which("javac"):

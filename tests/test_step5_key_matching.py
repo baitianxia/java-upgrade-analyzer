@@ -31,10 +31,24 @@ import s4_jar_compare  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
 import s6_report  # noqa: E402
 from step5_evidence_ingestion import ingest_collector_batches  # noqa: E402
+from step5_evidence_model import (  # noqa: E402
+    CollectorBatch,
+    CoverageRecord,
+    EvidenceConcern,
+    EvidenceFailure,
+)
 from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def _draft_from_result(self, result):
+        values = {
+            name: getattr(result, name)
+            for name in tracer.TraceDraft.__dataclass_fields__
+            if hasattr(result, name)
+        }
+        return tracer.TraceDraft(**values)
+
     def _verified_composite_framework_edge(self, **changes):
         artifact_entry = "BOOT-INF/classes/app/Application.class"
         framework_entry = "BOOT-INF/lib/spring-tx.jar"
@@ -2480,7 +2494,9 @@ BootstrapMethods:
             "jar_path": "/tmp/application.jar!/BOOT-INF/lib/library.jar",
         }
 
-        built = tracer._build_packaged_dependency_hit_result(result, [hit], graph)
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit], graph)
+        built = tracer._finalize_trace_draft(draft)
 
         self.assertEqual(built.analysis_status, "reachable")
         self.assertEqual(built.business_reach_depth, 2)
@@ -3311,7 +3327,8 @@ public class com.example.TargetBridge {
             for idx in range(8)
         ]
 
-        tracer._build_packaged_dependency_hit_result(result, hits, graph)
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, hits, graph)
 
         self.assertTrue(graph._prefer_runtime_dependency_member_candidate_index)
 
@@ -3521,11 +3538,15 @@ public class com.example.TargetBridge {
         )
 
     def test_inlined_constant_miss_remains_uncertain(self):
-        result = SimpleNamespace(
-            analysis_status="not_found_in_static_analysis", is_reachable=False,
-            reason_code="NO_STATIC_PATH", reachable_note="", verification_commands=[],
-        )
-        updated = tracer._build_inlined_constant_result(result)
+        draft = tracer._new_trace_draft({
+            "api_name": "com.vendor.Flags.RETRY_LIMIT",
+            "api_simple": "RETRY_LIMIT",
+            "symbol_kind": "field",
+            "change_type": "CONSTANT_VALUE_CHANGED",
+            "coord": "com.vendor:flags",
+        })
+        tracer._build_inlined_constant_result(draft)
+        updated = tracer._finalize_trace_draft(draft)
         self.assertEqual(updated.analysis_status, "uncertain")
         self.assertIsNone(updated.is_reachable)
         self.assertEqual(updated.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
@@ -4988,22 +5009,140 @@ public class com.example.TargetBridge {
         graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
         type_metadata = {}
 
-        result = tracer.trace_api_with_confidence_weighting(
-            api_row,
-            graph,
-            type_metadata,
-            max_total_cost=5,
-            graph_stats={
-                "truncated": True,
-                "truncation_reasons": ["max_methods"],
-                "parser_fallback_reasons": {},
-                "edge_cap_hits": 0,
-            },
-        )
+        with patch.object(
+            tracer, "decide_envelope", wraps=tracer.decide_envelope,
+        ) as decide, patch.object(
+            tracer, "render_trace_result", wraps=tracer.render_trace_result,
+        ) as render:
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                type_metadata,
+                max_total_cost=5,
+                graph_stats={
+                    "truncated": True,
+                    "truncation_reasons": ["max_methods"],
+                    "parser_fallback_reasons": {},
+                    "edge_cap_hits": 0,
+                },
+            )
 
+        decide.assert_called_once()
+        render.assert_called_once()
         self.assertEqual(result.analysis_status, "not_analyzed")
         self.assertEqual(result.reason_code, "ANALYSIS_INCOMPLETE")
         self.assertIn("图构建被截断", result.reachable_note)
+
+    def test_trace_api_consumes_partial_collector_coverage_from_graph(self):
+        api_row = {
+            "api_name": "com.vendor.TargetApi.call",
+            "api_simple": "call",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "method_changed",
+            "coord": "vendor:demo",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "gitdiff",
+            "analysis_scope": "method",
+        }
+        identity = tracer.indirect_api_key(api_row)
+        global_partial = CoverageRecord(
+            collector="spring_runtime_artifact",
+            api_identity="spring_runtime_artifact",
+            status="partial",
+            reason_codes=("FRAMEWORK_SCAN_PARTIAL",),
+        )
+        per_api_complete = CoverageRecord(
+            collector="spring_runtime_artifact",
+            api_identity=identity,
+            status="complete",
+        )
+        for records in (
+            (global_partial, per_api_complete),
+            (per_api_complete, global_partial),
+        ):
+            with self.subTest(order=[item.status for item in records]):
+                graph = SimpleNamespace(
+                    methods_by_id={},
+                    reverse_edges={},
+                    step5_collector_coverage=records,
+                )
+                with patch.object(
+                    tracer, "_capability_coverage_for_api", return_value={},
+                ):
+                    result = tracer.trace_api_with_confidence_weighting(
+                        api_row, graph, {}
+                    )
+
+                self.assertEqual(result.analysis_status, "not_analyzed")
+                self.assertEqual(
+                    result.reason_code, "INCOMPLETE_EVIDENCE_COVERAGE"
+                )
+
+    def test_trace_api_consumes_ingestion_failures_from_graph(self):
+        api_row = {
+            "api_name": "com.vendor.TargetApi.call",
+            "api_simple": "call",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "method_changed",
+            "coord": "vendor:demo",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "gitdiff",
+            "analysis_scope": "method",
+        }
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={},
+            step5_evidence_failures=(EvidenceFailure(
+                stage="framework-ingestion",
+                reason_code="FRAMEWORK_EDGE_REJECTED",
+                blocking=True,
+            ),),
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {})
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "FRAMEWORK_EDGE_REJECTED")
+
+    def test_trace_api_consumes_ingestion_concerns_from_graph(self):
+        api_row = {
+            "api_name": "com.vendor.TargetApi.call",
+            "api_simple": "call",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "method_changed",
+            "coord": "vendor:demo",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "gitdiff",
+            "analysis_scope": "method",
+        }
+        identity = tracer.indirect_api_key(api_row)
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="indirect_usage",
+            version="1",
+            concerns=(EvidenceConcern(
+                stage="dynamic-analysis",
+                reason_code="DYNAMIC_GAP",
+                detail="动态目标无法唯一解析",
+                api_identity=identity,
+            ),),
+            coverage=(CoverageRecord(
+                collector="indirect_usage",
+                api_identity=identity,
+                status="complete",
+            ),),
+        ),))
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {})
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "DYNAMIC_GAP")
 
     def test_assess_graph_completeness_ignores_kotlin_only_fallbacks(self):
         completeness = tracer.assess_graph_completeness(
@@ -9897,11 +10036,17 @@ public class com.example.TargetBridge {
             "symbol_kind": "method", "change_type": "REMOVED", "severity": "P0",
         }]
 
-        with patch.object(tracer, "collect_graph_analyzer_edges"), \
+        with patch.object(
+            tracer, "decide_envelope", wraps=tracer.decide_envelope,
+        ) as decide, patch.object(
+            tracer, "render_trace_result", wraps=tracer.render_trace_result,
+        ) as render, patch.object(tracer, "collect_graph_analyzer_edges"), \
              patch.object(tracer, "write_analyzer_edge_ledger"), \
              patch.object(tracer, "_emit_step5_perf_summary"):
             results = tracer.trace_all_apis_with_confidence_weighting(rows, None, {})
 
+        decide.assert_called_once()
+        render.assert_called_once()
         self.assertEqual(1, len(results))
         self.assertEqual("not_analyzed", results[0].analysis_status)
         self.assertEqual("MISSING_API_NAME", results[0].reason_code)
@@ -10586,7 +10731,9 @@ public class com.example.TargetBridge {
             "evidence_type": "bytecode_method_invocation",
         }
 
-        built = tracer._build_packaged_dependency_hit_result(result, [hit], graph)
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit], graph)
+        built = tracer._finalize_trace_draft(draft)
 
         self.assertEqual(built.analysis_status, "reachable")
         self.assertEqual(built.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
@@ -10616,7 +10763,9 @@ public class com.example.TargetBridge {
                 "evidence": [],
             }],
         )
-        merged = tracer._merge_runtime_framework_paths(generic, [hit], graph)
+        merged_draft = self._draft_from_result(generic)
+        tracer._merge_runtime_framework_paths(merged_draft, [hit], graph)
+        merged = tracer._finalize_trace_draft(merged_draft)
         self.assertEqual(merged.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
         self.assertTrue(any(
             "com.acme.Application.main -> Spring Boot框架注册" in item["path_text"]
@@ -16576,7 +16725,9 @@ public class com.example.consumer.ReflectiveCall {
             "jar_path": "/tmp/consumer-lib.jar",
         }
 
-        built = tracer._build_packaged_dependency_hit_result(result, [hit], graph)
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit], graph)
+        built = tracer._finalize_trace_draft(draft)
 
         self.assertEqual(built.analysis_status, "reachable")
         self.assertEqual(built.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
@@ -17640,7 +17791,9 @@ public class com.example.consumer.Adapter {
             "signature_ambiguous": True, "evidence_type": "bytecode_method_invocation",
         }
 
-        built = tracer._build_packaged_dependency_hit_result(result, [hit])
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit])
+        built = tracer._finalize_trace_draft(draft)
 
         self.assertEqual(built.analysis_status, "uncertain")
         self.assertIsNone(built.is_reachable)
@@ -17674,7 +17827,9 @@ public class com.example.consumer.Adapter {
             },
         ]
 
-        built = tracer._build_packaged_dependency_hit_result(result, hits)
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, hits)
+        built = tracer._finalize_trace_draft(draft)
 
         self.assertEqual(built.analysis_status, "uncertain")
         self.assertIsNone(built.is_reachable)
@@ -17794,6 +17949,35 @@ public class com.example.consumer.Adapter {
         self.assertTrue(index["failures"])
         self.assertIsNone(
             tracer._candidate_tasks_from_runtime_member_index(index, "com.acme.Api", "call")
+        )
+        self.assertTrue(graph._analyzer_edge_failures)
+
+    def test_member_index_late_archive_failure_invalidates_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "late-broken.jar"
+            jar_path.write_bytes(b"not-a-zip")
+            graph = SimpleNamespace()
+            index = {
+                "complete": True,
+                "failures": [],
+                "tasks": [],
+                "unparsed_tasks": [{
+                    "coord": "com.acme:late-broken",
+                    "jar_path": str(jar_path),
+                    "class_entry": "com/acme/Caller.class",
+                    "graph": graph,
+                }],
+            }
+
+            candidates = tracer._candidate_tasks_from_runtime_member_index(
+                index, "com.acme.Api", "call"
+            )
+
+        self.assertIsNone(candidates)
+        self.assertFalse(index["complete"])
+        self.assertEqual(
+            index["failures"][0]["reason"],
+            "BYTECODE_MEMBER_INDEX_LATE_ARCHIVE_FAILED",
         )
         self.assertTrue(graph._analyzer_edge_failures)
 

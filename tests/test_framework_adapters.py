@@ -621,6 +621,49 @@ class FrameworkAdaptersTest(unittest.TestCase):
             for finding in fallback["findings"]
         ))
 
+    def test_mybatis_mapper_scan_is_partial_instead_of_not_applicable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; "
+                "@org.springframework.boot.autoconfigure.SpringBootApplication "
+                "@org.mybatis.spring.annotation.MapperScan(\"com.acme.dao\") "
+                "class Application { public static void main(String[] args) { "
+                "org.springframework.boot.SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            dao = java / "dao/CityDao.java"
+            dao.parent.mkdir(parents=True)
+            dao.write_text(
+                "package com.acme.dao; public interface CityDao { "
+                "@org.apache.ibatis.annotations.Select(\"select 1\") "
+                "Object find(String state); }",
+                encoding="utf-8",
+            )
+            catalog = self._mybatis_runtime_catalog(module)
+
+            adapter = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=catalog,
+            )
+            missing_runtime = run_mybatis_proxy_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog={"entries": []},
+            )
+
+        self.assertEqual(adapter["status"], "partial")
+        self.assertTrue(any(
+            finding["reason_code"] == "mybatis_mapper_scan_unresolved"
+            for finding in adapter["findings"]
+        ))
+        self.assertEqual(missing_runtime["status"], "partial")
+        self.assertTrue(any(
+            finding["reason_code"] == "mybatis_mapper_scan_unresolved"
+            for finding in missing_runtime["findings"]
+        ))
+
     def test_mybatis_source_mapper_and_xml_must_exist_in_final_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = Path(tmp)
@@ -1010,6 +1053,8 @@ class FrameworkAdaptersTest(unittest.TestCase):
             with zipfile.ZipFile(business_jar, "w") as jar:
                 for class_file in business_classes.rglob("*.class"):
                     jar.write(class_file, class_file.relative_to(business_classes).as_posix())
+                jar.writestr("com/acme/Application.class", b"packaged-application")
+            business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
 
             payload = run_framework_adapters(
                 [{"root": str(module / "src/main/java"), "owner_type": "business"}],
@@ -1024,7 +1069,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     },
                     {
                         "coord": "__business__", "jar_path": str(business_jar),
-                        "artifact_entry": "<business-classes>", "sha256": "c" * 64,
+                        "artifact_entry": "<business-classes>", "sha256": business_sha,
                     },
                 ]},
             )
@@ -1044,20 +1089,41 @@ class FrameworkAdaptersTest(unittest.TestCase):
         })
         self.assertTrue(all(
             edge["provenance"]["authority"] == "final_artifact_javap"
-            and edge["provenance"]["business_artifact_sha256"] == "c" * 64
+            and edge["provenance"]["business_artifact_sha256"] == business_sha
             and edge["provenance"]["business_activation"]
             for edge in adapter["edges"]
         ))
 
     def test_spring_transaction_proxy_links_only_callers_of_annotated_method(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        business_jar = Path(temp_dir.name) / "application.jar"
+        framework_jar = Path(temp_dir.name) / "spring-tx.jar"
+        with zipfile.ZipFile(business_jar, "w") as archive:
+            archive.writestr(
+                "BOOT-INF/classes/com/acme/Application.class", b"application"
+            )
+            archive.writestr(
+                "BOOT-INF/classes/com/acme/AppRunner.class", b"caller"
+            )
+        framework_class = (
+            "org/springframework/transaction/interceptor/"
+            "TransactionInterceptor.class"
+        )
+        with zipfile.ZipFile(framework_jar, "w") as archive:
+            archive.writestr(framework_class, b"transaction-interceptor")
+        business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+        framework_sha = hashlib.sha256(framework_jar.read_bytes()).hexdigest()
         caller = SimpleNamespace(
             caller_symbol_id="runner", caller_qualified_key="com.acme.AppRunner.run()",
             callee_key="com.acme.BookingService.book(String[])",
             callee_simple_key="book(String[])", evidence_type="bytecode_method_invocation",
             evidence_source="current_final_artifact", confidence="high",
-            file="business.jar!/AppRunner.class", line=12, content="invoke book",
+            file=(
+                f"{business_jar}!/BOOT-INF/classes/com/acme/AppRunner.class"
+            ), line=12, content="invoke book",
             owner_type="business", owner_coord="BUSINESS", module="app", is_test=False,
-            artifact_sha256="b" * 64,
+            artifact_sha256=business_sha,
             artifact_entry="BOOT-INF/classes/com/acme/AppRunner.class",
         )
         unrelated = SimpleNamespace(
@@ -1085,11 +1151,15 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 "parameter_count": 1, "edge_kind": "spring_transaction_proxy_dispatch",
                 "confidence": "high", "conditions": [], "ambiguity": False,
                 "provenance": {
-                    "jar": "/runtime/spring-tx.jar", "authority": "final_artifact_javap",
-                    "artifact_sha256": "a" * 64, "business_artifact_sha256": "b" * 64,
+                    "jar": str(framework_jar), "authority": "final_artifact_javap",
+                    "artifact_sha256": framework_sha,
+                    "class_or_resource_entry": framework_class,
+                    "business_artifact_sha256": business_sha,
                     "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "artifact_path": str(business_jar),
                         "artifact_entry": "BOOT-INF/classes/com/acme/Application.class",
-                        "artifact_sha256": "b" * 64,
+                        "artifact_sha256": business_sha,
                         "authority": "current_final_artifact_classfile",
                     }],
                 },
@@ -1181,15 +1251,26 @@ class FrameworkAdaptersTest(unittest.TestCase):
             with zipfile.ZipFile(jar_path, "w") as jar:
                 for class_file in classes.rglob("*.class"):
                     jar.write(class_file, class_file.relative_to(classes).as_posix())
+            business_jar = module / "application.jar"
+            with zipfile.ZipFile(business_jar, "w") as jar:
+                jar.writestr("BOOT-INF/classes/com/acme/Application.class", b"application")
+            business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
 
             payload = run_framework_adapters(
                 [{"root": str(module / "src/main/java"), "owner_type": "business"}],
-                artifact_catalog={"entries": [{
-                    "coord": "org.springframework.data:spring-data-jpa",
-                    "jar_path": str(jar_path),
-                    "artifact_entry": "BOOT-INF/lib/spring-data-jpa.jar",
-                    "sha256": "a" * 64,
-                }]},
+                artifact_catalog={"entries": [
+                    {
+                        "coord": "org.springframework.data:spring-data-jpa",
+                        "jar_path": str(jar_path),
+                        "artifact_entry": "BOOT-INF/lib/spring-data-jpa.jar",
+                        "sha256": "a" * 64,
+                    },
+                    {
+                        "coord": "__business__",
+                        "jar_path": str(business_jar),
+                        "sha256": business_sha,
+                    },
+                ]},
             )
 
         adapter = next(
@@ -1853,12 +1934,25 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     "org.springframework.boot.autoconfigure.EnableAutoConfiguration=\\\n"
                     "com.vendor.OptionalAutoConfiguration\n",
                 )
+            business_jar = module / "application.jar"
+            with zipfile.ZipFile(business_jar, "w") as jar:
+                jar.writestr("BOOT-INF/classes/com/acme/Application.class", b"application")
+            business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
             payload = run_framework_adapters(
                 [{"root": str(module / "src/main/java")}],
-                artifact_catalog={"entries": [{
-                    "coord": "com.vendor:runtime",
-                    "jar_path": str(runtime_jar),
-                }]},
+                artifact_catalog={"entries": [
+                    {
+                        "coord": "__business__",
+                        "jar_path": str(business_jar),
+                        "sha256": business_sha,
+                    },
+                    {
+                        "coord": "com.vendor:runtime",
+                        "jar_path": str(runtime_jar),
+                        "artifact_entry": "BOOT-INF/lib/runtime.jar",
+                        "sha256": "b" * 64,
+                    },
+                ]},
             )
 
         runtime = next(item for item in payload["adapters"] if item["adapter"] == "spring_runtime_artifact")
@@ -1872,6 +1966,115 @@ class FrameworkAdaptersTest(unittest.TestCase):
         stats = ingest_framework_payload(graph, payload)
         self.assertEqual(stats["runtime_framework_entry_methods"], 1)
         self.assertIn("com.vendor.RuntimeListener.onApplicationEvent", graph.framework_runtime_entry_methods)
+
+    def test_runtime_activation_requires_sha_bound_business_class_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp)
+            java = module / "src/main/java/com/acme"
+            java.mkdir(parents=True)
+            (java / "Application.java").write_text(
+                "package com.acme; import org.springframework.boot.SpringApplication; "
+                "class Application { public static void main(String[] args) { "
+                "SpringApplication.run(Application.class, args); } }",
+                encoding="utf-8",
+            )
+            business_jar = module / "application.jar"
+            with zipfile.ZipFile(business_jar, "w") as jar:
+                jar.writestr("BOOT-INF/classes/com/acme/Other.class", b"other")
+            runtime_jar = module / "runtime.jar"
+            with zipfile.ZipFile(runtime_jar, "w") as jar:
+                jar.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener="
+                    "com.vendor.RuntimeListener\n",
+                )
+            catalog = {"entries": [
+                {
+                    "coord": "__business__",
+                    "jar_path": str(business_jar),
+                    "sha256": hashlib.sha256(business_jar.read_bytes()).hexdigest(),
+                },
+                {
+                    "coord": "com.vendor:runtime",
+                    "jar_path": str(runtime_jar),
+                    "artifact_entry": "BOOT-INF/lib/runtime.jar",
+                    "sha256": "b" * 64,
+                },
+            ]}
+
+            unverified = framework_adapter_module.run_runtime_spring_registration_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=catalog,
+            )
+            with zipfile.ZipFile(business_jar, "a") as jar:
+                jar.writestr(
+                    "BOOT-INF/classes/com/acme/Application.class",
+                    b"application",
+                )
+            catalog["entries"][0]["sha256"] = hashlib.sha256(
+                business_jar.read_bytes()
+            ).hexdigest()
+            verified = framework_adapter_module.run_runtime_spring_registration_adapter(
+                [{"root": str(module / "src/main/java"), "owner_type": "business"}],
+                artifact_catalog=catalog,
+            )
+
+        unverified_callback = next(
+            edge for edge in unverified.edges
+            if edge.edge_kind == "spring_runtime_registered_callback"
+        )
+        verified_callback = next(
+            edge for edge in verified.edges
+            if edge.edge_kind == "spring_runtime_registered_callback"
+        )
+        self.assertEqual(dict(unverified_callback.metadata)["runtime_activation"], "unproven")
+        metadata = dict(verified_callback.metadata)
+        self.assertEqual(metadata["runtime_activation"], "active")
+        provenance = framework_adapter_module.thaw_evidence_value(
+            metadata["framework_provenance"]
+        )
+        self.assertEqual(provenance["artifact_sha256"], "b" * 64)
+        self.assertEqual(provenance["artifact_entry"], "BOOT-INF/lib/runtime.jar")
+        activation = provenance["business_activation"]
+        self.assertEqual(len(activation), 1)
+        self.assertEqual(activation[0]["business_entry"], "com.acme.Application.main")
+        self.assertEqual(
+            activation[0]["artifact_entry"],
+            "BOOT-INF/classes/com/acme/Application.class",
+        )
+        self.assertEqual(
+            activation[0]["artifact_sha256"],
+            catalog["entries"][0]["sha256"],
+        )
+        self.assertEqual(
+            activation[0]["authority"],
+            "current_final_artifact_classfile",
+        )
+
+    def test_runtime_activation_rejects_catalog_sha_that_does_not_match_jar_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            business_jar = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(business_jar, "w") as jar:
+                jar.writestr(
+                    "BOOT-INF/classes/com/acme/Application.class",
+                    b"actual-class-bytes",
+                )
+            activation = [{
+                "business_entry": "com.acme.Application.main",
+                "spring_application_run": True,
+            }]
+            catalog = {"entries": [{
+                "coord": "__business__",
+                "jar_path": str(business_jar),
+                "sha256": "a" * 64,
+            }]}
+
+            verified = framework_adapter_module._verified_spring_boot_business_activation(
+                activation,
+                catalog,
+            )
+
+        self.assertEqual(verified, [])
 
     @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
     def test_packaged_message_listener_adapter_registers_exact_business_callback(self):
@@ -1918,6 +2121,8 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     relative = class_file.relative_to(classes).as_posix()
                     if relative.startswith("com/acme/"):
                         jar.write(class_file, relative)
+                jar.writestr("com/acme/Boot.class", b"packaged-boot")
+            business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
             source_root = module / "src/main/java/com/acme"
             source_root.mkdir(parents=True)
             (source_root / "Boot.java").write_text(
@@ -1933,6 +2138,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     "coord": "__business__",
                     "jar_path": str(business_jar),
                     "evidence_source": "current_final_artifact",
+                    "sha256": business_sha,
                 }]},
             )
 

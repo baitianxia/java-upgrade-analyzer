@@ -4,10 +4,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import io
 import json
+from pathlib import Path
 import re
+import struct
 from types import SimpleNamespace
 from typing import Iterable, Mapping, Tuple
+import zipfile
+from xml.etree import ElementTree as ET
 
 from enhanced_source_analyzer import CallEdge
 from signature_utils import normalize_signature_for_lookup
@@ -566,6 +572,42 @@ _MYBATIS_PHYSICAL_TARGET_STAGES = {
     ): "select_one_dispatch",
 }
 
+_MYBATIS_TARGET_DESCRIPTORS = {
+    "org.apache.ibatis.binding.MapperProxy.invoke": (
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)"
+        "Ljava/lang/Object;"
+    ),
+    "org.apache.ibatis.binding.MapperMethod.execute": (
+        "(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)Ljava/lang/Object;"
+    ),
+    "org.apache.ibatis.session.SqlSession.selectOne": (
+        "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;"
+    ),
+}
+
+_MYBATIS_DISPATCH_REFS = (
+    (
+        "org/apache/ibatis/binding/MapperProxy.class",
+        "org/apache/ibatis/binding/MapperProxy$MapperMethodInvoker",
+        "invoke",
+        (
+            "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;"
+            "Lorg/apache/ibatis/session/SqlSession;)Ljava/lang/Object;"
+        ),
+    ),
+    (
+        "org/apache/ibatis/binding/MapperProxy$PlainMethodInvoker.class",
+        "org/apache/ibatis/binding/MapperMethod",
+        "execute",
+        "(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "org/apache/ibatis/binding/MapperMethod.class",
+        "org/apache/ibatis/session/SqlSession",
+        "selectOne",
+        "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+)
 
 def _mybatis_chain_is_complete(edge, edge_mapping, caller):
     metadata = _edge_metadata(edge)
@@ -583,9 +625,24 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
     runtime_sha = str(provenance.get("artifact_sha256") or "").lower()
     runtime_entry = str(provenance.get("artifact_entry") or "").strip()
     expected_dispatch_stage = _MYBATIS_PHYSICAL_TARGET_STAGES.get(target, "")
+    source_parameter_count = int(edge_mapping.get("parameter_count") or 0)
     caller_sha = str(getattr(caller, "artifact_sha256", "") or "")
     caller_entry = str(getattr(caller, "artifact_entry", "") or "")
     caller_file = str(getattr(caller, "file", "") or "")
+    final_artifact_path = str(
+        provenance.get("final_artifact_path") or ""
+    ).strip()
+    if not final_artifact_path:
+        final_artifact_path = str(provenance.get("file") or "").split("!/", 1)[0]
+    caller_artifact_path, separator, caller_file_entry = caller_file.partition("!/")
+    caller_descriptor = _mybatis_caller_descriptor(
+        caller_artifact_path,
+        caller_sha,
+        (caller_entry, caller_file_entry),
+        edge_mapping.get("source_owner"),
+        edge_mapping.get("source_member"),
+        source_parameter_count,
+    )
     activation_is_verified = any(
         isinstance(item, Mapping)
         and str(item.get("artifact_entry") or "").strip()
@@ -594,7 +651,76 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
         == final_artifact_sha
         and str(item.get("authority") or "") == "current_final_artifact_classfile"
         and bool(_business_class_entry(item.get("artifact_entry")))
+        and _artifact_evidence_matches_bytes(
+            item.get("artifact_path") or final_artifact_path,
+            final_artifact_sha,
+            (item.get("artifact_entry"),),
+        )
+        and _mybatis_activation_semantics_match(
+            item.get("artifact_path") or final_artifact_path,
+            final_artifact_sha,
+            item.get("artifact_entry"),
+        )
         for item in (activations if isinstance(activations, (list, tuple)) else ())
+    )
+    registration_is_verified = bool(
+        isinstance(registration, Mapping)
+        and _artifact_evidence_matches_bytes(
+            registration.get("artifact_path") or final_artifact_path,
+            final_artifact_sha,
+            (registration.get("artifact_entry"),),
+        )
+        and _mybatis_registration_semantics_match(
+            registration.get("artifact_path") or final_artifact_path,
+            final_artifact_sha,
+            registration.get("artifact_entry"),
+            edge_mapping.get("source_owner"),
+            edge_mapping.get("source_member"),
+            caller_descriptor,
+        )
+    )
+    binding_is_verified = bool(
+        isinstance(binding, Mapping)
+        and _artifact_evidence_matches_bytes(
+            binding.get("artifact_path") or final_artifact_path,
+            final_artifact_sha,
+            (binding.get("artifact_entry"),),
+        )
+        and _mybatis_binding_semantics_match(
+            binding.get("artifact_path") or final_artifact_path,
+            final_artifact_sha,
+            binding.get("artifact_entry"),
+            edge_mapping.get("source_owner"),
+            edge_mapping.get("source_member"),
+            provenance.get("command"),
+            caller_descriptor,
+        )
+    )
+    caller_is_verified = bool(
+        caller_entry
+        and caller_artifact_path
+        and (
+            not separator
+            or _business_class_entry(caller_file_entry)
+            == _business_class_entry(caller_entry)
+        )
+        and _artifact_evidence_matches_bytes(
+            caller_artifact_path,
+            caller_sha,
+            (caller_entry, caller_file_entry),
+        )
+        and caller_descriptor
+    )
+    runtime_is_verified = bool(
+        isinstance(physical_target, Mapping)
+        and _artifact_evidence_matches_bytes(
+            provenance.get("jar"),
+            runtime_sha,
+            (physical_target.get("class_or_resource_entry"),),
+        )
+        and _mybatis_runtime_semantics_match(
+            provenance.get("jar"), runtime_sha, target
+        )
     )
     return bool(
         target
@@ -602,6 +728,7 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
         and declared_target == target
         and str(edge_mapping.get("source_owner") or "").strip()
         and str(edge_mapping.get("source_member") or "").strip()
+        and caller_descriptor
         and str(provenance.get("file") or "").strip()
         and str(provenance.get("binding_file") or "").strip()
         and str(provenance.get("authority") or "") == "final_artifact_javap"
@@ -612,6 +739,7 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
         == "current_final_artifact_classfile"
         and str(registration.get("artifact_sha256") or "").lower()
         == final_artifact_sha
+        and registration_is_verified
         and isinstance(binding, Mapping)
         and str(binding.get("artifact_entry") or "").strip()
         and str(binding.get("authority") or "") in {
@@ -620,6 +748,7 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
         }
         and str(binding.get("artifact_sha256") or "").lower()
         == final_artifact_sha
+        and binding_is_verified
         and runtime_entry
         and _valid_sha256(runtime_sha)
         and isinstance(dispatch, Mapping)
@@ -637,6 +766,7 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
         == runtime_entry
         and str(physical_target.get("artifact_sha256") or "").lower()
         == runtime_sha
+        and runtime_is_verified
         and str(getattr(caller, "evidence_source", "") or "")
         == "current_final_artifact"
         and caller_entry
@@ -646,42 +776,489 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
             "!/" not in caller_file
             or caller_file.split("!/", 1)[1] == caller_entry
         )
+        and caller_is_verified
         and activation_is_verified
     )
 
 
 def _proxy_final_artifact_verified(provenance, caller, *, require_business_sha):
     caller_sha = str(getattr(caller, "artifact_sha256", "") or "").lower()
+    caller_entry = str(getattr(caller, "artifact_entry", "") or "").strip()
     business_sha = str(
         provenance.get("business_artifact_sha256") or caller_sha
     ).lower()
     activations = provenance.get("business_activation")
     activation_verified = any(
         isinstance(item, Mapping)
-        and (
-            bool(item.get("spring_application_run"))
-            or bool(item.get("spring_boot_annotation"))
-            or bool(str(item.get("business_entry") or "").strip())
-            or (
-                str(item.get("authority") or "")
-                == "current_final_artifact_classfile"
-                and str(item.get("artifact_entry") or "").strip()
-                and str(item.get("artifact_sha256") or "").lower()
-                == business_sha
-            )
-        )
+        and _activation_matches_business_artifact(item, business_sha)
         for item in (activations if isinstance(activations, (list, tuple)) else ())
+    )
+    logical_caller_entry = _business_class_entry(caller_entry)
+    caller_file = str(getattr(caller, "file", "") or "").strip()
+    caller_artifact_path, separator, caller_file_entry = caller_file.partition("!/")
+    caller_verified = bool(
+        caller_artifact_path
+        and logical_caller_entry
+        and (
+            not separator
+            or _business_class_entry(caller_file_entry) == logical_caller_entry
+        )
+        and _artifact_evidence_matches_bytes(
+            caller_artifact_path,
+            caller_sha,
+            (
+                caller_entry,
+                caller_file_entry,
+                logical_caller_entry,
+                f"BOOT-INF/classes/{logical_caller_entry}",
+                f"WEB-INF/classes/{logical_caller_entry}",
+            ),
+        )
+    )
+    framework_verified = _artifact_evidence_matches_bytes(
+        provenance.get("jar"),
+        provenance.get("artifact_sha256"),
+        (
+            provenance.get("class_or_resource_entry"),
+            provenance.get("resource"),
+        ),
     )
     return bool(
         str(provenance.get("authority") or "") == "final_artifact_javap"
-        and _valid_sha256(provenance.get("artifact_sha256"))
+        and framework_verified
         and _valid_sha256(caller_sha)
+        and caller_entry
         and (not require_business_sha or _valid_sha256(
             provenance.get("business_artifact_sha256")
         ))
         and business_sha == caller_sha
         and activation_verified
+        and caller_verified
     )
+
+
+def _activation_matches_business_artifact(activation, business_sha):
+    artifact_path = str(activation.get("artifact_path") or "").strip()
+    artifact_entry = str(activation.get("artifact_entry") or "").strip()
+    business_entry = str(activation.get("business_entry") or "").strip()
+    owner = (
+        business_entry.rsplit(".", 1)[0]
+        if business_entry.endswith(".main")
+        else business_entry
+    )
+    expected_entry = owner.replace(".", "/") + ".class" if owner else ""
+    return bool(
+        str(activation.get("authority") or "")
+        == "current_final_artifact_classfile"
+        and _valid_sha256(business_sha)
+        and str(activation.get("artifact_sha256") or "").lower() == business_sha
+        and artifact_entry
+        and expected_entry
+        and _business_class_entry(artifact_entry) == expected_entry
+        and _artifact_evidence_matches_bytes(
+            artifact_path, business_sha, (artifact_entry,)
+        )
+    )
+
+
+def _artifact_evidence_matches_bytes(artifact_path, artifact_sha256, entries):
+    return _read_artifact_entry_bytes(
+        artifact_path, artifact_sha256, entries
+    ) is not None
+
+
+def _read_artifact_entry_bytes(artifact_path, artifact_sha256, entries):
+    path = Path(str(artifact_path or ""))
+    expected_sha256 = str(artifact_sha256 or "").lower()
+    evidence_entries = tuple(str(item or "").strip() for item in entries if item)
+    if not path.is_file() or not _valid_sha256(expected_sha256) or not evidence_entries:
+        return None
+    try:
+        content = path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != expected_sha256:
+            return False
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+            for entry in evidence_entries:
+                if entry in names:
+                    return archive.read(entry)
+                container_entry, separator, nested_entry = entry.partition("!/")
+                if not separator or container_entry not in names or not nested_entry:
+                    continue
+                try:
+                    with zipfile.ZipFile(
+                        io.BytesIO(archive.read(container_entry))
+                    ) as nested:
+                        if nested_entry in set(nested.namelist()):
+                            return nested.read(nested_entry)
+                except zipfile.BadZipFile:
+                    continue
+    except (OSError, zipfile.BadZipFile):
+        return None
+    return None
+
+
+def _classfile_semantics(data):
+    if not data or data[:4] != b"\xca\xfe\xba\xbe":
+        return None
+    try:
+        from business_bytecode_graph import (
+            _cp_class_name,
+            _cp_name_and_type,
+            _parse_classfile_constant_pool,
+        )
+
+        cp, offset = _parse_classfile_constant_pool(data)
+        if cp is None or offset + 8 > len(data):
+            return None
+        utf8_values = {
+            str(item.get("value") or "")
+            for item in cp.values()
+            if item.get("tag") == 1
+        }
+        method_refs = set()
+        for item in cp.values():
+            if item.get("tag") not in {10, 11}:
+                continue
+            owner = _cp_class_name(cp, item.get("class_index"))
+            name, descriptor = _cp_name_and_type(
+                cp, item.get("name_and_type_index")
+            )
+            method_refs.add((owner, name, descriptor))
+
+        this_class_index = struct.unpack_from(">H", data, offset + 2)[0]
+        class_internal_name = _cp_class_name(cp, this_class_index)
+        offset += 6
+        interface_count = struct.unpack_from(">H", data, offset)[0]
+        offset += 2 + interface_count * 2
+
+        def parse_element_value(position):
+            if position >= len(data):
+                raise ValueError("truncated annotation value")
+            tag = chr(data[position])
+            position += 1
+            if tag in "BCDFIJSZsc":
+                return position + 2
+            if tag == "e":
+                return position + 4
+            if tag == "@":
+                return parse_annotation(position)[0]
+            if tag == "[":
+                count = struct.unpack_from(">H", data, position)[0]
+                position += 2
+                for _ in range(count):
+                    position = parse_element_value(position)
+                return position
+            raise ValueError("unknown annotation value")
+
+        def parse_annotation(position):
+            type_index = struct.unpack_from(">H", data, position)[0]
+            pair_count = struct.unpack_from(">H", data, position + 2)[0]
+            position += 4
+            for _ in range(pair_count):
+                position += 2
+                position = parse_element_value(position)
+            descriptor = str((cp.get(type_index) or {}).get("value") or "")
+            return position, descriptor
+
+        def parse_annotations(position, length):
+            end = position + length
+            count = struct.unpack_from(">H", data, position)[0]
+            position += 2
+            annotations = set()
+            for _ in range(count):
+                position, descriptor = parse_annotation(position)
+                if descriptor:
+                    annotations.add(descriptor)
+            if position > end:
+                raise ValueError("truncated annotation attribute")
+            return annotations
+
+        def skip_members(position, *, collect=False):
+            count = struct.unpack_from(">H", data, position)[0]
+            position += 2
+            methods = set()
+            method_annotations = {}
+            for _ in range(count):
+                if position + 8 > len(data):
+                    raise ValueError("truncated class member")
+                name_index = struct.unpack_from(">H", data, position + 2)[0]
+                descriptor_index = struct.unpack_from(">H", data, position + 4)[0]
+                attribute_count = struct.unpack_from(">H", data, position + 6)[0]
+                method_identity = (
+                    str((cp.get(name_index) or {}).get("value") or ""),
+                    str((cp.get(descriptor_index) or {}).get("value") or ""),
+                )
+                if collect:
+                    methods.add(method_identity)
+                position += 8
+                for _attribute in range(attribute_count):
+                    if position + 6 > len(data):
+                        raise ValueError("truncated class attribute")
+                    attribute_name_index = struct.unpack_from(">H", data, position)[0]
+                    attribute_name = str(
+                        (cp.get(attribute_name_index) or {}).get("value") or ""
+                    )
+                    length = struct.unpack_from(">I", data, position + 2)[0]
+                    if collect and attribute_name in {
+                        "RuntimeVisibleAnnotations", "RuntimeInvisibleAnnotations",
+                    }:
+                        method_annotations.setdefault(method_identity, set()).update(
+                            parse_annotations(position + 6, length)
+                        )
+                    position += 6 + length
+                    if position > len(data):
+                        raise ValueError("truncated class attribute body")
+            return position, methods, method_annotations
+
+        offset, _fields, _field_annotations = skip_members(offset)
+        offset, methods, method_annotations = skip_members(offset, collect=True)
+        class_attribute_count = struct.unpack_from(">H", data, offset)[0]
+        offset += 2
+        class_annotations = set()
+        for _ in range(class_attribute_count):
+            if offset + 6 > len(data):
+                raise ValueError("truncated class attribute")
+            attribute_name_index = struct.unpack_from(">H", data, offset)[0]
+            attribute_name = str(
+                (cp.get(attribute_name_index) or {}).get("value") or ""
+            )
+            length = struct.unpack_from(">I", data, offset + 2)[0]
+            if attribute_name in {
+                "RuntimeVisibleAnnotations", "RuntimeInvisibleAnnotations",
+            }:
+                class_annotations.update(parse_annotations(offset + 6, length))
+            offset += 6 + length
+            if offset > len(data):
+                raise ValueError("truncated class attribute body")
+        return {
+            "class_internal_name": class_internal_name,
+            "class_annotations": class_annotations,
+            "utf8": utf8_values,
+            "method_refs": method_refs,
+            "methods": methods,
+            "method_annotations": method_annotations,
+        }
+    except (ImportError, IndexError, KeyError, struct.error, ValueError):
+        return None
+
+
+def _artifact_class_semantics(artifact_path, artifact_sha256, entries):
+    return _classfile_semantics(_read_artifact_entry_bytes(
+        artifact_path, artifact_sha256, entries
+    ))
+
+
+def _mybatis_activation_semantics_match(path, sha256, entry):
+    content = _read_artifact_entry_bytes(path, sha256, (entry,))
+    semantics = _classfile_semantics(content)
+    if not semantics:
+        return False
+    utf8_values = semantics["utf8"]
+    if not bool(
+        {
+            "Lorg/springframework/boot/autoconfigure/SpringBootApplication;",
+            "Lorg/springframework/boot/autoconfigure/EnableAutoConfiguration;",
+        }
+        & utf8_values
+        and "org/springframework/boot/SpringApplication" in utf8_values
+    ):
+        return False
+    try:
+        from business_bytecode_graph import parse_classfile_calls
+
+        calls = parse_classfile_calls(content, "activation.Application")
+    except ImportError:
+        return False
+    return bool(calls is not None and any(
+        str(call.get("caller_name") or "") == "main"
+        and str(call.get("caller_descriptor") or "") == "([Ljava/lang/String;)V"
+        and str(call.get("callee_jvm_owner") or "")
+        == "org.springframework.boot.SpringApplication"
+        and str(call.get("callee_descriptor") or "")
+        == (
+            "(Ljava/lang/Class;[Ljava/lang/String;)"
+            "Lorg/springframework/context/ConfigurableApplicationContext;"
+        )
+        for call in calls
+    ))
+
+
+def _java_type_descriptor(raw_type, owner, *, allow_void=False):
+    owner_package = str(owner or "").rpartition(".")[0]
+    primitives = {
+        "boolean": "Z", "byte": "B", "char": "C", "short": "S",
+        "int": "I", "long": "J", "float": "F", "double": "D",
+    }
+    java_lang = {
+        "Boolean", "Byte", "Character", "Short", "Integer", "Long",
+        "Float", "Double", "String", "Object", "Class", "Throwable",
+    }
+    value = re.sub(r"<.*>", "", str(raw_type or "").strip())
+    value = value.replace("...", "[]")
+    dimensions = 0
+    while value.endswith("[]"):
+        dimensions += 1
+        value = value[:-2].strip()
+    if allow_void and value == "void" and not dimensions:
+        return "V"
+    if value in primitives:
+        descriptor = primitives[value]
+    else:
+        if value in java_lang:
+            value = "java.lang." + value
+        elif "." not in value and owner_package:
+            value = owner_package + "." + value
+        if not value or "." not in value:
+            return ""
+        descriptor = "L" + value.replace(".", "/") + ";"
+    return "[" * dimensions + descriptor
+
+
+def _java_method_descriptor(parameters, return_type, owner):
+    if not isinstance(parameters, (list, tuple)):
+        return ""
+    parameter_descriptors = [
+        _java_type_descriptor(item, owner) for item in parameters
+    ]
+    return_descriptor = _java_type_descriptor(
+        return_type, owner, allow_void=True
+    )
+    if any(not item for item in parameter_descriptors) or not return_descriptor:
+        return ""
+    return "(" + "".join(parameter_descriptors) + ")" + return_descriptor
+
+
+def _method_descriptor_matches(methods, member, descriptor):
+    return any(
+        name == str(member or "")
+        and actual_descriptor == str(descriptor or "")
+        for name, actual_descriptor in methods
+    )
+
+
+def _mybatis_registration_semantics_match(
+    path, sha256, entry, owner, member, descriptor
+):
+    semantics = _artifact_class_semantics(path, sha256, (entry,))
+    return bool(
+        semantics
+        and semantics["class_internal_name"]
+        == str(owner or "").replace(".", "/")
+        and "Lorg/apache/ibatis/annotations/Mapper;"
+        in semantics["class_annotations"]
+        and _method_descriptor_matches(
+            semantics["methods"], member, descriptor
+        )
+    )
+
+
+def _mybatis_binding_semantics_match(
+    path, sha256, entry, owner, member, command, descriptor
+):
+    content = _read_artifact_entry_bytes(path, sha256, (entry,))
+    if not content:
+        return False
+    if str(entry or "").endswith(".xml"):
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:
+            return False
+        if str(root.tag).rsplit("}", 1)[-1] != "mapper":
+            return False
+        if str(root.attrib.get("namespace") or "").strip() != str(owner or ""):
+            return False
+        return any(
+            str(child.tag).rsplit("}", 1)[-1] == str(command or "")
+            and str(child.attrib.get("id") or "").strip() == str(member or "")
+            for child in root
+        )
+    semantics = _classfile_semantics(content)
+    annotation = str(command or "").strip().capitalize()
+    return bool(
+        semantics
+        and semantics["class_internal_name"]
+        == str(owner or "").replace(".", "/")
+        and annotation
+        and bool(
+            set(semantics["method_annotations"].get(
+                (str(member or ""), str(descriptor or "")), ()
+            ))
+            & {
+                f"Lorg/apache/ibatis/annotations/{annotation};",
+                f"Lorg/apache/ibatis/annotations/{annotation}Provider;",
+            }
+        )
+    )
+
+
+def _jvm_descriptor_parameter_count(descriptor):
+    value = str(descriptor or "")
+    if not value.startswith("(") or ")" not in value:
+        return -1
+    index = 1
+    count = 0
+    while index < len(value) and value[index] != ")":
+        while index < len(value) and value[index] == "[":
+            index += 1
+        if index >= len(value):
+            return -1
+        if value[index] == "L":
+            end = value.find(";", index)
+            if end < 0:
+                return -1
+            index = end + 1
+        elif value[index] in "ZBCSIJFD":
+            index += 1
+        else:
+            return -1
+        count += 1
+    return count if index < len(value) and value[index] == ")" else -1
+
+
+def _mybatis_caller_descriptor(
+    path, sha256, entries, owner, member, parameter_count
+):
+    semantics = _artifact_class_semantics(path, sha256, entries)
+    expected_owner = str(owner or "").replace(".", "/")
+    expected_member = str(member or "")
+    if not semantics:
+        return ""
+    descriptors = {
+        ref_descriptor
+        for ref_owner, ref_member, ref_descriptor in semantics["method_refs"]
+        if (
+            ref_owner == expected_owner
+            and ref_member == expected_member
+            and _jvm_descriptor_parameter_count(ref_descriptor)
+            == int(parameter_count)
+        )
+    }
+    return next(iter(descriptors)) if len(descriptors) == 1 else ""
+
+
+def _mybatis_runtime_semantics_match(path, sha256, target):
+    target_name = str(target or "").split("(", 1)[0]
+    target_owner, _, target_member = target_name.rpartition(".")
+    target_entry = target_owner.replace(".", "/") + ".class"
+    target_semantics = _artifact_class_semantics(path, sha256, (target_entry,))
+    expected_descriptor = _MYBATIS_TARGET_DESCRIPTORS.get(target_name)
+    if not target_semantics or (
+        target_member, expected_descriptor
+    ) not in target_semantics["methods"]:
+        return False
+    for (
+        class_entry, expected_owner, expected_member, expected_ref_descriptor
+    ) in _MYBATIS_DISPATCH_REFS:
+        semantics = _artifact_class_semantics(path, sha256, (class_entry,))
+        if not semantics or not any(
+            owner == expected_owner
+            and member == expected_member
+            and descriptor == expected_ref_descriptor
+            for owner, member, descriptor in semantics["method_refs"]
+        ):
+            return False
+    return True
 
 
 def _project_mybatis_proxy_edges(graph, records, reverse_edge_snapshot):
@@ -910,8 +1487,31 @@ def _framework_entry_candidates(
     return candidates
 
 
-def _activation_call_edge(batch, edge, edge_mapping, activation_method, callback_key):
+def _activation_call_edge(
+    batch, edge, edge_mapping, activation_method, callback_key, activation,
+):
     provenance = dict(edge_mapping.get("provenance") or {})
+    caller_artifact_path = str(activation.get("artifact_path") or "").strip()
+    caller_artifact_entry = str(activation.get("artifact_entry") or "").strip()
+    caller_artifact_sha = str(activation.get("artifact_sha256") or "").strip()
+    caller_file = caller_artifact_path
+    if caller_artifact_path and caller_artifact_entry:
+        caller_file = f"{caller_artifact_path}!/{caller_artifact_entry}"
+    framework_verified = bool(
+        _activation_matches_business_artifact(activation, caller_artifact_sha)
+        and _valid_sha256(edge.provenance.artifact_sha256)
+        and _artifact_evidence_matches_bytes(
+            edge.provenance.artifact_path,
+            edge.provenance.artifact_sha256,
+            (
+                edge.provenance.class_or_resource_entry,
+                edge.provenance.artifact_entry,
+            ),
+        )
+    )
+    caller_evidence_source = (
+        "current_final_artifact" if framework_verified else "source_ast"
+    )
     values = {
         "caller_symbol_id": getattr(activation_method, "symbol_id", ""),
         "caller_qualified_key": getattr(activation_method, "qualified_key", ""),
@@ -928,12 +1528,26 @@ def _activation_call_edge(batch, edge, edge_mapping, activation_method, callback
         "is_test": False,
         "framework_registration": True,
         "framework_source": edge_mapping.get("source") or "",
-        "framework_target": edge_mapping.get("target") or "",
+        "framework_target": callback_key or edge_mapping.get("target") or "",
         "framework_provenance": provenance,
         "runtime_activation": "active",
         "evidence_source": edge.provenance.evidence_source
         or edge.provenance.authority.value,
         "evidence_authority": edge.provenance.authority.value,
+        "artifact_sha256": edge.provenance.artifact_sha256,
+        "artifact_entry": edge.provenance.artifact_entry,
+        "semantic": True,
+        "collector": batch.collector,
+        "framework_final_artifact_verified": framework_verified,
+        "caller_evidence_source": caller_evidence_source,
+        "caller_evidence_authority": caller_evidence_source,
+        "caller_evidence_type": "spring_boot_activation",
+        "caller_artifact_sha256": caller_artifact_sha if framework_verified else "",
+        "caller_artifact_entry": caller_artifact_entry if framework_verified else "",
+        "caller_evidence_file": (
+            caller_file if framework_verified else str(activation.get("file") or "")
+        ),
+        "caller_evidence_line": 0,
     }
     values.update(_framework_evidence_fields(batch, edge))
     return SimpleNamespace(**values)
@@ -946,6 +1560,9 @@ def _project_framework_entries(graph, records):
     activation_linked_symbols = set()
     matched = 0
     unmatched = 0
+    final_artifact_mode = bool(
+        getattr(graph, "require_current_final_artifact_business_edges", False)
+    )
 
     for batch, edge, edge_mapping in records:
         if edge.edge_kind not in _FRAMEWORK_ENTRY_KINDS:
@@ -961,9 +1578,24 @@ def _project_framework_entries(graph, records):
             edge_mapping,
             target,
         )
-        if edge.edge_kind == "spring_runtime_registered_callback" and str(
-            edge_mapping.get("runtime_activation") or ""
-        ) == "active":
+        activations = list(
+            (edge_mapping.get("provenance") or {}).get("business_activation")
+            or ()
+        )
+        verified_activations = [
+            activation for activation in activations
+            if isinstance(activation, Mapping)
+            and _activation_matches_business_artifact(
+                activation,
+                str(activation.get("artifact_sha256") or "").lower(),
+            )
+        ]
+        callback_is_active = bool(
+            edge.edge_kind == "spring_runtime_registered_callback"
+            and str(edge_mapping.get("runtime_activation") or "") == "active"
+            and (verified_activations or not final_artifact_mode)
+        )
+        if callback_is_active:
             runtime_entries.setdefault(target.split("(", 1)[0], []).append({
                 **edge_mapping,
                 "adapter": batch.collector,
@@ -980,15 +1612,13 @@ def _project_framework_entries(graph, records):
             })
             matched += 1
             if not (
-                edge.edge_kind == "spring_runtime_registered_callback"
-                and str(edge_mapping.get("runtime_activation") or "") == "active"
+                callback_is_active
             ):
                 continue
-            activations = list(
-                (edge_mapping.get("provenance") or {}).get("business_activation")
-                or ()
+            active_activations = (
+                verified_activations if final_artifact_mode else activations
             )
-            for activation in activations:
+            for activation in active_activations:
                 activation_name = str(
                     (activation or {}).get("business_entry") or ""
                 ).strip()
@@ -1032,6 +1662,7 @@ def _project_framework_entries(graph, records):
                         edge_mapping,
                         activation_method,
                         callback_key,
+                        activation,
                     )
                     _append_call_edge(graph, callback_keys, synthetic)
                 activation_linked_symbols.add(method.symbol_id)
@@ -1097,6 +1728,11 @@ class EvidenceRegistry:
             for batch in self.batches
             for failure in batch.failures
         ]
+        concerns = tuple(
+            concern
+            for batch in self.batches
+            for concern in batch.concerns
+        )
         seen = set()
         duplicates = 0
         rejected = 0
@@ -1215,6 +1851,33 @@ class EvidenceRegistry:
         for batch in pre_framework_batches:
             ingest_ordinary_batch(batch)
 
+        replaced_framework_collectors = {
+            batch.collector for batch in framework_batches
+        }
+        all_prior_framework_records = tuple(
+            getattr(graph, "step5_framework_records", ()) or ()
+        )
+        stale_registry_identities = {
+            _edge_identity(edge)
+            for batch, edge, _mapping in all_prior_framework_records
+            if batch.collector in replaced_framework_collectors
+        }
+        if replaced_framework_collectors:
+            for lookup_key, edges in list(graph.reverse_edges.items()):
+                retained = [
+                    edge for edge in edges
+                    if not (
+                        str(getattr(edge, "collector", "") or "")
+                        in replaced_framework_collectors
+                        and bool(getattr(edge, "semantic", False))
+                        and bool(getattr(edge, "framework_registration", False))
+                    )
+                ]
+                if retained:
+                    graph.reverse_edges[lookup_key] = retained
+                else:
+                    graph.reverse_edges.pop(lookup_key, None)
+
         reverse_edge_snapshot = {
             key: list(edges)
             for key, edges in graph.reverse_edges.items()
@@ -1239,22 +1902,94 @@ class EvidenceRegistry:
                     _framework_edge_mapping(batch, edge),
                 ))
 
+        prior_framework_records = tuple(
+            record
+            for record in all_prior_framework_records
+            if record[0].collector not in replaced_framework_collectors
+        )
+        prior_framework_identities = {
+            _framework_edge_identity(batch, edge)
+            for batch, edge, _mapping in prior_framework_records
+        }
+        new_framework_records = []
+        for record in framework_records:
+            batch, edge, _mapping = record
+            identity = _framework_edge_identity(batch, edge)
+            if identity not in prior_framework_identities:
+                new_framework_records.append(record)
+                prior_framework_identities.add(identity)
+        graph.step5_framework_records = (
+            *prior_framework_records,
+            *new_framework_records,
+        )
         framework_stats = _project_framework_edges(
             graph,
-            framework_records,
+            graph.step5_framework_records,
             reverse_edge_snapshot,
         )
 
         for batch in post_framework_batches:
             ingest_ordinary_batch(batch)
 
-        graph.step5_evidence_registry = tuple(accepted_edges)
-        graph.step5_evidence_failures = tuple(failures)
-        graph.step5_evidence_failures_by_collector = tuple(failures_by_collector)
-        graph.step5_collector_coverage = tuple(
+        def cumulative(existing, additions):
+            merged = list(existing or ())
+            for item in additions:
+                if item not in merged:
+                    merged.append(item)
+            return tuple(merged)
+
+        prior_registry = tuple(
+            edge
+            for edge in (getattr(graph, "step5_evidence_registry", ()) or ())
+            if _edge_identity(edge) not in stale_registry_identities
+        )
+        graph.step5_evidence_registry = cumulative(prior_registry, accepted_edges)
+        prior_failures_by_collector = tuple(
+            item
+            for item in (
+                getattr(graph, "step5_evidence_failures_by_collector", ()) or ()
+            )
+            if item[0] not in replaced_framework_collectors
+        )
+        graph.step5_evidence_failures_by_collector = cumulative(
+            prior_failures_by_collector,
+            failures_by_collector,
+        )
+        graph.step5_evidence_failures = cumulative((), tuple(
+            failure
+            for _collector, failure in graph.step5_evidence_failures_by_collector
+        ))
+        prior_concerns_by_collector = tuple(
+            item
+            for item in (
+                getattr(graph, "step5_evidence_concerns_by_collector", ()) or ()
+            )
+            if item[0] not in replaced_framework_collectors
+        )
+        graph.step5_evidence_concerns_by_collector = cumulative(
+            prior_concerns_by_collector,
+            tuple(
+                (batch.collector, concern)
+                for batch in self.batches
+                for concern in batch.concerns
+            ),
+        )
+        graph.step5_evidence_concerns = cumulative((), tuple(
+            concern
+            for _collector, concern in graph.step5_evidence_concerns_by_collector
+        ))
+        prior_coverage = tuple(
+            coverage
+            for coverage in (getattr(graph, "step5_collector_coverage", ()) or ())
+            if coverage.collector not in replaced_framework_collectors
+        )
+        graph.step5_collector_coverage = cumulative(
+            prior_coverage,
+            tuple(
             coverage
             for batch in self.batches
             for coverage in batch.coverage
+            ),
         )
         return IngestionResult(
             merged_edges=len(accepted_edges),

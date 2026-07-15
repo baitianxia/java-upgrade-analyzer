@@ -326,6 +326,7 @@ def parse_classfile_calls(data, class_name):
                                     'callee_simple_key': f'field:{member}',
                                     'evidence_type': 'bytecode_field_access',
                                     'line': offset,
+                                    'instruction_offset': offset,
                                     'content': f'classfile opcode 0x{opcode:02x}',
                                 })
                         elif opcode in (0xb6, 0xb7, 0xb8, 0xb9) and offset + 2 < len(code):
@@ -347,6 +348,7 @@ def parse_classfile_calls(data, class_name):
                                     'callee_simple_key': f'method:{display_member}{signature}',
                                     'evidence_type': 'bytecode_constructor_invocation' if member == '<init>' else 'bytecode_method_invocation',
                                     'line': offset,
+                                    'instruction_offset': offset,
                                     'content': f'classfile opcode 0x{opcode:02x}',
                                 })
                         elif opcode == 0xba and offset + 2 < len(code):
@@ -363,6 +365,7 @@ def parse_classfile_calls(data, class_name):
                                 'callee_simple_key': f'invokedynamic:{indy_name}',
                                 'evidence_type': 'bytecode_invokedynamic',
                                 'line': offset,
+                                'instruction_offset': offset,
                                 'content': 'classfile invokedynamic',
                             })
                             pending_invokedynamic.append({
@@ -385,6 +388,7 @@ def parse_classfile_calls(data, class_name):
                                     'callee_simple_key': f'class:{owner.rsplit(".", 1)[-1]}',
                                     'evidence_type': 'bytecode_type_reference',
                                     'line': offset,
+                                    'instruction_offset': offset,
                                     'content': f'classfile opcode 0x{opcode:02x}',
                                 })
                         elif opcode == 0xc5 and offset + 2 < len(code):
@@ -399,6 +403,7 @@ def parse_classfile_calls(data, class_name):
                                     'callee_simple_key': f'class:{owner.rsplit(".", 1)[-1]}',
                                     'evidence_type': 'bytecode_type_reference',
                                     'line': offset,
+                                    'instruction_offset': offset,
                                     'content': 'classfile multianewarray',
                                 })
                         next_offset = _next_instruction_offset(code, offset)
@@ -435,6 +440,7 @@ def parse_classfile_calls(data, class_name):
                                 'callee_simple_key': f'class:{owner.rsplit(".", 1)[-1]}',
                                 'evidence_type': 'bytecode_exception_handler_reference',
                                 'line': handler_pc,
+                                'instruction_offset': handler_pc,
                                 'content': 'classfile exception-table catch type',
                             })
                 idx = attr_end
@@ -507,6 +513,7 @@ def parse_classfile_calls(data, class_name):
                         if member == '<init>' else 'bytecode_invokedynamic_method_reference'
                     ),
                     'line': pending['line'],
+                    'instruction_offset': pending['line'],
                     'content': 'classfile BootstrapMethods method handle',
                 })
         existing_type_refs = {
@@ -576,6 +583,8 @@ def parse_javap_calls(text, class_name):
     lines = (text or '').splitlines()
     class_refs = set()
     for index, raw in enumerate(lines):
+        offset_match = re.match(r'^\s*(\d+):', raw)
+        instruction_offset = int(offset_match.group(1)) if offset_match else -1
         cp_match = CLASS_CP_RE.match(raw)
         if cp_match:
             target = cp_match.group(1).replace('/', '.').replace('$', '.')
@@ -609,6 +618,7 @@ def parse_javap_calls(text, class_name):
                 'callee_simple_key': f'class:{owner.rsplit(".", 1)[-1]}',
                 'evidence_type': 'bytecode_type_reference',
                 'line': index + 1,
+                'instruction_offset': instruction_offset,
                 'content': raw.strip(),
             })
             continue
@@ -623,6 +633,7 @@ def parse_javap_calls(text, class_name):
                 'callee_simple_key': f'invokedynamic:{dynamic_match.group(1)}',
                 'evidence_type': 'bytecode_invokedynamic',
                 'line': index + 1,
+                'instruction_offset': instruction_offset,
                 'content': raw.strip(),
             })
             continue
@@ -640,6 +651,7 @@ def parse_javap_calls(text, class_name):
                 'callee_simple_key': f'method:{display_member}{signature}',
                 'evidence_type': 'bytecode_constructor_invocation' if member == '<init>' else 'bytecode_method_invocation',
                 'line': index + 1,
+                'instruction_offset': instruction_offset,
                 'content': raw.strip(),
             })
             continue
@@ -655,6 +667,7 @@ def parse_javap_calls(text, class_name):
                 'callee_simple_key': f'field:{member}',
                 'evidence_type': 'bytecode_field_access',
                 'line': index + 1,
+                'instruction_offset': instruction_offset,
                 'content': raw.strip(),
             })
     for item in parse_javap_indirect_references(text, class_name):
@@ -685,6 +698,7 @@ def parse_javap_calls(text, class_name):
             'callee_simple_key': simple_key,
             'evidence_type': evidence_type,
             'line': item.get('line') or 0,
+            'instruction_offset': int(item.get('instruction_offset', -1)),
             'content': 'javap reflection data-flow',
         })
 
@@ -720,7 +734,7 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
             cached = json.loads(Path(cache_path).read_text(encoding='utf-8'))
             cached_edges = list(cached.get('edges') or [])
             if (
-                cached.get('schema') == 'java-upgrade-analyzer.bytecode-index.v1'
+                cached.get('schema') == 'java-upgrade-analyzer.bytecode-index.v2'
                 and cached.get('artifact_sha256') == cache_key
                 and all(item.get('parser') in {'classfile', 'javap'} for item in cached_edges)
             ):
@@ -790,7 +804,7 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                     cache_file = Path(cache_path)
                     cache_file.parent.mkdir(parents=True, exist_ok=True)
                     cache_file.write_text(json.dumps({
-                        'schema': 'java-upgrade-analyzer.bytecode-index.v1',
+                        'schema': 'java-upgrade-analyzer.bytecode-index.v2',
                         'artifact_sha256': cache_key,
                         'edges': evidence,
                         'metrics': metrics,
@@ -892,6 +906,10 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
                 parser=str(item.get("parser") or "classfile"),
                 evidence_source=str(item.get("evidence_source") or "current_final_artifact"),
                 line=int(item.get("line") or 0),
+                instruction_offset=int(
+                    item["instruction_offset"]
+                    if item.get("instruction_offset") is not None else -1
+                ),
             ),
             metadata=(
                 ("caller_resolution_required", True),
