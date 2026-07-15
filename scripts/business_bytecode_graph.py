@@ -724,7 +724,11 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                 and cached.get('artifact_sha256') == cache_key
                 and all(item.get('parser') in {'classfile', 'javap'} for item in cached_edges)
             ):
-                return cached_edges, {**dict(cached.get('metrics') or {}), 'cache_hit': True}
+                return cached_edges, {
+                    **dict(cached.get('metrics') or {}),
+                    'artifact_sha256': cache_key,
+                    'cache_hit': True,
+                }
         except (OSError, ValueError, TypeError):
             pass
     if business_jar and os.path.isfile(business_jar):
@@ -778,6 +782,7 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                 'javap_fallback_classes': javap_fallback_classes,
                 'failures': failures,
                 'evidence_source': 'current_final_artifact',
+                'artifact_sha256': cache_key,
                 'cache_write_failed': False,
             }
             if cache_path and cache_key:
@@ -804,6 +809,7 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
         'javap_fallback_classes': 0,
         'failures': failures,
         'evidence_source': 'unavailable',
+        'artifact_sha256': cache_key,
     }
 
 
@@ -840,6 +846,12 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
     typed_failures = []
     concerns = []
     edges = []
+    batch_sha_invalid = (
+        strict_final_artifact
+        and not _valid_sha256(metrics.get("artifact_sha256"))
+    )
+    if batch_sha_invalid:
+        typed_failures.append(_bytecode_failure("current_final_artifact_sha_invalid"))
     for item in evidence or ():
         owner = str(item.get("caller_owner") or "").strip()
         name = str(item.get("caller_name") or "").strip()
@@ -854,10 +866,9 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
                 class_name=owner,
             ))
             continue
-        artifact_sha = str(item.get("artifact_sha256") or "")
-        if strict_final_artifact and not _valid_sha256(artifact_sha):
-            typed_failures.append(_bytecode_failure("current_final_artifact_sha_invalid"))
+        if batch_sha_invalid:
             continue
+        artifact_sha = str(item.get("artifact_sha256") or "")
         class_file = str(item.get("class_file") or "")
         artifact_path, separator, artifact_entry = class_file.partition("!/")
         authority = (

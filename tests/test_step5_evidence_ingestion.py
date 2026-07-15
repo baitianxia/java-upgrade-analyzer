@@ -351,6 +351,42 @@ class EvidenceIngestionTest(unittest.TestCase):
             item.applicable and item.status == "insufficient" for item in coverage
         ))
 
+    def test_business_bytecode_empty_edge_invalid_sha_blocks_applicable_incomplete_coverage(self):
+        from business_bytecode_graph import _business_bytecode_batch
+        from s5_call_chain_engine_integrated import _build_business_bytecode_coverage
+
+        for classes_scanned in (0, 1):
+            for artifact_sha256 in ("", "not-a-sha"):
+                batch = _business_bytecode_batch(
+                    (),
+                    {
+                        "classes_scanned": classes_scanned,
+                        "edges_found": 0,
+                        "evidence_source": "current_final_artifact",
+                        "artifact_sha256": artifact_sha256,
+                    },
+                    strict_final_artifact=True,
+                )
+                self.assertEqual(batch.edges, ())
+                self.assertEqual(
+                    [failure.reason_code for failure in batch.failures],
+                    ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"],
+                )
+                self.assertTrue(batch.failures[0].blocking)
+
+                graph = SimpleNamespace(reverse_edges={})
+                result = ingest_collector_batches(graph, (batch,))
+                coverage, status, reason_codes = _build_business_bytecode_coverage(
+                    batch, result, ("api:a", "api:b")
+                )
+
+                self.assertEqual(
+                    status, "insufficient" if classes_scanned == 0 else "partial"
+                )
+                self.assertEqual(reason_codes, ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"])
+                self.assertTrue(all(item.applicable for item in coverage))
+                self.assertTrue(all(item.status == status for item in coverage))
+
     def test_ingestion_preserves_indirect_occurrences_on_distinct_lines(self):
         first = CollectedEdge(
             caller_symbol="source-id",
