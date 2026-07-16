@@ -9,7 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from enhanced_source_analyzer import CallEdge
-from signature_utils import normalize_signature_for_lookup, split_signature_params
+from signature_utils import (
+    canonical_api_identity,
+    normalize_signature_for_lookup,
+    split_signature_params,
+)
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import (
     CollectedEdge,
@@ -300,9 +304,7 @@ def _target(row):
 
 
 def _api_key(row):
-    return '|'.join(str(row.get(key) or '').strip() for key in (
-        'coord', 'api_name', 'api_signature', 'symbol_kind', 'change_type'
-    ))
+    return canonical_api_identity(row)
 
 
 def _simple_type(value):
@@ -899,6 +901,7 @@ def _collected_indirect_edge(edge, api_identity, runtime_catalog):
         callee_symbol=edge.callee_key,
         edge_kind=edge.evidence_type,
         semantic=True,
+        activation_verified=True,
         owner_scope=_indirect_scope(edge, runtime_catalog),
         owner_coord=edge.owner_coord,
         provenance=EvidenceProvenance(

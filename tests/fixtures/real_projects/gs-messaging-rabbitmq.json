@@ -6,6 +6,34 @@
   "git_revision": "3e112f5e956bf61e6cc1ec92c8a5a9a96f738d86",
   "artifact_path": "target/messaging-rabbitmq-complete-0.0.1-SNAPSHOT.jar",
   "artifact_sha256": "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+  "materialization": {
+    "kind": "source_build",
+    "repository_url": "https://github.com/spring-guides/gs-messaging-rabbitmq.git",
+    "working_directory": "complete",
+    "command": ["mvn", "-q", "-DskipTests", "package"],
+    "artifact_path": "target/messaging-rabbitmq-complete-0.0.1-SNAPSHOT.jar"
+  },
+  "performance_baseline": {
+    "git_revision": "3e112f5e956bf61e6cc1ec92c8a5a9a96f738d86",
+    "artifact_sha256": "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
+    "scope": {
+      "selected_api_count": 3,
+      "accounted_api_count": 3,
+      "artifact_count": 30,
+      "class_count": 9413,
+      "analyzer_edge_count": 1611,
+      "oracle_edge_count": 1611,
+      "fault_injection_detected_count": 1
+    },
+    "metrics": {
+      "elapsed_seconds_per_api": {"value": 17.79, "max_ratio": 2.0},
+      "scan_seconds_per_1000_classes": {"value": 1.584, "max_ratio": 2.0},
+      "max_api_elapsed_seconds": {"value": 11.351, "max_ratio": 2.0},
+      "javap_invocations": {"value": 2500, "max_ratio": 1.25},
+      "duplicate_jar_scans": {"value": 0, "max_absolute": 0},
+      "peak_rss_mb": {"value": 260.062, "max_ratio": 1.5}
+    }
+  },
   "required_topologies": [
     "business_direct",
     "framework_callback"

@@ -106,6 +106,7 @@ class CollectedEdge:
     owner_coord: str = ""
     confidence: str = "high"
     ambiguous: bool = False
+    activation_verified: bool = False
     activation_conditions: Tuple[Any, ...] = field(default_factory=tuple)
     metadata: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
 
@@ -120,6 +121,8 @@ class CollectedEdge:
             EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
         }:
             raise ValueError("semantic edge authority must be semantic or runtime evidence")
+        if self.activation_verified and not self.semantic:
+            raise ValueError("activation verification is only valid for semantic edges")
         object.__setattr__(self, "activation_conditions", tuple(
             freeze_evidence_value(item)
             for item in tuple(self.activation_conditions or ())
@@ -137,6 +140,7 @@ class CoverageRecord:
     status: str
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
     applicable: bool = True
+    scope: str = "api"
 
     def __post_init__(self):
         reason_codes = tuple(self.reason_codes or ())
@@ -147,6 +151,8 @@ class CoverageRecord:
             raise ValueError("coverage requires collector and API identity")
         if self.status not in {"complete", "partial", "insufficient", "not_applicable"}:
             raise ValueError(f"unsupported coverage status: {self.status}")
+        if self.scope not in {"api", "global", "path"}:
+            raise ValueError(f"unsupported coverage scope: {self.scope}")
         if self.status == "not_applicable":
             object.__setattr__(self, "applicable", False)
 
@@ -209,6 +215,7 @@ class CollectorBatch:
                 "owner_coord": edge.owner_coord,
                 "confidence": edge.confidence,
                 "ambiguous": edge.ambiguous,
+                "activation_verified": edge.activation_verified,
                 "activation_conditions": thaw_evidence_value(edge.activation_conditions),
                 "provenance": provenance_mapping(edge.provenance),
                 "metadata": thaw_evidence_value(dict(edge.metadata)),
@@ -221,6 +228,7 @@ class CollectorBatch:
                 "status": item.status,
                 "reason_codes": list(item.reason_codes),
                 "applicable": item.applicable,
+                "scope": item.scope,
             } for item in self.coverage],
             "metrics": thaw_evidence_value(dict(self.metrics)),
         }
@@ -265,6 +273,8 @@ class PhysicalCallEdge:
     artifact: str = ""
     confidence: str = "high"
     instruction_offset: int = -1
+    semantic: bool = False
+    activation_verified: bool = False
     metadata: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
 
     def __post_init__(self):
@@ -274,6 +284,8 @@ class PhysicalCallEdge:
             or self.instruction_offset < -1
         ):
             raise ValueError("physical instruction offset must be an integer >= -1")
+        if self.activation_verified and not self.semantic:
+            raise ValueError("activation verification is only valid for semantic edges")
         object.__setattr__(self, "metadata", tuple(sorted(
             (key, freeze_evidence_value(value))
             for key, value in tuple(self.metadata or ())
@@ -409,7 +421,21 @@ def classify_module_scope(item: Optional[Mapping[str, Any]]) -> ModuleScope:
     if coord == "__business__":
         return ModuleScope.BUSINESS_CLASSES
     if bool(item.get("application_owned")):
-        return ModuleScope.INTERNAL_MODULE
+        evidence = item.get("ownership_evidence")
+        if not isinstance(evidence, Mapping):
+            return ModuleScope.UNKNOWN
+        authority = str(evidence.get("authority") or "").strip()
+        reactor_coord = str(evidence.get("reactor_coord") or "").strip()
+        artifact_entry = str(evidence.get("artifact_entry") or "").strip()
+        artifact_sha = str(evidence.get("final_artifact_sha256") or "").strip()
+        if (
+            authority == "reactor_coordinate_and_final_artifact_entry"
+            and reactor_coord == coord
+            and artifact_entry.endswith(".jar")
+            and re.fullmatch(r"[0-9a-f]{64}", artifact_sha)
+        ):
+            return ModuleScope.INTERNAL_MODULE
+        return ModuleScope.UNKNOWN
     if coord and ":" in coord:
         return ModuleScope.EXTERNAL_DEPENDENCY
     return ModuleScope.UNKNOWN
@@ -437,6 +463,27 @@ def decide_analysis(
     )
     direct_callers = sum(1 for depth in business_depths if depth == 1)
     business_reach_depth = min(business_depths, default=0)
+    blocking_failures = tuple(failure for failure in failure_items if failure.blocking)
+    blocking_failure = min(
+        blocking_failures,
+        key=lambda failure: (
+            0 if failure.stage == "input-validation" else
+            2 if failure.stage == "coverage" else 1,
+            failure.stage,
+            failure.reason_code,
+        ),
+        default=None,
+    )
+    if blocking_failure is not None and blocking_failure.stage == "input-validation":
+        return AnalysisDecision(
+            analysis_status="not_analyzed",
+            is_reachable=None,
+            reason_code=blocking_failure.reason_code,
+            reachable_note=blocking_failure.detail or "关键证据采集失败，无法形成可靠结论",
+            direct_callers=direct_callers,
+            business_reach_depth=business_reach_depth,
+        )
+
     if preservation is not None or preserved:
         return AnalysisDecision(
             analysis_status="not_impacted",
@@ -453,6 +500,17 @@ def decide_analysis(
             business_reach_depth=business_reach_depth,
         )
 
+    def activation_unproven(path):
+        semantic_edges = tuple(edge for edge in path.evidence if edge.semantic)
+        framework_claim = path.stop_reason in {
+            "RUNTIME_FRAMEWORK_ENTRY_REACHED",
+            "RUNTIME_DEPENDENCY_ENTRY_REACHED",
+        }
+        return bool(
+            (framework_claim and not semantic_edges)
+            or any(not edge.activation_verified for edge in semantic_edges)
+        )
+
     reachable_paths = tuple(
         path for path in path_items
         if (
@@ -460,6 +518,7 @@ def decide_analysis(
             and path.complete
             and not path.ambiguous
             and not path.truncated
+            and not activation_unproven(path)
         )
     )
     if reachable_paths:
@@ -488,7 +547,6 @@ def decide_analysis(
             business_reach_depth=business_reach_depth,
         )
 
-    blocking_failure = next((failure for failure in failure_items if failure.blocking), None)
     if blocking_failure is not None:
         return AnalysisDecision(
             analysis_status="not_analyzed",
@@ -500,12 +558,30 @@ def decide_analysis(
         )
 
     if concern_items:
-        concern = concern_items[0]
+        concern = min(
+            concern_items,
+            key=lambda item: (
+                item.stage, item.reason_code, item.api_identity,
+                item.artifact, item.class_name, item.detail,
+            ),
+        )
         return AnalysisDecision(
             analysis_status="uncertain",
             is_reachable=None,
             reason_code=concern.reason_code,
             reachable_note=concern.detail,
+            direct_callers=direct_callers,
+            business_reach_depth=business_reach_depth,
+        )
+
+    if any(activation_unproven(path) for path in path_items):
+        return AnalysisDecision(
+            analysis_status="uncertain",
+            is_reachable=None,
+            reason_code="FRAMEWORK_ACTIVATION_UNPROVEN",
+            reachable_note=(
+                "已发现框架、代理、反射或回调语义路径，但没有独立证据证明该语义边会由业务入口激活"
+            ),
             direct_callers=direct_callers,
             business_reach_depth=business_reach_depth,
         )
@@ -585,7 +661,18 @@ def decide_envelope(envelope: EvidenceEnvelope) -> AnalysisDecision:
         if item.status != "complete"
     )
     failures = envelope.failures
-    if incomplete:
+    target_concerns = tuple(
+        concern for concern in envelope.concerns
+        if concern.api_identity == envelope.target_identity
+    )
+    # Coverage gaps make an absence conclusion unsafe. They must not erase
+    # target-specific evidence that was actually observed; that evidence still
+    # supports reachable/uncertain while explicit collector failures remain
+    # independently blocking.
+    has_observed_evidence = bool(
+        envelope.paths or target_concerns or envelope.preservation is not None
+    )
+    if incomplete and not has_observed_evidence:
         detail = ", ".join(
             f"{item.collector}:{item.status}"
             for item in sorted(incomplete, key=lambda row: row.collector)
@@ -601,7 +688,7 @@ def decide_envelope(envelope: EvidenceEnvelope) -> AnalysisDecision:
     return decide_analysis(
         envelope.paths,
         failures,
-        concerns=envelope.concerns,
+        concerns=target_concerns,
         preservation=envelope.preservation,
         complete_scan=complete_scan,
     )

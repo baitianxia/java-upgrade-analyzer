@@ -103,6 +103,34 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         self.assertEqual(batch.failures[0].reason_code, "BYTECODE_CALLER_UNRESOLVED")
         self.assertTrue(batch.failures[0].blocking)
 
+    def test_collect_business_bytecode_batch_does_not_treat_constant_pool_class_refs_as_call_edges(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Marker.class", b"not-a-real-class")
+            original = module.parse_classfile_calls
+            module.parse_classfile_calls = lambda _data, _name: [{
+                "caller_owner": "com.acme.Marker",
+                "caller_name": "Marker",
+                "caller_signature": "",
+                "callee_key": "com.vendor.LegacyType",
+                "callee_simple_key": "class:LegacyType",
+                "evidence_type": "bytecode_class_reference",
+                "content": "classfile constant-pool/signature/annotation reference",
+            }]
+            try:
+                batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
+                    "jar_path": str(jar_path), "sha256": "d" * 64,
+                }}}, None)
+            finally:
+                module.parse_classfile_calls = original
+
+        self.assertEqual(batch.edges, ())
+        self.assertEqual(batch.failures, ())
+        self.assertEqual(dict(batch.metrics)["non_executable_class_references"], 1)
+
     def test_collect_business_bytecode_batch_rejects_invalid_sha_with_stable_failure(self):
         import business_bytecode_graph as module
 

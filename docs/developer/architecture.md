@@ -739,7 +739,7 @@ Step5 并不使用 `jar` 直接构建调用图，而是使用 `jar_metadata` 补
 当前链路如下：
 
 1. 根据 `dependency_source_mappings` 建立 `source_roots`
-2. 依据 Step1 识别的依赖版本定位本地 Maven 仓库中的目标 `jar`
+2. 依据 Step1 的 `build_provenance.json` 与依赖 `lib_entry`，从 current 最终制品提取目标 `jar`；无法提取时记录证据缺失，不使用本地 Maven 仓库替代
 3. 通过 `javap -s -p` 解析类层和方法层元数据
 4. 生成 `jar_metadata`
 5. 将 `jar_metadata` 合并进 `class_info`、`type_metadata` 和全局方法返回类型索引

@@ -4173,7 +4173,7 @@ def _user_field_label(field):
         "strict_risk_gate": "严格门控",
         "step4_git_diff_timeout": "源码差异对比超时秒数",
         "step4_japicmp_timeout": "JApiCmp 对比超时秒数",
-        "step4_fetch_timeout": "拉取依赖超时秒数",
+        "step4_fetch_timeout": "JApiCmp 工具自动安装超时秒数",
         "restart_step_id": "重跑起点",
         "notes": "备注",
     }

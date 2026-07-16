@@ -6,6 +6,13 @@
   "git_revision": "efa693451b6a6ca123476c9c6e65eedab9048e2c",
   "artifact_path": "target/managing-transactions-complete-0.0.1-SNAPSHOT.jar",
   "artifact_sha256": "fd0b8883214c641685ab8f0e7b583ec2f8150112f9679161908eb6829bd98b90",
+  "materialization": {
+    "kind": "source_build",
+    "repository_url": "https://github.com/spring-guides/gs-managing-transactions.git",
+    "working_directory": "complete",
+    "command": ["mvn", "-q", "-DskipTests", "package"],
+    "artifact_path": "target/managing-transactions-complete-0.0.1-SNAPSHOT.jar"
+  },
   "required_topologies": [
     "framework_proxy"
   ],

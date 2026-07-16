@@ -7,6 +7,8 @@ from collections import Counter, defaultdict
 import csv
 from pathlib import Path
 
+from signature_utils import canonical_api_identity
+
 
 PROVENANCE_FIELDS = (
     "authority",
@@ -20,12 +22,7 @@ SELF_AUTHORITIES = {"java-upgrade-analyzer", "jua", "self", "analyzer"}
 
 
 def canonical_identity(row: dict) -> str:
-    return "|".join((
-        str(row.get("coord") or "").strip(),
-        str(row.get("api_name") or row.get("api") or "").strip(),
-        str(row.get("symbol_kind") or "").strip().lower(),
-        str(row.get("api_signature") or "").strip(),
-    ))
+    return canonical_api_identity(row)
 
 
 def _valid_provenance(record: dict) -> bool:
@@ -77,9 +74,38 @@ def write_oracle_ledger(path: Path, audit: dict) -> None:
             writer.writerow({field: row.get(field, "") for field in fields})
 
 
+def _resolve_oracle_conclusions(records: list[dict]) -> set[str]:
+    conclusions = {
+        str(item.get("oracle_conclusion") or "").strip()
+        for item in records
+    } - {"", "uncertain"}
+    if "reachable" not in conclusions:
+        return conclusions
+    alternatives = conclusions - {"reachable"}
+    if alternatives != {"not_found_in_static_analysis"}:
+        return conclusions
+    static_absences = [
+        item for item in records
+        if str(item.get("oracle_conclusion") or "").strip()
+        == "not_found_in_static_analysis"
+    ]
+    if static_absences and all(
+        str(item.get("conclusion_scope") or "").strip() == "static_analysis"
+        for item in static_absences
+    ):
+        return {"reachable"}
+    return conclusions
+
+
 def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle_rows: list[dict]) -> dict:
+    changed_counts = Counter(canonical_identity(row) for row in changed_rows)
     changed_by_id = {canonical_identity(row): row for row in changed_rows}
-    analyzer_by_id = {canonical_identity(row): row for row in analyzer_rows}
+    analyzer_rows_by_id: dict[str, list[dict]] = defaultdict(list)
+    for row in analyzer_rows:
+        analyzer_rows_by_id[canonical_identity(row)].append(row)
+    analyzer_by_id = {
+        identity: rows[0] for identity, rows in analyzer_rows_by_id.items()
+    }
     oracle_by_id: dict[str, list[dict]] = defaultdict(list)
     for row in oracle_rows:
         oracle_by_id[canonical_identity(row)].append(row)
@@ -89,6 +115,18 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
         str(item.get("authority") or "") for item in oracle_by_id[identity]
     }) < count)
     extra_identities = sorted(set(oracle_by_id) - set(changed_by_id))
+    analyzer_extra_identities = sorted(set(analyzer_by_id) - set(changed_by_id))
+    analyzer_missing_identities = sorted(set(changed_by_id) - set(analyzer_by_id))
+    changed_duplicate_identities = sorted(
+        identity for identity, count in changed_counts.items() if count > 1
+    )
+    analyzer_duplicate_identities = sorted(
+        identity for identity, rows in analyzer_rows_by_id.items() if len(rows) > 1
+    )
+    analyzer_conflict_identities = sorted(
+        identity for identity, rows in analyzer_rows_by_id.items()
+        if len({str(row.get("analysis_status") or "") for row in rows}) > 1
+    )
     missing_identities = sorted(set(changed_by_id) - set(oracle_by_id))
     invalid_provenance: list[str] = []
     ledger: list[dict] = []
@@ -102,10 +140,7 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
                 valid_records.append(record)
             else:
                 invalid_provenance.append(identity)
-        recorded_conclusions = {
-            str(item.get("oracle_conclusion") or "") for item in valid_records
-        }
-        conclusions = recorded_conclusions - {"uncertain"}
+        conclusions = _resolve_oracle_conclusions(valid_records)
         analyzer_conclusion = str(analyzer.get("analysis_status") or "")
         if len(conclusions) > 1:
             verdict = "oracle_conflict"
@@ -122,9 +157,16 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
             requires_two = severity in {"P0", "P1", "HIGH"} and analyzer_conclusion in {
                 "not_impacted", "not_found_in_static_analysis", "uncertain",
             }
-            authority_count = len({str(item.get("authority") or "") for item in valid_records})
+            supporting_records = [
+                item for item in valid_records
+                if str(item.get("oracle_conclusion") or "") == oracle_conclusion
+            ]
+            authority_count = len({
+                str(item.get("authority") or "") for item in supporting_records
+            })
             has_project_test = any(
-                str(item.get("evidence_mode") or "") == "project_test" for item in valid_records
+                str(item.get("evidence_mode") or "") == "project_test"
+                for item in supporting_records
             )
             if requires_two and authority_count < 2 and not has_project_test:
                 verdict = "unverified"
@@ -150,12 +192,22 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
         "missing_identities": missing_identities,
         "duplicate_identities": duplicate_identities,
         "extra_identities": extra_identities,
+        "analyzer_extra_identities": analyzer_extra_identities,
+        "analyzer_missing_identities": analyzer_missing_identities,
+        "changed_duplicate_identities": changed_duplicate_identities,
+        "analyzer_duplicate_identities": analyzer_duplicate_identities,
+        "analyzer_conflict_identities": analyzer_conflict_identities,
         "invalid_provenance": sorted(set(invalid_provenance)),
     }
     result.update({
         "missing_identity_count": len(result["missing_identities"]),
         "duplicate_identity_count": len(result["duplicate_identities"]),
         "extra_identity_count": len(result["extra_identities"]),
+        "analyzer_extra_identity_count": len(result["analyzer_extra_identities"]),
+        "analyzer_missing_identity_count": len(result["analyzer_missing_identities"]),
+        "changed_duplicate_identity_count": len(result["changed_duplicate_identities"]),
+        "analyzer_duplicate_identity_count": len(result["analyzer_duplicate_identities"]),
+        "analyzer_conflict_identity_count": len(result["analyzer_conflict_identities"]),
         "invalid_provenance_count": len(result["invalid_provenance"]),
     })
     result["blocking"] = any((
@@ -165,6 +217,11 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
         result["oracle_conflicts"],
         result["duplicate_identities"],
         result["extra_identities"],
+        result["analyzer_extra_identities"],
+        result["analyzer_missing_identities"],
+        result["changed_duplicate_identities"],
+        result["analyzer_duplicate_identities"],
+        result["analyzer_conflict_identities"],
         result["invalid_provenance"],
     ))
     return result

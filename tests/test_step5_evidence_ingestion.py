@@ -7,6 +7,7 @@ import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -634,6 +635,34 @@ class EvidenceIngestionTest(unittest.TestCase):
         )
         self.assertEqual(len(graph.step5_evidence_registry), 2)
 
+    def test_same_callee_duplicate_detection_uses_linear_identity_index(self):
+        base = self._edge()
+        edges = tuple(
+            replace(base, provenance=replace(base.provenance, instruction_offset=index))
+            for index in range(400)
+        )
+        graph = SimpleNamespace(reverse_edges={})
+        equality_calls = 0
+        original_eq = CollectedEdge.__eq__
+
+        def counted_eq(left, right):
+            nonlocal equality_calls
+            equality_calls += 1
+            return original_eq(left, right)
+
+        with patch.object(
+            ingestion_module, "_call_edge_identity",
+            wraps=ingestion_module._call_edge_identity,
+        ) as identity, patch.object(CollectedEdge, "__eq__", counted_eq):
+            result = ingest_collector_batches(graph, (CollectorBatch(
+                collector="business_bytecode", version="1", edges=edges,
+            ),))
+
+        self.assertEqual(result.merged_edges, 400)
+        self.assertEqual(len(graph.reverse_edges[base.callee_symbol]), 400)
+        self.assertLess(identity.call_count, 2400)
+        self.assertLess(equality_calls, 2400)
+
     def test_instruction_offset_zero_does_not_collapse_into_unknown_offset(self):
         edge = self._edge()
         zero = replace(edge, provenance=replace(edge.provenance, instruction_offset=0))
@@ -905,6 +934,179 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual(reason_codes, ["BYTECODE_CALLER_UNRESOLVED"])
         self.assertEqual([item.api_identity for item in coverage], ["api:a", "api:b"])
         self.assertTrue(all(item.applicable and item.status == "partial" for item in coverage))
+
+    def test_business_bytecode_unrelated_rejection_does_not_poison_selected_api(self):
+        from s5_call_chain_engine_integrated import _build_business_bytecode_coverage
+        from step5_evidence_ingestion import IngestionResult
+
+        failure = EvidenceFailure(
+            stage="evidence-ingestion",
+            reason_code="BYTECODE_CALLER_UNRESOLVED",
+            blocking=True,
+            api_identity="org.springframework.cache.CacheManager",
+        )
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="2",
+            metrics=(("classes_scanned", 1), ("evidence_source", "current_final_artifact")),
+        )
+        result = IngestionResult(
+            merged_edges=0,
+            duplicate_edges=0,
+            rejected_edges=1,
+            failures=(failure,),
+            failures_by_collector=(("business_bytecode", failure),),
+        )
+        selected = (
+            "org.springframework.data:spring-data-commons|"
+            "org.springframework.data.domain.Page.getContent|()|method|REMOVED"
+        )
+
+        coverage, status, reason_codes = _build_business_bytecode_coverage(
+            batch, result, (selected,)
+        )
+
+        self.assertEqual(status, "complete")
+        self.assertEqual(reason_codes, [])
+        self.assertEqual(coverage[0].status, "complete")
+        self.assertTrue(coverage[0].applicable)
+
+    def test_business_bytecode_target_rejection_remains_partial(self):
+        from s5_call_chain_engine_integrated import _build_business_bytecode_coverage
+        from step5_evidence_ingestion import IngestionResult
+
+        api_name = "org.springframework.data.domain.Page.getContent"
+        selected = (
+            "org.springframework.data:spring-data-commons|"
+            f"{api_name}|()|method|REMOVED"
+        )
+        failure = EvidenceFailure(
+            stage="evidence-ingestion",
+            reason_code="BYTECODE_CALLER_UNRESOLVED",
+            blocking=True,
+            api_identity=f"{api_name}()",
+        )
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="2",
+            metrics=(("classes_scanned", 1), ("evidence_source", "current_final_artifact")),
+        )
+        result = IngestionResult(
+            merged_edges=0,
+            duplicate_edges=0,
+            rejected_edges=1,
+            failures=(failure,),
+            failures_by_collector=(("business_bytecode", failure),),
+        )
+
+        coverage, status, reason_codes = _build_business_bytecode_coverage(
+            batch, result, (selected,)
+        )
+
+        self.assertEqual(status, "partial")
+        self.assertEqual(reason_codes, ["BYTECODE_CALLER_UNRESOLVED"])
+        self.assertEqual(coverage[0].status, "partial")
+        self.assertEqual(coverage[0].reason_codes, ("BYTECODE_CALLER_UNRESOLVED",))
+
+    def test_business_bytecode_rejection_does_not_poison_another_overload(self):
+        from s5_call_chain_engine_integrated import _build_business_bytecode_coverage
+        from step5_evidence_ingestion import IngestionResult
+
+        api_name = "com.vendor.Target.call"
+        selected = f"vendor:target|{api_name}|(String)|method|REMOVED"
+        failure = EvidenceFailure(
+            stage="evidence-ingestion",
+            reason_code="BYTECODE_CALLER_UNRESOLVED",
+            blocking=True,
+            api_identity=f"{api_name}(Integer)",
+        )
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="2",
+            metrics=(("classes_scanned", 1), ("evidence_source", "current_final_artifact")),
+        )
+        result = IngestionResult(
+            merged_edges=0,
+            duplicate_edges=0,
+            rejected_edges=1,
+            failures=(failure,),
+            failures_by_collector=(("business_bytecode", failure),),
+        )
+
+        coverage, status, reason_codes = _build_business_bytecode_coverage(
+            batch, result, (selected,)
+        )
+
+        self.assertEqual(status, "complete")
+        self.assertEqual(reason_codes, [])
+        self.assertEqual(coverage[0].status, "complete")
+
+    def test_business_bytecode_failure_matches_nested_class_spelling(self):
+        from s5_call_chain_engine_integrated import _build_business_bytecode_coverage
+        from step5_evidence_ingestion import IngestionResult
+
+        selected = (
+            "vendor:target|com.vendor.Outer$Builder.call|"
+            "(com.vendor.Outer$Arg)|method|REMOVED"
+        )
+        failure = EvidenceFailure(
+            stage="evidence-ingestion",
+            reason_code="BYTECODE_CALLER_UNRESOLVED",
+            blocking=True,
+            api_identity=(
+                "com.vendor.Outer.Builder.call(com.vendor.Outer.Arg)"
+            ),
+        )
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="2",
+            metrics=(("classes_scanned", 1), ("evidence_source", "current_final_artifact")),
+        )
+        result = IngestionResult(
+            merged_edges=0,
+            duplicate_edges=0,
+            rejected_edges=1,
+            failures=(failure,),
+            failures_by_collector=(("business_bytecode", failure),),
+        )
+
+        coverage, status, _reason_codes = _build_business_bytecode_coverage(
+            batch, result, (selected,)
+        )
+
+        self.assertEqual(status, "partial")
+        self.assertEqual(coverage[0].status, "partial")
+
+    def test_business_bytecode_nested_signature_keeps_qualified_owner(self):
+        from s5_call_chain_engine_integrated import _build_business_bytecode_coverage
+        from step5_evidence_ingestion import IngestionResult
+
+        selected = "vendor:target|com.vendor.Target.call|(x.Outer$Arg)|method|REMOVED"
+        failure = EvidenceFailure(
+            stage="evidence-ingestion",
+            reason_code="BYTECODE_CALLER_UNRESOLVED",
+            blocking=True,
+            api_identity="com.vendor.Target.call(x.Other.Arg)",
+        )
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="2",
+            metrics=(("classes_scanned", 1), ("evidence_source", "current_final_artifact")),
+        )
+        result = IngestionResult(
+            merged_edges=0,
+            duplicate_edges=0,
+            rejected_edges=1,
+            failures=(failure,),
+            failures_by_collector=(("business_bytecode", failure),),
+        )
+
+        coverage, status, _reason_codes = _build_business_bytecode_coverage(
+            batch, result, (selected,)
+        )
+
+        self.assertEqual(status, "complete")
+        self.assertEqual(coverage[0].status, "complete")
 
     def test_business_bytecode_zero_scan_failure_is_insufficient_for_each_api(self):
         from s5_call_chain_engine_integrated import _build_business_bytecode_coverage

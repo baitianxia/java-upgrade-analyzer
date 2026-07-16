@@ -55,6 +55,15 @@ def descriptor_source_signature(descriptor: str) -> str:
     return _source_signature(str(descriptor).split(")", 1)[0] + ")").replace("$", ".")
 
 
+def _normalized_topology_signature(signature: str) -> str:
+    """Compare source and binary nested-class spellings as one Java type identity."""
+    return normalize_signature_for_lookup(str(signature or "").replace("$", "."))
+
+
+def _normalized_topology_owner(owner: str) -> str:
+    return str(owner or "").replace("$", ".")
+
+
 def _edge_identity(edge: dict) -> tuple[str, ...]:
     return tuple(str(edge.get(field) or "").strip() for field in EDGE_FIELDS)
 
@@ -465,44 +474,61 @@ def _is_assignable(
 
 
 def _selected_target_identities(
-    rows: list[dict], edges: list[dict], inventory: dict | None = None
+    rows: list[dict],
+    edges: list[dict],
+    inventory: dict | None = None,
+    *,
+    resolve_unreferenced: bool = True,
 ) -> tuple[list[dict], list[str]]:
     targets: dict[tuple[str, str, str], dict] = {}
     unresolved: list[str] = []
     for row in rows:
         api_name = str(row.get("api_name") or "").strip()
-        signature = normalize_signature_for_lookup(str(row.get("api_signature") or ""))
+        signature = _normalized_topology_signature(str(row.get("api_signature") or ""))
         kind = str(row.get("symbol_kind") or "method").strip()
         if kind == "class" and api_name:
-            targets[(api_name, "", "")] = {
-                "owner": api_name, "member": "", "descriptor": "",
-                "coordinate": str(row.get("coord") or ""),
-            }
+            if resolve_unreferenced:
+                targets[(api_name, "", "")] = {
+                    "owner": api_name, "member": "", "descriptor": "",
+                    "coordinate": str(row.get("coord") or ""),
+                }
             continue
         owner, separator, member = api_name.rpartition(".")
         matches = []
         for edge in edges:
-            if edge.get("callee_owner") != owner or edge.get("callee_member") != member:
+            if (
+                _normalized_topology_owner(edge.get("callee_owner"))
+                != _normalized_topology_owner(owner)
+                or edge.get("callee_member") != member
+            ):
                 continue
             descriptor = str(edge.get("callee_descriptor") or "")
-            if kind != "field" and normalize_signature_for_lookup(descriptor_source_signature(descriptor)) != signature:
+            if kind != "field" and _normalized_topology_signature(
+                descriptor_source_signature(descriptor)
+            ) != signature:
                 continue
             matches.append(edge)
         identities = {_method_node(edge, "callee") for edge in matches}
-        if not identities and inventory:
+        if not identities and inventory and resolve_unreferenced:
             for entry, content in (inventory.get("classes") or {}).items():
-                if _class_binary_name(entry) != owner:
+                binary_owner = _class_binary_name(entry)
+                if (
+                    _normalized_topology_owner(binary_owner)
+                    != _normalized_topology_owner(owner)
+                ):
                     continue
-                _parsed_owner, methods = _topology_javap_methods(entry, content)
+                parsed_owner, methods = _topology_javap_methods(entry, content)
                 for method in methods:
                     descriptor = str(method.get("descriptor") or "")
                     if method.get("member") != member:
                         continue
-                    if kind != "field" and normalize_signature_for_lookup(
+                    if kind != "field" and _normalized_topology_signature(
                         descriptor_source_signature(descriptor)
                     ) != signature:
                         continue
-                    identities.add((owner, member, descriptor))
+                    identities.add((parsed_owner or binary_owner, member, descriptor))
+        if not identities and not resolve_unreferenced:
+            continue
         if not separator or not identities:
             unresolved.append(f"{api_name}{row.get('api_signature') or ''}")
             continue
@@ -910,8 +936,83 @@ def _framework_callback_evidence(
         if callback_entry:
             parse_entry(callback_entry)
 
+    start_entry = owner_entries.get(start_class)
+    if start_entry:
+        parse_entry(start_entry)
+
     target_edges = [edge for edge in edges if _method_node(edge, "callee") in targets]
     results = []
+    spring_boot_activation = next((
+        method for method in parsed
+        if method["owner"] == start_class
+        and method["member"] == "main"
+        and any(
+            "org/springframework/boot/SpringApplication.run:" in instruction
+            for instruction in method["instructions"]
+        )
+    ), None)
+    runner_interfaces = {
+        "org.springframework.boot.CommandLineRunner": "([Ljava/lang/String;)V",
+        "org.springframework.boot.ApplicationRunner": (
+            "(Lorg/springframework/boot/ApplicationArguments;)V"
+        ),
+    }
+    runner_targets: dict[tuple[str, str, str, str], set[tuple[str, str, str]]] = defaultdict(set)
+    if spring_boot_activation is not None:
+        for edge in target_edges:
+            callback = _method_node(edge, "caller")
+            if callback[1] != "run":
+                continue
+            artifact_entry = str(edge.get("artifact_entry") or "")
+            content = application_classes.get(artifact_entry)
+            if content is None:
+                continue
+            output = _javap_text(content, "-v", "-p")
+            implemented_interface = next((
+                interface for interface, descriptor in runner_interfaces.items()
+                if callback[2] == descriptor
+                and re.search(
+                    rf"\bclass\s+{re.escape(callback[0])}\b[^\n]*\bimplements\b[^\n]*"
+                    rf"\b{re.escape(interface)}\b",
+                    output,
+                )
+            ), "")
+            if not implemented_interface:
+                continue
+            if not (
+                "RuntimeVisibleAnnotations:" in output
+                and "org.springframework.stereotype.Component" in output
+            ):
+                continue
+            runner_targets[
+                (callback[0], callback[1], callback[2], artifact_entry)
+            ].add(_method_node(edge, "callee"))
+    for (owner, member, descriptor, artifact_entry), linked_targets in sorted(
+        runner_targets.items()
+    ):
+        results.append({
+            "registration": [
+                str(spring_boot_activation.get("owner") or ""),
+                str(spring_boot_activation.get("member") or ""),
+                str(spring_boot_activation.get("descriptor") or ""),
+            ],
+            "registration_artifact_entry": str(
+                spring_boot_activation.get("artifact_entry") or ""
+            ),
+            "callback": [owner, member, descriptor],
+            "callback_artifact_entry": artifact_entry,
+            "targets": [list(target) for target in sorted(linked_targets)],
+            "start_class": start_class,
+            "evidence_authority": (
+                "final_artifact_javap_spring_boot_runner_activation"
+            ),
+            "authority": "jdk-javap",
+            "authority_version": "classfile-runtime-visible-annotation-v1",
+            "procedure": (
+                "verify Start-Class, exact SpringApplication.run edge, packaged "
+                "RuntimeVisible @Component, Runner interface, and run target edge"
+            ),
+        })
     for method in parsed:
         instructions = method["instructions"]
         for instruction_index, line in enumerate(instructions):
@@ -1249,7 +1350,10 @@ def extract_artifact_topology_evidence(
         inventory = {"classes": {}, "resources": {}, "containers": set()}
     errors.extend(str(item) for item in scan.get("failures") or [])
     targets, unresolved = _selected_target_identities(
-        changed_api_rows, scan.get("edges") or [], inventory
+        changed_api_rows,
+        scan.get("edges") or [],
+        inventory,
+        resolve_unreferenced=bool(target_owner_entries),
     )
     errors.extend(f"unresolved exact changed API identity: {item}" for item in unresolved)
     target_set = {_target_identity(item) for item in targets}
@@ -1487,7 +1591,10 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
     ):
         observed.add("mybatis_mapper_proxy")
     if any(
-        item.get("evidence_authority") == "final_artifact_javap_bounded_dataflow"
+        item.get("evidence_authority") in {
+            "final_artifact_javap_bounded_dataflow",
+            "final_artifact_javap_spring_boot_runner_activation",
+        }
         and item.get("start_class")
         and item.get("targets")
         for item in artifact_layout.get("framework_callback_links") or []

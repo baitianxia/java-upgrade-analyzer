@@ -80,7 +80,7 @@ GUIDANCE = {
             ],
             'is_optional': False,
             'impact': '无法做精确的 Binary Incompatible 检测',
-            'workaround': '可先基于源码 diff / 现有证据继续，但最终结论需明确标注 Binary Incompatible 检测已降级',
+            'workaround': '不允许降级继续；请安装 JApiCmp 或提供 japicmp_jar 后重跑 Step4',
         }
     },
 }

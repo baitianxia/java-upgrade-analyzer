@@ -9,6 +9,34 @@
   "artifact_path": "/private/tmp/mybatis-spring-boot-sample-xml-4.0.1.jar",
   "artifact_sha1": "f8d22314dae4a96ca7fe2f454cf6adc2b7628dd2",
   "artifact_sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7",
+  "materialization": {
+    "kind": "published_artifact",
+    "coordinate": "org.mybatis.spring.boot:mybatis-spring-boot-sample-xml:4.0.1",
+    "url": "https://repo1.maven.org/maven2/org/mybatis/spring/boot/mybatis-spring-boot-sample-xml/4.0.1/mybatis-spring-boot-sample-xml-4.0.1.jar",
+    "sha1": "f8d22314dae4a96ca7fe2f454cf6adc2b7628dd2",
+    "sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7"
+  },
+  "performance_baseline": {
+    "git_revision": "bb8bac144e4677cf1bab5a6d27ced2521972adfc",
+    "artifact_sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7",
+    "scope": {
+      "selected_api_count": 3,
+      "accounted_api_count": 3,
+      "artifact_count": 33,
+      "class_count": 8118,
+      "analyzer_edge_count": 6,
+      "oracle_edge_count": 6,
+      "fault_injection_detected_count": 1
+    },
+    "metrics": {
+      "elapsed_seconds_per_api": {"value": 2.4, "max_ratio": 2.0},
+      "scan_seconds_per_1000_classes": {"value": 0.337, "max_ratio": 2.0},
+      "max_api_elapsed_seconds": {"value": 2.11, "max_ratio": 2.0},
+      "javap_invocations": {"value": 48, "max_ratio": 1.25},
+      "duplicate_jar_scans": {"value": 0, "max_absolute": 0},
+      "peak_rss_mb": {"value": 157.3, "max_ratio": 1.5}
+    }
+  },
   "ground_truth_status": "reviewed",
   "required_topologies": [
     "business_direct",
@@ -83,21 +111,21 @@
   "canonical_edges": [],
   "canonical_semantic_references": [
     {
-      "api_identity": "('org.mybatis:mybatis', 'org.apache.ibatis.binding.MapperProxy.invoke', '(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])', 'method', 'REMOVED')",
+      "api_identity": "org.mybatis:mybatis|org.apache.ibatis.binding.MapperProxy.invoke|(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])|method|REMOVED",
       "target_class": "org.apache.ibatis.binding.MapperProxy.invoke",
       "artifact_sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7",
       "artifact_entry": "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/binding/MapperProxy.class",
       "authority": "final-artifact-mybatis-proxy-runtime"
     },
     {
-      "api_identity": "('org.mybatis:mybatis', 'org.apache.ibatis.binding.MapperMethod.execute', '(org.apache.ibatis.session.SqlSession,java.lang.Object[])', 'method', 'REMOVED')",
+      "api_identity": "org.mybatis:mybatis|org.apache.ibatis.binding.MapperMethod.execute|(org.apache.ibatis.session.SqlSession,java.lang.Object[])|method|REMOVED",
       "target_class": "org.apache.ibatis.binding.MapperMethod.execute",
       "artifact_sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7",
       "artifact_entry": "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/binding/MapperMethod.class",
       "authority": "final-artifact-mybatis-proxy-runtime"
     },
     {
-      "api_identity": "('org.mybatis:mybatis', 'org.apache.ibatis.session.SqlSession.selectOne', '(java.lang.String,java.lang.Object)', 'method', 'REMOVED')",
+      "api_identity": "org.mybatis:mybatis|org.apache.ibatis.session.SqlSession.selectOne|(java.lang.String,java.lang.Object)|method|REMOVED",
       "target_class": "org.apache.ibatis.session.SqlSession.selectOne",
       "artifact_sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7",
       "artifact_entry": "BOOT-INF/lib/mybatis-3.5.19.jar!/org/apache/ibatis/session/SqlSession.class",

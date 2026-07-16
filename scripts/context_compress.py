@@ -193,14 +193,14 @@ def summarize_step4(report_dir):
                 unconfirmed.append(api)
 
     compression_warnings = []
-    # 检查 jar 未找到情况
+    # 检查最终制品 JAR 证据缺失情况
     if os.path.isdir(jar_dir):
         for f in os.listdir(jar_dir):
             if f.endswith('_binary.txt'):
                 try:
                     content = Path(f"{jar_dir}/{f}").read_text(
                         encoding='utf-8', errors='replace')[:300]
-                    if '未找到' in content or 'jar 未找到' in content:
+                    if '最终制品' in content and ('证据缺失' in content or '未找到' in content):
                         jar_missing.append(f)
                 except (OSError, UnicodeError) as exc:
                     compression_warnings.append(
@@ -514,7 +514,7 @@ def display_checkpoint(checkpoint_path):
         s = steps['step4']
         print(f"  Step 4 jar 对比：P0={s.get('p0_count',0)} P1={s.get('p1_count',0)} P2={s.get('p2_count',0)}")
         if s.get('jar_missing_count', 0) > 0:
-            print(f"    ⚠️  {s['jar_missing_count']} 个依赖 jar 未找到，对比不完整")
+            print(f"    ⚠️  {s['jar_missing_count']} 个依赖缺少最终制品 JAR 证据，对比不完整")
 
     if 'step5' in steps:
         s = steps['step5']

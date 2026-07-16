@@ -27,7 +27,7 @@ s4_jar_compare.py — Step 4：jar 包变更全量对比
 
 import argparse, csv, json, os, re, shutil, struct, sys, time, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from datetime import datetime
 import hashlib, zipfile
@@ -353,9 +353,6 @@ def infer_package_from_source_path(source_path):
     return ''
 
 
-def m2_repo_hint():
-    return str(maven_repo_dir())
-
 def _split_coord(coord: str):
     parts = (coord or "").strip().split(":")
     if len(parts) < 2:
@@ -384,27 +381,41 @@ def _safe_artifact_entry_filename(entry_name):
 
 
 class Step1ArtifactJarResolver:
-    """Resolve dependency jars from Step1 final build artifacts before falling back to Maven.
+    """Resolve dependency jars exclusively from the Step1 final build artifacts.
 
     Step1 records the final deployable artifact and each packaged lib entry.  Reusing those
     nested jars keeps Step4 aligned with the exact artifacts that successfully built, and avoids
-    repeatedly resolving/downloading jars that are already present in the packaged output.
+    substituting a different jar from a developer's local Maven repository.
     """
 
     def __init__(self, report_dir, output_dir):
         self.report_dir = Path(report_dir or ".").resolve()
         self.output_dir = Path(output_dir or ".").resolve()
         self.cache_dir = self.output_dir / "step4_artifact_jars"
+        self._load_failure = None
+        self._entry_failures = {}
         self.sides = self._load_sides()
         self._entry_cache = {}
 
     def _load_sides(self):
         provenance_path = self.report_dir / "dependencies" / "build_provenance.json"
         if not provenance_path.is_file():
+            self._load_failure = {
+                "reason_code": "STEP1_BUILD_PROVENANCE_MISSING",
+                "message": "Step1 构建产物来源记录不存在",
+                "provenance_path": str(provenance_path),
+            }
             return {}
         try:
             data = json.loads(provenance_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            self._load_failure = {
+                "reason_code": "STEP1_BUILD_PROVENANCE_UNREADABLE",
+                "message": "Step1 构建产物来源记录无法读取",
+                "provenance_path": str(provenance_path),
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:300],
+            }
             return {}
         sides = {}
         for item in data.get("sides") or []:
@@ -432,6 +443,45 @@ class Step1ArtifactJarResolver:
             return None
         return self.resolve_entry(side, lib_entry)
 
+    def failure_for_row(self, row, side):
+        """Return user-reviewable evidence explaining why a final-artifact jar was unavailable."""
+        row = row or {}
+        entry_field = "base_lib_entry" if side == "base" else "current_lib_entry"
+        lib_entry = str(row.get(entry_field) or "").replace("\\", "/").strip()
+        if not lib_entry:
+            return {
+                "source": "step1_final_artifact",
+                "side": side,
+                "reason_code": "FINAL_ARTIFACT_LIB_ENTRY_MISSING",
+                "message": f"Step1 未记录 {side} 最终制品内的依赖 JAR 条目",
+            }
+        if self._load_failure:
+            return {
+                "source": "step1_final_artifact",
+                "side": side,
+                "lib_entry": lib_entry,
+                **self._load_failure,
+            }
+        side_meta = self.sides.get(side) or {}
+        artifact_path = str(side_meta.get("artifact_path") or "")
+        if not artifact_path:
+            return {
+                "source": "step1_final_artifact",
+                "side": side,
+                "lib_entry": lib_entry,
+                "reason_code": "FINAL_ARTIFACT_SIDE_UNAVAILABLE",
+                "message": f"Step1 留存的 {side} 最终制品不可用",
+            }
+        key = (side, artifact_path, lib_entry)
+        return dict(self._entry_failures.get(key) or {
+            "source": "step1_final_artifact",
+            "side": side,
+            "artifact_path": artifact_path,
+            "lib_entry": lib_entry,
+            "reason_code": "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
+            "message": "最终制品内依赖 JAR 证据缺失",
+        })
+
     def resolve_entry(self, side, lib_entry):
         side_meta = self.sides.get(side) or {}
         artifact_path = side_meta.get("artifact_path")
@@ -447,6 +497,14 @@ class Step1ArtifactJarResolver:
             with zipfile.ZipFile(artifact) as zf:
                 names = set(zf.namelist())
                 if lib_entry not in names:
+                    self._entry_failures[key] = {
+                        "source": "step1_final_artifact",
+                        "side": side,
+                        "artifact_path": str(artifact),
+                        "lib_entry": lib_entry,
+                        "reason_code": "FINAL_ARTIFACT_LIB_ENTRY_NOT_FOUND",
+                        "message": "Step1 记录的依赖 JAR 条目不在最终制品中",
+                    }
                     self._entry_cache[key] = None
                     return None
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -454,8 +512,17 @@ class Step1ArtifactJarResolver:
                 if not target.exists() or target.stat().st_size != info.file_size:
                     with zf.open(info) as src, open(target, "wb") as dst:
                         shutil.copyfileobj(src, dst)
-        except Exception as exc:
-            _ = exc
+        except (OSError, zipfile.BadZipFile, KeyError) as exc:
+            self._entry_failures[key] = {
+                "source": "step1_final_artifact",
+                "side": side,
+                "artifact_path": str(artifact),
+                "lib_entry": lib_entry,
+                "reason_code": "FINAL_ARTIFACT_JAR_EXTRACTION_FAILED",
+                "message": "无法从最终制品提取依赖 JAR",
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:300],
+            }
             self._entry_cache[key] = None
             return None
         evidence = {
@@ -1117,7 +1184,7 @@ def build_timeout_resolution_interaction(output_dir, timeout_items):
         "title": "step4 存在超时证据缺口",
         "question": (
             "Step4 出现了超时，当前证据池不完整。"
-            "请先确认是 git diff、JApiCmp 还是 dependency:get 超时，并在必要时放宽 Step4 超时参数后重跑；"
+            "请先确认是 git diff、JApiCmp 对比还是 JApiCmp 工具自动安装超时，并在必要时放宽 Step4 超时参数后重跑；"
             "在超时问题解决前不要继续进入 Step5。"
         ),
         "summary": f"共有 {len(timeout_items)} 个超时项需要先处理。",
@@ -1159,7 +1226,7 @@ def build_timeout_resolution_interaction(output_dir, timeout_items):
                 },
                 "step4_fetch_timeout": {
                     "type": "integer",
-                    "description": "可选。放宽 Maven dependency:get 的超时时间（秒）。",
+                    "description": "可选。放宽 JApiCmp 工具自动安装的超时时间（秒）；不会用于下载被分析依赖。",
                 },
                 "dependency_source_dirs": {
                     "type": "array",
@@ -1440,49 +1507,6 @@ def collect_data_contract_changes(
     )
 
 
-def find_jar_in_m2(group_id, artifact_id, version, classifier=None):
-    """在本地 Maven 仓库查找 jar 文件（Windows/Linux/macOS 兼容路径）"""
-    # 用 Path 逐级构建，不用 replace('.', '/') 避免 Windows 路径问题
-    base = maven_repo_dir()
-    for part in group_id.split('.'):
-        base = base / part
-    base = base / artifact_id / version
-    # 优先找非 sources/javadoc 的 jar
-    patterns = []
-    if classifier:
-        patterns.append(f"{artifact_id}-{version}-{classifier}.jar")
-    patterns.extend([f"{artifact_id}-{version}.jar", f"{artifact_id}-{version}-*.jar"])
-    for pattern in patterns:
-        matches = list(base.glob(pattern)) if base.exists() else []
-        matches = [m for m in matches
-                   if 'sources' not in m.name and 'javadoc' not in m.name]
-        if matches:
-            return str(matches[0])
-    return None
-
-def fetch_jar_from_repo(coord, version, timeout=DEFAULT_FETCH_TIMEOUT):
-    """尝试从 Maven 仓库下载 jar"""
-    group_id, artifact_id, classifier = _split_coord(coord)
-    if not group_id or not artifact_id or not version:
-        return False, "invalid_coord"
-    if classifier:
-        artifact_expr = f"{group_id}:{artifact_id}:{version}:jar:{classifier}"
-    else:
-        artifact_expr = f"{group_id}:{artifact_id}:{version}"
-    _stdout, stderr, rc = run_cmd(
-        mvn_cmd() + ['dependency:get',
-                     f'-Dartifact={artifact_expr}',
-                     '--no-transfer-progress', '-q'],
-        timeout=timeout
-    )
-    if rc == 0:
-        return True, None
-    if rc == -1 and '超时' in (stderr or ''):
-        timeout_label = f"{timeout}s" if timeout not in (None, "") else "unbounded"
-        return False, f"timeout({timeout_label})"
-    return False, (stderr or 'dependency:get failed')[:160]
-
-
 def _iter_jar_class_entries(jar_path):
     with zipfile.ZipFile(jar_path) as zf:
         for entry in sorted(zf.namelist()):
@@ -1491,6 +1515,192 @@ def _iter_jar_class_entries(jar_path):
             if entry.endswith('module-info.class') or entry.endswith('package-info.class'):
                 continue
             yield entry[:-6].replace('/', '.')
+
+
+def _jar_binary_class_set(jar_path):
+    try:
+        return set(_iter_jar_class_entries(str(jar_path or '')))
+    except (OSError, zipfile.BadZipFile):
+        return set()
+
+
+def _coord_group(coord):
+    return str(coord or '').split(':', 1)[0].strip()
+
+
+def _write_runtime_provider_set_jar(paths):
+    normalized = tuple(dict.fromkeys(
+        str(Path(path).resolve()) for path in paths if path
+    ))
+    digest = hashlib.sha256('\n'.join(normalized).encode('utf-8')).hexdigest()[:16]
+    output = Path(normalized[0]).parent / f'.jua-runtime-provider-set-{digest}.jar'
+    seen = set()
+    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as target:
+        for path in normalized:
+            with zipfile.ZipFile(path) as source:
+                for name in sorted(source.namelist()):
+                    if not name.endswith('.class') or name.startswith('META-INF/') or name in seen:
+                        continue
+                    seen.add(name)
+                    target.writestr(name, source.read(name))
+    return str(output)
+
+
+def pair_artifact_replacement_rows(rows):
+    """Build logical runtime providers from class-continuity evidence."""
+    prepared = [dict(row or {}) for row in (rows or [])]
+    removed = []
+    added = []
+    upgraded = []
+    class_sets = {}
+    for index, row in enumerate(prepared):
+        old_version = str(row.get('old_version') or '-').strip() or '-'
+        new_version = str(row.get('new_version') or '-').strip() or '-'
+        change_type = str(row.get('change_type') or '').strip()
+        if row.get('_step4_base_jar_path'):
+            class_sets[(index, 'base')] = _jar_binary_class_set(row.get('_step4_base_jar_path'))
+        if row.get('_step4_current_jar_path'):
+            class_sets[(index, 'current')] = _jar_binary_class_set(row.get('_step4_current_jar_path'))
+        if (change_type == '移除' or (new_version == '-' and old_version != '-')) and row.get('_step4_base_jar_path'):
+            removed.append(index)
+        elif (change_type == '新增' or (old_version == '-' and new_version != '-')) and row.get('_step4_current_jar_path'):
+            added.append(index)
+        elif row.get('_step4_base_jar_path') and row.get('_step4_current_jar_path'):
+            upgraded.append(index)
+
+    provider_replacements = {}
+    provider_consumed_added = set()
+    provider_evidence = []
+    candidate_owners = defaultdict(list)
+    for added_index in added:
+        added_classes = class_sets.get((added_index, 'current')) or set()
+        added_group = _coord_group(
+            prepared[added_index].get('current_coord') or prepared[added_index].get('coord')
+        )
+        for upgraded_index in upgraded:
+            old_classes = class_sets.get((upgraded_index, 'base')) or set()
+            upgraded_group = _coord_group(
+                prepared[upgraded_index].get('base_coord') or prepared[upgraded_index].get('coord')
+            )
+            if added_group and added_group == upgraded_group and len(old_classes & added_classes) >= 2:
+                candidate_owners[added_index].append(upgraded_index)
+    companions = defaultdict(list)
+    for added_index, owners in candidate_owners.items():
+        if len(owners) == 1:
+            companions[owners[0]].append(added_index)
+    for upgraded_index, companion_indexes in companions.items():
+        row = dict(prepared[upgraded_index])
+        provider_indexes = [upgraded_index, *companion_indexes]
+        provider_paths = [
+            prepared[index].get('_step4_current_jar_path') for index in provider_indexes
+        ]
+        old_classes = class_sets.get((upgraded_index, 'base')) or set()
+        new_classes = set().union(*(
+            class_sets.get((index, 'current')) or set() for index in provider_indexes
+        ))
+        row['_step4_current_jar_path'] = _write_runtime_provider_set_jar(provider_paths)
+        row['pairing_status'] = 'artifact_provider_set_replacement'
+        row['pairing_reason_code'] = ''
+        provider_replacements[upgraded_index] = row
+        provider_consumed_added.update(companion_indexes)
+        provider_evidence.append({
+            'base_coord': str(row.get('base_coord') or row.get('coord') or '').strip(),
+            'current_coord': str(row.get('current_coord') or row.get('coord') or '').strip(),
+            'old_version': str(row.get('old_version') or '-').strip() or '-',
+            'new_version': str(row.get('new_version') or '-').strip() or '-',
+            'old_classes': len(old_classes),
+            'new_classes': len(new_classes),
+            'shared_classes': len(old_classes & new_classes),
+            'old_class_coverage': round(len(old_classes & new_classes) / len(old_classes), 6) if old_classes else 0.0,
+            'new_class_coverage': round(len(old_classes & new_classes) / len(new_classes), 6) if new_classes else 0.0,
+            'current_provider_count': len(provider_indexes),
+            'current_provider_coords': [
+                str(prepared[index].get('current_coord') or prepared[index].get('coord') or '').strip()
+                for index in provider_indexes
+            ],
+            'evidence_type': 'final_artifact_binary_provider_set',
+        })
+
+    candidates = {}
+    reverse_candidates = defaultdict(list)
+    for old_index in removed:
+        old_classes = class_sets.get((old_index, 'base')) or set()
+        if len(old_classes) < 2:
+            continue
+        matches = []
+        for new_index in added:
+            if new_index in provider_consumed_added:
+                continue
+            old_group = _coord_group(
+                prepared[old_index].get('base_coord') or prepared[old_index].get('coord')
+            )
+            new_group = _coord_group(
+                prepared[new_index].get('current_coord') or prepared[new_index].get('coord')
+            )
+            if not old_group or old_group != new_group:
+                continue
+            new_classes = class_sets.get((new_index, 'current')) or set()
+            if old_classes and old_classes.issubset(new_classes):
+                matches.append(new_index)
+                reverse_candidates[new_index].append(old_index)
+        candidates[old_index] = matches
+
+    replacements = {}
+    evidence = list(provider_evidence)
+    for old_index, matches in candidates.items():
+        if len(matches) != 1:
+            continue
+        new_index = matches[0]
+        if len(reverse_candidates.get(new_index) or []) != 1:
+            continue
+        old_row = prepared[old_index]
+        new_row = prepared[new_index]
+        old_classes = class_sets[(old_index, 'base')]
+        new_classes = class_sets[(new_index, 'current')]
+        base_coord = str(old_row.get('base_coord') or old_row.get('coord') or '').strip()
+        current_coord = str(new_row.get('current_coord') or new_row.get('coord') or '').strip()
+        merged = dict(new_row)
+        merged.update({
+            'coord': current_coord or base_coord,
+            'base_coord': base_coord,
+            'current_coord': current_coord,
+            'old_version': str(old_row.get('old_version') or '-').strip() or '-',
+            'new_version': str(new_row.get('new_version') or '-').strip() or '-',
+            'change_type': '坐标替代升级',
+            'base_lib_entry': str(old_row.get('base_lib_entry') or '').strip(),
+            'pairing_status': 'artifact_class_set_replacement',
+            'pairing_reason_code': '',
+            '_step4_base_jar_path': old_row.get('_step4_base_jar_path') or '',
+            '_step4_base_jar_evidence': old_row.get('_step4_base_jar_evidence') or {},
+        })
+        replacements[old_index] = (new_index, merged)
+        evidence.append({
+            'base_coord': base_coord,
+            'current_coord': current_coord,
+            'old_version': merged['old_version'],
+            'new_version': merged['new_version'],
+            'old_classes': len(old_classes),
+            'new_classes': len(new_classes),
+            'shared_classes': len(old_classes & new_classes),
+            'old_class_coverage': round(len(old_classes & new_classes) / len(old_classes), 6),
+            'new_class_coverage': round(len(old_classes & new_classes) / len(new_classes), 6),
+            'base_lib_entry': merged.get('base_lib_entry') or '',
+            'current_lib_entry': merged.get('current_lib_entry') or '',
+            'evidence_type': 'final_artifact_binary_class_containment',
+        })
+
+    consumed_added = {new_index for new_index, _merged in replacements.values()}
+    result = []
+    for index, row in enumerate(prepared):
+        if index in provider_replacements:
+            result.append(provider_replacements[index])
+        elif index in provider_consumed_added:
+            continue
+        elif index in replacements:
+            result.append(replacements[index][1])
+        elif index not in consumed_added:
+            result.append(row)
+    return result, evidence
 
 
 def _run_javap_public_api_dump(jar_path, class_binary_name):
@@ -1752,22 +1962,19 @@ def export_removed_jar_apis(
         old_jar = None
         old_jar_source = ""
     if not old_jar:
-        old_jar = find_jar_in_m2(group_id, artifact_id, old_ver, classifier=classifier)
-        old_jar_source = "m2_repository" if old_jar else ""
-    fetch_old_error = None
-    if not old_jar:
-        fetched, fetch_old_error = fetch_jar_from_repo(resolved_old_coord, old_ver, timeout=fetch_timeout)
-        if fetched:
-            old_jar = find_jar_in_m2(group_id, artifact_id, old_ver, classifier=classifier)
-            old_jar_source = "m2_repository" if old_jar else ""
-    if not old_jar:
         msg = (
-            f"=== 无法导出 removed jar 符号：旧版 jar 未找到 ===\n"
+            f"=== 无法导出 removed jar 符号：base 最终制品证据缺失 ===\n"
             f"coord={resolved_old_coord}\nold_version={old_ver}\n"
-            f"fetch_result={fetch_old_error or '未尝试/成功'}\n"
+            "Step4 只允许分析 Step1 留存的 base 最终制品内 JAR，"
+            "不会读取本地 Maven 仓库或下载替代 JAR。\n"
         )
         write_result(out_file, msg)
-        return out_file, [], {"old_jar": None, "fetch_old_error": fetch_old_error}, "jar 未找到"
+        return out_file, [], {
+            "old_jar": None,
+            "old_jar_source": "",
+            "old_jar_evidence": old_jar_evidence or {},
+            "reason_code": "BASE_FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
+        }, "base 最终制品内未找到待分析依赖 JAR"
 
     apis = []
     errors = []
@@ -1858,58 +2065,21 @@ def run_japicmp(
     if new_jar and not os.path.exists(new_jar):
         new_jar = None
         new_jar_source = ""
-    if not old_jar:
-        old_jar = find_jar_in_m2(old_group_id, old_artifact_id, old_ver, classifier=old_classifier)
-        old_jar_source = "m2_repository" if old_jar else ""
-    if not new_jar:
-        new_jar = find_jar_in_m2(new_group_id, new_artifact_id, new_ver, classifier=new_classifier)
-        new_jar_source = "m2_repository" if new_jar else ""
-
-    fetch_old_error = None
-    fetch_new_error = None
-    if not old_jar:
-        print(f"  本地无 {resolved_old_coord}:{old_ver}，尝试下载...", file=sys.stderr)
-        fetched, fetch_old_error = fetch_jar_from_repo(resolved_old_coord, old_ver, timeout=fetch_timeout)
-        if fetched:
-            old_jar = find_jar_in_m2(old_group_id, old_artifact_id, old_ver, classifier=old_classifier)
-            old_jar_source = "m2_repository" if old_jar else ""
-    if not new_jar:
-        print(f"  本地无 {resolved_new_coord}:{new_ver}，尝试下载...", file=sys.stderr)
-        fetched, fetch_new_error = fetch_jar_from_repo(resolved_new_coord, new_ver, timeout=fetch_timeout)
-        if fetched:
-            new_jar = find_jar_in_m2(new_group_id, new_artifact_id, new_ver, classifier=new_classifier)
-            new_jar_source = "m2_repository" if new_jar else ""
-
-    # 仍然找不到：明确记录，不跳过
+    # 最终制品证据不完整时失败封闭，不使用本地仓库或下载 JAR 替代。
     if not old_jar or not new_jar:
-        old_hint_path = str(
-            Path(m2_repo_hint())
-            / Path(*old_group_id.split('.'))
-            / old_artifact_id
-            / old_ver
-        )
-        new_hint_path = str(
-            Path(m2_repo_hint())
-            / Path(*new_group_id.split('.'))
-            / new_artifact_id
-            / new_ver
-        )
+        missing_sides = []
+        if not old_jar:
+            missing_sides.append('base')
+        if not new_jar:
+            missing_sides.append('current')
         msg = (
-            f"=== 无法完成对比：{display_coord} ===\n"
+            f"=== 无法完成对比：最终制品证据缺失 ===\n"
+            f"依赖：{display_coord}\n"
             f"旧坐标：{resolved_old_coord}\n"
             f"新坐标：{resolved_new_coord}\n"
-            f"旧版本 {old_ver} jar：{'已找到 ' + old_jar if old_jar else '❌ 未找到'}\n"
-            f"新版本 {new_ver} jar：{'已找到 ' + new_jar if new_jar else '❌ 未找到'}\n\n"
-            f"下载结果：old={fetch_old_error or '未尝试/成功'} new={fetch_new_error or '未尝试/成功'}\n\n"
-            f"需要用户协助：\n"
-            f"  1. 确认私服地址已在本机 Maven settings.xml 中配置（常见路径：~/.m2/settings.xml）\n"
-            f"  2. 手动执行：mvn dependency:get -Dartifact={resolved_old_coord}:{old_ver}\n"
-            f"  3. 手动执行：mvn dependency:get -Dartifact={resolved_new_coord}:{new_ver}\n"
-            f"  4. 如果当前只有 jar 文件，请将旧版 jar 放到：\n"
-            f"     {old_hint_path}\n"
-            f"     并将新版 jar 放到：\n"
-            f"     {new_hint_path}\n"
-            f"  然后重新运行本步骤。\n"
+            f"缺少制品侧：{', '.join(missing_sides)}\n"
+            "Step4 只允许分析 Step1 留存的 base/current 最终制品内 JAR，"
+            "不会读取本地 Maven 仓库或下载替代 JAR。请先修复 Step1 制品条目证据后重跑。\n"
         )
         write_result(out_file, msg)
         return out_file, [], {
@@ -1919,9 +2089,9 @@ def run_japicmp(
             "new_jar_source": new_jar_source,
             "old_jar_evidence": old_jar_evidence or {},
             "new_jar_evidence": new_jar_evidence or {},
-            "fetch_old_error": fetch_old_error,
-            "fetch_new_error": fetch_new_error,
-        }, f"jar 未找到：{display_coord}（旧:{old_jar or '缺失'} 新:{new_jar or '缺失'}）"
+            "missing_sides": missing_sides,
+            "reason_code": "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
+        }, f"最终制品 JAR 证据缺失：{display_coord}（{', '.join(missing_sides)}）"
 
     if not os.path.exists(japicmp_jar):
         msg = (
@@ -4099,13 +4269,13 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
     lines.append("一、先看什么")
     lines.append("- 如果只决定 Step5 分析范围，先打开 changed_dependencies.md，按依赖包选择 selection_key。")
     lines.append("- 如果要核对完整 API 事实，再打开 all_changed_apis.csv。")
-    lines.append("- 如果报告提示缺少 jar、JApiCmp 或依赖源码 ref，再看本文件后面的缺口清单。")
+    lines.append("- 如果报告提示最终制品 JAR 证据缺失、JApiCmp 不可用或依赖源码 ref 待确认，再看本文件后面的缺口清单。")
     lines.append("")
     lines.append("二、本次是否能进入 Step5")
     lines.append(f"- 变更 API 有效行：{valid_count}")
     lines.append(f"- 契约校验失败：{invalid_count}")
     lines.append(f"- 高风险/需关注条目：{len(alerts)}")
-    lines.append(f"- jar 未找到：{len(jar_missing_deps)}")
+    lines.append(f"- 最终制品 JAR 证据缺失：{len(jar_missing_deps)}")
     lines.append(f"- JApiCmp 未安装导致未分析：{len(japicmp_missing_deps)}")
     lines.append(f"- 其他 JApiCmp 失败：{len(other_failed_deps)}")
     if valid_count:
@@ -4201,7 +4371,7 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
         lines.append(f"- {k or '未标明类型'}: {v}")
     lines.append("")
     if jar_missing_deps:
-        lines.append(f"jar 未找到（前 {min(20, len(jar_missing_deps))} 项）")
+        lines.append(f"最终制品 JAR 证据缺失（前 {min(20, len(jar_missing_deps))} 项）")
         for c in jar_missing_deps[:20]:
             lines.append(f"- {c}")
         if len(jar_missing_deps) > 20:
@@ -4280,7 +4450,7 @@ def main():
     ap.add_argument('--japicmp-timeout', type=int, default=DEFAULT_JAPICMP_TIMEOUT,
                     help='单个依赖执行 JApiCmp 的超时时间（秒）')
     ap.add_argument('--fetch-timeout', type=int, default=DEFAULT_FETCH_TIMEOUT,
-                    help='单个依赖通过 Maven 拉取 jar 的超时时间（秒）')
+                    help='自动安装 JApiCmp 工具的超时时间（秒）；不会用于下载被分析依赖')
     ap.add_argument('--workers', type=int, default=int(os.environ.get("JUA_STEP4_WORKERS", "4") or "4"),
                     help='Step4 依赖级并行 worker 数；设为 1 可恢复串行执行')
     ap.add_argument('--skip-changed-classes', action='store_true',
@@ -4598,26 +4768,48 @@ def main():
         prepared = dict(row)
         base_evidence = artifact_resolver.resolve_for_row(row, "base")
         current_evidence = artifact_resolver.resolve_for_row(row, "current")
+        prepared["_step4_base_jar_evidence"] = (
+            base_evidence or artifact_resolver.failure_for_row(row, "base")
+        )
+        prepared["_step4_current_jar_evidence"] = (
+            current_evidence or artifact_resolver.failure_for_row(row, "current")
+        )
         if base_evidence:
             artifact_jar_hits += 1
             prepared["_step4_base_jar_path"] = base_evidence.get("path") or ""
-            prepared["_step4_base_jar_evidence"] = base_evidence
         if current_evidence:
             artifact_jar_hits += 1
             prepared["_step4_current_jar_path"] = current_evidence.get("path") or ""
-            prepared["_step4_current_jar_evidence"] = current_evidence
         prepared_dep_rows.append(prepared)
+    prepared_dep_rows, artifact_replacements = pair_artifact_replacement_rows(prepared_dep_rows)
+    artifact_replacements_path = Path(args.output_dir) / "artifact_replacements.json"
+    artifact_replacements_path.write_text(
+        json.dumps(
+            {
+                "schema": "java-upgrade-analyzer.artifact-replacements.v1",
+                "items": artifact_replacements,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
     timing.record(
         "artifact_resolve",
         status="success",
         elapsed=time.perf_counter() - artifact_resolve_timer,
-        details={"dependencies": len(analysis_dep_rows), "jar_hits": artifact_jar_hits},
+        details={
+            "dependencies": len(analysis_dep_rows),
+            "prepared_dependencies": len(prepared_dep_rows),
+            "jar_hits": artifact_jar_hits,
+            "artifact_replacements": len(artifact_replacements),
+        },
     )
 
     workers = max(1, int(args.workers or 1))
-    if len(analysis_dep_rows) <= 1:
+    if len(prepared_dep_rows) <= 1:
         workers = 1
-    total_dependencies = len(analysis_dep_rows)
+    total_dependencies = len(prepared_dep_rows)
     print(
         f"\nStep 4 开始：处理 {total_dependencies} 个需分析依赖"
         f"（跳过 {len(dep_rows) - total_dependencies} 个无需分析依赖，workers={workers}，"
@@ -4857,7 +5049,14 @@ def main():
                 "error": err,
             }
             if err:
-                result["binary_runs"].append({'coord': coord, 'status': 'failed', 'mode': 'old_jar_export', 'error': err})
+                result["binary_runs"].append({
+                    'coord': coord,
+                    'status': 'failed',
+                    'mode': 'old_jar_export',
+                    'error': err,
+                    'reason_code': str((jar_info or {}).get('reason_code') or ''),
+                    'old_jar_evidence': (jar_info or {}).get('old_jar_evidence') or {},
+                })
                 print(f"    ⚠️  removed jar 旧版符号导出失败：{err}", file=sys.stderr)
                 emit_progress(
                     "step4",
@@ -4869,17 +5068,6 @@ def main():
                     item=coord,
                 )
                 result["jar_missing_deps"].append(coord)
-                if str((jar_info or {}).get("fetch_old_error") or "").startswith("timeout("):
-                    result["timeout_items"].append(
-                        {
-                            "coord": coord,
-                            "stage": "dependency_get",
-                            "timeout_seconds": args.fetch_timeout,
-                            "reason": (jar_info or {}).get("fetch_old_error"),
-                            "old_version": old_ver,
-                            "new_version": new_ver,
-                        }
-                    )
             else:
                 result["binary_runs"].append({
                     'coord': coord,
@@ -4946,6 +5134,9 @@ def main():
                 'japicmp_version': str((jar_info or {}).get('japicmp_version') or ''),
                 'japicmp_sha256': str((jar_info or {}).get('japicmp_sha256') or ''),
                 'error': str(err or ''),
+                'reason_code': str((jar_info or {}).get('reason_code') or ''),
+                'old_jar_evidence': (jar_info or {}).get('old_jar_evidence') or {},
+                'new_jar_evidence': (jar_info or {}).get('new_jar_evidence') or {},
             })
             if compute_changed_classes_enabled and jar_info and jar_info.get("old_jar") and jar_info.get("new_jar"):
                 changed_classes_timer = time.perf_counter()
@@ -4989,21 +5180,8 @@ def main():
                     elapsed=time.perf_counter() - japicmp_timer,
                     item=coord,
                 )
-                if 'jar 未找到' in err:
+                if (jar_info or {}).get('reason_code') == 'FINAL_ARTIFACT_JAR_EVIDENCE_MISSING':
                     result["jar_missing_deps"].append(coord)
-                    if str(jar_info.get("fetch_old_error") or "").startswith("timeout(") or str(
-                        jar_info.get("fetch_new_error") or ""
-                    ).startswith("timeout("):
-                        result["timeout_items"].append(
-                            {
-                                "coord": coord,
-                                "stage": "dependency_get",
-                                "timeout_seconds": args.fetch_timeout,
-                                "reason": jar_info.get("fetch_old_error") or jar_info.get("fetch_new_error"),
-                                "old_version": old_ver,
-                                "new_version": new_ver,
-                            }
-                        )
                 elif 'JApiCmp 未安装' in err:
                     result["japicmp_missing_deps"].append(coord)
                 else:
@@ -5278,7 +5456,7 @@ def main():
     print(f"\nStep 4 完成：", file=sys.stderr)
     print(f"  变更 API 总数：{valid_count}", file=sys.stderr)
     print(f"  数据验证失败：{invalid_count} 行", file=sys.stderr)
-    print(f"  jar 未找到：{len(jar_missing_deps)} 个依赖", file=sys.stderr)
+    print(f"  最终制品 JAR 证据缺失：{len(jar_missing_deps)} 个依赖", file=sys.stderr)
     print(f"  JApiCmp 未安装：{len(japicmp_missing_deps)} 个依赖", file=sys.stderr)
     print(f"  其他 JApiCmp 失败：{len(other_failed_deps)} 个依赖", file=sys.stderr)
     print(f"  git ref 待人工确认：{len(gitdiff_pending)} 个依赖", file=sys.stderr)
@@ -5316,6 +5494,11 @@ def main():
         )
 
     binary_failures = [item for item in binary_runs if item.get('status') != 'success']
+    binary_failure_reason_codes = sorted({
+        str(item.get('reason_code') or '').strip()
+        for item in binary_failures
+        if str(item.get('reason_code') or '').strip()
+    })
     text_fallbacks = [item for item in binary_runs if item.get('parser_mode') == 'text_fallback']
     missing_classes_ignored = [item for item in binary_runs if item.get('missing_class_policy') == 'ignored']
     binary_status = (
@@ -5323,7 +5506,7 @@ def main():
         else ('partial' if binary_failures or text_fallbacks or missing_classes_ignored else 'complete')
     ) if binary_runs else 'not_applicable'
     behavior_expected = [
-        row for row in analysis_dep_rows
+        row for row in prepared_dep_rows
         if row.get('coord') in dependency_paths
         and row.get('old_version') not in ('', '-')
         and row.get('new_version') not in ('', '-')
@@ -5339,6 +5522,7 @@ def main():
             'status': binary_status,
             'reason_codes': (
                 (['japicmp_or_old_jar_failed'] if binary_failures else [])
+                + binary_failure_reason_codes
                 + (['JAPICMP_TEXT_FALLBACK_USED'] if text_fallbacks else [])
                 + (['JAPICMP_MISSING_CLASSES_IGNORED'] if missing_classes_ignored else [])
             ),

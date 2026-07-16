@@ -15,6 +15,19 @@ import gate  # noqa: E402
 
 
 class Step2SourceDirsTest(unittest.TestCase):
+    def test_load_dep_changes_rejects_duplicate_artifact_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dep_changes = Path(tmp) / "dep_changes.csv"
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,resolution_status,base_lib_entry,current_lib_entry\n"
+                "org.apache.shiro:shiro-core,2.1.0,2.2.0,小版本升级,resolved,BOOT-INF/lib/shiro-core-2.1.0.jar,BOOT-INF/lib/shiro-core-2.2.0.jar\n"
+                "org.apache.shiro:shiro-core,2.1.0,2.2.0,小版本升级,resolved,BOOT-INF/lib/shiro-core-2.1.0-jakarta.jar,BOOT-INF/lib/shiro-core-2.2.0-jakarta.jar\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "duplicate dependency identity"):
+                step2.load_dep_changes(dep_changes)
+
     def test_dependency_graph_does_not_infer_edges_from_raw_dependency_poms(self):
         deps = {
             "org.example:parent": {

@@ -26,6 +26,8 @@ class GateTask:
     purpose: str
     heavy: bool = False
     real_project: bool = False
+    run_after_failure: bool = False
+    output_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -108,6 +110,7 @@ def _real_project_task(python_exe, case, report_root, json_out=""):
         purpose="真实项目矩阵，验证复杂源码、字节码、输出语义和性能边界",
         heavy=True,
         real_project=True,
+        output_paths=(json_out,) if json_out else (),
     )
 
 
@@ -118,12 +121,64 @@ def _quality_signal_audit_task(python_exe, real_json, audit_json):
             python_exe,
             "scripts/quality_signal_audit.py",
             real_json,
-            "--fail-on-blocking",
             "--json-out",
             audit_json,
         ],
         purpose="审计真实项目质量信号，阻塞 P0/P1 correctness/capability/evidence 问题",
         real_project=True,
+        run_after_failure=True,
+        output_paths=(audit_json,),
+    )
+
+
+def _test_round_retrospective_task(python_exe, real_json, audit_json, audit_root):
+    retrospective_json = str(audit_root / "test_round_retrospective.json")
+    retrospective_markdown = str(audit_root / "test_round_retrospective.md")
+    return GateTask(
+        name="test_round_retrospective",
+        command=[
+            python_exe,
+            "scripts/test_round_retrospective.py",
+            real_json,
+            audit_json,
+            "--reviews",
+            str(audit_root / "test_round_reviews.json"),
+            "--history",
+            str(audit_root / "test_round_history.json"),
+            "--json-out",
+            retrospective_json,
+            "--markdown-out",
+            retrospective_markdown,
+        ],
+        purpose="复盘本轮缺陷根因、逃逸原因、覆盖增量、性能和下一项目决策",
+        real_project=True,
+        run_after_failure=True,
+        output_paths=(retrospective_json, retrospective_markdown),
+    )
+
+
+def _capability_family_closure_task(python_exe, real_json, audit_root):
+    closure_json = str(audit_root / "capability_family_closure.json")
+    return GateTask(
+        name="capability_family_closure",
+        command=[
+            python_exe,
+            "scripts/capability_family_closure.py",
+            "tests/fixtures/capability_families.json",
+            real_json,
+            "--reviews",
+            str(audit_root / "test_round_reviews.json"),
+            "--history",
+            str(audit_root / "test_round_history.json"),
+            "--retrospective",
+            str(audit_root / "test_round_retrospective.json"),
+            "--json-out",
+            closure_json,
+        ],
+        purpose="验证能力家族已完成全生产路径、广义回归、故障注入和跨项目闭环",
+        real_project=True,
+        run_after_failure=True,
+        output_paths=(closure_json,),
     )
 
 
@@ -160,7 +215,7 @@ def _diff_check_task():
     )
 
 
-def build_plan(profile, python_exe=None, skip_real=False, real_case="all", report_root=None):
+def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", report_root=None):
     python_exe = python_exe or sys.executable
     tasks = [_py_compile_task(python_exe)]
     audit_root = Path(report_root or "/private/tmp/jua-quality-gate")
@@ -191,6 +246,12 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="all", repor
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root, real_json))
             tasks.append(_quality_signal_audit_task(python_exe, real_json, audit_json))
+            tasks.append(_test_round_retrospective_task(
+                python_exe, real_json, audit_json, audit_root
+            ))
+            tasks.append(_capability_family_closure_task(
+                python_exe, real_json, audit_root
+            ))
     elif profile == "release":
         tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))
@@ -199,6 +260,12 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="all", repor
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root, real_json))
             tasks.append(_quality_signal_audit_task(python_exe, real_json, audit_json))
+            tasks.append(_test_round_retrospective_task(
+                python_exe, real_json, audit_json, audit_root
+            ))
+            tasks.append(_capability_family_closure_task(
+                python_exe, real_json, audit_root
+            ))
         tasks.append(_diff_check_task())
     else:
         raise ValueError(f"unknown profile: {profile}")
@@ -206,6 +273,10 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="all", repor
 
 
 def _run_task(task, env=None):
+    for raw_path in task.output_paths:
+        output = Path(raw_path)
+        if output.is_file():
+            output.unlink()
     started = time.perf_counter()
     print(f"[quality-gate] START {task.name}: {' '.join(task.command)}", flush=True)
     completed = subprocess.run(task.command, cwd=str(ROOT), env=env)
@@ -256,12 +327,30 @@ def _read_audit_summary(tasks):
     return {}
 
 
+def _execute_tasks(tasks, env, continue_on_failure=False):
+    results = []
+    overall = "passed"
+    failure_seen = False
+    for task in tasks:
+        if failure_seen and not continue_on_failure and not task.run_after_failure:
+            break
+        result = _run_task(task, env=env)
+        results.append(result)
+        if result.status != "passed":
+            overall = "failed"
+            failure_seen = True
+    return results, overall
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run java-upgrade-analyzer quality gates")
     parser.add_argument("--profile", choices=["quick", "step5", "release"], default="quick")
     parser.add_argument("--python", default=sys.executable, help="Python executable used by gate commands")
     parser.add_argument("--skip-real", action="store_true", help="Skip real project regression matrix")
-    parser.add_argument("--real-case", default="all", help="real_project_regression.py case, default: all")
+    parser.add_argument(
+        "--real-case", default="guard",
+        help="real_project_regression.py selector; default: guard (reproducible guardian matrix)",
+    )
     parser.add_argument("--report-root", default="", help="Report root for real project regression")
     parser.add_argument("--dry-run", action="store_true", help="Print planned commands without executing")
     parser.add_argument("--continue-on-failure", action="store_true", help="Run remaining tasks after a failure")
@@ -288,15 +377,9 @@ def main(argv=None):
 
     started = time.perf_counter()
     env = dict(os.environ)
-    results = []
-    overall = "passed"
-    for task in tasks:
-        result = _run_task(task, env=env)
-        results.append(result)
-        if result.status != "passed":
-            overall = "failed"
-            if not args.continue_on_failure:
-                break
+    results, overall = _execute_tasks(
+        tasks, env=env, continue_on_failure=args.continue_on_failure
+    )
 
     audit_summary = _read_audit_summary(tasks)
     payload = {

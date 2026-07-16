@@ -8,13 +8,12 @@
 - 优先使用 `scripts/run_step.py` 执行单步，减少手动拼命令
 - 只在需要具体命令时查阅本文件
 - 每次只执行一个 Step，执行后立刻做门控与主状态保存
-- 若 `run_step.py` 返回退出码 `4` 或进入待交互状态，优先读取 `.upgrade-report/.runtime/state/main_state.json` 与 `.upgrade-report/.runtime/state/interaction.json`，再由 Agent 向用户发问
-- 若要在首次调用 `step1` 前让 Agent 先完成首轮抽参，可先执行 `python3 "$SKILL/scripts/run_step.py" --describe-step1-contract` 读取静态前置协议
+- 若 `run_step.py` 返回退出码 `4` 或进入待交互状态，优先读取 `.upgrade-report/.runtime/state/main_state.json` 与 `.upgrade-report/.runtime/state/interaction.json`，再由 Claude Code 向用户发问
+- 若要在首次调用 `step1` 前让 Claude Code 先完成首轮抽参，可先执行 `python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract` 读取静态前置协议
 
-### `$SKILL` 约定
+### 技能目录约定
 
-- `$SKILL` 指向本 Skill 的安装目录
-- 若运行环境没有自动注入 `$SKILL`，请先手动设置，或把命令中的 `$SKILL/scripts/...` 替换为实际绝对路径
+- Claude Code 使用 `${CLAUDE_SKILL_DIR}` 指向当前 Skill 的安装目录
 - 正式流程默认通过 `run_step.py` 调度；单脚本命令主要用于开发调试或门控排查
 - 以下命令默认使用 `python3`（适配 macOS/Linux）；若当前环境以 `python` 作为解释器入口，可等价替换
 
@@ -22,7 +21,7 @@
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6> \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6> \
   --project-dir . \
   --report-dir .upgrade-report
 ```
@@ -44,7 +43,7 @@ python3 "$SKILL/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --seed-json /abs/path/to/seed.json
@@ -54,7 +53,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report
 ```
@@ -152,7 +151,7 @@ JUA_TREE_SITTER_AUTO_INSTALL=0
 
 1. 已明确项目根目录、基准分支、当前分支
 2. Shell 环境已初始化 `export PYTHONUTF8=1`
-3. 若依赖 `$SKILL` 路径，已在当前会话正确设置
+3. Claude Code 已提供 `${CLAUDE_SKILL_DIR}` 技能目录变量
 4. 上一步产物存在且非空
 5. `.upgrade-report/` 目录可写
 
@@ -187,7 +186,7 @@ JUA_TREE_SITTER_AUTO_INSTALL=0
 待交互恢复命令示例：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
@@ -215,7 +214,7 @@ coord:com.example:legacy-lib
 恢复输入示例：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:legacy-lib"]}}}'
@@ -234,7 +233,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 若当前已经不在 Step4 checkpoint，也可以通过结构化新意图继续指定范围，例如：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:legacy-lib"]}}}'
@@ -247,7 +246,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 若用户答复较长，优先使用：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-file .upgrade-report/user_response.json
@@ -338,7 +337,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 # 在项目根目录执行（bash / zsh）
 export PYTHONUTF8=1
 
-python3 "$SKILL/scripts/run_step.py" --step step1 \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-branch <基准分支> \
@@ -348,7 +347,7 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 如果只分析 `module-a`：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step step1 \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-branch <基准分支> \
@@ -361,7 +360,7 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 - Maven 场景下，Step1 会真实执行 `package`，或直接读取用户提供的编译产物
 - `boot jar/war` 直接读取最终产物
 - `thin jar` / 无嵌套依赖场景当前不支持，会直接报错
-- 若 Step1 先进入待交互，Agent 必须把 `interaction.json` 整理成用户可读的决策卡片：缺什么输入、可用哪种输入方式、可以直接怎么回复；协议字段只用于内部恢复命令构造
+- 若 Step1 先进入待交互，Claude Code 必须把 `interaction.json` 整理成用户可读的决策卡片：缺什么输入、可用哪种输入方式、可以直接怎么回复；协议字段只用于内部恢复命令构造
 - 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支执行 `mvn dependency:list` 补全坐标；但这不是 direct artifact 模式的执行前硬前置
 - `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
 - 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧 ref 并运行 Maven 补全；自动构建模式则在构建前解析两侧 ref。解析时先尝试精确匹配，再查询本地分支与已经 fetch 到本机的远端跟踪分支；候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在 Maven 执行前暂停确认。该过程不会隐式执行 `git fetch`
@@ -378,7 +377,7 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 若已提前拿到两侧产物，可直接这样执行：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step step1 \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-artifact-path /abs/path/to/base-app.jar \
@@ -392,12 +391,12 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 - 哪些信息是可选补充
 - 用户可以直接怎么回复
 
-`response_schema`、`input_normalization`、`action_requirements`、`selection_resolution` 仅用于 Agent 把用户原话整理成恢复命令，不作为用户主信息展示。
+`response_schema`、`input_normalization`、`action_requirements`、`selection_resolution` 仅用于 Claude Code 把用户原话整理成恢复命令，不作为用户主信息展示。
 
 ### 门控
 
 ```bash
-python3 "$SKILL/scripts/gate.py" --step step1_scope --report-dir .upgrade-report
+python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step step1_scope --report-dir .upgrade-report
 ```
 
 ## Step 2：从依赖树推断上下文
@@ -408,7 +407,7 @@ python3 "$SKILL/scripts/gate.py" --step step1_scope --report-dir .upgrade-report
 ```bash
 export PYTHONUTF8=1
 
-python3 "$SKILL/scripts/s2_context_from_deps.py" \
+python3 "${CLAUDE_SKILL_DIR}/scripts/s2_context_from_deps.py" \
   --dep-changes .upgrade-report/evidence/dependencies/dep_changes.csv \
   --base <基准分支> \
   --current <当前分支> \
@@ -422,7 +421,7 @@ python3 "$SKILL/scripts/s2_context_from_deps.py" \
 ### 门控
 
 ```bash
-python3 "$SKILL/scripts/gate.py" --step context --report-dir .upgrade-report
+python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step context --report-dir .upgrade-report
 ```
 
 ## Step 3：静态扫描
@@ -441,19 +440,19 @@ export PYTHONUTF8=1
 $ctx = Get-Content .upgrade-report/evidence/context/context.json | ConvertFrom-Json
 
 if ($ctx.jdk_upgraded) {
-  python3 "$SKILL/scripts/s3_scan.py" --type jdk_removed --source-dir . --output .upgrade-report/s3_jdk_removed_api.csv
-  python3 "$SKILL/scripts/s3_scan.py" --type javax --source-dir . --output .upgrade-report/s3_jdk_javax_refs.csv
-  python3 "$SKILL/scripts/s3_scan.py" --type jdk_internal --source-dir . --output .upgrade-report/s3_jdk_internal_api.csv
-  python3 "$SKILL/scripts/s3_scan.py" --type reflection --source-dir . --output .upgrade-report/s3_jdk_reflection.csv
-  python3 "$SKILL/scripts/s3_scan.py" --type serialization --source-dir . --output .upgrade-report/s3_jdk_serialization.txt
+  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type jdk_removed --source-dir . --output .upgrade-report/s3_jdk_removed_api.csv
+  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type javax --source-dir . --output .upgrade-report/s3_jdk_javax_refs.csv
+  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type jdk_internal --source-dir . --output .upgrade-report/s3_jdk_internal_api.csv
+  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type reflection --source-dir . --output .upgrade-report/s3_jdk_reflection.csv
+  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type serialization --source-dir . --output .upgrade-report/s3_jdk_serialization.txt
 }
 
 if ($ctx.springboot_major_upgrade) {
-  python3 "$SKILL/scripts/s3_scan.py" --type sb_config --source-dir . --output .upgrade-report/s3_springboot_config.csv
-  python3 "$SKILL/scripts/s3_scan.py" --type sb_autoconfig --source-dir . --output .upgrade-report/s3_springboot_autoconfig.txt
+  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type sb_config --source-dir . --output .upgrade-report/s3_springboot_config.csv
+  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type sb_autoconfig --source-dir . --output .upgrade-report/s3_springboot_autoconfig.txt
 }
 
-python3 "$SKILL/scripts/s3_scan.py" --type dep_compat \
+python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type dep_compat \
   --source-dir . \
   --dep-changes .upgrade-report/evidence/dependencies/dep_changes.csv \
   --output .upgrade-report/s3_dependency_compat.csv
@@ -464,14 +463,14 @@ python3 "$SKILL/scripts/s3_scan.py" --type dep_compat \
 ### 门控
 
 ```bash
-python3 "$SKILL/scripts/gate.py" --step scan --report-dir .upgrade-report
+python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step scan --report-dir .upgrade-report
 ```
 
 ## Step 4：jar 包变更对比
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/s4_jar_compare.py" \
+python3 "${CLAUDE_SKILL_DIR}/scripts/s4_jar_compare.py" \
   --dep-changes .upgrade-report/evidence/dependencies/dep_changes.csv \
   --context .upgrade-report/evidence/context/context.json \
   --output-dir .upgrade-report/evidence/api_changes \
@@ -499,23 +498,23 @@ mvn dependency:get \
 
 1. 手动安装 JApiCmp 后重跑；
 2. 提供 `japicmp_jar` 绝对路径后重跑；
-3. 明确设置 `allow_degraded=true`，接受缺少二进制 API 对比证据后降级继续。
+3. 取消本轮分析，待环境准备完成后再运行。
 
-不要在用户未确认时静默降级。缺少 JApiCmp 可能漏掉删除方法、签名变化、字段变化、源码重编译不兼容等风险。
+JApiCmp 是 Java 依赖升级分析的必需工具，不允许降级继续。缺少 JApiCmp 会漏掉删除方法、签名变化、字段变化、源码重编译不兼容等风险。
 
 若处于离线/内网环境，建议额外准备：
 
 - 预先下载好 `japicmp-*-jar-with-dependencies.jar`
 - 在 `.upgrade-report/.runtime/state/main_state.json` 中填写 `japicmp_jar`
-- 若无法使用 JApiCmp，必须让用户确认降级，并在结论里明确标注“Binary Incompatible 检测已降级，当前主要基于源码 diff / 现有证据”
+- 若无法使用 JApiCmp，停止 Step4；不得仅凭源码 diff / 其他证据生成后续升级结论
 
 人工抽查点：
 
 - 变更 API 数量为 0 的依赖
-- `jar 未找到`
+- `最终制品 JAR 证据缺失`
 - `JApiCmp 未安装`
 - 其他执行失败项
-- Step4 会优先复用 Step1 成功构建产物中的 `base_lib_entry/current_lib_entry` jar，并将提取缓存写入 `.upgrade-report/evidence/api_changes/step4_artifact_jars/`；只有无法从最终制品定位时才回退本地 Maven 仓库或 Maven 拉取
+- Step4 只复用 Step1 成功构建产物中的 `base_lib_entry/current_lib_entry` JAR，并将提取缓存写入 `.upgrade-report/evidence/api_changes/step4_artifact_jars/`；无法从最终制品定位时会明确报告证据缺失，不读取本地 Maven 仓库，也不下载同坐标 JAR 替代
 - Step4 默认 `step4_workers=4` 进行依赖级并行；如果本机 CPU/磁盘压力过高，可在主状态或命令行设为 1/2
 - 正式流程默认不设置 Step4 超时；仅在主状态中显式写入 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应限制
 - 正式流程会向 `stderr` 输出 `[progress][step4][dependency|gitdiff|japicmp|done]` 日志，展示当前处理到哪个依赖、子阶段和耗时
@@ -524,7 +523,7 @@ mvn dependency:get \
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/s5_call_chain.py" \
+python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
   --all-changed-apis .upgrade-report/evidence/api_changes/all_changed_apis.csv \
   --jdk-scan-dir .upgrade-report \
   --source-dirs src/main/java \
@@ -570,7 +569,7 @@ python3 "$SKILL/scripts/s5_call_chain.py" \
 通过 `run_step.py` 恢复时，推荐直接使用：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"dependency_source_dirs":["D:/repo/dependency-a"]},"notes":"补依赖源码目录后复跑 Step5"}}'
@@ -579,14 +578,14 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 ### 门控
 
 ```bash
-python3 "$SKILL/scripts/gate.py" --step call_chain --report-dir .upgrade-report
+python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step call_chain --report-dir .upgrade-report
 ```
 
 ## Step 6：汇总报告
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/s6_report.py" \
+python3 "${CLAUDE_SKILL_DIR}/scripts/s6_report.py" \
   --report-dir .upgrade-report \
   --output-findings .upgrade-report/.runtime/findings/s6_findings.json \
   --output-report .upgrade-report/deliverables/report.md
@@ -604,7 +603,7 @@ python3 "$SKILL/scripts/s6_report.py" \
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/context_compress.py" save \
+python3 "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" save \
   --report-dir .upgrade-report \
   --completed-step-id <step1|step2|step3|step4|step5|step6> \
   --output .upgrade-report/context_summary.json
@@ -614,13 +613,13 @@ python3 "$SKILL/scripts/context_compress.py" save \
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/error_handler.py" summary --report-dir .upgrade-report
+python3 "${CLAUDE_SKILL_DIR}/scripts/error_handler.py" summary --report-dir .upgrade-report
 ```
 
 ### 首次运行环境诊断
 
 ```bash
-python3 "$SKILL/scripts/error_handler.py" summary --report-dir .upgrade-report
+python3 "${CLAUDE_SKILL_DIR}/scripts/error_handler.py" summary --report-dir .upgrade-report
 ```
 
 ## 稳定执行建议
@@ -630,15 +629,3 @@ python3 "$SKILL/scripts/error_handler.py" summary --report-dir .upgrade-report
 - 每一步结束都简要记录：输入是否齐全、输出是否生成、门控是否通过
 - 优先让 `run_step.py` 负责门控与主状态更新，而不是在对话里手动记流程
 - `scripts/step_manifest.json` 是机器可读流程定义，新增步骤时先更新它
-
-## 开发者测试
-
-- 最小回归：`python3 "$SKILL/scripts/smoke_regression.py"`
-- 按主题回归：`python3 "$SKILL/scripts/smoke_regression.py" --group core|step5|orchestrator`
-- 标准测试入口：`python3 -m unittest discover -s "$SKILL/tests" -v`
-- 真实项目回归（本地存在探针项目时）：`python3 "$SKILL/scripts/real_project_regression.py" --case all`
-- Dubbo 大型项目探针：`python3 "$SKILL/scripts/real_project_regression.py" --case dubbo --report-root /private/tmp/jua-real-dubbo-regression --json-out /private/tmp/jua-real-dubbo-regression/result.json`
-  - 该探针会校验静态导入、lambda、method reference、反射源码形态、Step5 图规模、alerts 输出完整性和 60 秒性能预算
-  - `org.apache.dubbo.common.URL.valueOf` 是重载较多的 non-gating 观测项；若质量审计报告 medium signal，需要人工确认是探针过宽还是分析漏报
-- 若需要保留临时目录便于排查：`python3 "$SKILL/scripts/smoke_regression.py" --keep-tmp`
-- CI 工作流：`.github/workflows/smoke-regression.yml`

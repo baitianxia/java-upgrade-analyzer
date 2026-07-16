@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -118,6 +119,13 @@ def normalize_signal(raw: dict, default_case: str = "") -> QualitySignal:
 
 def _load_payload(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def payload_sha256(payload: dict) -> str:
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _extract_results(payload: dict) -> list[dict]:
@@ -270,13 +278,21 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     signals: list[QualitySignal] = []
+    sources = []
     for raw_path in args.json_file:
-        signals.extend(audit_real_project_payload(_load_payload(Path(raw_path))))
+        source_path = Path(raw_path)
+        source_payload = _load_payload(source_path)
+        signals.extend(audit_real_project_payload(source_payload))
+        sources.append({
+            "path": str(source_path.resolve()),
+            "payload_sha256": payload_sha256(source_payload),
+        })
 
     payload = {
         "status": "signals_found" if signals else "clean",
         "summary": summarize_signals(signals),
         "signals": [asdict(signal) for signal in signals],
+        "sources": sources,
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     _write_json(args.json_out, payload)

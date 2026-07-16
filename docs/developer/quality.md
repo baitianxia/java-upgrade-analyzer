@@ -2,6 +2,8 @@
 
 本文面向维护者，定义本工程修改代码时必须遵守的质量要求。
 
+本页内容属于开发与发布治理，不是 Claude Code 执行分析任务时的运行时指令。测试命令、真实项目轮换、fixture 沉淀、复盘与发布门禁不得复制到 `SKILL.md` 或 `RUNBOOK.md`。
+
 修改代码前应先阅读 [工程宪法](constitution.md)。本文中的测试策略和质量门禁都服务于工程宪法，不得用“测试通过”替代对原则性约束的判断。
 
 ## 基本原则
@@ -64,6 +66,13 @@ python3 scripts/smoke_regression.py
 python3 scripts/smoke_regression.py --group core
 python3 scripts/smoke_regression.py --group step5
 python3 scripts/smoke_regression.py --group orchestrator
+```
+
+真实项目回归与质量信号审计：
+
+```bash
+python3 scripts/real_project_regression.py --case all
+python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <quality-signal-audit.json>
 ```
 
 ## 必须守住的语义
@@ -207,7 +216,19 @@ Step5 性能验证优先看：
 - 结论门禁：按 reason code 与 symbol kind 分组 `not_analyzed`，不得压成一条模糊汇总；
 - 真值门禁：每个输入 API 必须有且只有一条独立 oracle 记录；缺失、重复、错误、
   无法验证或 oracle 冲突都阻断，不能用抽样比例宣称准确性通过；
-- 性能门禁：同时约束绝对耗时、每千 API 耗时、候选配对总数与每 API 配对数。
+- 性能门禁：同时约束绝对耗时、每 API 耗时、每千 class 扫描耗时、候选配对数、
+  重复 JAR/class 扫描、javap 调用数和峰值 RSS；探索/守护案例还应使用绑定 Git revision
+  与最终制品 SHA-256 的历史基线设置相对退化阈值。
+
+具备独立物理边 Oracle 的真实项目必须声明故障注入。干净运行通过后，测试编排层从
+分析器侧删除一条由最终制品 Oracle 独立证明的物理边，再执行隔离对账。注入运行必须
+出现 `missing` 并阻断，且注入前后 Oracle 证据文件 SHA-256 必须相同。没有可注入边、
+Oracle 被一同修改、注入后仍通过或只产生无关错误，都属于 `fault_injection_failure`。
+故障注入只属于测试编排层，禁止加入生产 Step5 分支。
+
+每 API 性能记录必须覆盖完整输入闭集，不能只保存最慢 Top N。相对性能基线必须同时
+绑定真实项目 Git revision 和最终制品 SHA-256；绑定过期、指标缺失或逐 API 记录不完整
+必须失败关闭，不能退回仅观察绝对总耗时。
 
 runner 状态必须由质量信号派生。存在 blocking signal 时状态必须为 `failed`；
 只有 ground truth 尚未完成且没有其他阻断时才是 `observed`；独立 audit 的发布决定
@@ -243,6 +264,67 @@ Spring Boot repackage 的 `mall-admin` fat jar，并在远程 Docker goal 之前
 
 如果每轮真实项目测试都发现新问题，说明测试矩阵仍不足，应继续补充针对性测试和压力模型。
 
+## 每轮测试必须复盘
+
+真实项目 runner 和质量信号审计结束后，必须执行：
+
+```bash
+python3 scripts/test_round_retrospective.py \
+  <real-project-result.json> \
+  <quality-signal-audit.json> \
+  --reviews <test-round-reviews.json> \
+  --history <test-round-history.json> \
+  --json-out <test-round-retrospective.json> \
+  --markdown-out <test-round-retrospective.md>
+```
+
+每轮复盘必须记录：
+
+- 新增 P0/P1 数量以及与上一轮相比的上升、持平或下降；
+- 每个 finding 的根因族、上一轮未发现或本轮形成的原因、处置状态和待优化动作；
+- 新增拓扑、缺失拓扑、Oracle 完整性、fixture debt 和性能证据；
+- 修复是统一模型/架构修复还是案例补丁；
+- 当前项目应继续发现、转成 guard、轮换还是因质量债务阻塞。
+
+所有 P0/P1 必须额外填写回归测试和修复范围，`resolution_scope=case_patch` 不能通过。P2/P3 也不能因为非阻塞就不解释；客观无法证明的项可标记 `accepted_uncertainty`，但必须写清证据边界和下一步增强能力。外部或第三方复核发现的问题即使没有被当前 audit 捕获，也必须作为 `external_finding` 写入 reviews，不能丢失。
+
+`test-round-reviews.json` 推荐使用对象格式：
+
+```json
+{
+  "findings": [
+    {
+      "finding_id": "finding-...",
+      "root_cause_family": "evidence_identity",
+      "escape_reason": "此前矩阵没有组合覆盖嵌套类身份与重载签名",
+      "resolution_scope": "evidence_model",
+      "regression_test": "tests.test_step5_evidence_model.EvidenceModelTest.test_collector_batch_requires_identity_and_valid_sha",
+      "optimization_action": "统一身份后再进入图遍历",
+      "status": "fixed",
+      "architecture_review": true
+    }
+  ],
+  "next_action": {
+    "decision": "rotate",
+    "project": "新的真实项目或仓库标识",
+    "rationale": "覆盖当前项目未包含的运行时激活拓扑",
+    "target_topologies": ["framework_runtime_activation"]
+  }
+}
+```
+
+根因族必须使用固定分类：`artifact_provenance`、`business_activation_not_proven`、`coverage_scope`、`error_visibility`、`evidence_identity`、`framework_semantics`、`oracle_gap`、`output_contract`、`ownership_classification`、`performance_complexity`、`static_evidence_limit`、`test_asset_invalid`、`workflow_gate`。确属新架构缺口时使用 `new_architecture_gap` 并填写 `root_cause_definition`，避免通过不断换名称规避重复根因检测。
+
+复盘器会校验真实结果与 signal audit 的 payload SHA-256、Git revision/dirty 状态、API population/accounted/verified、逐边 Oracle、性能预算、超时和解析失败。API 与 Oracle 必须按闭集核验：既不能缺少输入 API，也不能出现输入集合之外的 analyzer 输出；同一 identity 的 analyzer 结论重复或冲突、Oracle identity 缺失/重复/额外、provenance 无效都必须阻断。所有计数字段必须真实存在且类型正确，不能把缺失字段解释为零。质量门禁在每个生成任务前清理该任务的旧 JSON/Markdown；即使 runner 或 audit 失败且没有产生输出，复盘器也必须生成带输入错误的 `blocked` 制品。
+
+同一 `root_cause_family` 跨轮重复出现时，必须进行架构复审，不能继续从相邻条件分支追加补丁。复盘门禁失败时不得开始下一轮项目，也不得宣称本轮测试完成。
+
+当本轮没有新增 P0/P1、Oracle 与性能证据完整、fixture debt 为零且没有新增拓扑时，决策应为 `rotate`；下一项目应从尚未覆盖的证据组合和调用拓扑中选择。仍有新增拓扑时先转为 `guard` 或继续收敛，不能立刻把项目丢弃。
+
+`rotate` 必须指定不同于当前 case/path 的下一项目、选择理由和至少一个当前尚未覆盖的目标拓扑；只写“换项目”或继续选择同一项目不能通过。
+
+四类决策的行动引用必须精确绑定事实集合：`guard` 只能指向所选当前项目本轮新增的拓扑；`continue` 必须精确列出该项目全部 P0/P1 finding，不能夹带不存在的 ID；`blocked` 必须精确列出本轮门禁错误；`rotate` 只能指向不同项目和尚未覆盖的拓扑。单一行动无法完整表达多项目轮次时必须阻断并升级行动模型，不能忽略其他项目的拓扑或 finding。
+
 真实项目矩阵必须按“发现池”而不是“固定纪念碑”维护。每次执行真实项目测试时都要遵守：
 
 - 探索期项目用于发现未知问题；
@@ -253,6 +335,39 @@ Spring Boot repackage 的 `mall-admin` fat jar，并在远程 Docker goal 之前
 优先轮换到能覆盖当前能力边界的工程，例如 Spring Boot 2 到 3、Jakarta 迁移、多模块应用、annotation processor、SPI、反射、动态代理、fat jar、shaded jar、nested jar、Kotlin/Groovy 混合 Java、复杂 Maven 依赖管理等。
 
 真实项目测试必须先校验测试资产本身。若项目不是有效 Git checkout、源码规模低于 case 假设，或 `target/generated-sources` 占比异常高，应输出 `project_asset_invalid` 并阻塞 release，不能继续跑 Step4/Step5 后把资产问题误归因成 analyzer 能力缺口。
+
+### 全量 API 与独立事实契约
+
+- 真实项目的 API 人口只能由 Step1 的全部最终制品依赖变化，经 Step4 生成的全部变更 API 决定。框架、owner、严重级别、已知调用形态和拓扑标签都不能缩小人口。
+- discovery/convergence 必须满足 `Step4 population == Step5 input == analyzer accounted == Oracle ledger`。拓扑只描述已观察到的边，不能充当 API 选择器；class 级变化本身也不能伪装成调用拓扑。
+- 坐标更名、一对多拆包和同一逻辑依赖的 provider 迁移必须按最终制品中的运行时 provider set 比较。provider set 合并时主升级制品优先，同名 class 不得被 companion 覆盖。
+- 对高风险 `not_found_in_static_analysis`、`not_impacted` 和 `uncertain`，两个权威必须支持同一明确结论；一条 `uncertain` 记录不能凑数成为负结论的第二权威。
+- 成员级事实至少由 JDK `javap` 物理边和独立原始 constant-pool 解析器交叉验证；class 级事实至少由原始 classfile 常量引用和系统 JDK `jdeps` 交叉验证。任一解析器失败都必须阻断，不得转成空结果。
+- 每轮必须删除一条已被 Oracle 证明的 analyzer 物理边。只有 injected ledger 出现 `missing`、干净 Oracle SHA 不变且干净边对账无错误，故障注入才算通过。
+- 性能门控除 Step5 外，还必须记录 Oracle 总耗时、`javap`/`jdeps` 调用数、扫描 class 数、每 API 耗时、每千 class 耗时、重复 JAR/class 扫描和峰值内存。
+
+## Capability Family Closure
+
+真实项目 finding 的修复单位是能力家族，不是项目或具体输入。能力家族注册表位于
+`tests/fixtures/capability_families.json`，每个家族必须定义一个可证伪的不变量、全部生产路径、
+广义正例、反例、故障注入和需要当前通过的真实项目守护案例。
+
+Step5 和 release 门在测试轮次复盘后执行 `scripts/capability_family_closure.py`。P0/P1 finding
+只有在以下条件全部满足时才能关闭：
+
+- review 精确绑定注册表中的 capability family 和 invariant；
+- `audited_production_paths` 与注册表路径集合完全相同；
+- 正例、反例和 mutation unittest 引用都能加载；
+- 当前轮次中的全部 cross-project guards 均为 `passed`；
+- 重复根因家族具有明确的架构决策；
+- retrospective 中每个 finding 都有对应 review，不能在组件边界消失。
+
+注册表中的 `enforced` 只表示共享实现边界和广义测试已建立，不表示能力已经全局关闭。只有本轮
+closure report 同时通过生产路径、测试和当前真实项目守护核验，才允许表述为 closed。能力审计状态
+见 `docs/developer/capability-family-audit.md`。
+
+不得通过把 `resolution_scope` 改写为 `architecture`、填写说明文字或增加项目专用断言关闭 finding。
+仍有开放的重复能力家族时不得继续轮换真实项目。
 
 ## Fixture Debt
 

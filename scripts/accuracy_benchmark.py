@@ -132,7 +132,7 @@ BENCHMARK_CATEGORIES = (
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_summarize_user_facing_outcome_maps_to_simple_conclusions",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_summarize_user_facing_outcome_treats_behavior_changed_fallback_simple_as_inconclusive",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_summarize_user_facing_outcome_explains_new_step5_precision_reason_codes",
-            "tests.test_step5_key_matching.Step5KeyMatchingTest.test_generate_enhanced_summary_outputs_user_conclusion_counts",
+            "tests.test_step5_key_matching.Step5KeyMatchingTest.test_generate_enhanced_summary_outputs_user_conclusion_counts_without_low_value_text_summary",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_s6_report_matches_by_api_using_signature_and_expands_not_found_items",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_s6_report_starts_with_concrete_impact_overview_from_alerts",
             "tests.test_step5_key_matching.Step5KeyMatchingTest.test_s6_report_keeps_probable_impact_and_needs_input_out_of_uncovered_section",

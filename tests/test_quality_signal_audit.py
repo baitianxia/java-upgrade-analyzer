@@ -13,6 +13,33 @@ import quality_signal_audit  # noqa: E402
 
 
 class QualitySignalAuditTest(unittest.TestCase):
+    def test_cli_binds_audit_to_exact_real_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_path = Path(tmp) / "real.json"
+            audit_path = Path(tmp) / "audit.json"
+            payload = {"results": [{"case": "clean", "status": "passed"}]}
+            real_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "quality_signal_audit.py"),
+                    str(real_path),
+                    "--json-out",
+                    str(audit_path),
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+            )
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            audit["sources"][0]["payload_sha256"],
+            quality_signal_audit.payload_sha256(payload),
+        )
+
     def test_normalize_quality_signal_defaults_blocking_from_type_and_severity(self):
         signal = quality_signal_audit.normalize_signal(
             {

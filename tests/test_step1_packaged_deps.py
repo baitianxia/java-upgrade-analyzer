@@ -97,6 +97,34 @@ class Step1PackagedDepsTest(unittest.TestCase):
             ["org.example:demo-lib"],
         )
 
+    def test_embedded_pom_preserves_filename_classifier_as_artifact_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_path = Path(tmp) / "app.jar"
+            plain = self._nested_jar_bytes(
+                [("META-INF/maven/org.apache.shiro/shiro-core/pom.properties",
+                  "groupId=org.apache.shiro\nartifactId=shiro-core\nversion=2.2.0\n")]
+            )
+            jakarta = self._nested_jar_bytes(
+                [("META-INF/maven/org.apache.shiro/shiro-core/pom.properties",
+                  "groupId=org.apache.shiro\nartifactId=shiro-core\nversion=2.2.0\n")]
+            )
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                outer.writestr("BOOT-INF/lib/shiro-core-2.2.0.jar", plain)
+                outer.writestr("BOOT-INF/lib/shiro-core-2.2.0-jakarta.jar", jakarta)
+
+            packaged_deps, meta = s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                str(artifact_path), runtime_deps={}
+            )
+
+        self.assertEqual(
+            set(packaged_deps),
+            {"org.apache.shiro:shiro-core", "org.apache.shiro:shiro-core:jakarta"},
+        )
+        self.assertEqual(
+            {item.get("coord") for item in meta.get("dep_entries") or []},
+            {"org.apache.shiro:shiro-core", "org.apache.shiro:shiro-core:jakarta"},
+        )
+
     def test_final_artifact_is_authoritative_for_bom_and_exclusion_resolution(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_path = Path(tmp) / "app.jar"
@@ -123,7 +151,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(set(packaged_deps), {"org.example:selected"})
         self.assertEqual(packaged_deps["org.example:selected"]["version"], "2.0.0")
 
-    def test_filename_only_nested_jar_uses_unique_local_m2_sha_match(self):
+    def test_filename_only_nested_jar_ignores_local_m2_and_uses_resolved_build_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repository"
@@ -137,15 +165,29 @@ class Step1PackagedDepsTest(unittest.TestCase):
             with zipfile.ZipFile(artifact, "w") as outer:
                 outer.writestr("BOOT-INF/lib/plain-lib-1.2.3.jar", nested_bytes)
 
+            loader_calls = []
+
+            def runtime_loader():
+                loader_calls.append(True)
+                return {
+                    "org.example:plain-lib": {
+                        "group_id": "org.example",
+                        "artifact_id": "plain-lib",
+                        "version": "1.2.3",
+                        "scope": "runtime",
+                    }
+                }
+
             with patch.dict(os.environ, {"MAVEN_REPO_LOCAL": str(repo)}):
                 deps, meta = s1_dep_diff.collect_packaged_deps_from_artifact_path(
                     str(artifact),
-                    runtime_deps_loader=lambda: self.fail("dependency:list must not run"),
+                    runtime_deps_loader=runtime_loader,
                 )
 
+        self.assertEqual(loader_calls, [True])
         self.assertIn("org.example:plain-lib", deps)
         self.assertEqual(meta["unresolved_items"], [])
-        self.assertEqual(meta["dep_entries"][0]["match_source"], "local-m2-sha256")
+        self.assertNotEqual(meta["dep_entries"][0]["match_source"], "local-m2-sha256")
 
     def test_local_m2_sha_match_stays_unresolved_when_coordinates_are_ambiguous(self):
         with tempfile.TemporaryDirectory() as tmp:

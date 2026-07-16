@@ -860,6 +860,7 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
     typed_failures = []
     concerns = []
     edges = []
+    non_executable_class_references = 0
     batch_sha_invalid = (
         strict_final_artifact
         and not _valid_sha256(metrics.get("artifact_sha256"))
@@ -867,6 +868,13 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
     if batch_sha_invalid:
         typed_failures.append(_bytecode_failure("current_final_artifact_sha_invalid"))
     for item in evidence or ():
+        if item.get("evidence_type") == "bytecode_class_reference":
+            # A constant-pool/signature/annotation class entry has no owning
+            # bytecode instruction or method.  Keep it as collection telemetry;
+            # treating it as a call edge creates synthetic callers and false
+            # blocking failures for interfaces and annotation-only classes.
+            non_executable_class_references += 1
+            continue
         owner = str(item.get("caller_owner") or "").strip()
         name = str(item.get("caller_name") or "").strip()
         signature = str(item.get("caller_signature") or "")
@@ -939,6 +947,7 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
             **metrics,
             "failures": stable_failure_codes,
             "collected_edges": len(edges),
+            "non_executable_class_references": non_executable_class_references,
             "unresolved_callers": sum(
                 failure.reason_code == "BYTECODE_CALLER_UNRESOLVED"
                 for failure in typed_failures

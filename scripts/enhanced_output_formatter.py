@@ -31,7 +31,7 @@ from pathlib import Path
 from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_OBSERVABILITY_DIRNAME
 from step5_evidence_model import thaw_evidence_value
 
-from signature_utils import split_signature_params
+from signature_utils import canonical_api_identity, split_signature_params
 
 try:
     from s4_contract import PER_DEPENDENCY_SUMMARY_FILE, get_per_dependency_dir
@@ -49,7 +49,7 @@ except ImportError:
 ALERTS_CSV_FIELDNAMES = [
     'conclusion', 'change_summary', 'review_reason', 'chain_summary',
     'review_focus', 'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
-    'api_id', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
+    'api_identity', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
     'symbol_kind', 'change_type', 'severity', 'path_status',
     'business_reachable', 'entry_kind', 'reach_kind', 'consumer_coord', 'consumer_class',
     'consumer_method', 'consumer_signature', 'path_text',
@@ -178,6 +178,13 @@ def trace_result_to_api_entry(r):
         public_match_tier = None
 
     return {
+        'api_identity': canonical_api_identity({
+            'coord': r.coord,
+            'api_name': r.api_name,
+            'api_signature': getattr(r, 'api_signature', '') or '',
+            'symbol_kind': getattr(r, 'symbol_kind', '') or '',
+            'change_type': r.change_type,
+        }),
         'coord':               r.coord,
         'old_version':         getattr(r, 'old_version', '') or '',
         'new_version':         getattr(r, 'new_version', '') or '',
@@ -1528,6 +1535,13 @@ def _alert_rows_for_result(result):
             'chain_hop_count': chain_view['hop_count'],
             'chain_detail': chain_view['detail'],
             'api_id': api_id,
+            'api_identity': canonical_api_identity({
+                'coord': result.coord,
+                'api_name': result.api_name,
+                'api_signature': getattr(result, 'api_signature', '') or '',
+                'symbol_kind': getattr(result, 'symbol_kind', '') or '',
+                'change_type': result.change_type,
+            }),
             'path_id': path_id,
             'target_coord': _target_coord_display(result),
             'changed_symbol': changed_symbol,

@@ -30,7 +30,7 @@ import sys
 import time
 import unittest
 import zipfile
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -48,9 +48,11 @@ from mybatis_mapper_oracle import (
     inspect_mybatis_artifact,
     verify_runtime_activation,
 )
-from signature_utils import normalize_signature_for_lookup
+from pipeline_constants import STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+from signature_utils import canonical_api_identity, normalize_signature_for_lookup
 from third_party_jdk_oracle import _source_signature
 from third_party_jdk_oracle import discover_calls, scan_class_files
+from third_party_jdeps_oracle import scan_artifact_class_references as scan_jdeps_class_references
 from topology_coverage import (
     classify_topologies,
     compute_topology_coverage,
@@ -104,6 +106,12 @@ class RealProjectCase:
     max_elapsed_seconds: float = 0.0
     max_full_step4_api_elapsed_seconds: float = 0.0
     run_step4: bool = False
+    derive_step1_from_artifacts: bool = False
+    base_final_artifact: Path | None = None
+    base_source_project: Path | None = None
+    current_source_project: Path | None = None
+    base_revision: str = ""
+    current_revision: str = ""
     step4_dep_rows: tuple[dict[str, str], ...] = field(default_factory=tuple)
     expected_step4_api_names: tuple[str, ...] = field(default_factory=tuple)
     max_step4_elapsed_seconds: float = 0.0
@@ -133,6 +141,9 @@ class RealProjectCase:
     source_attestation: Path | None = None
     prior_topology_matrix: Path | None = None
     fixture_manifest: Path | None = None
+    required_fault_injections: tuple[str, ...] = field(default_factory=tuple)
+    require_relative_performance_baseline: bool = False
+    performance_manifest: Path | None = None
 
 
 REAL_CASE_PERFORMANCE_BUDGET = {
@@ -187,6 +198,9 @@ CASES = {
         name="commons-text",
         default_project=Path("/private/tmp/jua-real-system-commons-text"),
         default_changed_apis=Path(""),
+        require_valid_git=True,
+        min_project_java_files=100,
+        min_main_java_files=100,
         required_topologies=("business_direct", "static_dispatch", "field_access"),
         changed_api_rows=(
             {
@@ -582,6 +596,9 @@ CASES = {
         name="commons-lang",
         default_project=Path("/private/tmp/jua-real-git-commons-lang"),
         default_changed_apis=Path(""),
+        require_valid_git=True,
+        min_project_java_files=500,
+        min_main_java_files=400,
         required_topologies=("same_jar_bridge", "static_dispatch", "field_access"),
         target_owner_entries={
             "org.apache.commons.lang3.StringUtils": ("org/apache/commons/lang3/StringUtils.class",),
@@ -713,6 +730,35 @@ CASES["mall"] = RealProjectCase(
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
 )
 
+CASES["spring-security-config"] = RealProjectCase(
+    name="spring-security-config",
+    default_project=Path("/private/tmp/jua-real-project-spring-security-6.5.10"),
+    default_changed_apis=Path(""),
+    source_dirs=(Path("config/src/main/java"),),
+    baseline_specs=(),
+    min_project_java_files=200,
+    min_main_java_files=200,
+    max_generated_java_ratio=0.1,
+    require_valid_git=True,
+    max_elapsed_seconds=130.0,
+    max_oracle_seconds=135.0,
+    case_mode="discovery",
+    ground_truth_status="unreviewed",
+    enable_jdk_oracle=True,
+    bytecode_owner_prefixes=(
+        "org/springframework/security/authentication/ProviderManager",
+        "org/springframework/security/core/context/SecurityContextHolder",
+        "org/springframework/security/authorization/method/AuthorizationAdvisorProxyFactory",
+    ),
+    bytecode_coord="org.springframework.security:spring-security-core",
+    final_artifact=Path(
+        "/Users/baitianxia/.m2/repository/org/springframework/security/"
+        "spring-security-config/6.5.10/spring-security-config-6.5.10.jar"
+    ),
+    required_topologies=("business_direct", "constructor", "static_dispatch"),
+    prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
+)
+
 CASES["dubbo-fatjar"] = RealProjectCase(
     name="dubbo-fatjar",
     default_project=Path("/private/tmp/jua-real-project-dubbo-source-20260710"),
@@ -747,6 +793,41 @@ CASES["dubbo-fatjar"] = RealProjectCase(
         "same_jar_bridge",
     ),
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
+)
+
+CASES["dubbo-rpc-proxy-consumer"] = RealProjectCase(
+    name="dubbo-rpc-proxy-consumer",
+    default_project=Path(
+        "/private/tmp/jua-real-project-dubbo-samples-retry/10-task/"
+        "dubbo-samples-rpc-basic/dubbo-samples-rpc-basic-consumer"
+    ),
+    default_changed_apis=Path(""),
+    baseline_specs=(),
+    source_dirs=(Path("src/main/java"),),
+    min_project_java_files=1,
+    min_main_java_files=1,
+    max_generated_java_ratio=0.1,
+    require_valid_git=True,
+    max_elapsed_seconds=180.0,
+    max_oracle_seconds=135.0,
+    case_mode="discovery",
+    ground_truth_status="unreviewed",
+    enable_jdk_oracle=True,
+    bytecode_owner_prefixes=("org/apache/dubbo/samples/DemoService",),
+    bytecode_coord=(
+        "org.apache.dubbo.samples:dubbo-samples-rpc-basic-api"
+    ),
+    final_artifact=Path(
+        "/private/tmp/jua-real-project-dubbo-samples-retry/10-task/"
+        "dubbo-samples-rpc-basic/dubbo-samples-rpc-basic-consumer/target/"
+        "dubbo-samples-rpc-basic-consumer-0.0.1-SNAPSHOT.jar"
+    ),
+    required_topologies=(
+        "business_direct", "framework_callback", "interface_dispatch",
+    ),
+    prior_topology_matrix=(
+        ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json"
+    ),
 )
 
 CASES["spring-petclinic"] = RealProjectCase(
@@ -837,6 +918,8 @@ CASES["gs-messaging-rabbitmq"] = RealProjectCase(
         ROOT_DIR / "tests" / "fixtures" / "real_projects" /
         "gs-messaging-rabbitmq.json"
     ),
+    required_fault_injections=("drop_analyzer_edge",),
+    require_relative_performance_baseline=True,
 )
 
 CASES["gs-managing-transactions"] = RealProjectCase(
@@ -994,6 +1077,43 @@ CASES["mybatis-sample-xml"] = RealProjectCase(
         ROOT_DIR / "tests" / "fixtures" / "real_projects" /
         "mybatis-sample-xml.json"
     ),
+    required_fault_injections=("drop_analyzer_edge",),
+    require_relative_performance_baseline=True,
+)
+
+CASES["ruoyi-full-artifact-discovery"] = RealProjectCase(
+    name="ruoyi-full-artifact-discovery",
+    default_project=Path("/private/tmp/jua-ruoyi-current-git"),
+    default_changed_apis=Path(""),
+    baseline_specs=(),
+    run_step4=True,
+    derive_step1_from_artifacts=True,
+    base_final_artifact=Path(
+        "/private/tmp/jua-ruoyi-before-12f30758/ruoyi-admin/target/ruoyi-admin.jar"
+    ),
+    final_artifact=Path(
+        "/private/tmp/jua-ruoyi-after-12f30758/ruoyi-admin/target/ruoyi-admin.jar"
+    ),
+    base_source_project=Path("/private/tmp/jua-ruoyi-base-git"),
+    current_source_project=Path("/private/tmp/jua-ruoyi-current-git"),
+    base_revision="a1df379e5c0091eaa11608ae6c431828a62cd7fc",
+    current_revision="12f307586bdcd6983abe92047baa7736c168ca04",
+    require_valid_git=True,
+    min_project_java_files=100,
+    min_main_java_files=100,
+    max_generated_java_ratio=0.1,
+    case_mode="discovery",
+    ground_truth_status="unreviewed",
+    required_topologies=("field_access", "same_jar_bridge"),
+    prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
+    required_fault_injections=("drop_analyzer_edge",),
+    require_relative_performance_baseline=True,
+    performance_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "ruoyi-full-artifact-discovery.json"
+    ),
+    max_step4_elapsed_seconds=120.0,
+    max_oracle_seconds=240.0,
 )
 
 CASES = {
@@ -1190,7 +1310,7 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
 
 
 def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
-    errors: list[str] = []
+    errors: list[str] = validate_reproducible_asset_contract(manifest)
     expected_revision = str(manifest.get("git_revision") or "")
     expected_sha = str(manifest.get("artifact_sha256") or "")
     artifact = project_root / str(manifest.get("artifact_path") or "")
@@ -1240,6 +1360,75 @@ def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
     }
 
 
+def validate_reproducible_asset_contract(manifest: dict) -> list[str]:
+    errors: list[str] = []
+    materialization = manifest.get("materialization")
+    if not isinstance(materialization, dict):
+        return ["materialization_contract_missing"]
+    kind = str(materialization.get("kind") or "").strip()
+    if kind == "source_build":
+        repository_url = str(materialization.get("repository_url") or "").strip()
+        if not re.fullmatch(r"https://github\.com/[^/]+/[^/]+(?:\.git)?", repository_url):
+            errors.append("source_build_repository_url_invalid")
+        working_directory = Path(str(materialization.get("working_directory") or ""))
+        if (
+            not str(working_directory)
+            or working_directory.is_absolute()
+            or ".." in working_directory.parts
+        ):
+            errors.append("source_build_working_directory_not_relative")
+        command = materialization.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(item, str) or not item.strip() for item in command)
+        ):
+            errors.append("source_build_command_invalid")
+        artifacts = list(materialization.get("artifacts") or [])
+        if not artifacts:
+            artifacts = [{
+                "revision": manifest.get("git_revision"),
+                "artifact_path": materialization.get("artifact_path"),
+                "artifact_sha256": manifest.get("artifact_sha256"),
+            }]
+        for index, artifact in enumerate(artifacts):
+            prefix = f"source_build_artifact_{index}"
+            if not isinstance(artifact, dict):
+                errors.append(f"{prefix}_invalid")
+                continue
+            revision = str(artifact.get("revision") or "")
+            artifact_path = Path(str(artifact.get("artifact_path") or ""))
+            digest = str(artifact.get("artifact_sha256") or "")
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                errors.append(f"{prefix}_revision_invalid")
+            if not str(artifact_path) or artifact_path.is_absolute() or ".." in artifact_path.parts:
+                errors.append("source_build_artifact_path_not_relative")
+            if not _valid_sha256(digest):
+                errors.append(f"{prefix}_sha256_invalid")
+    elif kind == "published_artifact":
+        url = str(materialization.get("url") or "").strip()
+        coordinate = str(materialization.get("coordinate") or "").strip()
+        sha1 = str(materialization.get("sha1") or "").strip()
+        sha256 = str(materialization.get("sha256") or "").strip()
+        if not url.startswith("https://") or not url.endswith(".jar"):
+            errors.append("published_artifact_url_invalid")
+        if len(coordinate.split(":")) != 3 or any(
+            not item for item in coordinate.split(":")
+        ):
+            errors.append("published_artifact_coordinate_invalid")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha1):
+            errors.append("published_artifact_sha1_invalid")
+        if not _valid_sha256(sha256):
+            errors.append("published_artifact_sha256_invalid")
+        if sha1 != str(manifest.get("artifact_sha1") or ""):
+            errors.append("published_artifact_sha1_mismatch")
+        if sha256 != str(manifest.get("artifact_sha256") or ""):
+            errors.append("published_artifact_sha256_mismatch")
+    else:
+        errors.append("materialization_kind_invalid")
+    return sorted(set(errors))
+
+
 def _fixture_debt_id(signal: dict) -> str:
     explicit = str(signal.get("fixture_debt_id") or "").strip()
     if explicit:
@@ -1263,11 +1452,8 @@ def _resolves_to_unittest(reference: str) -> bool:
     except (ImportError, AttributeError, ValueError):
         return False
     finally:
-        if added_root:
-            try:
-                sys.path.remove(root_entry)
-            except ValueError:
-                pass
+        if added_root and root_entry in sys.path:
+            sys.path.remove(root_entry)
     return bool(
         isinstance(case_class, type)
         and issubclass(case_class, unittest.TestCase)
@@ -1472,7 +1658,11 @@ def infer_final_artifact_java_version(artifact_path: Path) -> str:
 
 
 def write_pinned_final_artifact_provenance(
-    report_dir: Path, asset_gate: dict, case: RealProjectCase
+    report_dir: Path,
+    asset_gate: dict,
+    case: RealProjectCase,
+    *,
+    authority: str = "pinned-real-project-manifest",
 ) -> Path:
     output = report_dir / "evidence" / "dependencies" / "build_provenance.json"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1487,7 +1677,7 @@ def write_pinned_final_artifact_provenance(
             "side": "current",
             "artifact_path": str(artifact_path),
             "artifact_sha256": artifact_sha256,
-            "authority": "pinned-real-project-manifest",
+            "authority": authority,
         }],
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     context_path = report_dir / "evidence" / "context" / "context.json"
@@ -1549,8 +1739,11 @@ def write_pinned_final_artifact_provenance(
                             "version": "runtime",
                             "lib_entry": name,
                         })
-        except (OSError, zipfile.BadZipFile):
-            pass
+        except (OSError, zipfile.BadZipFile) as error:
+            raise RuntimeError(
+                f"REAL_PROJECT_ARTIFACT_SCAN_FAILED:{artifact_path}:"
+                f"{type(error).__name__}:{error}"
+            ) from error
     version = next(
         (
             str(row.get("old_version") or "").strip()
@@ -1586,6 +1779,42 @@ def write_pinned_final_artifact_provenance(
                 "resolution_status": "resolved",
             })
     return output
+
+
+def write_declared_final_artifact_provenance(
+    report_dir: Path, case: RealProjectCase
+) -> Path:
+    artifact = case.final_artifact
+    if artifact is None or not artifact.is_file():
+        raise ValueError("declared current final artifact is missing")
+    artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    dependencies_dir = Path(report_dir) / "evidence" / "dependencies"
+    provenance_path = dependencies_dir / "build_provenance.json"
+    resolved_path = dependencies_dir / "deps_current_resolved.csv"
+    try:
+        existing = json.loads(provenance_path.read_text(encoding="utf-8"))
+        current = next(
+            item for item in (existing.get("sides") or [])
+            if str(item.get("side") or "") == "current"
+        )
+        existing_sha = str(
+            current.get("artifact_sha256")
+            or current.get("actual_artifact_sha256")
+            or ""
+        )
+        if existing_sha == artifact_sha256 and resolved_path.is_file() and resolved_path.stat().st_size:
+            return provenance_path
+    except (OSError, StopIteration, ValueError, json.JSONDecodeError):
+        existing = {}
+    return write_pinned_final_artifact_provenance(
+        report_dir,
+        {
+            "artifact_path": str(artifact),
+            "actual_artifact_sha256": artifact_sha256,
+        },
+        case,
+        authority="local-final-artifact",
+    )
 
 
 def _resolve_fixture_debt(
@@ -1673,7 +1902,9 @@ def collect_baseline_files(project_root: Path, spec: BaselineSpec) -> tuple[set[
     return production_files, test_files, occurrence_count
 
 
-def collect_alert_files(alerts_csv: Path, symbol: str) -> set[str]:
+def collect_alert_files(
+    alerts_csv: Path, symbol: str, project_root: Path | None = None
+) -> set[str]:
     if not alerts_csv.exists():
         return set()
     files: set[str] = set()
@@ -1683,8 +1914,17 @@ def collect_alert_files(alerts_csv: Path, symbol: str) -> set[str]:
                 continue
             for item in re.split(r"[|;]", row.get("evidence_files") or ""):
                 item = item.strip()
-                if item:
+                if item and Path(item).suffix == ".java":
                     files.add(str((alerts_csv.parent / item).resolve()))
+            consumer_class = str(row.get("consumer_class") or "").strip().split("$", 1)[0]
+            if project_root is not None and consumer_class:
+                relative_source = Path(*consumer_class.split(".")).with_suffix(".java")
+                candidates = [
+                    path for path in project_root.rglob(relative_source.name)
+                    if path.is_file() and path.as_posix().endswith(relative_source.as_posix())
+                ]
+                if len(candidates) == 1:
+                    files.add(str(candidates[0].resolve()))
     return files
 
 
@@ -1724,6 +1964,27 @@ def _api_identity_from_alert_row(row: dict[str, str]) -> tuple[str, str, str]:
     )
 
 
+def _canonical_identity_from_changed_row(row: dict[str, str]) -> str:
+    return serialized_api_identity(row)
+
+
+def _canonical_identity_from_alert_row(row: dict[str, str]) -> str:
+    recorded = str(row.get("api_identity") or "").strip()
+    if recorded:
+        return recorded
+    api_name, signature, symbol_kind = _api_identity_from_alert_row(row)
+    target_coord = str(row.get("target_coord") or "").strip()
+    if "（" in target_coord:
+        target_coord = target_coord.split("（", 1)[0].strip()
+    return canonical_api_identity({
+        "coord": target_coord,
+        "api_name": api_name,
+        "api_signature": signature,
+        "symbol_kind": symbol_kind,
+        "change_type": str(row.get("change_type") or "").strip(),
+    })
+
+
 def _chain_target_matches_alert_api(row: dict[str, str]) -> bool:
     api_name, api_signature, symbol_kind = _api_identity_from_alert_row(row)
     chain_target = str(row.get("chain_target") or "").strip()
@@ -1761,17 +2022,50 @@ def audit_analysis_outputs(changed_apis: Path, alerts_csv: Path, summary: dict) 
     if missing_alert_fields:
         failures.append(f"alerts_missing_readable_fields:{','.join(missing_alert_fields)}")
 
-    changed_identities = {
-        identity for row in changed_rows
-        if (identity := _api_identity_from_changed_row(row))[0]
-    }
+    changed_identity_rows = [
+        (_canonical_identity_from_changed_row(row), row)
+        for row in changed_rows
+        if str(row.get("api_name") or "").strip()
+    ]
+    changed_identity_counts = Counter(identity for identity, _row in changed_identity_rows)
+    changed_identities = set(changed_identity_counts)
+    duplicate_changed_identities = sorted(
+        identity for identity, count in changed_identity_counts.items() if count > 1
+    )
+    if duplicate_changed_identities:
+        failures.append(
+            f"changed_duplicate_api_identities:{len(duplicate_changed_identities)}"
+        )
     alert_identities = {
-        identity for row in alert_rows
-        if (identity := _api_identity_from_alert_row(row))[0]
+        _canonical_identity_from_alert_row(row)
+        for row in alert_rows
+        if _api_identity_from_alert_row(row)[0]
     }
     missing_alert_identities = sorted(changed_identities - alert_identities)
     if missing_alert_identities:
         failures.append(f"alerts_missing_api_rows:{len(missing_alert_identities)}")
+    extra_alert_identities = sorted(alert_identities - changed_identities)
+    if extra_alert_identities:
+        failures.append(f"alerts_extra_api_rows:{len(extra_alert_identities)}")
+
+    summary_rows = load_analyzer_rows(summary)
+    summary_identity_counts = Counter(
+        serialized_api_identity(row) for row in summary_rows
+    )
+    summary_identities = set(summary_identity_counts)
+    missing_summary_identities = sorted(changed_identities - summary_identities)
+    extra_summary_identities = sorted(summary_identities - changed_identities)
+    duplicate_summary_identities = sorted(
+        identity for identity, count in summary_identity_counts.items() if count > 1
+    )
+    if missing_summary_identities:
+        failures.append(f"summary_missing_api_rows:{len(missing_summary_identities)}")
+    if extra_summary_identities:
+        failures.append(f"summary_extra_api_rows:{len(extra_summary_identities)}")
+    if duplicate_summary_identities:
+        failures.append(
+            f"summary_duplicate_api_identities:{len(duplicate_summary_identities)}"
+        )
 
     total_apis = summary.get("total_apis")
     if total_apis is not None and int(total_apis or 0) != len(changed_rows):
@@ -1854,10 +2148,11 @@ def audit_analysis_outputs(changed_apis: Path, alerts_csv: Path, summary: dict) 
         "alert_rows": len(alert_rows),
         "alert_unique_identities": len(alert_identities),
         "alert_status_counts": status_counts,
-        "missing_alert_identities": [
-            {"api_name": api, "api_signature": sig, "symbol_kind": kind}
-            for api, sig, kind in missing_alert_identities[:50]
-        ],
+        "missing_alert_identities": missing_alert_identities[:50],
+        "duplicate_changed_identities": duplicate_changed_identities[:50],
+        "missing_summary_identities": missing_summary_identities[:50],
+        "extra_summary_identities": extra_summary_identities[:50],
+        "duplicate_summary_identities": duplicate_summary_identities[:50],
         "suspicious_reachable": suspicious_reachable[:50],
         "unreadable_markers": unreadable_markers[:50],
         "unexplained_reachable": unexplained_reachable[:50],
@@ -1921,6 +2216,40 @@ def compute_api_coverage(case_mode: str, population: int, selected: int, output_
     }
 
 
+def extend_coordinate_entries_for_runtime_provider_sets(
+    report_dir: Path, coordinate_entries: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Map logical upgraded coordinates to every packaged provider entry."""
+    expanded = {
+        str(coord): list(dict.fromkeys(str(entry) for entry in entries))
+        for coord, entries in coordinate_entries.items()
+    }
+    path = Path(report_dir) / "evidence" / "api_changes" / "artifact_replacements.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return expanded
+    for item in payload.get("items") or []:
+        providers = [
+            str(coord).strip() for coord in (item.get("current_provider_coords") or [])
+            if str(coord).strip()
+        ]
+        if len(providers) < 2:
+            continue
+        provider_entries = list(dict.fromkeys(
+            entry for coord in providers for entry in expanded.get(coord, [])
+        ))
+        aliases = {
+            str(item.get("base_coord") or "").strip(),
+            str(item.get("current_coord") or "").strip(),
+        }
+        for coord in aliases - {""}:
+            expanded[coord] = list(dict.fromkeys([
+                *expanded.get(coord, []), *provider_entries,
+            ]))
+    return expanded
+
+
 def extract_case_topology_evidence(
     case: RealProjectCase,
     report_dir: Path,
@@ -1952,6 +2281,9 @@ def extract_case_topology_evidence(
         entry = str(row.get("lib_entry") or "").strip()
         if coordinate and entry:
             coordinate_entries.setdefault(coordinate, []).append(entry)
+    coordinate_entries = extend_coordinate_entries_for_runtime_provider_sets(
+        report_dir, coordinate_entries
+    )
 
     if artifact is None or errors:
         evidence = {
@@ -2170,6 +2502,15 @@ def derive_case_status(executed: bool, signals: list[dict], ground_truth_status:
     return "passed"
 
 
+def derive_run_status(results: list[dict]) -> str:
+    statuses = [str(item.get("status") or "") for item in results]
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    if statuses and all(status == "passed" for status in statuses):
+        return "passed"
+    return "incomplete"
+
+
 def collect_performance_envelope(
     summary: dict,
     elapsed: float,
@@ -2181,23 +2522,49 @@ def collect_performance_envelope(
     step5_perf = graph_stats.get("step5_perf") if isinstance(graph_stats.get("step5_perf"), dict) else {}
     perf_main = step5_perf.get("main") if isinstance(step5_perf.get("main"), dict) else {}
     bytecode_scan = step5_perf.get("bytecode_scan") if isinstance(step5_perf.get("bytecode_scan"), dict) else {}
+    bytecode_expand = step5_perf.get("bytecode_expand") if isinstance(step5_perf.get("bytecode_expand"), dict) else {}
+    trace_perf = step5_perf.get("trace") if isinstance(step5_perf.get("trace"), dict) else {}
     pairs = int(perf_main.get("indirect_usage_potential_legacy_method_target_pairs") or 0)
     owner_scans = int(perf_main.get("indirect_usage_owner_presence_scans") or 0)
     selected = int(selected or 0)
     oracle_metrics = oracle_metrics or {}
+    class_count = int(bytecode_scan.get("class_entries_scoped") or bytecode_scan.get("visited_classes") or 0)
+    scan_seconds = float(bytecode_scan.get("elapsed_sec") or 0.0)
+    per_api_timings = [
+        dict(item) for item in (trace_perf.get("api_trace_timings") or [])
+        if isinstance(item, dict)
+    ]
     return {
         "elapsed_seconds": float(elapsed or 0.0),
+        "elapsed_seconds_per_api": float(elapsed or 0.0) / selected if selected else 0.0,
         "elapsed_seconds_per_1000_apis": float(elapsed or 0.0) / (selected / 1000.0) if selected else 0.0,
         "potential_method_target_pairs": pairs,
+        "selected_api_count": selected,
+        "accounted_api_count": int(summary.get("total_apis") or 0),
         "potential_pairs_per_api": pairs / selected if selected else 0.0,
         "owner_presence_scans": owner_scans,
         "artifact_bytes": int(bytecode_scan.get("artifact_bytes") or 0),
-        "class_count": int(bytecode_scan.get("class_entries_scoped") or bytecode_scan.get("visited_classes") or 0),
+        "artifact_count": int(bytecode_scan.get("artifact_count") or 0),
+        "class_count": class_count,
+        "scan_seconds_per_1000_classes": scan_seconds * 1000.0 / class_count if class_count else 0.0,
         "parsed_class_count": int(bytecode_scan.get("class_entries_parsed") or 0),
         "parse_seconds": float(bytecode_scan.get("class_parse_elapsed_sec") or 0.0),
         "artifact_cache_hits": int(bytecode_scan.get("artifact_cache_hits") or 0),
         "javap_fallbacks": int(bytecode_scan.get("javap_fallbacks") or 0),
+        "javap_invocations": (
+            int(bytecode_scan.get("javap_tasks") or 0)
+            + int(bytecode_expand.get("javap_classes") or 0)
+        ),
+        "duplicate_jar_scans": int(bytecode_scan.get("duplicate_jar_scans") or 0),
         "duplicate_class_scans": int(bytecode_scan.get("duplicate_class_scans") or 0),
+        "peak_rss_mb": float(perf_main.get("peak_rss_mb") or 0.0),
+        "per_api_timings": per_api_timings,
+        "per_api_timing_count": len(per_api_timings),
+        "per_api_timing_complete": len(per_api_timings) == selected,
+        "max_api_elapsed_seconds": max(
+            (float(item.get("elapsed_sec") or 0.0) for item in per_api_timings),
+            default=0.0,
+        ),
         "oracle_class_count": int(oracle_metrics.get("class_count") or 0),
         "oracle_completed_class_count": int(oracle_metrics.get("completed_class_count") or 0),
         "oracle_parsed_class_count": int(oracle_metrics.get("parsed_class_count") or 0),
@@ -2210,6 +2577,9 @@ def collect_performance_envelope(
         "oracle_cache_misses": int(oracle_metrics.get("cache_misses") or 0),
         "oracle_timed_out": bool(oracle_metrics.get("timed_out")),
         "oracle_interrupted": bool(oracle_metrics.get("interrupted")),
+        "jdeps_invocations": int(oracle_metrics.get("jdeps_invocations") or 0),
+        "jdeps_class_count": int(oracle_metrics.get("jdeps_class_count") or 0),
+        "jdeps_elapsed_seconds": float(oracle_metrics.get("jdeps_elapsed_seconds") or 0.0),
     }
 
 
@@ -2238,18 +2608,172 @@ def finalize_performance_envelope(envelope: dict) -> dict:
     return envelope
 
 
+PERFORMANCE_SCOPE_FIELDS = (
+    "selected_api_count",
+    "accounted_api_count",
+    "artifact_count",
+    "class_count",
+    "analyzer_edge_count",
+    "oracle_edge_count",
+    "fault_injection_detected_count",
+)
+
+
+def evaluate_performance_scope_preservation(baseline: dict, current: dict) -> dict:
+    errors: list[str] = []
+    regressions: dict[str, dict] = {}
+    comparisons: dict[str, dict] = {}
+    for field in PERFORMANCE_SCOPE_FIELDS:
+        if field not in baseline:
+            errors.append(f"performance_scope_baseline_missing:{field}")
+            continue
+        if field not in current:
+            errors.append(f"performance_scope_current_missing:{field}")
+            continue
+        expected = int(baseline.get(field) or 0)
+        actual = int(current.get(field) or 0)
+        comparisons[field] = {"baseline": expected, "actual": actual}
+        if actual < expected:
+            regressions[field] = {
+                "baseline": expected,
+                "actual": actual,
+                "missing": expected - actual,
+            }
+    return {
+        "passed": not errors and not regressions,
+        "errors": errors,
+        "regressions": regressions,
+        "comparisons": comparisons,
+    }
+
+
+def evaluate_relative_performance_baseline(
+    case: RealProjectCase,
+    pinned_manifest: dict | None,
+    performance: dict,
+) -> dict:
+    if not case.require_relative_performance_baseline:
+        return {"required": False, "passed": True, "errors": [], "regressions": {}, "comparisons": {}}
+    manifest = dict(pinned_manifest or {})
+    baseline = dict(manifest.get("performance_baseline") or {})
+    errors = []
+    if not baseline:
+        errors.append("performance_baseline_missing")
+    if baseline.get("git_revision") != manifest.get("git_revision"):
+        errors.append("performance_baseline_git_revision_mismatch")
+    if baseline.get("artifact_sha256") != manifest.get("artifact_sha256"):
+        errors.append("performance_baseline_artifact_sha_mismatch")
+    metrics = baseline.get("metrics") if isinstance(baseline.get("metrics"), dict) else {}
+    if not metrics:
+        errors.append("performance_baseline_metrics_missing")
+    if not performance.get("per_api_timing_complete"):
+        errors.append("performance_per_api_timings_incomplete")
+    regressions = {}
+    comparisons = {}
+    scope_baseline = baseline.get("scope")
+    if isinstance(scope_baseline, dict):
+        scope_result = evaluate_performance_scope_preservation(
+            scope_baseline, performance
+        )
+        errors.extend(scope_result["errors"])
+        regressions.update({
+            f"scope:{name}": details
+            for name, details in scope_result["regressions"].items()
+        })
+    else:
+        scope_result = {
+            "passed": False,
+            "errors": ["performance_scope_baseline_missing"],
+            "regressions": {},
+            "comparisons": {},
+        }
+        errors.extend(scope_result["errors"])
+    for name, policy in metrics.items():
+        if not isinstance(policy, dict) or "value" not in policy:
+            errors.append(f"performance_baseline_metric_invalid:{name}")
+            continue
+        if name not in performance:
+            errors.append(f"performance_metric_missing:{name}")
+            continue
+        baseline_value = float(policy.get("value") or 0.0)
+        actual_value = float(performance.get(name) or 0.0)
+        max_absolute = policy.get("max_absolute")
+        max_ratio = float(policy.get("max_ratio") or 0.0)
+        limit = (
+            float(max_absolute)
+            if max_absolute is not None
+            else baseline_value * max_ratio
+        )
+        if max_absolute is None and max_ratio <= 0:
+            errors.append(f"performance_baseline_threshold_missing:{name}")
+            continue
+        comparisons[name] = {
+            "baseline": baseline_value,
+            "actual": actual_value,
+            "limit": limit,
+        }
+        if actual_value > limit:
+            regressions[name] = comparisons[name]
+    return {
+        "required": True,
+        "passed": not errors and not regressions,
+        "errors": sorted(set(errors)),
+        "regressions": regressions,
+        "comparisons": comparisons,
+        "scope": scope_result,
+    }
+
+
+def build_relative_performance_signals(
+    case: RealProjectCase,
+    relative_performance: dict,
+    report_dir: Path,
+) -> list[dict]:
+    if not relative_performance.get("required") or relative_performance.get("passed"):
+        return []
+    return [make_signal(
+        "performance_regression",
+        "P1",
+        case.name,
+        step="real-project-gate",
+        message="SHA-bound relative performance baseline failed",
+        count=(
+            len(relative_performance.get("errors") or [])
+            + len(relative_performance.get("regressions") or {})
+        ),
+        expected="all performance metrics present and within their pinned relative thresholds",
+        actual=json.dumps({
+            "errors": relative_performance.get("errors") or [],
+            "regressions": relative_performance.get("regressions") or {},
+        }, sort_keys=True),
+        evidence=[Path(report_dir) / "evidence" / "call_chain" / "summary.json"],
+        blocking=True,
+    )]
+
+
 def serialized_api_identity(api_row: dict) -> str:
-    """Match the Task 4 ledger's serialized API identity without importing its parser."""
-    return str(tuple(str((api_row or {}).get(field) or "").strip() for field in (
-        "coord", "api_name", "api_signature", "symbol_kind", "change_type",
-    )))
+    """Use the shared analyzer/Oracle API identity."""
+    return canonical_api_identity(api_row)
+
+
+def _constructor_owner_from_api_name(api_name: str) -> str:
+    value = str(api_name or "").strip()
+    if value.endswith(".<init>"):
+        return value[:-len(".<init>")]
+    possible_owner, separator, repeated_name = value.rpartition(".")
+    owner_simple_name = possible_owner.rpartition(".")[2]
+    if separator and repeated_name == owner_simple_name:
+        return possible_owner
+    return value
 
 
 def _api_target_matches(api_row: dict, edge: dict) -> bool:
     api_name = str((api_row or {}).get("api_name") or "").strip()
     symbol_kind = str((api_row or {}).get("symbol_kind") or "method").strip().lower()
     if symbol_kind == "constructor" and not api_name.endswith(".<init>"):
-        owner, separator, member = api_name, ".", "<init>"
+        owner = _constructor_owner_from_api_name(api_name)
+        separator = "."
+        member = "<init>"
     else:
         owner, separator, member = api_name.rpartition(".")
     if not separator or not owner or not member:
@@ -2340,6 +2864,9 @@ def physical_edge_occurrence(edge: dict) -> str:
 def _retain_authoritative_api_path(
     selected_rows: list[dict], oracle_rows: list[dict],
     semantic_targets: set[str] | None = None,
+    *,
+    absence_is_authoritative: bool = False,
+    class_reachability: dict[str, str] | None = None,
 ) -> tuple[list[dict], dict[str, str], list[str]]:
     """Keep every physical path and classify whether it reaches packaged business code."""
     incoming: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
@@ -2354,6 +2881,12 @@ def _retain_authoritative_api_path(
         if not direct:
             if identity in (semantic_targets or set()):
                 api_reachability[identity] = "uncertain"
+                continue
+            if identity in (class_reachability or {}):
+                api_reachability[identity] = str(class_reachability[identity])
+                continue
+            if absence_is_authoritative:
+                api_reachability[identity] = "not_found_in_static_analysis"
                 continue
             errors.append(f"selected_api_unresolved:{identity}")
             api_reachability[identity] = "not_analyzed"
@@ -2531,6 +3064,180 @@ def _classfile_utf8_constants(content: bytes) -> set[bytes]:
     return constants
 
 
+def _classfile_member_references(content: bytes) -> list[dict]:
+    """Parse exact field/method reference constants without using analyzer code."""
+    if len(content) < 10 or content[:4] != b"\xca\xfe\xba\xbe":
+        raise ValueError("not a classfile")
+    constant_count = struct.unpack_from(">H", content, 8)[0]
+    constants: list[object | None] = [None] * constant_count
+    index = 10
+    slot = 1
+    while slot < constant_count:
+        if index >= len(content):
+            raise ValueError("truncated constant pool")
+        tag = content[index]
+        index += 1
+        if tag == 1:
+            if index + 2 > len(content):
+                raise ValueError("truncated UTF8 constant length")
+            length = struct.unpack_from(">H", content, index)[0]
+            index += 2
+            if index + length > len(content):
+                raise ValueError("truncated UTF8 constant")
+            constants[slot] = ("utf8", content[index:index + length])
+            index += length
+        elif tag in {3, 4}:
+            index += 4
+        elif tag in {5, 6}:
+            index += 8
+            slot += 1
+        elif tag == 7:
+            constants[slot] = ("class", struct.unpack_from(">H", content, index)[0])
+            index += 2
+        elif tag in {8, 16, 19, 20}:
+            index += 2
+        elif tag in {9, 10, 11}:
+            class_index, name_type_index = struct.unpack_from(">HH", content, index)
+            constants[slot] = ("reference", tag, class_index, name_type_index)
+            index += 4
+        elif tag == 12:
+            name_index, descriptor_index = struct.unpack_from(">HH", content, index)
+            constants[slot] = ("name_type", name_index, descriptor_index)
+            index += 4
+        elif tag in {17, 18}:
+            index += 4
+        elif tag == 15:
+            index += 3
+        else:
+            raise ValueError(f"unsupported constant-pool tag {tag}")
+        if index > len(content):
+            raise ValueError("truncated constant-pool payload")
+        slot += 1
+
+    def utf8(constant_index: int) -> str:
+        value = constants[constant_index]
+        if not isinstance(value, tuple) or value[0] != "utf8":
+            raise ValueError("invalid UTF8 constant reference")
+        return value[1].decode("utf-8", errors="replace")
+
+    references = []
+    for value in constants:
+        if not isinstance(value, tuple) or value[0] != "reference":
+            continue
+        _kind, tag, class_index, name_type_index = value
+        class_value = constants[class_index]
+        name_type = constants[name_type_index]
+        if (
+            not isinstance(class_value, tuple) or class_value[0] != "class"
+            or not isinstance(name_type, tuple) or name_type[0] != "name_type"
+        ):
+            raise ValueError("invalid member reference")
+        references.append({
+            "callee_owner": utf8(class_value[1]).replace("/", "."),
+            "callee_member": utf8(name_type[1]),
+            "callee_descriptor": utf8(name_type[2]),
+            "reference_kind": {9: "field", 10: "method", 11: "interface_method"}[tag],
+        })
+    return references
+
+
+def scan_final_artifact_member_references(
+    artifact: Path,
+    selected_rows: list[dict],
+    *,
+    excluded_nested_jars: set[str] | None = None,
+) -> dict:
+    """Independently account for exact member refs in a packaged artifact."""
+    targets = [
+        row for row in selected_rows
+        if str(row.get("symbol_kind") or "").strip().lower() != "class"
+    ]
+    reachability = {
+        serialized_api_identity(row): "not_found_in_static_analysis"
+        for row in targets
+    }
+    if not targets:
+        return {"complete": True, "api_reachability": reachability, "references": [], "errors": []}
+    targets_by_member: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for row in targets:
+        api_name = str(row.get("api_name") or "").strip()
+        symbol_kind = str(row.get("symbol_kind") or "").strip().lower()
+        if symbol_kind == "constructor":
+            owner = _constructor_owner_from_api_name(api_name)
+            member = "<init>"
+        else:
+            owner, separator, member = api_name.rpartition(".")
+            if not separator:
+                continue
+        targets_by_member[(owner, member)].append(row)
+
+    excluded = set(excluded_nested_jars or set())
+    references: list[dict] = []
+    errors: list[str] = []
+    snapshot = Path(artifact).read_bytes()
+    artifact_sha256 = hashlib.sha256(snapshot).hexdigest()
+
+    def inspect(content: bytes, artifact_entry: str, business_owned: bool) -> None:
+        try:
+            member_references = _classfile_member_references(content)
+        except ValueError as error:
+            errors.append(f"{artifact_entry}:{error}")
+            return
+        for reference in member_references:
+            candidates = targets_by_member.get((
+                reference["callee_owner"], reference["callee_member"]
+            )) or []
+            for row in candidates:
+                if not _api_target_matches(row, reference):
+                    continue
+                identity = serialized_api_identity(row)
+                if business_owned:
+                    reachability[identity] = "reachable"
+                elif reachability[identity] != "reachable":
+                    reachability[identity] = "uncertain"
+                references.append({
+                    "api_identity": identity,
+                    **reference,
+                    "artifact_sha256": artifact_sha256,
+                    "artifact_entry": artifact_entry,
+                    "business_owned": business_owned,
+                    "authority": "raw-classfile-constant-pool",
+                    "authority_version": "1",
+                })
+
+    with zipfile.ZipFile(io.BytesIO(snapshot)) as archive:
+        names = archive.namelist()
+        application_prefix = next((
+            prefix for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/")
+            if any(name.startswith(prefix) and name.endswith(".class") for name in names)
+        ), "")
+        for name in sorted(names):
+            if name.endswith(".class") and not name.startswith("META-INF/"):
+                is_business = not application_prefix or name.startswith(application_prefix)
+                if is_business:
+                    inspect(archive.read(name), name, True)
+                continue
+            if (
+                not name.endswith(".jar")
+                or not name.startswith(("BOOT-INF/lib/", "WEB-INF/lib/"))
+                or name in excluded
+            ):
+                continue
+            try:
+                with zipfile.ZipFile(io.BytesIO(archive.read(name))) as nested:
+                    for nested_name in sorted(nested.namelist()):
+                        if nested_name.endswith(".class") and not nested_name.startswith("META-INF/"):
+                            inspect(nested.read(nested_name), f"{name}!/{nested_name}", False)
+            except (KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
+                errors.append(f"{name}:{type(error).__name__}:{error}")
+    return {
+        "complete": not errors,
+        "api_reachability": reachability,
+        "references": references,
+        "errors": sorted(errors),
+    }
+
+
 def scan_final_artifact_dynamic_class_references(
     artifact: Path, selected_rows: list[dict]
 ) -> list[dict]:
@@ -2596,6 +3303,111 @@ def scan_final_artifact_dynamic_class_references(
                     ),
                 })
     return references
+
+
+def _constant_pool_references_class(constants: set[bytes], internal_name: bytes) -> bool:
+    return any(
+        value == internal_name
+        or value == b"L" + internal_name + b";"
+        or (value.startswith(b"[") and value.endswith(b"L" + internal_name + b";"))
+        for value in constants
+    )
+
+
+def scan_final_artifact_class_references(
+    artifact: Path,
+    selected_rows: list[dict],
+    *,
+    excluded_nested_jars: set[str] | None = None,
+    application_owned_nested_jars: set[str] | None = None,
+) -> dict:
+    """Account for every class-level API using exact packaged class constants."""
+    targets = {
+        serialized_api_identity(row): str(row.get("api_name") or "").strip()
+        for row in selected_rows
+        if str(row.get("symbol_kind") or "").strip().lower() == "class"
+        and str(row.get("api_name") or "").strip()
+    }
+    if not targets:
+        return {"complete": True, "api_reachability": {}, "references": [], "errors": []}
+    excluded = set(excluded_nested_jars or set())
+    application_owned = set(application_owned_nested_jars or set())
+    references: list[dict] = []
+    errors: list[str] = []
+    snapshot = Path(artifact).read_bytes()
+    artifact_sha256 = hashlib.sha256(snapshot).hexdigest()
+
+    def inspect(content: bytes, artifact_entry: str, business_owned: bool) -> None:
+        try:
+            constants = _classfile_utf8_constants(content)
+        except ValueError as error:
+            errors.append(f"{artifact_entry}:{error}")
+            return
+        for identity, owner in targets.items():
+            internal_name = owner.replace(".", "/").encode("utf-8")
+            if not _constant_pool_references_class(constants, internal_name):
+                continue
+            references.append({
+                "api_identity": identity,
+                "target_class": owner,
+                "artifact_sha256": artifact_sha256,
+                "artifact_entry": artifact_entry,
+                "business_owned": business_owned,
+                "authority": "final-artifact-classfile-constants",
+                "authority_version": "1",
+                "procedure": "exact CONSTANT_Class or JVM type descriptor in SHA-verified final artifact",
+            })
+
+    with zipfile.ZipFile(io.BytesIO(snapshot)) as archive:
+        names = archive.namelist()
+        application_prefix = next(
+            (
+                prefix for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/")
+                if any(name.startswith(prefix) and name.endswith(".class") for name in names)
+            ),
+            "",
+        )
+        for name in sorted(names):
+            if name.endswith(".class") and not name.startswith("META-INF/"):
+                is_business = not application_prefix or name.startswith(application_prefix)
+                if is_business:
+                    inspect(archive.read(name), name, True)
+                continue
+            if not name.endswith(".jar") or not name.startswith(("BOOT-INF/lib/", "WEB-INF/lib/")):
+                continue
+            if name in excluded:
+                continue
+            try:
+                with zipfile.ZipFile(io.BytesIO(archive.read(name))) as nested:
+                    for nested_name in sorted(nested.namelist()):
+                        if not nested_name.endswith(".class") or nested_name.startswith("META-INF/"):
+                            continue
+                        inspect(
+                            nested.read(nested_name),
+                            f"{name}!/{nested_name}",
+                            name in application_owned,
+                        )
+            except (KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
+                errors.append(f"{name}:{type(error).__name__}:{error}")
+
+    by_identity: dict[str, list[dict]] = defaultdict(list)
+    for reference in references:
+        by_identity[str(reference["api_identity"])].append(reference)
+    reachability = {}
+    for identity in targets:
+        matched = by_identity.get(identity) or []
+        if any(item.get("business_owned") for item in matched):
+            reachability[identity] = "reachable"
+        elif matched:
+            reachability[identity] = "uncertain"
+        else:
+            reachability[identity] = "not_found_in_static_analysis"
+    return {
+        "complete": not errors,
+        "api_reachability": reachability,
+        "references": references,
+        "errors": sorted(errors),
+    }
 
 
 MYBATIS_SEMANTIC_APIS = {
@@ -2697,7 +3509,11 @@ def reconcile_selected_api_edges(
         if str(item.get("api_identity") or "")
     )
     retained_oracle_rows, api_reachability, path_errors = _retain_authoritative_api_path(
-        selected_rows, oracle_rows, semantic_targets
+        selected_rows,
+        oracle_rows,
+        semantic_targets,
+        absence_is_authoritative=bool(oracle_scan.get("complete")),
+        class_reachability=dict(oracle_scan.get("class_reachability") or {}),
     )
     path_errors.extend(_oracle_edge_identity_errors(oracle_rows))
     retained_analyzer_rows = _retain_analyzer_api_path(selected_rows, [dict(row) for row in (analyzer_rows or [])])
@@ -2741,6 +3557,39 @@ def reconcile_selected_api_edges(
         json.dumps(semantic_references, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    class_reference_path = (
+        report_dir / "evidence" / "call_chain" / "oracle_class_references.json"
+    )
+    class_reference_path.write_text(
+        json.dumps(
+            oracle_scan.get("class_references") or [],
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    member_reference_path = (
+        report_dir / "evidence" / "call_chain" / "oracle_member_references.json"
+    )
+    member_reference_path.write_text(
+        json.dumps(
+            oracle_scan.get("member_references") or [],
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    jdeps_reference_path = (
+        report_dir / "evidence" / "call_chain" / "oracle_jdeps_class_references.json"
+    )
+    jdeps_reference_path.write_text(
+        json.dumps(
+            oracle_scan.get("jdeps_class_references") or [],
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
     counts = {
         "oracle_edge_count": len(retained_oracle_rows),
         "analyzer_edge_count": len(retained_analyzer_rows),
@@ -2758,6 +3607,12 @@ def reconcile_selected_api_edges(
             "timed_out", "interrupted",
         )
     }
+    jdeps_metrics = dict(oracle_scan.get("jdeps_metrics") or {})
+    oracle_metrics.update({
+        "jdeps_invocations": int(jdeps_metrics.get("jdeps_invocations") or 0),
+        "jdeps_class_count": int(jdeps_metrics.get("class_count") or 0),
+        "jdeps_elapsed_seconds": float(jdeps_metrics.get("elapsed_seconds") or 0.0),
+    })
     return {
         "complete": complete,
         "errors": sorted(path_errors + [str(item) for item in (oracle_scan.get("failures") or [])]),
@@ -2768,6 +3623,15 @@ def reconcile_selected_api_edges(
         "edge_reconciliation": reconciliation_path,
         "semantic_references": semantic_references,
         "semantic_reference_evidence": str(semantic_path),
+        "class_reference_evidence": str(class_reference_path),
+        "member_reference_evidence": str(member_reference_path),
+        "member_reference_reachability": dict(
+            oracle_scan.get("member_reference_reachability") or {}
+        ),
+        "jdeps_class_reference_evidence": str(jdeps_reference_path),
+        "jdeps_class_reachability": dict(
+            oracle_scan.get("jdeps_class_reachability") or {}
+        ),
         "trusted_artifact_sha": str(oracle_scan.get("artifact_sha256") or ""),
         "oracle_metrics": oracle_metrics,
         "oracle_physical_occurrences": [
@@ -2817,7 +3681,7 @@ def _oracle_selected_targets(selected_rows: list[dict]) -> list[dict]:
         if symbol_kind == "class":
             continue
         if symbol_kind == "constructor" and not api_name.endswith(".<init>"):
-            owner, member = api_name, "<init>"
+            owner, member = _constructor_owner_from_api_name(api_name), "<init>"
         else:
             owner, separator, member = api_name.rpartition(".")
             if not separator:
@@ -2830,6 +3694,50 @@ def _oracle_selected_targets(selected_rows: list[dict]) -> list[dict]:
         {"owner": owner, "member": member, "descriptor": descriptor}
         for owner, member, descriptor in sorted(targets)
     ]
+
+
+def _external_target_provider_entries(
+    report_dir: Path, selected_rows: list[dict]
+) -> set[str]:
+    target_coords = {
+        str(row.get("coord") or "").strip() for row in selected_rows or []
+        if str(row.get("coord") or "").strip()
+    }
+    catalog_path = (
+        Path(report_dir) / ".runtime" / "cache"
+        / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+    )
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {
+        str(item.get("artifact_entry") or "").strip()
+        for item in (catalog.get("entries") or [])
+        if str(item.get("coord") or "").strip() in target_coords
+        and item.get("application_owned") is False
+        and str(item.get("artifact_entry") or "").startswith(
+            ("BOOT-INF/lib/", "WEB-INF/lib/")
+        )
+        and str(item.get("artifact_entry") or "").endswith(".jar")
+    }
+
+
+def _application_owned_provider_entries(report_dir: Path) -> set[str]:
+    catalog_path = (
+        Path(report_dir) / ".runtime" / "cache"
+        / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+    )
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {
+        str(item.get("artifact_entry") or "").strip()
+        for item in (catalog.get("entries") or [])
+        if item.get("application_owned") is True
+        and str(item.get("artifact_entry") or "").strip()
+    }
 
 
 def reconcile_final_artifact_edges(
@@ -2891,10 +3799,77 @@ def reconcile_final_artifact_edges(
             }
             scan["mybatis_runtime_activation"] = runtime_activation
         else:
-            scan = scan_final_artifact(
+            scan_kwargs = {
+                "time_budget_seconds": oracle_time_budget_seconds,
+                "selected_targets": _oracle_selected_targets(selected_rows),
+            }
+            excluded_provider_entries = _external_target_provider_entries(
+                report_dir, selected_rows
+            )
+            if excluded_provider_entries:
+                scan_kwargs["excluded_nested_jars"] = excluded_provider_entries
+            scan = scan_final_artifact(artifact, **scan_kwargs)
+        excluded_provider_entries = _external_target_provider_entries(
+            report_dir, selected_rows
+        )
+        try:
+            class_reference_scan = scan_final_artifact_class_references(
                 artifact,
-                time_budget_seconds=oracle_time_budget_seconds,
-                selected_targets=_oracle_selected_targets(selected_rows),
+                selected_rows,
+                excluded_nested_jars=excluded_provider_entries,
+                application_owned_nested_jars=_application_owned_provider_entries(report_dir),
+            )
+            scan["class_reachability"] = class_reference_scan["api_reachability"]
+            scan["class_references"] = class_reference_scan["references"]
+            if not class_reference_scan["complete"]:
+                scan["complete"] = False
+                scan.setdefault("failures", []).extend(
+                    f"class_reference_scan:{item}"
+                    for item in class_reference_scan["errors"]
+                )
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            scan["complete"] = False
+            scan.setdefault("failures", []).append(
+                f"class_reference_scan_failed:{error}"
+            )
+        try:
+            member_reference_scan = scan_final_artifact_member_references(
+                artifact,
+                selected_rows,
+                excluded_nested_jars=excluded_provider_entries,
+            )
+            scan["member_reference_reachability"] = member_reference_scan["api_reachability"]
+            scan["member_references"] = member_reference_scan["references"]
+            if not member_reference_scan["complete"]:
+                scan["complete"] = False
+                scan.setdefault("failures", []).extend(
+                    f"member_reference_scan:{item}"
+                    for item in member_reference_scan["errors"]
+                )
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            scan["complete"] = False
+            scan.setdefault("failures", []).append(
+                f"member_reference_scan_failed:{error}"
+            )
+        try:
+            jdeps_class_scan = scan_jdeps_class_references(
+                artifact,
+                selected_rows,
+                excluded_nested_jars=excluded_provider_entries,
+                application_owned_nested_jars=_application_owned_provider_entries(report_dir),
+            )
+            scan["jdeps_class_reachability"] = jdeps_class_scan["api_reachability"]
+            scan["jdeps_class_references"] = jdeps_class_scan["references"]
+            scan["jdeps_metrics"] = jdeps_class_scan["metrics"]
+            if not jdeps_class_scan["complete"]:
+                scan["complete"] = False
+                scan.setdefault("failures", []).extend(
+                    f"jdeps_class_scan:{item}" for item in jdeps_class_scan["errors"]
+                )
+        except (OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
+            scan["complete"] = False
+            scan.setdefault("failures", []).append(
+                f"jdeps_class_scan_failed:{error}"
             )
         try:
             scan["semantic_references"] = scan_final_artifact_dynamic_class_references(
@@ -2926,27 +3901,157 @@ def reconcile_final_artifact_edges(
     return reconcile_selected_api_edges(report_dir, selected_rows, analyzer_rows, scan)
 
 
+def _file_sha256(path: str | Path) -> str:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def evaluate_required_fault_injections(
+    case: RealProjectCase,
+    report_dir: Path,
+    selected_rows: list[dict],
+    clean_edge_truth: dict,
+    *,
+    analyzer_rows: list[dict] | None = None,
+) -> dict:
+    """Prove the real-project gate detects a deliberately omitted analyzer edge."""
+    report_dir = Path(report_dir)
+    root = report_dir / "evidence" / "quality" / "fault_injection"
+    root.mkdir(parents=True, exist_ok=True)
+    if analyzer_rows is None:
+        _fields, analyzer_rows = _csv_rows(
+            report_dir / "evidence" / "call_chain" / "analyzer_edges.csv"
+        )
+    analyzer_rows = [dict(row) for row in (analyzer_rows or [])]
+    clean_ledger = list((clean_edge_truth.get("reconciliation") or {}).get("ledger") or [])
+    oracle_scan = dict(clean_edge_truth.get("oracle_scan") or {})
+    clean_ready = bool(clean_edge_truth.get("complete")) and not bool(
+        clean_edge_truth.get("blocking")
+    )
+    runs = []
+    for mode in case.required_fault_injections:
+        run = {
+            "mode": mode,
+            "passed": False,
+            "error": "",
+            "removed_occurrence": "",
+            "removed_api_identity": "",
+            "verdict_counts": {},
+            "clean_oracle_sha256": _file_sha256(clean_edge_truth.get("oracle_edges") or ""),
+            "injected_oracle_sha256": "",
+            "edge_reconciliation": "",
+        }
+        if not clean_ready:
+            run["error"] = "clean_edge_truth_not_ready"
+            runs.append(run)
+            continue
+        if mode != "drop_analyzer_edge":
+            run["error"] = f"unsupported_fault_injection:{mode}"
+            runs.append(run)
+            continue
+        candidate = next(
+            (
+                row for row in clean_ledger
+                if row.get("side") == "analyzer"
+                and row.get("verdict") == "correct"
+                and str(row.get("physical_occurrence") or "")
+            ),
+            None,
+        )
+        if candidate is None:
+            run["error"] = "injectable_analyzer_edge_missing"
+            runs.append(run)
+            continue
+        occurrence = str(candidate.get("physical_occurrence") or "")
+        api_identity = str(candidate.get("api_identity") or "")
+        removed = False
+        mutated_rows = []
+        for row in analyzer_rows:
+            matches = physical_edge_occurrence(row) == occurrence
+            row_identity = str(row.get("api_identity") or "")
+            if api_identity and row_identity:
+                matches = matches and row_identity == api_identity
+            if matches and not removed:
+                removed = True
+                continue
+            mutated_rows.append(row)
+        if not removed:
+            run["error"] = "injectable_analyzer_edge_missing"
+            runs.append(run)
+            continue
+        injected = reconcile_selected_api_edges(
+            root / mode,
+            selected_rows,
+            mutated_rows,
+            oracle_scan,
+        )
+        counts = dict((injected.get("reconciliation") or {}).get("verdict_counts") or {})
+        run.update({
+            "removed_occurrence": occurrence,
+            "removed_api_identity": api_identity,
+            "verdict_counts": counts,
+            "injected_oracle_sha256": _file_sha256(injected.get("oracle_edges") or ""),
+            "edge_reconciliation": str(injected.get("edge_reconciliation") or ""),
+        })
+        oracle_unchanged = bool(run["clean_oracle_sha256"]) and (
+            run["clean_oracle_sha256"] == run["injected_oracle_sha256"]
+        )
+        run["passed"] = bool(
+            injected.get("complete")
+            and injected.get("blocking")
+            and int(counts.get("missing") or 0) > 0
+            and oracle_unchanged
+        )
+        if not run["passed"]:
+            run["error"] = "injected_false_negative_did_not_fail_closed"
+        runs.append(run)
+    payload = {
+        "case": case.name,
+        "required": list(case.required_fault_injections),
+        "passed": all(run.get("passed") for run in runs),
+        "runs": runs,
+    }
+    manifest = root / "manifest.json"
+    manifest.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return {**payload, "manifest": str(manifest)}
+
+
 def build_final_artifact_api_oracle_records(
     selected_rows: list[dict], edge_truth: dict
 ) -> list[dict]:
     """Convert the independent classfile graph into per-API semantic verdicts."""
     if not edge_truth.get("complete"):
         return []
-    evidence_path = Path(str(edge_truth.get("oracle_edges") or ""))
-    try:
-        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
-    except OSError:
-        return []
     reachability = edge_truth.get("api_reachability") or {}
     records = []
     for row in selected_rows:
         conclusion = str(reachability.get(serialized_api_identity(row)) or "")
-        if conclusion not in {"reachable", "uncertain"}:
+        if conclusion not in {
+            "reachable", "uncertain", "not_found_in_static_analysis"
+        }:
+            continue
+        evidence_path = Path(str(
+            edge_truth.get("class_reference_evidence")
+            if str(row.get("symbol_kind") or "").strip().lower() == "class"
+            else edge_truth.get("oracle_edges")
+            or ""
+        ))
+        try:
+            evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        except OSError:
             continue
         records.append({
             **{
                 key: str(row.get(key) or "")
-                for key in ("coord", "api_name", "api_signature", "symbol_kind")
+                for key in (
+                    "coord", "api_name", "api_signature", "symbol_kind",
+                    "change_type",
+                )
             },
             "oracle_conclusion": conclusion,
             "authority": "final-artifact-classfile",
@@ -2954,6 +4059,96 @@ def build_final_artifact_api_oracle_records(
             "procedure": (
                 "SHA-verified final artifact classfile graph; exact target edge; "
                 "reverse traversal to packaged business class boundary"
+            ),
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": evidence_sha256,
+            "generated_at": date.today().isoformat(),
+            "evidence_mode": "bytecode",
+            "conclusion_scope": "static_analysis",
+        })
+    return records
+
+
+def build_constant_pool_api_oracle_records(
+    selected_rows: list[dict], edge_truth: dict
+) -> list[dict]:
+    """Produce a second per-member authority from a raw classfile parser."""
+    if not edge_truth.get("complete"):
+        return []
+    evidence_path = Path(str(edge_truth.get("member_reference_evidence") or ""))
+    try:
+        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    except OSError:
+        return []
+    reachability = edge_truth.get("member_reference_reachability") or {}
+    records = []
+    for row in selected_rows:
+        if str(row.get("symbol_kind") or "").strip().lower() == "class":
+            continue
+        conclusion = str(reachability.get(serialized_api_identity(row)) or "")
+        if conclusion not in {
+            "reachable", "uncertain", "not_found_in_static_analysis",
+        }:
+            continue
+        records.append({
+            **{
+                key: str(row.get(key) or "")
+                for key in (
+                    "coord", "api_name", "api_signature", "symbol_kind",
+                    "change_type",
+                )
+            },
+            "oracle_conclusion": conclusion,
+            "authority": "raw-classfile-constant-pool",
+            "authority_version": "1",
+            "procedure": (
+                "independent JVM constant-pool parser; exact owner, member, and "
+                "descriptor reference in the SHA-verified final artifact"
+            ),
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": evidence_sha256,
+            "generated_at": date.today().isoformat(),
+            "evidence_mode": "bytecode",
+            "conclusion_scope": "static_analysis",
+        })
+    return records
+
+
+def build_jdeps_api_oracle_records(
+    selected_rows: list[dict], edge_truth: dict
+) -> list[dict]:
+    """Produce an independent class-level authority from the JDK jdeps tool."""
+    if not edge_truth.get("complete"):
+        return []
+    evidence_path = Path(str(edge_truth.get("jdeps_class_reference_evidence") or ""))
+    try:
+        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    except OSError:
+        return []
+    reachability = edge_truth.get("jdeps_class_reachability") or {}
+    records = []
+    for row in selected_rows:
+        if str(row.get("symbol_kind") or "").strip().lower() != "class":
+            continue
+        conclusion = str(reachability.get(serialized_api_identity(row)) or "")
+        if conclusion not in {
+            "reachable", "uncertain", "not_found_in_static_analysis",
+        }:
+            continue
+        records.append({
+            **{
+                key: str(row.get(key) or "")
+                for key in (
+                    "coord", "api_name", "api_signature", "symbol_kind",
+                    "change_type",
+                )
+            },
+            "oracle_conclusion": conclusion,
+            "authority": "jdk-jdeps",
+            "authority_version": "1",
+            "procedure": (
+                "JDK jdeps -verbose:class over effective classes in every non-target "
+                "container of the SHA-verified final artifact"
             ),
             "evidence_path": str(evidence_path),
             "evidence_sha256": evidence_sha256,
@@ -3044,6 +4239,30 @@ def build_edge_truth_signals(case: RealProjectCase, edge_truth: dict, source_con
     return signals
 
 
+def build_fault_injection_signals(case: RealProjectCase, fault_injection: dict) -> list[dict]:
+    if not case.required_fault_injections or fault_injection.get("passed"):
+        return []
+    failed = [
+        run for run in (fault_injection.get("runs") or [])
+        if not run.get("passed")
+    ]
+    return [make_signal(
+        "fault_injection_failure",
+        "P0",
+        case.name,
+        step="real-project-gate",
+        message="required fault injection did not prove that the gate detects a false negative",
+        count=len(failed),
+        expected="clean run passes and every injected analyzer-edge omission fails with a missing verdict",
+        actual="; ".join(
+            f"{run.get('mode')}:{run.get('error') or 'not_blocking'}"
+            for run in failed
+        ),
+        evidence=[fault_injection.get("manifest") or ""],
+        blocking=True,
+    )]
+
+
 def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_path: Path | None = None) -> Path:
     if case.prefer_embedded_changed_api_rows and case.changed_api_rows:
         changed_apis = materialized_path or changed_apis
@@ -3075,12 +4294,25 @@ def materialize_bytecode_changed_apis(
     extracted_root.mkdir(parents=True, exist_ok=True)
     target_lib_entry = ""
     target_lib_candidates: list[str] = []
+    target_filename_candidates: list[str] = []
     runtime_lib_entries: list[dict[str, str]] = []
     artifact_java_version = infer_final_artifact_java_version(artifact)
     owner_prefix_bytes = tuple(prefix.encode("utf-8") for prefix in case.bytecode_owner_prefixes)
     artifact_id = case.bytecode_coord.split(":", 1)[-1].strip()
+    class_files: list[Path] = []
     with zipfile.ZipFile(artifact) as source:
         names = source.namelist()
+        target_filename_candidates = [
+            name
+            for name in names
+            if name.startswith("BOOT-INF/lib/")
+            and name.endswith(".jar")
+            and artifact_id
+            and re.fullmatch(
+                rf"{re.escape(artifact_id)}(?:-.+)?\.jar",
+                Path(name).name,
+            )
+        ]
         application_prefix = next(
             (
                 prefix for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/")
@@ -3112,10 +4344,16 @@ def materialize_bytecode_changed_apis(
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 class_bytes = source.read(name)
                 destination.write_bytes(class_bytes)
+                class_files.append(destination)
             if (
                 name.startswith("BOOT-INF/lib/")
                 and name.endswith(".jar")
             ):
+                nested_filename = Path(name).name
+                is_target_provider = (
+                    len(target_filename_candidates) == 1
+                    and name == target_filename_candidates[0]
+                )
                 try:
                     nested_blob = source.read(name)
                     with zipfile.ZipFile(io.BytesIO(nested_blob)) as nested:
@@ -3137,8 +4375,12 @@ def materialize_bytecode_changed_apis(
                                 nested_coordinates.append(properties)
                         if len(nested_coordinates) == 1:
                             coordinate = nested_coordinates[0]
+                            nested_coord = (
+                                f"{coordinate['groupId']}:{coordinate['artifactId']}"
+                            )
+                            is_target_provider = nested_coord == case.bytecode_coord
                             runtime_lib_entries.append({
-                                "coord": f"{coordinate['groupId']}:{coordinate['artifactId']}",
+                                "coord": nested_coord,
                                 "version": coordinate["version"],
                                 "lib_entry": name,
                             })
@@ -3148,12 +4390,16 @@ def materialize_bytecode_changed_apis(
                                 "version": "runtime",
                                 "lib_entry": name,
                             })
+                        if is_target_provider and name not in target_lib_candidates:
+                            target_lib_candidates.append(name)
                         nested_root = (
                             extracted_root / "nested" /
                             f"{hashlib.sha256(name.encode('utf-8')).hexdigest()[:12]}-{Path(name).stem}"
                         )
                         for class_entry in sorted(nested.namelist()):
                             if not class_entry.endswith(".class") or class_entry.startswith("META-INF/"):
+                                continue
+                            if is_target_provider:
                                 continue
                             class_bytes = nested.read(class_entry)
                             if owner_prefix_bytes and not any(
@@ -3163,19 +4409,32 @@ def materialize_bytecode_changed_apis(
                             destination = nested_root / class_entry
                             destination.parent.mkdir(parents=True, exist_ok=True)
                             destination.write_bytes(class_bytes)
-                except (KeyError, OSError, ValueError, zipfile.BadZipFile):
-                    pass
-            if (
-                artifact_id
-                and name.startswith(f"BOOT-INF/lib/{artifact_id}-")
-                and name.endswith(".jar")
-            ):
-                target_lib_candidates.append(name)
+                            class_files.append(destination)
+                except (KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
+                    raise RuntimeError(
+                        f"FINAL_ARTIFACT_NESTED_CLASS_MATERIALIZATION_FAILED:"
+                        f"{name}:{type(error).__name__}:{error}"
+                    ) from error
+    if not target_lib_candidates and len(target_filename_candidates) == 1:
+        target_lib_candidates = target_filename_candidates
     if len(target_lib_candidates) == 1:
         target_lib_entry = target_lib_candidates[0]
-    class_files = sorted(extracted_root.rglob("*.class"))
+    class_files = sorted(set(class_files))
     if not class_files:
         raise ValueError("current final artifact contains no business class files")
+    inventory_path = report_dir / ".runtime" / "final-artifact-class-inventory.json"
+    inventory_path.parent.mkdir(parents=True, exist_ok=True)
+    inventory_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "artifact_sha256": artifact_sha256,
+            "extracted_root": str(extracted_root.resolve()),
+            "class_files": [
+                path.relative_to(extracted_root).as_posix() for path in class_files
+            ],
+        }, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     dependencies_dir = report_dir / "evidence" / "dependencies"
     dependencies_dir.mkdir(parents=True, exist_ok=True)
     context_dir = report_dir / "evidence" / "context"
@@ -3250,6 +4509,35 @@ def materialize_bytecode_changed_apis(
     return generated_changed_apis
 
 
+def load_materialized_class_inventory(report_dir: Path, artifact: Path) -> list[Path]:
+    """Load only class files materialized by the current artifact run."""
+    inventory_path = Path(report_dir) / ".runtime" / "final-artifact-class-inventory.json"
+    payload = json.loads(inventory_path.read_text(encoding="utf-8"))
+    expected_sha = hashlib.sha256(Path(artifact).read_bytes()).hexdigest()
+    if str(payload.get("artifact_sha256") or "") != expected_sha:
+        raise ValueError("materialized class inventory artifact SHA mismatch")
+    extracted_root = Path(str(payload.get("extracted_root") or "")).resolve()
+    expected_root = (
+        Path(report_dir) / ".runtime" / "final-artifact-classes" / expected_sha[:16]
+    ).resolve()
+    if extracted_root != expected_root:
+        raise ValueError("materialized class inventory root mismatch")
+    class_files = []
+    for value in payload.get("class_files") or []:
+        relative = PurePosixPath(str(value or ""))
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise ValueError(f"unsafe materialized class inventory entry: {value}")
+        candidate = extracted_root.joinpath(*relative.parts).resolve()
+        if candidate.parent != extracted_root and extracted_root not in candidate.parents:
+            raise ValueError(f"materialized class inventory entry escaped root: {value}")
+        if not candidate.is_file():
+            raise ValueError(f"materialized class inventory entry missing: {value}")
+        class_files.append(candidate)
+    if not class_files:
+        raise ValueError("materialized class inventory is empty")
+    return sorted(set(class_files))
+
+
 def materialize_step4_inputs(case: RealProjectCase, report_dir: Path) -> tuple[Path, Path]:
     runtime_dir = report_dir / ".runtime" / "real_project_regression"
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -3292,10 +4580,109 @@ def materialize_step4_inputs(case: RealProjectCase, report_dir: Path) -> tuple[P
     return dep_changes, context
 
 
+def validate_step4_population_contract(case: RealProjectCase) -> None:
+    if not case.derive_step1_from_artifacts:
+        return
+    if case.step4_dep_rows:
+        raise ValueError(
+            "artifact-derived Step4 population cannot declare step4_dep_rows"
+        )
+    if case.base_final_artifact is None or case.final_artifact is None:
+        raise ValueError(
+            "artifact-derived Step4 population requires base and current final artifacts"
+        )
+
+
+def requires_full_step4_population(case: RealProjectCase, requested: bool) -> bool:
+    return bool(requested or case.case_mode in {"discovery", "convergence"})
+
+
+def derive_step4_inputs_from_artifacts(
+    case: RealProjectCase, report_dir: Path
+) -> tuple[Path, Path, list[dict]]:
+    validate_step4_population_contract(case)
+    dependency_dir = report_dir / "evidence" / "dependencies"
+    context_dir = report_dir / "evidence" / "context"
+    dependency_dir.mkdir(parents=True, exist_ok=True)
+    context_dir.mkdir(parents=True, exist_ok=True)
+    dep_changes = dependency_dir / "s1_dep_changes.csv"
+    context = context_dir / "s2_context.json"
+    base_source = case.base_source_project or case.default_project
+    current_source = case.current_source_project or case.default_project
+    step1_cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "s1_dep_diff.py"),
+        "--base-artifact-path",
+        str(case.base_final_artifact),
+        "--current-artifact-path",
+        str(case.final_artifact),
+        "--base-source-project-dir",
+        str(base_source),
+        "--current-source-project-dir",
+        str(current_source),
+        "--output",
+        str(dep_changes),
+    ]
+    step1 = subprocess.run(
+        step1_cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", timeout=900
+    )
+    runs = [{"step": "step1", "returncode": step1.returncode, "command": step1_cmd}]
+    if step1.returncode != 0:
+        return dep_changes, context, runs
+
+    step2_cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "s2_context_from_deps.py"),
+        "--dep-changes",
+        str(dep_changes),
+        "--work-dir",
+        str(current_source),
+        "--output",
+        str(context),
+    ]
+    if case.base_revision:
+        step2_cmd.extend(("--base", case.base_revision))
+    if case.current_revision:
+        step2_cmd.extend(("--current", case.current_revision))
+    if case.source_dirs:
+        step2_cmd.append("--source-dirs")
+        step2_cmd.extend(str(current_source / source_dir) for source_dir in case.source_dirs)
+    step2 = subprocess.run(
+        step2_cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", timeout=900
+    )
+    runs.append({"step": "step2", "returncode": step2.returncode, "command": step2_cmd})
+    return dep_changes, context, runs
+
+
 def run_step4(case: RealProjectCase, report_dir: Path) -> dict:
     output_dir = report_dir / "evidence" / "api_changes"
     output_dir.mkdir(parents=True, exist_ok=True)
-    dep_changes, context = materialize_step4_inputs(case, report_dir)
+    preparation_runs: list[dict] = []
+    if case.derive_step1_from_artifacts:
+        dep_changes, context, preparation_runs = derive_step4_inputs_from_artifacts(
+            case, report_dir
+        )
+        preparation_returncode = next(
+            (
+                int(run["returncode"])
+                for run in preparation_runs
+                if int(run["returncode"]) != 0
+            ),
+            0,
+        )
+        if preparation_returncode:
+            return {
+                "returncode": preparation_returncode,
+                "elapsed_seconds": 0.0,
+                "dep_changes": str(dep_changes),
+                "context": str(context),
+                "output_dir": str(output_dir),
+                "all_changed_apis": str(output_dir / "all_changed_apis.csv"),
+                "population_source": "step1_final_artifacts",
+                "preparation_runs": preparation_runs,
+            }
+    else:
+        dep_changes, context = materialize_step4_inputs(case, report_dir)
     cmd = [
         sys.executable,
         str(ROOT_DIR / "scripts" / "s4_jar_compare.py"),
@@ -3321,6 +4708,10 @@ def run_step4(case: RealProjectCase, report_dir: Path) -> dict:
         "context": str(context),
         "output_dir": str(output_dir),
         "all_changed_apis": str(output_dir / "all_changed_apis.csv"),
+        "population_source": (
+            "step1_final_artifacts" if case.derive_step1_from_artifacts else "declared_dependency_rows"
+        ),
+        "preparation_runs": preparation_runs,
     }
 
 
@@ -3503,10 +4894,50 @@ def collect_project_asset_health(project_root: Path) -> dict:
         stderr=subprocess.PIPE,
         timeout=30,
     )
+    valid_git_checkout = git_result.returncode == 0 and git_result.stdout.strip() == "true"
+    revision = ""
+    git_dirty = None
+    extra_git_errors = []
+    if valid_git_checkout:
+        revision_result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        if revision_result.returncode == 0:
+            revision = revision_result.stdout.strip()
+        else:
+            extra_git_errors.append(
+                (revision_result.stderr or revision_result.stdout or "git revision unavailable").strip()
+            )
+        dirty_result = subprocess.run(
+            ["git", "-C", str(project_root), "status", "--porcelain"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        if dirty_result.returncode == 0:
+            git_dirty = bool(dirty_result.stdout.strip())
+        else:
+            extra_git_errors.append(
+                (dirty_result.stderr or dirty_result.stdout or "git status unavailable").strip()
+            )
     generated_ratio = (len(generated_java_files) / len(java_files)) if java_files else 0.0
+    initial_git_error = ""
+    if not valid_git_checkout:
+        initial_git_error = (git_result.stderr or git_result.stdout or "").strip()
     return {
-        "valid_git_checkout": git_result.returncode == 0 and git_result.stdout.strip() == "true",
-        "git_error": (git_result.stderr or git_result.stdout or "").strip(),
+        "valid_git_checkout": valid_git_checkout,
+        "git_revision": revision,
+        "git_dirty": git_dirty,
+        "git_error": "; ".join(filter(None, [initial_git_error, *extra_git_errors])),
         "java_files": len(java_files),
         "main_java_files": len(main_java_files),
         "generated_java_files": len(generated_java_files),
@@ -3836,6 +5267,7 @@ def build_quality_signals(
     failures: list[str],
     result_audit: dict,
     report_dir: Path,
+    oracle_audit: dict | None = None,
 ) -> list[dict]:
     signals: list[dict] = []
     conclusion_groups = group_conclusion_gaps(summary)
@@ -3857,8 +5289,15 @@ def build_quality_signals(
             symbol_kind=group["symbol_kind"],
             sample_symbols=group["sample_symbols"],
         ))
+    verified_absence = sum(
+        1 for row in ((oracle_audit or {}).get("ledger") or [])
+        if row.get("analyzer_conclusion") == "not_found_in_static_analysis"
+        and row.get("verdict") == "correct"
+    )
     for field in ("not_analyzed", "not_found_in_static_analysis"):
         count = int(summary.get(field) or 0)
+        if field == "not_found_in_static_analysis":
+            count = max(0, count - verified_absence)
         if count and not (field == "not_analyzed" and conclusion_groups):
             signals.append(make_signal(
                 "capability_gap",
@@ -4033,17 +5472,17 @@ def run_case(
         reason = f"project root missing: {project_root}"
         return {
             "case": case.name,
-            "status": "skipped",
+            "status": "failed",
             "reason": reason,
             "matrix_policy": real_project_matrix_policy(),
             "quality_signals": [
                 make_signal(
-                    "infra_skip",
+                    "project_asset_invalid",
                     "P1",
                     case.name,
                     message=reason,
                     actual="real project checkout unavailable",
-                    blocking=False,
+                    blocking=True,
                     fixture_status="",
                 )
             ],
@@ -4053,7 +5492,7 @@ def run_case(
     if asset_violations:
         return {
             "case": case.name,
-            "status": "skipped",
+            "status": "failed",
             "reason": "project asset invalid",
             "project_root": str(project_root),
             "project_asset_health": project_asset_health,
@@ -4074,6 +5513,34 @@ def run_case(
         }
     report_dir = report_root / case.name
     report_dir.mkdir(parents=True, exist_ok=True)
+    requires_final_artifact = bool(
+        case.bytecode_owner_prefixes
+        or case.enable_jdk_oracle
+        or case.required_topologies
+    )
+    if requires_final_artifact and (
+        case.final_artifact is None or not case.final_artifact.is_file()
+    ):
+        reason = "current final artifact unavailable"
+        return {
+            "case": case.name,
+            "status": "failed",
+            "reason": reason,
+            "project_root": str(project_root),
+            "report_dir": str(report_dir),
+            "matrix_policy": real_project_matrix_policy(),
+            "quality_signals": [make_signal(
+                "project_asset_invalid",
+                "P1",
+                case.name,
+                message=reason,
+                expected="SHA-verifiable current final artifact for bytecode discovery",
+                actual=str(case.final_artifact or ""),
+                evidence=[project_root, case.final_artifact or report_dir],
+                blocking=True,
+                fixture_status="missing",
+            )],
+        }
     if case.bytecode_owner_prefixes:
         explicit_changed_apis = changed_apis if changed_apis.is_file() else None
         changed_apis = materialize_bytecode_changed_apis(
@@ -4082,6 +5549,8 @@ def run_case(
             report_dir,
             selected_changed_apis=explicit_changed_apis,
         )
+    elif case.fixture_manifest is None and case.final_artifact is not None:
+        write_declared_final_artifact_provenance(report_dir, case)
     step4_result = {}
     step4_selection = {}
     failures = []
@@ -4097,7 +5566,10 @@ def run_case(
                 f"elapsed={float(step4_result.get('elapsed_seconds') or 0.0):.2f}s "
                 f"over_budget={case.max_step4_elapsed_seconds:.2f}s"
             )
-        if full_step4_apis:
+        use_full_step4_population = requires_full_step4_population(
+            case, full_step4_apis
+        )
+        if use_full_step4_population:
             _, step4_rows = _csv_rows(step4_all_changed_apis)
             step4_api_names = {
                 str(row.get("api_name") or "").strip()
@@ -4147,7 +5619,8 @@ def run_case(
         )
     performance_budget = (
         case.max_full_step4_api_elapsed_seconds
-        if full_step4_apis and case.max_full_step4_api_elapsed_seconds
+        if requires_full_step4_population(case, full_step4_apis)
+        and case.max_full_step4_api_elapsed_seconds
         else case.max_elapsed_seconds
     )
 
@@ -4176,13 +5649,13 @@ def run_case(
                 "matrix_policy": real_project_matrix_policy(),
                 "quality_signals": [
                     make_signal(
-                        "infra_skip",
+                        "project_asset_invalid",
                         "P1",
                         case.name,
                         step="step4",
                         message=missing_reason,
                         actual="changed API input unavailable",
-                        blocking=False,
+                        blocking=True,
                         fixture_status="",
                     )
                 ],
@@ -4190,18 +5663,18 @@ def run_case(
         reason = f"changed APIs missing: {changed_apis}"
         return {
             "case": case.name,
-            "status": "skipped",
+            "status": "failed",
             "reason": reason,
             "matrix_policy": real_project_matrix_policy(),
             "quality_signals": [
                 make_signal(
-                    "infra_skip",
+                    "project_asset_invalid",
                     "P1",
                     case.name,
                     step="step4",
                     message=reason,
                     actual="changed API input unavailable",
-                    blocking=False,
+                    blocking=True,
                     fixture_status="",
                 )
             ],
@@ -4214,6 +5687,45 @@ def run_case(
     )
     returncode, elapsed = run_step5(execution_case, project_root, changed_apis, report_dir)
     summary = load_summary(report_dir)
+    if returncode != 0 or not summary:
+        execution_failures = list(failures)
+        if returncode != 0:
+            execution_failures.append(f"step5_returncode={returncode}")
+        if not summary:
+            execution_failures.append("step5_summary_missing")
+        if performance_budget and elapsed > performance_budget:
+            execution_failures.append(
+                f"performance: elapsed={elapsed:.2f}s over_budget={performance_budget:.2f}s"
+            )
+        return {
+            "case": case.name,
+            "status": "failed",
+            "reason": "Step5 execution did not produce a complete summary",
+            "project_root": str(project_root),
+            "changed_apis": str(changed_apis),
+            "report_dir": str(report_dir),
+            "elapsed_seconds": round(elapsed, 3),
+            "performance_budget_seconds": performance_budget,
+            "step5_returncode": returncode,
+            "summary": summary,
+            "failures": execution_failures,
+            "warnings": [],
+            "project_asset_health": project_asset_health,
+            "matrix_policy": real_project_matrix_policy(),
+            "quality_signals": [make_signal(
+                "step5_execution_failure",
+                "P0",
+                case.name,
+                step="step5",
+                message="Step5 failed or did not produce a complete summary; edge truth audit was skipped",
+                expected="returncode=0 and readable summary.json before edge reconciliation",
+                actual="; ".join(execution_failures),
+                evidence=[
+                    report_dir / "evidence" / "quality" / "step5_timeout.json",
+                    report_dir / "evidence" / "call_chain" / "summary.json",
+                ],
+            )],
+        }
     graph_stats = extract_graph_stats(summary)
     source_shape_metrics = collect_source_shape_metrics(project_root, case.source_shape_patterns)
     alerts_csv = report_dir / "evidence" / "call_chain" / "alerts.csv"
@@ -4255,7 +5767,7 @@ def run_case(
 
     for spec in case.baseline_specs:
         production_baseline, test_baseline, occurrences = collect_baseline_files(project_root, spec)
-        alert_files = collect_alert_files(alerts_csv, spec.symbol)
+        alert_files = collect_alert_files(alerts_csv, spec.symbol, project_root=project_root)
         production_missing = sorted(production_baseline - alert_files)
         test_missing = sorted(test_baseline - alert_files)
         extra = sorted(alert_files - production_baseline - test_baseline)
@@ -4331,6 +5843,13 @@ def run_case(
         oracle_time_budget_seconds=case.max_oracle_seconds,
         pinned_manifest=pinned_manifest,
     )
+    fault_injection = (
+        evaluate_required_fault_injections(
+            case, report_dir, selected_rows, edge_truth
+        )
+        if case.required_fault_injections
+        else {"required": [], "passed": True, "runs": [], "manifest": ""}
+    )
     source_conflicts = validate_source_bytecode_conflicts(summary, edge_truth)
     performance_envelope = collect_performance_envelope(
         summary,
@@ -4339,28 +5858,47 @@ def run_case(
         oracle_metrics=edge_truth.get("oracle_metrics"),
     )
     performance_envelope.update(edge_truth["counts"])
+    performance_envelope["fault_injection_detected_count"] = sum(
+        1 for run in (fault_injection.get("runs") or []) if run.get("passed")
+    )
     finalize_performance_envelope(performance_envelope)
+    performance_manifest = pinned_manifest
+    if case.performance_manifest is not None:
+        try:
+            performance_manifest = json.loads(
+                Path(case.performance_manifest).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            performance_manifest = {}
+    relative_performance = evaluate_relative_performance_baseline(
+        case, performance_manifest, performance_envelope
+    )
     oracle_audit = None
     oracle_ledger = ""
     effective_ground_truth_status = case.ground_truth_status
     if case.case_mode in {"discovery", "convergence"}:
         oracle_rows = load_oracle_manifest(oracle_manifest or case.oracle_manifest)
         oracle_rows.extend(build_final_artifact_api_oracle_records(selected_rows, edge_truth))
+        oracle_rows.extend(build_constant_pool_api_oracle_records(selected_rows, edge_truth))
+        oracle_rows.extend(build_jdeps_api_oracle_records(selected_rows, edge_truth))
         if case.enable_jdk_oracle:
-            if case.final_artifact:
-                class_files = sorted(
-                    (report_dir / ".runtime" / "final-artifact-classes").rglob("*.class")
-                )
-            else:
-                class_files = []
-            oracle_rows.extend(scan_class_files(
-                selected_rows,
-                class_files,
-                report_dir / "evidence" / "quality" / "jdk-javap",
-                business_class_files=[
-                    path for path in class_files if "nested" not in path.parts
-                ],
-            ))
+            try:
+                if case.final_artifact:
+                    class_files = load_materialized_class_inventory(
+                        report_dir, case.final_artifact
+                    )
+                else:
+                    class_files = []
+                oracle_rows.extend(scan_class_files(
+                    selected_rows,
+                    class_files,
+                    report_dir / "evidence" / "quality" / "jdk-javap",
+                    business_class_files=[
+                        path for path in class_files if "nested" not in path.parts
+                    ],
+                ))
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                warnings.append(f"jdk_oracle_unavailable:{type(error).__name__}:{error}")
         oracle_audit = audit_api_oracle(
             selected_rows,
             load_analyzer_rows(summary),
@@ -4399,6 +5937,7 @@ def run_case(
         failures=failures,
         result_audit=result_audit,
         report_dir=report_dir,
+        oracle_audit=oracle_audit,
     )
     quality_signals.extend(build_policy_signals(
         case,
@@ -4413,6 +5952,14 @@ def run_case(
         report_dir,
     ))
     quality_signals.extend(build_edge_truth_signals(case, edge_truth, source_conflicts))
+    quality_signals.extend(build_fault_injection_signals(case, fault_injection))
+    quality_signals.extend(build_relative_performance_signals(
+        case, relative_performance, report_dir
+    ))
+    performance_envelope["within_budget"] = not any(
+        str(item.get("signal_type") or "") == "performance_regression"
+        for item in quality_signals
+    )
     if failures and not any(item.get("blocking") for item in quality_signals):
         quality_signals.append(make_signal(
             "correctness_failure", "P1", case.name,
@@ -4434,6 +5981,8 @@ def run_case(
         "elapsed_seconds": round(elapsed, 2),
         "performance_budget_seconds": performance_budget,
         "performance_envelope": performance_envelope,
+        "relative_performance": relative_performance,
+        "fault_injection": fault_injection,
         "edge_truth": {
             "complete": edge_truth["complete"],
             "blocking": edge_truth["blocking"],
@@ -4454,7 +6003,9 @@ def run_case(
             key: value for key, value in (oracle_audit or {}).items()
             if key not in {
                 "ledger", "missing_identities", "duplicate_identities",
-                "extra_identities", "invalid_provenance",
+                "extra_identities", "analyzer_extra_identities",
+                "analyzer_duplicate_identities", "analyzer_conflict_identities",
+                "invalid_provenance",
             }
         },
         "oracle_ledger": oracle_ledger,
@@ -4503,9 +6054,13 @@ def run_case(
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run real-project regression probes for Step5.")
-    parser.add_argument("--case", choices=sorted(CASES.keys()) + ["all"], default="all")
+    parser.add_argument("--case", choices=sorted(CASES.keys()) + ["all", "guard"], default="all")
     parser.add_argument("--project-root", help="Override project root for a single --case run.")
     parser.add_argument("--changed-apis", help="Override all_changed_apis.csv for a single --case run.")
+    parser.add_argument(
+        "--final-artifact",
+        help="Bind a SHA-verified current final JAR/WAR for a single --case run.",
+    )
     parser.add_argument(
         "--oracle-manifest",
         help="Override the independent per-API oracle CSV for a single --case run.",
@@ -4531,21 +6086,38 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def select_case_names(selector: str) -> list[str]:
+    if selector == "all":
+        return sorted(CASES)
+    if selector == "guard":
+        return sorted(
+            name for name, case in CASES.items()
+            if case.case_mode == "guard" and case.fixture_manifest is not None
+        )
+    return [selector]
+
+
 def main(argv=None):
     args = parse_args(argv)
-    case_names = sorted(CASES.keys()) if args.case == "all" else [args.case]
+    case_names = select_case_names(args.case)
     report_root = Path(args.report_root)
     results = []
     for name in case_names:
         case = CASES[name]
-        if args.case == "all" and (
-            args.project_root or args.changed_apis or args.oracle_manifest or args.required_topology
+        if args.case in {"all", "guard"} and (
+            args.project_root
+            or args.changed_apis
+            or args.final_artifact
+            or args.oracle_manifest
+            or args.required_topology
         ):
             raise SystemExit(
-                "single-case overrides cannot be used with --case all"
+                f"single-case overrides cannot be used with --case {args.case}"
             )
         if args.required_topology:
             case = replace(case, required_topologies=tuple(dict.fromkeys(args.required_topology)))
+        if args.final_artifact:
+            case = replace(case, final_artifact=Path(args.final_artifact))
         project_root = Path(args.project_root) if args.project_root else case.default_project
         changed_apis = Path(args.changed_apis) if args.changed_apis else case.default_changed_apis
         results.append(
@@ -4559,8 +6131,8 @@ def main(argv=None):
             )
         )
 
-    failed = any(item.get("status") == "failed" for item in results)
-    payload = {"status": "failed" if failed else "passed", "results": results}
+    run_status = derive_run_status(results)
+    payload = {"status": run_status, "results": results}
     if args.json_out:
         output = Path(args.json_out)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -4632,7 +6204,7 @@ def main(argv=None):
                 print(f"  FAILURE {failure}")
             for warning in item.get("warnings", []):
                 print(f"  WARNING {warning}")
-    return 1 if failed else 0
+    return 0 if run_status == "passed" else 1
 
 
 if __name__ == "__main__":

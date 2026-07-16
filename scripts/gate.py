@@ -231,8 +231,8 @@ def gate_jar_compare(d):
             fail(
                 f"Step4 存在超时导致的证据缺失：{len(timeout_items)} 项",
                 [
-                    "查看 evidence/api_changes/timeouts.json，确认是 git diff、JApiCmp 还是 dependency:get 超时",
-                    "通过 --response-json 调整 step4_git_diff_timeout / step4_japicmp_timeout / step4_fetch_timeout 后重跑 Step4",
+                    "查看 evidence/api_changes/timeouts.json，确认是 git diff 还是 JApiCmp 对比超时",
+                    "通过 --response-json 调整 step4_git_diff_timeout / step4_japicmp_timeout 后重跑 Step4",
                 ],
             )
     with open(csv_path, encoding="utf-8", errors="replace") as f:
@@ -248,14 +248,14 @@ def gate_jar_compare(d):
             if f.endswith('_binary.txt'):
                 try:
                     content = open(jar_dir / f, encoding="utf-8", errors="replace").read(200)
-                    if '未找到' in content or 'jar 未找到' in content:
+                    if '最终制品' in content and ('证据缺失' in content or '未找到' in content):
                         jar_missing.append(f)
                 except (OSError, UnicodeError) as exc:
                     jar_missing.append(f"{f}:unreadable:{type(exc).__name__}")
     if jar_missing:
         fail(
-            f"以下依赖 jar 未找到，Step4 证据池不完整：{jar_missing[:5]}",
-            ["补齐缺失 jar 或修复 Maven 仓库配置后，重新执行 Step 4"]
+            f"以下依赖缺少最终制品 JAR 证据，Step4 证据池不完整：{jar_missing[:5]}",
+            ["修复 Step1 最终制品或制品内依赖条目证据后，重新执行 Step4"]
         )
     ok(f"jar_compare 门控通过：{rows} 个变更 API")
 

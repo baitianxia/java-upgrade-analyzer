@@ -23,7 +23,7 @@ from pathlib import Path
 from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
-from compat import run_cmd, open_text, git_cmd, mvn_cmd, maven_repo_dir
+from compat import run_cmd, open_text, git_cmd, mvn_cmd
 
 
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -70,6 +70,15 @@ def load_dep_changes(csv_path):
                 continue
             coord = normalized.get('coord', '').strip()
             if coord and not coord.startswith('#'):
+                if coord in deps:
+                    previous = deps[coord]
+                    raise ValueError(
+                        "duplicate dependency identity in Step1 output: "
+                        f"{coord}; entries="
+                        f"{previous.get('base_lib_entry') or previous.get('current_lib_entry') or '<unknown>'},"
+                        f"{normalized.get('base_lib_entry') or normalized.get('current_lib_entry') or '<unknown>'}. "
+                        "Preserve Maven classifier in coord instead of collapsing physical artifacts."
+                    )
                 deps[coord] = normalized
 
     if not deps:
@@ -81,38 +90,9 @@ def load_dep_changes(csv_path):
 
 
 def get_pom_deps_from_m2(group_id, artifact_id, version):
-    pom_base = maven_repo_dir()
-    for part in group_id.split('.'):
-        pom_base = pom_base / part
-    pom_path = pom_base / artifact_id / version / f"{artifact_id}-{version}.pom"
-
-    if not pom_path.exists():
-        run_cmd(
-            mvn_cmd() + [
-                'dependency:get',
-                f'-Dartifact={group_id}:{artifact_id}:{version}:pom',
-                '-q',
-                '--no-transfer-progress',
-            ],
-            timeout=60,
-        )
-
-    if not pom_path.exists():
-        return []
-
-    try:
-        content = pom_path.read_text(encoding='utf-8', errors='replace')
-    except Exception:
-        return []
-
-    deps = []
-    for match in re.finditer(
-        r'<dependency>\s*<groupId>([^<]+)</groupId>\s*<artifactId>([^<]+)</artifactId>',
-        content,
-        re.DOTALL,
-    ):
-        deps.append(f"{match.group(1).strip()}:{match.group(2).strip()}")
-    return deps
+    """Deprecated compatibility hook; raw repository POMs are not analysis evidence."""
+    _ = group_id, artifact_id, version
+    return []
 
 
 def topological_sort(target_coords, edges):

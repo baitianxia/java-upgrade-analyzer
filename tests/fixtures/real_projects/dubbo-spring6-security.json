@@ -6,6 +6,13 @@
   "git_revision": "c587ff67c0aaccb7c459851e65ac19cbc8a1d3f4",
   "artifact_path": "dubbo-plugin/dubbo-spring6-security/target/dubbo-spring6-security-3.3.7-SNAPSHOT.jar",
   "artifact_sha256": "d4160292a05a8e536bb54591ff1cdb8f9796cdea0fd93fed2973af713ba7011f",
+  "materialization": {
+    "kind": "source_build",
+    "repository_url": "https://github.com/apache/dubbo.git",
+    "working_directory": ".",
+    "command": ["mvn", "-q", "-pl", "dubbo-plugin/dubbo-spring6-security", "-am", "-DskipTests", "package"],
+    "artifact_path": "dubbo-plugin/dubbo-spring6-security/target/dubbo-spring6-security-3.3.7-SNAPSHOT.jar"
+  },
   "required_topologies": [
     "reflection"
   ],
@@ -25,7 +32,7 @@
   "canonical_edges": [],
   "canonical_semantic_references": [
     {
-      "api_identity": "('org.springframework.security:spring-security-oauth2-core', 'org.springframework.security.oauth2.core.DefaultOAuth2AuthenticatedPrincipal', '', 'class', 'REMOVED')",
+      "api_identity": "org.springframework.security:spring-security-oauth2-core|org.springframework.security.oauth2.core.DefaultOAuth2AuthenticatedPrincipal||class|REMOVED",
       "target_class": "org.springframework.security.oauth2.core.DefaultOAuth2AuthenticatedPrincipal",
       "artifact_sha256": "d4160292a05a8e536bb54591ff1cdb8f9796cdea0fd93fed2973af713ba7011f",
       "artifact_entry": "org/apache/dubbo/spring/security/oauth2/OAuth2SecurityModule.class",

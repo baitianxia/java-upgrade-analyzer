@@ -1,4 +1,6 @@
 import csv
+import hashlib
+import io
 import json
 import subprocess
 import struct
@@ -7,6 +9,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -28,7 +31,102 @@ def minimal_classfile_with_utf8(*values):
     )
 
 
+def minimal_classfile_with_methodref(owner, member, descriptor):
+    values = (owner, member, descriptor)
+    utf8_entries = []
+    for value in values:
+        encoded = value.encode("utf-8")
+        utf8_entries.append(b"\x01" + struct.pack(">H", len(encoded)) + encoded)
+    entries = [
+        utf8_entries[0],
+        b"\x07" + struct.pack(">H", 1),
+        utf8_entries[1],
+        utf8_entries[2],
+        b"\x0c" + struct.pack(">HH", 3, 4),
+        b"\x0a" + struct.pack(">HH", 2, 5),
+    ]
+    return (
+        b"\xca\xfe\xba\xbe"
+        + struct.pack(">HHH", 0, 61, len(entries) + 1)
+        + b"".join(entries)
+    )
+
+
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_ruoyi_discovery_case_pins_full_population_and_performance_manifest(self):
+        case = realreg.CASES["ruoyi-full-artifact-discovery"]
+        manifest = json.loads(case.performance_manifest.read_text(encoding="utf-8"))
+
+        self.assertTrue(case.derive_step1_from_artifacts)
+        self.assertEqual(case.required_topologies, ("field_access", "same_jar_bridge"))
+        self.assertEqual(manifest["population_contract"]["step4_changed_apis"], 2185)
+        self.assertEqual(manifest["oracle_contract"]["verified_apis"], 2185)
+        self.assertEqual(
+            manifest["performance_baseline"]["artifact_sha256"],
+            manifest["current_artifact_sha256"],
+        )
+
+    def test_topology_coordinate_entries_include_split_runtime_provider_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp)
+            evidence = report / "evidence" / "api_changes"
+            evidence.mkdir(parents=True)
+            (evidence / "artifact_replacements.json").write_text(json.dumps({
+                "items": [{
+                    "base_coord": "g:core",
+                    "current_coord": "g:core",
+                    "current_provider_coords": ["g:core", "g:common"],
+                    "evidence_type": "final_artifact_binary_provider_set",
+                }],
+            }), encoding="utf-8")
+
+            result = realreg.extend_coordinate_entries_for_runtime_provider_sets(
+                report,
+                {
+                    "g:core": ["BOOT-INF/lib/core.jar"],
+                    "g:common": ["BOOT-INF/lib/common.jar"],
+                },
+            )
+
+        self.assertEqual(result["g:core"], [
+            "BOOT-INF/lib/core.jar", "BOOT-INF/lib/common.jar",
+        ])
+
+    def test_real_project_case_declares_required_fault_injections(self):
+        case = realreg.RealProjectCase(
+            name="fault-gated",
+            default_project=Path("."),
+            default_changed_apis=Path("changed.csv"),
+            baseline_specs=(),
+            required_fault_injections=("drop_analyzer_edge",),
+        )
+
+        self.assertEqual(case.required_fault_injections, ("drop_analyzer_edge",))
+
+    def test_parse_args_accepts_final_artifact_override_for_single_case(self):
+        args = realreg.parse_args([
+            "--case", "commons-text",
+            "--final-artifact", "/tmp/commons-text.jar",
+        ])
+
+        self.assertEqual(args.final_artifact, "/tmp/commons-text.jar")
+
+    def test_project_asset_health_records_revision_without_fake_git_error(self):
+        completed = [
+            subprocess.CompletedProcess([], 0, stdout="true\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="a" * 40 + "\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg.subprocess, "run", side_effect=completed
+        ):
+            health = realreg.collect_project_asset_health(Path(tmp))
+
+        self.assertTrue(health["valid_git_checkout"])
+        self.assertEqual(health["git_revision"], "a" * 40)
+        self.assertFalse(health["git_dirty"])
+        self.assertEqual(health["git_error"], "")
+
     def test_mybatis_sample_fixtures_pin_two_distinct_published_artifacts(self):
         fixture_dir = ROOT / "tests" / "fixtures" / "real_projects"
         annotation = json.loads(
@@ -51,6 +149,58 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(annotation["unverified_apis"], [])
         self.assertEqual(xml["unverified_apis"], [])
 
+    def test_every_pinned_manifest_has_an_executable_materialization_contract(self):
+        fixture_dir = ROOT / "tests" / "fixtures" / "real_projects"
+        manifests = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(fixture_dir.glob("*.json"))
+        ]
+
+        failures = {
+            manifest["case"]: realreg.validate_reproducible_asset_contract(manifest)
+            for manifest in manifests
+        }
+
+        self.assertEqual(failures, {manifest["case"]: [] for manifest in manifests})
+
+    def test_absolute_artifact_path_without_published_origin_is_not_reproducible(self):
+        manifest = {
+            "repository": "example/project",
+            "git_revision": "a" * 40,
+            "artifact_path": "/private/tmp/app.jar",
+            "artifact_sha256": "b" * 64,
+            "materialization": {
+                "kind": "source_build",
+                "repository_url": "https://github.com/example/project.git",
+                "working_directory": ".",
+                "command": ["mvn", "-q", "package"],
+                "artifact_path": "/private/tmp/app.jar",
+            },
+        }
+
+        errors = realreg.validate_reproducible_asset_contract(manifest)
+
+        self.assertIn("source_build_artifact_path_not_relative", errors)
+
+    def test_pinned_asset_gate_rejects_missing_materialization_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("app/App.class", minimal_classfile_with_utf8("app/App"))
+            manifest = {
+                "git_revision": "a" * 40,
+                "artifact_path": "app.jar",
+                "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            completed = SimpleNamespace(returncode=0, stdout="a" * 40, stderr="")
+
+            with patch.object(realreg.subprocess, "run", return_value=completed):
+                result = realreg.validate_pinned_asset(manifest, root)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("materialization_contract_missing", result["errors"])
+
     def test_mybatis_cases_audit_dependency_apis_not_business_mapper_contracts(self):
         expected = {
             "org.apache.ibatis.binding.MapperProxy.invoke",
@@ -69,6 +219,67 @@ class RealProjectRegressionTest(unittest.TestCase):
                 self.assertEqual(case.bytecode_coord, "org.mybatis:mybatis")
                 self.assertIn("mybatis_mapper_proxy", case.required_topologies)
                 self.assertEqual(case.case_mode, "guard")
+
+    def test_mybatis_xml_guard_requires_false_negative_fault_injection(self):
+        self.assertEqual(
+            realreg.CASES["mybatis-sample-xml"].required_fault_injections,
+            ("drop_analyzer_edge",),
+        )
+
+    def test_spring_security_config_case_discovers_proxy_and_context_calls_from_final_jar(self):
+        case = realreg.CASES["spring-security-config"]
+
+        self.assertEqual(case.source_dirs, (Path("config/src/main/java"),))
+        self.assertEqual(
+            case.final_artifact.name, "spring-security-config-6.5.10.jar"
+        )
+        self.assertEqual(case.case_mode, "discovery")
+        self.assertTrue(case.enable_jdk_oracle)
+        self.assertLessEqual(case.max_elapsed_seconds, 130.0)
+        self.assertEqual(
+            set(case.bytecode_owner_prefixes),
+            {
+                "org/springframework/security/authentication/ProviderManager",
+                "org/springframework/security/core/context/SecurityContextHolder",
+                "org/springframework/security/authorization/method/AuthorizationAdvisorProxyFactory",
+            },
+        )
+
+    def test_dubbo_rpc_proxy_consumer_case_is_a_new_strict_discovery_target(self):
+        case = realreg.CASES["dubbo-rpc-proxy-consumer"]
+
+        self.assertEqual(case.source_dirs, (Path("src/main/java"),))
+        self.assertEqual(
+            case.bytecode_coord,
+            "org.apache.dubbo.samples:dubbo-samples-rpc-basic-api",
+        )
+        self.assertEqual(
+            case.bytecode_owner_prefixes,
+            ("org/apache/dubbo/samples/DemoService",),
+        )
+        self.assertEqual(
+            case.final_artifact.name,
+            "dubbo-samples-rpc-basic-consumer-0.0.1-SNAPSHOT.jar",
+        )
+        self.assertEqual(case.case_mode, "discovery")
+        self.assertTrue(case.enable_jdk_oracle)
+        self.assertTrue(case.require_valid_git)
+        self.assertIn("business_direct", case.required_topologies)
+        self.assertIn("interface_dispatch", case.required_topologies)
+        self.assertIn("framework_callback", case.required_topologies)
+
+    def test_commons_cases_reject_empty_or_stale_real_project_checkouts(self):
+        expected_minimums = {
+            "commons-text": (100, 100),
+            "commons-lang": (500, 400),
+        }
+
+        for case_name, (project_min, main_min) in expected_minimums.items():
+            with self.subTest(case=case_name):
+                case = realreg.CASES[case_name]
+                self.assertTrue(case.require_valid_git)
+                self.assertGreaterEqual(case.min_project_java_files, project_min)
+                self.assertGreaterEqual(case.min_main_java_files, main_min)
 
     def test_mybatis_semantic_references_require_complete_oracle_and_runtime(self):
         selected = [
@@ -382,6 +593,228 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertNotIn("source_edges_in_final_artifact_paths:1", audit["failures"])
 
+    def test_output_audit_rejects_alert_identity_not_in_changed_api_population(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            changed.write_text(
+                "api_name,api_signature,symbol_kind\n"
+                "lib.Api.call,(),method\n",
+                encoding="utf-8",
+            )
+            fields = [
+                "conclusion", "change_summary", "review_reason", "chain_summary",
+                "chain_target", "changed_symbol", "api_signature", "symbol_kind",
+                "path_status",
+            ]
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for symbol in ("lib.Api.call", "lib.Api.notChanged"):
+                    writer.writerow({
+                        "conclusion": "需人工复核",
+                        "change_summary": "removed",
+                        "review_reason": "bytecode reference",
+                        "chain_summary": "dependency path",
+                        "chain_target": f"{symbol}()",
+                        "changed_symbol": f"{symbol}()",
+                        "api_signature": "()",
+                        "symbol_kind": "method",
+                        "path_status": "uncertain",
+                    })
+
+            audit = realreg.audit_analysis_outputs(
+                changed, alerts, {"total_apis": 1}
+            )
+
+        self.assertIn("alerts_extra_api_rows:1", audit["failures"])
+
+    def test_output_audit_uses_coordinate_and_change_type_in_closed_identity_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            changed_rows = [
+                {
+                    "coord": coord,
+                    "api_name": "lib.Api.call",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                }
+                for coord in ("one:api", "two:api")
+            ]
+            with changed.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=changed_rows[0])
+                writer.writeheader()
+                writer.writerows(changed_rows)
+            alert_identity = realreg.serialized_api_identity(changed_rows[0])
+            alert_row = {
+                "api_identity": alert_identity,
+                "conclusion": "需人工复核",
+                "change_summary": "removed",
+                "review_reason": "bytecode reference",
+                "chain_summary": "dependency path",
+                "chain_target": "lib.Api.call()",
+                "changed_symbol": "lib.Api.call()",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "path_status": "uncertain",
+            }
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=alert_row)
+                writer.writeheader()
+                writer.writerow(alert_row)
+
+            audit = realreg.audit_analysis_outputs(
+                changed, alerts, {"total_apis": 2}
+            )
+
+        self.assertIn("alerts_missing_api_rows:1", audit["failures"])
+
+    def test_output_audit_rejects_duplicate_step4_canonical_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            changed_row = {
+                "coord": "one:api",
+                "api_name": "lib.Api.call",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            with changed.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=changed_row)
+                writer.writeheader()
+                writer.writerows([changed_row, changed_row])
+            alert_row = {
+                "api_identity": realreg.serialized_api_identity(changed_row),
+                "conclusion": "需人工复核",
+                "change_summary": "removed",
+                "review_reason": "bytecode reference",
+                "chain_summary": "dependency path",
+                "chain_target": "lib.Api.call()",
+                "changed_symbol": "lib.Api.call()",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "path_status": "uncertain",
+            }
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=alert_row)
+                writer.writeheader()
+                writer.writerow(alert_row)
+
+            audit = realreg.audit_analysis_outputs(
+                changed, alerts, {"total_apis": 2}
+            )
+
+        self.assertIn("changed_duplicate_api_identities:1", audit["failures"])
+
+    def test_output_audit_rejects_equal_count_summary_with_wrong_identity_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            changed_rows = [
+                {
+                    "coord": "g:a",
+                    "api_name": name,
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                }
+                for name in ("p.Api.one", "p.Api.two")
+            ]
+            with changed.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=changed_rows[0])
+                writer.writeheader()
+                writer.writerows(changed_rows)
+            alert_fields = [
+                "api_identity", "conclusion", "change_summary", "review_reason",
+                "chain_summary", "chain_target", "changed_symbol", "api_signature",
+                "symbol_kind", "change_type", "path_status",
+            ]
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=alert_fields)
+                writer.writeheader()
+                for row in changed_rows:
+                    writer.writerow({
+                        "api_identity": realreg.serialized_api_identity(row),
+                        "conclusion": "需人工复核",
+                        "change_summary": "removed",
+                        "review_reason": "bytecode reference",
+                        "chain_summary": "dependency path",
+                        "chain_target": f"{row['api_name']}()",
+                        "changed_symbol": f"{row['api_name']}()",
+                        "api_signature": "()",
+                        "symbol_kind": "method",
+                        "change_type": "REMOVED",
+                        "path_status": "uncertain",
+                    })
+            wrong = {
+                **changed_rows[0],
+                "api_name": "p.Api.extra",
+                "api": "p.Api.extra",
+            }
+            summary = {
+                "total_apis": 2,
+                "uncertain_apis": [changed_rows[0], wrong],
+            }
+
+            audit = realreg.audit_analysis_outputs(changed, alerts, summary)
+
+        self.assertIn("summary_missing_api_rows:1", audit["failures"])
+        self.assertIn("summary_extra_api_rows:1", audit["failures"])
+
+    def test_output_audit_accepts_one_identical_canonical_identity_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            alerts = root / "alerts.csv"
+            changed_rows = [
+                {
+                    "coord": "g:a",
+                    "api_name": name,
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                }
+                for name in ("p.Api.one", "p.Api.two")
+            ]
+            with changed.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=changed_rows[0])
+                writer.writeheader()
+                writer.writerows(changed_rows)
+            alert_fields = [
+                "api_identity", "conclusion", "change_summary", "review_reason",
+                "chain_summary", "chain_target", "changed_symbol", "api_signature",
+                "symbol_kind", "change_type", "path_status",
+            ]
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=alert_fields)
+                writer.writeheader()
+                for row in changed_rows:
+                    writer.writerow({
+                        "api_identity": realreg.serialized_api_identity(row),
+                        "conclusion": "需人工复核",
+                        "change_summary": "removed",
+                        "review_reason": "bytecode reference",
+                        "chain_summary": "dependency path",
+                        "chain_target": f"{row['api_name']}()",
+                        "changed_symbol": f"{row['api_name']}()",
+                        "api_signature": "()",
+                        "symbol_kind": "method",
+                        "change_type": "REMOVED",
+                        "path_status": "uncertain",
+                    })
+            summary = {"total_apis": 2, "uncertain_apis": changed_rows}
+
+            audit = realreg.audit_analysis_outputs(changed, alerts, summary)
+
+        self.assertEqual(audit["failures"], [])
+
     def test_all_real_cases_have_active_measurable_performance_budgets(self):
         self.assertTrue(realreg.CASES)
         for name, case in realreg.CASES.items():
@@ -640,6 +1073,124 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertAlmostEqual(coverage["coverage_ratio"], 9 / 5440)
         self.assertFalse(coverage["complete"])
 
+    def test_discovery_step4_always_uses_the_full_api_population(self):
+        case = realreg.RealProjectCase(
+            name="full-discovery",
+            default_project=Path("/tmp/project"),
+            default_changed_apis=Path(""),
+            baseline_specs=(),
+            run_step4=True,
+            case_mode="discovery",
+            expected_step4_api_names=("only.a.probe",),
+        )
+
+        self.assertTrue(realreg.requires_full_step4_population(case, requested=False))
+
+    def test_artifact_derived_step4_rejects_hand_written_dependency_rows(self):
+        case = realreg.RealProjectCase(
+            name="artifact-derived",
+            default_project=Path("/tmp/current"),
+            default_changed_apis=Path(""),
+            baseline_specs=(),
+            run_step4=True,
+            derive_step1_from_artifacts=True,
+            base_final_artifact=Path("/tmp/old.jar"),
+            final_artifact=Path("/tmp/new.jar"),
+            step4_dep_rows=({"coord": "hand:selected"},),
+        )
+
+        with self.assertRaisesRegex(ValueError, "step4_dep_rows"):
+            realreg.validate_step4_population_contract(case)
+
+    def test_artifact_derived_step4_runs_step1_and_step2_before_step4(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+            project = root / "project"
+            source_dir = project / "module/src/main/java"
+            source_dir.mkdir(parents=True)
+            case = realreg.RealProjectCase(
+                name="artifact-derived",
+                default_project=project,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                source_dirs=(Path("module/src/main/java"),),
+                run_step4=True,
+                derive_step1_from_artifacts=True,
+                base_final_artifact=old_jar,
+                final_artifact=new_jar,
+                base_source_project=project,
+                current_source_project=project,
+                base_revision="base-sha",
+                current_revision="current-sha",
+            )
+            commands = []
+
+            def fake_run(cmd, **_kwargs):
+                commands.append(cmd)
+                if str(cmd[1]).endswith("s1_dep_diff.py"):
+                    Path(cmd[cmd.index("--output") + 1]).write_text(
+                        "coord,old_version,new_version,change_type,scope\n"
+                        "g:a,1,2,MINOR,compile\n",
+                        encoding="utf-8",
+                    )
+                elif str(cmd[1]).endswith("s2_context_from_deps.py"):
+                    Path(cmd[cmd.index("--output") + 1]).write_text(
+                        json.dumps({"changed_dependencies": [{"coord": "g:a"}]}),
+                        encoding="utf-8",
+                    )
+                else:
+                    output = Path(cmd[cmd.index("--output-dir") + 1])
+                    output.mkdir(parents=True, exist_ok=True)
+                    (output / "all_changed_apis.csv").write_text(
+                        "coord,api_name,symbol_kind,api_signature\n"
+                        "g:a,p.A.m,method,()\n",
+                        encoding="utf-8",
+                    )
+                return SimpleNamespace(returncode=0)
+
+            with patch.object(realreg.subprocess, "run", side_effect=fake_run):
+                result = realreg.run_step4(case, root / "report")
+
+        self.assertEqual(len(commands), 3)
+        self.assertTrue(str(commands[0][1]).endswith("s1_dep_diff.py"))
+        self.assertIn("--base-artifact-path", commands[0])
+        self.assertTrue(str(commands[1][1]).endswith("s2_context_from_deps.py"))
+        self.assertIn(str(source_dir), commands[1])
+        self.assertTrue(str(commands[2][1]).endswith("s4_jar_compare.py"))
+        self.assertEqual(result["population_source"], "step1_final_artifacts")
+        self.assertIn("evidence/dependencies/s1_dep_changes.csv", result["dep_changes"])
+        self.assertIn("evidence/context/s2_context.json", result["context"])
+
+    def test_declared_artifact_provenance_preserves_matching_step1_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "app.jar"
+            artifact.write_bytes(b"artifact")
+            report = root / "report"
+            dependencies = report / "evidence/dependencies"
+            dependencies.mkdir(parents=True)
+            provenance = dependencies / "build_provenance.json"
+            provenance.write_text(json.dumps({"sides": [{
+                "side": "current",
+                "artifact_path": str(artifact),
+                "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }]}), encoding="utf-8")
+            resolved = dependencies / "deps_current_resolved.csv"
+            resolved.write_text("coord\ng:a\n", encoding="utf-8")
+            case = realreg.RealProjectCase(
+                name="preserve", default_project=root, default_changed_apis=Path(""),
+                baseline_specs=(), final_artifact=artifact,
+            )
+
+            realreg.write_declared_final_artifact_provenance(report, case)
+            preserved = resolved.read_text(encoding="utf-8")
+
+        self.assertEqual(preserved, "coord\ng:a\n")
+
     def test_guard_coverage_declares_probe_scope(self):
         coverage = realreg.compute_api_coverage("guard", 5440, 9, 9)
 
@@ -668,6 +1219,27 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(realreg.derive_case_status(False, [], "reviewed"), "skipped")
         self.assertEqual(realreg.derive_case_status(True, [], "unreviewed"), "observed")
         self.assertEqual(realreg.derive_case_status(True, [], "reviewed"), "passed")
+
+    def test_run_status_requires_every_case_to_be_conclusively_passed(self):
+        self.assertEqual(
+            realreg.derive_run_status([{"status": "passed"}]),
+            "passed",
+        )
+        self.assertEqual(
+            realreg.derive_run_status([
+                {"status": "passed"},
+                {"status": "observed"},
+            ]),
+            "incomplete",
+        )
+        self.assertEqual(
+            realreg.derive_run_status([{"status": "skipped"}]),
+            "incomplete",
+        )
+        self.assertEqual(
+            realreg.derive_run_status([{"status": "failed"}]),
+            "failed",
+        )
 
     def test_performance_envelope_normalizes_candidate_pairs(self):
         envelope = realreg.collect_performance_envelope(
@@ -746,6 +1318,129 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertFalse(envelope["oracle_timed_out"])
         self.assertFalse(envelope["oracle_interrupted"])
 
+    def test_performance_envelope_exposes_complete_normalized_resource_metrics(self):
+        envelope = realreg.collect_performance_envelope(
+            {"meta": {"graph_stats": {"step5_perf": {
+                "main": {"peak_rss_mb": 256.5},
+                "bytecode_scan": {
+                    "class_entries_scoped": 2000,
+                    "elapsed_sec": 4.0,
+                    "javap_tasks": 7,
+                    "duplicate_jar_scans": 2,
+                },
+                "bytecode_expand": {"javap_classes": 3},
+                "trace": {"api_trace_timings": [
+                    {"api_name": "a.A.one", "elapsed_sec": 0.1},
+                    {"api_name": "a.A.two", "elapsed_sec": 0.2},
+                ]},
+            }}}},
+            elapsed=2.0,
+            selected=2,
+        )
+
+        self.assertEqual(envelope["elapsed_seconds_per_api"], 1.0)
+        self.assertEqual(envelope["scan_seconds_per_1000_classes"], 2.0)
+        self.assertEqual(envelope["duplicate_jar_scans"], 2)
+        self.assertEqual(envelope["javap_invocations"], 10)
+        self.assertEqual(envelope["peak_rss_mb"], 256.5)
+        self.assertEqual(len(envelope["per_api_timings"]), 2)
+
+    def test_relative_performance_baseline_is_sha_bound_and_blocks_regression(self):
+        case = realreg.RealProjectCase(
+            name="relative-perf",
+            default_project=Path("."),
+            default_changed_apis=Path("changed.csv"),
+            baseline_specs=(),
+            require_relative_performance_baseline=True,
+        )
+        manifest = {
+            "git_revision": "a" * 40,
+            "artifact_sha256": "b" * 64,
+            "performance_baseline": {
+                "git_revision": "a" * 40,
+                "artifact_sha256": "b" * 64,
+                "scope": {
+                    "selected_api_count": 1,
+                    "accounted_api_count": 1,
+                    "artifact_count": 1,
+                    "class_count": 1,
+                    "analyzer_edge_count": 1,
+                    "oracle_edge_count": 1,
+                    "fault_injection_detected_count": 1,
+                },
+                "metrics": {
+                    "elapsed_seconds_per_api": {"value": 1.0, "max_ratio": 1.5},
+                    "duplicate_jar_scans": {"value": 0, "max_absolute": 0},
+                },
+            },
+        }
+
+        regression = realreg.evaluate_relative_performance_baseline(
+            case,
+            manifest,
+            {
+                "elapsed_seconds_per_api": 1.6,
+                "duplicate_jar_scans": 0,
+                "per_api_timing_complete": True,
+                **manifest["performance_baseline"]["scope"],
+            },
+        )
+        stale = realreg.evaluate_relative_performance_baseline(
+            case,
+            {**manifest, "artifact_sha256": "c" * 64},
+            {
+                "elapsed_seconds_per_api": 1.0,
+                "duplicate_jar_scans": 0,
+                "per_api_timing_complete": True,
+                **manifest["performance_baseline"]["scope"],
+            },
+        )
+
+        self.assertFalse(regression["passed"])
+        self.assertIn("elapsed_seconds_per_api", regression["regressions"])
+        self.assertFalse(stale["passed"])
+        self.assertIn("performance_baseline_artifact_sha_mismatch", stale["errors"])
+
+    def test_performance_scope_gate_accepts_faster_run_with_identical_scope(self):
+        baseline = {
+            "selected_api_count": 3,
+            "accounted_api_count": 3,
+            "artifact_count": 33,
+            "class_count": 8118,
+            "analyzer_edge_count": 6,
+            "oracle_edge_count": 6,
+            "fault_injection_detected_count": 1,
+        }
+        current = {**baseline, "elapsed_seconds": 4.0}
+
+        result = realreg.evaluate_performance_scope_preservation(baseline, current)
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["regressions"], {})
+
+    def test_performance_scope_gate_rejects_faster_run_that_reduces_scan_scope(self):
+        baseline = {
+            "selected_api_count": 2185,
+            "accounted_api_count": 2185,
+            "artifact_count": 119,
+            "class_count": 44462,
+            "analyzer_edge_count": 313,
+            "oracle_edge_count": 313,
+            "fault_injection_detected_count": 1,
+        }
+        current = {
+            **baseline,
+            "class_count": 44461,
+            "analyzer_edge_count": 312,
+            "elapsed_seconds": 1.0,
+        }
+
+        result = realreg.evaluate_performance_scope_preservation(baseline, current)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["regressions"]["class_count"]["missing"], 1)
+        self.assertEqual(result["regressions"]["analyzer_edge_count"]["missing"], 1)
+
     def test_final_artifact_reconciliation_passes_budget_and_exposes_oracle_metrics(self):
         scan = {
             "artifact_sha256": "a" * 64,
@@ -790,6 +1485,53 @@ class RealProjectRegressionTest(unittest.TestCase):
         )
         self.assertEqual(result["oracle_metrics"]["class_count"], 9)
         self.assertEqual(result["oracle_metrics"]["parse_seconds"], 1.25)
+
+    def test_final_artifact_oracle_excludes_explicitly_external_target_provider_jar(self):
+        scan = {
+            "artifact_sha256": "a" * 64,
+            "complete": True,
+            "edges": [],
+            "failures": [],
+            "artifact_entries": ["BOOT-INF/classes/app/App.class"],
+        }
+        selected = [{
+            "coord": "vendor:provider",
+            "api_name": "vendor.Target.changed",
+            "api_signature": "()",
+            "symbol_kind": "method",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp)
+            catalog_path = (
+                report / ".runtime" / "cache" / "s5_artifact_bytecode_catalog.json"
+            )
+            catalog_path.parent.mkdir(parents=True)
+            catalog_path.write_text(json.dumps({"entries": [{
+                "coord": "vendor:provider",
+                "artifact_entry": "BOOT-INF/lib/provider-1.0.jar",
+                "application_owned": False,
+            }]}), encoding="utf-8")
+            with patch.object(
+                realreg, "_verified_current_final_artifact",
+                return_value=(Path("artifact.jar"), "a" * 64, []),
+            ), patch.object(realreg, "_csv_rows", return_value=([], [])), patch.object(
+                realreg, "_artifact_class_entries",
+                return_value={"BOOT-INF/classes/app/App.class"},
+            ), patch.object(
+                realreg, "scan_final_artifact", return_value=scan
+            ) as scan_oracle:
+                realreg.reconcile_final_artifact_edges(report, selected)
+
+        scan_oracle.assert_called_once_with(
+            Path("artifact.jar"),
+            time_budget_seconds=None,
+            selected_targets=[{
+                "owner": "vendor.Target",
+                "member": "changed",
+                "descriptor": "",
+            }],
+            excluded_nested_jars={"BOOT-INF/lib/provider-1.0.jar"},
+        )
 
     def test_oracle_budget_failure_emits_blocking_incomplete_and_performance_signals(self):
         case = realreg.RealProjectCase(
@@ -995,6 +1737,128 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(result["reconciliation"]["verdict_counts"]["missing"], 1)
         self.assertEqual(len(oracle_rows), 2)
         self.assertEqual(len(ledger_rows), 3)
+
+    def test_fault_injection_drops_analyzer_edge_and_proves_gate_detects_false_negative(self):
+        artifact_sha256 = "a" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        edge = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class",
+            instruction_offset=12,
+        )
+        edge["api_identity"] = realreg.serialized_api_identity(target)
+        case = realreg.RealProjectCase(
+            name="fault-gated",
+            default_project=Path("."),
+            default_changed_apis=Path("changed.csv"),
+            baseline_specs=(),
+            required_fault_injections=("drop_analyzer_edge",),
+        )
+        oracle_scan = {
+            "artifact_sha256": artifact_sha256,
+            "complete": True,
+            "edges": [edge],
+            "failures": [],
+            "artifact_entries": [edge["artifact_entry"]],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            clean = realreg.reconcile_selected_api_edges(
+                report_dir / "clean", [target], [edge], oracle_scan
+            )
+            injected = realreg.evaluate_required_fault_injections(
+                case,
+                report_dir,
+                [target],
+                {**clean, "oracle_scan": oracle_scan},
+                analyzer_rows=[edge],
+            )
+            persisted = json.loads(
+                Path(injected["manifest"]).read_text(encoding="utf-8")
+            )
+
+        self.assertFalse(clean["blocking"])
+        self.assertTrue(injected["passed"])
+        self.assertEqual(injected["runs"][0]["mode"], "drop_analyzer_edge")
+        self.assertGreaterEqual(
+            injected["runs"][0]["verdict_counts"]["missing"], 1
+        )
+        self.assertEqual(persisted["runs"][0]["removed_occurrence"],
+                         realreg.physical_edge_occurrence(edge))
+
+    def test_fault_injection_fails_closed_when_no_analyzer_edge_can_be_removed(self):
+        case = realreg.RealProjectCase(
+            name="fault-gated",
+            default_project=Path("."),
+            default_changed_apis=Path("changed.csv"),
+            baseline_specs=(),
+            required_fault_injections=("drop_analyzer_edge",),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.evaluate_required_fault_injections(
+                case,
+                Path(tmp),
+                [],
+                {"complete": True, "blocking": False, "oracle_scan": {}},
+                analyzer_rows=[],
+            )
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["runs"][0]["error"], "injectable_analyzer_edge_missing")
+
+    def test_fault_injection_rejects_unsupported_mode(self):
+        case = realreg.RealProjectCase(
+            name="fault-gated",
+            default_project=Path("."),
+            default_changed_apis=Path("changed.csv"),
+            baseline_specs=(),
+            required_fault_injections=("invent_edge",),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.evaluate_required_fault_injections(
+                case,
+                Path(tmp),
+                [],
+                {"complete": True, "blocking": False, "oracle_scan": {}},
+                analyzer_rows=[],
+            )
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(
+            result["runs"][0]["error"],
+            "unsupported_fault_injection:invent_edge",
+        )
+
+    def test_failed_required_fault_injection_emits_blocking_quality_signal(self):
+        case = realreg.RealProjectCase(
+            name="fault-gated",
+            default_project=Path("."),
+            default_changed_apis=Path("changed.csv"),
+            baseline_specs=(),
+            required_fault_injections=("drop_analyzer_edge",),
+        )
+
+        signals = realreg.build_fault_injection_signals(case, {
+            "passed": False,
+            "manifest": "/tmp/fault-injection.json",
+            "runs": [{
+                "mode": "drop_analyzer_edge",
+                "passed": False,
+                "error": "injected_false_negative_did_not_fail_closed",
+            }],
+        })
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["signal_type"], "fault_injection_failure")
+        self.assertTrue(signals[0]["blocking"])
 
     def test_edge_truth_preserves_duplicate_physical_oracle_occurrences(self):
         artifact_sha256 = "d" * 64
@@ -1242,6 +2106,7 @@ class RealProjectRegressionTest(unittest.TestCase):
         reachable = {
             "coord": "vendor:api", "api_name": "vendor.Api.call",
             "api_signature": "()", "symbol_kind": "method",
+            "change_type": "REMOVED",
         }
         internal = {
             "coord": "vendor:api", "api_name": "vendor.Api.internal",
@@ -1267,7 +2132,132 @@ class RealProjectRegressionTest(unittest.TestCase):
             {"vendor.Api.call": "reachable", "vendor.Api.internal": "uncertain"},
         )
         self.assertTrue(all(row["authority"] == "final-artifact-classfile" for row in records))
+        self.assertEqual(records[0]["change_type"], "REMOVED")
         self.assertTrue(all(len(row["evidence_sha256"]) == 64 for row in records))
+
+    def test_final_artifact_oracle_records_include_authoritative_absence(self):
+        absent = {
+            "coord": "vendor:api", "api_name": "vendor.Api.removed",
+            "api_signature": "()", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "oracle_edges.csv"
+            evidence.write_text("header\n", encoding="utf-8")
+            records = realreg.build_final_artifact_api_oracle_records(
+                [absent],
+                {
+                    "complete": True,
+                    "oracle_edges": str(evidence),
+                    "api_reachability": {
+                        realreg.serialized_api_identity(absent):
+                            "not_found_in_static_analysis",
+                    },
+                },
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            records[0]["oracle_conclusion"], "not_found_in_static_analysis"
+        )
+
+    def test_constant_pool_oracle_records_are_a_distinct_member_authority(self):
+        absent = {
+            "coord": "vendor:api", "api_name": "vendor.Api.removed",
+            "api_signature": "()", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "member-references.json"
+            evidence.write_text("[]\n", encoding="utf-8")
+            records = realreg.build_constant_pool_api_oracle_records(
+                [absent],
+                {
+                    "complete": True,
+                    "member_reference_evidence": str(evidence),
+                    "member_reference_reachability": {
+                        realreg.serialized_api_identity(absent):
+                            "not_found_in_static_analysis",
+                    },
+                },
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["authority"], "raw-classfile-constant-pool")
+        self.assertEqual(records[0]["change_type"], "REMOVED")
+        self.assertEqual(records[0]["oracle_conclusion"], "not_found_in_static_analysis")
+
+    def test_jdeps_oracle_records_are_a_distinct_class_authority(self):
+        target = {
+            "coord": "vendor:api", "api_name": "vendor.RemovedType",
+            "api_signature": "", "symbol_kind": "class",
+            "change_type": "REMOVED",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "jdeps-references.json"
+            evidence.write_text("[]\n", encoding="utf-8")
+            records = realreg.build_jdeps_api_oracle_records(
+                [target],
+                {
+                    "complete": True,
+                    "jdeps_class_reference_evidence": str(evidence),
+                    "jdeps_class_reachability": {
+                        realreg.serialized_api_identity(target):
+                            "not_found_in_static_analysis",
+                    },
+                },
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["authority"], "jdk-jdeps")
+        self.assertEqual(records[0]["change_type"], "REMOVED")
+
+    def test_final_artifact_class_reference_oracle_uses_packaged_constant_pool(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.RemovedType",
+            "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/demo/App.class",
+                    minimal_classfile_with_utf8("vendor/RemovedType"),
+                )
+
+            result = realreg.scan_final_artifact_class_references(
+                artifact, selected
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["api_reachability"][identity], "reachable")
+        self.assertEqual(result["references"][0]["artifact_entry"], "BOOT-INF/classes/demo/App.class")
+
+    def test_final_artifact_member_reference_oracle_parses_exact_constant_pool_reference(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Api.call",
+            "api_signature": "(java.lang.String)", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/demo/App.class",
+                    minimal_classfile_with_methodref(
+                        "vendor/Api", "call", "(Ljava/lang/String;)V"
+                    ),
+                )
+
+            result = realreg.scan_final_artifact_member_references(
+                artifact, selected
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["api_reachability"][identity], "reachable")
+        self.assertEqual(result["references"][0]["callee_member"], "call")
 
     def test_analyzer_path_cannot_import_an_edge_labeled_for_another_api(self):
         artifact_sha256 = "e" * 64
@@ -1424,6 +2414,32 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(result["complete"])
         self.assertFalse(result["blocking"])
         self.assertEqual(result["reconciliation"]["verdict_counts"]["correct"], 2)
+
+    def test_edge_truth_matches_constructor_api_with_repeated_simple_class_name(self):
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.Api",
+            "api_signature": "()",
+            "symbol_kind": "constructor",
+            "change_type": "REMOVED",
+        }
+        edge = self._edge_row(
+            "c" * 64, "app.Entry", "run", "()V",
+            "vendor.Api", "<init>", "()V", "invokespecial",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+
+        self.assertTrue(realreg._api_target_matches(target, edge))
+
+    def test_oracle_target_selection_normalizes_repeated_constructor_name(self):
+        targets = realreg._oracle_selected_targets([{
+            "api_name": "vendor.Api.Api",
+            "symbol_kind": "constructor",
+        }])
+
+        self.assertEqual(targets, [{
+            "owner": "vendor.Api", "member": "<init>", "descriptor": "",
+        }])
 
     def test_edge_truth_accepts_plain_jar_root_class_as_business_boundary(self):
         artifact_sha256 = "d" * 64
@@ -1624,17 +2640,50 @@ class RealProjectRegressionTest(unittest.TestCase):
 
             self.assertEqual(files, {str(project_file.resolve())})
 
+    def test_collect_alert_files_maps_final_artifact_consumer_class_to_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_file = root / "src/main/java/org/example/App.java"
+            project_file.parent.mkdir(parents=True)
+            project_file.write_text(
+                "package org.example; class App {}\n", encoding="utf-8"
+            )
+            alerts = root / "report/evidence/call_chain/alerts.csv"
+            alerts.parent.mkdir(parents=True)
+            with alerts.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "changed_symbol", "api_signature", "symbol_kind",
+                    "evidence_files", "consumer_class",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "changed_symbol": "vendor.Api.call()",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "evidence_files": "../../business-classes.jar",
+                    "consumer_class": "org.example.App$Nested",
+                })
+
+            files = realreg.collect_alert_files(
+                alerts, "vendor.Api.call", project_root=root
+            )
+
+        self.assertEqual(files, {str(project_file.resolve())})
+
     def test_bytecode_materialization_selects_nested_dependency_from_target_coordinate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifact = root / "application.jar"
+            nested_jar = io.BytesIO()
+            with zipfile.ZipFile(nested_jar, "w") as nested:
+                nested.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("BOOT-INF/classes/demo/App.class", b"class")
                 archive.writestr(
                     "BOOT-INF/lib/dubbo-demo-spring-boot-interface-3.3.7-SNAPSHOT.jar",
-                    b"jar",
+                    nested_jar.getvalue(),
                 )
-                archive.writestr("BOOT-INF/lib/unrelated-1.0.jar", b"jar")
+                archive.writestr("BOOT-INF/lib/unrelated-1.0.jar", nested_jar.getvalue())
             case = realreg.RealProjectCase(
                 name="dubbo-fatjar",
                 default_project=root,
@@ -1661,8 +2710,44 @@ class RealProjectRegressionTest(unittest.TestCase):
                 {row["lib_entry"] for row in rows},
                 {
                     "BOOT-INF/lib/dubbo-demo-spring-boot-interface-3.3.7-SNAPSHOT.jar",
+                    "BOOT-INF/lib/unrelated-1.0.jar",
                 },
             )
+
+    def test_declared_final_artifact_is_bound_to_verified_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("demo/App.class", b"class")
+            case = realreg.RealProjectCase(
+                name="fixed-api-final-artifact",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                bytecode_coord="demo:application",
+                final_artifact=artifact,
+            )
+            report = root / "report"
+
+            realreg.write_declared_final_artifact_provenance(report, case)
+
+            provenance = json.loads(
+                (report / "evidence/dependencies/build_provenance.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            current = provenance["sides"][0]
+            expected_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            verified_artifact, verified_sha, errors = (
+                realreg._verified_current_final_artifact(report)
+            )
+
+        self.assertEqual(current["authority"], "local-final-artifact")
+        self.assertEqual(current["artifact_sha256"], expected_sha)
+        self.assertEqual(verified_artifact, artifact)
+        self.assertEqual(verified_sha, expected_sha)
+        self.assertEqual(errors, [])
 
     def test_bytecode_materialization_preserves_explicit_changed_api_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1764,9 +2849,16 @@ class RealProjectRegressionTest(unittest.TestCase):
                 )
                 archive.writestr("bridge/Unrelated.class", b"class-bytes")
             artifact = root / "application.jar"
+            provider = root / "interface.jar"
+            with zipfile.ZipFile(provider, "w") as archive:
+                archive.writestr(
+                    "org/apache/dubbo/springboot/demo/DemoService.class",
+                    b"class-bytes org/apache/dubbo/springboot/demo/DemoService",
+                )
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("BOOT-INF/classes/demo/App.class", b"class")
                 archive.writestr("BOOT-INF/lib/bridge-1.0.jar", nested.read_bytes())
+                archive.writestr("BOOT-INF/lib/interface-1.0.jar", provider.read_bytes())
             case = realreg.RealProjectCase(
                 name="nested-bridge",
                 default_project=root,
@@ -1783,6 +2875,14 @@ class RealProjectRegressionTest(unittest.TestCase):
                 return []
 
             report = root / "report"
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            stale = (
+                report / ".runtime" / "final-artifact-classes" / artifact_sha[:16]
+                / "nested" / "stale" / "org" / "apache" / "dubbo" / "springboot"
+                / "demo" / "DemoService.class"
+            )
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale provider cache")
             with patch.object(realreg, "discover_calls", side_effect=capture):
                 realreg.materialize_bytecode_changed_apis(case, root, report)
             _, runtime_rows = realreg._csv_rows(
@@ -1791,11 +2891,44 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertTrue(any("InternalBridge.class" in str(path) for path in captured))
         self.assertFalse(any("Unrelated.class" in str(path) for path in captured))
+        self.assertFalse(any("DemoService.class" in str(path) for path in captured))
         self.assertTrue(any(
             row["coord"] == "runtime:bridge-1.0"
             and row["lib_entry"] == "BOOT-INF/lib/bridge-1.0.jar"
             for row in runtime_rows
         ))
+
+    def test_materialized_class_inventory_excludes_stale_provider_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/demo/App.class", b"business")
+            case = realreg.RealProjectCase(
+                name="inventory",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                bytecode_owner_prefixes=("vendor/Api",),
+                bytecode_coord="vendor:api",
+                final_artifact=artifact,
+            )
+            report = root / "report"
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            stale = (
+                report / ".runtime" / "final-artifact-classes" / artifact_sha[:16]
+                / "nested" / "stale" / "vendor" / "Api.class"
+            )
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale")
+
+            with patch.object(realreg, "discover_calls", return_value=[]):
+                realreg.materialize_bytecode_changed_apis(case, root, report)
+
+            class_files = realreg.load_materialized_class_inventory(report, artifact)
+
+        self.assertEqual([path.name for path in class_files], ["App.class"])
+        self.assertNotIn(stale, class_files)
 
     def test_bytecode_materialization_writes_artifact_java_version_for_multi_release_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1855,10 +2988,15 @@ class RealProjectRegressionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifact = root / "application.jar"
+            nested_jar = io.BytesIO()
+            with zipfile.ZipFile(nested_jar, "w") as nested:
+                nested.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("BOOT-INF/classes/demo/App.class", b"class")
-                archive.writestr("BOOT-INF/lib/dubbo-3.3.7.jar", b"jar")
-                archive.writestr("BOOT-INF/lib/dubbo-common-3.3.7.jar", b"jar")
+                archive.writestr("BOOT-INF/lib/dubbo-3.3.7.jar", nested_jar.getvalue())
+                archive.writestr(
+                    "BOOT-INF/lib/dubbo-common-3.3.7.jar", nested_jar.getvalue()
+                )
             case = realreg.RealProjectCase(
                 name="ambiguous",
                 default_project=root,
@@ -2171,6 +3309,7 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(
             any(item["signal_type"] == "performance_regression" for item in result["quality_signals"])
         )
+        self.assertFalse(result["performance_envelope"]["within_budget"])
 
     def test_run_case_emits_quality_signals_for_blocking_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2214,6 +3353,35 @@ class RealProjectRegressionTest(unittest.TestCase):
         signals = result["quality_signals"]
         self.assertTrue(any(item["signal_type"] == "capability_gap" for item in signals))
         self.assertTrue(any(item["blocking"] for item in signals))
+
+    def test_verified_static_absence_is_not_reported_as_a_capability_gap(self):
+        case = realreg.RealProjectCase("verified-absence", Path("."), Path("apis.csv"), ())
+        signals = realreg.build_quality_signals(
+            case,
+            summary={
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": 2,
+                "uncertain": 0,
+            },
+            checks=[],
+            failures=[],
+            result_audit={},
+            report_dir=Path("report"),
+            oracle_audit={
+                "ledger": [
+                    {
+                        "analyzer_conclusion": "not_found_in_static_analysis",
+                        "verdict": "correct",
+                    },
+                    {
+                        "analyzer_conclusion": "not_found_in_static_analysis",
+                        "verdict": "correct",
+                    },
+                ],
+            },
+        )
+
+        self.assertFalse(any(item["signal_type"] == "capability_gap" for item in signals))
 
     def test_run_case_includes_real_project_matrix_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2304,13 +3472,59 @@ class RealProjectRegressionTest(unittest.TestCase):
                 result = realreg.run_case(case, root, changed_apis, report_root)
 
         fake_run_step5.assert_not_called()
-        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "project asset invalid")
         self.assertLess(result["project_asset_health"]["java_files"], 10)
         self.assertTrue(
             any(item["signal_type"] == "project_asset_invalid" for item in result["quality_signals"])
         )
         self.assertTrue(any(item["blocking"] for item in result["quality_signals"]))
+
+    def test_run_case_fails_closed_when_discovery_artifact_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            case = realreg.RealProjectCase(
+                name="missing-artifact",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                bytecode_owner_prefixes=("vendor/Api",),
+                bytecode_coord="vendor:api",
+                final_artifact=root / "target/missing.jar",
+            )
+
+            result = realreg.run_case(case, root, Path(""), Path(tmp) / "reports")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "current final artifact unavailable")
+        self.assertTrue(any(
+            signal["signal_type"] == "project_asset_invalid"
+            and signal["blocking"]
+            and signal["fixture_status"] == "missing"
+            for signal in result["quality_signals"]
+        ))
+
+    def test_run_case_fails_closed_when_topology_artifact_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            case = realreg.RealProjectCase(
+                name="missing-topology-artifact",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                required_topologies=("business_direct",),
+            )
+
+            with patch.object(realreg, "run_step5") as run_step5:
+                result = realreg.run_case(
+                    case, root, Path(""), Path(tmp) / "reports"
+                )
+
+        run_step5.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "current final artifact unavailable")
 
     def test_run_case_prefers_embedded_changed_api_rows_over_existing_external_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2732,6 +3946,31 @@ class RealProjectRegressionTest(unittest.TestCase):
 
 
 class RealProjectRegressionTests(unittest.TestCase):
+    def test_guard_selector_contains_only_guard_cases(self):
+        selected = realreg.select_case_names("guard")
+
+        self.assertTrue(selected)
+        self.assertEqual(selected, sorted(selected))
+        self.assertTrue(all(realreg.CASES[name].case_mode == "guard" for name in selected))
+        self.assertTrue(all(realreg.CASES[name].fixture_manifest for name in selected))
+        self.assertNotIn("spring-petclinic", selected)
+        self.assertNotIn("seata", selected)
+
+    def test_complete_edge_oracle_treats_exact_absence_as_a_fact(self):
+        selected = [{
+            "coord": "g:a", "api_name": "p.Api.removed", "api_signature": "()",
+            "symbol_kind": "method", "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+
+        retained, reachability, errors = realreg._retain_authoritative_api_path(
+            selected, [], absence_is_authoritative=True
+        )
+
+        self.assertEqual(retained, [])
+        self.assertEqual(reachability[identity], "not_found_in_static_analysis")
+        self.assertEqual(errors, [])
+
     def test_edge_oracle_abstains_for_final_artifact_verified_framework_target(self):
         selected = [{
             "coord": "g:a", "api_name": "p.Proxy.invoke", "api_signature": "()",
@@ -2898,6 +4137,23 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(
             case.required_topologies,
             ("business_direct", "framework_callback"),
+        )
+        self.assertEqual(
+            case.required_fault_injections,
+            ("drop_analyzer_edge",),
+        )
+        self.assertTrue(case.require_relative_performance_baseline)
+        self.assertEqual(
+            manifest["performance_baseline"]["git_revision"],
+            manifest["git_revision"],
+        )
+        self.assertEqual(
+            manifest["performance_baseline"]["artifact_sha256"],
+            manifest["artifact_sha256"],
+        )
+        self.assertEqual(
+            manifest["performance_baseline"]["scope"]["fault_injection_detected_count"],
+            1,
         )
         self.assertEqual(len(changed_rows), 3)
         self.assertEqual(len(manifest["apis"]), len(changed_rows))
@@ -3142,6 +4398,35 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.0)
         self.assertEqual(timeout_record["reason"], "STEP5_PERFORMANCE_BUDGET_EXCEEDED")
         self.assertEqual(timeout_record["timeout_seconds"], 1.5)
+
+    def test_run_case_skips_edge_oracle_when_step5_did_not_produce_a_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            report_root = Path(tmp) / "reports"
+            root.mkdir()
+            changed_apis = Path(tmp) / "changed.csv"
+            changed_apis.write_text(
+                "coord,api_name,api_signature,symbol_kind,change_type\n"
+                "g:a,com.example.Target.call,(),method,REMOVED\n",
+                encoding="utf-8",
+            )
+            case = realreg.RealProjectCase(
+                name="timed-out",
+                default_project=root,
+                default_changed_apis=changed_apis,
+                baseline_specs=(),
+            )
+
+            with patch.object(realreg, "run_step5", return_value=(124, 1.0)), patch.object(
+                realreg, "reconcile_final_artifact_edges"
+            ) as reconcile:
+                result = realreg.run_case(
+                    case, root, changed_apis, report_root
+                )
+
+        reconcile.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("step5_returncode=124", result["failures"])
 
     def test_full_step4_run_uses_full_api_budget_for_step5_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:

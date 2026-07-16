@@ -1296,6 +1296,24 @@ def _filename_stem(name):
     return stem
 
 
+def _classifier_from_filename(name, artifact_id, version):
+    stem = _filename_stem(name)
+    artifact_id = str(artifact_id or '').strip()
+    version = str(version or '').strip()
+    if not stem or not artifact_id or not version:
+        return ''
+    version_first = f'{artifact_id}-{version}'
+    if stem == version_first:
+        return ''
+    if stem.startswith(version_first + '-'):
+        return stem[len(version_first) + 1:]
+    classifier_first_prefix = f'{artifact_id}-'
+    classifier_first_suffix = f'-{version}'
+    if stem.startswith(classifier_first_prefix) and stem.endswith(classifier_first_suffix):
+        return stem[len(classifier_first_prefix):-len(classifier_first_suffix)]
+    return ''
+
+
 def _runtime_candidate_filename_stems(item):
     artifact_id = str(item.get('artifact_id') or '').strip()
     version = str(item.get('version') or '').strip()
@@ -1365,11 +1383,16 @@ def _extract_packaged_dep_from_nested_jar(blob, entry_name):
                 artifact_id = (props.get('artifactId') or '').strip()
                 version = (props.get('version') or '').strip()
                 if artifact_id and version:
+                    classifier = _classifier_from_filename(entry_name, artifact_id, version)
+                    coord = f"{group_id}:{artifact_id}" if group_id else ''
+                    if coord and classifier:
+                        coord = f"{coord}:{classifier}"
                     entry.update({
-                        'coord': f"{group_id}:{artifact_id}" if group_id else '',
+                        'coord': coord,
                         'group_id': group_id,
                         'artifact_id': artifact_id,
                         'version': version,
+                        'classifier': classifier,
                         'match_source': 'embedded-pom',
                     })
                     return entry
@@ -1387,84 +1410,6 @@ def _extract_packaged_dep_from_nested_jar(blob, entry_name):
         'match_source': 'filename',
     })
     return entry
-
-
-def _enrich_filename_only_deps_from_local_m2(packaged_deps):
-    """Resolve coordinates from an exact local-repository JAR byte match.
-
-    Some published JARs omit META-INF/maven/pom.properties. Running
-    ``dependency:list`` across a large snapshot reactor can fail even after a
-    successful package because dependency-plugin goals try to resolve every
-    upstream module from ~/.m2. An exact SHA-256 match against a uniquely
-    identified local Maven artifact is stronger coordinate evidence and avoids
-    that unnecessary reactor-wide command.
-    """
-    unresolved = [
-        item for item in packaged_deps or []
-        if not str(item.get('coord') or '').strip()
-        and str(item.get('lib_name') or '').strip()
-        and str(item.get('content_sha256') or '').strip()
-    ]
-    if not unresolved:
-        return packaged_deps
-    repo = Path(os.environ.get('MAVEN_REPO_LOCAL') or (Path.home() / '.m2' / 'repository'))
-    if not repo.is_dir():
-        return packaged_deps
-    by_filename = defaultdict(list)
-    for item in unresolved:
-        by_filename[str(item.get('lib_name') or '').strip()].append(item)
-    for filename, items in by_filename.items():
-        expected_hashes = {str(item.get('content_sha256') or '').strip() for item in items}
-        candidates_by_hash = defaultdict(list)
-        try:
-            candidates = repo.rglob(filename)
-            for candidate in candidates:
-                if not candidate.is_file() or candidate.suffix.lower() != '.jar':
-                    continue
-                digest = sha256_file(candidate)
-                if digest not in expected_hashes:
-                    continue
-                try:
-                    relative = candidate.resolve().relative_to(repo.resolve())
-                except ValueError:
-                    continue
-                parts = relative.parts
-                if len(parts) < 4:
-                    continue
-                artifact_id = parts[-3]
-                version = parts[-2]
-                group_id = '.'.join(parts[:-3])
-                if not group_id or not artifact_id or not version:
-                    continue
-                stem = candidate.stem
-                base_stem = f'{artifact_id}-{version}'
-                classifier = stem[len(base_stem) + 1:] if stem.startswith(base_stem + '-') else ''
-                coord = f'{group_id}:{artifact_id}' + (f':{classifier}' if classifier else '')
-                candidates_by_hash[digest].append({
-                    'coord': coord,
-                    'group_id': group_id,
-                    'artifact_id': artifact_id,
-                    'version': version,
-                    'classifier': classifier,
-                    'path': str(candidate),
-                })
-        except OSError:
-            continue
-        for item in items:
-            matches = candidates_by_hash.get(str(item.get('content_sha256') or '').strip(), [])
-            unique = {match['coord']: match for match in matches}
-            if len(unique) != 1:
-                continue
-            match = next(iter(unique.values()))
-            item.update({
-                'coord': match['coord'],
-                'group_id': match['group_id'],
-                'artifact_id': match['artifact_id'],
-                'version': match['version'],
-                'classifier': match['classifier'],
-                'match_source': 'local-m2-sha256',
-            })
-    return packaged_deps
 
 
 def _inspect_packaged_archive(artifact_path):
@@ -1691,10 +1636,20 @@ def _enrich_packaged_deps_with_runtime(
     confirmed_unresolved_items=None,
 ):
     """Use runtime metadata to补齐坐标, while keeping packaged-artifact version facts authoritative."""
+    normalized_runtime_deps = {}
     runtime_by_artifact_version = defaultdict(list)
     runtime_by_filename_artifact_version = defaultdict(list)
     runtime_by_filename_stem = defaultdict(list)
-    for item in runtime_deps.values():
+    for runtime_coord, raw_item in runtime_deps.items():
+        item = dict(raw_item or {})
+        coord_parts = str(runtime_coord or '').split(':')
+        if len(coord_parts) >= 2:
+            item.setdefault('group_id', coord_parts[0])
+            item.setdefault('artifact_id', coord_parts[1])
+            item.setdefault('coord', ':'.join(coord_parts[:2]))
+            if len(coord_parts) > 2:
+                item.setdefault('classifier', ':'.join(coord_parts[2:]))
+        normalized_runtime_deps[str(runtime_coord)] = item
         artifact_id = item.get('artifact_id')
         version = item.get('version')
         if artifact_id and version:
@@ -1705,6 +1660,8 @@ def _enrich_packaged_deps_with_runtime(
                 runtime_by_filename_artifact_version[(f"{artifact_id}-{classifier}", version)].append(item)
             for stem in _runtime_candidate_filename_stems(item):
                 runtime_by_filename_stem[stem].append(item)
+
+    runtime_deps = normalized_runtime_deps
 
     manual_coord_overrides = manual_coord_overrides or {}
     confirmed_unresolved_map = {}
@@ -2064,8 +2021,6 @@ def collect_packaged_deps_from_artifact_path(
                 f"用户提供的编译产物中未发现可比较的打包依赖：{artifact_file}。"
                 "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不再作为正式结果输出。"
             )
-
-        packaged_raw = _enrich_filename_only_deps_from_local_m2(packaged_raw)
 
     resolved_runtime_deps = runtime_deps or {}
     if any(not (item.get('coord') or '').strip() for item in packaged_raw):

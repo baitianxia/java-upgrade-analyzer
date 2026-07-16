@@ -56,7 +56,7 @@ from confidence_weighted_tracer import (
     trace_all_apis_with_confidence_weighting,
 )
 from enhanced_output_formatter import generate_enhanced_summary, register_step5_summary_artifacts
-from compat import maven_repo_dir, run_cmd
+from compat import run_cmd
 from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_batch
 from indirect_usage_analyzer import (
@@ -67,7 +67,8 @@ from indirect_usage_analyzer import (
 from framework_adapters import run_framework_adapters, serialize_framework_batches
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import CoverageRecord, thaw_evidence_value
-from analysis_contract import sha256_file
+from signature_utils import normalize_signature_for_identity, signatures_match_identity
+from analysis_contract import build_project_scope, discover_maven_modules, sha256_file
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
     EVIDENCE_CALL_CHAIN_DIRNAME,
@@ -118,6 +119,26 @@ def _build_provenance_path(report_dir):
 
 def _context_path(report_dir):
     return _evidence_dir(report_dir, EVIDENCE_CONTEXT_DIRNAME) / "context.json"
+
+
+def load_context_source_dirs(context_path):
+    path = Path(context_path)
+    if not path.exists():
+        return []
+    try:
+        context = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"STEP5_CONTEXT_PARSE_FAILED:{path}:{type(exc).__name__}:{exc}"
+        ) from exc
+    source_dirs = context.get("source_dirs") or []
+    if not isinstance(source_dirs, list) or any(
+        not isinstance(item, str) for item in source_dirs
+    ):
+        raise RuntimeError(
+            f"STEP5_CONTEXT_PARSE_FAILED:{path}:source_dirs must be a string list"
+        )
+    return source_dirs
 
 
 def _source_mapping_summary_path(report_dir):
@@ -675,27 +696,61 @@ def _build_business_bytecode_coverage(batch, ingestion_result, api_identities):
         for collector, failure in ingestion_result.failures_by_collector
         if collector == 'business_bytecode'
     ]
-    reason_codes = sorted({failure.reason_code for failure in business_failures})
     blocking_failures = [failure for failure in business_failures if failure.blocking]
     scan_applicable = bool(
         bytecode_stats.get('classes_scanned')
         and bytecode_stats.get('evidence_source') == 'current_final_artifact'
     )
     applicable = bool(blocking_failures) or scan_applicable
-    if blocking_failures:
-        status = 'partial' if bytecode_stats.get('classes_scanned') else 'insufficient'
-    else:
-        status = 'complete' if scan_applicable else 'not_applicable'
-    coverage = tuple(
-        CoverageRecord(
+    def failures_for_api(api_identity):
+        parts = str(api_identity or '').split('|')
+        api_name = parts[1].strip() if len(parts) > 1 else str(api_identity or '').strip()
+        signature = parts[2].strip() if len(parts) > 2 else ''
+        normalized_api_name = api_name.replace('$', '.')
+        normalized_signature = normalize_signature_for_identity(signature.replace('$', '.'))
+        relevant = []
+        for failure in blocking_failures:
+            failure_identity = str(failure.api_identity or '').strip()
+            normalized_failure = failure_identity.replace('$', '.')
+            if (
+                not failure_identity
+                or failure_identity == str(api_identity)
+                or normalized_failure == normalized_api_name
+            ):
+                relevant.append(failure)
+                continue
+            if not normalized_failure.startswith(f'{normalized_api_name}('):
+                continue
+            failure_signature = normalized_failure[len(normalized_api_name):]
+            if signatures_match_identity(failure_signature, normalized_signature):
+                relevant.append(failure)
+        return relevant
+
+    coverage = []
+    for api_identity in api_identities:
+        relevant_failures = failures_for_api(api_identity)
+        if relevant_failures:
+            api_status = 'partial' if bytecode_stats.get('classes_scanned') else 'insufficient'
+        else:
+            api_status = 'complete' if scan_applicable else 'not_applicable'
+        coverage.append(CoverageRecord(
             collector='business_bytecode',
             api_identity=api_identity,
-            status=status,
-            reason_codes=tuple(reason_codes),
+            status=api_status,
+            reason_codes=tuple(sorted({failure.reason_code for failure in relevant_failures})),
             applicable=applicable,
-        )
-        for api_identity in api_identities
+        ))
+    coverage = tuple(coverage)
+    statuses = {item.status for item in coverage}
+    status = (
+        'insufficient' if 'insufficient' in statuses
+        else 'partial' if 'partial' in statuses
+        else 'complete' if 'complete' in statuses
+        else 'not_applicable'
     )
+    reason_codes = sorted({
+        reason_code for item in coverage for reason_code in item.reason_codes
+    })
     return coverage, status, reason_codes
 
 
@@ -736,13 +791,7 @@ def _step5_integrated_main_impl(args):
     context_path = str(_context_path(report_dir))
     context_source_dirs = []
 
-    if os.path.exists(context_path):
-        try:
-            with open(context_path, 'r', encoding='utf-8') as f:
-                context = json.load(f)
-                context_source_dirs = context.get('source_dirs') or []
-        except:
-            pass
+    context_source_dirs = load_context_source_dirs(context_path)
 
     # 业务源码目录来源优先级：
     # 1. 正式流程：main_state.step5.input.source_dirs
@@ -902,7 +951,10 @@ def _step5_integrated_main_impl(args):
             'all_api_count': len(all_apis),
         },
     )
-    runtime_dependency_catalog = build_runtime_dependency_catalog(report_dir)
+    runtime_dependency_catalog = build_runtime_dependency_catalog(
+        report_dir,
+        business_source_dirs=business_source_dirs,
+    )
     allowed_business_classes = runtime_business_class_index(runtime_dependency_catalog)
     dependency_source_mappings, skipped_dependency_source_mappings = (
         filter_dependency_source_mappings_for_runtime(
@@ -1635,44 +1687,6 @@ def _split_coord(coord):
     return parts[0].strip(), parts[1].strip()
 
 
-def _find_maven_jar(coord, version):
-    group_id, artifact_id = _split_coord(coord)
-    version = str(version or '').strip()
-    if not group_id or not artifact_id or not version or version == '-':
-        return ''
-    base = maven_repo_dir()
-    for part in group_id.split('.'):
-        base = base / part
-    base = base / artifact_id / version
-    if not base.exists():
-        return ''
-    candidates = []
-    for pattern in (f'{artifact_id}-{version}.jar', f'{artifact_id}-{version}-*.jar'):
-        candidates.extend(base.glob(pattern))
-    for jar_path in candidates:
-        name = jar_path.name
-        if 'sources' in name or 'javadoc' in name:
-            continue
-        return str(jar_path)
-    return ''
-
-
-def _load_coord_versions(report_dir):
-    dep_changes_path = str(_dep_changes_path(report_dir))
-    result = {}
-    if not os.path.exists(dep_changes_path):
-        return result
-    with open(dep_changes_path, 'r', encoding='utf-8', errors='replace') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if str((row or {}).get('resolution_status') or '').strip() == 'unresolved':
-                continue
-            coord = str(row.get('coord') or '').strip()
-            if coord:
-                result[coord] = dict(row)
-    return result
-
-
 def _maven_coordinates_from_archive(archive):
     coordinates = []
     for name in archive.namelist():
@@ -1698,7 +1712,54 @@ def _maven_coordinates_from_archive(archive):
     return sorted(set(coordinates))
 
 
-def build_runtime_dependency_catalog(report_dir):
+def _recover_reactor_module_coords(business_source_dirs, artifact_path):
+    source_paths = [
+        Path(value).resolve() for value in (business_source_dirs or [])
+        if str(value or '').strip()
+    ]
+    if not source_paths or not artifact_path or not Path(artifact_path).is_file():
+        return set()
+    try:
+        with zipfile.ZipFile(artifact_path) as archive:
+            artifact_coords = {
+                f'{group_id}:{artifact_id}'
+                for group_id, artifact_id, _version
+                in _maven_coordinates_from_archive(archive)
+            }
+    except (OSError, zipfile.BadZipFile):
+        return set()
+    if not artifact_coords:
+        return set()
+
+    candidate_roots = set()
+    for source_path in source_paths:
+        start = source_path if source_path.is_dir() else source_path.parent
+        candidate_roots.update(
+            parent for parent in (start, *start.parents)
+            if (parent / 'pom.xml').is_file()
+        )
+
+    recovered_scopes = []
+    for candidate in sorted(candidate_roots, key=lambda path: len(path.parts), reverse=True):
+        discovery = discover_maven_modules(candidate)
+        reactor_coords = {
+            str(item.get('coord') or '').strip()
+            for item in discovery.get('modules') or []
+            if str(item.get('coord') or '').strip()
+        }
+        for target_coord in sorted(artifact_coords & reactor_coords):
+            scope = build_project_scope(candidate, target_coord)
+            included = {
+                str(item).strip()
+                for item in scope.get('included_module_coords') or []
+                if str(item).strip()
+            }
+            if included:
+                recovered_scopes.append(included)
+    return max(recovered_scopes, key=len, default=set())
+
+
+def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
     current_resolved_path = str(_current_resolved_path(report_dir))
     catalog = {
         'by_coord': {},
@@ -1764,9 +1825,15 @@ def build_runtime_dependency_catalog(report_dir):
     if artifact_ok:
         catalog['final_artifact_path'] = artifact_path
         catalog['final_artifact_sha256'] = sha256_file(artifact_path)
+        if not application_module_coords:
+            application_module_coords.update(
+                _recover_reactor_module_coords(
+                    business_source_dirs,
+                    artifact_path,
+                )
+            )
 
     exact_count = 0
-    fallback_count = 0
     extraction_failures = []
     business_class_count = 0
     cache_dir = _runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME / 'current'
@@ -1775,11 +1842,6 @@ def build_runtime_dependency_catalog(report_dir):
         try:
             with zipfile.ZipFile(artifact_path) as outer:
                 names = set(outer.namelist())
-                application_group_ids = {
-                    group_id
-                    for group_id, _artifact_id, _version
-                    in _maven_coordinates_from_archive(outer)
-                }
                 for row in rows:
                     coord = str((row or {}).get('coord') or '').strip()
                     version = str((row or {}).get('version') or '').strip()
@@ -1805,15 +1867,20 @@ def build_runtime_dependency_catalog(report_dir):
                         jar_path = cache_dir / f'{digest[:16]}-{Path(lib_entry).name}'
                         if not jar_path.exists() or sha256_file(jar_path) != digest:
                             jar_path.write_bytes(blob)
+                        application_owned = coord in application_module_coords
                         item = {
                             'coord': coord, 'version': version, 'scope': scope,
                             'jar_path': str(jar_path), 'artifact_entry': lib_entry,
                             'sha256': digest, 'evidence_source': 'current_final_artifact',
-                            'application_owned': (
-                                coord in application_module_coords
-                                or coord.split(':', 1)[0] in application_group_ids
-                            ),
+                            'application_owned': application_owned,
                         }
+                        if application_owned:
+                            item['ownership_evidence'] = {
+                                'authority': 'reactor_coordinate_and_final_artifact_entry',
+                                'reactor_coord': coord,
+                                'artifact_entry': lib_entry,
+                                'final_artifact_sha256': catalog['final_artifact_sha256'],
+                            }
                         catalog['by_coord'][coord] = item
                         catalog['entries'].append(item)
                         catalog['jar_paths'][coord] = str(jar_path)
@@ -1836,7 +1903,8 @@ def build_runtime_dependency_catalog(report_dir):
                             internal_coordinates = [
                                 coordinate
                                 for coordinate in _maven_coordinates_from_archive(nested)
-                                if coordinate[0] in application_group_ids
+                                if f'{coordinate[0]}:{coordinate[1]}'
+                                in application_module_coords
                             ]
                         if len(internal_coordinates) != 1:
                             continue
@@ -1853,6 +1921,12 @@ def build_runtime_dependency_catalog(report_dir):
                             'jar_path': str(jar_path), 'artifact_entry': lib_entry,
                             'sha256': digest, 'evidence_source': 'current_final_artifact',
                             'application_owned': True,
+                            'ownership_evidence': {
+                                'authority': 'reactor_coordinate_and_final_artifact_entry',
+                                'reactor_coord': coord,
+                                'artifact_entry': lib_entry,
+                                'final_artifact_sha256': catalog['final_artifact_sha256'],
+                            },
                         }
                         catalog['by_coord'][coord] = item
                         catalog['entries'].append(item)
@@ -1897,33 +1971,6 @@ def build_runtime_dependency_catalog(report_dir):
         except (OSError, zipfile.BadZipFile) as exc:
             extraction_failures.append({'coord': '', 'lib_entry': '', 'reason': f'artifact_open_failed:{exc}'})
 
-    for row in rows:
-            coord = str((row or {}).get('coord') or '').strip()
-            version = str((row or {}).get('version') or '').strip()
-            scope = str((row or {}).get('scope') or '').strip()
-            if not coord or not version:
-                continue
-            if scope in {'test', 'provided', 'optional'}:
-                continue
-            if coord in catalog['by_coord']:
-                continue
-            jar_path = _find_maven_jar(coord, version)
-            if not jar_path:
-                continue
-            item = {
-                'coord': coord,
-                'version': version,
-                'scope': scope,
-                'jar_path': jar_path,
-                'artifact_entry': str((row or {}).get('lib_entry') or '').strip(),
-                'sha256': sha256_file(jar_path) if os.path.isfile(jar_path) else '',
-                'evidence_source': 'local_maven_fallback',
-            }
-            catalog['by_coord'][coord] = item
-            catalog['entries'].append(item)
-            catalog['jar_paths'][coord] = jar_path
-            fallback_count += 1
-
     expected_coords = {
         str(row.get('coord') or '').strip() for row in rows
         if str(row.get('coord') or '').strip()
@@ -1932,16 +1979,13 @@ def build_runtime_dependency_catalog(report_dir):
     missing_coords = sorted(expected_coords - set(catalog['by_coord']))
     if missing_coords:
         catalog['reason_codes'].append('runtime_dependency_jars_missing')
-    if fallback_count:
-        catalog['reason_codes'].append('local_maven_fallback_used')
     catalog['status'] = (
-        'complete' if artifact_ok and not extraction_failures and not missing_coords and not fallback_count
+        'complete' if artifact_ok and not extraction_failures and not missing_coords
         else ('partial' if catalog['by_coord'] else 'insufficient')
     )
     catalog['metrics'] = {
         'expected_runtime_dependencies': len(expected_coords),
         'exact_artifact_dependencies': exact_count,
-        'local_maven_fallback_dependencies': fallback_count,
         'missing_dependencies': len(missing_coords),
         'business_classes': business_class_count,
         'extraction_failures': len(extraction_failures),
@@ -2327,7 +2371,6 @@ def _index_jar_classes_for_source_resolution(metadata):
 
 
 def build_jar_metadata_for_source_roots(source_roots, report_dir, runtime_dependency_catalog=None):
-    coord_versions = _load_coord_versions(report_dir)
     metadata = {
         'by_coord': {},
         'by_class': {},
@@ -2349,31 +2392,6 @@ def build_jar_metadata_for_source_roots(source_roots, report_dir, runtime_depend
             'jar_path': jar_path,
             'classes': {},
         })
-    dependency_coords = []
-    seen_coords = set()
-    for root in source_roots or []:
-        if root.get('owner_type') != 'dependency':
-            continue
-        coord = str(root.get('owner_coord') or '').strip()
-        if coord and coord not in seen_coords:
-            seen_coords.add(coord)
-            dependency_coords.append(coord)
-    for coord in dependency_coords:
-        version_row = coord_versions.get(coord, {})
-        version = (
-            str(version_row.get('new_version') or '').strip()
-            or str(version_row.get('old_version') or '').strip()
-        )
-        jar_path = _find_maven_jar(coord, version)
-        if not jar_path:
-            continue
-        metadata['jar_paths'][coord] = jar_path
-        metadata['by_coord'][coord] = {
-            'coord': coord,
-            'version': version,
-            'jar_path': jar_path,
-            'classes': {},
-        }
     return _index_jar_classes_for_source_resolution(metadata)
 
 

@@ -1340,7 +1340,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
             indent=2,
         ) + "\n",
     )
-    run_script(
+    runtime_expand_stdout, runtime_expand_stderr, runtime_expand_rc = run_script_with_rc(
         "run_step.py",
         [
             "--step", "step4",
@@ -1352,9 +1352,18 @@ def run_core_pipeline_smoke(workspace, dep_env):
         ],
         cwd=project_dir,
         env=dep_env,
-        allow_awaiting=True,
     )
-    runtime_expand_rows = read_csv(runtime_expand_report / "evidence" / "api_changes" / "all_changed_apis.csv")
+    assert_true(
+        runtime_expand_rc == 1
+        and "缺少最终制品 JAR 证据" in (runtime_expand_stdout + runtime_expand_stderr),
+        "只有源码映射时，Step4 应保留辅助证据并拒绝生成正式 API 结论："
+        f"rc={runtime_expand_rc}, stdout={runtime_expand_stdout[-500:]}, "
+        f"stderr={runtime_expand_stderr[-500:]}",
+    )
+    runtime_expand_rows = read_csv(
+        runtime_expand_report / "evidence" / "api_changes" /
+        "demo-lib_gitdiff_auxiliary_only.csv"
+    )
     runtime_expand_behavior_rows = [
         r for r in runtime_expand_rows
         if r.get("coord") == "com.example:demo-lib"
@@ -1362,9 +1371,12 @@ def run_core_pipeline_smoke(workspace, dep_env):
         and r.get("source") == "gitdiff"
     ]
     runtime_expand_ckpt = read_json(main_state_path(runtime_expand_report))
-    expanded_internal_paths = main_state_step_output(runtime_expand_ckpt, "step4").get("dependency_repo_mappings", [])
+    expanded_internal_paths = main_state_step_input(runtime_expand_ckpt, "step4").get("dependency_repo_mappings", [])
     expected_internal_mapping = f"com.example:demo-lib={dep_repo.resolve()}"
-    assert_true(runtime_expand_behavior_rows, "run_step 未将源码路径自动展开后用于 Step4 git diff")
+    assert_true(
+        runtime_expand_behavior_rows,
+        "run_step 未将源码路径自动展开后用于 Step4 git diff 辅助证据",
+    )
     assert_true(
         any("singleLine" in r.get("api_name", "") or "multiLine" in r.get("api_name", "") for r in runtime_expand_behavior_rows),
         "run_step Step4 git diff 未生成完整 FQCN api_name（当前测试fixture使用singleLine/multiLine）"
@@ -1393,7 +1405,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
         dependency_source_report / "main_state_seed.json",
         json.dumps({"dependency_source_dirs": [str(dep_repo)]}, ensure_ascii=False, indent=2) + "\n",
     )
-    run_script(
+    dependency_source_stdout, dependency_source_stderr, dependency_source_rc = run_script_with_rc(
         "run_step.py",
         [
             "--step", "step4",
@@ -1405,9 +1417,16 @@ def run_core_pipeline_smoke(workspace, dep_env):
         ],
         cwd=project_dir,
         env=dep_env,
-        allow_awaiting=True,
     )
-    dependency_source_rows = read_csv(dependency_source_report / "evidence" / "api_changes" / "all_changed_apis.csv")
+    assert_true(
+        dependency_source_rc == 1
+        and "缺少最终制品 JAR 证据" in (dependency_source_stdout + dependency_source_stderr),
+        "只有 dependency_source_dirs 时，Step4 应保留辅助证据并拒绝生成正式 API 结论",
+    )
+    dependency_source_rows = read_csv(
+        dependency_source_report / "evidence" / "api_changes" /
+        "demo-lib_gitdiff_auxiliary_only.csv"
+    )
     dependency_source_behavior_rows = [
         r for r in dependency_source_rows
         if r.get("coord") == "com.example:demo-lib"
@@ -1416,16 +1435,16 @@ def run_core_pipeline_smoke(workspace, dep_env):
     ]
     dependency_source_ckpt = read_json(main_state_path(dependency_source_report))
     assert_true(
-        main_state_step_output(dependency_source_ckpt, "step4").get("dependency_source_dirs") == [str(dep_repo.resolve())],
+        main_state_step_input(dependency_source_ckpt, "step4").get("dependency_source_dirs") == [str(dep_repo.resolve())],
         "run_step 未保留用户提供的 dependency_source_dirs",
     )
     assert_true(
-        main_state_step_output(dependency_source_ckpt, "step4").get("dependency_repo_mappings") == [expected_internal_mapping],
+        main_state_step_input(dependency_source_ckpt, "step4").get("dependency_repo_mappings") == [expected_internal_mapping],
         "dependency_source_dirs 未自动推断 Step4 所需的 dependency_repo_mappings",
     )
     assert_true(
         dependency_source_behavior_rows,
-        "仅提供 dependency_source_dirs 时，Step4 未自动完成源码 diff",
+        "仅提供 dependency_source_dirs 时，Step4 未生成源码 diff 辅助证据",
     )
 
     prefix_internal_mapping_report = project_dir / ".upgrade-report-prefix-internal-mapping"
@@ -1456,9 +1475,12 @@ def run_core_pipeline_smoke(workspace, dep_env):
         cwd=project_dir,
         env=dep_env,
     )
-    assert_true(rc == EXIT_AWAITING_USER, "groupId 前缀形式的 dependency_repo_mappings 推断后应进入待交互退出码")
+    assert_true(
+        rc == 1 and "缺少最终制品 JAR 证据" in (stdout + stderr),
+        "groupId 前缀源码映射推断后仍应拒绝缺少最终制品的正式 API 结论",
+    )
     prefix_internal_mapping_ckpt = read_json(main_state_path(prefix_internal_mapping_report))
-    prefix_internal_paths = main_state_step_output(prefix_internal_mapping_ckpt, "step4").get("dependency_repo_mappings", [])
+    prefix_internal_paths = main_state_step_input(prefix_internal_mapping_ckpt, "step4").get("dependency_repo_mappings", [])
     assert_true(
         prefix_internal_paths == [expected_internal_mapping],
         "groupId 前缀形式的 dependency_repo_mappings 未按源码仓库真实模块展开",
@@ -1585,7 +1607,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
         dependency_multi_report / "main_state_seed.json",
         json.dumps({"dependency_source_dirs": [str(multi_dep_repo)]}, ensure_ascii=False, indent=2) + "\n",
     )
-    run_script(
+    dependency_multi_stdout, dependency_multi_stderr, dependency_multi_rc = run_script_with_rc(
         "run_step.py",
         [
             "--step", "step4",
@@ -1597,11 +1619,15 @@ def run_core_pipeline_smoke(workspace, dep_env):
         ],
         cwd=project_dir,
         env=dep_env,
-        allow_awaiting=True,
+    )
+    assert_true(
+        dependency_multi_rc == 1
+        and "缺少最终制品 JAR 证据" in (dependency_multi_stdout + dependency_multi_stderr),
+        "多模块源码映射不得绕过最终制品门控",
     )
     dependency_multi_ckpt = read_json(main_state_path(dependency_multi_report))
     dependency_multi_internal_paths = set(
-        main_state_step_output(dependency_multi_ckpt, "step4").get("dependency_repo_mappings", [])
+        main_state_step_input(dependency_multi_ckpt, "step4").get("dependency_repo_mappings", [])
     )
     assert_true(
         dependency_multi_internal_paths == {f"com.example:demo-lib={multi_dep_repo.resolve()}"},
@@ -2532,53 +2558,39 @@ return ExtraApi.callLegacy();
             "--step", "auto",
             "--project-dir", str(project_dir),
             "--report-dir", str(dependency_multi_report),
-            "--response-json",
-            json.dumps(
-                {
-                    "action": "continue",
-                    "notes": "Step4 结果已复核，继续验证 dependency_source_dirs 多模块自动发现",
-                },
-                ensure_ascii=False,
-            ),
         ],
         cwd=project_dir,
     )
     assert_true(
-        dependency_multi_bridge_rc == EXIT_AWAITING_USER,
-        f"仅提供 dependency_source_dirs 的多模块 Step5 应进入 awaiting_user_input: {dependency_multi_bridge_stderr}",
+        dependency_multi_bridge_rc == 1
+        and "缺少最终制品 JAR 证据" in dependency_multi_bridge_stderr,
+        "多模块源码映射不得绕过 Step4 最终制品门控进入 Step5",
     )
-    dependency_multi_interaction = read_json(interaction_path(dependency_multi_report))
-    assert_true(
-        dependency_multi_interaction.get("step_id") == "step5",
-        "仅提供 dependency_source_dirs 的多模块场景未进入 Step5 确认点",
-    )
-    dependency_multi_summary = read_json(dependency_multi_report / "evidence" / "call_chain" / "summary.json")
-    dependency_multi_api = (dependency_multi_summary.get("not_analyzed_apis") or [{}])[0]
-    assert_true(
-        dependency_multi_summary.get("not_analyzed") == 1,
-        "缺少最终制品字节码目录时，Step5 不得把源码未命中归入 not_found_in_static_analysis",
+    dependency_multi_auxiliary = read_csv(
+        dependency_multi_report / "evidence" / "api_changes" /
+        "demo-lib_gitdiff_auxiliary_only.csv"
     )
     assert_true(
-        dependency_multi_api.get("reason_code") in {
-            "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE", "ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE"
-        },
-        "最终制品字节码不可用时，Step5 未保留覆盖不足原因码",
+        not (dependency_multi_report / "evidence" / "call_chain" / "summary.json").exists(),
+        "缺少最终制品时不得生成 Step5 正式分析结果",
     )
     assert_true(
-        dependency_multi_api.get("business_reach_depth") == 0,
-        "仅提供 dependency_source_dirs 且未命中静态路径时，Step5 不应伪造业务回溯深度",
-    )
-    assert_true(
-        dependency_multi_api.get("dependency_chain_coords") == [],
-        "仅提供 dependency_source_dirs 且未命中静态路径时，Step5 不应伪造依赖桥接链",
+        any(
+            row.get("coord") == "com.example:demo-lib"
+            and row.get("source") == "gitdiff"
+            for row in dependency_multi_auxiliary
+        ),
+        "缺少最终制品时，Step4 应保留源码 diff 辅助证据供补齐制品后复核",
     )
     dependency_multi_main_state = read_json(main_state_path(dependency_multi_report))
-    dependency_multi_step5_mappings = (
-        ((dependency_multi_main_state.get("step5") or {}).get("input") or {}).get("dependency_source_mappings") or []
+    dependency_multi_step4_mappings = (
+        ((dependency_multi_main_state.get("step4") or {}).get("input") or {}).get("dependency_repo_mappings") or []
     )
     assert_true(
-        any(str(item).startswith("com.example:demo-lib=") for item in dependency_multi_step5_mappings),
-        "仅提供 dependency_source_dirs 时，Step5 未保留自动派生的依赖源码映射",
+        (dependency_multi_main_state.get("state") or {}).get("current_step") == "step4"
+        and (dependency_multi_main_state.get("state") or {}).get("status") == "blocked_by_system"
+        and any(str(item).startswith("com.example:demo-lib=") for item in dependency_multi_step4_mappings),
+        "系统阻塞时应停留在 Step4 并保留自动派生的多模块源码映射",
     )
 
     interactive_step4_report = project_dir / ".upgrade-report-step4-interactive"
@@ -2586,6 +2598,14 @@ return ExtraApi.callLegacy();
     copy_file(
         report_dir / "evidence" / "dependencies" / "dep_changes.csv",
         interactive_step4_report / "evidence" / "dependencies" / "dep_changes.csv",
+    )
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv",
+        interactive_step4_report / "evidence" / "dependencies" / "deps_current_resolved.csv",
+    )
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "build_provenance.json",
+        interactive_step4_report / "evidence" / "dependencies" / "build_provenance.json",
     )
     write_text(
         interactive_step4_report / "evidence" / "context" / "context.json",
@@ -2703,6 +2723,14 @@ return ExtraApi.callLegacy();
     copy_file(
         report_dir / "evidence" / "dependencies" / "dep_changes.csv",
         interactive_step4_restart_report / "evidence" / "dependencies" / "dep_changes.csv",
+    )
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv",
+        interactive_step4_restart_report / "evidence" / "dependencies" / "deps_current_resolved.csv",
+    )
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "build_provenance.json",
+        interactive_step4_restart_report / "evidence" / "dependencies" / "build_provenance.json",
     )
     write_text(
         interactive_step4_restart_report / "evidence" / "context" / "context.json",
@@ -3673,6 +3701,7 @@ return "noop";
             "DEPENDENCY_SOURCE_MAPPING_MISSING",
             "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE",
             "ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE",
+            "CURRENT_FINAL_ARTIFACT_REQUIRED",
         },
         "缺少依赖映射或最终制品字节码时应输出明确的覆盖不足原因",
     )
@@ -4151,7 +4180,17 @@ BridgeFacade.callAdapter();
     behavior_summary = read_json(behavior_chain_dir / "summary.json")
     assert_true(behavior_summary.get("not_analyzed") >= 1, "行为变更命中业务路径时应进入 not_analyzed，而非 reachable/uncertain")
     behavior_api = behavior_summary.get("not_analyzed_apis", [])[0]
-    assert_true(behavior_api.get("reason_code") == "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION", "行为变更应输出专用 reason_code")
+    assert_true(
+        behavior_api.get("reason_code") == "ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE",
+        "缺少最终制品时，API 级裁决应优先暴露字节码覆盖不完整",
+    )
+    assert_true(
+        any(
+            path.get("stop_reason") == "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION"
+            for path in behavior_api.get("path_details") or []
+        ),
+        "行为变更调用路径应保留运行时验证专用原因码",
+    )
 
 
 def run_orchestrator_smoke_cases(workspace, dep_env):

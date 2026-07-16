@@ -5,7 +5,7 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 
 # Java 系统升级兼容性分析
 
-使用说明与自我排查清单见：`README.md`（面向使用者）；本文件更多是技能规则与流程约束（面向维护/编排）。
+这是一个给 Claude Code 使用的 Java 升级兼容性分析 Skill。本文件只包含模型执行任务时需要的运行时规则；使用说明见 `README.md`，维护与测试规则见 `docs/developer/`。
 
 极简版待交互硬规则见：`CHECKPOINT_RULES.md`。若只需要在每个阶段重读最小规则集，优先读取该文件，而不是重复通读整份 `SKILL.md`。
 
@@ -23,10 +23,10 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 首次调用 `step1` 前，必须先读取静态前置协议，而不是先试跑：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 ```
 
-这份 JSON 协议用于让 Agent 在首轮就知道：
+这份 JSON 协议用于让 Claude Code 在首轮就知道：
 
 1. `step1` 有哪些输入模式
 2. 默认系统升级场景下应优先抽取哪些字段
@@ -43,11 +43,18 @@ python3 "$SKILL/scripts/run_step.py" --describe-step1-contract
 
 ## Meta Rules
 
+0. 所有回答都必须清晰、准确、诚实。必须区分“已核实事实”“基于证据的推断”“无法确认”；不得编造或夸大事实、执行、进度、结果、原因和能力，不得通过遗漏与问题直接相关的关键事实形成误导。发现先前回答不准确时，必须立即明确更正。
 1. 本 Skill 含多个 `[CHECKPOINT]`；每个 `[CHECKPOINT]` 都是硬中断，不是建议。
 2. 只要脚本输出包含 `AWAITING USER INPUT`、`run_step.py` 返回退出码 `4`，或 `.upgrade-report/.runtime/state/main_state.json` 中的 `state.status` 进入 `awaiting_*`，就必须立即停止。
 3. 停止后只允许读取 `.upgrade-report/.runtime/state/interaction.json`，先形成用户可读的决策卡片；协议字段只用于判断该问什么、如何恢复。
 4. 未获得用户答复前，不得执行任何“继续”“恢复”“下一步”命令。
 5. 如果发现自己越过了 `[CHECKPOINT]`，必须立即停止，明确承认越界，并回到最近一个待交互点。
+6. 回答“是否完成”“是否修复”“是否全部通过”等状态问题前，必须重新核对当前任务清单、验证结果、Git 工作区和用户尚未撤销的要求；不得凭记忆或先前运行结果作答。
+7. 每个任务项的执行状态必须按事实标记为“已完成”“正在执行”“待执行”“阻塞”或“失败”。“正在执行”只能用于报告时确有命令、进程或实际工作正在运行的任务；计划执行、准备执行、曾经执行或等待恢复都不是正在执行。尚未开始的任务必须写“待执行”。
+8. 验证状态与执行状态分开记录为“已验证”或“未验证”。实现完成但没有足够证据时，应写“已完成、未验证”，不能用验证状态替代执行状态。
+9. 多项任务必须报告总数及各状态数量，并列出未完成项，例如“共 10 项：已完成 4、正在执行 1、待执行 5”。“未完成”只表示总体尚有任务未完成，不能代替具体任务状态。局部步骤或单一证据通过，只能证明对应范围。
+10. 只要仍有待执行、正在执行、阻塞、失败、未交付或用户要求的验证尚未执行，就必须直接回答“没有全部完成”，并准确列出各项状态。不得把待执行写成正在执行，也不得用“应该正确”“基本完成”或“后续增强”掩盖未完成工作。
+11. 只有所有任务项均已完成、要求的验证有本轮新鲜证据、交付动作已经完成且没有已知剩余项时，才能宣称“全部完成”。无法取得事实或证据时，应说明“无法确认”，不得用推测填补。
 
 窄例外：如果 Step5 已经成功生成 `.upgrade-report/.runtime/indexes/s5_query_index.json`，且用户只是询问某个方法的调用链，允许执行只读诊断查询 `scripts/s5_query_call_chain.py` 并直接返回调用链文本。该动作不得修改 `main_state.json`、不得清理/重跑任何 Step、不得恢复 checkpoint，也不得继续推进 Step6。
 
@@ -123,7 +130,7 @@ if gate failed or step blocked:
 2. `run_step.py` 退出码 `4` 表示 `AWAITING_USER`；必须读取 `interaction.json` 后停下问用户，不能把它当成失败重试，也不能当成成功完成
 3. 恢复命令只使用 `--response-json` 或 `--response-file`；不得使用裸动作参数绕过结构化用户答复
 4. checkpoint 转述必须先形成用户可读的“决策卡片”：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可以直接怎么回复。
-5. Agent 不要把 action_requirements、selection_resolution、response_schema、runtime_rules 作为普通用户的主信息；这些字段只用于构造恢复命令。
+5. Claude Code 不要把 action_requirements、selection_resolution、response_schema、runtime_rules 作为普通用户的主信息；这些字段只用于构造恢复命令。
 6. Step4 后进入 Step5 的候选对象必须按依赖包维度展示，优先引用 `evidence/api_changes/changed_dependencies.md`，不要要求用户从 `all_changed_apis.csv` 中逐行挑 API。
 
 优先使用统一调度入口 `scripts/run_step.py`。不要要求自己一次记住所有命令；具体命令、参数、产物清单统一按需查看 `RUNBOOK.md`。
@@ -147,11 +154,9 @@ if gate failed or step blocked:
 
 命令约定：
 
-1. `$SKILL` 指向本 Skill 的安装目录。
-2. 在当前仓库中，通常就是 `.../.trae/skills/java-upgrade-analyzer`。
-3. 若执行环境没有预先注入 `$SKILL`，请先手动设置，或直接把命令中的 `$SKILL/scripts/...` 替换为本 Skill 的绝对路径。
-4. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本仅用于开发调试，不等价于完整主状态流程。
-5. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
+1. Claude Code 使用 `${CLAUDE_SKILL_DIR}` 指向当前 Skill 的安装目录。
+2. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本不等价于完整主状态流程。
+3. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
 
 Step5 必须使用 `tree-sitter` 做 Java AST 分析。若当前 Python 环境缺少 `tree-sitter` / `tree-sitter-java`，正式流程会先用**当前实际执行 Skill 的 Python 解释器**自动尝试安装一次；安装或加载失败后必须进入 checkpoint，提示用户手动安装并重跑。正式流程不允许继续用增强正则生成分析结论。
 
@@ -207,7 +212,7 @@ python3 -m pip install tree-sitter tree-sitter-java
 ```
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --seed-json /abs/path/to/seed.json
@@ -218,7 +223,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 若需要执行单步，优先使用：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6> \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6> \
   --project-dir . \
   --report-dir .upgrade-report
 ```
@@ -230,7 +235,7 @@ python3 "$SKILL/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6
 Step1 必须显式提供一种输入方式；若两种方式都没给全，`run_step.py` 会先返回前置输入契约交互，而不是直接执行实际分析：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step step1 \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-branch <base_branch> \
@@ -240,7 +245,7 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 或直接提供两侧编译产物：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step step1 \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-artifact-path /abs/path/to/base-app.jar \
@@ -254,7 +259,7 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 若用户已明确只分析某个模块，第一次执行 `step1` 时必须直接带模块参数，不得先跑 root 范围：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step step1 \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-branch <base_branch> \
@@ -268,7 +273,7 @@ Step2 应优先消费 Step1 已确认并写入主状态的 `base_branch/current_
 如果希望按主状态续跑，可使用：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report
 ```
@@ -284,7 +289,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 1. 只要进入 `[CHECKPOINT]`，就必须停下并向用户发问
 2. 只要 `main_state.json.state.status` 为 `awaiting_user_input` 或其他 `awaiting_*`，不得继续推进
-3. Claude Code 不会因为 Python 子进程输出 JSON 自动弹出对话，因此 Agent 必须主动读取 `.upgrade-report/.runtime/state/main_state.json` 和 `.upgrade-report/.runtime/state/interaction.json`
+3. Claude Code 不会因为 Python 子进程输出 JSON 自动弹出对话，因此必须主动读取 `.upgrade-report/.runtime/state/main_state.json` 和 `.upgrade-report/.runtime/state/interaction.json`
 4. `main_state.json + interaction.json` 是恢复状态的实现细节；真正决定“这里必须停”的依据，是本文件中的 `[CHECKPOINT]` 约束
 
 进入 `[CHECKPOINT]` 后，只允许做以下动作：
@@ -319,7 +324,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：若两种输入方式都不完整，不进入实际 Step1，而是先进入前置输入契约交互（`reason_code=missing_step1_entry_inputs`）
 - 规则：若用户首轮已明确模块范围，第一次执行 `step1` 时必须直接传 `target_module`；不得先跑 root 范围结果再靠待交互确认点纠偏
 - 规则：对 direct artifact 模式，若后续要进入 Step2+，必须显式给出 `base_branch/current_branch`；不得依赖系统自动猜测
-- 规则：若 Step1 进入 `unresolved_dependency_coordinates_after_enrichment`，Agent 必须先向用户暴露 `unresolved_items`，允许用户补 `manual_coord_overrides`，或明确选择 `confirm_unresolved`；这条补丁路径同时适用于直接产物模式和 checkout_build 模式
+- 规则：若 Step1 进入 `unresolved_dependency_coordinates_after_enrichment`，Claude Code 必须先向用户暴露 `unresolved_items`，允许用户补 `manual_coord_overrides`，或明确选择 `confirm_unresolved`；这条补丁路径同时适用于直接产物模式和 checkout_build 模式
 - 门控：执行 `step1_scope`
 
 ### Phase 2 [CHECKPOINT] Confirm Dependency Scope
@@ -327,7 +332,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 对应步骤：`step1` 完成后立即进入
 - 必须展示：构建来源、变更范围、`evidence/dependencies/dep_changes.csv`
 - 必须确认：当前真实构建结果是否可信，是否可以作为后续分析范围
-- 若用户指定“只分析某个模块”，或用户首轮其实已明确模块但 Agent 漏传导致仍跑成 root 范围，不得直接进入 `step2`；必须把该答复写成结构化 JSON，并以 `action=rerun_current_step` 连同 `primary_module` / `modules` 一起重跑 `step1`
+- 若用户指定“只分析某个模块”，或用户首轮其实已明确模块但 Claude Code 漏传导致仍跑成 root 范围，不得直接进入 `step2`；必须把该答复写成结构化 JSON，并以 `action=rerun_current_step` 连同 `primary_module` / `modules` 一起重跑 `step1`
 - 用户答复前，不得进入 `step2`
 - 允许动作：`continue`、`rerun_current_step`、`cancel`
 - 禁止动作：在未得到用户确认前直接进入 `step2`
@@ -335,13 +340,13 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ```bash
 # 用户确认当前范围可信
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
 
 # 用户要求只分析某个模块
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"primary_module":"module-a","modules":["module-a"]}}}'
@@ -368,13 +373,13 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ```bash
 # 用户确认上下文正确
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
 
 # 用户补充分支后再恢复
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{"base_branch":"origin/main","current_branch":"feature/upgrade"}}}'
@@ -396,7 +401,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 输入：依赖变更清单、上下文、分支信息、依赖源码目录（推荐字段：`dependency_source_dirs`）
 - 输出：`.upgrade-report/evidence/api_changes/` 与 `all_changed_apis.csv`
 - 重点：JApiCmp XML 是机器解析主证据，stdout 仅用于人读和 XML 失败回退；分别保留 binary/source compatibility，不能把“二进制兼容但源码重编译不兼容”合并掉
-- 规则：Step4 必须优先复用 Step1 `evidence/dependencies/build_provenance.json` 指向的 base/current 最终构建产物，并按 `evidence/dependencies/dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 jar；只有最终制品中无法定位时，才回退到本地 Maven 仓库或 Maven 拉取
+- 规则：Step4 必须且只能复用 Step1 `evidence/dependencies/build_provenance.json` 指向的 base/current 最终构建产物，并按 `evidence/dependencies/dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 JAR；最终制品中无法定位时必须输出明确的证据缺失原因，不得回退本地 Maven 仓库或下载同坐标 JAR 替代
 - 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应超时
 - 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再按依赖的 `old_version/new_version` 只在对应源码仓库远端分支 `remotes` 中匹配 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支；old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；若未匹配到或存在歧义，必须进入人工确认，不得直接套用主项目分支名
@@ -420,19 +425,19 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ```bash
 # 用户接受当前证据池，继续调用链分析
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
 
 # 用户接受当前证据池，但只分析指定依赖
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:demo-lib"]}}}'
 
 # 用户补充依赖源码映射后再恢复
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"dependency_source_dirs":["/abs/path/to/dependency-repo"]},"notes":"补依赖源码目录后复跑 Step5"}}'
@@ -452,17 +457,14 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 规则：显式重跑某一步前，调度层必须先清空该步骤全部正式输出，避免旧轮次的制品、目录或字节码证据混入本轮结果
 - 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
 - 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
-- 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step5 必须优先按 `lib_entry` 提取制品中的真实嵌套 JAR，不得用本地 Maven 仓库副本冒充完整制品证据
-- 规则：本地 Maven JAR 只能作为显式 fallback；一旦使用、缺失嵌套 JAR、坐标 unresolved、SHA 不一致或 javap 失败，字节码覆盖必须降级，未命中不得解释为无影响
+- 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step3、Step4、Step5 必须按 `lib_entry` 使用制品中的真实嵌套 JAR，且不得用本地 Maven 仓库副本或重新下载的 JAR 替代最终制品证据
+- 规则：最终制品内缺失嵌套 JAR、坐标 unresolved、SHA 不一致或字节码解析失败时，必须记录覆盖缺口；未命中不得解释为无影响，也不得以本地 Maven JAR 填补缺口
 - 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4
-- 规则：准确性相关变更必须运行显式基准矩阵 `python3 scripts/accuracy_benchmark.py --profile core|step5|all`，覆盖 `jdeps` 对照、运行时依赖字节码链路、间接引用、owner/signature 精度、alerts 完整台账和汇总结论
-- 规则：真实项目矩阵的 `passed` 不代表没有质量风险；必须使用 `scripts/quality_signal_audit.py` 审计 skipped、`not_analyzed`、`uncertain`、`not_found_in_static_analysis` 和 non-gating production missing，并按 `docs/developer/quality.md` 解释或升级为回归测试
-- 规则：打包给真实工程测试前必须优先执行 `python3 scripts/quality_gate.py --profile release`；若因本地缺少真实项目矩阵而使用 `--skip-real`，交付说明必须明确标记真实项目矩阵未执行
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
 - 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`
 - 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中保留 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` / `RUNTIME_DEPENDENCY_USES_REMOVED_API` 事实，但若该依赖存在源码映射，Step5 必须先继续尝试回溯到业务代码，只有未能证明业务入口时才收敛为 `uncertain`
 - 规则：若依赖源码或资源配置中存在明确运行时主动入口（如 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle、Quartz `Job.execute`、Spring XML `task:scheduled`、`init-method`、`MethodInvokingJobDetailFactoryBean`），且该入口链路触达变更 API，即使没有业务源码显式调用方，也应作为 Step5 影响链路处理，不得仅因未回溯到业务源码而降为静态未找到。JPA `@PrePersist` / `@PostUpdate` 等生命周期回调必须进入框架证据，但在没有实体生命周期激活证据时保留为条件入口；`@Async` 只改变执行线程，不得单独伪造成调用入口
-- 规则：验收测试必须包含真实 `jdeps` 对照；`jdeps` 能发现的静态跨 JAR 类依赖，本 Skill 不得漏报，并继续提供成员级方法/字段匹配
+- 规则：Step5 对静态跨 JAR 类依赖的覆盖不得弱于 `jdeps`；`jdeps` 能识别的依赖不得漏报，并继续提供成员级方法/字段匹配
 - 规则：业务源码图与当前业务字节码图使用统一 owner/name/signature 身份；冲突时保留两类 provenance，不得用字节码静默覆盖源码证据
 - 规则：`evidence/call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条唯一终止链路独立一行，禁止只保留第一条路径或静默截断；同一终止链路重复命中时合并为一行并用 `path_occurrence_count` 表示次数
 - 规则：`alerts.csv` 必须作为完整主文件保留；当台账较大时，Step5 可额外输出 `alerts_reachable.csv`、`alerts_uncertain.csv`、`alerts_not_found_in_static_analysis.csv`、`alerts_not_analyzed.csv` 及 `alerts_<status>_NNN.csv` 分片作为人工阅读视图。拆分文件不得替代完整主文件，也不得做成轻量索引或样例子集
@@ -512,13 +514,13 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ```bash
 # 用户接受当前影响结论
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
 
 # 用户要求先补依赖源码映射，再重跑 Step5
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"dependency_source_dirs":["/abs/path/to/dependency-repo"]},"notes":"补依赖源码目录后复跑 Step5"}}'
@@ -533,11 +535,11 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ## 恢复与压缩
 
-默认由 `run_step.py` 自动保存主状态。若步骤执行后进入待交互状态，还会额外生成 `.upgrade-report/.runtime/state/interaction.json`，并以退出码 `4` 结束当前命令，供 Agent 读取并转成用户对话。若需要手动保存压缩摘要，执行：
+默认由 `run_step.py` 自动保存主状态。若步骤执行后进入待交互状态，还会额外生成 `.upgrade-report/.runtime/state/interaction.json`，并以退出码 `4` 结束当前命令，供 Claude Code 读取并转成用户对话。若需要手动保存压缩摘要，执行：
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/context_compress.py" save \
+python3 "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" save \
   --report-dir .upgrade-report \
   --completed-step <步骤号> \
   --output .upgrade-report/context_summary.json
@@ -547,7 +549,7 @@ python3 "$SKILL/scripts/context_compress.py" save \
 
 ```bash
 export PYTHONUTF8=1
-python3 "$SKILL/scripts/context_compress.py" load \
+python3 "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" load \
   --input .upgrade-report/context_summary.json
 ```
 
@@ -567,7 +569,7 @@ python3 "$SKILL/scripts/context_compress.py" load \
 4. 在 stdout / stderr / `interaction.json` 中输出结构化交互提示
 5. **以退出码 `4` 结束当前脚本**
 
-Agent 在恢复或接收新的正式用户意图时必须：
+Claude Code 在恢复或接收新的正式用户意图时必须：
 
 1. 先读取 `main_state.json`
 2. 若 `status` 为 `awaiting_*`，再读取 `interaction.json`
@@ -577,7 +579,7 @@ Agent 在恢复或接收新的正式用户意图时必须：
 
 ```bash
 # 推荐：直接传 `intent_patch` 结构化答复
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
@@ -585,7 +587,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 ```bash
 # 推荐：答复较长时，写入文件后恢复
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-file .upgrade-report/user_response.json
@@ -603,14 +605,14 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 - 若 `step1` 需要切换到模块级分析，优先使用：
 
 ```bash
-python3 "$SKILL/scripts/run_step.py" --step auto \
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"primary_module":"module-a","modules":["module-a"]}}}'
 ```
 
 - 不要只传裸动作；收到用户答复后，必须整理成完整结构化 JSON，再优先包成 `intent_patch` 恢复执行
-- `step_manifest.json` 中的 `interaction` 是脚本级配置；本文件中的 `[CHECKPOINT]` 与“非 checkpoint 正式意图桥接”共同构成 Agent 必须遵守的流程约束
+- `step_manifest.json` 中的 `interaction` 是脚本级配置；本文件中的 `[CHECKPOINT]` 与“非 checkpoint 正式意图桥接”共同构成 Claude Code 必须遵守的流程约束
 
 合法交互路径：
 
@@ -649,7 +651,7 @@ python3 "$SKILL/scripts/run_step.py" --step auto \
 
 - 缺少上一步产物
 - 门控失败
-- JApiCmp / 本地 Maven 仓库 / 源码路径等关键依赖不可用
+- JApiCmp、最终构建产物或必要源码路径等关键证据不可用
 - 结果存在明显盲区，无法确认是否触达系统
 
 ## 按需查阅

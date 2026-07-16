@@ -304,6 +304,7 @@ def _framework_batch(adapter, version, status, nodes, edges, findings, errors, m
             api_identity=adapter,
             status=status,
             applicable=status != 'not_applicable',
+            scope='path',
         ),),
         metrics=tuple(sorted(result_metrics.items())),
     )

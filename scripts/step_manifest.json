@@ -294,7 +294,7 @@
             },
             "step4_fetch_timeout": {
               "type": "integer",
-              "description": "可选。放宽 Maven dependency:get 的超时时间（秒）。"
+              "description": "可选。放宽通过 Maven dependency:get 安装 JApiCmp 工具的超时时间（秒）；不会用于下载被分析依赖。"
             },
             "notes": {
               "type": "string",

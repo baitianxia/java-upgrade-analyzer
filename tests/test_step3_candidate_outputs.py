@@ -5,7 +5,6 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -16,6 +15,30 @@ import s4_contract  # noqa: E402
 
 
 class Step3CandidateOutputsTest(unittest.TestCase):
+    @staticmethod
+    def _prepare_current_artifact(report_dir, coord="sample:demo", version="2.0.0"):
+        dependencies_dir = report_dir / "evidence" / "dependencies"
+        dependencies_dir.mkdir(parents=True, exist_ok=True)
+        nested_buffer = tempfile.SpooledTemporaryFile()
+        with zipfile.ZipFile(nested_buffer, "w") as nested:
+            nested.writestr("com/lib/TargetType.class", b"")
+        nested_buffer.seek(0)
+        nested_bytes = nested_buffer.read()
+        nested_buffer.close()
+        lib_entry = f"BOOT-INF/lib/demo-{version}.jar"
+        artifact_path = dependencies_dir / "current.jar"
+        with zipfile.ZipFile(artifact_path, "w") as outer:
+            outer.writestr(lib_entry, nested_bytes)
+        (dependencies_dir / "build_provenance.json").write_text(
+            json.dumps({"sides": [{"side": "current", "artifact_path": str(artifact_path)}]}),
+            encoding="utf-8",
+        )
+        (dependencies_dir / "deps_current_resolved.csv").write_text(
+            "entry_id,lib_entry,lib_name,coord,version,scope,resolution_status\n"
+            f"{lib_entry},{lib_entry},demo-{version}.jar,{coord},{version},runtime,resolved\n",
+            encoding="utf-8",
+        )
+
     def test_cleanup_step3_outputs_removes_candidate_artifacts_and_preserves_other_summary_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -64,24 +87,21 @@ class Step3CandidateOutputsTest(unittest.TestCase):
             source_dir = root / "src" / "main" / "java"
             source_dir.mkdir(parents=True)
             dep_changes_path = report_dir / "s1_dep_changes.csv"
-            jar_path = root / "demo.jar"
-            with zipfile.ZipFile(jar_path, "w") as zf:
-                zf.writestr("com/lib/TargetType.class", b"")
+            self._prepare_current_artifact(report_dir)
             (source_dir / "Entry.java").write_text(
                 "class Entry { Class<?> type = com.lib.TargetType.class; }\n",
                 encoding="utf-8",
             )
             dep_changes_path.write_text(
-                "coord,old_version,new_version,change_type\nsample:demo,1.0.0,-,移除\n",
+                "coord,old_version,new_version,change_type\nsample:demo,1.0.0,2.0.0,小版本升级\n",
                 encoding="utf-8",
             )
 
-            with patch.object(s3_scan, "find_maven_jar", return_value=str(jar_path)):
-                hit_count = s3_scan.build_per_dependency_candidate_outputs(
-                    [str(source_dir)],
-                    str(dep_changes_path),
-                    str(report_dir),
-                )
+            hit_count = s3_scan.build_per_dependency_candidate_outputs(
+                [str(source_dir)],
+                str(dep_changes_path),
+                str(report_dir),
+            )
 
             self.assertEqual(hit_count, 1)
             per_dep_dir = s4_contract.get_per_dependency_dir(str(report_dir), "sample:demo")
@@ -113,11 +133,9 @@ class Step3CandidateOutputsTest(unittest.TestCase):
             report_dir.mkdir(parents=True)
             dep_changes_path = report_dir / "s1_dep_changes.csv"
             dep_compat_path = report_dir / "s3_dependency_compat.csv"
-            jar_path = root / "demo.jar"
-            with zipfile.ZipFile(jar_path, "w") as zf:
-                zf.writestr("com/lib/TargetType.class", b"")
+            self._prepare_current_artifact(report_dir)
             dep_changes_path.write_text(
-                "coord,old_version,new_version,change_type\nsample:demo,1.0.0,-,移除\n",
+                "coord,old_version,new_version,change_type\nsample:demo,1.0.0,2.0.0,小版本升级\n",
                 encoding="utf-8",
             )
             dep_compat_path.write_text(
@@ -126,12 +144,11 @@ class Step3CandidateOutputsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch.object(s3_scan, "find_maven_jar", return_value=str(jar_path)):
-                hit_count = s3_scan.build_per_dependency_candidate_outputs(
-                    [],
-                    str(dep_changes_path),
-                    str(report_dir),
-                )
+            hit_count = s3_scan.build_per_dependency_candidate_outputs(
+                [],
+                str(dep_changes_path),
+                str(report_dir),
+            )
 
             self.assertEqual(hit_count, 1)
             per_dep_dir = s4_contract.get_per_dependency_dir(str(report_dir), "sample:demo")

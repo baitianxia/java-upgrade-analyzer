@@ -82,9 +82,15 @@ def clear_immutable_oracle_cache() -> None:
 
 
 def _oracle_cache_key(
-    artifact_sha256: str, jdk_version: str, selected_targets: tuple[tuple[str, str, str], ...]
+    artifact_sha256: str,
+    jdk_version: str,
+    selected_targets: tuple[tuple[str, str, str], ...],
+    excluded_nested_jars: tuple[str, ...] = (),
 ) -> tuple[str, str, str, str, str]:
-    target_scope = json.dumps(selected_targets, separators=(",", ":"))
+    target_scope = json.dumps(
+        {"targets": selected_targets, "excluded_nested_jars": excluded_nested_jars},
+        separators=(",", ":"),
+    )
     return artifact_sha256, ORACLE_PROCEDURE_VERSION, PROCEDURE, jdk_version, target_scope
 
 
@@ -248,7 +254,12 @@ def _write_extracted_class(destination: Path, index: int, content: bytes) -> Pat
 
 
 def _extract_packaged_classes(
-    snapshot: bytes, destination: Path, target_major: int | None, *, defer_writes: bool = False
+    snapshot: bytes,
+    destination: Path,
+    target_major: int | None,
+    *,
+    defer_writes: bool = False,
+    excluded_nested_jars: set[str] | None = None,
 ) -> tuple[list[PackagedClass], list[str]]:
     entries: list[PackagedClass] = []
     failures: list[str] = []
@@ -290,6 +301,8 @@ def _extract_packaged_classes(
                 if not info.is_dir() and _is_nested_jar(info.filename):
                     nested_by_name.setdefault(info.filename, []).append(info)
             for nested_name in sorted(nested_by_name):
+                if nested_name in (excluded_nested_jars or set()):
+                    continue
                 nested_infos = nested_by_name[nested_name]
                 if len(nested_infos) != 1:
                     failures.append(f"{nested_name}: duplicate nested JAR entry")
@@ -956,6 +969,7 @@ def scan_final_artifact(
     max_workers: int | None = None,
     time_budget_seconds: float | None = None,
     selected_targets: list[dict] | None = None,
+    excluded_nested_jars: set[str] | None = None,
 ) -> dict:
     """Return every executable edge found in the final artifact and nested runtime JARs."""
     artifact = Path(artifact)
@@ -1022,7 +1036,13 @@ def scan_final_artifact(
             complete=False,
         )
     normalized_targets = _normalize_selected_targets(selected_targets)
-    cache_key = _oracle_cache_key(digest, version, normalized_targets)
+    normalized_exclusions = tuple(sorted({
+        str(item or "").strip() for item in (excluded_nested_jars or set())
+        if str(item or "").strip()
+    }))
+    cache_key = _oracle_cache_key(
+        digest, version, normalized_targets, normalized_exclusions
+    )
     with _IMMUTABLE_ORACLE_CACHE_LOCK:
         cached_serialized = _IMMUTABLE_ORACLE_CACHE.get(cache_key)
     if cached_serialized is not None:
@@ -1057,6 +1077,7 @@ def scan_final_artifact(
                 Path(temporary_directory),
                 target_major,
                 defer_writes=bool(normalized_targets),
+                excluded_nested_jars=set(normalized_exclusions),
             )
             inventory_class_count = len(entries)
             if deadline is not None and time.perf_counter() >= deadline:

@@ -37,7 +37,7 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
 
         self.assertEqual(
             oracle.canonical_identity(row),
-            "g:a|p.Owner.call|method|(java.lang.String)",
+            "g:a|p.Owner.call|(java.lang.String)|method|",
         )
 
     def test_audit_verifies_every_api_with_third_party_provenance(self):
@@ -76,6 +76,86 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
         self.assertEqual(len(result["invalid_provenance"]), 1)
         self.assertTrue(result["blocking"])
 
+    def test_analyzer_identity_outside_changed_population_is_blocking(self):
+        changed = [
+            {"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"}
+        ]
+        extra = {
+            "coord": "g:a", "api_name": "p.A.extra", "api_signature": "()",
+            "symbol_kind": "method", "analysis_status": "reachable",
+        }
+        analyzed = [{**changed[0], "analysis_status": "reachable"}, extra]
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, [authority("p.A.one", "()", "reachable")]
+        )
+
+        self.assertEqual(result["analyzer_extra_identity_count"], 1)
+        self.assertEqual(
+            result["analyzer_extra_identities"],
+            ["g:a|p.A.extra|()|method|"],
+        )
+        self.assertTrue(result["blocking"])
+
+    def test_missing_analyzer_identity_is_an_explicit_closed_world_failure(self):
+        changed = [
+            {"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"},
+            {"coord": "g:a", "api_name": "p.A.two", "api_signature": "()", "symbol_kind": "method"},
+        ]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+
+        result = oracle.audit_api_oracle(
+            changed,
+            analyzed,
+            [
+                authority("p.A.one", "()", "reachable"),
+                authority("p.A.two", "()", "reachable"),
+            ],
+        )
+
+        self.assertEqual(
+            result["analyzer_missing_identities"],
+            ["g:a|p.A.two|()|method|"],
+        )
+        self.assertEqual(result["analyzer_missing_identity_count"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_duplicate_changed_identity_is_an_explicit_closed_world_failure(self):
+        changed = [
+            {"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"}
+        ]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+
+        result = oracle.audit_api_oracle(
+            changed + changed,
+            analyzed,
+            [authority("p.A.one", "()", "reachable")],
+        )
+
+        self.assertEqual(
+            result["changed_duplicate_identities"],
+            ["g:a|p.A.one|()|method|"],
+        )
+        self.assertEqual(result["changed_duplicate_identity_count"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_duplicate_analyzer_identity_with_conflicting_conclusions_is_blocking(self):
+        changed = [
+            {"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"}
+        ]
+        analyzed = [
+            {**changed[0], "analysis_status": "reachable"},
+            {**changed[0], "analysis_status": "not_impacted"},
+        ]
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, [authority("p.A.one", "()", "not_impacted")]
+        )
+
+        self.assertEqual(result["analyzer_duplicate_identity_count"], 1)
+        self.assertEqual(result["analyzer_conflict_identity_count"], 1)
+        self.assertTrue(result["blocking"])
+
     def test_conflicting_authorities_do_not_use_majority_vote(self):
         changed = [{"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"}]
         analyzed = [{**changed[0], "analysis_status": "reachable"}]
@@ -105,6 +185,30 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
         self.assertEqual(result["verified"], 1)
         self.assertEqual(result["ledger"][0]["oracle_conclusion"], "reachable")
 
+    def test_runtime_reachable_dominates_static_absence_without_oracle_conflict(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+        static = authority(
+            "p.A.one", "()", "not_found_in_static_analysis",
+            authority="final-artifact-classfile",
+        )
+        static["conclusion_scope"] = "static_analysis"
+        project_test = authority(
+            "p.A.one", "()", "reachable", authority="project-runtime",
+        )
+        project_test["evidence_mode"] = "project_test"
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, [static, project_test]
+        )
+
+        self.assertEqual(result["oracle_conflicts"], 0)
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(result["ledger"][0]["oracle_conclusion"], "reachable")
+
     def test_uncertain_static_authority_alone_cannot_verify_reachable(self):
         changed = [{"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"}]
         analyzed = [{**changed[0], "analysis_status": "reachable"}]
@@ -122,6 +226,22 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
         changed = [{"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method", "severity": "P0"}]
         analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
         records = [authority("p.A.one", "()", "not_found_in_static_analysis")]
+
+        result = oracle.audit_api_oracle(changed, analyzed, records)
+
+        self.assertEqual(result["unverified"], 1)
+        self.assertEqual(result["ledger"][0]["verdict"], "unverified")
+
+    def test_uncertain_authority_does_not_count_as_support_for_negative_conclusion(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "P0",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        records = [
+            authority("p.A.one", "()", "not_found_in_static_analysis", authority="jdk-javap"),
+            authority("p.A.one", "()", "uncertain", authority="constant-pool-scan"),
+        ]
 
         result = oracle.audit_api_oracle(changed, analyzed, records)
 

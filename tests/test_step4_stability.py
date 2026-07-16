@@ -21,6 +21,154 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_pair_artifact_replacements_uses_unique_complete_class_containment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_jar = root / "jna-5.18.1.jar"
+            new_jar = root / "jna-jpms-5.19.0.jar"
+            with zipfile.ZipFile(old_jar, "w") as archive:
+                for name in ("com/sun/jna/Native.class", "com/sun/jna/Pointer.class"):
+                    archive.writestr(name, b"old")
+            with zipfile.ZipFile(new_jar, "w") as archive:
+                for name in (
+                    "com/sun/jna/Native.class",
+                    "com/sun/jna/Pointer.class",
+                    "com/sun/jna/SecurityManagerExposer.class",
+                ):
+                    archive.writestr(name, b"new")
+            rows = [
+                {
+                    "coord": "net.java.dev.jna:jna",
+                    "base_coord": "net.java.dev.jna:jna",
+                    "old_version": "5.18.1",
+                    "new_version": "-",
+                    "change_type": "移除",
+                    "base_lib_entry": "BOOT-INF/lib/jna-5.18.1.jar",
+                    "_step4_base_jar_path": str(old_jar),
+                },
+                {
+                    "coord": "net.java.dev.jna:jna-jpms",
+                    "current_coord": "net.java.dev.jna:jna-jpms",
+                    "old_version": "-",
+                    "new_version": "5.19.0",
+                    "change_type": "新增",
+                    "current_lib_entry": "BOOT-INF/lib/jna-jpms-5.19.0.jar",
+                    "_step4_current_jar_path": str(new_jar),
+                },
+            ]
+
+            paired, evidence = step4.pair_artifact_replacement_rows(rows)
+
+        self.assertEqual(len(paired), 1)
+        self.assertEqual(paired[0]["base_coord"], "net.java.dev.jna:jna")
+        self.assertEqual(paired[0]["current_coord"], "net.java.dev.jna:jna-jpms")
+        self.assertEqual(paired[0]["coord"], "net.java.dev.jna:jna-jpms")
+        self.assertEqual(paired[0]["old_version"], "5.18.1")
+        self.assertEqual(paired[0]["new_version"], "5.19.0")
+        self.assertEqual(paired[0]["pairing_status"], "artifact_class_set_replacement")
+        self.assertEqual(evidence[0]["shared_classes"], 2)
+        self.assertEqual(evidence[0]["old_class_coverage"], 1.0)
+
+    def test_pair_artifact_replacements_compares_split_runtime_provider_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_jar = root / "core-1.jar"
+            new_core = root / "core-2.jar"
+            new_common = root / "common-2.jar"
+            with zipfile.ZipFile(old_jar, "w") as archive:
+                for name in ("p/A.class", "p/B.class", "p/C.class", "p/D.class"):
+                    archive.writestr(name, name.encode())
+            with zipfile.ZipFile(new_core, "w") as archive:
+                for name in ("p/A.class", "p/B.class"):
+                    archive.writestr(name, name.encode())
+            with zipfile.ZipFile(new_common, "w") as archive:
+                for name in ("p/C.class", "p/D.class", "p/E.class"):
+                    archive.writestr(name, name.encode())
+            rows = [
+                {
+                    "coord": "g:core", "base_coord": "g:core", "current_coord": "g:core",
+                    "old_version": "1", "new_version": "2", "change_type": "大版本升级",
+                    "_step4_base_jar_path": str(old_jar),
+                    "_step4_current_jar_path": str(new_core),
+                },
+                {
+                    "coord": "g:common", "current_coord": "g:common",
+                    "old_version": "-", "new_version": "2", "change_type": "新增",
+                    "_step4_current_jar_path": str(new_common),
+                },
+            ]
+
+            paired, evidence = step4.pair_artifact_replacement_rows(rows)
+            merged_path = Path(paired[0]["_step4_current_jar_path"])
+            with zipfile.ZipFile(merged_path) as merged:
+                merged_classes = {
+                    name for name in merged.namelist() if name.endswith(".class")
+                }
+
+        self.assertEqual(len(paired), 1)
+        self.assertEqual(paired[0]["pairing_status"], "artifact_provider_set_replacement")
+        self.assertEqual(merged_classes, {
+            "p/A.class", "p/B.class", "p/C.class", "p/D.class", "p/E.class",
+        })
+        self.assertEqual(evidence[0]["current_provider_count"], 2)
+
+    def test_split_runtime_provider_set_prefers_primary_artifact_for_duplicate_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_jar = root / "core-1.jar"
+            new_core = root / "z-core-2.jar"
+            new_common = root / "a-common-2.jar"
+            with zipfile.ZipFile(old_jar, "w") as archive:
+                archive.writestr("p/A.class", b"old-a")
+                archive.writestr("p/B.class", b"old-b")
+            with zipfile.ZipFile(new_core, "w") as archive:
+                archive.writestr("p/A.class", b"primary-a")
+                archive.writestr("p/B.class", b"primary-b")
+            with zipfile.ZipFile(new_common, "w") as archive:
+                archive.writestr("p/A.class", b"companion-a")
+                archive.writestr("p/B.class", b"companion-b")
+                archive.writestr("p/C.class", b"companion-c")
+            rows = [
+                {
+                    "coord": "g:core", "base_coord": "g:core", "current_coord": "g:core",
+                    "old_version": "1", "new_version": "2", "change_type": "major",
+                    "_step4_base_jar_path": str(old_jar),
+                    "_step4_current_jar_path": str(new_core),
+                },
+                {
+                    "coord": "g:common", "current_coord": "g:common",
+                    "old_version": "-", "new_version": "2", "change_type": "new",
+                    "_step4_current_jar_path": str(new_common),
+                },
+            ]
+
+            paired, _evidence = step4.pair_artifact_replacement_rows(rows)
+            with zipfile.ZipFile(paired[0]["_step4_current_jar_path"]) as merged:
+                duplicate_payload = merged.read("p/A.class")
+
+        self.assertEqual(duplicate_payload, b"primary-a")
+
+    def test_pair_artifact_replacements_does_not_pair_cross_group_containment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            for path in (old_jar, new_jar):
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("p/A.class", b"a")
+                    archive.writestr("p/B.class", b"b")
+            rows = [
+                {"coord": "old.group:a", "old_version": "1", "new_version": "-",
+                 "change_type": "移除", "_step4_base_jar_path": str(old_jar)},
+                {"coord": "new.group:b", "old_version": "-", "new_version": "1",
+                 "change_type": "新增", "_step4_current_jar_path": str(new_jar)},
+            ]
+
+            paired, evidence = step4.pair_artifact_replacement_rows(rows)
+
+        self.assertEqual(len(paired), 2)
+        self.assertEqual(evidence, [])
+
     def test_japicmp_xml_signature_erases_nested_generic_arguments_only_for_binary_identity(self):
         element = step4.ET.fromstring(
             '<method name="consume">'
@@ -427,14 +575,17 @@ class Step4StabilityTest(unittest.TestCase):
                 captured["timeout"] = timeout
                 return "", "", 0
 
-            with patch.object(step4, "find_jar_in_m2", side_effect=[str(old_jar), str(new_jar)]), \
-                 patch.object(step4, "run_cmd", side_effect=fake_run_cmd):
+            with patch.object(step4, "run_cmd", side_effect=fake_run_cmd):
                 step4.run_japicmp(
                     "com.example:demo",
                     "1.0.0",
                     "2.0.0",
                     tmp,
                     str(japicmp_jar),
+                    old_jar_path=str(old_jar),
+                    new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
                 )
 
         self.assertIsNone(captured["timeout"])
@@ -448,20 +599,23 @@ class Step4StabilityTest(unittest.TestCase):
             old_jar.write_text("old", encoding="utf-8")
             new_jar.write_text("new", encoding="utf-8")
 
-            with patch.object(step4, "find_jar_in_m2", side_effect=[str(old_jar), str(new_jar)]):
-                with patch.object(
-                    step4,
-                    "run_cmd",
-                    return_value=("See '--help' or '-h' for more information.\n", "E: Required option -o, --old is missing.\n", 1),
-                ) as run_cmd_mock:
-                    out_file, apis, jar_info, err = step4.run_japicmp(
-                        "com.example:demo",
-                        "1.0.0",
-                        "2.0.0",
-                        tmp,
-                        str(japicmp_jar),
-                    )
-                    content = Path(out_file).read_text(encoding="utf-8")
+            with patch.object(
+                step4,
+                "run_cmd",
+                return_value=("See '--help' or '-h' for more information.\n", "E: Required option -o, --old is missing.\n", 1),
+            ) as run_cmd_mock:
+                out_file, apis, jar_info, err = step4.run_japicmp(
+                    "com.example:demo",
+                    "1.0.0",
+                    "2.0.0",
+                    tmp,
+                    str(japicmp_jar),
+                    old_jar_path=str(old_jar),
+                    new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                )
+                content = Path(out_file).read_text(encoding="utf-8")
 
         called_cmd = run_cmd_mock.call_args.args[0]
         self.assertIn("--old", called_cmd)
@@ -485,35 +639,26 @@ class Step4StabilityTest(unittest.TestCase):
             old_jar.write_text("old", encoding="utf-8")
             new_jar.write_text("new", encoding="utf-8")
 
-            with patch.object(
-                step4,
-                "find_jar_in_m2",
-                side_effect=[str(old_jar), str(new_jar)],
-            ) as find_jar_mock:
-                with patch.object(step4, "run_cmd", return_value=("", "", 0)):
-                    out_file, apis, jar_info, err = step4.run_japicmp(
-                        "tools.jackson.core:jackson-core",
-                        "2.14.1",
-                        "3.0.4",
-                        tmp,
-                        str(japicmp_jar),
-                        old_coord="com.fasterxml.jackson.core:jackson-core",
-                        new_coord="tools.jackson.core:jackson-core",
-                    )
-                    content = Path(out_file).read_text(encoding="utf-8")
+            with patch.object(step4, "run_cmd", return_value=("", "", 0)):
+                out_file, apis, jar_info, err = step4.run_japicmp(
+                    "tools.jackson.core:jackson-core",
+                    "2.14.1",
+                    "3.0.4",
+                    tmp,
+                    str(japicmp_jar),
+                    old_coord="com.fasterxml.jackson.core:jackson-core",
+                    new_coord="tools.jackson.core:jackson-core",
+                    old_jar_path=str(old_jar),
+                    new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                )
+                content = Path(out_file).read_text(encoding="utf-8")
 
         self.assertIsNone(err)
         self.assertEqual(apis, [])
         self.assertEqual(jar_info["old_jar"], str(old_jar))
         self.assertEqual(jar_info["new_jar"], str(new_jar))
-        self.assertEqual(
-            find_jar_mock.call_args_list[0].args,
-            ("com.fasterxml.jackson.core", "jackson-core", "2.14.1"),
-        )
-        self.assertEqual(
-            find_jar_mock.call_args_list[1].args,
-            ("tools.jackson.core", "jackson-core", "3.0.4"),
-        )
         self.assertIn("旧坐标：com.fasterxml.jackson.core:jackson-core", content)
         self.assertIn("新坐标：tools.jackson.core:jackson-core", content)
 
@@ -1890,6 +2035,7 @@ class Step4StabilityTest(unittest.TestCase):
                 step4,
                 "fetch_jar_from_repo",
                 side_effect=AssertionError("Step1 packaged jars should avoid Maven fetch"),
+                create=True,
             ):
                 exit_code = step4.main()
 

@@ -22,24 +22,28 @@ import confidence_weighted_tracer as tracer
 
 class ArtifactBytecodeCatalogTest(unittest.TestCase):
     def test_application_owned_nested_module_requires_a_business_entry_path(self):
-        result = tracer.TraceResult(
-            api_name="com.vendor.Legacy.removed", api_simple="removed", api_signature="()",
-            symbol_kind="method", change_type="REMOVED", coord="com.vendor:legacy",
-            severity="P0", confirmed=True, source="japicmp", analysis_scope="api",
-            analysis_status="not_analyzed", direct_callers=0, is_reachable=None,
-            reachable_note="", business_reach_depth=0, dependency_chain_coords=[],
-            call_paths=[], evidence_paths=[], reason_code="", verification_commands=[],
-            hops=[], confidence_score=1.0, critical_nodes_hit=[],
-        )
+        result = tracer._new_trace_draft({
+            "api_name": "com.vendor.Legacy.removed", "api_simple": "removed",
+            "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            "coord": "com.vendor:legacy", "severity": "P0", "confirmed": "true",
+            "source": "japicmp", "analysis_scope": "api",
+        })
         hit = {
             "coord": "com.acme:library", "application_owned": True,
+            "ownership_evidence": {
+                "authority": "reactor_coordinate_and_final_artifact_entry",
+                "reactor_coord": "com.acme:library",
+                "artifact_entry": "BOOT-INF/lib/library.jar",
+                "final_artifact_sha256": "a" * 64,
+            },
             "jar_path": "/artifact/BOOT-INF/lib/library.jar",
             "class_fqcn": "com.acme.library.Job", "consumer_method": "run",
             "consumer_signature": "()", "target_display": "com.vendor.Legacy.removed()",
             "evidence_type": "bytecode_method_invocation",
         }
 
-        built = tracer._build_packaged_dependency_hit_result(result, [hit])
+        tracer._build_packaged_dependency_hit_result(result, [hit])
+        built = tracer._finalize_trace_draft(result)
 
         self.assertEqual(built.analysis_status, "uncertain")
         self.assertIsNone(built.is_reachable)
@@ -407,7 +411,12 @@ BootstrapMethods:
                 }]
             }), encoding="utf-8")
 
-            with patch.object(step5, "_find_maven_jar", side_effect=AssertionError("must not use m2")):
+            with patch.object(
+                step5,
+                "_find_maven_jar",
+                side_effect=AssertionError("must not use m2"),
+                create=True,
+            ):
                 catalog = step5.build_runtime_dependency_catalog(str(report))
 
             self.assertEqual(catalog["status"], "complete")
@@ -418,7 +427,7 @@ BootstrapMethods:
             with zipfile.ZipFile(business_jar) as zf:
                 self.assertEqual(zf.read("com/example/App.class"), b"business-bytecode")
 
-    def test_catalog_marks_local_maven_fallback_partial(self):
+    def test_catalog_rejects_local_maven_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp)
             fallback = report / "fallback.jar"
@@ -431,11 +440,17 @@ BootstrapMethods:
                 writer.writeheader()
                 writer.writerow({"coord": "com.acme:consumer", "version": "1", "scope": "packaged", "lib_entry": ""})
 
-            with patch.object(step5, "_find_maven_jar", return_value=str(fallback)):
+            with patch.object(
+                step5,
+                "_find_maven_jar",
+                side_effect=AssertionError("不得读取本地 Maven 仓库"),
+                create=True,
+            ):
                 catalog = step5.build_runtime_dependency_catalog(str(report))
 
-            self.assertEqual(catalog["status"], "partial")
-            self.assertIn("local_maven_fallback_used", catalog["reason_codes"])
+            self.assertEqual(catalog["status"], "insufficient")
+            self.assertIn("runtime_dependency_jars_missing", catalog["reason_codes"])
+            self.assertNotIn("local_maven_fallback_used", catalog["reason_codes"])
 
 
 if __name__ == "__main__":

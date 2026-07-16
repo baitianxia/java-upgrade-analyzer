@@ -125,7 +125,12 @@ class Step3FinalArtifactDependencyScansTest(unittest.TestCase):
             )
             output = root / "s3_dependency_classfile.csv"
 
-            with patch.object(s3_scan, "find_maven_jar", side_effect=AssertionError("不得读取本地 Maven 仓库")):
+            with patch.object(
+                s3_scan,
+                "find_maven_jar",
+                side_effect=AssertionError("不得读取本地 Maven 仓库"),
+                create=True,
+            ):
                 risk_count = s3_scan.scan_dependency_classfile_versions(
                     [], str(output), str(current_path)
                 )
@@ -231,7 +236,12 @@ class Step3FinalArtifactDependencyScansTest(unittest.TestCase):
             )
             output = root / "s3_dependency_compat.csv"
 
-            with patch.object(s3_scan, "find_maven_jar", side_effect=AssertionError("不得读取本地 Maven 仓库")):
+            with patch.object(
+                s3_scan,
+                "find_maven_jar",
+                side_effect=AssertionError("不得读取本地 Maven 仓库"),
+                create=True,
+            ):
                 count = s3_scan.scan_dependency_compat([], str(output), str(current_path))
 
             self.assertEqual(count, 2)

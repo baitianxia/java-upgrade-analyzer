@@ -57,6 +57,26 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertNotIn("原样转述", text)
         self.assertNotIn("原样列出", text)
 
+    def test_claude_code_runtime_docs_exclude_developer_test_governance(self):
+        skill = self.read("SKILL.md")
+        runbook = self.read("RUNBOOK.md")
+        quality = self.read("docs/developer/quality.md")
+
+        self.assertIn("给 Claude Code 使用", skill)
+        self.assertIn("${CLAUDE_SKILL_DIR}", skill)
+        self.assertNotIn("$SKILL", skill)
+        for maintenance_entry in (
+            "scripts/accuracy_benchmark.py",
+            "scripts/quality_signal_audit.py",
+            "scripts/test_round_retrospective.py",
+            "scripts/quality_gate.py --profile release",
+        ):
+            self.assertNotIn(maintenance_entry, skill)
+            self.assertIn(maintenance_entry, quality)
+        self.assertNotIn("## 开发者测试", runbook)
+        self.assertNotIn("scripts/real_project_regression.py", runbook)
+        self.assertNotIn("$SKILL", runbook)
+
     def test_checkpoint_rules_keep_internal_protocol_out_of_user_main_message(self):
         text = self.read("CHECKPOINT_RULES.md")
         self.assertIn("当前所有交互点", text)

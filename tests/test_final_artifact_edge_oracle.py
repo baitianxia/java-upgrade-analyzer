@@ -79,6 +79,38 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
             ],
         )
 
+    def test_boot_archive_can_exclude_external_target_provider_from_consumer_oracle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            provider = root / "provider.jar"
+            consumer = root / "consumer.jar"
+            with zipfile.ZipFile(provider, "w") as archive:
+                archive.writestr("vendor/Provider.class", b"provider")
+            with zipfile.ZipFile(consumer, "w") as archive:
+                archive.writestr("app/Bridge.class", b"consumer")
+            artifact = root / "boot.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/app/App.class", b"business")
+                archive.writestr("BOOT-INF/lib/provider-1.0.jar", provider.read_bytes())
+                archive.writestr("BOOT-INF/lib/consumer-1.0.jar", consumer.read_bytes())
+
+            with tempfile.TemporaryDirectory() as extracted:
+                entries, failures = oracle._extract_packaged_classes(
+                    artifact.read_bytes(),
+                    Path(extracted),
+                    target_major=21,
+                    excluded_nested_jars={"BOOT-INF/lib/provider-1.0.jar"},
+                )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            [entry.artifact_entry for entry in entries],
+            [
+                "BOOT-INF/classes/app/App.class",
+                "BOOT-INF/lib/consumer-1.0.jar!/app/Bridge.class",
+            ],
+        )
+
     def test_sequential_concurrent_and_cached_scans_are_edge_equivalent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact = _fake_artifact(

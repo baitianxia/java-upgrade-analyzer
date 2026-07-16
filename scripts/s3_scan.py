@@ -31,7 +31,7 @@ from datetime import datetime
 import json
 
 sys.path.insert(0, str(Path(__file__).parent))
-from compat import open_text, write_text, maven_repo_dir
+from compat import open_text, write_text
 from progress_logging import PhaseTimer, emit_progress
 from pipeline_constants import (
     EVIDENCE_CONTEXT_DIRNAME,
@@ -481,37 +481,6 @@ FINAL_ARTIFACT_SCAN_FAILURE_MESSAGES = {
 }
 
 
-def find_maven_jar(coord, version):
-    """在本地 Maven 仓库定位 jar，支持带 classifier 的坐标"""
-    parts = coord.split(':')
-    if len(parts) < 2 or not version:
-        return None
-    group_id, artifact_id = parts[0], parts[1]
-    classifier = parts[2] if len(parts) >= 3 else None
-
-    base = maven_repo_dir()
-    for part in group_id.split('.'):
-        base = base / part
-    base = base / artifact_id / version
-    if not base.exists():
-        return None
-
-    patterns = []
-    if classifier:
-        patterns.append(f"{artifact_id}-{version}-{classifier}.jar")
-    patterns.extend([
-        f"{artifact_id}-{version}.jar",
-        f"{artifact_id}-{version}-*.jar",
-    ])
-
-    for pattern in patterns:
-        matches = [m for m in base.glob(pattern)
-                   if 'sources' not in m.name and 'javadoc' not in m.name]
-        if matches:
-            return str(matches[0])
-    return None
-
-
 def _change_type_to_contract(change_type):
     text = str(change_type or '').strip()
     if text in {'移除', 'removed'}:
@@ -553,12 +522,12 @@ def _iter_candidate_scan_files(source_dirs):
                     yield os.path.join(root, fname)
 
 
-def _iter_jar_class_names(jar_path, max_classes=160):
+def _iter_jar_class_names(jar_bytes, max_classes=160):
     classes = []
-    if not jar_path or not os.path.exists(jar_path):
+    if not jar_bytes:
         return classes
     try:
-        with zipfile.ZipFile(jar_path) as zf:
+        with zipfile.ZipFile(io.BytesIO(jar_bytes)) as zf:
             for entry in sorted(zf.namelist()):
                 if len(classes) >= max_classes:
                     break
@@ -572,13 +541,32 @@ def _iter_jar_class_names(jar_path, max_classes=160):
     return classes
 
 
-def _build_coord_scan_tokens(dep_row):
+def _current_dependency_ledger_path(report_dir):
+    root = Path(report_dir or '').resolve()
+    candidates = [
+        root / EVIDENCE_DIRNAME / 'dependencies' / 'deps_current_resolved.csv',
+        root / 'dependencies' / 'deps_current_resolved.csv',
+        root / 'deps_current_resolved.csv',
+    ]
+    return next((str(path) for path in candidates if path.is_file()), '')
+
+
+def _build_coord_scan_tokens(dep_row, report_dir):
     coord = str(dep_row.get('coord') or '').strip()
-    old_version = str(dep_row.get('old_version') or '').strip()
-    new_version = str(dep_row.get('new_version') or '').strip()
-    version = new_version if new_version and new_version != '-' else old_version
-    jar_path = find_maven_jar(coord, version) if version and version != '-' else None
-    class_names = _iter_jar_class_names(jar_path)
+    class_names = []
+    artifact_entry = ''
+    ledger_path = _current_dependency_ledger_path(report_dir)
+    if ledger_path:
+        for scan_input in iter_current_final_artifact_dependencies(ledger_path):
+            dependency = scan_input.get('dependency') or {}
+            if str(dependency.get('coord') or '').strip() != coord:
+                continue
+            if not scan_input.get('error_code'):
+                class_names = _iter_jar_class_names(scan_input.get('jar_bytes'))
+                artifact_entry = str(
+                    dependency.get('lib_entry') or dependency.get('entry_id') or ''
+                ).strip()
+            break
     package_prefixes = []
     for fqcn in class_names:
         if '.' not in fqcn:
@@ -597,7 +585,7 @@ def _build_coord_scan_tokens(dep_row):
             break
     return {
         'coord': coord,
-        'jar_path': jar_path or '',
+        'jar_path': artifact_entry,
         'class_names': class_names,
         'package_prefixes': package_prefixes,
         'simple_names': simple_names,
@@ -733,7 +721,7 @@ def build_per_dependency_candidate_outputs(source_dirs, dep_changes_path, report
         coord = str(dep_row.get('coord') or '').strip()
         if not coord:
             continue
-        token_bundle = _build_coord_scan_tokens(dep_row)
+        token_bundle = _build_coord_scan_tokens(dep_row, report_dir)
         class_names = token_bundle.get('class_names') or []
         if not class_names:
             continue

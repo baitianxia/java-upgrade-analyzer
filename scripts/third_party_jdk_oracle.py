@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import re
 import subprocess
@@ -73,16 +74,23 @@ def discover_calls(
     evidence_dir.mkdir(parents=True, exist_ok=True)
     evidence_path = evidence_dir / "jdk_javap_discovered_calls.txt"
     discovered: dict[tuple[str, str, str], dict] = {}
+
+    def run_javap(class_file: Path):
+        return class_file, subprocess.run(
+            ["javap", "-c", "-s", "-p", str(class_file)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+
+    worker_count = min(8, len(class_files))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        javap_results = list(executor.map(run_javap, class_files))
+
     with evidence_path.open("w", encoding="utf-8") as evidence:
-        for class_file in class_files:
-            completed = subprocess.run(
-                ["javap", "-c", "-s", "-p", str(class_file)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-            )
+        for class_file, completed in javap_results:
             evidence.write(f"===== {class_file} =====\n")
             evidence.write(completed.stdout)
             if completed.stderr:
@@ -307,7 +315,7 @@ def scan_class_files(
 
     evidence_dir.mkdir(parents=True, exist_ok=True)
     evidence_path = evidence_dir / "jdk_javap_calls.txt"
-    matched: dict[tuple[str, str, str], dict] = {}
+    matched: set[tuple[str, str, str]] = set()
     graph_incoming: dict[tuple[str, str, str], set[tuple[str, str, str]]] = defaultdict(set)
     with evidence_path.open("w", encoding="utf-8") as evidence:
         for offset in range(0, len(class_files), 100):
@@ -330,7 +338,7 @@ def scan_class_files(
             for owner, member, descriptor in CALL_RE.findall(completed.stdout):
                 key = (owner, member, descriptor)
                 if key in targets:
-                    matched[key] = targets[key][0]
+                    matched.add(key)
 
     digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
     version = subprocess.run(
@@ -339,25 +347,32 @@ def scan_class_files(
     generated_at = datetime.now(timezone.utc).isoformat()
     business_files = list(class_files if business_class_files is None else business_class_files)
     records = []
-    for key, row in matched.items():
-        records.append({
-            **{key: str(row.get(key) or "") for key in ("coord", "api_name", "api_signature", "symbol_kind")},
-            "oracle_conclusion": (
-                "reachable"
-                if _target_reaches_business(key, graph_incoming, business_files)
-                else "uncertain"
-            ),
-            "authority": "jdk-javap",
-            "authority_version": version,
-            "procedure": (
-                "javap -c -s -p <class-file>; exact owner/member/JVM parameter descriptor; "
-                "reverse method graph to explicit business class boundary"
-            ),
-            "evidence_path": str(evidence_path),
-            "evidence_sha256": digest,
-            "generated_at": generated_at,
-            "evidence_mode": "bytecode",
-        })
+    for key in matched:
+        for row in targets[key]:
+            records.append({
+                **{
+                    field: str(row.get(field) or "")
+                    for field in (
+                        "coord", "api_name", "api_signature", "symbol_kind",
+                        "change_type",
+                    )
+                },
+                "oracle_conclusion": (
+                    "reachable"
+                    if _target_reaches_business(key, graph_incoming, business_files)
+                    else "uncertain"
+                ),
+                "authority": "jdk-javap",
+                "authority_version": version,
+                "procedure": (
+                    "javap -c -s -p <class-file>; exact owner/member/JVM parameter descriptor; "
+                    "reverse method graph to explicit business class boundary"
+                ),
+                "evidence_path": str(evidence_path),
+                "evidence_sha256": digest,
+                "generated_at": generated_at,
+                "evidence_mode": "bytecode",
+            })
     return sorted(records, key=lambda row: (
         row["api_name"], row["symbol_kind"], row["api_signature"]
     ))

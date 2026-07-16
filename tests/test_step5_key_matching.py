@@ -41,6 +41,12 @@ from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
+    def setUp(self):
+        tracer.clear_immutable_artifact_parse_cache()
+
+    def tearDown(self):
+        tracer.clear_immutable_artifact_parse_cache()
+
     def _draft_from_result(self, result):
         values = {
             name: getattr(result, name)
@@ -48,6 +54,14 @@ class Step5KeyMatchingTest(unittest.TestCase):
             if hasattr(result, name)
         }
         return tracer.TraceDraft(**values)
+
+    def test_malformed_context_cannot_fall_back_to_empty_source_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "context.json"
+            context_path.write_text('{"source_dirs": [', encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "STEP5_CONTEXT_PARSE_FAILED"):
+                step5.load_context_source_dirs(context_path)
 
     def _verified_composite_framework_edge(self, **changes):
         artifact_entry = "BOOT-INF/classes/app/Application.class"
@@ -1019,7 +1033,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertEqual(class_entries, ["app/App.class"])
 
-    def test_runtime_catalog_discovers_same_group_internal_modules_inside_boot_lib(self):
+    def test_runtime_catalog_does_not_infer_internal_module_from_group_id(self):
         def nested_jar(group_id, artifact_id):
             payload = io.BytesIO()
             with zipfile.ZipFile(payload, "w") as archive:
@@ -1070,9 +1084,10 @@ class Step5KeyMatchingTest(unittest.TestCase):
             catalog = step5.build_runtime_dependency_catalog(report_dir)
 
         self.assertIn("com.acme:library", catalog["by_coord"])
-        self.assertTrue(catalog["by_coord"]["com.acme:library"]["application_owned"])
+        self.assertFalse(catalog["by_coord"]["com.acme:library"]["application_owned"])
+        self.assertNotIn("ownership_evidence", catalog["by_coord"]["com.acme:library"])
         self.assertNotIn("org.external:external", catalog["by_coord"])
-        self.assertEqual(catalog["metrics"]["application_owned_nested_dependencies"], 1)
+        self.assertEqual(catalog["metrics"]["application_owned_nested_dependencies"], 0)
 
     def _graph_with_business_edge(self, catalog, callee_key, root):
         business_method = SimpleNamespace(
@@ -1181,6 +1196,46 @@ class Step5KeyMatchingTest(unittest.TestCase):
         bridge = next(hit for hit in scan["hits"] if hit["class_fqcn"] == "com.vendor.InternalBridge")
         self.assertEqual(bridge["edge_role"], "internal_bridge")
         self.assertFalse(bridge["direct_consumer"])
+
+    def test_same_coordinate_external_provider_is_not_scanned_as_an_internal_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            catalog = self._runtime_catalog(((api_row["coord"], jar_path),))
+            catalog["by_coord"][api_row["coord"]]["application_owned"] = False
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=catalog,
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+
+        scan = scans[tracer.build_api_identity_key(api_row)]
+        self.assertEqual(scan.get("hits", []), [])
+        self.assertEqual(
+            tracer._step5_perf_stats(graph)["bytecode_scan"]["external_provider_jars_skipped"],
+            1,
+        )
+
+    def test_runtime_closure_does_not_expand_through_an_external_target_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            catalog = self._runtime_catalog(((api_row["coord"], jar_path),))
+            catalog["by_coord"][api_row["coord"]]["application_owned"] = False
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=catalog,
+            )
+
+            expansion = tracer._ensure_runtime_dependency_callers_for_key(
+                graph,
+                "com.vendor.Target.removed(String)",
+                excluded_provider_coord=api_row["coord"],
+            )
+
+        self.assertEqual(expansion["edges_added"], 0)
+        self.assertFalse(graph.reverse_edges)
 
     def test_same_coordinate_batch_javap_retains_internal_bridge(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1556,6 +1611,31 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 },
             },
         ), artifact_sha256
+
+    def test_corrupt_nested_final_artifact_is_incomplete_not_verified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/app/App.class", b"class")
+                archive.writestr("BOOT-INF/lib/corrupt.jar", b"not-a-jar")
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            provenance = report_dir / "evidence" / "dependencies" / "build_provenance.json"
+            self._write_text(
+                provenance,
+                json.dumps({"sides": [{
+                    "side": "current",
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": artifact_sha256,
+                }]}),
+                encoding="utf-8",
+            )
+            graph = SimpleNamespace(report_dir=str(report_dir))
+
+            verified = tracer._verified_final_artifact_provenance(graph)
+
+        self.assertFalse(verified["complete"])
+        self.assertIn("BOOT-INF/lib/corrupt.jar", verified["failures"][0])
 
     def test_writes_complete_analyzer_edge_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2415,7 +2495,7 @@ BootstrapMethods:
         )
         calls = 0
 
-        def fake_expand(_graph, _lookup_key):
+        def fake_expand(_graph, _lookup_key, **_kwargs):
             nonlocal calls
             calls += 1
             return {"expanded": True, "edges_added": 0, "javap_classes": 0, "visited_classes": 0}
@@ -3550,6 +3630,16 @@ public class com.example.TargetBridge {
         self.assertEqual(updated.analysis_status, "uncertain")
         self.assertIsNone(updated.is_reachable)
         self.assertEqual(updated.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
+
+    def test_field_type_change_is_not_treated_as_an_inlined_constant(self):
+        self.assertFalse(tracer._is_inlined_constant_change({
+            "api_name": "com.vendor.Dto.value",
+            "symbol_kind": "field",
+            "change_type": "DATA_FIELD_TYPE_CHANGED",
+            "compatibility_flags": "DATA_CONTRACT_CHANGE",
+            "old_value": "com.vendor.OldType",
+            "new_value": "com.vendor.NewType",
+        }))
 
     def test_complete_bytecode_miss_cannot_clear_changed_inlined_constant(self):
         api_row = {
@@ -5080,6 +5170,222 @@ public class com.example.TargetBridge {
                     result.reason_code, "INCOMPLETE_EVIDENCE_COVERAGE"
                 )
 
+    def test_trace_api_ignores_path_scoped_framework_gap_unrelated_to_target(self):
+        api_row = {
+            "api_name": "org.springframework.data.domain.Page.getContent",
+            "api_simple": "getContent",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.springframework.data:spring-data-commons",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "final_artifact",
+            "analysis_scope": "method",
+        }
+        identity = tracer.indirect_api_key(api_row)
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={},
+            step5_collector_coverage=(
+                CoverageRecord(
+                    collector="business_bytecode",
+                    api_identity=identity,
+                    status="complete",
+                ),
+                CoverageRecord(
+                    collector="spring_basic",
+                    api_identity="spring_basic",
+                    status="partial",
+                    reason_codes=("spring_bean_method_unresolved",),
+                    scope="path",
+                ),
+            ),
+            step5_evidence_concerns=(EvidenceConcern(
+                stage="spring_basic",
+                reason_code="spring_bean_method_unresolved",
+                detail="unresolved cache customizer",
+                class_name=(
+                    "org.springframework.samples.petclinic.system.CacheConfiguration."
+                    "petclinicCacheConfigurationCustomizer"
+                ),
+            ),),
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {})
+
+        self.assertEqual(result.analysis_status, "not_found_in_static_analysis")
+        self.assertEqual(result.reason_code, "NO_STATIC_PATH")
+
+    def test_trace_api_keeps_path_scoped_framework_gap_on_target_path(self):
+        api_row = {
+            "api_name": "org.springframework.data.domain.Page.getContent",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "org.springframework.data:spring-data-commons",
+        }
+        framework_coverage = CoverageRecord(
+            collector="spring_basic",
+            api_identity="spring_basic",
+            status="partial",
+            reason_codes=("spring_bean_method_unresolved",),
+            scope="path",
+        )
+        graph = SimpleNamespace(
+            reverse_edges={
+                "org.springframework.data.domain.Page.getContent()": (
+                    SimpleNamespace(
+                        collector="spring_basic",
+                        caller_symbol_id="app.Repository.findAll()",
+                        caller_qualified_key="app.Repository.findAll()",
+                    ),
+                ),
+            },
+            step5_collector_coverage=(framework_coverage,),
+            step5_evidence_concerns=(),
+        )
+
+        draft = tracer._new_trace_draft(api_row, graph)
+
+        self.assertEqual(len(draft.envelope_coverage), 1)
+        projected = draft.envelope_coverage[0]
+        self.assertEqual(projected.collector, "spring_basic")
+        self.assertEqual(projected.api_identity, tracer.build_api_identity_key(api_row))
+        self.assertEqual(projected.status, "partial")
+        self.assertEqual(projected.scope, "path")
+        self.assertEqual(
+            projected.reason_codes, ("spring_bean_method_unresolved",)
+        )
+
+    def test_path_scoped_framework_gap_does_not_cross_overloads(self):
+        api_row = {
+            "api_name": "com.vendor.Target.call",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "vendor:target",
+        }
+        graph = SimpleNamespace(
+            reverse_edges={
+                "com.vendor.Target.call(Integer)": (
+                    SimpleNamespace(
+                        collector="spring_basic",
+                        caller_symbol_id="app.Config.integerCall()",
+                        caller_qualified_key="app.Config.integerCall()",
+                    ),
+                ),
+            },
+            step5_collector_coverage=(CoverageRecord(
+                collector="spring_basic",
+                api_identity="spring_basic",
+                status="partial",
+                scope="path",
+            ),),
+            step5_evidence_concerns=(),
+        )
+
+        draft = tracer._new_trace_draft(api_row, graph)
+
+        self.assertEqual(draft.envelope_coverage, ())
+
+    def test_path_scope_traverses_beyond_ten_thousand_nodes(self):
+        target = "com.vendor.Target.call()"
+        reverse_edges = {}
+        current = target
+        for index in range(10002):
+            caller = f"app.Chain.node{index}()"
+            reverse_edges[current] = (SimpleNamespace(
+                collector="spring_basic" if index == 10001 else "",
+                caller_symbol_id=caller,
+                caller_qualified_key=caller,
+            ),)
+            current = caller
+        graph = SimpleNamespace(reverse_edges=reverse_edges)
+
+        collectors, symbols = tracer._target_reverse_path_context(
+            {"api_name": "com.vendor.Target.call", "api_signature": "()"}, graph
+        )
+
+        self.assertIn("spring_basic", collectors)
+        self.assertIn("app.Chain.node10001", symbols)
+
+    def test_path_scope_matches_nested_class_spelling(self):
+        graph = SimpleNamespace(reverse_edges={
+            "com.vendor.Outer.Builder.call(com.vendor.Outer.Arg)": (
+                SimpleNamespace(
+                    collector="spring_basic",
+                    caller_symbol_id="app.Config.call()",
+                    caller_qualified_key="app.Config.call()",
+                ),
+            ),
+        })
+
+        collectors, _symbols = tracer._target_reverse_path_context({
+            "api_name": "com.vendor.Outer$Builder.call",
+            "api_signature": "(com.vendor.Outer$Arg)",
+        }, graph)
+
+        self.assertEqual(collectors, {"spring_basic"})
+
+    def test_path_scope_nested_signature_keeps_qualified_owner(self):
+        graph = SimpleNamespace(reverse_edges={
+            "com.vendor.Target.call(x.Other.Arg)": (
+                SimpleNamespace(
+                    collector="spring_basic",
+                    caller_symbol_id="app.Config.call()",
+                    caller_qualified_key="app.Config.call()",
+                ),
+            ),
+        })
+
+        collectors, _symbols = tracer._target_reverse_path_context({
+            "api_name": "com.vendor.Target.call",
+            "api_signature": "(x.Outer$Arg)",
+        }, graph)
+
+        self.assertEqual(collectors, set())
+
+    def test_path_scope_observes_edges_added_after_first_lookup(self):
+        target = "com.vendor.Target.call()"
+        graph = SimpleNamespace(reverse_edges={
+            target: [SimpleNamespace(
+                collector="first",
+                caller_symbol_id="app.First.call()",
+                caller_qualified_key="app.First.call()",
+            )],
+        })
+        api_row = {"api_name": "com.vendor.Target.call", "api_signature": "()"}
+
+        first, _symbols = tracer._target_reverse_path_context(api_row, graph)
+        graph.reverse_edges[target].append(SimpleNamespace(
+            collector="second",
+            caller_symbol_id="app.Second.call()",
+            caller_qualified_key="app.Second.call()",
+        ))
+        second, _symbols = tracer._target_reverse_path_context(api_row, graph)
+
+        self.assertEqual(first, {"first"})
+        self.assertEqual(second, {"first", "second"})
+
+    def test_missing_signature_is_rejected_before_positive_evidence_builders(self):
+        api_row = {
+            "api_name": "com.vendor.Target.call",
+            "api_signature": "",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "coord": "vendor:target",
+        }
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+        with patch.object(
+            tracer, "_build_runtime_symbol_preserved_result",
+            side_effect=AssertionError("positive evidence builder must not run"),
+        ):
+            result = tracer.trace_api_with_confidence_weighting(api_row, graph, {})
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "MISSING_API_SIGNATURE")
+
     def test_trace_api_consumes_ingestion_failures_from_graph(self):
         api_row = {
             "api_name": "com.vendor.TargetApi.call",
@@ -5107,6 +5413,36 @@ public class com.example.TargetBridge {
 
         self.assertEqual(result.analysis_status, "not_analyzed")
         self.assertEqual(result.reason_code, "FRAMEWORK_EDGE_REJECTED")
+
+    def test_analyzer_collector_failure_blocks_a_negative_conclusion(self):
+        api_row = {
+            "api_name": "com.vendor.TargetApi.call",
+            "api_simple": "call",
+            "api_signature": "(java.lang.String)",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "coord": "vendor:demo",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_scope": "method",
+        }
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+
+        tracer._record_analyzer_ledger_failure(
+            graph,
+            "BYTECODE_SCAN_FAILED",
+            artifact="broken.jar",
+            error_type="BadZipFile",
+        )
+        result = tracer.trace_api_with_confidence_weighting(api_row, graph, {})
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "BYTECODE_SCAN_FAILED")
+        self.assertEqual(
+            graph.step5_evidence_failures[0].artifact,
+            "broken.jar",
+        )
 
     def test_trace_api_consumes_ingestion_concerns_from_graph(self):
         api_row = {
@@ -9401,7 +9737,7 @@ public class com.example.TargetBridge {
         self.assertEqual({row["consumer_method"] for row in rows}, {"validate", "convert"})
         self.assertTrue(all(row["path_status"] == "uncertain" for row in rows))
         self.assertTrue(all(row["business_reachable"] == "unknown" for row in rows))
-        self.assertTrue(all(row["api_id"] and row["path_id"] for row in rows))
+        self.assertTrue(all(row["api_identity"] and row["path_id"] for row in rows))
         self.assertTrue(all("尚缺少从业务入口" in row["review_reason"] for row in rows))
         self.assertEqual(original_path_ids, [row["path_id"] for row in relocated_rows])
 
@@ -10358,7 +10694,7 @@ public class com.example.TargetBridge {
 
         self.assertTrue(tracer.is_system_code_touched(method_def, type_metadata))
 
-    def test_dependency_scheduled_entry_is_reachable_without_business_source_caller(self):
+    def test_dependency_scheduled_entry_is_uncertain_without_activation_proof(self):
         scheduled_method = SimpleNamespace(
             symbol_id="dep_job",
             qualified_key="com.dep.CleanupJob.cleanup",
@@ -10424,15 +10760,15 @@ public class com.example.TargetBridge {
             max_total_cost=5,
         )
 
-        self.assertEqual(result.analysis_status, "reachable")
-        self.assertEqual(result.reason_code, "RUNTIME_DEPENDENCY_ENTRY_REACHED")
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
         self.assertEqual(result.dependency_chain_coords, ["com.example:dep-job"])
         self.assertEqual(
             result.call_paths,
             ["com.dep.CleanupJob.cleanup → 变更API: com.vendor.LegacyApi.removed()"],
         )
 
-    def test_packaged_spring_listener_is_reachable_from_runtime_registration(self):
+    def test_packaged_spring_listener_requires_verified_runtime_registration(self):
         listener = SimpleNamespace(
             symbol_id="runtime:com.vendor:boot:com.vendor.RuntimeListener.onApplicationEvent(java.lang.Object)",
             qualified_key="com.vendor.RuntimeListener.onApplicationEvent(java.lang.Object)",
@@ -10497,8 +10833,8 @@ public class com.example.TargetBridge {
             max_total_cost=5,
         )
 
-        self.assertEqual(result.analysis_status, "reachable")
-        self.assertEqual(result.reason_code, "RUNTIME_DEPENDENCY_ENTRY_REACHED")
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
         self.assertEqual(result.dependency_chain_coords, ["com.vendor:boot"])
 
     def test_active_spring_registration_produces_complete_business_to_callback_chain(self):
@@ -10680,7 +11016,7 @@ public class com.example.TargetBridge {
         self.assertEqual(result.reason_code, "FRAMEWORK_BOUNDARY")
         self.assertNotEqual(result.analysis_status, "reachable")
 
-    def test_packaged_hit_is_reachable_when_consumer_is_registered_spring_callback(self):
+    def test_packaged_hit_requires_verified_spring_callback_activation(self):
         graph = SimpleNamespace(
             methods_by_id={},
             reverse_edges={},
@@ -10744,8 +11080,8 @@ public class com.example.TargetBridge {
         tracer._build_packaged_dependency_hit_result(draft, [hit], graph)
         built = tracer._finalize_trace_draft(draft)
 
-        self.assertEqual(built.analysis_status, "reachable")
-        self.assertEqual(built.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
+        self.assertEqual(built.analysis_status, "uncertain")
+        self.assertEqual(built.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
         self.assertIn("com.acme.Application.main -> Spring Boot框架注册", built.call_paths[-1])
         self.assertEqual(
             built.path_details[-1]["stop_reason"],
@@ -10773,10 +11109,20 @@ public class com.example.TargetBridge {
             }],
         )
         merged_draft = self._draft_from_result(generic)
+        tracer._apply_evidence_decision(
+            merged_draft,
+            paths=(tracer.ReachabilityPath(
+                path_text=generic.call_paths[0],
+                entry_scope=tracer.ModuleScope.BUSINESS_CLASSES,
+                complete=True,
+                reason_code="SYSTEM_CODE_REACHED",
+                depth=1,
+            ),),
+        )
         tracer._merge_runtime_framework_paths(merged_draft, [hit], graph)
         merged = tracer._finalize_trace_draft(merged_draft)
-        self.assertEqual(merged.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
-        self.assertTrue(any(
+        self.assertEqual(merged.reason_code, "SYSTEM_CODE_REACHED")
+        self.assertFalse(any(
             "com.acme.Application.main -> Spring Boot框架注册" in item["path_text"]
             for item in merged.path_details
         ))
@@ -11007,6 +11353,38 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             providers = tracer._build_identical_current_class_provider_index([api], graph)
 
         self.assertNotIn(("com.vendor:legacy", "com.vendor.LegacyApi"), providers)
+
+    def test_unreadable_preservation_artifact_cannot_be_treated_as_no_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            dep_dir = report / "evidence" / "dependencies"
+            old_dir = report / "evidence" / "api_changes" / "step4_artifact_jars" / "base"
+            dep_dir.mkdir(parents=True)
+            old_dir.mkdir(parents=True)
+            (dep_dir / "dep_changes.csv").write_text(
+                "coord,base_lib_entry\n"
+                "com.vendor:legacy,BOOT-INF/lib/legacy-1.0.jar\n",
+                encoding="utf-8",
+            )
+            (old_dir / "BOOT-INF__lib__legacy-1.0.jar").write_bytes(b"not-a-jar")
+            api = {
+                "coord": "com.vendor:legacy",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "com.vendor.LegacyApi.removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report),
+                runtime_dependency_catalog={"entries": []},
+            )
+
+            tracer._build_identical_current_class_provider_index([api], graph)
+            result = tracer.trace_api_with_confidence_weighting(api, graph, {})
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "PRESERVATION_BASE_ARTIFACT_UNREADABLE")
 
     def test_generate_enhanced_summary_cleans_stale_by_api_and_by_module_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -12536,7 +12914,19 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                  }]), \
                  patch.object(step5, "build_enhanced_source_graph", return_value=graph_result), \
                  patch.object(step5, "check_apis_that_need_bridge", side_effect=fake_check_bridge), \
-                 patch.object(step5, "_find_maven_jar", return_value="/tmp/sample-consumer.jar"), \
+                 patch.object(step5, "build_runtime_dependency_catalog", return_value={
+                     "by_coord": {
+                         "sample:consumer": {
+                             "coord": "sample:consumer",
+                             "version": "1.0.0",
+                             "scope": "packaged",
+                             "jar_path": "/tmp/sample-consumer.jar",
+                             "evidence_source": "current_final_artifact",
+                         },
+                     },
+                     "entries": [],
+                     "status": "complete",
+                 }), \
                  patch.object(step5, "trace_all_apis_with_confidence_weighting", return_value=[fake_result]), \
                  patch.object(step5, "generate_enhanced_summary", return_value=None):
                 exit_code = step5.step5_integrated_main(args)
@@ -12811,17 +13201,26 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "module": "demo",
             }
         ]
-        with patch.object(
-            step5,
-            "_load_coord_versions",
-            return_value={"com.example:demo": {"new_version": "1.0.0"}},
-        ), patch.object(step5, "_find_maven_jar", return_value="/tmp/demo.jar"), patch.object(
-            step5,
-            "_run_javap_for_class",
-        ) as mocked_javap:
-            metadata = step5.build_jar_metadata_for_source_roots(source_roots, ".")
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "demo.jar"
+            with zipfile.ZipFile(jar_path, "w"):
+                pass
+            runtime_catalog = {"by_coord": {
+                "com.example:demo": {
+                    "coord": "com.example:demo",
+                    "version": "1.0.0",
+                    "jar_path": str(jar_path),
+                    "evidence_source": "current_final_artifact",
+                },
+            }}
+            with patch.object(step5, "_run_javap_for_class") as mocked_javap:
+                metadata = step5.build_jar_metadata_for_source_roots(
+                    source_roots,
+                    ".",
+                    runtime_dependency_catalog=runtime_catalog,
+                )
 
-        self.assertEqual(metadata["jar_paths"], {"com.example:demo": "/tmp/demo.jar"})
+        self.assertEqual(metadata["jar_paths"], {"com.example:demo": str(jar_path)})
         self.assertEqual(metadata["by_class"], {})
         self.assertEqual(metadata["by_coord"]["com.example:demo"]["classes"], {})
         mocked_javap.assert_not_called()
@@ -16477,8 +16876,14 @@ public class com.example.consumer.Adapter {
                 )
 
             self.assertEqual(mocked_run.call_count, 1)
-            self.assertEqual([item.analysis_status for item in results], ["uncertain", "not_found_in_static_analysis"])
-            self.assertEqual(results[0].reason_code, "PACKAGED_DEPENDENCY_BYTECODE_USAGE")
+            self.assertEqual(
+                [item.analysis_status for item in results],
+                ["not_analyzed", "not_analyzed"],
+            )
+            self.assertEqual(
+                results[0].reason_code,
+                "FINAL_ARTIFACT_PROVENANCE_UNREADABLE",
+            )
 
     def test_batch_packaged_bytecode_skips_javap_for_string_only_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -16544,6 +16949,57 @@ public class com.example.consumer.StringOnly {
             # A valid direct classfile parse proves this is only a string
             # literal, so the constant-pool fast path must avoid javap.
             mocked_javap.assert_not_called()
+
+    def test_batch_packaged_bytecode_skips_owner_and_member_string_constants_without_reflection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes_root = self._compile_java_fixture(
+                tmp,
+                "com/example/consumer/StringOnly.java",
+                """
+package com.example.consumer;
+
+public class StringOnly {
+    private static final String OWNER_INTERNAL = "com/vendor/Target";
+    private static final String OWNER_DOTTED = "com.vendor.Target";
+    private static final String METHOD = "removed";
+
+    public String describe() {
+        return OWNER_INTERNAL + OWNER_DOTTED + METHOD;
+    }
+}
+""",
+            )
+            jar_path = Path(tmp) / "consumer.jar"
+            self._jar_compiled_classes(jar_path, classes_root)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "by_coord": {
+                        "sample:consumer": {
+                            "coord": "sample:consumer",
+                            "version": "1",
+                            "scope": "compile",
+                            "jar_path": str(jar_path),
+                        }
+                    },
+                },
+            )
+            apis = [{
+                "coord": "com.vendor:api",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }]
+
+            with patch.object(tracer, "run_cmd", side_effect=AssertionError("javap should be skipped")):
+                tracer._build_packaged_runtime_dependency_scan_cache(apis, graph)
+
+            cached = graph.runtime_dependency_catalog["_packaged_api_scan_results"]
+            self.assertEqual(cached[tracer.build_api_identity_key(apis[0])]["status"], "miss")
 
     def test_batch_packaged_bytecode_keeps_reflection_string_candidates_for_javap(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -18072,6 +18528,35 @@ public class com.example.consumer.Adapter {
         self.assertTrue(result.call_paths)
         self.assertEqual(result.direct_callers, 1)
         self.assertEqual(result.evidence_paths[0][0]["evidence_type"], "ast_method_invocation")
+
+    def test_source_artifact_miss_replaces_prior_complete_source_paths(self):
+        api_row = {
+            "coord": "lib:api", "api_name": "lib.Api.FLAG", "api_simple": "FLAG",
+            "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
+            "severity": "P0", "confirmed": "true",
+        }
+        graph = SimpleNamespace(source_artifact_alignment={"status": "unverified"})
+        method = SimpleNamespace(
+            symbol_id="source", qualified_key="app.App.run", owner_type="business",
+            owner_coord="__business__", is_test=False, file="App.java", line=4,
+            class_fqcn="app.App", method_name="run",
+        )
+        draft = tracer._new_trace_draft(api_row)
+        tracer._build_direct_usage_result(
+            draft,
+            method,
+            "DIRECT_FIELD_USAGE",
+            "source field usage",
+            "field_access",
+            "lib.Api.FLAG",
+        )
+
+        tracer._apply_source_artifact_miss(draft, graph, "final artifact miss")
+        result = tracer._finalize_trace_draft(draft)
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "SOURCE_ARTIFACT_ALIGNMENT_UNVERIFIED")
+        self.assertFalse(any(path.complete for path in draft.envelope_paths))
 
     def test_target_runtime_closure_continues_upstream_from_field_consumer(self):
         api_row = {

@@ -549,6 +549,7 @@ def _to_call_edge(
     converted.instruction_offset = edge.provenance.instruction_offset
     converted.evidence_authority = edge.provenance.authority.value
     converted.semantic = edge.semantic
+    converted.framework_activation_verified = edge.activation_verified
     converted.collector = collector
     converted.evidence_registry_identity = _edge_identity(edge)
     converted.activation_conditions = thaw_evidence_value(edge.activation_conditions)
@@ -1537,6 +1538,7 @@ def _activation_call_edge(
         "artifact_sha256": edge.provenance.artifact_sha256,
         "artifact_entry": edge.provenance.artifact_entry,
         "semantic": True,
+        "framework_activation_verified": True,
         "collector": batch.collector,
         "framework_final_artifact_verified": framework_verified,
         "caller_evidence_source": caller_evidence_source,
@@ -1595,12 +1597,17 @@ def _project_framework_entries(graph, records):
             and str(edge_mapping.get("runtime_activation") or "") == "active"
             and (verified_activations or not final_artifact_mode)
         )
+        runtime_entry_record = None
         if callback_is_active:
-            runtime_entries.setdefault(target.split("(", 1)[0], []).append({
+            runtime_entry_record = {
                 **edge_mapping,
                 "adapter": batch.collector,
                 "adapter_version": batch.version,
-            })
+                "activation_verified": bool(verified_activations),
+            }
+            runtime_entries.setdefault(target.split("(", 1)[0], []).append(
+                runtime_entry_record
+            )
         if not candidates:
             unmatched += 1
             continue
@@ -1665,6 +1672,8 @@ def _project_framework_entries(graph, records):
                         activation,
                     )
                     _append_call_edge(graph, callback_keys, synthetic)
+                    if runtime_entry_record is not None:
+                        runtime_entry_record["activation_verified"] = True
                 activation_linked_symbols.add(method.symbol_id)
 
     graph.framework_entry_symbols = entries
@@ -1739,6 +1748,18 @@ class EvidenceRegistry:
         merged_by_collector = {}
         duplicate_by_collector = {}
         rejected_by_collector = {}
+        call_edge_identity_index = {}
+
+        def indexed_call_edge_identities(collector, lookup_key):
+            cache_key = (collector, lookup_key)
+            identities = call_edge_identity_index.get(cache_key)
+            if identities is None:
+                identities = {
+                    _call_edge_identity(existing, collector)
+                    for existing in graph.reverse_edges.get(lookup_key, ())
+                }
+                call_edge_identity_index[cache_key] = identities
+            return identities
 
         def reject_unknown_scope(batch, edge):
             nonlocal rejected
@@ -1815,15 +1836,19 @@ class EvidenceRegistry:
                     converted.callee_simple_key,
                 )))
                 if any(
-                    _call_edge_identity(existing, batch.collector) == converted_identity
+                    converted_identity in indexed_call_edge_identities(
+                        batch.collector, key
+                    )
                     for key in keys
-                    for existing in graph.reverse_edges.get(key, ())
                 ):
                     record_duplicate(batch)
                     continue
                 record_merge(batch, edge)
                 for key in keys:
                     graph.reverse_edges.setdefault(key, []).append(converted)
+                    indexed_call_edge_identities(
+                        batch.collector, key
+                    ).add(converted_identity)
 
         framework_batches = tuple(
             batch for batch in self.batches if _is_framework_batch(batch)
@@ -1928,14 +1953,27 @@ class EvidenceRegistry:
             reverse_edge_snapshot,
         )
 
+        call_edge_identity_index.clear()
         for batch in post_framework_batches:
             ingest_ordinary_batch(batch)
 
         def cumulative(existing, additions):
             merged = list(existing or ())
+
+            def dedupe_key(item):
+                try:
+                    hash(item)
+                except TypeError:
+                    return type(item), repr(item)
+                return type(item), item
+
+            seen_items = {dedupe_key(item) for item in merged}
             for item in additions:
-                if item not in merged:
-                    merged.append(item)
+                item_key = dedupe_key(item)
+                if item_key in seen_items:
+                    continue
+                seen_items.add(item_key)
+                merged.append(item)
             return tuple(merged)
 
         prior_registry = tuple(

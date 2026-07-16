@@ -44,11 +44,9 @@ public class com.example.LegacyApi {
     def test_export_removed_jar_apis_aggregates_all_public_symbols(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
+            old_jar = output_dir / "legacy-lib-1.0.0.jar"
+            old_jar.write_bytes(b"final-artifact-jar")
             with patch.object(
-                step4,
-                "find_jar_in_m2",
-                return_value=str(output_dir / "legacy-lib-1.0.0.jar"),
-            ), patch.object(
                 step4,
                 "_iter_jar_class_entries",
                 return_value=["com.example.LegacyApi"],
@@ -66,10 +64,12 @@ public class com.example.LegacyApi {
                     coord="com.example:legacy-lib",
                     old_ver="1.0.0",
                     output_dir=str(output_dir),
+                    old_jar_path=str(old_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
                 )
                 self.assertIsNone(err)
                 self.assertTrue(Path(out_file).exists())
-                self.assertEqual(jar_info["old_jar"], str(output_dir / "legacy-lib-1.0.0.jar"))
+                self.assertEqual(jar_info["old_jar"], str(old_jar))
                 self.assertEqual([row["symbol_kind"] for row in apis], ["class", "constructor", "method"])
 
 

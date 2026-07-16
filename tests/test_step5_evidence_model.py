@@ -25,6 +25,7 @@ from step5_evidence_model import (
     EvidenceFailure,
     EvidenceProvenance,
     ModuleScope,
+    PhysicalCallEdge,
     PreservationEvidence,
     ReachabilityPath,
     TraceSeed,
@@ -46,7 +47,9 @@ class EvidenceModelTest(unittest.TestCase):
         }
         return tracer.TraceDraft(**values)
 
-    def _final_artifact_edge(self, *, semantic=False, authority=None):
+    def _final_artifact_edge(
+        self, *, semantic=False, authority=None, activation_verified=False
+    ):
         return CollectedEdge(
             caller_symbol="com.acme.Application.run()",
             callee_symbol="com.vendor.Legacy.call()",
@@ -55,6 +58,7 @@ class EvidenceModelTest(unittest.TestCase):
                 else "bytecode_method_invocation"
             ),
             semantic=semantic,
+            activation_verified=activation_verified,
             owner_scope=ModuleScope.BUSINESS_CLASSES,
             provenance=EvidenceProvenance(
                 authority=authority or (
@@ -96,6 +100,23 @@ class EvidenceModelTest(unittest.TestCase):
             EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
         )
 
+    def test_collected_activation_proof_is_typed_and_serialized(self):
+        edge = self._final_artifact_edge(
+            semantic=True,
+            authority=EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
+            activation_verified=True,
+        )
+
+        mapping = CollectorBatch(
+            collector="indirect_usage",
+            version="1",
+            edges=(edge,),
+        ).to_mapping()
+
+        self.assertTrue(mapping["edges"][0]["activation_verified"])
+        with self.assertRaisesRegex(ValueError, "only valid for semantic edges"):
+            self._final_artifact_edge(activation_verified=True)
+
     def test_collector_batch_serialization_is_deterministic(self):
         batch = CollectorBatch(
             collector="business_bytecode",
@@ -115,6 +136,146 @@ class EvidenceModelTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first["collector"], "business_bytecode")
         self.assertEqual(first["edges"][0]["provenance"]["artifact_sha256"], "a" * 64)
+
+    def test_coverage_scope_is_validated_and_serialized(self):
+        coverage = CoverageRecord(
+            collector="spring_basic",
+            api_identity="spring_basic",
+            status="partial",
+            scope="path",
+        )
+        batch = CollectorBatch(
+            collector="spring_basic",
+            version="1",
+            coverage=(coverage,),
+        )
+
+        self.assertEqual(batch.to_mapping()["coverage"][0]["scope"], "path")
+        with self.assertRaisesRegex(ValueError, "unsupported coverage scope"):
+            CoverageRecord(
+                collector="spring_basic",
+                api_identity="spring_basic",
+                status="partial",
+                scope="unknown",
+            )
+
+    def test_observed_target_concern_precedes_partial_coverage_gap(self):
+        target = "com.vendor.Legacy.call()"
+        decision = decide_envelope(EvidenceEnvelope(
+            target_identity=target,
+            concerns=(EvidenceConcern(
+                stage="indirect-usage-analysis",
+                reason_code="REFLECTION_OVERLOAD_UNRESOLVED",
+                api_identity=target,
+                detail="dynamic member name",
+            ),),
+            coverage=(CoverageRecord(
+                collector="indirect_usage:reflection_source",
+                api_identity=target,
+                status="partial",
+                reason_codes=("reflection_source_partial",),
+            ),),
+        ))
+
+        self.assertEqual(decision.analysis_status, "uncertain")
+        self.assertEqual(decision.reason_code, "REFLECTION_OVERLOAD_UNRESOLVED")
+
+    def test_input_validation_failure_precedes_collector_failure_regardless_of_order(self):
+        collector_failure = EvidenceFailure(
+            stage="business-bytecode",
+            reason_code="CURRENT_FINAL_ARTIFACT_REQUIRED",
+            blocking=True,
+        )
+        input_failure = EvidenceFailure(
+            stage="input-validation",
+            reason_code="MISSING_API_SIGNATURE",
+            blocking=True,
+        )
+        for failures in (
+            (collector_failure, input_failure),
+            (input_failure, collector_failure),
+        ):
+            with self.subTest(order=[item.stage for item in failures]):
+                decision = decide_analysis((), failures)
+                self.assertEqual(decision.analysis_status, "not_analyzed")
+                self.assertEqual(decision.reason_code, "MISSING_API_SIGNATURE")
+
+    def test_input_validation_failure_precedes_positive_evidence(self):
+        failure = EvidenceFailure(
+            stage="input-validation",
+            reason_code="MISSING_API_SIGNATURE",
+            blocking=True,
+        )
+        path = ReachabilityPath(
+            path_text="Application.run -> Legacy.call",
+            entry_scope=ModuleScope.BUSINESS_CLASSES,
+            complete=True,
+        )
+        preservation = PreservationEvidence(
+            reason_code="API_PRESERVED",
+            detail="symbol still exists",
+        )
+        for kwargs in ({"paths": (path,)}, {"preservation": preservation}):
+            with self.subTest(evidence=next(iter(kwargs))):
+                decision = decide_analysis(
+                    kwargs.get("paths", ()),
+                    failures=(failure,),
+                    preservation=kwargs.get("preservation"),
+                )
+                self.assertEqual(decision.analysis_status, "not_analyzed")
+                self.assertEqual(decision.reason_code, "MISSING_API_SIGNATURE")
+
+    def test_collector_failure_does_not_erase_independent_reachable_path(self):
+        decision = decide_analysis(
+            (ReachabilityPath(
+                path_text="Application.run -> Legacy.call",
+                entry_scope=ModuleScope.BUSINESS_CLASSES,
+                complete=True,
+            ),),
+            failures=(EvidenceFailure(
+                stage="business-bytecode",
+                reason_code="CURRENT_FINAL_ARTIFACT_REQUIRED",
+                blocking=True,
+            ),),
+        )
+
+        self.assertEqual(decision.analysis_status, "reachable")
+        self.assertEqual(decision.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
+
+    def test_unrelated_concern_does_not_override_partial_target_coverage(self):
+        target = "com.vendor.Legacy.call()"
+        coverage = (CoverageRecord(
+            collector="business_bytecode",
+            api_identity=target,
+            status="partial",
+            reason_codes=("BYTECODE_CALLER_UNRESOLVED",),
+        ),)
+        for concern_identity in ("", "com.other.Api.call()"):
+            with self.subTest(concern_identity=concern_identity):
+                decision = decide_envelope(EvidenceEnvelope(
+                    target_identity=target,
+                    concerns=(EvidenceConcern(
+                        stage="source-analysis",
+                        reason_code="UNRELATED_CONCERN",
+                        api_identity=concern_identity,
+                        detail="unrelated",
+                    ),),
+                    coverage=coverage,
+                ))
+                self.assertEqual(decision.analysis_status, "not_analyzed")
+                self.assertEqual(decision.reason_code, "INCOMPLETE_EVIDENCE_COVERAGE")
+
+    def test_concern_selection_is_deterministic(self):
+        concerns = (
+            EvidenceConcern(stage="z-stage", reason_code="Z_REASON", detail="z"),
+            EvidenceConcern(stage="a-stage", reason_code="A_REASON", detail="a"),
+        )
+        decisions = [
+            decide_analysis((), concerns=ordered)
+            for ordered in (concerns, tuple(reversed(concerns)))
+        ]
+
+        self.assertEqual([item.reason_code for item in decisions], ["A_REASON", "A_REASON"])
 
     def test_typed_evidence_recursively_copies_mutable_input_containers(self):
         edge = self._final_artifact_edge()
@@ -222,7 +383,16 @@ class EvidenceModelTest(unittest.TestCase):
         cases = [
             ({"coord": "__business__"}, ModuleScope.BUSINESS_CLASSES),
             (
-                {"coord": "com.example:library", "application_owned": True},
+                {
+                    "coord": "com.example:library",
+                    "application_owned": True,
+                    "ownership_evidence": {
+                        "authority": "reactor_coordinate_and_final_artifact_entry",
+                        "reactor_coord": "com.example:library",
+                        "artifact_entry": "BOOT-INF/lib/library.jar",
+                        "final_artifact_sha256": "a" * 64,
+                    },
+                },
                 ModuleScope.INTERNAL_MODULE,
             ),
             ({"coord": "org.example:external"}, ModuleScope.EXTERNAL_DEPENDENCY),
@@ -262,10 +432,49 @@ class EvidenceModelTest(unittest.TestCase):
             complete=True,
             stop_reason="RUNTIME_FRAMEWORK_ENTRY_REACHED",
             depth=4,
+            evidence=(PhysicalCallEdge(
+                caller_symbol="Application.main",
+                callee_key="Listener.receive",
+                evidence_type="spring_runtime_registered_callback",
+                owner_scope=ModuleScope.BUSINESS_CLASSES,
+                semantic=True,
+                activation_verified=True,
+            ),),
         ),))
 
         self.assertEqual(decision.analysis_status, "reachable")
         self.assertEqual(decision.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
+
+    def test_framework_label_without_typed_activation_proof_is_uncertain(self):
+        decision = decide_analysis((ReachabilityPath(
+            path_text="Application.main -> Spring registration -> Listener.receive -> API",
+            entry_scope=ModuleScope.BUSINESS_CLASSES,
+            complete=True,
+            stop_reason="RUNTIME_FRAMEWORK_ENTRY_REACHED",
+            depth=4,
+        ),))
+
+        self.assertEqual(decision.analysis_status, "uncertain")
+        self.assertEqual(decision.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
+
+    def test_semantic_edge_without_independent_activation_is_uncertain(self):
+        decision = decide_analysis((ReachabilityPath(
+            path_text="Service.call -> Mapper.proxy -> API",
+            entry_scope=ModuleScope.BUSINESS_CLASSES,
+            complete=True,
+            depth=3,
+            evidence=(PhysicalCallEdge(
+                caller_symbol="Service.call",
+                callee_key="Mapper.proxy",
+                evidence_type="mybatis_mapper_proxy",
+                owner_scope=ModuleScope.BUSINESS_CLASSES,
+                semantic=True,
+                activation_verified=False,
+            ),),
+        ),))
+
+        self.assertEqual(decision.analysis_status, "uncertain")
+        self.assertEqual(decision.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
 
     def test_reachable_path_can_preserve_evidence_specific_conclusion_text(self):
         decision = decide_analysis((ReachabilityPath(
@@ -815,7 +1024,7 @@ class EvidenceModelTest(unittest.TestCase):
         self.assertEqual(built.direct_callers, 1)
         self.assertEqual(built.business_reach_depth, 1)
 
-    def test_registered_business_callback_keeps_framework_activation_path(self):
+    def test_direct_business_bytecode_reach_does_not_need_framework_activation(self):
         result = tracer.TraceResult(
             api_name="java.util.concurrent.CountDownLatch.countDown",
             api_simple="countDown",
@@ -875,7 +1084,7 @@ class EvidenceModelTest(unittest.TestCase):
         built = tracer._finalize_trace_draft(draft)
 
         self.assertEqual(built.analysis_status, "reachable")
-        self.assertEqual(built.reason_code, "RUNTIME_FRAMEWORK_ENTRY_REACHED")
+        self.assertEqual(built.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
         self.assertTrue(any(
             "com.example.Application.main -> Spring Boot框架注册" in path
             and "com.example.Receiver.receiveMessage(String)" in path

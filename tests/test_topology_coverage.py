@@ -202,6 +202,91 @@ class TopologyCoverageTest(unittest.TestCase):
             "(example.Outer.Callback)",
         )
 
+    def test_target_identity_accepts_binary_nested_class_signature(self):
+        row = {
+            "coord": "example:nested",
+            "api_name": "example.Outer$Builder.withCallback",
+            "api_signature": "(example.Outer$Callback)",
+            "symbol_kind": "method",
+        }
+        entry = "BOOT-INF/lib/nested.jar!/example/Outer$Builder.class"
+        method = {
+            "member": "withCallback",
+            "descriptor": "(Lexample/Outer$Callback;)Lexample/Outer$Builder;",
+        }
+        with mock.patch.object(
+            topology_coverage,
+            "_topology_javap_methods",
+            return_value=("example.Outer$Builder", [method]),
+        ):
+            targets, unresolved = topology_coverage._selected_target_identities(
+                [row], [], {"classes": {entry: b"class"}}
+            )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(targets[0]["descriptor"], method["descriptor"])
+
+    def test_target_identity_accepts_source_nested_class_owner(self):
+        row = {
+            "coord": "example:nested",
+            "api_name": "example.Outer.Builder.withCallback",
+            "api_signature": "(example.Outer.Callback)",
+            "symbol_kind": "method",
+        }
+        entry = "BOOT-INF/lib/nested.jar!/example/Outer$Builder.class"
+        method = {
+            "member": "withCallback",
+            "descriptor": "(Lexample/Outer$Callback;)Lexample/Outer$Builder;",
+        }
+        with mock.patch.object(
+            topology_coverage,
+            "_topology_javap_methods",
+            return_value=("example.Outer$Builder", [method]),
+        ):
+            targets, unresolved = topology_coverage._selected_target_identities(
+                [row], [], {"classes": {entry: b"class"}}
+            )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(targets[0]["owner"], "example.Outer$Builder")
+
+    def test_bulk_topology_skips_unreferenced_method_declaration_javap(self):
+        row = {
+            "coord": "example:api",
+            "api_name": "example.Api.unused",
+            "api_signature": "()",
+            "symbol_kind": "method",
+        }
+        inventory = {
+            "classes": {"BOOT-INF/lib/api.jar!/example/Api.class": b"class"}
+        }
+
+        with mock.patch.object(
+            topology_coverage, "_topology_javap_methods"
+        ) as javap:
+            targets, unresolved = topology_coverage._selected_target_identities(
+                [row], [], inventory, resolve_unreferenced=False
+            )
+
+        javap.assert_not_called()
+        self.assertEqual(targets, [])
+        self.assertEqual(unresolved, [])
+
+    def test_bulk_topology_does_not_treat_changed_class_as_a_call_target(self):
+        row = {
+            "coord": "example:api",
+            "api_name": "example.RemovedType",
+            "api_signature": "",
+            "symbol_kind": "class",
+        }
+
+        targets, unresolved = topology_coverage._selected_target_identities(
+            [row], [], {"classes": {}}, resolve_unreferenced=False
+        )
+
+        self.assertEqual(targets, [])
+        self.assertEqual(unresolved, [])
+
     def test_artifact_topology_reuses_precomputed_oracle_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -894,6 +979,87 @@ class TopologyCoverageTest(unittest.TestCase):
         ])
         self.assertEqual(callback["registration_instruction_offset"], 7)
         self.assertEqual(callback["start_class"], "sample.Application")
+
+    def test_packaged_command_line_runner_activation_is_framework_callback_topology(self):
+        target = ("vendor.Api", "call", "()V")
+        inventory = {
+            "resources": {
+                "META-INF/MANIFEST.MF": (
+                    b"Manifest-Version: 1.0\nStart-Class: sample.Application\n"
+                ),
+            },
+            "classes": {
+                "BOOT-INF/classes/sample/Application.class": b"application",
+                "BOOT-INF/classes/sample/StartupTask.class": b"runner",
+            },
+        }
+        edges = [
+            {
+                "artifact_entry": "BOOT-INF/classes/sample/StartupTask.class",
+                "caller_owner": "sample.StartupTask",
+                "caller_member": "run",
+                "caller_descriptor": "([Ljava/lang/String;)V",
+                "callee_owner": target[0],
+                "callee_member": target[1],
+                "callee_descriptor": target[2],
+            },
+        ]
+        verbose_runner = """
+class sample.StartupTask implements org.springframework.boot.CommandLineRunner
+RuntimeVisibleAnnotations:
+  0: #1()
+    org.springframework.stereotype.Component
+"""
+        application_javap = """
+public class sample.Application {
+  public static void main(java.lang.String[]);
+    descriptor: ([Ljava/lang/String;)V
+    Code:
+         0: invokestatic  #1  // Method org/springframework/boot/SpringApplication.run:(Ljava/lang/Class;[Ljava/lang/String;)Lorg/springframework/context/ConfigurableApplicationContext;
+}
+"""
+
+        def javap_output(content, *_args):
+            return application_javap if content == b"application" else verbose_runner
+
+        with mock.patch.object(
+            topology_coverage,
+            "_javap_text",
+            side_effect=javap_output,
+        ):
+            callbacks = topology_coverage._framework_callback_evidence(
+                inventory, {target}, edges
+            )
+        with mock.patch.object(
+            topology_coverage,
+            "_javap_text",
+            side_effect=lambda content, *_args: (
+                application_javap if content == b"application" else
+                "class sample.StartupTask implements "
+                "org.springframework.boot.CommandLineRunner\n"
+            ),
+        ):
+            unregistered_callbacks = topology_coverage._framework_callback_evidence(
+                inventory, {target}, edges
+            )
+        observed = topology_coverage.classify_topologies([], {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [{
+                "owner": target[0], "member": target[1], "descriptor": target[2],
+            }],
+            "entry_layout": [],
+            "framework_callback_links": callbacks,
+        })
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0]["start_class"], "sample.Application")
+        self.assertEqual(callbacks[0]["callback"], [
+            "sample.StartupTask", "run", "([Ljava/lang/String;)V",
+        ])
+        self.assertEqual(callbacks[0]["targets"], [list(target)])
+        self.assertEqual(unregistered_callbacks, [])
+        self.assertIn("framework_callback", observed)
 
     def test_source_conflict_requires_verified_provenance_and_explicit_normalization(self):
         with tempfile.TemporaryDirectory() as temp_dir:

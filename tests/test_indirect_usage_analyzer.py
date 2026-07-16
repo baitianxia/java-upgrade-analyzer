@@ -199,6 +199,12 @@ class IndirectUsageAnalyzerTest(unittest.TestCase):
         graph.runtime_dependency_catalog = {"by_coord": {
             "com.acme:internal-module": {
                 "coord": "com.acme:internal-module", "application_owned": True,
+                "ownership_evidence": {
+                    "authority": "reactor_coordinate_and_final_artifact_entry",
+                    "reactor_coord": "com.acme:internal-module",
+                    "artifact_entry": "BOOT-INF/lib/internal-module.jar",
+                    "final_artifact_sha256": "a" * 64,
+                },
             }
         }}
 

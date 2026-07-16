@@ -1,0 +1,251 @@
+{
+  "schema_version": 1,
+  "families": [
+    {
+      "family_id": "artifact_identity_ownership",
+      "invariant_id": "final_artifact_identity_and_ownership",
+      "invariant": "Every analyzed class and edge has one verified final-artifact identity and explicit ownership; packaging layout and coordinate equality never suppress a physical edge.",
+      "root_cause_families": [
+        "artifact_provenance",
+        "ownership_classification"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/confidence_weighted_tracer.py",
+        "scripts/s5_call_chain_engine_integrated.py",
+        "scripts/step5_evidence_model.py"
+      ],
+      "positive_tests": [
+        "tests.test_artifact_identity_ownership_invariants.ArtifactIdentityOwnershipInvariantTest.test_reactor_nested_module_has_final_artifact_ownership_evidence",
+        "tests.test_artifact_identity_ownership_invariants.ArtifactIdentityOwnershipInvariantTest.test_missing_orchestrator_state_recovers_scope_from_reactor_and_artifact",
+        "tests.test_artifact_identity_ownership_invariants.ArtifactIdentityOwnershipInvariantTest.test_runtime_scan_preserves_verified_internal_module_ownership"
+      ],
+      "negative_tests": [
+        "tests.test_artifact_identity_ownership_invariants.ArtifactIdentityOwnershipInvariantTest.test_same_group_dependency_is_not_internal_without_reactor_membership",
+        "tests.test_artifact_identity_ownership_invariants.ArtifactIdentityOwnershipInvariantTest.test_scope_recovery_does_not_promote_same_group_non_reactor_jar",
+        "tests.test_artifact_identity_ownership_invariants.ArtifactIdentityOwnershipInvariantTest.test_unproved_application_owned_flag_cannot_create_internal_scope"
+      ],
+      "mutation_tests": [
+        "tests.test_artifact_identity_ownership_invariants.ArtifactIdentityOwnershipInvariantTest.test_mismatched_reactor_coordinate_cannot_create_internal_scope"
+      ],
+      "cross_project_guards": [
+        "gs-multi-module",
+        "ruoyi-full-artifact-discovery"
+      ],
+      "architecture_review_on_repeat": true
+    },
+    {
+      "family_id": "canonical_evidence_identity",
+      "invariant_id": "canonical_owner_member_descriptor_identity",
+      "invariant": "Every evidence producer uses the same canonical coordinate, owner, member, descriptor, symbol kind, and change identity before graph ingestion or Oracle reconciliation.",
+      "root_cause_families": [
+        "evidence_identity"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/confidence_weighted_tracer.py",
+        "scripts/exhaustive_api_oracle.py",
+        "scripts/final_artifact_edge_oracle.py",
+        "scripts/indirect_usage_analyzer.py",
+        "scripts/real_project_regression.py",
+        "scripts/signature_utils.py",
+        "scripts/step5_evidence_ingestion.py",
+        "scripts/step5_evidence_model.py",
+        "scripts/third_party_jdeps_oracle.py",
+        "scripts/third_party_jdk_oracle.py"
+      ],
+      "positive_tests": [
+        "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_equivalent_source_and_bytecode_spellings_have_one_identity",
+        "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_trace_envelope_uses_canonical_target_identity",
+        "tests.test_third_party_jdk_oracle.ThirdPartyJdkOracleTest.test_javap_certifies_only_exact_owner_and_descriptor",
+        "tests.test_third_party_jdeps_oracle.ThirdPartyJdepsOracleTest.test_scan_artifact_uses_jdeps_as_independent_class_authority"
+      ],
+      "negative_tests": [
+        "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_different_change_types_never_collapse_in_any_producer"
+      ],
+      "mutation_tests": [
+        "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_dropping_change_identity_from_oracle_fails_closed"
+      ],
+      "cross_project_guards": [
+        "ruoyi-full-artifact-discovery"
+      ],
+      "architecture_review_on_repeat": true
+    },
+    {
+      "family_id": "evidence_completeness_visibility",
+      "invariant_id": "parser_failure_never_becomes_absence",
+      "invariant": "Missing, partial, failed, timed-out, or conflicting evidence remains explicit and can never be converted into a normal empty result or a proved absence.",
+      "root_cause_families": [
+        "error_visibility",
+        "oracle_gap",
+        "static_evidence_limit"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/confidence_weighted_tracer.py",
+        "scripts/exhaustive_api_oracle.py",
+        "scripts/final_artifact_edge_oracle.py",
+        "scripts/real_project_regression.py",
+        "scripts/step5_evidence_ingestion.py"
+      ],
+      "positive_tests": [
+        "tests.test_evidence_completeness_visibility.EvidenceCompletenessVisibilityInvariantTest.test_critical_evidence_paths_have_no_bare_or_pass_handlers",
+        "tests.test_business_bytecode_graph.BusinessBytecodeGraphTest.test_collect_business_bytecode_batch_reports_parse_failure",
+        "tests.test_indirect_usage_analyzer.IndirectUsageAnalyzerTest.test_collect_indirect_usage_batch_reports_resource_read_failure_as_evidence_failure",
+        "tests.test_final_artifact_edge_oracle.FinalArtifactEdgeOraclePerformanceTest.test_hung_javap_version_probe_returns_a_structured_incomplete_result"
+      ],
+      "negative_tests": [
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_malformed_context_cannot_fall_back_to_empty_source_scope",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_corrupt_nested_final_artifact_is_incomplete_not_verified"
+      ],
+      "mutation_tests": [
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_analyzer_collector_failure_blocks_a_negative_conclusion",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_unreadable_preservation_artifact_cannot_be_treated_as_no_provider"
+      ],
+      "cross_project_guards": [
+        "gs-managing-transactions",
+        "ruoyi-full-artifact-discovery"
+      ],
+      "architecture_review_on_repeat": true
+    },
+    {
+      "family_id": "framework_activation_semantics",
+      "invariant_id": "framework_edges_are_typed_and_activation_bounded",
+      "invariant": "Proxy, reflection, configuration, callback, and framework activation evidence remains typed and cannot be promoted to an ordinary static edge or reachable conclusion without an independently proved business activation path.",
+      "root_cause_families": [
+        "business_activation_not_proven",
+        "framework_semantics"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/confidence_weighted_tracer.py",
+        "scripts/framework_adapters.py",
+        "scripts/s5_call_chain_engine_integrated.py",
+        "scripts/step5_evidence_ingestion.py",
+        "scripts/step5_evidence_model.py"
+      ],
+      "positive_tests": [
+        "tests.test_step5_evidence_model.EvidenceModelTest.test_framework_activated_path_is_reachable",
+        "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_mybatis_high_confidence_requires_one_sha_bound_complete_evidence_chain",
+        "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_runtime_callback_verified_activation_carries_traceable_composite_provenance",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_active_spring_registration_produces_complete_business_to_callback_chain",
+        "tests.test_indirect_usage_analyzer.IndirectUsageAnalyzerTest.test_exact_reflection_chain_becomes_reachable_step5_edge",
+        "tests.test_step5_evidence_model.EvidenceModelTest.test_collected_activation_proof_is_typed_and_serialized"
+      ],
+      "negative_tests": [
+        "tests.test_step5_evidence_model.EvidenceModelTest.test_framework_label_without_typed_activation_proof_is_uncertain",
+        "tests.test_step5_evidence_model.EvidenceModelTest.test_semantic_edge_without_independent_activation_is_uncertain",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_dependency_scheduled_entry_is_uncertain_without_activation_proof",
+        "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_runtime_callback_source_only_activation_is_not_linked_in_final_artifact_mode"
+      ],
+      "mutation_tests": [
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_packaged_hit_requires_verified_spring_callback_activation",
+        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_runtime_reachable_dominates_static_absence_without_oracle_conflict"
+      ],
+      "cross_project_guards": [
+        "dubbo-spring6-security",
+        "gs-managing-transactions",
+        "mybatis-sample-xml"
+      ],
+      "architecture_review_on_repeat": true
+    },
+    {
+      "family_id": "closed_world_pipeline",
+      "invariant_id": "step4_step5_oracle_identity_closed_set",
+      "invariant": "The complete Step4 API population, Step5 accounted identities, analyzer conclusions, and independent Oracle ledger form the same closed identity set without filtering, duplicates, extras, or conflicts.",
+      "root_cause_families": [
+        "coverage_scope",
+        "output_contract",
+        "workflow_gate"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/enhanced_output_formatter.py",
+        "scripts/exhaustive_api_oracle.py",
+        "scripts/quality_gate.py",
+        "scripts/real_project_regression.py",
+        "scripts/s4_jar_compare.py",
+        "scripts/s5_call_chain_engine_integrated.py",
+        "scripts/signature_utils.py"
+      ],
+      "positive_tests": [
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_accepts_one_identical_canonical_identity_set",
+        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_audit_verifies_every_api_with_third_party_provenance"
+      ],
+      "negative_tests": [
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_uses_coordinate_and_change_type_in_closed_identity_set",
+        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_missing_analyzer_identity_is_an_explicit_closed_world_failure"
+      ],
+      "mutation_tests": [
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_rejects_equal_count_summary_with_wrong_identity_set",
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_rejects_duplicate_step4_canonical_identity",
+        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_duplicate_changed_identity_is_an_explicit_closed_world_failure"
+      ],
+      "cross_project_guards": [
+        "ruoyi-full-artifact-discovery"
+      ],
+      "architecture_review_on_repeat": true
+    },
+    {
+      "family_id": "reproducible_test_assets",
+      "invariant_id": "pinned_assets_are_rebuildable_or_block",
+      "invariant": "Every mandatory real-project guard is reproducible from a pinned revision and verified final-artifact SHA; unavailable assets block and are never silently skipped or replaced by loose classes.",
+      "root_cause_families": [
+        "test_asset_invalid"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/materialize_real_project_asset.py",
+        "scripts/quality_gate.py",
+        "scripts/real_project_regression.py"
+      ],
+      "positive_tests": [
+        "tests.test_materialize_real_project_asset.MaterializeRealProjectAssetTest.test_source_build_plan_is_revision_scoped_and_never_uses_a_shell",
+        "tests.test_materialize_real_project_asset.MaterializeRealProjectAssetTest.test_published_plan_downloads_to_sha_scoped_destination",
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_every_pinned_manifest_has_an_executable_materialization_contract"
+      ],
+      "negative_tests": [
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_absolute_artifact_path_without_published_origin_is_not_reproducible",
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_run_case_fails_closed_when_discovery_artifact_is_missing"
+      ],
+      "mutation_tests": [
+        "tests.test_materialize_real_project_asset.MaterializeRealProjectAssetTest.test_cli_rejects_manifest_without_reproducible_contract",
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_pinned_asset_gate_rejects_missing_materialization_contract",
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_run_case_fails_closed_when_topology_artifact_is_missing"
+      ],
+      "cross_project_guards": [
+        "dubbo-spring6-security",
+        "gs-multi-module"
+      ],
+      "architecture_review_on_repeat": true
+    },
+    {
+      "family_id": "performance_without_scope_loss",
+      "invariant_id": "performance_optimization_preserves_closed_world_scope",
+      "invariant": "Performance optimizations may reduce duplicate work but cannot reduce API, class, artifact, edge, parser-failure, or Oracle coverage.",
+      "root_cause_families": [
+        "performance_complexity"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/confidence_weighted_tracer.py",
+        "scripts/final_artifact_edge_oracle.py",
+        "scripts/real_project_regression.py"
+      ],
+      "positive_tests": [
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_scope_gate_accepts_faster_run_with_identical_scope",
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_envelope_exposes_complete_normalized_resource_metrics"
+      ],
+      "negative_tests": [
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_relative_performance_baseline_is_sha_bound_and_blocks_regression"
+      ],
+      "mutation_tests": [
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_scope_gate_rejects_faster_run_that_reduces_scan_scope"
+      ],
+      "cross_project_guards": [
+        "ruoyi-full-artifact-discovery"
+      ],
+      "architecture_review_on_repeat": true
+    }
+  ]
+}

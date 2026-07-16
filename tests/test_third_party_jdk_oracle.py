@@ -1,8 +1,11 @@
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +24,48 @@ class ThirdPartyJdkOracleTest(unittest.TestCase):
                     coord="g:a",
                     evidence_dir=Path(tmp),
                 )
+
+    def test_discovery_runs_independent_javap_tasks_with_bounded_parallelism(self):
+        active = 0
+        peak_active = 0
+        lock = threading.Lock()
+
+        def fake_run(command, **_kwargs):
+            nonlocal active, peak_active
+            if command[1] == "-version":
+                return subprocess.CompletedProcess(command, 0, stdout="24\n", stderr="")
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    "public class app.Caller {\n"
+                    "  void run();\n"
+                    "    descriptor: ()V\n"
+                    "       0: invokestatic #1 // Method dep/Tool.use:()V\n"
+                    "}\n"
+                ),
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            jdk_oracle.subprocess, "run", side_effect=fake_run
+        ):
+            rows = jdk_oracle.discover_calls(
+                [Path(tmp) / f"Caller{index}.class" for index in range(6)],
+                owner_prefixes=("dep/",),
+                coord="g:a",
+                evidence_dir=Path(tmp) / "evidence",
+            )
+
+        self.assertGreater(peak_active, 1)
+        self.assertLessEqual(peak_active, 8)
+        self.assertEqual(len(rows), 1)
 
     def test_discovers_dependency_calls_as_exhaustive_changed_api_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,7 +133,8 @@ class ThirdPartyJdkOracleTest(unittest.TestCase):
                 text=True,
             )
             changed = [
-                {"coord": "g:a", "api_name": "p.Target.call", "api_signature": "(java.lang.String)", "symbol_kind": "method"},
+                {"coord": "g:a", "api_name": "p.Target.call", "api_signature": "(java.lang.String)", "symbol_kind": "method", "change_type": "REMOVED"},
+                {"coord": "g:a", "api_name": "p.Target.call", "api_signature": "(java.lang.String)", "symbol_kind": "method", "change_type": "SIGNATURE_CHANGED"},
                 {"coord": "g:a", "api_name": "p.Target.call", "api_signature": "(int)", "symbol_kind": "method"},
             ]
 
@@ -98,11 +144,15 @@ class ThirdPartyJdkOracleTest(unittest.TestCase):
                 root / "evidence",
             )
 
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["api_signature"], "(java.lang.String)")
-        self.assertEqual(records[0]["oracle_conclusion"], "reachable")
-        self.assertEqual(records[0]["authority"], "jdk-javap")
-        self.assertEqual(len(records[0]["evidence_sha256"]), 64)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            {record["change_type"] for record in records},
+            {"REMOVED", "SIGNATURE_CHANGED"},
+        )
+        self.assertTrue(all(record["api_signature"] == "(java.lang.String)" for record in records))
+        self.assertTrue(all(record["oracle_conclusion"] == "reachable" for record in records))
+        self.assertTrue(all(record["authority"] == "jdk-javap" for record in records))
+        self.assertTrue(all(len(record["evidence_sha256"]) == 64 for record in records))
 
     def test_javap_distinguishes_business_reachability_from_internal_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
