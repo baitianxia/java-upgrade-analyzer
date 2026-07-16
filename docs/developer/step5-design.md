@@ -207,7 +207,7 @@ Step5 的性能优化必须保持分析语义不变。
 Step5 会输出：
 
 ```text
-evidence/call_chain/step5_timing.csv
+.runtime/observability/step5_timing.csv
 ```
 
 重点看：

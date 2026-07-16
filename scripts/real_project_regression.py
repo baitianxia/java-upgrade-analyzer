@@ -3949,7 +3949,7 @@ def build_quality_signals(
                 actual=text,
                 evidence=[
                     report_dir / "evidence" / "call_chain" / "summary.json",
-                    report_dir / "evidence" / "call_chain" / "step5_timing.csv",
+                    report_dir / ".runtime" / "observability" / "step5_timing.csv",
                 ],
             ))
         elif text.startswith(("graph_stats:", "source_shape:")):

@@ -28,6 +28,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_OBSERVABILITY_DIRNAME
 from step5_evidence_model import thaw_evidence_value
 
 from signature_utils import split_signature_params
@@ -1241,14 +1242,20 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     return summary_json_path
 
 
-def register_step5_summary_artifacts(output_dir):
+def register_step5_summary_artifacts(output_dir, report_dir=None):
     """Declare the review files actually emitted beside ``summary.json``.
 
     Consumers should not have to infer that a timing file or the detailed API
-    directory exists from console output.  Paths are deliberately relative to
-    ``call_chain`` so a complete report remains portable after archiving.
+    directory exists from console output. Evidence paths are relative to
+    ``call_chain``; runtime diagnostics use report-root-relative paths.
     """
     output_path = Path(output_dir)
+    if report_dir:
+        report_path = Path(report_dir).resolve()
+    elif output_path.name == "call_chain" and output_path.parent.name == "evidence":
+        report_path = output_path.resolve().parent.parent
+    else:
+        report_path = output_path.resolve().parent
     summary_path = output_path / 'summary.json'
     try:
         with summary_path.open('r', encoding='utf-8') as handle:
@@ -1259,15 +1266,18 @@ def register_step5_summary_artifacts(output_dir):
         return False
     artifacts = dict(summary.get('artifacts') or {})
     known = {
-        'summary_json': 'summary.json',
-        'alerts_csv': 'alerts.csv',
-        'api_detail_dir': 'by_api',
-        'module_summary_dir': 'by_module',
-        'timing_csv': 'step5_timing.csv',
+        'summary_json': (output_path / 'summary.json', 'summary.json'),
+        'alerts_csv': (output_path / 'alerts.csv', 'alerts.csv'),
+        'api_detail_dir': (output_path / 'by_api', 'by_api'),
+        'module_summary_dir': (output_path / 'by_module', 'by_module'),
+        'timing_csv': (
+            report_path / RUNTIME_DIRNAME / RUNTIME_OBSERVABILITY_DIRNAME / 'step5_timing.csv',
+            f'{RUNTIME_DIRNAME}/{RUNTIME_OBSERVABILITY_DIRNAME}/step5_timing.csv',
+        ),
     }
-    for key, relative_path in known.items():
-        if (output_path / relative_path).exists():
-            artifacts[key] = relative_path
+    for key, (artifact_path, declared_path) in known.items():
+        if artifact_path.exists():
+            artifacts[key] = declared_path
     summary['artifacts'] = artifacts
     with summary_path.open('w', encoding='utf-8', newline='\n') as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)

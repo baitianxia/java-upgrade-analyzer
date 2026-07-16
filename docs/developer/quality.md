@@ -159,7 +159,7 @@ runner 的 `performance_envelope` 至少保留以下 oracle 指标：
 Step4 性能验证优先看：
 
 ```text
-evidence/api_changes/step4_timing.csv
+.runtime/observability/step4_timing.csv
 ```
 
 关键阶段：
@@ -175,7 +175,7 @@ evidence/api_changes/step4_timing.csv
 Step5 性能验证优先看：
 
 ```text
-evidence/call_chain/step5_timing.csv
+.runtime/observability/step5_timing.csv
 ```
 
 关键指标：

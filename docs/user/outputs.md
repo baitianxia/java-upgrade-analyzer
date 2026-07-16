@@ -21,7 +21,7 @@
 |---|---|---|
 | `deliverables/` | 普通使用者、评审人 | 交付报告和分类清单 |
 | `evidence/` | 需要深入复核的人 | 依赖、上下文、API 变化和系统触达证据 |
-| `.runtime/` | 程序和 Agent | 状态、索引、恢复信息；普通阅读不需要进入 |
+| `.runtime/` | 程序和 Agent | 状态、索引、恢复信息、运行进度和耗时诊断；普通阅读不需要进入 |
 
 建议按这个顺序阅读：
 
@@ -69,11 +69,22 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 | `evidence/dependencies/dep_alerts.csv` | 需要优先复核的依赖变化 | 降级、删除、无法解析或高风险依赖 |
 | `evidence/dependencies/build_provenance.json` | base/current 构建产物来源和摘要 | 后续字节码分析是否基于正确制品 |
 | `evidence/dependencies/s1_artifacts/` | 留存的 base/current 产物 | Step5 业务字节码和运行时依赖 JAR 的来源 |
-| `evidence/dependencies/step1_progress.jsonl` | Step1 实时过程日志 | Agent 可在运行中查看当前侧、当前阶段、命令和阶段状态 |
-| `evidence/dependencies/step1_timing.csv` | Step1 分阶段耗时 | 定位分支工作区、Maven 构建、依赖坐标补全、制品解析、差异计算和结果写入的耗时点 |
 
 注意：Step1 当前以真实构建结果或用户提供的构建产物为准，不把手工 dependency tree 当作正式事实源。
 `dep_changes.csv` 仍只在完整比较成功后写入；过程日志和耗时文件仅用于监控与诊断，不是未完成分析的部分结果。
+
+## 运行监控与性能诊断
+
+运行过程和耗时不是分析结论证据，统一放在 `.runtime/observability/`：
+
+| 文件 | 用途 |
+|---|---|
+| `.runtime/observability/step1_progress.jsonl` | Agent 在 Step1 运行中查看当前侧、当前阶段、命令和状态 |
+| `.runtime/observability/step1_timing.csv` | Step1 分支工作区、Maven 构建、坐标补全、制品解析、差异计算和结果写入耗时 |
+| `.runtime/observability/step4_timing.csv` | Step4 jar 解析、git diff、JApiCmp、removed jar 导出、changed classes 和汇总写入耗时 |
+| `.runtime/observability/step5_timing.csv` | Step5 建图、字节码扫描、框架适配、间接引用和调用链追踪耗时 |
+
+这些文件用于运行监控和性能排查，不用于证明依赖、API 或调用链结论。
 
 ## 升级上下文
 
@@ -121,7 +132,6 @@ evidence/api_changes/
 | `*_binary.txt` / `*_binary.xml` | JApiCmp 原始证据 | 二进制兼容性变化来源 |
 | `*_gitdiff_api_changes.txt` | 依赖源码 git diff 证据 | 行为变化、源码级 API 变化 |
 | `*_removed_symbols.txt` | removed jar 的旧版 public/protected 符号导出 | 删除依赖场景目标池是否完整 |
-| `step4_timing.csv` | Step4 耗时拆解 | 定位 jar 解析、git diff、JApiCmp、removed jar 导出、changed_classes 或汇总写文件等耗时点 |
 
 Step4 还会从 old/current 最终 JAR 识别 DTO/数据对象的实例字段新增、删除和类型变化。`all_changed_apis.csv` 中对应的 `change_type` 为 `DATA_FIELD_ADDED`、`DATA_FIELD_REMOVED` 或 `DATA_FIELD_TYPE_CHANGED`，`old_value` / `new_value` 展示字段类型变化，`data_contract_evidence` 展示为何把该类识别为数据对象。该事实不代表数据库字段已经同步或不匹配。
 
@@ -179,7 +189,7 @@ evidence/call_chain/
 |---|---|---|
 | `summary.json` | 程序使用 | Step6 读取的结构化汇总，包含 `analysis_status`、`reason_code` 和能力覆盖 |
 | `analyzer_edges.csv` | 程序和深度复核使用 | 分析器从当前最终制品中确认的可执行边台账，用于和独立边真值核对 |
-| `step5_timing.csv` | 深度排查 | Step5 耗时拆解，用于性能问题定位 |
+| `.runtime/observability/step5_timing.csv` | 深度排查 | Step5 耗时拆解，用于性能问题定位 |
 | `dependency_source_alignment.json` | 依赖源码版本对齐证据 | 使用了哪个 current ref/commit、用户工作区是否保持不变、多少源码类被 current JAR 保留或排除 |
 | `.runtime/indexes/s5_query_index.json` | 程序使用 | Agent 按方法即时查询调用链；不作为人工阅读文件 |
 | `by_module/*_impacts.json` | 按模块聚合视图 | 分派处理责任 |
@@ -294,7 +304,7 @@ Step6 主结果表固定使用以下五列：
 Step5 慢时优先查看：
 
 ```text
-evidence/call_chain/step5_timing.csv
+.runtime/observability/step5_timing.csv
 ```
 
 重点指标：

@@ -696,7 +696,7 @@ class Step4StabilityTest(unittest.TestCase):
             pending = json.loads((output_dir / "git_ref_pending.json").read_text(encoding="utf-8"))
             matches = json.loads((output_dir / "git_ref_matches.json").read_text(encoding="utf-8"))
             summary_text = (output_dir / "summary.txt").read_text(encoding="utf-8")
-            with (output_dir / step4.STEP4_TIMING_FILE).open(encoding="utf-8") as fh:
+            with (report_dir / ".runtime/observability" / step4.STEP4_TIMING_FILE).open(encoding="utf-8") as fh:
                 timing_rows = list(csv.DictReader(fh))
 
         self.assertEqual(exit_code, 2)
@@ -741,7 +741,7 @@ class Step4StabilityTest(unittest.TestCase):
             ):
                 exit_code = step4.main()
 
-            timing_path = output_dir / step4.STEP4_TIMING_FILE
+            timing_path = report_dir / ".runtime/observability" / step4.STEP4_TIMING_FILE
             timing_exists = timing_path.exists()
             with timing_path.open(encoding="utf-8") as fh:
                 timing_rows = list(csv.DictReader(fh))

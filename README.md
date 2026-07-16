@@ -304,7 +304,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 Step4 慢时，让 Claude Code 先查看：
 
 ```text
-.upgrade-report/evidence/api_changes/step4_timing.csv
+.upgrade-report/.runtime/observability/step4_timing.csv
 ```
 
 重点关注：
@@ -321,7 +321,7 @@ Step4 慢时，让 Claude Code 先查看：
 Step5 慢时，让 Claude Code 查看：
 
 ```text
-.upgrade-report/evidence/call_chain/step5_timing.csv
+.upgrade-report/.runtime/observability/step5_timing.csv
 ```
 
 重点关注：

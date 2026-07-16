@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pipeline_constants import (
+    EVIDENCE_DEPENDENCIES_DIRNAME,
+    EVIDENCE_DIRNAME,
+    RUNTIME_DIRNAME,
+    RUNTIME_OBSERVABILITY_DIRNAME,
+)
 from progress_logging import emit_progress
 
 
@@ -42,10 +48,27 @@ class Step1Observer:
     """
 
     def __init__(self, output_path):
-        output_dir = Path(output_path).expanduser().resolve().parent
-        output_dir.mkdir(parents=True, exist_ok=True)
-        self.progress_path = output_dir / "step1_progress.jsonl"
-        self.timing_path = output_dir / "step1_timing.csv"
+        output_path = Path(output_path).expanduser().resolve()
+        output_dir = output_path.parent
+        if (
+            output_dir.name == EVIDENCE_DEPENDENCIES_DIRNAME
+            and output_dir.parent.name == EVIDENCE_DIRNAME
+        ):
+            report_dir = output_dir.parent.parent
+        else:
+            report_dir = output_dir
+        observability_dir = (
+            report_dir / RUNTIME_DIRNAME / RUNTIME_OBSERVABILITY_DIRNAME
+        )
+        observability_dir.mkdir(parents=True, exist_ok=True)
+        self.progress_path = observability_dir / "step1_progress.jsonl"
+        self.timing_path = observability_dir / "step1_timing.csv"
+        for legacy_path in (
+            output_dir / "step1_progress.jsonl",
+            output_dir / "step1_timing.csv",
+        ):
+            if legacy_path.exists():
+                legacy_path.unlink()
         self.progress_path.write_text("", encoding="utf-8")
         with self.timing_path.open("w", encoding="utf-8", newline="") as handle:
             csv.DictWriter(handle, fieldnames=TIMING_FIELDS).writeheader()

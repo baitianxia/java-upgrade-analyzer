@@ -44,6 +44,9 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertLess(step5_text.index("`alerts.csv` | 人工优先入口"), step5_text.index("`summary.json`"))
         self.assertIn("`.runtime/indexes/s5_query_index.json` | 程序使用", text)
         self.assertIn("`.runtime/findings/s6_findings.json` | 程序使用", text)
+        self.assertIn(".runtime/observability/step1_progress.jsonl", text)
+        self.assertIn(".runtime/observability/step4_timing.csv", text)
+        self.assertIn(".runtime/observability/step5_timing.csv", text)
 
     def test_skill_doc_requires_user_facing_decision_card(self):
         text = self.read("SKILL.md")

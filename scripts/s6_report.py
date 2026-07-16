@@ -2206,6 +2206,7 @@ def render_report_appendix(findings):
         "| `.runtime/state/main_state.json` | 流程状态；用于恢复、重跑和 checkpoint 判断 |",
         "| `.runtime/state/interaction.json` | 当前等待用户确认的问题和选项 |",
         "| `.runtime/coverage/coverage.json` / `.runtime/coverage/s*_coverage.json` | 各步骤覆盖情况；用于判断结论限制 |",
+        "| `.runtime/observability/step*_timing.csv` / `step1_progress.jsonl` | 运行进度与分阶段耗时；供 Agent 监控和性能排查 |",
         "| `.runtime/findings/s6_findings.json` | Step6 结构化结果；供程序读取，不作为人工优先阅读文件 |",
         "| `.runtime/indexes/s5_query_index.json` | 调用链查询索引；供只读查询命令使用 |",
         "",

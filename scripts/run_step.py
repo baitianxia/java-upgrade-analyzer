@@ -30,6 +30,7 @@ from pipeline_constants import (
     RUNTIME_DIRNAME,
     RUNTIME_FINDINGS_DIRNAME,
     RUNTIME_INDEXES_DIRNAME,
+    RUNTIME_OBSERVABILITY_DIRNAME,
     RUNTIME_STATE_DIRNAME,
     STEP1_ARTIFACTS_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
@@ -164,6 +165,10 @@ def runtime_findings_dir(report_dir):
 
 def runtime_cache_dir(report_dir):
     return runtime_dir(report_dir) / RUNTIME_CACHE_DIRNAME
+
+
+def runtime_observability_dir(report_dir):
+    return runtime_dir(report_dir) / RUNTIME_OBSERVABILITY_DIRNAME
 
 
 def step1_dep_changes_path(report_dir):
@@ -5629,8 +5634,8 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             step1_dep_changes_path(report_dir),
             step1_dep_summary_path(report_dir),
             step1_current_resolved_path(report_dir),
-            evidence_dependencies_dir(report_dir) / "step1_progress.jsonl",
-            evidence_dependencies_dir(report_dir) / "step1_timing.csv",
+            runtime_observability_dir(report_dir) / "step1_progress.jsonl",
+            runtime_observability_dir(report_dir) / "step1_timing.csv",
             build_provenance_path(report_dir),
             step1_artifacts_dir(report_dir),
         ],
@@ -5654,9 +5659,11 @@ def step_output_paths_for_cleanup(step_id, report_dir):
         ],
         "step4": [
             step4_api_changes_dir(report_dir),
+            runtime_observability_dir(report_dir) / "step4_timing.csv",
         ],
         "step5": [
             step5_call_chain_dir(report_dir),
+            runtime_observability_dir(report_dir) / "step5_timing.csv",
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME,

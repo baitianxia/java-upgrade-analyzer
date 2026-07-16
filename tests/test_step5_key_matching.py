@@ -8817,6 +8817,10 @@ public class com.example.TargetBridge {
             }
 
             timing_path = step5._write_step5_timing_csv(output_dir, graph_stats)
+            self.assertEqual(
+                Path(timing_path),
+                output_dir / ".runtime/observability/step5_timing.csv",
+            )
             with Path(timing_path).open(encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
 
@@ -9981,12 +9985,17 @@ public class com.example.TargetBridge {
                 verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[],
             )
             formatter.generate_enhanced_summary([result], str(output), graph_stats={})
-            (output / "step5_timing.csv").write_text("section,metric,value\n", encoding="utf-8")
+            timing = Path(tmp) / ".runtime/observability/step5_timing.csv"
+            timing.parent.mkdir(parents=True)
+            timing.write_text("section,metric,value\n", encoding="utf-8")
             formatter.register_step5_summary_artifacts(str(output))
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
 
         self.assertEqual("alerts.csv", summary["artifacts"]["alerts_csv"])
-        self.assertEqual("step5_timing.csv", summary["artifacts"]["timing_csv"])
+        self.assertEqual(
+            ".runtime/observability/step5_timing.csv",
+            summary["artifacts"]["timing_csv"],
+        )
         self.assertEqual("by_api", summary["artifacts"]["api_detail_dir"])
 
     def test_alert_review_focus_names_the_missing_runtime_input(self):
@@ -11822,6 +11831,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             self.assertNotIn("机器可消费", report_text)
             self.assertNotIn("scan_stats", report_text)
             self.assertIn("| `.runtime/findings/s6_findings.json` | Step6 结构化结果；供程序读取，不作为人工优先阅读文件 |", report_text)
+            self.assertIn("| `.runtime/observability/step*_timing.csv` / `step1_progress.jsonl` | 运行进度与分阶段耗时；供 Agent 监控和性能排查 |", report_text)
             self.assertIn("主报告按结论类型各展示前 20 条", report_text)
             self.assertIn("com.example.Api0.removed", report_text)
             self.assertNotIn("com.example.Api99.removed", report_text)

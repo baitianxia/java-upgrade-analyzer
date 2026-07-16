@@ -12,7 +12,8 @@ s4_jar_compare.py — Step 4：jar 包变更全量对比
   s2_context.json           — 项目上下文（含升级依赖清单）
   <japicmp-jar>             — JApiCmp 工具 jar
 
-输出（全部写入 .upgrade-report/evidence/api_changes/ 目录）：
+正式证据写入 `.upgrade-report/evidence/api_changes/`，运行耗时写入
+`.upgrade-report/.runtime/observability/`：
   [artifact]_[旧版]_vs_[新版]_binary.txt   — JApiCmp 完整原始输出（不裁剪）
   [artifact]_[旧版]_vs_[新版]_behavior.txt — changelog 行为变更记录
   [lib]_gitdiff_api_changes.txt            — 依赖源码 git diff 结果
@@ -57,6 +58,7 @@ from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
     EVIDENCE_DIRNAME,
     RUNTIME_DIRNAME,
+    RUNTIME_OBSERVABILITY_DIRNAME,
     RUNTIME_STATE_DIRNAME,
 )
 from signature_utils import normalize_signature_for_lookup
@@ -250,11 +252,14 @@ class Step4TimingRecorder:
         "details",
     ]
 
-    def __init__(self, output_dir):
-        self.output_dir = Path(output_dir)
+    def __init__(self, report_dir):
+        self.output_dir = (
+            Path(report_dir) / RUNTIME_DIRNAME / RUNTIME_OBSERVABILITY_DIRNAME
+        )
         self.path = self.output_dir / STEP4_TIMING_FILE
         self._lock = threading.RLock()
         self._rows = []
+        self.flush()
 
     def record(
         self,
@@ -4315,7 +4320,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     cleanup_step4_generated_outputs(args.output_dir)
-    timing = Step4TimingRecorder(args.output_dir)
+    timing = Step4TimingRecorder(infer_report_dir_from_output_dir(args.output_dir))
     try:
         dependency_git_ref_overrides = parse_dependency_git_ref_overrides(args.dependency_git_ref_overrides_json)
     except ValueError as exc:

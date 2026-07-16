@@ -65,7 +65,23 @@ class Step1ObservabilityTest(unittest.TestCase):
     def test_progress_and_timing_files_are_created_before_step1_finishes(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "evidence/dependencies/dep_changes.csv"
+            output.parent.mkdir(parents=True)
+            legacy_progress = output.parent / "step1_progress.jsonl"
+            legacy_timing = output.parent / "step1_timing.csv"
+            legacy_progress.write_text("stale\n", encoding="utf-8")
+            legacy_timing.write_text("stale\n", encoding="utf-8")
             observer = step1_observability.Step1Observer(output)
+
+            self.assertEqual(
+                observer.progress_path,
+                Path(tmp).resolve() / ".runtime/observability/step1_progress.jsonl",
+            )
+            self.assertEqual(
+                observer.timing_path,
+                Path(tmp).resolve() / ".runtime/observability/step1_timing.csv",
+            )
+            self.assertFalse(legacy_progress.exists())
+            self.assertFalse(legacy_timing.exists())
 
             token = observer.start_phase(
                 "maven_package",
@@ -170,8 +186,18 @@ class Step1ObservabilityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             paths = set(run_step.step_output_paths_for_cleanup("step1", tmp))
 
-        self.assertIn(Path(tmp).resolve() / "evidence/dependencies/step1_progress.jsonl", paths)
-        self.assertIn(Path(tmp).resolve() / "evidence/dependencies/step1_timing.csv", paths)
+        observability = Path(tmp).resolve() / ".runtime/observability"
+        self.assertIn(observability / "step1_progress.jsonl", paths)
+        self.assertIn(observability / "step1_timing.csv", paths)
+
+    def test_step4_and_step5_cleanup_contract_includes_observability_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observability = Path(tmp).resolve() / ".runtime/observability"
+            step4_paths = set(run_step.step_output_paths_for_cleanup("step4", tmp))
+            step5_paths = set(run_step.step_output_paths_for_cleanup("step5", tmp))
+
+        self.assertIn(observability / "step4_timing.csv", step4_paths)
+        self.assertIn(observability / "step5_timing.csv", step5_paths)
 
 
 if __name__ == "__main__":

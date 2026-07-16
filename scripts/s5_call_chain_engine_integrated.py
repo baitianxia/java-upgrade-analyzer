@@ -77,6 +77,7 @@ from pipeline_constants import (
     RUNTIME_CACHE_DIRNAME,
     RUNTIME_DIRNAME,
     RUNTIME_INDEXES_DIRNAME,
+    RUNTIME_OBSERVABILITY_DIRNAME,
     RUNTIME_STATE_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
     STEP5_ARTIFACT_BYTECODE_DIRNAME,
@@ -135,6 +136,10 @@ def _runtime_cache_dir(report_dir):
     return _runtime_dir(report_dir, RUNTIME_CACHE_DIRNAME)
 
 
+def _runtime_observability_dir(report_dir):
+    return _runtime_dir(report_dir, RUNTIME_OBSERVABILITY_DIRNAME)
+
+
 def _default_query_index_path(report_dir):
     return _runtime_dir(report_dir, RUNTIME_INDEXES_DIRNAME) / STEP5_QUERY_INDEX_FILE
 
@@ -164,7 +169,7 @@ def _step5_debug(topic, message, **fields):
     )
 
 
-def _write_step5_timing_csv(output_dir, graph_stats):
+def _write_step5_timing_csv(report_dir, graph_stats):
     """Persist Step5 timing metrics in a small human-readable CSV."""
     perf = ((graph_stats or {}).get('step5_perf') or {})
     rows = []
@@ -261,7 +266,9 @@ def _write_step5_timing_csv(output_dir, graph_stats):
             rows.append({'section': section, 'metric': key, 'value': bucket.get(key)})
     if not rows:
         return ''
-    path = Path(output_dir) / 'step5_timing.csv'
+    observability_dir = _runtime_observability_dir(report_dir)
+    observability_dir.mkdir(parents=True, exist_ok=True)
+    path = observability_dir / 'step5_timing.csv'
     with path.open('w', encoding='utf-8', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['section', 'metric', 'value'])
         writer.writeheader()
@@ -712,6 +719,12 @@ def _step5_integrated_main_impl(args):
     report_dir = infer_step5_report_dir(args)
     output_dir = args.output_dir or str(_call_chain_dir(report_dir))
     os.makedirs(output_dir, exist_ok=True)
+    legacy_timing_path = Path(output_dir) / 'step5_timing.csv'
+    if legacy_timing_path.exists():
+        legacy_timing_path.unlink()
+    timing_path = _runtime_observability_dir(report_dir) / 'step5_timing.csv'
+    if timing_path.exists():
+        timing_path.unlink()
     orchestrated_input = load_orchestrated_step5_input(report_dir)
 
     # Phase 1: 先确定 all_changed_apis_path（避免未定义变量错误）
@@ -1462,10 +1475,10 @@ def _step5_integrated_main_impl(args):
         "汇总报告生成完成",
         elapsed=time.perf_counter() - summary_timer,
     )
-    timing_csv = _write_step5_timing_csv(output_dir, graph_stats)
+    timing_csv = _write_step5_timing_csv(report_dir, graph_stats)
     if timing_csv:
         print(f"  耗时明细 → {timing_csv}", file=sys.stderr)
-    register_step5_summary_artifacts(output_dir)
+    register_step5_summary_artifacts(output_dir, report_dir=report_dir)
 
     # 统计
     reachable_count = sum(1 for r in all_results if r.analysis_status == 'reachable')
