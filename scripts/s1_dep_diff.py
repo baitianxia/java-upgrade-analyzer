@@ -19,6 +19,7 @@ Windows 兼容：通过 compat.py 统一处理编码，不会因 GBK/UTF-8 不�
 import argparse, csv, hashlib, io, json, os, re, shutil, sys, tempfile, zipfile
 import safe_xml as ET
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 
 # compat 必须第一个 import，它会在 Windows 上修复 stdout/stderr 编码
@@ -26,11 +27,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, mvn_cmd, git_cmd, IS_WINDOWS, require_human_confirm
 from analysis_contract import sha256_file
 from pipeline_constants import STEP1_ARTIFACTS_DIRNAME
+from step1_observability import Step1Observer
 
 
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
+
+
+def _observed_phase(observer, phase, **kwargs):
+    return observer.phase(phase, **kwargs) if observer is not None else nullcontext()
+
+
+def _side_display(side):
+    return {
+        "base": "基准侧",
+        "current": "当前侧",
+    }.get(str(side or "").strip(), str(side or "当前侧").strip())
 
 
 def retain_artifact_for_analysis(meta, artifact_cache_dir, side):
@@ -1721,7 +1734,9 @@ def _enrich_packaged_deps_with_runtime(
     return entries, resolved, unresolved
 
 
-def collect_runtime_deps_for_workspace(work_dir, primary_module=None, modules=None, env=None):
+def collect_runtime_deps_for_workspace(
+    work_dir, primary_module=None, modules=None, env=None, observer=None, side="",
+):
     work_dir = str(Path(work_dir).resolve())
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
     pl = _normalize_maven_pl_with_workdir(target_selector, work_dir)
@@ -1734,14 +1749,27 @@ def collect_runtime_deps_for_workspace(work_dir, primary_module=None, modules=No
         '-DincludeScope=runtime',
         '-DoutputAbsoluteArtifactFilename=true',
     ]
-    list_stdout, list_stderr, list_rc = run_cmd(list_cmd, cwd=work_dir, timeout=1800, env=env)
-    if list_rc != 0:
-        raise RuntimeError(
-            "最终制品中存在无法直接识别坐标的嵌套依赖，且 `mvn dependency:list` 执行失败，"
-            f"无法安全补全坐标：{(list_stderr[:300] or list_stdout[:300])}"
+    list_command = ' '.join(list_cmd)
+    side_display = _side_display(side)
+    with _observed_phase(
+        observer,
+        "maven_dependency_list",
+        side=side,
+        item=target_selector or ".",
+        command=list_command,
+        start_message=f"开始补全{side_display}最终制品依赖坐标",
+        complete_message=f"{side_display}依赖坐标补全完成",
+    ):
+        list_stdout, list_stderr, list_rc = run_cmd(
+            list_cmd, cwd=work_dir, timeout=1800, env=env, stream_output=True,
         )
+        if list_rc != 0:
+            raise RuntimeError(
+                "最终制品中存在无法直接识别坐标的嵌套依赖，且 `mvn dependency:list` 执行失败，"
+                f"无法安全补全坐标：{(list_stderr[:300] or list_stdout[:300])}"
+            )
     runtime_deps = parse_maven_dependency_list(list_stdout)
-    return runtime_deps, ' '.join(list_cmd)
+    return runtime_deps, list_command
 
 
 def collect_maven_deps_for_workspace(
@@ -1752,6 +1780,8 @@ def collect_maven_deps_for_workspace(
     manual_coord_overrides=None,
     allow_unresolved=False,
     confirmed_unresolved_items=None,
+    observer=None,
+    side="",
 ):
     work_dir = str(Path(work_dir).resolve())
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
@@ -1767,11 +1797,32 @@ def collect_maven_deps_for_workspace(
         '-DskipTests',
         'package',
     ]
-    stdout, stderr, rc = run_cmd(package_cmd, cwd=work_dir, timeout=1800, env=env)
-    if rc != 0:
-        raise RuntimeError(f"mvn package 失败（退出码 {rc}）：\n{stderr[:1000] or stdout[:1000]}")
+    package_command = ' '.join(package_cmd)
+    side_display = _side_display(side)
+    with _observed_phase(
+        observer,
+        "maven_package",
+        side=side,
+        item=target_selector or ".",
+        command=package_command,
+        start_message=f"开始构建{side_display}目标模块",
+        complete_message=f"{side_display}目标模块构建完成",
+    ):
+        stdout, stderr, rc = run_cmd(
+            package_cmd, cwd=work_dir, timeout=1800, env=env, stream_output=True,
+        )
+        if rc != 0:
+            raise RuntimeError(f"mvn package 失败（退出码 {rc}）：\n{stderr[:1000] or stdout[:1000]}")
 
-    archives = _discover_packaged_archives(module_dir)
+    with _observed_phase(
+        observer,
+        "artifact_discovery",
+        side=side,
+        item=module_dir,
+        start_message=f"开始定位{side_display}最终制品",
+        complete_message=f"{side_display}最终制品定位完成",
+    ):
+        archives = _discover_packaged_archives(module_dir)
     if not archives:
         raise RuntimeError(
             f"目标模块未产出可解析的最终制品：{module_dir}。"
@@ -1782,12 +1833,20 @@ def collect_maven_deps_for_workspace(
     list_cmd_text = ''
     need_runtime_enrichment = False
     for artifact_path in archives:
-        packaging_type = _detect_archive_packaging_type(artifact_path)
-        if packaging_type not in ('boot_jar', 'war', 'packaged_jar'):
-            continue
-        packaged_raw = _inspect_packaged_archive(artifact_path)
-        if not packaged_raw:
-            continue
+        with _observed_phase(
+            observer,
+            "artifact_parse",
+            side=side,
+            item=str(artifact_path),
+            start_message=f"开始解析{side_display}最终制品：{Path(artifact_path).name}",
+            complete_message=f"{side_display}最终制品解析完成：{Path(artifact_path).name}",
+        ):
+            packaging_type = _detect_archive_packaging_type(artifact_path)
+            if packaging_type not in ('boot_jar', 'war', 'packaged_jar'):
+                continue
+            packaged_raw = _inspect_packaged_archive(artifact_path)
+            if not packaged_raw:
+                continue
         if any(not (item.get('coord') or '').strip() for item in packaged_raw):
             need_runtime_enrichment = True
         if need_runtime_enrichment and not runtime_deps:
@@ -1796,18 +1855,28 @@ def collect_maven_deps_for_workspace(
                 primary_module=primary_module,
                 modules=modules,
                 env=env,
+                observer=observer,
+                side=side,
             )
             list_cmd_text = list_command_text or ''
-        dep_entries, packaged_deps, unresolved_items = _enrich_packaged_deps_with_runtime(
-            packaged_raw,
-            runtime_deps,
-            manual_coord_overrides=manual_coord_overrides,
-            confirmed_unresolved_items=confirmed_unresolved_items,
-        )
-        if unresolved_items and not allow_unresolved:
-            raise UnresolvedPackagedCoordinatesError(unresolved_items, resolved_deps=packaged_deps)
-        if dep_entries:
-            return packaged_deps, {
+        with _observed_phase(
+            observer,
+            "artifact_coordinate_resolution",
+            side=side,
+            item=str(artifact_path),
+            start_message=f"开始解析{side_display}最终制品中的依赖坐标",
+            complete_message=f"{side_display}最终制品依赖坐标解析完成",
+        ):
+            dep_entries, packaged_deps, unresolved_items = _enrich_packaged_deps_with_runtime(
+                packaged_raw,
+                runtime_deps,
+                manual_coord_overrides=manual_coord_overrides,
+                confirmed_unresolved_items=confirmed_unresolved_items,
+            )
+            if unresolved_items and not allow_unresolved:
+                raise UnresolvedPackagedCoordinatesError(unresolved_items, resolved_deps=packaged_deps)
+            if dep_entries:
+                return packaged_deps, {
                 'mode': 'final_artifact',
                 'packaging_type': packaging_type,
                 'artifact_path': str(artifact_path),
@@ -1837,6 +1906,8 @@ def collect_packaged_deps_from_artifact_path(
     manual_coord_overrides=None,
     confirmed_unresolved_items=None,
     allow_unresolved=False,
+    observer=None,
+    side="",
 ):
     artifact_file = Path(artifact_path).expanduser()
     if not artifact_file.is_absolute():
@@ -1847,31 +1918,48 @@ def collect_packaged_deps_from_artifact_path(
     if not artifact_file.exists() or not artifact_file.is_file():
         raise RuntimeError(f"用户提供的编译产物不存在或不是文件：{artifact_file}")
 
-    packaging_type = _detect_archive_packaging_type(artifact_file)
-    if packaging_type not in ('boot_jar', 'war', 'packaged_jar'):
-        raise RuntimeError(
-            f"用户提供的编译产物未发现可比较的嵌套依赖：{artifact_file}。"
-            "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不再作为正式结果输出。"
-        )
+    with _observed_phase(
+        observer,
+        "artifact_parse",
+        side=side,
+        item=str(artifact_file),
+        start_message=f"开始解析{_side_display(side)}最终制品",
+        complete_message=f"{_side_display(side)}最终制品解析完成",
+    ):
+        packaging_type = _detect_archive_packaging_type(artifact_file)
+        if packaging_type not in ('boot_jar', 'war', 'packaged_jar'):
+            raise RuntimeError(
+                f"用户提供的编译产物未发现可比较的嵌套依赖：{artifact_file}。"
+                "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不再作为正式结果输出。"
+            )
 
-    packaged_raw = _inspect_packaged_archive(artifact_file)
-    if not packaged_raw:
-        raise RuntimeError(
-            f"用户提供的编译产物中未发现可比较的打包依赖：{artifact_file}。"
-            "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不再作为正式结果输出。"
-        )
+        packaged_raw = _inspect_packaged_archive(artifact_file)
+        if not packaged_raw:
+            raise RuntimeError(
+                f"用户提供的编译产物中未发现可比较的打包依赖：{artifact_file}。"
+                "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不再作为正式结果输出。"
+            )
 
-    packaged_raw = _enrich_filename_only_deps_from_local_m2(packaged_raw)
+        packaged_raw = _enrich_filename_only_deps_from_local_m2(packaged_raw)
+
     resolved_runtime_deps = runtime_deps or {}
     if any(not (item.get('coord') or '').strip() for item in packaged_raw):
         if not resolved_runtime_deps and runtime_deps_loader is not None:
             resolved_runtime_deps = runtime_deps_loader() or {}
-    dep_entries, packaged_deps, unresolved_items = _enrich_packaged_deps_with_runtime(
-        packaged_raw,
-        resolved_runtime_deps,
-        manual_coord_overrides=manual_coord_overrides,
-        confirmed_unresolved_items=confirmed_unresolved_items,
-    )
+    with _observed_phase(
+        observer,
+        "artifact_coordinate_resolution",
+        side=side,
+        item=str(artifact_file),
+        start_message=f"开始解析{_side_display(side)}最终制品中的依赖坐标",
+        complete_message=f"{_side_display(side)}最终制品依赖坐标解析完成",
+    ):
+        dep_entries, packaged_deps, unresolved_items = _enrich_packaged_deps_with_runtime(
+            packaged_raw,
+            resolved_runtime_deps,
+            manual_coord_overrides=manual_coord_overrides,
+            confirmed_unresolved_items=confirmed_unresolved_items,
+        )
     if unresolved_items and not allow_unresolved:
         raise ArtifactCoordinateInputRequiredError(
             str(artifact_file.resolve()),
@@ -1906,6 +1994,7 @@ def _collect_runtime_deps_for_artifact_input(
     jdk_home="",
     side="",
     artifact_path="",
+    observer=None,
 ):
     source_dir = str(source_project_dir or '').strip()
     if source_dir:
@@ -1929,6 +2018,8 @@ def _collect_runtime_deps_for_artifact_input(
                 primary_module=primary_module,
                 modules=modules,
                 env=env,
+                observer=observer,
+                side=side,
             )
         except Exception as exc:
             if isinstance(exc, Step1CommandExecutionBlockedError):
@@ -1960,6 +2051,7 @@ def _collect_runtime_deps_for_artifact_input(
             jdk_home=jdk_home,
             side=side,
             artifact_path=artifact_path,
+            observer=observer,
         )
         return runtime_deps, {
             'source_mode': 'checkout_branch',
@@ -2008,6 +2100,7 @@ def get_packaged_deps_by_switching_branch(
     allow_unresolved=False,
     confirmed_unresolved_items=None,
     artifact_cache_dir=None,
+    observer=None,
 ):
     blocked_error = None
     env = None
@@ -2028,7 +2121,16 @@ def get_packaged_deps_by_switching_branch(
         )
     if blocked_error is None:
         try:
-            temp_dir = create_branch_worktree(branch, work_dir)
+            with _observed_phase(
+                observer,
+                "prepare_worktree",
+                side=side,
+                item=branch,
+                command=f"git worktree add --detach <temp> {branch}",
+                start_message=f"开始准备{_side_display(side)}分支工作区",
+                complete_message=f"{_side_display(side)}分支工作区准备完成",
+            ):
+                temp_dir = create_branch_worktree(branch, work_dir)
         except Exception as exc:
             blocked_error = build_step1_command_blocked_error(
                 stage="prepare_branch_worktree",
@@ -2050,16 +2152,31 @@ def get_packaged_deps_by_switching_branch(
                 manual_coord_overrides=manual_coord_overrides,
                 allow_unresolved=allow_unresolved,
                 confirmed_unresolved_items=confirmed_unresolved_items,
+                observer=observer,
+                side=side,
             )
             meta['branch'] = branch
             meta['jdk_home'] = resolve_effective_jdk_home(jdk_home)
             meta['worktree_dir'] = str(temp_dir)
             artifact_path = str(meta.get('artifact_path') or '').strip()
-            meta['artifact_sha256'] = sha256_file(artifact_path) if artifact_path and Path(artifact_path).is_file() else ''
             revision, _revision_err, revision_rc = run_cmd(git_cmd() + ['rev-parse', 'HEAD'], cwd=str(temp_dir))
             meta['revision'] = revision.strip() if revision_rc == 0 else ''
             if artifact_path and artifact_cache_dir:
-                retain_artifact_for_analysis(meta, artifact_cache_dir, side)
+                with _observed_phase(
+                    observer,
+                    "artifact_retention",
+                    side=side,
+                    item=artifact_path,
+                    start_message=f"开始保留{_side_display(side)}最终制品供后续分析",
+                    complete_message=f"{_side_display(side)}最终制品保留完成",
+                ):
+                    retain_artifact_for_analysis(meta, artifact_cache_dir, side)
+            else:
+                meta['artifact_sha256'] = (
+                    sha256_file(artifact_path)
+                    if artifact_path and Path(artifact_path).is_file()
+                    else ''
+                )
             result = (deps, meta)
         except Exception as exc:
             blocked_error = exc if isinstance(exc, Step1CommandExecutionBlockedError) else build_step1_command_blocked_error(
@@ -2074,7 +2191,16 @@ def get_packaged_deps_by_switching_branch(
             )
     if temp_dir is not None:
         try:
-            remove_branch_worktree(temp_dir, work_dir)
+            with _observed_phase(
+                observer,
+                "cleanup_worktree",
+                side=side,
+                item=str(temp_dir),
+                command=f"git worktree remove --force {temp_dir}",
+                start_message=f"开始清理{_side_display(side)}临时工作区",
+                complete_message=f"{_side_display(side)}临时工作区清理完成",
+            ):
+                remove_branch_worktree(temp_dir, work_dir)
         except Exception as cleanup_exc:
             if blocked_error is not None:
                 blocked_error = append_cleanup_failure_to_blocked_error(blocked_error, cleanup_exc)
@@ -2094,7 +2220,10 @@ def get_packaged_deps_by_switching_branch(
     return result
 
 
-def get_runtime_deps_by_switching_branch(branch, work_dir, primary_module=None, modules=None, jdk_field="", jdk_home="", side="", artifact_path=""):
+def get_runtime_deps_by_switching_branch(
+    branch, work_dir, primary_module=None, modules=None, jdk_field="", jdk_home="",
+    side="", artifact_path="", observer=None,
+):
     blocked_error = None
     env = None
     temp_dir = None
@@ -2115,7 +2244,16 @@ def get_runtime_deps_by_switching_branch(branch, work_dir, primary_module=None, 
         )
     if blocked_error is None:
         try:
-            temp_dir = create_branch_worktree(branch, work_dir)
+            with _observed_phase(
+                observer,
+                "prepare_worktree",
+                side=side,
+                item=branch,
+                command=f"git worktree add --detach <temp> {branch}",
+                start_message=f"开始准备{_side_display(side)}分支工作区",
+                complete_message=f"{_side_display(side)}分支工作区准备完成",
+            ):
+                temp_dir = create_branch_worktree(branch, work_dir)
         except Exception as exc:
             blocked_error = build_step1_command_blocked_error(
                 stage="prepare_branch_worktree",
@@ -2135,6 +2273,8 @@ def get_runtime_deps_by_switching_branch(branch, work_dir, primary_module=None, 
                 primary_module=primary_module,
                 modules=modules,
                 env=add_branch_hint_to_env(env, branch),
+                observer=observer,
+                side=side,
             )
             result = (
                 runtime_deps,
@@ -2159,7 +2299,16 @@ def get_runtime_deps_by_switching_branch(branch, work_dir, primary_module=None, 
             )
     if temp_dir is not None:
         try:
-            remove_branch_worktree(temp_dir, work_dir)
+            with _observed_phase(
+                observer,
+                "cleanup_worktree",
+                side=side,
+                item=str(temp_dir),
+                command=f"git worktree remove --force {temp_dir}",
+                start_message=f"开始清理{_side_display(side)}临时工作区",
+                complete_message=f"{_side_display(side)}临时工作区清理完成",
+            ):
+                remove_branch_worktree(temp_dir, work_dir)
         except Exception as cleanup_exc:
             if blocked_error is not None:
                 blocked_error = append_cleanup_failure_to_blocked_error(blocked_error, cleanup_exc)
@@ -2467,6 +2616,16 @@ def main():
             print(f"  - {item}", file=sys.stderr)
         sys.exit(1)
 
+    observer = Step1Observer(args.output) if args.output else None
+    total_token = (
+        observer.start_phase(
+            "step1_total",
+            item=args.primary_module or ".",
+            message="Step1 开始：准备 base/current 构建产物和依赖范围",
+        )
+        if observer is not None else None
+    )
+
     packaged_summary = {'mode': 'final_artifact', 'archives': [], 'deps': [], 'matched_count': 0, 'runtime_only_count': 0, 'runtime_only_coords': []}
     base_fmt = ''
     curr_fmt = ''
@@ -2500,6 +2659,7 @@ def main():
                         jdk_home=args.base_jdk_home,
                         side="base",
                         artifact_path=args.base_artifact_path,
+                        observer=observer,
                     )
                 return base_runtime_deps
 
@@ -2516,6 +2676,7 @@ def main():
                         jdk_home=args.current_jdk_home,
                         side="current",
                         artifact_path=args.current_artifact_path,
+                        observer=observer,
                     )
                 return curr_runtime_deps
 
@@ -2527,6 +2688,8 @@ def main():
                 manual_coord_overrides=manual_coord_overrides,
                 confirmed_unresolved_items=confirmed_unresolved_items,
                 allow_unresolved=unresolved_confirmed,
+                observer=observer,
+                side="base",
             )
             curr_deps, curr_meta = collect_packaged_deps_from_artifact_path(
                 args.current_artifact_path,
@@ -2536,6 +2699,8 @@ def main():
                 manual_coord_overrides=manual_coord_overrides,
                 confirmed_unresolved_items=confirmed_unresolved_items,
                 allow_unresolved=unresolved_confirmed,
+                observer=observer,
+                side="current",
             )
             if base_runtime_meta.get('list_command'):
                 base_meta['list_command'] = base_runtime_meta.get('list_command', '')
@@ -2661,6 +2826,7 @@ def main():
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
+                    observer=observer,
             )
             curr_deps, curr_meta = get_packaged_deps_by_switching_branch(
                     args.current_branch, args.work_dir, args.primary_module, args.modules,
@@ -2669,6 +2835,7 @@ def main():
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
+                    observer=observer,
             )
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
@@ -2741,6 +2908,8 @@ def main():
 
     if args.debug_only:
         print("\n调试模式完成，未写入文件。", file=sys.stderr)
+        if observer is not None and total_token is not None:
+            observer.finish_phase(total_token, status="completed", message="Step1 调试模式完成")
         return
 
     # ── 对比并写 CSV ─────────────────────────────────────────────
@@ -2748,7 +2917,21 @@ def main():
         print("❌ 请指定 --output 参数", file=sys.stderr)
         sys.exit(1)
 
+    diff_token = (
+        observer.start_phase(
+            "dependency_diff",
+            item=args.primary_module or ".",
+            message="开始比较 base/current 最终制品依赖",
+        )
+        if observer is not None else None
+    )
     rows = _build_step1_change_rows(base_entries, curr_entries)
+    if observer is not None and diff_token is not None:
+        observer.finish_phase(
+            diff_token,
+            status="completed",
+            message=f"依赖比较完成，共生成 {len(rows)} 条依赖记录",
+        )
 
     def _risk_rank(value):
         v = (value or '').strip()
@@ -2786,6 +2969,14 @@ def main():
 
     out_dir = Path(args.output).parent
     out_dir.mkdir(parents=True, exist_ok=True)
+    report_token = (
+        observer.start_phase(
+            "report_write",
+            item=str(out_dir),
+            message="开始写入 Step1 正式结果文件",
+        )
+        if observer is not None else None
+    )
     if args.base_artifact_path and args.current_artifact_path:
         retain_artifact_for_analysis(base_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'base')
         retain_artifact_for_analysis(curr_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'current')
@@ -2986,6 +3177,18 @@ def main():
     print(f"✅ 输出：{provenance_path.resolve()}", file=sys.stderr)
     print(f"运行门控：python scripts/gate.py --step step1_scope --report-dir .upgrade-report/",
           file=sys.stderr)
+    if observer is not None and report_token is not None:
+        observer.finish_phase(
+            report_token,
+            status="completed",
+            message="Step1 正式结果文件写入完成",
+        )
+    if observer is not None and total_token is not None:
+        observer.finish_phase(
+            total_token,
+            status="completed",
+            message="Step1 分析完成",
+        )
     if not os.environ.get("JUA_ORCHESTRATED"):
         print(
             "\n⚠️  当前为单脚本直跑模式：下面的人工确认只会输出复核清单，"

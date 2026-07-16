@@ -952,7 +952,18 @@ def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
     }
     if report_dir is not None:
         env["UPGRADE_REPORT_DIR"] = str(Path(report_dir).resolve())
-    stdout, stderr, rc = run_cmd(cmd, cwd=str(cwd), env=env, timeout=timeout)
+    stream_output = script_name == "s1_dep_diff.py"
+    run_kwargs = {
+        "cwd": str(cwd),
+        "env": env,
+        "timeout": timeout,
+    }
+    if stream_output:
+        run_kwargs["stream_output"] = True
+        # Step scripts use stdout for structured interaction messages. Maven and
+        # progress logs are written to stderr, so do not expose protocol lines.
+        run_kwargs["stream_stdout"] = False
+    stdout, stderr, rc = run_cmd(cmd, **run_kwargs)
     interaction_prefix = "JUA_STEP_INTERACTION_JSON:"
     interaction = None
     filtered_stdout_lines = []
@@ -975,7 +986,7 @@ def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
     filtered_stdout = "\n".join(filtered_stdout_lines)
     if stdout.endswith("\n") and filtered_stdout:
         filtered_stdout += "\n"
-    print_output(filtered_stdout, stderr)
+    print_output(filtered_stdout, "" if stream_output else stderr)
     if interaction is not None:
         raise StepInteractionRequired(interaction)
     if rc != 0:
@@ -5618,6 +5629,8 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             step1_dep_changes_path(report_dir),
             step1_dep_summary_path(report_dir),
             step1_current_resolved_path(report_dir),
+            evidence_dependencies_dir(report_dir) / "step1_progress.jsonl",
+            evidence_dependencies_dir(report_dir) / "step1_timing.csv",
             build_provenance_path(report_dir),
             step1_artifacts_dir(report_dir),
         ],

@@ -69,8 +69,11 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 | `evidence/dependencies/dep_alerts.csv` | 需要优先复核的依赖变化 | 降级、删除、无法解析或高风险依赖 |
 | `evidence/dependencies/build_provenance.json` | base/current 构建产物来源和摘要 | 后续字节码分析是否基于正确制品 |
 | `evidence/dependencies/s1_artifacts/` | 留存的 base/current 产物 | Step5 业务字节码和运行时依赖 JAR 的来源 |
+| `evidence/dependencies/step1_progress.jsonl` | Step1 实时过程日志 | Agent 可在运行中查看当前侧、当前阶段、命令和阶段状态 |
+| `evidence/dependencies/step1_timing.csv` | Step1 分阶段耗时 | 定位分支工作区、Maven 构建、依赖坐标补全、制品解析、差异计算和结果写入的耗时点 |
 
 注意：Step1 当前以真实构建结果或用户提供的构建产物为准，不把手工 dependency tree 当作正式事实源。
+`dep_changes.csv` 仍只在完整比较成功后写入；过程日志和耗时文件仅用于监控与诊断，不是未完成分析的部分结果。
 
 ## 升级上下文
 

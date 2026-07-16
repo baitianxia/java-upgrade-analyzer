@@ -1738,7 +1738,7 @@ def main():
             [("com.example", "demo-lib", "2.0.0")],
         )
 
-        def fake_packaged_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None):
+        def fake_packaged_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None, **_kwargs):
             joined = " ".join(str(part) for part in cmd)
             if "dependency:list" in joined:
                 return (
@@ -1931,7 +1931,7 @@ def main():
         thin_module_dir.mkdir(parents=True, exist_ok=True)
         create_plain_jar(thin_module_dir / "module-a-1.0.0.jar")
 
-        def fake_runtime_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None):
+        def fake_runtime_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None, **_kwargs):
             joined = " ".join(str(part) for part in cmd)
             if "dependency:list" in joined:
                 return (
@@ -4281,7 +4281,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     (fake_current_jdk / "bin" / "java").chmod(0o755)
     worktree_calls = []
 
-    def fake_worktree_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None):
+    def fake_worktree_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None, **_kwargs):
         joined = " ".join(str(part) for part in cmd)
         worktree_calls.append({"cmd": list(cmd), "cwd": cwd, "env": dict(env or {})})
         if cmd[:3] == ["git", "worktree", "add"] or (len(cmd) >= 3 and cmd[1:3] == ["worktree", "add"]):
@@ -4370,7 +4370,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     host_jdk_calls = []
 
-    def fake_host_jdk_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None):
+    def fake_host_jdk_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None, **_kwargs):
         joined = " ".join(str(part) for part in cmd)
         host_jdk_calls.append({"cmd": list(cmd), "cwd": cwd, "env": dict(env or {})})
         if cmd[:3] == ["git", "worktree", "add"] or (len(cmd) >= 3 and cmd[1:3] == ["worktree", "add"]):

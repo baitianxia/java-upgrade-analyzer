@@ -19,6 +19,7 @@ import subprocess
 import locale
 import io
 import re
+import threading
 import safe_xml as ET
 from pathlib import Path
 
@@ -148,7 +149,21 @@ def maven_repo_dir():
     return Path.home() / '.m2' / 'repository'
 
 
-def run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None):
+def _decode_subprocess_output(raw_bytes):
+    if not raw_bytes:
+        return ''
+    for enc in ['utf-8', _SUBPROCESS_ENCODING, 'latin-1']:
+        try:
+            return raw_bytes.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw_bytes.decode('utf-8', errors='replace')
+
+
+def run_cmd(
+    cmd, cwd=None, timeout=300, input_text=None, env=None,
+    stream_output=False, stream_stdout=True,
+):
     """
     跨平台安全地运行子进程，正确处理编码。
 
@@ -161,6 +176,8 @@ def run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None):
       timeout      超时秒数
       input_text   stdin 输入（字符串）
       env          额外的环境变量（合并到当前环境）
+      stream_output 将子进程 stdout/stderr 实时转发到当前 stderr，同时仍完整捕获返回
+      stream_stdout 流式模式下是否转发 stdout；协议型子进程可仅转发 stderr
     """
     # 构建环境变量：强制 Maven/Git 使用 UTF-8 输出
     proc_env = os.environ.copy()
@@ -179,6 +196,57 @@ def run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None):
     proc_env.setdefault('LANG', 'en_US.UTF-8')
 
     try:
+        if stream_output:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                env=proc_env,
+            )
+            stdout_chunks = []
+            stderr_chunks = []
+
+            def drain(pipe, chunks, relay):
+                try:
+                    while True:
+                        chunk = pipe.readline()
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        if relay:
+                            sys.stderr.write(_decode_subprocess_output(chunk))
+                            sys.stderr.flush()
+                finally:
+                    pipe.close()
+
+            stdout_thread = threading.Thread(
+                target=drain, args=(proc.stdout, stdout_chunks, stream_stdout), daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=drain, args=(proc.stderr, stderr_chunks, True), daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+            if input_text is not None and proc.stdin is not None:
+                proc.stdin.write(input_text.encode('utf-8'))
+                proc.stdin.close()
+            try:
+                return_code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+                return '', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1
+            stdout_thread.join()
+            stderr_thread.join()
+            return (
+                _decode_subprocess_output(b''.join(stdout_chunks)),
+                _decode_subprocess_output(b''.join(stderr_chunks)),
+                return_code,
+            )
         proc = subprocess.run(
             cmd,
             cwd=cwd,
@@ -190,19 +258,8 @@ def run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None):
         )
 
         # 解码输出：先尝试 UTF-8，失败则用系统编码，再失败则替换非法字符
-        def decode_output(raw_bytes):
-            if not raw_bytes:
-                return ''
-            for enc in ['utf-8', _SUBPROCESS_ENCODING, 'latin-1']:
-                try:
-                    return raw_bytes.decode(enc)
-                except (UnicodeDecodeError, LookupError):
-                    continue
-            # 最终兜底：替换无法解码的字符
-            return raw_bytes.decode('utf-8', errors='replace')
-
-        stdout = decode_output(proc.stdout)
-        stderr = decode_output(proc.stderr)
+        stdout = _decode_subprocess_output(proc.stdout)
+        stderr = _decode_subprocess_output(proc.stderr)
         return stdout, stderr, proc.returncode
 
     except subprocess.TimeoutExpired:
