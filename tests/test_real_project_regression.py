@@ -233,6 +233,11 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(
             case.final_artifact.name, "spring-security-config-6.5.10.jar"
         )
+        self.assertEqual(
+            case.final_artifact.parent,
+            case.default_project / "config" / "build" / "libs",
+        )
+        self.assertNotIn(".m2", case.final_artifact.parts)
         self.assertEqual(case.case_mode, "discovery")
         self.assertTrue(case.enable_jdk_oracle)
         self.assertLessEqual(case.max_elapsed_seconds, 130.0)
@@ -4069,7 +4074,7 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(manifest["git_revision"], "d88a2b721bda3798a6a934987157498e66da06c5")
         self.assertEqual(
             manifest["artifact_sha256"],
-            "ea61c71eb0bd0ce669e4ecbe32c60317a9df49df2cf31a2248d5f71296ead2d7",
+            "609d58279a4c509da5cf453cf57ae2e28b41f3e42ec2f4789710db6c68e2c523",
         )
 
         self.assertEqual(case.required_topologies, (
@@ -4090,10 +4095,10 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(
             [realreg.canonical_edge_identity(row) for row in manifest["canonical_edges"]],
             [
-                "ea61c71eb0bd0ce669e4ecbe32c60317a9df49df2cf31a2248d5f71296ead2d7|"
+                "609d58279a4c509da5cf453cf57ae2e28b41f3e42ec2f4789710db6c68e2c523|"
                 "com.example.multimodule.application.DemoApplication|home|()Ljava/lang/String;|"
                 "com.example.multimodule.service.MyService|message|()Ljava/lang/String;|invokevirtual",
-                "ea61c71eb0bd0ce669e4ecbe32c60317a9df49df2cf31a2248d5f71296ead2d7|"
+                "609d58279a4c509da5cf453cf57ae2e28b41f3e42ec2f4789710db6c68e2c523|"
                 "com.example.multimodule.service.MyService|message|()Ljava/lang/String;|"
                 "com.example.multimodule.service.ServiceProperties|getMessage|()Ljava/lang/String;|invokevirtual",
             ],

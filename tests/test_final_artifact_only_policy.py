@@ -17,6 +17,7 @@ import s1_dep_diff as step1  # noqa: E402
 import s2_context_from_deps as step2  # noqa: E402
 import s4_jar_compare as step4  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
+import real_project_regression as realreg  # noqa: E402
 
 
 class FinalArtifactOnlyPolicyTest(unittest.TestCase):
@@ -157,6 +158,14 @@ class FinalArtifactOnlyPolicyTest(unittest.TestCase):
             step2, "run_cmd", side_effect=AssertionError("不得下载 POM")
         ):
             self.assertEqual(step2.get_pom_deps_from_m2("org.example", "demo", "1.0"), [])
+
+    def test_real_project_regression_artifacts_never_point_at_local_maven_repository(self):
+        offenders = {
+            name: str(case.final_artifact)
+            for name, case in realreg.CASES.items()
+            if case.final_artifact is not None and ".m2" in case.final_artifact.parts
+        }
+        self.assertEqual(offenders, {})
 
 
 if __name__ == "__main__":

@@ -752,8 +752,8 @@ CASES["spring-security-config"] = RealProjectCase(
     ),
     bytecode_coord="org.springframework.security:spring-security-core",
     final_artifact=Path(
-        "/Users/baitianxia/.m2/repository/org/springframework/security/"
-        "spring-security-config/6.5.10/spring-security-config-6.5.10.jar"
+        "/private/tmp/jua-real-project-spring-security-6.5.10/config/build/libs/"
+        "spring-security-config-6.5.10.jar"
     ),
     required_topologies=("business_direct", "constructor", "static_dispatch"),
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
