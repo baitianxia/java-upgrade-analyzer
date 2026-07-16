@@ -1781,6 +1781,7 @@ def build_interaction_selection_options(selection_options):
                 "label": str((item or {}).get("label") or coord or name or selection_key).strip(),
                 "api_count": (item or {}).get("api_count"),
                 "high_risk_api_count": (item or {}).get("high_risk_api_count"),
+                "recommended": _parse_bool((item or {}).get("recommended")),
                 "change_types": str((item or {}).get("change_types") or "").strip(),
                 "detail": str((item or {}).get("detail") or "").strip(),
                 "aliases": aliases,
@@ -1796,11 +1797,11 @@ def build_selection_resolution(selection_options):
     return {
         "enabled": True,
         "response_field": "selected_targets",
-        "preferred_identifier": "selection_key",
+        "preferred_identifier": "coord",
         "preferred_write_fields": ["step5_selected_coords", "step5_selected_names"],
         "rules": [
-            "若用户提到候选依赖，应优先输出 selected_targets，并优先使用 selection_key。",
-            "selected_targets 若填写 selection_key 或 coord，必须严格按该唯一目标执行；若只填写 name，则按 artifactId 名称筛选命中的全部候选。",
+            "若用户提到候选依赖，应优先输出 selected_targets，并使用 changed_dependencies.md 中的完整依赖坐标。",
+            "完整依赖坐标必须严格匹配唯一目标；只有用户仅提供依赖名称时，才按 artifactId 名称筛选命中的全部候选。",
             "selected_targets 只是候选选择输入；系统会自动把它归一化为正式的 step5_selected_coords / step5_selected_names。",
         ],
         "options": normalized_options,
@@ -1847,6 +1848,35 @@ def _parse_int_or_zero(value):
         return 0
 
 
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "是"}
+
+
+def _is_recommended_selection_target(row):
+    if str((row or {}).get("recommended") or "").strip():
+        return _parse_bool((row or {}).get("recommended"))
+    high_risk = _parse_int_or_zero((row or {}).get("high_risk_api_count"))
+    changed = _parse_int_or_zero((row or {}).get("changed_api_count") or (row or {}).get("api_count"))
+    change_types = str((row or {}).get("change_types") or "").lower()
+    return bool(high_risk or "removed" in change_types or "signature" in change_types or changed >= 20)
+
+
+def _is_high_risk_selection_api_row(row):
+    severity = str((row or {}).get("severity") or "").strip().upper()
+    change_type = str((row or {}).get("change_type") or "").strip().lower()
+    if severity:
+        return severity in {"P0", "P1", "HIGH", "CRITICAL"}
+    return change_type in {
+        "removed",
+        "signature_changed",
+        "method_removed",
+        "field_removed",
+        "class_removed",
+    }
+
+
 def build_step5_dependency_selection_summary(report_dir):
     report_dir = Path(report_dir).resolve()
     dependency_rows = read_csv_rows(step4_changed_dependencies_path(report_dir))
@@ -1856,8 +1886,7 @@ def build_step5_dependency_selection_summary(report_dir):
             coord = str(row.get("coord") or "").strip()
             if not coord:
                 continue
-            available_targets.append(
-                {
+            target = {
                     "selection_key": str(row.get("selection_key") or f"coord:{coord}").strip(),
                     "coord": coord,
                     "name": str(row.get("dependency_name") or _artifact_name_from_coord(coord)).strip(),
@@ -1865,15 +1894,23 @@ def build_step5_dependency_selection_summary(report_dir):
                     "high_risk_api_count": _parse_int_or_zero(row.get("high_risk_api_count")),
                     "change_types": str(row.get("change_types") or "").strip(),
                     "detail": str(row.get("detail") or "").strip(),
+                    "recommended": _is_recommended_selection_target(row),
                 }
-            )
+            available_targets.append(target)
+        recommended_targets = [item for item in available_targets if item.get("recommended")]
         return {
             "available_targets": available_targets,
             "available_target_count": len(available_targets),
+            "recommended_targets": recommended_targets,
+            "recommended_target_count": len(recommended_targets),
             "source_file": str(step4_changed_dependencies_path(report_dir)),
         }
     all_rows = read_csv_rows(step4_api_changes_dir(report_dir) / "all_changed_apis.csv")
     fallback = build_step5_selection_summary(all_rows)
+    fallback["recommended_targets"] = [
+        item for item in fallback.get("available_targets", []) if _is_recommended_selection_target(item)
+    ]
+    fallback["recommended_target_count"] = len(fallback["recommended_targets"])
     fallback["source_file"] = str(step4_api_changes_dir(report_dir) / "all_changed_apis.csv")
     return fallback
 
@@ -1893,9 +1930,19 @@ def build_step5_selection_summary(all_rows, selected_coords=None, selected_names
                 "coord": coord,
                 "name": _artifact_name_from_coord(coord),
                 "api_count": 0,
+                "high_risk_api_count": 0,
+                "change_type_set": set(),
             },
         )
         item["api_count"] += 1
+        if _is_high_risk_selection_api_row(row):
+            item["high_risk_api_count"] += 1
+        change_type = str((row or {}).get("change_type") or "").strip()
+        if change_type:
+            item["change_type_set"].add(change_type)
+    for item in per_coord_counts.values():
+        item["change_types"] = ", ".join(sorted(item.pop("change_type_set")))
+        item["recommended"] = _is_recommended_selection_target(item)
     available_targets = sorted(
         per_coord_counts.values(),
         key=lambda item: (item.get("coord") or ""),
@@ -3243,20 +3290,20 @@ def _response_payload_example(action_id, required_fields, properties):
     elif action_id == "continue":
         fields = ["base_branch", "current_branch", "source_dirs", "dependency_source_dirs"]
         for field in fields:
-            if field in required_fields or field in properties:
+            if field in required_fields:
                 if field in ("source_dirs", "dependency_source_dirs"):
                     payload[field] = [f"<{field} 值>"]
                 elif field not in payload:
                     payload[field] = f"<{field} 值>"
-        if "selected_targets" in properties:
-            payload["selected_targets"] = ["<selection_key 或 coord>"]
-        elif "step5_selected_coords" in properties:
+        if "selected_targets" in required_fields:
+            payload["selected_targets"] = ["<依赖包完整坐标>"]
+        elif "step5_selected_coords" in required_fields:
             payload["step5_selected_coords"] = ["<coord 值>"]
-        elif "step5_selected_names" in properties:
+        elif "step5_selected_names" in required_fields:
             payload["step5_selected_names"] = ["<name 值>"]
-        if "strict_risk_gate" in properties:
+        if "strict_risk_gate" in required_fields:
             payload["strict_risk_gate"] = True
-    if "notes" in properties:
+    if "notes" in required_fields:
         payload["notes"] = "<可选：用户补充说明>"
     return _wrap_response_payload_as_intent_patch(payload)
 
@@ -3309,7 +3356,8 @@ def build_resume_command_examples(options, required_fields, properties, project_
     return examples
 
 
-def _response_payload_action_example(action_id, properties):
+def _response_payload_action_example(action_id, properties, required_fields=None):
+    required_fields = set(required_fields or [])
     payload = {"action": action_id}
     if action_id == "rerun_current_step":
         if "primary_module" in properties:
@@ -3331,20 +3379,20 @@ def _response_payload_action_example(action_id, properties):
             ("base_branch", "origin/main"),
             ("current_branch", "feature/upgrade"),
         ):
-            if field in properties:
+            if field in required_fields:
                 payload[field] = sample
                 break
-        if "source_dirs" in properties:
+        if "source_dirs" in required_fields:
             payload["source_dirs"] = ["src/main/java"]
-        if "dependency_source_dirs" in properties:
+        if "dependency_source_dirs" in required_fields:
             payload["dependency_source_dirs"] = ["/abs/path/to/dependency-repo"]
-        if "selected_targets" in properties:
-            payload["selected_targets"] = ["coord:com.example:demo-lib"]
-        elif "step5_selected_coords" in properties:
+        if "selected_targets" in required_fields:
+            payload["selected_targets"] = ["com.example:demo-lib"]
+        elif "step5_selected_coords" in required_fields:
             payload["step5_selected_coords"] = ["com.example:demo-lib"]
-        if "strict_risk_gate" in properties:
+        if "strict_risk_gate" in required_fields:
             payload["strict_risk_gate"] = True
-        if "notes" in properties:
+        if "notes" in required_fields:
             payload["notes"] = "当前结果可信，继续"
     elif action_id == "cancel":
         if "notes" in properties:
@@ -4031,7 +4079,11 @@ def build_input_normalization_contract(options, required_fields, properties):
                 "label": option.get("label") or action_id,
                 "description": option.get("description", ""),
                 "user_reply_examples": _build_user_reply_examples(action_id, properties),
-                "normalized_response_example": _response_payload_action_example(action_id, properties),
+                "normalized_response_example": _response_payload_action_example(
+                    action_id,
+                    properties,
+                    required_fields=required_fields,
+                ),
             }
         )
 
@@ -4103,27 +4155,24 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
         payload["selection_options"] = build_interaction_selection_options(
             selection_resolution.get("options") or []
         )
-    if step_id == "step5":
-        properties.setdefault(
-            "step5_selected_coords",
-            {
-                "type": "array",
-                "description": "可选。重跑 Step5 时，只分析这些依赖包对应的变更 API；先从 changed_dependencies.md 读取 selection_key，需要筛选时再用 changed_dependencies.csv。",
-            },
-        )
-        properties.setdefault(
-            "step5_selected_names",
-            {
-                "type": "array",
-                "description": "可选。重跑 Step5 时，只分析这些依赖名称对应的变更 API；名称按 coord 的 artifactId 匹配。",
-            },
-        )
     if selection_resolution.get("enabled"):
+        for internal_field in ("step5_selected_coords", "step5_selected_names"):
+            properties.pop(internal_field, None)
+        sanitized_required_fields = []
+        for field in payload.get("required_fields") or []:
+            normalized_field = (
+                "selected_targets"
+                if field in ("step5_selected_coords", "step5_selected_names")
+                else field
+            )
+            if normalized_field not in sanitized_required_fields:
+                sanitized_required_fields.append(normalized_field)
+        payload["required_fields"] = sanitized_required_fields
         properties.setdefault(
             "selected_targets",
             {
                 "type": "array",
-                "description": "可选。优先填写 selection_key；也支持精确填写候选的 coord 或 name。系统会自动解析为正式的 Step5 目标字段。",
+                "description": "可选。从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。",
             },
         )
         payload["selection_resolution"] = selection_resolution
@@ -4132,13 +4181,52 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
         options,
         required_fields=payload.get("required_fields") or [],
     )
+    if selection_resolution.get("enabled"):
+        for requirement in action_requirements.values():
+            for field_list_name in ("required_fields", "recommended_fields", "at_least_one_of"):
+                fields = []
+                for field in requirement.get(field_list_name) or []:
+                    normalized_field = (
+                        "selected_targets"
+                        if field in ("step5_selected_coords", "step5_selected_names")
+                        else field
+                    )
+                    if normalized_field not in fields:
+                        fields.append(normalized_field)
+                if fields:
+                    requirement[field_list_name] = fields
+                else:
+                    requirement.pop(field_list_name, None)
     if action_requirements:
         payload["action_requirements"] = action_requirements
     response_schema["properties"] = properties
+    response_schema["required"] = [
+        field
+        for field in (response_schema.get("required") or ["action"])
+        if field not in ("step5_selected_coords", "step5_selected_names")
+    ]
     response_schema.setdefault("required", ["action"])
     payload["response_schema"] = response_schema
+    existing_normalization = dict(payload.get("input_normalization") or {})
+    rebuilt_normalization = build_input_normalization_contract(
+        options,
+        payload.get("required_fields") or [],
+        properties,
+    )
+    for list_key in ("rules", "do_not"):
+        merged_items = []
+        for item in list(existing_normalization.get(list_key) or []) + list(
+            rebuilt_normalization.get(list_key) or []
+        ):
+            if item not in merged_items:
+                merged_items.append(item)
+        if merged_items:
+            rebuilt_normalization[list_key] = merged_items
+    for key, value in existing_normalization.items():
+        if key not in rebuilt_normalization:
+            rebuilt_normalization[key] = value
     payload["input_normalization"] = enrich_input_normalization_contract(
-        payload.get("input_normalization") or {},
+        rebuilt_normalization,
         action_requirements=action_requirements,
         selection_resolution=selection_resolution,
     )
@@ -4193,7 +4281,7 @@ def _user_field_description(field, meta=None):
         "current_artifact_path": "升级后构建出的 jar/war 路径。",
         "dependency_source_dirs": "相关依赖源码仓库或多模块仓库根目录。",
         "dependency_git_ref_overrides": "当依赖版本无法自动匹配 git ref 时，显式给出 old_ref/new_ref。",
-        "selected_targets": "来自 changed_dependencies.md/csv 的 selection_key、依赖坐标或依赖名称。",
+        "selected_targets": "从 changed_dependencies.md 的“依赖包”列复制完整坐标。",
         "step5_selected_coords": "只分析这些依赖坐标的系统触达证据。",
         "step5_selected_names": "只分析这些依赖名称的系统触达证据。",
         "strict_risk_gate": "要求存在未确认项时不要继续产出无盲区结论。",
@@ -4328,21 +4416,22 @@ def build_user_decision_card(interaction):
                 lines.append(f"- {label}")
 
     options = list(interaction.get("options") or [])
-    if options:
-        lines.append("你可以选择：")
-        for option in options:
-            option_id = str(option.get("id") or "").strip()
-            label = option.get("label") or USER_ACTION_LABELS.get(option_id, "选择此处理方式")
-            desc = _humanize_interaction_text(option.get("description") or "").strip()
-            suffix = f" - {desc}" if desc else ""
-            lines.append(f"- {label}{suffix}")
-
     selection_options = list(interaction.get("selection_options") or [])
     if selection_options:
         selection_resolution = interaction.get("selection_resolution") or {}
         all_selection_options = list(selection_resolution.get("options") or [])
         total_candidates = len(all_selection_options) or len(selection_options)
-        displayed_candidates = min(10, len(selection_options))
+        recommended_options = list(interaction.get("recommended_selection_options") or [])
+        if not recommended_options:
+            recommended_options = [
+                item for item in selection_options if _is_recommended_selection_target(item)
+            ]
+        recommended_total = int(
+            interaction.get("recommended_candidate_count")
+            if interaction.get("recommended_candidate_count") is not None
+            else len(recommended_options)
+        )
+        displayed_recommended = min(10, len(recommended_options))
         full_candidate_file = next(
             (
                 str(path)
@@ -4353,21 +4442,61 @@ def build_user_decision_card(interaction):
         )
         if not full_candidate_file:
             full_candidate_file = str(selection_resolution.get("source_file") or "").strip()
-        lines.append("候选依赖包：")
-        lines.append(f"展示 {displayed_candidates} / {total_candidates} 个候选依赖包。")
-        lines.append("| 依赖包 | 变化 API 数 | 高风险 API 数 |")
-        lines.append("|---|---:|---:|")
-        for item in selection_options[:10]:
+        lines.append("请选择分析范围：")
+        lines.append("1. 全量分析")
+        lines.append(f"- 覆盖全部 {total_candidates} 个候选依赖包。")
+        lines.append("- 直接回复：全量继续")
+        lines.append("2. 从推荐候选中选择")
+        lines.append("- 推荐依据：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个。")
+        if recommended_total:
             lines.append(
-                f"| `{item.get('coord') or item.get('name') or ''}` | "
-                f"{item.get('api_count') or 0} | {item.get('high_risk_api_count') or 0} |"
+                f"- 推荐 {recommended_total} 个，展示 {displayed_recommended} / {recommended_total} 个。"
             )
-        if total_candidates > displayed_candidates:
-            remaining = total_candidates - displayed_candidates
-            if full_candidate_file:
-                lines.append(f"其余 {remaining} 个候选依赖包见 `{full_candidate_file}`。")
-            else:
-                lines.append(f"其余 {remaining} 个候选依赖包见完整依赖包清单。")
+            lines.append("| 推荐依赖包 | 变化 API 数 | 高风险 API 数 |")
+            lines.append("|---|---:|---:|")
+            for item in recommended_options[:10]:
+                lines.append(
+                    f"| `{item.get('coord') or item.get('name') or ''}` | "
+                    f"{item.get('api_count') or 0} | {item.get('high_risk_api_count') or 0} |"
+                )
+            first_recommended_coord = str(
+                recommended_options[0].get("coord")
+                or recommended_options[0].get("name")
+                or ""
+            ).strip()
+            if first_recommended_coord:
+                lines.append(f"- 直接回复，例如：只分析 {first_recommended_coord}")
+            if recommended_total > displayed_recommended:
+                remaining_recommended = recommended_total - displayed_recommended
+                if full_candidate_file:
+                    lines.append(
+                        f"- 其余 {remaining_recommended} 个推荐候选见 `{full_candidate_file}` 的“推荐候选”列。"
+                    )
+        else:
+            lines.append("- 当前没有符合推荐规则的候选依赖包。")
+        lines.append("3. 从全部候选中选择")
+        if full_candidate_file:
+            lines.append(
+                f"- 打开 `{full_candidate_file}`；这里列出了全部 {total_candidates} 个候选依赖包。"
+            )
+        else:
+            lines.append(f"- 打开完整依赖包清单；这里列出了全部 {total_candidates} 个候选依赖包。")
+        lines.append("- 查看“推荐候选”“依赖包”“高风险 API 数”和“为什么先看”。")
+        lines.append("- 复制“依赖包”列中的完整坐标，可同时复制多个依赖包。")
+        first_coord = str(
+            selection_options[0].get("coord") or selection_options[0].get("name") or ""
+        ).strip()
+        if first_coord:
+            lines.append(f"- 直接回复，例如：只分析 {first_coord}")
+
+    if options:
+        lines.append("你可以选择：")
+        for option in options:
+            option_id = str(option.get("id") or "").strip()
+            label = option.get("label") or USER_ACTION_LABELS.get(option_id, "选择此处理方式")
+            desc = _humanize_interaction_text(option.get("description") or "").strip()
+            suffix = f" - {desc}" if desc else ""
+            lines.append(f"- {label}{suffix}")
 
     files_to_review = list(interaction.get("files_to_review") or [])
     if files_to_review:
@@ -4478,6 +4607,12 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
                 "input_normalization": interaction.get("input_normalization", {}),
                 "action_requirements": action_requirements,
                 "selection_options": selection_options,
+                "recommended_selection_options": interaction.get(
+                    "recommended_selection_options", []
+                ),
+                "recommended_candidate_count": interaction.get(
+                    "recommended_candidate_count", 0
+                ),
                 "selection_resolution": interaction.get("selection_resolution", {}),
                 "runtime_rules": runtime_rules,
                 "next_action_rule": interaction.get("next_action_rule"),
@@ -4785,6 +4920,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                     "name": item.get("name"),
                     "api_count": item.get("api_count"),
                     "high_risk_api_count": item.get("high_risk_api_count"),
+                    "recommended": item.get("recommended"),
                     "change_types": item.get("change_types"),
                     "detail": item.get("detail"),
                     "label": item.get("coord") or item.get("name"),
@@ -4793,12 +4929,17 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             ]
         )
         selection_options = full_selection_options[:20]
+        recommended_selection_options = build_interaction_selection_options(
+            [item for item in full_selection_options if item.get("recommended")]
+        )
         interaction_meta["selection_options"] = selection_options
+        interaction_meta["recommended_selection_options"] = recommended_selection_options[:20]
+        interaction_meta["recommended_candidate_count"] = len(recommended_selection_options)
         interaction_meta["selection_resolution"] = build_selection_resolution(full_selection_options)
         checklist_lines.append("当前需要确认：Step5 是全量分析，还是只分析部分依赖包？")
         checklist_lines.append("推荐默认动作：如果依赖包数量不多，选择 continue 全量进入 Step5。")
-        checklist_lines.append("如果依赖包很多，请从候选依赖包中选择一个或多个 selection_key。")
-        checklist_lines.append("候选依赖包先看 evidence/api_changes/changed_dependencies.md；需要筛选或自动化时再用 changed_dependencies.csv。")
+        checklist_lines.append("如果依赖包很多，请从完整候选清单中复制一个或多个依赖包坐标。")
+        checklist_lines.append("完整候选清单见 evidence/api_changes/changed_dependencies.md；需要自动化筛选时再用 changed_dependencies.csv。")
         checklist_lines.append(
             f"  - 可选依赖数={target_summary.get('available_target_count', 0)} "
             f"Step4 API 行数={len(available_rows)}"
@@ -4809,7 +4950,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 f"changed_api_count={item.get('api_count')} | high_risk_api_count={item.get('high_risk_api_count') or 0}"
             )
         if target_summary.get("available_target_count", 0) > 10:
-            checklist_lines.append("  - 其余候选请查看 evidence/api_changes/changed_dependencies.md；展示列表之外的目标仍可通过精确 selection_key/coord/name 正式选择")
+            checklist_lines.append("  - 其余候选请查看 evidence/api_changes/changed_dependencies.md；复制“依赖包”列中的完整坐标即可选择")
         existing_selection = build_step5_selection_summary(
             available_rows,
             selected_coords=(run_context or {}).get("step5_selected_coords"),
@@ -4991,17 +5132,10 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             },
         )
         properties.setdefault(
-            "step5_selected_coords",
+            "selected_targets",
             {
                 "type": "array",
-                "description": "可选。继续进入 Step5 时，只分析这些依赖包对应的变更 API；先从 changed_dependencies.md 读取 selection_key，需要筛选时再用 changed_dependencies.csv。",
-            },
-        )
-        properties.setdefault(
-            "step5_selected_names",
-            {
-                "type": "array",
-                "description": "可选。继续进入 Step5 时，只分析这些依赖名称对应的变更 API；名称按 coord 的 artifactId 匹配。",
+                "description": "可选。定向分析时，从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。",
             },
         )
     if step_id == "step2":
@@ -5031,17 +5165,10 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             },
         )
         properties.setdefault(
-            "step5_selected_coords",
+            "selected_targets",
             {
                 "type": "array",
-                "description": "可选。重跑 Step5 时，只分析这些依赖包对应的变更 API；先从 changed_dependencies.md 读取 selection_key，需要筛选时再用 changed_dependencies.csv。",
-            },
-        )
-        properties.setdefault(
-            "step5_selected_names",
-            {
-                "type": "array",
-                "description": "可选。重跑 Step5 时，只分析这些依赖名称对应的变更 API；名称按 coord 的 artifactId 匹配。",
+                "description": "可选。定向分析时，从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。",
             },
         )
     for field in interaction_meta.get("required_fields", []) or []:
@@ -5091,6 +5218,13 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     }
     if interaction_meta.get("selection_options"):
         payload["selection_options"] = list(interaction_meta.get("selection_options") or [])
+    if interaction_meta.get("recommended_selection_options") is not None:
+        payload["recommended_selection_options"] = list(
+            interaction_meta.get("recommended_selection_options") or []
+        )
+        payload["recommended_candidate_count"] = int(
+            interaction_meta.get("recommended_candidate_count") or 0
+        )
     if interaction_meta.get("selection_resolution"):
         payload["selection_resolution"] = dict(interaction_meta.get("selection_resolution") or {})
     if step_id == "step5" and not payload.get("selection_resolution"):
@@ -5324,10 +5458,12 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
             (pending_interaction or {}).get("selection_resolution") or {},
             user_response.get("selected_targets"),
         ) or {}
-        if selection_result.get("step5_selected_coords"):
-            user_response["step5_selected_coords"] = selection_result.get("step5_selected_coords")
-        if selection_result.get("step5_selected_names"):
-            user_response["step5_selected_names"] = selection_result.get("step5_selected_names")
+        user_response["step5_selected_coords"] = list(
+            selection_result.get("step5_selected_coords") or []
+        )
+        user_response["step5_selected_names"] = list(
+            selection_result.get("step5_selected_names") or []
+        )
     pending_step_id = str((pending_interaction or {}).get("step_id") or "").strip()
     pending_kind = str((pending_interaction or {}).get("kind") or "").strip()
     step_id = str(target_step_id or pending_step_id or "").strip()
@@ -5335,6 +5471,14 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
         return main_state, {}
     base_context = build_restore_context(main_state, step_id)
     action = str((user_response or {}).get("action") or "").strip()
+    if (
+        step_id == "step4"
+        and action == "continue"
+        and not user_response.get("step5_selected_coords")
+        and not user_response.get("step5_selected_names")
+    ):
+        base_context.pop("step5_selected_coords", None)
+        base_context.pop("step5_selected_names", None)
     if action == "restart_from_step" and pending_step_id and pending_step_id != step_id:
         # When restarting to an earlier step, preserve already known runtime context
         # from the current checkpoint (for example base/current branches from Step4).
@@ -5344,6 +5488,9 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
             merged_base_context.update(restart_fallback_context)
             base_context = merged_base_context
     updated = merge_user_response_into_run_context(base_context, user_response, project_dir)
+    for selection_field in ("step5_selected_coords", "step5_selected_names"):
+        if selection_field in updated and not updated.get(selection_field):
+            updated.pop(selection_field, None)
     if step_id == "step1":
         main_state["step1"]["input"] = dict(updated)
     else:
@@ -5434,7 +5581,7 @@ def build_non_pending_structured_response_interaction(target_step_id, report_dir
         if not (selection_resolution.get("options") or []):
             raise StepError(
                 "当前无法解析 selected_targets：缺少可用的 Step5 候选目标。"
-                "请先执行 Step4 生成候选，或直接提供 step5_selected_coords / step5_selected_names。"
+                "请先完成依赖 API 变化分析，生成 changed_dependencies.md 后再选择依赖包。"
             )
         interaction["selection_resolution"] = selection_resolution
     return interaction

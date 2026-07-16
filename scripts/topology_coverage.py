@@ -479,6 +479,7 @@ def _selected_target_identities(
     inventory: dict | None = None,
     *,
     resolve_unreferenced: bool = True,
+    unreferenced_owner_allowlist: set[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     targets: dict[tuple[str, str, str], dict] = {}
     unresolved: list[str] = []
@@ -486,14 +487,22 @@ def _selected_target_identities(
         api_name = str(row.get("api_name") or "").strip()
         signature = _normalized_topology_signature(str(row.get("api_signature") or ""))
         kind = str(row.get("symbol_kind") or "method").strip()
+        owner, separator, member = api_name.rpartition(".")
+        unreferenced_owner_allowed = (
+            unreferenced_owner_allowlist is None
+            or any(
+                _normalized_topology_owner(candidate)
+                == _normalized_topology_owner(api_name if kind == "class" else owner)
+                for candidate in unreferenced_owner_allowlist
+            )
+        )
         if kind == "class" and api_name:
-            if resolve_unreferenced:
+            if resolve_unreferenced and unreferenced_owner_allowed:
                 targets[(api_name, "", "")] = {
                     "owner": api_name, "member": "", "descriptor": "",
                     "coordinate": str(row.get("coord") or ""),
                 }
             continue
-        owner, separator, member = api_name.rpartition(".")
         matches = []
         for edge in edges:
             if (
@@ -509,7 +518,12 @@ def _selected_target_identities(
                 continue
             matches.append(edge)
         identities = {_method_node(edge, "callee") for edge in matches}
-        if not identities and inventory and resolve_unreferenced:
+        if (
+            not identities
+            and inventory
+            and resolve_unreferenced
+            and unreferenced_owner_allowed
+        ):
             for entry, content in (inventory.get("classes") or {}).items():
                 binary_owner = _class_binary_name(entry)
                 if (
@@ -527,7 +541,9 @@ def _selected_target_identities(
                     ) != signature:
                         continue
                     identities.add((parsed_owner or binary_owner, member, descriptor))
-        if not identities and not resolve_unreferenced:
+        if not identities and (
+            not resolve_unreferenced or not unreferenced_owner_allowed
+        ):
             continue
         if not separator or not identities:
             unresolved.append(f"{api_name}{row.get('api_signature') or ''}")
@@ -1354,6 +1370,9 @@ def extract_artifact_topology_evidence(
         scan.get("edges") or [],
         inventory,
         resolve_unreferenced=bool(target_owner_entries),
+        unreferenced_owner_allowlist=(
+            set(target_owner_entries or {}) if target_owner_entries else None
+        ),
     )
     errors.extend(f"unresolved exact changed API identity: {item}" for item in unresolved)
     target_set = {_target_identity(item) for item in targets}
@@ -1568,6 +1587,17 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
     semantic_target_classes = {
         target[0] for target in targets if not target[1] and not target[2]
     }
+    for reference in artifact_layout.get("semantic_references") or []:
+        identity = str(reference.get("api_identity") or "")
+        fields = identity.split("|")
+        if (
+            len(fields) >= 5
+            and fields[1]
+            and not fields[2]
+            and fields[3] == "class"
+            and fields[1] == str(reference.get("target_class") or "")
+        ):
+            semantic_target_classes.add(fields[1])
     if any(
         item.get("authority") == "final-artifact-classfile-constants"
         and item.get("target_class") in semantic_target_classes

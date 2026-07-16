@@ -547,7 +547,15 @@ def decide_analysis(
             business_reach_depth=business_reach_depth,
         )
 
-    if blocking_failure is not None:
+    independent_uncertain_semantic_path = any(
+        path.entry_scope == ModuleScope.BUSINESS_CLASSES
+        and path.complete
+        and not path.ambiguous
+        and not path.truncated
+        and any(edge.semantic for edge in path.evidence)
+        for path in path_items
+    )
+    if blocking_failure is not None and not independent_uncertain_semantic_path:
         return AnalysisDecision(
             analysis_status="not_analyzed",
             is_reachable=None,
@@ -629,6 +637,16 @@ def decide_analysis(
                 "已在当前最终制品的运行时依赖字节码中确认对目标符号的稳定引用，"
                 "但当前尚未证明这些依赖是否回到系统业务入口"
             ),
+            direct_callers=direct_callers,
+            business_reach_depth=business_reach_depth,
+        )
+
+    if blocking_failure is not None:
+        return AnalysisDecision(
+            analysis_status="not_analyzed",
+            is_reachable=None,
+            reason_code=blocking_failure.reason_code,
+            reachable_note=blocking_failure.detail or "关键证据采集失败，无法形成可靠结论",
             direct_callers=direct_callers,
             business_reach_depth=business_reach_depth,
         )

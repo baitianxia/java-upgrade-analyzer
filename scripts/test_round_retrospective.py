@@ -11,6 +11,8 @@ import math
 from pathlib import Path
 import unittest
 
+from topology_coverage import STABLE_TOPOLOGY_IDS
+
 
 REQUIRED_REVIEW_FIELDS = (
     "root_cause_family",
@@ -116,6 +118,13 @@ def _oracle_complete(results: list[dict]) -> bool:
         audit = result.get("result_audit") or {}
         if not audit or audit.get("failures") or int(audit.get("unverified") or 0):
             return False
+        guard_contract = result.get("guard_contract") or {}
+        guard_oracle_complete = bool(
+            guard_contract.get("passed") is True
+            and not guard_contract.get("errors")
+            and type(guard_contract.get("api_count")) is int
+            and guard_contract.get("api_count") == population
+        )
         oracle_audit = result.get("oracle_audit") or {}
         zero_count_fields = (
             "incorrect",
@@ -129,7 +138,7 @@ def _oracle_complete(results: list[dict]) -> bool:
             "analyzer_duplicate_identity_count",
             "analyzer_conflict_identity_count",
         )
-        if not oracle_audit or (
+        if not guard_oracle_complete and (not oracle_audit or (
             oracle_audit.get("blocking") is not False
             or type(oracle_audit.get("selected")) is not int
             or oracle_audit.get("selected") != population
@@ -140,7 +149,7 @@ def _oracle_complete(results: list[dict]) -> bool:
                 or oracle_audit.get(field) != 0
                 for field in zero_count_fields
             )
-        ):
+        )):
             return False
         edge_truth = result.get("edge_truth") or {}
         counts = edge_truth.get("counts") or {}
@@ -157,23 +166,43 @@ def _oracle_complete(results: list[dict]) -> bool:
             "edge_truth_provenance_invalid_count",
             "edge_truth_oracle_conflict_count",
         )
-        if (
+        common_edge_invalid = bool(
             edge_truth.get("complete") is not True
             or edge_truth.get("blocking") is not False
             or edge_truth.get("errors")
             or not counts
             or any(
-                type(counts.get(field)) is not int or counts.get(field) <= 0
-                for field in positive_edge_fields
-            )
-            or any(
                 type(counts.get(field)) is not int or counts.get(field) != 0
                 for field in zero_edge_fields
             )
-            or counts.get("edge_reconciliation_row_count")
-            != counts.get("oracle_edge_count", 0) + counts.get("analyzer_edge_count", 0)
-            or counts.get("edge_truth_correct_count")
-            != counts.get("edge_reconciliation_row_count")
+        )
+        if common_edge_invalid:
+            return False
+        physical_edge_count = counts.get("oracle_edge_count")
+        semantic_reference_count = counts.get("semantic_reference_count", 0)
+        if type(physical_edge_count) is not int or type(semantic_reference_count) is not int:
+            return False
+        if physical_edge_count > 0:
+            if (
+                any(
+                    type(counts.get(field)) is not int or counts.get(field) <= 0
+                    for field in positive_edge_fields
+                )
+                or counts.get("edge_reconciliation_row_count")
+                != physical_edge_count + counts.get("analyzer_edge_count", 0)
+                or counts.get("edge_truth_correct_count")
+                != counts.get("edge_reconciliation_row_count")
+            ):
+                return False
+        elif not (
+            guard_oracle_complete
+            and semantic_reference_count > 0
+            and counts.get("analyzer_edge_count") == 0
+            and counts.get("edge_reconciliation_row_count") == 0
+            and counts.get("edge_truth_correct_count") == 0
+            and guard_contract.get("expected_physical_edge_count") == 0
+            and guard_contract.get("expected_semantic_reference_count")
+            == semantic_reference_count
         ):
             return False
         topology = result.get("topology_coverage") or {}
@@ -675,7 +704,20 @@ def build_retrospective(
         )
         if str(topology)
     }
-    newly_observed = sorted(set(observed_topologies) - prior_observed_topologies)
+    stabilized_topologies = {
+        str(topology)
+        for result in results
+        if str(result.get("case_mode") or "") == "guard"
+        for topology in (
+            (result.get("topology_coverage") or {}).get("observed")
+            or (result.get("topology_coverage") or {}).get("newly_observed")
+            or []
+        )
+        if str(topology)
+    }
+    newly_observed = sorted(
+        set(observed_topologies) - prior_observed_topologies - stabilized_topologies
+    )
     missing_topologies = sorted({
         str(topology)
         for result in results
@@ -718,7 +760,8 @@ def build_retrospective(
                     (result.get("project_asset_health") or {}).get("git_revision") or ""
                 ),
                 "git_dirty": (result.get("project_asset_health") or {}).get("git_dirty"),
-                "newly_observed_topologies": sorted({
+                "newly_observed_topologies": (
+                    [] if str(result.get("case_mode") or "") == "guard" else sorted({
                     str(item).strip()
                     for item in (
                         (result.get("topology_coverage") or {}).get("observed")
@@ -726,7 +769,8 @@ def build_retrospective(
                         or []
                     )
                     if str(item).strip()
-                } - prior_observed_topologies),
+                    } - prior_observed_topologies)
+                ),
             }
             for result in results
         ],
@@ -798,6 +842,23 @@ def build_retrospective(
             "rationale": "; ".join(domain_errors),
             "target_topologies": missing_topologies,
             "blockers": domain_errors,
+        }
+    elif next_action is None and recommended_decision == "rotate":
+        rotation_targets = sorted(
+            set(STABLE_TOPOLOGY_IDS)
+            - set(observed_topologies)
+            - prior_observed_topologies
+        )
+        if not rotation_targets:
+            rotation_targets = ["new_orthogonal_framework_topology"]
+        next_action = {
+            "decision": "rotate",
+            "project": "next-orthogonal-real-project",
+            "rationale": (
+                "current guard projects are converged; select a new project that "
+                "exercises an uncovered topology"
+            ),
+            "target_topologies": rotation_targets[:1],
         }
     payload["recommended_decision"] = recommended_decision
     payload["next_action"] = dict(next_action or {})

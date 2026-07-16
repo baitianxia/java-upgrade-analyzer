@@ -128,7 +128,7 @@ evidence/api_changes/
 | 文件 | 说明 | 复核重点 |
 |---|---|---|
 | `changed_dependencies.md` | 给人看的依赖包维度清单 | Step5 全量分析还是选择部分依赖包 |
-| `changed_dependencies.csv` | 结构化依赖包清单 | `selection_key`、变化 API 数、高风险 API 数 |
+| `changed_dependencies.csv` | 结构化依赖包清单 | 推荐标记、变化 API 数、高风险 API 数 |
 | `all_changed_apis.csv` | 完整 API 变化事实集合，每行一个变更 API 或候选目标 | 变化 API 是否真实、符号类型是否正确 |
 | `all_changed_apis_alerts.csv` | 高风险 API 变化子集 | P0/P1、删除、行为变化等 |
 | `summary.txt` | Step4 覆盖率和执行摘要 | jar 是否缺失、JApiCmp 是否失败、git diff 是否跳过 |
@@ -148,8 +148,13 @@ Step4 还会从 old/current 最终 JAR 识别 DTO/数据对象的实例字段新
 | `evidence/api_changes/changed_dependencies.csv` | 结构化依赖包清单 |
 | `evidence/api_changes/all_changed_apis.csv` | 完整 API 变化事实集合 |
 
-普通选择应使用 `changed_dependencies.md` 中的 `selection_key`，例如 `coord:com.foo:bar`。
-`all_changed_apis.csv` 可能很大，它用于核对完整 API 明细，不作为普通选择入口。
+范围选择分为三层：
+
+1. **全量分析**：覆盖全部候选依赖包。
+2. **从推荐候选中选择**：选择“推荐候选”为“是”的依赖包。推荐依据是含高风险 API、删除或签名变化，或变化 API 数不少于 20 个。
+3. **从全部候选中选择**：打开 `changed_dependencies.md`，从完整清单复制“依赖包”列中的坐标，可同时复制多个，例如：`只分析 com.foo:bar、com.foo:baz`。
+
+`all_changed_apis.csv` 用于核对 API 级明细，不作为依赖包选择入口。推荐候选只表示优先查看，不表示已经确认影响当前系统。
 
 ### per-dependency 视图
 

@@ -1,0 +1,56 @@
+{
+  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "case": "commons-text",
+  "repository": "apache/commons-text",
+  "checkout_root": "/private/tmp/jua-real-system-commons-text-20260716-c",
+  "git_revision": "2c2d0818b0540c59f055f5174db51d0574af46da",
+  "artifact_path": "target/commons-text-1.12.0.jar",
+  "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+  "materialization": {
+    "kind": "source_build",
+    "repository_url": "https://github.com/apache/commons-text.git",
+    "working_directory": ".",
+    "command": ["mvn", "-q", "-DskipTests", "package"],
+    "artifact_path": "target/commons-text-1.12.0.jar"
+  },
+  "performance_baseline": {
+    "git_revision": "2c2d0818b0540c59f055f5174db51d0574af46da",
+    "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+    "scope": {
+      "selected_api_count": 6,
+      "accounted_api_count": 6,
+      "artifact_count": 1,
+      "class_count": 152,
+      "analyzer_edge_count": 34,
+      "oracle_edge_count": 34,
+      "fault_injection_detected_count": 1
+    },
+    "metrics": {
+      "elapsed_seconds_per_api": {"value": 2.461, "max_ratio": 2.0},
+      "scan_seconds_per_1000_classes": {"value": 5.948, "max_ratio": 2.0},
+      "max_api_elapsed_seconds": {"value": 0.008, "max_ratio": 3.0},
+      "javap_invocations": {"value": 219, "max_ratio": 1.5},
+      "duplicate_jar_scans": {"value": 0, "max_absolute": 0},
+      "peak_rss_mb": {"value": 95.438, "max_ratio": 1.5}
+    }
+  },
+  "ground_truth_status": "reviewed",
+  "required_topologies": ["source_bytecode_agree"],
+  "apis": [
+    {"coord": "org.apache.commons:commons-lang3", "owner": "org.apache.commons.lang3.StringUtils", "member": "isBlank", "descriptor": "(Ljava/lang/CharSequence;)Z", "symbol_kind": "method", "expected_conclusion": "reachable", "expected_chain": ["org.apache.commons.text.WordUtils.containsAllWords", "org.apache.commons.lang3.StringUtils.isBlank"]},
+    {"coord": "org.apache.commons:commons-lang3", "owner": "org.apache.commons.lang3.StringUtils", "member": "isEmpty", "descriptor": "(Ljava/lang/CharSequence;)Z", "symbol_kind": "method", "expected_conclusion": "reachable", "expected_chain": ["org.apache.commons.text.CaseUtils.toCamelCase", "org.apache.commons.lang3.StringUtils.isEmpty"]},
+    {"coord": "org.apache.commons:commons-lang3", "owner": "org.apache.commons.lang3.StringUtils", "member": "defaultString", "descriptor": "(Ljava/lang/String;)Ljava/lang/String;", "symbol_kind": "method", "expected_conclusion": "reachable", "expected_chain": ["org.apache.commons.text.WordUtils.abbreviate", "org.apache.commons.lang3.StringUtils.defaultString"]},
+    {"coord": "org.apache.commons:commons-lang3", "owner": "org.apache.commons.lang3.StringUtils", "member": "EMPTY", "descriptor": "Ljava/lang/String;", "symbol_kind": "field", "expected_conclusion": "uncertain", "expected_chain": ["org.apache.commons.text.AlphabetConverter.createConverter", "org.apache.commons.lang3.StringUtils.EMPTY"]},
+    {"coord": "org.apache.commons:commons-lang3", "owner": "org.apache.commons.lang3.ArrayUtils", "member": "isEmpty", "descriptor": "([C)Z", "symbol_kind": "method", "expected_conclusion": "reachable", "expected_chain": ["org.apache.commons.text.CaseUtils.toDelimiterSet", "org.apache.commons.lang3.ArrayUtils.isEmpty"]},
+    {"coord": "org.apache.commons:commons-lang3", "owner": "org.apache.commons.lang3.Validate", "member": "isTrue", "descriptor": "(ZLjava/lang/String;[Ljava/lang/Object;)V", "symbol_kind": "method", "expected_conclusion": "reachable", "expected_chain": ["org.apache.commons.text.RandomStringGenerator.generate", "org.apache.commons.lang3.Validate.isTrue"]}
+  ],
+  "canonical_edges": [
+    {"artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79", "artifact_entry": "org/apache/commons/text/CaseUtils.class", "caller_owner": "org.apache.commons.text.CaseUtils", "caller_member": "toDelimiterSet", "caller_descriptor": "([C)Ljava/util/Set;", "callee_owner": "org.apache.commons.lang3.ArrayUtils", "callee_member": "isEmpty", "callee_descriptor": "([C)Z", "opcode_family": "invokestatic", "instruction_offset": 31},
+    {"artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79", "artifact_entry": "org/apache/commons/text/WordUtils.class", "caller_owner": "org.apache.commons.text.WordUtils", "caller_member": "abbreviate", "caller_descriptor": "(Ljava/lang/String;IILjava/lang/String;)Ljava/lang/String;", "callee_owner": "org.apache.commons.lang3.StringUtils", "callee_member": "defaultString", "callee_descriptor": "(Ljava/lang/String;)Ljava/lang/String;", "opcode_family": "invokestatic", "instruction_offset": 127},
+    {"artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79", "artifact_entry": "org/apache/commons/text/WordUtils.class", "caller_owner": "org.apache.commons.text.WordUtils", "caller_member": "containsAllWords", "caller_descriptor": "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Z", "callee_owner": "org.apache.commons.lang3.StringUtils", "callee_member": "isBlank", "callee_descriptor": "(Ljava/lang/CharSequence;)Z", "opcode_family": "invokestatic", "instruction_offset": 38},
+    {"artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79", "artifact_entry": "org/apache/commons/text/CaseUtils.class", "caller_owner": "org.apache.commons.text.CaseUtils", "caller_member": "toCamelCase", "caller_descriptor": "(Ljava/lang/String;Z[C)Ljava/lang/String;", "callee_owner": "org.apache.commons.lang3.StringUtils", "callee_member": "isEmpty", "callee_descriptor": "(Ljava/lang/CharSequence;)Z", "opcode_family": "invokestatic", "instruction_offset": 1},
+    {"artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79", "artifact_entry": "org/apache/commons/text/RandomStringGenerator$Builder.class", "caller_owner": "org.apache.commons.text.RandomStringGenerator$Builder", "caller_member": "withinRange", "caller_descriptor": "(II)Lorg/apache/commons/text/RandomStringGenerator$Builder;", "callee_owner": "org.apache.commons.lang3.Validate", "callee_member": "isTrue", "callee_descriptor": "(ZLjava/lang/String;[Ljava/lang/Object;)V", "opcode_family": "invokestatic", "instruction_offset": 30}
+  ],
+  "canonical_semantic_references": [],
+  "fixture_debt": []
+}

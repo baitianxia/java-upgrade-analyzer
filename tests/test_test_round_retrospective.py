@@ -169,6 +169,52 @@ class TestRoundRetrospectiveTest(unittest.TestCase):
         self.assertTrue(result["evidence"]["project_provenance_complete"])
         self.assertEqual(result["optimization_backlog"], [])
 
+    def test_guard_matrix_topologies_are_stabilized_and_auto_rotate(self):
+        real = clean_real_payload(newly_observed=["business_direct"])
+        real["results"][0]["case_mode"] = "guard"
+
+        result = retro.build_retrospective(
+            real,
+            audit_payload(real=real),
+            reviews=[],
+            history=[],
+        )
+
+        self.assertEqual(retro.evaluate_retrospective(result), [])
+        self.assertEqual(result["decision"], "rotate")
+        self.assertEqual(result["coverage"]["newly_observed"], [])
+        self.assertNotEqual(result["next_action"]["project"], "sample")
+        self.assertTrue(result["next_action"]["target_topologies"])
+
+    def test_pinned_guard_contract_accepts_semantic_only_oracle(self):
+        real = clean_real_payload()
+        result = real["results"][0]
+        result["oracle_audit"] = {}
+        result["guard_contract"] = {
+            "passed": True,
+            "errors": [],
+            "api_count": 1,
+            "expected_physical_edge_count": 0,
+            "expected_semantic_reference_count": 1,
+        }
+        result["edge_truth"]["counts"].update({
+            "oracle_edge_count": 0,
+            "analyzer_edge_count": 0,
+            "edge_reconciliation_row_count": 0,
+            "edge_truth_correct_count": 0,
+            "semantic_reference_count": 1,
+        })
+
+        retrospective = retro.build_retrospective(
+            real,
+            audit_payload(real=real),
+            reviews=[],
+            history=[],
+            next_action=rotation_action(),
+        )
+
+        self.assertTrue(retrospective["evidence"]["oracle_complete"])
+
     def test_new_topology_keeps_project_as_guard_before_rotation(self):
         real = clean_real_payload(newly_observed=["framework_callback"])
         result = retro.build_retrospective(
@@ -506,14 +552,15 @@ class TestRoundRetrospectiveTest(unittest.TestCase):
             retro.evaluate_retrospective(result),
         )
 
-    def test_rotate_decision_requires_next_project_and_rationale(self):
+    def test_rotate_decision_generates_next_project_and_rationale(self):
         result = retro.build_retrospective(
             clean_real_payload(), audit_payload(), [], history=[]
         )
 
-        errors = retro.evaluate_retrospective(result)
-        self.assertIn("next_action_project_missing", errors)
-        self.assertIn("next_action_rationale_missing", errors)
+        self.assertEqual(retro.evaluate_retrospective(result), [])
+        self.assertEqual(result["next_action"]["decision"], "rotate")
+        self.assertEqual(result["next_action"]["project"], "next-orthogonal-real-project")
+        self.assertTrue(result["next_action"]["rationale"])
 
     def test_rotate_rejects_current_project_and_already_covered_topology(self):
         action = rotation_action()

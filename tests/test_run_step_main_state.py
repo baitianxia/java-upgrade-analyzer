@@ -388,7 +388,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "intent_patch": {
                             "action": "continue",
                             "set": {
-                                "selected_targets": ["coord:com.example:demo-lib"],
+                                "selected_targets": ["com.example:demo-lib"],
                             },
                         }
                     },
@@ -419,8 +419,8 @@ class RunStepMainStateTest(unittest.TestCase):
             api_dir = report_dir / "evidence" / "api_changes"
             api_dir.mkdir(parents=True, exist_ok=True)
             (api_dir / "changed_dependencies.csv").write_text(
-                "selection_key,coord,dependency_name,changed_api_count,high_risk_api_count,change_types,symbol_kinds,detail\n"
-                "coord:com.acme:alpha,com.acme:alpha,alpha,42,5,removed,method,s4_per_dependency/com.acme__alpha/summary.json\n",
+                "selection_key,coord,dependency_name,changed_api_count,high_risk_api_count,change_types,symbol_kinds,recommended,detail\n"
+                "coord:com.acme:alpha,com.acme:alpha,alpha,42,5,removed,method,true,s4_per_dependency/com.acme__alpha/summary.json\n",
                 encoding="utf-8",
             )
 
@@ -431,6 +431,10 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(selection_resolution["options"][0]["coord"], "com.acme:alpha")
             self.assertEqual(selection_resolution["options"][0]["api_count"], 42)
             self.assertEqual(selection_resolution["options"][0]["high_risk_api_count"], 5)
+
+            summary = run_step.build_step5_dependency_selection_summary(report_dir)
+            self.assertEqual(summary["recommended_target_count"], 1)
+            self.assertEqual(summary["recommended_targets"][0]["coord"], "com.acme:alpha")
 
     def test_report_landing_doc_is_single_dynamic_user_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -642,6 +646,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 "coord": f"com.acme:lib-{index}",
                 "api_count": index + 1,
                 "high_risk_api_count": index % 3,
+                "recommended": index < 12,
             }
             for index in range(37)
         ]
@@ -650,6 +655,8 @@ class RunStepMainStateTest(unittest.TestCase):
             "question": "请选择系统触达证据的分析范围。",
             "options": [{"id": "continue", "label": "全部分析"}],
             "selection_options": all_candidates[:20],
+            "recommended_selection_options": all_candidates[:12],
+            "recommended_candidate_count": 12,
             "selection_resolution": {
                 "enabled": True,
                 "options": all_candidates,
@@ -668,14 +675,74 @@ class RunStepMainStateTest(unittest.TestCase):
 
         text = "\n".join(run_step.build_user_decision_card(interaction))
 
-        self.assertIn("展示 10 / 37 个候选依赖包", text)
+        self.assertIn("覆盖全部 37 个候选依赖包", text)
+        self.assertIn("推荐 12 个，展示 10 / 12 个", text)
         self.assertIn(
-            "其余 27 个候选依赖包见 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md`",
+            "其余 2 个推荐候选见 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md` 的“推荐候选”列",
             text,
         )
         self.assertNotIn("完整候选请看下面的文件", text)
         self.assertNotIn("interaction.json", text)
         self.assertIn("all_changed_apis_part_002.csv", text)
+
+    def test_dependency_selection_card_explains_how_to_select_from_full_list(self):
+        interaction = {
+            "step_id": "step4",
+            "question": "请选择系统触达证据的分析范围。",
+            "options": [
+                {"id": "continue", "label": "继续（全量分析）"},
+            ],
+            "selection_options": [
+                {
+                    "selection_key": "coord:com.acme:alpha",
+                    "coord": "com.acme:alpha",
+                    "api_count": 42,
+                    "high_risk_api_count": 5,
+                }
+            ],
+            "recommended_selection_options": [
+                {
+                    "selection_key": "coord:com.acme:alpha",
+                    "coord": "com.acme:alpha",
+                    "api_count": 42,
+                    "high_risk_api_count": 5,
+                }
+            ],
+            "recommended_candidate_count": 1,
+            "selection_resolution": {
+                "enabled": True,
+                "options": [
+                    {
+                        "selection_key": "coord:com.acme:alpha",
+                        "coord": "com.acme:alpha",
+                    },
+                    {
+                        "selection_key": "coord:com.acme:beta",
+                        "coord": "com.acme:beta",
+                    },
+                ],
+            },
+            "files_to_review": [
+                "/project/.upgrade-report/evidence/api_changes/changed_dependencies.md",
+            ],
+        }
+
+        text = "\n".join(run_step.build_user_decision_card(interaction))
+
+        self.assertIn("请选择分析范围：", text)
+        self.assertIn("1. 全量分析", text)
+        self.assertIn("覆盖全部 2 个候选依赖包", text)
+        self.assertIn("2. 从推荐候选中选择", text)
+        self.assertIn("推荐 1 个，展示 1 / 1 个", text)
+        self.assertIn("推荐依据：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", text)
+        self.assertIn("3. 从全部候选中选择", text)
+        self.assertIn(
+            "打开 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md`；这里列出了全部 2 个候选依赖包",
+            text,
+        )
+        self.assertIn("查看“推荐候选”“依赖包”“高风险 API 数”和“为什么先看”", text)
+        self.assertIn("复制“依赖包”列中的完整坐标", text)
+        self.assertIn("只分析 com.acme:alpha", text)
 
     def test_terminal_pause_message_only_shows_user_facing_decision_information(self):
         interaction = {
@@ -1392,6 +1459,26 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn('"action": "restart_from_step"', restart_example["command"])
         self.assertIn('"restart_step_id": "<step1|step2|step3|step4|step5>"', restart_example["command"])
 
+    def test_continue_resume_example_does_not_fill_optional_scope_fields(self):
+        examples = run_step.build_resume_command_examples(
+            [{"id": "continue", "label": "继续（全量或定向分析）"}],
+            [],
+            {
+                "action": {"type": "string"},
+                "dependency_source_dirs": {"type": "array"},
+                "selected_targets": {"type": "array"},
+                "strict_risk_gate": {"type": "boolean"},
+            },
+            Path("/tmp/project"),
+            Path("/tmp/project/.upgrade-report"),
+        )
+
+        command = examples[0]["command"]
+        self.assertIn('"action": "continue"', command)
+        self.assertNotIn("依赖包完整坐标", command)
+        self.assertNotIn("dependency_source_dirs", command)
+        self.assertNotIn("strict_risk_gate", command)
+
     def test_build_input_normalization_contract_uses_intent_patch_examples(self):
         contract = run_step.build_input_normalization_contract(
             [{"id": "continue", "label": "继续", "description": "继续执行"}],
@@ -1435,6 +1522,46 @@ class RunStepMainStateTest(unittest.TestCase):
             interaction["action_requirements"]["continue"]["required_fields"],
             ["base_branch", "current_branch"],
         )
+
+    def test_selection_protocol_rebuilds_normalization_examples_after_adding_selected_targets(self):
+        interaction = run_step.apply_interaction_protocol_enhancements(
+            {
+                "step_id": "step4",
+                "options": [{"id": "continue", "label": "继续"}],
+                "response_schema": {
+                    "type": "object",
+                    "required": ["action"],
+                    "properties": {
+                        "action": {"type": "string"},
+                        "step5_selected_coords": {"type": "array"},
+                    },
+                },
+                "required_fields": ["step5_selected_coords"],
+                "selection_options": [{"coord": "com.example:demo-lib", "name": "demo-lib"}],
+                "input_normalization": run_step.build_input_normalization_contract(
+                    [{"id": "continue", "label": "继续"}],
+                    [],
+                    {
+                        "action": {"type": "string"},
+                        "step5_selected_coords": {"type": "array"},
+                    },
+                ),
+            },
+            "step4",
+        )
+
+        normalization = interaction["input_normalization"]
+        self.assertEqual(interaction["required_fields"], ["selected_targets"])
+        self.assertIn("selected_targets", normalization["field_hints"])
+        self.assertIn("selected_targets", interaction["response_schema"]["properties"])
+        self.assertNotIn("step5_selected_coords", interaction["response_schema"]["properties"])
+        self.assertNotIn("step5_selected_names", interaction["response_schema"]["properties"])
+        example = normalization["action_examples"][0]["normalized_response_example"]
+        self.assertEqual(
+            example["intent_patch"]["set"],
+            {"selected_targets": ["com.example:demo-lib"]},
+        )
+        self.assertNotIn("step5_selected_coords", json.dumps(example, ensure_ascii=False))
 
     def test_validate_pending_interaction_response_enforces_action_requirements(self):
         interaction = {
@@ -1541,12 +1668,12 @@ class RunStepMainStateTest(unittest.TestCase):
 
         properties = payload["response_schema"]["properties"]
         self.assertIn("selected_targets", properties)
-        self.assertIn("step5_selected_coords", properties)
-        self.assertIn("step5_selected_names", properties)
+        self.assertNotIn("step5_selected_coords", properties)
+        self.assertNotIn("step5_selected_names", properties)
         self.assertTrue(payload["selection_resolution"]["enabled"])
         run_step.validate_pending_interaction_response(
             payload,
-            {"action": "rerun_current_step", "selected_targets": ["coord:com.example:demo-lib"]},
+            {"action": "rerun_current_step", "selected_targets": ["com.example:demo-lib"]},
         )
 
     def test_step5_checkpoint_review_files_point_to_alerts_not_summary_text(self):
@@ -2240,6 +2367,143 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertNotIn("step5_selected_coords", state["step5"]["input"])
             self.assertNotIn("step5_selected_names", state["step5"]["input"])
 
+    def test_full_continue_clears_previous_step4_and_step5_target_selection(self):
+        for response_set in ({}, {"selected_targets": []}):
+            with self.subTest(response_set=response_set), tempfile.TemporaryDirectory() as tmp:
+                project_dir = Path(tmp)
+                report_dir = project_dir / ".upgrade-report"
+                report_dir.mkdir(parents=True)
+                state = run_step.new_main_state(report_dir)
+                state["step4"]["input"] = {
+                    "step5_selected_coords": ["com.example:previous"],
+                    "step5_selected_names": ["previous"],
+                }
+                state["step5"]["input"] = {
+                    "step5_selected_coords": ["com.example:previous"],
+                    "step5_selected_names": ["previous"],
+                }
+                pending_interaction = run_step.apply_interaction_protocol_enhancements(
+                    {
+                        "step_id": "step4",
+                        "kind": "review",
+                        "options": [{"id": "continue", "label": "继续"}],
+                        "response_schema": {
+                            "type": "object",
+                            "required": ["action"],
+                            "properties": {"action": {"type": "string"}},
+                        },
+                        "selection_options": [{"coord": "com.example:previous", "name": "previous"}],
+                    },
+                    "step4",
+                    project_dir=project_dir,
+                    report_dir=report_dir,
+                )
+
+                updated_state, _ = run_step.apply_user_response_to_main_state(
+                    state,
+                    pending_interaction,
+                    {"intent_patch": {"action": "continue", "set": response_set}},
+                    project_dir,
+                    target_step_id="step4",
+                )
+                run_step.handle_step4_resume_followups(
+                    updated_state,
+                    report_dir,
+                    "step4",
+                    "continue",
+                )
+
+                self.assertNotIn("step5_selected_coords", updated_state["step4"]["input"])
+                self.assertNotIn("step5_selected_names", updated_state["step4"]["input"])
+                self.assertNotIn("step5_selected_coords", updated_state["step5"]["input"])
+                self.assertNotIn("step5_selected_names", updated_state["step5"]["input"])
+
+    def test_new_target_selection_replaces_old_coordinate_and_name_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            state = run_step.new_main_state(report_dir)
+            state["step4"]["input"] = {
+                "step5_selected_coords": ["com.old:old-lib"],
+                "step5_selected_names": ["old-lib"],
+            }
+            pending_interaction = run_step.apply_interaction_protocol_enhancements(
+                {
+                    "step_id": "step4",
+                    "kind": "review",
+                    "options": [{"id": "continue", "label": "继续"}],
+                    "response_schema": {
+                        "type": "object",
+                        "required": ["action"],
+                        "properties": {"action": {"type": "string"}},
+                    },
+                    "selection_options": [{"coord": "com.new:new-lib", "name": "new-lib"}],
+                },
+                "step4",
+            )
+
+            updated_state, _ = run_step.apply_user_response_to_main_state(
+                state,
+                pending_interaction,
+                {
+                    "intent_patch": {
+                        "action": "continue",
+                        "set": {"selected_targets": ["com.new:new-lib"]},
+                    }
+                },
+                project_dir,
+                target_step_id="step4",
+            )
+
+        self.assertEqual(
+            updated_state["step4"]["input"]["step5_selected_coords"],
+            ["com.new:new-lib"],
+        )
+        self.assertNotIn("step5_selected_names", updated_state["step4"]["input"])
+
+    def test_full_continue_with_no_current_candidates_clears_old_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            state = run_step.new_main_state(report_dir)
+            state["step4"]["input"] = {
+                "step5_selected_coords": ["com.old:old-lib"],
+                "step5_selected_names": ["old-lib"],
+            }
+            pending_interaction = {
+                "step_id": "step4",
+                "kind": "review",
+                "selection_resolution": {},
+            }
+
+            updated_state, _ = run_step.apply_user_response_to_main_state(
+                state,
+                pending_interaction,
+                {"intent_patch": {"action": "continue", "set": {}}},
+                project_dir,
+                target_step_id="step4",
+            )
+
+        self.assertNotIn("step5_selected_coords", updated_state["step4"]["input"])
+        self.assertNotIn("step5_selected_names", updated_state["step4"]["input"])
+
+    def test_fallback_high_risk_count_matches_step4_when_severity_is_present(self):
+        summary = run_step.build_step5_selection_summary(
+            [
+                {
+                    "coord": "com.example:demo",
+                    "severity": "P2",
+                    "change_type": "REMOVED",
+                }
+            ]
+        )
+
+        target = summary["available_targets"][0]
+        self.assertEqual(target["high_risk_api_count"], 0)
+        self.assertTrue(target["recommended"])
+
     def test_build_interaction_payload_step4_exposes_step5_target_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -2286,13 +2550,18 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
             properties = payload["response_schema"]["properties"]
-            self.assertIn("step5_selected_coords", properties)
-            self.assertIn("step5_selected_names", properties)
             self.assertIn("selected_targets", properties)
+            self.assertNotIn("step5_selected_coords", properties)
+            self.assertNotIn("step5_selected_names", properties)
             self.assertTrue(payload["selection_resolution"]["enabled"])
             self.assertEqual(payload["selection_options"][0]["coord"], "com.example:demo-lib")
             self.assertEqual(payload["selection_options"][0]["name"], "demo-lib")
             self.assertEqual(payload["selection_options"][0]["selection_key"], "coord:com.example:demo-lib")
+            self.assertEqual(payload["recommended_candidate_count"], 1)
+            self.assertEqual(
+                payload["recommended_selection_options"][0]["coord"],
+                "com.example:demo-lib",
+            )
 
     def test_apply_user_response_to_main_state_resolves_selected_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2329,7 +2598,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 {
                     "intent_patch": {
                         "action": "continue",
-                        "set": {"selected_targets": ["coord:com.example:demo-lib"]},
+                        "set": {"selected_targets": ["com.example:demo-lib"]},
                     }
                 },
                 project_dir,
@@ -2437,7 +2706,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 {
                     "intent_patch": {
                         "action": "continue",
-                        "set": {"selected_targets": ["coord:com.example:demo-lib-20"]},
+                        "set": {"selected_targets": ["com.example:demo-lib-20"]},
                     }
                 },
                 project_dir,
@@ -3194,8 +3463,8 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(saved["state"]["completed_step"], "step4")
             self.assertEqual(saved["state"]["pending_interaction"]["reason_code"], "step5_dependency_source_mapping_missing")
             pending_properties = saved["state"]["pending_interaction"]["response_schema"]["properties"]
-            self.assertIn("step5_selected_coords", pending_properties)
-            self.assertIn("step5_selected_names", pending_properties)
+            self.assertNotIn("step5_selected_coords", pending_properties)
+            self.assertNotIn("step5_selected_names", pending_properties)
             self.assertTrue(interaction_exists)
 
     def test_main_auto_repairs_missing_step4_prereq_by_restarting_step1(self):
@@ -3306,7 +3575,7 @@ class RunStepMainStateTest(unittest.TestCase):
                             "intent_patch": {
                                 "action": "continue",
                                 "set": {
-                                    "selected_targets": ["coord:com.example:demo-lib"],
+                                    "selected_targets": ["com.example:demo-lib"],
                                 },
                             }
                         },

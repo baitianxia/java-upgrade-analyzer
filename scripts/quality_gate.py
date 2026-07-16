@@ -342,6 +342,29 @@ def _execute_tasks(tasks, env, continue_on_failure=False):
     return results, overall
 
 
+def ensure_round_input_files(tasks):
+    defaults = {
+        "--reviews": {"findings": []},
+        "--history": [],
+    }
+    for task in tasks:
+        command = list(task.command)
+        for option, default in defaults.items():
+            if option not in command:
+                continue
+            index = command.index(option) + 1
+            if index >= len(command):
+                continue
+            path = Path(command[index])
+            if path.exists():
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(default, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run java-upgrade-analyzer quality gates")
     parser.add_argument("--profile", choices=["quick", "step5", "release"], default="quick")
@@ -375,6 +398,7 @@ def main(argv=None):
         _write_json(args.json_out, payload)
         return 0
 
+    ensure_round_input_files(tasks)
     started = time.perf_counter()
     env = dict(os.environ)
     results, overall = _execute_tasks(

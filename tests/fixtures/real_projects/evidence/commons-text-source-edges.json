@@ -1,0 +1,65 @@
+{
+  "source_edges": [
+    {
+      "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+      "artifact_entry": "org/apache/commons/text/CaseUtils.class",
+      "caller_owner": "org.apache.commons.text.CaseUtils",
+      "caller_member": "toDelimiterSet",
+      "caller_descriptor": "([C)Ljava/util/Set;",
+      "callee_owner": "org.apache.commons.lang3.ArrayUtils",
+      "callee_member": "isEmpty",
+      "callee_descriptor": "([C)Z",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 31
+    },
+    {
+      "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+      "artifact_entry": "org/apache/commons/text/WordUtils.class",
+      "caller_owner": "org.apache.commons.text.WordUtils",
+      "caller_member": "abbreviate",
+      "caller_descriptor": "(Ljava/lang/String;IILjava/lang/String;)Ljava/lang/String;",
+      "callee_owner": "org.apache.commons.lang3.StringUtils",
+      "callee_member": "defaultString",
+      "callee_descriptor": "(Ljava/lang/String;)Ljava/lang/String;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 127
+    },
+    {
+      "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+      "artifact_entry": "org/apache/commons/text/WordUtils.class",
+      "caller_owner": "org.apache.commons.text.WordUtils",
+      "caller_member": "containsAllWords",
+      "caller_descriptor": "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Z",
+      "callee_owner": "org.apache.commons.lang3.StringUtils",
+      "callee_member": "isBlank",
+      "callee_descriptor": "(Ljava/lang/CharSequence;)Z",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 38
+    },
+    {
+      "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+      "artifact_entry": "org/apache/commons/text/CaseUtils.class",
+      "caller_owner": "org.apache.commons.text.CaseUtils",
+      "caller_member": "toCamelCase",
+      "caller_descriptor": "(Ljava/lang/String;Z[C)Ljava/lang/String;",
+      "callee_owner": "org.apache.commons.lang3.StringUtils",
+      "callee_member": "isEmpty",
+      "callee_descriptor": "(Ljava/lang/CharSequence;)Z",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+      "artifact_entry": "org/apache/commons/text/RandomStringGenerator$Builder.class",
+      "caller_owner": "org.apache.commons.text.RandomStringGenerator$Builder",
+      "caller_member": "withinRange",
+      "caller_descriptor": "(II)Lorg/apache/commons/text/RandomStringGenerator$Builder;",
+      "callee_owner": "org.apache.commons.lang3.Validate",
+      "callee_member": "isTrue",
+      "callee_descriptor": "(ZLjava/lang/String;[Ljava/lang/Object;)V",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 30
+    }
+  ],
+  "source_conflicts": []
+}

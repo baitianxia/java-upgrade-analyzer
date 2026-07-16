@@ -203,12 +203,14 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ### Step4 后按单依赖包进入 Step5
 
-当 Step4 已生成 `evidence/api_changes/changed_dependencies.md` / `changed_dependencies.csv` 后，可在主状态中通过依赖包维度的 `selection_key` 只让某个或某几个依赖进入 Step5。
+当 Step4 已生成 `evidence/api_changes/changed_dependencies.md` / `changed_dependencies.csv` 后，可通过依赖包完整坐标只让某个或某几个依赖进入 Step5。
 
-优先让用户从 `changed_dependencies.md` 选择，例如：
+对用户展示三层入口：全量分析、从推荐候选中选择、从完整候选清单中选择。推荐候选由 `recommended=true` 标识，规则为含高风险 API、删除或签名变化，或变化 API 数不少于 20；推荐只用于缩小范围，不代表已经确认影响。
+
+让用户从 `changed_dependencies.md` 的“依赖包”列复制完整坐标，例如：
 
 ```text
-coord:com.example:legacy-lib
+com.example:legacy-lib
 ```
 
 恢复输入示例：
@@ -217,13 +219,13 @@ coord:com.example:legacy-lib
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:legacy-lib"]}}}'
+  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["com.example:legacy-lib"]}}}'
 ```
 
 说明：
 
-- `selected_targets` 优先填写 `changed_dependencies.md/csv` 中的 `selection_key`
-- 也支持精确填写完整 `coord` 或 artifactId `name`
+- `selected_targets` 填写 `changed_dependencies.md` 中“依赖包”列的完整坐标
+- `changed_dependencies.csv` 中的 `selection_key` 仅供程序兼容解析和自动化使用，不作为人工选择入口
 - 这些选择字段必须先归一化写入 `main_state.json`
 - 正式流程中不要把选中依赖直接透传给 `s5_call_chain*.py`
 - Step5 只消费 Step4 API 目标的选中子集；Step3 candidate 保留为独立风险线索，不再生成合并后的 Step5 目标文件
@@ -236,12 +238,12 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:legacy-lib"]}}}'
+  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["com.example:legacy-lib"]}}}'
 ```
 
 - 调度器会先把 `selected_targets` 归一化为正式 `step5_selected_coords` / `step5_selected_names`，再自动桥接为从 `step5` 重跑，而不是直接卡死在“当前没有 pending interaction”
 - 只有已进入 Step4 API 目标集的依赖才能通过 `step5_selected_coords` / `step5_selected_names` 被选中
-- Step4 checkpoint 中展示给用户的候选列表可以按数量截断，但 `selected_targets` 的正式解析范围仍是完整候选集；因此即使目标未出现在前端展示片段中，也可以直接提交精确 `selection_key` / `coord` / `name`
+- Step4 checkpoint 中展示给用户的候选列表可以按数量截断，但 `selected_targets` 的正式解析范围仍是完整候选集；因此即使目标未出现在终端展示片段中，也可以从 `changed_dependencies.md` 复制完整坐标提交
 
 若用户答复较长，优先使用：
 
@@ -533,7 +535,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
 
 若通过 `run_step.py` 执行，建议将 `source_dirs` / `dependency_source_dirs` / `max_depth` 写入 `main_state.json`，命令保持最小参数集。
 - 若 Step4 checkpoint 只想分析部分变更 jar，优先在恢复时传 `selected_targets`；调度器会先把它归一化为正式的 `step5_selected_coords` / `step5_selected_names`，再基于 Step4 API 生成过滤后的输入文件执行 Step5。
-- 若 `selected_targets` 提供的是 `selection_key` 或完整 `coord`，调度器必须严格按该唯一目标执行；只有当用户只给出 `name` 时，才允许按 `artifactId` 名称筛选命中的全部候选。
+- 人工输入的 `selected_targets` 使用依赖包完整坐标，调度器必须严格匹配唯一目标；`selection_key` 仅供结构化自动化输入兼容解析。只有用户仅给出依赖名称时，才允许按 `artifactId` 名称筛选命中的全部候选。
 正式流程默认不设置 Step5 外层超时；仅在主状态中显式写入 `step5_timeout` 时才启用限制。
 
 规则：
@@ -543,7 +545,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
 - 只要回溯到系统代码即可记为 `reachable`，不要求必须到达最外层 HTTP 入口
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 的成因；`by_api/*.json` 中的 `evidence_paths` 是逐边证据
 - 若 `all_changed_apis.csv` 为空，直接跳过并说明“Step4 未提取到可追踪的变更 API”
-- 若指定 `selected_targets`，优先按候选的 `selection_key` 精确匹配；也支持精确填写 `coord` 或 `name`，随后会归一化为正式的 `step5_selected_coords` / `step5_selected_names`
+- 若指定 `selected_targets`，优先按依赖包完整坐标精确匹配；结构化自动化输入仍可使用 `selection_key`。解析后归一化为程序内部的 `step5_selected_coords` / `step5_selected_names`
 - Step4 checkpoint 若只展示前若干个候选，这只影响展示，不影响正式匹配；未展示的合法目标仍会参与 `selected_targets` 解析
 - 显式重跑 Step1 或 Step5 前，调度层会先清空该步骤全部正式输出，避免旧的制品、catalog、framework adapter 或对齐文件污染新一轮结果
 - 若直接指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配

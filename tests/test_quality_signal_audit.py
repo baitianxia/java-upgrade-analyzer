@@ -13,6 +13,26 @@ import quality_signal_audit  # noqa: E402
 
 
 class QualitySignalAuditTest(unittest.TestCase):
+    def test_verified_guard_uncertainty_is_not_recreated_as_fallback_signal(self):
+        payload = {
+            "results": [{
+                "case": "reflection-guard",
+                "status": "passed",
+                "quality_signals": [],
+                "summary": {"uncertain": 1},
+                "guard_contract": {
+                    "passed": True,
+                    "errors": [],
+                    "api_count": 1,
+                },
+                "gates": {"conclusion": {"passed": True, "errors": []}},
+            }]
+        }
+
+        signals = quality_signal_audit.audit_real_project_payload(payload)
+
+        self.assertEqual(signals, [])
+
     def test_cli_binds_audit_to_exact_real_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             real_path = Path(tmp) / "real.json"

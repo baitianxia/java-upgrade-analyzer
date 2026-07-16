@@ -103,6 +103,30 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(case.required_fault_injections, ("drop_analyzer_edge",))
 
+    def test_embedded_changed_api_materialization_preserves_step4_evidence_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "all_changed_apis.csv"
+            case = realreg.RealProjectCase(
+                name="constant", default_project=Path(tmp),
+                default_changed_apis=output, baseline_specs=(),
+                prefer_embedded_changed_api_rows=True,
+                changed_api_rows=({
+                    "coord": "g:a", "old_version": "1", "new_version": "2",
+                    "change_type": "REMOVED", "api_name": "p.Flags.VALUE",
+                    "api_simple": "VALUE", "symbol_kind": "field",
+                    "api_signature": "", "confirmed": "true", "severity": "P1",
+                    "source": "japicmp", "compatibility_flags": "CONSTANT_REMOVED",
+                    "old_value": "10",
+                },),
+            )
+
+            realreg.ensure_changed_apis(case, output)
+            with output.open(newline="", encoding="utf-8") as handle:
+                row = next(csv.DictReader(handle))
+
+        self.assertEqual(row["compatibility_flags"], "CONSTANT_REMOVED")
+        self.assertEqual(row["old_value"], "10")
+
     def test_parse_args_accepts_final_artifact_override_for_single_case(self):
         args = realreg.parse_args([
             "--case", "commons-text",
@@ -226,7 +250,7 @@ class RealProjectRegressionTest(unittest.TestCase):
             ("drop_analyzer_edge",),
         )
 
-    def test_spring_security_config_case_discovers_proxy_and_context_calls_from_final_jar(self):
+    def test_spring_security_config_case_is_a_pinned_constructor_guard(self):
         case = realreg.CASES["spring-security-config"]
 
         self.assertEqual(case.source_dirs, (Path("config/src/main/java"),))
@@ -238,7 +262,22 @@ class RealProjectRegressionTest(unittest.TestCase):
             case.default_project / "config" / "build" / "libs",
         )
         self.assertNotIn(".m2", case.final_artifact.parts)
-        self.assertEqual(case.case_mode, "discovery")
+        fixture_dir = realreg.ROOT_DIR / "tests" / "fixtures" / "real_projects"
+        self.assertEqual(case.case_mode, "guard")
+        self.assertEqual(case.ground_truth_status, "reviewed")
+        self.assertEqual(
+            case.default_changed_apis,
+            fixture_dir / "spring-security-config-changed-apis.csv",
+        )
+        self.assertEqual(
+            case.fixture_manifest,
+            fixture_dir / "spring-security-config.json",
+        )
+        self.assertEqual(
+            case.required_fault_injections,
+            ("drop_analyzer_edge",),
+        )
+        self.assertTrue(case.require_relative_performance_baseline)
         self.assertTrue(case.enable_jdk_oracle)
         self.assertLessEqual(case.max_elapsed_seconds, 130.0)
         self.assertEqual(
@@ -249,6 +288,16 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "org/springframework/security/authorization/method/AuthorizationAdvisorProxyFactory",
             },
         )
+
+        manifest = realreg.load_pinned_guard_manifest(case)
+        self.assertEqual(len(manifest["apis"]), 15)
+        self.assertEqual(len(manifest["canonical_edges"]), 15)
+        self.assertEqual(manifest["ground_truth_status"], "reviewed")
+        self.assertEqual(
+            manifest["performance_baseline"]["scope"]["selected_api_count"],
+            15,
+        )
+        self.assertEqual(manifest.get("unverified_apis", []), [])
 
     def test_dubbo_rpc_proxy_consumer_case_is_a_new_strict_discovery_target(self):
         case = realreg.CASES["dubbo-rpc-proxy-consumer"]
@@ -285,6 +334,59 @@ class RealProjectRegressionTest(unittest.TestCase):
                 self.assertTrue(case.require_valid_git)
                 self.assertGreaterEqual(case.min_project_java_files, project_min)
                 self.assertGreaterEqual(case.min_main_java_files, main_min)
+
+    def test_commons_text_is_a_pinned_source_bytecode_guard(self):
+        case = realreg.CASES["commons-text"]
+
+        self.assertEqual(case.case_mode, "guard")
+        self.assertEqual(case.source_dirs, (Path("src/main/java"),))
+        self.assertEqual(case.required_topologies, ("source_bytecode_agree",))
+        self.assertEqual(case.required_fault_injections, ("drop_analyzer_edge",))
+        self.assertTrue(case.require_relative_performance_baseline)
+        self.assertTrue(case.source_attestation.is_file())
+        self.assertTrue(case.default_changed_apis.is_file())
+
+        manifest = realreg.load_pinned_guard_manifest(case)
+        self.assertEqual(len(manifest["apis"]), 6)
+        self.assertEqual(len(manifest["canonical_edges"]), 5)
+        self.assertEqual(
+            sum(api["expected_conclusion"] == "uncertain" for api in manifest["apis"]),
+            1,
+        )
+        self.assertEqual(
+            manifest["performance_baseline"]["scope"]["fault_injection_detected_count"],
+            1,
+        )
+
+    def test_grpc_netty_shaded_is_a_pinned_source_bytecode_conflict_guard(self):
+        case = realreg.CASES["grpc-netty-shaded"]
+
+        self.assertEqual(case.case_mode, "guard")
+        self.assertEqual(case.source_dirs, (Path("netty/src/main/java"),))
+        self.assertEqual(case.required_topologies, ("source_bytecode_true_conflict",))
+        self.assertEqual(case.required_fault_injections, ("drop_analyzer_edge",))
+        self.assertTrue(case.require_relative_performance_baseline)
+        self.assertTrue(case.source_attestation.is_file())
+        self.assertTrue(case.default_changed_apis.is_file())
+
+        manifest = realreg.load_pinned_guard_manifest(case)
+        self.assertEqual(len(manifest["apis"]), 84)
+        self.assertEqual(
+            sum(api["expected_conclusion"] == "reachable" for api in manifest["apis"]),
+            42,
+        )
+        self.assertEqual(
+            sum(
+                api["expected_conclusion"] == "not_found_in_static_analysis"
+                for api in manifest["apis"]
+            ),
+            42,
+        )
+        self.assertGreaterEqual(len(manifest["canonical_edges"]), 100)
+        self.assertEqual(
+            manifest["performance_baseline"]["scope"]["fault_injection_detected_count"],
+            1,
+        )
 
     def test_mybatis_semantic_references_require_complete_oracle_and_runtime(self):
         selected = [
@@ -2090,6 +2192,8 @@ class RealProjectRegressionTest(unittest.TestCase):
             "summary": {
                 "uncertain_apis": [{
                     "api_name": target["api_name"],
+                    "coord": target["coord"],
+                    "symbol_kind": target["symbol_kind"],
                     "analysis_status": "uncertain",
                     "call_paths": [
                         f"app.SecurityModule.setup -> {target['api_name']}"
@@ -2166,6 +2270,30 @@ class RealProjectRegressionTest(unittest.TestCase):
             records[0]["oracle_conclusion"], "not_found_in_static_analysis"
         )
 
+    def test_final_artifact_oracle_treats_compile_time_constant_absence_as_uncertain(self):
+        constant = {
+            "coord": "vendor:api", "api_name": "vendor.Flags.EMPTY",
+            "api_signature": "", "symbol_kind": "field",
+            "change_type": "REMOVED", "compatibility_flags": "CONSTANT_REMOVED",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "oracle_edges.csv"
+            evidence.write_text("header\n", encoding="utf-8")
+            records = realreg.build_final_artifact_api_oracle_records(
+                [constant],
+                {
+                    "complete": True,
+                    "oracle_edges": str(evidence),
+                    "api_reachability": {
+                        realreg.serialized_api_identity(constant):
+                            "not_found_in_static_analysis",
+                    },
+                },
+            )
+
+        self.assertEqual(records[0]["oracle_conclusion"], "uncertain")
+        self.assertIn("compile-time constant", records[0]["procedure"])
+
     def test_constant_pool_oracle_records_are_a_distinct_member_authority(self):
         absent = {
             "coord": "vendor:api", "api_name": "vendor.Api.removed",
@@ -2191,6 +2319,30 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(records[0]["authority"], "raw-classfile-constant-pool")
         self.assertEqual(records[0]["change_type"], "REMOVED")
         self.assertEqual(records[0]["oracle_conclusion"], "not_found_in_static_analysis")
+
+    def test_constant_pool_oracle_treats_compile_time_constant_absence_as_uncertain(self):
+        constant = {
+            "coord": "vendor:api", "api_name": "vendor.Flags.EMPTY",
+            "api_signature": "", "symbol_kind": "field",
+            "change_type": "REMOVED", "compatibility_flags": "CONSTANT_REMOVED",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "member-references.json"
+            evidence.write_text("[]\n", encoding="utf-8")
+            records = realreg.build_constant_pool_api_oracle_records(
+                [constant],
+                {
+                    "complete": True,
+                    "member_reference_evidence": str(evidence),
+                    "member_reference_reachability": {
+                        realreg.serialized_api_identity(constant):
+                            "not_found_in_static_analysis",
+                    },
+                },
+            )
+
+        self.assertEqual(records[0]["oracle_conclusion"], "uncertain")
+        self.assertIn("compile-time constant", records[0]["procedure"])
 
     def test_jdeps_oracle_records_are_a_distinct_class_authority(self):
         target = {
@@ -2718,6 +2870,31 @@ class RealProjectRegressionTest(unittest.TestCase):
                     "BOOT-INF/lib/unrelated-1.0.jar",
                 },
             )
+
+    def test_bytecode_materialization_does_not_record_absent_target_as_resolved_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "thin-library.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("demo/App.class", b"class")
+            case = realreg.RealProjectCase(
+                name="thin-reflection",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                bytecode_coord="vendor:removed-api",
+                final_artifact=artifact,
+            )
+            report = root / "report"
+
+            with patch.object(realreg, "discover_calls", return_value=[]):
+                realreg.materialize_bytecode_changed_apis(case, root, report)
+
+            _, rows = realreg._csv_rows(
+                report / "evidence/dependencies/deps_current_resolved.csv"
+            )
+
+        self.assertEqual(rows, [])
 
     def test_declared_final_artifact_is_bound_to_verified_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3388,6 +3565,42 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertFalse(any(item["signal_type"] == "capability_gap" for item in signals))
 
+    def test_oracle_expected_uncertain_is_not_reported_as_a_capability_gap(self):
+        case = realreg.RealProjectCase("expected-uncertain", Path("."), Path("apis.csv"), ())
+        signals = realreg.build_quality_signals(
+            case,
+            summary={
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": 0,
+                "uncertain": 1,
+            },
+            checks=[],
+            failures=[],
+            result_audit={},
+            report_dir=Path("report"),
+            expected_uncertain=1,
+        )
+
+        self.assertFalse(any(item["signal_type"] == "capability_gap" for item in signals))
+
+    def test_pinned_expected_static_absence_is_not_reported_as_a_capability_gap(self):
+        case = realreg.RealProjectCase("expected-absence", Path("."), Path("apis.csv"), ())
+        signals = realreg.build_quality_signals(
+            case,
+            summary={
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": 2,
+                "uncertain": 0,
+            },
+            checks=[],
+            failures=[],
+            result_audit={},
+            report_dir=Path("report"),
+            expected_not_found=2,
+        )
+
+        self.assertFalse(any(item["signal_type"] == "capability_gap" for item in signals))
+
     def test_run_case_includes_real_project_matrix_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -4045,6 +4258,9 @@ class RealProjectRegressionTests(unittest.TestCase):
                 "not_found_in_static_analysis": 0,
                 "reachable_apis": [{
                     "api": "com.example.multimodule.service.ServiceProperties.getMessage",
+                    "coord": manifest["api"]["coord"],
+                    "symbol_kind": manifest["api"]["symbol_kind"],
+                    "api_signature": "()",
                     "analysis_status": "reachable",
                     "call_paths": [],
                     "path_details": [{
@@ -4234,8 +4450,10 @@ class RealProjectRegressionTests(unittest.TestCase):
             manifest["artifact_sha256"],
             "fd0b8883214c641685ab8f0e7b583ec2f8150112f9679161908eb6829bd98b90",
         )
-        self.assertEqual(case.case_mode, "convergence")
+        self.assertEqual(case.case_mode, "guard")
         self.assertEqual(case.required_topologies, ("framework_proxy",))
+        self.assertEqual(case.required_fault_injections, ("drop_analyzer_edge",))
+        self.assertTrue(case.require_relative_performance_baseline)
         self.assertEqual(len(changed_rows), 3)
         self.assertEqual(len(oracle_rows), len(changed_rows))
         self.assertTrue(all(row["oracle_conclusion"] == "reachable" for row in oracle_rows))
@@ -4248,6 +4466,10 @@ class RealProjectRegressionTests(unittest.TestCase):
             {identity(row) for row in oracle_rows},
         )
         self.assertEqual(len(manifest["canonical_edges"]), 1)
+        self.assertEqual(
+            manifest["performance_baseline"]["scope"]["selected_api_count"],
+            3,
+        )
 
     def test_pinned_guard_evaluates_every_api_in_callback_manifest(self):
         manifest = json.loads((
@@ -4264,6 +4486,9 @@ class RealProjectRegressionTests(unittest.TestCase):
             }[target]
             reachable.append({
                 "api": target,
+                "coord": expected["coord"],
+                "symbol_kind": expected["symbol_kind"],
+                "api_signature": signature,
                 "analysis_status": expected["expected_conclusion"],
                 "path_details": [{
                     "path_text": " -> ".join([
@@ -4304,7 +4529,13 @@ class RealProjectRegressionTests(unittest.TestCase):
 
         guard = realreg.evaluate_pinned_guard_contract(manifest, result)
 
-        self.assertEqual(guard, {"passed": True, "errors": []})
+        self.assertEqual(guard, {
+            "passed": True,
+            "errors": [],
+            "api_count": 3,
+            "expected_physical_edge_count": 5,
+            "expected_semantic_reference_count": 0,
+        })
 
     def test_callback_chain_match_ignores_business_artifact_display_prefix(self):
         expected_api = {
@@ -4324,6 +4555,36 @@ class RealProjectRegressionTests(unittest.TestCase):
             "Spring Boot框架注册 -> "
             "业务制品：com.example.messagingrabbitmq.Receiver.receiveMessage(String) -> "
             "java.util.concurrent.CountDownLatch.countDown()"
+        )
+
+        self.assertTrue(realreg._matches_expected_call_chain(
+            rendered_path, expected_chain, expected_api
+        ))
+
+    def test_guard_chain_matches_equivalent_nested_class_renderings(self):
+        expected_api = {
+            "owner": (
+                "org.springframework.security.authorization.method."
+                "AuthorizationAdvisorProxyFactory$TargetVisitor"
+            ),
+            "member": "of",
+            "descriptor": (
+                "([Lorg/springframework/security/authorization/method/"
+                "AuthorizationAdvisorProxyFactory$TargetVisitor;)"
+                "Lorg/springframework/security/authorization/method/"
+                "AuthorizationAdvisorProxyFactory$TargetVisitor;"
+            ),
+            "symbol_kind": "method",
+        }
+        expected_chain = [
+            "example.Configuration$Nested.configure",
+            expected_api["owner"] + ".of",
+        ]
+        rendered_path = (
+            "业务制品：example.Configuration.Nested.configure(ObjectProvider) -> "
+            "org.springframework.security.authorization.method."
+            "AuthorizationAdvisorProxyFactory$TargetVisitor."
+            "of(AuthorizationAdvisorProxyFactory$TargetVisitor[])"
         )
 
         self.assertTrue(realreg._matches_expected_call_chain(
@@ -4496,6 +4757,45 @@ class RealProjectRegressionTests(unittest.TestCase):
             "resolution_status": "resolved",
         }])
 
+    def test_pinned_source_build_provenance_preserves_revision_alignment(self):
+        case = realreg.CASES["gs-managing-transactions"]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            artifact = Path(tmp) / "application.jar"
+            with realreg.zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("app/App.class", b"class")
+            revision = "a" * 40
+            asset_gate = {
+                "artifact_path": str(artifact),
+                "artifact_sha256": realreg.hashlib.sha256(
+                    artifact.read_bytes()
+                ).hexdigest(),
+                "actual_git_revision": revision,
+                "source_mode": "checkout_build",
+            }
+
+            output = realreg.write_pinned_final_artifact_provenance(
+                report_dir, asset_gate, case
+            )
+            current = json.loads(output.read_text(encoding="utf-8"))["sides"][0]
+
+        self.assertEqual(current["revision"], revision)
+        self.assertEqual(current["source_mode"], "checkout_build")
+
+    def test_published_artifact_manifest_does_not_claim_checkout_build_alignment(self):
+        self.assertEqual(
+            realreg.pinned_source_mode({
+                "materialization": {"kind": "published_artifact"}
+            }),
+            "provided_artifact",
+        )
+        self.assertEqual(
+            realreg.pinned_source_mode({
+                "materialization": {"kind": "source_build"}
+            }),
+            "checkout_build",
+        )
+
     def test_pinned_fat_jar_preparation_enumerates_all_runtime_libraries(self):
         case = realreg.CASES["gs-messaging-rabbitmq"]
         with tempfile.TemporaryDirectory() as tmp:
@@ -4589,6 +4889,20 @@ class RealProjectRegressionTests(unittest.TestCase):
 
         self.assertTrue(guard["passed"], guard["errors"])
         self.assertIn("|0", realreg.physical_edge_occurrence(manifest["canonical_edges"][0]))
+
+    def test_pinned_guard_rejects_a_different_overload_with_the_same_name(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        result = self._passing_gs_guard_result(manifest)
+        manifest["api"]["descriptor"] = "(I)Ljava/lang/String;"
+        manifest["expected_chain"] = []
+
+        guard = realreg.evaluate_pinned_guard_contract(manifest, result)
+
+        self.assertFalse(guard["passed"])
+        self.assertIn("expected_conclusion_missing", guard["errors"])
 
     def test_pinned_guard_rejects_nested_reconciliation_rows_at_wrong_instruction_offset(self):
         manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"

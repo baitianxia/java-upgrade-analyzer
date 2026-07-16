@@ -1,0 +1,1940 @@
+{
+  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "case": "grpc-netty-shaded",
+  "repository": "grpc/grpc-java",
+  "checkout_root": "/private/tmp/jua-real-grpc-java-1.81.0",
+  "git_revision": "6951542f66c59f63cbf5348b38a2306a3964adda",
+  "release_version": "1.81.0",
+  "published_repository": "Maven Central",
+  "artifact_path": "netty/shaded/build/libs/grpc-netty-shaded-1.81.0.jar",
+  "artifact_sha1": "134b4014a4140c3ca54fe9d758b160a76210bfb0",
+  "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+  "materialization": {
+    "kind": "published_artifact",
+    "coordinate": "io.grpc:grpc-netty-shaded:1.81.0",
+    "url": "https://repo1.maven.org/maven2/io/grpc/grpc-netty-shaded/1.81.0/grpc-netty-shaded-1.81.0.jar",
+    "sha1": "134b4014a4140c3ca54fe9d758b160a76210bfb0",
+    "sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12"
+  },
+  "performance_baseline": {
+    "git_revision": "6951542f66c59f63cbf5348b38a2306a3964adda",
+    "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+    "scope": {
+      "selected_api_count": 84,
+      "accounted_api_count": 84,
+      "artifact_count": 1,
+      "class_count": 2852,
+      "analyzer_edge_count": 100,
+      "oracle_edge_count": 100,
+      "fault_injection_detected_count": 1
+    },
+    "metrics": {
+      "elapsed_seconds_per_api": {
+        "value": 0.476,
+        "max_ratio": 2.0
+      },
+      "scan_seconds_per_1000_classes": {
+        "value": 0.335,
+        "max_ratio": 2.0
+      },
+      "max_api_elapsed_seconds": {
+        "value": 0.008,
+        "max_ratio": 3.0
+      },
+      "javap_invocations": {
+        "value": 599,
+        "max_ratio": 1.5
+      },
+      "duplicate_jar_scans": {
+        "value": 0,
+        "max_absolute": 0
+      },
+      "peak_rss_mb": {
+        "value": 754.594,
+        "max_ratio": 1.5
+      }
+    }
+  },
+  "ground_truth_status": "reviewed",
+  "required_topologies": [
+    "source_bytecode_true_conflict"
+  ],
+  "apis": [
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "<init>",
+      "descriptor": "()V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "<init>",
+      "descriptor": "(ZLio/grpc/netty/shaded/io/netty/handler/ssl/ResumptionController;)V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "applicationProtocolNegotiator",
+      "descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "cipherSuites",
+      "descriptor": "()Ljava/util/List;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "isClient",
+      "descriptor": "()Z",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "isServer",
+      "descriptor": "()Z",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newClientContextInternal",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/security/Provider;[Ljava/security/cert/X509Certificate;Ljavax/net/ssl/TrustManagerFactory;[Ljava/security/cert/X509Certificate;Ljava/security/PrivateKey;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;[Ljava/lang/String;JJZLjava/security/SecureRandom;Ljava/lang/String;Ljava/lang/String;[Ljava/util/Map$Entry;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newEngine",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Ljavax/net/ssl/SSLEngine;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newEngine",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Z)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;ZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "newServerContextInternal",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/security/Provider;[Ljava/security/cert/X509Certificate;Ljavax/net/ssl/TrustManagerFactory;[Ljava/security/cert/X509Certificate;Ljava/security/PrivateKey;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJLio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;[Ljava/lang/String;ZZLjava/security/SecureRandom;Ljava/lang/String;[Ljava/util/Map$Entry;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "sessionCacheSize",
+      "descriptor": "()J",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "sessionContext",
+      "descriptor": "()Ljavax/net/ssl/SSLSessionContext;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "sessionTimeout",
+      "descriptor": "()J",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "toPrivateKey",
+      "descriptor": "(Ljava/io/File;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "toPrivateKey",
+      "descriptor": "(Ljava/io/InputStream;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "toX509Certificates",
+      "descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "member": "toX509Certificates",
+      "descriptor": "(Ljava/io/InputStream;)[Ljava/security/cert/X509Certificate;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "applicationProtocolConfig",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "build",
+      "descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "ciphers",
+      "descriptor": "(Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "clientAuth",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "forClient",
+      "descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljava/io/File;Ljava/io/File;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljava/io/File;Ljava/io/File;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljavax/net/ssl/KeyManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "keyManager",
+      "descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "keyManager",
+      "descriptor": "(Ljavax/net/ssl/KeyManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "protocols",
+      "descriptor": "([Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "sslContextProvider",
+      "descriptor": "(Ljava/security/Provider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "sslProvider",
+      "descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "trustManager",
+      "descriptor": "(Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "member": "trustManager",
+      "descriptor": "(Ljavax/net/ssl/TrustManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption$1",
+      "member": "<init>",
+      "descriptor": "()V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption",
+      "member": "<init>",
+      "descriptor": "(ILjava/lang/String;Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextOption$1;)V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.grpc:grpc-netty-shaded",
+      "owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption",
+      "member": "<init>",
+      "descriptor": "(Ljava/lang/String;)V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "reachable"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "<init>",
+      "descriptor": "()V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "<init>",
+      "descriptor": "(ZLio/netty/handler/ssl/ResumptionController;)V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "applicationProtocolNegotiator",
+      "descriptor": "()Lio/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "cipherSuites",
+      "descriptor": "()Ljava/util/List;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "isClient",
+      "descriptor": "()Z",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "isServer",
+      "descriptor": "()Z",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newClientContextInternal",
+      "descriptor": "(Lio/netty/handler/ssl/SslProvider;Ljava/security/Provider;[Ljava/security/cert/X509Certificate;Ljavax/net/ssl/TrustManagerFactory;[Ljava/security/cert/X509Certificate;Ljava/security/PrivateKey;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/netty/handler/ssl/CipherSuiteFilter;Lio/netty/handler/ssl/ApplicationProtocolConfig;[Ljava/lang/String;JJZLjava/security/SecureRandom;Ljava/lang/String;Ljava/lang/String;[Ljava/util/Map$Entry;)Lio/netty/handler/ssl/SslContext;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newEngine",
+      "descriptor": "(Lio/netty/buffer/ByteBufAllocator;)Ljavax/net/ssl/SSLEngine;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newEngine",
+      "descriptor": "(Lio/netty/buffer/ByteBufAllocator;Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/netty/buffer/ByteBufAllocator;)Lio/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/netty/buffer/ByteBufAllocator;Z)Lio/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/netty/buffer/ByteBufAllocator;ZLjava/util/concurrent/Executor;)Lio/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZ)Lio/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newHandler",
+      "descriptor": "(Lio/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZLjava/util/concurrent/Executor;)Lio/netty/handler/ssl/SslHandler;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "newServerContextInternal",
+      "descriptor": "(Lio/netty/handler/ssl/SslProvider;Ljava/security/Provider;[Ljava/security/cert/X509Certificate;Ljavax/net/ssl/TrustManagerFactory;[Ljava/security/cert/X509Certificate;Ljava/security/PrivateKey;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/netty/handler/ssl/CipherSuiteFilter;Lio/netty/handler/ssl/ApplicationProtocolConfig;JJLio/netty/handler/ssl/ClientAuth;[Ljava/lang/String;ZZLjava/security/SecureRandom;Ljava/lang/String;[Ljava/util/Map$Entry;)Lio/netty/handler/ssl/SslContext;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "sessionCacheSize",
+      "descriptor": "()J",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "sessionContext",
+      "descriptor": "()Ljavax/net/ssl/SSLSessionContext;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "sessionTimeout",
+      "descriptor": "()J",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "toPrivateKey",
+      "descriptor": "(Ljava/io/File;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "toPrivateKey",
+      "descriptor": "(Ljava/io/InputStream;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "toX509Certificates",
+      "descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContext",
+      "member": "toX509Certificates",
+      "descriptor": "(Ljava/io/InputStream;)[Ljava/security/cert/X509Certificate;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "applicationProtocolConfig",
+      "descriptor": "(Lio/netty/handler/ssl/ApplicationProtocolConfig;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "build",
+      "descriptor": "()Lio/netty/handler/ssl/SslContext;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "ciphers",
+      "descriptor": "(Ljava/lang/Iterable;Lio/netty/handler/ssl/CipherSuiteFilter;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "clientAuth",
+      "descriptor": "(Lio/netty/handler/ssl/ClientAuth;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "forClient",
+      "descriptor": "()Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljava/io/File;Ljava/io/File;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljava/io/File;Ljava/io/File;Ljava/lang/String;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "forServer",
+      "descriptor": "(Ljavax/net/ssl/KeyManagerFactory;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "keyManager",
+      "descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "keyManager",
+      "descriptor": "(Ljavax/net/ssl/KeyManagerFactory;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "protocols",
+      "descriptor": "([Ljava/lang/String;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "sslContextProvider",
+      "descriptor": "(Ljava/security/Provider;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "sslProvider",
+      "descriptor": "(Lio/netty/handler/ssl/SslProvider;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "trustManager",
+      "descriptor": "(Ljava/io/InputStream;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextBuilder",
+      "member": "trustManager",
+      "descriptor": "(Ljavax/net/ssl/TrustManagerFactory;)Lio/netty/handler/ssl/SslContextBuilder;",
+      "symbol_kind": "method",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextOption$1",
+      "member": "<init>",
+      "descriptor": "()V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextOption",
+      "member": "<init>",
+      "descriptor": "(ILjava/lang/String;Lio/netty/handler/ssl/SslContextOption$1;)V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "not_found_in_static_analysis"
+    },
+    {
+      "coord": "io.netty:netty-handler",
+      "owner": "io.netty.handler.ssl.SslContextOption",
+      "member": "<init>",
+      "descriptor": "(Ljava/lang/String;)V",
+      "symbol_kind": "constructor",
+      "expected_conclusion": "not_found_in_static_analysis"
+    }
+  ],
+  "canonical_edges": [
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "<init>",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "<init>",
+      "callee_descriptor": "()V",
+      "opcode_family": "invokespecial",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/JdkSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.JdkSslContext",
+      "caller_member": "<init>",
+      "caller_descriptor": "(Ljavax/net/ssl/SSLContext;ZLjava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/JdkApplicationProtocolNegotiator;Lio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;[Ljava/lang/String;ZLjava/lang/String;Lio/grpc/netty/shaded/io/netty/handler/ssl/ResumptionController;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "<init>",
+      "callee_descriptor": "(ZLio/grpc/netty/shaded/io/netty/handler/ssl/ResumptionController;)V",
+      "opcode_family": "invokespecial",
+      "instruction_offset": 5
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/ReferenceCountedOpenSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.ReferenceCountedOpenSslContext",
+      "caller_member": "<init>",
+      "caller_descriptor": "(Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/OpenSslApplicationProtocolNegotiator;I[Ljava/security/cert/Certificate;Lio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;[Ljava/lang/String;ZLjava/lang/String;ZZLio/grpc/netty/shaded/io/netty/handler/ssl/ResumptionController;[Ljava/util/Map$Entry;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "<init>",
+      "callee_descriptor": "(ZLio/grpc/netty/shaded/io/netty/handler/ssl/ResumptionController;)V",
+      "opcode_family": "invokespecial",
+      "instruction_offset": 5
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "<init>",
+      "caller_descriptor": "(Z)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "<init>",
+      "callee_descriptor": "(ZLio/grpc/netty/shaded/io/netty/handler/ssl/ResumptionController;)V",
+      "opcode_family": "invokespecial",
+      "instruction_offset": 3
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettyChannelBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder",
+      "caller_member": "sslContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/netty/shaded/io/grpc/netty/NettyChannelBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "applicationProtocolNegotiator",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 33
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettyServerBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder",
+      "caller_member": "sslContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/netty/shaded/io/grpc/netty/NettyServerBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "applicationProtocolNegotiator",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 33
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettySslContextChannelCredentials.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettySslContextChannelCredentials",
+      "caller_member": "create",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/ChannelCredentials;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "applicationProtocolNegotiator",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 10
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettySslContextServerCredentials.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettySslContextServerCredentials",
+      "caller_member": "create",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/ServerCredentials;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "applicationProtocolNegotiator",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 10
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$ClientTlsHandler.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators$ClientTlsHandler",
+      "caller_member": "userEventTriggered0",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/channel/ChannelHandlerContext;Ljava/lang/Object;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "applicationProtocolNegotiator",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 41
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$ServerTlsHandler.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators$ServerTlsHandler",
+      "caller_member": "userEventTriggered",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/channel/ChannelHandlerContext;Ljava/lang/Object;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "applicationProtocolNegotiator",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 81
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "applicationProtocolNegotiator",
+      "caller_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "applicationProtocolNegotiator",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 4
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "nextProtocols",
+      "caller_descriptor": "()Ljava/util/List;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "applicationProtocolNegotiator",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolNegotiator;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "cipherSuites",
+      "caller_descriptor": "()Ljava/util/List;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "cipherSuites",
+      "callee_descriptor": "()Ljava/util/List;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 4
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettyChannelBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder",
+      "caller_member": "sslContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/netty/shaded/io/grpc/netty/NettyChannelBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "isClient",
+      "callee_descriptor": "()Z",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 23
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettySslContextChannelCredentials.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettySslContextChannelCredentials",
+      "caller_member": "create",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/ChannelCredentials;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "isClient",
+      "callee_descriptor": "()Z",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "isClient",
+      "caller_descriptor": "()Z",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "isClient",
+      "callee_descriptor": "()Z",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 4
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "isServer",
+      "caller_descriptor": "()Z",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "isClient",
+      "callee_descriptor": "()Z",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettyServerBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder",
+      "caller_member": "sslContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/netty/shaded/io/grpc/netty/NettyServerBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "isServer",
+      "callee_descriptor": "()Z",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 23
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettySslContextServerCredentials.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettySslContextServerCredentials",
+      "caller_member": "create",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/ServerCredentials;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "isServer",
+      "callee_descriptor": "()Z",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "build",
+      "caller_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newClientContextInternal",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/security/Provider;[Ljava/security/cert/X509Certificate;Ljavax/net/ssl/TrustManagerFactory;[Ljava/security/cert/X509Certificate;Ljava/security/PrivateKey;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;[Ljava/lang/String;JJZLjava/security/SecureRandom;Ljava/lang/String;Ljava/lang/String;[Ljava/util/Map$Entry;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 195
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newClientContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/io/File;Ljava/io/File;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newClientContextInternal",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/security/Provider;[Ljava/security/cert/X509Certificate;Ljavax/net/ssl/TrustManagerFactory;[Ljava/security/cert/X509Certificate;Ljava/security/PrivateKey;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;[Ljava/lang/String;JJZLjava/security/SecureRandom;Ljava/lang/String;Ljava/lang/String;[Ljava/util/Map$Entry;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 43
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$ClientTlsHandler.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators$ClientTlsHandler",
+      "caller_member": "handlerAdded0",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/channel/ChannelHandlerContext;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 46
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$ServerTlsHandler.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators$ServerTlsHandler",
+      "caller_member": "handlerAdded",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/channel/ChannelHandlerContext;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 15
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "newEngine",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Ljavax/net/ssl/SSLEngine;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 5
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Z)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 6
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;ZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 6
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$ClientTlsHandler.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators$ClientTlsHandler",
+      "caller_member": "handlerAdded0",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/channel/ChannelHandlerContext;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 26
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "newEngine",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 7
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 8
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newEngine",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 8
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/OptionalSslHandler.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.OptionalSslHandler",
+      "caller_member": "newSslHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/channel/ChannelHandlerContext;Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 7
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SniHandler.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SniHandler",
+      "caller_member": "newSslHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 2
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Z)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Z)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 6
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Z)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 6
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;ZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;ZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 7
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;ZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 7
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 9
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;I)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 8
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 11
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newHandler",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;ILjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newHandler",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/buffer/ByteBufAllocator;Ljava/lang/String;IZLjava/util/concurrent/Executor;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslHandler;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 10
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "build",
+      "caller_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newServerContextInternal",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/security/Provider;[Ljava/security/cert/X509Certificate;Ljavax/net/ssl/TrustManagerFactory;[Ljava/security/cert/X509Certificate;Ljava/security/PrivateKey;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJLio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;[Ljava/lang/String;ZZLjava/security/SecureRandom;Ljava/lang/String;[Ljava/util/Map$Entry;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 101
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newServerContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/io/File;Ljava/io/File;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJLjava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "newServerContextInternal",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/security/Provider;[Ljava/security/cert/X509Certificate;Ljavax/net/ssl/TrustManagerFactory;[Ljava/security/cert/X509Certificate;Ljava/security/PrivateKey;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJLio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;[Ljava/lang/String;ZZLjava/security/SecureRandom;Ljava/lang/String;[Ljava/util/Map$Entry;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 45
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "sessionCacheSize",
+      "caller_descriptor": "()J",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "sessionCacheSize",
+      "callee_descriptor": "()J",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 4
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "sessionContext",
+      "caller_descriptor": "()Ljavax/net/ssl/SSLSessionContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "sessionContext",
+      "callee_descriptor": "()Ljavax/net/ssl/SSLSessionContext;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 4
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "sessionCacheSize",
+      "caller_descriptor": "()J",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "sessionContext",
+      "callee_descriptor": "()Ljavax/net/ssl/SSLSessionContext;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "sessionTimeout",
+      "caller_descriptor": "()J",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "sessionContext",
+      "callee_descriptor": "()Ljavax/net/ssl/SSLSessionContext;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/DelegatingSslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.DelegatingSslContext",
+      "caller_member": "sessionTimeout",
+      "caller_descriptor": "()J",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "sessionTimeout",
+      "callee_descriptor": "()J",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 4
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "keyManager",
+      "caller_descriptor": "(Ljava/io/File;Ljava/io/File;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toPrivateKey",
+      "callee_descriptor": "(Ljava/io/File;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 42
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newClientContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/io/File;Ljava/io/File;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toPrivateKey",
+      "callee_descriptor": "(Ljava/io/File;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 15
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newServerContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/io/File;Ljava/io/File;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJLjava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toPrivateKey",
+      "callee_descriptor": "(Ljava/io/File;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 15
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "toPrivateKeyInternal",
+      "caller_descriptor": "(Ljava/io/File;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toPrivateKey",
+      "callee_descriptor": "(Ljava/io/File;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 2
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "keyManager",
+      "caller_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toPrivateKey",
+      "callee_descriptor": "(Ljava/io/InputStream;Ljava/lang/String;)Ljava/security/PrivateKey;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 25
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/OpenSslX509KeyManagerFactory.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.OpenSslX509KeyManagerFactory",
+      "caller_member": "newEngineBased",
+      "caller_descriptor": "(Ljava/io/File;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/OpenSslX509KeyManagerFactory;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/OpenSslX509KeyManagerFactory.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.OpenSslX509KeyManagerFactory",
+      "caller_member": "newKeyless",
+      "caller_descriptor": "(Ljava/io/File;)Lio/grpc/netty/shaded/io/netty/handler/ssl/OpenSslX509KeyManagerFactory;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "keyManager",
+      "caller_descriptor": "(Ljava/io/File;Ljava/io/File;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "trustManager",
+      "caller_descriptor": "(Ljava/io/File;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 2
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "buildTrustManagerFactory",
+      "caller_descriptor": "(Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newClientContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/io/File;Ljava/io/File;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 3
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newClientContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/io/File;Ljava/io/File;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJ)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 8
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newServerContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/io/File;Ljava/io/File;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJLjava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 3
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "newServerContext",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;Ljava/io/File;Ljavax/net/ssl/TrustManagerFactory;Ljava/io/File;Ljava/io/File;Ljava/lang/String;Ljavax/net/ssl/KeyManagerFactory;Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;JJLjava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 8
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "caller_member": "toX509CertificatesInternal",
+      "caller_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/File;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/OpenSslX509KeyManagerFactory.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.OpenSslX509KeyManagerFactory",
+      "caller_member": "newKeyless",
+      "caller_descriptor": "(Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/netty/handler/ssl/OpenSslX509KeyManagerFactory;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/InputStream;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "keyManager",
+      "caller_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/InputStream;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 1
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "trustManager",
+      "caller_descriptor": "(Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+      "callee_member": "toX509Certificates",
+      "callee_descriptor": "(Ljava/io/InputStream;)[Ljava/security/cert/X509Certificate;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 2
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "configure",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "applicationProtocolConfig",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 94
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "configure",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;Ljava/security/Provider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "applicationProtocolConfig",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/ApplicationProtocolConfig;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 232
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettyChannelBuilder$DefaultProtocolNegotiator.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder$DefaultProtocolNegotiator",
+      "caller_member": "newNegotiator",
+      "caller_descriptor": "()Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiator;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "build",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 22
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettyServerBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder",
+      "caller_member": "useTransportSecurity",
+      "caller_descriptor": "(Ljava/io/File;Ljava/io/File;)Lio/grpc/netty/shaded/io/grpc/netty/NettyServerBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "build",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 23
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/NettyServerBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder",
+      "caller_member": "useTransportSecurity",
+      "caller_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/grpc/netty/NettyServerBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "build",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 23
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ChannelCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromChannelCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "build",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 214
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ServerCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromServerCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "build",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContext;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 277
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "configure",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "ciphers",
+      "callee_descriptor": "(Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 90
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "configure",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;Ljava/security/Provider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "ciphers",
+      "callee_descriptor": "(Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 228
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "ciphers",
+      "caller_descriptor": "(Ljava/lang/Iterable;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "ciphers",
+      "callee_descriptor": "(Ljava/lang/Iterable;Lio/grpc/netty/shaded/io/netty/handler/ssl/CipherSuiteFilter;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 5
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ServerCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromServerCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "clientAuth",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 220
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ServerCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromServerCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "clientAuth",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 231
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ServerCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromServerCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "clientAuth",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/ClientAuth;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 242
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "forClient",
+      "caller_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "forClient",
+      "callee_descriptor": "()Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 0
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "forServer",
+      "caller_descriptor": "(Ljava/io/File;Ljava/io/File;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "forServer",
+      "callee_descriptor": "(Ljava/io/File;Ljava/io/File;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 2
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "forServer",
+      "caller_descriptor": "(Ljava/io/File;Ljava/io/File;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "forServer",
+      "callee_descriptor": "(Ljava/io/File;Ljava/io/File;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 3
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "forServer",
+      "caller_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "forServer",
+      "callee_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 2
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "forServer",
+      "caller_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "forServer",
+      "callee_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 3
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ServerCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromServerCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "forServer",
+      "callee_descriptor": "(Ljavax/net/ssl/KeyManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokestatic",
+      "instruction_offset": 70
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ChannelCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromChannelCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "keyManager",
+      "callee_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 116
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "forServer",
+      "caller_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "keyManager",
+      "callee_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 11
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "keyManager",
+      "caller_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "keyManager",
+      "callee_descriptor": "(Ljava/io/InputStream;Ljava/io/InputStream;Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 4
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ChannelCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromChannelCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "keyManager",
+      "callee_descriptor": "(Ljavax/net/ssl/KeyManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 75
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "forServer",
+      "caller_descriptor": "(Ljavax/net/ssl/KeyManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "keyManager",
+      "callee_descriptor": "(Ljavax/net/ssl/KeyManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 9
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "configure",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;Ljava/security/Provider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "protocols",
+      "callee_descriptor": "([Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 181
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "caller_member": "protocols",
+      "caller_descriptor": "(Ljava/lang/Iterable;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "protocols",
+      "callee_descriptor": "([Ljava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 11
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "configure",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;Ljava/security/Provider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "sslContextProvider",
+      "callee_descriptor": "(Ljava/security/Provider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 236
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "configure",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "sslProvider",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 81
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/GrpcSslContexts.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts",
+      "caller_member": "configure",
+      "caller_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;Ljava/security/Provider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "sslProvider",
+      "callee_descriptor": "(Lio/grpc/netty/shaded/io/netty/handler/ssl/SslProvider;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 219
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ServerCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromServerCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "trustManager",
+      "callee_descriptor": "(Ljava/io/InputStream;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 176
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ChannelCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromChannelCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "trustManager",
+      "callee_descriptor": "(Ljavax/net/ssl/TrustManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 202
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators.class",
+      "caller_owner": "io.grpc.netty.shaded.io.grpc.netty.ProtocolNegotiators",
+      "caller_member": "from",
+      "caller_descriptor": "(Lio/grpc/ServerCredentials;)Lio/grpc/netty/shaded/io/grpc/netty/ProtocolNegotiators$FromServerCredentialsResult;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+      "callee_member": "trustManager",
+      "callee_descriptor": "(Ljavax/net/ssl/TrustManagerFactory;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextBuilder;",
+      "opcode_family": "invokevirtual",
+      "instruction_offset": 150
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextOption.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption",
+      "caller_member": "<clinit>",
+      "caller_descriptor": "()V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption$1",
+      "callee_member": "<init>",
+      "callee_descriptor": "()V",
+      "opcode_family": "invokespecial",
+      "instruction_offset": 4
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/SslContextOption$1.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption$1",
+      "caller_member": "newConstant",
+      "caller_descriptor": "(ILjava/lang/String;)Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextOption;",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption",
+      "callee_member": "<init>",
+      "callee_descriptor": "(ILjava/lang/String;Lio/grpc/netty/shaded/io/netty/handler/ssl/SslContextOption$1;)V",
+      "opcode_family": "invokespecial",
+      "instruction_offset": 7
+    },
+    {
+      "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+      "artifact_entry": "io/grpc/netty/shaded/io/netty/handler/ssl/OpenSslContextOption.class",
+      "caller_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.OpenSslContextOption",
+      "caller_member": "<init>",
+      "caller_descriptor": "(Ljava/lang/String;)V",
+      "callee_owner": "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption",
+      "callee_member": "<init>",
+      "callee_descriptor": "(Ljava/lang/String;)V",
+      "opcode_family": "invokespecial",
+      "instruction_offset": 2
+    }
+  ],
+  "canonical_semantic_references": [],
+  "fixture_debt": []
+}

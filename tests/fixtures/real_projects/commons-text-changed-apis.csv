@@ -1,0 +1,7 @@
+conclusion,change_summary,review_reason,coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source,binary_compatible,source_compatible,compatibility_flags,reason_code,data_contract_evidence,evidence_path,old_value,new_value
+,,,org.apache.commons:commons-lang3,3.x,4.x,REMOVED,org.apache.commons.lang3.StringUtils.isBlank,isBlank,method,(CharSequence),true,HIGH,jdk-javap-git-source-review,,,,,,,,
+,,,org.apache.commons:commons-lang3,3.x,4.x,REMOVED,org.apache.commons.lang3.StringUtils.isEmpty,isEmpty,method,(CharSequence),true,HIGH,jdk-javap-git-source-review,,,,,,,,
+,,,org.apache.commons:commons-lang3,3.x,4.x,REMOVED,org.apache.commons.lang3.StringUtils.defaultString,defaultString,method,(String),true,HIGH,jdk-javap-git-source-review,,,,,,,,
+,,,org.apache.commons:commons-lang3,3.x,4.x,REMOVED,org.apache.commons.lang3.StringUtils.EMPTY,EMPTY,field,,true,HIGH,jdk-javap-git-source-review,,,CONSTANT_REMOVED,,,,,
+,,,org.apache.commons:commons-lang3,3.x,4.x,REMOVED,org.apache.commons.lang3.ArrayUtils.isEmpty,isEmpty,method,(char[]),true,HIGH,jdk-javap-git-source-review,,,,,,,,
+,,,org.apache.commons:commons-lang3,3.x,4.x,REMOVED,org.apache.commons.lang3.Validate.isTrue,isTrue,method,"(boolean, String, Object...)",true,HIGH,jdk-javap-git-source-review,,,,,,,,

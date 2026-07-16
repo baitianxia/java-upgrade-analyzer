@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,24 @@ import quality_gate  # noqa: E402
 
 
 class QualityGateTest(unittest.TestCase):
+    def test_round_input_files_are_initialized_without_overwriting_reviews(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reviews = root / "test_round_reviews.json"
+            history = root / "test_round_history.json"
+            reviews.write_text('{"findings":[{"finding_id":"kept"}]}', encoding="utf-8")
+            tasks = quality_gate.build_plan(
+                "step5", report_root=str(root), skip_real=False
+            )
+
+            quality_gate.ensure_round_input_files(tasks)
+
+            self.assertEqual(
+                json.loads(reviews.read_text(encoding="utf-8"))["findings"][0]["finding_id"],
+                "kept",
+            )
+            self.assertEqual(json.loads(history.read_text(encoding="utf-8")), [])
+
     def test_step5_default_real_matrix_uses_reproducible_guards(self):
         tasks = quality_gate.build_plan(
             "step5", python_exe="python3", skip_real=False,

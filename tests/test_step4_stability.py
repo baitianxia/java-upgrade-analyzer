@@ -242,11 +242,16 @@ class Step4StabilityTest(unittest.TestCase):
             md_text = md_path.read_text(encoding="utf-8")
             self.assertIn("selection_key,coord,dependency_name,changed_api_count", csv_text)
             self.assertIn("coord:com.acme:alpha", csv_text)
-            self.assertIn("本文件回答：哪些依赖包发生 API 变化", md_text)
-            self.assertIn("先看顺序", md_text)
+            self.assertIn("本文件列出全部发生 API 变化", md_text)
+            self.assertIn("## 如何选择定向分析范围", md_text)
+            self.assertIn("复制“依赖包”列中的完整坐标", md_text)
+            self.assertIn("只分析 com.example:demo-lib", md_text)
+            self.assertIn("推荐依据是：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", md_text)
+            self.assertIn("| 推荐候选 | 依赖包 |", md_text)
+            self.assertIn("| 是 | `com.acme:alpha` |", md_text)
             self.assertIn("为什么先看", md_text)
-            self.assertIn("含高风险 API，优先进入 Step5", md_text)
-            self.assertIn("`coord:com.acme:alpha`", md_text)
+            self.assertIn("含高风险 API，优先做系统触达分析", md_text)
+            self.assertIn("`com.acme:alpha`", md_text)
             self.assertIn("完整 API 明细", md_text)
 
     def test_source_refs_compare_resolved_commits_not_only_branch_names(self):
@@ -314,7 +319,10 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertIn("Step4 依赖 API 变化摘要", summary_text)
         self.assertLess(summary_text.index("一、先看什么"), summary_text.index("二、本次是否能进入 Step5"))
         self.assertLess(summary_text.index("二、本次是否能进入 Step5"), summary_text.index("三、复核入口"))
-        self.assertIn("如果只决定 Step5 分析范围，先打开 changed_dependencies.md", summary_text)
+        self.assertIn(
+            "如果只决定系统触达分析范围，先打开 changed_dependencies.md，复制“依赖包”列中的完整坐标",
+            summary_text,
+        )
         self.assertIn("- 变更 API 有效行：1", summary_text)
         self.assertIn("- 完整变更 API 清单：", summary_text)
         self.assertIn("附录：统计分布", summary_text)
@@ -489,6 +497,22 @@ class Step4StabilityTest(unittest.TestCase):
             rows = step4.parse_japicmp_xml(xml_path, "com.acme:api", "1", "2")
         self.assertEqual(rows[0]["change_type"], "CONSTANT_VALUE_CHANGED")
         self.assertEqual((rows[0]["old_value"], rows[0]["new_value"]), ("10", "20"))
+
+    def test_removed_compile_time_constant_preserves_inlining_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "diff.xml"
+            xml_path.write_text(
+                '<japicmp><classes><class name="com.acme.Flags" changeStatus="MODIFIED" '
+                'binaryCompatible="false" sourceCompatible="false"><fields><field name="LIMIT" '
+                'changeStatus="REMOVED" binaryCompatible="false" sourceCompatible="false" '
+                'oldValue="10"/></fields></class></classes></japicmp>',
+                encoding="utf-8",
+            )
+            rows = step4.parse_japicmp_xml(xml_path, "com.acme:api", "1", "2")
+
+        self.assertEqual(rows[0]["change_type"], "REMOVED")
+        self.assertIn("CONSTANT_REMOVED", rows[0]["compatibility_flags"])
+        self.assertEqual(rows[0]["old_value"], "10")
 
     def test_parse_japicmp_xml_ignores_nested_and_top_level_jdk_type_noise(self):
         with tempfile.TemporaryDirectory() as tmp:

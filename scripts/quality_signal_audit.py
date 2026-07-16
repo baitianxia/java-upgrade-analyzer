@@ -169,19 +169,28 @@ def audit_real_project_payload(payload: dict) -> list[QualitySignal]:
         if explicit_signal_count:
             continue
 
-        summary = result.get("summary") or {}
-        for field in ("uncertain", "not_analyzed", "not_found_in_static_analysis"):
-            count = int(summary.get(field) or 0)
-            if count:
-                signals.append(
-                    normalize_signal({
-                        "severity": "medium",
-                        "kind": f"summary_{field}",
-                        "case": case,
-                        "count": count,
-                        "message": f"{case} summary has {count} {field} item(s)",
-                    })
-                )
+        guard_contract = result.get("guard_contract") or {}
+        conclusion_gate = (result.get("gates") or {}).get("conclusion") or {}
+        guard_conclusion_verified = bool(
+            guard_contract.get("passed") is True
+            and not guard_contract.get("errors")
+            and conclusion_gate.get("passed") is True
+            and not conclusion_gate.get("errors")
+        )
+        if not guard_conclusion_verified:
+            summary = result.get("summary") or {}
+            for field in ("uncertain", "not_analyzed", "not_found_in_static_analysis"):
+                count = int(summary.get(field) or 0)
+                if count:
+                    signals.append(
+                        normalize_signal({
+                            "severity": "medium",
+                            "kind": f"summary_{field}",
+                            "case": case,
+                            "count": count,
+                            "message": f"{case} summary has {count} {field} item(s)",
+                        })
+                    )
 
         for check in result.get("checks") or []:
             prod_missing = int(check.get("production_missing") or 0)

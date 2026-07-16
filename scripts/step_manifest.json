@@ -276,13 +276,9 @@
               "type": "array",
               "description": "当源码仓库已识别但 old_version/new_version 无法自动唯一匹配 git refs 时，按依赖显式确认 old_ref/new_ref，例如 [{\"coord\":\"g:a\",\"old_ref\":\"v1\",\"new_ref\":\"v2\"}]。"
             },
-            "step5_selected_coords": {
+            "selected_targets": {
               "type": "array",
-              "description": "可选。继续进入 Step5 时，只分析这些依赖坐标对应的变更 API；坐标必须来自 all_changed_apis.csv 的 coord 列。"
-            },
-            "step5_selected_names": {
-              "type": "array",
-              "description": "可选。继续进入 Step5 时，只分析这些依赖名称对应的变更 API；名称按 coord 的 artifactId 匹配。"
+              "description": "可选。定向分析时，从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。"
             },
             "step4_git_diff_timeout": {
               "type": "integer",
@@ -302,12 +298,12 @@
             }
           }
         },
-        "resume_hint": "若用户补充依赖源码目录、依赖 old_ref/new_ref 或 Step4 超时参数，请使用 --response-json 传回 action=rerun_current_step 与对应字段，并重跑 Step4；若用户已确认证据池，但只想让 Step5 分析部分变更 jar，可在 continue 时同时传回 step5_selected_coords / step5_selected_names；若用户要求从更早阶段重跑，请传回 action=restart_from_step 与 restart_step_id（如 step2 / step4）。",
+        "resume_hint": "若用户补充依赖源码目录、依赖 old_ref/new_ref 或 Step4 超时参数，请使用 --response-json 传回 action=rerun_current_step 与对应字段，并重跑 Step4；若用户只想分析部分依赖包，在 continue 时通过 selected_targets 传回从 changed_dependencies.md 复制的完整坐标；若用户要求从更早阶段重跑，请传回 action=restart_from_step 与 restart_step_id（如 step2 / step4）。",
         "options": [
           {
             "id": "continue",
-            "label": "继续",
-            "description": "依赖 API 变化完整可信，继续判断这些变化是否触达当前系统。"
+            "label": "继续（选择分析范围）",
+            "description": "可全量分析、从推荐候选中选择，或打开 evidence/api_changes/changed_dependencies.md 从全部候选中选择。定向分析时提供“依赖包”列中的一个或多个完整坐标。"
           },
           {
             "id": "rerun_current_step",
@@ -323,11 +319,9 @@
         "action_requirements": {
           "continue": {
             "recommended_fields": [
-              "selected_targets",
-              "step5_selected_coords",
-              "step5_selected_names"
+              "selected_targets"
             ],
-            "description": "若用户只想让 Step5 分析部分变更 jar，应显式选择候选目标。"
+            "description": "定向分析时，应从 changed_dependencies.md 的“依赖包”列提供一个或多个完整坐标。"
           },
           "rerun_current_step": {
             "at_least_one_of": [
@@ -456,7 +450,7 @@
         "evidence/call_chain/source_artifact_alignment.json"
       ],
       "notes": [
-        "Step5 默认会遍历 all_changed_apis.csv，并对每条变更做反向调用链追踪；若 Step4 checkpoint 指定了 changed_dependencies.csv 中的 selection_key，则只分析被选中的依赖包。"
+        "系统触达分析默认遍历 all_changed_apis.csv；若用户通过 selected_targets 提供 changed_dependencies.md 中的依赖包完整坐标，则只分析对应依赖包。"
       ]
     },
     {

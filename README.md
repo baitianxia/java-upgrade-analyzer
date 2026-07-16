@@ -137,7 +137,13 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 4. 如果需要核对调用链证据，看 `.upgrade-report/evidence/call_chain/alerts.csv`。
 5. `.upgrade-report/.runtime/` 是程序状态目录，普通阅读不需要进入。
 
-依赖 API 变化分析完成后，如果 Claude Code 询问系统触达证据是全量分析还是只分析部分依赖包，候选项来自 `changed_dependencies.md/csv` 的依赖包维度清单，不需要从 `all_changed_apis.csv` 逐行挑 API。
+依赖 API 变化分析完成后，系统会提供三层范围选择：
+
+1. **全量分析**：分析全部发生 API 变化的依赖包，直接回复“全量继续”。
+2. **从推荐候选中选择**：优先展示含高风险 API、删除或签名变化，或变化 API 数不少于 20 个的依赖包。
+3. **从全部候选中选择**：打开 `.upgrade-report/evidence/api_changes/changed_dependencies.md`，从完整清单复制“依赖包”列中的坐标，例如：`只分析 com.foo:bar、com.foo:baz`。
+
+不需要从 `all_changed_apis.csv` 逐行挑选 API。推荐候选只是缩小范围的入口，不代表已经确认影响当前系统。
 
 ---
 
@@ -228,7 +234,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 | 顺序 | 文件 | 用途 |
 |---:|---|---|
 | 1 | `.upgrade-report/deliverables/report.md` | 查看最终客观分析结果和结论限制 |
-| 2 | `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 查看依赖包维度的 API 变化摘要和 Step5 选择值 |
+| 2 | `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 查看依赖包维度的 API 变化摘要和定向分析范围 |
 | 3 | `.upgrade-report/evidence/api_changes/all_changed_apis.csv` | 查看完整 API 变化事实 |
 | 4 | `.upgrade-report/evidence/call_chain/alerts.csv` | 查看每个变化 API 的完整调用链台账 |
 

@@ -13,13 +13,13 @@ This audit records architecture capability closure. It is development evidence, 
 
 | Capability family | Implementation state | Current guard state | Missing closure evidence |
 |---|---|---|---|
-| `artifact_identity_ownership` | enforced | guard blocked | `gs-multi-module` pinned checkout and final artifact are unavailable; full matrix must be rerun |
-| `canonical_evidence_identity` | enforced | RuoYi full audit passed | 2185/2185 APIs independently verified; 313/313 physical edges matched, fault injection and performance gates passed |
-| `evidence_completeness_visibility` | enforced | RuoYi full audit passed | 2185/2185 APIs verified, 313/313 physical edges matched; collector failures, malformed context, and unreadable final-artifact inputs fail closed |
-| `framework_activation_semantics` | enforced | MyBatis XML and Spring transaction guards passed | typed semantic edges require independent activation evidence; runtime positive Oracle evidence is compatible with static absence |
-| `closed_world_pipeline` | enforced | RuoYi full audit passed | additional orthogonal project guard remains pending; shared Step4/Step5/summary/alert/Oracle identity-set gates are executable |
-| `reproducible_test_assets` | enforced | materialization plans 7/7 valid; `gs-multi-module` execution blocked | source-build and published-artifact contracts are executable; missing assets now fail rather than skip |
-| `performance_without_scope_loss` | enforced | MyBatis XML and RuoYi prior runs satisfy scope contracts | fresh end-to-end rerun with new envelope schema remains pending |
+| `artifact_identity_ownership` | enforced | five-project guard passed | `gs-multi-module` same-coordinate inner bridge and final-artifact ownership passed all seven gates |
+| `canonical_evidence_identity` | enforced | five-project guard passed | every declared API, physical edge, and semantic reference passed the pinned guard contracts |
+| `evidence_completeness_visibility` | enforced | five-project guard passed | blocking collector failures fail closed without erasing independent reachable or typed semantic evidence |
+| `framework_activation_semantics` | enforced | Dubbo reflection and two MyBatis guards passed | verified activation can establish reachability; exact reflection without activation remains objectively uncertain |
+| `closed_world_pipeline` | enforced | formal Step5 gate passed | API coverage, edge truth, conclusion, performance, fixture debt, retrospective, and capability closure passed together |
+| `reproducible_test_assets` | enforced | materialization plans valid; five pinned guards passed | source-build and published-artifact contracts are executable; missing assets fail rather than skip |
+| `performance_without_scope_loss` | enforced | fresh five-project guard passed | the current envelope schema preserved API, class, edge, Oracle, and fault-injection scope within budget |
 
 ## Artifact Identity And Ownership Finding
 
@@ -50,7 +50,11 @@ The current RuoYi guard passed all 2,185 APIs with an independent Oracle result
 of 2,185 verified, zero unverified/incorrect/conflicting conclusions, 313 analyzer
 and 313 Oracle physical edges, and a successful removed-edge fault injection.
 
-The family is not globally closed because the current `gs-multi-module` cross-project guard cannot run without its pinned checkout and final artifact.
+The restored `gs-multi-module` checkout and deterministic final artifact now pass
+the same-coordinate cross-project guard. The 2026-07-16 formal Step5 gate also
+passed capability-family closure for the registered production paths. This is
+current closure evidence for the registered matrix, not a claim that unseen Java
+framework topologies cannot expose new defects.
 
 ## Closed-World Pipeline Finding
 
@@ -68,9 +72,10 @@ identities explicitly instead of relying on an indirect incorrect verdict.
 
 Generalized tests cover an identical closed set, same symbol under different
 coordinates, duplicate Step4 identities, equal-count summary substitution,
-missing analyzer output, and duplicate changed input. The RuoYi guard remains
-valid current evidence; an additional orthogonal real-project run is still
-required before this family can be considered globally closed.
+missing analyzer output, and duplicate changed input. The current guard adds
+orthogonal reflection, same-coordinate multi-module, Fat Jar callback, MyBatis
+annotation proxy, and MyBatis XML mapping topologies; all declared APIs passed
+the closed-set and conclusion contracts.
 
 ## Reproducible Asset Finding
 
@@ -104,9 +109,10 @@ Relative performance baselines now include a mandatory scope contract. The
 shared evaluator rejects any reduction in selected or accounted APIs, artifacts,
 classes, analyzer edges, Oracle edges, or detected fault injections. A mutation
 that removes one class and one analyzer edge fails even when its elapsed time is
-lower. Existing MyBatis XML and RuoYi evidence satisfies the new scope values;
-because those result files predate the new envelope field, artifact counts were
-read from their same-run summary files rather than represented as a fresh run.
+lower. The fresh five-project guard satisfies the new scope values with the
+current envelope schema. It includes the 9,413-class RabbitMQ Fat Jar run, all
+declared API and edge reconciliation, fault-injection detection, and per-case
+performance budgets in the same formal gate execution.
 
 ## Canonical Evidence Identity Finding
 

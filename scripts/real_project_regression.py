@@ -49,7 +49,12 @@ from mybatis_mapper_oracle import (
     verify_runtime_activation,
 )
 from pipeline_constants import STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
-from signature_utils import canonical_api_identity, normalize_signature_for_lookup
+from s4_contract import ALL_CHANGED_APIS_FIELDS
+from signature_utils import (
+    canonical_api_identity,
+    normalize_signature_for_lookup,
+    signatures_match_identity,
+)
 from third_party_jdk_oracle import _source_signature
 from third_party_jdk_oracle import discover_calls, scan_class_files
 from third_party_jdeps_oracle import scan_artifact_class_references as scan_jdeps_class_references
@@ -196,12 +201,28 @@ def apply_real_case_performance_budget(case: RealProjectCase) -> RealProjectCase
 CASES = {
     "commons-text": RealProjectCase(
         name="commons-text",
-        default_project=Path("/private/tmp/jua-real-system-commons-text"),
-        default_changed_apis=Path(""),
+        default_project=Path("/private/tmp/jua-real-system-commons-text-20260716-c"),
+        default_changed_apis=(
+            ROOT_DIR / "tests" / "fixtures" / "real_projects"
+            / "commons-text-changed-apis.csv"
+        ),
+        source_dirs=(Path("src/main/java"),),
         require_valid_git=True,
         min_project_java_files=100,
         min_main_java_files=100,
-        required_topologies=("business_direct", "static_dispatch", "field_access"),
+        required_topologies=("source_bytecode_agree",),
+        final_artifact=Path(
+            "/private/tmp/jua-real-system-commons-text-20260716-c/target/commons-text-1.12.0.jar"
+        ),
+        source_attestation=(
+            ROOT_DIR / "tests" / "fixtures" / "real_projects" / "evidence"
+            / "commons-text-source-attestation.json"
+        ),
+        fixture_manifest=(
+            ROOT_DIR / "tests" / "fixtures" / "real_projects" / "commons-text.json"
+        ),
+        required_fault_injections=("drop_analyzer_edge",),
+        require_relative_performance_baseline=True,
         changed_api_rows=(
             {
                 "coord": "org.apache.commons:commons-lang3",
@@ -282,7 +303,7 @@ CASES = {
                 "source": "manual_real_project_probe",
             },
         ),
-        prefer_embedded_changed_api_rows=True,
+        prefer_embedded_changed_api_rows=False,
         baseline_specs=(
             BaselineSpec(
                 symbol="org.apache.commons.lang3.StringUtils.isBlank",
@@ -733,7 +754,10 @@ CASES["mall"] = RealProjectCase(
 CASES["spring-security-config"] = RealProjectCase(
     name="spring-security-config",
     default_project=Path("/private/tmp/jua-real-project-spring-security-6.5.10"),
-    default_changed_apis=Path(""),
+    default_changed_apis=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects"
+        / "spring-security-config-changed-apis.csv"
+    ),
     source_dirs=(Path("config/src/main/java"),),
     baseline_specs=(),
     min_project_java_files=200,
@@ -742,8 +766,8 @@ CASES["spring-security-config"] = RealProjectCase(
     require_valid_git=True,
     max_elapsed_seconds=130.0,
     max_oracle_seconds=135.0,
-    case_mode="discovery",
-    ground_truth_status="unreviewed",
+    case_mode="guard",
+    ground_truth_status="reviewed",
     enable_jdk_oracle=True,
     bytecode_owner_prefixes=(
         "org/springframework/security/authentication/ProviderManager",
@@ -757,6 +781,64 @@ CASES["spring-security-config"] = RealProjectCase(
     ),
     required_topologies=("business_direct", "constructor", "static_dispatch"),
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
+    fixture_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects"
+        / "spring-security-config.json"
+    ),
+    required_fault_injections=("drop_analyzer_edge",),
+    require_relative_performance_baseline=True,
+)
+
+CASES["grpc-netty-shaded"] = RealProjectCase(
+    name="grpc-netty-shaded",
+    default_project=Path("/private/tmp/jua-real-grpc-java-1.81.0"),
+    default_changed_apis=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects"
+        / "grpc-netty-shaded-changed-apis.csv"
+    ),
+    baseline_specs=(),
+    source_dirs=(Path("netty/src/main/java"),),
+    min_project_java_files=1500,
+    min_main_java_files=900,
+    max_generated_java_ratio=0.1,
+    require_valid_git=True,
+    max_elapsed_seconds=180.0,
+    max_oracle_seconds=135.0,
+    case_mode="guard",
+    ground_truth_status="reviewed",
+    enable_jdk_oracle=True,
+    bytecode_owner_prefixes=(
+        "io/grpc/netty/shaded/io/netty/handler/ssl/SslContext",
+        "io/netty/handler/ssl/SslContext",
+    ),
+    bytecode_coord="io.grpc:grpc-netty-shaded",
+    final_artifact=Path(
+        "/private/tmp/jua-real-grpc-java-1.81.0/netty/shaded/build/libs/"
+        "grpc-netty-shaded-1.81.0.jar"
+    ),
+    required_topologies=("source_bytecode_true_conflict",),
+    target_owner_entries={
+        owner: (owner.replace(".", "/") + ".class",)
+        for owner in (
+            "io.grpc.netty.shaded.io.netty.handler.ssl.SslContext",
+            "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder",
+            "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption",
+            "io.grpc.netty.shaded.io.netty.handler.ssl.SslContextOption$1",
+        )
+    },
+    source_attestation=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" / "evidence"
+        / "grpc-netty-shaded-source-attestation.json"
+    ),
+    prior_topology_matrix=(
+        ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json"
+    ),
+    fixture_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects"
+        / "grpc-netty-shaded.json"
+    ),
+    required_fault_injections=("drop_analyzer_edge",),
+    require_relative_performance_baseline=True,
 )
 
 CASES["dubbo-fatjar"] = RealProjectCase(
@@ -934,7 +1016,7 @@ CASES["gs-managing-transactions"] = RealProjectCase(
     require_valid_git=True,
     min_project_java_files=3,
     min_main_java_files=3,
-    case_mode="convergence",
+    case_mode="guard",
     ground_truth_status="reviewed",
     oracle_manifest=(
         ROOT_DIR / "tests" / "fixtures" / "real_projects" /
@@ -967,6 +1049,8 @@ CASES["gs-managing-transactions"] = RealProjectCase(
     prior_topology_matrix=(
         ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json"
     ),
+    required_fault_injections=("drop_analyzer_edge",),
+    require_relative_performance_baseline=True,
 )
 
 CASES["dubbo-spring6-security"] = RealProjectCase(
@@ -1148,10 +1232,12 @@ def _matches_expected_call_chain(path_text: str, expected_chain: list[str], expe
             "", actual, count=1
         )
         signature_match = re.fullmatch(r"(.+?)(\(.*\))", normalized_actual)
-        if normalized_actual != expected and not (
+        actual_identity = (signature_match.group(1) if signature_match else normalized_actual).replace("$", ".")
+        expected_identity = expected.replace("$", ".")
+        if actual_identity != expected_identity and not (
             "(" not in expected
             and signature_match
-            and signature_match.group(1).strip() == expected
+            and signature_match.group(1).strip().replace("$", ".") == expected_identity
         ):
             return False
 
@@ -1162,7 +1248,7 @@ def _matches_expected_call_chain(path_text: str, expected_chain: list[str], expe
         ) if item
     )
     expected_signature = _expected_target_signature(expected_api)
-    if not target_identity or expected_chain[-1] != target_identity:
+    if not target_identity or expected_chain[-1].replace("$", ".") != target_identity.replace("$", "."):
         return False
     terminal = nodes[-1]
     if marker_indexes:
@@ -1174,9 +1260,20 @@ def _matches_expected_call_chain(path_text: str, expected_chain: list[str], expe
     if not expected_signature:
         return False
     terminal_match = re.fullmatch(r"(.+?)(\(.*\))", terminal)
-    if not terminal_match or terminal_match.group(1).strip() != target_identity:
+    if (
+        not terminal_match
+        or terminal_match.group(1).strip().replace("$", ".")
+        != target_identity.replace("$", ".")
+    ):
         return False
-    return normalize_signature_for_lookup(terminal_match.group(2)) == expected_signature
+    descriptor = str((expected_api or {}).get("descriptor") or "").strip()
+    try:
+        descriptor_signature = _source_signature(descriptor)
+    except (IndexError, ValueError):
+        descriptor_signature = ""
+    return bool(descriptor_signature) and signatures_match_identity(
+        terminal_match.group(2), descriptor_signature
+    )
 
 
 def _reachable_call_paths(row: dict) -> list[str]:
@@ -1249,10 +1346,34 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
             or manifest.get("expected_conclusion")
             or ""
         )
+        expected_kind = str(expected_api.get("symbol_kind") or "").strip().lower()
+        expected_coord = str(expected_api.get("coord") or "").strip()
+        expected_descriptor = str(expected_api.get("descriptor") or "").strip()
+        try:
+            expected_signature = _source_signature(expected_descriptor)
+        except (IndexError, ValueError):
+            expected_signature = ""
         matching_rows = [
             row for row in conclusion_rows
             if str(row.get("api") or row.get("api_name") or "") == expected_name
             and str(row.get("analysis_status") or "") == expected_conclusion
+            and (
+                not expected_coord
+                or str(row.get("coord") or "").strip() == expected_coord
+            )
+            and (
+                not expected_kind
+                or str(row.get("symbol_kind") or "").strip().lower() == expected_kind
+            )
+            and (
+                expected_kind in {"field", "class"}
+                or (
+                    bool(expected_signature)
+                    and signatures_match_identity(
+                        str(row.get("api_signature") or ""), expected_signature
+                    )
+                )
+            )
         ]
         if not matching_rows:
             if "expected_conclusion_missing" not in errors:
@@ -1306,7 +1427,13 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
         errors.append("unexpected_semantic_reference")
     if not expected_physical_edges and not expected_semantic_identities:
         errors.append("expected_physical_edge_missing")
-    return {"passed": not errors, "errors": errors}
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "api_count": len(expected_apis),
+        "expected_physical_edge_count": len(expected_physical_edges),
+        "expected_semantic_reference_count": len(expected_semantic_identities),
+    }
 
 
 def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
@@ -1672,13 +1799,24 @@ def write_pinned_final_artifact_provenance(
         or asset_gate.get("artifact_sha256")
         or ""
     )
+    revision = str(
+        asset_gate.get("actual_git_revision")
+        or asset_gate.get("expected_git_revision")
+        or ""
+    ).strip()
+    source_mode = str(asset_gate.get("source_mode") or "").strip()
+    current_side = {
+        "side": "current",
+        "artifact_path": str(artifact_path),
+        "artifact_sha256": artifact_sha256,
+        "authority": authority,
+    }
+    if revision:
+        current_side["revision"] = revision
+    if source_mode:
+        current_side["source_mode"] = source_mode
     output.write_text(json.dumps({
-        "sides": [{
-            "side": "current",
-            "artifact_path": str(artifact_path),
-            "artifact_sha256": artifact_sha256,
-            "authority": authority,
-        }],
+        "sides": [current_side],
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     context_path = report_dir / "evidence" / "context" / "context.json"
     context_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1781,6 +1919,15 @@ def write_pinned_final_artifact_provenance(
     return output
 
 
+def pinned_source_mode(manifest: dict) -> str:
+    materialization = manifest.get("materialization") or {}
+    return (
+        "checkout_build"
+        if str(materialization.get("kind") or "") == "source_build"
+        else "provided_artifact"
+    )
+
+
 def write_declared_final_artifact_provenance(
     report_dir: Path, case: RealProjectCase
 ) -> Path:
@@ -1849,6 +1996,7 @@ def finalize_pinned_guard(
     result.update({
         "asset": asset_gate,
         "gates": gates,
+        "guard_contract": evaluate_pinned_guard_contract(manifest, result),
         "fixture_debt": fixture_debt,
         "v3_output_files": output_files,
     })
@@ -4021,6 +4169,27 @@ def evaluate_required_fault_injections(
     return {**payload, "manifest": str(manifest)}
 
 
+def _is_compile_time_constant_candidate(row: dict) -> bool:
+    return bool(
+        str(row.get("symbol_kind") or "").strip().lower() == "field"
+        and (
+            str(row.get("change_type") or "").strip() == "CONSTANT_VALUE_CHANGED"
+            or "CONSTANT" in str(row.get("compatibility_flags") or "").upper()
+            or str(row.get("reason_code") or "").strip().lower()
+            == "constant_value_changed"
+        )
+    )
+
+
+def _constant_aware_oracle_conclusion(row: dict, conclusion: str) -> str:
+    if (
+        conclusion == "not_found_in_static_analysis"
+        and _is_compile_time_constant_candidate(row)
+    ):
+        return "uncertain"
+    return conclusion
+
+
 def build_final_artifact_api_oracle_records(
     selected_rows: list[dict], edge_truth: dict
 ) -> list[dict]:
@@ -4031,6 +4200,7 @@ def build_final_artifact_api_oracle_records(
     records = []
     for row in selected_rows:
         conclusion = str(reachability.get(serialized_api_identity(row)) or "")
+        conclusion = _constant_aware_oracle_conclusion(row, conclusion)
         if conclusion not in {
             "reachable", "uncertain", "not_found_in_static_analysis"
         }:
@@ -4058,6 +4228,10 @@ def build_final_artifact_api_oracle_records(
             "authority_version": "1",
             "procedure": (
                 "SHA-verified final artifact classfile graph; exact target edge; "
+                "reverse traversal to packaged business class boundary; compile-time constant "
+                "absence remains uncertain because javac may inline the value"
+                if _is_compile_time_constant_candidate(row)
+                else "SHA-verified final artifact classfile graph; exact target edge; "
                 "reverse traversal to packaged business class boundary"
             ),
             "evidence_path": str(evidence_path),
@@ -4086,6 +4260,7 @@ def build_constant_pool_api_oracle_records(
         if str(row.get("symbol_kind") or "").strip().lower() == "class":
             continue
         conclusion = str(reachability.get(serialized_api_identity(row)) or "")
+        conclusion = _constant_aware_oracle_conclusion(row, conclusion)
         if conclusion not in {
             "reachable", "uncertain", "not_found_in_static_analysis",
         }:
@@ -4102,7 +4277,11 @@ def build_constant_pool_api_oracle_records(
             "authority": "raw-classfile-constant-pool",
             "authority_version": "1",
             "procedure": (
-                "independent JVM constant-pool parser; exact owner, member, and "
+                "independent JVM constant-pool parser; exact owner, member, and descriptor "
+                "reference in the SHA-verified final artifact; compile-time constant absence "
+                "remains uncertain because javac may inline the value"
+                if _is_compile_time_constant_candidate(row)
+                else "independent JVM constant-pool parser; exact owner, member, and "
                 "descriptor reference in the SHA-verified final artifact"
             ),
             "evidence_path": str(evidence_path),
@@ -4269,12 +4448,8 @@ def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_
     elif changed_apis.exists() or not case.changed_api_rows:
         return changed_apis
     changed_apis.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "coord", "old_version", "new_version", "change_type", "api_name",
-        "api_simple", "symbol_kind", "api_signature", "confirmed", "severity", "source",
-    ]
     with changed_apis.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer = csv.DictWriter(fh, fieldnames=ALL_CHANGED_APIS_FIELDS)
         writer.writeheader()
         writer.writerows(case.changed_api_rows)
     return changed_apis
@@ -4419,6 +4594,10 @@ def materialize_bytecode_changed_apis(
         target_lib_candidates = target_filename_candidates
     if len(target_lib_candidates) == 1:
         target_lib_entry = target_lib_candidates[0]
+    target_resolution_ambiguous = bool(
+        not target_lib_entry
+        and (len(target_lib_candidates) > 1 or len(target_filename_candidates) > 1)
+    )
     class_files = sorted(set(class_files))
     if not class_files:
         raise ValueError("current final artifact contains no business class files")
@@ -4454,17 +4633,24 @@ def materialize_bytecode_changed_apis(
         fields = ["coord", "version", "scope", "lib_entry", "resolution_status"]
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
-        target_version = "runtime"
         if target_lib_entry:
             filename = Path(target_lib_entry).name
-            target_version = filename[len(artifact_id) + 1:-4] or target_version
-        writer.writerow({
-            "coord": case.bytecode_coord,
-            "version": target_version,
-            "scope": "compile",
-            "lib_entry": target_lib_entry,
-            "resolution_status": "resolved" if target_lib_entry else "unresolved",
-        })
+            target_version = filename[len(artifact_id) + 1:-4] or "runtime"
+            writer.writerow({
+                "coord": case.bytecode_coord,
+                "version": target_version,
+                "scope": "compile",
+                "lib_entry": target_lib_entry,
+                "resolution_status": "resolved",
+            })
+        elif target_resolution_ambiguous:
+            writer.writerow({
+                "coord": case.bytecode_coord,
+                "version": "runtime",
+                "scope": "compile",
+                "lib_entry": "",
+                "resolution_status": "unresolved",
+            })
         for runtime_item in runtime_lib_entries:
             if runtime_item["lib_entry"] == target_lib_entry:
                 continue
@@ -5268,6 +5454,8 @@ def build_quality_signals(
     result_audit: dict,
     report_dir: Path,
     oracle_audit: dict | None = None,
+    expected_uncertain: int = 0,
+    expected_not_found: int = 0,
 ) -> list[dict]:
     signals: list[dict] = []
     conclusion_groups = group_conclusion_gaps(summary)
@@ -5297,7 +5485,10 @@ def build_quality_signals(
     for field in ("not_analyzed", "not_found_in_static_analysis"):
         count = int(summary.get(field) or 0)
         if field == "not_found_in_static_analysis":
-            count = max(0, count - verified_absence)
+            count = max(
+                0,
+                count - max(verified_absence, max(0, int(expected_not_found or 0))),
+            )
         if count and not (field == "not_analyzed" and conclusion_groups):
             signals.append(make_signal(
                 "capability_gap",
@@ -5313,7 +5504,10 @@ def build_quality_signals(
                     report_dir / "evidence" / "call_chain" / "alerts.csv",
                 ],
             ))
-    uncertain = int(summary.get("uncertain") or 0)
+    uncertain = max(
+        0,
+        int(summary.get("uncertain") or 0) - max(0, int(expected_uncertain or 0)),
+    )
     if uncertain:
         signals.append(make_signal(
             "capability_gap",
@@ -5422,6 +5616,7 @@ def run_case(
         try:
             pinned_manifest = load_pinned_guard_manifest(case)
             pinned_asset_gate = validate_pinned_asset(pinned_manifest, project_root)
+            pinned_asset_gate["source_mode"] = pinned_source_mode(pinned_manifest)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             pinned_asset_gate = {
                 "name": "asset", "passed": False,
@@ -5938,6 +6133,17 @@ def run_case(
         result_audit=result_audit,
         report_dir=report_dir,
         oracle_audit=oracle_audit,
+        expected_uncertain=sum(
+            1
+            for item in (pinned_manifest.get("apis") or [])
+            if str(item.get("expected_conclusion") or "") == "uncertain"
+        ),
+        expected_not_found=sum(
+            1
+            for item in (pinned_manifest.get("apis") or [])
+            if str(item.get("expected_conclusion") or "")
+            == "not_found_in_static_analysis"
+        ),
     )
     quality_signals.extend(build_policy_signals(
         case,

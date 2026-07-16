@@ -824,11 +824,12 @@ class Step5KeyMatchingTest(unittest.TestCase):
             md_text = (output_dir / "changed_dependencies.md").read_text(encoding="utf-8")
 
         self.assertIn("展示 2 / 2 个依赖包", md_text)
-        self.assertIn("选择 Step5 范围时使用 `selection_key`", md_text)
+        self.assertIn("## 如何选择定向分析范围", md_text)
+        self.assertIn("复制“依赖包”列中的完整坐标", md_text)
         self.assertIn("完整 API 明细：`all_changed_apis.csv`", md_text)
         self.assertIn("依赖包明细目录：`s4_per_dependency/`", md_text)
-        self.assertIn("| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |", md_text)
-        self.assertIn("含高风险 API，优先进入 Step5", md_text)
+        self.assertIn("| 推荐候选 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |", md_text)
+        self.assertIn("含高风险 API，优先做系统触达分析", md_text)
 
     def test_alerts_generation_does_not_write_low_value_summary_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1974,6 +1975,55 @@ BootstrapMethods:
         self.assertIsNone(accepted)
         self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
         self.assertFalse(graph_stats["edge_ledger_complete"])
+
+    def test_analyzer_edge_accepts_matching_thin_jar_business_class_with_pseudo_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as zf:
+                zf.writestr("app/Service.class", b"matching-class-bytes")
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self._write_text(
+                report_dir / "evidence" / "dependencies" / "build_provenance.json",
+                json.dumps({
+                    "sides": [{
+                        "side": "current",
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": artifact_sha256,
+                    }]
+                }),
+                encoding="utf-8",
+            )
+            business_jar = Path(tmp) / "business-classes.jar"
+            with zipfile.ZipFile(business_jar, "w") as zf:
+                zf.writestr("app/Service.class", b"matching-class-bytes")
+            graph = SimpleNamespace(report_dir=str(report_dir), runtime_dependency_catalog={})
+
+            accepted = tracer.record_analyzer_edge(
+                graph,
+                {"api_name": "com.vendor.Target.call", "api_signature": "()"},
+                {
+                    "coord": "__business__",
+                    "artifact_container_entry": "<business-classes>",
+                    "jar_path": str(business_jar),
+                    "class_entry": "app/Service.class",
+                    "caller_owner": "app.Service",
+                    "consumer_method": "run",
+                    "consumer_descriptor": "()V",
+                    "callee_owner": "com.vendor.Target",
+                    "callee_member": "call",
+                    "callee_descriptor": "()V",
+                    "opcode_family": "invokestatic",
+                    "instruction_offset": 0,
+                },
+            )
+            graph_stats = {}
+            tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
+
+        self.assertIsNotNone(accepted)
+        self.assertEqual(accepted["artifact_entry"], "app/Service.class")
+        self.assertEqual(graph_stats["edge_ledger_failure_count"], 0)
+        self.assertTrue(graph_stats["edge_ledger_complete"])
 
     def test_absent_runtime_catalog_marks_edge_ledger_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -16808,6 +16858,47 @@ public class com.example.consumer.Adapter {
         self.assertEqual(scan["status"], "hit")
         self.assertEqual({item["consumer_method"] for item in scan["hits"]}, {"validate", "convert"})
 
+    def test_indirect_business_finding_is_migrated_to_typed_semantic_path(self):
+        api_row = {
+            "coord": "com.vendor:security",
+            "api_name": "com.vendor.RemovedType",
+            "api_simple": "RemovedType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "analysis_scope": "class_usage",
+        }
+        key = tracer.indirect_api_key(api_row)
+        graph = SimpleNamespace(
+            reverse_edges={},
+            indirect_usage_findings={key: [{
+                "caller_symbol": "com.acme.SecurityModule.setup",
+                "evidence_type": "reflection_class_lookup",
+                "reason_code": "REFLECTION_CLASS_LOOKUP",
+                "owner_coord": "业务制品",
+                "file": "/src/SecurityModule.java",
+                "line": 12,
+            }]},
+            indirect_usage_unresolved={},
+            indirect_analysis_coverage={},
+            step5_collector_coverage=(),
+            step5_evidence_concerns=(),
+            step5_evidence_failures=(EvidenceFailure(
+                stage="analyzer-edge-collection",
+                reason_code="PRESERVATION_MANIFEST_UNREADABLE",
+                blocking=True,
+            ),),
+        )
+        draft = tracer._new_trace_draft(api_row, graph)
+
+        tracer._build_indirect_usage_result(draft, api_row, graph)
+        result = tracer._finalize_trace_draft(draft)
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "REFLECTION_CLASS_LOOKUP")
+        self.assertEqual(len(draft.envelope_paths), 1)
+        self.assertTrue(draft.envelope_paths[0].evidence[0].semantic)
+
     def test_batch_packaged_bytecode_scan_reuses_javap_across_apis(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "consumer.jar"
@@ -18528,6 +18619,87 @@ public class com.example.consumer.Adapter {
         self.assertTrue(result.call_paths)
         self.assertEqual(result.direct_callers, 1)
         self.assertEqual(result.evidence_paths[0][0]["evidence_type"], "ast_method_invocation")
+
+    def test_final_artifact_miss_with_source_constant_usage_reports_inlining_uncertainty(self):
+        method = SimpleNamespace(
+            symbol_id="source", qualified_key="app.App.run", owner_type="business",
+            owner_coord="__business__", is_test=False, file="App.java", line=4,
+            annotations=[], class_annotations=[], class_name="App", class_fqcn="app.App",
+            modifiers=["public"], is_interface=False,
+        )
+        source_edge = tracer.CallEdge(
+            caller_symbol_id="source", caller_qualified_key=method.qualified_key,
+            callee_key="lib.Flags.EMPTY", callee_simple_key="field:EMPTY",
+            evidence_type="field_access", confidence="high",
+            file="App.java", line=5, content="Flags.EMPTY", owner_type="business",
+            owner_coord="__business__", module="app", is_test=False,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={"source": method},
+            reverse_edges={"lib.Flags.EMPTY": [source_edge]},
+            runtime_dependency_catalog={},
+            require_current_final_artifact_business_edges=True,
+            source_artifact_alignment={"status": "aligned"},
+        )
+        api_row = {
+            "coord": "lib:flags", "api_name": "lib.Flags.EMPTY", "api_simple": "EMPTY",
+            "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
+            "compatibility_flags": "CONSTANT_REMOVED", "old_value": "",
+            "severity": "P0", "confirmed": "true",
+        }
+
+        with patch.object(
+            tracer, "_scan_packaged_runtime_dependencies_for_api", return_value={"status": "miss"}
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
+        self.assertIsNone(result.is_reachable)
+        self.assertTrue(result.call_paths)
+        self.assertEqual(result.evidence_paths[0][0]["evidence_type"], "field_access")
+
+    def test_direct_source_constant_usage_uses_inlining_decision_before_early_return(self):
+        api_row = {
+            "coord": "lib:flags", "api_name": "lib.Flags.EMPTY", "api_simple": "EMPTY",
+            "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
+            "compatibility_flags": "CONSTANT_REMOVED", "severity": "P0", "confirmed": "true",
+        }
+        graph = SimpleNamespace(
+            methods_by_id={}, reverse_edges={}, runtime_dependency_catalog={},
+            source_artifact_alignment={"status": "aligned"},
+        )
+
+        def direct_usage(_api_row, draft, _graph, trace_cache=None):
+            draft.call_paths = ["app.App.run -> lib.Flags.EMPTY"]
+            draft.evidence_paths = [[{"evidence_type": "field_access"}]]
+            draft.path_details = [{
+                "path_status": "reachable", "business_reachable": True,
+                "business_entry": "app.App.run", "path_text": draft.call_paths[0],
+                "depth": 1, "evidence": draft.evidence_paths[0],
+            }]
+            return draft
+
+        with (
+            patch.object(
+                tracer, "_scan_packaged_runtime_dependencies_for_api",
+                return_value={"status": "miss"},
+            ),
+            patch.object(tracer, "_try_build_direct_usage_result", side_effect=direct_usage),
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row, graph, {}, has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
+        self.assertEqual(result.call_paths, ["app.App.run -> lib.Flags.EMPTY"])
+        self.assertEqual(result.path_details[0]["path_status"], "uncertain")
 
     def test_source_artifact_miss_replaces_prior_complete_source_paths(self):
         api_row = {

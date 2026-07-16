@@ -13,6 +13,27 @@
     "command": ["mvn", "-q", "-DskipTests", "package"],
     "artifact_path": "target/managing-transactions-complete-0.0.1-SNAPSHOT.jar"
   },
+  "performance_baseline": {
+    "git_revision": "efa693451b6a6ca123476c9c6e65eedab9048e2c",
+    "artifact_sha256": "fd0b8883214c641685ab8f0e7b583ec2f8150112f9679161908eb6829bd98b90",
+    "scope": {
+      "selected_api_count": 3,
+      "accounted_api_count": 3,
+      "artifact_count": 34,
+      "class_count": 8718,
+      "analyzer_edge_count": 2,
+      "oracle_edge_count": 2,
+      "fault_injection_detected_count": 1
+    },
+    "metrics": {
+      "elapsed_seconds_per_api": {"value": 1.776, "max_ratio": 2.0},
+      "scan_seconds_per_1000_classes": {"value": 0.067, "max_ratio": 2.0},
+      "max_api_elapsed_seconds": {"value": 0.479, "max_ratio": 2.0},
+      "javap_invocations": {"value": 8, "max_ratio": 1.5},
+      "duplicate_jar_scans": {"value": 0, "max_absolute": 0},
+      "peak_rss_mb": {"value": 77.156, "max_ratio": 1.5}
+    }
+  },
   "required_topologies": [
     "framework_proxy"
   ],

@@ -88,6 +88,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         readme = self.read("README.md")
         runbook = self.read("RUNBOOK.md")
         manifest = self.read("scripts/step_manifest.json")
+        outputs = self.read("docs/user/outputs.md")
 
         self.assertIn(".upgrade-report/README.md", readme)
         self.assertIn(".upgrade-report/evidence/context/review.md", readme)
@@ -101,7 +102,11 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertNotIn("call_chain/\n      README.md", runbook)
         self.assertIn("changed_dependencies.md", runbook)
         self.assertIn("changed_dependencies.csv", manifest)
-        self.assertIn("selection_key", manifest)
+        self.assertIn("selected_targets", manifest)
+        self.assertIn("changed_dependencies.md", manifest)
+        self.assertIn("完整坐标", manifest)
+        self.assertIn("不少于 20", readme)
+        self.assertIn("不少于 20", outputs)
 
 
 if __name__ == "__main__":

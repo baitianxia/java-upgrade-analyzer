@@ -117,6 +117,47 @@ class TopologyCoverageTest(unittest.TestCase):
 
         self.assertIn("reflection", observed)
 
+    def test_removed_class_semantic_reference_still_defines_reflection_topology(self):
+        target = "com.vendor.RemovedSecurityType"
+        layout = {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [],
+            "entry_layout": [],
+            "semantic_references": [{
+                "api_identity": (
+                    "com.vendor:security|com.vendor.RemovedSecurityType||class|REMOVED"
+                ),
+                "target_class": target,
+                "authority": "final-artifact-classfile-constants",
+                "artifact_sha256": "a" * 64,
+                "artifact_entry": "app/SecurityModule.class",
+            }],
+        }
+
+        observed = topology_coverage.classify_topologies([], layout)
+
+        self.assertIn("reflection", observed)
+
+    def test_removed_class_semantic_reference_rejects_mismatched_api_identity(self):
+        layout = {
+            "authority": "final_artifact_edge_oracle",
+            "complete": True,
+            "target_apis": [],
+            "entry_layout": [],
+            "semantic_references": [{
+                "api_identity": "com.vendor:security|com.vendor.OtherType||class|REMOVED",
+                "target_class": "com.vendor.RemovedSecurityType",
+                "authority": "final-artifact-classfile-constants",
+                "artifact_sha256": "a" * 64,
+                "artifact_entry": "app/SecurityModule.class",
+            }],
+        }
+
+        observed = topology_coverage.classify_topologies([], layout)
+
+        self.assertNotIn("reflection", observed)
+
     def test_transaction_proxy_topology_requires_packaged_runtime_annotation(self):
         target = (
             "org.springframework.transaction.interceptor.TransactionInterceptor",
@@ -271,6 +312,39 @@ class TopologyCoverageTest(unittest.TestCase):
         javap.assert_not_called()
         self.assertEqual(targets, [])
         self.assertEqual(unresolved, [])
+
+    def test_unreferenced_resolution_is_limited_to_explicit_owner_mappings(self):
+        mapped = {
+            "coord": "example:mapped",
+            "api_name": "example.Mapped.present",
+            "api_signature": "()",
+            "symbol_kind": "method",
+        }
+        authoritative_absence = {
+            "coord": "example:absent",
+            "api_name": "example.Absent.removed",
+            "api_signature": "()",
+            "symbol_kind": "method",
+        }
+        entry = "example/Mapped.class"
+        inventory = {"classes": {entry: b"class"}}
+        method = {"member": "present", "descriptor": "()V"}
+
+        with mock.patch.object(
+            topology_coverage,
+            "_topology_javap_methods",
+            return_value=("example.Mapped", [method]),
+        ):
+            targets, unresolved = topology_coverage._selected_target_identities(
+                [mapped, authoritative_absence],
+                [],
+                inventory,
+                resolve_unreferenced=True,
+                unreferenced_owner_allowlist={"example.Mapped"},
+            )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual([target["owner"] for target in targets], ["example.Mapped"])
 
     def test_bulk_topology_does_not_treat_changed_class_as_a_call_target(self):
         row = {

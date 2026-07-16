@@ -2272,6 +2272,13 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
             flag = _xml_attr(child, 'type', 'name') or (child.text or '').strip()
             if flag and flag not in flags:
                 flags.append(flag)
+        if (
+            symbol_kind == 'field'
+            and status == 'REMOVED'
+            and old_value
+            and 'CONSTANT_REMOVED' not in flags
+        ):
+            flags.append('CONSTANT_REMOVED')
         if status in ('NEW', 'UNCHANGED'):
             return
         if symbol_kind == 'class' and status == 'MODIFIED':
@@ -3889,12 +3896,24 @@ def _dependency_review_focus(row):
     changed = int((row or {}).get("changed_api_count") or 0)
     change_types = str((row or {}).get("change_types") or "").lower()
     if high_risk:
-        return "含高风险 API，优先进入 Step5"
+        return "含高风险 API，优先做系统触达分析"
     if "removed" in change_types or "signature" in change_types:
-        return "包含删除或签名变化，建议纳入 Step5"
+        return "包含删除或签名变化，优先确认系统是否调用"
     if changed >= 20:
         return "变化 API 较多，建议按依赖包复核"
     return "低风险变化，可在全量分析时覆盖"
+
+
+def _is_recommended_dependency(row):
+    high_risk = int((row or {}).get("high_risk_api_count") or 0)
+    changed = int((row or {}).get("changed_api_count") or 0)
+    change_types = str((row or {}).get("change_types") or "").lower()
+    return bool(
+        high_risk
+        or "removed" in change_types
+        or "signature" in change_types
+        or changed >= 20
+    )
 
 
 def write_changed_dependencies(api_rows, output_dir):
@@ -3909,6 +3928,7 @@ def write_changed_dependencies(api_rows, output_dir):
         "dependency_name",
         "changed_api_count",
         "high_risk_api_count",
+        "recommended",
         "change_types",
         "symbol_kinds",
         "review_focus",
@@ -3916,6 +3936,15 @@ def write_changed_dependencies(api_rows, output_dir):
     ]
     for row in dependency_rows:
         row["review_focus"] = _dependency_review_focus(row)
+        row["recommended"] = "true" if _is_recommended_dependency(row) else "false"
+    dependency_rows.sort(
+        key=lambda row: (
+            row["recommended"] != "true",
+            -int(row["high_risk_api_count"]),
+            -int(row["changed_api_count"]),
+            row["coord"],
+        )
+    )
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -3924,23 +3953,27 @@ def write_changed_dependencies(api_rows, output_dir):
     lines = [
         "# 发生 API 变化的依赖包",
         "",
-        "本文件回答：哪些依赖包发生 API 变化，以及是否可作为 Step5 调用链分析范围。",
+        "本文件列出全部发生 API 变化、可进入系统触达分析的依赖包。",
         "",
         f"展示 {len(dependency_rows)} / {len(dependency_rows)} 个依赖包。",
         "",
-        "选择 Step5 范围时使用 `selection_key`，例如 `coord:com.example:demo-lib`。",
-        "先看顺序：优先查看高风险 API 数大于 0 的依赖包；如果只做定向分析，复制对应 `selection_key`。",
+        "## 如何选择定向分析范围",
+        "",
+        "1. 可以直接全量分析全部候选依赖包。",
+        "2. 也可以先从“推荐候选”为“是”的依赖包中选择。推荐依据是：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个。",
+        "3. 还可以从本文件列出的全部候选中选择；复制“依赖包”列中的完整坐标即可。",
+        "4. 定向分析可直接回复，例如：`只分析 com.example:demo-lib`。",
         "",
         "完整 API 明细：`all_changed_apis.csv`。",
         "依赖包明细目录：`s4_per_dependency/`。",
         "",
-        "| 选择值 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |",
+        "| 推荐候选 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |",
         "|---|---|---:|---:|---|---|---|",
     ]
     if dependency_rows:
         for row in dependency_rows:
             lines.append(
-                f"| `{row['selection_key']}` | `{row['coord']}` | "
+                f"| {'是' if row['recommended'] == 'true' else '否'} | `{row['coord']}` | "
                 f"{row['changed_api_count']} | {row['high_risk_api_count']} | "
                 f"{row['review_focus']} | "
                 f"{row['change_types'] or '-'} | `{row['detail']}` |"
@@ -4267,7 +4300,7 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
     lines.append("Step4 依赖 API 变化摘要")
     lines.append("")
     lines.append("一、先看什么")
-    lines.append("- 如果只决定 Step5 分析范围，先打开 changed_dependencies.md，按依赖包选择 selection_key。")
+    lines.append("- 如果只决定系统触达分析范围，先打开 changed_dependencies.md，复制“依赖包”列中的完整坐标。")
     lines.append("- 如果要核对完整 API 事实，再打开 all_changed_apis.csv。")
     lines.append("- 如果报告提示最终制品 JAR 证据缺失、JApiCmp 不可用或依赖源码 ref 待确认，再看本文件后面的缺口清单。")
     lines.append("")

@@ -1,0 +1,12 @@
+{
+  "authority": "git-source-gradle-shadow-jdk-javap-review",
+  "authority_version": "1",
+  "procedure": "enumerate original source edge, verify pinned Gradle Shadow relocation rules, and reconcile the relocated final-artifact edge with JDK javap",
+  "git_revision": "6951542f66c59f63cbf5348b38a2306a3964adda",
+  "git_tree": "096a525a4f5488c9c71a5641c4accac786116f86",
+  "source_path": "netty/src/main/java",
+  "source_tree_sha256": "8704b0b2843308b658a16f691de01b0bef5c0560b4c0f98d7796c78d884abffe",
+  "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
+  "evidence_path": "grpc-netty-shaded-source-edges.json",
+  "evidence_sha256": "97ba34f51272df3a80af18cdfc86331e973f5e5f91c80edec89ae415f5a5a934"
+}

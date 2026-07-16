@@ -242,6 +242,77 @@ class EvidenceModelTest(unittest.TestCase):
         self.assertEqual(decision.analysis_status, "reachable")
         self.assertEqual(decision.reason_code, "BUSINESS_ARTIFACT_BYTECODE_USAGE")
 
+    def test_collector_failure_does_not_erase_independent_uncertain_semantic_path(self):
+        decision = decide_analysis(
+            (ReachabilityPath(
+                path_text="Module.setup -> Class.forName -> RemovedType",
+                entry_scope=ModuleScope.BUSINESS_CLASSES,
+                complete=True,
+                depth=1,
+                evidence=(PhysicalCallEdge(
+                    caller_symbol="Module.setup",
+                    callee_key="RemovedType",
+                    evidence_type="reflection_class_lookup",
+                    owner_scope=ModuleScope.BUSINESS_CLASSES,
+                    semantic=True,
+                    activation_verified=False,
+                ),),
+            ),),
+            failures=(EvidenceFailure(
+                stage="analyzer-edge-collection",
+                reason_code="PRESERVATION_MANIFEST_UNREADABLE",
+                blocking=True,
+            ),),
+        )
+
+        self.assertEqual(decision.analysis_status, "uncertain")
+        self.assertEqual(decision.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
+
+    def test_collector_failure_blocks_nonsemantic_dependency_path(self):
+        decision = decide_analysis(
+            (ReachabilityPath(
+                path_text="runtime.jar:Adapter.call -> RemovedApi.call",
+                entry_scope=ModuleScope.EXTERNAL_DEPENDENCY,
+                complete=False,
+                depth=1,
+                evidence=(PhysicalCallEdge(
+                    caller_symbol="Adapter.call",
+                    callee_key="RemovedApi.call",
+                    evidence_type="bytecode_method_invocation",
+                    owner_scope=ModuleScope.EXTERNAL_DEPENDENCY,
+                ),),
+            ),),
+            failures=(EvidenceFailure(
+                stage="analyzer-edge-collection",
+                reason_code="FINAL_ARTIFACT_PROVENANCE_UNREADABLE",
+                blocking=True,
+            ),),
+        )
+
+        self.assertEqual(decision.analysis_status, "not_analyzed")
+        self.assertEqual(
+            decision.reason_code, "FINAL_ARTIFACT_PROVENANCE_UNREADABLE"
+        )
+
+    def test_boundary_failure_blocks_the_incomplete_path_that_created_it(self):
+        decision = decide_analysis(
+            (ReachabilityPath(
+                path_text="OptionalCallback.call -> RemovedApi.call",
+                entry_scope=ModuleScope.EXTERNAL_DEPENDENCY,
+                complete=False,
+                stop_reason="FRAMEWORK_BOUNDARY",
+                reason_code="FRAMEWORK_BOUNDARY",
+            ),),
+            failures=(EvidenceFailure(
+                stage="call-graph-boundary",
+                reason_code="FRAMEWORK_BOUNDARY",
+                blocking=True,
+            ),),
+        )
+
+        self.assertEqual(decision.analysis_status, "not_analyzed")
+        self.assertEqual(decision.reason_code, "FRAMEWORK_BOUNDARY")
+
     def test_unrelated_concern_does_not_override_partial_target_coverage(self):
         target = "com.vendor.Legacy.call()"
         coverage = (CoverageRecord(

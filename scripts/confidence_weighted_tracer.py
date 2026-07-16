@@ -228,11 +228,18 @@ def _verified_final_artifact_provenance(graph):
     return result
 
 
-def _analyzer_edge_artifact_entry(graph, edge, provenance):
-    class_entry = str((edge or {}).get('class_entry') or '').replace('\\', '/').strip('/')
+def _normalized_artifact_container_entry(edge):
     container_entry = str(
         (edge or {}).get('artifact_container_entry') or ''
     ).replace('\\', '/').strip('/')
+    if container_entry.startswith('<') and container_entry.endswith('>'):
+        return ''
+    return container_entry
+
+
+def _analyzer_edge_artifact_entry(graph, edge, provenance):
+    class_entry = str((edge or {}).get('class_entry') or '').replace('\\', '/').strip('/')
+    container_entry = _normalized_artifact_container_entry(edge)
     if not container_entry and str((edge or {}).get('coord') or '') != '__business__':
         return ''
     if container_entry and class_entry:
@@ -265,9 +272,7 @@ def _evidence_bytes_match_final_artifact(edge, provenance, artifact_entry):
     class_entry = str((edge or {}).get('class_entry') or '').replace('\\', '/').strip('/')
     if not jar_path or not class_entry or not os.path.isfile(jar_path):
         return False
-    container_entry = str(
-        (edge or {}).get('artifact_container_entry') or ''
-    ).replace('\\', '/').strip('/')
+    container_entry = _normalized_artifact_container_entry(edge)
     try:
         if container_entry:
             expected_jar_sha = (provenance.get('entry_sha256') or {}).get(container_entry)
@@ -1732,9 +1737,11 @@ def _apply_source_artifact_miss(result, graph, reachable_note):
     )
 
 
-def _build_source_only_artifact_conflict_result(result, graph, matched_key_groups):
+def _attach_source_only_paths(
+    result, graph, matched_key_groups, *, stop_reason='SOURCE_ONLY_ARTIFACT_CONFLICT'
+):
     if not bool(getattr(graph, 'require_current_final_artifact_business_edges', False)):
-        return None
+        return False
 
     reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
     source_edges = []
@@ -1756,7 +1763,7 @@ def _build_source_only_artifact_conflict_result(result, graph, matched_key_group
                 source_edges.append((key, edge))
 
     if not source_edges:
-        return None
+        return False
 
     result.call_paths = []
     result.evidence_paths = []
@@ -1781,15 +1788,21 @@ def _build_source_only_artifact_conflict_result(result, graph, matched_key_group
         result.call_paths.append(path_text)
         result.evidence_paths.append(evidence)
         result.path_details.append({
-            'path_status': 'reachable',
-            'stop_reason': 'SOURCE_ONLY_ARTIFACT_CONFLICT',
+            'path_status': 'uncertain' if stop_reason != 'SOURCE_ONLY_ARTIFACT_CONFLICT' else 'reachable',
+            'stop_reason': stop_reason,
             'business_entry': caller,
-            'business_reachable': True,
+            'business_reachable': None if stop_reason != 'SOURCE_ONLY_ARTIFACT_CONFLICT' else True,
             'path_text': path_text,
             'confidence': result.confidence_score,
             'depth': 1,
             'evidence': evidence,
         })
+    return True
+
+
+def _build_source_only_artifact_conflict_result(result, graph, matched_key_groups):
+    if not _attach_source_only_paths(result, graph, matched_key_groups):
+        return None
 
     return _apply_source_artifact_miss(result, graph, (
         '源码中发现了目标调用，但当前最终制品的字节码扫描没有发现对应引用；'
@@ -1827,9 +1840,25 @@ def _build_inlined_constant_result(result):
         '搜索业务及依赖源码中的常量字段引用，并执行覆盖该常量语义的回归测试',
         '必要时比较调用方 class 常量池与 old/new 常量值，但不要仅凭字面量命中确认调用关系',
     ]
-    return _apply_evidence_decision(result, concerns=(EvidenceConcern(
+    reason_code = 'INLINED_CONSTANT_USAGE_UNDETECTABLE'
+    _downgrade_reachable_path_details(result, 'uncertain', reason_code)
+    result.envelope_paths = tuple(
+        path for path in result.envelope_paths if not path.complete
+    )
+    candidate_paths = tuple(
+        ReachabilityPath(
+            path_text=str(detail.get('path_text') or ''),
+            entry_scope=ModuleScope.BUSINESS_CLASSES,
+            complete=False,
+            stop_reason=reason_code,
+            depth=int(detail.get('depth') or 1),
+        )
+        for detail in (result.path_details or [])
+        if detail.get('business_entry') or detail.get('business_reachable') is not False
+    )
+    return _apply_evidence_decision(result, paths=candidate_paths, concerns=(EvidenceConcern(
         stage='constant-bytecode-analysis',
-        reason_code='INLINED_CONSTANT_USAGE_UNDETECTABLE',
+        reason_code=reason_code,
         detail=note,
         api_identity=_trace_target_identity(result),
     ),))
@@ -5419,8 +5448,17 @@ def _build_indirect_usage_result(result, api_row, graph):
     result.call_paths = []
     result.evidence_paths = []
     result.path_details = []
+    typed_paths = []
     for finding in findings:
         caller = str(finding.get('caller_symbol') or 'indirect-reference')
+        owner_coord = str(finding.get('owner_coord') or '')
+        owner_scope = classify_module_scope({
+            'coord': (
+                '__business__'
+                if owner_coord in {'BUSINESS', '__business__', '业务制品'}
+                else owner_coord
+            ),
+        })
         path_text = f"{caller} -> {result.api_name}{result.api_signature or ''}"
         evidence = [{
             'caller_symbol': caller,
@@ -5442,11 +5480,33 @@ def _build_indirect_usage_result(result, api_row, graph):
             'consumer_signature': '', 'path_text': path_text,
             'confidence': 0.6, 'depth': 1, 'evidence': evidence,
         })
+        typed_paths.append(ReachabilityPath(
+            path_text=path_text,
+            entry_scope=owner_scope,
+            complete=owner_scope == ModuleScope.BUSINESS_CLASSES,
+            stop_reason=str(finding.get('reason_code') or reason_code),
+            reason_code=str(finding.get('reason_code') or reason_code),
+            note=note,
+            depth=1,
+            evidence=(PhysicalCallEdge(
+                caller_symbol=caller,
+                callee_key=f"{result.api_name}{result.api_signature or ''}",
+                evidence_type=str(
+                    finding.get('evidence_type') or 'indirect_reference'
+                ),
+                owner_scope=owner_scope,
+                owner_coord=owner_coord,
+                artifact=str(finding.get('file') or ''),
+                confidence='medium',
+                semantic=True,
+                activation_verified=False,
+            ),),
+        ))
     result.verification_commands = [
         '核对间接引用中的动态类名、成员名和参数类型',
         '结合实际配置或运行测试确认目标 API 是否会被调用',
     ]
-    return _apply_evidence_decision(result, concerns=(EvidenceConcern(
+    return _apply_evidence_decision(result, paths=tuple(typed_paths), concerns=(EvidenceConcern(
         stage='indirect-usage-analysis',
         reason_code=reason_code,
         detail=note,
@@ -6019,10 +6079,13 @@ def _collect_trace_api_with_confidence_weighting(
         if artifact_scan_miss and not _has_verified_final_artifact_framework_target(
             api_row, graph
         ):
-            _apply_source_artifact_miss(direct_usage_result, graph, (
-                '源码中发现了目标调用，但当前打包产物的字节码扫描没有发现对应引用；'
-                '可能是源码、构建参数或目标模块与本次打包产物不一致，当前不能确认影响'
-            ))
+            if _is_inlined_constant_change(api_row):
+                _build_inlined_constant_result(direct_usage_result)
+            else:
+                _apply_source_artifact_miss(direct_usage_result, graph, (
+                    '源码中发现了目标调用，但当前打包产物的字节码扫描没有发现对应引用；'
+                    '可能是源码、构建参数或目标模块与本次打包产物不一致，当前不能确认影响'
+                ))
         if artifact_dependency_hits:
             for hit in artifact_dependency_hits:
                 consumer_display = f"{hit.get('coord')}:{hit.get('class_fqcn')}"
@@ -6698,6 +6761,12 @@ def _collect_trace_api_with_confidence_weighting(
 
     if artifact_scan_miss:
         if _is_inlined_constant_change(api_row):
+            _attach_source_only_paths(
+                result,
+                graph,
+                target_match_groups,
+                stop_reason='INLINED_CONSTANT_USAGE_UNDETECTABLE',
+            )
             built = _build_inlined_constant_result(result)
             _debug_trace_result('trace_api_result', built)
             return built
