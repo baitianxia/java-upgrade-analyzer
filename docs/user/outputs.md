@@ -112,8 +112,8 @@ Step3 用于识别 JDK、Jakarta、Spring 等框架升级带来的背景风险�
 | `evidence/static_scan/s3_jdk_internal_api.csv` | JDK 内部 API 引用 |
 | `evidence/static_scan/s3_springboot_config.csv` | Spring Boot 配置相关线索；优先查看 `配置键`。若 `扫描状态` 为“未完成”，说明配置使用了当前行级扫描无法可靠展开的 YAML 形态，不能将未命中视为无风险。|
 | `evidence/static_scan/s3_springboot_autoconfig.txt` | 自动装配相关线索 |
-| `evidence/static_scan/s3_dependency_compat.csv` | 依赖兼容性规则命中 |
-| `evidence/static_scan/s3_dependency_classfile.csv` | classfile 版本等字节码线索 |
+| `evidence/static_scan/s3_dependency_compat.csv` | current 最终制品内依赖 JAR 的兼容性规则命中；每条记录都通过“最终制品内路径”定位到实际打包条目，不读取本地 Maven 仓库 |
+| `evidence/static_scan/s3_dependency_classfile.csv` | current 最终制品内全部依赖 JAR 的字节码版本扫描台账；每个实际打包条目一行，“扫描结论”明确区分完成、风险和未完成 |
 
 ## 依赖 API 变化事实
 

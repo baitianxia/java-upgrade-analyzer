@@ -25,7 +25,7 @@ s3_scan.py — Step 3：静态扫描（替代全部 Shell 脚本，Windows/Linux
   python s3_scan.py --all --source-dir . --output-dir .upgrade-report/
 """
 
-import argparse, csv, os, re, sys, time, zipfile, hashlib
+import argparse, csv, io, os, re, sys, time, zipfile, hashlib
 from pathlib import Path
 from datetime import datetime
 import json
@@ -318,11 +318,7 @@ def load_current_deps(csv_path):
                 if not row:
                     continue
                 normalized = {k: (v or '').strip() for k, v in row.items()}
-                if normalized.get('resolution_status') == 'unresolved':
-                    continue
                 coord = (normalized.get('coord') or '').strip()
-                if not coord:
-                    continue
                 scope = (normalized.get('scope') or 'compile').strip()
                 if is_current_list:
                     version = (normalized.get('version') or '').strip()
@@ -330,13 +326,159 @@ def load_current_deps(csv_path):
                     version = resolve_current_dep_version(normalized)
                 else:
                     version = ''
-                if not version or version == '-':
+                physical_entry = (
+                    normalized.get('lib_entry')
+                    or normalized.get('entry_id')
+                    or ''
+                ).strip()
+                if is_current_list and physical_entry:
+                    deps.append(normalized)
                     continue
-                deps.append({'coord': coord, 'version': version, 'scope': scope})
+                if not coord or not version or version == '-':
+                    continue
+                deps.append({
+                    **normalized,
+                    'coord': coord,
+                    'version': version,
+                    'scope': scope,
+                })
     except (OSError, UnicodeError, csv.Error) as exc:
         record_scan_diagnostic(stage='current_dependencies_load', path=csv_path, error=exc)
         return []
     return deps
+
+
+def _step3_build_provenance_candidates(dep_list_path):
+    candidates = []
+    if dep_list_path:
+        candidates.append(Path(dep_list_path).resolve().parent / 'build_provenance.json')
+    if STEP3_REPORT_DIR:
+        report_dir = Path(STEP3_REPORT_DIR).resolve()
+        candidates.extend([
+            report_dir / EVIDENCE_DIRNAME / 'dependencies' / 'build_provenance.json',
+            report_dir / 'dependencies' / 'build_provenance.json',
+            report_dir / 'build_provenance.json',
+        ])
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield candidate
+
+
+def resolve_current_final_artifact_path(dep_list_path):
+    """Return the Step1-retained current artifact; never consult a local repository."""
+    provenance_path = next(
+        (path for path in _step3_build_provenance_candidates(dep_list_path) if path.is_file()),
+        None,
+    )
+    if provenance_path is None:
+        return '', 'current_final_artifact_provenance_missing'
+    try:
+        payload = json.loads(provenance_path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        record_scan_diagnostic(
+            stage='current_final_artifact_provenance_load', path=provenance_path, error=exc,
+        )
+        return '', 'current_final_artifact_provenance_unreadable'
+    current = next(
+        (item for item in payload.get('sides') or [] if item.get('side') == 'current'),
+        {},
+    )
+    artifact_path = str(current.get('artifact_path') or '').strip()
+    if not artifact_path or not Path(artifact_path).is_file():
+        return artifact_path, 'current_final_artifact_missing'
+    return str(Path(artifact_path).resolve()), ''
+
+
+def iter_current_final_artifact_dependencies(dep_list_path):
+    """Yield each physical current dependency JAR from the retained artifact.
+
+    Each returned item contains ``dependency``, ``jar_bytes`` and ``error_code``.
+    The outer artifact stays open while one nested JAR at a time is yielded, avoiding
+    memory growth proportional to the number of dependencies. Failures remain explicit
+    records so a read error can never masquerade as a clean scan.
+    """
+    physical_dep_list_path = dep_list_path
+    if dep_list_path:
+        provided_path = Path(dep_list_path)
+        sibling_current = provided_path.parent / 'deps_current_resolved.csv'
+        if provided_path.name != sibling_current.name and sibling_current.is_file():
+            physical_dep_list_path = str(sibling_current)
+    dep_rows = load_current_deps(physical_dep_list_path)
+    if not dep_rows:
+        return
+    artifact_path, artifact_error = resolve_current_final_artifact_path(dep_list_path)
+    if artifact_error:
+        for dep in dep_rows:
+            yield {'dependency': dep, 'jar_bytes': None, 'error_code': artifact_error}
+        return
+    try:
+        with zipfile.ZipFile(artifact_path) as outer:
+            available_entries = set(outer.namelist())
+            seen_entries = set()
+            for dep in dep_rows:
+                entry = str(dep.get('lib_entry') or dep.get('entry_id') or '').strip()
+                if not entry:
+                    yield {
+                        'dependency': dep,
+                        'jar_bytes': None,
+                        'error_code': 'dependency_artifact_entry_missing',
+                    }
+                    continue
+                if entry in seen_entries:
+                    continue
+                seen_entries.add(entry)
+                if entry not in available_entries:
+                    yield {
+                        'dependency': dep,
+                        'jar_bytes': None,
+                        'error_code': 'current_final_artifact_entry_missing',
+                    }
+                    continue
+                try:
+                    jar_bytes = outer.read(entry)
+                except (OSError, RuntimeError, KeyError, zipfile.BadZipFile) as exc:
+                    record_scan_diagnostic(
+                        stage='current_final_artifact_dependency_read',
+                        path=f'{artifact_path}!/{entry}',
+                        error=exc,
+                    )
+                    yield {
+                        'dependency': dep,
+                        'jar_bytes': None,
+                        'error_code': 'current_final_artifact_entry_unreadable',
+                    }
+                    continue
+                yield {
+                    'dependency': dep,
+                    'jar_bytes': jar_bytes,
+                    'error_code': '',
+                }
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        record_scan_diagnostic(
+            stage='current_final_artifact_open', path=artifact_path, error=exc,
+        )
+        for dep in dep_rows:
+            yield {
+                'dependency': dep,
+                'jar_bytes': None,
+                'error_code': 'current_final_artifact_unreadable',
+            }
+
+
+FINAL_ARTIFACT_SCAN_FAILURE_MESSAGES = {
+    'current_final_artifact_provenance_missing': '未完成：找不到 Step1 的 current 最终制品来源记录',
+    'current_final_artifact_provenance_unreadable': '未完成：无法读取 Step1 的 current 最终制品来源记录',
+    'current_final_artifact_missing': '未完成：Step1 留存的 current 最终制品不存在',
+    'current_final_artifact_unreadable': '未完成：Step1 留存的 current 最终制品无法读取',
+    'dependency_artifact_entry_missing': '未完成：依赖清单缺少最终制品内路径',
+    'current_final_artifact_entry_missing': '未完成：current 最终制品内找不到该依赖条目',
+    'current_final_artifact_entry_unreadable': '未完成：current 最终制品内的依赖条目无法读取',
+    'nested_jar_unreadable': '未完成：current 最终制品内的依赖 JAR 已损坏或无法读取',
+}
 
 
 def find_maven_jar(coord, version):
@@ -648,7 +790,9 @@ def build_per_dependency_candidate_outputs(source_dirs, dep_changes_path, report
                         'reason': str(row.get('证据') or '').strip(),
                         'evidence_level': 'weak',
                         'matched_class': '',
-                        'file': str(row.get('jar路径') or '').strip(),
+                        'file': str(
+                            row.get('最终制品内路径') or row.get('jar路径') or ''
+                        ).strip(),
                         'line': '',
                         'content': str(row.get('证据') or '').strip()[:240],
                     }
@@ -1467,59 +1611,49 @@ def scan_sb_autoconfig(source_dir, output_path, _dep_changes_path=None):
 
 def scan_dependency_compat(_source_dir, output_path, dep_changes_path=None):
     """
-    扫描本地 Maven 依赖 jar 的兼容性信号。
+    扫描 Step1 留存的 current 最终制品内依赖 JAR 的兼容性信号。
 
     目标：
       - 补充源码扫描看不到的第三方库风险
       - 提前发现 javax/jakarta、JDK 内部 API、Spring Boot 自动装配元数据等问题
     """
-    dep_rows = load_current_deps(dep_changes_path)
-    if not dep_rows:
-        write_csv_results([], ['坐标', '版本', 'scope', '风险类型', '证据', 'jar路径'], output_path)
-        print(f"  dep_compat: 未提供或无法读取依赖清单 → {output_path}", file=sys.stderr)
-        return 0
+    fields = ['坐标', '版本', '依赖范围', '风险类型', '证据', '最终制品内路径']
 
     rows = []
-    seen = set()
-
-    for dep in dep_rows:
+    input_count = 0
+    for scan_input in iter_current_final_artifact_dependencies(dep_changes_path):
+        input_count += 1
+        dep = scan_input['dependency']
         coord = dep.get('coord', '')
         version = dep.get('version', '')
         scope = dep.get('scope', 'compile')
+        lib_entry = str(dep.get('lib_entry') or dep.get('entry_id') or '').strip()
         if not should_scan_dep_scope(scope):
             continue
-        if not coord or not version:
-            continue
-
-        jar_path = find_maven_jar(coord, version)
-        key = (coord, version)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if not jar_path or not os.path.exists(jar_path):
+        error_code = scan_input.get('error_code') or ''
+        if error_code:
             rows.append({
-                '坐标': coord,
-                '版本': version,
-                'scope': scope,
-                '风险类型': 'jar_missing',
-                '证据': '本地 Maven 仓库未找到 jar',
-                'jar路径': jar_path or '',
+                '坐标': coord or '未解析',
+                '版本': version or '未解析',
+                '依赖范围': scope,
+                '风险类型': error_code,
+                '证据': FINAL_ARTIFACT_SCAN_FAILURE_MESSAGES.get(error_code, error_code),
+                '最终制品内路径': lib_entry,
             })
             continue
 
         try:
-            with zipfile.ZipFile(jar_path) as zf:
+            with zipfile.ZipFile(io.BytesIO(scan_input['jar_bytes'])) as zf:
                 names = zf.namelist()
 
                 def add_row(risk_type, evidence):
                     rows.append({
-                        '坐标': coord,
-                        '版本': version,
-                        'scope': scope,
+                        '坐标': coord or '未解析',
+                        '版本': version or '未解析',
+                        '依赖范围': scope,
                         '风险类型': risk_type,
                         '证据': evidence[:200],
-                        'jar路径': jar_path,
+                        '最终制品内路径': lib_entry,
                     })
 
                 if 'META-INF/spring.factories' in names:
@@ -1551,7 +1685,12 @@ def scan_dependency_compat(_source_dir, output_path, dep_changes_path=None):
                     try:
                         with zf.open(entry) as fp:
                             return fp.read(limit_bytes)
-                    except Exception:
+                    except (OSError, RuntimeError, KeyError, zipfile.BadZipFile) as exc:
+                        record_scan_diagnostic(
+                            stage='dependency_compat_class_read',
+                            path=f'{lib_entry}!/{entry}',
+                            error=exc,
+                        )
                         return b''
 
                 found_types = set()
@@ -1568,65 +1707,58 @@ def scan_dependency_compat(_source_dir, output_path, dep_changes_path=None):
                             add_row(risk_type, f'{entry} 命中 {needle.decode("utf-8", errors="ignore")}')
                             found_types.add(risk_type)
 
-        except zipfile.BadZipFile:
+        except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+            record_scan_diagnostic(
+                stage='dependency_compat_nested_jar_open', path=lib_entry, error=exc,
+            )
             rows.append({
-                '坐标': coord,
-                '版本': version,
-                'scope': scope,
-                '风险类型': 'jar_unreadable',
-                '证据': 'jar 文件无法读取或已损坏',
-                'jar路径': jar_path,
+                '坐标': coord or '未解析',
+                '版本': version or '未解析',
+                '依赖范围': scope,
+                '风险类型': 'nested_jar_unreadable',
+                '证据': FINAL_ARTIFACT_SCAN_FAILURE_MESSAGES['nested_jar_unreadable'],
+                '最终制品内路径': lib_entry,
             })
 
-    count = write_csv_results(rows,
-                              ['坐标', '版本', 'scope', '风险类型', '证据', 'jar路径'],
-                              output_path)
+    count = write_csv_results(rows, fields, output_path)
+    if not input_count:
+        print(f"  dep_compat: 未提供或无法读取依赖清单 → {output_path}", file=sys.stderr)
+        return 0
     print(f"  dep_compat: {count} 处命中 → {output_path}", file=sys.stderr)
     return count
 
 def scan_dependency_classfile_versions(_source_dir, output_path, dep_changes_path=None):
-    dep_rows = load_current_deps(dep_changes_path)
-    if not dep_rows:
-        write_csv_results([],
-                          ['坐标', '版本', 'scope', 'jar路径', 'multi_release', 'max_major_base', 'max_major_mr',
-                           'max_java_base', 'max_java_mr', 'max_java_any', 'target_jdk', '风险'],
-                          output_path)
-        print(f"  dep_classfile: 未提供或无法读取依赖清单 → {output_path}", file=sys.stderr)
-        return 0
-
+    fields = [
+        '依赖坐标', '版本', '依赖范围', '最终制品内路径', '是否为多版本JAR',
+        '基础区最高Class版本', '多版本区最高Class版本', '基础区所需Java版本',
+        '多版本区所需Java版本', '最高所需Java版本', '目标JDK版本', '扫描结论',
+    ]
     rows = []
-    seen = set()
     risk_count = 0
 
-    for dep in dep_rows:
+    for scan_input in iter_current_final_artifact_dependencies(dep_changes_path):
+        dep = scan_input['dependency']
         coord = dep.get('coord', '')
         version = dep.get('version', '')
         scope = dep.get('scope', 'compile')
+        lib_entry = str(dep.get('lib_entry') or dep.get('entry_id') or '').strip()
         if not should_scan_dep_scope(scope):
             continue
-        if not coord or not version:
-            continue
-
-        jar_path = find_maven_jar(coord, version)
-        key = (coord, version)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if not jar_path or not os.path.exists(jar_path):
+        error_code = scan_input.get('error_code') or ''
+        if error_code:
             rows.append({
-                '坐标': coord,
-                '版本': version,
-                'scope': scope,
-                'jar路径': jar_path or '',
-                'multi_release': 'unknown',
-                'max_major_base': '',
-                'max_major_mr': '',
-                'max_java_base': '',
-                'max_java_mr': '',
-                'max_java_any': '',
-                'target_jdk': TARGET_JDK or '',
-                '风险': 'jar_missing',
+                '依赖坐标': coord or '未解析',
+                '版本': version or '未解析',
+                '依赖范围': scope,
+                '最终制品内路径': lib_entry,
+                '是否为多版本JAR': '无法判断',
+                '基础区最高Class版本': '',
+                '多版本区最高Class版本': '',
+                '基础区所需Java版本': '',
+                '多版本区所需Java版本': '',
+                '最高所需Java版本': '',
+                '目标JDK版本': TARGET_JDK or '',
+                '扫描结论': FINAL_ARTIFACT_SCAN_FAILURE_MESSAGES.get(error_code, error_code),
             })
             risk_count += 1
             continue
@@ -1634,9 +1766,10 @@ def scan_dependency_classfile_versions(_source_dir, output_path, dep_changes_pat
         max_major_base = None
         max_major_mr = None
         multi_release = False
+        class_read_failures = 0
 
         try:
-            with zipfile.ZipFile(jar_path) as zf:
+            with zipfile.ZipFile(io.BytesIO(scan_input['jar_bytes'])) as zf:
                 for name in zf.namelist():
                     if not name.endswith('.class'):
                         continue
@@ -1648,7 +1781,13 @@ def scan_dependency_classfile_versions(_source_dir, output_path, dep_changes_pat
 
                     try:
                         data = zf.read(name, pwd=None)[:8]
-                    except Exception:
+                    except (OSError, RuntimeError, KeyError, zipfile.BadZipFile) as exc:
+                        class_read_failures += 1
+                        record_scan_diagnostic(
+                            stage='dependency_classfile_entry_read',
+                            path=f'{lib_entry}!/{name}',
+                            error=exc,
+                        )
                         continue
                     major = parse_class_major_version(data)
                     if major is None:
@@ -1659,20 +1798,23 @@ def scan_dependency_classfile_versions(_source_dir, output_path, dep_changes_pat
                     else:
                         if max_major_base is None or major > max_major_base:
                             max_major_base = major
-        except zipfile.BadZipFile:
+        except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+            record_scan_diagnostic(
+                stage='dependency_classfile_nested_jar_open', path=lib_entry, error=exc,
+            )
             rows.append({
-                '坐标': coord,
-                '版本': version,
-                'scope': scope,
-                'jar路径': jar_path,
-                'multi_release': 'unknown',
-                'max_major_base': '',
-                'max_major_mr': '',
-                'max_java_base': '',
-                'max_java_mr': '',
-                'max_java_any': '',
-                'target_jdk': TARGET_JDK or '',
-                '风险': 'jar_unreadable',
+                '依赖坐标': coord or '未解析',
+                '版本': version or '未解析',
+                '依赖范围': scope,
+                '最终制品内路径': lib_entry,
+                '是否为多版本JAR': '无法判断',
+                '基础区最高Class版本': '',
+                '多版本区最高Class版本': '',
+                '基础区所需Java版本': '',
+                '多版本区所需Java版本': '',
+                '最高所需Java版本': '',
+                '目标JDK版本': TARGET_JDK or '',
+                '扫描结论': FINAL_ARTIFACT_SCAN_FAILURE_MESSAGES['nested_jar_unreadable'],
             })
             risk_count += 1
             continue
@@ -1685,33 +1827,36 @@ def scan_dependency_classfile_versions(_source_dir, output_path, dep_changes_pat
         max_java_mr = classfile_major_to_java(max_major_mr) if max_major_mr is not None else None
         max_java_any = classfile_major_to_java(max_major_any) if max_major_any is not None else None
 
-        risk = ''
+        conclusion = '扫描完成，未发现字节码版本风险'
         if TARGET_JDK and max_java_any and max_java_any > TARGET_JDK:
-            risk = f'需要JDK{max_java_any}+'
+            conclusion = f'存在风险：该依赖至少需要 JDK {max_java_any}'
             risk_count += 1
         elif max_java_any is None and max_major_any is not None:
-            risk = f'未知class版本{max_major_any}'
+            conclusion = f'未完成：无法识别 Class 版本 {max_major_any}'
+            risk_count += 1
+        elif class_read_failures:
+            conclusion = f'未完成：有 {class_read_failures} 个 Class 条目无法读取'
             risk_count += 1
 
         rows.append({
-            '坐标': coord,
-            '版本': version,
-            'scope': scope,
-            'jar路径': jar_path,
-            'multi_release': 'Y' if multi_release else 'N',
-            'max_major_base': max_major_base or '',
-            'max_major_mr': max_major_mr or '',
-            'max_java_base': max_java_base or '',
-            'max_java_mr': max_java_mr or '',
-            'max_java_any': max_java_any or '',
-            'target_jdk': TARGET_JDK or '',
-            '风险': risk,
+            '依赖坐标': coord or '未解析',
+            '版本': version or '未解析',
+            '依赖范围': scope,
+            '最终制品内路径': lib_entry,
+            '是否为多版本JAR': '是' if multi_release else '否',
+            '基础区最高Class版本': max_major_base or '',
+            '多版本区最高Class版本': max_major_mr or '',
+            '基础区所需Java版本': max_java_base or '',
+            '多版本区所需Java版本': max_java_mr or '',
+            '最高所需Java版本': max_java_any or '',
+            '目标JDK版本': TARGET_JDK or '',
+            '扫描结论': conclusion,
         })
 
-    write_csv_results(rows,
-                      ['坐标', '版本', 'scope', 'jar路径', 'multi_release', 'max_major_base', 'max_major_mr',
-                       'max_java_base', 'max_java_mr', 'max_java_any', 'target_jdk', '风险'],
-                      output_path)
+    write_csv_results(rows, fields, output_path)
+    if not rows:
+        print(f"  dep_classfile: 未提供或无法读取依赖清单 → {output_path}", file=sys.stderr)
+        return 0
     print(f"  dep_classfile: {len(rows)} 个依赖扫描，风险 {risk_count} 个 → {output_path}", file=sys.stderr)
     return risk_count
 

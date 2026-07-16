@@ -1136,7 +1136,7 @@ def collect_findings(d):
         for row in dep_compat_rows:
             by_type[row.get('风险类型', '未知')] += 1
             by_coord[row.get('坐标', '未知依赖')] += 1
-            if row.get('scope') == 'compile':
+            if (row.get('依赖范围') or row.get('scope')) == 'compile':
                 compile_hits += 1
         findings['dep_compat_summary'] = {
             'total': len(dep_compat_rows),
