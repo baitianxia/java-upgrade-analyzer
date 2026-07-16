@@ -1,6 +1,7 @@
 import io
 import csv
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -328,6 +329,176 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertIn("org.example:demo-lib", deps)
         self.assertEqual(meta["branch"], "feature/upgrade")
         self.assertEqual(meta["worktree_dir"], str(temp_dir))
+
+    def test_artifact_coordinate_enrichment_prefers_branch_over_source_directory(self):
+        branch_deps = {"org.example:branch": {"version": "2.0.0"}}
+        branch_meta = {
+            "list_command": "mvn branch dependency:list",
+        }
+        source_deps = {"org.example:source": {"version": "1.0.0"}}
+
+        with patch.object(s1_dep_diff, "build_java_env", return_value={}), \
+             patch.object(
+                 s1_dep_diff,
+                 "resolve_step1_ref",
+                 return_value={
+                     "status": "resolved",
+                     "requested_ref": "current-release",
+                     "resolved_ref": "origin/current-release",
+                     "resolved_commit": "a" * 40,
+                     "resolution_mode": "unique_remote",
+                     "candidates": [{"ref": "origin/current-release", "commit": "a" * 40}],
+                     "fingerprint": "fixture",
+                 },
+             ) as ref_call, \
+             patch.object(
+                 s1_dep_diff,
+                 "collect_runtime_deps_for_workspace",
+                 return_value=(source_deps, "mvn source dependency:list"),
+             ) as source_call, \
+             patch.object(
+                 s1_dep_diff,
+                 "get_runtime_deps_by_switching_branch",
+                 return_value=(branch_deps, branch_meta),
+             ) as branch_call:
+            deps, meta = s1_dep_diff._collect_runtime_deps_for_artifact_input(
+                "/same/project",
+                "current-release",
+                "/same/project",
+                primary_module="app",
+                side="current",
+                artifact_path="/tmp/current.jar",
+            )
+
+        self.assertEqual(deps, branch_deps)
+        self.assertEqual(meta["source_mode"], "checkout_branch")
+        self.assertEqual(meta["branch"], "a" * 40)
+        self.assertEqual(meta["requested_ref"], "current-release")
+        self.assertEqual(meta["resolved_ref"], "origin/current-release")
+        ref_call.assert_called_once_with("/same/project", "current-release")
+        branch_call.assert_called_once()
+        self.assertEqual(branch_call.call_args.args[0], "a" * 40)
+        source_call.assert_not_called()
+
+    def test_artifact_coordinate_enrichment_stops_when_branch_is_ambiguous(self):
+        resolution = {
+            "status": "ambiguous",
+            "requested_ref": "release-2.0.0",
+            "resolved_ref": "",
+            "resolved_commit": "",
+            "resolution_mode": "unresolved",
+            "candidates": [
+                {"ref": "origin/release-2.0.0", "commit": "a" * 40},
+                {"ref": "upstream/release-2.0.0", "commit": "b" * 40},
+            ],
+            "fingerprint": "ambiguous-fixture",
+        }
+        with patch.object(s1_dep_diff, "resolve_step1_ref", return_value=resolution), \
+             patch.object(s1_dep_diff, "get_runtime_deps_by_switching_branch") as branch_call:
+            with self.assertRaises(s1_dep_diff.Step1RefResolutionRequiredError) as caught:
+                s1_dep_diff._collect_runtime_deps_for_artifact_input(
+                    "/same/project",
+                    "release-2.0.0",
+                    "/same/project",
+                    side="current",
+                    artifact_path="/tmp/current.jar",
+                )
+
+        self.assertEqual(caught.exception.resolution["status"], "ambiguous")
+        branch_call.assert_not_called()
+        interaction = s1_dep_diff.build_step1_ref_resolution_interaction(caught.exception)
+        self.assertEqual(interaction["reason_code"], "ambiguous_step1_source_ref")
+        self.assertEqual(interaction["required_fields"], ["current_branch"])
+        self.assertEqual(len(interaction["ref_resolution_requests"][0]["candidates"]), 2)
+
+    def test_source_only_artifact_enrichment_requires_revision_confirmation(self):
+        resolution = {
+            "status": "resolved",
+            "requested_ref": "HEAD",
+            "resolved_ref": "HEAD",
+            "resolved_commit": "c" * 40,
+            "resolution_mode": "exact",
+            "candidates": [],
+            "fingerprint": "head-fixture",
+        }
+        with patch.object(s1_dep_diff, "resolve_step1_ref", return_value=resolution):
+            with self.assertRaises(s1_dep_diff.SourceRevisionConfirmationRequiredError) as caught:
+                s1_dep_diff._collect_runtime_deps_for_artifact_input(
+                    "/same/project",
+                    "",
+                    "/same/project",
+                    primary_module="app",
+                    side="current",
+                    artifact_path="/tmp/current.jar",
+                )
+
+        interaction = s1_dep_diff.build_step1_ref_resolution_interaction(caught.exception)
+        request = interaction["ref_resolution_requests"][0]
+        self.assertEqual(interaction["reason_code"], "step1_source_revision_confirmation_required")
+        self.assertEqual(request["detected_commit"], "c" * 40)
+
+    def test_same_repository_path_uses_distinct_confirmed_commits_for_each_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "project"
+            repo.mkdir()
+
+            def git(*args):
+                result = subprocess.run(
+                    ["git", *args],
+                    cwd=repo,
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                return result.stdout.strip()
+
+            git("init")
+            git("config", "user.email", "step1@example.invalid")
+            git("config", "user.name", "Step1 Test")
+            marker = repo / "runtime-dependency.txt"
+            marker.write_text("org.example:base-lib:1.0.0\n", encoding="utf-8")
+            git("add", "runtime-dependency.txt")
+            git("commit", "-m", "base")
+            base_commit = git("rev-parse", "HEAD")
+            marker.write_text("org.example:current-lib:2.0.0\n", encoding="utf-8")
+            git("commit", "-am", "current")
+            current_commit = git("rev-parse", "HEAD")
+
+            observed_worktrees = []
+
+            def fake_collect(worktree_dir, **_kwargs):
+                worktree = Path(worktree_dir)
+                observed_worktrees.append(worktree)
+                coord = (worktree / "runtime-dependency.txt").read_text(
+                    encoding="utf-8"
+                ).strip()
+                group_id, artifact_id, version = coord.split(":")
+                return {
+                    f"{group_id}:{artifact_id}": {
+                        "coord": f"{group_id}:{artifact_id}",
+                        "version": version,
+                    }
+                }, "mvn dependency:list"
+
+            with patch.object(
+                s1_dep_diff,
+                "collect_runtime_deps_for_workspace",
+                side_effect=fake_collect,
+            ):
+                base_deps, base_meta = s1_dep_diff._collect_runtime_deps_for_artifact_input(
+                    str(repo), base_commit, str(repo), side="base"
+                )
+                current_deps, current_meta = s1_dep_diff._collect_runtime_deps_for_artifact_input(
+                    str(repo), current_commit, str(repo), side="current"
+                )
+
+            self.assertEqual(set(base_deps), {"org.example:base-lib"})
+            self.assertEqual(set(current_deps), {"org.example:current-lib"})
+            self.assertEqual(base_meta["branch"], base_commit)
+            self.assertEqual(current_meta["branch"], current_commit)
+            self.assertEqual(git("rev-parse", "HEAD"), current_commit)
+            self.assertTrue(all(not path.exists() for path in observed_worktrees))
 
     def test_main_writes_alerts_csv_with_subset_fields_only(self):
         with tempfile.TemporaryDirectory() as tmp:

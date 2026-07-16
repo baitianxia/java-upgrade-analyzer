@@ -28,6 +28,7 @@ from compat import run_cmd, open_text, mvn_cmd, git_cmd, IS_WINDOWS, require_hum
 from analysis_contract import sha256_file
 from pipeline_constants import STEP1_ARTIFACTS_DIRNAME
 from step1_observability import Step1Observer
+from step1_ref_resolution import resolve_step1_ref
 
 
 EXIT_AWAITING_USER = 4
@@ -71,6 +72,130 @@ class ArtifactCoordinateInputRequiredError(RuntimeError):
         self.artifact_path = str(artifact_path)
         self.unresolved_items = list(unresolved_items or [])
         super().__init__(self.artifact_path)
+
+
+class SourceRevisionConfirmationRequiredError(RuntimeError):
+    def __init__(self, side, source_project_dir, artifact_path="", resolution=None):
+        self.side = str(side or "")
+        self.source_project_dir = str(source_project_dir or "")
+        self.artifact_path = str(artifact_path or "")
+        self.resolution = dict(resolution or {})
+        super().__init__(
+            "只有源码目录不足以确认其对应的制品版本；"
+            f"请先为 {self.side or '该侧'} 确认 branch/tag/commit，再执行坐标补全。"
+        )
+
+
+class Step1RefResolutionRequiredError(RuntimeError):
+    def __init__(self, side, source_project_dir, artifact_path, resolution):
+        self.side = str(side or "")
+        self.source_project_dir = str(source_project_dir or "")
+        self.artifact_path = str(artifact_path or "")
+        self.resolution = dict(resolution or {})
+        status = str(self.resolution.get("status") or "not_found")
+        super().__init__(
+            f"{self.side or '该侧'}源码 ref 无法唯一固定（{status}），"
+            "必须人工确认明确的 branch/tag/commit。"
+        )
+
+
+def build_step1_ref_resolution_interaction(error):
+    side = str(error.side or "").strip() or "current"
+    field = f"{side}_branch"
+    side_cn = "基准侧" if side == "base" else "当前侧"
+    resolution = dict(getattr(error, "resolution", {}) or {})
+    candidates = [dict(item) for item in (resolution.get("candidates") or [])]
+    status = str(resolution.get("status") or "not_found")
+    source_only = isinstance(error, SourceRevisionConfirmationRequiredError)
+    if source_only:
+        reason_code = "step1_source_revision_confirmation_required"
+        summary = f"{side_cn}只提供了源码目录，无法证明它对应当前制品的 revision。"
+    elif status == "ambiguous":
+        reason_code = "ambiguous_step1_source_ref"
+        summary = f"{side_cn}分支匹配到多个不同 commit，不能自动选择。"
+    else:
+        reason_code = "step1_source_ref_not_found"
+        summary = f"{side_cn}分支无法在本地或现有远端跟踪 ref 中定位。"
+    request = {
+        "side": side,
+        "field": field,
+        "requested_ref": str(resolution.get("requested_ref") or ""),
+        "status": "confirmation_required" if source_only else status,
+        "source_project_dir": str(error.source_project_dir or ""),
+        "artifact_path": str(error.artifact_path or ""),
+        "candidates": candidates,
+        "fingerprint": str(resolution.get("fingerprint") or ""),
+    }
+    if source_only and resolution.get("resolved_commit"):
+        request.update({
+            "detected_ref": str(resolution.get("resolved_ref") or "HEAD"),
+            "detected_commit": str(resolution.get("resolved_commit") or ""),
+            "candidates": [{
+                "ref": str(resolution.get("resolved_commit") or ""),
+                "display_ref": str(resolution.get("resolved_ref") or "HEAD"),
+                "commit": str(resolution.get("resolved_commit") or ""),
+                "kind": "detected_source_head",
+            }],
+        })
+    return {
+        "schema": "java-upgrade-analyzer.interaction.v2",
+        "checkpoint": True,
+        "hard_stop": True,
+        "status": "awaiting_user_input",
+        "kind": "input_request",
+        "step_id": "step1",
+        "reason_code": reason_code,
+        "title": "Step1 需要确认源码版本",
+        "summary": summary,
+        "question": f"请为{side_cn}填写明确的 branch、tag 或 commit；确认后才会执行 Maven 坐标补全。",
+        "required_fields": [field],
+        "missing_inputs": [{
+            "field": field,
+            "label": f"{side_cn}源码 ref",
+            "side": side,
+            "required": True,
+            "recommended": True,
+            "reason": summary,
+            "value_type": "branch",
+        }],
+        "fallback_inputs": [],
+        "files_to_review": [str(error.source_project_dir)] if error.source_project_dir else [],
+        "ref_resolution_requests": [request],
+        "checklist_lines": [
+            f"{side_cn}待补全产物: {error.artifact_path}",
+            *(
+                [f"{side_cn}源码目录当前 revision: {request.get('detected_ref')} ({request.get('detected_commit')})"]
+                if request.get("detected_commit") else []
+            ),
+            *[
+                f"{side_cn}候选: {item.get('ref')} ({item.get('commit')})"
+                for item in candidates
+            ],
+        ],
+        "options": [
+            {"id": "continue", "label": "确认 ref 后继续", "description": "固定 commit 后重新执行 Step1。"},
+            {"id": "cancel", "label": "取消", "description": "停止本次分析。"},
+        ],
+        "response_schema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {"type": "string", "enum": ["continue", "cancel"]},
+                field: {"type": "string", "description": f"{side_cn}明确的 branch、tag 或 commit。"},
+                "notes": {"type": "string", "description": "可选。记录 revision 的确认依据。"},
+            },
+        },
+        "action_requirements": {"continue": {"required_fields": [field]}},
+        "input_normalization": {
+            "enabled": True,
+            "mode": "llm_assisted_structuring",
+            "required_fields": [field],
+            "rules": ["必须提供能够唯一解析到 commit 的明确 ref。"],
+        },
+        "runtime_rules": ["确认前不得执行 Maven 坐标补全。"],
+        "next_action_rule": "只能等待用户补充明确 ref 或取消。",
+        "must_wait_for_user_reply": True,
+    }
 
 
 def load_orchestrated_step1_input():
@@ -1997,53 +2122,30 @@ def _collect_runtime_deps_for_artifact_input(
     observer=None,
 ):
     source_dir = str(source_project_dir or '').strip()
-    if source_dir:
-        try:
-            env = build_java_env(jdk_home)
-        except Exception as exc:
-            raise build_step1_command_blocked_error(
-                stage="prepare_java_env",
-                command="",
-                exc=exc,
-                side=side,
-                jdk_field=jdk_field,
-                jdk_home=jdk_home,
-                source_mode="source_project_dir",
-                source_project_dir=source_dir,
-                artifact_path=artifact_path,
-            ) from exc
-        try:
-            runtime_deps, list_command = collect_runtime_deps_for_workspace(
-                source_dir,
-                primary_module=primary_module,
-                modules=modules,
-                env=env,
-                observer=observer,
-                side=side,
-            )
-        except Exception as exc:
-            if isinstance(exc, Step1CommandExecutionBlockedError):
-                raise
-            raise build_step1_command_blocked_error(
-                stage="mvn_dependency_list",
-                command="mvn --batch-mode --no-transfer-progress -DskipTests dependency:list -DincludeScope=runtime -DoutputAbsoluteArtifactFilename=true",
-                exc=exc,
-                side=side,
-                jdk_field=jdk_field,
-                jdk_home=jdk_home,
-                source_mode="source_project_dir",
-                source_project_dir=source_dir,
-                artifact_path=artifact_path,
-            ) from exc
-        return runtime_deps, {
-            'source_mode': 'source_project_dir',
-            'source_project_dir': str(Path(source_dir).resolve()),
-            'list_command': list_command,
-            'jdk_home': resolve_effective_jdk_home(jdk_home),
-        }
     if branch:
+        repo_dir = source_dir or str(Path(work_dir).resolve())
+        resolution = resolve_step1_ref(repo_dir, branch)
+        if resolution.get("status") != "resolved":
+            raise Step1RefResolutionRequiredError(
+                side, repo_dir, artifact_path, resolution,
+            )
+        resolved_commit = str(resolution.get("resolved_commit") or "").strip()
+        if observer is not None:
+            observer.event(
+                "ref_resolution",
+                "completed",
+                f"{'基准侧' if side == 'base' else '当前侧'}坐标补全源码版本已固定",
+                side=side,
+                details={
+                    "requested_ref": str(resolution.get("requested_ref") or branch),
+                    "resolved_ref": str(resolution.get("resolved_ref") or branch),
+                    "resolved_commit": resolved_commit,
+                    "resolution_mode": str(resolution.get("resolution_mode") or "exact"),
+                    "candidate_count": len(resolution.get("candidates") or []),
+                },
+            )
         runtime_deps, meta = get_runtime_deps_by_switching_branch(
-            branch,
+            resolved_commit,
             work_dir,
             primary_module=primary_module,
             modules=modules,
@@ -2054,9 +2156,19 @@ def _collect_runtime_deps_for_artifact_input(
             observer=observer,
         )
         return runtime_deps, {
-            'source_mode': 'checkout_branch',
             **meta,
+            'source_mode': 'checkout_branch',
+            'requested_ref': str(resolution.get('requested_ref') or branch),
+            'resolved_ref': str(resolution.get('resolved_ref') or branch),
+            'resolved_commit': resolved_commit,
+            'ref_resolution_mode': str(resolution.get('resolution_mode') or 'exact'),
+            'branch': resolved_commit,
         }
+    if source_dir:
+        resolution = resolve_step1_ref(source_dir, "HEAD")
+        raise SourceRevisionConfirmationRequiredError(
+            side, source_dir, artifact_path, resolution,
+        )
     return {}, {
         'source_mode': 'none',
         'source_project_dir': '',
@@ -2579,8 +2691,18 @@ def main():
     args = ap.parse_args()
     orchestrated_input = load_orchestrated_step1_input()
     if orchestrated_input:
-        args.base_branch = args.base_branch or orchestrated_input.get("base_branch", "")
-        args.current_branch = args.current_branch or orchestrated_input.get("current_branch", "")
+        args.base_branch = (
+            args.base_branch
+            or orchestrated_input.get("base_resolved_commit", "")
+            or orchestrated_input.get("base_resolved_ref", "")
+            or orchestrated_input.get("base_branch", "")
+        )
+        args.current_branch = (
+            args.current_branch
+            or orchestrated_input.get("current_resolved_commit", "")
+            or orchestrated_input.get("current_resolved_ref", "")
+            or orchestrated_input.get("current_branch", "")
+        )
         args.tool = args.tool or orchestrated_input.get("tool", "maven")
         args.base_artifact_path = args.base_artifact_path or orchestrated_input.get("base_artifact_path", "")
         args.current_artifact_path = args.current_artifact_path or orchestrated_input.get("current_artifact_path", "")
@@ -2617,6 +2739,34 @@ def main():
         sys.exit(1)
 
     observer = Step1Observer(args.output) if args.output else None
+    if observer is not None and orchestrated_input:
+        for side in ("base", "current"):
+            resolved_commit = str(
+                orchestrated_input.get(f"{side}_resolved_commit") or ""
+            ).strip()
+            if not resolved_commit:
+                continue
+            observer.event(
+                "ref_resolution",
+                "completed",
+                f"{'基准侧' if side == 'base' else '当前侧'}源码版本已固定",
+                side=side,
+                details={
+                    "requested_ref": str(
+                        orchestrated_input.get(f"{side}_requested_ref") or ""
+                    ),
+                    "resolved_ref": str(
+                        orchestrated_input.get(f"{side}_resolved_ref") or ""
+                    ),
+                    "resolved_commit": resolved_commit,
+                    "resolution_mode": str(
+                        orchestrated_input.get(f"{side}_ref_resolution_mode") or "exact"
+                    ),
+                    "candidate_count": int(
+                        orchestrated_input.get(f"{side}_ref_candidate_count") or 0
+                    ),
+                },
+            )
     total_token = (
         observer.start_phase(
             "step1_total",
@@ -2705,9 +2855,24 @@ def main():
             if base_runtime_meta.get('list_command'):
                 base_meta['list_command'] = base_runtime_meta.get('list_command', '')
                 base_meta['runtime_source_mode'] = base_runtime_meta.get('source_mode', '')
+                base_meta['requested_ref'] = base_runtime_meta.get('requested_ref', '')
+                base_meta['resolved_ref'] = base_runtime_meta.get('resolved_ref', '')
+                base_meta['revision'] = base_runtime_meta.get('resolved_commit', '')
+                base_meta['ref_resolution_mode'] = base_runtime_meta.get('ref_resolution_mode', '')
             if curr_runtime_meta.get('list_command'):
                 curr_meta['list_command'] = curr_runtime_meta.get('list_command', '')
                 curr_meta['runtime_source_mode'] = curr_runtime_meta.get('source_mode', '')
+                curr_meta['requested_ref'] = curr_runtime_meta.get('requested_ref', '')
+                curr_meta['resolved_ref'] = curr_runtime_meta.get('resolved_ref', '')
+                curr_meta['revision'] = curr_runtime_meta.get('resolved_commit', '')
+                curr_meta['ref_resolution_mode'] = curr_runtime_meta.get('ref_resolution_mode', '')
+        except (Step1RefResolutionRequiredError, SourceRevisionConfirmationRequiredError) as e:
+            interaction = build_step1_ref_resolution_interaction(e)
+            print(interaction["summary"], file=sys.stderr)
+            for line in interaction.get("checklist_lines") or []:
+                print(f"  - {line}", file=sys.stderr)
+            emit_step_interaction(interaction)
+            sys.exit(EXIT_AWAITING_USER)
         except ArtifactCoordinateInputRequiredError as e:
             base_artifact = str(Path(args.base_artifact_path).expanduser().resolve())
             current_artifact = str(Path(args.current_artifact_path).expanduser().resolve())
@@ -3032,7 +3197,9 @@ def main():
         provenance_sides.append({
             'side': side,
             'source_mode': 'provided_artifact' if (args.base_artifact_path and args.current_artifact_path) else 'checkout_build',
-            'ref': str(branch or ''),
+            'ref': str((meta or {}).get('resolved_ref') or branch or ''),
+            'requested_ref': str((meta or {}).get('requested_ref') or branch or ''),
+            'ref_resolution_mode': str((meta or {}).get('ref_resolution_mode') or ''),
             'revision': str((meta or {}).get('revision') or ''),
             'target_module': str(args.primary_module or ''),
             'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),

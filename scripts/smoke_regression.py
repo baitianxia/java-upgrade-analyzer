@@ -798,6 +798,9 @@ def find_git_root(start):
 
 
 def current_branch(root):
+    fixture_ref = root / ".step1-fixture-ref"
+    if fixture_ref.is_file():
+        return fixture_ref.read_text(encoding="utf-8").strip()
     branch_hint = os.environ.get("JUA_GIT_BRANCH_HINT", "").strip()
     if branch_hint:
         return branch_hint
@@ -952,6 +955,7 @@ def initialize_smoke_project(workspace):
     )
     write_text(project_dir / "s1_deps_base.txt", build_maven_tree("1.0.0"))
     write_text(project_dir / "s1_deps_current.txt", build_maven_tree("2.0.0"))
+    write_text(project_dir / ".step1-fixture-ref", "base\n")
     write_text(
         project_dir / "s1_deps_base_noisy.txt",
         "[INFO] Scanning for projects...\n"
@@ -981,6 +985,9 @@ public class App {
     run_external_cmd(git + ["commit", "-m", "base"], project_dir)
     run_external_cmd(git + ["branch", "-M", "base"], project_dir)
     run_external_cmd(git + ["checkout", "-b", "current"], project_dir)
+    write_text(project_dir / ".step1-fixture-ref", "current\n")
+    run_external_cmd(git + ["add", ".step1-fixture-ref"], project_dir)
+    run_external_cmd(git + ["commit", "-m", "current"], project_dir)
     write_text(project_dir / ".git" / "info" / "exclude", ".upgrade-report*\n")
 
 
@@ -4438,28 +4445,18 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true(cleanup_dir.exists(), "worktree remove 失败时不应继续强删目录，避免留下脏的 Git worktree 元数据")
 
     try:
-        with mock.patch.object(
-            s1_dep_diff_module,
-            "collect_runtime_deps_for_workspace",
-            side_effect=RuntimeError("[ERROR] invalid target release: 8"),
-        ), mock.patch.object(
-            s1_dep_diff_module,
-            "build_java_env",
-            return_value={"JAVA_HOME": "/fake/jdk", "PATH": "/fake/jdk/bin"},
-        ):
-            s1_dep_diff_module._collect_runtime_deps_for_artifact_input(
-                str(project_dir),
-                "",
-                str(project_dir),
-                primary_module="app-module",
-                jdk_home="/fake/jdk",
-                side="current",
-                artifact_path="/tmp/current-app.jar",
-            )
-        raise AssertionError("source_project_dir 补全失败应转为结构化阻塞错误")
-    except s1_dep_diff_module.Step1CommandExecutionBlockedError as exc:
-        assert_true(exc.stage == "mvn_dependency_list", "source_project_dir 补全失败应标记为 mvn_dependency_list")
-        assert_true(exc.source_mode == "source_project_dir", "source_project_dir 补全失败应保留 source_mode")
+        s1_dep_diff_module._collect_runtime_deps_for_artifact_input(
+            str(project_dir),
+            "",
+            str(project_dir),
+            primary_module="app-module",
+            jdk_home="/fake/jdk",
+            side="current",
+            artifact_path="/tmp/current-app.jar",
+        )
+        raise AssertionError("source_project_dir 未确认 revision 时不应执行坐标补全")
+    except s1_dep_diff_module.SourceRevisionConfirmationRequiredError as exc:
+        assert_true(exc.side == "current", "source-only 阻塞应保留 current 侧信息")
 
     try:
         with mock.patch.object(
@@ -4712,6 +4709,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 "base_artifact_path": "artifact-inputs/base-app.jar",
                 "current_artifact_path": "artifact-inputs/current-app-no-pom.jar",
                 "base_branch": "base",
+                "current_branch": "current",
                 "current_source_project_dir": ".",
                 "target_module": ".",
             },
@@ -4743,7 +4741,36 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     assert_true(
         artifact_source_demo and artifact_source_demo[0].get("new_version") == "2.0.0",
-        "artifact + source_project_dir 模式未用源码工程补全 filename-only 嵌套 jar 坐标",
+        "artifact + branch/source_project_dir 模式未优先用已确认分支补全 filename-only 嵌套 jar 坐标",
+    )
+    artifact_source_progress = [
+        json.loads(line)
+        for line in (
+            artifact_source_report / ".runtime" / "observability" / "step1_progress.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    current_ref_events = [
+        row for row in artifact_source_progress
+        if row.get("phase") == "ref_resolution" and row.get("side") == "current"
+    ]
+    assert_true(
+        current_ref_events
+        and (current_ref_events[-1].get("details") or {}).get("resolved_commit"),
+        "Step1 进度日志未记录 current 分支解析后的不可变 commit",
+    )
+    artifact_source_provenance = read_json(
+        artifact_source_report / "evidence" / "dependencies" / "build_provenance.json"
+    )
+    current_provenance = next(
+        item for item in artifact_source_provenance.get("sides") or []
+        if item.get("side") == "current"
+    )
+    assert_true(
+        current_provenance.get("requested_ref") == "current"
+        and current_provenance.get("revision")
+        and current_provenance.get("ref_resolution_mode") == "exact",
+        "Step1 构建来源未保留按需坐标补全实际采用的 current ref/commit",
     )
     artifact_base_source_report = project_dir / ".upgrade-report-artifact-base-source"
     artifact_base_source_report.mkdir(parents=True, exist_ok=True)

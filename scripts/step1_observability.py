@@ -73,7 +73,18 @@ class Step1Observer:
         with self.timing_path.open("w", encoding="utf-8", newline="") as handle:
             csv.DictWriter(handle, fieldnames=TIMING_FIELDS).writeheader()
 
-    def event(self, phase, status, message, *, side="", item="", command="", elapsed_sec=None):
+    def event(
+        self,
+        phase,
+        status,
+        message,
+        *,
+        side="",
+        item="",
+        command="",
+        elapsed_sec=None,
+        details=None,
+    ):
         payload = {
             "timestamp": _utc_now(),
             "step": "step1",
@@ -84,6 +95,7 @@ class Step1Observer:
             "item": str(item or ""),
             "command": str(command or ""),
             "message": str(message or ""),
+            "details": dict(details or {}),
         }
         with self.progress_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")

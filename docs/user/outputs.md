@@ -71,6 +71,7 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 | `evidence/dependencies/s1_artifacts/` | 留存的 base/current 产物 | Step5 业务字节码和运行时依赖 JAR 的来源 |
 
 注意：Step1 当前以真实构建结果或用户提供的构建产物为准，不把手工 dependency tree 当作正式事实源。
+base/current 即使使用同一个源码目录，也会按各自确认后的 commit 分别建立临时 worktree；源码目录本身不代表制品版本。
 `dep_changes.csv` 仍只在完整比较成功后写入；过程日志和耗时文件仅用于监控与诊断，不是未完成分析的部分结果。
 
 ## 运行监控与性能诊断
@@ -79,7 +80,7 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 
 | 文件 | 用途 |
 |---|---|
-| `.runtime/observability/step1_progress.jsonl` | Agent 在 Step1 运行中查看当前侧、当前阶段、命令和状态 |
+| `.runtime/observability/step1_progress.jsonl` | Agent 在 Step1 运行中查看当前侧、当前阶段、命令和状态；`ref_resolution.details` 可核对实际采用的 ref 与 commit |
 | `.runtime/observability/step1_timing.csv` | Step1 分支工作区、Maven 构建、坐标补全、制品解析、差异计算和结果写入耗时 |
 | `.runtime/observability/step4_timing.csv` | Step4 jar 解析、git diff、JApiCmp、removed jar 导出、changed classes 和汇总写入耗时 |
 | `.runtime/observability/step5_timing.csv` | Step5 建图、字节码扫描、框架适配、间接引用和调用链追踪耗时 |

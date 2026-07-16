@@ -337,10 +337,15 @@ Step1 负责识别依赖变化范围，并建立后续分析所需的最小可�
 
 - 支持 `artifact_inputs` 与 `checkout_build` 两种入口
 - 输入不足时优先进入前置交互，而不是直接失败
+- base/current 可共享同一个源码仓库路径；revision 才是两侧身份，解析后持久化 requested ref、resolved ref 与 immutable commit
+- `artifact_inputs` 先解析最终 JAR，只有坐标缺失的一侧才按需解析 ref 并运行 Maven 补全；`checkout_build` 在构建前解析两侧 ref
+- ref 解析只读取本地及现有远端跟踪 refs，不隐式 fetch；候选按 commit 去重，唯一 commit 自动采用，歧义在 Maven 前形成硬 checkpoint
+- 坐标补全同时拿到 source directory 与 ref 时始终优先 ref；source-only 输入必须确认 HEAD 对应的 commit，不能直接分析可变工作区
+- 所有分支构建和坐标补全使用 detached worktree，不改变用户仓库当前 HEAD 与未提交内容
 - 首轮确认的模块范围必须尽早写入主状态
 - 依赖坐标无法安全补齐时不伪装成功
 - Maven 输出通过编排层实时转发，避免长时间构建期间完全无反馈
-- `.runtime/observability/step1_progress.jsonl` 记录可增量读取的阶段事件
+- `.runtime/observability/step1_progress.jsonl` 记录可增量读取的阶段事件；`ref_resolution` 事件保存 requested ref、resolved ref、commit、解析方式与候选数量
 - `.runtime/observability/step1_timing.csv`、`step4_timing.csv`、`step5_timing.csv` 统一记录各阶段耗时与状态
 - 进度与耗时属于诊断证据；正式依赖差异仍只在 base/current 两侧均成功后生成
 

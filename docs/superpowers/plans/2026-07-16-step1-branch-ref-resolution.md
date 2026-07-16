@@ -4,7 +4,7 @@
 
 **Goal:** 让 Step1 在同仓库双分支场景中优先固定并使用 base/current ref 补齐 Fat Jar 坐标，安全处理本地/远端候选、歧义确认和 source-only 输入。
 
-**Architecture:** 新增独立的 Step1 ref 解析模块，负责无副作用地解析精确 ref、枚举本地与远端跟踪候选并按 commit 去歧义。`run_step.py` 在执行 Maven 前完成解析、确认和状态持久化；`s1_dep_diff.py` 只消费已确认 ref，并将 branch 置于 source directory 之前。Step1 进度文件记录实际 ref、commit 和解析方式。
+**Architecture:** 新增独立的 Step1 ref 解析模块，负责无副作用地解析精确 ref、枚举本地与远端跟踪候选并按 commit 去歧义。`checkout_build` 由 `run_step.py` 在构建前完成解析与确认；`artifact_inputs` 先解析最终制品，只有某一侧坐标缺失时才由 `s1_dep_diff.py` 按需解析该侧 ref，并将 branch 置于 source directory 之前。Step1 进度与构建来源记录实际 ref、commit 和解析方式。
 
 **Tech Stack:** Python 3、`unittest`、Git CLI、现有 checkpoint/interaction 协议、现有 Step1 observability JSONL/CSV。
 
@@ -109,7 +109,7 @@ Expected: all resolver tests pass.
 
 ---
 
-### Task 2: 在 Step1 执行前解析、确认并持久化 ref
+### Task 2: 在自动构建前解析、确认并持久化 ref
 
 **Files:**
 - Modify: `scripts/run_step.py`
@@ -144,7 +144,7 @@ Expected: missing `resolve_step1_refs_for_execution`.
 
 - [ ] **Step 3: Implement the preflight and context persistence**
 
-Invoke ref resolution after `build_step1_preflight_interaction` has validated entry inputs but before `execute_step`. For resolved refs, preserve the user value in `<side>_requested_ref`, store exact ref/commit metadata, and pass `<side>_resolved_commit` to Step1 as the immutable checkout target. For ambiguity or no match, return a checkpoint interaction containing candidate refs and commits.
+For `checkout_build`, invoke ref resolution after `build_step1_preflight_interaction` has validated entry inputs but before `execute_step`. For resolved refs, preserve the user value in `<side>_requested_ref`, store exact ref/commit metadata, and pass `<side>_resolved_commit` to Step1 as the immutable checkout target. For ambiguity or no match, return a checkpoint interaction containing candidate refs and commits. For `artifact_inputs`, defer this work until final-artifact parsing proves that a concrete side needs Maven coordinate enrichment.
 
 - [ ] **Step 4: Write failing source-only confirmation and unchanged-input loop tests**
 
@@ -230,7 +230,7 @@ if source_dir:
 return {}, {"source_mode": "none", "source_project_dir": "", "list_command": ""}
 ```
 
-Formal orchestration must convert a confirmed source commit into `branch=<commit>` before reaching this function. Standalone debug execution must fail with a specific confirmation-required error instead of directly analyzing the mutable checkout.
+Automatic-build orchestration converts a confirmed source ref into `branch=<commit>` before checkout. Direct-artifact execution resolves the ref lazily inside this function only when unresolved nested JAR coordinates trigger the loader. Standalone source-only execution must fail with a specific confirmation-required error instead of directly analyzing the mutable checkout.
 
 - [ ] **Step 4: Add a real Git fixture test for one repository, two refs, one source path**
 

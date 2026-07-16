@@ -3250,6 +3250,10 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step,
                 "execute_step",
                 side_effect=fake_execute_step,
+            ), patch.object(
+                run_step,
+                "resolve_step1_refs_for_execution",
+                side_effect=lambda context, _project: (dict(context), None),
             ):
                 exit_code = run_step.main()
 
@@ -3422,6 +3426,130 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(saved["state"]["current_step"], "step5")
             self.assertEqual(saved["state"]["completed_step"], "step4")
             self.assertEqual(saved["step5"]["input"]["base_branch"], "base")
+
+    def test_step1_ref_preflight_persists_unique_remote_ref_and_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {
+                "analysis_mode": "artifact_inputs",
+                "current_branch": "release-2.0.0",
+                "current_source_project_dir": str(project_dir),
+            }
+            resolution = {
+                "status": "resolved",
+                "requested_ref": "release-2.0.0",
+                "resolved_ref": "origin/release-2.0.0",
+                "resolved_commit": "a" * 40,
+                "resolution_mode": "unique_remote",
+                "candidates": [
+                    {"ref": "origin/release-2.0.0", "commit": "a" * 40, "kind": "remote", "score": 200},
+                ],
+                "fingerprint": "fingerprint-current",
+            }
+
+            with patch.object(run_step, "resolve_step1_ref", return_value=resolution):
+                updated, interaction = run_step.resolve_step1_refs_for_execution(context, project_dir)
+
+        self.assertIsNone(interaction)
+        self.assertEqual(updated["current_branch"], "release-2.0.0")
+        self.assertEqual(updated["current_requested_ref"], "release-2.0.0")
+        self.assertEqual(updated["current_resolved_ref"], "origin/release-2.0.0")
+        self.assertEqual(updated["current_resolved_commit"], "a" * 40)
+        self.assertEqual(updated["current_ref_resolution_mode"], "unique_remote")
+        self.assertEqual(updated["current_ref_candidate_count"], 1)
+
+    def test_step1_direct_artifacts_do_not_resolve_refs_before_coordinate_fallback(self):
+        context = {
+            "analysis_mode": "artifact_inputs",
+            "base_artifact_path": "/tmp/base.jar",
+            "current_artifact_path": "/tmp/current.jar",
+            "base_branch": "possibly-ambiguous-base",
+            "current_branch": "possibly-ambiguous-current",
+        }
+
+        with patch.object(run_step, "resolve_step1_ref") as resolver:
+            updated, interaction = run_step.resolve_step1_refs_for_execution(
+                context, "/tmp/project"
+            )
+
+        self.assertIsNone(interaction)
+        self.assertEqual(updated, context)
+        resolver.assert_not_called()
+
+    def test_step1_ref_preflight_stops_for_ambiguous_remote_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {"current_branch": "release-2.0.0"}
+            resolution = {
+                "status": "ambiguous",
+                "requested_ref": "release-2.0.0",
+                "resolved_ref": "",
+                "resolved_commit": "",
+                "resolution_mode": "unresolved",
+                "candidates": [
+                    {"ref": "origin/release-2.0.0", "commit": "a" * 40, "kind": "remote", "score": 200},
+                    {"ref": "upstream/release-2.0.0", "commit": "b" * 40, "kind": "remote", "score": 200},
+                ],
+                "fingerprint": "ambiguous-current",
+            }
+
+            with patch.object(run_step, "resolve_step1_ref", return_value=resolution):
+                _updated, interaction = run_step.resolve_step1_refs_for_execution(context, project_dir)
+
+        self.assertEqual(interaction["reason_code"], "ambiguous_step1_source_ref")
+        self.assertEqual(interaction["kind"], "input_request")
+        self.assertEqual(interaction["required_fields"], ["current_branch"])
+        self.assertEqual(len(interaction["ref_resolution_requests"][0]["candidates"]), 2)
+        self.assertTrue(interaction["must_wait_for_user_reply"])
+
+    def test_step1_source_only_input_requires_revision_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {"base_source_project_dir": str(project_dir)}
+            head_resolution = {
+                "status": "resolved",
+                "requested_ref": "HEAD",
+                "resolved_ref": "HEAD",
+                "resolved_commit": "c" * 40,
+                "resolution_mode": "exact",
+                "candidates": [],
+                "fingerprint": "source-head",
+            }
+
+            with patch.object(run_step, "resolve_step1_ref", return_value=head_resolution):
+                _updated, interaction = run_step.resolve_step1_refs_for_execution(context, project_dir)
+
+        self.assertEqual(
+            interaction["reason_code"],
+            "step1_source_revision_confirmation_required",
+        )
+        self.assertEqual(interaction["required_fields"], ["base_branch"])
+        request = interaction["ref_resolution_requests"][0]
+        self.assertEqual(request["detected_commit"], "c" * 40)
+        self.assertEqual(request["source_project_dir"], str(project_dir.resolve()))
+
+    def test_step1_ref_confirmation_rejects_same_unresolved_value(self):
+        interaction = {
+            "step_id": "step1",
+            "reason_code": "ambiguous_step1_source_ref",
+            "options": [{"id": "continue"}],
+            "required_fields": ["current_branch"],
+            "action_requirements": {
+                "continue": {"required_fields": ["current_branch"]},
+            },
+            "ref_resolution_requests": [
+                {
+                    "field": "current_branch",
+                    "requested_ref": "release-2.0.0",
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(run_step.StepError, "不同的明确 ref"):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "continue", "current_branch": "release-2.0.0"},
+            )
 
 
 if __name__ == "__main__":

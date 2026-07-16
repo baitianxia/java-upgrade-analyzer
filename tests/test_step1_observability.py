@@ -20,6 +20,33 @@ import step1_observability
 
 
 class Step1ObservabilityTest(unittest.TestCase):
+    def test_ref_resolution_event_records_requested_and_resolved_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = step1_observability.Step1Observer(
+                Path(tmp) / "evidence/dependencies/dep_changes.csv"
+            )
+            commit = "a" * 40
+            event = observer.event(
+                "ref_resolution",
+                "completed",
+                "当前侧源码版本已固定",
+                side="current",
+                details={
+                    "requested_ref": "release-2.0.0",
+                    "resolved_ref": "origin/release-2.0.0",
+                    "resolved_commit": commit,
+                    "resolution_mode": "unique_remote",
+                    "candidate_count": 1,
+                },
+            )
+
+            self.assertEqual(event["details"]["resolved_commit"], commit)
+            persisted = json.loads(
+                observer.progress_path.read_text(encoding="utf-8").splitlines()[-1]
+            )
+            self.assertEqual(persisted["details"]["requested_ref"], "release-2.0.0")
+            self.assertEqual(persisted["details"]["candidate_count"], 1)
+
     def test_streaming_command_relays_output_and_still_returns_it(self):
         relayed = io.StringIO()
         command = [

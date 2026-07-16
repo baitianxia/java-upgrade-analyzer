@@ -2,6 +2,7 @@
 """统一调度入口：执行单个 Step，并负责门控与主状态持久化。"""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -46,6 +47,7 @@ from s4_contract import (
     PER_DEPENDENCY_SUMMARY_FILE,
     STEP3_RISK_CANDIDATES_FILE,
 )
+from step1_ref_resolution import resolve_step1_ref
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -833,6 +835,16 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
                 updated["primary_module"] = value.strip()
             if key in ("base_branch", "current_branch"):
                 updated[f"{key}_explicit"] = True
+                side = key.split("_", 1)[0]
+                for suffix in (
+                    "requested_ref",
+                    "resolved_ref",
+                    "resolved_commit",
+                    "ref_resolution_mode",
+                    "ref_resolution_fingerprint",
+                    "ref_candidate_count",
+                ):
+                    updated.pop(f"{side}_{suffix}", None)
     for key in ("base_jdk_home", "current_jdk_home"):
         value = response.get(key)
         if isinstance(value, str) and value.strip():
@@ -2865,6 +2877,22 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             default_current_branch,
             current_branch_explicit,
         ),
+        "base_requested_ref": resolve_value(None, merged, "base_requested_ref", ""),
+        "base_resolved_ref": resolve_value(None, merged, "base_resolved_ref", ""),
+        "base_resolved_commit": resolve_value(None, merged, "base_resolved_commit", ""),
+        "base_ref_resolution_mode": resolve_value(None, merged, "base_ref_resolution_mode", ""),
+        "base_ref_resolution_fingerprint": resolve_value(
+            None, merged, "base_ref_resolution_fingerprint", "",
+        ),
+        "base_ref_candidate_count": resolve_value(None, merged, "base_ref_candidate_count", 0),
+        "current_requested_ref": resolve_value(None, merged, "current_requested_ref", ""),
+        "current_resolved_ref": resolve_value(None, merged, "current_resolved_ref", ""),
+        "current_resolved_commit": resolve_value(None, merged, "current_resolved_commit", ""),
+        "current_ref_resolution_mode": resolve_value(None, merged, "current_ref_resolution_mode", ""),
+        "current_ref_resolution_fingerprint": resolve_value(
+            None, merged, "current_ref_resolution_fingerprint", "",
+        ),
+        "current_ref_candidate_count": resolve_value(None, merged, "current_ref_candidate_count", 0),
         "modules": resolve_value(cli_list(args.modules), merged, "modules", []),
         "source_dirs": resolve_value(cli_list(args.source_dirs), merged, "source_dirs"),
         "dependency_source_dirs": resolve_value(cli_list(args.dependency_source_dirs), merged, "dependency_source_dirs", []),
@@ -3785,6 +3813,197 @@ def build_step1_preflight_interaction(run_context):
         "next_action_rule": "只能向用户确认 Step1 的输入方式和缺失字段并等待回复，不得继续执行后续步骤。",
         "must_wait_for_user_reply": True,
     }
+
+
+def _step1_ref_repository(run_context, side, project_dir):
+    source_dir = str(run_context.get(f"{side}_source_project_dir") or "").strip()
+    return Path(source_dir).resolve() if source_dir else Path(project_dir).resolve()
+
+
+def _step1_ref_request(side, field, source_dir, resolution, *, source_only=False):
+    candidates = [dict(item) for item in (resolution.get("candidates") or [])]
+    request = {
+        "side": side,
+        "field": field,
+        "requested_ref": str(resolution.get("requested_ref") or ""),
+        "status": str(resolution.get("status") or "not_found"),
+        "fingerprint": str(resolution.get("fingerprint") or ""),
+        "source_project_dir": str(source_dir or ""),
+        "candidates": candidates,
+    }
+    if source_only and resolution.get("resolved_commit"):
+        request.update({
+            "detected_ref": str(resolution.get("resolved_ref") or "HEAD"),
+            "detected_commit": str(resolution.get("resolved_commit") or ""),
+            "status": "confirmation_required",
+            "candidates": [{
+                "ref": str(resolution.get("resolved_commit") or ""),
+                "display_ref": str(resolution.get("resolved_ref") or "HEAD"),
+                "commit": str(resolution.get("resolved_commit") or ""),
+                "kind": "detected_source_head",
+                "score": 0,
+            }],
+        })
+    return request
+
+
+def build_step1_ref_confirmation_interaction(run_context, requests):
+    requests = [dict(item) for item in (requests or [])]
+    required_fields = [
+        str(item.get("field") or "").strip()
+        for item in requests
+        if str(item.get("field") or "").strip()
+    ]
+    reason_codes = {
+        "source_only" if item.get("status") == "confirmation_required" else item.get("status")
+        for item in requests
+    }
+    if "source_only" in reason_codes:
+        reason_code = "step1_source_revision_confirmation_required"
+        title = "Step1 需要确认源码 revision"
+        summary = "仅有源码目录不能证明其对应 base 或 current 制品，必须先确认并固定 commit。"
+    elif "ambiguous" in reason_codes:
+        reason_code = "ambiguous_step1_source_ref"
+        title = "Step1 分支存在多个候选"
+        summary = "提供的分支名称匹配到多个不同 commit，不能自动选择。"
+    else:
+        reason_code = "step1_source_ref_not_found"
+        title = "Step1 无法定位源码分支"
+        summary = "提供的分支无法解析为当前仓库已有的本地或远端跟踪 ref。"
+    properties = {
+        "action": {"type": "string", "enum": ["continue", "cancel"]},
+        "notes": {"type": "string", "description": "可选。记录分支或 revision 的确认依据。"},
+    }
+    missing_inputs = []
+    checklist_lines = []
+    for request in requests:
+        field = request["field"]
+        side_cn = "基准侧" if request.get("side") == "base" else "当前侧"
+        properties[field] = {
+            "type": "string",
+            "description": f"{side_cn}明确的本地分支、远端跟踪 ref、tag 或 commit。",
+        }
+        missing_inputs.append({
+            "field": field,
+            "label": f"{side_cn}源码 ref",
+            "side": request.get("side"),
+            "required": True,
+            "recommended": True,
+            "reason": summary,
+            "value_type": "branch",
+        })
+        if request.get("requested_ref"):
+            checklist_lines.append(f"{side_cn}原始输入: {request.get('requested_ref')}")
+        if request.get("detected_commit"):
+            checklist_lines.append(
+                f"{side_cn}源码目录当前 revision: {request.get('detected_ref')} "
+                f"({request.get('detected_commit')})"
+            )
+        for candidate in request.get("candidates") or []:
+            checklist_lines.append(
+                f"{side_cn}候选: {candidate.get('ref')} ({candidate.get('commit')})"
+            )
+    fingerprint_payload = json.dumps(
+        [item.get("fingerprint") for item in requests],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    return {
+        "schema": "java-upgrade-analyzer.interaction.v2",
+        "checkpoint": True,
+        "hard_stop": True,
+        "status": "awaiting_user_input",
+        "kind": "input_request",
+        "step_id": "step1",
+        "reason_code": reason_code,
+        "summary": summary,
+        "title": title,
+        "question": "请为列出的每一侧选择或填写一个明确 ref；确认后 Step1 会固定 commit 再执行。",
+        "files_to_review": [
+            item.get("source_project_dir") for item in requests if item.get("source_project_dir")
+        ],
+        "required_fields": required_fields,
+        "missing_inputs": missing_inputs,
+        "fallback_inputs": [],
+        "checklist_lines": checklist_lines,
+        "ref_resolution_requests": requests,
+        "ref_resolution_fingerprint": hashlib.sha256(fingerprint_payload).hexdigest(),
+        "options": [
+            {"id": "continue", "label": "确认 ref 后继续", "description": "固定所选 commit 后重新执行 Step1。"},
+            {"id": "cancel", "label": "取消", "description": "停止本次分析。"},
+        ],
+        "response_schema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": properties,
+        },
+        "action_requirements": {
+            "continue": {"required_fields": required_fields},
+        },
+        "input_normalization": {
+            "enabled": True,
+            "mode": "llm_assisted_structuring",
+            "source": "user_free_text",
+            "target": "response_json",
+            "target_schema_ref": "response_schema",
+            "allowed_actions": ["continue", "cancel"],
+            "required_fields": required_fields,
+            "rules": [
+                "必须使用候选中的完整 ref/commit，或用户明确提供的其他可解析 ref。",
+                "不得原样重复已解析失败或存在歧义的输入。",
+            ],
+        },
+        "runtime_rules": [
+            "确认前不得执行 Maven、创建分析 worktree 或继续后续步骤。",
+            "用户确认后必须固定到 resolved commit，不能依赖工作区当前 checkout。",
+        ],
+        "next_action_rule": "只能等待用户补充明确 ref 或取消。",
+        "must_wait_for_user_reply": True,
+    }
+
+
+def resolve_step1_refs_for_execution(run_context, project_dir):
+    """Resolve explicit Step1 refs and stop mutable source-only inputs before Maven."""
+    updated = dict(run_context or {})
+    if updated.get("base_artifact_path") and updated.get("current_artifact_path"):
+        # Direct artifacts are parsed first. Ref resolution is deferred until a
+        # concrete unresolved nested JAR actually needs Maven coordinate fallback.
+        return updated, None
+    requests = []
+    for side in ("base", "current"):
+        branch_field = f"{side}_branch"
+        source_field = f"{side}_source_project_dir"
+        requested_ref = str(updated.get(branch_field) or "").strip()
+        source_dir = str(updated.get(source_field) or "").strip()
+        repo_dir = _step1_ref_repository(updated, side, project_dir)
+        if requested_ref:
+            resolution = resolve_step1_ref(repo_dir, requested_ref)
+            if resolution.get("status") != "resolved":
+                requests.append(
+                    _step1_ref_request(side, branch_field, source_dir or str(repo_dir), resolution)
+                )
+                continue
+            updated[f"{side}_requested_ref"] = requested_ref
+            updated[f"{side}_resolved_ref"] = str(resolution.get("resolved_ref") or requested_ref)
+            updated[f"{side}_resolved_commit"] = str(resolution.get("resolved_commit") or "")
+            updated[f"{side}_ref_resolution_mode"] = str(resolution.get("resolution_mode") or "exact")
+            updated[f"{side}_ref_resolution_fingerprint"] = str(resolution.get("fingerprint") or "")
+            updated[f"{side}_ref_candidate_count"] = len(resolution.get("candidates") or [])
+            continue
+        if source_dir:
+            resolution = resolve_step1_ref(repo_dir, "HEAD")
+            requests.append(
+                _step1_ref_request(
+                    side,
+                    branch_field,
+                    str(repo_dir),
+                    resolution,
+                    source_only=True,
+                )
+            )
+    if requests:
+        return updated, build_step1_ref_confirmation_interaction(updated, requests)
+    return updated, None
 
 
 def build_input_normalization_contract(options, required_fields, properties):
@@ -5006,6 +5225,20 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             user_response.get("selected_targets"),
         )
 
+    if step_id == "step1" and reason_code in {
+        "ambiguous_step1_source_ref",
+        "step1_source_ref_not_found",
+    } and action == "continue":
+        for request in pending_interaction.get("ref_resolution_requests") or []:
+            field = str(request.get("field") or "").strip()
+            previous = str(request.get("requested_ref") or "").strip()
+            current = str(user_response.get(field) or "").strip()
+            if field and previous and current == previous:
+                raise StepError(
+                    f"{field}={current} 已经解析失败或存在歧义；"
+                    "必须补充不同的明确 ref/commit，不能用相同输入重复执行 Step1。"
+                )
+
     if step5_missing_source_rerun:
         dependency_source_dirs = [
             str(item).strip()
@@ -5978,6 +6211,18 @@ def main():
     )
     if preflight_exit is not None:
         return preflight_exit
+    if step_id == "step1":
+        run_context, ref_interaction = resolve_step1_refs_for_execution(run_context, project_dir)
+        store_step_input(main_state, step_id, run_context)
+        save_main_state(report_dir, main_state)
+        ref_preflight_exit = maybe_emit_step1_preflight_interaction(
+            step_id,
+            main_state,
+            report_dir,
+            ref_interaction,
+        )
+        if ref_preflight_exit is not None:
+            return ref_preflight_exit
 
     task_name = USER_TASK_NAMES.get(step_id, "当前分析")
     print("", file=sys.stderr)

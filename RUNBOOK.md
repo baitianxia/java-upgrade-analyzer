@@ -363,7 +363,9 @@ python3 "$SKILL/scripts/run_step.py" --step step1 \
 - `thin jar` / 无嵌套依赖场景当前不支持，会直接报错
 - 若 Step1 先进入待交互，Agent 必须把 `interaction.json` 整理成用户可读的决策卡片：缺什么输入、可用哪种输入方式、可以直接怎么回复；协议字段只用于内部恢复命令构造
 - 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支执行 `mvn dependency:list` 补全坐标；但这不是 direct artifact 模式的执行前硬前置
-- `base_source_project_dir/current_source_project_dir` 仅保留给特殊兼容场景，不作为默认交互模型
+- `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
+- 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧 ref 并运行 Maven 补全；自动构建模式则在构建前解析两侧 ref。解析时先尝试精确匹配，再查询本地分支与已经 fetch 到本机的远端跟踪分支；候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在 Maven 执行前暂停确认。该过程不会隐式执行 `git fetch`
+- 同时提供 branch/ref 与 source directory 时，以确认后的 branch/ref 为准；只有 source directory 时不得直接使用当前 checkout 执行坐标补全
 - 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源
 - 若这两个分支是在 Step1 review checkpoint 才补充，恢复 `continue` 后调度器会先把确认值写入 `step2.input`，再进入 Step2
 - 任一步 checkpoint 恢复时，若主状态里该 step 已有更新后的 `input`，恢复逻辑会优先使用它，而不是继续沿用旧 `output`

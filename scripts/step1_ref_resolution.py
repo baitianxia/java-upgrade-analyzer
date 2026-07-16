@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Safe, read-only Git ref resolution for Step1 source snapshots."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from pathlib import Path
+
+from compat import git_cmd, run_cmd
+
+
+_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_CORE_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
+
+
+def _git(repo_dir, *args, timeout=20):
+    stdout, stderr, rc = run_cmd(
+        git_cmd() + list(args),
+        cwd=str(Path(repo_dir).resolve()),
+        timeout=timeout,
+    )
+    return str(stdout or "").strip(), str(stderr or "").strip(), rc
+
+
+def _verify_commit(repo_dir, ref):
+    stdout, _stderr, rc = _git(repo_dir, "rev-parse", "--verify", f"{ref}^{{commit}}", timeout=10)
+    if rc != 0 or not stdout:
+        return ""
+    return stdout.splitlines()[-1].strip()
+
+
+def _exact_ref_target(repo_dir, requested_ref):
+    requested_ref = str(requested_ref or "").strip()
+    if not requested_ref:
+        return "", ""
+    candidates = []
+    if requested_ref.startswith("refs/"):
+        candidates.append(requested_ref)
+    else:
+        candidates.extend((
+            f"refs/heads/{requested_ref}",
+            f"refs/tags/{requested_ref}",
+        ))
+        if "/" in requested_ref:
+            candidates.append(f"refs/remotes/{requested_ref}")
+    for canonical_ref in candidates:
+        commit = _verify_commit(repo_dir, canonical_ref)
+        if commit:
+            if canonical_ref.startswith("refs/heads/"):
+                display_ref = canonical_ref[len("refs/heads/"):]
+            elif canonical_ref.startswith("refs/remotes/"):
+                display_ref = canonical_ref[len("refs/remotes/"):]
+            elif canonical_ref.startswith("refs/tags/"):
+                display_ref = canonical_ref[len("refs/tags/"):]
+            else:
+                display_ref = canonical_ref
+            return display_ref, commit
+    if requested_ref == "HEAD" or _COMMIT_RE.fullmatch(requested_ref):
+        commit = _verify_commit(repo_dir, requested_ref)
+        if commit:
+            return requested_ref, commit
+    return "", ""
+
+
+def _list_branch_refs(repo_dir):
+    stdout, _stderr, rc = _git(
+        repo_dir,
+        "for-each-ref",
+        "--format=%(refname)%09%(objectname)",
+        "refs/heads",
+        "refs/remotes",
+    )
+    if rc != 0:
+        return []
+    refs = []
+    for raw_line in stdout.splitlines():
+        parts = raw_line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        canonical_ref, commit = (part.strip() for part in parts)
+        if not canonical_ref or not commit or canonical_ref.endswith("/HEAD"):
+            continue
+        if canonical_ref.startswith("refs/heads/"):
+            kind = "local"
+            display_ref = canonical_ref[len("refs/heads/"):]
+            short_name = display_ref
+        elif canonical_ref.startswith("refs/remotes/"):
+            kind = "remote"
+            display_ref = canonical_ref[len("refs/remotes/"):]
+            short_name = display_ref.split("/", 1)[1] if "/" in display_ref else display_ref
+        else:
+            continue
+        refs.append({
+            "ref": display_ref,
+            "canonical_ref": canonical_ref,
+            "short_name": short_name,
+            "kind": kind,
+            "commit": commit,
+        })
+    return refs
+
+
+def _version_boundary_score(candidate_name, requested_ref):
+    requested = re.sub(r"(?i)-SNAPSHOT$", "", str(requested_ref or "").strip())
+    version_match = _CORE_VERSION_RE.search(requested)
+    if not version_match:
+        return 0
+    version = version_match.group(0).lower()
+    text = str(candidate_name or "").lower()
+    start = 0
+    while True:
+        index = text.find(version, start)
+        if index < 0:
+            return 0
+        end = index + len(version)
+        start = index + 1
+        previous = text[index - 1] if index else ""
+        following = text[end] if end < len(text) else ""
+        if previous and (previous.isdigit() or previous == "."):
+            continue
+        if following and following not in "-_/":
+            continue
+        return 120
+
+
+def _candidate_score(candidate, requested_ref):
+    requested = str(requested_ref or "").strip()
+    if not requested:
+        return 0
+    if candidate["ref"] == requested:
+        return 220
+    if candidate["short_name"] == requested:
+        return 200
+    return _version_boundary_score(candidate["short_name"], requested)
+
+
+def _matching_candidates(repo_dir, requested_ref):
+    scored = []
+    for candidate in _list_branch_refs(repo_dir):
+        score = _candidate_score(candidate, requested_ref)
+        if score:
+            scored.append({**candidate, "score": score})
+    if not scored:
+        return []
+    highest_score = max(item["score"] for item in scored)
+    return sorted(
+        (item for item in scored if item["score"] == highest_score),
+        key=lambda item: (0 if item["kind"] == "local" else 1, item["ref"]),
+    )
+
+
+def _fingerprint(requested_ref, candidates):
+    payload = {
+        "requested_ref": str(requested_ref or "").strip(),
+        "candidates": [
+            {
+                "ref": item.get("ref", ""),
+                "commit": item.get("commit", ""),
+                "kind": item.get("kind", ""),
+                "score": item.get("score", 0),
+            }
+            for item in candidates or []
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def resolve_step1_ref(repo_dir, requested_ref):
+    """Resolve a Step1 ref without fetching or mutating the repository."""
+    requested_ref = str(requested_ref or "").strip()
+    resolved_ref, resolved_commit = _exact_ref_target(repo_dir, requested_ref)
+    if resolved_commit:
+        return {
+            "status": "resolved",
+            "requested_ref": requested_ref,
+            "resolved_ref": resolved_ref,
+            "resolved_commit": resolved_commit,
+            "resolution_mode": "exact",
+            "candidates": [],
+            "fingerprint": _fingerprint(requested_ref, []),
+        }
+
+    candidates = _matching_candidates(repo_dir, requested_ref)
+    commits = {}
+    for candidate in candidates:
+        commits.setdefault(candidate["commit"], []).append(candidate)
+    if len(commits) == 1:
+        same_commit_candidates = next(iter(commits.values()))
+        selected = sorted(
+            same_commit_candidates,
+            key=lambda item: (0 if item["kind"] == "local" else 1, item["ref"]),
+        )[0]
+        return {
+            "status": "resolved",
+            "requested_ref": requested_ref,
+            "resolved_ref": selected["ref"],
+            "resolved_commit": selected["commit"],
+            "resolution_mode": "unique_local" if selected["kind"] == "local" else "unique_remote",
+            "candidates": candidates,
+            "fingerprint": _fingerprint(requested_ref, candidates),
+        }
+    return {
+        "status": "ambiguous" if commits else "not_found",
+        "requested_ref": requested_ref,
+        "resolved_ref": "",
+        "resolved_commit": "",
+        "resolution_mode": "unresolved",
+        "candidates": candidates,
+        "fingerprint": _fingerprint(requested_ref, candidates),
+    }
+
+
+__all__ = ["resolve_step1_ref"]
