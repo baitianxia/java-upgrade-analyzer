@@ -3855,6 +3855,61 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(len(interaction["ref_resolution_requests"][0]["candidates"]), 2)
         self.assertTrue(interaction["must_wait_for_user_reply"])
 
+    def test_step1_remote_failure_offers_explicit_local_fallback_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {"current_branch": "release-2.0.0"}
+            resolution = {
+                "status": "not_found",
+                "source_status": "awaiting_local_source_confirmation",
+                "requested_ref": "release-2.0.0",
+                "resolved_ref": "",
+                "resolved_commit": "",
+                "resolution_mode": "unresolved",
+                "candidates": [],
+                "failures": [{"remote": "origin", "stage": "ls_remote", "reason": "network unavailable"}],
+                "local_candidate_commit": "d" * 40,
+                "dirty": False,
+                "fingerprint": "remote-unavailable-current",
+            }
+
+            with patch.object(run_step, "resolve_step1_ref", return_value=resolution):
+                _updated, interaction = run_step.resolve_step1_refs_for_execution(context, project_dir)
+
+        self.assertEqual(interaction["reason_code"], "step1_remote_source_unavailable")
+        self.assertIn("current_allow_local_source", interaction["response_schema"]["properties"])
+        self.assertIn("confirm_local_source", {row["id"] for row in interaction["options"]})
+        request = interaction["ref_resolution_requests"][0]
+        self.assertEqual(request["local_candidate_commit"], "d" * 40)
+        self.assertEqual(request["remote_failures"][0]["stage"], "ls_remote")
+
+    def test_step1_passes_confirmed_local_fallback_flags_to_resolver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {
+                "current_branch": "release-2.0.0",
+                "current_allow_local_source": True,
+                "current_allow_dirty_local_source": True,
+            }
+            resolution = {
+                "status": "resolved",
+                "source_status": "user_confirmed_local_source",
+                "requested_ref": "release-2.0.0",
+                "resolved_ref": "release-2.0.0",
+                "resolved_commit": "e" * 40,
+                "resolution_mode": "user_confirmed_local_source",
+                "candidates": [],
+                "fingerprint": "confirmed-local-current",
+            }
+
+            with patch.object(run_step, "resolve_step1_ref", return_value=resolution) as resolver:
+                updated, interaction = run_step.resolve_step1_refs_for_execution(context, project_dir)
+
+        self.assertIsNone(interaction)
+        self.assertEqual(updated["current_ref_source_status"], "user_confirmed_local_source")
+        self.assertTrue(resolver.call_args.kwargs["allow_local_source"])
+        self.assertTrue(resolver.call_args.kwargs["allow_dirty_local_source"])
+
     def test_step1_source_only_input_requires_revision_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)

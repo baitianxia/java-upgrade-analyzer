@@ -2394,11 +2394,28 @@ def _collect_runtime_deps_for_artifact_input(
     side="",
     artifact_path="",
     observer=None,
+    source_resolution=None,
+    allow_local_source=False,
+    allow_dirty_local_source=False,
 ):
     source_dir = str(source_project_dir or '').strip()
     if branch:
         repo_dir = source_dir or str(Path(work_dir).resolve())
-        resolution = resolve_step1_ref(repo_dir, branch)
+        resolution = dict(source_resolution or {})
+        if not (
+            resolution.get("status") == "resolved"
+            and str(resolution.get("resolved_commit") or "").strip()
+            and str(resolution.get("source_status") or "") in {
+                "remote_source_resolved",
+                "user_confirmed_local_source",
+            }
+        ):
+            resolution = resolve_step1_ref(
+                repo_dir,
+                branch,
+                allow_local_source=allow_local_source,
+                allow_dirty_local_source=allow_dirty_local_source,
+            )
         if resolution.get("status") != "resolved":
             raise Step1RefResolutionRequiredError(
                 side, repo_dir, artifact_path, resolution,
@@ -2416,6 +2433,9 @@ def _collect_runtime_deps_for_artifact_input(
                     "resolved_commit": resolved_commit,
                     "resolution_mode": str(resolution.get("resolution_mode") or "exact"),
                     "candidate_count": len(resolution.get("candidates") or []),
+                    "source_status": str(resolution.get("source_status") or ""),
+                    "remote": str(resolution.get("remote") or ""),
+                    "remote_ref": str(resolution.get("remote_ref") or ""),
                 },
             )
         runtime_deps, meta = get_runtime_deps_by_switching_branch(
@@ -2436,6 +2456,9 @@ def _collect_runtime_deps_for_artifact_input(
             'resolved_ref': str(resolution.get('resolved_ref') or branch),
             'resolved_commit': resolved_commit,
             'ref_resolution_mode': str(resolution.get('resolution_mode') or 'exact'),
+            'ref_source_status': str(resolution.get('source_status') or ''),
+            'ref_remote': str(resolution.get('remote') or ''),
+            'ref_remote_ref': str(resolution.get('remote_ref') or ''),
             'branch': resolved_commit,
         }
     if source_dir:
@@ -3070,6 +3093,27 @@ def main():
             base_runtime_meta = {}
             curr_runtime_meta = {}
 
+            def confirmed_source_resolution(side):
+                resolved_commit = str(orchestrated_input.get(f"{side}_resolved_commit") or "").strip()
+                source_status = str(orchestrated_input.get(f"{side}_ref_source_status") or "").strip()
+                if not resolved_commit or source_status not in {
+                    "remote_source_resolved",
+                    "user_confirmed_local_source",
+                }:
+                    return {}
+                return {
+                    "status": "resolved",
+                    "source_status": source_status,
+                    "requested_ref": str(orchestrated_input.get(f"{side}_requested_ref") or ""),
+                    "resolved_ref": str(orchestrated_input.get(f"{side}_resolved_ref") or ""),
+                    "resolved_commit": resolved_commit,
+                    "resolution_mode": str(orchestrated_input.get(f"{side}_ref_resolution_mode") or ""),
+                    "fingerprint": str(orchestrated_input.get(f"{side}_ref_resolution_fingerprint") or ""),
+                    "remote": str(orchestrated_input.get(f"{side}_ref_remote") or ""),
+                    "remote_ref": str(orchestrated_input.get(f"{side}_ref_remote_ref") or ""),
+                    "candidates": [],
+                }
+
             def load_base_runtime_deps():
                 nonlocal base_runtime_deps, base_runtime_meta
                 if not base_runtime_meta:
@@ -3084,6 +3128,9 @@ def main():
                         side="base",
                         artifact_path=args.base_artifact_path,
                         observer=observer,
+                        source_resolution=confirmed_source_resolution("base"),
+                        allow_local_source=bool(orchestrated_input.get("base_allow_local_source")),
+                        allow_dirty_local_source=bool(orchestrated_input.get("base_allow_dirty_local_source")),
                     )
                 return base_runtime_deps
 
@@ -3101,6 +3148,9 @@ def main():
                         side="current",
                         artifact_path=args.current_artifact_path,
                         observer=observer,
+                        source_resolution=confirmed_source_resolution("current"),
+                        allow_local_source=bool(orchestrated_input.get("current_allow_local_source")),
+                        allow_dirty_local_source=bool(orchestrated_input.get("current_allow_dirty_local_source")),
                     )
                 return curr_runtime_deps
 

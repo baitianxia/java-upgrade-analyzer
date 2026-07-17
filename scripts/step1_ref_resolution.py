@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from compat import git_cmd, run_cmd
+from remote_source_refs import resolve_local_source_ref, resolve_remote_source_ref
 
 
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
@@ -168,48 +169,40 @@ def _fingerprint(requested_ref, candidates):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def resolve_step1_ref(repo_dir, requested_ref):
-    """Resolve a Step1 ref without fetching or mutating the repository."""
-    requested_ref = str(requested_ref or "").strip()
-    resolved_ref, resolved_commit = _exact_ref_target(repo_dir, requested_ref)
-    if resolved_commit:
-        return {
-            "status": "resolved",
-            "requested_ref": requested_ref,
-            "resolved_ref": resolved_ref,
-            "resolved_commit": resolved_commit,
-            "resolution_mode": "exact",
-            "candidates": [],
-            "fingerprint": _fingerprint(requested_ref, []),
-        }
+def resolve_step1_ref(
+    repo_dir,
+    requested_ref,
+    *,
+    allow_local_source=False,
+    allow_dirty_local_source=False,
+):
+    """Resolve Step1 auxiliary source from live remotes, with confirmed local fallback."""
+    remote = resolve_remote_source_ref(repo_dir, requested_ref)
+    if remote.get("status") == "remote_source_resolved":
+        return {**remote, "status": "resolved", "source_status": "remote_source_resolved"}
+    if remote.get("status") == "remote_source_ambiguous":
+        return {**remote, "status": "ambiguous", "source_status": "remote_source_ambiguous"}
 
-    candidates = _matching_candidates(repo_dir, requested_ref)
-    commits = {}
-    for candidate in candidates:
-        commits.setdefault(candidate["commit"], []).append(candidate)
-    if len(commits) == 1:
-        same_commit_candidates = next(iter(commits.values()))
-        selected = sorted(
-            same_commit_candidates,
-            key=lambda item: (0 if item["kind"] == "local" else 1, item["ref"]),
-        )[0]
+    local = resolve_local_source_ref(
+        repo_dir,
+        requested_ref,
+        allow_local_source=allow_local_source,
+        allow_dirty_local_source=allow_dirty_local_source,
+    )
+    if local.get("status") == "user_confirmed_local_source":
         return {
+            **local,
             "status": "resolved",
-            "requested_ref": requested_ref,
-            "resolved_ref": selected["ref"],
-            "resolved_commit": selected["commit"],
-            "resolution_mode": "unique_local" if selected["kind"] == "local" else "unique_remote",
-            "candidates": candidates,
-            "fingerprint": _fingerprint(requested_ref, candidates),
+            "source_status": "user_confirmed_local_source",
+            "remote_failures": list(remote.get("failures") or []),
         }
+    status = "dirty_confirmation_required" if local.get("status") == "awaiting_dirty_local_source_confirmation" else "not_found"
     return {
-        "status": "ambiguous" if commits else "not_found",
-        "requested_ref": requested_ref,
-        "resolved_ref": "",
-        "resolved_commit": "",
-        "resolution_mode": "unresolved",
-        "candidates": candidates,
-        "fingerprint": _fingerprint(requested_ref, candidates),
+        **remote,
+        "status": status,
+        "source_status": str(local.get("status") or "awaiting_local_source_confirmation"),
+        "local_candidate_commit": str(local.get("local_candidate_commit") or ""),
+        "dirty": bool(local.get("dirty")),
     }
 
 

@@ -70,6 +70,7 @@ USER_ACTION_LABELS = {
     "rerun_current_step": "补充信息后重新分析",
     "restart_from_step": "从指定任务重新分析",
     "cancel": "暂时停止分析",
+    "confirm_local_source": "确认使用本地源码兜底",
 }
 STEP1_MAVEN_MODULE_SEP = re.compile(r"\[INFO\]\s*---.*@\s*(\S+)\s*---")
 INTENT_PATCH_ALLOWED_SET_FIELDS = {
@@ -78,10 +79,14 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "analysis_mode",
     "base_artifact_path",
     "base_branch",
+    "base_allow_local_source",
+    "base_allow_dirty_local_source",
     "base_jdk_home",
     "base_source_project_dir",
     "current_artifact_path",
     "current_branch",
+    "current_allow_local_source",
+    "current_allow_dirty_local_source",
     "current_jdk_home",
     "current_source_project_dir",
     "dependency_git_ref_overrides",
@@ -837,6 +842,8 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
             if key in ("base_branch", "current_branch"):
                 updated[f"{key}_explicit"] = True
                 side = key.split("_", 1)[0]
+                updated.pop(f"{side}_allow_local_source", None)
+                updated.pop(f"{side}_allow_dirty_local_source", None)
                 for suffix in (
                     "requested_ref",
                     "resolved_ref",
@@ -929,7 +936,16 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         if timeout_key in response:
             updated[timeout_key] = parse_positive_int_like(response.get(timeout_key), timeout_key)
 
-    for key in ("include_test_scope", "allow_degraded", "strict_risk_gate", "tree_sitter_installed"):
+    for key in (
+        "include_test_scope",
+        "allow_degraded",
+        "strict_risk_gate",
+        "tree_sitter_installed",
+        "base_allow_local_source",
+        "base_allow_dirty_local_source",
+        "current_allow_local_source",
+        "current_allow_dirty_local_source",
+    ):
         if key in response:
             updated[key] = parse_bool_like(response.get(key), key)
     if "strict_risk_gate" in response:
@@ -2936,6 +2952,15 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             None, merged, "base_ref_resolution_fingerprint", "",
         ),
         "base_ref_candidate_count": resolve_value(None, merged, "base_ref_candidate_count", 0),
+        "base_ref_source_status": resolve_value(None, merged, "base_ref_source_status", ""),
+        "base_allow_local_source": (
+            parse_bool_like(merged.get("base_allow_local_source"), "base_allow_local_source")
+            if "base_allow_local_source" in merged else False
+        ),
+        "base_allow_dirty_local_source": (
+            parse_bool_like(merged.get("base_allow_dirty_local_source"), "base_allow_dirty_local_source")
+            if "base_allow_dirty_local_source" in merged else False
+        ),
         "current_requested_ref": resolve_value(None, merged, "current_requested_ref", ""),
         "current_resolved_ref": resolve_value(None, merged, "current_resolved_ref", ""),
         "current_resolved_commit": resolve_value(None, merged, "current_resolved_commit", ""),
@@ -2944,6 +2969,15 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             None, merged, "current_ref_resolution_fingerprint", "",
         ),
         "current_ref_candidate_count": resolve_value(None, merged, "current_ref_candidate_count", 0),
+        "current_ref_source_status": resolve_value(None, merged, "current_ref_source_status", ""),
+        "current_allow_local_source": (
+            parse_bool_like(merged.get("current_allow_local_source"), "current_allow_local_source")
+            if "current_allow_local_source" in merged else False
+        ),
+        "current_allow_dirty_local_source": (
+            parse_bool_like(merged.get("current_allow_dirty_local_source"), "current_allow_dirty_local_source")
+            if "current_allow_dirty_local_source" in merged else False
+        ),
         "modules": resolve_value(cli_list(args.modules), merged, "modules", []),
         "source_dirs": resolve_value(cli_list(args.source_dirs), merged, "source_dirs"),
         "dependency_source_dirs": resolve_value(cli_list(args.dependency_source_dirs), merged, "dependency_source_dirs", []),
@@ -3885,6 +3919,10 @@ def _step1_ref_request(side, field, source_dir, resolution, *, source_only=False
         "fingerprint": str(resolution.get("fingerprint") or ""),
         "source_project_dir": str(source_dir or ""),
         "candidates": candidates,
+        "source_status": str(resolution.get("source_status") or ""),
+        "remote_failures": [dict(item) for item in (resolution.get("failures") or resolution.get("remote_failures") or [])],
+        "local_candidate_commit": str(resolution.get("local_candidate_commit") or ""),
+        "dirty": bool(resolution.get("dirty")),
     }
     if source_only and resolution.get("resolved_commit"):
         request.update({
@@ -3920,13 +3958,21 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
     elif "ambiguous" in reason_codes:
         reason_code = "ambiguous_step1_source_ref"
         title = "Step1 分支存在多个候选"
-        summary = "提供的分支名称匹配到多个不同 commit，不能自动选择。"
+        summary = "提供的分支名称在远程仓库匹配到多个不同 commit，不能自动选择。"
+    elif any(item.get("source_status") == "awaiting_dirty_local_source_confirmation" for item in requests):
+        reason_code = "step1_dirty_local_source_confirmation_required"
+        title = "Step1 本地源码包含未提交修改"
+        summary = "远程源码不可用；本地仓库存在未提交修改，使用前必须单独确认。"
+    elif any(item.get("source_status") == "awaiting_local_source_confirmation" for item in requests):
+        reason_code = "step1_remote_source_unavailable"
+        title = "Step1 远程源码不可用"
+        summary = "远程分支无法获取；不会自动使用本地分支，可更正远程 ref 或明确确认本地兜底。"
     else:
         reason_code = "step1_source_ref_not_found"
         title = "Step1 无法定位源码分支"
-        summary = "提供的分支无法解析为当前仓库已有的本地或远端跟踪 ref。"
+        summary = "提供的分支无法从远程仓库解析并固定为 commit。"
     properties = {
-        "action": {"type": "string", "enum": ["continue", "cancel"]},
+        "action": {"type": "string", "enum": ["continue", "confirm_local_source", "cancel"]},
         "notes": {"type": "string", "description": "可选。记录分支或 revision 的确认依据。"},
     }
     missing_inputs = []
@@ -3936,8 +3982,19 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         side_cn = "基准侧" if request.get("side") == "base" else "当前侧"
         properties[field] = {
             "type": "string",
-            "description": f"{side_cn}明确的本地分支、远端跟踪 ref、tag 或 commit。",
+            "description": f"{side_cn}明确的远程分支或 tag；指定 remote 时使用 origin/release 形式。",
         }
+        allow_local_field = f"{request.get('side')}_allow_local_source"
+        allow_dirty_field = f"{request.get('side')}_allow_dirty_local_source"
+        properties[allow_local_field] = {
+            "type": "boolean",
+            "description": f"仅当远程不可用时，明确允许{side_cn}使用本地 commit 作为辅助源码。",
+        }
+        if request.get("dirty"):
+            properties[allow_dirty_field] = {
+                "type": "boolean",
+                "description": f"明确知晓{side_cn}本地仓库含未提交修改并仍允许使用固定 commit。",
+            }
         missing_inputs.append({
             "field": field,
             "label": f"{side_cn}源码 ref",
@@ -3957,6 +4014,15 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         for candidate in request.get("candidates") or []:
             checklist_lines.append(
                 f"{side_cn}候选: {candidate.get('ref')} ({candidate.get('commit')})"
+            )
+        for failure in request.get("remote_failures") or []:
+            checklist_lines.append(
+                f"{side_cn}远程失败: {failure.get('remote') or '远程仓库'} / "
+                f"{failure.get('stage') or '解析'} / {failure.get('reason') or '未知原因'}"
+            )
+        if request.get("local_candidate_commit"):
+            checklist_lines.append(
+                f"{side_cn}可确认的本地 commit: {request.get('local_candidate_commit')}"
             )
     fingerprint_payload = json.dumps(
         [item.get("fingerprint") for item in requests],
@@ -3984,7 +4050,8 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         "ref_resolution_requests": requests,
         "ref_resolution_fingerprint": hashlib.sha256(fingerprint_payload).hexdigest(),
         "options": [
-            {"id": "continue", "label": "确认 ref 后继续", "description": "固定所选 commit 后重新执行 Step1。"},
+            {"id": "continue", "label": "更正远程 ref 后继续", "description": "重新查询远程并固定所选 commit。"},
+            {"id": "confirm_local_source", "label": "确认使用本地源码兜底", "description": "仅在远程不可用时使用用户明确确认的本地 commit。"},
             {"id": "cancel", "label": "取消", "description": "停止本次分析。"},
         ],
         "response_schema": {
@@ -3994,6 +4061,16 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         },
         "action_requirements": {
             "continue": {"required_fields": required_fields},
+            "confirm_local_source": {
+                "required_fields": [
+                    field
+                    for item in requests
+                    for field in (
+                        [f"{item.get('side')}_allow_local_source"]
+                        + ([f"{item.get('side')}_allow_dirty_local_source"] if item.get("dirty") else [])
+                    )
+                ],
+            },
         },
         "input_normalization": {
             "enabled": True,
@@ -4001,10 +4078,11 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             "source": "user_free_text",
             "target": "response_json",
             "target_schema_ref": "response_schema",
-            "allowed_actions": ["continue", "cancel"],
+            "allowed_actions": ["continue", "confirm_local_source", "cancel"],
             "required_fields": required_fields,
             "rules": [
-                "必须使用候选中的完整 ref/commit，或用户明确提供的其他可解析 ref。",
+                "更正远程 ref 时必须使用完整 remote/ref，或用户明确提供的其他远程 ref。",
+                "只有用户明确同意本地兜底时才能设置 allow_local_source=true。",
                 "不得原样重复已解析失败或存在歧义的输入。",
             ],
         },
@@ -4012,7 +4090,7 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             "确认前不得执行 Maven、创建分析 worktree 或继续后续步骤。",
             "用户确认后必须固定到 resolved commit，不能依赖工作区当前 checkout。",
         ],
-        "next_action_rule": "只能等待用户补充明确 ref 或取消。",
+        "next_action_rule": "只能等待用户补充远程 ref、明确确认本地兜底或取消。",
         "must_wait_for_user_reply": True,
     }
 
@@ -4032,7 +4110,12 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
         source_dir = str(updated.get(source_field) or "").strip()
         repo_dir = _step1_ref_repository(updated, side, project_dir)
         if requested_ref:
-            resolution = resolve_step1_ref(repo_dir, requested_ref)
+            resolution = resolve_step1_ref(
+                repo_dir,
+                requested_ref,
+                allow_local_source=bool(updated.get(f"{side}_allow_local_source")),
+                allow_dirty_local_source=bool(updated.get(f"{side}_allow_dirty_local_source")),
+            )
             if resolution.get("status") != "resolved":
                 requests.append(
                     _step1_ref_request(side, branch_field, source_dir or str(repo_dir), resolution)
@@ -4044,6 +4127,12 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
             updated[f"{side}_ref_resolution_mode"] = str(resolution.get("resolution_mode") or "exact")
             updated[f"{side}_ref_resolution_fingerprint"] = str(resolution.get("fingerprint") or "")
             updated[f"{side}_ref_candidate_count"] = len(resolution.get("candidates") or [])
+            updated[f"{side}_ref_source_status"] = str(
+                resolution.get("source_status") or "remote_source_resolved"
+            )
+            updated[f"{side}_ref_remote"] = str(resolution.get("remote") or "")
+            updated[f"{side}_ref_remote_ref"] = str(resolution.get("remote_ref") or "")
+            updated[f"{side}_ref_queried_at"] = str(resolution.get("queried_at") or "")
             continue
         if source_dir:
             resolution = resolve_step1_ref(repo_dir, "HEAD")
@@ -5340,6 +5429,17 @@ def validate_pending_interaction_response(pending_interaction, user_response):
     for field in requirement.get("required_fields") or []:
         if not _response_value_present(user_response.get(field)):
             raise StepError(f"当前动作 {action} 要求字段 {field} 必填，不能为空。")
+    if step_id == "step1" and action == "confirm_local_source":
+        confirmation_fields = [
+            str(field or "").strip()
+            for field in (requirement.get("required_fields") or [])
+            if str(field or "").strip().endswith(
+                ("_allow_local_source", "_allow_dirty_local_source")
+            )
+        ]
+        for field in confirmation_fields:
+            if user_response.get(field) is not True:
+                raise StepError(f"当前动作 confirm_local_source 要求 {field}=true，不能隐式确认本地源码。")
     step5_missing_source_rerun = (
         step_id == "step5"
         and reason_code == "step5_dependency_source_mapping_missing"
@@ -5369,6 +5469,8 @@ def validate_pending_interaction_response(pending_interaction, user_response):
     if step_id == "step1" and reason_code in {
         "ambiguous_step1_source_ref",
         "step1_source_ref_not_found",
+        "step1_remote_source_unavailable",
+        "step1_dirty_local_source_confirmation_required",
     } and action == "continue":
         for request in pending_interaction.get("ref_resolution_requests") or []:
             field = str(request.get("field") or "").strip()

@@ -788,7 +788,12 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(meta["branch"], "a" * 40)
         self.assertEqual(meta["requested_ref"], "current-release")
         self.assertEqual(meta["resolved_ref"], "origin/current-release")
-        ref_call.assert_called_once_with("/same/project", "current-release")
+        ref_call.assert_called_once_with(
+            "/same/project",
+            "current-release",
+            allow_local_source=False,
+            allow_dirty_local_source=False,
+        )
         branch_call.assert_called_once()
         self.assertEqual(branch_call.call_args.args[0], "a" * 40)
         source_call.assert_not_called()
@@ -900,10 +905,32 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 side_effect=fake_collect,
             ):
                 base_deps, base_meta = s1_dep_diff._collect_runtime_deps_for_artifact_input(
-                    str(repo), base_commit, str(repo), side="base"
+                    str(repo),
+                    base_commit,
+                    str(repo),
+                    side="base",
+                    source_resolution={
+                        "status": "resolved",
+                        "source_status": "remote_source_resolved",
+                        "requested_ref": "release-base",
+                        "resolved_ref": "origin/release-base",
+                        "resolved_commit": base_commit,
+                        "resolution_mode": "live_remote",
+                    },
                 )
                 current_deps, current_meta = s1_dep_diff._collect_runtime_deps_for_artifact_input(
-                    str(repo), current_commit, str(repo), side="current"
+                    str(repo),
+                    current_commit,
+                    str(repo),
+                    side="current",
+                    source_resolution={
+                        "status": "resolved",
+                        "source_status": "remote_source_resolved",
+                        "requested_ref": "release-current",
+                        "resolved_ref": "origin/release-current",
+                        "resolved_commit": current_commit,
+                        "resolution_mode": "live_remote",
+                    },
                 )
 
             self.assertEqual(set(base_deps), {"org.example:base-lib"})
