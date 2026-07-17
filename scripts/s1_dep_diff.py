@@ -3541,6 +3541,7 @@ def main():
             'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),
             'build_command': str((meta or {}).get('build_command') or ''),
             'artifact_path': artifact_path,
+            'original_artifact_path': str((meta or {}).get('original_artifact_path') or artifact_path),
             'artifact_sha256': artifact_hash,
             'build_succeeded': bool(artifact_path),
         })

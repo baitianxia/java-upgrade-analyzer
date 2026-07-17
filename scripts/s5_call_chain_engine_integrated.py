@@ -88,6 +88,7 @@ from pipeline_constants import (
 )
 from s5_query_call_chain import write_query_index
 from dependency_source_alignment import align_dependency_source_mappings
+from artifact_alignment import build_artifact_alignment
 
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
@@ -2059,20 +2060,38 @@ def assess_source_artifact_alignment(report_dir, business_source_dirs):
     if not current:
         status = 'unverified'
         reasons.append('build_provenance_missing')
-    elif source_mode == 'provided_artifact':
-        status = 'unverified'
-        reasons.append('direct_artifact_source_revision_unverified')
     elif not expected_revision or not revision:
         status = 'unverified'
         reasons.append('source_revision_unavailable')
-    elif expected_revision != revision:
-        status = 'conflict'
-        reasons.append('source_revision_differs_from_build_revision')
-    elif dirty:
-        status = 'conflict'
-        reasons.append('source_worktree_has_unbuilt_changes')
     else:
-        status = 'aligned'
+        alignment = build_artifact_alignment(
+            git_root,
+            current.get('original_artifact_path') or current.get('artifact_path') or '',
+            target_module=current.get('target_module') or '',
+            build_command=(str(current.get('build_command') or ''),),
+            build_profile=current.get('build_profile') or '',
+            expected_revision=expected_revision,
+            expected_sha256=current.get('artifact_sha256') or '',
+            internally_built=source_mode == 'checkout_build',
+        )
+        reason_map = {
+            'source_revision_mismatch': 'source_revision_differs_from_build_revision',
+            'source_worktree_dirty': 'source_worktree_has_unbuilt_changes',
+            'external_artifact_manifest_missing': 'direct_artifact_source_revision_unverified',
+        }
+        reasons = [reason_map.get(item, item) for item in alignment.reasons]
+        conflict_reasons = {
+            'source_revision_differs_from_build_revision',
+            'source_worktree_has_unbuilt_changes',
+            'artifact_sha256_mismatch',
+            'target_module_mismatch',
+        }
+        if alignment.status == 'aligned':
+            status = 'aligned'
+        elif any(item in conflict_reasons for item in reasons):
+            status = 'conflict'
+        else:
+            status = 'unverified'
     payload = {
         'schema': 'java-upgrade-analyzer.source-artifact-alignment.v1',
         'status': status,
@@ -2085,6 +2104,7 @@ def assess_source_artifact_alignment(report_dir, business_source_dirs):
         'target_module': current.get('target_module', ''),
         'artifact_path': current.get('artifact_path', ''),
         'artifact_sha256': current.get('artifact_sha256', ''),
+        'alignment_record': alignment.to_dict() if current and expected_revision and revision else {},
     }
     alignment_path = _call_chain_dir(report_dir) / 'source_artifact_alignment.json'
     alignment_path.parent.mkdir(parents=True, exist_ok=True)
