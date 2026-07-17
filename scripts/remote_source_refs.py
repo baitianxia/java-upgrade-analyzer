@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Resolve auxiliary source refs from live Git remotes without changing user branches."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+from compat import git_cmd, run_cmd
+
+
+_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_CORE_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
+
+
+def _git(repo_dir, *args, timeout=30):
+    stdout, stderr, rc = run_cmd(
+        git_cmd() + list(args),
+        cwd=str(Path(repo_dir).resolve()),
+        timeout=timeout,
+        env={"GIT_TERMINAL_PROMPT": "0"},
+    )
+    return str(stdout or "").strip(), str(stderr or "").strip(), rc
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _fingerprint(requested_ref, candidates, failures):
+    payload = {
+        "requested_ref": str(requested_ref or "").strip(),
+        "candidates": candidates or [],
+        "failures": failures or [],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _remote_names(repo_dir):
+    stdout, stderr, rc = _git(repo_dir, "remote", timeout=10)
+    if rc != 0:
+        return [], [{"remote": "", "stage": "list_remotes", "reason": stderr or "git remote failed"}]
+    return sorted({line.strip() for line in stdout.splitlines() if line.strip()}), []
+
+
+def query_live_remote_refs(repo_dir, timeout=30):
+    """Return branch/tag facts directly reported by every configured remote."""
+    names, failures = _remote_names(repo_dir)
+    refs = []
+    for remote in names:
+        stdout, stderr, rc = _git(repo_dir, "ls-remote", "--heads", "--tags", remote, timeout=timeout)
+        if rc != 0:
+            failures.append({
+                "remote": remote,
+                "stage": "ls_remote",
+                "reason": stderr or f"git ls-remote exited with {rc}",
+            })
+            continue
+        for raw_line in stdout.splitlines():
+            parts = raw_line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            commit, canonical_ref = parts
+            if canonical_ref.endswith("^{}"):
+                continue
+            if canonical_ref.startswith("refs/heads/"):
+                ref_kind = "branch"
+                short_name = canonical_ref[len("refs/heads/"):]
+            elif canonical_ref.startswith("refs/tags/"):
+                ref_kind = "tag"
+                short_name = canonical_ref[len("refs/tags/"):]
+            else:
+                continue
+            refs.append({
+                "remote": remote,
+                "ref": f"{remote}/{short_name}",
+                "canonical_ref": canonical_ref,
+                "short_name": short_name,
+                "kind": ref_kind,
+                "commit": commit,
+            })
+    refs.sort(key=lambda row: (row["remote"], row["kind"], row["short_name"], row["commit"]))
+    return {"queried_at": _now(), "refs": refs, "failures": failures, "remotes": names}
+
+
+def _version_boundary_score(candidate_name, requested_ref):
+    requested = re.sub(r"(?i)-SNAPSHOT$", "", str(requested_ref or "").strip())
+    match = _CORE_VERSION_RE.search(requested)
+    if not match:
+        return 0
+    version = match.group(0).lower()
+    text = str(candidate_name or "").lower()
+    start = 0
+    while True:
+        index = text.find(version, start)
+        if index < 0:
+            return 0
+        end = index + len(version)
+        start = index + 1
+        previous = text[index - 1] if index else ""
+        following = text[end] if end < len(text) else ""
+        if previous and (previous.isdigit() or previous == "."):
+            continue
+        if following and following not in "-_/.":
+            continue
+        return 120
+
+
+def _matching_remote_candidates(inventory, requested_ref):
+    requested = str(requested_ref or "").strip()
+    if not requested:
+        return []
+    remote_names = set(inventory.get("remotes") or [])
+    explicit_remote = ""
+    explicit_name = requested
+    if "/" in requested:
+        prefix, remainder = requested.split("/", 1)
+        if prefix in remote_names:
+            explicit_remote, explicit_name = prefix, remainder
+    scored = []
+    for candidate in inventory.get("refs") or []:
+        if explicit_remote and candidate["remote"] != explicit_remote:
+            continue
+        if explicit_remote:
+            score = 240 if candidate["short_name"] == explicit_name else 0
+        elif candidate["short_name"] == requested:
+            score = 220
+        else:
+            score = _version_boundary_score(candidate["short_name"], requested)
+        if score:
+            scored.append({**candidate, "score": score})
+    if not scored:
+        return []
+    highest = max(row["score"] for row in scored)
+    return sorted((row for row in scored if row["score"] == highest), key=lambda row: (row["remote"], row["kind"], row["ref"]))
+
+
+def _base_result(status, requested_ref, candidates=None, failures=None, queried_at=""):
+    candidates = list(candidates or [])
+    failures = list(failures or [])
+    return {
+        "status": status,
+        "requested_ref": str(requested_ref or "").strip(),
+        "resolved_ref": "",
+        "resolved_commit": "",
+        "remote": "",
+        "remote_ref": "",
+        "resolution_mode": "unresolved",
+        "candidates": candidates,
+        "failures": failures,
+        "queried_at": queried_at or _now(),
+        "fingerprint": _fingerprint(requested_ref, candidates, failures),
+    }
+
+
+def _materialize_remote_candidate(repo_dir, candidate, timeout=60):
+    stdout, stderr, rc = _git(
+        repo_dir,
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        candidate["remote"],
+        candidate["canonical_ref"],
+        timeout=timeout,
+    )
+    if rc != 0:
+        return "", stderr or stdout or f"git fetch exited with {rc}"
+    stdout, stderr, rc = _git(repo_dir, "rev-parse", "--verify", f"{candidate['commit']}^{{commit}}", timeout=10)
+    if rc != 0 or not stdout:
+        return "", stderr or "fetched object is not a commit"
+    fixed_commit = stdout.splitlines()[-1].strip()
+    if fixed_commit.lower() != candidate["commit"].lower():
+        return "", "remote ref changed while it was being materialized"
+    return fixed_commit, ""
+
+
+def resolve_remote_source_ref(repo_dir, requested_ref, query_timeout=30, fetch_timeout=60):
+    """Resolve a requested ref from live remotes and fetch its immutable commit."""
+    inventory = query_live_remote_refs(repo_dir, timeout=query_timeout)
+    candidates = _matching_remote_candidates(inventory, requested_ref)
+    commits = {row["commit"] for row in candidates}
+    if len(commits) > 1:
+        return _base_result(
+            "remote_source_ambiguous",
+            requested_ref,
+            candidates,
+            inventory["failures"],
+            inventory["queried_at"],
+        )
+    if not candidates:
+        failures = list(inventory["failures"])
+        if not inventory["remotes"]:
+            failures.append({"remote": "", "stage": "resolve", "reason": "repository has no configured remote"})
+        elif not failures:
+            failures.append({"remote": "", "stage": "resolve", "reason": "requested ref was not found on a live remote"})
+        return _base_result("remote_source_unavailable", requested_ref, [], failures, inventory["queried_at"])
+
+    selected = candidates[0]
+    fixed_commit, error = _materialize_remote_candidate(repo_dir, selected, timeout=fetch_timeout)
+    if not fixed_commit:
+        failures = list(inventory["failures"])
+        failures.append({"remote": selected["remote"], "stage": "fetch", "reason": error})
+        return _base_result("remote_source_unavailable", requested_ref, candidates, failures, inventory["queried_at"])
+
+    result = _base_result("remote_source_resolved", requested_ref, candidates, inventory["failures"], inventory["queried_at"])
+    result.update({
+        "resolved_ref": selected["ref"],
+        "resolved_commit": fixed_commit,
+        "remote": selected["remote"],
+        "remote_ref": selected["canonical_ref"],
+        "resolution_mode": "live_remote",
+    })
+    return result
+
+
+def _verify_local_commit(repo_dir, requested_ref):
+    requested = str(requested_ref or "").strip()
+    candidates = []
+    if requested.startswith("refs/"):
+        candidates.append(requested)
+    else:
+        candidates.extend((f"refs/heads/{requested}", f"refs/tags/{requested}"))
+    if requested == "HEAD" or _COMMIT_RE.fullmatch(requested):
+        candidates.append(requested)
+    for candidate in candidates:
+        stdout, _stderr, rc = _git(repo_dir, "rev-parse", "--verify", f"{candidate}^{{commit}}", timeout=10)
+        if rc == 0 and stdout:
+            return stdout.splitlines()[-1].strip()
+    return ""
+
+
+def resolve_local_source_ref(
+    repo_dir,
+    requested_ref,
+    *,
+    allow_local_source=False,
+    allow_dirty_local_source=False,
+):
+    """Resolve a local ref only after explicit confirmation."""
+    commit = _verify_local_commit(repo_dir, requested_ref)
+    stdout, _stderr, rc = _git(repo_dir, "status", "--porcelain", timeout=10)
+    dirty = rc == 0 and bool(stdout.strip())
+    if not allow_local_source:
+        result = _base_result("awaiting_local_source_confirmation", requested_ref)
+        result.update({"local_candidate_commit": commit, "dirty": dirty})
+        return result
+    if not commit:
+        result = _base_result("remote_source_unavailable", requested_ref)
+        result.update({"dirty": dirty, "failures": [{"stage": "local_resolve", "reason": "confirmed local ref was not found"}]})
+        return result
+    if dirty and not allow_dirty_local_source:
+        result = _base_result("awaiting_dirty_local_source_confirmation", requested_ref)
+        result.update({"local_candidate_commit": commit, "dirty": True})
+        return result
+    result = _base_result("user_confirmed_local_source", requested_ref)
+    result.update({
+        "resolved_ref": str(requested_ref or "").strip(),
+        "resolved_commit": commit,
+        "resolution_mode": "user_confirmed_local_source",
+        "dirty": dirty,
+    })
+    return result
+
+
+__all__ = [
+    "query_live_remote_refs",
+    "resolve_local_source_ref",
+    "resolve_remote_source_ref",
+]
