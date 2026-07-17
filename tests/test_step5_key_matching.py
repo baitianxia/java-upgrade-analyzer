@@ -1346,7 +1346,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
             tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
             graph_stats = {}
             ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
-            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+            with Path(ledger_path).open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
 
         bridge = next(row for row in rows if row["caller_owner"] == "com.vendor.InternalBridge")
@@ -1753,7 +1753,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
             graph_stats = {}
             ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
 
-            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+            with Path(ledger_path).open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
 
         self.assertEqual(len(rows), 4)
@@ -1888,7 +1888,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
             tracer.record_analyzer_edge(graph, api_row, edge)
             graph_stats = {}
             ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
-            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+            with Path(ledger_path).open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
 
         self.assertEqual([row["instruction_offset"] for row in rows], ["0"])
@@ -2376,7 +2376,7 @@ BootstrapMethods:
             self.assertEqual(bytecode_scan.get("duplicate_class_scans", 0), 0)
             graph_stats = {}
             ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
-            with Path(ledger_path).open(encoding="utf-8", newline="") as handle:
+            with Path(ledger_path).open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
 
         row = next(item for item in rows if item["caller_owner"] == "app.Service")
@@ -9243,7 +9243,7 @@ public class com.example.TargetBridge {
                 Path(timing_path),
                 output_dir / ".runtime/observability/step5_timing.csv",
             )
-            with Path(timing_path).open(encoding="utf-8") as f:
+            with Path(timing_path).open(encoding="utf-8-sig") as f:
                 rows = list(csv.DictReader(f))
 
         values = {(row["section"], row["metric"]): row["value"] for row in rows}
@@ -9809,7 +9809,7 @@ public class com.example.TargetBridge {
             )
 
             formatter.generate_alerts_csv([result], output)
-            with output.open(encoding="utf-8") as handle:
+            with output.open(encoding="utf-8-sig") as handle:
                 rows = list(csv.DictReader(handle))
             original_path_ids = [row["path_id"] for row in rows]
             result.path_details[0]["evidence"][0]["file"] = "/different/run/a.jar"
@@ -10217,7 +10217,7 @@ public class com.example.TargetBridge {
                 verification_commands=[], hops=[], confidence_score=0.0, critical_nodes_hit=[],
             )
             formatter.generate_alerts_csv([result], output)
-            with output.open(encoding="utf-8") as handle:
+            with output.open(encoding="utf-8-sig") as handle:
                 rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 1)
         self.assertEqual("未发现静态调用路径", rows[0]["conclusion"])

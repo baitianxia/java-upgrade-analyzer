@@ -985,7 +985,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
             self.assertTrue(alerts_path.exists())
             self.assertTrue(summary_path.exists())
             summary_text = summary_path.read_text(encoding="utf-8")
-            with alerts_path.open("r", encoding="utf-8", newline="") as f:
+            with alerts_path.open("r", encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.DictReader(f))
 
         self.assertIn("一、先看什么", summary_text)

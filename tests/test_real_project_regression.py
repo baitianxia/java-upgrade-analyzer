@@ -1138,7 +1138,7 @@ class RealProjectRegressionTest(unittest.TestCase):
             paths = realreg.write_topology_coverage(report_dir, coverage)
 
             payload = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
-            with Path(paths["csv"]).open(encoding="utf-8") as handle:
+            with Path(paths["csv"]).open(encoding="utf-8-sig") as handle:
                 rows = list(csv.DictReader(handle))
         self.assertEqual(payload["missing"], ["spi"])
         self.assertEqual(
@@ -4745,7 +4745,7 @@ class RealProjectRegressionTests(unittest.TestCase):
             realreg.write_pinned_final_artifact_provenance(report_dir, asset_gate, case)
 
             with (report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv").open(
-                newline="", encoding="utf-8"
+                newline="", encoding="utf-8-sig"
             ) as handle:
                 rows = list(csv.DictReader(handle))
 
@@ -4822,7 +4822,7 @@ class RealProjectRegressionTests(unittest.TestCase):
             realreg.write_pinned_final_artifact_provenance(report_dir, asset_gate, case)
 
             with (report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv").open(
-                newline="", encoding="utf-8"
+                newline="", encoding="utf-8-sig"
             ) as handle:
                 rows = list(csv.DictReader(handle))
             context = json.loads(

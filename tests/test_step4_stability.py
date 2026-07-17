@@ -335,7 +335,7 @@ class Step4StabilityTest(unittest.TestCase):
             )
 
             summary_text = Path(summary_path).read_text(encoding="utf-8")
-            with Path(alerts_path).open(encoding="utf-8") as f:
+            with Path(alerts_path).open(encoding="utf-8-sig") as f:
                 alert_rows = list(csv.DictReader(f))
 
         self.assertIn("Step4 依赖 API 变化摘要", summary_text)
@@ -1432,7 +1432,7 @@ class Step4StabilityTest(unittest.TestCase):
             pending = json.loads((output_dir / "git_ref_pending.json").read_text(encoding="utf-8"))
             matches = json.loads((output_dir / "git_ref_matches.json").read_text(encoding="utf-8"))
             summary_text = (output_dir / "summary.txt").read_text(encoding="utf-8")
-            with (report_dir / ".runtime/observability" / step4.STEP4_TIMING_FILE).open(encoding="utf-8") as fh:
+            with (report_dir / ".runtime/observability" / step4.STEP4_TIMING_FILE).open(encoding="utf-8-sig") as fh:
                 timing_rows = list(csv.DictReader(fh))
 
         self.assertEqual(exit_code, 2)
@@ -1479,7 +1479,7 @@ class Step4StabilityTest(unittest.TestCase):
 
             timing_path = report_dir / ".runtime/observability" / step4.STEP4_TIMING_FILE
             timing_exists = timing_path.exists()
-            with timing_path.open(encoding="utf-8") as fh:
+            with timing_path.open(encoding="utf-8-sig") as fh:
                 timing_rows = list(csv.DictReader(fh))
 
         phases = {row["phase"] for row in timing_rows}

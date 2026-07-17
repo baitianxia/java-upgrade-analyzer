@@ -136,7 +136,7 @@ class Step3FinalArtifactDependencyScansTest(unittest.TestCase):
                 )
 
             self.assertEqual(risk_count, 0)
-            with output.open(encoding="utf-8", newline="") as handle:
+            with output.open(encoding="utf-8-sig", newline="") as handle:
                 reader = csv.DictReader(handle)
                 rows = list(reader)
                 self.assertEqual(reader.fieldnames, CLASSFILE_HEADERS)
@@ -170,7 +170,7 @@ class Step3FinalArtifactDependencyScansTest(unittest.TestCase):
 
             s3_scan.scan_dependency_classfile_versions([], str(output), str(current_path))
 
-            with output.open(encoding="utf-8", newline="") as handle:
+            with output.open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["依赖坐标"], "未解析")

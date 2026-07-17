@@ -121,7 +121,7 @@ class Step3CandidateOutputsTest(unittest.TestCase):
             self.assertEqual(summary["step3"]["bucket_counts"], {"system_source": 1})
             self.assertTrue(summary["artifacts"]["candidate_hits_csv"].endswith("candidate_hits.csv"))
 
-            with aggregate_path.open(encoding="utf-8", newline="") as f:
+            with aggregate_path.open(encoding="utf-8-sig", newline="") as f:
                 aggregate_rows = list(csv.DictReader(f))
             self.assertEqual(len(aggregate_rows), 1)
             self.assertEqual(aggregate_rows[0]["coord"], "sample:demo")

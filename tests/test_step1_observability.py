@@ -123,7 +123,7 @@ class Step1ObservabilityTest(unittest.TestCase):
                 json.loads(line)
                 for line in observer.progress_path.read_text(encoding="utf-8").splitlines()
             ]
-            with observer.timing_path.open(encoding="utf-8", newline="") as handle:
+            with observer.timing_path.open(encoding="utf-8-sig", newline="") as handle:
                 timing_rows_before_finish = list(csv.DictReader(handle))
 
             self.assertEqual(progress_rows[-1]["status"], "running")
@@ -133,7 +133,7 @@ class Step1ObservabilityTest(unittest.TestCase):
 
             observer.finish_phase(token, status="completed", message="基准侧构建完成")
 
-            with observer.timing_path.open(encoding="utf-8", newline="") as handle:
+            with observer.timing_path.open(encoding="utf-8-sig", newline="") as handle:
                 timing_rows = list(csv.DictReader(handle))
             self.assertEqual(len(timing_rows), 1)
             self.assertEqual(timing_rows[0]["phase"], "maven_package")
@@ -155,7 +155,7 @@ class Step1ObservabilityTest(unittest.TestCase):
             with observer.phase("artifact_parse"):
                 pass
 
-            with observer.timing_path.open(encoding="utf-8", newline="") as handle:
+            with observer.timing_path.open(encoding="utf-8-sig", newline="") as handle:
                 row = list(csv.DictReader(handle))[0]
 
         self.assertEqual(row["cache_hits"], "2")
@@ -171,7 +171,7 @@ class Step1ObservabilityTest(unittest.TestCase):
             with observer.phase("artifact_parse"):
                 pass
 
-            with observer.timing_path.open(encoding="utf-8", newline="") as handle:
+            with observer.timing_path.open(encoding="utf-8-sig", newline="") as handle:
                 row = list(csv.DictReader(handle))[0]
 
         self.assertIn("archive_bytes", step1_observability.TIMING_FIELDS)
@@ -216,7 +216,7 @@ class Step1ObservabilityTest(unittest.TestCase):
                 )
 
             self.assertTrue(calls[0][1]["stream_output"])
-            with observer.timing_path.open(encoding="utf-8", newline="") as handle:
+            with observer.timing_path.open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertTrue(any(
                 row["phase"] == "maven_package"
@@ -242,7 +242,7 @@ class Step1ObservabilityTest(unittest.TestCase):
                 json.loads(line)
                 for line in observer.progress_path.read_text(encoding="utf-8").splitlines()
             ]
-            with observer.timing_path.open(encoding="utf-8", newline="") as handle:
+            with observer.timing_path.open(encoding="utf-8-sig", newline="") as handle:
                 timing = list(csv.DictReader(handle))
             self.assertEqual(progress[-1]["status"], "failed")
             self.assertEqual(timing[-1]["status"], "failed")
