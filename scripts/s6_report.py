@@ -19,6 +19,7 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
+from csv_io import open_csv_read
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -259,7 +260,7 @@ def load_csv(path, *, diagnostics=None, artifact=""):
         return []
     rows = []
     try:
-        with open_text(path) as f:
+        with open_csv_read(path) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 if row:
@@ -276,7 +277,7 @@ def iter_csv_rows(path, *, diagnostics=None, artifact=""):
     if not os.path.exists(path):
         return
     try:
-        with open_text(path) as f:
+        with open_csv_read(path) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 if row:
@@ -760,7 +761,7 @@ def write_changed_api_split_artifacts(report_dir):
             pass
 
     try:
-        source = source_path.open(encoding="utf-8-sig", newline="")
+        source = open_csv_read(source_path)
     except OSError:
         return artifacts
 

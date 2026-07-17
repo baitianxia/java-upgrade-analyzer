@@ -32,6 +32,7 @@ import json
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
+from csv_io import open_csv_read
 from progress_logging import PhaseTimer, emit_progress
 from pipeline_constants import (
     EVIDENCE_CONTEXT_DIRNAME,
@@ -271,7 +272,7 @@ def load_dep_changes(csv_path):
     if not csv_path or not os.path.exists(csv_path):
         return rows
     try:
-        with open_text(csv_path) as f:
+        with open_csv_read(csv_path) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 if not row:
@@ -309,7 +310,7 @@ def load_current_deps(csv_path):
     if not csv_path or not os.path.exists(csv_path):
         return deps
     try:
-        with open_text(csv_path) as f:
+        with open_csv_read(csv_path) as f:
             reader = csv.DictReader(f)
             fieldnames = set(reader.fieldnames or [])
             is_dep_changes = 'new_version' in fieldnames
@@ -827,7 +828,7 @@ def load_csv_rows(path):
     if not path or not os.path.exists(path):
         return rows
     try:
-        with open_text(path) as f:
+        with open_csv_read(path) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 if row:

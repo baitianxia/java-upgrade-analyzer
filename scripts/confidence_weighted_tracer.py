@@ -34,6 +34,7 @@ from pathlib import Path
 from threading import Event, Lock
 
 from compat import run_cmd
+from csv_io import open_csv_read
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import (
@@ -1537,7 +1538,7 @@ def _build_identical_current_class_provider_index(all_apis, graph):
     old_jars = {}
     try:
         import csv
-        with open(dep_changes_path, newline='', encoding='utf-8-sig') as handle:
+        with open_csv_read(dep_changes_path) as handle:
             for row in csv.DictReader(handle):
                 coord = str(row.get('coord') or '').strip()
                 entry = str(row.get('base_lib_entry') or '').strip()

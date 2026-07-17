@@ -36,6 +36,7 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
+from csv_io import open_csv_read
 from exhaustive_api_oracle import (
     audit_api_oracle,
     load_analyzer_rows,
@@ -2056,7 +2057,7 @@ def collect_alert_files(
     if not alerts_csv.exists():
         return set()
     files: set[str] = set()
-    with alerts_csv.open(newline="", encoding="utf-8") as fh:
+    with open_csv_read(alerts_csv) as fh:
         for row in csv.DictReader(fh):
             if _api_identity_from_alert_row(row)[0] != symbol:
                 continue
@@ -2079,7 +2080,7 @@ def collect_alert_files(
 def _csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     if not path.exists():
         return [], []
-    with path.open(newline="", encoding="utf-8") as fh:
+    with open_csv_read(path) as fh:
         reader = csv.DictReader(fh)
         return list(reader.fieldnames or []), list(reader)
 
@@ -4912,7 +4913,7 @@ def select_step4_changed_apis(step4_all_changed_apis: Path, selected_names: Iter
             "selected_rows": 0,
             "missing_api_names": sorted(selected_set),
         }
-    with step4_all_changed_apis.open(newline="", encoding="utf-8") as fh:
+    with open_csv_read(step4_all_changed_apis) as fh:
         reader = csv.DictReader(fh)
         fields = list(reader.fieldnames or [])
         rows = list(reader)

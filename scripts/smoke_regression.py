@@ -26,6 +26,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd as compat_run_cmd, open_text, git_cmd
+from csv_io import open_csv_read
 from confidence_weighted_tracer import (
     build_api_target_keys,
     build_api_identity_key,
@@ -122,7 +123,7 @@ def run_script_with_rc(script_name, args, cwd=None, env=None):
 
 
 def read_csv(path):
-    with open_text(path) as f:
+    with open_csv_read(path) as f:
         return list(csv.DictReader(f))
 
 

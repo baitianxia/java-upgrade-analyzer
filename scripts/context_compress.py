@@ -29,6 +29,7 @@ from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text
+from csv_io import open_csv_read
 from pipeline_constants import STEP_SEQUENCE, STEP_TO_MAJOR
 
 
@@ -74,7 +75,7 @@ def summarize_step1(report_dir):
     total, major_upgraded, minor_upgraded, downgraded, added, removed = 0, 0, 0, 0, 0, 0
     high_risk = []
 
-    with open_text(csv_path) as f:
+    with open_csv_read(csv_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
             total += 1
@@ -174,7 +175,7 @@ def summarize_step4(report_dir):
     jar_dir = f"{report_dir}/evidence/api_changes"
     jar_missing = []
 
-    with open_text(csv_path) as f:
+    with open_csv_read(csv_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
             sev = row.get('severity', 'P2')

@@ -20,6 +20,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_INDEXES_DIRNAME, STEP5_QUERY_INDEX_FILE
+from csv_io import open_csv_read
 from signature_utils import normalize_signature_for_lookup
 
 
@@ -368,7 +369,7 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
     target_prefixes = _target_match_prefixes(method)
     chains = []
     seen = set()
-    with alerts_path.open(newline="", encoding="utf-8") as fh:
+    with open_csv_read(alerts_path) as fh:
         for row in csv.DictReader(fh):
             if _clean(row.get("path_status")) and _clean(row.get("path_status")) != "reachable":
                 continue

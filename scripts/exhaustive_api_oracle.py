@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 import csv
 from pathlib import Path
 
+from csv_io import open_csv_read
 from signature_utils import canonical_api_identity
 
 
@@ -54,7 +55,7 @@ def load_analyzer_rows(summary: dict) -> list[dict]:
 def load_oracle_manifest(path: Path | None) -> list[dict]:
     if path is None or not path.is_file():
         return []
-    with path.open(encoding="utf-8-sig", newline="") as fh:
+    with open_csv_read(path) as fh:
         return list(csv.DictReader(fh))
 
 

@@ -12,6 +12,7 @@ import safe_xml as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
+from csv_io import open_csv_read
 from pipeline_constants import STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
 
 
@@ -328,7 +329,7 @@ def build_provenance(project_dir, side, ref, module, build_command, artifact_pat
 def _csv_rows(path):
     if not Path(path).is_file():
         return []
-    with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+    with open_csv_read(path) as handle:
         return list(csv.DictReader(handle))
 
 

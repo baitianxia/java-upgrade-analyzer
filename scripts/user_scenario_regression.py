@@ -35,6 +35,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import s4_jar_compare as step4  # noqa: E402
+from csv_io import open_csv_read  # noqa: E402
 
 
 CHANGED_API_FIELDS = [
@@ -126,7 +127,7 @@ def _write_changed_apis(path: Path, rows: list[dict[str, str]]) -> None:
 def _read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
-    with path.open(newline="", encoding="utf-8") as fh:
+    with open_csv_read(path) as fh:
         return list(csv.DictReader(fh))
 
 

@@ -24,6 +24,7 @@ from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, git_cmd, mvn_cmd
+from csv_io import open_csv_read
 
 
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -60,7 +61,7 @@ def load_dep_changes(csv_path):
         sys.exit(1)
 
     deps = {}
-    with open_text(csv_path) as f:
+    with open_csv_read(csv_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
             if not row:

@@ -57,6 +57,7 @@ from confidence_weighted_tracer import (
 )
 from enhanced_output_formatter import generate_enhanced_summary, register_step5_summary_artifacts
 from compat import run_cmd
+from csv_io import open_csv_read
 from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_batch
 from indirect_usage_analyzer import (
@@ -1797,7 +1798,7 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
     if not os.path.exists(current_resolved_path):
         return catalog
 
-    with open(current_resolved_path, 'r', encoding='utf-8', errors='replace') as f:
+    with open_csv_read(current_resolved_path) as f:
         rows = list(csv.DictReader(f))
 
     artifact_path = ''
@@ -2434,7 +2435,7 @@ def load_changed_apis(csv_path, jdk_scan_dir=""):
     """加载变更API列表"""
     rows = []
 
-    with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
+    with open_csv_read(csv_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append(dict(row))
@@ -3825,7 +3826,7 @@ def check_if_needs_bridge_sources(all_apis_path, report_dir, source_dirs=None, b
     # Collect all changed API coords and their api_names
     changed_apis = []
     try:
-        with open(all_apis_path, 'r', encoding='utf-8') as f:
+        with open_csv_read(all_apis_path) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 coord = row.get('coord', '')
@@ -3901,7 +3902,7 @@ def check_apis_that_need_bridge(
     if isinstance(all_apis_input, str):
         import csv
         try:
-            with open(all_apis_input, 'r', encoding='utf-8') as f:
+            with open_csv_read(all_apis_input) as f:
                 all_apis = list(csv.DictReader(f))
         except (OSError, UnicodeError, csv.Error) as e:
             print(f"Error checking APIs: {e}", file=sys.stderr)

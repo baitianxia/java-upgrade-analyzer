@@ -16,6 +16,7 @@ from pipeline_constants import (
     RUNTIME_DIRNAME,
 )
 from analysis_contract import sha256_file
+from csv_io import open_csv_read
 GATES = list(GATE_SEQUENCE)
 
 def python_cmds():
@@ -78,7 +79,7 @@ def coverage_path(report_dir):
 
 def read_csv_dicts(path, required_headers):
     try:
-        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        with open_csv_read(path) as f:
             reader = csv.DictReader(f)
             headers = reader.fieldnames or []
             missing = [h for h in required_headers if h not in headers]

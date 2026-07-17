@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from compat import infer_maven_coords, open_text, resolve_repo_input_path, run_cmd
 from compat import git_cmd
+from csv_io import open_csv_read
 from auto_discover_bridge_sources import discover_bridge_source_mappings
 from analysis_contract import build_project_scope, discover_maven_modules, write_coverage_report
 from pipeline_constants import (
@@ -349,7 +350,7 @@ def read_csv_rows(path):
     path = Path(path)
     if not path.exists():
         return []
-    with open_text(path) as f:
+    with open_csv_read(path) as f:
         reader = csv.DictReader(f)
         return [{k: (v or "").strip() for k, v in row.items()} for row in reader if row]
 

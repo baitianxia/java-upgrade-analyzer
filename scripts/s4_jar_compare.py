@@ -38,6 +38,7 @@ from compat import (
     run_cmd, write_text, open_text, mvn_cmd, git_cmd, maven_repo_dir,
     infer_maven_coord_locations,
 )
+from csv_io import open_csv_read
 
 sys.path.insert(0, os.path.dirname(__file__))
 from s4_contract import (
@@ -392,7 +393,7 @@ def load_json(path):
 def load_csv(path):
     if not os.path.exists(path): return []
     rows = []
-    with open_text(path) as f:
+    with open_csv_read(path) as f:
         reader = csv.DictReader(f)
         for row in reader:
             first_value = next(iter(row.values()), "") if row else ""
