@@ -719,7 +719,12 @@ class EnhancedRegexAnalyzer:
     def _detect_package(self, lines):
         """提取包名"""
         for line in lines[:40]:
-            m = re.match(r"^\s*package\s+([A-Za-z_][\w.]*)\s*;", line)
+            pattern = (
+                r"^\s*package\s+([A-Za-z_][\w.]*)\s*$"
+                if self.language == "kotlin"
+                else r"^\s*package\s+([A-Za-z_][\w.]*)\s*;"
+            )
+            m = re.match(pattern, line)
             if m:
                 return m.group(1)
         return ""
@@ -731,6 +736,19 @@ class EnhancedRegexAnalyzer:
         wildcard_imports = []
 
         for line in lines[:200]:
+            if self.language == "kotlin":
+                kotlin_import = re.match(
+                    r"^\s*import\s+([A-Za-z_][\w.]*(?:\.\*)?)"
+                    r"(?:\s+as\s+([A-Za-z_]\w*))?\s*$",
+                    line,
+                )
+                if kotlin_import:
+                    fqcn, alias = kotlin_import.groups()
+                    if fqcn.endswith(".*"):
+                        wildcard_imports.append(fqcn[:-2])
+                    else:
+                        imports[alias or fqcn.rsplit('.', 1)[-1]] = fqcn
+                    continue
             # 静态导入
             static_m = re.match(r"^\s*import\s+static\s+([A-Za-z_][\w.]*)\s*;", line)
             if static_m:
@@ -1064,7 +1082,25 @@ class EnhancedRegexAnalyzer:
             return {}
 
         param_types = {}
-        params = [p.strip() for p in params_part.split(',') if p.strip()]
+        params = split_signature_params(f"({params_part})") or []
+
+        if self.language == "kotlin":
+            for declaration in params:
+                declaration = declaration.split('=', 1)[0].strip()
+                declaration = re.sub(
+                    r'^(?:(?:crossinline|noinline|vararg)\s+|@\w+(?:\([^)]*\))?\s*)+',
+                    '',
+                    declaration,
+                )
+                if ':' not in declaration:
+                    continue
+                name, raw_type = declaration.split(':', 1)
+                name = name.strip()
+                raw_type = raw_type.strip().removesuffix('?').strip()
+                resolved_type = self._resolve_type(raw_type)
+                if name and resolved_type:
+                    param_types[name] = resolved_type
+            return param_types
 
         for param in params:
             # 分离类型和参数名

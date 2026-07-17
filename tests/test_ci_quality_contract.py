@@ -38,6 +38,17 @@ class CiQualityContractTest(unittest.TestCase):
         self.assertIn("--continue-on-failure", text)
         self.assertIn("--json-out", text)
 
+    def test_release_workflow_runs_artifact_matrix_on_multiple_jdks(self):
+        text = (ROOT / ".github/workflows/release-regression.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("artifact-topology-matrix:", text)
+        self.assertIn("java: [\"11\", \"17\", \"21\"]", text)
+        self.assertIn("java-version: ${{ matrix.java }}", text)
+        self.assertIn("tests.test_runtime_topology_matrix", text)
+        self.assertIn("tests.test_artifact_bytecode_catalog", text)
+
     def test_required_tools_report_every_missing_executable(self):
         with patch.object(quality_gate.shutil, "which", return_value=None):
             missing = quality_gate.validate_required_tools(
