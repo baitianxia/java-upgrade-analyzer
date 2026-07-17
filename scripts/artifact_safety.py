@@ -127,3 +127,11 @@ def inspect_archive(path, **limits):
             max_observed_depth=0,
         )
     return _inspect_archive_source(archive_path, **limits)
+
+
+def require_safe_archive(path, **limits):
+    result = inspect_archive(path, **limits)
+    if not result.safe:
+        evidence = result.details or result.reason_codes
+        raise ValueError("artifact_safety_violation:" + ",".join(evidence))
+    return result

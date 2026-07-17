@@ -67,6 +67,7 @@ from signature_utils import normalize_signature_for_lookup
 from data_contract_analysis import compare_jar_data_contracts
 from step1_observability import peak_rss_mb
 from analysis_contract import sha256_file
+from artifact_safety import require_safe_archive
 from remote_source_refs import (
     materialize_remote_source_candidate,
     query_live_remote_refs,
@@ -676,6 +677,7 @@ class Step1ArtifactJarResolver:
         artifact = Path(artifact_path)
         target = self.cache_dir / side / _safe_artifact_entry_filename(lib_entry)
         try:
+            require_safe_archive(artifact)
             with zipfile.ZipFile(artifact) as zf:
                 names = set(zf.namelist())
                 if lib_entry not in names:
@@ -694,7 +696,7 @@ class Step1ArtifactJarResolver:
                 if not target.exists() or target.stat().st_size != info.file_size:
                     with zf.open(info) as src, open(target, "wb") as dst:
                         shutil.copyfileobj(src, dst)
-        except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        except (OSError, ValueError, zipfile.BadZipFile, KeyError) as exc:
             self._entry_failures[key] = {
                 "source": "step1_final_artifact",
                 "side": side,
@@ -1667,6 +1669,7 @@ def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, pl
 
 def _jar_class_hash_map(jar_path: str) -> dict:
     m = {}
+    require_safe_archive(jar_path)
     with zipfile.ZipFile(jar_path) as zf:
         for entry in zf.namelist():
             if not entry.endswith(".class"):
@@ -1742,6 +1745,7 @@ def collect_data_contract_changes(
 
 
 def _iter_jar_class_entries(jar_path):
+    require_safe_archive(jar_path)
     with zipfile.ZipFile(jar_path) as zf:
         for entry in sorted(zf.namelist()):
             if not entry.endswith('.class') or entry.startswith('META-INF/'):
@@ -1771,6 +1775,7 @@ def _write_runtime_provider_set_jar(paths):
     seen = set()
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as target:
         for path in normalized:
+            require_safe_archive(path)
             with zipfile.ZipFile(path) as source:
                 for name in sorted(source.namelist()):
                     if not name.endswith('.class') or name.startswith('META-INF/') or name in seen:

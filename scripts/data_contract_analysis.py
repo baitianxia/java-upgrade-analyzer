@@ -15,6 +15,7 @@ from business_bytecode_graph import (
     _parse_classfile_constant_pool,
     _skip_attributes,
 )
+from artifact_safety import require_safe_archive
 
 
 ACC_STATIC = 0x0008
@@ -175,6 +176,8 @@ def compare_jar_data_contracts(
     conditional system runtime entry.
     """
     rows: list[dict] = []
+    require_safe_archive(old_jar)
+    require_safe_archive(new_jar)
     with zipfile.ZipFile(old_jar) as old_archive, zipfile.ZipFile(new_jar) as new_archive:
         old_entries = _effective_class_entries(old_archive, target_java_version)
         new_entries = _effective_class_entries(new_archive, target_java_version)

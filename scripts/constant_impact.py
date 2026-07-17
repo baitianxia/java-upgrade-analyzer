@@ -25,7 +25,7 @@ def classify_constant_impact(
     runtime_field_edge_present, source_artifact_aligned,
 ):
     if not source_artifact_aligned:
-        compile_impact = runtime_impact = "unverified"
+        compile_impact = "unverified"
     else:
         normalized = str(change_type or "").upper()
         if not source_reference_present:
@@ -37,16 +37,19 @@ def classify_constant_impact(
         else:
             compile_impact = "recompile_review_required"
 
-        if runtime_field_edge_present:
-            runtime_impact = "runtime_link_present"
-        elif old_field_has_constant_value and source_reference_present:
-            runtime_impact = (
-                "inlined_old_value"
-                if normalized == "CONSTANT_VALUE_CHANGED"
-                else "inlined_no_link"
-            )
-        else:
-            runtime_impact = "runtime_link_absent"
+    normalized = str(change_type or "").upper()
+    if runtime_field_edge_present:
+        runtime_impact = "runtime_link_present"
+    elif not source_artifact_aligned:
+        runtime_impact = "unverified"
+    elif old_field_has_constant_value and source_reference_present:
+        runtime_impact = (
+            "inlined_old_value"
+            if normalized == "CONSTANT_VALUE_CHANGED"
+            else "inlined_no_link"
+        )
+    else:
+        runtime_impact = "runtime_link_absent"
 
     return ConstantImpact(
         compile_impact=compile_impact,

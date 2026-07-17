@@ -18,6 +18,8 @@ if str(SCRIPTS) not in sys.path:
 
 import artifact_safety  # noqa: E402
 import confidence_weighted_tracer as tracer  # noqa: E402
+import data_contract_analysis  # noqa: E402
+import s4_jar_compare  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
 
 
@@ -153,6 +155,33 @@ class ArtifactSafetyTest(unittest.TestCase):
             "ARCHIVE_ENTRY_PATH_UNSAFE" in failure
             for failure in result["failures"]
         ), result["failures"])
+
+    def test_step4_class_hash_scan_rejects_unsafe_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "unsafe.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("../Escaped.class", b"class")
+
+            with self.assertRaisesRegex(ValueError, "ARCHIVE_ENTRY_PATH_UNSAFE"):
+                s4_jar_compare._jar_class_hash_map(str(artifact))
+
+    def test_data_contract_scan_rejects_unsafe_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unsafe = Path(tmp) / "unsafe.jar"
+            safe = Path(tmp) / "safe.jar"
+            with zipfile.ZipFile(unsafe, "w") as archive:
+                archive.writestr("../Escaped.class", b"class")
+            with zipfile.ZipFile(safe, "w"):
+                pass
+
+            with self.assertRaisesRegex(ValueError, "ARCHIVE_ENTRY_PATH_UNSAFE"):
+                data_contract_analysis.compare_jar_data_contracts(
+                    unsafe,
+                    safe,
+                    coord="sample:api",
+                    old_version="1",
+                    new_version="2",
+                )
 
 
 if __name__ == "__main__":

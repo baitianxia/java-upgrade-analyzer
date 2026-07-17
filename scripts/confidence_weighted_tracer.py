@@ -1858,6 +1858,49 @@ def _is_inlined_constant_change(api_row):
     )
 
 
+def _evidence_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _apply_constant_impact(
+    result, api_row, graph, *, runtime_field_edge_present, source_reference_present=None
+):
+    if not _is_inlined_constant_change(api_row):
+        return result
+    if source_reference_present is None:
+        source_reference_present = any(
+            str(edge.get('evidence_type') or '') in {
+                'field_access', 'static_import_field', 'source_reference'
+            }
+            for path in (result.evidence_paths or [])
+            for edge in (path or [])
+        )
+    source_artifact_aligned = (
+        str((getattr(graph, 'source_artifact_alignment', {}) or {}).get('status') or '')
+        == 'aligned'
+    )
+    old_evidence_present = 'old_field_has_constant_value' in (api_row or {})
+    impact = classify_constant_impact(
+        change_type=(api_row or {}).get('change_type') or result.change_type,
+        old_field_has_constant_value=_evidence_bool(
+            (api_row or {}).get('old_field_has_constant_value')
+        ),
+        source_reference_present=bool(source_reference_present),
+        runtime_field_edge_present=bool(runtime_field_edge_present),
+        source_artifact_aligned=source_artifact_aligned,
+    ).to_dict()
+    if not runtime_field_edge_present and not old_evidence_present:
+        impact['runtime_link_impact'] = 'unverified'
+    result.compile_impact = impact.pop('compile_impact')
+    result.runtime_link_impact = impact.pop('runtime_link_impact')
+    result.constant_impact_evidence = impact
+    return result
+
+
 def _build_inlined_constant_result(result, api_row=None, graph=None):
     note = (
         '编译期常量值已变化，但调用方 class 可能只保留内联旧值而没有字段访问指令；'
@@ -1867,34 +1910,9 @@ def _build_inlined_constant_result(result, api_row=None, graph=None):
         '搜索业务及依赖源码中的常量字段引用，并执行覆盖该常量语义的回归测试',
         '必要时比较调用方 class 常量池与 old/new 常量值，但不要仅凭字面量命中确认调用关系',
     ]
-    api_row = dict(api_row or {})
-    source_reference_present = any(
-        str(edge.get('evidence_type') or '') in {
-            'field_access', 'static_import_field', 'source_reference'
-        }
-        for path in (result.evidence_paths or [])
-        for edge in (path or [])
+    _apply_constant_impact(
+        result, dict(api_row or {}), graph, runtime_field_edge_present=False
     )
-    source_artifact_aligned = (
-        str((getattr(graph, 'source_artifact_alignment', {}) or {}).get('status') or '')
-        == 'aligned'
-    )
-    evidence_complete = bool(
-        'old_field_has_constant_value' in api_row
-        and source_reference_present
-        and source_artifact_aligned
-    )
-    old_constant = api_row.get('old_field_has_constant_value') is True
-    impact = classify_constant_impact(
-        change_type=api_row.get('change_type') or result.change_type,
-        old_field_has_constant_value=old_constant,
-        source_reference_present=source_reference_present,
-        runtime_field_edge_present=False,
-        source_artifact_aligned=source_artifact_aligned if evidence_complete else False,
-    ).to_dict()
-    result.compile_impact = impact.pop('compile_impact')
-    result.runtime_link_impact = impact.pop('runtime_link_impact')
-    result.constant_impact_evidence = impact
     reason_code = 'INLINED_CONSTANT_USAGE_UNDETECTABLE'
     _downgrade_reachable_path_details(result, 'uncertain', reason_code)
     result.envelope_paths = tuple(
@@ -6668,6 +6686,12 @@ def _collect_trace_api_with_confidence_weighting(
                 for item in scan_hits
             ):
                 packaged_dependency_result = _build_packaged_dependency_hit_result(result, scan_hits, graph)
+                _apply_constant_impact(
+                    packaged_dependency_result,
+                    api_row,
+                    graph,
+                    runtime_field_edge_present=True,
+                )
                 _debug_trace_result('trace_api_result', packaged_dependency_result)
                 return packaged_dependency_result
             artifact_dependency_hits = scan_hits

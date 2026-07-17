@@ -2691,12 +2691,16 @@ class Step4StabilityTest(unittest.TestCase):
             current_artifact = report_dir / "current-app.jar"
             base_entry = "BOOT-INF/lib/demo-1.0.0.jar"
             current_entry = "BOOT-INF/lib/demo-2.0.0.jar"
+            nested_jar = io.BytesIO()
+            with zipfile.ZipFile(nested_jar, "w") as zf:
+                zf.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+            nested_jar_bytes = nested_jar.getvalue()
             with zipfile.ZipFile(base_artifact, "w") as zf:
-                zf.writestr(base_entry, b"base demo jar")
-                zf.writestr("BOOT-INF/lib/stable-1.0.0.jar", b"stable jar")
+                zf.writestr(base_entry, nested_jar_bytes)
+                zf.writestr("BOOT-INF/lib/stable-1.0.0.jar", nested_jar_bytes)
             with zipfile.ZipFile(current_artifact, "w") as zf:
-                zf.writestr(current_entry, b"current demo jar")
-                zf.writestr("BOOT-INF/lib/stable-1.0.0.jar", b"stable jar")
+                zf.writestr(current_entry, nested_jar_bytes)
+                zf.writestr("BOOT-INF/lib/stable-1.0.0.jar", nested_jar_bytes)
             dependencies_dir = report_dir / "dependencies"
             dependencies_dir.mkdir()
             (dependencies_dir / "build_provenance.json").write_text(
@@ -2768,8 +2772,8 @@ class Step4StabilityTest(unittest.TestCase):
             self.assertEqual(kwargs["jdk_current"], "21")
             self.assertTrue(Path(kwargs["old_jar_path"]).exists())
             self.assertTrue(Path(kwargs["new_jar_path"]).exists())
-            self.assertEqual(Path(kwargs["old_jar_path"]).read_bytes(), b"base demo jar")
-            self.assertEqual(Path(kwargs["new_jar_path"]).read_bytes(), b"current demo jar")
+            self.assertEqual(Path(kwargs["old_jar_path"]).read_bytes(), nested_jar_bytes)
+            self.assertEqual(Path(kwargs["new_jar_path"]).read_bytes(), nested_jar_bytes)
             self.assertFalse(any(
                 "stable" in path.name
                 for path in (output_dir / "step4_artifact_jars").rglob("*.jar")

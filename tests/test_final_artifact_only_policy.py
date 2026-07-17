@@ -69,7 +69,10 @@ class FinalArtifactOnlyPolicyTest(unittest.TestCase):
             dependencies.mkdir(parents=True)
             artifact = Path(tmp) / "app.jar"
             with zipfile.ZipFile(artifact, "w") as archive:
-                archive.writestr("BOOT-INF/lib/other-1.0.jar", b"not-the-target")
+                archive.writestr(
+                    "BOOT-INF/lib/other-1.0.jar",
+                    self._nested_jar_bytes([("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")]),
+                )
             (dependencies / "build_provenance.json").write_text(
                 json.dumps({"sides": [{"side": "current", "artifact_path": str(artifact)}]}),
                 encoding="utf-8",

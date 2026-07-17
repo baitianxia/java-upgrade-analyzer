@@ -133,6 +133,17 @@ class RuntimeTopologyMatrixTest(unittest.TestCase):
                 and edge["callee_member"] == "changed"
                 for edge in oracle_scan["edges"]
             ), oracle_scan["edges"])
+            result = tracer.trace_api_with_confidence_weighting(
+                target,
+                graph,
+                {},
+                has_packaged_bytecode_fallback=True,
+            )
+            output = report / "war-output"
+            formatter.generate_enhanced_summary([result], output)
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(result.analysis_status, "reachable")
+            self.assertEqual(summary["reachable"], 1)
 
     def test_multi_release_selection_matrix_respects_target_jdk(self):
         entries = [
@@ -223,8 +234,8 @@ class RuntimeTopologyMatrixTest(unittest.TestCase):
                 "runtime_dependency_catalog": {
                     "status": "complete",
                     "by_coord": {
-                        "com.acme:consumer": {
-                            "coord": "com.acme:consumer",
+                        "__business__": {
+                            "coord": "__business__",
                             "jar_path": str(artifact),
                         }
                     },
@@ -241,6 +252,26 @@ class RuntimeTopologyMatrixTest(unittest.TestCase):
                 },
                 graph,
             )
+            result = tracer.trace_api_with_confidence_weighting(
+                {
+                    "coord": "com.vendor:api",
+                    "api_name": "com.vendor.Api.versioned",
+                    "api_simple": "versioned",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "severity": "P1",
+                    "confirmed": "true",
+                },
+                graph,
+                {},
+                has_packaged_bytecode_fallback=True,
+            )
+            output_tmp = root / "output"
+            formatter.generate_enhanced_summary([result], output_tmp)
+            summary = json.loads(
+                (Path(output_tmp) / "summary.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(scan["status"], "hit", scan)
         self.assertTrue(any(
@@ -248,6 +279,8 @@ class RuntimeTopologyMatrixTest(unittest.TestCase):
             and int(hit.get("multi_release_version") or 0) == target_jdk
             for hit in scan["hits"]
         ), scan["hits"])
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(summary["reachable"], 1)
 
     def test_kotlin_standard_package_and_import_resolve_call_owner(self):
         with tempfile.TemporaryDirectory() as tmp:

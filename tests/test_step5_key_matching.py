@@ -19638,7 +19638,7 @@ public class com.example.consumer.Adapter {
             "coord": "lib:flags", "api_name": "lib.Flags.EMPTY", "api_simple": "EMPTY",
             "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
             "compatibility_flags": "CONSTANT_REMOVED", "old_value": "",
-            "old_field_has_constant_value": True,
+            "old_field_has_constant_value": "true",
             "severity": "P0", "confirmed": "true",
         }
 
@@ -19662,6 +19662,44 @@ public class com.example.consumer.Adapter {
         rendered = formatter.trace_result_to_api_entry(result)
         self.assertEqual(rendered["compile_impact"], "recompile_break")
         self.assertEqual(rendered["runtime_link_impact"], "inlined_no_link")
+
+    def test_constant_field_bytecode_hit_reports_runtime_link_present(self):
+        api_row = {
+            "coord": "lib:flags", "api_name": "lib.Flags.VALUE", "api_simple": "VALUE",
+            "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
+            "compatibility_flags": "CONSTANT_REMOVED",
+            "old_field_has_constant_value": "true",
+            "severity": "P0", "confirmed": "true",
+        }
+        graph = SimpleNamespace(
+            methods_by_id={}, reverse_edges={},
+            source_artifact_alignment={"status": "unverified"},
+        )
+        hit = {
+            "status": "hit",
+            "hits": [{
+                "coord": "__business__",
+                "class_fqcn": "app.App",
+                "consumer_method": "run",
+                "consumer_signature": "()",
+                "target_display": "lib.Flags.VALUE",
+                "evidence_type": "bytecode_field_access",
+            }],
+        }
+
+        with patch.object(
+            tracer, "_scan_packaged_runtime_dependencies_for_api", return_value=hit
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row, graph, {}, has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.runtime_link_impact, "runtime_link_present")
+        self.assertEqual(result.compile_impact, "unverified")
+        alert = formatter._alert_rows_for_result(result)[0]
+        self.assertEqual(alert["runtime_link_impact"], "runtime_link_present")
+        self.assertEqual(alert["compile_impact"], "unverified")
 
     def test_direct_source_constant_usage_uses_inlining_decision_before_early_return(self):
         api_row = {
