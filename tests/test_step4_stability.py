@@ -1,5 +1,6 @@
-import json
+import hashlib
 import io
+import json
 import csv
 import sys
 import tempfile
@@ -21,6 +22,26 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_runtime_provider_set_jar_is_byte_deterministic_across_build_times(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary = root / "primary.jar"
+            companion = root / "companion.jar"
+            with zipfile.ZipFile(primary, "w") as archive:
+                archive.writestr("p/A.class", b"primary")
+            with zipfile.ZipFile(companion, "w") as archive:
+                archive.writestr("p/B.class", b"companion")
+
+            with patch("zipfile.time.localtime", return_value=(2020, 1, 2, 3, 4, 6, 0, 0, -1)):
+                output = Path(step4._write_runtime_provider_set_jar([primary, companion]))
+            first_sha = hashlib.sha256(output.read_bytes()).hexdigest()
+            output.unlink()
+            with patch("zipfile.time.localtime", return_value=(2025, 6, 7, 8, 9, 10, 0, 0, -1)):
+                rebuilt = Path(step4._write_runtime_provider_set_jar([primary, companion]))
+            second_sha = hashlib.sha256(rebuilt.read_bytes()).hexdigest()
+
+        self.assertEqual(first_sha, second_sha)
+
     def test_pair_artifact_replacements_uses_unique_complete_class_containment(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

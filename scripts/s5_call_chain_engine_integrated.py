@@ -1958,7 +1958,13 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
                     business_jar = cache_dir / 'business-classes.jar'
                     with zipfile.ZipFile(business_jar, 'w', compression=zipfile.ZIP_DEFLATED) as target:
                         for source_name, target_name in business_entries:
-                            target.writestr(target_name, outer.read(source_name))
+                            entry = zipfile.ZipInfo(
+                                target_name, date_time=(1980, 1, 1, 0, 0, 0)
+                            )
+                            entry.compress_type = zipfile.ZIP_DEFLATED
+                            entry.create_system = 3
+                            entry.external_attr = 0o100644 << 16
+                            target.writestr(entry, outer.read(source_name))
                     business_class_count = len(business_entries)
                     catalog['by_coord']['__business__'] = {
                         'coord': '__business__', 'version': '', 'scope': 'business',

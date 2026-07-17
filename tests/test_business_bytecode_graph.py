@@ -238,6 +238,106 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         self.assertTrue(all(edge.provenance.parser == "javap" for edge in first.edges))
         self.assertTrue(all(edge.provenance.parser == "javap" for edge in second.edges))
 
+    def test_collect_business_bytecode_batch_streams_validated_v3_cache_without_read_text(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "bytecode-index.json"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            catalog = {"by_coord": {"__business__": {
+                "jar_path": str(jar_path), "sha256": "f" * 64,
+            }}}
+            original_parse, original_read_text = module.parse_classfile_calls, Path.read_text
+            module.parse_classfile_calls = lambda _data, _name: [{
+                "caller_owner": "com.acme.Service", "caller_name": "run",
+                "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+                "callee_simple_key": "method:call()",
+                "evidence_type": "bytecode_method_invocation",
+                "instruction_offset": 7,
+            }]
+            try:
+                first = collect_business_bytecode_batch([], catalog, str(cache_path))
+                with cache_path.open("rb") as cache_file:
+                    header = cache_file.readline()
+                self.assertIn(b"java-upgrade-analyzer.bytecode-index.v3", header)
+                module.parse_classfile_calls = lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("validated cache should avoid artifact rescan")
+                )
+                Path.read_text = lambda path, *args, **kwargs: (
+                    (_ for _ in ()).throw(AssertionError("cache must be streamed"))
+                    if path == cache_path else original_read_text(path, *args, **kwargs)
+                )
+                second = collect_business_bytecode_batch([], catalog, str(cache_path))
+            finally:
+                module.parse_classfile_calls, Path.read_text = original_parse, original_read_text
+
+        self.assertEqual(first.edges, second.edges)
+        self.assertTrue(dict(second.metrics)["cache_hit"])
+
+    def test_collect_business_bytecode_batch_rejects_tampered_v3_cache_and_rescans(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "bytecode-index.json"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            catalog = {"by_coord": {"__business__": {
+                "jar_path": str(jar_path), "sha256": "1" * 64,
+            }}}
+            calls = []
+            original_parse = module.parse_classfile_calls
+
+            def parse(_data, _name):
+                calls.append(_name)
+                return [{
+                    "caller_owner": "com.acme.Service", "caller_name": "run",
+                    "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+                    "callee_simple_key": "method:call()",
+                    "evidence_type": "bytecode_method_invocation",
+                    "instruction_offset": 7,
+                }]
+
+            module.parse_classfile_calls = parse
+            try:
+                collect_business_bytecode_batch([], catalog, str(cache_path))
+                tampered = cache_path.read_text(encoding="utf-8").replace(
+                    "com.vendor.Legacy.call()", "com.vendor.Legacy.fail()", 1
+                )
+                cache_path.write_text(tampered, encoding="utf-8")
+                second = collect_business_bytecode_batch([], catalog, str(cache_path))
+            finally:
+                module.parse_classfile_calls = original_parse
+
+        self.assertEqual(calls, ["com.acme.Service", "com.acme.Service"])
+        self.assertFalse(dict(second.metrics).get("cache_hit", False))
+        self.assertEqual(second.edges[0].callee_symbol, "com.vendor.Legacy.call()")
+
+    def test_business_bytecode_batch_can_release_consumed_raw_edges(self):
+        import business_bytecode_graph as module
+
+        evidence = [{
+            "caller_owner": "com.acme.Service", "caller_name": "run",
+            "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+            "callee_simple_key": "method:call()",
+            "evidence_type": "bytecode_method_invocation",
+            "artifact_sha256": "2" * 64,
+            "class_file": "/tmp/application.jar!/com/acme/Service.class",
+            "parser": "classfile",
+        }]
+
+        batch = module._business_bytecode_batch(
+            evidence,
+            {"artifact_sha256": "2" * 64},
+            strict_final_artifact=True,
+            release_consumed=True,
+        )
+
+        self.assertEqual(len(batch.edges), 1)
+        self.assertEqual(evidence, [None])
+
     def test_collect_business_bytecode_batch_keeps_evidence_when_cache_write_fails(self):
         import business_bytecode_graph as module
 
@@ -246,23 +346,24 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             cache_path = Path(tmp) / "bytecode-index.json"
             with zipfile.ZipFile(jar_path, "w") as archive:
                 archive.writestr("com/acme/Service.class", b"not-a-real-class")
-            original_parse, original_write = module.parse_classfile_calls, Path.write_text
+            original_parse = module.parse_classfile_calls
+            original_write = module._write_business_bytecode_cache
             module.parse_classfile_calls = lambda _data, _name: [{
                 "caller_owner": "com.acme.Service", "caller_name": "run",
                 "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
                 "callee_simple_key": "method:call()",
                 "evidence_type": "bytecode_method_invocation",
             }]
-            Path.write_text = lambda path, *args, **kwargs: (
-                (_ for _ in ()).throw(OSError("cache denied"))
-                if path == cache_path else original_write(path, *args, **kwargs)
+            module._write_business_bytecode_cache = (
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cache denied"))
             )
             try:
                 batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
                     "jar_path": str(jar_path), "sha256": "e" * 64,
                 }}}, str(cache_path))
             finally:
-                module.parse_classfile_calls, Path.write_text = original_parse, original_write
+                module.parse_classfile_calls = original_parse
+                module._write_business_bytecode_cache = original_write
 
         self.assertEqual(len(batch.edges), 1)
         self.assertEqual(batch.failures, ())

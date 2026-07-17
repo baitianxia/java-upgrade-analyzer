@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
-import os
+import hashlib
 import json
+import os
 import re
 import struct
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -52,6 +54,125 @@ REFLECTION_UTF8_MARKERS = {
     'findSetter',
     'unreflect',
 }
+BYTECODE_CACHE_SCHEMA = 'java-upgrade-analyzer.bytecode-index.v3'
+
+
+def _cache_line(payload):
+    return (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        + '\n'
+    ).encode('utf-8')
+
+
+def _write_business_bytecode_cache(cache_path, artifact_sha256, evidence, metrics):
+    cache_file = Path(cache_path)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='wb', dir=cache_file.parent, prefix=cache_file.name + '.',
+            suffix='.tmp', delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(_cache_line({
+                'kind': 'header',
+                'schema': BYTECODE_CACHE_SCHEMA,
+                'artifact_sha256': artifact_sha256,
+            }))
+            digest = hashlib.sha256()
+            edge_count = 0
+            for edge in evidence:
+                line = _cache_line({'kind': 'edge', 'edge': edge})
+                handle.write(line)
+                digest.update(line)
+                edge_count += 1
+            handle.write(_cache_line({
+                'kind': 'footer',
+                'edge_count': edge_count,
+                'edges_sha256': digest.hexdigest(),
+                'metrics': metrics,
+            }))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, cache_file)
+    except Exception:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _validate_business_bytecode_cache(cache_path, artifact_sha256):
+    cache_file = Path(cache_path)
+    with cache_file.open('rb') as handle:
+        header_line = handle.readline()
+        header = json.loads(header_line)
+        if (
+            header.get('kind') != 'header'
+            or header.get('schema') != BYTECODE_CACHE_SCHEMA
+            or header.get('artifact_sha256') != artifact_sha256
+        ):
+            raise ValueError('bytecode cache identity mismatch')
+        digest = hashlib.sha256()
+        edge_count = 0
+        footer = None
+        for line in handle:
+            record = json.loads(line)
+            kind = record.get('kind')
+            if kind == 'edge' and footer is None:
+                edge = record.get('edge')
+                if not isinstance(edge, dict) or edge.get('parser') not in {'classfile', 'javap'}:
+                    raise ValueError('bytecode cache edge invalid')
+                digest.update(line)
+                edge_count += 1
+                continue
+            if kind == 'footer' and footer is None:
+                footer = record
+                continue
+            raise ValueError('bytecode cache record order invalid')
+    if footer is None:
+        raise ValueError('bytecode cache footer missing')
+    if int(footer.get('edge_count', -1)) != edge_count:
+        raise ValueError('bytecode cache edge count mismatch')
+    if footer.get('edges_sha256') != digest.hexdigest():
+        raise ValueError('bytecode cache integrity mismatch')
+    metrics = footer.get('metrics')
+    if not isinstance(metrics, dict):
+        raise ValueError('bytecode cache metrics invalid')
+    return metrics
+
+
+def _iter_business_bytecode_cache(cache_path, artifact_sha256):
+    """Recheck integrity while streaming so validated evidence cannot be swapped."""
+    cache_file = Path(cache_path)
+    with cache_file.open('rb') as handle:
+        header = json.loads(handle.readline())
+        if (
+            header.get('schema') != BYTECODE_CACHE_SCHEMA
+            or header.get('artifact_sha256') != artifact_sha256
+        ):
+            raise ValueError('bytecode cache changed after validation')
+        digest = hashlib.sha256()
+        edge_count = 0
+        footer = None
+        for line in handle:
+            record = json.loads(line)
+            if record.get('kind') == 'edge' and footer is None:
+                digest.update(line)
+                edge_count += 1
+                yield record['edge']
+            elif record.get('kind') == 'footer' and footer is None:
+                footer = record
+            else:
+                raise ValueError('bytecode cache changed during streaming')
+        if (
+            footer is None
+            or int(footer.get('edge_count', -1)) != edge_count
+            or footer.get('edges_sha256') != digest.hexdigest()
+        ):
+            raise ValueError('bytecode cache changed during streaming')
 
 
 def _cp_class_name(cp, index):
@@ -731,18 +852,13 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
     cache_key = str(business_item.get('sha256') or '').strip()
     if cache_path and cache_key:
         try:
-            cached = json.loads(Path(cache_path).read_text(encoding='utf-8'))
-            cached_edges = list(cached.get('edges') or [])
-            if (
-                cached.get('schema') == 'java-upgrade-analyzer.bytecode-index.v2'
-                and cached.get('artifact_sha256') == cache_key
-                and all(item.get('parser') in {'classfile', 'javap'} for item in cached_edges)
-            ):
-                return cached_edges, {
-                    **dict(cached.get('metrics') or {}),
-                    'artifact_sha256': cache_key,
-                    'cache_hit': True,
-                }
+            cached_metrics = _validate_business_bytecode_cache(cache_path, cache_key)
+            cached_edges = list(_iter_business_bytecode_cache(cache_path, cache_key))
+            return cached_edges, {
+                **dict(cached_metrics),
+                'artifact_sha256': cache_key,
+                'cache_hit': True,
+            }
         except (OSError, ValueError, TypeError):
             pass
     if business_jar and os.path.isfile(business_jar):
@@ -801,15 +917,10 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
             }
             if cache_path and cache_key:
                 try:
-                    cache_file = Path(cache_path)
-                    cache_file.parent.mkdir(parents=True, exist_ok=True)
-                    cache_file.write_text(json.dumps({
-                        'schema': 'java-upgrade-analyzer.bytecode-index.v2',
-                        'artifact_sha256': cache_key,
-                        'edges': evidence,
-                        'metrics': metrics,
-                    }, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-                except OSError as exc:
+                    _write_business_bytecode_cache(
+                        cache_path, cache_key, evidence, metrics
+                    )
+                except (OSError, TypeError, ValueError) as exc:
                     metrics['cache_write_failed'] = True
                     metrics['cache_write_error'] = str(exc)
             return evidence, metrics
@@ -854,7 +965,9 @@ def _valid_sha256(value):
     return bool(re.fullmatch(r"[0-9a-f]{64}", str(value or "")))
 
 
-def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
+def _business_bytecode_batch(
+    evidence, metrics, *, strict_final_artifact, release_consumed=False,
+):
     metrics = dict(metrics or {})
     string_pool = {}
 
@@ -873,7 +986,12 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
     )
     if batch_sha_invalid:
         typed_failures.append(_bytecode_failure("current_final_artifact_sha_invalid"))
-    for item in evidence or ():
+    release_list = evidence if release_consumed and isinstance(evidence, list) else None
+    for index, item in enumerate(evidence or ()):
+        if release_list is not None:
+            release_list[index] = None
+        if item is None:
+            continue
         if item.get("evidence_type") == "bytecode_class_reference":
             # A constant-pool/signature/annotation class entry has no owning
             # bytecode instruction or method.  Keep it as collection telemetry;
@@ -968,12 +1086,33 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
 
 def collect_business_bytecode_batch(source_roots, artifact_catalog, cache_path):
     """Collect immutable current-final-artifact bytecode evidence without a graph."""
+    business_item = ((artifact_catalog or {}).get('by_coord') or {}).get('__business__') or {}
+    cache_key = str(business_item.get('sha256') or '').strip()
+    if cache_path and cache_key:
+        try:
+            cached_metrics = _validate_business_bytecode_cache(cache_path, cache_key)
+            return _business_bytecode_batch(
+                _iter_business_bytecode_cache(cache_path, cache_key),
+                {
+                    **dict(cached_metrics),
+                    'artifact_sha256': cache_key,
+                    'cache_hit': True,
+                },
+                strict_final_artifact=True,
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     evidence, metrics = collect_business_bytecode_edges(
         source_roots,
         artifact_catalog=artifact_catalog,
         cache_path=cache_path,
     )
-    return _business_bytecode_batch(evidence, metrics, strict_final_artifact=True)
+    return _business_bytecode_batch(
+        evidence,
+        metrics,
+        strict_final_artifact=True,
+        release_consumed=True,
+    )
 
 
 def merge_business_bytecode_edges(graph, evidence):

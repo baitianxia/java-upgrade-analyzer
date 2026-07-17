@@ -1034,6 +1034,39 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertEqual(class_entries, ["app/App.class"])
 
+    def test_runtime_catalog_business_jar_is_byte_deterministic_across_build_times(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "report"
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/app/App.class", b"runtime-copy")
+            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self._write_text(
+                self._dependencies_dir(report_dir) / "deps_current_resolved.csv",
+                "coord,version,scope,lib_entry,resolution_status\n",
+                encoding="utf-8",
+            )
+            self._write_text(
+                self._dependencies_dir(report_dir) / "build_provenance.json",
+                json.dumps({"sides": [{
+                    "side": "current",
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": artifact_sha256,
+                }]}),
+                encoding="utf-8",
+            )
+
+            with patch("zipfile.time.localtime", return_value=(2020, 1, 2, 3, 4, 6, 0, 0, -1)):
+                first = step5.build_runtime_dependency_catalog(report_dir)
+            first_sha = first["by_coord"]["__business__"]["sha256"]
+            Path(first["by_coord"]["__business__"]["jar_path"]).unlink()
+            with patch("zipfile.time.localtime", return_value=(2025, 6, 7, 8, 9, 10, 0, 0, -1)):
+                second = step5.build_runtime_dependency_catalog(report_dir)
+            second_sha = second["by_coord"]["__business__"]["sha256"]
+
+        self.assertEqual(first_sha, second_sha)
+
     def test_runtime_catalog_does_not_infer_internal_module_from_group_id(self):
         def nested_jar(group_id, artifact_id):
             payload = io.BytesIO()
@@ -18392,6 +18425,43 @@ public class com.example.consumer.Adapter {
         self.assertIsNone(built.is_reachable)
         self.assertEqual(built.reason_code, "UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS")
 
+    def test_packaged_business_hit_output_is_deterministic_for_parallel_hit_order(self):
+        def build(hits):
+            result = tracer.TraceResult(
+                api_name="com.vendor.Target.call", api_simple="call", api_signature="()",
+                symbol_kind="method", change_type="REMOVED", coord="com.vendor:target",
+                old_version="1", new_version="2", severity="P1", confirmed=True,
+                source="git_diff", analysis_scope="method", analysis_status="not_analyzed",
+                direct_callers=0, is_reachable=False, reachable_note="",
+                business_reach_depth=0, dependency_chain_coords=[], call_paths=[],
+                evidence_paths=[], reason_code="", verification_commands=[], hops=[],
+                confidence_score=1.0, critical_nodes_hit=[],
+            )
+            draft = self._draft_from_result(result)
+            tracer._build_packaged_dependency_hit_result(draft, hits)
+            return tracer._finalize_trace_draft(draft)
+
+        hits = [
+            {
+                "coord": "__business__", "class_fqcn": "app.Zeta",
+                "consumer_method": "run", "consumer_signature": "()",
+                "target_display": "com.vendor.Target.call()",
+                "evidence_type": "bytecode_method_invocation", "instruction_offset": 8,
+            },
+            {
+                "coord": "__business__", "class_fqcn": "app.Alpha",
+                "consumer_method": "run", "consumer_signature": "()",
+                "target_display": "com.vendor.Target.call()",
+                "evidence_type": "bytecode_method_invocation", "instruction_offset": 4,
+            },
+        ]
+
+        forward = build(hits)
+        reverse = build(list(reversed(hits)))
+
+        self.assertEqual(forward.call_paths, reverse.call_paths)
+        self.assertEqual(forward.evidence_paths, reverse.evidence_paths)
+
     def test_packaged_business_lookup_honors_five_edge_trace_budget(self):
         methods = {}
         reverse_edges = {}
@@ -18451,6 +18521,96 @@ public class com.example.consumer.Adapter {
         self.assertNotIn("graph", index["tasks"][0])
         self.assertNotIn("catalog", index["tasks"][0])
         self.assertIs(index["graph"], graph)
+
+    def test_runtime_member_index_persists_complete_candidate_set_across_graphs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes = self._compile_java_fixture(
+                tmp, "com/example/Reflective.java", """
+                package com.example;
+                public class Reflective {
+                    public void call() throws Exception {
+                        Class.forName("com.vendor.Target").getDeclaredMethod("removed");
+                    }
+                }
+                """,
+            )
+            jar_path = Path(tmp) / "reflective.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            catalog = [{"coord": "sample:reflective", "jar_path": str(jar_path)}]
+            first_graph = SimpleNamespace(report_dir=str(Path(tmp) / "report"))
+            first = tracer._get_runtime_dependency_member_candidate_index(
+                first_graph, catalog, 17
+            )
+            first_candidates = tracer._candidate_tasks_from_runtime_member_index(
+                first, "com.vendor.Target", "removed"
+            )
+
+            second_graph = SimpleNamespace(report_dir=str(Path(tmp) / "report"))
+            with patch.object(
+                tracer,
+                "_build_runtime_dependency_member_candidate_index",
+                side_effect=AssertionError("valid persistent index should avoid rebuild"),
+            ):
+                second = tracer._get_runtime_dependency_member_candidate_index(
+                    second_graph, catalog, 17
+                )
+            second_candidates = tracer._candidate_tasks_from_runtime_member_index(
+                second, "com.vendor.Target", "removed"
+            )
+
+        self.assertEqual(first_candidates, second_candidates)
+        self.assertEqual(len(second_candidates), 1)
+        self.assertIs(second["graph"], second_graph)
+
+    def test_runtime_member_index_identity_changes_with_artifact_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("p/A.class", b"first")
+            catalog = [{"coord": "sample:fixture", "jar_path": str(jar_path)}]
+            first = tracer._runtime_member_index_cache_identity(catalog, 17)
+            with zipfile.ZipFile(jar_path, "a") as archive:
+                archive.writestr("p/B.class", b"second")
+            second = tracer._runtime_member_index_cache_identity(catalog, 17)
+
+        self.assertNotEqual(first, second)
+
+    def test_runtime_member_index_corruption_falls_back_to_full_rebuild(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes = self._compile_java_fixture(
+                tmp, "com/example/Caller.java", """
+                package com.example;
+                public class Caller {
+                    public void call() throws Exception {
+                        Class.forName("com.vendor.Target").getDeclaredMethod("removed");
+                    }
+                }
+                """,
+            )
+            jar_path = Path(tmp) / "caller.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            catalog = [{"coord": "sample:caller", "jar_path": str(jar_path)}]
+            report_dir = Path(tmp) / "report"
+            tracer._get_runtime_dependency_member_candidate_index(
+                SimpleNamespace(report_dir=str(report_dir)), catalog, 17
+            )
+            cache_path = (
+                report_dir / ".runtime" / "cache" /
+                "s5_runtime_member_candidate_index.json"
+            )
+            cache_path.write_text("{broken", encoding="utf-8")
+            graph = SimpleNamespace(report_dir=str(report_dir))
+            original = tracer._build_runtime_dependency_member_candidate_index
+            with patch.object(tracer, "_build_runtime_dependency_member_candidate_index", wraps=original) as rebuilt:
+                index = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+
+        self.assertEqual(rebuilt.call_count, 1)
+        self.assertTrue(index["complete"])
+        self.assertTrue(tracer._candidate_tasks_from_runtime_member_index(
+            index, "com.vendor.Target", "removed"
+        ))
 
     def test_runtime_reference_signature_resolves_nested_type_from_owner_package(self):
         range_reference = {

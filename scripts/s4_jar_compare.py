@@ -1677,7 +1677,11 @@ def _write_runtime_provider_set_jar(paths):
                     if not name.endswith('.class') or name.startswith('META-INF/') or name in seen:
                         continue
                     seen.add(name)
-                    target.writestr(name, source.read(name))
+                    entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                    entry.compress_type = zipfile.ZIP_DEFLATED
+                    entry.create_system = 3
+                    entry.external_attr = 0o100644 << 16
+                    target.writestr(entry, source.read(name))
     return str(output)
 
 

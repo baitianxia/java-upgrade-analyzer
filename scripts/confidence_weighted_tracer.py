@@ -23,6 +23,7 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zipfile
 from collections.abc import Mapping
@@ -77,6 +78,7 @@ CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
 
 ANALYZER_EDGE_PROCEDURE_VERSION = 'java-upgrade-analyzer.analyzer-edge-ledger.v1'
 ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION = 'java-upgrade-analyzer.runtime-javap.v1'
+RUNTIME_MEMBER_INDEX_CACHE_SCHEMA = 'java-upgrade-analyzer.runtime-member-index.v1'
 ANALYZER_EDGE_PROCEDURE = (
     'Step5 executable bytecode matching at analyzer edge creation points'
 )
@@ -4205,6 +4207,160 @@ def _add_runtime_dependency_caller_edge(
     return edge
 
 
+def _runtime_member_index_cache_identity(catalog_entries, target_jdk):
+    artifacts = []
+    for item in catalog_entries or ():
+        jar_path = str(item.get('jar_path') or '').strip()
+        resolved = str(Path(jar_path).resolve()) if jar_path else ''
+        artifact_sha256 = ''
+        if jar_path and os.path.isfile(jar_path):
+            artifact_sha256 = _artifact_sha256(jar_path)
+        artifacts.append({
+            'coord': str(item.get('coord') or '').strip(),
+            'jar_path': resolved,
+            'artifact_entry': str(item.get('artifact_entry') or ''),
+            'artifact_sha256': artifact_sha256,
+            'application_owned': item.get('application_owned'),
+            'ownership_evidence': item.get('ownership_evidence'),
+        })
+    return {
+        'schema': RUNTIME_MEMBER_INDEX_CACHE_SCHEMA,
+        'target_jdk': str(target_jdk or ''),
+        'artifacts': sorted(
+            artifacts,
+            key=lambda row: (
+                row['coord'], row['jar_path'], row['artifact_entry'],
+                row['artifact_sha256'],
+            ),
+        ),
+    }
+
+
+def _runtime_member_index_cache_path(graph):
+    report_dir = str(getattr(graph, 'report_dir', '') or '').strip()
+    if not report_dir:
+        return None
+    return (
+        Path(report_dir) / '.runtime' / 'cache'
+        / 's5_runtime_member_candidate_index.json'
+    )
+
+
+def _runtime_member_index_serializable(index):
+    return {
+        'tasks': list(index.get('tasks') or []),
+        'unparsed_tasks': list(index.get('unparsed_tasks') or []),
+        'direct_by_owner_member': [
+            {'owner': owner, 'member': member, 'task_ids': sorted(task_ids)}
+            for (owner, member), task_ids in sorted(
+                (index.get('direct_by_owner_member') or {}).items()
+            )
+        ],
+        'owner_string_ids': {
+            key: sorted(value)
+            for key, value in sorted((index.get('owner_string_ids') or {}).items())
+        },
+        'member_string_ids': {
+            key: sorted(value)
+            for key, value in sorted((index.get('member_string_ids') or {}).items())
+        },
+        'reflection_ids': sorted(index.get('reflection_ids') or ()),
+        'visited_classes': int(index.get('visited_classes') or 0),
+        'parse_failures': int(index.get('parse_failures') or 0),
+        'complete': bool(index.get('complete', True)),
+        'failures': list(index.get('failures') or []),
+    }
+
+
+def _runtime_member_index_from_serializable(payload, graph):
+    direct = defaultdict(set)
+    for row in payload.get('direct_by_owner_member') or ():
+        direct[(str(row.get('owner') or ''), str(row.get('member') or ''))].update(
+            int(value) for value in (row.get('task_ids') or ())
+        )
+    return {
+        'graph': graph,
+        'catalog': _get_runtime_dependency_catalog(graph),
+        'tasks': list(payload.get('tasks') or []),
+        'unparsed_tasks': list(payload.get('unparsed_tasks') or []),
+        'direct_by_owner_member': direct,
+        'owner_string_ids': {
+            str(key): set(value or ())
+            for key, value in (payload.get('owner_string_ids') or {}).items()
+        },
+        'member_string_ids': {
+            str(key): set(value or ())
+            for key, value in (payload.get('member_string_ids') or {}).items()
+        },
+        'reflection_ids': set(payload.get('reflection_ids') or ()),
+        'visited_classes': int(payload.get('visited_classes') or 0),
+        'parse_failures': int(payload.get('parse_failures') or 0),
+        'complete': bool(payload.get('complete', True)),
+        'failures': list(payload.get('failures') or []),
+    }
+
+
+def _runtime_member_index_canonical_bytes(payload):
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    ).encode('utf-8')
+
+
+def _write_runtime_member_index_cache(path, identity, index):
+    body = {
+        'identity': identity,
+        'index': _runtime_member_index_serializable(index),
+    }
+    wrapper = {
+        **body,
+        'integrity_sha256': hashlib.sha256(
+            _runtime_member_index_canonical_bytes(body)
+        ).hexdigest(),
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', dir=path.parent,
+            prefix=path.name + '.', suffix='.tmp', delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(wrapper, handle, ensure_ascii=False, sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception as exc:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                exc.add_note(
+                    f'runtime member index temporary cache cleanup failed: {cleanup_exc}'
+                )
+        raise
+
+
+def _load_runtime_member_index_cache(path, identity, graph):
+    wrapper = json.loads(Path(path).read_text(encoding='utf-8'))
+    body = {
+        'identity': wrapper.get('identity'),
+        'index': wrapper.get('index'),
+    }
+    if body['identity'] != identity or not isinstance(body['index'], dict):
+        raise ValueError('runtime member index cache identity mismatch')
+    expected = hashlib.sha256(
+        _runtime_member_index_canonical_bytes(body)
+    ).hexdigest()
+    if wrapper.get('integrity_sha256') != expected:
+        raise ValueError('runtime member index cache integrity mismatch')
+    index = _runtime_member_index_from_serializable(body['index'], graph)
+    if not index.get('complete'):
+        raise ValueError('incomplete runtime member index cannot be reused')
+    return index
+
+
 def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk):
     index_started_at = time.perf_counter()
     _perf_add(graph, 'bytecode_expand', 'member_index_builds', 1)
@@ -4341,8 +4497,33 @@ def _get_runtime_dependency_member_candidate_index(graph, catalog_entries, targe
     cached = getattr(graph, '_runtime_dependency_member_candidate_index', None)
     if cached is not None:
         return cached
+    cache_path = _runtime_member_index_cache_path(graph)
+    identity = None
+    if cache_path is not None:
+        cache_started_at = time.perf_counter()
+        try:
+            identity = _runtime_member_index_cache_identity(catalog_entries, target_jdk)
+            index = _load_runtime_member_index_cache(cache_path, identity, graph)
+            _perf_add(graph, 'bytecode_expand', 'member_index_persistent_cache_hits', 1)
+            _perf_add(
+                graph, 'bytecode_expand', 'member_index_cache_load_elapsed_sec',
+                time.perf_counter() - cache_started_at,
+            )
+            setattr(graph, '_runtime_dependency_member_candidate_index', index)
+            return index
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            _perf_add(graph, 'bytecode_expand', 'member_index_persistent_cache_misses', 1)
     index = _build_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk)
     setattr(graph, '_runtime_dependency_member_candidate_index', index)
+    if cache_path is not None and index.get('complete'):
+        try:
+            if identity is None:
+                identity = _runtime_member_index_cache_identity(
+                    catalog_entries, target_jdk
+                )
+            _write_runtime_member_index_cache(cache_path, identity, index)
+        except (OSError, TypeError, ValueError):
+            _perf_add(graph, 'bytecode_expand', 'member_index_cache_write_failures', 1)
     emit_progress(
         "step5",
         "bytecode-expand",
@@ -5052,7 +5233,20 @@ def _packaged_hit_is_external_consumer(hit):
     return True
 
 
+def _packaged_hit_sort_key(hit):
+    return (
+        str((hit or {}).get('coord') or ''),
+        str((hit or {}).get('class_fqcn') or ''),
+        str((hit or {}).get('consumer_method') or ''),
+        str((hit or {}).get('consumer_signature') or ''),
+        str((hit or {}).get('target_display') or ''),
+        _normalized_instruction_offset((hit or {}).get('instruction_offset')) or -1,
+        str((hit or {}).get('jar_path') or ''),
+    )
+
+
 def _build_packaged_dependency_hit_result(result, hits, graph=None):
+    hits = sorted(hits or (), key=_packaged_hit_sort_key)
     ambiguous_hits = [item for item in hits if item.get('signature_ambiguous')]
     business_hits = [
         item for item in hits
