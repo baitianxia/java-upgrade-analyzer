@@ -35,6 +35,7 @@ jobs:
           python -m unittest -q
           tests.test_runtime_topology_matrix
           tests.test_artifact_bytecode_catalog
+          tests.test_artifact_safety
           tests.test_data_contract_analysis
 
   release-regression:

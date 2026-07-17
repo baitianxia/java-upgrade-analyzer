@@ -70,6 +70,7 @@ from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import CoverageRecord, thaw_evidence_value
 from signature_utils import normalize_signature_for_identity, signatures_match_identity
 from analysis_contract import build_project_scope, discover_maven_modules, sha256_file
+from artifact_safety import inspect_archive
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
     EVIDENCE_CALL_CHAIN_DIRNAME,
@@ -1827,7 +1828,19 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
     if artifact_ok:
         catalog['final_artifact_path'] = artifact_path
         catalog['final_artifact_sha256'] = sha256_file(artifact_path)
-        if not application_module_coords:
+        safety = inspect_archive(artifact_path)
+        catalog['artifact_safety'] = {
+            'safe': safety.safe,
+            'reason_codes': list(safety.reason_codes),
+            'entry_count': safety.entry_count,
+            'total_uncompressed_bytes': safety.total_uncompressed_bytes,
+            'nested_archives': safety.nested_archives,
+            'max_observed_depth': safety.max_observed_depth,
+        }
+        if not safety.safe:
+            artifact_ok = False
+            catalog['reason_codes'].append('artifact_safety_violation')
+        if artifact_ok and not application_module_coords:
             application_module_coords.update(
                 _recover_reactor_module_coords(
                     business_source_dirs,
