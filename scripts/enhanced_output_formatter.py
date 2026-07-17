@@ -28,6 +28,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from csv_io import open_csv_write
 from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_OBSERVABILITY_DIRNAME
 from step5_evidence_model import thaw_evidence_value
 
@@ -1304,7 +1305,7 @@ def generate_alerts_csv(all_results, output_path):
     ))
     _relativize_alert_evidence_paths(rows, os.path.dirname(os.path.abspath(output_path)))
 
-    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(output_path) as f:
         writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(rows)
@@ -1421,7 +1422,7 @@ def _write_alerts_review_bucket(output_dir, bucket_name, rows, max_rows):
 
 
 def _write_alert_rows_csv(path, rows):
-    with open(path, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(path) as f:
         writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(rows)

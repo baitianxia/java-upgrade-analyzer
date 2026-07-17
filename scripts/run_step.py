@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from compat import infer_maven_coords, open_text, resolve_repo_input_path, run_cmd
 from compat import git_cmd
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 from auto_discover_bridge_sources import discover_bridge_source_mappings
 from analysis_contract import build_project_scope, discover_maven_modules, write_coverage_report
 from pipeline_constants import (
@@ -2262,7 +2262,7 @@ def write_step5_selected_input(output_path, selection_summary):
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(output_path) as f:
         writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS, extrasaction="ignore")
         writer.writeheader()
         for row in selection_summary.get("matched_rows") or []:
@@ -2275,7 +2275,7 @@ def write_csv_rows(output_path, rows, fieldnames):
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(output_path) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows or []:

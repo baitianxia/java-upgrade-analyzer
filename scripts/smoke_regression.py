@@ -26,7 +26,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd as compat_run_cmd, open_text, git_cmd
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 from confidence_weighted_tracer import (
     build_api_target_keys,
     build_api_identity_key,
@@ -302,7 +302,7 @@ def create_scoped_runtime_evidence(report_dir, dependencies):
 
     resolved_path = report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv"
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    with resolved_path.open("w", encoding="utf-8", newline="") as handle:
+    with open_csv_write(resolved_path) as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"],
@@ -2779,7 +2779,7 @@ return ExtraApi.callLegacy();
 
     s4_dir = report_dir / "evidence" / "api_changes"
     s4_dir.mkdir(parents=True, exist_ok=True)
-    with open(s4_dir / "all_changed_apis.csv", "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(s4_dir / "all_changed_apis.csv") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -2874,7 +2874,7 @@ return ExtraApi.callLegacy();
             stale_contract.unlink()
 
     instance_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_instance_apis.csv"
-    with open(instance_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(instance_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -2935,7 +2935,7 @@ DirectApi.doWork();
     """,
     )
     direct_thirdparty_apis = report_dir / "evidence" / "api_changes" / "all_changed_direct_thirdparty_apis.csv"
-    with open(direct_thirdparty_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(direct_thirdparty_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -3248,7 +3248,7 @@ return service.doWork();
     """,
     )
     interface_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_interface_apis.csv"
-    with open(interface_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(interface_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -3329,7 +3329,7 @@ return repository.search(page, keyword);
     """,
     )
     helper_chain_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_helper_chain_apis.csv"
-    with open(helper_chain_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(helper_chain_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -3425,7 +3425,7 @@ new ConstructedService();
     """,
     )
     overload_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_overload_apis.csv"
-    with open(overload_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(overload_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -3490,7 +3490,7 @@ return "noop";
     )
 
     overload_missing_signature_apis = report_dir / "evidence" / "api_changes" / "all_changed_overload_missing_signature.csv"
-    with open(overload_missing_signature_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(overload_missing_signature_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=[field for field in ALL_CHANGED_APIS_FIELDS if field != "api_signature"],
@@ -3534,7 +3534,7 @@ return "noop";
     )
 
     constructor_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_constructor_apis.csv"
-    with open(constructor_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(constructor_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -3570,7 +3570,7 @@ return "noop";
     assert_true(constructor_summary.get("reachable") == 1, "零参数构造器变更应能命中 new 调用链")
 
     field_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_field_apis.csv"
-    with open(field_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(field_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -3614,7 +3614,7 @@ return "noop";
     )
 
     missing_symbol_kind_apis = report_dir / "evidence" / "api_changes" / "all_changed_missing_symbol_kind.csv"
-    with open(missing_symbol_kind_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(missing_symbol_kind_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=[field for field in ALL_CHANGED_APIS_FIELDS if field != "symbol_kind"],
@@ -3658,7 +3658,7 @@ return "noop";
     )
 
     not_found_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_not_found_apis.csv"
-    with open(not_found_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(not_found_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -3766,7 +3766,7 @@ AdapterFacade.callDeep();
         ],
     )
     bridge_changed_apis = bridge_runtime_report / "evidence" / "api_changes" / "all_changed_apis_bridge.csv"
-    with open(bridge_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(bridge_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -3852,7 +3852,7 @@ NestedAdapter.Inner.callDeep();
         ],
     )
     nested_bridge_changed_apis = bridge_runtime_report / "evidence" / "api_changes" / "all_changed_apis_nested_bridge.csv"
-    with open(nested_bridge_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(nested_bridge_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -4121,7 +4121,7 @@ BridgeFacade.callAdapter();
     )
 
     empty_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_apis_empty.csv"
-    with open(empty_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(empty_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,
@@ -4146,7 +4146,7 @@ BridgeFacade.callAdapter();
     assert_true(empty_summary.get("skip_reason") == "no_changed_apis", "空变更集时 Step 5 skip_reason 应为 no_changed_apis")
 
     behavior_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_behavior_candidates.csv"
-    with open(behavior_changed_apis, "w", encoding="utf-8", newline="") as f:
+    with open_csv_write(behavior_changed_apis) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=ALL_CHANGED_APIS_FIELDS,

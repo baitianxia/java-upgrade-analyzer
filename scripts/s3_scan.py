@@ -32,7 +32,7 @@ import json
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 from progress_logging import PhaseTimer, emit_progress
 from pipeline_constants import (
     EVIDENCE_CONTEXT_DIRNAME,
@@ -251,7 +251,7 @@ def scan_pattern(source_dir, pattern, extensions=('.java',),
 def write_csv_results(rows, fieldnames, output_path):
     """写 CSV 结果文件"""
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(output_path) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
@@ -656,7 +656,7 @@ def _write_candidate_rows(path, rows):
         'evidence_level', 'matched_class', 'file', 'line', 'content',
     ]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(path) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows or [])

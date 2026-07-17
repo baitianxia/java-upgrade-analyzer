@@ -57,7 +57,7 @@ from confidence_weighted_tracer import (
 )
 from enhanced_output_formatter import generate_enhanced_summary, register_step5_summary_artifacts
 from compat import run_cmd
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_batch
 from indirect_usage_analyzer import (
@@ -291,7 +291,7 @@ def _write_step5_timing_csv(report_dir, graph_stats):
     observability_dir = _runtime_observability_dir(report_dir)
     observability_dir.mkdir(parents=True, exist_ok=True)
     path = observability_dir / 'step5_timing.csv'
-    with path.open('w', encoding='utf-8', newline='') as f:
+    with open_csv_write(path) as f:
         writer = csv.DictWriter(f, fieldnames=['section', 'metric', 'value'])
         writer.writeheader()
         writer.writerows(rows)

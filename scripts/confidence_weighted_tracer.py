@@ -34,7 +34,7 @@ from pathlib import Path
 from threading import Event, Lock
 
 from compat import run_cmd
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import (
@@ -475,7 +475,7 @@ def write_analyzer_edge_ledger(graph, graph_stats=None):
         return ''
     output_path = Path(report_dir) / 'evidence' / 'call_chain' / 'analyzer_edges.csv'
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open('w', encoding='utf-8', newline='') as handle:
+    with open_csv_write(output_path) as handle:
         writer = csv.DictWriter(handle, fieldnames=ANALYZER_EDGE_FIELDS)
         writer.writeheader()
         writer.writerows(rows)

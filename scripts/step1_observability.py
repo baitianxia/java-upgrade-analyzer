@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from csv_io import open_csv_append, open_csv_write
 from pipeline_constants import (
     EVIDENCE_DEPENDENCIES_DIRNAME,
     EVIDENCE_DIRNAME,
@@ -93,7 +94,7 @@ class Step1Observer:
             if legacy_path.exists():
                 legacy_path.unlink()
         self.progress_path.write_text("", encoding="utf-8")
-        with self.timing_path.open("w", encoding="utf-8", newline="") as handle:
+        with open_csv_write(self.timing_path) as handle:
             csv.DictWriter(handle, fieldnames=TIMING_FIELDS).writeheader()
 
     def increment_counter(self, name, amount=1):
@@ -152,7 +153,7 @@ class Step1Observer:
             token.phase, status, final_message, side=token.side, item=token.item,
             command=token.command, elapsed_sec=elapsed,
         )
-        with self.timing_path.open("a", encoding="utf-8", newline="") as handle:
+        with open_csv_append(self.timing_path) as handle:
             writer = csv.DictWriter(handle, fieldnames=TIMING_FIELDS)
             writer.writerow({
                 "side": token.side,

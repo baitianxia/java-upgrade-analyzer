@@ -35,7 +35,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import s4_jar_compare as step4  # noqa: E402
-from csv_io import open_csv_read  # noqa: E402
+from csv_io import open_csv_read, open_csv_write  # noqa: E402
 
 
 CHANGED_API_FIELDS = [
@@ -118,7 +118,7 @@ def _sha256(path: Path) -> str:
 
 def _write_changed_apis(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as fh:
+    with open_csv_write(path) as fh:
         writer = csv.DictWriter(fh, fieldnames=CHANGED_API_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
@@ -226,7 +226,7 @@ def _prepare_transitive_deleted_dependency_workspace(workspace: Path) -> dict[st
     report_dir = project / ".upgrade-report"
     deps_dir = report_dir / "evidence" / "dependencies"
     deps_dir.mkdir(parents=True, exist_ok=True)
-    with (deps_dir / "deps_current_resolved.csv").open("w", newline="", encoding="utf-8") as fh:
+    with open_csv_write(deps_dir / "deps_current_resolved.csv") as fh:
         writer = csv.DictWriter(fh, fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"])
         writer.writeheader()
         writer.writerow({

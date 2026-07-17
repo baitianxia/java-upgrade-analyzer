@@ -19,7 +19,7 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -606,7 +606,7 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
         "recommended_action",
         "verification",
     ]
-    with csv_path.open("w", encoding="utf-8", newline="") as f:
+    with open_csv_write(csv_path) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for item in items:
@@ -747,6 +747,13 @@ def available_s6_detail_artifacts(findings):
     return rows
 
 
+def _write_changed_api_part(path, fieldnames, rows):
+    with open_csv_write(path) as output:
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def write_changed_api_split_artifacts(report_dir):
     artifacts = {}
     source_path = _api_changes_dir(report_dir) / "all_changed_apis.csv"
@@ -767,29 +774,27 @@ def write_changed_api_split_artifacts(report_dir):
 
     part_count = 0
     row_count = 0
-    output = None
     try:
         with source:
             reader = csv.DictReader(source)
             fieldnames = list(reader.fieldnames or [])
             if not fieldnames:
                 return artifacts
+            part_rows = []
             for row in reader:
-                if row_count % S6_CHANGED_API_SPLIT_ROWS == 0:
-                    if output is not None:
-                        output.close()
+                part_rows.append(row)
+                row_count += 1
+                if len(part_rows) == S6_CHANGED_API_SPLIT_ROWS:
                     part_count += 1
                     part_path = split_dir / f"all_changed_apis_part_{part_count:03d}.csv"
-                    output = part_path.open("w", encoding="utf-8", newline="")
-                    writer = csv.DictWriter(output, fieldnames=fieldnames)
-                    writer.writeheader()
-                writer.writerow(row)
-                row_count += 1
+                    _write_changed_api_part(part_path, fieldnames, part_rows)
+                    part_rows = []
+            if part_rows:
+                part_count += 1
+                part_path = split_dir / f"all_changed_apis_part_{part_count:03d}.csv"
+                _write_changed_api_part(part_path, fieldnames, part_rows)
     except (OSError, csv.Error):
         return artifacts
-    finally:
-        if output is not None:
-            output.close()
 
     if not row_count:
         return artifacts

@@ -36,7 +36,7 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 from exhaustive_api_oracle import (
     audit_api_oracle,
     load_analyzer_rows,
@@ -1740,7 +1740,7 @@ def write_v3_guard_outputs(
         json.dumps(fixture_debt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     fields = ("finding_id", "state", "fixture", "target_fixture", "reason", "expires")
-    with debt_csv_path.open("w", newline="", encoding="utf-8") as handle:
+    with open_csv_write(debt_csv_path) as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(fixture_debt.get("rows") or [])
@@ -1891,9 +1891,7 @@ def write_pinned_final_artifact_provenance(
         ),
         "pinned",
     )
-    with (output.parent / "deps_current_resolved.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
+    with open_csv_write(output.parent / "deps_current_resolved.csv") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"],
@@ -2603,7 +2601,7 @@ def write_topology_coverage(report_dir: Path, coverage: dict) -> dict[str, str]:
     required = set(coverage.get("required") or [])
     observed = set(coverage.get("observed") or [])
     missing = set(coverage.get("missing") or [])
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+    with open_csv_write(csv_path) as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=("topology_id", "required", "observed", "missing"),
@@ -3139,7 +3137,7 @@ def _reconcile_physical_edge_occurrences(
 
 def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with open_csv_write(path) as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
@@ -4449,7 +4447,7 @@ def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_
     elif changed_apis.exists() or not case.changed_api_rows:
         return changed_apis
     changed_apis.parent.mkdir(parents=True, exist_ok=True)
-    with changed_apis.open("w", newline="", encoding="utf-8") as fh:
+    with open_csv_write(changed_apis) as fh:
         writer = csv.DictWriter(fh, fieldnames=ALL_CHANGED_APIS_FIELDS)
         writer.writeheader()
         writer.writerows(case.changed_api_rows)
@@ -4630,7 +4628,7 @@ def materialize_bytecode_changed_apis(
             "artifact_sha256": artifact_sha256,
         }],
     }, indent=2) + "\n", encoding="utf-8")
-    with (dependencies_dir / "deps_current_resolved.csv").open("w", newline="", encoding="utf-8") as fh:
+    with open_csv_write(dependencies_dir / "deps_current_resolved.csv") as fh:
         fields = ["coord", "version", "scope", "lib_entry", "resolution_status"]
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
@@ -4741,7 +4739,7 @@ def materialize_step4_inputs(case: RealProjectCase, report_dir: Path) -> tuple[P
         "base_lib_entry",
         "current_lib_entry",
     ]
-    with dep_changes.open("w", newline="", encoding="utf-8") as fh:
+    with open_csv_write(dep_changes) as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         for row in case.step4_dep_rows:
@@ -4920,7 +4918,7 @@ def select_step4_changed_apis(step4_all_changed_apis: Path, selected_names: Iter
     matched_names = {str(row.get("api_name") or "").strip() for row in rows if str(row.get("api_name") or "").strip() in selected_set}
     selected_rows = [row for row in rows if str(row.get("api_name") or "").strip() in selected_set]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as fh:
+    with open_csv_write(output_path) as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(selected_rows)

@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 import csv
 from pathlib import Path
 
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 from signature_utils import canonical_api_identity
 
 
@@ -65,7 +65,7 @@ def write_oracle_ledger(path: Path, audit: dict) -> None:
         "identity", "analyzer_conclusion", "oracle_conclusion", "verdict",
         "authorities", "evidence_paths",
     )
-    with path.open("w", encoding="utf-8", newline="") as fh:
+    with open_csv_write(path) as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         for raw in audit.get("ledger") or []:

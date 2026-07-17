@@ -26,6 +26,7 @@ from pathlib import Path
 # compat 必须第一个 import，它会在 Windows 上修复 stdout/stderr 编码
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, mvn_cmd, git_cmd, IS_WINDOWS, require_human_confirm
+from csv_io import open_csv_write
 from analysis_contract import sha256_file
 from pipeline_constants import STEP1_ARTIFACTS_DIRNAME
 from step1_observability import Step1Observer
@@ -3413,8 +3414,8 @@ def main():
     if args.base_artifact_path and args.current_artifact_path:
         retain_artifact_for_analysis(base_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'base')
         retain_artifact_for_analysis(curr_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'current')
-    # 写 CSV 时明确指定 UTF-8 + newline=''（兼容 Windows 的 csv 模块）
-    with open(args.output, 'w', newline='', encoding='utf-8') as f:
+    # CSV 统一使用 UTF-8 BOM，可直接用 Excel 打开。
+    with open_csv_write(args.output) as f:
         fields = ['coord', 'base_coord', 'current_coord', 'old_version', 'new_version', 'change_type',
                   'risk', 'scope', 'remark', 'current_packaged', 'downgrade_confirmed', 'resolution_status',
                   'comparison_key', 'pairing_status', 'pairing_reason_code', 'base_lib_entry', 'current_lib_entry',
@@ -3445,7 +3446,7 @@ def main():
             'resolution_status': 'resolved',
         })
         current_rows[-1]['resolution_status'] = item.get('resolution_status', 'resolved')
-    with open(current_out, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(current_out) as f:
         fields = ['entry_id', 'lib_entry', 'lib_name', 'coord', 'group_id', 'artifact_id', 'classifier',
                   'version', 'scope', 'remark', 'packaged_present', 'packaged_match_source', 'read_error',
                   'resolution_status']
@@ -3496,7 +3497,7 @@ def main():
     alerts = [r for r in rows
               if '降级' in r['change_type'] or '❓' in r['risk']]
     alerts_out = str((out_dir / "dep_alerts.csv").resolve())
-    with open(alerts_out, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(alerts_out) as f:
         fields = ['conclusion', 'change_summary', 'review_reason',
                   'coord', 'old_version', 'new_version', 'change_type',
                   'risk', 'scope', 'remark', 'current_packaged', 'downgrade_confirmed', 'resolution_status']

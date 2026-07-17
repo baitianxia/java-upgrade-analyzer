@@ -38,7 +38,7 @@ from compat import (
     run_cmd, write_text, open_text, mvn_cmd, git_cmd, maven_repo_dir,
     infer_maven_coord_locations,
 )
-from csv_io import open_csv_read
+from csv_io import open_csv_read, open_csv_write
 
 sys.path.insert(0, os.path.dirname(__file__))
 from s4_contract import (
@@ -475,7 +475,7 @@ class Step4TimingRecorder:
         with self._lock:
             rows = list(self._rows)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "w", encoding="utf-8", newline="") as f:
+        with open_csv_write(self.path) as f:
             writer = csv.DictWriter(f, fieldnames=self.FIELDS)
             writer.writeheader()
             writer.writerows(rows)
@@ -2112,7 +2112,7 @@ def write_gitdiff_auxiliary_rows(output_dir, coord, rows):
     for extra in ('filter_reason', 'jar_truth'):
         if extra not in fields:
             fields.append(extra)
-    with open(path, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(path) as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(rows)
@@ -4231,13 +4231,13 @@ def write_all_changed_apis(all_apis, output_dir):
             print(f"  {item['row'].get('api_name', '?')}: "
                   f"{'; '.join(item['errors'])}", file=sys.stderr)
 
-    with open(raw_out_file, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(raw_out_file) as f:
         writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS)
         writer.writeheader()
         writer.writerows(valid_rows)
 
     normalized_rows = _enrich_changed_api_rows(normalize_step5_input_rows(valid_rows))
-    with open(out_file, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(out_file) as f:
         writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS)
         writer.writeheader()
         writer.writerows(normalized_rows)
@@ -4363,7 +4363,7 @@ def write_changed_dependencies(api_rows, output_dir):
             row["coord"],
         )
     )
-    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+    with open_csv_write(csv_path) as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(dependency_rows)
@@ -4482,7 +4482,7 @@ def normalize_step5_input_rows(rows):
 
 
 def _write_contract_csv(path, rows):
-    with open(path, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(path) as f:
         writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS)
         writer.writeheader()
         writer.writerows(_enrich_changed_api_rows(rows or []))
@@ -4680,7 +4680,7 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
     alerts.sort(key=lambda x: (_severity_rank(x.get('severity')), x.get('coord', ''), x.get('api_name', '')))
 
     alerts_path = os.path.join(output_dir, "all_changed_apis_alerts.csv")
-    with open(alerts_path, 'w', newline='', encoding='utf-8') as f:
+    with open_csv_write(alerts_path) as f:
         writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS)
         writer.writeheader()
         writer.writerows(alerts)
