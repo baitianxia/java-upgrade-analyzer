@@ -132,14 +132,17 @@ def build_step1_ref_resolution_interaction(error):
         "candidates": candidates,
         "fingerprint": str(resolution.get("fingerprint") or ""),
     }
-    if source_only and resolution.get("resolved_commit"):
+    detected_commit = str(
+        resolution.get("resolved_commit") or resolution.get("local_candidate_commit") or ""
+    ).strip()
+    if source_only and detected_commit:
         request.update({
             "detected_ref": str(resolution.get("resolved_ref") or "HEAD"),
-            "detected_commit": str(resolution.get("resolved_commit") or ""),
+            "detected_commit": detected_commit,
             "candidates": [{
-                "ref": str(resolution.get("resolved_commit") or ""),
+                "ref": detected_commit,
                 "display_ref": str(resolution.get("resolved_ref") or "HEAD"),
-                "commit": str(resolution.get("resolved_commit") or ""),
+                "commit": detected_commit,
                 "kind": "detected_source_head",
             }],
         })

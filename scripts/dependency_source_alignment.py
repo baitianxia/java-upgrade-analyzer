@@ -105,6 +105,12 @@ def load_step4_current_ref_records(report_dir):
             or merged.get("new_ref")
             or ""
         ).strip()
+        new_source = dict(merged.get("new_source") or {})
+        source_status = str(
+            merged.get("current_source_status")
+            or new_source.get("status")
+            or ""
+        ).strip()
         if not coord:
             continue
         records.append({
@@ -113,7 +119,9 @@ def load_step4_current_ref_records(report_dir):
             "module_rel_path": str(merged.get("module_rel_path") or ".").strip() or ".",
             "current_ref": ref,
             "new_version": str(merged.get("new_version") or "").strip(),
-            "source_status": str(item.get("status") or "matched").strip(),
+            "source_status": source_status,
+            "remote": str(new_source.get("remote") or "").strip(),
+            "remote_ref": str(new_source.get("remote_ref") or "").strip(),
         })
     return records
 
@@ -126,11 +134,22 @@ def resolve_unique_ref_record(coord, records):
     ]
     if not candidates:
         return None, "step4_current_ref_missing"
+    invalid_statuses = sorted({
+        str(item.get("source_status") or "").strip() or "missing"
+        for item in candidates
+        if str(item.get("source_status") or "").strip() not in {
+            "remote_source_resolved",
+            "user_confirmed_local_source",
+        }
+    })
+    if invalid_statuses:
+        return None, "step4_source_provenance_unconfirmed"
     unique = {
         (
             str(item.get("repo_path") or "").strip(),
             str(item.get("module_rel_path") or ".").strip() or ".",
             str(item.get("current_ref") or "").strip(),
+            str(item.get("source_status") or "").strip(),
         )
         for item in candidates
     }
@@ -423,6 +442,9 @@ def align_dependency_source_mappings(report_dir, dependency_source_mappings, run
             "runtime_jar": jar_path,
             "original_mapping_path": original_path,
             "selected_ref": ref_record["current_ref"],
+            "source_status": ref_record.get("source_status") or "",
+            "remote": ref_record.get("remote") or "",
+            "remote_ref": ref_record.get("remote_ref") or "",
             "commit": snapshot["commit"],
             "snapshot_path": snapshot["snapshot_path"],
             "module_rel_path": ref_record.get("module_rel_path") or ".",

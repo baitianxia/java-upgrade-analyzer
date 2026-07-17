@@ -668,6 +668,10 @@ class Step4StabilityTest(unittest.TestCase):
                 "module_path": str(repo_dir),
                 "old_version": "1.0.0",
                 "new_version": "2.0.0",
+                "base_ref": "a" * 40,
+                "cur_ref": "b" * 40,
+                "old_match_reason": "preflight_remote_commit",
+                "new_match_reason": "preflight_remote_commit",
             }
             captured = []
 
@@ -675,12 +679,7 @@ class Step4StabilityTest(unittest.TestCase):
                 captured.append({"cmd": list(cmd), "cwd": cwd, "timeout": timeout})
                 return "", "", 0
 
-            with patch.object(
-                step4,
-                "resolve_repo_ref_pair_for_versions",
-                return_value=("v1", "v2", "pair-old", "pair-new", [], []),
-            ), \
-                 patch.object(step4, "run_cmd", side_effect=fake_run_cmd):
+            with patch.object(step4, "run_cmd", side_effect=fake_run_cmd):
                 result = step4.run_gitdiff(lib_info, tmp)
 
         self.assertEqual(result["status"], "success")
@@ -1274,6 +1273,27 @@ class Step4StabilityTest(unittest.TestCase):
         )
         self.assertEqual([item["ref"] for item in candidates], ["origin/release-1.0.0", "upstream/support-1.0.0"])
 
+    def test_resolve_repo_ref_for_version_accepts_equal_commit_on_multiple_remotes(self):
+        shared_commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={
+                "heads": [],
+                "tags": [],
+                "remotes": ["origin/release-1.0.0", "upstream/support-1.0.0"],
+                "remote_records": [
+                    {"ref": "origin/release-1.0.0", "commit": shared_commit, "canonical_ref": "refs/heads/release-1.0.0", "remote": "origin"},
+                    {"ref": "upstream/support-1.0.0", "commit": shared_commit, "canonical_ref": "refs/heads/support-1.0.0", "remote": "upstream"},
+                ],
+            },
+        ):
+            resolved, reason, candidates = step4.resolve_repo_ref_for_version(tmp, "1.0.0")
+
+        self.assertEqual(resolved, "origin/release-1.0.0")
+        self.assertIn("matched_by_version", reason)
+        self.assertEqual({item["commit"] for item in candidates}, {shared_commit})
+
     def test_resolve_repo_ref_for_version_matches_branch_name_containing_normalized_version(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
@@ -1369,6 +1389,54 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["coord"], "com.acme:acct-sdk")
         self.assertEqual(pending[0]["reason"], "无法定位对比 ref")
+
+    def test_preflight_materializes_remote_refs_to_immutable_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "acct-sdk"
+            repo_dir.mkdir()
+            (repo_dir / ".git").mkdir()
+            old_candidate = {
+                "ref": "origin/release-1.0.0",
+                "commit": "a" * 40,
+                "canonical_ref": "refs/heads/release-1.0.0",
+                "remote": "origin",
+            }
+            new_candidate = {
+                "ref": "origin/release-2.0.0",
+                "commit": "b" * 40,
+                "canonical_ref": "refs/heads/release-2.0.0",
+                "remote": "origin",
+            }
+            with patch.object(
+                step4,
+                "resolve_repo_ref_pair_for_versions",
+                return_value=(
+                    old_candidate["ref"],
+                    new_candidate["ref"],
+                    "old-match",
+                    "new-match",
+                    [old_candidate],
+                    [new_candidate],
+                ),
+            ), patch.object(
+                step4,
+                "materialize_remote_source_candidate",
+                side_effect=[
+                    {"status": "remote_source_resolved", "resolved_commit": "a" * 40, "remote": "origin", "remote_ref": old_candidate["canonical_ref"]},
+                    {"status": "remote_source_resolved", "resolved_commit": "b" * 40, "remote": "origin", "remote_ref": new_candidate["canonical_ref"]},
+                ],
+            ):
+                plan = step4.resolve_gitdiff_ref_plan_for_row(
+                    {"coord": "com.acme:acct-sdk", "old_version": "1.0.0", "new_version": "2.0.0"},
+                    {"repo_path": str(repo_dir), "module_path": str(repo_dir)},
+                    {"mapping_mode": "explicit"},
+                    {},
+                )
+
+        self.assertEqual(plan["status"], "matched")
+        self.assertEqual(plan["base_ref"], "a" * 40)
+        self.assertEqual(plan["cur_ref"], "b" * 40)
+        self.assertEqual(plan["old_source"]["status"], "remote_source_resolved")
 
     def test_main_preflights_git_refs_before_japicmp_or_removed_jar_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1492,7 +1560,32 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertIn("step4.total", phases)
         self.assertEqual(timing_rows[-1]["status"], "done")
 
-    def test_resolve_repo_ref_for_version_accepts_manual_override_when_no_candidates(self):
+    def test_list_repo_refs_uses_live_remote_inventory_not_tracking_refs(self):
+        inventory = {
+            "queried_at": "2026-07-17T00:00:00Z",
+            "failures": [],
+            "refs": [
+                {
+                    "remote": "origin",
+                    "ref": "origin/release-1.0.0",
+                    "canonical_ref": "refs/heads/release-1.0.0",
+                    "short_name": "release-1.0.0",
+                    "kind": "branch",
+                    "commit": "a" * 40,
+                }
+            ],
+        }
+        step4._REPO_REFS_CACHE.clear()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            step4, "query_live_remote_refs", return_value=inventory
+        ) as query:
+            refs = step4._list_repo_refs(tmp)
+
+        self.assertEqual(refs["remotes"], ["origin/release-1.0.0"])
+        self.assertEqual(refs["remote_records"][0]["commit"], "a" * 40)
+        query.assert_called_once()
+
+    def test_resolve_repo_ref_for_version_rejects_unconfirmed_local_override(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
                 step4,
@@ -1502,17 +1595,48 @@ class Step4StabilityTest(unittest.TestCase):
                     "heads": [],
                     "remotes": [],
                 },
+            ), patch.object(
+                step4,
+                "resolve_local_source_ref",
+                return_value={
+                    "status": "awaiting_local_source_confirmation",
+                    "local_candidate_commit": "b" * 40,
+                },
             ):
-                with patch.object(step4, "_git_ref_exists", return_value=True):
-                    resolved, reason, candidates = step4.resolve_repo_ref_for_version(
-                        tmp,
-                        "3.5.14",
-                        selected_ref="mybatis-3.5.14",
-                    )
+                resolved, reason, candidates = step4.resolve_repo_ref_for_version(
+                    tmp,
+                    "3.5.14",
+                    selected_ref="mybatis-3.5.14",
+                )
 
-        self.assertEqual(resolved, "mybatis-3.5.14")
-        self.assertEqual(reason, "selected_by_user(kind=manual,score=-1,version=3.5.14)")
+        self.assertIsNone(resolved)
+        self.assertEqual(reason, "local_source_confirmation_required=mybatis-3.5.14")
         self.assertEqual(candidates, [])
+
+    def test_resolve_repo_ref_for_version_accepts_confirmed_local_override(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={"tags": [], "heads": [], "remotes": []},
+        ), patch.object(
+            step4,
+            "resolve_local_source_ref",
+            return_value={
+                "status": "user_confirmed_local_source",
+                "resolved_commit": "c" * 40,
+            },
+        ) as local_resolver:
+            resolved, reason, candidates = step4.resolve_repo_ref_for_version(
+                tmp,
+                "3.5.14",
+                selected_ref="mybatis-3.5.14",
+                allow_local_source=True,
+            )
+
+        self.assertEqual(resolved, "c" * 40)
+        self.assertIn("user_confirmed_local_source", reason)
+        self.assertEqual(candidates, [])
+        self.assertTrue(local_resolver.call_args.kwargs["allow_local_source"])
 
     def test_resolve_repo_ref_for_version_accepts_branch_names_containing_exact_version(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2887,6 +3011,28 @@ class Step4StabilityTest(unittest.TestCase):
 
         normalized_from_json = run_step.normalize_dependency_git_ref_overrides(json.dumps(payload, ensure_ascii=False))
         self.assertEqual(normalized_from_json, payload)
+
+        confirmed_local = run_step.normalize_dependency_git_ref_overrides([
+            {
+                "coord": "com.foo:local",
+                "old_ref": "local-v1",
+                "new_ref": "local-v2",
+                "allow_local_source": True,
+                "allow_dirty_local_source": True,
+            }
+        ])
+        self.assertTrue(confirmed_local[0]["allow_local_source"])
+        self.assertTrue(confirmed_local[0]["allow_dirty_local_source"])
+
+        with self.assertRaises(run_step.StepError):
+            run_step.normalize_dependency_git_ref_overrides([
+                {
+                    "coord": "com.foo:invalid",
+                    "old_ref": "v1",
+                    "new_ref": "v2",
+                    "allow_dirty_local_source": True,
+                }
+            ])
 
     def test_step4_rerun_requires_git_ref_overrides(self):
         pending_interaction = {

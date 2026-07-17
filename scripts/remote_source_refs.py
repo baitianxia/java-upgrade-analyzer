@@ -60,11 +60,18 @@ def query_live_remote_refs(repo_dir, timeout=30):
                 "reason": stderr or f"git ls-remote exited with {rc}",
             })
             continue
+        remote_rows = []
         for raw_line in stdout.splitlines():
             parts = raw_line.strip().split(None, 1)
             if len(parts) != 2:
                 continue
-            commit, canonical_ref = parts
+            remote_rows.append((parts[0], parts[1]))
+        peeled_tags = {
+            canonical_ref[:-3]: commit
+            for commit, canonical_ref in remote_rows
+            if canonical_ref.endswith("^{}")
+        }
+        for commit, canonical_ref in remote_rows:
             if canonical_ref.endswith("^{}"):
                 continue
             if canonical_ref.startswith("refs/heads/"):
@@ -73,6 +80,7 @@ def query_live_remote_refs(repo_dir, timeout=30):
             elif canonical_ref.startswith("refs/tags/"):
                 ref_kind = "tag"
                 short_name = canonical_ref[len("refs/tags/"):]
+                commit = peeled_tags.get(canonical_ref, commit)
             else:
                 continue
             refs.append({
@@ -178,6 +186,29 @@ def _materialize_remote_candidate(repo_dir, candidate, timeout=60):
     return fixed_commit, ""
 
 
+def materialize_remote_source_candidate(repo_dir, candidate, timeout=60):
+    """Fetch one live-remote candidate and return an immutable source record."""
+    fixed_commit, error = _materialize_remote_candidate(repo_dir, candidate, timeout=timeout)
+    if not fixed_commit:
+        return {
+            "status": "remote_source_unavailable",
+            "resolved_commit": "",
+            "failure": {
+                "remote": str((candidate or {}).get("remote") or ""),
+                "stage": "fetch",
+                "reason": error,
+            },
+        }
+    return {
+        "status": "remote_source_resolved",
+        "resolved_ref": str(candidate.get("ref") or ""),
+        "resolved_commit": fixed_commit,
+        "remote": str(candidate.get("remote") or ""),
+        "remote_ref": str(candidate.get("canonical_ref") or ""),
+        "resolution_mode": "live_remote",
+    }
+
+
 def resolve_remote_source_ref(repo_dir, requested_ref, query_timeout=30, fetch_timeout=60):
     """Resolve a requested ref from live remotes and fetch its immutable commit."""
     inventory = query_live_remote_refs(repo_dir, timeout=query_timeout)
@@ -268,6 +299,7 @@ def resolve_local_source_ref(
 
 __all__ = [
     "query_live_remote_refs",
+    "materialize_remote_source_candidate",
     "resolve_local_source_ref",
     "resolve_remote_source_ref",
 ]

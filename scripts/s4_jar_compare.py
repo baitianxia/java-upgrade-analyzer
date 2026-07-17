@@ -67,6 +67,11 @@ from signature_utils import normalize_signature_for_lookup
 from data_contract_analysis import compare_jar_data_contracts
 from step1_observability import peak_rss_mb
 from analysis_contract import sha256_file
+from remote_source_refs import (
+    materialize_remote_source_candidate,
+    query_live_remote_refs,
+    resolve_local_source_ref,
+)
 
 INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -874,19 +879,19 @@ def _list_repo_refs(repo_dir: str):
     if cached is not None:
         return cached
 
-    git = git_cmd()
-    remotes_out, _remotes_err, remotes_rc = run_cmd(
-        git + ["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
-        cwd=repo_dir,
-        timeout=20,
-    )
-    remotes = []
-    if remotes_rc == 0:
-        remotes = [
-            l.strip() for l in (remotes_out or "").splitlines()
-            if l.strip() and not l.strip().endswith("/HEAD")
-        ]
-    result = {"tags": [], "heads": [], "remotes": remotes}
+    inventory = query_live_remote_refs(repo_dir, timeout=30)
+    remote_records = [
+        dict(item) for item in (inventory.get("refs") or [])
+        if item.get("kind") == "branch"
+    ]
+    result = {
+        "tags": [],
+        "heads": [],
+        "remotes": [item.get("ref") for item in remote_records if item.get("ref")],
+        "remote_records": remote_records,
+        "remote_failures": list(inventory.get("failures") or []),
+        "queried_at": str(inventory.get("queried_at") or ""),
+    }
     _REPO_REFS_CACHE[repo_dir] = result
     return result
 
@@ -1061,6 +1066,11 @@ def list_repo_ref_candidates_for_version(repo_dir: str, version: str):
     if not version_norm:
         return [], version_norm, "version_empty"
     refs = _list_repo_refs(repo_dir)
+    record_by_ref = {
+        str(item.get("ref") or ""): item
+        for item in (refs.get("remote_records") or [])
+        if str(item.get("ref") or "")
+    }
     candidates = []
     for kind, ref_names in (("remotes", refs.get("remotes", [])),):
         normalized_kind = kind[:-1] if kind.endswith("s") else kind
@@ -1090,10 +1100,19 @@ def list_repo_ref_candidates_for_version(repo_dir: str, version: str):
             "prefix": item[7]["prefix"],
             "branch_name": item[7]["branch_name"],
             "remote_name": item[7]["remote_name"],
+            "commit": str((record_by_ref.get(item[5]) or {}).get("commit") or ""),
+            "canonical_ref": str((record_by_ref.get(item[5]) or {}).get("canonical_ref") or ""),
+            "remote": str((record_by_ref.get(item[5]) or {}).get("remote") or item[7]["remote_name"]),
         }
         for item in candidates
     ]
     if not candidates:
+        if refs.get("remote_failures"):
+            reasons = "; ".join(
+                str(item.get("reason") or item.get("stage") or "remote query failed")
+                for item in refs.get("remote_failures") or []
+            )
+            return result, version_norm, f"remote_source_unavailable={reasons}"
         return result, version_norm, f"no_ref_match_for_version={version_norm}"
     return result, version_norm, None
 
@@ -1163,14 +1182,19 @@ def resolve_repo_ref_pair_for_versions(repo_dir: str, old_version: str, new_vers
         return None, None, old_error, new_error, old_candidates, new_candidates
 
     best = pair_candidates[0]
-    if len(pair_candidates) > 1:
-        runner_up = pair_candidates[1]
-        if (
-            runner_up["pair_score"] == best["pair_score"]
-            and runner_up["delta_match_kind"] == best["delta_match_kind"]
-            and runner_up["same_prefix"] == best["same_prefix"]
-            and runner_up["same_remote"] == best["same_remote"]
-        ):
+    tied_pairs = [
+        item for item in pair_candidates
+        if item["pair_score"] == best["pair_score"]
+        and item["delta_match_kind"] == best["delta_match_kind"]
+        and item["same_prefix"] == best["same_prefix"]
+        and item["same_remote"] == best["same_remote"]
+    ]
+    if len(tied_pairs) > 1:
+        fixed_commit_pairs = {
+            (item["old"].get("commit"), item["new"].get("commit"))
+            for item in tied_pairs
+        }
+        if len(fixed_commit_pairs) != 1 or not all(next(iter(fixed_commit_pairs), (None, None))):
             return (
                 None,
                 None,
@@ -1204,7 +1228,14 @@ def resolve_repo_ref_pair_for_versions(repo_dir: str, old_version: str, new_vers
     )
 
 
-def resolve_repo_ref_for_version(repo_dir: str, version: str, selected_ref: str = ""):
+def resolve_repo_ref_for_version(
+    repo_dir: str,
+    version: str,
+    selected_ref: str = "",
+    *,
+    allow_local_source=False,
+    allow_dirty_local_source=False,
+):
     candidates, version_norm, error = list_repo_ref_candidates_for_version(repo_dir, version)
     selected_ref = (selected_ref or "").strip()
     if selected_ref:
@@ -1213,18 +1244,32 @@ def resolve_repo_ref_for_version(repo_dir: str, version: str, selected_ref: str 
                 return selected_ref, (
                     f"selected_by_user(kind={item['kind']},score={item['score']},version={version_norm})"
                 ), candidates
-        if _git_ref_exists(repo_dir, selected_ref):
-            return selected_ref, f"selected_by_user(kind=manual,score=-1,version={version_norm})", candidates
+        local = resolve_local_source_ref(
+            repo_dir,
+            selected_ref,
+            allow_local_source=allow_local_source,
+            allow_dirty_local_source=allow_dirty_local_source,
+        )
+        if local.get("status") == "user_confirmed_local_source":
+            return str(local.get("resolved_commit") or selected_ref), (
+                f"selected_by_user(kind=user_confirmed_local_source,score=-1,version={version_norm})"
+            ), candidates
+        if local.get("status") == "awaiting_dirty_local_source_confirmation":
+            return None, f"dirty_local_source_confirmation_required={selected_ref}", candidates
+        if local.get("local_candidate_commit"):
+            return None, f"local_source_confirmation_required={selected_ref}", candidates
         return None, f"selected_ref_not_found={selected_ref}", candidates
     if error:
         return None, error, candidates
     best = candidates[0]
-    if len(candidates) > 1:
-        runner_up = candidates[1]
-        if (
-            runner_up.get("score") == best.get("score")
-            and _ref_kind_priority(runner_up.get("kind")) == _ref_kind_priority(best.get("kind"))
-        ):
+    tied_candidates = [
+        item for item in candidates
+        if item.get("score") == best.get("score")
+        and _ref_kind_priority(item.get("kind")) == _ref_kind_priority(best.get("kind"))
+    ]
+    if len(tied_candidates) > 1:
+        fixed_commits = {item.get("commit") for item in tied_candidates}
+        if len(fixed_commits) != 1 or not next(iter(fixed_commits), ""):
             return None, f"ambiguous_ref_matches_for_version={version_norm}", candidates
     return best["ref"], f"matched_by_version(kind={best['kind']},score={best['score']},version={version_norm})", candidates
 
@@ -1248,9 +1293,18 @@ def parse_dependency_git_ref_overrides(raw_text):
         coord = str(item.get("coord") or "").strip()
         old_ref = str(item.get("old_ref") or item.get("base_ref") or "").strip()
         new_ref = str(item.get("new_ref") or item.get("current_ref") or "").strip()
+        allow_local_source = item.get("allow_local_source") is True
+        allow_dirty_local_source = item.get("allow_dirty_local_source") is True
         if not (coord and old_ref and new_ref):
             raise ValueError("dependency_git_ref_overrides_json 的每项都必须包含 coord/old_ref/new_ref")
-        mapping[coord] = {"old_ref": old_ref, "new_ref": new_ref}
+        if allow_dirty_local_source and not allow_local_source:
+            raise ValueError("allow_dirty_local_source=true 时必须同时设置 allow_local_source=true")
+        mapping[coord] = {
+            "old_ref": old_ref,
+            "new_ref": new_ref,
+            "allow_local_source": allow_local_source,
+            "allow_dirty_local_source": allow_dirty_local_source,
+        }
     return mapping
 
 
@@ -1261,8 +1315,8 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
         if os.path.exists(path):
             files_to_review.append(os.path.abspath(path))
     question = (
-        "已识别到依赖源码仓库，但以下依赖无法仅根据 old_version/new_version 自动确定 git refs。"
-        "请逐项确认 old_ref/new_ref 后重跑 Step4；在确认前不要继续进入 Step5。"
+        "已识别到依赖源码仓库，但以下依赖无法从远程仓库唯一固定 old/new commit。"
+        "请逐项更正远程 old_ref/new_ref 后重跑 Step4；只有远程不可用时，才可明确确认本地源码兜底。"
     )
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
@@ -1304,7 +1358,10 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
                 },
                 "dependency_git_ref_overrides": {
                     "type": "array",
-                    "description": "按依赖显式指定 old_ref/new_ref，例如 [{\"coord\":\"g:a\",\"old_ref\":\"v1\",\"new_ref\":\"v2\"}]。",
+                    "description": (
+                        "按依赖显式指定远程 old_ref/new_ref，例如 origin/release-1；"
+                        "远程不可用且用户明确同意本地兜底时，额外设置 allow_local_source=true。"
+                    ),
                 },
                 "dependency_source_dirs": {
                     "type": "array",
@@ -3362,6 +3419,26 @@ def dependency_needs_gitdiff_preflight(row, source_mapping):
     return True
 
 
+def _materialize_resolved_remote_ref(repo_path, resolved_ref, candidates):
+    candidate = next(
+        (
+            item for item in (candidates or [])
+            if item.get("ref") == resolved_ref
+            and item.get("commit")
+            and item.get("canonical_ref")
+            and (item.get("remote") or item.get("remote_name"))
+        ),
+        None,
+    )
+    if not candidate:
+        return None, "remote_candidate_metadata_missing"
+    materialized = materialize_remote_source_candidate(repo_path, candidate)
+    if materialized.get("status") != "remote_source_resolved":
+        failure = materialized.get("failure") or {}
+        return None, str(failure.get("reason") or "remote fetch failed")
+    return materialized, ""
+
+
 def resolve_gitdiff_ref_plan_for_row(row, source_mapping, source_meta, dependency_git_ref_overrides):
     row = row or {}
     source_mapping = source_mapping or {}
@@ -3374,6 +3451,8 @@ def resolve_gitdiff_ref_plan_for_row(row, source_mapping, source_meta, dependenc
     overrides = dependency_git_ref_overrides.get(coord) or {}
     override_old_ref = str(overrides.get("old_ref") or "").strip()
     override_new_ref = str(overrides.get("new_ref") or "").strip()
+    allow_local_source = bool(overrides.get("allow_local_source"))
+    allow_dirty_local_source = bool(overrides.get("allow_dirty_local_source"))
 
     resolved_old_ref = resolved_new_ref = None
     old_reason = new_reason = ""
@@ -3389,11 +3468,15 @@ def resolve_gitdiff_ref_plan_for_row(row, source_mapping, source_meta, dependenc
             repo_path,
             old_ver,
             selected_ref=override_old_ref,
+            allow_local_source=allow_local_source,
+            allow_dirty_local_source=allow_dirty_local_source,
         )
         resolved_new_ref, new_reason, new_candidates = resolve_repo_ref_for_version(
             repo_path,
             new_ver,
             selected_ref=override_new_ref,
+            allow_local_source=allow_local_source,
+            allow_dirty_local_source=allow_dirty_local_source,
         )
     else:
         (
@@ -3435,6 +3518,47 @@ def resolve_gitdiff_ref_plan_for_row(row, source_mapping, source_meta, dependenc
             "old_reason": old_reason,
             "new_reason": new_reason,
         }
+    old_source = new_source = None
+    if "user_confirmed_local_source" in str(old_reason):
+        old_source = {
+            "status": "user_confirmed_local_source",
+            "resolved_ref": override_old_ref,
+            "resolved_commit": resolved_old_ref,
+        }
+    else:
+        old_source, old_materialize_error = _materialize_resolved_remote_ref(
+            repo_path, resolved_old_ref, old_candidates,
+        )
+        if old_materialize_error:
+            return {
+                **common,
+                "status": "pending",
+                "reason": "远程旧版本源码无法固定",
+                "resolved_old_ref": None,
+                "resolved_new_ref": resolved_new_ref,
+                "old_reason": old_materialize_error,
+                "new_reason": new_reason,
+            }
+    if "user_confirmed_local_source" in str(new_reason):
+        new_source = {
+            "status": "user_confirmed_local_source",
+            "resolved_ref": override_new_ref,
+            "resolved_commit": resolved_new_ref,
+        }
+    else:
+        new_source, new_materialize_error = _materialize_resolved_remote_ref(
+            repo_path, resolved_new_ref, new_candidates,
+        )
+        if new_materialize_error:
+            return {
+                **common,
+                "status": "pending",
+                "reason": "远程新版本源码无法固定",
+                "resolved_old_ref": (old_source or {}).get("resolved_commit"),
+                "resolved_new_ref": None,
+                "old_reason": old_reason,
+                "new_reason": new_materialize_error,
+            }
     return {
         **common,
         "status": "matched",
@@ -3442,9 +3566,11 @@ def resolve_gitdiff_ref_plan_for_row(row, source_mapping, source_meta, dependenc
         "behavior_changed": 0,
         "structural_source_changes": 0,
         "out_file": "",
-        "base_ref": resolved_old_ref,
-        "cur_ref": resolved_new_ref,
+        "base_ref": old_source.get("resolved_commit"),
+        "cur_ref": new_source.get("resolved_commit"),
         "ref_source": "preflight",
+        "old_source": old_source,
+        "new_source": new_source,
         "old_match_reason": old_reason,
         "new_match_reason": new_reason,
     }
@@ -3571,12 +3697,29 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
 
     override_old_ref = str(lib_info.get("old_ref_override") or "").strip()
     override_new_ref = str(lib_info.get("new_ref_override") or "").strip()
-    if override_old_ref or override_new_ref:
+    fixed_base_ref = str(lib_info.get("base_ref") or "").strip()
+    fixed_cur_ref = str(lib_info.get("cur_ref") or "").strip()
+    if fixed_base_ref and fixed_cur_ref:
+        resolved_old_ref = fixed_base_ref
+        resolved_new_ref = fixed_cur_ref
+        old_reason = str(lib_info.get("old_match_reason") or "preflight_remote_commit")
+        new_reason = str(lib_info.get("new_match_reason") or "preflight_remote_commit")
+        old_candidates = []
+        new_candidates = []
+    elif override_old_ref or override_new_ref:
         resolved_old_ref, old_reason, old_candidates = resolve_repo_ref_for_version(
-            repo_path, old_ver, selected_ref=override_old_ref
+            repo_path,
+            old_ver,
+            selected_ref=override_old_ref,
+            allow_local_source=bool(lib_info.get("allow_local_source")),
+            allow_dirty_local_source=bool(lib_info.get("allow_dirty_local_source")),
         )
         resolved_new_ref, new_reason, new_candidates = resolve_repo_ref_for_version(
-            repo_path, new_ver, selected_ref=override_new_ref
+            repo_path,
+            new_ver,
+            selected_ref=override_new_ref,
+            allow_local_source=bool(lib_info.get("allow_local_source")),
+            allow_dirty_local_source=bool(lib_info.get("allow_dirty_local_source")),
         )
     else:
         (
@@ -3627,9 +3770,32 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
             },
         }
 
+    if not (fixed_base_ref and fixed_cur_ref):
+        if "user_confirmed_local_source" not in str(old_reason):
+            old_source, error = _materialize_resolved_remote_ref(repo_path, resolved_old_ref, old_candidates)
+            if error:
+                return {
+                    "status": "needs_user_confirmation",
+                    "out_file": out_file,
+                    "apis": [],
+                    "error": "远程旧版本源码无法固定",
+                    "meta": {"coord": coord, "reason": error, "old_candidates": old_candidates, "new_candidates": new_candidates},
+                }
+            resolved_old_ref = old_source.get("resolved_commit")
+        if "user_confirmed_local_source" not in str(new_reason):
+            new_source, error = _materialize_resolved_remote_ref(repo_path, resolved_new_ref, new_candidates)
+            if error:
+                return {
+                    "status": "needs_user_confirmation",
+                    "out_file": out_file,
+                    "apis": [],
+                    "error": "远程新版本源码无法固定",
+                    "meta": {"coord": coord, "reason": error, "old_candidates": old_candidates, "new_candidates": new_candidates},
+                }
+            resolved_new_ref = new_source.get("resolved_commit")
     base_ref = resolved_old_ref
     cur_ref = resolved_new_ref
-    ref_source = "version"
+    ref_source = "preflight_fixed_commit" if fixed_base_ref and fixed_cur_ref else "version_fixed_commit"
     module_rel_path = ""
     if module_path:
         try:
@@ -5197,6 +5363,11 @@ def main():
             timing.record("step4.total", status="japicmp_missing", elapsed=step_timer.elapsed())
             timing.flush()
             return 2
+    preflight_plan_by_coord = {
+        str(item.get("coord") or ""): item
+        for item in preflight_gitdiff_runs
+        if str(item.get("coord") or "")
+    }
     all_apis            = []
     jar_missing_deps    = []
     japicmp_missing_deps = []
@@ -5344,7 +5515,19 @@ def main():
                 'new_version':   new_ver,
                 'old_ref_override': (dependency_git_ref_overrides.get(coord) or {}).get('old_ref', ''),
                 'new_ref_override': (dependency_git_ref_overrides.get(coord) or {}).get('new_ref', ''),
+                'allow_local_source': bool((dependency_git_ref_overrides.get(coord) or {}).get('allow_local_source')),
+                'allow_dirty_local_source': bool((dependency_git_ref_overrides.get(coord) or {}).get('allow_dirty_local_source')),
             }
+            fixed_plan = preflight_plan_by_coord.get(coord) or {}
+            if fixed_plan:
+                lib_info.update({
+                    "base_ref": fixed_plan.get("base_ref"),
+                    "cur_ref": fixed_plan.get("cur_ref"),
+                    "old_source": fixed_plan.get("old_source") or {},
+                    "new_source": fixed_plan.get("new_source") or {},
+                    "old_match_reason": fixed_plan.get("old_match_reason") or "",
+                    "new_match_reason": fixed_plan.get("new_match_reason") or "",
+                })
             gitdiff_result = run_gitdiff(lib_info, args.output_dir, git_diff_timeout=args.git_diff_timeout)
             _out_file = gitdiff_result.get("out_file")
             apis = gitdiff_result.get("apis") or []
@@ -5452,6 +5635,11 @@ def main():
                         "new_match_reason": (meta or {}).get("new_reason"),
                         "old_candidates": (meta or {}).get("old_candidates") or [],
                         "new_candidates": (meta or {}).get("new_candidates") or [],
+                        "old_source": fixed_plan.get("old_source") or {},
+                        "new_source": fixed_plan.get("new_source") or {},
+                        "current_source_status": str(
+                            (fixed_plan.get("new_source") or {}).get("status") or ""
+                        ),
                         "repo_path": (meta or {}).get("repo_path") or source_mapping.get("repo_path", ""),
                         "module_path": (meta or {}).get("module_path") or source_mapping.get("module_path", ""),
                         "module_rel_path": (meta or {}).get("module_rel_path"),

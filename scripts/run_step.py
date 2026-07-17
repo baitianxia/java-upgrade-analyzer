@@ -1616,6 +1616,8 @@ def normalize_dependency_git_ref_overrides(raw_value, config_key="dependency_git
         coord = ""
         old_ref = ""
         new_ref = ""
+        allow_local_source = False
+        allow_dirty_local_source = False
         if isinstance(item, str):
             raw = item.strip()
             if not raw:
@@ -1644,6 +1646,12 @@ def normalize_dependency_git_ref_overrides(raw_value, config_key="dependency_git
             coord = str(item.get("coord") or item.get("coord_hint") or "").strip()
             old_ref = str(item.get("old_ref") or item.get("base_ref") or "").strip()
             new_ref = str(item.get("new_ref") or item.get("current_ref") or "").strip()
+            if "allow_local_source" in item:
+                allow_local_source = parse_bool_like(item.get("allow_local_source"), "allow_local_source")
+            if "allow_dirty_local_source" in item:
+                allow_dirty_local_source = parse_bool_like(
+                    item.get("allow_dirty_local_source"), "allow_dirty_local_source"
+                )
         else:
             raise StepError(f"当前步骤输入中的 {config_key} 存在不支持的项类型")
 
@@ -1652,11 +1660,18 @@ def normalize_dependency_git_ref_overrides(raw_value, config_key="dependency_git
         new_ref = new_ref.strip()
         if not (coord and old_ref and new_ref):
             raise StepError(f"当前步骤输入中的 {config_key} 每项都必须包含 coord/old_ref/new_ref")
-        key = (coord, old_ref, new_ref)
+        if allow_dirty_local_source and not allow_local_source:
+            raise StepError("allow_dirty_local_source=true 时必须同时明确 allow_local_source=true")
+        key = (coord, old_ref, new_ref, allow_local_source, allow_dirty_local_source)
         if key in seen:
             continue
         seen.add(key)
-        normalized.append({"coord": coord, "old_ref": old_ref, "new_ref": new_ref})
+        normalized_item = {"coord": coord, "old_ref": old_ref, "new_ref": new_ref}
+        if allow_local_source:
+            normalized_item["allow_local_source"] = True
+        if allow_dirty_local_source:
+            normalized_item["allow_dirty_local_source"] = True
+        normalized.append(normalized_item)
     return normalized
 
 
@@ -3924,15 +3939,18 @@ def _step1_ref_request(side, field, source_dir, resolution, *, source_only=False
         "local_candidate_commit": str(resolution.get("local_candidate_commit") or ""),
         "dirty": bool(resolution.get("dirty")),
     }
-    if source_only and resolution.get("resolved_commit"):
+    detected_commit = str(
+        resolution.get("resolved_commit") or resolution.get("local_candidate_commit") or ""
+    ).strip()
+    if source_only and detected_commit:
         request.update({
             "detected_ref": str(resolution.get("resolved_ref") or "HEAD"),
-            "detected_commit": str(resolution.get("resolved_commit") or ""),
+            "detected_commit": detected_commit,
             "status": "confirmation_required",
             "candidates": [{
-                "ref": str(resolution.get("resolved_commit") or ""),
+                "ref": detected_commit,
                 "display_ref": str(resolution.get("resolved_ref") or "HEAD"),
-                "commit": str(resolution.get("resolved_commit") or ""),
+                "commit": detected_commit,
                 "kind": "detected_source_head",
                 "score": 0,
             }],

@@ -96,14 +96,26 @@ class DependencySourceAlignmentTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         items = []
         for ref in refs:
+            try:
+                fixed_ref = self._git(repo, "rev-parse", f"{ref}^{{commit}}")
+            except subprocess.CalledProcessError:
+                fixed_ref = ref
             items.append({
                 "status": "success",
                 "meta": {
                     "coord": "com.example:dep",
                     "repo_path": str(repo),
                     "module_rel_path": ".",
-                    "resolved_new_ref": ref,
+                    "resolved_new_ref": fixed_ref,
                     "new_version": "2.0.0",
+                    "current_source_status": "remote_source_resolved",
+                    "new_source": {
+                        "status": "remote_source_resolved",
+                        "resolved_ref": f"origin/{ref}",
+                        "resolved_commit": fixed_ref,
+                        "remote": "origin",
+                        "remote_ref": f"refs/heads/{ref}",
+                    },
                 },
             })
         path.write_text(json.dumps({"matched_items": items}), encoding="utf-8")
@@ -160,7 +172,8 @@ class DependencySourceAlignmentTest(unittest.TestCase):
             self.assertEqual(result["records"][0]["retained_source_class_count"], 1)
             self.assertEqual(result["records"][0]["skipped_source_class_count"], 1)
             evidence = json.loads(Path(result["evidence_path"]).read_text(encoding="utf-8"))
-            self.assertEqual(evidence["items"][0]["selected_ref"], "jar-version")
+            self.assertEqual(evidence["items"][0]["selected_ref"], self._git(repo, "rev-parse", "jar-version"))
+            self.assertEqual(evidence["items"][0]["source_status"], "remote_source_resolved")
             self.assertEqual(evidence["items"][0]["skipped_source_class_count"], 1)
 
     def test_alignment_reuses_snapshot_for_same_commit(self):
@@ -221,6 +234,26 @@ class DependencySourceAlignmentTest(unittest.TestCase):
             )
             self.assertEqual(conflict["mappings"], [])
             self.assertEqual(conflict["records"][0]["reason_code"], "step4_current_ref_conflict")
+
+    def test_alignment_rejects_source_record_without_confirmed_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_repo(tmp)
+            report_dir = Path(tmp) / "unconfirmed-report"
+            jar_path = self._make_runtime_jar(tmp)
+            evidence_path = self._write_ref_evidence(report_dir, repo)
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            payload["matched_items"][0]["meta"].pop("current_source_status", None)
+            payload["matched_items"][0]["meta"].pop("new_source", None)
+            evidence_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = alignment.align_dependency_source_mappings(
+                str(report_dir),
+                [f"com.example:dep={repo}"],
+                self._catalog(jar_path),
+            )
+
+        self.assertEqual(result["mappings"], [])
+        self.assertEqual(result["records"][0]["reason_code"], "step4_source_provenance_unconfirmed")
 
     def test_real_multibranch_snapshot_graph_uses_selected_ref_and_jar_scope(self):
         with tempfile.TemporaryDirectory() as tmp:

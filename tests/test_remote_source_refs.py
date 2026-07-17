@@ -72,6 +72,17 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["remote"], "upstream")
         self.assertEqual(result["resolved_commit"], self.current_commit)
 
+    def test_annotated_remote_tag_resolves_to_peeled_commit(self):
+        self.add_remote("origin", {"main": self.current_commit})
+        self.git(self.repo, "tag", "-a", "v2.0.0", self.current_commit, "-m", "release")
+        self.git(self.repo, "push", "origin", "refs/tags/v2.0.0")
+
+        result = resolve_remote_source_ref(self.repo, "v2.0.0")
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_commit"], self.current_commit)
+        self.assertEqual(result["remote_ref"], "refs/tags/v2.0.0")
+
     def test_same_commit_on_multiple_remotes_resolves_and_keeps_all_candidates(self):
         self.add_remote("origin", {"release": self.current_commit})
         self.add_remote("upstream", {"release": self.current_commit})
