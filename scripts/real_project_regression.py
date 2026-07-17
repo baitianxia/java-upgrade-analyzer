@@ -45,6 +45,7 @@ from exhaustive_api_oracle import (
 )
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity, reconcile_edges
 from final_artifact_edge_oracle import scan_final_artifact
+from fault_injection import apply_fault_injection, detect_oracle_mutation
 from mybatis_mapper_oracle import (
     inspect_mybatis_artifact,
     verify_runtime_activation,
@@ -83,6 +84,13 @@ EDGE_RECONCILIATION_VERDICTS = (
 V3_GATE_NAMES = (
     "asset", "api_coverage", "topology_coverage", "edge_truth",
     "conclusion", "performance", "fixture_debt",
+)
+STANDARD_FAULT_INJECTIONS = (
+    "drop_analyzer_edge",
+    "add_analyzer_edge",
+    "wrong_analyzer_descriptor",
+    "corrupt_oracle_digest",
+    "truncate_oracle_scan",
 )
 
 
@@ -222,7 +230,7 @@ CASES = {
         fixture_manifest=(
             ROOT_DIR / "tests" / "fixtures" / "real_projects" / "commons-text.json"
         ),
-        required_fault_injections=("drop_analyzer_edge",),
+        required_fault_injections=STANDARD_FAULT_INJECTIONS,
         require_relative_performance_baseline=True,
         changed_api_rows=(
             {
@@ -786,7 +794,7 @@ CASES["spring-security-config"] = RealProjectCase(
         ROOT_DIR / "tests" / "fixtures" / "real_projects"
         / "spring-security-config.json"
     ),
-    required_fault_injections=("drop_analyzer_edge",),
+    required_fault_injections=STANDARD_FAULT_INJECTIONS,
     require_relative_performance_baseline=True,
 )
 
@@ -838,7 +846,7 @@ CASES["grpc-netty-shaded"] = RealProjectCase(
         ROOT_DIR / "tests" / "fixtures" / "real_projects"
         / "grpc-netty-shaded.json"
     ),
-    required_fault_injections=("drop_analyzer_edge",),
+    required_fault_injections=STANDARD_FAULT_INJECTIONS,
     require_relative_performance_baseline=True,
 )
 
@@ -1001,7 +1009,7 @@ CASES["gs-messaging-rabbitmq"] = RealProjectCase(
         ROOT_DIR / "tests" / "fixtures" / "real_projects" /
         "gs-messaging-rabbitmq.json"
     ),
-    required_fault_injections=("drop_analyzer_edge",),
+    required_fault_injections=STANDARD_FAULT_INJECTIONS,
     require_relative_performance_baseline=True,
 )
 
@@ -1050,7 +1058,7 @@ CASES["gs-managing-transactions"] = RealProjectCase(
     prior_topology_matrix=(
         ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json"
     ),
-    required_fault_injections=("drop_analyzer_edge",),
+    required_fault_injections=STANDARD_FAULT_INJECTIONS,
     require_relative_performance_baseline=True,
 )
 
@@ -1162,7 +1170,7 @@ CASES["mybatis-sample-xml"] = RealProjectCase(
         ROOT_DIR / "tests" / "fixtures" / "real_projects" /
         "mybatis-sample-xml.json"
     ),
-    required_fault_injections=("drop_analyzer_edge",),
+    required_fault_injections=STANDARD_FAULT_INJECTIONS,
     require_relative_performance_baseline=True,
 )
 
@@ -1191,7 +1199,7 @@ CASES["ruoyi-full-artifact-discovery"] = RealProjectCase(
     ground_truth_status="unreviewed",
     required_topologies=("field_access", "same_jar_bridge"),
     prior_topology_matrix=ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json",
-    required_fault_injections=("drop_analyzer_edge",),
+    required_fault_injections=STANDARD_FAULT_INJECTIONS,
     require_relative_performance_baseline=True,
     performance_manifest=(
         ROOT_DIR / "tests" / "fixtures" / "real_projects" /
@@ -4094,10 +4102,6 @@ def evaluate_required_fault_injections(
             run["error"] = "clean_edge_truth_not_ready"
             runs.append(run)
             continue
-        if mode != "drop_analyzer_edge":
-            run["error"] = f"unsupported_fault_injection:{mode}"
-            runs.append(run)
-            continue
         candidate = next(
             (
                 row for row in clean_ledger
@@ -4107,32 +4111,43 @@ def evaluate_required_fault_injections(
             ),
             None,
         )
-        if candidate is None:
-            run["error"] = "injectable_analyzer_edge_missing"
+        occurrence = str((candidate or {}).get("physical_occurrence") or "")
+        api_identity = str((candidate or {}).get("api_identity") or "")
+        ordered_rows = list(analyzer_rows)
+        if candidate is not None:
+            for index, row in enumerate(ordered_rows):
+                if physical_edge_occurrence(row) == occurrence:
+                    ordered_rows.insert(0, ordered_rows.pop(index))
+                    break
+        try:
+            mutation = apply_fault_injection(mode, ordered_rows, oracle_scan)
+        except ValueError as error:
+            message = str(error)
+            if message.startswith("injectable_analyzer_edge_missing"):
+                message = "injectable_analyzer_edge_missing"
+            run["error"] = message
             runs.append(run)
             continue
-        occurrence = str(candidate.get("physical_occurrence") or "")
-        api_identity = str(candidate.get("api_identity") or "")
-        removed = False
-        mutated_rows = []
-        for row in analyzer_rows:
-            matches = physical_edge_occurrence(row) == occurrence
-            row_identity = str(row.get("api_identity") or "")
-            if api_identity and row_identity:
-                matches = matches and row_identity == api_identity
-            if matches and not removed:
-                removed = True
-                continue
-            mutated_rows.append(row)
-        if not removed:
-            run["error"] = "injectable_analyzer_edge_missing"
+
+        if mutation.oracle_mutated:
+            detected = detect_oracle_mutation(oracle_scan, mutation.oracle_scan)
+            run.update({
+                "removed_occurrence": occurrence,
+                "removed_api_identity": api_identity,
+                "detected_signal": detected,
+                "injected_oracle_sha256": "",
+            })
+            run["passed"] = detected == mutation.expected_signal
+            if not run["passed"]:
+                run["error"] = "injected_oracle_mutation_was_not_rejected"
             runs.append(run)
             continue
+
         injected = reconcile_selected_api_edges(
             root / mode,
             selected_rows,
-            mutated_rows,
-            oracle_scan,
+            list(mutation.analyzer_rows),
+            mutation.oracle_scan,
         )
         counts = dict((injected.get("reconciliation") or {}).get("verdict_counts") or {})
         run.update({
@@ -4145,10 +4160,12 @@ def evaluate_required_fault_injections(
         oracle_unchanged = bool(run["clean_oracle_sha256"]) and (
             run["clean_oracle_sha256"] == run["injected_oracle_sha256"]
         )
+        expected_count = int(counts.get(mutation.expected_verdict) or 0)
+        run["detected_signal"] = "edge_reconciliation"
         run["passed"] = bool(
             injected.get("complete")
             and injected.get("blocking")
-            and int(counts.get("missing") or 0) > 0
+            and expected_count > 0
             and oracle_unchanged
         )
         if not run["passed"]:

@@ -247,7 +247,7 @@ class RealProjectRegressionTest(unittest.TestCase):
     def test_mybatis_xml_guard_requires_false_negative_fault_injection(self):
         self.assertEqual(
             realreg.CASES["mybatis-sample-xml"].required_fault_injections,
-            ("drop_analyzer_edge",),
+            realreg.STANDARD_FAULT_INJECTIONS,
         )
 
     def test_spring_security_config_case_is_a_pinned_constructor_guard(self):
@@ -275,7 +275,7 @@ class RealProjectRegressionTest(unittest.TestCase):
         )
         self.assertEqual(
             case.required_fault_injections,
-            ("drop_analyzer_edge",),
+            realreg.STANDARD_FAULT_INJECTIONS,
         )
         self.assertTrue(case.require_relative_performance_baseline)
         self.assertTrue(case.enable_jdk_oracle)
@@ -341,7 +341,7 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(case.case_mode, "guard")
         self.assertEqual(case.source_dirs, (Path("src/main/java"),))
         self.assertEqual(case.required_topologies, ("source_bytecode_agree",))
-        self.assertEqual(case.required_fault_injections, ("drop_analyzer_edge",))
+        self.assertEqual(case.required_fault_injections, realreg.STANDARD_FAULT_INJECTIONS)
         self.assertTrue(case.require_relative_performance_baseline)
         self.assertTrue(case.source_attestation.is_file())
         self.assertTrue(case.default_changed_apis.is_file())
@@ -364,7 +364,7 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(case.case_mode, "guard")
         self.assertEqual(case.source_dirs, (Path("netty/src/main/java"),))
         self.assertEqual(case.required_topologies, ("source_bytecode_true_conflict",))
-        self.assertEqual(case.required_fault_injections, ("drop_analyzer_edge",))
+        self.assertEqual(case.required_fault_injections, realreg.STANDARD_FAULT_INJECTIONS)
         self.assertTrue(case.require_relative_performance_baseline)
         self.assertTrue(case.source_attestation.is_file())
         self.assertTrue(case.default_changed_apis.is_file())
@@ -1893,7 +1893,7 @@ class RealProjectRegressionTest(unittest.TestCase):
             )
 
         self.assertFalse(clean["blocking"])
-        self.assertTrue(injected["passed"])
+        self.assertTrue(injected["passed"], injected)
         self.assertEqual(injected["runs"][0]["mode"], "drop_analyzer_edge")
         self.assertGreaterEqual(
             injected["runs"][0]["verdict_counts"]["missing"], 1
@@ -1920,6 +1920,68 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertFalse(result["passed"])
         self.assertEqual(result["runs"][0]["error"], "injectable_analyzer_edge_missing")
+
+    def test_fault_injection_registry_detects_extra_wrong_and_oracle_mutations(self):
+        artifact_sha256 = "b" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        edge = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class", instruction_offset=12,
+        )
+        edge["api_identity"] = realreg.serialized_api_identity(target)
+        modes = (
+            "add_analyzer_edge",
+            "wrong_analyzer_descriptor",
+            "corrupt_oracle_digest",
+            "truncate_oracle_scan",
+        )
+        case = realreg.RealProjectCase(
+            name="fault-registry",
+            default_project=Path("."),
+            default_changed_apis=Path("changed.csv"),
+            baseline_specs=(),
+            required_fault_injections=modes,
+        )
+        oracle_scan = {
+            "artifact_sha256": artifact_sha256,
+            "complete": True,
+            "edges": [edge],
+            "failures": [],
+            "artifact_entries": [edge["artifact_entry"]],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            clean = realreg.reconcile_selected_api_edges(
+                report_dir / "clean", [target], [edge], oracle_scan
+            )
+            injected = realreg.evaluate_required_fault_injections(
+                case,
+                report_dir,
+                [target],
+                {**clean, "oracle_scan": oracle_scan},
+                analyzer_rows=[edge],
+            )
+
+        self.assertTrue(injected["passed"], injected)
+        by_mode = {run["mode"]: run for run in injected["runs"]}
+        self.assertGreater(by_mode["add_analyzer_edge"]["verdict_counts"]["extra"], 0)
+        self.assertGreater(
+            by_mode["wrong_analyzer_descriptor"]["verdict_counts"]["missing"], 0
+        )
+        self.assertEqual(
+            by_mode["corrupt_oracle_digest"]["detected_signal"], "oracle_invalid"
+        )
+        self.assertEqual(
+            by_mode["truncate_oracle_scan"]["detected_signal"], "oracle_incomplete"
+        )
 
     def test_fault_injection_rejects_unsupported_mode(self):
         case = realreg.RealProjectCase(
@@ -4361,7 +4423,7 @@ class RealProjectRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             case.required_fault_injections,
-            ("drop_analyzer_edge",),
+            realreg.STANDARD_FAULT_INJECTIONS,
         )
         self.assertTrue(case.require_relative_performance_baseline)
         self.assertEqual(
@@ -4452,7 +4514,7 @@ class RealProjectRegressionTests(unittest.TestCase):
         )
         self.assertEqual(case.case_mode, "guard")
         self.assertEqual(case.required_topologies, ("framework_proxy",))
-        self.assertEqual(case.required_fault_injections, ("drop_analyzer_edge",))
+        self.assertEqual(case.required_fault_injections, realreg.STANDARD_FAULT_INJECTIONS)
         self.assertTrue(case.require_relative_performance_baseline)
         self.assertEqual(len(changed_rows), 3)
         self.assertEqual(len(oracle_rows), len(changed_rows))

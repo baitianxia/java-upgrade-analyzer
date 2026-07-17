@@ -55,7 +55,11 @@
     "same_jar_bridge"
   ],
   "required_fault_injections": [
-    "drop_analyzer_edge"
+    "drop_analyzer_edge",
+    "add_analyzer_edge",
+    "wrong_analyzer_descriptor",
+    "corrupt_oracle_digest",
+    "truncate_oracle_scan"
   ],
   "runtime_provider_replacements": [
     ["com.github.oshi:oshi-core", "com.github.oshi:oshi-common"],
