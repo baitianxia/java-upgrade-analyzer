@@ -57,4 +57,3 @@ Generated artifacts exercise malformed class files, unsafe ZIP entries, excessiv
 - The three open TODO capability items have executable positive, negative, and incomplete-evidence tests and are removed from `TODO.md` only after implementation and verification.
 - New topology fixtures are registered and covered by topology closure.
 - Release verification passes without skipped mandatory tasks and without reducing the registered scope baselines.
-

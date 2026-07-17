@@ -151,4 +151,3 @@
 - [ ] Confirm no mandatory task skipped and scope baselines did not decrease.
 - [ ] Remove only completed TODO items, update capability closure evidence, and commit.
 - [ ] Run a fresh final release gate and review the full diff.
-

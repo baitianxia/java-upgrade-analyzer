@@ -12,6 +12,13 @@ quality_gate = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(quality_gate)
 
+GIT_CHECK_SPEC = importlib.util.spec_from_file_location(
+    "git_change_check", ROOT / "scripts" / "git_change_check.py"
+)
+git_change_check = importlib.util.module_from_spec(GIT_CHECK_SPEC)
+assert GIT_CHECK_SPEC.loader is not None
+GIT_CHECK_SPEC.loader.exec_module(git_change_check)
+
 
 class CiQualityContractTest(unittest.TestCase):
     def test_smoke_workflow_covers_behavior_paths_and_explicit_java_tools(self):
@@ -71,6 +78,43 @@ class CiQualityContractTest(unittest.TestCase):
 
         self.assertNotIn("mvn", quick.command)
         self.assertIn("mvn", step5.command)
+
+    def test_release_diff_check_includes_committed_branch_changes(self):
+        task = next(
+            item for item in quality_gate.build_plan("release", skip_real=True)
+            if item.name == "git_diff_check"
+        )
+
+        self.assertEqual(task.command[-1], "scripts/git_change_check.py")
+        release = (ROOT / ".github/workflows/release-regression.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("fetch-depth: 0", release)
+
+    def test_git_change_check_prefers_github_base_branch(self):
+        def fake_git(*args):
+            candidate = args[-1]
+            return type("Result", (), {
+                "returncode": 0 if candidate == "origin/release" else 1,
+                "stdout": "feature\n" if args[:2] == ("branch", "--show-current") else "",
+            })()
+
+        with patch.dict(git_change_check.os.environ, {"GITHUB_BASE_REF": "release"}), \
+                patch.object(git_change_check, "_git", side_effect=fake_git):
+            self.assertEqual(git_change_check.comparison_base(), "origin/release")
+
+    def test_git_change_check_uses_previous_commit_on_main(self):
+        def fake_git(*args):
+            if args[:2] == ("branch", "--show-current"):
+                return type("Result", (), {"returncode": 0, "stdout": "main\n"})()
+            return type("Result", (), {
+                "returncode": 0 if args[-1] == "HEAD^" else 1,
+                "stdout": "",
+            })()
+
+        with patch.dict(git_change_check.os.environ, {}, clear=True), \
+                patch.object(git_change_check, "_git", side_effect=fake_git):
+            self.assertEqual(git_change_check.comparison_base(), "HEAD^")
 
     def test_required_tool_preflight_fails_instead_of_skipping(self):
         task = quality_gate._required_tools_task()

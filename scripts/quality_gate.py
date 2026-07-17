@@ -251,8 +251,8 @@ def _accuracy_benchmark_task(python_exe, profile):
 def _diff_check_task():
     return GateTask(
         name="git_diff_check",
-        command=["git", "diff", "--check"],
-        purpose="检查 whitespace/error markers，防止低级提交污染",
+        command=[sys.executable, "scripts/git_change_check.py"],
+        purpose="检查工作区与分支已提交变更的 whitespace/error markers",
     )
 
 
