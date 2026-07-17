@@ -467,10 +467,24 @@ def run_external_cmd(cmd, cwd):
 
 def create_remote_refs(repo_dir, ref_to_branch):
     git = git_cmd()
+    remote_dir = repo_dir.parent / f"{repo_dir.name}-remote.git"
+    if not remote_dir.exists():
+        run_external_cmd(git + ["init", "--bare", str(remote_dir)], repo_dir.parent)
+    _stdout, _stderr, remote_rc = compat_run_cmd(
+        git + ["remote", "get-url", "origin"],
+        cwd=str(repo_dir),
+    )
+    if remote_rc == 0:
+        run_external_cmd(git + ["remote", "set-url", "origin", str(remote_dir)], repo_dir)
+    else:
+        run_external_cmd(git + ["remote", "add", "origin", str(remote_dir)], repo_dir)
     for ref_name, branch_name in (ref_to_branch or {}).items():
         commit, _ = run_external_cmd(git + ["rev-parse", branch_name], repo_dir)
+        remote_name, _, remote_branch = str(ref_name).partition("/")
+        if remote_name != "origin" or not remote_branch:
+            raise ValueError(f"smoke remote ref 必须使用 origin/<branch>：{ref_name}")
         run_external_cmd(
-            git + ["update-ref", f"refs/remotes/{ref_name}", commit.strip()],
+            git + ["push", "--force", "origin", f"{commit.strip()}:refs/heads/{remote_branch}"],
             repo_dir,
         )
 
@@ -1270,12 +1284,13 @@ def run_core_pipeline_smoke(workspace, dep_env):
     branch_gitdiff = (branch_match_dir / "demo-lib_gitdiff_api_changes.txt").read_text(encoding="utf-8")
     branch_ref_match_txt = (branch_match_dir / "git_ref_matches.txt").read_text(encoding="utf-8")
     branch_ref_match_json = read_json(branch_match_dir / "git_ref_matches.json")
+    branch_match_item = (branch_ref_match_json.get("matched_items") or [{}])[0]
     assert_true(
-        (
-            "refs=origin/release-1.0.0..origin/release-2.0.0（version）" in branch_summary
-            or "refs=origin/release-1.0.0..origin/release-2.0.0(version)" in branch_summary
-        ),
-        "Step 4 未按依赖版本号命中 release-* 形态的源码 refs",
+        branch_match_item.get("old_source", {}).get("resolved_ref") == "origin/release-1.0.0"
+        and branch_match_item.get("new_source", {}).get("resolved_ref") == "origin/release-2.0.0"
+        and branch_match_item.get("old_source", {}).get("resolution_mode") == "live_remote"
+        and branch_match_item.get("new_source", {}).get("resolution_mode") == "live_remote",
+        "Step 4 未通过实时远端按依赖版本号命中 release-* 源码 refs",
     )
     assert_true(
         (
@@ -1292,16 +1307,14 @@ def run_core_pipeline_smoke(workspace, dep_env):
             "当前没有待确认项；可按需抽查" in branch_ref_match_txt
             or "已自动匹配，可抽查" in branch_ref_match_txt
         )
-        and (
-            "ref=origin/release-1.0.0..origin/release-2.0.0" in branch_ref_match_txt
-            or "selected=origin/release-1.0.0..origin/release-2.0.0" in branch_ref_match_txt
-        ),
+        and "匹配原因=old[matched_by_version_pair" in branch_ref_match_txt,
         "Step 4 未产出 release-* 版本命中的 git ref 匹配摘要",
     )
     assert_true(
         branch_ref_match_json.get("need_user_confirmation") is False
-        and (branch_ref_match_json.get("matched_items") or [{}])[0].get("base_ref") == "origin/release-1.0.0",
-        "Step 4 未在 git_ref_matches.json 中写入 release-* 版本命中的 ref 结果",
+        and branch_match_item.get("base_ref") == branch_match_item.get("old_source", {}).get("resolved_commit")
+        and branch_match_item.get("cur_ref") == branch_match_item.get("new_source", {}).get("resolved_commit"),
+        "Step 4 未在 git_ref_matches.json 中固定 release-* 远端版本命中的 commit",
     )
     assert_true(
         (branch_ref_match_json.get("source_repo_mappings") or [{}])[0].get("repo_path"),
