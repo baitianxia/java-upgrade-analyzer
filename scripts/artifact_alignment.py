@@ -83,6 +83,8 @@ def build_artifact_alignment(
         reasons.append("source_revision_mismatch")
     if expected_sha256 and artifact_sha != expected_sha256:
         reasons.append("artifact_sha256_mismatch")
+    if not expected_sha256:
+        reasons.append("artifact_sha256_unpinned")
 
     module = str(target_module or "").strip().strip("/")
     if module and module != ".":

@@ -46,6 +46,8 @@ from signature_utils import (
 )
 from enhanced_source_analyzer import CallEdge, MethodDef, _strip_strings_and_comments
 from business_bytecode_graph import parse_classfile_calls
+from artifact_safety import inspect_archive
+from constant_impact import classify_constant_impact
 from indirect_usage_analyzer import (
     api_key as indirect_api_key,
     parse_javap_indirect_references,
@@ -181,6 +183,12 @@ def _verified_final_artifact_provenance(graph):
         )
         artifact_path = Path(str(current.get('artifact_path') or '').strip())
         expected_sha256 = str(current.get('artifact_sha256') or '').strip()
+        safety = inspect_archive(artifact_path)
+        if not safety.safe:
+            raise ValueError(
+                'artifact safety violation:'
+                + ','.join(safety.details or safety.reason_codes)
+            )
         snapshot = artifact_path.read_bytes()
         actual_sha256 = hashlib.sha256(snapshot).hexdigest()
         if not _valid_sha256(expected_sha256) or actual_sha256 != expected_sha256:
@@ -838,6 +846,9 @@ class TraceResult:
     # 全部终止链路的人工复核视图；call_paths/evidence_paths 保留兼容语义。
     path_details: list = field(default_factory=list)
     capability_coverage: dict = field(default_factory=dict)
+    compile_impact: str = ''
+    runtime_link_impact: str = ''
+    constant_impact_evidence: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -866,6 +877,9 @@ class TraceDraft:
     new_version: str = ''
     path_details: list = field(default_factory=list)
     capability_coverage: dict = field(default_factory=dict)
+    compile_impact: str = ''
+    runtime_link_impact: str = ''
+    constant_impact_evidence: dict = field(default_factory=dict)
     envelope_paths: tuple = field(default_factory=tuple)
     envelope_failures: tuple = field(default_factory=tuple)
     envelope_concerns: tuple = field(default_factory=tuple)
@@ -906,6 +920,11 @@ def render_trace_result(seed: TraceSeed, outcome: AnalysisOutcome) -> TraceResul
         new_version=seed.new_version,
         path_details=thaw_evidence_value(outcome.path_details),
         capability_coverage=thaw_evidence_value(dict(outcome.capability_coverage)),
+        compile_impact=outcome.compile_impact,
+        runtime_link_impact=outcome.runtime_link_impact,
+        constant_impact_evidence=thaw_evidence_value(
+            dict(outcome.constant_impact_evidence)
+        ),
     )
 
 
@@ -1133,6 +1152,9 @@ def _finalize_trace_draft(draft):
         match_provenance=draft.match_provenance,
         match_tier=draft.match_tier,
         capability_coverage=tuple(sorted(draft.capability_coverage.items())),
+        compile_impact=draft.compile_impact,
+        runtime_link_impact=draft.runtime_link_impact,
+        constant_impact_evidence=tuple(sorted(draft.constant_impact_evidence.items())),
     )
     return render_trace_result(seed, outcome)
 
@@ -1836,7 +1858,7 @@ def _is_inlined_constant_change(api_row):
     )
 
 
-def _build_inlined_constant_result(result):
+def _build_inlined_constant_result(result, api_row=None, graph=None):
     note = (
         '编译期常量值已变化，但调用方 class 可能只保留内联旧值而没有字段访问指令；'
         '字节码未发现 getstatic/getfield 不能解释为未使用'
@@ -1845,6 +1867,34 @@ def _build_inlined_constant_result(result):
         '搜索业务及依赖源码中的常量字段引用，并执行覆盖该常量语义的回归测试',
         '必要时比较调用方 class 常量池与 old/new 常量值，但不要仅凭字面量命中确认调用关系',
     ]
+    api_row = dict(api_row or {})
+    source_reference_present = any(
+        str(edge.get('evidence_type') or '') in {
+            'field_access', 'static_import_field', 'source_reference'
+        }
+        for path in (result.evidence_paths or [])
+        for edge in (path or [])
+    )
+    source_artifact_aligned = (
+        str((getattr(graph, 'source_artifact_alignment', {}) or {}).get('status') or '')
+        == 'aligned'
+    )
+    evidence_complete = bool(
+        'old_field_has_constant_value' in api_row
+        and source_reference_present
+        and source_artifact_aligned
+    )
+    old_constant = api_row.get('old_field_has_constant_value') is True
+    impact = classify_constant_impact(
+        change_type=api_row.get('change_type') or result.change_type,
+        old_field_has_constant_value=old_constant,
+        source_reference_present=source_reference_present,
+        runtime_field_edge_present=False,
+        source_artifact_aligned=source_artifact_aligned if evidence_complete else False,
+    ).to_dict()
+    result.compile_impact = impact.pop('compile_impact')
+    result.runtime_link_impact = impact.pop('runtime_link_impact')
+    result.constant_impact_evidence = impact
     reason_code = 'INLINED_CONSTANT_USAGE_UNDETECTABLE'
     _downgrade_reachable_path_details(result, 'uncertain', reason_code)
     result.envelope_paths = tuple(
@@ -6632,7 +6682,7 @@ def _collect_trace_api_with_confidence_weighting(
             api_row, graph
         ):
             if _is_inlined_constant_change(api_row):
-                _build_inlined_constant_result(direct_usage_result)
+                _build_inlined_constant_result(direct_usage_result, api_row, graph)
             else:
                 _apply_source_artifact_miss(direct_usage_result, graph, (
                     '源码中发现了目标调用，但当前打包产物的字节码扫描没有发现对应引用；'
@@ -7319,7 +7369,7 @@ def _collect_trace_api_with_confidence_weighting(
                 target_match_groups,
                 stop_reason='INLINED_CONSTANT_USAGE_UNDETECTABLE',
             )
-            built = _build_inlined_constant_result(result)
+            built = _build_inlined_constant_result(result, api_row, graph)
             _debug_trace_result('trace_api_result', built)
             return built
         source_conflict = _build_source_only_artifact_conflict_result(

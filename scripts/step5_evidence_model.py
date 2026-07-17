@@ -442,6 +442,9 @@ class AnalysisOutcome:
     match_provenance: str = ""
     match_tier: int = -1
     capability_coverage: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+    compile_impact: str = ""
+    runtime_link_impact: str = ""
+    constant_impact_evidence: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
 
     def __post_init__(self):
         if not isinstance(self.decision, AnalysisDecision):

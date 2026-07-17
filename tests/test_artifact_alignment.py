@@ -56,6 +56,21 @@ class ArtifactAlignmentTest(unittest.TestCase):
         self.assertEqual(record.artifact_sha256, sha)
         self.assertEqual(record.dirty_paths, ())
 
+    def test_internal_artifact_without_pinned_sha_is_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, artifact, revision, _sha = self.make_project(tmp)
+            artifact.write_bytes(b"unrelated artifact")
+            record = artifact_alignment.build_artifact_alignment(
+                project,
+                artifact,
+                target_module="app",
+                expected_revision=revision,
+                internally_built=True,
+            )
+
+        self.assertEqual(record.status, "unverified")
+        self.assertIn("artifact_sha256_unpinned", record.reasons)
+
     def test_external_artifact_without_manifest_is_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, artifact, _revision, _sha = self.make_project(tmp)

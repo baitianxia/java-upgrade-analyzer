@@ -17,6 +17,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import artifact_safety  # noqa: E402
+import confidence_weighted_tracer as tracer  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
 
 
@@ -127,6 +128,31 @@ class ArtifactSafetyTest(unittest.TestCase):
         self.assertEqual(result.entry_count, 5_000)
         self.assertLess(elapsed, 5.0)
         self.assertLess(peak, 32 * 1024 * 1024)
+
+    def test_final_artifact_provenance_rejects_unsafe_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp)
+            artifact = report / "unsafe.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("../escaped.class", b"class")
+            dependencies = report / "evidence/dependencies"
+            dependencies.mkdir(parents=True)
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [{
+                    "side": "current",
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                }]
+            }), encoding="utf-8")
+            graph = type("Graph", (), {"report_dir": str(report)})()
+
+            result = tracer._verified_final_artifact_provenance(graph)
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(any(
+            "ARCHIVE_ENTRY_PATH_UNSAFE" in failure
+            for failure in result["failures"]
+        ), result["failures"])
 
 
 if __name__ == "__main__":

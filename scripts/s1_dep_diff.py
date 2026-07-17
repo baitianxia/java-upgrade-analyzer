@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, mvn_cmd, git_cmd, IS_WINDOWS, require_human_confirm
 from csv_io import open_csv_write
 from analysis_contract import sha256_file
+from artifact_safety import inspect_archive
 from pipeline_constants import STEP1_ARTIFACTS_DIRNAME
 from step1_observability import Step1Observer
 from step1_ref_resolution import resolve_step1_ref
@@ -1574,6 +1575,27 @@ def _scan_packaged_archive(artifact_path):
             }],
             archive_bytes=0,
             nested_entries=0,
+        )
+    safety = inspect_archive(artifact_path)
+    if not safety.safe:
+        return _PackagedArchiveScanResult(
+            rows=[],
+            complete=False,
+            failures=[{
+                'stage': (
+                    'archive_open'
+                    if reason == 'ARCHIVE_FORMAT_INVALID'
+                    else 'archive_safety'
+                ),
+                'entry': '',
+                'error': (
+                    f'archive open failed: {reason}'
+                    if reason == 'ARCHIVE_FORMAT_INVALID'
+                    else reason
+                ),
+            } for reason in safety.reason_codes],
+            archive_bytes=archive_bytes,
+            nested_entries=safety.nested_archives,
         )
     try:
         outer_zip = zipfile.ZipFile(str(artifact_path))

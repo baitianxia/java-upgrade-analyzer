@@ -16,6 +16,7 @@ class ArchiveSafetyResult:
     total_uncompressed_bytes: int
     nested_archives: int
     max_observed_depth: int
+    details: tuple[str, ...] = ()
 
 
 def _unsafe_entry_name(name):
@@ -42,12 +43,13 @@ def _inspect_archive_source(
     max_nested_archive_bytes=64 * 1024 * 1024,
 ):
     reasons = set()
+    details = set()
     entry_count = 0
     total_size = 0
     nested_archives = 0
     max_depth = 0
 
-    def inspect(payload, depth):
+    def inspect(payload, depth, location="<root>"):
         nonlocal entry_count, total_size, nested_archives, max_depth
         max_depth = max(max_depth, depth)
         try:
@@ -62,9 +64,11 @@ def _inspect_archive_source(
                     reasons.add("ARCHIVE_ENTRY_COUNT_EXCEEDED")
                 if len(names) != len(set(names)):
                     reasons.add("ARCHIVE_DUPLICATE_ENTRY")
+                    details.add(f"ARCHIVE_DUPLICATE_ENTRY:{location}")
                 for info in infos:
                     if _unsafe_entry_name(info.filename):
                         reasons.add("ARCHIVE_ENTRY_PATH_UNSAFE")
+                        details.add(f"ARCHIVE_ENTRY_PATH_UNSAFE:{info.filename}")
                     total_size += max(int(info.file_size), 0)
                     if total_size > max_total_uncompressed_bytes:
                         reasons.add("ARCHIVE_UNCOMPRESSED_SIZE_EXCEEDED")
@@ -87,10 +91,12 @@ def _inspect_archive_source(
                         nested_payload = archive.read(info)
                     except (OSError, RuntimeError, zipfile.BadZipFile, KeyError):
                         reasons.add("ARCHIVE_NESTED_READ_FAILED")
+                        details.add(f"ARCHIVE_NESTED_READ_FAILED:{info.filename}")
                         continue
-                    inspect(nested_payload, depth + 1)
+                    inspect(nested_payload, depth + 1, info.filename)
         except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
             reasons.add("ARCHIVE_FORMAT_INVALID")
+            details.add(f"ARCHIVE_FORMAT_INVALID:{location}")
 
     inspect(source, 0)
     reason_codes = tuple(sorted(reasons))
@@ -101,6 +107,7 @@ def _inspect_archive_source(
         total_uncompressed_bytes=total_size,
         nested_archives=nested_archives,
         max_observed_depth=max_depth,
+        details=tuple(sorted(details)),
     )
 
 

@@ -1962,13 +1962,18 @@ class RealProjectRegressionTest(unittest.TestCase):
             clean = realreg.reconcile_selected_api_edges(
                 report_dir / "clean", [target], [edge], oracle_scan
             )
-            injected = realreg.evaluate_required_fault_injections(
-                case,
-                report_dir,
-                [target],
-                {**clean, "oracle_scan": oracle_scan},
-                analyzer_rows=[edge],
-            )
+            with patch.object(
+                realreg,
+                "detect_oracle_mutation",
+                side_effect=AssertionError("self-referential detector must not be used"),
+            ):
+                injected = realreg.evaluate_required_fault_injections(
+                    case,
+                    report_dir,
+                    [target],
+                    {**clean, "oracle_scan": oracle_scan},
+                    analyzer_rows=[edge],
+                )
 
         self.assertTrue(injected["passed"], injected)
         by_mode = {run["mode"]: run for run in injected["runs"]}
@@ -2383,6 +2388,26 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(records[0]["compile_impact"], "recompile_break")
         self.assertEqual(records[0]["runtime_link_impact"], "inlined_no_link")
         self.assertTrue(records[0]["constant_impact_evidence"]["source_reference_present"])
+
+    def test_constant_impact_parses_false_string_evidence_as_false(self):
+        constant = {
+            "coord": "vendor:api", "api_name": "vendor.Flags.EMPTY",
+            "api_signature": "", "symbol_kind": "field",
+            "change_type": "REMOVED", "compatibility_flags": "CONSTANT_REMOVED",
+            "old_field_has_constant_value": "false",
+            "source_reference_present": "false",
+            "source_artifact_aligned": "false",
+        }
+
+        record = realreg._constant_impact_record(constant, "uncertain")
+
+        self.assertEqual(record["compile_impact"], "unverified")
+        self.assertFalse(
+            record["constant_impact_evidence"]["old_field_has_constant_value"]
+        )
+        self.assertFalse(
+            record["constant_impact_evidence"]["source_reference_present"]
+        )
 
     def test_constant_impact_is_unverified_without_independent_source_evidence(self):
         constant = {

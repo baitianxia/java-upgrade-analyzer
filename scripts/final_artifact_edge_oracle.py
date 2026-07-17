@@ -17,6 +17,7 @@ from threading import Event, Lock
 import time
 import zipfile
 
+from artifact_safety import inspect_archive
 from edge_truth import EdgeIdentity, canonical_edge_identity
 
 
@@ -976,6 +977,14 @@ def scan_final_artifact(
     started_at = time.perf_counter()
     budget = float(time_budget_seconds or 0.0)
     deadline = started_at + budget if budget > 0 else None
+    safety = inspect_archive(artifact)
+    if not safety.safe:
+        return _base_result(
+            "",
+            elapsed_seconds=time.perf_counter() - started_at,
+            failures=[f"artifact_safety:{reason}" for reason in safety.reason_codes],
+            complete=False,
+        )
     try:
         snapshot = artifact.read_bytes()
     except OSError as error:

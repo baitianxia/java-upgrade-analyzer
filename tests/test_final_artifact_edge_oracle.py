@@ -56,6 +56,20 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
     def setUp(self):
         oracle.clear_immutable_oracle_cache()
 
+    def test_scan_rejects_unsafe_archive_before_snapshot_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = Path(temp_dir) / "unsafe.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("../escaped.class", b"not-a-class")
+
+            result = oracle.scan_final_artifact(artifact)
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(any(
+            "ARCHIVE_ENTRY_PATH_UNSAFE" in failure
+            for failure in result["failures"]
+        ), result["failures"])
+
     def test_boot_archive_ignores_duplicate_root_class_entries(self):
         """Only BOOT-INF/classes is on a Spring Boot archive's application classpath."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -865,7 +879,10 @@ public class com.example.ArrayOwner {
 
         self.assertFalse(result["complete"])
         self.assertEqual(result["class_count"], 0)
-        self.assertTrue(any("duplicate logical class entry" in failure for failure in result["failures"]))
+        self.assertTrue(any(
+            "ARCHIVE_DUPLICATE_ENTRY" in failure
+            for failure in result["failures"]
+        ), result["failures"])
 
     def test_multi_release_nested_jar_uses_highest_entry_supported_by_javap(self):
         version_text = subprocess.run(

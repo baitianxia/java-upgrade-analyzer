@@ -23,6 +23,7 @@ import hashlib
 import importlib
 import io
 import json
+import os
 import re
 import struct
 import subprocess
@@ -38,6 +39,7 @@ from typing import Iterable
 
 from csv_io import open_csv_read, open_csv_write
 from constant_impact import classify_constant_impact
+from artifact_safety import inspect_archive
 from exhaustive_api_oracle import (
     audit_api_oracle,
     load_analyzer_rows,
@@ -3814,6 +3816,22 @@ def _artifact_class_entries(artifact: Path) -> set[str]:
     return entries
 
 
+def validate_oracle_scan(oracle_scan: dict, expected_artifact_sha256: str) -> tuple[dict, str]:
+    """Apply the production Oracle trust boundary before reconciliation."""
+    validated = dict(oracle_scan or {})
+    failures = list(validated.get("failures") or [])
+    signal = ""
+    if str(validated.get("artifact_sha256") or "") != str(expected_artifact_sha256 or ""):
+        failures.append("oracle_artifact_sha_mismatch")
+        signal = "oracle_invalid"
+    elif validated.get("complete") is not True:
+        failures.append("oracle_scan_incomplete")
+        signal = "oracle_incomplete"
+    validated["failures"] = sorted(set(str(item) for item in failures if str(item)))
+    validated["complete"] = validated.get("complete") is True and not signal
+    return validated, signal
+
+
 def _verified_current_final_artifact(report_dir: Path) -> tuple[Path | None, str, list[str]]:
     provenance_path = Path(report_dir) / "evidence" / "dependencies" / "build_provenance.json"
     try:
@@ -3821,7 +3839,12 @@ def _verified_current_final_artifact(report_dir: Path) -> tuple[Path | None, str
         current = next(item for item in provenance.get("sides") or [] if item.get("side") == "current")
         artifact = Path(str(current.get("artifact_path") or ""))
         expected_sha = str(current.get("artifact_sha256") or "")
-        actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        safety = inspect_archive(artifact)
+        if not safety.safe:
+            raise ValueError(
+                "current final artifact safety violation:" + ",".join(safety.reason_codes)
+            )
+        actual_sha = _file_sha256(artifact)
         if len(expected_sha) != 64 or actual_sha != expected_sha:
             raise ValueError("current final artifact SHA-256 is missing or mismatched")
         return artifact, expected_sha, []
@@ -4051,9 +4074,7 @@ def reconcile_final_artifact_edges(
             scan["complete"] = False
             scan.setdefault("failures", []).append(f"artifact_class_inventory_failed:{error}")
             scan["artifact_entries"] = []
-        if scan.get("artifact_sha256") != expected_sha:
-            scan["complete"] = False
-            scan.setdefault("failures", []).append("oracle_artifact_sha_mismatch")
+        scan, _validation_signal = validate_oracle_scan(scan, expected_sha)
     return reconcile_selected_api_edges(report_dir, selected_rows, analyzer_rows, scan)
 
 
@@ -4131,14 +4152,28 @@ def evaluate_required_fault_injections(
             continue
 
         if mutation.oracle_mutated:
-            detected = detect_oracle_mutation(oracle_scan, mutation.oracle_scan)
+            validated_scan, detected = validate_oracle_scan(
+                mutation.oracle_scan,
+                str(oracle_scan.get("artifact_sha256") or ""),
+            )
+            injected = reconcile_selected_api_edges(
+                root / mode,
+                selected_rows,
+                analyzer_rows,
+                validated_scan,
+            )
             run.update({
                 "removed_occurrence": occurrence,
                 "removed_api_identity": api_identity,
                 "detected_signal": detected,
                 "injected_oracle_sha256": "",
+                "edge_reconciliation": str(injected.get("edge_reconciliation") or ""),
             })
-            run["passed"] = detected == mutation.expected_signal
+            run["passed"] = bool(
+                detected == mutation.expected_signal
+                and injected.get("blocking")
+                and not injected.get("complete")
+            )
             if not run["passed"]:
                 run["error"] = "injected_oracle_mutation_was_not_rejected"
             runs.append(run)
@@ -4216,13 +4251,20 @@ def _constant_impact_record(row: dict, conclusion: str) -> dict:
         "source_artifact_aligned",
     )
     evidence_complete = all(key in row for key in required_evidence)
+    def evidence_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value == 1
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
     impact = classify_constant_impact(
         change_type=row.get("change_type") or row.get("reason_code"),
-        old_field_has_constant_value=bool(row.get("old_field_has_constant_value")),
-        source_reference_present=bool(row.get("source_reference_present")),
+        old_field_has_constant_value=evidence_bool(row.get("old_field_has_constant_value")),
+        source_reference_present=evidence_bool(row.get("source_reference_present")),
         runtime_field_edge_present=conclusion == "reachable",
         source_artifact_aligned=(
-            bool(row.get("source_artifact_aligned")) if evidence_complete else False
+            evidence_bool(row.get("source_artifact_aligned")) if evidence_complete else False
         ),
     )
     payload = impact.to_dict()
@@ -6367,9 +6409,11 @@ def main(argv=None):
             )
         if args.required_topology:
             case = replace(case, required_topologies=tuple(dict.fromkeys(args.required_topology)))
-        if args.final_artifact:
-            case = replace(case, final_artifact=Path(args.final_artifact))
-        project_root = Path(args.project_root) if args.project_root else case.default_project
+        artifact_override = args.final_artifact or os.environ.get("JUA_REAL_FINAL_ARTIFACT", "")
+        if artifact_override:
+            case = replace(case, final_artifact=Path(artifact_override))
+        project_override = args.project_root or os.environ.get("JUA_REAL_PROJECT_ROOT", "")
+        project_root = Path(project_override) if project_override else case.default_project
         changed_apis = Path(args.changed_apis) if args.changed_apis else case.default_changed_apis
         results.append(
             run_case(

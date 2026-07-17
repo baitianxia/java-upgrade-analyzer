@@ -41,9 +41,10 @@ class CiQualityContractTest(unittest.TestCase):
         self.assertIn("workflow_dispatch:", text)
         self.assertIn("actions/setup-java@", text)
         self.assertIn("--profile release", text)
-        self.assertIn("--real-case guard", text)
         self.assertIn("--continue-on-failure", text)
         self.assertIn("--json-out", text)
+        self.assertIn("materialize_real_project_asset.py", text)
+        self.assertIn("--real-case commons-text", text)
 
     def test_release_workflow_runs_artifact_matrix_on_multiple_jdks(self):
         text = (ROOT / ".github/workflows/release-regression.yml").read_text(

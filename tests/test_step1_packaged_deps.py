@@ -18,6 +18,20 @@ from pipeline_constants import STEP1_ARTIFACTS_DIRNAME  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
+    def test_packaged_archive_rejects_unsafe_entry_before_scanning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "unsafe.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("../escaped.jar", self._nested_jar_bytes([]))
+
+            result = s1_dep_diff._scan_packaged_archive(artifact)
+
+        self.assertFalse(result.complete)
+        self.assertTrue(any(
+            failure.get("error") == "ARCHIVE_ENTRY_PATH_UNSAFE"
+            for failure in result.failures
+        ), result.failures)
+
     def test_dependency_list_parser_preserves_custom_scope_and_classifier(self):
         parsed = s1_dep_diff._parse_maven_dependency_list_line(
             "[INFO] org.example:native-lib:jar:linux-x86_64:1.2.3:company-runtime"

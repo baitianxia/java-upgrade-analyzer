@@ -72,9 +72,18 @@ jobs:
           jdeps -version
           mvn -version
 
-      - name: Run Release Quality Gate
+      - name: Materialize SHA-pinned real project
         run: >-
-          python scripts/quality_gate.py --profile release --real-case guard
+          python scripts/materialize_real_project_asset.py
+          tests/fixtures/real_projects/commons-text.json
+          --output-root /tmp/jua-real-assets
+
+      - name: Run Release Quality Gate
+        env:
+          JUA_REAL_PROJECT_ROOT: /tmp/jua-real-assets/commons-text/.checkout
+          JUA_REAL_FINAL_ARTIFACT: /tmp/jua-real-assets/commons-text/.checkout/target/commons-text-1.12.0.jar
+        run: >-
+          python scripts/quality_gate.py --profile release --real-case commons-text
           --continue-on-failure
           --report-root /tmp/jua-release-regression
           --json-out /tmp/jua-release-quality-gate.json

@@ -214,6 +214,11 @@ def trace_result_to_api_entry(r):
         'match_provenance':    getattr(r, 'match_provenance', '') or '',
         'match_tier':          public_match_tier,
         'critical_nodes_hit':  r.critical_nodes_hit or [],
+        'compile_impact': getattr(r, 'compile_impact', '') or '',
+        'runtime_link_impact': getattr(r, 'runtime_link_impact', '') or '',
+        'constant_impact_evidence': dict(
+            getattr(r, 'constant_impact_evidence', {}) or {}
+        ),
         'user_conclusion':     user_view['user_conclusion'],
         'decision_bucket':     user_view['decision_bucket'],
         'user_reason':         user_view['user_reason'],

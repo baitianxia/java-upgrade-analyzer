@@ -19638,6 +19638,7 @@ public class com.example.consumer.Adapter {
             "coord": "lib:flags", "api_name": "lib.Flags.EMPTY", "api_simple": "EMPTY",
             "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
             "compatibility_flags": "CONSTANT_REMOVED", "old_value": "",
+            "old_field_has_constant_value": True,
             "severity": "P0", "confirmed": "true",
         }
 
@@ -19656,6 +19657,11 @@ public class com.example.consumer.Adapter {
         self.assertIsNone(result.is_reachable)
         self.assertTrue(result.call_paths)
         self.assertEqual(result.evidence_paths[0][0]["evidence_type"], "field_access")
+        self.assertEqual(result.compile_impact, "recompile_break")
+        self.assertEqual(result.runtime_link_impact, "inlined_no_link")
+        rendered = formatter.trace_result_to_api_entry(result)
+        self.assertEqual(rendered["compile_impact"], "recompile_break")
+        self.assertEqual(rendered["runtime_link_impact"], "inlined_no_link")
 
     def test_direct_source_constant_usage_uses_inlining_decision_before_early_return(self):
         api_row = {
