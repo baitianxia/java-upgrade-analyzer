@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,12 +23,24 @@ from progress_logging import emit_progress
 
 TIMING_FIELDS = (
     "side", "phase", "item", "started_at", "ended_at", "elapsed_sec",
-    "status", "command", "message",
+    "peak_rss_mb", "status", "command", "message",
 )
 
 
 def _utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def peak_rss_mb():
+    """Return this process's high-water RSS in MiB on supported platforms."""
+    try:
+        import resource
+
+        raw = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0.0)
+    except (ImportError, OSError, ValueError):
+        return 0.0
+    divisor = 1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0
+    return raw / divisor
 
 
 @dataclass(frozen=True)
@@ -133,6 +146,7 @@ class Step1Observer:
                 "started_at": token.started_at,
                 "ended_at": ended_at,
                 "elapsed_sec": f"{elapsed:.3f}",
+                "peak_rss_mb": f"{peak_rss_mb():.3f}",
                 "status": str(status or ""),
                 "command": token.command,
                 "message": final_message,
@@ -159,4 +173,4 @@ class Step1Observer:
             )
 
 
-__all__ = ["PhaseToken", "Step1Observer", "TIMING_FIELDS"]
+__all__ = ["PhaseToken", "Step1Observer", "TIMING_FIELDS", "peak_rss_mb"]

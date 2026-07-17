@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
 import compat
 import run_step
 import s1_dep_diff
+import s4_jar_compare
 import step1_observability
 
 
@@ -139,6 +140,10 @@ class Step1ObservabilityTest(unittest.TestCase):
             self.assertEqual(timing_rows[0]["side"], "base")
             self.assertEqual(timing_rows[0]["status"], "completed")
             self.assertGreaterEqual(float(timing_rows[0]["elapsed_sec"]), 0.0)
+            self.assertGreater(float(timing_rows[0]["peak_rss_mb"]), 0.0)
+
+    def test_step1_timing_schema_records_peak_rss(self):
+        self.assertIn("peak_rss_mb", step1_observability.TIMING_FIELDS)
 
     def test_maven_package_streams_and_records_side_specific_timing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,6 +230,23 @@ class Step1ObservabilityTest(unittest.TestCase):
 
         self.assertIn(observability / "step4_timing.csv", step4_paths)
         self.assertIn(observability / "step5_timing.csv", step5_paths)
+
+    def test_step4_timing_records_resources_and_external_processes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            timing = s4_jar_compare.Step4TimingRecorder(tmp)
+            timing.record(
+                "dependency.japicmp",
+                status="success",
+                elapsed=0.25,
+                external_process_count=1,
+            )
+            timing.flush()
+
+            with Path(timing.path).open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(rows[0]["external_process_count"], "1")
+        self.assertGreater(float(rows[0]["peak_rss_mb"]), 0.0)
 
 
 if __name__ == "__main__":

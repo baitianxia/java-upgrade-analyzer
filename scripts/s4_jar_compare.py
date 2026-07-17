@@ -63,6 +63,7 @@ from pipeline_constants import (
 )
 from signature_utils import normalize_signature_for_lookup
 from data_contract_analysis import compare_jar_data_contracts
+from step1_observability import peak_rss_mb
 
 INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -248,6 +249,8 @@ class Step4TimingRecorder:
         "new_version",
         "status",
         "elapsed_sec",
+        "peak_rss_mb",
+        "external_process_count",
         "api_count",
         "details",
     ]
@@ -270,6 +273,7 @@ class Step4TimingRecorder:
         new_version="",
         status="",
         elapsed=None,
+        external_process_count=0,
         api_count="",
         details=None,
     ):
@@ -288,6 +292,8 @@ class Step4TimingRecorder:
             "new_version": str(new_version or ""),
             "status": str(status or ""),
             "elapsed_sec": elapsed_value,
+            "peak_rss_mb": f"{peak_rss_mb():.3f}",
+            "external_process_count": str(max(0, int(external_process_count or 0))),
             "api_count": "" if api_count is None else str(api_count),
             "details": details_value,
         }
@@ -5248,6 +5254,7 @@ def main():
                 new_version=new_ver,
                 status="error" if err else "success",
                 elapsed=time.perf_counter() - japicmp_timer,
+                external_process_count=1,
                 api_count=len(apis),
                 details=err or {
                     "old_jar_source": str((jar_info or {}).get("old_jar_source") or ""),
