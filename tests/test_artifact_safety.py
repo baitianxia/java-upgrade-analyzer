@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import tracemalloc
 import unittest
@@ -244,6 +245,32 @@ class ArtifactSafetyTest(unittest.TestCase):
 
             self.assertTrue(all(result.safe for result in results))
             self.assertEqual(inspect_mock.call_count, 1)
+
+    def test_cache_clear_during_scan_prevents_stale_writeback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "in-flight.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("sample/Ok.class", b"class")
+            started = threading.Event()
+            release = threading.Event()
+            original = artifact_safety._inspect_archive_source
+
+            def blocked_scan(*args, **kwargs):
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+                return original(*args, **kwargs)
+
+            with patch.object(
+                artifact_safety, "_inspect_archive_source", side_effect=blocked_scan,
+            ) as inspect_mock, ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(artifact_safety.require_safe_archive, artifact)
+                self.assertTrue(started.wait(timeout=2))
+                artifact_safety.clear_archive_safety_cache()
+                release.set()
+                self.assertTrue(first.result(timeout=2).safe)
+                self.assertTrue(artifact_safety.require_safe_archive(artifact).safe)
+
+            self.assertEqual(inspect_mock.call_count, 2)
 
     def test_archive_safety_cache_invalidates_after_same_size_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:

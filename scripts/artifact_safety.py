@@ -171,6 +171,7 @@ def _cached_archive_inspection(path, device, inode, size, mtime_ns, ctime_ns, li
         if cached is not None:
             _ARCHIVE_SAFETY_CACHE.move_to_end(key)
             return cached
+        scan_generation = _ARCHIVE_CACHE_GENERATION
         _ARCHIVE_CACHE_IN_FLIGHT.add(key)
     try:
         expected_identity = (device, inode, size, mtime_ns, ctime_ns)
@@ -196,21 +197,25 @@ def _cached_archive_inspection(path, device, inode, size, mtime_ns, ctime_ns, li
             _ARCHIVE_CACHE_CONDITION.notify_all()
         raise
     with _ARCHIVE_CACHE_CONDITION:
-        _ARCHIVE_SAFETY_CACHE[key] = result
-        _ARCHIVE_SAFETY_CACHE.move_to_end(key)
-        while len(_ARCHIVE_SAFETY_CACHE) > _ARCHIVE_CACHE_MAX_SIZE:
-            _ARCHIVE_SAFETY_CACHE.popitem(last=False)
+        if scan_generation == _ARCHIVE_CACHE_GENERATION:
+            _ARCHIVE_SAFETY_CACHE[key] = result
+            _ARCHIVE_SAFETY_CACHE.move_to_end(key)
+            while len(_ARCHIVE_SAFETY_CACHE) > _ARCHIVE_CACHE_MAX_SIZE:
+                _ARCHIVE_SAFETY_CACHE.popitem(last=False)
         _ARCHIVE_CACHE_IN_FLIGHT.discard(key)
         _ARCHIVE_CACHE_CONDITION.notify_all()
     return result
 
 
 def clear_archive_safety_cache():
+    global _ARCHIVE_CACHE_GENERATION
     with _ARCHIVE_CACHE_CONDITION:
+        _ARCHIVE_CACHE_GENERATION += 1
         _ARCHIVE_SAFETY_CACHE.clear()
 
 
 _ARCHIVE_CACHE_MAX_SIZE = 256
+_ARCHIVE_CACHE_GENERATION = 0
 _ARCHIVE_SAFETY_CACHE = OrderedDict()
 _ARCHIVE_CACHE_IN_FLIGHT = set()
 _ARCHIVE_CACHE_CONDITION = threading.Condition()
