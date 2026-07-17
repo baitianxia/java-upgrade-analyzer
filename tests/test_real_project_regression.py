@@ -2356,6 +2356,57 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(records[0]["oracle_conclusion"], "uncertain")
         self.assertIn("compile-time constant", records[0]["procedure"])
 
+    def test_final_artifact_oracle_reports_compile_and_runtime_constant_impacts(self):
+        constant = {
+            "coord": "vendor:api", "api_name": "vendor.Flags.EMPTY",
+            "api_signature": "", "symbol_kind": "field",
+            "change_type": "REMOVED", "compatibility_flags": "CONSTANT_REMOVED",
+            "old_field_has_constant_value": True,
+            "source_reference_present": True,
+            "source_artifact_aligned": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "oracle_edges.csv"
+            evidence.write_text("header\n", encoding="utf-8")
+            records = realreg.build_final_artifact_api_oracle_records(
+                [constant],
+                {
+                    "complete": True,
+                    "oracle_edges": str(evidence),
+                    "api_reachability": {
+                        realreg.serialized_api_identity(constant):
+                            "not_found_in_static_analysis",
+                    },
+                },
+            )
+
+        self.assertEqual(records[0]["compile_impact"], "recompile_break")
+        self.assertEqual(records[0]["runtime_link_impact"], "inlined_no_link")
+        self.assertTrue(records[0]["constant_impact_evidence"]["source_reference_present"])
+
+    def test_constant_impact_is_unverified_without_independent_source_evidence(self):
+        constant = {
+            "coord": "vendor:api", "api_name": "vendor.Flags.EMPTY",
+            "api_signature": "", "symbol_kind": "field",
+            "change_type": "REMOVED", "compatibility_flags": "CONSTANT_REMOVED",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "oracle_edges.csv"
+            evidence.write_text("header\n", encoding="utf-8")
+            records = realreg.build_final_artifact_api_oracle_records(
+                [constant],
+                {
+                    "complete": True,
+                    "oracle_edges": str(evidence),
+                    "api_reachability": {
+                        realreg.serialized_api_identity(constant): "uncertain",
+                    },
+                },
+            )
+
+        self.assertEqual(records[0]["compile_impact"], "unverified")
+        self.assertEqual(records[0]["runtime_link_impact"], "unverified")
+
     def test_constant_pool_oracle_records_are_a_distinct_member_authority(self):
         absent = {
             "coord": "vendor:api", "api_name": "vendor.Api.removed",

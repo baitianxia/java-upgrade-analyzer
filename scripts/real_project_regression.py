@@ -37,6 +37,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from csv_io import open_csv_read, open_csv_write
+from constant_impact import classify_constant_impact
 from exhaustive_api_oracle import (
     audit_api_oracle,
     load_analyzer_rows,
@@ -4206,6 +4207,32 @@ def _constant_aware_oracle_conclusion(row: dict, conclusion: str) -> str:
     return conclusion
 
 
+def _constant_impact_record(row: dict, conclusion: str) -> dict:
+    if not _is_compile_time_constant_candidate(row):
+        return {}
+    required_evidence = (
+        "old_field_has_constant_value",
+        "source_reference_present",
+        "source_artifact_aligned",
+    )
+    evidence_complete = all(key in row for key in required_evidence)
+    impact = classify_constant_impact(
+        change_type=row.get("change_type") or row.get("reason_code"),
+        old_field_has_constant_value=bool(row.get("old_field_has_constant_value")),
+        source_reference_present=bool(row.get("source_reference_present")),
+        runtime_field_edge_present=conclusion == "reachable",
+        source_artifact_aligned=(
+            bool(row.get("source_artifact_aligned")) if evidence_complete else False
+        ),
+    )
+    payload = impact.to_dict()
+    return {
+        "compile_impact": payload.pop("compile_impact"),
+        "runtime_link_impact": payload.pop("runtime_link_impact"),
+        "constant_impact_evidence": payload,
+    }
+
+
 def build_final_artifact_api_oracle_records(
     selected_rows: list[dict], edge_truth: dict
 ) -> list[dict]:
@@ -4255,6 +4282,7 @@ def build_final_artifact_api_oracle_records(
             "generated_at": date.today().isoformat(),
             "evidence_mode": "bytecode",
             "conclusion_scope": "static_analysis",
+            **_constant_impact_record(row, conclusion),
         })
     return records
 
@@ -4305,6 +4333,7 @@ def build_constant_pool_api_oracle_records(
             "generated_at": date.today().isoformat(),
             "evidence_mode": "bytecode",
             "conclusion_scope": "static_analysis",
+            **_constant_impact_record(row, conclusion),
         })
     return records
 
