@@ -57,6 +57,7 @@ from progress_logging import PhaseTimer, emit_progress
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
     EVIDENCE_DIRNAME,
+    RUNTIME_CACHE_DIRNAME,
     RUNTIME_DIRNAME,
     RUNTIME_OBSERVABILITY_DIRNAME,
     RUNTIME_STATE_DIRNAME,
@@ -64,6 +65,7 @@ from pipeline_constants import (
 from signature_utils import normalize_signature_for_lookup
 from data_contract_analysis import compare_jar_data_contracts
 from step1_observability import peak_rss_mb
+from analysis_contract import sha256_file
 
 INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -72,7 +74,11 @@ DEFAULT_JAPICMP_TIMEOUT = None
 DEFAULT_GIT_DIFF_TIMEOUT = None
 DEFAULT_JAPICMP_COORD = "com.github.siom79.japicmp:japicmp:0.21.2:jar:jar-with-dependencies"
 _WRITE_RESULT_LOCK = threading.RLock()
+_JAPICMP_TOOL_DIGEST_LOCK = threading.RLock()
+_JAPICMP_TOOL_DIGEST_CACHE = {}
 STEP4_TIMING_FILE = "step4_timing.csv"
+JAPICMP_COMPARISON_CACHE_SCHEMA_VERSION = 1
+JAPICMP_COMPARISON_CACHE_DIRNAME = "step4_japicmp"
 
 
 _CHANGE_TYPE_LABELS = {
@@ -93,6 +99,129 @@ _SYMBOL_KIND_LABELS = {
     "class": "类",
     "constructor": "构造方法",
 }
+
+
+def clear_japicmp_tool_digest_cache():
+    with _JAPICMP_TOOL_DIGEST_LOCK:
+        _JAPICMP_TOOL_DIGEST_CACHE.clear()
+
+
+def japicmp_tool_sha256(jar_path):
+    path = Path(jar_path).resolve()
+    stat = path.stat()
+    identity = (
+        str(path), int(stat.st_size), int(stat.st_mtime_ns),
+        int(getattr(stat, 'st_ino', 0) or 0),
+    )
+    with _JAPICMP_TOOL_DIGEST_LOCK:
+        cached = _JAPICMP_TOOL_DIGEST_CACHE.get(identity)
+        if cached:
+            return cached
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with _JAPICMP_TOOL_DIGEST_LOCK:
+        stale_keys = [key for key in _JAPICMP_TOOL_DIGEST_CACHE if key[0] == str(path)]
+        for key in stale_keys:
+            _JAPICMP_TOOL_DIGEST_CACHE.pop(key, None)
+        _JAPICMP_TOOL_DIGEST_CACHE[identity] = digest
+    return digest
+
+
+def _canonical_json_bytes(value):
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _japicmp_comparison_cache_identity(
+    *, coord, old_coord, new_coord, old_version, new_version,
+    old_jar_sha256, new_jar_sha256, tool_sha256,
+):
+    return {
+        "schema_version": JAPICMP_COMPARISON_CACHE_SCHEMA_VERSION,
+        "coord": str(coord or ""),
+        "old_coord": str(old_coord or ""),
+        "new_coord": str(new_coord or ""),
+        "old_version": str(old_version or ""),
+        "new_version": str(new_version or ""),
+        "old_jar_sha256": str(old_jar_sha256 or ""),
+        "new_jar_sha256": str(new_jar_sha256 or ""),
+        "tool_sha256": str(tool_sha256 or ""),
+        "options": ["--only-modified", "--ignore-missing-classes", "--xml-file"],
+    }
+
+
+def _japicmp_comparison_cache_path(cache_dir, identity):
+    digest = hashlib.sha256(_canonical_json_bytes(identity)).hexdigest()
+    return Path(cache_dir) / f"{digest}.json"
+
+
+def _load_japicmp_comparison_cache(cache_path, identity):
+    try:
+        payload = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+        rows = payload.get("rows")
+        raw_output = payload.get("raw_output")
+        xml_content = payload.get("xml_content")
+        if payload.get("identity") != identity:
+            return None
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            return None
+        if not isinstance(raw_output, str) or not isinstance(xml_content, str):
+            return None
+        if payload.get("rows_sha256") != hashlib.sha256(_canonical_json_bytes(rows)).hexdigest():
+            return None
+        if payload.get("raw_output_sha256") != hashlib.sha256(raw_output.encode("utf-8")).hexdigest():
+            return None
+        if payload.get("xml_sha256") != hashlib.sha256(xml_content.encode("utf-8")).hexdigest():
+            return None
+        return {"rows": rows, "raw_output": raw_output, "xml_content": xml_content}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_japicmp_comparison_cache(cache_path, identity, rows, raw_output, xml_content):
+    payload = {
+        "identity": identity,
+        "rows": rows,
+        "raw_output": raw_output,
+        "xml_content": xml_content,
+        "rows_sha256": hashlib.sha256(_canonical_json_bytes(rows)).hexdigest(),
+        "raw_output_sha256": hashlib.sha256(raw_output.encode("utf-8")).hexdigest(),
+        "xml_sha256": hashlib.sha256(xml_content.encode("utf-8")).hexdigest(),
+    }
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, cache_path)
+    except (OSError, TypeError, ValueError):
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _japicmp_output_header(
+    *, display_coord, old_coord, new_coord, old_version, new_version,
+    old_jar, new_jar, old_jar_source, new_jar_source,
+):
+    return (
+        f"=== JApiCmp 对比报告 ===\n"
+        f"依赖：{display_coord}\n"
+        f"旧坐标：{old_coord}\n"
+        f"新坐标：{new_coord}\n"
+        f"旧版本：{old_version}  ({old_jar})\n"
+        f"新版本：{new_version}  ({new_jar})\n"
+        f"旧 jar 来源：{old_jar_source or 'unknown'}\n"
+        f"新 jar 来源：{new_jar_source or 'unknown'}\n"
+        f"执行时间：{datetime.now().isoformat()}\n"
+        f"{'='*60}\n\n"
+    )
 
 
 def _api_display_name(row):
@@ -2031,6 +2160,7 @@ def run_japicmp(
     new_jar_path=None,
     old_jar_evidence=None,
     new_jar_evidence=None,
+    cache_dir=None,
 ):
     """
     对单个依赖运行 JApiCmp，返回 (output_file, changed_apis, error_msg)
@@ -2116,6 +2246,61 @@ def run_japicmp(
             "new_jar_evidence": new_jar_evidence or {},
         }, "JApiCmp 未安装"
 
+    tool_sha256 = ''
+    comparison_identity = None
+    comparison_cache_path = None
+    try:
+        tool_sha256 = japicmp_tool_sha256(japicmp_jar)
+        if cache_dir is not None:
+            comparison_identity = _japicmp_comparison_cache_identity(
+                coord=display_coord,
+                old_coord=resolved_old_coord,
+                new_coord=resolved_new_coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                old_jar_sha256=sha256_file(old_jar),
+                new_jar_sha256=sha256_file(new_jar),
+                tool_sha256=tool_sha256,
+            )
+            comparison_cache_path = _japicmp_comparison_cache_path(
+                cache_dir, comparison_identity
+            )
+            cached = _load_japicmp_comparison_cache(
+                comparison_cache_path, comparison_identity
+            )
+            if cached is not None:
+                Path(xml_file).write_text(cached["xml_content"], encoding="utf-8")
+                header = _japicmp_output_header(
+                    display_coord=display_coord,
+                    old_coord=resolved_old_coord,
+                    new_coord=resolved_new_coord,
+                    old_version=old_ver,
+                    new_version=new_ver,
+                    old_jar=old_jar,
+                    new_jar=new_jar,
+                    old_jar_source=old_jar_source,
+                    new_jar_source=new_jar_source,
+                )
+                write_result(out_file, header + cached["raw_output"])
+                return out_file, cached["rows"], {
+                    "old_jar": old_jar,
+                    "new_jar": new_jar,
+                    "old_jar_source": old_jar_source,
+                    "new_jar_source": new_jar_source,
+                    "old_jar_evidence": old_jar_evidence or {},
+                    "new_jar_evidence": new_jar_evidence or {},
+                    "xml_file": xml_file,
+                    "parser_mode": "xml",
+                    "xml_error": "",
+                    "missing_class_policy": "ignored",
+                    "japicmp_version": "0.21.2",
+                    "japicmp_sha256": tool_sha256,
+                    "comparison_cache_hit": True,
+                }, None
+    except OSError:
+        comparison_identity = None
+        comparison_cache_path = None
+
     # 执行 JApiCmp
     stdout, stderr, rc = run_cmd(
         ['java', '-jar', japicmp_jar,
@@ -2156,17 +2341,16 @@ def run_japicmp(
     raw_output = stdout or stderr or "(无输出)"
 
     # 完整保留原始输出
-    header = (
-        f"=== JApiCmp 对比报告 ===\n"
-        f"依赖：{display_coord}\n"
-        f"旧坐标：{resolved_old_coord}\n"
-        f"新坐标：{resolved_new_coord}\n"
-        f"旧版本：{old_ver}  ({old_jar})\n"
-        f"新版本：{new_ver}  ({new_jar})\n"
-        f"旧 jar 来源：{old_jar_source or 'unknown'}\n"
-        f"新 jar 来源：{new_jar_source or 'unknown'}\n"
-        f"执行时间：{datetime.now().isoformat()}\n"
-        f"{'='*60}\n\n"
+    header = _japicmp_output_header(
+        display_coord=display_coord,
+        old_coord=resolved_old_coord,
+        new_coord=resolved_new_coord,
+        old_version=old_ver,
+        new_version=new_ver,
+        old_jar=old_jar,
+        new_jar=new_jar,
+        old_jar_source=old_jar_source,
+        new_jar_source=new_jar_source,
     )
     write_result(out_file, header + raw_output)
 
@@ -2184,11 +2368,22 @@ def run_japicmp(
             row['evidence_path'] = str(out_file)
             row['binary_compatible'] = row.get('binary_compatible') or 'unknown'
             row['source_compatible'] = row.get('source_compatible') or 'unknown'
-    tool_sha256 = ''
-    try:
-        tool_sha256 = hashlib.sha256(Path(japicmp_jar).read_bytes()).hexdigest()
-    except OSError:
-        pass
+    if (
+        parser_mode == 'xml'
+        and comparison_cache_path is not None
+        and comparison_identity is not None
+        and Path(xml_file).is_file()
+    ):
+        try:
+            _write_japicmp_comparison_cache(
+                comparison_cache_path,
+                comparison_identity,
+                changed_apis,
+                raw_output,
+                Path(xml_file).read_text(encoding='utf-8'),
+            )
+        except OSError:
+            pass
     return out_file, changed_apis, {
         "old_jar": old_jar,
         "new_jar": new_jar,
@@ -2202,6 +2397,7 @@ def run_japicmp(
         "missing_class_policy": "ignored",
         "japicmp_version": "0.21.2",
         "japicmp_sha256": tool_sha256,
+        "comparison_cache_hit": False,
     }, None
 
 
@@ -5160,6 +5356,11 @@ def main():
                 new_jar_path=row.get("_step4_current_jar_path") or "",
                 old_jar_evidence=row.get("_step4_base_jar_evidence") or {},
                 new_jar_evidence=row.get("_step4_current_jar_evidence") or {},
+                cache_dir=(
+                    infer_report_dir_from_output_dir(args.output_dir)
+                    / RUNTIME_DIRNAME / RUNTIME_CACHE_DIRNAME
+                    / JAPICMP_COMPARISON_CACHE_DIRNAME
+                ),
             )
             result["binary_runs"].append({
                 'coord': coord,
@@ -5254,12 +5455,17 @@ def main():
                 new_version=new_ver,
                 status="error" if err else "success",
                 elapsed=time.perf_counter() - japicmp_timer,
-                external_process_count=1,
+                external_process_count=(
+                    0 if bool((jar_info or {}).get("comparison_cache_hit")) else 1
+                ),
                 api_count=len(apis),
                 details=err or {
                     "old_jar_source": str((jar_info or {}).get("old_jar_source") or ""),
                     "new_jar_source": str((jar_info or {}).get("new_jar_source") or ""),
                     "parser_mode": str((jar_info or {}).get("parser_mode") or ""),
+                    "comparison_cache_hit": bool(
+                        (jar_info or {}).get("comparison_cache_hit")
+                    ),
                 },
             )
             dependency_old_jar = str((jar_info or {}).get("old_jar") or "")

@@ -614,6 +614,110 @@ class Step4StabilityTest(unittest.TestCase):
 
         self.assertIsNone(captured["timeout"])
 
+    def test_japicmp_tool_digest_is_reused_until_file_identity_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = Path(tmp) / "japicmp.jar"
+            tool.write_bytes(b"first")
+            step4.clear_japicmp_tool_digest_cache()
+
+            def read_tool_bytes(path):
+                with Path.open(path, "rb") as handle:
+                    return handle.read()
+
+            with patch.object(
+                step4.Path,
+                "read_bytes",
+                autospec=True,
+                side_effect=read_tool_bytes,
+            ) as read_bytes:
+                first = step4.japicmp_tool_sha256(tool)
+                repeated = step4.japicmp_tool_sha256(tool)
+                tool.write_bytes(b"second-version")
+                changed = step4.japicmp_tool_sha256(tool)
+
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, changed)
+        self.assertEqual(read_bytes.call_count, 2)
+
+    def test_run_japicmp_reuses_valid_content_addressed_comparison(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            cache_dir = root / "cache"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+
+            def successful_japicmp(cmd, **_kwargs):
+                xml_path = Path(cmd[cmd.index("--xml-file") + 1])
+                xml_path.write_text(
+                    '<japicmp><classes><class name="com.acme.Api" '
+                    'changeStatus="MODIFIED" binaryCompatible="false" '
+                    'sourceCompatible="false"><methods><method name="gone" '
+                    'changeStatus="REMOVED" binaryCompatible="false" '
+                    'sourceCompatible="false"/></methods></class></classes></japicmp>',
+                    encoding="utf-8",
+                )
+                return "japicmp-output", "", 0
+
+            with patch.object(step4, "run_cmd", side_effect=successful_japicmp) as run_cmd:
+                first = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+                second = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+                next(cache_dir.glob("*.json")).write_text("{broken", encoding="utf-8")
+                recovered = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+
+        self.assertEqual(first[1], second[1])
+        self.assertEqual(first[1], recovered[1])
+        self.assertIsNone(second[3])
+        self.assertTrue(second[2]["comparison_cache_hit"])
+        self.assertFalse(recovered[2]["comparison_cache_hit"])
+        self.assertEqual(run_cmd.call_count, 2)
+
+    def test_run_japicmp_does_not_cache_failed_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+
+            with patch.object(
+                step4, "run_cmd", return_value=("", "failed", 1)
+            ) as run_cmd:
+                for _ in range(2):
+                    result = step4.run_japicmp(
+                        "com.acme:api", "1", "2", root, str(tool),
+                        old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                        old_jar_evidence={"source": "step1_final_artifact"},
+                        new_jar_evidence={"source": "step1_final_artifact"},
+                        cache_dir=root / "cache",
+                    )
+
+        self.assertIsNotNone(result[3])
+        self.assertEqual(run_cmd.call_count, 2)
+
     def test_run_japicmp_uses_old_and_new_flags_and_rejects_nonzero_exit(self):
         with tempfile.TemporaryDirectory() as tmp:
             japicmp_jar = Path(tmp) / "japicmp.jar"
