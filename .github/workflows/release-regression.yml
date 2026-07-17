@@ -1,0 +1,53 @@
+name: Release Regression
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 18 * * 1,4"
+
+jobs:
+  release-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "maven"
+
+      - name: Install Runtime Dependencies
+        run: python -m pip install "tree-sitter==0.25.2" "tree-sitter-java==0.23.5"
+
+      - name: Verify Required Tools
+        run: |
+          java -version
+          javac -version
+          javap -version
+          jdeps -version
+          mvn -version
+
+      - name: Run Release Quality Gate
+        run: >-
+          python scripts/quality_gate.py --profile release --real-case guard
+          --continue-on-failure
+          --report-root /tmp/jua-release-regression
+          --json-out /tmp/jua-release-quality-gate.json
+
+      - name: Upload Quality Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jua-release-quality-evidence
+          path: |
+            /tmp/jua-release-quality-gate.json
+            /tmp/jua-release-regression

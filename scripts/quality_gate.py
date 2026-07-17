@@ -11,6 +11,7 @@ from dataclasses import dataclass, asdict
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -57,6 +58,46 @@ CORE_SEMANTIC_TESTS = [
     "tests.test_s5_query_call_chain.S5QueryCallChainTest.test_query_respects_limit_on_many_business_callers",
     "tests.test_s5_query_call_chain.S5QueryCallChainTest.test_query_avoids_cycles_while_finding_business_chain",
 ]
+
+REQUIRED_TOOLS = ("git", "java", "javac", "javap", "jdeps", "mvn")
+
+
+def validate_required_tools(names=REQUIRED_TOOLS):
+    """Return every mandatory executable missing from PATH."""
+    return [name for name in names if shutil.which(name) is None]
+
+
+def _required_tools_task(names=REQUIRED_TOOLS):
+    return GateTask(
+        name="required_tools",
+        command=list(names),
+        purpose="必需工具预检：" + ", ".join(names),
+    )
+
+
+def _run_required_tools_task(task):
+    started = time.perf_counter()
+    missing = validate_required_tools(tuple(task.command))
+    status = "failed" if missing else "passed"
+    purpose = task.purpose
+    if missing:
+        purpose = f"{purpose}；缺失：{', '.join(missing)}"
+    result = GateResult(
+        name=task.name,
+        command=task.command,
+        status=status,
+        elapsed_sec=round(time.perf_counter() - started, 3),
+        returncode=1 if missing else 0,
+        purpose=purpose,
+    )
+    print(
+        f"[quality-gate] {status.upper()} {task.name} "
+        f"elapsed={result.elapsed_sec:.2f}s rc={result.returncode}",
+        flush=True,
+    )
+    if missing:
+        print(f"[quality-gate] missing required tools: {', '.join(missing)}", flush=True)
+    return result
 
 
 def _python_files_under_scripts():
@@ -217,7 +258,8 @@ def _diff_check_task():
 
 def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", report_root=None):
     python_exe = python_exe or sys.executable
-    tasks = [_py_compile_task(python_exe)]
+    required_tools = REQUIRED_TOOLS if profile in {"step5", "release"} else REQUIRED_TOOLS[:-1]
+    tasks = [_required_tools_task(required_tools), _py_compile_task(python_exe)]
     audit_root = Path(report_root or "/private/tmp/jua-quality-gate")
     real_json = str(audit_root / f"real_project_{real_case}.json")
     audit_json = str(audit_root / f"quality_signal_audit_{real_case}.json")
@@ -273,6 +315,8 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
 
 
 def _run_task(task, env=None):
+    if task.name == "required_tools":
+        return _run_required_tools_task(task)
     for raw_path in task.output_paths:
         output = Path(raw_path)
         if output.is_file():
