@@ -34,6 +34,8 @@ from step1_ref_resolution import resolve_step1_ref
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
+NESTED_JAR_SPOOL_MAX_MEMORY_BYTES = 8 * 1024 * 1024
+NESTED_JAR_COPY_CHUNK_BYTES = 1024 * 1024
 
 
 def _observed_phase(observer, phase, **kwargs):
@@ -1366,11 +1368,11 @@ def _is_ignorable_packaging_support_dep(entry):
     return candidate.startswith('spring-boot-jarmode-')
 
 
-def _extract_packaged_dep_from_nested_jar(blob, entry_name):
+def _extract_packaged_dep_from_nested_jar_source(source, entry_name, content_sha256):
     entry = _build_packaged_entry(entry_name)
-    entry['content_sha256'] = hashlib.sha256(blob).hexdigest()
+    entry['content_sha256'] = str(content_sha256 or '')
     try:
-        with zipfile.ZipFile(io.BytesIO(blob)) as nested_zip:
+        with zipfile.ZipFile(source) as nested_zip:
             for nested_name in nested_zip.namelist():
                 if not nested_name.startswith('META-INF/maven/') or not nested_name.endswith('/pom.properties'):
                     continue
@@ -1412,6 +1414,33 @@ def _extract_packaged_dep_from_nested_jar(blob, entry_name):
     return entry
 
 
+def _extract_packaged_dep_from_nested_jar(blob, entry_name):
+    return _extract_packaged_dep_from_nested_jar_source(
+        io.BytesIO(blob), entry_name, hashlib.sha256(blob).hexdigest()
+    )
+
+
+def _stream_nested_jar_to_spool(outer_zip, entry_name):
+    digest = hashlib.sha256()
+    spool = tempfile.SpooledTemporaryFile(
+        max_size=NESTED_JAR_SPOOL_MAX_MEMORY_BYTES,
+        mode='w+b',
+    )
+    try:
+        with outer_zip.open(entry_name, 'r') as source:
+            while True:
+                chunk = source.read(NESTED_JAR_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                spool.write(chunk)
+        spool.seek(0)
+        return spool, digest.hexdigest()
+    except BaseException:
+        spool.close()
+        raise
+
+
 def _inspect_packaged_archive(artifact_path):
     deps = []
     informative_paths = 0
@@ -1429,7 +1458,9 @@ def _inspect_packaged_archive(artifact_path):
                     continue
                 informative_paths += 1
                 try:
-                    nested_blob = outer_zip.read(name)
+                    nested_source, content_sha256 = _stream_nested_jar_to_spool(
+                        outer_zip, name
+                    )
                 except Exception as exc:
                     dep = _build_packaged_entry(name)
                     dep['match_source'] = 'outer-read-error'
@@ -1437,7 +1468,12 @@ def _inspect_packaged_archive(artifact_path):
                     dep['read_error'] = f"outer_read_error:{exc}"
                     deps.append(dep)
                     continue
-                dep = _extract_packaged_dep_from_nested_jar(nested_blob, name)
+                try:
+                    dep = _extract_packaged_dep_from_nested_jar_source(
+                        nested_source, name, content_sha256
+                    )
+                finally:
+                    nested_source.close()
                 if not dep:
                     continue
                 if _is_ignorable_packaging_support_dep(dep):

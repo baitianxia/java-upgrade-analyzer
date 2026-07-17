@@ -97,6 +97,37 @@ class Step1PackagedDepsTest(unittest.TestCase):
             ["org.example:demo-lib"],
         )
 
+    def test_packaged_archive_streams_nested_jars_without_outer_read_buffer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_path = Path(tmp) / "app.jar"
+            nested_bytes = self._nested_jar_bytes([
+                (
+                    "META-INF/maven/org.example/demo-lib/pom.properties",
+                    "groupId=org.example\nartifactId=demo-lib\nversion=1.2.3\n",
+                ),
+                ("payload.bin", b"x" * 4096),
+            ])
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                outer.writestr("BOOT-INF/lib/demo-lib-1.2.3.jar", nested_bytes)
+
+            original_read = zipfile.ZipFile.read
+
+            def reject_outer_nested_jar_read(zf, name, *args, **kwargs):
+                if str(name).startswith("BOOT-INF/lib/"):
+                    raise AssertionError("nested jar must be streamed from the outer archive")
+                return original_read(zf, name, *args, **kwargs)
+
+            with patch.object(zipfile.ZipFile, "read", new=reject_outer_nested_jar_read):
+                rows = s1_dep_diff._inspect_packaged_archive(artifact_path)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coord"], "org.example:demo-lib")
+        self.assertEqual(rows[0]["version"], "1.2.3")
+        self.assertEqual(
+            rows[0]["content_sha256"],
+            s1_dep_diff.hashlib.sha256(nested_bytes).hexdigest(),
+        )
+
     def test_embedded_pom_preserves_filename_classifier_as_artifact_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_path = Path(tmp) / "app.jar"
