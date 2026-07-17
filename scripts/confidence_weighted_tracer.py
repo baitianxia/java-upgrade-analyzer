@@ -6731,6 +6731,12 @@ def _collect_trace_api_with_confidence_weighting(
                 coord = str(hit.get('coord') or '').strip()
                 if coord and coord not in direct_usage_result.dependency_chain_coords:
                     direct_usage_result.dependency_chain_coords.append(coord)
+            _apply_constant_impact(
+                direct_usage_result,
+                api_row,
+                graph,
+                runtime_field_edge_present=True,
+            )
         _debug_trace_result('trace_api_result', direct_usage_result)
         return direct_usage_result
 

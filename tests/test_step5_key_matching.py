@@ -19739,6 +19739,48 @@ public class com.example.consumer.Adapter {
         self.assertEqual(result.runtime_link_impact, "runtime_link_present")
         self.assertEqual(result.compile_impact, "unverified")
 
+    def test_direct_usage_with_external_constant_field_hit_reports_runtime_link_present(self):
+        api_row = {
+            "coord": "lib:flags", "api_name": "lib.Flags.VALUE", "api_simple": "VALUE",
+            "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
+            "compatibility_flags": "CONSTANT_REMOVED",
+            "old_field_has_constant_value": "true",
+            "severity": "P0", "confirmed": "true",
+        }
+        graph = SimpleNamespace(
+            methods_by_id={}, reverse_edges={}, runtime_dependency_catalog={},
+            source_artifact_alignment={"status": "aligned"},
+        )
+        hit = {
+            "status": "hit",
+            "hits": [{
+                "coord": "app:internal-library",
+                "class_fqcn": "app.bridge.InternalBridge",
+                "consumer_method": "run",
+                "consumer_signature": "()",
+                "target_display": "lib.Flags.VALUE",
+                "evidence_type": "bytecode_field_access",
+            }],
+        }
+
+        def direct_usage(_api_row, draft, _graph, trace_cache=None):
+            draft.call_paths = ["app.App.run -> lib.Flags.VALUE"]
+            draft.evidence_paths = [[{"evidence_type": "field_access"}]]
+            return draft
+
+        with (
+            patch.object(
+                tracer, "_scan_packaged_runtime_dependencies_for_api", return_value=hit,
+            ),
+            patch.object(tracer, "_try_build_direct_usage_result", side_effect=direct_usage),
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row, graph, {}, has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.runtime_link_impact, "runtime_link_present")
+        self.assertEqual(result.compile_impact, "recompile_break")
+
     def test_direct_source_constant_usage_uses_inlining_decision_before_early_return(self):
         api_row = {
             "coord": "lib:flags", "api_name": "lib.Flags.EMPTY", "api_simple": "EMPTY",

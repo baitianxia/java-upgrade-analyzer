@@ -2,6 +2,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -219,6 +220,44 @@ class ArtifactSafetyTest(unittest.TestCase):
                 artifact_safety.require_safe_archive(artifact)
 
             self.assertEqual(inspect_mock.call_count, 1)
+
+    def test_archive_safety_cache_invalidates_after_same_size_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "mutable.jar"
+            payload = b"mutable-class-payload"
+            with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("sample/Mutable.class", payload)
+            artifact_safety.require_safe_archive(artifact)
+            original_stat = artifact.stat()
+            content = bytearray(artifact.read_bytes())
+            content[content.index(payload)] ^= 0x01
+            artifact.write_bytes(content)
+            os.utime(
+                artifact,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+
+            with self.assertRaisesRegex(ValueError, "ARCHIVE_ENTRY_READ_FAILED"):
+                artifact_safety.require_safe_archive(artifact)
+
+    def test_high_expansion_ratio_entry_is_not_decompressed_after_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "ratio.jar"
+            with zipfile.ZipFile(
+                artifact, "w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
+                archive.writestr("sample/Large.class", b"0" * 1024 * 1024)
+
+            with patch.object(
+                zipfile.ZipFile,
+                "open",
+                side_effect=AssertionError("unsafe entry must not be decompressed"),
+            ) as open_mock:
+                result = artifact_safety.inspect_archive(artifact)
+
+            self.assertFalse(result.safe)
+            self.assertIn("ARCHIVE_EXPANSION_RATIO_EXCEEDED", result.reason_codes)
+            open_mock.assert_not_called()
 
 
 if __name__ == "__main__":
