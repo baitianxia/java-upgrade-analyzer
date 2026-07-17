@@ -74,7 +74,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 
 ## 核心原则
 
-1. **最终产物优先**：Step1 只比较单个目标模块的最终打包依赖；输入既可以是自动切分支后的真实构建结果，也可以是用户直接提供的 base/current 编译产物路径。`boot jar/war` 读最终产物，`thin jar` / 无嵌套依赖场景直接阻塞。若 direct artifact 模式还要继续进入 Step2+，必须显式给出 `base_branch/current_branch`，不能让系统自动猜。
+1. **最终产物优先**：Step1 只比较单个目标模块的最终打包依赖；输入既可以是从已固定远程 commit 构建的真实结果，也可以是用户直接提供的 base/current 编译产物路径。`boot jar/war` 读最终产物，`thin jar` / 无嵌套依赖场景直接阻塞。若 direct artifact 模式还要继续进入 Step2+，必须显式给出 `base_branch/current_branch`，不能让系统自动猜。源码永远是辅助证据，不能覆盖最终制品中的依赖、版本、类或字节码事实。
 2. **门控强制**：上一步输入不完整或门控失败，不进入下一步。
 3. **结论可追溯**：每条结论都要记录证据来源。
 4. **不猜测**：必须区分五态：`reachable` / `not_impacted` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis`。只有当前制品中的其他依赖以完全相同的类字节码保留目标 API 时才能使用 `not_impacted`；不要把“未覆盖”或“静态未找到”误写成“未影响”。
@@ -257,6 +257,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 
 若 direct artifact 模式的两侧产物已经齐全，Step1 可以直接进入执行；`base_branch/current_branch` 属于强烈推荐的补全来源，不是 direct artifact 入口的执行前硬前置。
 
+需要源码时必须遵循统一来源顺序：先用 `git ls-remote` 查询所有配置 remote 的实时分支/tag，选定后定向 fetch 并固定 commit；不得用本地 `refs/remotes/*` 冒充远端最新状态，不得执行 `git pull`、checkout、merge 或 rebase。未指定 remote 的同名候选只有在 commit 唯一时才能自动采用；多个不同 commit 必须 checkpoint。远端不存在、认证失败、网络失败、超时或 fetch 失败时，不得自动使用本地分支；只有结构化答复明确设置对应侧 `allow_local_source=true` 后才允许本地兜底，dirty 工作区还必须明确 `allow_dirty_local_source=true`。来源状态必须记录为 `remote_source_resolved` 或 `user_confirmed_local_source`。
+
 若用户已明确只分析某个模块，第一次执行 `step1` 时必须直接带模块参数，不得先跑 root 范围：
 
 ```bash
@@ -405,7 +407,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：Step4 必须且只能复用 Step1 `evidence/dependencies/build_provenance.json` 指向的 base/current 最终构建产物，并按 `evidence/dependencies/dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 JAR；最终制品中无法定位时必须输出明确的证据缺失原因，不得回退本地 Maven 仓库或下载同坐标 JAR 替代
 - 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应超时
-- 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再按依赖的 `old_version/new_version` 只在对应源码仓库远端分支 `remotes` 中匹配 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支；old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；若未匹配到或存在歧义，必须进入人工确认，不得直接套用主项目分支名
+- 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；同名候选只有 commit 相同才可自动合并。选定后必须定向 fetch 并用 commit SHA 执行 diff。未匹配、歧义或远程失败必须进入人工确认，不得直接套用主项目分支名或静默使用本地 ref
 - 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
 - 门控：`step4` 完成后执行 `jar_compare`
 
@@ -460,6 +462,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
 - 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step3、Step4、Step5 必须按 `lib_entry` 使用制品中的真实嵌套 JAR，且不得用本地 Maven 仓库副本或重新下载的 JAR 替代最终制品证据
 - 规则：最终制品内缺失嵌套 JAR、坐标 unresolved、SHA 不一致或字节码解析失败时，必须记录覆盖缺口；未命中不得解释为无影响，也不得以本地 Maven JAR 填补缺口
+- 规则：依赖源码只有在 Step4 记录包含固定 commit 且来源为 `remote_source_resolved` 或 `user_confirmed_local_source` 时，才允许进入 Step5 增强图；来源未确认、仓库不一致、源码类不在当前最终制品 JAR 中时必须拒绝该源码边并记录覆盖缺口，不能降级成确定无影响
 - 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
 - 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`

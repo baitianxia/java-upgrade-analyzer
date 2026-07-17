@@ -123,7 +123,7 @@ JUA_TREE_SITTER_AUTO_INSTALL=0
 
 - `dependency_source_dirs` 是推荐主入口；只要提供源码工程目录或仓库根目录，调度层就会优先扫描仓库 `pom.xml` / `build.gradle` 并展开所有推断出的 `groupId:artifactId`。
 - 路径支持相对路径（相对 `project-dir`）和绝对路径。
-- `dependency_source_dirs` 一旦提供，Step4 会优先按依赖 `old_version/new_version` 只在匹配到的源码仓库远端分支 `remotes` 中匹配 git ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支；若 old/new 两侧同时存在多个候选，则优先选择 remote 一致、版本前缀家族一致的 ref pair；若仍未匹配到或存在歧义，则进入人工确认，而不是直接套用主项目分支名。
+- `dependency_source_dirs` 一旦提供，Step4 会通过 `git ls-remote` 查询源码仓库的实时远程分支，再按依赖 `old_version/new_version` 做严格边界匹配；old/new 两侧优先选择 remote 和版本前缀家族一致的 ref pair，同名候选只有 commit 相同才会自动合并。选定 ref 后会定向 fetch 并固定 commit，再执行源码 diff；不会以本地远端跟踪分支冒充远端最新状态。
 - `dependency_source_dirs` 是唯一推荐用户入口；系统会自动推断后续所需映射。
 - `main_state.json` 是唯一主状态和业务参数来源；步骤执行时不应再由 CLI 覆盖已确认的业务参数。
 - 上述约束同样适用于正式恢复/重建路径；即使是重建 `step2` 上下文，也只能传壳层参数，不能把 `base_branch/current_branch/source_dirs` 之类的业务参数重新塞回单步脚本 CLI。
@@ -366,7 +366,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 - 若 Step1 先进入待交互，Claude Code 必须把 `interaction.json` 整理成用户可读的决策卡片：缺什么输入、可用哪种输入方式、可以直接怎么回复；协议字段只用于内部恢复命令构造
 - 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支执行 `mvn dependency:list` 补全坐标；但这不是 direct artifact 模式的执行前硬前置
 - `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
-- 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧 ref 并运行 Maven 补全；自动构建模式则在构建前解析两侧 ref。解析时先尝试精确匹配，再查询本地分支与已经 fetch 到本机的远端跟踪分支；候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在 Maven 执行前暂停确认。该过程不会隐式执行 `git fetch`
+- 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧源码并运行 Maven 补全；自动构建模式则在构建前解析两侧 ref。解析时先查询实时远程 refs，候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在 Maven 执行前暂停确认；选定后仅定向 fetch 所需 ref，不执行 `git pull`，也不修改用户当前分支。
+- 远端不存在、认证失败、网络失败、超时或定向 fetch 失败时会暂停。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地 commit；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。依赖源码 ref 使用 `dependency_git_ref_overrides` 中对应的 `allow_local_source` / `allow_dirty_local_source`，不得由 Claude Code 代替用户填写确认。
 - 同时提供 branch/ref 与 source directory 时，以确认后的 branch/ref 为准；只有 source directory 时不得直接使用当前 checkout 执行坐标补全
 - 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源
 - 若这两个分支是在 Step1 review checkpoint 才补充，恢复 `continue` 后调度器会先把确认值写入 `step2.input`，再进入 Step2
@@ -488,7 +489,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s4_jar_compare.py" \
 ```
 
 更推荐写入 `main_state.json` 的 `dependency_source_dirs`，减少命令行复杂度。
-提供后，Step4 会默认尝试将 `old_version/new_version` 匹配为对应依赖源码仓库中的远端分支，例如 `origin/release-1.2.3`、`origin/hotfix-1.2.3`、`origin/support/1.2.3-DEV`；其中会先去掉末尾 `-SNAPSHOT`，按“严格边界命中”筛选候选。比如版本 `3.0.2` 会命中 `origin/auth-sdk3.0.2`，不会命中 `origin/auth-sdk3.0.2.1`。若 old/new 两侧同时存在多个候选，还会优先选择 remote 一致、版本前缀家族一致的 ref pair；若仍未匹配到或存在歧义，则进入人工确认。
+提供后，Step4 会从远端实时查询结果中尝试将 `old_version/new_version` 匹配为对应依赖源码分支，例如 `origin/release-1.2.3`、`origin/hotfix-1.2.3`、`origin/support/1.2.3-DEV`；其中会先去掉末尾 `-SNAPSHOT`，按“严格边界命中”筛选候选。比如版本 `3.0.2` 会命中 `origin/auth-sdk3.0.2`，不会命中 `origin/auth-sdk3.0.2.1`。若 old/new 两侧同时存在多个候选，还会优先选择 remote 一致、版本前缀家族一致的 ref pair；同分候选指向不同 commit 时进入人工确认，指向同一 commit 时固定该 commit。
 
 Step4 需要 JApiCmp 执行 jar 二进制 API 对比。正式流程会先自动尝试安装：
 
