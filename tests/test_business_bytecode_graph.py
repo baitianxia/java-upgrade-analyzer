@@ -23,6 +23,48 @@ from business_bytecode_graph import (
 
 
 class BusinessBytecodeGraphTest(unittest.TestCase):
+    def test_business_bytecode_batch_interns_repeated_immutable_edge_strings(self):
+        import business_bytecode_graph as module
+
+        digest_a = "".join(["a" for _ in range(64)])
+        digest_b = (" " + digest_a).strip()
+        path_a = "".join(["/tmp/app.jar", "!/fixture/Consumer.class"])
+        path_b = (" " + path_a).strip()
+        base = {
+            "caller_owner": "fixture.Consumer",
+            "caller_name": "run",
+            "caller_signature": "()",
+            "callee_key": "java.lang.System.nanoTime()",
+            "callee_simple_key": "method:nanoTime()",
+            "evidence_type": "bytecode_method_invocation",
+            "parser": "classfile",
+            "evidence_source": "current_final_artifact",
+            "content": "invokestatic java.lang.System.nanoTime",
+        }
+        evidence = [
+            {**base, "artifact_sha256": digest_a, "class_file": path_a, "instruction_offset": 1},
+            {**base, "artifact_sha256": digest_b, "class_file": path_b, "instruction_offset": 4},
+        ]
+
+        batch = module._business_bytecode_batch(
+            evidence,
+            {"artifact_sha256": digest_a, "classes_scanned": 1},
+            strict_final_artifact=True,
+        )
+
+        self.assertEqual(len(batch.edges), 2)
+        self.assertIsNot(batch.edges[0], batch.edges[1])
+        self.assertIs(
+            batch.edges[0].provenance.artifact_sha256,
+            batch.edges[1].provenance.artifact_sha256,
+        )
+        self.assertIs(
+            batch.edges[0].provenance.artifact_path,
+            batch.edges[1].provenance.artifact_path,
+        )
+        self.assertIs(batch.edges[0].caller_symbol, batch.edges[1].caller_symbol)
+        self.assertIs(batch.edges[0].callee_symbol, batch.edges[1].callee_symbol)
+
     def test_collect_business_bytecode_batch_preserves_method_constructor_field_and_reflection_identities(self):
         import business_bytecode_graph as module
 

@@ -18448,6 +18448,9 @@ public class com.example.consumer.Adapter {
         )
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["class_fqcn"], "com.example.Reflective")
+        self.assertNotIn("graph", index["tasks"][0])
+        self.assertNotIn("catalog", index["tasks"][0])
+        self.assertIs(index["graph"], graph)
 
     def test_runtime_reference_signature_resolves_nested_type_from_owner_package(self):
         range_reference = {

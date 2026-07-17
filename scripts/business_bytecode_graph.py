@@ -856,6 +856,12 @@ def _valid_sha256(value):
 
 def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
     metrics = dict(metrics or {})
+    string_pool = {}
+
+    def pooled(value):
+        text = str(value or "")
+        return string_pool.setdefault(text, text)
+
     failure_values = list(metrics.get("failures") or ())
     typed_failures = []
     concerns = []
@@ -875,9 +881,9 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
             # blocking failures for interfaces and annotation-only classes.
             non_executable_class_references += 1
             continue
-        owner = str(item.get("caller_owner") or "").strip()
-        name = str(item.get("caller_name") or "").strip()
-        signature = str(item.get("caller_signature") or "")
+        owner = pooled(str(item.get("caller_owner") or "").strip())
+        name = pooled(str(item.get("caller_name") or "").strip())
+        signature = pooled(item.get("caller_signature"))
         if not owner or not name:
             typed_failures.append(EvidenceFailure(
                 stage="business-bytecode",
@@ -890,18 +896,20 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
             continue
         if batch_sha_invalid:
             continue
-        artifact_sha = str(item.get("artifact_sha256") or "")
-        class_file = str(item.get("class_file") or "")
+        artifact_sha = pooled(item.get("artifact_sha256"))
+        class_file = pooled(item.get("class_file"))
         artifact_path, separator, artifact_entry = class_file.partition("!/")
+        artifact_path = pooled(artifact_path)
+        artifact_entry = pooled(artifact_entry)
         authority = (
             EvidenceAuthority.CURRENT_FINAL_ARTIFACT
             if _valid_sha256(artifact_sha)
             else EvidenceAuthority.SOURCE_AST
         )
         edges.append(CollectedEdge(
-            caller_symbol=f"{owner}.{name}{signature}",
-            callee_symbol=str(item.get("callee_key") or ""),
-            edge_kind=str(item.get("evidence_type") or "bytecode_reference"),
+            caller_symbol=pooled(f"{owner}.{name}{signature}"),
+            callee_symbol=pooled(item.get("callee_key")),
+            edge_kind=pooled(item.get("evidence_type") or "bytecode_reference"),
             semantic=False,
             owner_scope=ModuleScope.BUSINESS_CLASSES,
             owner_coord="__business__",
@@ -911,8 +919,10 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
                 artifact_sha256=artifact_sha if authority == EvidenceAuthority.CURRENT_FINAL_ARTIFACT else "",
                 artifact_entry=artifact_entry if separator else "",
                 class_or_resource_entry=artifact_entry if separator else "",
-                parser=str(item.get("parser") or "classfile"),
-                evidence_source=str(item.get("evidence_source") or "current_final_artifact"),
+                parser=pooled(item.get("parser") or "classfile"),
+                evidence_source=pooled(
+                    item.get("evidence_source") or "current_final_artifact"
+                ),
                 line=int(item.get("line") or 0),
                 instruction_offset=int(
                     item["instruction_offset"]
@@ -924,8 +934,8 @@ def _business_bytecode_batch(evidence, metrics, *, strict_final_artifact):
                 ("caller_owner", owner),
                 ("caller_name", name),
                 ("caller_signature", signature),
-                ("callee_simple_key", str(item.get("callee_simple_key") or "")),
-                ("content", str(item.get("content") or "")[:100]),
+                ("callee_simple_key", pooled(item.get("callee_simple_key"))),
+                ("content", pooled(str(item.get("content") or "")[:100])),
                 ("artifact_sha256", artifact_sha),
             ),
         ))

@@ -4256,7 +4256,6 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                     visited_classes += 1
                     class_binary_name = logical_name[:-6].replace('/', '.')
                     task = {
-                        'catalog': catalog,
                         'coord': coord,
                         'jar_path': jar_path,
                         'artifact_container_entry': item.get('artifact_entry') or '',
@@ -4266,7 +4265,6 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         'multi_release_version': selected_version,
                         'artifact_sha256': artifact_sha256,
                         'target_jdk': target_jdk,
-                        'graph': graph,
                         'application_owned': item.get('application_owned'),
                         'ownership_evidence': item.get('ownership_evidence'),
                     }
@@ -4322,6 +4320,8 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
     _perf_add(graph, 'bytecode_expand', 'member_index_unparsed_tasks', len(unparsed_tasks))
     _perf_add(graph, 'bytecode_expand', 'member_index_parse_failures', parse_failures)
     return {
+        'graph': graph,
+        'catalog': _get_runtime_dependency_catalog(graph),
         'tasks': tasks,
         'unparsed_tasks': unparsed_tasks,
         'direct_by_owner_member': direct_by_owner_member,
@@ -4392,7 +4392,7 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
             }
             index.setdefault('failures', []).append(failure)
             index['complete'] = False
-            graph = task.get('graph')
+            graph = task.get('graph') or index.get('graph')
             if graph is not None:
                 _record_analyzer_ledger_failure(graph, **failure)
             return None
@@ -4624,6 +4624,10 @@ def _ensure_runtime_dependency_callers_for_key(
                     })
                     continue
             _perf_add(graph, 'bytecode_expand', 'light_scan_elapsed_sec', time.perf_counter() - scan_started_at)
+        javap_tasks = [
+            {**task, 'catalog': catalog, 'graph': graph}
+            for task in javap_tasks
+        ]
         candidate_cache[candidate_cache_key] = {
             'javap_tasks': list(javap_tasks),
             'visited_classes': visited_classes,
