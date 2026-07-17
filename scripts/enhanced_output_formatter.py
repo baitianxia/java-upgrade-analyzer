@@ -50,8 +50,8 @@ except ImportError:
 ALERTS_CSV_FIELDNAMES = [
     'conclusion', 'change_summary', 'review_reason', 'chain_summary',
     'review_focus', 'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
-    'api_identity', 'path_id', 'target_coord', 'changed_symbol', 'compile_impact',
-    'runtime_link_impact', 'change_type', 'severity', 'path_status',
+    'api_identity', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
+    'symbol_kind', 'compile_impact', 'runtime_link_impact', 'change_type', 'severity', 'path_status',
     'business_reachable', 'entry_kind', 'reach_kind', 'consumer_coord', 'consumer_class',
     'consumer_method', 'consumer_signature', 'path_text',
     'path_occurrence_count', 'evidence_files', 'detail_file',

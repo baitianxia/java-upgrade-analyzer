@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import real_project_regression as realreg  # noqa: E402
+import confidence_weighted_tracer as tracer  # noqa: E402
+import enhanced_output_formatter as formatter  # noqa: E402
 
 
 def minimal_classfile_with_utf8(*values):
@@ -53,6 +55,53 @@ def minimal_classfile_with_methodref(owner, member, descriptor):
 
 
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_formatter_output_satisfies_real_project_output_audit_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            with changed.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "coord", "api_name", "api_signature", "symbol_kind", "change_type",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "coord": "lib:api",
+                    "api_name": "lib.Api.call",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                })
+            result = tracer.TraceResult(
+                coord="lib:api", api_name="lib.Api.call", api_simple="call",
+                api_signature="()", symbol_kind="method", change_type="REMOVED",
+                severity="P0", confirmed=True, source="japicmp", analysis_scope="method",
+                analysis_status="reachable", direct_callers=1, is_reachable=True,
+                reachable_note="packaged bytecode path", business_reach_depth=1,
+                dependency_chain_coords=[],
+                call_paths=[["app.App.run()", "lib.Api.call()"]],
+                evidence_paths=[[{
+                    "caller": "app.App.run()",
+                    "callee": "lib.Api.call()",
+                    "evidence_type": "bytecode_method_invocation",
+                    "evidence_source": "current_final_artifact",
+                    "business_reachable": True,
+                }]],
+                reason_code="BUSINESS_ENTRY_REACHED", verification_commands=[], hops=[],
+                confidence_score=1.0, critical_nodes_hit=[],
+            )
+            output = root / "output"
+            formatter.generate_enhanced_summary([result], output)
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+
+            audit = realreg.audit_analysis_outputs(
+                changed, output / "alerts.csv", summary
+            )
+
+        self.assertEqual(audit["failures"], [], audit)
+
     def test_ruoyi_discovery_case_pins_full_population_and_performance_manifest(self):
         case = realreg.CASES["ruoyi-full-artifact-discovery"]
         manifest = json.loads(case.performance_manifest.read_text(encoding="utf-8"))

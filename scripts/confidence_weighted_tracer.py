@@ -7322,6 +7322,12 @@ def _collect_trace_api_with_confidence_weighting(
                 artifact_dependency_hits,
                 graph,
             )
+            _apply_constant_impact(
+                built,
+                api_row,
+                graph,
+                runtime_field_edge_present=True,
+            )
         _debug_trace_result('trace_api_result', built, candidate_counts={
             'reachable': len(reachable_candidates),
             'uncertain': len(uncertain_candidates),
@@ -7334,6 +7340,12 @@ def _collect_trace_api_with_confidence_weighting(
     # 只有在源码图没有产出更强结论时，才回退为打包依赖字节码命中结论。
     if artifact_dependency_hits:
         packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits, graph)
+        _apply_constant_impact(
+            packaged_dependency_result,
+            api_row,
+            graph,
+            runtime_field_edge_present=True,
+        )
         _debug_trace_result('trace_api_result', packaged_dependency_result, candidate_counts={
             'reachable': len(reachable_candidates),
             'uncertain': len(uncertain_candidates),

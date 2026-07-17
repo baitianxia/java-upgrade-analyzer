@@ -2,6 +2,7 @@
 """Bounded, fail-closed validation for JAR/WAR/ZIP analysis inputs."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 import io
 from pathlib import Path, PurePosixPath
 import re
@@ -78,22 +79,35 @@ def _inspect_archive_source(
                     )
                     if ratio > max_expansion_ratio:
                         reasons.add("ARCHIVE_EXPANSION_RATIO_EXCEEDED")
-                    if info.is_dir() or not info.filename.lower().endswith((".jar", ".war", ".zip")):
+                    if info.is_dir():
                         continue
-                    nested_archives += 1
-                    if depth >= max_nested_depth:
-                        reasons.add("ARCHIVE_NESTED_DEPTH_EXCEEDED")
-                        continue
-                    if info.file_size > max_nested_archive_bytes:
-                        reasons.add("ARCHIVE_NESTED_SIZE_EXCEEDED")
-                        continue
+                    is_nested = info.filename.lower().endswith((".jar", ".war", ".zip"))
+                    if is_nested:
+                        nested_archives += 1
+                        if depth >= max_nested_depth:
+                            reasons.add("ARCHIVE_NESTED_DEPTH_EXCEEDED")
+                            continue
+                        if info.file_size > max_nested_archive_bytes:
+                            reasons.add("ARCHIVE_NESTED_SIZE_EXCEEDED")
+                            continue
                     try:
-                        nested_payload = archive.read(info)
+                        if is_nested:
+                            nested_payload = archive.read(info)
+                        else:
+                            with archive.open(info) as entry_stream:
+                                while entry_stream.read(1024 * 1024):
+                                    pass
                     except (OSError, RuntimeError, zipfile.BadZipFile, KeyError):
-                        reasons.add("ARCHIVE_NESTED_READ_FAILED")
-                        details.add(f"ARCHIVE_NESTED_READ_FAILED:{info.filename}")
+                        reason = (
+                            "ARCHIVE_NESTED_READ_FAILED"
+                            if is_nested
+                            else "ARCHIVE_ENTRY_READ_FAILED"
+                        )
+                        reasons.add(reason)
+                        details.add(f"{reason}:{info.filename}")
                         continue
-                    inspect(nested_payload, depth + 1, info.filename)
+                    if is_nested:
+                        inspect(nested_payload, depth + 1, info.filename)
         except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
             reasons.add("ARCHIVE_FORMAT_INVALID")
             details.add(f"ARCHIVE_FORMAT_INVALID:{location}")
@@ -129,8 +143,31 @@ def inspect_archive(path, **limits):
     return _inspect_archive_source(archive_path, **limits)
 
 
+@lru_cache(maxsize=256)
+def _cached_archive_inspection(path, device, inode, size, mtime_ns, limits):
+    del device, inode, size, mtime_ns
+    return _inspect_archive_source(Path(path), **dict(limits))
+
+
+def clear_archive_safety_cache():
+    _cached_archive_inspection.cache_clear()
+
+
 def require_safe_archive(path, **limits):
-    result = inspect_archive(path, **limits)
+    archive_path = Path(path)
+    try:
+        stat = archive_path.stat()
+    except OSError:
+        result = inspect_archive(archive_path, **limits)
+    else:
+        result = _cached_archive_inspection(
+            str(archive_path.resolve()),
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            tuple(sorted(limits.items())),
+        )
     if not result.safe:
         evidence = result.details or result.reason_codes
         raise ValueError("artifact_safety_violation:" + ",".join(evidence))

@@ -1678,10 +1678,7 @@ def _jar_class_hash_map(jar_path: str) -> dict:
                 continue
             if entry.endswith("module-info.class"):
                 continue
-            try:
-                data = zf.read(entry)
-            except Exception:
-                continue
+            data = zf.read(entry)
             digest = hashlib.sha1(data).hexdigest()
             class_fqn = entry[:-6].replace("/", ".")
             if class_fqn:

@@ -10,6 +10,7 @@ import unittest
 import warnings
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -32,6 +33,12 @@ def _archive_bytes(entries, compression=zipfile.ZIP_DEFLATED):
 
 
 class ArtifactSafetyTest(unittest.TestCase):
+    def setUp(self):
+        artifact_safety.clear_archive_safety_cache()
+
+    def tearDown(self):
+        artifact_safety.clear_archive_safety_cache()
+
     def test_safe_archive_reports_bounded_metadata(self):
         result = artifact_safety.inspect_archive_bytes(_archive_bytes([
             ("com/acme/App.class", b"class"),
@@ -182,6 +189,36 @@ class ArtifactSafetyTest(unittest.TestCase):
                     old_version="1",
                     new_version="2",
                 )
+
+    def test_step4_class_hash_scan_rejects_crc_corruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "corrupt.jar"
+            payload = b"unique-class-payload"
+            with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("sample/Broken.class", payload)
+            content = bytearray(artifact.read_bytes())
+            offset = content.index(payload)
+            content[offset] ^= 0x01
+            artifact.write_bytes(content)
+
+            with self.assertRaisesRegex(ValueError, "ARCHIVE_ENTRY_READ_FAILED"):
+                s4_jar_compare._jar_class_hash_map(str(artifact))
+
+    def test_archive_safety_result_is_cached_for_unchanged_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "safe.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("sample/Ok.class", b"class")
+
+            with patch.object(
+                artifact_safety,
+                "_inspect_archive_source",
+                wraps=artifact_safety._inspect_archive_source,
+            ) as inspect_mock:
+                artifact_safety.require_safe_archive(artifact)
+                artifact_safety.require_safe_archive(artifact)
+
+            self.assertEqual(inspect_mock.call_count, 1)
 
 
 if __name__ == "__main__":

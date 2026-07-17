@@ -10536,9 +10536,13 @@ public class com.example.TargetBridge {
         self.assertEqual(2, summary["meta"]["graph_stats"]["parser_usage"]["regex"])
 
     def test_alerts_csv_is_a_focused_human_review_table(self):
-        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 29)
+        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 31)
         self.assertIn("chain_detail", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("path_text", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertIn("api_signature", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertIn("symbol_kind", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertIn("compile_impact", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertIn("runtime_link_impact", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("conclusion_level", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("action_type", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("coverage_details", formatter.ALERTS_CSV_FIELDNAMES)
@@ -19700,6 +19704,40 @@ public class com.example.consumer.Adapter {
         alert = formatter._alert_rows_for_result(result)[0]
         self.assertEqual(alert["runtime_link_impact"], "runtime_link_present")
         self.assertEqual(alert["compile_impact"], "unverified")
+
+    def test_external_dependency_constant_field_hit_reports_runtime_link_present(self):
+        api_row = {
+            "coord": "lib:flags", "api_name": "lib.Flags.VALUE", "api_simple": "VALUE",
+            "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
+            "compatibility_flags": "CONSTANT_REMOVED",
+            "old_field_has_constant_value": "true",
+            "severity": "P0", "confirmed": "true",
+        }
+        graph = SimpleNamespace(
+            methods_by_id={}, reverse_edges={},
+            source_artifact_alignment={"status": "unverified"},
+        )
+        hit = {
+            "status": "hit",
+            "hits": [{
+                "coord": "app:internal-library",
+                "class_fqcn": "app.bridge.InternalBridge",
+                "consumer_method": "run",
+                "consumer_signature": "()",
+                "target_display": "lib.Flags.VALUE",
+                "evidence_type": "bytecode_field_access",
+            }],
+        }
+
+        with patch.object(
+            tracer, "_scan_packaged_runtime_dependencies_for_api", return_value=hit
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row, graph, {}, has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.runtime_link_impact, "runtime_link_present")
+        self.assertEqual(result.compile_impact, "unverified")
 
     def test_direct_source_constant_usage_uses_inlining_decision_before_early_return(self):
         api_row = {
