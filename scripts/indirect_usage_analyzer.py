@@ -16,6 +16,7 @@ from signature_utils import (
 )
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import (
+    ActivationEvidence,
     CollectedEdge,
     CollectorBatch,
     CoverageRecord,
@@ -902,6 +903,12 @@ def _collected_indirect_edge(edge, api_identity, runtime_catalog):
         edge_kind=edge.evidence_type,
         semantic=True,
         activation_verified=True,
+        activation_evidence=(ActivationEvidence(
+            authority=EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
+            proof_kind=edge.evidence_type,
+            source=f"{edge.file}:{edge.line}",
+            detail=api_identity,
+        ),),
         owner_scope=_indirect_scope(edge, runtime_catalog),
         owner_coord=edge.owner_coord,
         provenance=EvidenceProvenance(

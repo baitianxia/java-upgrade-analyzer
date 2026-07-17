@@ -51,8 +51,10 @@ from indirect_usage_analyzer import (
     parse_javap_indirect_references,
 )
 from step5_evidence_model import (
+    ActivationEvidence,
     AnalysisOutcome,
     CoverageRecord,
+    EvidenceAuthority,
     EvidenceConcern,
     EvidenceEnvelope,
     EvidenceFailure,
@@ -5813,7 +5815,13 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
                     else -1
                 ),
                 semantic=bool(edge.get('semantic')),
-                activation_verified=bool(edge.get('activation_verified')),
+                activation_verified=bool(
+                    edge.get('activation_verified') and _typed_activation_evidence(edge)
+                ),
+                activation_evidence=(
+                    _typed_activation_evidence(edge)
+                    if edge.get('activation_verified') else ()
+                ),
             )
             for edge in detail.get('evidence') or []
         )
@@ -5939,7 +5947,8 @@ def _merge_runtime_framework_paths(result, hits, graph):
             artifact=str(activation_edge.get('file') or ''),
             confidence=str(activation_edge.get('confidence') or 'high'),
             semantic=True,
-            activation_verified=True,
+            activation_verified=bool(_typed_activation_evidence(activation_edge)),
+            activation_evidence=_typed_activation_evidence(activation_edge),
         ),),
     ),))
 
@@ -7604,6 +7613,48 @@ def _semantic_edge_activation_verified(edge):
         getattr(edge, 'framework_activation_verified', False)
         or _verified_composite_framework_projection(edge)
     )
+
+
+def _typed_activation_evidence(edge):
+    """Project activation proof only when its authority can be independently located."""
+    keys = (
+        'evidence_type', 'edge_kind', 'file', 'caller_evidence_file',
+        'caller_symbol', 'caller_symbol_id', 'framework_evidence_artifact_sha256',
+        'caller_artifact_sha256', 'artifact_sha256', 'evidence_source',
+    )
+    value = edge if isinstance(edge, Mapping) else {
+        key: getattr(edge, key, None) for key in keys
+    }
+    evidence_type = str(
+        value.get('evidence_type') or value.get('edge_kind') or 'semantic_activation'
+    ).strip()
+    source = str(
+        value.get('file') or value.get('caller_evidence_file')
+        or value.get('caller_symbol') or value.get('caller_symbol_id') or ''
+    ).strip()
+    digest = str(
+        value.get('framework_evidence_artifact_sha256')
+        or value.get('caller_artifact_sha256')
+        or value.get('artifact_sha256') or ''
+    ).strip().lower()
+    if source and _valid_projected_sha256(digest):
+        return (ActivationEvidence(
+            authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+            proof_kind=evidence_type,
+            source=source,
+            artifact_sha256=digest,
+        ),)
+    evidence_source = str(value.get('evidence_source') or '').strip()
+    if source and (
+        evidence_source == 'source_indirect_inference'
+        or any(token in evidence_type for token in ('reflection', 'method_handle', 'resource_lookup'))
+    ):
+        return (ActivationEvidence(
+            authority=EvidenceAuthority.SOURCE_INDIRECT_INFERENCE,
+            proof_kind=evidence_type,
+            source=source,
+        ),)
+    return ()
 
 
 def get_cached_sorted_incoming_edges(reverse_edges, current_key, trace_cache=None, graph=None):
@@ -9688,7 +9739,14 @@ def _candidate_reachability_path(result, candidate, complete, reason_code, note)
                 getattr(edge, 'semantic', False)
                 or getattr(edge, 'framework_registration', False)
             ),
-            activation_verified=_semantic_edge_activation_verified(edge),
+            activation_verified=bool(
+                _semantic_edge_activation_verified(edge)
+                and _typed_activation_evidence(edge)
+            ),
+            activation_evidence=(
+                _typed_activation_evidence(edge)
+                if _semantic_edge_activation_verified(edge) else ()
+            ),
         ))
     entry_point = candidate.get('entry_point') or {}
     if (
@@ -9704,7 +9762,14 @@ def _candidate_reachability_path(result, candidate, complete, reason_code, note)
             artifact=str(entry_point.get('file') or ''),
             confidence='high',
             semantic=True,
-            activation_verified=bool(entry_point.get('activation_verified')),
+            activation_verified=bool(
+                entry_point.get('activation_verified')
+                and _typed_activation_evidence(entry_point)
+            ),
+            activation_evidence=(
+                _typed_activation_evidence(entry_point)
+                if entry_point.get('activation_verified') else ()
+            ),
         ))
     return ReachabilityPath(
         path_text=path_text,

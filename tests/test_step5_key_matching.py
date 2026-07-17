@@ -10923,7 +10923,7 @@ public class com.example.TargetBridge {
         self.assertEqual(result.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
         self.assertEqual(result.dependency_chain_coords, ["com.vendor:boot"])
 
-    def test_active_spring_registration_produces_complete_business_to_callback_chain(self):
+    def test_source_claimed_active_spring_registration_without_artifact_proof_is_uncertain(self):
         def method_def(symbol_id, qualified_key, owner_type, owner_coord, method_name, params):
             class_fqcn = qualified_key.rsplit('.', 1)[0]
             signature = '(' + ', '.join(params) + ')'
@@ -11025,13 +11025,8 @@ public class com.example.TargetBridge {
             max_total_cost=5,
         )
 
-        self.assertEqual(result.analysis_status, "reachable")
-        self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
-        self.assertIn(
-            "com.acme.Application.main → Spring Boot框架注册 → "
-            "com.vendor.RuntimeListener.onApplicationEvent → 变更API: com.vendor.LegacyApi.removed()",
-            result.call_paths,
-        )
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
 
     def test_conditional_dependency_framework_callback_is_not_confirmed_reachable(self):
         callback = SimpleNamespace(

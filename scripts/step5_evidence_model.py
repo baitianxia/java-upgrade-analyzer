@@ -96,6 +96,29 @@ class EvidenceProvenance:
 
 
 @dataclass(frozen=True)
+class ActivationEvidence:
+    """Independent proof that a semantic edge is active in the analyzed runtime."""
+
+    authority: EvidenceAuthority
+    proof_kind: str
+    source: str
+    artifact_sha256: str = ""
+    detail: str = ""
+
+    def __post_init__(self):
+        if not str(self.proof_kind or "").strip() or not str(self.source or "").strip():
+            raise ValueError("activation evidence requires proof kind and source")
+        digest = str(self.artifact_sha256 or "")
+        if digest and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("activation evidence SHA-256 must contain 64 lowercase hex characters")
+        if self.authority in {
+            EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+            EvidenceAuthority.PACKAGED_RUNTIME,
+        } and not digest:
+            raise ValueError("packaged activation evidence requires artifact SHA-256")
+
+
+@dataclass(frozen=True)
 class CollectedEdge:
     caller_symbol: str
     callee_symbol: str
@@ -107,6 +130,7 @@ class CollectedEdge:
     confidence: str = "high"
     ambiguous: bool = False
     activation_verified: bool = False
+    activation_evidence: Tuple[ActivationEvidence, ...] = field(default_factory=tuple)
     activation_conditions: Tuple[Any, ...] = field(default_factory=tuple)
     metadata: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
 
@@ -123,6 +147,14 @@ class CollectedEdge:
             raise ValueError("semantic edge authority must be semantic or runtime evidence")
         if self.activation_verified and not self.semantic:
             raise ValueError("activation verification is only valid for semantic edges")
+        activation_evidence = tuple(self.activation_evidence or ())
+        if any(not isinstance(item, ActivationEvidence) for item in activation_evidence):
+            raise ValueError("activation evidence must contain typed ActivationEvidence values")
+        if self.activation_verified and not activation_evidence:
+            raise ValueError("activation verification requires typed activation evidence")
+        if activation_evidence and not self.semantic:
+            raise ValueError("activation evidence is only valid for semantic edges")
+        object.__setattr__(self, "activation_evidence", activation_evidence)
         object.__setattr__(self, "activation_conditions", tuple(
             freeze_evidence_value(item)
             for item in tuple(self.activation_conditions or ())
@@ -216,6 +248,13 @@ class CollectorBatch:
                 "confidence": edge.confidence,
                 "ambiguous": edge.ambiguous,
                 "activation_verified": edge.activation_verified,
+                "activation_evidence": [{
+                    "authority": item.authority.value,
+                    "proof_kind": item.proof_kind,
+                    "source": item.source,
+                    "artifact_sha256": item.artifact_sha256,
+                    "detail": item.detail,
+                } for item in edge.activation_evidence],
                 "activation_conditions": thaw_evidence_value(edge.activation_conditions),
                 "provenance": provenance_mapping(edge.provenance),
                 "metadata": thaw_evidence_value(dict(edge.metadata)),
@@ -275,6 +314,7 @@ class PhysicalCallEdge:
     instruction_offset: int = -1
     semantic: bool = False
     activation_verified: bool = False
+    activation_evidence: Tuple[ActivationEvidence, ...] = field(default_factory=tuple)
     metadata: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
 
     def __post_init__(self):
@@ -286,6 +326,14 @@ class PhysicalCallEdge:
             raise ValueError("physical instruction offset must be an integer >= -1")
         if self.activation_verified and not self.semantic:
             raise ValueError("activation verification is only valid for semantic edges")
+        activation_evidence = tuple(self.activation_evidence or ())
+        if any(not isinstance(item, ActivationEvidence) for item in activation_evidence):
+            raise ValueError("activation evidence must contain typed ActivationEvidence values")
+        if self.activation_verified and not activation_evidence:
+            raise ValueError("activation verification requires typed activation evidence")
+        if activation_evidence and not self.semantic:
+            raise ValueError("activation evidence is only valid for semantic edges")
+        object.__setattr__(self, "activation_evidence", activation_evidence)
         object.__setattr__(self, "metadata", tuple(sorted(
             (key, freeze_evidence_value(value))
             for key, value in tuple(self.metadata or ())

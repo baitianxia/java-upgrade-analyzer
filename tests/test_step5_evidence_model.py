@@ -14,6 +14,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from step5_evidence_model import (
+    ActivationEvidence,
     AnalysisDecision,
     AnalysisOutcome,
     CollectedEdge,
@@ -59,6 +60,12 @@ class EvidenceModelTest(unittest.TestCase):
             ),
             semantic=semantic,
             activation_verified=activation_verified,
+            activation_evidence=((ActivationEvidence(
+                authority=EvidenceAuthority.RUNTIME_OBSERVATION,
+                proof_kind="business_entry_activation",
+                source="application.jar!/Application.class#main",
+                artifact_sha256="a" * 64,
+            ),) if activation_verified else ()),
             owner_scope=ModuleScope.BUSINESS_CLASSES,
             provenance=EvidenceProvenance(
                 authority=authority or (
@@ -114,8 +121,22 @@ class EvidenceModelTest(unittest.TestCase):
         ).to_mapping()
 
         self.assertTrue(mapping["edges"][0]["activation_verified"])
+        self.assertEqual(
+            mapping["edges"][0]["activation_evidence"][0]["proof_kind"],
+            "business_entry_activation",
+        )
         with self.assertRaisesRegex(ValueError, "only valid for semantic edges"):
             self._final_artifact_edge(activation_verified=True)
+
+    def test_activation_boolean_without_typed_proof_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "typed activation evidence"):
+            PhysicalCallEdge(
+                caller_symbol="Application.main",
+                callee_key="Listener.receive",
+                evidence_type="spring_callback",
+                semantic=True,
+                activation_verified=True,
+            )
 
     def test_collector_batch_serialization_is_deterministic(self):
         batch = CollectorBatch(
@@ -510,6 +531,12 @@ class EvidenceModelTest(unittest.TestCase):
                 owner_scope=ModuleScope.BUSINESS_CLASSES,
                 semantic=True,
                 activation_verified=True,
+                activation_evidence=(ActivationEvidence(
+                    authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+                    proof_kind="packaged_business_entry",
+                    source="application.jar!/Application.class#main",
+                    artifact_sha256="a" * 64,
+                ),),
             ),),
         ),))
 
@@ -527,6 +554,60 @@ class EvidenceModelTest(unittest.TestCase):
 
         self.assertEqual(decision.analysis_status, "uncertain")
         self.assertEqual(decision.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
+
+    def test_framework_evidence_state_transitions_are_explicit(self):
+        target = "com.vendor.Legacy.call()"
+        coverage = (CoverageRecord(
+            collector="framework",
+            api_identity=target,
+            status="complete",
+        ),)
+        absent = decide_envelope(EvidenceEnvelope(
+            target_identity=target,
+            coverage=coverage,
+        ))
+        candidate = decide_envelope(EvidenceEnvelope(
+            target_identity=target,
+            coverage=coverage,
+            paths=(ReachabilityPath(
+                path_text="Application.main -> callback -> API",
+                entry_scope=ModuleScope.BUSINESS_CLASSES,
+                complete=True,
+                evidence=(PhysicalCallEdge(
+                    caller_symbol="Application.main",
+                    callee_key="Listener.receive",
+                    evidence_type="spring_callback",
+                    semantic=True,
+                ),),
+            ),),
+        ))
+        activated = decide_envelope(EvidenceEnvelope(
+            target_identity=target,
+            coverage=coverage,
+            paths=(ReachabilityPath(
+                path_text="Application.main -> callback -> API",
+                entry_scope=ModuleScope.BUSINESS_CLASSES,
+                complete=True,
+                evidence=(PhysicalCallEdge(
+                    caller_symbol="Application.main",
+                    callee_key="Listener.receive",
+                    evidence_type="spring_callback",
+                    semantic=True,
+                    activation_verified=True,
+                    activation_evidence=(ActivationEvidence(
+                        authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+                        proof_kind="packaged_business_entry",
+                        source="application.jar!/Application.class#main",
+                        artifact_sha256="a" * 64,
+                    ),),
+                ),),
+            ),),
+        ))
+
+        self.assertEqual(
+            [absent.analysis_status, candidate.analysis_status, activated.analysis_status],
+            ["not_found_in_static_analysis", "uncertain", "reachable"],
+        )
 
     def test_semantic_edge_without_independent_activation_is_uncertain(self):
         decision = decide_analysis((ReachabilityPath(
