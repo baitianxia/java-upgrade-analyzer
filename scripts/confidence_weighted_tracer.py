@@ -78,7 +78,7 @@ CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
 
 ANALYZER_EDGE_PROCEDURE_VERSION = 'java-upgrade-analyzer.analyzer-edge-ledger.v1'
 ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION = 'java-upgrade-analyzer.runtime-javap.v1'
-RUNTIME_MEMBER_INDEX_CACHE_SCHEMA = 'java-upgrade-analyzer.runtime-member-index.v1'
+RUNTIME_MEMBER_INDEX_CACHE_SCHEMA = 'java-upgrade-analyzer.runtime-member-index.v2'
 ANALYZER_EDGE_PROCEDURE = (
     'Step5 executable bytecode matching at analyzer edge creation points'
 )
@@ -3337,9 +3337,16 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
             'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
             catalog_status=catalog_status,
         )
-    cached_results = catalog.get('_packaged_api_scan_results') or {}
     identity_key = build_api_identity_key(api_row)
-    if identity_key in cached_results:
+    cached_results = catalog.get('_packaged_api_scan_results') or {}
+    active_trace_serial = int(
+        getattr(graph, '_active_packaged_scan_trace_serial', 0) or 0
+    )
+    if (
+        active_trace_serial
+        and catalog.get('_packaged_api_scan_validated_trace_serial') == active_trace_serial
+        and identity_key in cached_results
+    ):
         return cached_results[identity_key]
     _build_packaged_runtime_dependency_scan_cache([api_row], graph)
     cached_results = catalog.get('_packaged_api_scan_results') or {}
@@ -3459,16 +3466,7 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
             continue
     _record_analyzer_scan_failures(graph, scan_failures)
     if hits:
-        unique_hits = []
-        seen_hits = set()
-        for hit in hits:
-            identity = tuple(hit.get(key) for key in (
-                'coord', 'class_fqcn', 'consumer_method', 'consumer_signature',
-                'evidence_type', 'target_display', 'multi_release_version',
-            ))
-            if identity not in seen_hits:
-                seen_hits.add(identity)
-                unique_hits.append(hit)
+        unique_hits = _deduplicate_physical_packaged_hits(hits)
         return {
             'status': 'hit', 'hits': unique_hits, 'scan_failures': scan_failures,
             'scanned_classes': scanned_classes, 'visited_classes': visited_classes,
@@ -3497,6 +3495,56 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
         'status': 'miss', 'scan_failures': scan_failures,
         'scanned_classes': scanned_classes, 'visited_classes': visited_classes,
     }
+
+
+def _mark_packaged_scan_input_changed(
+    existing, api_rows, failures, scanned_classes, visited_classes,
+):
+    existing.clear()
+    for row in api_rows or ():
+        existing[build_api_identity_key(row)] = {
+            'status': 'unavailable',
+            'reason': 'BYTECODE_SCAN_INPUT_CHANGED',
+            'scan_failures': list(failures or ()),
+            'scanned_classes': scanned_classes,
+            'visited_classes': visited_classes,
+            'scan_mode': 'batch',
+        }
+    return existing
+
+
+def _commit_packaged_analyzer_edges_transaction(graph, api_hit_pairs):
+    analyzer_edges = getattr(graph, 'analyzer_edges', None)
+    before = dict(analyzer_edges or {})
+    discovery_before = int(
+        getattr(graph, '_analyzer_edge_discovery_count', 0) or 0
+    )
+    incomplete_before = int(
+        getattr(graph, '_analyzer_edge_incomplete_count', 0) or 0
+    )
+    failures_before = set(
+        getattr(graph, '_analyzer_edge_failures', set()) or set()
+    )
+    typed_failures_before = tuple(
+        getattr(graph, 'step5_evidence_failures', ()) or ()
+    )
+    committed = []
+    try:
+        for api_row, hit in api_hit_pairs or ():
+            row = record_analyzer_edge(graph, api_row, hit)
+            if row is not None:
+                committed.append(row)
+    except BaseException:
+        current = getattr(graph, 'analyzer_edges', None)
+        if current is not None:
+            current.clear()
+            current.update(before)
+        graph._analyzer_edge_discovery_count = discovery_before
+        graph._analyzer_edge_incomplete_count = incomplete_before
+        graph._analyzer_edge_failures = failures_before
+        graph.step5_evidence_failures = typed_failures_before
+        raise
+    return committed
 
 
 def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
@@ -3529,7 +3577,21 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         'class_entries_parsed', 'class_parse_elapsed_sec', 'duplicate_class_scans',
     ):
         _perf_add(graph, 'bytecode_scan', metric, 0)
+    by_coord = catalog.get('by_coord') or {}
+    catalog_entries = list(catalog.get('entries') or [
+        ({'coord': coord, **item} if not item.get('coord') else item)
+        for coord, item in by_coord.items()
+    ])
+    target_jdk = catalog.get('target_jdk')
+    current_stat_snapshot = _runtime_artifact_stat_snapshot(
+        catalog_entries, target_jdk
+    )
     existing = catalog.setdefault('_packaged_api_scan_results', {})
+    if (
+        existing
+        and catalog.get('_packaged_api_scan_stat_snapshot') != current_stat_snapshot
+    ):
+        existing.clear()
     api_rows = [dict(row or {}) for row in (api_rows or []) if (row or {}).get('api_name')]
     missing_rows = [
         row for row in api_rows
@@ -3539,8 +3601,16 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     _perf_add(graph, 'bytecode_scan', 'missing_api_rows', len(missing_rows))
     _perf_add(graph, 'bytecode_scan', 'cache_hit_api_rows', max(0, len(api_rows) - len(missing_rows)))
     if not missing_rows:
-        _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
-        return existing
+        snapshot_after_cache_check = _runtime_artifact_stat_snapshot(
+            catalog_entries, target_jdk
+        )
+        if snapshot_after_cache_check != current_stat_snapshot:
+            existing.clear()
+            missing_rows = list(api_rows)
+            current_stat_snapshot = snapshot_after_cache_check
+        else:
+            _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
+            return existing
 
     target_rows_by_owner = defaultdict(list)
     owner_internal_names = {}
@@ -3569,12 +3639,6 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
         return existing
 
-    by_coord = catalog.get('by_coord') or {}
-    catalog_entries = list(catalog.get('entries') or [
-        ({'coord': coord, **item} if not item.get('coord') else item)
-        for coord, item in by_coord.items()
-    ])
-
     scan_failures = []
     candidate_failures_by_key = defaultdict(list)
     hits_by_key = defaultdict(list)
@@ -3585,8 +3649,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     visited_classes = 0
     multi_release_seen = False
     multi_release_target_resolved = False
-    target_jdk = catalog.get('target_jdk')
     counted_artifacts = set()
+    scanned_artifact_sha256 = {}
     started_at = time.perf_counter()
     progress_interval = suggest_log_interval(len(catalog_entries), target_updates=8, minimum=1)
 
@@ -3678,6 +3742,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             continue
         try:
             artifact_sha256 = _artifact_sha256(jar_path)
+            scanned_artifact_sha256[str(Path(jar_path).resolve())] = artifact_sha256
             if artifact_sha256 in counted_artifacts:
                 _perf_add(graph, 'bytecode_scan', 'duplicate_jar_scans', 1)
             else:
@@ -3881,7 +3946,6 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                             'multi_release_version': selected_version,
                         }
                         hits_by_key[key].append(hit)
-                        record_analyzer_edge(graph, api_row, hit)
 
         if workers <= 1:
             progress_interval = suggest_log_interval(len(javap_tasks), target_updates=12, minimum=1)
@@ -3933,6 +3997,82 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         )
         _perf_add(graph, 'bytecode_scan', 'javap_elapsed_sec', time.perf_counter() - javap_started_at)
 
+    snapshot_before_final_hash = _runtime_artifact_stat_snapshot(
+        catalog_entries, target_jdk
+    )
+    changed_artifacts = []
+    for jar_path, expected_sha256 in sorted(scanned_artifact_sha256.items()):
+        try:
+            actual_sha256 = _artifact_sha256(jar_path)
+        except OSError as exc:
+            actual_sha256 = ''
+            error = f'{type(exc).__name__}:{exc}'
+        else:
+            error = ''
+        if actual_sha256 != expected_sha256:
+            changed_artifacts.append({
+                'reason': 'BYTECODE_SCAN_INPUT_CHANGED',
+                'jar_path': jar_path,
+                'expected_sha256': expected_sha256,
+                'actual_sha256': actual_sha256,
+                'error': error,
+            })
+    snapshot_after_final_hash = _runtime_artifact_stat_snapshot(
+        catalog_entries, target_jdk
+    )
+    if snapshot_after_final_hash != snapshot_before_final_hash:
+        changed_artifacts.append({
+            'reason': 'BYTECODE_SCAN_INPUT_CHANGED',
+            'jar_path': '',
+            'expected_sha256': '',
+            'actual_sha256': '',
+            'error': 'runtime dependency stat identity changed during final verification',
+        })
+    if changed_artifacts:
+        scan_failures.extend(changed_artifacts)
+        _record_analyzer_scan_failures(graph, changed_artifacts)
+        _mark_packaged_scan_input_changed(
+            existing, api_rows, changed_artifacts,
+            scanned_classes, visited_classes,
+        )
+        catalog['_packaged_api_scan_stat_snapshot'] = None
+        _perf_add(graph, 'bytecode_scan', 'scan_failures', len(scan_failures))
+        _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
+        return existing
+
+    committed_analyzer_edges = _commit_packaged_analyzer_edges_transaction(
+        graph,
+        [
+            (row, hit)
+            for row in missing_rows
+            for hit in (hits_by_key.get(build_api_identity_key(row)) or ())
+        ],
+    )
+
+    snapshot_after_commit = _runtime_artifact_stat_snapshot(
+        catalog_entries, target_jdk
+    )
+    if snapshot_after_commit != snapshot_after_final_hash:
+        analyzer_edges = getattr(graph, 'analyzer_edges', {}) or {}
+        for row in committed_analyzer_edges:
+            identity = physical_analyzer_edge_identity(row)
+            if analyzer_edges.get(identity) is row:
+                analyzer_edges.pop(identity, None)
+        failure = {
+            'reason': 'BYTECODE_SCAN_INPUT_CHANGED',
+            'jar_path': '',
+            'error': 'runtime dependency stat identity changed during edge commit',
+        }
+        _record_analyzer_scan_failures(graph, [failure])
+        _mark_packaged_scan_input_changed(
+            existing, api_rows, [failure], scanned_classes, visited_classes,
+        )
+        catalog['_packaged_api_scan_stat_snapshot'] = None
+        _perf_add(graph, 'bytecode_scan', 'scan_failures', 1)
+        _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
+        return existing
+
+    catalog['_packaged_api_scan_stat_snapshot'] = snapshot_after_commit
     _record_analyzer_scan_failures(graph, scan_failures)
     for failures in candidate_failures_by_key.values():
         _record_analyzer_scan_failures(graph, failures)
@@ -3944,17 +4084,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         hits = hits_by_key.get(key) or []
         api_scan_failures = scan_failures + list(candidate_failures_by_key.get(key) or [])
         if hits:
-            unique_hits = []
-            seen_hits = set()
-            for hit in hits:
-                identity = tuple(hit.get(field) for field in (
-                    'coord', 'class_fqcn', 'consumer_method', 'consumer_signature',
-                    'evidence_type', 'target_display', 'multi_release_version',
-                ))
-                if identity in seen_hits:
-                    continue
-                seen_hits.add(identity)
-                unique_hits.append(hit)
+            unique_hits = _deduplicate_physical_packaged_hits(hits)
             existing[key] = {
                 'status': 'hit',
                 'hits': unique_hits,
@@ -4236,6 +4366,29 @@ def _runtime_member_index_cache_identity(catalog_entries, target_jdk):
     }
 
 
+def _runtime_artifact_stat_snapshot(catalog_entries, target_jdk):
+    artifacts = []
+    for item in catalog_entries or ():
+        jar_path = str(item.get('jar_path') or '').strip()
+        resolved = str(Path(jar_path).resolve()) if jar_path else ''
+        stat_identity = None
+        if jar_path:
+            try:
+                stat = os.stat(jar_path)
+                stat_identity = (
+                    int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
+                    int(stat.st_mtime_ns), int(stat.st_ctime_ns),
+                )
+            except OSError:
+                stat_identity = None
+        artifacts.append((
+            str(item.get('coord') or '').strip(), resolved,
+            str(item.get('artifact_entry') or ''), stat_identity,
+            item.get('application_owned'), item.get('ownership_evidence'),
+        ))
+    return (str(target_jdk or ''), tuple(sorted(artifacts, key=repr)))
+
+
 def _runtime_member_index_cache_path(graph):
     report_dir = str(getattr(graph, 'report_dir', '') or '').strip()
     if not report_dir:
@@ -4274,29 +4427,29 @@ def _runtime_member_index_serializable(index):
 
 def _runtime_member_index_from_serializable(payload, graph):
     direct = defaultdict(set)
-    for row in payload.get('direct_by_owner_member') or ():
+    for row in payload.pop('direct_by_owner_member', None) or ():
         direct[(str(row.get('owner') or ''), str(row.get('member') or ''))].update(
             int(value) for value in (row.get('task_ids') or ())
         )
+    owner_string_ids = payload.pop('owner_string_ids', None) or {}
+    for key, values in owner_string_ids.items():
+        owner_string_ids[key] = set(values or ())
+    member_string_ids = payload.pop('member_string_ids', None) or {}
+    for key, values in member_string_ids.items():
+        member_string_ids[key] = set(values or ())
     return {
         'graph': graph,
         'catalog': _get_runtime_dependency_catalog(graph),
-        'tasks': list(payload.get('tasks') or []),
-        'unparsed_tasks': list(payload.get('unparsed_tasks') or []),
+        'tasks': payload.pop('tasks', None) or [],
+        'unparsed_tasks': payload.pop('unparsed_tasks', None) or [],
         'direct_by_owner_member': direct,
-        'owner_string_ids': {
-            str(key): set(value or ())
-            for key, value in (payload.get('owner_string_ids') or {}).items()
-        },
-        'member_string_ids': {
-            str(key): set(value or ())
-            for key, value in (payload.get('member_string_ids') or {}).items()
-        },
-        'reflection_ids': set(payload.get('reflection_ids') or ()),
+        'owner_string_ids': owner_string_ids,
+        'member_string_ids': member_string_ids,
+        'reflection_ids': set(payload.pop('reflection_ids', None) or ()),
         'visited_classes': int(payload.get('visited_classes') or 0),
         'parse_failures': int(payload.get('parse_failures') or 0),
         'complete': bool(payload.get('complete', True)),
-        'failures': list(payload.get('failures') or []),
+        'failures': payload.pop('failures', None) or [],
     }
 
 
@@ -4304,6 +4457,16 @@ def _runtime_member_index_canonical_bytes(payload):
     return json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
     ).encode('utf-8')
+
+
+def _runtime_member_index_integrity_sha256(payload):
+    digest = hashlib.sha256()
+    encoder = json.JSONEncoder(
+        ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    )
+    for chunk in encoder.iterencode(payload):
+        digest.update(chunk.encode('utf-8'))
+    return digest.hexdigest()
 
 
 def _write_runtime_member_index_cache(path, identity, index):
@@ -4343,16 +4506,15 @@ def _write_runtime_member_index_cache(path, identity, index):
 
 
 def _load_runtime_member_index_cache(path, identity, graph):
-    wrapper = json.loads(Path(path).read_text(encoding='utf-8'))
+    with Path(path).open('r', encoding='utf-8') as handle:
+        wrapper = json.load(handle)
     body = {
         'identity': wrapper.get('identity'),
         'index': wrapper.get('index'),
     }
     if body['identity'] != identity or not isinstance(body['index'], dict):
         raise ValueError('runtime member index cache identity mismatch')
-    expected = hashlib.sha256(
-        _runtime_member_index_canonical_bytes(body)
-    ).hexdigest()
+    expected = _runtime_member_index_integrity_sha256(body)
     if wrapper.get('integrity_sha256') != expected:
         raise ValueError('runtime member index cache integrity mismatch')
     index = _runtime_member_index_from_serializable(body['index'], graph)
@@ -4388,9 +4550,29 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                 item=coord or str(item.get('jar_path') or '')[:120],
             )
         if not coord:
+            parse_failures += 1
+            failure = {
+                'reason': 'BYTECODE_MEMBER_INDEX_COORD_MISSING',
+                'coord': '',
+                'jar_path': str(item.get('jar_path') or '').strip(),
+                'error_type': 'ValueError',
+                'error': 'runtime member index catalog entry has no coordinate',
+            }
+            failures.append(failure)
+            _record_analyzer_ledger_failure(graph, **failure)
             continue
         jar_path = str(item.get('jar_path') or '').strip()
         if not jar_path or not os.path.exists(jar_path):
+            parse_failures += 1
+            failure = {
+                'reason': 'BYTECODE_MEMBER_INDEX_ARTIFACT_MISSING',
+                'coord': coord,
+                'jar_path': jar_path,
+                'error_type': 'FileNotFoundError',
+                'error': 'runtime member index artifact is missing',
+            }
+            failures.append(failure)
+            _record_analyzer_ledger_failure(graph, **failure)
             continue
         try:
             catalog = _get_runtime_dependency_catalog(graph)
@@ -4442,22 +4624,23 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         str(value or '') for value in (summary.get('utf8_values') or set())
                         if value
                     }
-                    for value in utf8_values:
-                        if re.fullmatch(r'[A-Za-z_$][\w$]*(?:[/.][A-Za-z_$][\w$]*)+', value):
-                            owner_string_ids[value].add(task_id)
-                            dotted_owner = value.replace('/', '.').replace('$', '.')
-                            owner_string_ids[dotted_owner].add(task_id)
-                            owner_string_ids[dotted_owner.replace('.', '/')].add(task_id)
-                        if re.fullmatch(r'[A-Za-z_$][\w$]*', value):
-                            member_string_ids[value].add(task_id)
-                    if summary.get('has_dynamic_reference') or any(
+                    reflective = summary.get('has_dynamic_reference') or any(
                         marker in utf8_values
                         for marker in (
                             'java/lang/Class', 'java/lang/reflect/Method',
                             'java/lang/reflect/Constructor', 'java/lang/invoke/MethodHandles',
                         )
-                    ):
+                    )
+                    if reflective:
                         reflection_ids.add(task_id)
+                        for value in utf8_values:
+                            if re.fullmatch(r'[A-Za-z_$][\w$]*(?:[/.][A-Za-z_$][\w$]*)+', value):
+                                owner_string_ids[value].add(task_id)
+                                dotted_owner = value.replace('/', '.').replace('$', '.')
+                                owner_string_ids[dotted_owner].add(task_id)
+                                owner_string_ids[dotted_owner.replace('.', '/')].add(task_id)
+                            if re.fullmatch(r'[A-Za-z_$][\w$]*', value):
+                                member_string_ids[value].add(task_id)
         except Exception as exc:
             parse_failures += 1
             failure = {
@@ -4496,26 +4679,109 @@ def _get_runtime_dependency_member_candidate_index(graph, catalog_entries, targe
         return None
     cached = getattr(graph, '_runtime_dependency_member_candidate_index', None)
     if cached is not None:
-        return cached
+        current_stat_snapshot = _runtime_artifact_stat_snapshot(
+            catalog_entries, target_jdk
+        )
+        if cached.get('_stat_snapshot') == current_stat_snapshot:
+            return cached
+        snapshot_before_identity = current_stat_snapshot
+        try:
+            current_identity = _runtime_member_index_cache_identity(
+                catalog_entries, target_jdk
+            )
+        except OSError:
+            current_identity = None
+        snapshot_after_identity = _runtime_artifact_stat_snapshot(
+            catalog_entries, target_jdk
+        )
+        if (
+            current_identity is not None
+            and cached.get('_identity') == current_identity
+            and snapshot_after_identity == snapshot_before_identity
+        ):
+            cached['_stat_snapshot'] = snapshot_after_identity
+            return cached
+        setattr(graph, '_runtime_dependency_member_candidate_index', None)
     cache_path = _runtime_member_index_cache_path(graph)
     identity = None
     if cache_path is not None:
         cache_started_at = time.perf_counter()
         try:
+            snapshot_before_load = _runtime_artifact_stat_snapshot(
+                catalog_entries, target_jdk
+            )
             identity = _runtime_member_index_cache_identity(catalog_entries, target_jdk)
             index = _load_runtime_member_index_cache(cache_path, identity, graph)
-            _perf_add(graph, 'bytecode_expand', 'member_index_persistent_cache_hits', 1)
-            _perf_add(
-                graph, 'bytecode_expand', 'member_index_cache_load_elapsed_sec',
-                time.perf_counter() - cache_started_at,
+            identity_after_load = _runtime_member_index_cache_identity(
+                catalog_entries, target_jdk
             )
-            setattr(graph, '_runtime_dependency_member_candidate_index', index)
-            return index
+            snapshot_after_load = _runtime_artifact_stat_snapshot(
+                catalog_entries, target_jdk
+            )
+            if (
+                identity_after_load == identity
+                and snapshot_after_load == snapshot_before_load
+            ):
+                index['_identity'] = identity_after_load
+                index['_stat_snapshot'] = snapshot_after_load
+                _perf_add(graph, 'bytecode_expand', 'member_index_persistent_cache_hits', 1)
+                _perf_add(
+                    graph, 'bytecode_expand', 'member_index_cache_load_elapsed_sec',
+                    time.perf_counter() - cache_started_at,
+                )
+                setattr(graph, '_runtime_dependency_member_candidate_index', index)
+                return index
+            identity = identity_after_load
+            _perf_add(
+                graph, 'bytecode_expand',
+                'member_index_cache_input_changed_misses', 1,
+            )
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             _perf_add(graph, 'bytecode_expand', 'member_index_persistent_cache_misses', 1)
+    if identity is None:
+        try:
+            identity = _runtime_member_index_cache_identity(
+                catalog_entries, target_jdk
+            )
+        except OSError:
+            identity = None
     index = _build_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk)
+    snapshot_before_final_identity = _runtime_artifact_stat_snapshot(
+        catalog_entries, target_jdk
+    )
+    try:
+        identity_after_build = _runtime_member_index_cache_identity(
+            catalog_entries, target_jdk
+        )
+    except OSError as exc:
+        identity_after_build = None
+        identity_error = f'{type(exc).__name__}:{exc}'
+    else:
+        identity_error = ''
+    snapshot_after_final_identity = _runtime_artifact_stat_snapshot(
+        catalog_entries, target_jdk
+    )
+    if (
+        identity is None
+        or identity_after_build != identity
+        or snapshot_after_final_identity != snapshot_before_final_identity
+    ):
+        failure = {
+            'reason': 'BYTECODE_MEMBER_INDEX_INPUT_CHANGED',
+            'error_type': 'ArtifactIdentityChanged',
+            'error': identity_error or 'runtime dependency identity changed during index build',
+        }
+        index['complete'] = False
+        index.setdefault('failures', []).append(failure)
+        _record_analyzer_ledger_failure(graph, **failure)
+    else:
+        index['_identity'] = identity_after_build
+        index['_stat_snapshot'] = snapshot_after_final_identity
     setattr(graph, '_runtime_dependency_member_candidate_index', index)
     if cache_path is not None and index.get('complete'):
+        snapshot_before_cache_write = _runtime_artifact_stat_snapshot(
+            catalog_entries, target_jdk
+        )
         try:
             if identity is None:
                 identity = _runtime_member_index_cache_identity(
@@ -4524,6 +4790,32 @@ def _get_runtime_dependency_member_candidate_index(graph, catalog_entries, targe
             _write_runtime_member_index_cache(cache_path, identity, index)
         except (OSError, TypeError, ValueError):
             _perf_add(graph, 'bytecode_expand', 'member_index_cache_write_failures', 1)
+        snapshot_after_cache_write = _runtime_artifact_stat_snapshot(
+            catalog_entries, target_jdk
+        )
+        if snapshot_after_cache_write != snapshot_before_cache_write:
+            failure = {
+                'reason': 'BYTECODE_MEMBER_INDEX_INPUT_CHANGED',
+                'error_type': 'ArtifactIdentityChanged',
+                'error': 'runtime dependency identity changed during cache write',
+            }
+            index['complete'] = False
+            index.setdefault('failures', []).append(failure)
+            index.pop('_identity', None)
+            index.pop('_stat_snapshot', None)
+            _record_analyzer_ledger_failure(graph, **failure)
+            try:
+                Path(cache_path).unlink(missing_ok=True)
+            except OSError as exc:
+                _perf_add(
+                    graph, 'bytecode_expand',
+                    'member_index_cache_cleanup_failures', 1,
+                )
+                index.setdefault('failures', []).append({
+                    'reason': 'BYTECODE_MEMBER_INDEX_CACHE_CLEANUP_FAILED',
+                    'error_type': type(exc).__name__,
+                    'error': str(exc),
+                })
     emit_progress(
         "step5",
         "bytecode-expand",
@@ -5234,28 +5526,78 @@ def _packaged_hit_is_external_consumer(hit):
 
 
 def _packaged_hit_sort_key(hit):
+    instruction_offset = _normalized_instruction_offset(
+        (hit or {}).get('instruction_offset')
+    )
     return (
         str((hit or {}).get('coord') or ''),
+        str((hit or {}).get('artifact_container_entry') or ''),
+        str((hit or {}).get('jar_path') or ''),
+        str((hit or {}).get('class_entry') or ''),
         str((hit or {}).get('class_fqcn') or ''),
         str((hit or {}).get('consumer_method') or ''),
         str((hit or {}).get('consumer_signature') or ''),
+        str((hit or {}).get('consumer_descriptor') or ''),
+        str((hit or {}).get('callee_owner') or ''),
+        str((hit or {}).get('callee_member') or ''),
+        str((hit or {}).get('callee_descriptor') or ''),
+        str((hit or {}).get('opcode_family') or ''),
         str((hit or {}).get('target_display') or ''),
-        _normalized_instruction_offset((hit or {}).get('instruction_offset')) or -1,
-        str((hit or {}).get('jar_path') or ''),
+        -1 if instruction_offset is None else int(instruction_offset),
+        str((hit or {}).get('edge_role') or ''),
+        str((hit or {}).get('evidence_type') or ''),
+        str((hit or {}).get('multi_release_version') or ''),
+        bool((hit or {}).get('signature_ambiguous')),
     )
 
 
+def _deduplicate_physical_packaged_hits(hits):
+    unique = []
+    seen = set()
+    for hit in sorted(hits or (), key=_packaged_hit_sort_key):
+        identity = _packaged_hit_sort_key(hit)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(hit)
+    return unique
+
+
+def _select_canonical_packaged_hits(hits):
+    unique = []
+    seen = set()
+    for hit in _deduplicate_physical_packaged_hits(hits):
+        identity = tuple(hit.get(field) for field in (
+            'coord', 'class_fqcn', 'consumer_method', 'consumer_signature',
+            'evidence_type', 'target_display', 'multi_release_version',
+        ))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(hit)
+    return unique
+
+
 def _build_packaged_dependency_hit_result(result, hits, graph=None):
-    hits = sorted(hits or (), key=_packaged_hit_sort_key)
-    ambiguous_hits = [item for item in hits if item.get('signature_ambiguous')]
+    physical_hits = _deduplicate_physical_packaged_hits(hits)
+    hits = _select_canonical_packaged_hits(physical_hits)
+    ambiguous_hits = [
+        item for item in physical_hits if item.get('signature_ambiguous')
+    ]
     business_hits = [
+        item for item in physical_hits
+        if item.get('coord') == '__business__' and not item.get('signature_ambiguous')
+    ]
+    display_business_hits = [
         item for item in hits
         if item.get('coord') == '__business__' and not item.get('signature_ambiguous')
     ]
-    if graph is not None and len([item for item in hits if item not in business_hits]) >= 8:
+    if graph is not None and len([
+        item for item in physical_hits if item not in business_hits
+    ]) >= 8:
         setattr(graph, '_prefer_runtime_dependency_member_candidate_index', True)
     bridged_hits = []
-    for item in hits:
+    for item in physical_hits:
         if item.get('signature_ambiguous'):
             continue
         runtime_entry, framework_entries = _packaged_hit_runtime_framework_entry(item, graph)
@@ -5277,7 +5619,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
                 'framework_entries': framework_entries,
             })
     dependency_chain = []
-    for item in hits:
+    for item in physical_hits:
         coord = str(item.get('coord') or '').strip()
         if coord and coord not in dependency_chain:
             dependency_chain.append(coord)
@@ -5291,7 +5633,9 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             ):
                 dependency_chain.append(coord)
     result.dependency_chain_coords = dependency_chain
-    ordered_hits = business_hits + [item for item in hits if item not in business_hits]
+    ordered_hits = display_business_hits + [
+        item for item in hits if item not in display_business_hits
+    ]
     result.call_paths = []
     result.evidence_paths = []
     result.path_details = []
@@ -9725,28 +10069,43 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         graph_stats=graph_stats or {},
     )
     if graph is not None and all_apis:
-        graph._trace_max_total_cost = int(max_total_cost or 5)
-        changed_api_overload_signatures = defaultdict(set)
-        for row in all_apis:
-            if not method_api_requires_signature(row):
-                continue
-            api_name = str(row.get('api_name') or '').strip()
-            api_signature = str(row.get('api_signature') or '').strip()
-            if api_name and api_signature:
-                changed_api_overload_signatures[api_name].add(api_signature)
-        graph.changed_api_overload_signatures = {
-            api_name: frozenset(signatures)
-            for api_name, signatures in changed_api_overload_signatures.items()
-        }
-        identical_providers = _build_identical_current_class_provider_index(all_apis, graph)
-        scan_apis = [
-            row for row in all_apis
-            if (
-                str(row.get('coord') or '').strip(),
-                _changed_api_owner_fqcn(row),
-            ) not in identical_providers
-        ]
-        _build_packaged_runtime_dependency_scan_cache(scan_apis, graph)
+        graph._active_packaged_scan_trace_serial = int(
+            getattr(graph, '_active_packaged_scan_trace_serial', 0) or 0
+        ) + 1
+        catalog = _get_runtime_dependency_catalog(graph)
+        catalog['_packaged_api_scan_validated_trace_serial'] = 0
+        try:
+            graph._trace_max_total_cost = int(max_total_cost or 5)
+            changed_api_overload_signatures = defaultdict(set)
+            for row in all_apis:
+                if not method_api_requires_signature(row):
+                    continue
+                api_name = str(row.get('api_name') or '').strip()
+                api_signature = str(row.get('api_signature') or '').strip()
+                if api_name and api_signature:
+                    changed_api_overload_signatures[api_name].add(api_signature)
+            graph.changed_api_overload_signatures = {
+                api_name: frozenset(signatures)
+                for api_name, signatures in changed_api_overload_signatures.items()
+            }
+            identical_providers = _build_identical_current_class_provider_index(
+                all_apis, graph
+            )
+            scan_apis = [
+                row for row in all_apis
+                if (
+                    str(row.get('coord') or '').strip(),
+                    _changed_api_owner_fqcn(row),
+                ) not in identical_providers
+            ]
+            _build_packaged_runtime_dependency_scan_cache(scan_apis, graph)
+        except BaseException:
+            graph._active_packaged_scan_trace_serial = 0
+            catalog['_packaged_api_scan_validated_trace_serial'] = 0
+            raise
+        catalog['_packaged_api_scan_validated_trace_serial'] = (
+            graph._active_packaged_scan_trace_serial
+        )
 
     for idx, api_row in enumerate(all_apis, 1):
         api_started_at = time.perf_counter()
@@ -9794,18 +10153,25 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
             bridge_info=bridge_info,
         )
 
-        result = trace_api_with_confidence_weighting(
-            api_row,
-            graph,
-            type_metadata,
-            max_total_cost=max_total_cost,
-            needs_bridge=needs_bridge,
-            has_dependency_source_mapping=has_dependency_source_mapping,
-            has_packaged_bytecode_fallback=has_packaged_bytecode_fallback,
-            allow_degraded=allow_degraded,
-            graph_stats=graph_stats,
-            trace_cache=trace_cache,
-        )
+        try:
+            result = trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                type_metadata,
+                max_total_cost=max_total_cost,
+                needs_bridge=needs_bridge,
+                has_dependency_source_mapping=has_dependency_source_mapping,
+                has_packaged_bytecode_fallback=has_packaged_bytecode_fallback,
+                allow_degraded=allow_degraded,
+                graph_stats=graph_stats,
+                trace_cache=trace_cache,
+            )
+        except BaseException:
+            if graph is not None:
+                graph._active_packaged_scan_trace_serial = 0
+                catalog = _get_runtime_dependency_catalog(graph)
+                catalog['_packaged_api_scan_validated_trace_serial'] = 0
+            raise
 
         results.append(result)
         api_elapsed_sec = time.perf_counter() - api_started_at
@@ -9844,6 +10210,11 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                 total=total,
                 elapsed=time.perf_counter() - started_at,
             )
+
+    if graph is not None:
+        graph._active_packaged_scan_trace_serial = 0
+        catalog = _get_runtime_dependency_catalog(graph)
+        catalog['_packaged_api_scan_validated_trace_serial'] = 0
 
     emit_progress(
         "step5",

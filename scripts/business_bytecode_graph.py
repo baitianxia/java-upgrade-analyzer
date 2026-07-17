@@ -57,6 +57,14 @@ REFLECTION_UTF8_MARKERS = {
 BYTECODE_CACHE_SCHEMA = 'java-upgrade-analyzer.bytecode-index.v3'
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _cache_line(payload):
     return (
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
@@ -141,6 +149,8 @@ def _validate_business_bytecode_cache(cache_path, artifact_sha256):
     metrics = footer.get('metrics')
     if not isinstance(metrics, dict):
         raise ValueError('bytecode cache metrics invalid')
+    if metrics.get('failures'):
+        raise ValueError('incomplete bytecode scan cache cannot be reused')
     return metrics
 
 
@@ -850,17 +860,85 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
     business_item = ((artifact_catalog or {}).get('by_coord') or {}).get('__business__') or {}
     business_jar = str(business_item.get('jar_path') or '').strip()
     cache_key = str(business_item.get('sha256') or '').strip()
+    if not business_jar or not os.path.isfile(business_jar):
+        failures.append('current_final_artifact_required')
+        return [], {
+            'classes_scanned': 0,
+            'edges_found': 0,
+            'classfile_fast_path_classes': 0,
+            'javap_fallback_classes': 0,
+            'failures': failures,
+            'evidence_source': 'unavailable',
+            'artifact_sha256': cache_key,
+        }
+    if business_jar and os.path.isfile(business_jar):
+        try:
+            actual_business_sha256 = _sha256_file(business_jar)
+        except OSError as exc:
+            failures.append(f'business_artifact_identity_failed:{exc}')
+            return [], {
+                'classes_scanned': 0,
+                'edges_found': 0,
+                'classfile_fast_path_classes': 0,
+                'javap_fallback_classes': 0,
+                'failures': failures,
+                'evidence_source': 'unavailable',
+                'artifact_sha256': cache_key,
+            }
+        if (
+            actual_business_sha256
+            and re.fullmatch(r'[0-9a-f]{64}', cache_key)
+            and cache_key != actual_business_sha256
+        ):
+            failures.append('current_final_artifact_sha_mismatch')
+            return [], {
+                'classes_scanned': 0,
+                'edges_found': 0,
+                'classfile_fast_path_classes': 0,
+                'javap_fallback_classes': 0,
+                'failures': failures,
+                'evidence_source': 'unavailable',
+                'artifact_sha256': cache_key,
+                'actual_artifact_sha256': actual_business_sha256,
+            }
     if cache_path and cache_key:
         try:
             cached_metrics = _validate_business_bytecode_cache(cache_path, cache_key)
             cached_edges = list(_iter_business_bytecode_cache(cache_path, cache_key))
+        except (OSError, ValueError, TypeError):
+            cached_metrics = None
+            cached_edges = None
+        if cached_metrics is not None:
+            try:
+                artifact_sha256_after_load = _sha256_file(business_jar)
+            except OSError as exc:
+                failures.append(f'business_artifact_identity_failed:{exc}')
+                return [], {
+                    **dict(cached_metrics),
+                    'classes_scanned': 0,
+                    'edges_found': 0,
+                    'failures': failures,
+                    'evidence_source': 'unavailable',
+                    'artifact_sha256': cache_key,
+                    'cache_hit': False,
+                }
+            if artifact_sha256_after_load != actual_business_sha256:
+                failures.append('current_final_artifact_changed_during_scan')
+                return [], {
+                    **dict(cached_metrics),
+                    'classes_scanned': 0,
+                    'edges_found': 0,
+                    'failures': failures,
+                    'evidence_source': 'unavailable',
+                    'artifact_sha256': cache_key,
+                    'actual_artifact_sha256': artifact_sha256_after_load,
+                    'cache_hit': False,
+                }
             return cached_edges, {
                 **dict(cached_metrics),
                 'artifact_sha256': cache_key,
                 'cache_hit': True,
             }
-        except (OSError, ValueError, TypeError):
-            pass
     if business_jar and os.path.isfile(business_jar):
         try:
             with zipfile.ZipFile(business_jar) as zf:
@@ -894,7 +972,7 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                         fast_path_classes += 1
                     for item in parsed_edges:
                         item['class_file'] = f'{business_jar}!/{entry}'
-                        item['artifact_sha256'] = business_item.get('sha256', '')
+                        item['artifact_sha256'] = actual_business_sha256
                         item['evidence_source'] = 'current_final_artifact'
                         item['parser'] = parser_kind
                         evidence.append(item)
@@ -915,7 +993,17 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                 'artifact_sha256': cache_key,
                 'cache_write_failed': False,
             }
-            if cache_path and cache_key:
+            try:
+                artifact_sha256_after_scan = _sha256_file(business_jar)
+            except OSError as exc:
+                failures.append(f'business_artifact_identity_failed:{exc}')
+                artifact_sha256_after_scan = ''
+            if artifact_sha256_after_scan != actual_business_sha256:
+                failures.append('current_final_artifact_changed_during_scan')
+                metrics['failures'] = failures
+                metrics['edges_found'] = 0
+                return [], metrics
+            if cache_path and cache_key and not failures:
                 try:
                     _write_business_bytecode_cache(
                         cache_path, cache_key, evidence, metrics
@@ -952,6 +1040,8 @@ def _bytecode_failure(value):
         "current_final_artifact_required": "CURRENT_FINAL_ARTIFACT_REQUIRED",
         "class_scan_limit_reached": "BYTECODE_CLASS_SCAN_LIMIT_REACHED",
         "current_final_artifact_sha_invalid": "CURRENT_FINAL_ARTIFACT_SHA_INVALID",
+        "current_final_artifact_sha_mismatch": "CURRENT_FINAL_ARTIFACT_SHA_MISMATCH",
+        "current_final_artifact_changed_during_scan": "CURRENT_FINAL_ARTIFACT_CHANGED_DURING_SCAN",
     }.get(text, "BYTECODE_COLLECTION_FAILED")
     return EvidenceFailure(
         stage="business-bytecode",
@@ -1086,22 +1176,6 @@ def _business_bytecode_batch(
 
 def collect_business_bytecode_batch(source_roots, artifact_catalog, cache_path):
     """Collect immutable current-final-artifact bytecode evidence without a graph."""
-    business_item = ((artifact_catalog or {}).get('by_coord') or {}).get('__business__') or {}
-    cache_key = str(business_item.get('sha256') or '').strip()
-    if cache_path and cache_key:
-        try:
-            cached_metrics = _validate_business_bytecode_cache(cache_path, cache_key)
-            return _business_bytecode_batch(
-                _iter_business_bytecode_cache(cache_path, cache_key),
-                {
-                    **dict(cached_metrics),
-                    'artifact_sha256': cache_key,
-                    'cache_hit': True,
-                },
-                strict_final_artifact=True,
-            )
-        except (OSError, ValueError, TypeError, KeyError):
-            pass
     evidence, metrics = collect_business_bytecode_edges(
         source_roots,
         artifact_catalog=artifact_catalog,

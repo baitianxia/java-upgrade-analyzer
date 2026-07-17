@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import csv
+import os
 import sys
 import tempfile
 import threading
@@ -458,6 +459,86 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertIn("METHOD_NEW_DEFAULT", source_only["compatibility_flags"])
         self.assertEqual(by_name["com.acme.Api.gone"]["change_type"], "REMOVED")
 
+    def test_parse_japicmp_xml_rejects_non_japicmp_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "error.xml"
+            xml_path.write_text(
+                "<error><message>tool failed</message></error>",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "JApiCmp XML structure"):
+                step4.parse_japicmp_xml(
+                    xml_path, "com.acme:api", "1", "2"
+                )
+
+    def test_parse_japicmp_xml_rejects_changed_class_without_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "broken.xml"
+            xml_path.write_text(
+                '<japicmp><classes><class changeStatus="REMOVED"/></classes></japicmp>',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "class identity missing"):
+                step4.parse_japicmp_xml(
+                    xml_path, "com.acme:api", "1", "2"
+                )
+
+    def test_parse_japicmp_xml_rejects_nested_changed_class_without_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "nested-broken.xml"
+            xml_path.write_text(
+                "<japicmp><classes><wrapper>"
+                '<class changeStatus="REMOVED"/>'
+                "</wrapper></classes></japicmp>",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "class identity missing"):
+                step4.parse_japicmp_xml(
+                    xml_path, "com.acme:api", "1", "2"
+                )
+
+    def test_parse_japicmp_xml_keeps_nested_class_members_with_nested_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "nested.xml"
+            xml_path.write_text(
+                "<japicmp><classes>"
+                '<class name="com.acme.Outer" changeStatus="UNCHANGED">'
+                '<class name="com.acme.Inner" changeStatus="MODIFIED">'
+                '<method name="innerGone" changeStatus="REMOVED"/>'
+                "</class></class></classes></japicmp>",
+                encoding="utf-8",
+            )
+
+            rows = step4.parse_japicmp_xml(
+                xml_path, "com.acme:api", "1", "2"
+            )
+
+        names = {row["api_name"] for row in rows}
+        self.assertIn("com.acme.Inner.innerGone", names)
+        self.assertNotIn("com.acme.Outer.innerGone", names)
+
+    def test_java_runtime_identity_is_incomplete_when_explicit_java_home_has_no_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            java = root / "bin" / "java"
+            java.parent.mkdir()
+            java.write_bytes(b"java-launcher")
+            missing_home = root / "missing-jdk"
+
+            with patch.object(
+                step4.shutil, "which", return_value=str(java)
+            ), patch.dict(
+                os.environ, {"JAVA_HOME": str(missing_home)}, clear=False
+            ):
+                identity = step4.effective_java_runtime_identity()
+
+        self.assertFalse(identity["complete"])
+        self.assertEqual(identity["release_sha256"], "")
+        self.assertIn("java_release_file_missing", identity["failures"])
+
     def test_parse_japicmp_xml_keeps_all_compatibility_flags_without_downgrading(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml_path = Path(tmp) / "diff.xml"
@@ -635,11 +716,12 @@ class Step4StabilityTest(unittest.TestCase):
 
         self.assertIsNone(captured["timeout"])
 
-    def test_japicmp_tool_digest_is_reused_until_file_identity_changes(self):
+    def test_japicmp_tool_digest_detects_same_stat_byte_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
             tool = Path(tmp) / "japicmp.jar"
             tool.write_bytes(b"first")
             step4.clear_japicmp_tool_digest_cache()
+            original_stat = tool.stat()
 
             def read_tool_bytes(path):
                 with Path.open(path, "rb") as handle:
@@ -652,13 +734,65 @@ class Step4StabilityTest(unittest.TestCase):
                 side_effect=read_tool_bytes,
             ) as read_bytes:
                 first = step4.japicmp_tool_sha256(tool)
-                repeated = step4.japicmp_tool_sha256(tool)
-                tool.write_bytes(b"second-version")
+                tool.write_bytes(b"other")
+                os.utime(
+                    tool,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+                mutated_stat = tool.stat()
                 changed = step4.japicmp_tool_sha256(tool)
 
-        self.assertEqual(first, repeated)
+        self.assertEqual(original_stat.st_ino, mutated_stat.st_ino)
+        self.assertEqual(original_stat.st_size, mutated_stat.st_size)
+        self.assertEqual(original_stat.st_mtime_ns, mutated_stat.st_mtime_ns)
         self.assertNotEqual(first, changed)
         self.assertEqual(read_bytes.call_count, 2)
+
+    def test_japicmp_tool_digest_rehashes_unchanged_tool_for_each_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = Path(tmp) / "japicmp.jar"
+            tool.write_bytes(b"stable-tool")
+            step4.clear_japicmp_tool_digest_cache()
+
+            original_read_bytes = Path.read_bytes
+            with patch.object(
+                step4.Path,
+                "read_bytes",
+                autospec=True,
+                side_effect=lambda path: original_read_bytes(path),
+            ) as read_bytes:
+                first = step4.japicmp_tool_sha256(tool)
+                second = step4.japicmp_tool_sha256(tool)
+
+        self.assertEqual(first, second)
+        self.assertEqual(read_bytes.call_count, 2)
+
+    def test_japicmp_comparison_identity_includes_target_jdk_and_java_runtime(self):
+        base = {
+            "coord": "com.acme:api",
+            "old_coord": "com.acme:api",
+            "new_coord": "com.acme:api",
+            "old_version": "1",
+            "new_version": "2",
+            "old_jar_sha256": "old",
+            "new_jar_sha256": "new",
+            "tool_sha256": "tool",
+        }
+
+        jdk_17 = step4._japicmp_comparison_cache_identity(
+            **base, target_jdk="17", java_runtime_identity={"java": "/jdk/a/bin/java"}
+        )
+        jdk_21 = step4._japicmp_comparison_cache_identity(
+            **base, target_jdk="21", java_runtime_identity={"java": "/jdk/a/bin/java"}
+        )
+        other_runtime = step4._japicmp_comparison_cache_identity(
+            **base, target_jdk="17", java_runtime_identity={"java": "/jdk/b/bin/java"}
+        )
+
+        self.assertNotEqual(jdk_17, jdk_21)
+        self.assertNotEqual(jdk_17, other_runtime)
+        self.assertEqual(jdk_17["target_jdk"], "17")
+        self.assertEqual(jdk_17["java_runtime_identity"]["java"], "/jdk/a/bin/java")
 
     def test_run_japicmp_reuses_valid_content_addressed_comparison(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -713,6 +847,308 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertTrue(second[2]["comparison_cache_hit"])
         self.assertFalse(recovered[2]["comparison_cache_hit"])
         self.assertEqual(run_cmd.call_count, 2)
+
+    def test_run_japicmp_invalidates_cache_when_effective_java_runtime_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            cache_dir = root / "cache"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+
+            def successful_japicmp(cmd, **_kwargs):
+                Path(cmd[cmd.index("--xml-file") + 1]).write_text(
+                    "<japicmp><classes/></japicmp>", encoding="utf-8"
+                )
+                return "japicmp-output", "", 0
+
+            with patch.object(
+                step4,
+                "effective_java_runtime_identity",
+                side_effect=[
+                    {"java": "/jdk/a/bin/java", "java_sha256": "a", "complete": True},
+                    {"java": "/jdk/a/bin/java", "java_sha256": "a", "complete": True},
+                    {"java": "/jdk/b/bin/java", "java_sha256": "b", "complete": True},
+                    {"java": "/jdk/b/bin/java", "java_sha256": "b", "complete": True},
+                ],
+                create=True,
+            ), patch.object(step4, "run_cmd", side_effect=successful_japicmp) as run_cmd:
+                first = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir, jdk_current="17",
+                )
+                second = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir, jdk_current="17",
+                )
+
+        self.assertFalse(first[2]["comparison_cache_hit"])
+        self.assertFalse(second[2]["comparison_cache_hit"])
+        self.assertEqual(run_cmd.call_count, 2)
+
+    def test_run_japicmp_recomputes_when_cached_xml_disagrees_with_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            cache_dir = root / "cache"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+
+            def successful_japicmp(cmd, **_kwargs):
+                Path(cmd[cmd.index("--xml-file") + 1]).write_text(
+                    '<japicmp><classes><class name="com.acme.Api" '
+                    'changeStatus="MODIFIED"><methods><method name="gone" '
+                    'changeStatus="REMOVED" binaryCompatible="false" '
+                    'sourceCompatible="false"/></methods></class></classes></japicmp>',
+                    encoding="utf-8",
+                )
+                return "japicmp-output", "", 0
+
+            with patch.object(step4, "run_cmd", side_effect=successful_japicmp) as run_cmd:
+                first = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+                cache_path = next(cache_dir.glob("*.json"))
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                payload["rows"] = []
+                payload["rows_sha256"] = hashlib.sha256(
+                    step4._canonical_json_bytes(payload["rows"])
+                ).hexdigest()
+                cache_path.write_text(json.dumps(payload), encoding="utf-8")
+                second = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+
+        self.assertEqual(first[1], second[1])
+        self.assertFalse(second[2]["comparison_cache_hit"])
+        self.assertEqual(run_cmd.call_count, 2)
+
+    def test_run_japicmp_removes_stale_xml_before_successful_process_without_xml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            cache_dir = root / "cache"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+            stale_xml = root / "api_1_vs_2_binary.xml"
+            stale_xml.write_text(
+                '<japicmp><classes><class name="com.acme.Stale" '
+                'changeStatus="REMOVED" binaryCompatible="false" '
+                'sourceCompatible="false"/></classes></japicmp>',
+                encoding="utf-8",
+            )
+
+            with patch.object(step4, "run_cmd", return_value=("", "", 0)):
+                result = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+
+        self.assertEqual(result[1], [])
+        self.assertEqual(result[2]["parser_mode"], "text_fallback")
+        self.assertEqual(result[2]["external_process_count"], 1)
+        self.assertEqual(result[2]["reason_code"], "JAPICMP_FRESH_XML_MISSING")
+        self.assertIsNotNone(result[3])
+        self.assertFalse(stale_xml.exists())
+        self.assertEqual(list(cache_dir.glob("*.json")), [])
+
+    def test_run_japicmp_disables_cache_when_java_runtime_identity_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            cache_dir = root / "cache"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+
+            def successful_japicmp(cmd, **_kwargs):
+                Path(cmd[cmd.index("--xml-file") + 1]).write_text(
+                    "<japicmp><classes/></japicmp>", encoding="utf-8"
+                )
+                return "japicmp-output", "", 0
+
+            incomplete_runtime = {
+                "java": "/jdk/bin/java",
+                "java_sha256": "",
+                "complete": False,
+                "failures": ["java_sha256_unavailable"],
+            }
+            with patch.object(
+                step4, "effective_java_runtime_identity",
+                return_value=incomplete_runtime,
+            ), patch.object(step4, "run_cmd", side_effect=successful_japicmp) as run_cmd:
+                first = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+                second = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+
+        self.assertFalse(first[2]["comparison_cache_hit"])
+        self.assertFalse(second[2]["comparison_cache_hit"])
+        self.assertEqual(run_cmd.call_count, 2)
+        self.assertEqual(list(cache_dir.glob("*.json")), [])
+
+    def test_run_japicmp_rejects_result_when_input_jar_changes_during_comparison(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            cache_dir = root / "cache"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+
+            def mutating_japicmp(cmd, **_kwargs):
+                Path(cmd[cmd.index("--xml-file") + 1]).write_text(
+                    "<japicmp><classes/></japicmp>", encoding="utf-8"
+                )
+                old_jar.write_bytes(b"changed-during-comparison")
+                return "japicmp-output", "", 0
+
+            with patch.object(step4, "run_cmd", side_effect=mutating_japicmp):
+                result = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+
+        self.assertEqual(result[1], [])
+        self.assertEqual(result[2]["reason_code"], "JAPICMP_INPUT_CHANGED_DURING_COMPARISON")
+        self.assertIsNotNone(result[3])
+        self.assertEqual(list(cache_dir.glob("*.json")), [])
+
+    def test_run_japicmp_rejects_cache_hit_when_input_changes_during_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            cache_dir = root / "cache"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+
+            def successful_japicmp(cmd, **_kwargs):
+                Path(cmd[cmd.index("--xml-file") + 1]).write_text(
+                    "<japicmp><classes/></japicmp>", encoding="utf-8"
+                )
+                return "japicmp-output", "", 0
+
+            with patch.object(step4, "run_cmd", side_effect=successful_japicmp):
+                first = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+            original_load = step4._load_japicmp_comparison_cache
+
+            def mutating_load(path, identity):
+                cached = original_load(path, identity)
+                old_jar.write_bytes(b"changed-during-cache-load")
+                return cached
+
+            with patch.object(
+                step4, "_load_japicmp_comparison_cache",
+                side_effect=mutating_load,
+            ), patch.object(step4, "run_cmd") as run_cmd:
+                second = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+
+        self.assertIsNone(first[3])
+        self.assertEqual(second[1], [])
+        self.assertEqual(second[2]["reason_code"], "JAPICMP_INPUT_CHANGED_DURING_CACHE_LOAD")
+        self.assertIsNotNone(second[3])
+        run_cmd.assert_not_called()
+
+    def test_run_japicmp_external_process_count_tracks_actual_java_invocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "japicmp.jar"
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            cache_dir = root / "cache"
+            tool.write_bytes(b"tool")
+            old_jar.write_bytes(b"old")
+            new_jar.write_bytes(b"new")
+
+            missing = step4.run_japicmp(
+                "com.acme:api", "1", "2", root, str(tool),
+                old_jar_path="", new_jar_path=str(new_jar),
+                cache_dir=cache_dir,
+            )
+
+            def successful_japicmp(cmd, **_kwargs):
+                Path(cmd[cmd.index("--xml-file") + 1]).write_text(
+                    "<japicmp><classes/></japicmp>", encoding="utf-8"
+                )
+                return "", "", 0
+
+            with patch.object(step4, "run_cmd", side_effect=successful_japicmp):
+                invoked = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+                cached = step4.run_japicmp(
+                    "com.acme:api", "1", "2", root, str(tool),
+                    old_jar_path=str(old_jar), new_jar_path=str(new_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                    new_jar_evidence={"source": "step1_final_artifact"},
+                    cache_dir=cache_dir,
+                )
+
+        self.assertEqual(missing[2]["external_process_count"], 0)
+        self.assertEqual(invoked[2]["external_process_count"], 1)
+        self.assertEqual(cached[2]["external_process_count"], 0)
 
     def test_run_japicmp_does_not_cache_failed_process(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -788,7 +1224,13 @@ class Step4StabilityTest(unittest.TestCase):
             old_jar.write_text("old", encoding="utf-8")
             new_jar.write_text("new", encoding="utf-8")
 
-            with patch.object(step4, "run_cmd", return_value=("", "", 0)):
+            def successful_japicmp(cmd, **_kwargs):
+                Path(cmd[cmd.index("--xml-file") + 1]).write_text(
+                    "<japicmp><classes/></japicmp>", encoding="utf-8"
+                )
+                return "", "", 0
+
+            with patch.object(step4, "run_cmd", side_effect=successful_japicmp):
                 out_file, apis, jar_info, err = step4.run_japicmp(
                     "tools.jackson.core:jackson-core",
                     "2.14.1",
@@ -2158,7 +2600,13 @@ class Step4StabilityTest(unittest.TestCase):
                 encoding="utf-8",
             )
             context_json.write_text(
-                json.dumps({"changed_dependencies": [{"coord": "com.example:demo"}]}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "changed_dependencies": [{"coord": "com.example:demo"}],
+                        "jdk_current": "21",
+                    },
+                    ensure_ascii=False,
+                ),
                 encoding="utf-8",
             )
 
@@ -2193,6 +2641,7 @@ class Step4StabilityTest(unittest.TestCase):
             kwargs = japicmp_mock.call_args.kwargs
             self.assertEqual(kwargs["old_jar_evidence"]["source"], "step1_final_artifact")
             self.assertEqual(kwargs["new_jar_evidence"]["source"], "step1_final_artifact")
+            self.assertEqual(kwargs["jdk_current"], "21")
             self.assertTrue(Path(kwargs["old_jar_path"]).exists())
             self.assertTrue(Path(kwargs["new_jar_path"]).exists())
             self.assertEqual(Path(kwargs["old_jar_path"]).read_bytes(), b"base demo jar")

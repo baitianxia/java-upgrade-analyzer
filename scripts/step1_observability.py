@@ -24,7 +24,8 @@ from progress_logging import emit_progress
 
 TIMING_FIELDS = (
     "side", "phase", "item", "started_at", "ended_at", "elapsed_sec",
-    "peak_rss_mb", "cache_hits", "cache_misses", "status", "command", "message",
+    "peak_rss_mb", "archive_bytes", "nested_entries", "cache_hits",
+    "cache_misses", "status", "command", "message",
 )
 
 
@@ -76,7 +77,12 @@ class Step1Observer:
         )
         self.report_dir = report_dir
         self.cache_dir = report_dir / RUNTIME_DIRNAME / RUNTIME_CACHE_DIRNAME
-        self._counters = {"cache_hits": 0, "cache_misses": 0}
+        self._counters = {
+            "archive_bytes": 0,
+            "nested_entries": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
         observability_dir.mkdir(parents=True, exist_ok=True)
         self.progress_path = observability_dir / "step1_progress.jsonl"
         self.timing_path = observability_dir / "step1_timing.csv"
@@ -156,6 +162,8 @@ class Step1Observer:
                 "ended_at": ended_at,
                 "elapsed_sec": f"{elapsed:.3f}",
                 "peak_rss_mb": f"{peak_rss_mb():.3f}",
+                "archive_bytes": str(self._counters["archive_bytes"]),
+                "nested_entries": str(self._counters["nested_entries"]),
                 "cache_hits": str(self._counters["cache_hits"]),
                 "cache_misses": str(self._counters["cache_misses"]),
                 "status": str(status or ""),

@@ -194,6 +194,264 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(second[0]["version"], "2.0.0")
         self.assertEqual(cache_file_count, 2)
 
+    def test_packaged_archive_inventory_rejects_artifact_changed_during_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "app.jar"
+            cache_dir = root / "cache"
+            nested = self._nested_jar_bytes([(
+                "META-INF/maven/org.example/demo/pom.properties",
+                "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+            )])
+            with zipfile.ZipFile(artifact_path, "w") as archive:
+                archive.writestr("BOOT-INF/lib/demo-1.0.jar", nested)
+            original_scan = s1_dep_diff._scan_packaged_archive
+
+            def mutating_scan(path):
+                result = original_scan(path)
+                with zipfile.ZipFile(path, "a") as archive:
+                    archive.writestr("mutation-marker", b"changed")
+                return result
+
+            with patch.object(
+                s1_dep_diff, "_scan_packaged_archive", side_effect=mutating_scan
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "changed during packaged archive scan"
+                ):
+                    s1_dep_diff._inspect_packaged_archive(
+                        artifact_path, cache_dir=cache_dir, cache_stats={}
+                    )
+
+            cache_files = list(cache_dir.glob("*.json"))
+
+        self.assertEqual(cache_files, [])
+
+    def test_packaged_archive_inventory_without_cache_rejects_artifact_changed_during_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_path = Path(tmp) / "app.jar"
+            nested = self._nested_jar_bytes([(
+                "META-INF/maven/org.example/demo/pom.properties",
+                "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+            )])
+            with zipfile.ZipFile(artifact_path, "w") as archive:
+                archive.writestr("BOOT-INF/lib/demo-1.0.jar", nested)
+            original_scan = s1_dep_diff._scan_packaged_archive
+
+            def mutating_scan(path):
+                result = original_scan(path)
+                with zipfile.ZipFile(path, "a") as archive:
+                    archive.writestr("mutation-marker", b"changed")
+                return result
+
+            with patch.object(
+                s1_dep_diff, "_scan_packaged_archive", side_effect=mutating_scan
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "changed during packaged archive scan"
+                ):
+                    s1_dep_diff._inspect_packaged_archive(
+                        artifact_path, cache_dir=None, cache_stats={}
+                    )
+
+    def test_packaged_archive_inventory_rejects_artifact_changed_during_cache_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "app.jar"
+            cache_dir = root / "cache"
+            nested = self._nested_jar_bytes([(
+                "META-INF/maven/org.example/demo/pom.properties",
+                "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+            )])
+            with zipfile.ZipFile(artifact_path, "w") as archive:
+                archive.writestr("BOOT-INF/lib/demo-1.0.jar", nested)
+            s1_dep_diff._inspect_packaged_archive(
+                artifact_path, cache_dir=cache_dir
+            )
+            original_load = s1_dep_diff._load_packaged_inventory_cache
+
+            def mutating_load(path, identity):
+                cached = original_load(path, identity)
+                with zipfile.ZipFile(artifact_path, "a") as archive:
+                    archive.writestr("cache-load-mutation", b"changed")
+                return cached
+
+            with patch.object(
+                s1_dep_diff, "_load_packaged_inventory_cache",
+                side_effect=mutating_load,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "changed during packaged archive cache load"
+                ):
+                    s1_dep_diff._inspect_packaged_archive(
+                        artifact_path, cache_dir=cache_dir
+                    )
+
+    def test_scan_distinguishes_successful_empty_archive_from_open_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            empty_artifact = root / "empty.jar"
+            with zipfile.ZipFile(empty_artifact, "w") as outer:
+                outer.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+
+            successful = s1_dep_diff._scan_packaged_archive(empty_artifact)
+            with patch.object(
+                s1_dep_diff.zipfile,
+                "ZipFile",
+                side_effect=OSError("archive open failed"),
+            ):
+                failed = s1_dep_diff._scan_packaged_archive(empty_artifact)
+
+        self.assertTrue(successful.complete)
+        self.assertEqual(successful.rows, [])
+        self.assertEqual(successful.failures, [])
+        self.assertFalse(failed.complete)
+        self.assertEqual(failed.rows, [])
+        self.assertEqual(failed.failures[0]["stage"], "archive_open")
+        self.assertIn("archive open failed", failed.failures[0]["error"])
+
+    def test_post_hash_archive_open_failure_is_not_cached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "app.jar"
+            cache_dir = root / "cache"
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                outer.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+
+            cache_stats = {}
+            with patch.object(
+                s1_dep_diff.zipfile,
+                "ZipFile",
+                side_effect=OSError("post-hash archive open failed"),
+            ):
+                rows = s1_dep_diff._inspect_packaged_archive(
+                    artifact_path,
+                    cache_dir=cache_dir,
+                    cache_stats=cache_stats,
+                )
+            cache_files = list(cache_dir.glob("*.json"))
+
+        self.assertIsInstance(rows, list)
+        self.assertEqual(rows, [])
+        self.assertFalse(cache_stats["scan_complete"])
+        self.assertEqual(cache_stats["failures"][0]["stage"], "archive_open")
+        self.assertEqual(cache_files, [])
+
+    def test_artifact_collection_rejects_incomplete_packaged_archive_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_path = Path(tmp) / "app.jar"
+            artifact_path.write_bytes(b"placeholder")
+
+            def incomplete_scan(_path, cache_dir=None, cache_stats=None):
+                cache_stats.update({
+                    "scan_complete": False,
+                    "failures": [{
+                        "stage": "archive_open",
+                        "entry": "",
+                        "error": "OSError:transient read failure",
+                    }],
+                    "archive_bytes": len(b"placeholder"),
+                    "nested_entries": 0,
+                    "misses": 1,
+                })
+                return []
+
+            with patch.object(
+                s1_dep_diff, "_detect_archive_packaging_type", return_value="boot_jar"
+            ), patch.object(
+                s1_dep_diff, "_inspect_packaged_archive", side_effect=incomplete_scan
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "最终制品扫描不完整.*transient read failure"
+                ):
+                    s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                        artifact_path,
+                    )
+
+    def test_embedded_metadata_read_failure_is_visible_and_not_cached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "app.jar"
+            cache_dir = root / "cache"
+            nested_bytes = self._nested_jar_bytes([
+                (
+                    "META-INF/maven/org.example/demo-lib/pom.properties",
+                    "groupId=org.example\nartifactId=demo-lib\nversion=1.2.3\n",
+                )
+            ])
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                outer.writestr("BOOT-INF/lib/demo-lib-1.2.3.jar", nested_bytes)
+
+            original_read = zipfile.ZipFile.read
+
+            def fail_embedded_metadata_read(zf, name, *args, **kwargs):
+                if str(name).endswith("/pom.properties"):
+                    raise OSError("metadata read failed")
+                return original_read(zf, name, *args, **kwargs)
+
+            cache_stats = {}
+            with patch.object(zipfile.ZipFile, "read", new=fail_embedded_metadata_read):
+                failed_rows = s1_dep_diff._inspect_packaged_archive(
+                    artifact_path,
+                    cache_dir=cache_dir,
+                    cache_stats=cache_stats,
+                )
+            failed_cache_file_count = len(list(cache_dir.glob("*.json")))
+
+            recovered_rows = s1_dep_diff._inspect_packaged_archive(
+                artifact_path,
+                cache_dir=cache_dir,
+            )
+            cache_file_count = len(list(cache_dir.glob("*.json")))
+
+        self.assertEqual(len(failed_rows), 1)
+        self.assertEqual(failed_rows[0]["match_source"], "embedded-metadata-read-error")
+        self.assertEqual(failed_rows[0]["artifact_id"], "")
+        self.assertEqual(failed_rows[0]["version"], "")
+        self.assertIn("metadata_read_error", failed_rows[0]["read_error"])
+        self.assertFalse(cache_stats["scan_complete"])
+        self.assertEqual(len(cache_stats["failures"]), 1)
+        self.assertEqual(failed_cache_file_count, 0)
+        self.assertEqual(recovered_rows[0]["match_source"], "embedded-pom")
+        self.assertEqual(cache_file_count, 1)
+
+    def test_filename_fallback_is_retained_when_metadata_is_absent_without_read_failure(self):
+        nested_bytes = self._nested_jar_bytes([
+            ("com/example/Demo.class", b"class-bytes"),
+        ])
+
+        row = s1_dep_diff._extract_packaged_dep_from_nested_jar(
+            nested_bytes,
+            "BOOT-INF/lib/demo-lib-1.2.3.jar",
+        )
+
+        self.assertEqual(row["match_source"], "filename")
+        self.assertEqual(row["artifact_id"], "demo-lib")
+        self.assertEqual(row["version"], "1.2.3")
+        self.assertEqual(row["read_error"], "")
+
+    def test_packaged_archive_reports_archive_bytes_and_nested_entry_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "app.jar"
+            nested_bytes = self._nested_jar_bytes([
+                ("com/example/Demo.class", b"class-bytes"),
+            ])
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                outer.writestr("BOOT-INF/lib/demo-lib-1.2.3.jar", nested_bytes)
+                outer.writestr("BOOT-INF/lib/other-lib-2.0.0.jar", nested_bytes)
+
+            cache_stats = {}
+            s1_dep_diff._inspect_packaged_archive(
+                artifact_path,
+                cache_stats=cache_stats,
+            )
+            archive_size = artifact_path.stat().st_size
+
+        self.assertEqual(cache_stats["archive_bytes"], archive_size)
+        self.assertEqual(cache_stats["nested_entries"], 2)
+        self.assertTrue(cache_stats["scan_complete"])
+
     def test_embedded_pom_preserves_filename_classifier_as_artifact_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_path = Path(tmp) / "app.jar"

@@ -77,7 +77,7 @@ _WRITE_RESULT_LOCK = threading.RLock()
 _JAPICMP_TOOL_DIGEST_LOCK = threading.RLock()
 _JAPICMP_TOOL_DIGEST_CACHE = {}
 STEP4_TIMING_FILE = "step4_timing.csv"
-JAPICMP_COMPARISON_CACHE_SCHEMA_VERSION = 1
+JAPICMP_COMPARISON_CACHE_SCHEMA_VERSION = 2
 JAPICMP_COMPARISON_CACHE_DIRNAME = "step4_japicmp"
 
 
@@ -108,22 +108,60 @@ def clear_japicmp_tool_digest_cache():
 
 def japicmp_tool_sha256(jar_path):
     path = Path(jar_path).resolve()
-    stat = path.stat()
-    identity = (
-        str(path), int(stat.st_size), int(stat.st_mtime_ns),
-        int(getattr(stat, 'st_ino', 0) or 0),
-    )
-    with _JAPICMP_TOOL_DIGEST_LOCK:
-        cached = _JAPICMP_TOOL_DIGEST_CACHE.get(identity)
-        if cached:
-            return cached
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    with _JAPICMP_TOOL_DIGEST_LOCK:
-        stale_keys = [key for key in _JAPICMP_TOOL_DIGEST_CACHE if key[0] == str(path)]
-        for key in stale_keys:
-            _JAPICMP_TOOL_DIGEST_CACHE.pop(key, None)
-        _JAPICMP_TOOL_DIGEST_CACHE[identity] = digest
-    return digest
+    for _attempt in range(2):
+        before = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        after = path.stat()
+        before_identity = (
+            int(getattr(before, 'st_dev', 0) or 0),
+            int(getattr(before, 'st_ino', 0) or 0), int(before.st_size),
+            int(before.st_mtime_ns), int(before.st_ctime_ns),
+        )
+        after_identity = (
+            int(getattr(after, 'st_dev', 0) or 0),
+            int(getattr(after, 'st_ino', 0) or 0), int(after.st_size),
+            int(after.st_mtime_ns), int(after.st_ctime_ns),
+        )
+        if after_identity != before_identity:
+            continue
+        return digest
+    raise OSError(f"JApiCmp tool changed while hashing: {path}")
+
+
+def effective_java_runtime_identity():
+    java_command = shutil.which("java") or "java"
+    java_path = Path(java_command).resolve() if Path(java_command).exists() else Path(java_command)
+    identity = {
+        "java": str(java_path),
+        "java_sha256": "",
+        "java_home": str(os.environ.get("JAVA_HOME") or "").strip(),
+        "release_sha256": "",
+        "complete": True,
+        "failures": [],
+    }
+    try:
+        if java_path.is_file():
+            identity["java_sha256"] = sha256_file(java_path)
+        else:
+            identity["failures"].append("java_executable_not_a_file")
+    except OSError as exc:
+        identity["failures"].append(f"java_executable_hash_failed:{type(exc).__name__}")
+    java_home = Path(identity["java_home"]).expanduser() if identity["java_home"] else None
+    if java_home is None and java_path.is_absolute():
+        java_home = java_path.parent.parent
+    if java_home is not None:
+        try:
+            identity["java_home"] = str(java_home.resolve())
+            release_file = java_home / "release"
+            if release_file.is_file():
+                identity["release_sha256"] = sha256_file(release_file)
+            else:
+                identity["failures"].append("java_release_file_missing")
+        except OSError as exc:
+            identity["java_home"] = str(java_home)
+            identity["failures"].append(f"java_release_hash_failed:{type(exc).__name__}")
+    identity["complete"] = bool(identity["java_sha256"] and not identity["failures"])
+    return identity
 
 
 def _canonical_json_bytes(value):
@@ -134,7 +172,8 @@ def _canonical_json_bytes(value):
 
 def _japicmp_comparison_cache_identity(
     *, coord, old_coord, new_coord, old_version, new_version,
-    old_jar_sha256, new_jar_sha256, tool_sha256,
+    old_jar_sha256, new_jar_sha256, tool_sha256, target_jdk,
+    java_runtime_identity,
 ):
     return {
         "schema_version": JAPICMP_COMPARISON_CACHE_SCHEMA_VERSION,
@@ -146,6 +185,8 @@ def _japicmp_comparison_cache_identity(
         "old_jar_sha256": str(old_jar_sha256 or ""),
         "new_jar_sha256": str(new_jar_sha256 or ""),
         "tool_sha256": str(tool_sha256 or ""),
+        "target_jdk": str(target_jdk or ""),
+        "java_runtime_identity": java_runtime_identity or {},
         "options": ["--only-modified", "--ignore-missing-classes", "--xml-file"],
     }
 
@@ -2165,6 +2206,7 @@ def run_japicmp(
     old_jar_evidence=None,
     new_jar_evidence=None,
     cache_dir=None,
+    jdk_current=None,
 ):
     """
     对单个依赖运行 JApiCmp，返回 (output_file, changed_apis, error_msg)
@@ -2188,7 +2230,9 @@ def run_japicmp(
             "期望格式：groupId:artifactId 或 groupId:artifactId:classifier\n"
         )
         write_result(out_file, msg)
-        return out_file, [], {"old_jar": None, "new_jar": None}, "非法坐标"
+        return out_file, [], {
+            "old_jar": None, "new_jar": None, "external_process_count": 0,
+        }, "非法坐标"
     safe_name = safe_artifact_id.replace('.', '-') + (f"_{safe_classifier}" if safe_classifier else "")
     out_file = os.path.join(output_dir,
         f"{safe_name}_{old_ver}_vs_{new_ver}_binary.txt")
@@ -2231,6 +2275,7 @@ def run_japicmp(
             "new_jar_evidence": new_jar_evidence or {},
             "missing_sides": missing_sides,
             "reason_code": "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
+            "external_process_count": 0,
         }, f"最终制品 JAR 证据缺失：{display_coord}（{', '.join(missing_sides)}）"
 
     if not os.path.exists(japicmp_jar):
@@ -2248,23 +2293,31 @@ def run_japicmp(
             "new_jar_source": new_jar_source,
             "old_jar_evidence": old_jar_evidence or {},
             "new_jar_evidence": new_jar_evidence or {},
+            "external_process_count": 0,
         }, "JApiCmp 未安装"
 
     tool_sha256 = ''
+    old_jar_sha256 = ''
+    new_jar_sha256 = ''
     comparison_identity = None
     comparison_cache_path = None
+    java_runtime_identity = effective_java_runtime_identity()
     try:
         tool_sha256 = japicmp_tool_sha256(japicmp_jar)
-        if cache_dir is not None:
+        old_jar_sha256 = sha256_file(old_jar)
+        new_jar_sha256 = sha256_file(new_jar)
+        if cache_dir is not None and java_runtime_identity.get("complete") is True:
             comparison_identity = _japicmp_comparison_cache_identity(
                 coord=display_coord,
                 old_coord=resolved_old_coord,
                 new_coord=resolved_new_coord,
                 old_version=old_ver,
                 new_version=new_ver,
-                old_jar_sha256=sha256_file(old_jar),
-                new_jar_sha256=sha256_file(new_jar),
+                old_jar_sha256=old_jar_sha256,
+                new_jar_sha256=new_jar_sha256,
                 tool_sha256=tool_sha256,
+                target_jdk=jdk_current,
+                java_runtime_identity=java_runtime_identity,
             )
             comparison_cache_path = _japicmp_comparison_cache_path(
                 cache_dir, comparison_identity
@@ -2274,6 +2327,45 @@ def run_japicmp(
             )
             if cached is not None:
                 Path(xml_file).write_text(cached["xml_content"], encoding="utf-8")
+                try:
+                    parsed_cached_rows = parse_japicmp_xml(
+                        xml_file, coord, old_ver, new_ver
+                    )
+                except (ET.ParseError, OSError, ValueError):
+                    cached = None
+                else:
+                    if _canonical_json_bytes(parsed_cached_rows) != _canonical_json_bytes(cached["rows"]):
+                        cached = None
+            if cached is not None:
+                cache_load_changes = []
+                try:
+                    if sha256_file(old_jar) != old_jar_sha256:
+                        cache_load_changes.append('old_jar')
+                    if sha256_file(new_jar) != new_jar_sha256:
+                        cache_load_changes.append('new_jar')
+                    if japicmp_tool_sha256(japicmp_jar) != tool_sha256:
+                        cache_load_changes.append('japicmp_tool')
+                    if effective_java_runtime_identity() != java_runtime_identity:
+                        cache_load_changes.append('java_runtime')
+                except OSError as exc:
+                    cache_load_changes.append(
+                        f'identity_unavailable:{type(exc).__name__}'
+                    )
+                if cache_load_changes:
+                    return out_file, [], {
+                        "old_jar": old_jar,
+                        "new_jar": new_jar,
+                        "old_jar_source": old_jar_source,
+                        "new_jar_source": new_jar_source,
+                        "old_jar_evidence": old_jar_evidence or {},
+                        "new_jar_evidence": new_jar_evidence or {},
+                        "reason_code": "JAPICMP_INPUT_CHANGED_DURING_CACHE_LOAD",
+                        "input_change_failures": cache_load_changes,
+                        "comparison_cache_hit": False,
+                        "java_runtime_identity": java_runtime_identity,
+                        "target_jdk": str(jdk_current or ""),
+                        "external_process_count": 0,
+                    }, "JApiCmp 缓存读取期间输入身份发生变化，缓存结果已拒绝"
                 header = _japicmp_output_header(
                     display_coord=display_coord,
                     old_coord=resolved_old_coord,
@@ -2300,10 +2392,27 @@ def run_japicmp(
                     "japicmp_version": "0.21.2",
                     "japicmp_sha256": tool_sha256,
                     "comparison_cache_hit": True,
+                    "java_runtime_identity": java_runtime_identity,
+                    "target_jdk": str(jdk_current or ""),
+                    "external_process_count": 0,
                 }, None
     except OSError:
         comparison_identity = None
         comparison_cache_path = None
+
+    try:
+        Path(xml_file).unlink(missing_ok=True)
+    except OSError as exc:
+        return out_file, [], {
+            "old_jar": old_jar,
+            "new_jar": new_jar,
+            "old_jar_source": old_jar_source,
+            "new_jar_source": new_jar_source,
+            "old_jar_evidence": old_jar_evidence or {},
+            "new_jar_evidence": new_jar_evidence or {},
+            "reason_code": "JAPICMP_XML_CLEANUP_FAILED",
+            "external_process_count": 0,
+        }, f"无法清理旧 JApiCmp XML：{exc}"
 
     # 执行 JApiCmp
     stdout, stderr, rc = run_cmd(
@@ -2325,6 +2434,7 @@ def run_japicmp(
             "new_jar_source": new_jar_source,
             "old_jar_evidence": old_jar_evidence or {},
             "new_jar_evidence": new_jar_evidence or {},
+            "external_process_count": 1,
         }, "超时"
     if rc != 0:
         error_lines = [f"❌ JApiCmp 执行失败（退出码 {rc}）"]
@@ -2341,6 +2451,7 @@ def run_japicmp(
             "new_jar_source": new_jar_source,
             "old_jar_evidence": old_jar_evidence or {},
             "new_jar_evidence": new_jar_evidence or {},
+            "external_process_count": 1,
         }, failure_msg[:100]
     raw_output = stdout or stderr or "(无输出)"
 
@@ -2366,12 +2477,69 @@ def run_japicmp(
     except (ET.ParseError, OSError, ValueError) as exc:
         parser_mode = 'text_fallback'
         xml_error = f"{type(exc).__name__}:{exc}"
-        changed_apis = parse_japicmp_output(raw_output, coord, old_ver, new_ver)
-        for row in changed_apis:
+        fallback_rows = parse_japicmp_output(raw_output, coord, old_ver, new_ver)
+        for row in fallback_rows:
             row['reason_code'] = 'JAPICMP_TEXT_FALLBACK_USED'
             row['evidence_path'] = str(out_file)
             row['binary_compatible'] = row.get('binary_compatible') or 'unknown'
             row['source_compatible'] = row.get('source_compatible') or 'unknown'
+        reason_code = (
+            'JAPICMP_FRESH_XML_MISSING'
+            if not Path(xml_file).is_file()
+            else 'JAPICMP_FRESH_XML_INVALID'
+        )
+        return out_file, [], {
+            "old_jar": old_jar,
+            "new_jar": new_jar,
+            "old_jar_source": old_jar_source,
+            "new_jar_source": new_jar_source,
+            "old_jar_evidence": old_jar_evidence or {},
+            "new_jar_evidence": new_jar_evidence or {},
+            "xml_file": xml_file if Path(xml_file).is_file() else '',
+            "parser_mode": parser_mode,
+            "xml_error": xml_error,
+            "text_fallback_row_count": len(fallback_rows),
+            "reason_code": reason_code,
+            "missing_class_policy": "ignored",
+            "japicmp_version": "0.21.2",
+            "japicmp_sha256": tool_sha256,
+            "comparison_cache_hit": False,
+            "java_runtime_identity": java_runtime_identity,
+            "target_jdk": str(jdk_current or ""),
+            "external_process_count": 1,
+        }, f"JApiCmp 未产生可验证的新鲜 XML：{xml_error}"
+
+    input_change_failures = []
+    try:
+        if not old_jar_sha256 or sha256_file(old_jar) != old_jar_sha256:
+            input_change_failures.append('old_jar')
+        if not new_jar_sha256 or sha256_file(new_jar) != new_jar_sha256:
+            input_change_failures.append('new_jar')
+        if not tool_sha256 or japicmp_tool_sha256(japicmp_jar) != tool_sha256:
+            input_change_failures.append('japicmp_tool')
+        if effective_java_runtime_identity() != java_runtime_identity:
+            input_change_failures.append('java_runtime')
+    except OSError as exc:
+        input_change_failures.append(f'identity_unavailable:{type(exc).__name__}')
+    if input_change_failures:
+        return out_file, [], {
+            "old_jar": old_jar,
+            "new_jar": new_jar,
+            "old_jar_source": old_jar_source,
+            "new_jar_source": new_jar_source,
+            "old_jar_evidence": old_jar_evidence or {},
+            "new_jar_evidence": new_jar_evidence or {},
+            "xml_file": xml_file,
+            "parser_mode": parser_mode,
+            "xml_error": xml_error,
+            "reason_code": "JAPICMP_INPUT_CHANGED_DURING_COMPARISON",
+            "input_change_failures": input_change_failures,
+            "japicmp_sha256": tool_sha256,
+            "comparison_cache_hit": False,
+            "java_runtime_identity": java_runtime_identity,
+            "target_jdk": str(jdk_current or ""),
+            "external_process_count": 1,
+        }, "JApiCmp 对比期间输入身份发生变化，结果已拒绝"
     if (
         parser_mode == 'xml'
         and comparison_cache_path is not None
@@ -2402,6 +2570,13 @@ def run_japicmp(
         "japicmp_version": "0.21.2",
         "japicmp_sha256": tool_sha256,
         "comparison_cache_hit": False,
+        "java_runtime_identity": java_runtime_identity,
+        "comparison_cache_disabled_reason": (
+            "JAVA_RUNTIME_IDENTITY_INCOMPLETE"
+            if java_runtime_identity.get("complete") is not True else ""
+        ),
+        "target_jdk": str(jdk_current or ""),
+        "external_process_count": 1,
     }, None
 
 
@@ -2429,6 +2604,15 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
     if not path.is_file() or path.stat().st_size == 0:
         raise OSError(f"JApiCmp XML 未生成：{path}")
     root = ET.parse(str(path)).getroot()
+    if _xml_local_name(root) != 'japicmp':
+        raise ValueError(
+            f"JApiCmp XML structure invalid: unexpected root {_xml_local_name(root)!r}"
+        )
+    if not any(
+        _xml_local_name(element) in {'classes', 'class-list', 'classlist'}
+        for element in root.iter()
+    ):
+        raise ValueError("JApiCmp XML structure invalid: classes container missing")
     apis = []
 
     def is_jdk_standard_owner(owner):
@@ -2446,6 +2630,16 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
         ]
         if not class_containers:
             class_containers = [root]
+        for container in class_containers:
+            for descendant in container.iter():
+                if _xml_local_name(descendant) not in class_tags:
+                    continue
+                if not _xml_attr(
+                    descendant, 'fullyQualifiedName', 'fully_qualified_name', 'name'
+                ):
+                    raise ValueError(
+                        "JApiCmp XML structure invalid: class identity missing"
+                    )
         seen = set()
         for container in class_containers:
             for child in list(container):
@@ -2456,6 +2650,14 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
                     continue
                 seen.add(identity)
                 yield child
+                for descendant in child.iter():
+                    if descendant is child or _xml_local_name(descendant) != 'class':
+                        continue
+                    identity = id(descendant)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    yield descendant
 
     def add_row(owner, element, symbol_kind):
         if is_jdk_standard_owner(owner):
@@ -2566,12 +2768,21 @@ def parse_japicmp_xml(xml_file, coord, old_ver, new_ver):
 
     for class_element in iter_top_level_class_elements():
         owner = _xml_attr(class_element, 'fullyQualifiedName', 'fully_qualified_name', 'name')
-        if not owner or is_jdk_standard_owner(owner):
+        if not owner:
+            raise ValueError("JApiCmp XML structure invalid: class identity missing")
+        if is_jdk_standard_owner(owner):
             continue
         add_row(owner, class_element, 'class')
-        for member in class_element.iter():
-            if member is class_element:
-                continue
+        def iter_owned_members(element):
+            for member in list(element):
+                tag = _xml_local_name(member)
+                if tag in {'class', 'interface', 'enum', 'annotation', 'record'}:
+                    continue
+                if tag in {'method', 'constructor', 'field'}:
+                    yield member
+                yield from iter_owned_members(member)
+
+        for member in iter_owned_members(class_element):
             tag = _xml_local_name(member)
             if tag == 'method':
                 add_row(owner, member, 'method')
@@ -5360,6 +5571,7 @@ def main():
                 new_jar_path=row.get("_step4_current_jar_path") or "",
                 old_jar_evidence=row.get("_step4_base_jar_evidence") or {},
                 new_jar_evidence=row.get("_step4_current_jar_evidence") or {},
+                jdk_current=jdk_current,
                 cache_dir=(
                     infer_report_dir_from_output_dir(args.output_dir)
                     / RUNTIME_DIRNAME / RUNTIME_CACHE_DIRNAME
@@ -5460,7 +5672,7 @@ def main():
                 status="error" if err else "success",
                 elapsed=time.perf_counter() - japicmp_timer,
                 external_process_count=(
-                    0 if bool((jar_info or {}).get("comparison_cache_hit")) else 1
+                    int((jar_info or {}).get("external_process_count") or 0)
                 ),
                 api_count=len(apis),
                 details=err or {

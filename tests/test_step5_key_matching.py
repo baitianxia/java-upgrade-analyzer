@@ -6537,7 +6537,10 @@ public class com.example.TargetBridge {
             runtime_dependency_catalog={
                 "_packaged_api_scan_results": {
                     identity: {"status": "hit", "hits": [dependency_hit]}
-                }
+                },
+                "_packaged_api_scan_stat_snapshot": (
+                    tracer._runtime_artifact_stat_snapshot([], None)
+                ),
             },
             changed_api_overload_signatures={
                 "org.slf4j.Logger.info": frozenset({
@@ -17009,6 +17012,254 @@ public class com.example.consumer.Adapter {
                 "FINAL_ARTIFACT_PROVENANCE_UNREADABLE",
             )
 
+    def test_batch_packaged_bytecode_scan_rejects_artifact_changed_during_parse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr(
+                    "com/example/Consumer.class",
+                    b"com/vendor/Target removed",
+                )
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": [{
+                        "coord": "sample:consumer",
+                        "jar_path": str(jar_path),
+                    }],
+                },
+            )
+            api = {
+                "coord": "com.vendor:api",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+
+            def mutating_parse(task):
+                with zipfile.ZipFile(jar_path, "a") as archive:
+                    archive.writestr("mutation-marker", b"changed")
+                return task, {
+                    "class_refs": {"com.vendor.Target"},
+                    "method_refs": [{
+                        "owner": "com.vendor.Target",
+                        "name": "removed",
+                        "signature": "()",
+                        "descriptor": "()V",
+                        "consumer_method": "call",
+                        "consumer_signature": "()",
+                        "consumer_descriptor": "()V",
+                        "opcode_family": "invokevirtual",
+                        "instruction_offset": 1,
+                    }],
+                    "field_refs": [],
+                }
+
+            with patch.object(
+                tracer,
+                "_load_runtime_dependency_class_references_for_task",
+                side_effect=mutating_parse,
+            ):
+                cached = tracer._build_packaged_runtime_dependency_scan_cache(
+                    [api], graph
+                )
+
+        result = cached[tracer.build_api_identity_key(api)]
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "BYTECODE_SCAN_INPUT_CHANGED")
+        self.assertEqual(graph.reverse_edges, {})
+
+    def test_batch_packaged_bytecode_scan_rolls_back_when_artifact_changes_during_edge_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr(
+                    "com/example/Consumer.class", b"com/vendor/Target removed"
+                )
+            graph = SimpleNamespace(
+                methods_by_id={}, reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": [{"coord": "sample:consumer", "jar_path": str(jar_path)}],
+                },
+            )
+            api = {
+                "coord": "com.vendor:api", "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed", "api_signature": "", "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            references = {
+                "class_refs": {"com.vendor.Target"},
+                "method_refs": [{
+                    "owner": "com.vendor.Target", "name": "removed", "signature": "()",
+                    "descriptor": "()V", "consumer_method": "call",
+                    "consumer_signature": "()", "consumer_descriptor": "()V",
+                    "opcode_family": "invokevirtual", "instruction_offset": 1,
+                }],
+                "field_refs": [],
+            }
+            original_record = tracer.record_analyzer_edge
+            mutated = False
+
+            def mutating_record(current_graph, current_api, hit):
+                nonlocal mutated
+                row = original_record(current_graph, current_api, hit)
+                if not mutated:
+                    mutated = True
+                    with zipfile.ZipFile(jar_path, "w") as archive:
+                        archive.writestr("com/example/Replacement.class", b"unrelated")
+                return row
+
+            with patch.object(
+                tracer, "_load_runtime_dependency_class_references_for_task",
+                side_effect=lambda task: (task, references),
+            ), patch.object(
+                tracer, "record_analyzer_edge", side_effect=mutating_record
+            ):
+                cached = tracer._build_packaged_runtime_dependency_scan_cache([api], graph)
+
+        result = cached[tracer.build_api_identity_key(api)]
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "BYTECODE_SCAN_INPUT_CHANGED")
+        self.assertEqual(getattr(graph, "analyzer_edges", {}), {})
+
+    def test_batch_packaged_bytecode_scan_rolls_back_analyzer_ledger_on_commit_exception(self):
+        graph = SimpleNamespace(
+            analyzer_edges={},
+            _analyzer_edge_discovery_count=7,
+            _analyzer_edge_incomplete_count=2,
+            _analyzer_edge_failures={('before', ())},
+            step5_evidence_failures=("before",),
+        )
+        api = {
+            "coord": "com.vendor:api", "api_name": "com.vendor.Target.removed",
+            "api_simple": "removed", "api_signature": "", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        hit = {"coord": "sample:consumer", "jar_path": "/tmp/consumer.jar"}
+
+        def insert_then_raise(current_graph, _api, _hit):
+            current_graph.analyzer_edges["partial"] = {"api_identity": "partial"}
+            current_graph._analyzer_edge_discovery_count = 8
+            current_graph._analyzer_edge_incomplete_count = 3
+            current_graph._analyzer_edge_failures.add(('during', ()))
+            current_graph.step5_evidence_failures += ("during",)
+            raise RuntimeError("commit failed")
+
+        with patch.object(
+            tracer, "_get_runtime_dependency_catalog", return_value={
+                "status": "complete",
+                "_packaged_api_scan_results": {},
+            }
+        ), patch.object(
+            tracer, "_runtime_artifact_stat_snapshot", return_value=("17", ())
+        ), patch.object(
+            tracer, "_artifact_sha256", return_value="a" * 64
+        ), patch.object(
+            tracer, "record_analyzer_edge", side_effect=insert_then_raise
+        ), patch.object(
+            tracer, "_deduplicate_physical_packaged_hits", return_value=[hit]
+        ):
+            catalog = tracer._get_runtime_dependency_catalog(graph)
+            catalog["entries"] = []
+            catalog["_packaged_api_scan_results"] = {}
+            with self.assertRaisesRegex(RuntimeError, "commit failed"):
+                # Seed the hit at the point immediately before the commit loop.
+                with patch.object(
+                    tracer, "_match_runtime_dependency_references", return_value=[]
+                ):
+                    tracer._commit_packaged_analyzer_edges_transaction(
+                        graph, [(api, hit)]
+                    )
+
+        self.assertEqual(graph.analyzer_edges, {})
+        self.assertEqual(graph._analyzer_edge_discovery_count, 7)
+        self.assertEqual(graph._analyzer_edge_incomplete_count, 2)
+        self.assertEqual(graph._analyzer_edge_failures, {('before', ())})
+        self.assertEqual(graph.step5_evidence_failures, ("before",))
+
+    def test_packaged_scan_input_change_invalidates_cached_and_new_api_results(self):
+        api_a = {
+            "coord": "com.vendor:api", "api_name": "com.vendor.Target.first",
+            "api_simple": "first", "api_signature": "", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        api_b = {**api_a, "api_name": "com.vendor.Target.second", "api_simple": "second"}
+        key_a = tracer.build_api_identity_key(api_a)
+        key_b = tracer.build_api_identity_key(api_b)
+        existing = {key_a: {"status": "hit", "hits": [{"old": True}]}}
+
+        tracer._mark_packaged_scan_input_changed(
+            existing, [api_a, api_b],
+            [{"reason": "BYTECODE_SCAN_INPUT_CHANGED"}], 3, 10,
+        )
+
+        self.assertEqual(set(existing), {key_a, key_b})
+        self.assertEqual(existing[key_a]["status"], "unavailable")
+        self.assertEqual(existing[key_b]["status"], "unavailable")
+
+    def test_packaged_api_scan_cache_invalidates_after_runtime_jar_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "consumer.jar"
+
+            def write_jar(content):
+                with zipfile.ZipFile(jar_path, "w") as archive:
+                    archive.writestr("com/example/Consumer.class", content)
+
+            write_jar(b"com/vendor/Target removed")
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": [{
+                        "coord": "sample:consumer",
+                        "jar_path": str(jar_path),
+                    }],
+                },
+            )
+            api = {
+                "coord": "com.vendor:api",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed",
+                "api_signature": "",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+            references = {
+                "class_refs": {"com.vendor.Target"},
+                "method_refs": [{
+                    "owner": "com.vendor.Target",
+                    "name": "removed",
+                    "signature": "()",
+                    "descriptor": "()V",
+                    "consumer_method": "call",
+                    "consumer_signature": "()",
+                    "consumer_descriptor": "()V",
+                    "opcode_family": "invokevirtual",
+                    "instruction_offset": 1,
+                }],
+                "field_refs": [],
+            }
+            with patch.object(
+                tracer,
+                "_load_runtime_dependency_class_references_for_task",
+                side_effect=lambda task: (task, references),
+            ):
+                first = tracer._scan_packaged_runtime_dependencies_for_api(
+                    api, graph
+                )
+
+            write_jar(b"unrelated-content")
+            second = tracer._scan_packaged_runtime_dependencies_for_api(api, graph)
+
+        self.assertEqual(first["status"], "hit")
+        self.assertEqual(second["status"], "miss")
+
     def test_batch_packaged_bytecode_skips_javap_for_string_only_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             classes_root = self._compile_java_fixture(
@@ -18462,6 +18713,88 @@ public class com.example.consumer.Adapter {
         self.assertEqual(forward.call_paths, reverse.call_paths)
         self.assertEqual(forward.evidence_paths, reverse.evidence_paths)
 
+    def test_packaged_hit_deduplication_selects_same_physical_edge_for_any_input_order(self):
+        def build(hits):
+            result = tracer.TraceResult(
+                api_name="com.vendor.Target.call", api_simple="call", api_signature="()",
+                symbol_kind="method", change_type="REMOVED", coord="com.vendor:target",
+                old_version="1", new_version="2", severity="P1", confirmed=True,
+                source="git_diff", analysis_scope="method", analysis_status="not_analyzed",
+                direct_callers=0, is_reachable=False, reachable_note="",
+                business_reach_depth=0, dependency_chain_coords=[], call_paths=[],
+                evidence_paths=[], reason_code="", verification_commands=[], hops=[],
+                confidence_score=1.0, critical_nodes_hit=[],
+            )
+            draft = self._draft_from_result(result)
+            tracer._build_packaged_dependency_hit_result(draft, hits)
+            return tracer._finalize_trace_draft(draft)
+
+        base = {
+            "coord": "__business__", "class_fqcn": "app.Entry",
+            "consumer_method": "run", "consumer_signature": "()",
+            "target_display": "com.vendor.Target.call()",
+            "evidence_type": "bytecode_method_invocation",
+            "multi_release_version": "base", "jar_path": "/tmp/business.jar",
+        }
+        hits = [
+            {**base, "instruction_offset": 18},
+            {**base, "instruction_offset": 6},
+        ]
+
+        forward = build(hits)
+        reverse = build(list(reversed(hits)))
+
+        self.assertEqual(forward.call_paths, reverse.call_paths)
+        self.assertEqual(forward.evidence_paths, reverse.evidence_paths)
+        self.assertEqual(len(forward.evidence_paths), 1)
+        self.assertEqual(forward.evidence_paths[0][0]["instruction_offset"], 6)
+
+    def test_packaged_hit_decision_checks_all_physical_edges_before_display_dedup(self):
+        result = tracer.TraceResult(
+            api_name="com.vendor.Target.call", api_simple="call", api_signature="()",
+            symbol_kind="method", change_type="REMOVED", coord="com.vendor:target",
+            old_version="1", new_version="2", severity="P1", confirmed=True,
+            source="git_diff", analysis_scope="method", analysis_status="not_analyzed",
+            direct_callers=0, is_reachable=False, reachable_note="",
+            business_reach_depth=0, dependency_chain_coords=[], call_paths=[],
+            evidence_paths=[], reason_code="", verification_commands=[], hops=[],
+            confidence_score=1.0, critical_nodes_hit=[],
+        )
+        base = {
+            "coord": "com.example:bridge", "class_fqcn": "com.example.Bridge",
+            "consumer_method": "use", "consumer_signature": "()",
+            "consumer_descriptor": "()V", "callee_descriptor": "()V",
+            "target_display": "com.vendor.Target.call()",
+            "evidence_type": "bytecode_method_invocation",
+            "edge_role": "external_consumer", "instruction_offset": 4,
+        }
+        hits = [
+            {**base, "jar_path": "/tmp/a-unreachable.jar"},
+            {**base, "jar_path": "/tmp/z-reachable.jar"},
+        ]
+        business_entry = SimpleNamespace(qualified_key="app.Entry.run()")
+
+        def runtime_entry(hit, _graph):
+            if hit.get("jar_path") == "/tmp/z-reachable.jar":
+                return business_entry, []
+            return None, []
+
+        draft = self._draft_from_result(result)
+        with patch.object(
+            tracer, "_packaged_hit_runtime_framework_entry",
+            side_effect=runtime_entry,
+        ):
+            tracer._build_packaged_dependency_hit_result(
+                draft, hits, SimpleNamespace()
+            )
+
+        finalized = tracer._finalize_trace_draft(draft)
+        self.assertEqual(finalized.analysis_status, "reachable")
+        self.assertTrue(any(
+            detail.get("business_reachable") is True
+            for detail in finalized.path_details
+        ))
+
     def test_packaged_business_lookup_honors_five_edge_trace_budget(self):
         methods = {}
         reverse_edges = {}
@@ -18562,6 +18895,423 @@ public class com.example.consumer.Adapter {
         self.assertEqual(len(second_candidates), 1)
         self.assertIs(second["graph"], second_graph)
 
+    def test_runtime_member_index_rebuilds_when_artifact_changes_during_cache_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes = self._compile_java_fixture(
+                tmp, "com/example/Caller.java", """
+                package com.example;
+                public class Caller {
+                    public void call() throws Exception {
+                        Class.forName("com.vendor.Target").getDeclaredMethod("removed");
+                    }
+                }
+                """,
+            )
+            jar_path = Path(tmp) / "caller.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            catalog = [{"coord": "sample:caller", "jar_path": str(jar_path)}]
+            report_dir = Path(tmp) / "report"
+            tracer._get_runtime_dependency_member_candidate_index(
+                SimpleNamespace(report_dir=str(report_dir)), catalog, 17
+            )
+            original_load = tracer._load_runtime_member_index_cache
+            original_build = tracer._build_runtime_dependency_member_candidate_index
+
+            def mutating_load(path, identity, graph):
+                cached = original_load(path, identity, graph)
+                with zipfile.ZipFile(jar_path, "a") as archive:
+                    archive.writestr("mutation-marker", b"changed")
+                return cached
+
+            graph = SimpleNamespace(report_dir=str(report_dir))
+            with patch.object(
+                tracer, "_load_runtime_member_index_cache",
+                side_effect=mutating_load,
+            ), patch.object(
+                tracer, "_build_runtime_dependency_member_candidate_index",
+                wraps=original_build,
+            ) as rebuilt:
+                index = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+
+        self.assertEqual(rebuilt.call_count, 1)
+        self.assertTrue(index["complete"])
+        self.assertTrue(tracer._candidate_tasks_from_runtime_member_index(
+            index, "com.vendor.Target", "removed"
+        ))
+
+    def test_runtime_member_index_rebuilds_when_graph_cached_artifact_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            classes = self._compile_java_fixture(
+                tmp, "com/example/Caller.java", """
+                package com.example;
+                public class Caller {
+                    public void call() throws Exception {
+                        Class.forName("com.vendor.Target").getDeclaredMethod("removed");
+                    }
+                }
+                """,
+            )
+            jar_path = Path(tmp) / "caller.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            catalog = [{"coord": "sample:caller", "jar_path": str(jar_path)}]
+            graph = SimpleNamespace(report_dir=str(Path(tmp) / "report"))
+            first = tracer._get_runtime_dependency_member_candidate_index(
+                graph, catalog, 17
+            )
+            with zipfile.ZipFile(jar_path, "a") as archive:
+                archive.writestr("mutation-marker", b"changed")
+            original_build = tracer._build_runtime_dependency_member_candidate_index
+            with patch.object(
+                tracer, "_build_runtime_dependency_member_candidate_index",
+                wraps=original_build,
+            ) as rebuilt:
+                second = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+
+        self.assertIsNot(first, second)
+        self.assertEqual(rebuilt.call_count, 1)
+        self.assertTrue(second["complete"])
+
+    def test_runtime_member_index_graph_cache_hit_does_not_rehash_unchanged_jars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("p/Caller.class", b"com/vendor/Target removed")
+            catalog = [{"coord": "sample:fixture", "jar_path": str(jar_path)}]
+            graph = SimpleNamespace(report_dir=str(Path(tmp) / "report"))
+
+            with patch.object(
+                tracer, "_artifact_sha256", wraps=tracer._artifact_sha256
+            ) as digest:
+                first = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+                hashes_after_build = digest.call_count
+                second = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+
+        self.assertIs(first, second)
+        self.assertGreater(hashes_after_build, 0)
+        self.assertEqual(digest.call_count, hashes_after_build)
+
+    def test_runtime_member_index_rejects_change_between_final_identity_and_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("p/Caller.class", b"first")
+            catalog = [{"coord": "sample:fixture", "jar_path": str(jar_path)}]
+            graph = SimpleNamespace(report_dir=str(Path(tmp) / "report"))
+            original_identity = tracer._runtime_member_index_cache_identity
+            calls = 0
+
+            def mutating_identity(entries, target_jdk):
+                nonlocal calls
+                calls += 1
+                identity = original_identity(entries, target_jdk)
+                if calls == 2:
+                    with zipfile.ZipFile(jar_path, "a") as archive:
+                        archive.writestr("p/Changed.class", b"second")
+                return identity
+
+            with patch.object(
+                tracer, "_runtime_member_index_cache_identity",
+                side_effect=mutating_identity,
+            ):
+                first = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+            original_build = tracer._build_runtime_dependency_member_candidate_index
+            with patch.object(
+                tracer, "_build_runtime_dependency_member_candidate_index",
+                wraps=original_build,
+            ) as rebuilt:
+                second = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+
+        self.assertFalse(first["complete"])
+        self.assertIsNot(first, second)
+        self.assertEqual(rebuilt.call_count, 1)
+
+    def test_runtime_member_index_rejects_artifact_changed_during_cache_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("p/Caller.class", b"first")
+            catalog = [{"coord": "sample:fixture", "jar_path": str(jar_path)}]
+            graph = SimpleNamespace(report_dir=str(Path(tmp) / "report"))
+            original_write = tracer._write_runtime_member_index_cache
+
+            def mutating_write(path, identity, index):
+                original_write(path, identity, index)
+                with zipfile.ZipFile(jar_path, "a") as archive:
+                    archive.writestr("p/Changed.class", b"second")
+
+            with patch.object(
+                tracer, "_write_runtime_member_index_cache",
+                side_effect=mutating_write,
+            ):
+                index = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+
+        self.assertFalse(index["complete"])
+        self.assertEqual(
+            index["failures"][-1]["reason"],
+            "BYTECODE_MEMBER_INDEX_INPUT_CHANGED",
+        )
+
+    def test_trace_batch_clears_scan_serial_when_api_trace_raises(self):
+        api = {
+            "coord": "com.vendor:api", "api_name": "com.vendor.Target.removed",
+            "api_simple": "removed", "api_signature": "", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        graph = SimpleNamespace(
+            runtime_dependency_catalog={"status": "complete", "entries": []},
+        )
+
+        with patch.object(
+            tracer, "_build_identical_current_class_provider_index", return_value={}
+        ), patch.object(
+            tracer, "_build_packaged_runtime_dependency_scan_cache", return_value={}
+        ), patch.object(
+            tracer, "trace_api_with_confidence_weighting",
+            side_effect=RuntimeError("trace failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "trace failed"):
+                tracer.trace_all_apis_with_confidence_weighting(
+                    [api], graph, {}, allow_degraded=True
+                )
+
+        self.assertEqual(graph._active_packaged_scan_trace_serial, 0)
+        self.assertEqual(
+            graph.runtime_dependency_catalog.get(
+                "_packaged_api_scan_validated_trace_serial", 0
+            ),
+            0,
+        )
+
+    def test_trace_batch_clears_scan_serial_when_provider_discovery_raises(self):
+        api = {
+            "coord": "com.vendor:api", "api_name": "com.vendor.Target.removed",
+            "api_simple": "removed", "api_signature": "", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        graph = SimpleNamespace(runtime_dependency_catalog={
+            "status": "complete", "entries": [],
+            "_packaged_api_scan_validated_trace_serial": 1,
+        })
+
+        with patch.object(
+            tracer, "_build_identical_current_class_provider_index",
+            side_effect=RuntimeError("provider failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "provider failed"):
+                tracer.trace_all_apis_with_confidence_weighting(
+                    [api], graph, {}, allow_degraded=True
+                )
+
+        self.assertEqual(graph._active_packaged_scan_trace_serial, 0)
+        self.assertEqual(
+            graph.runtime_dependency_catalog[
+                "_packaged_api_scan_validated_trace_serial"
+            ],
+            0,
+        )
+
+    def test_trace_batch_freezes_input_changed_results_for_all_per_api_queries(self):
+        apis = [{
+            "coord": "com.vendor:api", "api_name": f"com.vendor.Target.call{index}",
+            "api_simple": f"call{index}", "api_signature": "", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        } for index in range(2)]
+        graph = SimpleNamespace(runtime_dependency_catalog={
+            "status": "complete", "entries": [],
+        })
+        build_calls = 0
+
+        def build_results(rows, current_graph):
+            nonlocal build_calls
+            build_calls += 1
+            catalog = current_graph.runtime_dependency_catalog
+            status = "unavailable" if build_calls == 1 else "hit"
+            catalog["_packaged_api_scan_results"] = {
+                tracer.build_api_identity_key(row): {
+                    "status": status,
+                    "reason": "BYTECODE_SCAN_INPUT_CHANGED" if status == "unavailable" else "",
+                    "hits": [] if status == "unavailable" else [{"stale": True}],
+                }
+                for row in apis
+            }
+            catalog["_packaged_api_scan_stat_snapshot"] = None
+            return catalog["_packaged_api_scan_results"]
+
+        def trace_one(row, current_graph, *_args, **_kwargs):
+            scanned = tracer._scan_packaged_runtime_dependencies_for_api(
+                row, current_graph
+            )
+            return SimpleNamespace(
+                analysis_status=scanned["status"], direct_callers=0,
+                business_reach_depth=None, confidence_score=0,
+                reason_code=scanned.get("reason", ""),
+            )
+
+        with patch.object(
+            tracer, "_build_identical_current_class_provider_index", return_value={}
+        ), patch.object(
+            tracer, "_build_packaged_runtime_dependency_scan_cache",
+            side_effect=build_results,
+        ), patch.object(
+            tracer, "trace_api_with_confidence_weighting", side_effect=trace_one,
+        ), patch.object(tracer, "collect_graph_analyzer_edges"), patch.object(
+            tracer, "write_analyzer_edge_ledger"
+        ):
+            results = tracer.trace_all_apis_with_confidence_weighting(
+                apis, graph, {}, allow_degraded=True
+            )
+
+        self.assertEqual(build_calls, 1)
+        self.assertEqual(
+            [result.analysis_status for result in results],
+            ["unavailable", "unavailable"],
+        )
+
+    def test_packaged_scan_batch_validation_avoids_per_api_stat_scans(self):
+        api = {
+            "coord": "com.vendor:api", "api_name": "com.vendor.Target.removed",
+            "api_simple": "removed", "api_signature": "", "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        identity = tracer.build_api_identity_key(api)
+        catalog = {
+            "_packaged_api_scan_results": {identity: {"status": "miss"}},
+            "_packaged_api_scan_stat_snapshot": tracer._runtime_artifact_stat_snapshot([], None),
+            "_packaged_api_scan_validated_trace_serial": 7,
+        }
+        graph = SimpleNamespace(
+            runtime_dependency_catalog=catalog,
+            _active_packaged_scan_trace_serial=7,
+        )
+
+        with patch.object(
+            tracer, "_runtime_artifact_stat_snapshot",
+            side_effect=AssertionError("batch cache hit must not rescan every jar per API"),
+        ):
+            result = tracer._scan_packaged_runtime_dependencies_for_api(api, graph)
+
+        self.assertEqual(result["status"], "miss")
+
+    def test_runtime_member_index_marks_missing_catalog_jar_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_jar = Path(tmp) / "missing.jar"
+            classes = self._compile_java_fixture(
+                tmp, "com/acme/TargetBridge.java", """
+                package com.acme;
+                public class TargetBridge {
+                    public static void removed() {}
+                    public static void caller() { removed(); }
+                }
+                """,
+            )
+            valid_jar = Path(tmp) / "valid.jar"
+            self._jar_compiled_classes(valid_jar, classes)
+            catalog = [
+                {"coord": "com.acme:missing", "jar_path": str(missing_jar)},
+                {"coord": "com.acme:valid", "jar_path": str(valid_jar)},
+            ]
+            graph = SimpleNamespace(
+                report_dir=str(Path(tmp) / "report"),
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": catalog,
+                    "target_jdk": 17,
+                },
+                _prefer_runtime_dependency_member_candidate_index=True,
+            )
+
+            index = tracer._get_runtime_dependency_member_candidate_index(
+                graph, catalog, 17,
+            )
+
+            self.assertFalse(index["complete"])
+            self.assertEqual(
+                index["failures"][0]["reason"],
+                "BYTECODE_MEMBER_INDEX_ARTIFACT_MISSING",
+            )
+            self.assertFalse(
+                Path(
+                    tmp, "report", ".runtime", "cache",
+                    "s5_runtime_member_candidate_index.json",
+                ).exists()
+            )
+            expansion = tracer._ensure_runtime_dependency_callers_for_key(
+                graph, "com.acme.TargetBridge.removed()"
+            )
+            perf = tracer._finalize_step5_perf_stats(graph)["bytecode_expand"]
+
+        self.assertTrue(expansion["expanded"])
+        self.assertGreaterEqual(expansion["edges_added"], 1)
+        self.assertEqual(perf["light_scans"], 1.0)
+        self.assertEqual(
+            perf["slow_runtime_lookups"][0]["candidate_source"], "light_scan"
+        )
+        self.assertTrue(any(
+            "BYTECODE_MEMBER_INDEX_ARTIFACT_MISSING" in str(failure)
+            for failure in graph._analyzer_edge_failures
+        ))
+
+    def test_runtime_member_index_rejects_artifact_changed_during_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("p/Caller.class", b"first")
+            graph = SimpleNamespace(report_dir=str(Path(tmp) / "report"))
+            catalog = [{"coord": "sample:fixture", "jar_path": str(jar_path)}]
+
+            def mutating_build(current_graph, _catalog, _target_jdk):
+                with zipfile.ZipFile(jar_path, "a") as archive:
+                    archive.writestr("p/Changed.class", b"second")
+                return {
+                    "graph": current_graph,
+                    "catalog": _catalog,
+                    "tasks": [],
+                    "unparsed_tasks": [],
+                    "direct_by_owner_member": {},
+                    "owner_string_ids": {},
+                    "member_string_ids": {},
+                    "reflection_ids": set(),
+                    "visited_classes": 1,
+                    "parse_failures": 0,
+                    "complete": True,
+                    "failures": [],
+                }
+
+            with patch.object(
+                tracer, "_build_runtime_dependency_member_candidate_index",
+                side_effect=mutating_build,
+            ):
+                index = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+
+            cache_path = Path(
+                tmp, "report", ".runtime", "cache",
+                "s5_runtime_member_candidate_index.json",
+            )
+            cache_exists = cache_path.exists()
+
+        self.assertFalse(index["complete"])
+        self.assertEqual(
+            index["failures"][-1]["reason"],
+            "BYTECODE_MEMBER_INDEX_INPUT_CHANGED",
+        )
+        self.assertFalse(cache_exists)
+
     def test_runtime_member_index_identity_changes_with_artifact_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "fixture.jar"
@@ -18611,6 +19361,91 @@ public class com.example.consumer.Adapter {
         self.assertTrue(tracer._candidate_tasks_from_runtime_member_index(
             index, "com.vendor.Target", "removed"
         ))
+
+    def test_runtime_member_index_cache_load_streams_integrity_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "member-index.json"
+            identity = {"schema": "fixture", "artifacts": []}
+            index = {
+                "tasks": [{"class_fqcn": "p.Caller"}],
+                "unparsed_tasks": [],
+                "direct_by_owner_member": {("p.Target", "removed"): {0}},
+                "owner_string_ids": {},
+                "member_string_ids": {},
+                "reflection_ids": set(),
+                "visited_classes": 1,
+                "parse_failures": 0,
+                "complete": True,
+                "failures": [],
+            }
+            tracer._write_runtime_member_index_cache(path, identity, index)
+
+            with patch.object(
+                tracer,
+                "_runtime_member_index_canonical_bytes",
+                side_effect=AssertionError("cache load must not materialize canonical bytes"),
+            ):
+                loaded = tracer._load_runtime_member_index_cache(
+                    path, identity, SimpleNamespace()
+                )
+
+        self.assertEqual(loaded["tasks"], index["tasks"])
+        self.assertTrue(loaded["complete"])
+
+    def test_runtime_member_index_deserialization_reuses_large_task_lists(self):
+        tasks = [{"class_fqcn": f"p.Caller{index}"} for index in range(100)]
+        unparsed_tasks = [{"class_fqcn": "p.Unparsed"}]
+        payload = {
+            "tasks": tasks,
+            "unparsed_tasks": unparsed_tasks,
+            "direct_by_owner_member": [
+                {"owner": "p.Target", "member": "removed", "task_ids": [0, 1]}
+            ],
+            "owner_string_ids": {"p.Target": [0, 1]},
+            "member_string_ids": {"removed": [0, 1]},
+            "reflection_ids": [0, 1],
+            "visited_classes": 101,
+            "parse_failures": 0,
+            "complete": True,
+            "failures": [],
+        }
+
+        loaded = tracer._runtime_member_index_from_serializable(
+            payload, SimpleNamespace()
+        )
+
+        self.assertIs(loaded["tasks"], tasks)
+        self.assertIs(loaded["unparsed_tasks"], unparsed_tasks)
+        self.assertNotIn("direct_by_owner_member", payload)
+        self.assertEqual(
+            loaded["direct_by_owner_member"][("p.Target", "removed")], {0, 1}
+        )
+
+    def test_runtime_member_index_omits_string_buckets_for_non_reflective_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "caller.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("p/Caller.class", b"fixture")
+            summary = {
+                "ref_members": [],
+                "utf8_values": {
+                    "com/vendor/Target", "removed", "ordinaryLiteral"
+                },
+                "has_dynamic_reference": False,
+            }
+            with patch.object(
+                tracer, "_parse_classfile_constant_pool_summary",
+                return_value=summary,
+            ):
+                index = tracer._build_runtime_dependency_member_candidate_index(
+                    SimpleNamespace(),
+                    [{"coord": "sample:caller", "jar_path": str(jar_path)}],
+                    17,
+                )
+
+        self.assertEqual(index["reflection_ids"], set())
+        self.assertEqual(dict(index["owner_string_ids"]), {})
+        self.assertEqual(dict(index["member_string_ids"]), {})
 
     def test_runtime_reference_signature_resolves_nested_type_from_owner_package(self):
         range_reference = {

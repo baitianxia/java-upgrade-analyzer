@@ -1,3 +1,4 @@
+import hashlib
 import sys
 import shutil
 import subprocess
@@ -6,6 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -23,6 +25,35 @@ from business_bytecode_graph import (
 
 
 class BusinessBytecodeGraphTest(unittest.TestCase):
+    def _artifact_sha256(self, path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def test_incomplete_business_bytecode_scan_is_not_persisted(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "bytecode-index.jsonl"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/First.class", b"first")
+                archive.writestr("com/acme/Second.class", b"second")
+            original = module.parse_classfile_calls
+            module.parse_classfile_calls = lambda _data, _name: []
+            try:
+                _evidence, metrics = collect_business_bytecode_edges(
+                    [],
+                    max_classes=1,
+                    artifact_catalog={"by_coord": {"__business__": {
+                        "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
+                    }}},
+                    cache_path=str(cache_path),
+                )
+            finally:
+                module.parse_classfile_calls = original
+
+            self.assertIn("class_scan_limit_reached", metrics["failures"])
+            self.assertFalse(cache_path.exists())
+
     def test_business_bytecode_batch_interns_repeated_immutable_edge_strings(self):
         import business_bytecode_graph as module
 
@@ -72,6 +103,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             jar_path = Path(tmp) / "application.jar"
             with zipfile.ZipFile(jar_path, "w") as archive:
                 archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            artifact_sha256 = self._artifact_sha256(jar_path)
             original = module.parse_classfile_calls
             module.parse_classfile_calls = lambda _data, _name: [
                 {"caller_owner": "com.acme.Service", "caller_name": "run", "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()", "callee_simple_key": "method:call()", "evidence_type": "bytecode_method_invocation", "line": 11},
@@ -81,7 +113,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             ]
             try:
                 batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
-                    "jar_path": str(jar_path), "sha256": "a" * 64,
+                    "jar_path": str(jar_path), "sha256": artifact_sha256,
                 }}}, None)
             finally:
                 module.parse_classfile_calls = original
@@ -97,7 +129,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             ],
         )
         self.assertTrue(all(
-            edge.provenance.artifact_sha256 == "a" * 64 for edge in batch.edges
+            edge.provenance.artifact_sha256 == artifact_sha256 for edge in batch.edges
         ))
 
     def test_collect_business_bytecode_batch_reports_parse_failure(self):
@@ -112,7 +144,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             module.run_cmd = lambda *_args, **_kwargs: ("", "bad class", 1)
             try:
                 failed = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
-                    "jar_path": str(jar_path), "sha256": "b" * 64,
+                    "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
                 }}}, None)
             finally:
                 module.parse_classfile_calls, module.run_cmd = original_parse, original_run
@@ -136,7 +168,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             }]
             try:
                 batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
-                    "jar_path": str(jar_path), "sha256": "c" * 64,
+                    "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
                 }}}, None)
             finally:
                 module.parse_classfile_calls = original
@@ -164,7 +196,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             }]
             try:
                 batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
-                    "jar_path": str(jar_path), "sha256": "d" * 64,
+                    "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
                 }}}, None)
             finally:
                 module.parse_classfile_calls = original
@@ -204,6 +236,157 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             ("CURRENT_FINAL_ARTIFACT_SHA_INVALID",),
         )
 
+    def test_collect_business_bytecode_batch_rejects_stale_catalog_sha(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"not-a-real-class")
+            original = module.parse_classfile_calls
+            module.parse_classfile_calls = lambda _data, _name: [{
+                "caller_owner": "com.acme.Service", "caller_name": "run",
+                "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+                "callee_simple_key": "method:call()",
+                "evidence_type": "bytecode_method_invocation",
+            }]
+            try:
+                batch = collect_business_bytecode_batch([], {
+                    "by_coord": {"__business__": {
+                        "jar_path": str(jar_path), "sha256": "a" * 64,
+                    }}
+                }, None)
+            finally:
+                module.parse_classfile_calls = original
+
+        self.assertEqual(batch.edges, ())
+        self.assertEqual(
+            [failure.reason_code for failure in batch.failures],
+            ["CURRENT_FINAL_ARTIFACT_SHA_MISMATCH"],
+        )
+
+    def test_collect_business_bytecode_batch_rejects_stale_cache_after_artifact_replacement(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "business-bytecode.jsonl"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"old-class")
+            stale_sha = self._artifact_sha256(jar_path)
+            catalog = {"by_coord": {"__business__": {
+                "jar_path": str(jar_path), "sha256": stale_sha,
+            }}}
+            original = module.parse_classfile_calls
+            module.parse_classfile_calls = lambda _data, _name: [{
+                "caller_owner": "com.acme.Service", "caller_name": "run",
+                "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+                "callee_simple_key": "method:call()",
+                "evidence_type": "bytecode_method_invocation",
+            }]
+            try:
+                first = collect_business_bytecode_batch(
+                    [], catalog, str(cache_path)
+                )
+                with zipfile.ZipFile(jar_path, "w") as archive:
+                    archive.writestr("com/acme/Replacement.class", b"new-class")
+                second = collect_business_bytecode_batch(
+                    [], catalog, str(cache_path)
+                )
+            finally:
+                module.parse_classfile_calls = original
+
+        self.assertEqual(len(first.edges), 1)
+        self.assertEqual(second.edges, ())
+        self.assertEqual(
+            [failure.reason_code for failure in second.failures],
+            ["CURRENT_FINAL_ARTIFACT_SHA_MISMATCH"],
+        )
+        self.assertFalse(dict(second.metrics).get("cache_hit", False))
+
+    def test_collect_business_bytecode_batch_rejects_cache_when_artifact_is_missing(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "business-bytecode.jsonl"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"class")
+            catalog = {"by_coord": {"__business__": {
+                "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
+            }}}
+            with patch.object(module, "parse_classfile_calls", return_value=[{
+                "caller_owner": "com.acme.Service", "caller_name": "run",
+                "caller_signature": "()", "callee_key": "com.vendor.Legacy.call()",
+                "callee_simple_key": "method:call()",
+                "evidence_type": "bytecode_method_invocation",
+            }]):
+                first = collect_business_bytecode_batch([], catalog, str(cache_path))
+            jar_path.unlink()
+            second = collect_business_bytecode_batch([], catalog, str(cache_path))
+
+        self.assertEqual(len(first.edges), 1)
+        self.assertEqual(second.edges, ())
+        self.assertIn(
+            "CURRENT_FINAL_ARTIFACT_REQUIRED",
+            [failure.reason_code for failure in second.failures],
+        )
+
+    def test_collect_business_bytecode_batch_rejects_artifact_changed_during_cache_load(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "business-bytecode.jsonl"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"class")
+            catalog = {"by_coord": {"__business__": {
+                "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
+            }}}
+            with patch.object(module, "parse_classfile_calls", return_value=[]):
+                collect_business_bytecode_batch([], catalog, str(cache_path))
+            original_iter = module._iter_business_bytecode_cache
+
+            def mutating_iter(path, cache_key):
+                iterator = original_iter(path, cache_key)
+                with zipfile.ZipFile(jar_path, "a") as archive:
+                    archive.writestr("mutation-marker", b"changed")
+                return iterator
+
+            with patch.object(
+                module, "_iter_business_bytecode_cache", side_effect=mutating_iter
+            ):
+                batch = collect_business_bytecode_batch([], catalog, str(cache_path))
+
+        self.assertEqual(batch.edges, ())
+        self.assertIn(
+            "CURRENT_FINAL_ARTIFACT_CHANGED_DURING_SCAN",
+            [failure.reason_code for failure in batch.failures],
+        )
+
+    def test_collect_business_bytecode_batch_fails_closed_when_post_cache_sha_is_unreadable(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            cache_path = Path(tmp) / "business-bytecode.jsonl"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"class")
+            digest = self._artifact_sha256(jar_path)
+            catalog = {"by_coord": {"__business__": {
+                "jar_path": str(jar_path), "sha256": digest,
+            }}}
+            with patch.object(module, "parse_classfile_calls", return_value=[]):
+                collect_business_bytecode_batch([], catalog, str(cache_path))
+            with patch.object(
+                module, "_sha256_file",
+                side_effect=[digest, OSError("unreadable"), digest],
+            ):
+                batch = collect_business_bytecode_batch([], catalog, str(cache_path))
+
+        self.assertEqual(batch.edges, ())
+        self.assertTrue(batch.failures)
+
     def test_collect_business_bytecode_batch_records_javap_parser_across_cache_hit(self):
         import business_bytecode_graph as module
 
@@ -219,7 +402,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             with zipfile.ZipFile(jar_path, "w") as archive:
                 archive.writestr("com/acme/Service.class", b"reflection-class")
             catalog = {"by_coord": {"__business__": {
-                "jar_path": str(jar_path), "sha256": "d" * 64,
+                "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
             }}}
             original_parse, original_run = module.parse_classfile_calls, module.run_cmd
             module.parse_classfile_calls = lambda _data, _name: None
@@ -247,7 +430,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             with zipfile.ZipFile(jar_path, "w") as archive:
                 archive.writestr("com/acme/Service.class", b"not-a-real-class")
             catalog = {"by_coord": {"__business__": {
-                "jar_path": str(jar_path), "sha256": "f" * 64,
+                "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
             }}}
             original_parse, original_read_text = module.parse_classfile_calls, Path.read_text
             module.parse_classfile_calls = lambda _data, _name: [{
@@ -285,7 +468,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             with zipfile.ZipFile(jar_path, "w") as archive:
                 archive.writestr("com/acme/Service.class", b"not-a-real-class")
             catalog = {"by_coord": {"__business__": {
-                "jar_path": str(jar_path), "sha256": "1" * 64,
+                "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
             }}}
             calls = []
             original_parse = module.parse_classfile_calls
@@ -359,7 +542,7 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
             )
             try:
                 batch = collect_business_bytecode_batch([], {"by_coord": {"__business__": {
-                    "jar_path": str(jar_path), "sha256": "e" * 64,
+                    "jar_path": str(jar_path), "sha256": self._artifact_sha256(jar_path),
                 }}}, str(cache_path))
             finally:
                 module.parse_classfile_calls = original_parse
@@ -531,7 +714,7 @@ public class Service {
             batch = collect_business_bytecode_batch([], {
                 "by_coord": {"__business__": {
                     "jar_path": str(jar_path),
-                    "sha256": "a" * 64,
+                    "sha256": self._artifact_sha256(jar_path),
                 }},
             }, None)
 
@@ -837,7 +1020,7 @@ public class Service {
                     "by_coord": {
                         "__business__": {
                             "jar_path": str(jar_path),
-                            "sha256": "fixture-sha",
+                            "sha256": self._artifact_sha256(jar_path),
                         }
                     }
                 },

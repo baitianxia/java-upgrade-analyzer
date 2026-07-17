@@ -20,6 +20,7 @@ import argparse, csv, hashlib, io, json, os, re, shutil, sys, tempfile, zipfile
 import safe_xml as ET
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 # compat 必须第一个 import，它会在 Windows 上修复 stdout/stderr 编码
@@ -36,7 +37,7 @@ STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
 NESTED_JAR_SPOOL_MAX_MEMORY_BYTES = 8 * 1024 * 1024
 NESTED_JAR_COPY_CHUNK_BYTES = 1024 * 1024
-PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION = 1
+PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION = 2
 PACKAGED_INVENTORY_CACHE_DIRNAME = 'step1_packaged_inventory'
 
 
@@ -1380,7 +1381,11 @@ def _extract_packaged_dep_from_nested_jar_source(source, entry_name, content_sha
                     continue
                 try:
                     props_text = nested_zip.read(nested_name).decode('utf-8', errors='replace')
-                except Exception:
+                except Exception as exc:
+                    entry['read_error'] = (
+                        f"metadata_read_error:{nested_name}:"
+                        f"{exc.__class__.__name__}:{exc}"
+                    )
                     continue
                 props = _parse_properties_text(props_text)
                 group_id = (props.get('groupId') or '').strip()
@@ -1404,6 +1409,13 @@ def _extract_packaged_dep_from_nested_jar_source(source, entry_name, content_sha
         entry['read_error'] = f"bad_nested_zip:{exc}"
     except Exception as exc:
         entry['read_error'] = f"nested_zip_error:{exc}"
+
+    if entry['read_error']:
+        entry.update({
+            'match_source': 'embedded-metadata-read-error',
+            'resolution_status': 'unresolved',
+        })
+        return entry
 
     stem = _filename_stem(entry_name)
     artifact_id, version = _parse_artifact_version_from_filename(entry_name)
@@ -1460,6 +1472,22 @@ def _packaged_inventory_rows_are_valid(rows):
     return all(isinstance(row, dict) and required.issubset(row) for row in rows)
 
 
+def _packaged_inventory_rows_are_cacheable(rows):
+    return (
+        _packaged_inventory_rows_are_valid(rows)
+        and all(not str(row.get('read_error') or '').strip() for row in rows)
+    )
+
+
+@dataclass(frozen=True)
+class _PackagedArchiveScanResult:
+    rows: list
+    complete: bool
+    failures: list
+    archive_bytes: int
+    nested_entries: int
+
+
 def _load_packaged_inventory_cache(cache_path, artifact_sha256):
     try:
         payload = json.loads(cache_path.read_text(encoding='utf-8'))
@@ -1468,20 +1496,33 @@ def _load_packaged_inventory_cache(cache_path, artifact_sha256):
             return None
         if str(payload.get('artifact_sha256') or '') != artifact_sha256:
             return None
-        if not _packaged_inventory_rows_are_valid(rows):
+        if not _packaged_inventory_rows_are_cacheable(rows):
+            return None
+        archive_bytes = int(payload.get('archive_bytes'))
+        nested_entries = int(payload.get('nested_entries'))
+        if archive_bytes < 0 or nested_entries < 0:
             return None
         rows_sha256 = hashlib.sha256(_canonical_packaged_inventory_bytes(rows)).hexdigest()
         if str(payload.get('rows_sha256') or '') != rows_sha256:
             return None
-        return rows
+        return _PackagedArchiveScanResult(
+            rows=rows,
+            complete=True,
+            failures=[],
+            archive_bytes=archive_bytes,
+            nested_entries=nested_entries,
+        )
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
 
-def _write_packaged_inventory_cache(cache_path, artifact_sha256, rows):
+def _write_packaged_inventory_cache(cache_path, artifact_sha256, scan_result):
+    rows = scan_result.rows
     payload = {
         'schema_version': PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION,
         'artifact_sha256': artifact_sha256,
+        'archive_bytes': scan_result.archive_bytes,
+        'nested_entries': scan_result.nested_entries,
         'rows': rows,
         'rows_sha256': hashlib.sha256(
             _canonical_packaged_inventory_bytes(rows)
@@ -1509,10 +1550,41 @@ def _write_packaged_inventory_cache(cache_path, artifact_sha256, rows):
 
 
 def _scan_packaged_archive(artifact_path):
+    artifact_path = Path(artifact_path)
     deps = []
     informative_paths = 0
+    failures = []
     try:
-        with zipfile.ZipFile(str(artifact_path)) as outer_zip:
+        archive_bytes = artifact_path.stat().st_size
+    except OSError as exc:
+        return _PackagedArchiveScanResult(
+            rows=[],
+            complete=False,
+            failures=[{
+                'stage': 'archive_stat',
+                'entry': '',
+                'error': f'{exc.__class__.__name__}:{exc}',
+            }],
+            archive_bytes=0,
+            nested_entries=0,
+        )
+    try:
+        outer_zip = zipfile.ZipFile(str(artifact_path))
+    except Exception as exc:
+        return _PackagedArchiveScanResult(
+            rows=[],
+            complete=False,
+            failures=[{
+                'stage': 'archive_open',
+                'entry': '',
+                'error': f'{exc.__class__.__name__}:{exc}',
+            }],
+            archive_bytes=archive_bytes,
+            nested_entries=0,
+        )
+
+    try:
+        with outer_zip:
             for name in outer_zip.namelist():
                 lower_name = name.lower()
                 if not lower_name.endswith('.jar'):
@@ -1534,6 +1606,11 @@ def _scan_packaged_archive(artifact_path):
                     dep['resolution_status'] = 'unresolved'
                     dep['read_error'] = f"outer_read_error:{exc}"
                     deps.append(dep)
+                    failures.append({
+                        'stage': 'nested_entry_read',
+                        'entry': name,
+                        'error': dep['read_error'],
+                    })
                     continue
                 try:
                     dep = _extract_packaged_dep_from_nested_jar_source(
@@ -1543,43 +1620,106 @@ def _scan_packaged_archive(artifact_path):
                     nested_source.close()
                 if not dep:
                     continue
+                if str(dep.get('read_error') or '').strip():
+                    failures.append({
+                        'stage': 'embedded_metadata_read',
+                        'entry': name,
+                        'error': dep['read_error'],
+                    })
                 if _is_ignorable_packaging_support_dep(dep):
                     continue
                 deps.append(dep)
-    except zipfile.BadZipFile:
-        return []
-    except Exception:
-        return []
+    except Exception as exc:
+        failures.append({
+            'stage': 'archive_read',
+            'entry': '',
+            'error': f'{exc.__class__.__name__}:{exc}',
+        })
 
-    if informative_paths == 0:
-        return []
-    return deps
+    return _PackagedArchiveScanResult(
+        rows=deps,
+        complete=not failures,
+        failures=failures,
+        archive_bytes=archive_bytes,
+        nested_entries=informative_paths,
+    )
+
+
+def _update_packaged_archive_stats(stats, scan_result):
+    if stats is None:
+        return
+    stats['scan_complete'] = bool(scan_result.complete)
+    stats['failures'] = [dict(item) for item in scan_result.failures]
+    stats['archive_bytes'] = int(scan_result.archive_bytes)
+    stats['nested_entries'] = int(scan_result.nested_entries)
 
 
 def _inspect_packaged_archive(artifact_path, cache_dir=None, cache_stats=None):
     artifact_path = Path(artifact_path)
     stats = cache_stats if isinstance(cache_stats, dict) else None
+    try:
+        artifact_sha256 = sha256_file(artifact_path)
+    except OSError as exc:
+        raise RuntimeError(
+            f'packaged archive identity unavailable before scan: {artifact_path}: {exc}'
+        ) from exc
     if cache_dir is None:
         if stats is not None:
             stats['misses'] = int(stats.get('misses') or 0) + 1
-        return _scan_packaged_archive(artifact_path)
+        scan_result = _scan_packaged_archive(artifact_path)
+        try:
+            artifact_sha256_after_scan = sha256_file(artifact_path)
+        except OSError as exc:
+            raise RuntimeError(
+                f'packaged archive identity unavailable after scan: {artifact_path}: {exc}'
+            ) from exc
+        if artifact_sha256_after_scan != artifact_sha256:
+            raise RuntimeError(
+                f'packaged archive changed during packaged archive scan: {artifact_path}'
+            )
+        _update_packaged_archive_stats(stats, scan_result)
+        return scan_result.rows
 
-    artifact_sha256 = sha256_file(artifact_path)
     cache_path = (
         Path(cache_dir) / f'{artifact_sha256}.json'
     )
-    cached_rows = _load_packaged_inventory_cache(cache_path, artifact_sha256)
-    if cached_rows is not None:
+    cached_result = _load_packaged_inventory_cache(cache_path, artifact_sha256)
+    if cached_result is not None:
+        try:
+            artifact_sha256_after_load = sha256_file(artifact_path)
+        except OSError as exc:
+            raise RuntimeError(
+                f'packaged archive identity unavailable after cache load: {artifact_path}: {exc}'
+            ) from exc
+        if artifact_sha256_after_load != artifact_sha256:
+            raise RuntimeError(
+                f'packaged archive changed during packaged archive cache load: {artifact_path}'
+            )
         if stats is not None:
             stats['hits'] = int(stats.get('hits') or 0) + 1
-        return cached_rows
+        _update_packaged_archive_stats(stats, cached_result)
+        return cached_result.rows
 
     if stats is not None:
         stats['misses'] = int(stats.get('misses') or 0) + 1
-    rows = _scan_packaged_archive(artifact_path)
-    if _packaged_inventory_rows_are_valid(rows):
-        _write_packaged_inventory_cache(cache_path, artifact_sha256, rows)
-    return rows
+    scan_result = _scan_packaged_archive(artifact_path)
+    try:
+        artifact_sha256_after_scan = sha256_file(artifact_path)
+    except OSError as exc:
+        raise RuntimeError(
+            f'packaged archive identity unavailable after scan: {artifact_path}: {exc}'
+        ) from exc
+    if artifact_sha256_after_scan != artifact_sha256:
+        raise RuntimeError(
+            f'packaged archive changed during packaged archive scan: {artifact_path}'
+        )
+    _update_packaged_archive_stats(stats, scan_result)
+    if (
+        scan_result.complete
+        and _packaged_inventory_rows_are_cacheable(scan_result.rows)
+    ):
+        _write_packaged_inventory_cache(cache_path, artifact_sha256, scan_result)
+    return scan_result.rows
 
 
 def _observer_packaged_inventory_cache_dir(observer):
@@ -1587,6 +1727,21 @@ def _observer_packaged_inventory_cache_dir(observer):
     if cache_dir is None:
         return None
     return Path(cache_dir) / PACKAGED_INVENTORY_CACHE_DIRNAME
+
+
+def _require_complete_packaged_archive_scan(cache_stats, artifact_path):
+    if (cache_stats or {}).get('scan_complete') is not False:
+        return
+    failures = list((cache_stats or {}).get('failures') or [])
+    details = '; '.join(
+        ':'.join(filter(None, (
+            str(item.get('stage') or ''),
+            str(item.get('entry') or ''),
+            str(item.get('error') or ''),
+        )))
+        for item in failures
+    ) or 'unknown archive scan failure'
+    raise RuntimeError(f"最终制品扫描不完整：{artifact_path}。{details}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2071,6 +2226,9 @@ def collect_maven_deps_for_workspace(
             if observer is not None:
                 observer.increment_counter('cache_hits', cache_stats.get('hits', 0))
                 observer.increment_counter('cache_misses', cache_stats.get('misses', 0))
+                observer.increment_counter('archive_bytes', cache_stats.get('archive_bytes', 0))
+                observer.increment_counter('nested_entries', cache_stats.get('nested_entries', 0))
+            _require_complete_packaged_archive_scan(cache_stats, artifact_path)
             if not packaged_raw:
                 continue
         if any(not (item.get('coord') or '').strip() for item in packaged_raw):
@@ -2168,6 +2326,9 @@ def collect_packaged_deps_from_artifact_path(
         if observer is not None:
             observer.increment_counter('cache_hits', cache_stats.get('hits', 0))
             observer.increment_counter('cache_misses', cache_stats.get('misses', 0))
+            observer.increment_counter('archive_bytes', cache_stats.get('archive_bytes', 0))
+            observer.increment_counter('nested_entries', cache_stats.get('nested_entries', 0))
+        _require_complete_packaged_archive_scan(cache_stats, artifact_file)
         if not packaged_raw:
             raise RuntimeError(
                 f"用户提供的编译产物中未发现可比较的打包依赖：{artifact_file}。"

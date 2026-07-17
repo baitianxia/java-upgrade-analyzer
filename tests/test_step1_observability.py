@@ -161,6 +161,24 @@ class Step1ObservabilityTest(unittest.TestCase):
         self.assertEqual(row["cache_hits"], "2")
         self.assertEqual(row["cache_misses"], "1")
 
+    def test_step1_timing_records_cumulative_archive_scan_counters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = step1_observability.Step1Observer(
+                Path(tmp) / "evidence/dependencies/dep_changes.csv"
+            )
+            observer.increment_counter("archive_bytes", 4096)
+            observer.increment_counter("nested_entries", 3)
+            with observer.phase("artifact_parse"):
+                pass
+
+            with observer.timing_path.open(encoding="utf-8", newline="") as handle:
+                row = list(csv.DictReader(handle))[0]
+
+        self.assertIn("archive_bytes", step1_observability.TIMING_FIELDS)
+        self.assertIn("nested_entries", step1_observability.TIMING_FIELDS)
+        self.assertEqual(row["archive_bytes"], "4096")
+        self.assertEqual(row["nested_entries"], "3")
+
     def test_maven_package_streams_and_records_side_specific_timing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
