@@ -1,4 +1,5 @@
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -219,6 +220,29 @@ class ArtifactSafetyTest(unittest.TestCase):
                 artifact_safety.require_safe_archive(artifact)
                 artifact_safety.require_safe_archive(artifact)
 
+            self.assertEqual(inspect_mock.call_count, 1)
+
+    def test_archive_safety_coalesces_concurrent_first_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "concurrent.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("sample/Ok.class", b"class")
+
+            original = artifact_safety._inspect_archive_source
+
+            def slow_scan(*args, **kwargs):
+                time.sleep(0.05)
+                return original(*args, **kwargs)
+
+            with patch.object(
+                artifact_safety, "_inspect_archive_source", side_effect=slow_scan,
+            ) as inspect_mock, ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(
+                    lambda _index: artifact_safety.require_safe_archive(artifact),
+                    range(8),
+                ))
+
+            self.assertTrue(all(result.safe for result in results))
             self.assertEqual(inspect_mock.call_count, 1)
 
     def test_archive_safety_cache_invalidates_after_same_size_mutation(self):

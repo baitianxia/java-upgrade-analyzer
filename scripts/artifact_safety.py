@@ -2,10 +2,11 @@
 """Bounded, fail-closed validation for JAR/WAR/ZIP analysis inputs."""
 
 from dataclasses import dataclass
-from functools import lru_cache
+from collections import OrderedDict
 import io
 from pathlib import Path, PurePosixPath
 import re
+import threading
 import zipfile
 
 
@@ -161,29 +162,58 @@ def _changed_during_scan_result():
     )
 
 
-@lru_cache(maxsize=256)
 def _cached_archive_inspection(path, device, inode, size, mtime_ns, ctime_ns, limits):
-    expected_identity = (device, inode, size, mtime_ns, ctime_ns)
-    archive_path = Path(path)
-    result = _inspect_archive_source(archive_path, **dict(limits))
+    key = (path, device, inode, size, mtime_ns, ctime_ns, limits)
+    with _ARCHIVE_CACHE_CONDITION:
+        while key in _ARCHIVE_CACHE_IN_FLIGHT:
+            _ARCHIVE_CACHE_CONDITION.wait()
+        cached = _ARCHIVE_SAFETY_CACHE.get(key)
+        if cached is not None:
+            _ARCHIVE_SAFETY_CACHE.move_to_end(key)
+            return cached
+        _ARCHIVE_CACHE_IN_FLIGHT.add(key)
     try:
-        stat = archive_path.stat()
-    except OSError:
-        return _changed_during_scan_result()
-    actual_identity = (
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_size,
-        stat.st_mtime_ns,
-        stat.st_ctime_ns,
-    )
-    if actual_identity != expected_identity:
-        return _changed_during_scan_result()
+        expected_identity = (device, inode, size, mtime_ns, ctime_ns)
+        archive_path = Path(path)
+        result = _inspect_archive_source(archive_path, **dict(limits))
+        try:
+            stat = archive_path.stat()
+        except OSError:
+            result = _changed_during_scan_result()
+        else:
+            actual_identity = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+            if actual_identity != expected_identity:
+                result = _changed_during_scan_result()
+    except BaseException:
+        with _ARCHIVE_CACHE_CONDITION:
+            _ARCHIVE_CACHE_IN_FLIGHT.discard(key)
+            _ARCHIVE_CACHE_CONDITION.notify_all()
+        raise
+    with _ARCHIVE_CACHE_CONDITION:
+        _ARCHIVE_SAFETY_CACHE[key] = result
+        _ARCHIVE_SAFETY_CACHE.move_to_end(key)
+        while len(_ARCHIVE_SAFETY_CACHE) > _ARCHIVE_CACHE_MAX_SIZE:
+            _ARCHIVE_SAFETY_CACHE.popitem(last=False)
+        _ARCHIVE_CACHE_IN_FLIGHT.discard(key)
+        _ARCHIVE_CACHE_CONDITION.notify_all()
     return result
 
 
 def clear_archive_safety_cache():
-    _cached_archive_inspection.cache_clear()
+    with _ARCHIVE_CACHE_CONDITION:
+        _ARCHIVE_SAFETY_CACHE.clear()
+
+
+_ARCHIVE_CACHE_MAX_SIZE = 256
+_ARCHIVE_SAFETY_CACHE = OrderedDict()
+_ARCHIVE_CACHE_IN_FLIGHT = set()
+_ARCHIVE_CACHE_CONDITION = threading.Condition()
 
 
 def require_safe_archive(path, **limits):
