@@ -10,6 +10,7 @@
 - 每次只执行一个 Step，执行后立刻做门控与主状态保存
 - 若 `run_step.py` 返回退出码 `4` 或进入待交互状态，优先读取 `.upgrade-report/.runtime/state/main_state.json` 与 `.upgrade-report/.runtime/state/interaction.json`，再由 Claude Code 向用户发问
 - 若要在首次调用 `step1` 前让 Claude Code 先完成首轮抽参，可先执行 `python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract` 读取静态前置协议
+- 所有 CSV 产物统一采用 UTF-8 BOM，可直接用 Excel 打开；脚本读取时兼容历史无 BOM 的 UTF-8 CSV
 
 ### 技能目录约定
 

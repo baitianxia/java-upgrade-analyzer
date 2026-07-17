@@ -138,6 +138,11 @@ class CsvEncodingContractTest(unittest.TestCase):
             for path in outputs:
                 self.assert_single_leading_bom(path)
 
+    def test_user_documentation_declares_excel_compatible_csv_encoding(self):
+        for relative_path in ("SKILL.md", "RUNBOOK.md", "docs/user/outputs.md"):
+            content = (ROOT_DIR / relative_path).read_text(encoding="utf-8")
+            self.assertIn("UTF-8 BOM", content, relative_path)
+
 
 if __name__ == "__main__":
     unittest.main()

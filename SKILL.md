@@ -83,6 +83,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
 8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
 9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。缺失时会先自动尝试安装；安装或加载失败后必须 checkpoint，安装/提供工具后重跑。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
+10. **CSV 编码统一**：所有 CSV 产物统一使用 UTF-8 BOM；程序读取时同时兼容带 BOM 与历史无 BOM 的 UTF-8 文件，保证 Excel 直接打开中文不乱码。
 
 ## 执行模式
 
