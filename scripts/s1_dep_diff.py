@@ -489,7 +489,10 @@ def build_step1_coordinate_followup_interaction(
         },
         "manual_coord_overrides": {
             "type": "array",
-            "description": "可选。人工补充坐标，格式为 artifact:version -> group:artifact。",
+            "description": (
+                "可选。补充本轮新增坐标，格式为 artifact:version -> group:artifact；"
+                "系统会与前几轮已提交的坐标合并。"
+            ),
         },
     }
     missing_inputs = []
@@ -1858,6 +1861,8 @@ def _parse_maven_dependency_list_line(raw_line):
         return None
 
     left = re.sub(r'\s+--\s+.+$', '', line).strip()
+    left = re.sub(r'\s+\((?:optional|omitted[^)]*)\)$', '', left, flags=re.IGNORECASE)
+    left = re.sub(r':(?:[A-Za-z]:[\\/]|/|\\\\).+$', '', left)
     if not left or ':' not in left:
         return None
 

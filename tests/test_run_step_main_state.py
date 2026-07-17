@@ -126,6 +126,36 @@ class RunStepMainStateTest(unittest.TestCase):
                 [str((project_dir / "src/main/java").resolve())],
             )
 
+    def test_user_response_accumulates_manual_coord_overrides_across_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            state = run_step.new_main_state(project_dir / ".upgrade-report")
+            first_round = [
+                f"lib-{index}:1.0 -> com.example:lib-{index}"
+                for index in range(1, 10)
+            ]
+            state["step1"]["input"] = {
+                "manual_coord_overrides": first_round,
+            }
+
+            _, updated = run_step.apply_user_response_to_main_state(
+                state,
+                {"step_id": "step1", "kind": "input_request"},
+                {
+                    "action": "rerun_current_step",
+                    "manual_coord_overrides": [
+                        "asm-util:7.1 -> org.ow2.asm:asm-util",
+                    ],
+                },
+                project_dir,
+                target_step_id="step1",
+            )
+
+            self.assertEqual(
+                updated["manual_coord_overrides"],
+                first_round + ["asm-util:7.1 -> org.ow2.asm:asm-util"],
+            )
+
     def test_user_response_primary_module_overrides_stale_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -1071,6 +1101,60 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertNotIn("dependency_source_dirs", updated)
             self.assertNotIn("dependency_repo_mappings", updated)
             self.assertNotIn("dependency_source_dirs", updated_state["step2"]["input"])
+
+    def test_intent_patch_clear_resets_accumulated_manual_coord_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            state = run_step.new_main_state(project_dir / ".upgrade-report")
+            pending = {
+                "step_id": "step1",
+                "status": "awaiting_user_input",
+                "kind": "input_request",
+            }
+            state["step1"]["input"] = {
+                "manual_coord_overrides": [
+                    "old-lib:1.0 -> com.example:old-lib",
+                ],
+            }
+
+            state, cleared = run_step.apply_user_response_to_main_state(
+                state,
+                pending,
+                {
+                    "intent_patch": {
+                        "action": "rerun_current_step",
+                        "set": {
+                            "manual_coord_overrides": [
+                                "discarded-lib:1.0 -> com.example:discarded-lib",
+                            ],
+                        },
+                        "clear": ["manual_coord_overrides"],
+                    }
+                },
+                project_dir,
+                target_step_id="step1",
+            )
+
+            self.assertNotIn("manual_coord_overrides", cleared)
+            self.assertNotIn("manual_coord_overrides", state["step1"]["input"])
+
+            _, resubmitted = run_step.apply_user_response_to_main_state(
+                state,
+                pending,
+                {
+                    "action": "rerun_current_step",
+                    "manual_coord_overrides": [
+                        "new-lib:2.0 -> com.example:new-lib",
+                    ],
+                },
+                project_dir,
+                target_step_id="step1",
+            )
+
+            self.assertEqual(
+                resubmitted["manual_coord_overrides"],
+                ["new-lib:2.0 -> com.example:new-lib"],
+            )
 
     def test_step2_continue_with_clear_rebuilds_outputs_before_advancing(self):
         with tempfile.TemporaryDirectory() as tmp:

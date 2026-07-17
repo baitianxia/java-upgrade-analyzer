@@ -32,6 +32,22 @@ class Step1PackagedDepsTest(unittest.TestCase):
         )
         self.assertEqual(optional["scope"], "compile")
 
+    def test_dependency_list_parser_ignores_absolute_artifact_filename(self):
+        samples = (
+            "[INFO] org.ow2.asm:asm-util:jar:7.1:runtime:"
+            "/Users/me/.m2/repository/org/ow2/asm/asm-util/7.1/asm-util-7.1.jar",
+            "[INFO] org.ow2.asm:asm-util:jar:7.1:runtime:"
+            r"C:\Users\me\.m2\repository\org\ow2\asm\asm-util\7.1\asm-util-7.1.jar",
+        )
+
+        for line in samples:
+            with self.subTest(line=line):
+                parsed = s1_dep_diff._parse_maven_dependency_list_line(line)
+                self.assertEqual(parsed["key"], "org.ow2.asm:asm-util")
+                self.assertEqual(parsed["version"], "7.1")
+                self.assertEqual(parsed["scope"], "runtime")
+                self.assertEqual(parsed["classifier"], "")
+
     def test_dependency_list_parser_rejects_log_prose_with_colons(self):
         self.assertIsNone(
             s1_dep_diff._parse_maven_dependency_list_line(

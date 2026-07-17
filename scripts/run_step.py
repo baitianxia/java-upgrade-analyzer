@@ -937,13 +937,16 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
     manual_coord_overrides = response.get("manual_coord_overrides")
     if manual_coord_overrides is not None:
         if isinstance(manual_coord_overrides, str):
-            updated["manual_coord_overrides"] = [manual_coord_overrides.strip()] if manual_coord_overrides.strip() else []
+            incoming_coord_overrides = [manual_coord_overrides.strip()] if manual_coord_overrides.strip() else []
         elif isinstance(manual_coord_overrides, list):
-            updated["manual_coord_overrides"] = _dedupe_strings(
+            incoming_coord_overrides = _dedupe_strings(
                 [str(item).strip() for item in manual_coord_overrides if str(item).strip()]
             )
         else:
             raise StepError("manual_coord_overrides 仅支持字符串或字符串列表")
+        updated["manual_coord_overrides"] = _dedupe_strings(
+            list(updated.get("manual_coord_overrides") or []) + incoming_coord_overrides
+        )
     if str(response.get("action") or "").strip() == "confirm_unresolved":
         updated["allow_unresolved"] = True
 
@@ -3486,7 +3489,10 @@ def build_step1_response_properties():
         },
         "manual_coord_overrides": {
             "type": "array",
-            "description": "可选。人工补充 Step1 unresolved 坐标，格式为 artifact:version -> group:artifact。",
+            "description": (
+                "可选。补充本轮新增的 Step1 unresolved 坐标，格式为 "
+                "artifact:version -> group:artifact；系统会与前几轮已提交的坐标合并。"
+            ),
         },
         "tool": {
             "type": "string",

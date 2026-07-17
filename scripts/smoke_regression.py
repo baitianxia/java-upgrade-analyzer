@@ -880,13 +880,13 @@ def print_dependency_list(module, branch):
     print("[INFO] The following files have been resolved:")
     if module == "module-a":
         version = current_version(branch)
-        print(f"[INFO]    com.example:demo-lib:jar:{version}:runtime -- /tmp/demo-lib-{version}.jar")
+        print(f"[INFO]    com.example:demo-lib:jar:{version}:runtime:/tmp/demo-lib-{version}.jar")
     elif module == "module-b":
         version = other_version(branch)
-        print(f"[INFO]    com.example:other-lib:jar:{version}:runtime -- /tmp/other-lib-{version}.jar")
+        print(f"[INFO]    com.example:other-lib:jar:{version}:runtime:/tmp/other-lib-{version}.jar")
     else:
         version = current_version(branch)
-        print(f"[INFO]    com.example:demo-lib:jar:{version}:runtime -- /tmp/demo-lib-{version}.jar")
+        print(f"[INFO]    com.example:demo-lib:jar:{version}:runtime:/tmp/demo-lib-{version}.jar")
 
 
 def main():
@@ -1777,7 +1777,7 @@ def main():
             if "dependency:list" in joined:
                 return (
                     "[INFO] The following files have been resolved:\n"
-                    "[INFO]    com.example:demo-lib:jar:2.0.0:runtime -- /tmp/demo-lib-2.0.0.jar\n",
+                    "[INFO]    com.example:demo-lib:jar:2.0.0:runtime:/tmp/demo-lib-2.0.0.jar\n",
                     "",
                     0,
                 )
@@ -1793,9 +1793,9 @@ def main():
             )
         parsed_runtime_deps = s1_dep_diff_module.parse_maven_dependency_list(
             "[INFO] The following files have been resolved:\n"
-            "[INFO]    xmlpull:xmlpull:jar:1.1.3.1:compile -- /tmp/xmlpull-1.1.3.1.jar\n"
-            "[INFO]    com.example:demo-lib:jar::2.0.0:runtime -- /tmp/demo-lib-2.0.0.jar\n"
-            "[INFO]    com.example:demo-lib:jar:jdk8:2.0.0:runtime -- /tmp/demo-lib-2.0.0-jdk8.jar\n"
+            "[INFO]    xmlpull:xmlpull:jar:1.1.3.1:compile:/tmp/xmlpull-1.1.3.1.jar\n"
+            "[INFO]    com.example:demo-lib:jar::2.0.0:runtime:/tmp/demo-lib-2.0.0.jar\n"
+            "[INFO]    com.example:demo-lib:jar:jdk8:2.0.0:runtime:/tmp/demo-lib-2.0.0-jdk8.jar\n"
             "[INFO]    org.slf4j:slf4j-api:1.7.36:test\n"
         )
         assert_true(
@@ -1970,8 +1970,8 @@ def main():
             if "dependency:list" in joined:
                 return (
                     "[INFO] The following files have been resolved:\n"
-                    "[INFO]    com.example:demo-lib:jar:2.0.0:runtime -- /tmp/demo-lib-2.0.0.jar\n"
-                    "[INFO]    org.slf4j:slf4j-api:jar:1.7.36:runtime -- /tmp/slf4j-api-1.7.36.jar\n",
+                    "[INFO]    com.example:demo-lib:jar:2.0.0:runtime:/tmp/demo-lib-2.0.0.jar\n"
+                    "[INFO]    org.slf4j:slf4j-api:jar:1.7.36:runtime:/tmp/slf4j-api-1.7.36.jar\n",
                     "",
                     0,
                 )
@@ -4340,7 +4340,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         if "dependency:list" in joined:
             return (
                 "[INFO] The following files have been resolved:\n"
-                "[INFO]    com.example:demo-lib:jar:2.0.0:runtime -- /tmp/demo-lib-2.0.0.jar\n",
+                "[INFO]    com.example:demo-lib:jar:2.0.0:runtime:/tmp/demo-lib-2.0.0.jar\n",
                 "",
                 0,
             )
@@ -4429,7 +4429,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         if "dependency:list" in joined:
             return (
                 "[INFO] The following files have been resolved:\n"
-                "[INFO]    com.example:demo-lib:jar:2.0.0:runtime -- /tmp/demo-lib-2.0.0.jar\n",
+                "[INFO]    com.example:demo-lib:jar:2.0.0:runtime:/tmp/demo-lib-2.0.0.jar\n",
                 "",
                 0,
             )
