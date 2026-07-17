@@ -102,7 +102,7 @@ class DataContractTraceTest(unittest.TestCase):
         self.assertNotEqual(result.analysis_status, "reachable")
         self.assertNotIn(row["api_name"], graph.reverse_edges)
 
-    def test_scheduled_dependency_method_is_a_system_runtime_entry(self):
+    def test_scheduled_dependency_method_without_artifact_activation_is_uncertain(self):
         row = contract_row()
         method = method_def(
             symbol_id="refreshCustomers",
@@ -129,7 +129,8 @@ class DataContractTraceTest(unittest.TestCase):
             has_dependency_source_mapping=True,
         )
 
-        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertEqual(result.reason_code, "FRAMEWORK_ACTIVATION_UNPROVEN")
 
     def test_current_final_artifact_type_reference_remains_authoritative(self):
         row = contract_row()
