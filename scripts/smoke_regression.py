@@ -1003,6 +1003,13 @@ public class App {
     write_text(project_dir / ".step1-fixture-ref", "current\n")
     run_external_cmd(git + ["add", ".step1-fixture-ref"], project_dir)
     run_external_cmd(git + ["commit", "-m", "current"], project_dir)
+    create_remote_refs(
+        project_dir,
+        {
+            "origin/base": "base",
+            "origin/current": "current",
+        },
+    )
     write_text(project_dir / ".git" / "info" / "exclude", ".upgrade-report*\n")
 
 
@@ -4822,8 +4829,9 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true(
         current_provenance.get("requested_ref") == "current"
         and current_provenance.get("revision")
-        and current_provenance.get("ref_resolution_mode") == "exact",
-        "Step1 构建来源未保留按需坐标补全实际采用的 current ref/commit",
+        and current_provenance.get("ref_resolution_mode") == "live_remote"
+        and current_provenance.get("ref_source_status") == "remote_source_resolved",
+        "Step1 构建来源未保留按需坐标补全实际采用的远端 current ref/commit",
     )
     artifact_base_source_report = project_dir / ".upgrade-report-artifact-base-source"
     artifact_base_source_report.mkdir(parents=True, exist_ok=True)

@@ -3186,6 +3186,9 @@ def main():
                 base_meta['resolved_ref'] = base_runtime_meta.get('resolved_ref', '')
                 base_meta['revision'] = base_runtime_meta.get('resolved_commit', '')
                 base_meta['ref_resolution_mode'] = base_runtime_meta.get('ref_resolution_mode', '')
+                base_meta['ref_source_status'] = base_runtime_meta.get('ref_source_status', '')
+                base_meta['ref_remote'] = base_runtime_meta.get('ref_remote', '')
+                base_meta['ref_remote_ref'] = base_runtime_meta.get('ref_remote_ref', '')
             if curr_runtime_meta.get('list_command'):
                 curr_meta['list_command'] = curr_runtime_meta.get('list_command', '')
                 curr_meta['runtime_source_mode'] = curr_runtime_meta.get('source_mode', '')
@@ -3193,6 +3196,9 @@ def main():
                 curr_meta['resolved_ref'] = curr_runtime_meta.get('resolved_ref', '')
                 curr_meta['revision'] = curr_runtime_meta.get('resolved_commit', '')
                 curr_meta['ref_resolution_mode'] = curr_runtime_meta.get('ref_resolution_mode', '')
+                curr_meta['ref_source_status'] = curr_runtime_meta.get('ref_source_status', '')
+                curr_meta['ref_remote'] = curr_runtime_meta.get('ref_remote', '')
+                curr_meta['ref_remote_ref'] = curr_runtime_meta.get('ref_remote_ref', '')
         except (Step1RefResolutionRequiredError, SourceRevisionConfirmationRequiredError) as e:
             interaction = build_step1_ref_resolution_interaction(e)
             print(interaction["summary"], file=sys.stderr)
@@ -3527,6 +3533,9 @@ def main():
             'ref': str((meta or {}).get('resolved_ref') or branch or ''),
             'requested_ref': str((meta or {}).get('requested_ref') or branch or ''),
             'ref_resolution_mode': str((meta or {}).get('ref_resolution_mode') or ''),
+            'ref_source_status': str((meta or {}).get('ref_source_status') or ''),
+            'ref_remote': str((meta or {}).get('ref_remote') or ''),
+            'ref_remote_ref': str((meta or {}).get('ref_remote_ref') or ''),
             'revision': str((meta or {}).get('revision') or ''),
             'target_module': str(args.primary_module or ''),
             'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),
