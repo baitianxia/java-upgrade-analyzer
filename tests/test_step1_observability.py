@@ -145,6 +145,22 @@ class Step1ObservabilityTest(unittest.TestCase):
     def test_step1_timing_schema_records_peak_rss(self):
         self.assertIn("peak_rss_mb", step1_observability.TIMING_FIELDS)
 
+    def test_step1_timing_records_cumulative_cache_counters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = step1_observability.Step1Observer(
+                Path(tmp) / "evidence/dependencies/dep_changes.csv"
+            )
+            observer.increment_counter("cache_hits", 2)
+            observer.increment_counter("cache_misses", 1)
+            with observer.phase("artifact_parse"):
+                pass
+
+            with observer.timing_path.open(encoding="utf-8", newline="") as handle:
+                row = list(csv.DictReader(handle))[0]
+
+        self.assertEqual(row["cache_hits"], "2")
+        self.assertEqual(row["cache_misses"], "1")
+
     def test_maven_package_streams_and_records_side_specific_timing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

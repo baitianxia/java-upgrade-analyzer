@@ -36,6 +36,8 @@ STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
 NESTED_JAR_SPOOL_MAX_MEMORY_BYTES = 8 * 1024 * 1024
 NESTED_JAR_COPY_CHUNK_BYTES = 1024 * 1024
+PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION = 1
+PACKAGED_INVENTORY_CACHE_DIRNAME = 'step1_packaged_inventory'
 
 
 def _observed_phase(observer, phase, **kwargs):
@@ -1441,7 +1443,72 @@ def _stream_nested_jar_to_spool(outer_zip, entry_name):
         raise
 
 
-def _inspect_packaged_archive(artifact_path):
+def _canonical_packaged_inventory_bytes(rows):
+    return json.dumps(
+        rows, ensure_ascii=False, sort_keys=True, separators=(',', ':')
+    ).encode('utf-8')
+
+
+def _packaged_inventory_rows_are_valid(rows):
+    if not isinstance(rows, list):
+        return False
+    required = {
+        'entry_id', 'lib_entry', 'lib_name', 'coord', 'group_id',
+        'artifact_id', 'version', 'classifier', 'filename_stem',
+        'match_source', 'resolution_status', 'read_error', 'content_sha256',
+    }
+    return all(isinstance(row, dict) and required.issubset(row) for row in rows)
+
+
+def _load_packaged_inventory_cache(cache_path, artifact_sha256):
+    try:
+        payload = json.loads(cache_path.read_text(encoding='utf-8'))
+        rows = payload.get('rows')
+        if int(payload.get('schema_version') or 0) != PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION:
+            return None
+        if str(payload.get('artifact_sha256') or '') != artifact_sha256:
+            return None
+        if not _packaged_inventory_rows_are_valid(rows):
+            return None
+        rows_sha256 = hashlib.sha256(_canonical_packaged_inventory_bytes(rows)).hexdigest()
+        if str(payload.get('rows_sha256') or '') != rows_sha256:
+            return None
+        return rows
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_packaged_inventory_cache(cache_path, artifact_sha256, rows):
+    payload = {
+        'schema_version': PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION,
+        'artifact_sha256': artifact_sha256,
+        'rows': rows,
+        'rows_sha256': hashlib.sha256(
+            _canonical_packaged_inventory_bytes(rows)
+        ).hexdigest(),
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', dir=cache_path.parent,
+            prefix=f'.{cache_path.name}.', suffix='.tmp', delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, cache_path)
+    except (OSError, TypeError, ValueError):
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _scan_packaged_archive(artifact_path):
     deps = []
     informative_paths = 0
     try:
@@ -1487,6 +1554,39 @@ def _inspect_packaged_archive(artifact_path):
     if informative_paths == 0:
         return []
     return deps
+
+
+def _inspect_packaged_archive(artifact_path, cache_dir=None, cache_stats=None):
+    artifact_path = Path(artifact_path)
+    stats = cache_stats if isinstance(cache_stats, dict) else None
+    if cache_dir is None:
+        if stats is not None:
+            stats['misses'] = int(stats.get('misses') or 0) + 1
+        return _scan_packaged_archive(artifact_path)
+
+    artifact_sha256 = sha256_file(artifact_path)
+    cache_path = (
+        Path(cache_dir) / f'{artifact_sha256}.json'
+    )
+    cached_rows = _load_packaged_inventory_cache(cache_path, artifact_sha256)
+    if cached_rows is not None:
+        if stats is not None:
+            stats['hits'] = int(stats.get('hits') or 0) + 1
+        return cached_rows
+
+    if stats is not None:
+        stats['misses'] = int(stats.get('misses') or 0) + 1
+    rows = _scan_packaged_archive(artifact_path)
+    if _packaged_inventory_rows_are_valid(rows):
+        _write_packaged_inventory_cache(cache_path, artifact_sha256, rows)
+    return rows
+
+
+def _observer_packaged_inventory_cache_dir(observer):
+    cache_dir = getattr(observer, 'cache_dir', None) if observer is not None else None
+    if cache_dir is None:
+        return None
+    return Path(cache_dir) / PACKAGED_INVENTORY_CACHE_DIRNAME
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1962,7 +2062,15 @@ def collect_maven_deps_for_workspace(
             packaging_type = _detect_archive_packaging_type(artifact_path)
             if packaging_type not in ('boot_jar', 'war', 'packaged_jar'):
                 continue
-            packaged_raw = _inspect_packaged_archive(artifact_path)
+            cache_stats = {}
+            packaged_raw = _inspect_packaged_archive(
+                artifact_path,
+                cache_dir=_observer_packaged_inventory_cache_dir(observer),
+                cache_stats=cache_stats,
+            )
+            if observer is not None:
+                observer.increment_counter('cache_hits', cache_stats.get('hits', 0))
+                observer.increment_counter('cache_misses', cache_stats.get('misses', 0))
             if not packaged_raw:
                 continue
         if any(not (item.get('coord') or '').strip() for item in packaged_raw):
@@ -2051,7 +2159,15 @@ def collect_packaged_deps_from_artifact_path(
                 "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不再作为正式结果输出。"
             )
 
-        packaged_raw = _inspect_packaged_archive(artifact_file)
+        cache_stats = {}
+        packaged_raw = _inspect_packaged_archive(
+            artifact_file,
+            cache_dir=_observer_packaged_inventory_cache_dir(observer),
+            cache_stats=cache_stats,
+        )
+        if observer is not None:
+            observer.increment_counter('cache_hits', cache_stats.get('hits', 0))
+            observer.increment_counter('cache_misses', cache_stats.get('misses', 0))
         if not packaged_raw:
             raise RuntimeError(
                 f"用户提供的编译产物中未发现可比较的打包依赖：{artifact_file}。"

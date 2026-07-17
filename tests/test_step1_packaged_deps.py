@@ -128,6 +128,72 @@ class Step1PackagedDepsTest(unittest.TestCase):
             s1_dep_diff.hashlib.sha256(nested_bytes).hexdigest(),
         )
 
+    def test_packaged_archive_inventory_cache_reuses_only_valid_content_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "app.jar"
+            cache_dir = root / "cache"
+            nested_bytes = self._nested_jar_bytes([
+                (
+                    "META-INF/maven/org.example/demo-lib/pom.properties",
+                    "groupId=org.example\nartifactId=demo-lib\nversion=1.2.3\n",
+                )
+            ])
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                outer.writestr("BOOT-INF/lib/demo-lib-1.2.3.jar", nested_bytes)
+
+            with patch.object(
+                s1_dep_diff,
+                "_stream_nested_jar_to_spool",
+                wraps=s1_dep_diff._stream_nested_jar_to_spool,
+            ) as stream:
+                fresh = s1_dep_diff._inspect_packaged_archive(
+                    artifact_path, cache_dir=cache_dir
+                )
+                cached = s1_dep_diff._inspect_packaged_archive(
+                    artifact_path, cache_dir=cache_dir
+                )
+
+                cache_file = next(cache_dir.glob("*.json"))
+                cache_file.write_text("{broken", encoding="utf-8")
+                recovered = s1_dep_diff._inspect_packaged_archive(
+                    artifact_path, cache_dir=cache_dir
+                )
+
+        self.assertEqual(cached, fresh)
+        self.assertEqual(recovered, fresh)
+        self.assertEqual(stream.call_count, 2)
+
+    def test_packaged_archive_inventory_cache_invalidates_when_artifact_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "app.jar"
+            cache_dir = root / "cache"
+
+            def write_artifact(version):
+                nested = self._nested_jar_bytes([
+                    (
+                        "META-INF/maven/org.example/demo-lib/pom.properties",
+                        f"groupId=org.example\nartifactId=demo-lib\nversion={version}\n",
+                    )
+                ])
+                with zipfile.ZipFile(artifact_path, "w") as outer:
+                    outer.writestr(f"BOOT-INF/lib/demo-lib-{version}.jar", nested)
+
+            write_artifact("1.0.0")
+            first = s1_dep_diff._inspect_packaged_archive(
+                artifact_path, cache_dir=cache_dir
+            )
+            write_artifact("2.0.0")
+            second = s1_dep_diff._inspect_packaged_archive(
+                artifact_path, cache_dir=cache_dir
+            )
+            cache_file_count = len(list(cache_dir.glob("*.json")))
+
+        self.assertEqual(first[0]["version"], "1.0.0")
+        self.assertEqual(second[0]["version"], "2.0.0")
+        self.assertEqual(cache_file_count, 2)
+
     def test_embedded_pom_preserves_filename_classifier_as_artifact_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_path = Path(tmp) / "app.jar"

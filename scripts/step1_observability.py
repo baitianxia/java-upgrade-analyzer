@@ -15,6 +15,7 @@ from pathlib import Path
 from pipeline_constants import (
     EVIDENCE_DEPENDENCIES_DIRNAME,
     EVIDENCE_DIRNAME,
+    RUNTIME_CACHE_DIRNAME,
     RUNTIME_DIRNAME,
     RUNTIME_OBSERVABILITY_DIRNAME,
 )
@@ -23,7 +24,7 @@ from progress_logging import emit_progress
 
 TIMING_FIELDS = (
     "side", "phase", "item", "started_at", "ended_at", "elapsed_sec",
-    "peak_rss_mb", "status", "command", "message",
+    "peak_rss_mb", "cache_hits", "cache_misses", "status", "command", "message",
 )
 
 
@@ -73,6 +74,9 @@ class Step1Observer:
         observability_dir = (
             report_dir / RUNTIME_DIRNAME / RUNTIME_OBSERVABILITY_DIRNAME
         )
+        self.report_dir = report_dir
+        self.cache_dir = report_dir / RUNTIME_DIRNAME / RUNTIME_CACHE_DIRNAME
+        self._counters = {"cache_hits": 0, "cache_misses": 0}
         observability_dir.mkdir(parents=True, exist_ok=True)
         self.progress_path = observability_dir / "step1_progress.jsonl"
         self.timing_path = observability_dir / "step1_timing.csv"
@@ -85,6 +89,11 @@ class Step1Observer:
         self.progress_path.write_text("", encoding="utf-8")
         with self.timing_path.open("w", encoding="utf-8", newline="") as handle:
             csv.DictWriter(handle, fieldnames=TIMING_FIELDS).writeheader()
+
+    def increment_counter(self, name, amount=1):
+        if name not in self._counters:
+            raise KeyError(f"unsupported Step1 counter: {name}")
+        self._counters[name] += int(amount or 0)
 
     def event(
         self,
@@ -147,6 +156,8 @@ class Step1Observer:
                 "ended_at": ended_at,
                 "elapsed_sec": f"{elapsed:.3f}",
                 "peak_rss_mb": f"{peak_rss_mb():.3f}",
+                "cache_hits": str(self._counters["cache_hits"]),
+                "cache_misses": str(self._counters["cache_misses"]),
                 "status": str(status or ""),
                 "command": token.command,
                 "message": final_message,
