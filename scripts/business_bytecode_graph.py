@@ -861,7 +861,30 @@ def _logical_application_class_entry(entry):
     return entry
 
 
-def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_catalog=None, cache_path=None):
+def _iter_business_class_bytes(business_jar, fact_store=None):
+    if fact_store is not None:
+        for entry, data in fact_store.iter_physical_class_bytes('__business__'):
+            if (
+                entry.startswith('META-INF/')
+                or entry.endswith(('module-info.class', 'package-info.class'))
+            ):
+                continue
+            yield entry, data
+        return
+    with zipfile.ZipFile(business_jar) as archive:
+        for entry in sorted(
+            name for name in archive.namelist()
+            if name.endswith('.class')
+            and not name.startswith('META-INF/')
+            and not name.endswith(('module-info.class', 'package-info.class'))
+        ):
+            yield entry, archive.read(entry)
+
+
+def collect_business_bytecode_edges(
+    source_roots, max_classes=10000, artifact_catalog=None, cache_path=None,
+    fact_store=None,
+):
     evidence = []
     failures = []
     scanned = 0
@@ -951,64 +974,78 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
             }
     if business_jar and os.path.isfile(business_jar):
         try:
-            with zipfile.ZipFile(business_jar) as zf:
-                class_entries = sorted(
-                    name for name in zf.namelist()
-                    if name.endswith('.class')
-                    and not name.startswith('META-INF/')
-                    and not name.endswith(('module-info.class', 'package-info.class'))
-                )
-                for entry in class_entries:
-                    if scanned >= max_classes:
-                        failures.append('class_scan_limit_reached')
-                        break
-                    logical_entry = _logical_application_class_entry(entry)
-                    class_name = logical_entry[:-6].replace('/', '.')
-                    data = zf.read(entry)
-                    scanned += 1
-                    parsed_edges = parse_classfile_calls(data, class_name)
-                    if parsed_edges is None:
-                        parser_kind = 'javap'
-                        javap_fallback_classes += 1
+            for entry, data in _iter_business_class_bytes(business_jar, fact_store):
+                if scanned >= max_classes:
+                    failures.append('class_scan_limit_reached')
+                    break
+                logical_entry = _logical_application_class_entry(entry)
+                class_name = logical_entry[:-6].replace('/', '.')
+                scanned += 1
+                parsed_edges = parse_classfile_calls(data, class_name)
+                if parsed_edges is None:
+                    parser_kind = 'javap'
+                    javap_fallback_classes += 1
+
+                    def produce_javap(identity=None, _location=None, _profile=None):
+                        artifact_path = identity.path if identity is not None else business_jar
                         if logical_entry == entry:
-                            javap_target = ['-classpath', business_jar, class_name]
-                            temporary_class = None
-                        else:
-                            temporary_class = tempfile.NamedTemporaryFile(
-                                suffix='.class', delete=False
+                            return run_cmd(
+                                [
+                                    'javap', '-classpath', artifact_path,
+                                    '-c', '-s', '-p', '-v', class_name,
+                                ],
+                                timeout=30,
                             )
-                            try:
-                                temporary_class.write(data)
-                                temporary_class.close()
-                                javap_target = [temporary_class.name]
-                            except Exception:
-                                temporary_class.close()
-                                os.unlink(temporary_class.name)
-                                raise
+                        temporary_class = tempfile.NamedTemporaryFile(
+                            suffix='.class', delete=False
+                        )
                         try:
-                            stdout, stderr, rc = run_cmd(
-                                ['javap', '-c', '-s', '-p', '-v', *javap_target],
+                            temporary_class.write(data)
+                            temporary_class.close()
+                            return run_cmd(
+                                [
+                                    'javap', '-c', '-s', '-p', '-v',
+                                    temporary_class.name,
+                                ],
                                 timeout=30,
                             )
                         finally:
-                            if temporary_class is not None:
-                                try:
-                                    os.unlink(temporary_class.name)
-                                except OSError:
-                                    pass
-                        if rc != 0:
-                            failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
-                            continue
-                        parsed_edges = parse_javap_calls(stdout, class_name)
+                            try:
+                                os.unlink(temporary_class.name)
+                            except OSError:
+                                pass
+
+                    if fact_store is None:
+                        stdout, stderr, rc = produce_javap()
                     else:
-                        parser_kind = 'classfile'
-                        fast_path_classes += 1
-                    for item in parsed_edges:
-                        item['class_file'] = f'{business_jar}!/{entry}'
-                        item['artifact_sha256'] = actual_business_sha256
-                        item['evidence_source'] = 'current_final_artifact'
-                        item['parser'] = parser_kind
-                        evidence.append(item)
+                        from step5_artifact_fact_store import ClassLocation
+                        location = ClassLocation(
+                            logical_name=logical_entry,
+                            binary_name=class_name,
+                            physical_entry=entry,
+                            multi_release_version='base',
+                        )
+                        outcome = fact_store.javap_fact(
+                            '__business__', location,
+                            'verbose-code-private-signatures-v1', produce_javap,
+                        )
+                        if outcome.status == 'complete':
+                            stdout, stderr, rc = outcome.value
+                        else:
+                            stdout, stderr, rc = '', outcome.reason, 1
+                    if rc != 0:
+                        failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
+                        continue
+                    parsed_edges = parse_javap_calls(stdout, class_name)
+                else:
+                    parser_kind = 'classfile'
+                    fast_path_classes += 1
+                for item in parsed_edges:
+                    item['class_file'] = f'{business_jar}!/{entry}'
+                    item['artifact_sha256'] = actual_business_sha256
+                    item['evidence_source'] = 'current_final_artifact'
+                    item['parser'] = parser_kind
+                    evidence.append(item)
             metrics = {
                 'classes_scanned': scanned,
                 'edges_found': len(evidence),
@@ -1207,12 +1244,15 @@ def _business_bytecode_batch(
     )
 
 
-def collect_business_bytecode_batch(source_roots, artifact_catalog, cache_path):
+def collect_business_bytecode_batch(
+    source_roots, artifact_catalog, cache_path, *, fact_store=None,
+):
     """Collect immutable current-final-artifact bytecode evidence without a graph."""
     evidence, metrics = collect_business_bytecode_edges(
         source_roots,
         artifact_catalog=artifact_catalog,
         cache_path=cache_path,
+        fact_store=fact_store,
     )
     return _business_bytecode_batch(
         evidence,

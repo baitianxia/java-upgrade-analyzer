@@ -2,6 +2,8 @@ import csv
 import hashlib
 import json
 import sys
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -18,6 +20,7 @@ from real_project_regression import (  # noqa: E402
     step5_result_contract,
 )
 from step5_artifact_fact_store import FactOutcome, Step5ArtifactFactStore  # noqa: E402
+from business_bytecode_graph import collect_business_bytecode_batch  # noqa: E402
 
 
 class Step5ColdRunContractTest(unittest.TestCase):
@@ -292,6 +295,86 @@ class SingleFlightFactTest(unittest.TestCase):
         self.assertEqual(second.value, b"class-bytes")
         self.assertIsNot(first, second)
         self.assertEqual(store.metrics()["class_bytes_reads"], 2)
+
+
+class BusinessBytecodeFactParityTest(unittest.TestCase):
+    def _compiled_business_catalog(self, tmp):
+        if not shutil.which("javac"):
+            self.skipTest("javac is required")
+        root = Path(tmp)
+        source = root / "src" / "com" / "example" / "Business.java"
+        classes = root / "classes"
+        source.parent.mkdir(parents=True)
+        classes.mkdir()
+        source.write_text(
+            """
+            package com.example;
+            import java.util.function.Supplier;
+            public class Business {
+                public String call(String value) {
+                    Supplier<String> supplier = value::trim;
+                    return supplier.get();
+                }
+                public Class<?> reflective(String name) throws Exception {
+                    return Class.forName(name);
+                }
+                public int switched(int value) {
+                    switch (value) { case 1: return call(" a ").length(); default: return 0; }
+                }
+            }
+            """,
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            ["javac", "-d", str(classes), str(source)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        jar_path = root / "business.jar"
+        with zipfile.ZipFile(jar_path, "w") as archive:
+            for class_file in sorted(classes.rglob("*.class")):
+                archive.write(class_file, class_file.relative_to(classes).as_posix())
+        digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+        entry = {
+            "coord": "__business__", "jar_path": str(jar_path),
+            "sha256": digest, "artifact_entry": "<business-classes>",
+        }
+        return {"target_jdk": "17", "entries": [entry], "by_coord": {"__business__": entry}}
+
+    def test_shared_business_collector_is_exactly_equal_to_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = self._compiled_business_catalog(tmp)
+            legacy = collect_business_bytecode_batch(
+                [], catalog, str(Path(tmp) / "legacy.jsonl"),
+            )
+            shared = collect_business_bytecode_batch(
+                [], catalog, str(Path(tmp) / "shared.jsonl"),
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
+            )
+
+        self.assertEqual(shared, legacy)
+
+    def test_shared_business_collector_preserves_malformed_class_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "business.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/example/Broken.class", b"broken")
+            digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            entry = {
+                "coord": "__business__", "jar_path": str(jar_path),
+                "sha256": digest, "artifact_entry": "<business-classes>",
+            }
+            catalog = {"target_jdk": "17", "entries": [entry], "by_coord": {"__business__": entry}}
+
+            legacy = collect_business_bytecode_batch([], catalog, None)
+            shared = collect_business_bytecode_batch(
+                [], catalog, None,
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
+            )
+
+        self.assertEqual(shared, legacy)
+        self.assertTrue(shared.failures)
 
 if __name__ == "__main__":
     unittest.main()

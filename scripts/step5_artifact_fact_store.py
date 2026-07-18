@@ -34,6 +34,7 @@ class ArtifactInventory:
     identity: ArtifactIdentity
     classes: tuple[ClassLocation, ...]
     resources: tuple[str, ...]
+    physical_classes: tuple[str, ...] = ()
     failure: str = ""
 
 
@@ -177,6 +178,7 @@ class Step5ArtifactFactStore:
                 identity=identity,
                 classes=(),
                 resources=(),
+                physical_classes=(),
                 failure=f"{type(exc).__name__}: {exc}",
             )
         with self._lock:
@@ -208,6 +210,34 @@ class Step5ArtifactFactStore:
             return FactOutcome("complete", content, "", "zipfile")
         except Exception as exc:
             return FactOutcome("failed", None, f"{type(exc).__name__}: {exc}", "zipfile")
+
+    def iter_class_bytes(self, coord: str):
+        """Yield effective classes in inventory order from one ZIP open."""
+        identity = self._identity(coord)
+        inventory = self.inventory(coord)
+        if inventory.failure:
+            raise ValueError(inventory.failure)
+        with zipfile.ZipFile(identity.path) as archive:
+            for location in inventory.classes:
+                content = archive.read(location.physical_entry)
+                with self._lock:
+                    self._metrics["class_bytes_reads"] += 1
+                    self._metrics["class_bytes_read"] += len(content)
+                yield location, content
+
+    def iter_physical_class_bytes(self, coord: str):
+        """Yield all physical class entries in stable name order from one ZIP open."""
+        identity = self._identity(coord)
+        inventory = self.inventory(coord)
+        if inventory.failure:
+            raise ValueError(inventory.failure)
+        with zipfile.ZipFile(identity.path) as archive:
+            for entry in inventory.physical_classes:
+                content = archive.read(entry)
+                with self._lock:
+                    self._metrics["class_bytes_reads"] += 1
+                    self._metrics["class_bytes_read"] += len(content)
+                yield entry, content
 
     def _single_flight(self, key, producer, *, parser: str) -> FactOutcome:
         while True:
@@ -303,10 +333,11 @@ class Step5ArtifactFactStore:
                 names, identity.target_jdk, multi_release_enabled=multi_release,
             )
             resources = tuple(sorted(name for name in names if not name.endswith(".class")))
+            physical_classes = tuple(sorted(name for name in names if name.endswith(".class")))
         after = _sha256_file(path)
         if after != before:
             raise ValueError("artifact_changed_during_inventory")
-        return ArtifactInventory(identity, classes, resources)
+        return ArtifactInventory(identity, classes, resources, physical_classes)
 
 
 __all__ = [

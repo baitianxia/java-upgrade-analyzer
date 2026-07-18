@@ -70,6 +70,7 @@ from framework_adapters import run_framework_adapters, serialize_framework_batch
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import CoverageRecord, thaw_evidence_value
 from step5_memory_observer import record_step5_memory
+from step5_artifact_fact_store import Step5ArtifactFactStore
 from signature_utils import normalize_signature_for_identity, signatures_match_identity
 from analysis_contract import build_project_scope, discover_maven_modules, sha256_file
 from artifact_safety import inspect_archive
@@ -1010,6 +1011,9 @@ def _step5_integrated_main_impl(args):
         report_dir,
         business_source_dirs=business_source_dirs,
     )
+    artifact_fact_store = Step5ArtifactFactStore.from_catalog(
+        runtime_dependency_catalog
+    )
     allowed_business_classes = runtime_business_class_index(runtime_dependency_catalog)
     dependency_source_mappings, skipped_dependency_source_mappings = (
         filter_dependency_source_mappings_for_runtime(
@@ -1329,6 +1333,7 @@ def _step5_integrated_main_impl(args):
         business_roots,
         runtime_dependency_catalog,
         str(_runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE),
+        fact_store=artifact_fact_store,
     )
     bytecode_stats = dict(bytecode_batch.metrics)
     graph.require_current_final_artifact_business_edges = (
