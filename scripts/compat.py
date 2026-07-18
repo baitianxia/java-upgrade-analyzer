@@ -30,18 +30,19 @@ IS_WINDOWS = sys.platform == 'win32'
 def setup_utf8_io():
     """
     在脚本入口调用，确保 stdout/stderr 使用 UTF-8。
-    Windows PowerShell / CMD 默认用 GBK，会导致 print() 报错或乱码。
+    Windows PowerShell / CMD 以及被继承的单字节编码会导致 print() 报错或乱码。
     """
-    if IS_WINDOWS:
-        # 重新包装 stdout/stderr 为 UTF-8
-        if hasattr(sys.stdout, 'buffer'):
-            sys.stdout = io.TextIOWrapper(
-                sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True
-            )
-        if hasattr(sys.stderr, 'buffer'):
-            sys.stderr = io.TextIOWrapper(
-                sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True
-            )
+    for name in ('stdout', 'stderr'):
+        stream = getattr(sys, name)
+        encoding = (getattr(stream, 'encoding', '') or '').replace('-', '').lower()
+        if encoding == 'utf8':
+            continue
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+        elif hasattr(stream, 'buffer'):
+            setattr(sys, name, io.TextIOWrapper(
+                stream.buffer, encoding='utf-8', errors='replace', line_buffering=True
+            ))
 
 
 # ── 检测子进程输出的实际编码 ──────────────────────────────────────

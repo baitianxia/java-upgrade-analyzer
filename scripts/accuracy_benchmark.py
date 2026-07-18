@@ -15,8 +15,12 @@ import subprocess
 import sys
 import time
 
+from compat import setup_utf8_io
+
 
 ROOT = Path(__file__).resolve().parents[1]
+
+setup_utf8_io()
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -101,6 +102,26 @@ class AccuracyBenchmarkTest(unittest.TestCase):
             [category["name"] for category in payload["categories"]],
             ["alerts_ledger"],
         )
+
+    def test_cli_emits_utf8_json_when_inherited_console_encoding_cannot_encode_chinese(self):
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "cp1252"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "accuracy_benchmark.py"),
+                "--category",
+                "alerts_ledger",
+                "--dry-run",
+            ],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        payload = json.loads(completed.stdout.decode("utf-8"))
+        self.assertEqual(payload["profile"], "category:alerts_ledger")
 
 
 if __name__ == "__main__":
