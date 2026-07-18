@@ -67,6 +67,17 @@ class SmokeCoreTest(SmokeRegressionTestCase):
             "missing-s3_dependency_classfile-s3_dependency_compat",
         )
 
+    def test_successful_child_command_advances_checkpoint_to_passed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            smoke_regression.run_script(
+                "gate.py", ["--step", "scan", "--report-dir", tmp]
+            )
+
+        self.assertEqual(
+            smoke_regression._SMOKE_CHECKPOINT,
+            "script-gate-scan-passed",
+        )
+
     def test_failure_writes_machine_readable_last_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "smoke-result.json"

@@ -137,7 +137,8 @@ def run_script(script_name, args, cwd=None, env=None, allow_awaiting=False):
         allow_awaiting: 是否允许 EXIT_AWAITING_USER。只有在明确知道是 checkpoint 场景时才设为 True。
                         设为 False 时，任何 await 都视为测试失败，暴露调度状态机问题。
     """
-    mark_smoke_checkpoint(smoke_script_checkpoint(script_name, args))
+    command_checkpoint = smoke_script_checkpoint(script_name, args)
+    mark_smoke_checkpoint(command_checkpoint)
     cmd = [sys.executable, str(SCRIPT_DIR / script_name), *(args or [])]
     merged_env = dict(env or {})
     stdout, stderr, rc = compat_run_cmd(cmd, cwd=str(cwd) if cwd else None, env=merged_env)
@@ -159,13 +160,16 @@ def run_script(script_name, args, cwd=None, env=None, allow_awaiting=False):
     if rc not in allowed_rcs:
         if Path(script_name).stem == "gate":
             mark_smoke_checkpoint(
-                f"{smoke_script_checkpoint(script_name, args)}-{gate_failure_reason(stderr)}"
+                f"{command_checkpoint}-{gate_failure_reason(stderr)}"
             )
         raise RuntimeError(
             f"命令失败: {' '.join(cmd)}\n"
             f"stdout:\n{stdout}\n"
             f"stderr:\n{stderr}"
         )
+    mark_smoke_checkpoint(
+        f"{command_checkpoint}-{'passed' if rc == 0 else 'awaiting'}"
+    )
     return stdout, stderr
 
 
