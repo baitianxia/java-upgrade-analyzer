@@ -70,6 +70,11 @@ class Step5ResultFingerprintTest(unittest.TestCase):
                 canonical_step5_result_fingerprint(second_root),
             )
 
+    def test_rejects_directory_without_step5_result_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(FileNotFoundError):
+                canonical_step5_result_fingerprint(Path(tmp))
+
 
 class ReverseEdgeOverlayTest(unittest.TestCase):
     def test_reuses_untouched_base_lists_and_combines_only_overlay_keys(self):

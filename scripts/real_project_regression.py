@@ -156,6 +156,10 @@ def canonical_step5_result_fingerprint(report_dir):
             json.loads(query_index.read_text(encoding="utf-8-sig")),
             report_roots,
         )
+    if not payload:
+        raise FileNotFoundError(
+            f"no Step5 summary, alerts or query index found under {report_root}"
+        )
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
