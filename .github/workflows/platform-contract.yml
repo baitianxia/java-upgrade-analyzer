@@ -60,12 +60,25 @@ jobs:
           --report-root "${{ runner.temp }}/jua-platform-contract"
           --json-out "${{ runner.temp }}/platform-contract.json"
 
-      - name: Diagnose Failed Accuracy Benchmark
-        id: accuracy_diagnostic
-        if: ${{ failure() && steps.quality_gate.outcome == 'failure' }}
-        run: >-
-          python scripts/accuracy_benchmark.py --profile core --continue-on-failure
-          --json-out "${{ runner.temp }}/accuracy-benchmark-diagnostic.json"
+      - name: Diagnose jdeps floor
+        id: diag_jdeps_floor
+        if: ${{ always() && runner.os == 'Windows' && steps.quality_gate.outcome == 'failure' }}
+        run: python scripts/accuracy_benchmark.py --category jdeps_floor
+
+      - name: Diagnose runtime bytecode reachability
+        id: diag_runtime_bytecode
+        if: ${{ always() && runner.os == 'Windows' && steps.quality_gate.outcome == 'failure' }}
+        run: python scripts/accuracy_benchmark.py --category runtime_bytecode_reachability
+
+      - name: Diagnose indirect usage
+        id: diag_indirect_usage
+        if: ${{ always() && runner.os == 'Windows' && steps.quality_gate.outcome == 'failure' }}
+        run: python scripts/accuracy_benchmark.py --category indirect_usage
+
+      - name: Diagnose alerts ledger
+        id: diag_alerts_ledger
+        if: ${{ always() && runner.os == 'Windows' && steps.quality_gate.outcome == 'failure' }}
+        run: python scripts/accuracy_benchmark.py --category alerts_ledger
 
       - name: Record Platform Cell Result
         if: always()
@@ -76,13 +89,16 @@ jobs:
           MATRIX_JAVA: ${{ matrix.java }}
           CELL_RESULT_PATH: ${{ runner.temp }}/platform-cell-${{ matrix.os }}-jdk${{ matrix.java }}.txt
           QUALITY_GATE_JSON: ${{ runner.temp }}/platform-contract.json
-          ACCURACY_BENCHMARK_JSON: ${{ runner.temp }}/accuracy-benchmark-diagnostic.json
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           SETUP_PYTHON_OUTCOME: ${{ steps.setup_python.outcome }}
           SETUP_JAVA_OUTCOME: ${{ steps.setup_java.outcome }}
           VERIFY_MAVEN_OUTCOME: ${{ steps.verify_maven.outcome }}
           INSTALL_DEPENDENCIES_OUTCOME: ${{ steps.install_dependencies.outcome }}
           QUALITY_GATE_OUTCOME: ${{ steps.quality_gate.outcome }}
+          JDEPS_FLOOR_OUTCOME: ${{ steps.diag_jdeps_floor.outcome }}
+          RUNTIME_BYTECODE_OUTCOME: ${{ steps.diag_runtime_bytecode.outcome }}
+          INDIRECT_USAGE_OUTCOME: ${{ steps.diag_indirect_usage.outcome }}
+          ALERTS_LEDGER_OUTCOME: ${{ steps.diag_alerts_ledger.outcome }}
         run: |
           printf '%s|%s|%s\n' "${CELL_STATUS}" "${MATRIX_OS}" "${MATRIX_JAVA}" > "${CELL_RESULT_PATH}"
           printf 'step|checkout|%s\n' "${CHECKOUT_OUTCOME}" >> "${CELL_RESULT_PATH}"
@@ -91,15 +107,20 @@ jobs:
           printf 'step|verify-maven|%s\n' "${VERIFY_MAVEN_OUTCOME}" >> "${CELL_RESULT_PATH}"
           printf 'step|install-dependencies|%s\n' "${INSTALL_DEPENDENCIES_OUTCOME}" >> "${CELL_RESULT_PATH}"
           printf 'step|quality-gate|%s\n' "${QUALITY_GATE_OUTCOME}" >> "${CELL_RESULT_PATH}"
-          python - "${QUALITY_GATE_JSON}" "${ACCURACY_BENCHMARK_JSON}" "${CELL_RESULT_PATH}" <<'PY'
+          if [[ "${JDEPS_FLOOR_OUTCOME}" != "skipped" ]]; then
+            printf 'benchmark|jdeps_floor|%s\n' "${JDEPS_FLOOR_OUTCOME}" >> "${CELL_RESULT_PATH}"
+            printf 'benchmark|runtime_bytecode_reachability|%s\n' "${RUNTIME_BYTECODE_OUTCOME}" >> "${CELL_RESULT_PATH}"
+            printf 'benchmark|indirect_usage|%s\n' "${INDIRECT_USAGE_OUTCOME}" >> "${CELL_RESULT_PATH}"
+            printf 'benchmark|alerts_ledger|%s\n' "${ALERTS_LEDGER_OUTCOME}" >> "${CELL_RESULT_PATH}"
+          fi
+          python - "${QUALITY_GATE_JSON}" "${CELL_RESULT_PATH}" <<'PY'
           import json
           import re
           import sys
           from pathlib import Path
 
           source = Path(sys.argv[1])
-          benchmark_source = Path(sys.argv[2])
-          destination = Path(sys.argv[3])
+          destination = Path(sys.argv[2])
           with destination.open("a", encoding="utf-8", newline="\n") as handle:
               if not source.is_file():
                   handle.write("gate|quality-gate-report|missing\n")
@@ -112,15 +133,6 @@ jobs:
                       name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(result.get("name") or "unknown"))
                       status = re.sub(r"[^A-Za-z0-9._-]+", "-", status)
                       handle.write(f"gate|{name}|{status}\n")
-              if benchmark_source.is_file():
-                  payload = json.loads(benchmark_source.read_text(encoding="utf-8"))
-                  for result in payload.get("results") or []:
-                      status = str(result.get("status") or "missing")
-                      if status == "passed":
-                          continue
-                      name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(result.get("name") or "unknown"))
-                      status = re.sub(r"[^A-Za-z0-9._-]+", "-", status)
-                      handle.write(f"benchmark|{name}|{status}\n")
           PY
 
       - name: Upload Platform Evidence

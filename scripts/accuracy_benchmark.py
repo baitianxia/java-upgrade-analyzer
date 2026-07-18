@@ -243,6 +243,12 @@ def _plan_payload(profile, categories, dry_run):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run explicit java-upgrade-analyzer accuracy benchmarks")
     parser.add_argument("--profile", choices=sorted(PROFILE_CATEGORIES), default="core")
+    parser.add_argument(
+        "--category",
+        choices=sorted(_category_by_name()),
+        default="",
+        help="Run one benchmark category for platform diagnostics",
+    )
     parser.add_argument("--python", default=sys.executable, help="Python executable used by unittest")
     parser.add_argument("--dry-run", action="store_true", help="Print benchmark matrix without executing tests")
     parser.add_argument("--list", action="store_true", help="Alias for --dry-run")
@@ -251,10 +257,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     validate_matrix()
-    categories = build_plan(args.profile)
+    categories = (
+        [_category_by_name()[args.category]]
+        if args.category else build_plan(args.profile)
+    )
+    selection = f"category:{args.category}" if args.category else args.profile
 
     if args.dry_run or args.list:
-        payload = _plan_payload(args.profile, categories, dry_run=True)
+        payload = _plan_payload(selection, categories, dry_run=True)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         _write_json(args.json_out, payload)
         return 0
@@ -271,7 +281,7 @@ def main(argv=None):
                 break
 
     payload = {
-        "profile": args.profile,
+        "profile": selection,
         "status": overall,
         "elapsed_sec": round(time.perf_counter() - started, 3),
         "results": [asdict(result) for result in results],

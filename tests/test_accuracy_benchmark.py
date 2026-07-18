@@ -81,6 +81,27 @@ class AccuracyBenchmarkTest(unittest.TestCase):
         self.assertEqual(payload["profile"], "step5")
         self.assertGreater(len(payload["categories"]), 4)
 
+    def test_single_category_mode_is_available_for_platform_diagnostics(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "accuracy_benchmark.py"),
+                "--category",
+                "alerts_ledger",
+                "--dry-run",
+            ],
+            cwd=str(ROOT),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(completed.stdout)
+
+        self.assertEqual(
+            [category["name"] for category in payload["categories"]],
+            ["alerts_ledger"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
