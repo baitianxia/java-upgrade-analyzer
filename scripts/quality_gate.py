@@ -134,12 +134,16 @@ def _unittest_discover_task(python_exe):
     )
 
 
-def _smoke_task(python_exe, group):
+def _smoke_task(python_exe, group, json_out=""):
+    command = [python_exe, "scripts/smoke_regression.py", "--group", group]
+    if json_out:
+        command.extend(["--json-out", json_out])
     return GateTask(
         name=f"smoke_{group}",
-        command=[python_exe, "scripts/smoke_regression.py", "--group", group],
+        command=command,
         purpose=f"主流程 smoke 回归：{group}",
         heavy=group == "all",
+        output_paths=(json_out,) if json_out else (),
     )
 
 
@@ -367,7 +371,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
             CORE_SEMANTIC_TESTS,
             "核心准确性契约：jdeps 对照、多依赖链路、字段链路",
         ))
-        tasks.append(_smoke_task(python_exe, "core"))
+        tasks.append(_smoke_task(python_exe, "core", str(audit_root / "smoke_core.json")))
     elif profile == "step5":
         tasks.append(_accuracy_benchmark_task(
             python_exe,
@@ -381,8 +385,8 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
             "Step5 语义回归：owner/signature/字节码/反射/间接引用",
             heavy=True,
         ))
-        tasks.append(_smoke_task(python_exe, "core"))
-        tasks.append(_smoke_task(python_exe, "step5"))
+        tasks.append(_smoke_task(python_exe, "core", str(audit_root / "smoke_core.json")))
+        tasks.append(_smoke_task(python_exe, "step5", str(audit_root / "smoke_step5.json")))
         tasks.append(_user_scenario_task(python_exe))
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root, real_json))
@@ -405,7 +409,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
             str(audit_root / "accuracy_benchmark_all.json"),
         ))
         tasks.append(_unittest_discover_task(python_exe))
-        tasks.append(_smoke_task(python_exe, "all"))
+        tasks.append(_smoke_task(python_exe, "all", str(audit_root / "smoke_all.json")))
         tasks.append(_user_scenario_task(python_exe))
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root, real_json))

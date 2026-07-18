@@ -54,6 +54,15 @@ class QualityGateTest(unittest.TestCase):
             )
             self.assertEqual(task.output_paths, (task.command[-1],))
 
+    def test_quick_smoke_writes_structured_failure_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = quality_gate.build_plan("quick", report_root=tmp, skip_real=True)
+            task = next(item for item in tasks if item.name == "smoke_core")
+
+            self.assertIn("--json-out", task.command)
+            self.assertEqual(task.command[-1], str(Path(tmp) / "smoke_core.json"))
+            self.assertEqual(task.output_paths, (task.command[-1],))
+
     def test_release_profile_has_explicit_execution_fault_gate(self):
         tasks = quality_gate.build_plan("release", skip_real=True)
         task = next(item for item in tasks if item.name == "execution_faults")

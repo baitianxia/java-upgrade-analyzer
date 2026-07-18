@@ -1,3 +1,7 @@
+import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -10,6 +14,32 @@ from scripts import smoke_regression
 
 
 class SmokeCoreTest(SmokeRegressionTestCase):
+    def test_failure_writes_machine_readable_last_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "smoke-result.json"
+            env = dict(os.environ)
+            env["PATH"] = ""
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(smoke_regression.SCRIPT_DIR / "smoke_regression.py"),
+                    "--group",
+                    "core",
+                    "--json-out",
+                    str(output),
+                ],
+                cwd=str(smoke_regression.SCRIPT_DIR.parent),
+                env=env,
+                capture_output=True,
+            )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(payload["status"], "failed")
+        self.assertRegex(payload["checkpoint"], r"^[a-z0-9._-]+$")
+        self.assertTrue(payload["checkpoint"].startswith("external-git"))
+
     def test_fixture_exposes_windows_maven_launcher_and_explicit_local_repository(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = smoke_regression.create_smoke_workspace(Path(tmp))

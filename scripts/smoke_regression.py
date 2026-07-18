@@ -62,6 +62,33 @@ from s4_contract import ALL_CHANGED_APIS_FIELDS
 SCRIPT_DIR = Path(__file__).resolve().parent
 EXIT_AWAITING_USER = 4
 SMOKE_GROUPS = ("all", "core", "step5", "orchestrator")
+_SMOKE_CHECKPOINT = "startup"
+
+
+def mark_smoke_checkpoint(value):
+    global _SMOKE_CHECKPOINT
+    normalized = "".join(
+        char.lower() if char.isalnum() or char in "._-" else "-"
+        for char in str(value or "unknown")
+    ).strip("-")
+    _SMOKE_CHECKPOINT = normalized or "unknown"
+
+
+def write_smoke_result(path, status, error=None):
+    if not path:
+        return
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": status,
+        "checkpoint": _SMOKE_CHECKPOINT,
+        "error_type": type(error).__name__ if error is not None else "",
+        "error": str(error) if error is not None else "",
+    }
+    output.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 @dataclass(frozen=True)
@@ -89,6 +116,7 @@ def run_script(script_name, args, cwd=None, env=None, allow_awaiting=False):
         allow_awaiting: 是否允许 EXIT_AWAITING_USER。只有在明确知道是 checkpoint 场景时才设为 True。
                         设为 False 时，任何 await 都视为测试失败，暴露调度状态机问题。
     """
+    mark_smoke_checkpoint(f"script-{Path(script_name).stem}")
     cmd = [sys.executable, str(SCRIPT_DIR / script_name), *(args or [])]
     merged_env = dict(env or {})
     stdout, stderr, rc = compat_run_cmd(cmd, cwd=str(cwd) if cwd else None, env=merged_env)
@@ -457,6 +485,7 @@ def create_plain_jar(path):
 
 
 def run_external_cmd(cmd, cwd):
+    mark_smoke_checkpoint(f"external-{Path(str(cmd[0])).stem}")
     stdout, stderr, rc = compat_run_cmd(cmd, cwd=str(cwd))
     if rc != 0:
         raise RuntimeError(
@@ -769,6 +798,7 @@ def parse_smoke_args(argv):
         default="all",
         help="按主题执行回归子集：core=步骤1-4，step5=调用链与报告，orchestrator=run_step 编排链路。",
     )
+    parser.add_argument("--json-out", default="", help="写出机器可读的 smoke 结果与失败检查点。")
     return parser.parse_args(argv)
 
 
@@ -1668,8 +1698,8 @@ def run_core_pipeline_smoke(workspace, dep_env):
     )
 
 
-def main():
-    cli_args = parse_smoke_args(sys.argv[1:])
+def run_smoke(cli_args):
+    mark_smoke_checkpoint("startup")
     base_tmp = Path(tempfile.mkdtemp(prefix="java-upgrade-smoke-"))
     try:
         workspace = create_smoke_workspace(base_tmp)
@@ -5908,6 +5938,17 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true("# Java 升级兼容性分析报告" in orchestrated_report_text, "run_step 链路未生成最终报告")
     assert_true("分析结果总表" in orchestrated_report_text, "run_step 链路未在 Step6 报告中呈现分析结果总表")
 
+
+
+def main(argv=None):
+    cli_args = parse_smoke_args(sys.argv[1:] if argv is None else argv)
+    try:
+        return_code = run_smoke(cli_args)
+    except BaseException as exc:
+        write_smoke_result(cli_args.json_out, "failed", error=exc)
+        raise
+    write_smoke_result(cli_args.json_out, "passed")
+    return return_code
 
 
 if __name__ == "__main__":

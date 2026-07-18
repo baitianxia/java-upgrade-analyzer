@@ -41,6 +41,7 @@ class PlatformContractTest(unittest.TestCase):
         self.assertIn("platform-contract-step-${STEP_OUTCOME}-${STEP_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
         self.assertIn("platform-contract-gate-${GATE_STATUS}-${GATE_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
         self.assertIn("platform-contract-benchmark-${BENCHMARK_STATUS}-${BENCHMARK_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
+        self.assertIn("platform-contract-smoke-${SMOKE_STATUS}-${SMOKE_CHECKPOINT}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
         self.assertIn("steps.quality_gate.outcome == 'failure'", text)
         self.assertIn("steps.diag_jdeps_floor.outcome", text)
         self.assertIn("gate|quality-gate-report|missing", text)
