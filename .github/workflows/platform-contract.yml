@@ -2,6 +2,14 @@ name: Platform Contract
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "codex/**"
+    paths:
+      - "scripts/**"
+      - "tests/**"
+      - "SKILL.md"
+      - ".github/workflows/platform-contract.yml"
   pull_request:
     paths:
       - "scripts/**"

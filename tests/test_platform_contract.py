@@ -24,6 +24,8 @@ class PlatformContractTest(unittest.TestCase):
         self.assertIn("timeout-minutes:", text)
         self.assertIn("actions/upload-artifact@v4", text)
         self.assertIn("platform-contract.json", text)
+        self.assertIn("push:", text)
+        self.assertIn('- "codex/**"', text)
         self.assertNotIn("continue-on-error", text)
 
     def test_run_cmd_preserves_unicode_space_and_metacharacter_arguments(self):
