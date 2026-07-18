@@ -18,6 +18,7 @@ from typing import Protocol
 from enhanced_source_analyzer import analyze_file
 from signature_utils import normalize_signature_for_lookup
 from step5_evidence_model import (
+    ActivationEvidence,
     CollectedEdge,
     CollectorBatch,
     CoverageRecord,
@@ -208,6 +209,20 @@ def _framework_failure(adapter, error):
         reason = 'SPRING_TRANSACTION_MODE_SOURCE_READ_FAILED'
     elif 'mybatis_runtime_sha256_mismatch' in text:
         reason = 'MYBATIS_RUNTIME_ARTIFACT_SHA256_MISMATCH'
+    elif 'spring_aop_pointcut_unsupported' in text:
+        reason = 'SPRING_AOP_POINTCUT_UNSUPPORTED'
+    elif 'spring_aop_join_point_unresolved' in text:
+        reason = 'SPRING_AOP_JOIN_POINT_UNRESOLVED'
+    elif 'spring_security_filter_condition_unresolved' in text:
+        reason = 'SPRING_SECURITY_FILTER_CONDITION_UNRESOLVED'
+    elif 'spring_security_filter_registration_incomplete' in text:
+        reason = 'SPRING_SECURITY_FILTER_REGISTRATION_INCOMPLETE'
+    elif 'spring_security_source_read_failed' in text:
+        reason = 'SPRING_SECURITY_SOURCE_READ_FAILED'
+    elif 'spring_nested_artifact_invalid' in text:
+        reason = 'SPRING_NESTED_ARTIFACT_INVALID'
+    elif 'spring_packaged_class_ambiguous' in text:
+        reason = 'SPRING_PACKAGED_CLASS_AMBIGUOUS'
     return EvidenceFailure(
         stage=adapter,
         reason_code=reason,
@@ -254,6 +269,16 @@ def _framework_batch(adapter, version, status, nodes, edges, findings, errors, m
             'framework_provenance': provenance,
             'legacy_edge': normalized,
         })
+        typed_activation_evidence = tuple(
+            item if isinstance(item, ActivationEvidence) else ActivationEvidence(
+                authority=EvidenceAuthority(str(item.get('authority') or '')),
+                proof_kind=str(item.get('proof_kind') or ''),
+                source=str(item.get('source') or ''),
+                artifact_sha256=str(item.get('artifact_sha256') or ''),
+                detail=str(item.get('detail') or ''),
+            )
+            for item in (normalized.get('activation_evidence') or ())
+        )
         normalized_edges.append(CollectedEdge(
             caller_symbol=str(normalized.get('source') or ''),
             callee_symbol=str(normalized.get('target') or ''),
@@ -280,6 +305,8 @@ def _framework_batch(adapter, version, status, nodes, edges, findings, errors, m
             ),
             confidence=str(normalized.get('confidence') or 'high'),
             ambiguous=ambiguity,
+            activation_verified=bool(normalized.get('activation_verified')),
+            activation_evidence=typed_activation_evidence,
             activation_conditions=tuple(normalized.get('activation_conditions') or ()),
             metadata=tuple(sorted(metadata.items())),
         ))
@@ -2310,6 +2337,13 @@ def _descriptor_parameter_types(descriptor):
     return parameters if index < len(descriptor) and descriptor[index] == ')' else None
 
 
+def _descriptor_method_identity(owner, member, descriptor):
+    parameters = _descriptor_parameter_types(descriptor)
+    if parameters is None:
+        return ''
+    return f"{owner}.{member}({','.join(parameters)})"
+
+
 _SPRING_DATA_REPOSITORY_CONTRACTS = {
     'Repository', 'CrudRepository', 'ListCrudRepository',
     'PagingAndSortingRepository', 'ListPagingAndSortingRepository',
@@ -3077,6 +3111,722 @@ def _message_listener_adapter_callbacks(jar_path, coord, activation_evidence):
     return callbacks, errors
 
 
+def _javap_method_annotation_blocks(text):
+    blocks = []
+    current = None
+    for line in str(text or '').splitlines():
+        header = _JAVAP_METHOD_HEADER.match(line)
+        if header:
+            if current:
+                blocks.append(current)
+            value = header.group('header')
+            prefix = value.split('(', 1)[0].strip()
+            current = {
+                'member': prefix.rsplit(' ', 1)[-1].rsplit('.', 1)[-1],
+                'descriptor': '',
+                'lines': [line],
+            }
+            continue
+        if current is None:
+            continue
+        descriptor = re.match(r'^\s+descriptor:\s+(\S+)\s*$', line)
+        if descriptor:
+            current['descriptor'] = descriptor.group(1)
+        current['lines'].append(line)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _insufficient_activation_batch(collector, reason_code, artifact='', detail=''):
+    return CollectorBatch(
+        collector=collector,
+        version='1',
+        failures=(EvidenceFailure(
+            stage=collector,
+            reason_code=reason_code,
+            blocking=False,
+            artifact=str(artifact or ''),
+            detail=str(detail or ''),
+        ),),
+        coverage=(CoverageRecord(
+            collector=collector,
+            api_identity=collector,
+            status='insufficient',
+            reason_codes=(reason_code,),
+            scope='path',
+        ),),
+    )
+
+
+def collect_spring_aop_activation(runtime_catalog, business_inventory):
+    """Collect only exact, packaged and registered Spring AOP activation paths."""
+    business_entries = [
+        item for item in (runtime_catalog or {}).get('entries') or ()
+        if _catalog_entry_is_application_owned(item)
+    ]
+    if not business_entries:
+        return _insufficient_activation_batch(
+            'spring_aop_activation', 'SPRING_AOP_BUSINESS_ARTIFACT_UNAVAILABLE'
+        )
+    class_records, class_errors = _catalog_class_records(business_entries)
+    raw_edges = []
+    errors = list(class_errors)
+    aspect_count = 0
+    registered_count = 0
+    with tempfile.TemporaryDirectory(prefix='spring-aop-activation-') as temporary:
+        verified_join_points = {}
+
+        def packaged_join_point(owner, member, descriptor):
+            identity = (owner, member, descriptor)
+            if identity in verified_join_points:
+                return verified_join_points[identity]
+            locations, diagnostics = _locate_catalog_classes(
+                business_entries, {owner}
+            )
+            errors.extend(diagnostics)
+            location = locations.get(owner)
+            if location is None:
+                verified_join_points[identity] = None
+                return None
+            class_file = Path(temporary) / f'join-point-{len(verified_join_points):06d}.class'
+            class_file.write_bytes(location['bytes'])
+            completed = subprocess.run(
+                ['javap', '-p', '-s', str(class_file)], capture_output=True,
+                text=True, encoding='utf-8', errors='replace', timeout=30,
+            )
+            if completed.returncode != 0:
+                verified_join_points[identity] = None
+                return None
+            parsed_owner, methods = _parse_javap_methods(completed.stdout)
+            if parsed_owner != owner or (member, descriptor) not in {
+                (method['member'], method['descriptor']) for method in methods
+            }:
+                verified_join_points[identity] = None
+                return None
+            verified_join_points[identity] = location
+            return location
+
+        for index, record in enumerate(class_records):
+            name = record['entry']
+            class_bytes = record['bytes']
+            if b'Lorg/aspectj/lang/annotation/Aspect;' not in class_bytes:
+                continue
+            aspect_count += 1
+            if b'Lorg/springframework/stereotype/Component;' not in class_bytes:
+                continue
+            registered_count += 1
+            class_file = Path(temporary) / f'aspect-{index:06d}.class'
+            class_file.write_bytes(class_bytes)
+            completed = subprocess.run(
+                ['javap', '-v', '-p', '-s', str(class_file)],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=30,
+            )
+            if completed.returncode != 0:
+                errors.append(
+                    f'{record["artifact_path"]}!/{name}:'
+                    f'javap_exit_{completed.returncode}'
+                )
+                continue
+            owner, _methods = _parse_javap_methods(completed.stdout)
+            for method in _javap_method_annotation_blocks(completed.stdout):
+                block = '\n'.join(method['lines'])
+                advice = re.search(
+                    r'org\.aspectj\.lang\.annotation\.'
+                    r'(?:Before|After|AfterReturning|AfterThrowing|Around)\('
+                    r'.*?value="([^"]+)"',
+                    block,
+                    re.DOTALL,
+                )
+                if not advice:
+                    continue
+                pointcut = advice.group(1)
+                exact = re.fullmatch(
+                    r'execution\(void\s+([\w.$]+)\.([\w$]+)\(\)\)',
+                    pointcut,
+                )
+                if not exact:
+                    errors.append(
+                        f'{record["artifact_path"]}!/{name}:'
+                        f'spring_aop_pointcut_unsupported:{pointcut}'
+                    )
+                    continue
+                join_point = (exact.group(1), exact.group(2), '()V')
+                join_location = packaged_join_point(*join_point)
+                if join_location is None:
+                    errors.append(
+                        f'{record["artifact_path"]}!/{name}:'
+                        f'spring_aop_join_point_unresolved:{pointcut}'
+                    )
+                    continue
+                advice_identity = _descriptor_method_identity(
+                    owner, method['member'], method['descriptor']
+                )
+                join_identity = _descriptor_method_identity(*join_point)
+                raw_edges.append({
+                    'source': join_identity,
+                    'target': advice_identity,
+                    'edge_kind': 'spring_aop_activation',
+                    'confidence': 'high',
+                    'conditions': [],
+                    'ambiguity': False,
+                    'activation_verified': True,
+                    'caller_resolution_required': True,
+                    'caller_owner': join_point[0],
+                    'caller_name': join_point[1],
+                    'caller_signature': join_identity.split(join_point[1], 1)[-1],
+                    'activation_evidence': [{
+                        'authority': 'current_final_artifact',
+                        'proof_kind': 'runtime_visible_aspect_registration',
+                        'source': name,
+                        'artifact_sha256': record['artifact_sha256'],
+                        'detail': f'{advice_identity}|{pointcut}',
+                    }, {
+                        'authority': 'current_final_artifact',
+                        'proof_kind': 'aop_join_point_packaged',
+                        'source': join_location['entry'],
+                        'artifact_sha256': join_location['artifact_sha256'],
+                        'detail': join_identity,
+                    }],
+                    'provenance': {
+                        'authority': 'final_artifact_javap',
+                        'jar': record['artifact_path'],
+                        'artifact_sha256': record['artifact_sha256'],
+                        'artifact_entry': name,
+                        'class_or_resource_entry': join_location['entry'],
+                        'parser': 'jdk-javap-verbose',
+                        'pointcut': pointcut,
+                    },
+                })
+    applicable = bool(aspect_count)
+    status = 'not_applicable' if not applicable else 'partial' if errors else 'complete'
+    return _framework_batch(
+        'spring_aop_activation', '1', status, (), raw_edges, (), errors,
+        {
+            'aspects': aspect_count,
+            'registered_aspects': registered_count,
+            'active_advice': len(raw_edges),
+        },
+    )
+
+
+def _resolve_java_type(type_name, imports, package_name):
+    value = re.sub(r'<.*>', '', str(type_name or '')).strip()
+    value = value.replace('[]', '')
+    if not value:
+        return ''
+    if '.' in value:
+        return value
+    if value in imports:
+        return imports[value]
+    return f'{package_name}.{value}' if package_name else value
+
+
+def _spring_security_source_inventory(source_roots):
+    chains = []
+    packaged_filters = set()
+    errors = []
+    method_pattern = re.compile(
+        r'(?P<annotations>(?:\s*@[\w.]+(?:\([^)]*\))?\s*)*)'
+        r'(?:(?:public|protected|private|static|final|synchronized)\s+)*'
+        r'(?P<return>[\w.$<>?]+)\s+'
+        r'(?P<member>[\w$]+)\s*\((?P<parameters>.*?)\)\s*'
+        r'(?:throws\s+[^{]+)?\{(?P<body>.*?)\}',
+        re.DOTALL,
+    )
+    registration_pattern = re.compile(
+        r'\.\s*addFilterBefore\s*\(\s*(?P<filter>[\w$]+)\s*'
+        r'(?P<factory>\(\s*\))?\s*,\s*'
+        r'(?P<anchor>[\w.$]+)\s*\.\s*class\s*\)'
+    )
+    condition_pattern = re.compile(
+        r'@(?:[\w.]+\.)?(?:Profile|Conditional(?:On\w+)?)\b'
+    )
+    for path in _production_java_files(source_roots):
+        try:
+            text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
+        except OSError as error:
+            errors.append(
+                f'{path}:spring_security_source_read_failed:{error}'
+            )
+            continue
+        package_match = re.search(r'\bpackage\s+([\w.]+)\s*;', text)
+        package_name = package_match.group(1) if package_match else ''
+        owner = _java_package_and_class(text, path.stem)
+        class_declaration = re.search(
+            r'\b(?:class|interface|record|enum)\s+[\w$]+', text
+        )
+        class_condition_unresolved = bool(
+            class_declaration
+            and condition_pattern.search(text[:class_declaration.start()])
+        )
+        imports = {
+            value.rsplit('.', 1)[-1]: value
+            for value in re.findall(r'\bimport\s+([\w.]+)\s*;', text)
+        }
+        methods = list(method_pattern.finditer(text))
+        bean_returns = {
+            method.group('member'): _resolve_java_type(
+                method.group('return'), imports, package_name
+            )
+            for method in methods
+            if re.search(r'@(?:org\.springframework\.context\.annotation\.)?Bean\b',
+                         method.group('annotations') or '')
+        }
+        for method in methods:
+            parameters = {}
+            parameter_parts = _split_java_type_list(method.group('parameters'))
+            for parameter in parameter_parts:
+                tokens = re.sub(r'@[\w.]+(?:\([^)]*\))?\s*', '', parameter).split()
+                if len(tokens) >= 2:
+                    parameters[tokens[-1]] = _resolve_java_type(
+                        tokens[-2], imports, package_name
+                    )
+            return_type = _resolve_java_type(
+                method.group('return'), imports, package_name
+            )
+            modern_chain = return_type.endswith('.SecurityFilterChain')
+            legacy_chain = bool(
+                method.group('member') == 'configure'
+                and method.group('return') == 'void'
+                and any(value.endswith('.HttpSecurity') for value in parameters.values())
+            )
+            if not modern_chain and not legacy_chain:
+                continue
+            conditions_resolved = not (
+                class_condition_unresolved
+                or condition_pattern.search(method.group('annotations') or '')
+            )
+            for registration in registration_pattern.finditer(method.group('body')):
+                filter_name = registration.group('filter')
+                filter_owner = (
+                    bean_returns.get(filter_name, '')
+                    if registration.group('factory')
+                    else parameters.get(filter_name, '')
+                )
+                anchor_owner = _resolve_java_type(
+                    registration.group('anchor'), imports, package_name
+                )
+                if filter_owner:
+                    packaged_filters.add(filter_owner)
+                chains.append({
+                    'config_owner': owner,
+                    'chain_member': method.group('member'),
+                    'chain_descriptor': '',
+                    'chain_parameter_count': len(parameter_parts),
+                    'filter_owner': filter_owner,
+                    'before_filter_owner': anchor_owner,
+                    'condition_status': 'resolved' if conditions_resolved else 'unresolved',
+                    'registration_style': (
+                        'security_filter_chain' if modern_chain else 'legacy_configurer'
+                    ),
+                })
+    return {
+        'packaged_filters': sorted(packaged_filters),
+        'security_filter_chains': chains,
+        'errors': errors,
+    }
+
+
+def _spring_aop_source_present(source_roots):
+    for path in _production_java_files(source_roots):
+        try:
+            text = _mask_java_comments(path.read_text(encoding='utf-8', errors='replace'))
+        except OSError:
+            continue
+        if re.search(r'@(?:org\.aspectj\.lang\.annotation\.)?Aspect\b', text):
+            return True
+    return False
+
+
+def _locate_packaged_classes(archive, owners):
+    """Locate exact classes in application entries or one nested runtime JAR."""
+    logical_by_owner = {
+        str(owner): str(owner).replace('.', '/') + '.class'
+        for owner in owners
+        if str(owner or '').strip()
+    }
+    candidates = {owner: [] for owner in logical_by_owner}
+    diagnostics = []
+    outer_names = set(archive.namelist())
+    for owner, logical in logical_by_owner.items():
+        for entry in (
+            logical,
+            f'BOOT-INF/classes/{logical}',
+            f'WEB-INF/classes/{logical}',
+        ):
+            if entry in outer_names:
+                candidates[owner].append({
+                    'entry': entry,
+                    'bytes': archive.read(entry),
+                })
+    nested_names = sorted(
+        entry for entry in outer_names
+        if entry.endswith('.jar')
+        and entry.startswith(('BOOT-INF/lib/', 'WEB-INF/lib/'))
+    )
+    wanted = set(logical_by_owner.values())
+    for nested_name in nested_names:
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive.read(nested_name))) as nested:
+                present = wanted.intersection(nested.namelist())
+                for owner, logical in logical_by_owner.items():
+                    if logical in present:
+                        candidates[owner].append({
+                            'entry': f'{nested_name}!/{logical}',
+                            'bytes': nested.read(logical),
+                        })
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            diagnostics.append(
+                f'{nested_name}:spring_nested_artifact_invalid:{error}'
+            )
+    for owner, values in candidates.items():
+        if len(values) > 1:
+            diagnostics.append(
+                f'{owner}:spring_packaged_class_ambiguous:'
+                + ','.join(item['entry'] for item in values)
+            )
+    locations = {
+        owner: values[0] if len(values) == 1 else None
+        for owner, values in candidates.items()
+    }
+    return locations, diagnostics
+
+
+def _catalog_entry_is_application_owned(item):
+    if str(item.get('coord') or '') == '__business__':
+        return True
+    ownership = item.get('ownership_evidence') or {}
+    return bool(
+        item.get('application_owned') is True
+        and str(ownership.get('authority') or '').strip()
+    )
+
+
+def _locate_catalog_classes(entries, owners, *, include_nested=False):
+    requested = {str(owner) for owner in owners if str(owner or '').strip()}
+    candidates = {owner: [] for owner in requested}
+    diagnostics = []
+    for item in entries:
+        artifact_path = Path(str(item.get('jar_path') or ''))
+        expected_sha = str(item.get('sha256') or '').lower()
+        if not artifact_path.is_file() or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+            diagnostics.append(
+                f'{artifact_path}:spring_runtime_artifact_identity_invalid'
+            )
+            continue
+        try:
+            content = artifact_path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != expected_sha:
+                raise ValueError('sha256_mismatch')
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                if include_nested:
+                    located, nested_diagnostics = _locate_packaged_classes(
+                        archive, requested
+                    )
+                else:
+                    nested_diagnostics = []
+                    names = set(archive.namelist())
+                    located = {}
+                    for owner in requested:
+                        logical = owner.replace('.', '/') + '.class'
+                        matches = [
+                            entry for entry in (
+                                logical,
+                                f'BOOT-INF/classes/{logical}',
+                                f'WEB-INF/classes/{logical}',
+                            )
+                            if entry in names
+                        ]
+                        located[owner] = (
+                            {'entry': matches[0], 'bytes': archive.read(matches[0])}
+                            if len(matches) == 1 else None
+                        )
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            diagnostics.append(
+                f'{artifact_path}:spring_runtime_artifact_invalid:{error}'
+            )
+            continue
+        diagnostics.extend(
+            f'{artifact_path}:{detail}' for detail in nested_diagnostics
+        )
+        catalog_entry = str(item.get('artifact_entry') or '')
+        for owner, location in located.items():
+            if location is None:
+                continue
+            class_entry = location['entry']
+            if catalog_entry and catalog_entry != '<business-classes>':
+                class_entry = f'{catalog_entry}!/{class_entry}'
+            candidates[owner].append({
+                **location,
+                'entry': class_entry,
+                'artifact_path': str(artifact_path),
+                'artifact_sha256': expected_sha,
+                'coord': str(item.get('coord') or ''),
+            })
+    for owner, values in candidates.items():
+        if len(values) > 1:
+            diagnostics.append(
+                f'{owner}:spring_packaged_class_ambiguous:'
+                + ','.join(item['entry'] for item in values)
+            )
+    return {
+        owner: values[0] if len(values) == 1 else None
+        for owner, values in candidates.items()
+    }, diagnostics
+
+
+def _catalog_class_records(entries):
+    records = []
+    diagnostics = []
+    identities = {}
+    for item in entries:
+        artifact_path = Path(str(item.get('jar_path') or ''))
+        expected_sha = str(item.get('sha256') or '').lower()
+        if not artifact_path.is_file() or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+            diagnostics.append(
+                f'{artifact_path}:spring_runtime_artifact_identity_invalid'
+            )
+            continue
+        try:
+            content = artifact_path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != expected_sha:
+                raise ValueError('sha256_mismatch')
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                catalog_entry = str(item.get('artifact_entry') or '')
+
+                def append_record(class_entry, class_bytes, logical_entry):
+                    full_entry = class_entry
+                    if catalog_entry and catalog_entry != '<business-classes>':
+                        full_entry = f'{catalog_entry}!/{class_entry}'
+                    record = {
+                        'entry': full_entry,
+                        'logical_entry': logical_entry,
+                        'bytes': class_bytes,
+                        'artifact_path': str(artifact_path),
+                        'artifact_sha256': expected_sha,
+                        'coord': str(item.get('coord') or ''),
+                    }
+                    identities.setdefault(logical_entry, []).append(record)
+                    records.append(record)
+
+                for name in sorted(archive.namelist()):
+                    if not name.endswith('.class') or name.startswith('META-INF/'):
+                        continue
+                    logical = name
+                    for prefix in ('BOOT-INF/classes/', 'WEB-INF/classes/'):
+                        if logical.startswith(prefix):
+                            logical = logical[len(prefix):]
+                            break
+                    append_record(name, archive.read(name), logical)
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            diagnostics.append(
+                f'{artifact_path}:spring_runtime_artifact_invalid:{error}'
+            )
+    duplicate_entries = {
+        logical: values for logical, values in identities.items() if len(values) > 1
+    }
+    for logical, values in sorted(duplicate_entries.items()):
+        diagnostics.append(
+            f'{logical}:spring_packaged_class_ambiguous:'
+            + ','.join(item['entry'] for item in values)
+        )
+    if duplicate_entries:
+        records = [
+            record for record in records
+            if record['logical_entry'] not in duplicate_entries
+        ]
+    return tuple(records), diagnostics
+
+
+def collect_spring_security_filter_activation(runtime_catalog, business_inventory):
+    """Verify exact SecurityFilterChain membership from source inventory and bytes."""
+    runtime_entries = list((runtime_catalog or {}).get('entries') or ())
+    business_entries = [
+        item for item in runtime_entries if _catalog_entry_is_application_owned(item)
+    ]
+    if not business_entries:
+        return _insufficient_activation_batch(
+            'spring_security_filter_activation',
+            'SPRING_SECURITY_BUSINESS_ARTIFACT_UNAVAILABLE',
+        )
+    raw_edges = []
+    errors = list((business_inventory or {}).get('errors') or ())
+    chains = list((business_inventory or {}).get('security_filter_chains') or ())
+    business_owners = {
+        str(chain.get(key) or '')
+        for chain in chains
+        for key in ('config_owner', 'filter_owner')
+    }
+    anchor_owners = {
+        str(chain.get('before_filter_owner') or '') for chain in chains
+    }
+    business_locations, business_errors = _locate_catalog_classes(
+        business_entries, business_owners
+    )
+    anchor_locations, runtime_errors = _locate_catalog_classes(
+        runtime_entries, anchor_owners, include_nested=True
+    )
+    errors.extend(business_errors)
+    errors.extend(runtime_errors)
+    with tempfile.TemporaryDirectory(prefix='spring-security-activation-') as temporary:
+        for index, chain in enumerate(chains):
+            filter_owner = str(chain.get('filter_owner') or '')
+            if str(chain.get('condition_status') or '') != 'resolved':
+                errors.append(
+                    f'{filter_owner}:spring_security_filter_condition_unresolved'
+                )
+                continue
+            config_owner = str(chain.get('config_owner') or '')
+            anchor_owner = str(chain.get('before_filter_owner') or '')
+            config_location = business_locations.get(config_owner)
+            filter_location = business_locations.get(filter_owner)
+            anchor_location = anchor_locations.get(anchor_owner)
+            if not all((config_location, filter_location, anchor_location)):
+                errors.append(
+                    f'{filter_owner}:'
+                    'spring_security_filter_registration_incomplete:class_entry'
+                )
+                continue
+            artifact_path = Path(config_location['artifact_path'])
+            expected_sha = config_location['artifact_sha256']
+            config_entry = config_location['entry']
+            filter_entry = filter_location['entry']
+            anchor_entry = anchor_location['entry']
+            config_bytes = config_location['bytes']
+            style_marker = (
+                b'org/springframework/security/config/annotation/web/configuration/'
+                b'WebSecurityConfigurerAdapter'
+                if str(chain.get('registration_style') or '') == 'legacy_configurer'
+                else b'org/springframework/security/web/SecurityFilterChain'
+            )
+            required_markers = (
+                style_marker,
+                b'addFilterBefore',
+                filter_owner.replace('.', '/').encode('utf-8'),
+                anchor_owner.replace('.', '/').encode('utf-8'),
+            )
+            if not all(marker in config_bytes for marker in required_markers):
+                errors.append(
+                    f'{artifact_path}!/{config_entry}:{filter_owner}:'
+                    'spring_security_filter_registration_incomplete:bytecode_markers'
+                )
+                continue
+            class_file = Path(temporary) / f'config-{index:06d}.class'
+            class_file.write_bytes(config_bytes)
+            completed = subprocess.run(
+                ['javap', '-c', '-p', '-s', str(class_file)],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=30,
+            )
+            if completed.returncode != 0:
+                errors.append(f'{artifact_path}!/{config_entry}:javap_exit_{completed.returncode}')
+                continue
+            parsed_owner, methods = _parse_javap_methods(completed.stdout)
+            expected_member = str(chain.get('chain_member') or '')
+            expected_descriptor = str(chain.get('chain_descriptor') or '')
+            candidate_methods = [
+                method for method in methods
+                if method['member'] == expected_member
+                and (
+                    expected_descriptor and method['descriptor'] == expected_descriptor
+                    or not expected_descriptor and len(_descriptor_parameter_types(
+                        method['descriptor']
+                    )) == int(chain.get('chain_parameter_count') or 0)
+                )
+            ]
+            if parsed_owner != config_owner or len(candidate_methods) != 1:
+                errors.append(
+                    f'{artifact_path}!/{config_entry}:{filter_owner}:'
+                    'spring_security_filter_registration_incomplete:chain_method'
+                )
+                continue
+            expected_descriptor = candidate_methods[0]['descriptor']
+            chain_identity = _descriptor_method_identity(
+                config_owner, expected_member, expected_descriptor
+            )
+            filter_file = Path(temporary) / f'filter-{index:06d}.class'
+            filter_file.write_bytes(filter_location['bytes'])
+            filter_javap = subprocess.run(
+                ['javap', '-p', '-s', str(filter_file)], capture_output=True,
+                text=True, encoding='utf-8', errors='replace', timeout=30,
+            )
+            parsed_filter_owner, filter_methods = _parse_javap_methods(
+                filter_javap.stdout if filter_javap.returncode == 0 else ''
+            )
+            callbacks = [
+                method for method in filter_methods
+                if method['member'] in {'doFilter', 'doFilterInternal'}
+            ]
+            if parsed_filter_owner != filter_owner or not callbacks:
+                errors.append(
+                    f'{filter_location["artifact_path"]}!/{filter_entry}:{filter_owner}:'
+                    'spring_security_filter_registration_incomplete:callback_method'
+                )
+                continue
+            for callback in callbacks:
+                callback_identity = _descriptor_method_identity(
+                    filter_owner, callback['member'], callback['descriptor']
+                )
+                raw_edges.append({
+                    'source': chain_identity,
+                    'target': callback_identity,
+                    'edge_kind': 'spring_security_filter_activation',
+                    'confidence': 'high',
+                    'conditions': [],
+                    'ambiguity': len(callbacks) > 1,
+                    'activation_verified': True,
+                    'caller_resolution_required': True,
+                    'caller_owner': config_owner,
+                    'caller_name': expected_member,
+                    'caller_signature': chain_identity.split(expected_member, 1)[-1],
+                    'activation_evidence': [{
+                        'authority': 'current_final_artifact',
+                        'proof_kind': 'security_filter_chain_membership',
+                        'source': config_entry,
+                        'artifact_sha256': expected_sha,
+                        'detail': f'{chain_identity}|{callback_identity}',
+                    }, {
+                        'authority': 'current_final_artifact',
+                        'proof_kind': 'security_filter_callback_packaged',
+                        'source': filter_entry,
+                        'artifact_sha256': filter_location['artifact_sha256'],
+                        'detail': callback_identity,
+                    }, {
+                        'authority': 'packaged_runtime',
+                        'proof_kind': 'security_filter_anchor_packaged',
+                        'source': anchor_entry,
+                        'artifact_sha256': anchor_location['artifact_sha256'],
+                        'detail': anchor_owner,
+                    }],
+                    'provenance': {
+                        'authority': 'final_artifact_javap',
+                        'jar': str(artifact_path),
+                        'artifact_sha256': expected_sha,
+                        'artifact_entry': config_entry,
+                        'class_or_resource_entry': filter_entry,
+                        'parser': 'jdk-javap-bytecode',
+                        'filter_entry': filter_entry,
+                        'anchor_entry': anchor_entry,
+                    },
+                })
+    status = 'not_applicable' if not chains else 'partial' if errors else 'complete'
+    return _framework_batch(
+        'spring_security_filter_activation', '1', status, (), raw_edges, (), errors,
+        {
+            'declared_chains': len(chains),
+            'active_filters': len(raw_edges),
+            'packaged_filters': len(
+                (business_inventory or {}).get('packaged_filters') or ()
+            ),
+        },
+    )
+
+
 def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None):
     """Read Spring registrations from the exact packaged runtime jars.
 
@@ -3239,6 +3989,28 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
 
 
 def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
+    spring_security_inventory = _spring_security_source_inventory(source_roots)
+    has_business_artifact = any(
+        str(item.get('coord') or '') == '__business__'
+        for item in (artifact_catalog or {}).get('entries') or ()
+    )
+    aop_batch = (
+        collect_spring_aop_activation(artifact_catalog or {}, {})
+        if has_business_artifact or _spring_aop_source_present(source_roots)
+        else _framework_batch(
+            'spring_aop_activation', '1', 'not_applicable', (), (), (), (), {}
+        )
+    )
+    security_batch = (
+        collect_spring_security_filter_activation(
+            artifact_catalog or {}, spring_security_inventory
+        )
+        if has_business_artifact or spring_security_inventory['security_filter_chains']
+        else _framework_batch(
+            'spring_security_filter_activation', '1', 'not_applicable',
+            (), (), (), (), {}
+        )
+    )
     batches = (
         run_spi_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_spring_adapter(source_roots, artifact_catalog=artifact_catalog),
@@ -3249,6 +4021,8 @@ def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
         run_mybatis_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_dynamic_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_declarative_http_client_adapter(source_roots, artifact_catalog=artifact_catalog),
+        aop_batch,
+        security_batch,
     )
     if output_path:
         serialize_framework_batches(batches, output_path)

@@ -44,6 +44,7 @@ class IngestionResult:
     framework_proxy_dispatch_edges: int = 0
     framework_mybatis_proxy_dispatch_edges: int = 0
     framework_transaction_proxy_edges: int = 0
+    framework_activation_edges: int = 0
     ambiguous_framework_proxy_dispatches: int = 0
 
     def framework_projection_stats(self):
@@ -60,6 +61,7 @@ class IngestionResult:
             "framework_transaction_proxy_edges": (
                 self.framework_transaction_proxy_edges
             ),
+            "framework_activation_edges": self.framework_activation_edges,
             "ambiguous_framework_proxy_dispatches": (
                 self.ambiguous_framework_proxy_dispatches
             ),
@@ -133,6 +135,8 @@ _FRAMEWORK_COLLECTORS = {
     "mybatis_mapper_proxy",
     "dynamic_proxy_basic",
     "declarative_http_client_basic",
+    "spring_aop_activation",
+    "spring_security_filter_activation",
 }
 
 _FRAMEWORK_ENTRY_KINDS = {
@@ -202,6 +206,17 @@ def _framework_edge_mapping(
         "confidence": edge.confidence,
         "conditions": thaw_evidence_value(edge.activation_conditions),
         "ambiguity": edge.ambiguous,
+        "activation_verified": edge.activation_verified,
+        "activation_evidence": [
+            {
+                "authority": item.authority.value,
+                "proof_kind": item.proof_kind,
+                "source": item.source,
+                "artifact_sha256": item.artifact_sha256,
+                "detail": item.detail,
+            }
+            for item in edge.activation_evidence
+        ],
         "provenance": {
             **dict(provenance),
             **({"artifact_path": edge.provenance.artifact_path}
@@ -329,6 +344,8 @@ def _framework_evidence_fields(batch, edge):
         "framework_evidence_artifact_entry": edge.provenance.artifact_entry,
         "semantic": True,
         "collector": batch.collector,
+        "framework_activation_verified": edge.activation_verified,
+        "activation_evidence": tuple(edge.activation_evidence),
     }
 
 
@@ -550,6 +567,7 @@ def _to_call_edge(
     converted.evidence_authority = edge.provenance.authority.value
     converted.semantic = edge.semantic
     converted.framework_activation_verified = edge.activation_verified
+    converted.activation_evidence = tuple(edge.activation_evidence)
     converted.collector = collector
     converted.evidence_registry_identity = _edge_identity(edge)
     converted.activation_conditions = thaw_evidence_value(edge.activation_conditions)
@@ -1688,6 +1706,48 @@ def _project_framework_entries(graph, records):
     }
 
 
+def _project_verified_activation_edges(graph, records):
+    attached = 0
+    for batch, edge, _edge_mapping in records:
+        if edge.edge_kind not in {
+            "spring_aop_activation", "spring_security_filter_activation",
+        }:
+            continue
+        if (
+            not edge.activation_verified
+            or not edge.activation_evidence
+            or edge.ambiguous
+            or edge.activation_conditions
+        ):
+            continue
+        caller_symbol, caller_qualified_key, caller_method = _resolve_caller(graph, edge)
+        if caller_symbol is None:
+            continue
+        converted = _to_call_edge(
+            edge,
+            batch.collector,
+            caller_symbol=caller_symbol,
+            caller_qualified_key=caller_qualified_key,
+            caller_method=caller_method,
+        )
+        for key, value in _caller_evidence_fields(caller_method).items():
+            setattr(converted, key, value)
+        for key, value in _framework_evidence_fields(batch, edge).items():
+            setattr(converted, key, value)
+        converted.framework_registration = True
+        converted.framework_final_artifact_verified = True
+        converted.framework_source = edge.caller_symbol
+        converted.framework_target = edge.callee_symbol
+        converted.framework_provenance = dict(_edge_metadata(edge).get(
+            "framework_provenance"
+        ) or {})
+        if _append_call_edge(
+            graph, _target_lookup_keys(edge.callee_symbol), converted
+        ):
+            attached += 1
+    return attached
+
+
 def _project_framework_edges(graph, records, reverse_edge_snapshot):
     graph.framework_edges = [dict(record[2]) for record in records]
     mybatis_edges, mybatis_ambiguous = _project_mybatis_proxy_edges(
@@ -1699,11 +1759,13 @@ def _project_framework_edges(graph, records, reverse_edge_snapshot):
     spring_data_edges, spring_data_ambiguous = _project_spring_data_proxy_edges(
         graph, records, reverse_edge_snapshot
     )
+    activation_edges = _project_verified_activation_edges(graph, records)
     stats = _project_framework_entries(graph, records)
     stats.update({
         "framework_proxy_dispatch_edges": spring_data_edges,
         "framework_mybatis_proxy_dispatch_edges": mybatis_edges,
         "framework_transaction_proxy_edges": transaction_edges,
+        "framework_activation_edges": activation_edges,
         "ambiguous_framework_proxy_dispatches": (
             mybatis_ambiguous + transaction_ambiguous + spring_data_ambiguous
         ),

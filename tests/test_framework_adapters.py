@@ -24,6 +24,7 @@ from framework_adapters import (
 )
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import (
+    ActivationEvidence,
     CollectedEdge,
     CollectorBatch,
     CoverageRecord,
@@ -151,6 +152,38 @@ class FrameworkAdaptersTest(unittest.TestCase):
             "BOOT-INF/classes/com/acme/Repository.class",
         )
 
+    def test_framework_batch_preserves_typed_composite_activation_proof(self):
+        raw_edge = {
+            "source": "framework:spring-aop",
+            "target": "com.acme.AuditAspect.before()V",
+            "edge_kind": "spring_aop_activation",
+            "confidence": "high",
+            "activation_verified": True,
+            "activation_evidence": [{
+                "authority": "current_final_artifact",
+                "proof_kind": "runtime_visible_aspect_registration",
+                "source": "BOOT-INF/classes/com/acme/AuditAspect.class",
+                "artifact_sha256": "a" * 64,
+                "detail": "com.acme.AuditAspect.before()V",
+            }],
+            "provenance": {
+                "artifact_sha256": "a" * 64,
+                "artifact_entry": "BOOT-INF/classes/com/acme/AuditAspect.class",
+            },
+        }
+
+        batch = framework_adapter_module._framework_batch(
+            "spring_aop_activation", "1", "complete", (), [raw_edge], (), (), {}
+        )
+        mapping = batch.to_mapping()
+
+        self.assertTrue(batch.edges[0].activation_verified)
+        self.assertIsInstance(batch.edges[0].activation_evidence[0], ActivationEvidence)
+        self.assertEqual(
+            mapping["edges"][0]["activation_evidence"][0]["proof_kind"],
+            "runtime_visible_aspect_registration",
+        )
+
     def test_mybatis_runtime_dispatch_requires_exact_jvm_descriptors(self):
         wrong_outputs = {
             "org.apache.ibatis.binding.MapperProxy": (
@@ -187,7 +220,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
         batches = _run_framework_adapters([], artifact_catalog={"entries": []})
 
         self.assertIsInstance(batches, tuple)
-        self.assertEqual(len(batches), 9)
+        self.assertEqual(len(batches), 11)
         self.assertTrue(all(isinstance(batch, CollectorBatch) for batch in batches))
         serializer = getattr(framework_adapter_module, "serialize_framework_batches", None)
         self.assertTrue(callable(serializer))

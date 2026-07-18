@@ -1342,6 +1342,7 @@ def _step5_integrated_main_impl(args):
             'framework_proxy_dispatch_edges',
             'framework_mybatis_proxy_dispatch_edges',
             'framework_transaction_proxy_edges',
+            'framework_activation_edges',
             'ambiguous_framework_proxy_dispatches',
         )
     }

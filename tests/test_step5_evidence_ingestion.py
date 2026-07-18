@@ -15,8 +15,10 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import step5_evidence_ingestion as ingestion_module
+import confidence_weighted_tracer as tracer_module
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import (
+    ActivationEvidence,
     CollectedEdge,
     CollectorBatch,
     CoverageRecord,
@@ -599,6 +601,101 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual(projected["edge_kind"], "dynamic_proxy_callback")
         self.assertEqual(projected["confidence"], "high")
         self.assertNotEqual(projected["provenance"].get("authority"), "legacy")
+
+    def test_framework_projection_preserves_typed_activation_evidence(self):
+        edge = self._framework_edge(
+            "spring_aop_activation",
+            target="demo.Aspect.before()V",
+            metadata=(("framework_source", "demo.Service.run()V"),),
+        )
+        edge = replace(
+            edge,
+            activation_verified=True,
+            activation_evidence=(ActivationEvidence(
+                authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+                proof_kind="runtime_visible_aspect_registration",
+                source="BOOT-INF/classes/demo/Aspect.class",
+                artifact_sha256="a" * 64,
+                detail="demo.Service.run()V|demo.Aspect.before()V",
+            ),),
+        )
+
+        projected = ingestion_module._framework_edge_mapping(
+            CollectorBatch(collector="spring_aop_activation", version="1", edges=(edge,)),
+            edge,
+        )
+
+        self.assertTrue(projected["activation_verified"])
+        self.assertEqual(
+            projected["activation_evidence"][0]["proof_kind"],
+            "runtime_visible_aspect_registration",
+        )
+        self.assertEqual(projected["activation_evidence"][0]["artifact_sha256"], "a" * 64)
+
+    def test_verified_spring_activation_projects_into_reverse_call_graph(self):
+        method = SimpleNamespace(
+            symbol_id="service-run", qualified_key="demo.Service.run",
+            declared_qualified_key="demo.Service.run", owner_type="business",
+            owner_coord="__business__", module="app", is_test=False,
+            file=(
+                "/artifact/application.jar!/"
+                "BOOT-INF/classes/demo/Service.class"
+            ),
+            line=1, evidence_source="current_final_artifact",
+            evidence_authority="current_final_artifact",
+            evidence_type="business_artifact_method",
+            artifact_sha256="a" * 64,
+            artifact_entry="BOOT-INF/classes/demo/Service.class",
+        )
+        graph = SimpleNamespace(
+            methods_by_id={method.symbol_id: method},
+            methods_by_qualified={"demo.Service.run": [method]},
+            lookup_keys_by_symbol={method.symbol_id: ("demo.Service.run()",)},
+            reverse_edges={},
+        )
+        edge = CollectedEdge(
+            caller_symbol="demo.Service.run()",
+            callee_symbol="demo.Aspect.before()",
+            edge_kind="spring_aop_activation",
+            semantic=True,
+            owner_scope=ModuleScope.BUSINESS_CLASSES,
+            owner_coord="__business__",
+            provenance=EvidenceProvenance(
+                authority=EvidenceAuthority.FRAMEWORK_SEMANTIC,
+                artifact_path="/artifact/application.jar",
+                artifact_sha256="a" * 64,
+                artifact_entry="BOOT-INF/classes/demo/Aspect.class",
+                parser="jdk-javap-verbose",
+                evidence_source="framework_semantic",
+            ),
+            activation_verified=True,
+            activation_evidence=(ActivationEvidence(
+                authority=EvidenceAuthority.CURRENT_FINAL_ARTIFACT,
+                proof_kind="runtime_visible_aspect_registration",
+                source="BOOT-INF/classes/demo/Aspect.class",
+                artifact_sha256="a" * 64,
+            ),),
+            metadata=(("caller_resolution_required", True),
+                      ("caller_owner", "demo.Service"),
+                      ("caller_name", "run"),
+                      ("caller_signature", "()")),
+        )
+
+        result = ingest_collector_batches(
+            graph,
+            (CollectorBatch(collector="spring_aop_activation", version="1", edges=(edge,)),),
+        )
+
+        projected = graph.reverse_edges["demo.Aspect.before()"][0]
+        self.assertEqual(projected.caller_symbol_id, "service-run")
+        self.assertEqual(projected.evidence_type, "spring_aop_activation")
+        self.assertTrue(projected.framework_activation_verified)
+        self.assertEqual(projected.activation_evidence[0].proof_kind,
+                         "runtime_visible_aspect_registration")
+        self.assertEqual(result.framework_activation_edges, 1)
+
+        graph.require_current_final_artifact_business_edges = True
+        self.assertTrue(tracer_module._edge_allowed_for_trace(projected, graph))
 
     def test_distinct_physical_instruction_offsets_are_not_deduplicated(self):
         first = self._edge()
