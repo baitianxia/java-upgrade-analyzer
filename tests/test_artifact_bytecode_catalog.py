@@ -76,6 +76,7 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
             shared_graph = SimpleNamespace(
                 runtime_dependency_catalog=shared_catalog,
                 step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog(shared_catalog),
+                report_dir=str(root / "report"),
             )
             shared = tracer._scan_packaged_runtime_dependencies_for_api(
                 api_row, shared_graph,
@@ -161,12 +162,38 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
             shared_graph = SimpleNamespace(
                 runtime_dependency_catalog=shared_catalog,
                 step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog(shared_catalog),
+                report_dir=str(root / "report"),
             )
             legacy = tracer._build_packaged_runtime_dependency_scan_cache(
                 api_rows, legacy_graph,
             )
             shared = tracer._build_packaged_runtime_dependency_scan_cache(
                 api_rows, shared_graph,
+            )
+            cache_path = (
+                root / "report/.runtime/cache/s5_runtime_member_candidate_index.json"
+            )
+            self.assertTrue(cache_path.is_file())
+            reload_catalog = {
+                "status": "complete", "target_jdk": "17",
+                "entries": [dict(entry) for entry in entries],
+            }
+            reload_graph = SimpleNamespace(
+                runtime_dependency_catalog=reload_catalog,
+                report_dir=str(root / "report"),
+            )
+            with patch.object(
+                tracer, "_build_runtime_dependency_member_candidate_index",
+                side_effect=AssertionError("persistent member index should be reused"),
+            ):
+                reloaded_index = tracer._get_runtime_dependency_member_candidate_index(
+                    reload_graph, reload_catalog["entries"], "17",
+                )
+            self.assertEqual(
+                tracer._runtime_member_index_serializable(
+                    shared_graph._runtime_dependency_member_candidate_index
+                ),
+                tracer._runtime_member_index_serializable(reloaded_index),
             )
 
         self.assertEqual(legacy, shared)

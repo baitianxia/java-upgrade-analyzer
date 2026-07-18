@@ -3771,6 +3771,8 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     multi_release_target_resolved = False
     counted_artifacts = set()
     scanned_artifact_sha256 = {}
+    fast_member_index = None
+    fast_member_index_identity = None
     started_at = time.perf_counter()
     progress_interval = suggest_log_interval(len(catalog_entries), target_updates=8, minimum=1)
 
@@ -3822,6 +3824,12 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         if indexed_tasks is not None:
             member_index['_stat_snapshot'] = current_stat_snapshot
             setattr(graph, '_runtime_dependency_member_candidate_index', member_index)
+            fast_member_index = member_index
+            fast_member_index_identity = (
+                _runtime_member_index_cache_identity_from_verified_catalog(
+                    catalog_entries, target_jdk,
+                )
+            )
             scan_catalog_entries = []
             for item in catalog_entries:
                 coord = str(item.get('coord') or '').strip()
@@ -4265,6 +4273,21 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
         return existing
 
+    member_cache_path = _runtime_member_index_cache_path(graph)
+    if (
+        fast_member_index is not None
+        and fast_member_index_identity is not None
+        and member_cache_path is not None
+    ):
+        try:
+            _write_runtime_member_index_cache(
+                member_cache_path, fast_member_index_identity, fast_member_index,
+            )
+            fast_member_index['_identity'] = fast_member_index_identity
+            _perf_add(graph, 'bytecode_expand', 'member_index_cache_writes', 1)
+        except (OSError, TypeError, ValueError):
+            _perf_add(graph, 'bytecode_expand', 'member_index_cache_write_failures', 1)
+
     catalog['_packaged_api_scan_stat_snapshot'] = snapshot_after_commit
     _record_analyzer_scan_failures(graph, scan_failures)
     for failures in candidate_failures_by_key.values():
@@ -4551,6 +4574,31 @@ def _runtime_member_index_cache_identity(catalog_entries, target_jdk):
             'application_owned': item.get('application_owned'),
             'ownership_evidence': item.get('ownership_evidence'),
         })
+    return {
+        'schema': RUNTIME_MEMBER_INDEX_CACHE_SCHEMA,
+        'target_jdk': str(target_jdk or ''),
+        'artifacts': sorted(
+            artifacts,
+            key=lambda row: (
+                row['coord'], row['jar_path'], row['artifact_entry'],
+                row['artifact_sha256'],
+            ),
+        ),
+    }
+
+
+def _runtime_member_index_cache_identity_from_verified_catalog(
+    catalog_entries, target_jdk,
+):
+    """Build the same identity after every catalog SHA was verified by the fact store."""
+    artifacts = [{
+        'coord': str(item.get('coord') or '').strip(),
+        'jar_path': str(Path(str(item.get('jar_path') or '')).resolve()),
+        'artifact_entry': str(item.get('artifact_entry') or ''),
+        'artifact_sha256': str(item.get('sha256') or '').lower(),
+        'application_owned': item.get('application_owned'),
+        'ownership_evidence': item.get('ownership_evidence'),
+    } for item in catalog_entries or ()]
     return {
         'schema': RUNTIME_MEMBER_INDEX_CACHE_SCHEMA,
         'target_jdk': str(target_jdk or ''),
