@@ -1669,6 +1669,8 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(len(commands), 3)
         self.assertTrue(str(commands[0][1]).endswith("s1_dep_diff.py"))
         self.assertIn("--base-artifact-path", commands[0])
+        self.assertEqual(commands[0][commands[0].index("--base") + 1], "base-sha")
+        self.assertEqual(commands[0][commands[0].index("--current") + 1], "current-sha")
         self.assertTrue(str(commands[1][1]).endswith("s2_context_from_deps.py"))
         self.assertIn(str(source_dir), commands[1])
         self.assertTrue(str(commands[2][1]).endswith("s4_jar_compare.py"))

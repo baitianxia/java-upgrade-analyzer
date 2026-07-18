@@ -5293,6 +5293,10 @@ def derive_step4_inputs_from_artifacts(
         "--output",
         str(dep_changes),
     ]
+    if case.base_revision:
+        step1_cmd.extend(("--base", case.base_revision))
+    if case.current_revision:
+        step1_cmd.extend(("--current", case.current_revision))
     step1 = subprocess.run(
         step1_cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", timeout=900
     )
