@@ -69,6 +69,7 @@ jobs:
           MATRIX_JAVA: ${{ matrix.java }}
           CELL_RESULT_PATH: ${{ runner.temp }}/platform-cell-${{ matrix.os }}-jdk${{ matrix.java }}.txt
           QUALITY_GATE_JSON: ${{ runner.temp }}/platform-contract.json
+          ACCURACY_BENCHMARK_JSON: ${{ runner.temp }}/jua-platform-contract/accuracy_benchmark_core.json
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           SETUP_PYTHON_OUTCOME: ${{ steps.setup_python.outcome }}
           SETUP_JAVA_OUTCOME: ${{ steps.setup_java.outcome }}
@@ -83,14 +84,15 @@ jobs:
           printf 'step|verify-maven|%s\n' "${VERIFY_MAVEN_OUTCOME}" >> "${CELL_RESULT_PATH}"
           printf 'step|install-dependencies|%s\n' "${INSTALL_DEPENDENCIES_OUTCOME}" >> "${CELL_RESULT_PATH}"
           printf 'step|quality-gate|%s\n' "${QUALITY_GATE_OUTCOME}" >> "${CELL_RESULT_PATH}"
-          python - "${QUALITY_GATE_JSON}" "${CELL_RESULT_PATH}" <<'PY'
+          python - "${QUALITY_GATE_JSON}" "${ACCURACY_BENCHMARK_JSON}" "${CELL_RESULT_PATH}" <<'PY'
           import json
           import re
           import sys
           from pathlib import Path
 
           source = Path(sys.argv[1])
-          destination = Path(sys.argv[2])
+          benchmark_source = Path(sys.argv[2])
+          destination = Path(sys.argv[3])
           with destination.open("a", encoding="utf-8", newline="\n") as handle:
               if not source.is_file():
                   handle.write("gate|quality-gate-report|missing\n")
@@ -103,6 +105,15 @@ jobs:
                       name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(result.get("name") or "unknown"))
                       status = re.sub(r"[^A-Za-z0-9._-]+", "-", status)
                       handle.write(f"gate|{name}|{status}\n")
+              if benchmark_source.is_file():
+                  payload = json.loads(benchmark_source.read_text(encoding="utf-8"))
+                  for result in payload.get("results") or []:
+                      status = str(result.get("status") or "missing")
+                      if status == "passed":
+                          continue
+                      name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(result.get("name") or "unknown"))
+                      status = re.sub(r"[^A-Za-z0-9._-]+", "-", status)
+                      handle.write(f"benchmark|{name}|{status}\n")
           PY
 
       - name: Upload Platform Evidence
@@ -172,6 +183,12 @@ jobs:
                 GATE_NAME="${STEP_NAME}"
                 GATE_STATUS="${STEP_OUTCOME}"
                 publish_tag "platform-contract-gate-${GATE_STATUS}-${GATE_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}"
+                continue
+              fi
+              if [[ "${RECORD_KIND}" = "benchmark" ]]; then
+                BENCHMARK_NAME="${STEP_NAME}"
+                BENCHMARK_STATUS="${STEP_OUTCOME}"
+                publish_tag "platform-contract-benchmark-${BENCHMARK_STATUS}-${BENCHMARK_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}"
                 continue
               fi
               if [[ "${RECORD_KIND}" != "step" || "${STEP_OUTCOME}" = "success" ]]; then

@@ -40,6 +40,20 @@ class QualityGateTest(unittest.TestCase):
         self.assertTrue(quick_task.command[-1].endswith("test_generated_core_matrix_is_semantically_identical"))
         self.assertTrue(release_task.command[-1].endswith("test_generated_production_matrix_is_semantically_identical"))
 
+    def test_accuracy_benchmarks_preserve_every_category_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = quality_gate.build_plan(
+                "quick", report_root=tmp, skip_real=True
+            )
+            task = next(item for item in tasks if item.name == "accuracy_benchmark_core")
+
+            self.assertIn("--continue-on-failure", task.command)
+            self.assertIn("--json-out", task.command)
+            self.assertEqual(
+                task.command[-1], str(Path(tmp) / "accuracy_benchmark_core.json")
+            )
+            self.assertEqual(task.output_paths, (task.command[-1],))
+
     def test_release_profile_has_explicit_execution_fault_gate(self):
         tasks = quality_gate.build_plan("release", skip_real=True)
         task = next(item for item in tasks if item.name == "execution_faults")

@@ -239,12 +239,22 @@ def _user_scenario_task(python_exe):
     )
 
 
-def _accuracy_benchmark_task(python_exe, profile):
+def _accuracy_benchmark_task(python_exe, profile, json_out=""):
+    command = [
+        python_exe,
+        "scripts/accuracy_benchmark.py",
+        "--profile",
+        profile,
+        "--continue-on-failure",
+    ]
+    if json_out:
+        command.extend(["--json-out", json_out])
     return GateTask(
         name=f"accuracy_benchmark_{profile}",
-        command=[python_exe, "scripts/accuracy_benchmark.py", "--profile", profile],
+        command=command,
         purpose=f"准确性基准矩阵：{profile}",
         heavy=profile in {"step5", "all"},
+        output_paths=(json_out,) if json_out else (),
     )
 
 
@@ -342,7 +352,11 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
 
     if profile == "quick":
         tasks.append(_determinism_task(python_exe, "core"))
-        tasks.append(_accuracy_benchmark_task(python_exe, "core"))
+        tasks.append(_accuracy_benchmark_task(
+            python_exe,
+            "core",
+            str(audit_root / "accuracy_benchmark_core.json"),
+        ))
         tasks.append(_unittest_task(
             python_exe,
             "unit_core_semantics",
@@ -351,7 +365,11 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
         ))
         tasks.append(_smoke_task(python_exe, "core"))
     elif profile == "step5":
-        tasks.append(_accuracy_benchmark_task(python_exe, "step5"))
+        tasks.append(_accuracy_benchmark_task(
+            python_exe,
+            "step5",
+            str(audit_root / "accuracy_benchmark_step5.json"),
+        ))
         tasks.append(_unittest_task(
             python_exe,
             "unit_step5_semantics",
@@ -377,7 +395,11 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
         tasks.append(_determinism_task(python_exe, "full"))
         tasks.append(_generated_complexity_task(python_exe))
         tasks.append(_claude_skill_contract_task(python_exe))
-        tasks.append(_accuracy_benchmark_task(python_exe, "all"))
+        tasks.append(_accuracy_benchmark_task(
+            python_exe,
+            "all",
+            str(audit_root / "accuracy_benchmark_all.json"),
+        ))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all"))
         tasks.append(_user_scenario_task(python_exe))
