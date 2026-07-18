@@ -925,11 +925,15 @@ def minimal_valid_app_class_bytes():
 
 def create_boot_jar(path, deps):
     path.parent.mkdir(parents=True, exist_ok=True)
+    repository = Path(
+        os.environ.get("MAVEN_REPO_LOCAL")
+        or (Path.home() / ".m2" / "repository")
+    )
     with zipfile.ZipFile(path, "w") as outer:
         outer.writestr("BOOT-INF/classes/com/example/App.class", minimal_valid_app_class_bytes())
         for group_id, artifact_id, version in deps:
             local_jar = (
-                Path.home() / ".m2" / "repository" / Path(*group_id.split("."))
+                repository / Path(*group_id.split("."))
                 / artifact_id / version / f"{artifact_id}-{version}.jar"
             )
             if local_jar.is_file():

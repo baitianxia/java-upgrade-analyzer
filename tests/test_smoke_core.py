@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import zipfile
+import io
 from pathlib import Path
 
 try:
@@ -14,6 +16,38 @@ from scripts import smoke_regression
 
 
 class SmokeCoreTest(SmokeRegressionTestCase):
+    def test_fake_maven_packages_dependency_from_explicit_repository_not_platform_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            (root / ".git" / "HEAD").write_text("ref: refs/heads/current\n", encoding="utf-8")
+            script = root / "fake-mvn"
+            script.write_text(smoke_regression.fake_maven_script_text(), encoding="utf-8")
+            repository = root / "fixture-repository"
+            dependency = repository / "com" / "example" / "demo-lib" / "2.0.0" / "demo-lib-2.0.0.jar"
+            dependency.parent.mkdir(parents=True)
+            with zipfile.ZipFile(dependency, "w") as archive:
+                archive.writestr("META-INF/spring.factories", "fixture=true\n")
+
+            env = dict(os.environ)
+            env["HOME"] = str(root / "wrong-home")
+            env["MAVEN_REPO_LOCAL"] = str(repository)
+            completed = subprocess.run(
+                [sys.executable, str(script), "package"],
+                cwd=str(root),
+                env=env,
+                capture_output=True,
+            )
+
+            artifact = root / "target" / "demo-app-2.0.0.jar"
+            with zipfile.ZipFile(artifact) as outer:
+                nested_bytes = outer.read("BOOT-INF/lib/demo-lib-2.0.0.jar")
+            with zipfile.ZipFile(io.BytesIO(nested_bytes)) as nested:
+                names = set(nested.namelist())
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        self.assertIn("META-INF/spring.factories", names)
+
     def test_checkpoint_distinguishes_gate_stage(self):
         self.assertEqual(
             smoke_regression.smoke_script_checkpoint(
