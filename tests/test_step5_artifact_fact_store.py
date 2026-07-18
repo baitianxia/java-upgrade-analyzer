@@ -1,8 +1,10 @@
 import csv
+import hashlib
 import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -13,6 +15,7 @@ from real_project_regression import (  # noqa: E402
     cold_run_metrics,
     step5_result_contract,
 )
+from step5_artifact_fact_store import Step5ArtifactFactStore  # noqa: E402
 
 
 class Step5ColdRunContractTest(unittest.TestCase):
@@ -79,6 +82,107 @@ class Step5ColdRunContractTest(unittest.TestCase):
                 {"artifact_facts.inventory_builds": "2"},
             )
 
+
+class ArtifactInventoryTest(unittest.TestCase):
+    def _catalog(self, jar_path, *, target_jdk="17", sha256=None):
+        digest = sha256 or hashlib.sha256(Path(jar_path).read_bytes()).hexdigest()
+        entry = {
+            "coord": "com.example:fixture",
+            "jar_path": str(jar_path),
+            "sha256": digest,
+            "artifact_entry": "BOOT-INF/lib/fixture.jar",
+        }
+        return {
+            "target_jdk": target_jdk,
+            "by_coord": {entry["coord"]: entry},
+            "entries": [entry],
+        }
+
+    def _write_jar(self, path, *, multi_release=True):
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("META-INF/MANIFEST.MF", (
+                "Manifest-Version: 1.0\n"
+                + ("Multi-Release: true\n" if multi_release else "")
+            ))
+            archive.writestr("com/example/A.class", b"base")
+            archive.writestr("com/example/B.class", b"base-b")
+            archive.writestr("META-INF/versions/11/com/example/A.class", b"v11")
+            archive.writestr("META-INF/versions/17/com/example/A.class", b"v17")
+            archive.writestr("META-INF/services/com.example.Service", b"impl")
+
+    def test_selects_effective_multi_release_class_for_target_jdk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            self._write_jar(jar_path)
+
+            inventory = Step5ArtifactFactStore.from_catalog(
+                self._catalog(jar_path, target_jdk="11")
+            ).inventory("com.example:fixture")
+
+        self.assertEqual(inventory.failure, "")
+        self.assertEqual(
+            [(item.logical_name, item.physical_entry, item.multi_release_version)
+             for item in inventory.classes],
+            [
+                ("com/example/A.class", "META-INF/versions/11/com/example/A.class", "11"),
+                ("com/example/B.class", "com/example/B.class", "base"),
+            ],
+        )
+        self.assertEqual(
+            inventory.resources,
+            ("META-INF/MANIFEST.MF", "META-INF/services/com.example.Service"),
+        )
+
+    def test_without_multi_release_manifest_ignores_versioned_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            self._write_jar(jar_path, multi_release=False)
+
+            inventory = Step5ArtifactFactStore.from_catalog(
+                self._catalog(jar_path, target_jdk="17")
+            ).inventory("com.example:fixture")
+
+        self.assertEqual(
+            [item.physical_entry for item in inventory.classes],
+            ["com/example/A.class", "com/example/B.class"],
+        )
+
+    def test_inventory_is_singleton_per_artifact_and_immutable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            self._write_jar(jar_path)
+            store = Step5ArtifactFactStore.from_catalog(self._catalog(jar_path))
+
+            first = store.inventory("com.example:fixture")
+            second = store.inventory("com.example:fixture")
+
+        self.assertIs(first, second)
+        with self.assertRaises(Exception):
+            first.failure = "changed"
+
+    def test_sha_mismatch_is_explicit_failure_not_empty_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            self._write_jar(jar_path)
+            store = Step5ArtifactFactStore.from_catalog(
+                self._catalog(jar_path, sha256="0" * 64)
+            )
+
+            inventory = store.inventory("com.example:fixture")
+
+        self.assertIn("sha256_mismatch", inventory.failure)
+        self.assertEqual(inventory.classes, ())
+
+    def test_corrupt_archive_is_explicit_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "broken.jar"
+            jar_path.write_bytes(b"not-a-zip")
+            store = Step5ArtifactFactStore.from_catalog(self._catalog(jar_path))
+
+            inventory = store.inventory("com.example:fixture")
+
+        self.assertIn("BadZipFile", inventory.failure)
+        self.assertEqual(inventory.classes, ())
 
 if __name__ == "__main__":
     unittest.main()
