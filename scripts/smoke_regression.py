@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -101,6 +102,16 @@ def smoke_script_checkpoint(script_name, args):
     return f"script-{script}"
 
 
+def gate_failure_reason(stderr):
+    artifacts = sorted({
+        Path(match).stem
+        for match in re.findall(r"\bs3_[A-Za-z0-9_]+\.(?:csv|txt|json)\b", stderr or "")
+    })
+    if artifacts:
+        return "missing-" + "-".join(artifacts)
+    return "failed"
+
+
 @dataclass(frozen=True)
 class SmokeWorkspace:
     base_tmp: Path
@@ -146,6 +157,10 @@ def run_script(script_name, args, cwd=None, env=None, allow_awaiting=False):
         )
 
     if rc not in allowed_rcs:
+        if Path(script_name).stem == "gate":
+            mark_smoke_checkpoint(
+                f"{smoke_script_checkpoint(script_name, args)}-{gate_failure_reason(stderr)}"
+            )
         raise RuntimeError(
             f"命令失败: {' '.join(cmd)}\n"
             f"stdout:\n{stdout}\n"

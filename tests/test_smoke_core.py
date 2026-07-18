@@ -22,6 +22,17 @@ class SmokeCoreTest(SmokeRegressionTestCase):
             "script-gate-step1_scope",
         )
 
+    def test_gate_failure_reason_lists_missing_artifacts_without_localized_text(self):
+        reason = smoke_regression.gate_failure_reason(
+            "门控未通过：以下扫描文件缺失："
+            "['s3_dependency_compat.csv', 's3_dependency_classfile.csv']"
+        )
+
+        self.assertEqual(
+            reason,
+            "missing-s3_dependency_classfile-s3_dependency_compat",
+        )
+
     def test_failure_writes_machine_readable_last_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "smoke-result.json"
