@@ -4,12 +4,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 from real_project_regression import canonical_step5_result_fingerprint  # noqa: E402
+import s5_call_chain_engine_integrated as step5_engine  # noqa: E402
 
 
 class Step5ResultFingerprintTest(unittest.TestCase):
@@ -65,6 +67,45 @@ class Step5ResultFingerprintTest(unittest.TestCase):
                 canonical_step5_result_fingerprint(first_root),
                 canonical_step5_result_fingerprint(second_root),
             )
+
+
+class ReverseEdgeOverlayTest(unittest.TestCase):
+    def test_reuses_untouched_base_lists_and_combines_only_overlay_keys(self):
+        base_only = [SimpleNamespace(evidence_type="ast")]
+        shared = [SimpleNamespace(evidence_type="source")]
+        graph = SimpleNamespace(reverse_edges={"base": base_only, "shared": shared})
+        batch = SimpleNamespace(edges=(
+            SimpleNamespace(
+                edge_kind="bytecode_reflection_method_invocation",
+                callee_symbol="shared",
+            ),
+            SimpleNamespace(
+                edge_kind="bytecode_reflection_class_lookup",
+                callee_symbol="overlay",
+            ),
+            SimpleNamespace(edge_kind="bytecode_method_invocation", callee_symbol="ignored"),
+        ))
+
+        snapshot = step5_engine._graph_snapshot_with_bytecode_batch(graph, batch)
+
+        self.assertIs(snapshot.reverse_edges["base"], base_only)
+        self.assertEqual(
+            [item.evidence_type for item in snapshot.reverse_edges["shared"]],
+            ["source", "bytecode_reflection_method_invocation"],
+        )
+        self.assertEqual(
+            [item.evidence_type for item in snapshot.reverse_edges["overlay"]],
+            ["bytecode_reflection_class_lookup"],
+        )
+        self.assertNotIn("ignored", snapshot.reverse_edges)
+        self.assertEqual(list(snapshot.reverse_edges), ["base", "shared", "overlay"])
+
+    def test_overlay_mapping_is_read_only(self):
+        overlay_type = step5_engine._ReverseEdgeOverlay
+        overlay = overlay_type({"base": []}, {"overlay": (object(),)})
+
+        with self.assertRaises(TypeError):
+            overlay["new"] = []
 
 
 if __name__ == "__main__":

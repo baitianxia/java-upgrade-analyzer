@@ -34,6 +34,7 @@ import time
 import traceback
 import zipfile
 from collections import defaultdict, deque
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -676,19 +677,48 @@ def _requires_current_final_artifact_edges(bytecode_stats):
     return str((bytecode_stats or {}).get('evidence_source') or '') == 'current_final_artifact'
 
 
+class _ReverseEdgeOverlay(Mapping):
+    """Read-only reverse-edge view that allocates only for overlaid keys."""
+
+    def __init__(self, base, overlay):
+        self._base = base or {}
+        self._overlay = overlay or {}
+
+    def __getitem__(self, key):
+        base_present = key in self._base
+        overlay_present = key in self._overlay
+        if not base_present and not overlay_present:
+            raise KeyError(key)
+        if not overlay_present:
+            return self._base[key]
+        if not base_present:
+            return self._overlay[key]
+        return tuple(self._base[key]) + tuple(self._overlay[key])
+
+    def __iter__(self):
+        yield from self._base
+        for key in self._overlay:
+            if key not in self._base:
+                yield key
+
+    def __len__(self):
+        return len(self._base) + sum(key not in self._base for key in self._overlay)
+
+
 def _graph_snapshot_with_bytecode_batch(graph, batch):
     """Provide indirect coverage a read-only view of pending bytecode reflection evidence."""
     snapshot = SimpleNamespace(**vars(graph))
-    snapshot.reverse_edges = {
-        key: list(edges)
-        for key, edges in (getattr(graph, 'reverse_edges', {}) or {}).items()
-    }
+    overlay = defaultdict(list)
     for edge in batch.edges:
         if not edge.edge_kind.startswith('bytecode_reflection_'):
             continue
-        snapshot.reverse_edges.setdefault(edge.callee_symbol, []).append(
+        overlay[edge.callee_symbol].append(
             SimpleNamespace(evidence_type=edge.edge_kind)
         )
+    snapshot.reverse_edges = _ReverseEdgeOverlay(
+        getattr(graph, 'reverse_edges', {}) or {},
+        {key: tuple(edges) for key, edges in overlay.items()},
+    )
     return snapshot
 
 
