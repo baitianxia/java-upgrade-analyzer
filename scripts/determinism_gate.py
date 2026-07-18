@@ -94,7 +94,8 @@ def run_generated_determinism_matrix(
                     env["PYTHONHASHSEED"] = str(hash_seed)
                     completed = subprocess.run(
                         command, cwd=str(repo_root), env=env,
-                        capture_output=True, text=True, timeout=60,
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=60,
                     )
                     if completed.returncode != 0 or not output.is_file():
                         ledger = {"apis": [], "edges": [], "completeness": {"process_error": completed.stderr}, "reason_codes": ["PROCESS_FAILED"]}

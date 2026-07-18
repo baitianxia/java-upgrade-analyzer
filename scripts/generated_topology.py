@@ -236,6 +236,8 @@ def materialize_topology(
         ["javac", "-encoding", "UTF-8", "-d", str(classes_dir), *map(str, source_paths)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
     )
     if completed.returncode != 0:
