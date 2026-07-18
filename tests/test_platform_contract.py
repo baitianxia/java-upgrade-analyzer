@@ -21,6 +21,7 @@ class PlatformContractTest(unittest.TestCase):
         self.assertRegex(text, r'java:\s*\["11",\s*"17",\s*"21"\]')
         self.assertIn('python-version: "3.12"', text)
         self.assertIn("mvn -version", text)
+        self.assertNotIn("cache: maven", text)
         self.assertIn("timeout-minutes:", text)
         self.assertIn("actions/upload-artifact@v4", text)
         self.assertIn("platform-contract.json", text)

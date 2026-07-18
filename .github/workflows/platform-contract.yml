@@ -41,7 +41,6 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
-          cache: maven
 
       - name: Verify Maven
         run: mvn -version
