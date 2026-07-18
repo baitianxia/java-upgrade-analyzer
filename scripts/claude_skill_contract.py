@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 
 
 PUBLIC_SCRIPT_RE = re.compile(r"\$\{CLAUDE_SKILL_DIR\}/(scripts/[A-Za-z0-9_./-]+\.py)")
@@ -28,6 +29,9 @@ class SkillContractReport:
     first_state_sha256: str
     rerun_state_sha256: str
     clean_copy_without_report_state: bool
+    completed_step: str = ""
+    deliverables_verified: bool = False
+    successful_rerun_returncode: int = -1
 
 
 def audit_public_contract(root: Path) -> tuple[str, ...]:
@@ -91,7 +95,83 @@ def _run(command, cwd):
     )
 
 
-def run_skill_contract(repo_root: Path, workspace: Path) -> SkillContractReport:
+def _compile_java(source: Path, output: Path, *, classpath: Path | None = None):
+    output.mkdir(parents=True, exist_ok=True)
+    command = ["javac", "-encoding", "UTF-8", "-d", str(output)]
+    if classpath is not None:
+        command.extend(["-classpath", str(classpath)])
+    command.append(str(source))
+    completed = _run(command, source.parent)
+    if completed.returncode != 0:
+        raise RuntimeError(f"javac fixture failed: {completed.stderr}")
+
+
+def _write_library_jar(path: Path, classes: Path, version: str):
+    properties = (
+        "groupId=contract\nartifactId=demo-lib\n"
+        f"version={version}\n"
+    ).encode("utf-8")
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for class_file in sorted(classes.rglob("*.class")):
+            archive.write(class_file, class_file.relative_to(classes).as_posix())
+        archive.writestr(
+            "META-INF/maven/contract/demo-lib/pom.properties", properties
+        )
+
+
+def _write_fat_jar(path: Path, app_classes: Path, library: Path):
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "META-INF/MANIFEST.MF",
+            "Manifest-Version: 1.0\nMain-Class: contract.App\n",
+        )
+        for class_file in sorted(app_classes.rglob("*.class")):
+            archive.write(
+                class_file,
+                "BOOT-INF/classes/" + class_file.relative_to(app_classes).as_posix(),
+            )
+        archive.write(library, f"BOOT-INF/lib/{library.name}")
+
+
+def _materialize_complete_fixture(fixture: Path) -> tuple[Path, Path, Path]:
+    build = fixture / "contract-build"
+    old_source = build / "old-src" / "contract" / "Target.java"
+    new_source = build / "new-src" / "contract" / "Target.java"
+    app_source = fixture / "src" / "main" / "java" / "contract" / "App.java"
+    for path, content in (
+        (old_source, "package contract; public class Target { public String removed() { return \"old\"; } }\n"),
+        (new_source, "package contract; public class Target { }\n"),
+        (app_source, "package contract; public class App { public String run(Target target) { return target.removed(); } }\n"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    old_classes = build / "old-classes"
+    new_classes = build / "new-classes"
+    app_classes = build / "app-classes"
+    _compile_java(old_source, old_classes)
+    _compile_java(new_source, new_classes)
+    _compile_java(app_source, app_classes, classpath=old_classes)
+    old_library = build / "demo-lib-1.0.jar"
+    new_library = build / "demo-lib-2.0.jar"
+    _write_library_jar(old_library, old_classes, "1.0")
+    _write_library_jar(new_library, new_classes, "2.0")
+    base_artifact = build / "app-base.jar"
+    current_artifact = build / "app-current.jar"
+    _write_fat_jar(base_artifact, app_classes, old_library)
+    _write_fat_jar(current_artifact, app_classes, new_library)
+    return base_artifact, current_artifact, app_source.parents[2]
+
+
+def _state_completed_step(state_path: Path) -> str:
+    if not state_path.is_file():
+        return ""
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    return str((payload.get("state") or {}).get("completed_step") or "")
+
+
+def run_skill_contract(
+    repo_root: Path, workspace: Path, *, complete_workflow: bool = False
+) -> SkillContractReport:
     repo_root = Path(repo_root)
     workspace = Path(workspace)
     skill_root = workspace / "clean-skill"
@@ -109,6 +189,11 @@ def run_skill_contract(repo_root: Path, workspace: Path) -> SkillContractReport:
         "<version>1</version></project>\n",
         encoding="utf-8",
     )
+    base_artifact = current_artifact = source_root = None
+    if complete_workflow:
+        base_artifact, current_artifact, source_root = _materialize_complete_fixture(
+            fixture
+        )
     clean = not report_dir.exists() and not (skill_root / ".upgrade-report").exists()
     errors = list(audit_public_contract(skill_root))
     describe = _run(
@@ -124,6 +209,16 @@ def run_skill_contract(repo_root: Path, workspace: Path) -> SkillContractReport:
         "--project-dir", str(fixture),
         "--report-dir", str(report_dir),
     ]
+    if complete_workflow:
+        command.extend([
+            "--base-artifact-path", str(base_artifact),
+            "--current-artifact-path", str(current_artifact),
+            "--base-branch", "base-artifact",
+            "--current-branch", "current-artifact",
+            "--source-dirs", str(source_root),
+            "--target-module", ".",
+            "--allow-degraded",
+        ])
     first = _run(command, fixture)
     state = report_dir / ".runtime" / "state" / "main_state.json"
     interaction = report_dir / ".runtime" / "state" / "interaction.json"
@@ -140,18 +235,80 @@ def run_skill_contract(repo_root: Path, workspace: Path) -> SkillContractReport:
     rerun_sha = _semantic_state_sha(state) if state.is_file() else ""
     if first_sha and rerun_sha and first_sha != rerun_sha:
         errors.append("checkpoint_rerun_not_idempotent")
+    invalid_report_dir = fixture / ".upgrade-report-invalid-resume"
+    if report_dir.is_dir():
+        shutil.copytree(report_dir, invalid_report_dir)
     failed_resume = _run(
         [
             sys.executable, str(skill_root / "scripts" / "run_step.py"),
             "--step", "auto",
             "--project-dir", str(fixture),
-            "--report-dir", str(report_dir),
+            "--report-dir", str(invalid_report_dir),
             "--response-json", '{"intent_patch":{"action":"continue"}}',
         ],
         fixture,
     )
     if failed_resume.returncode == 0:
         errors.append("invalid_resume_was_accepted")
+    completed_step = _state_completed_step(state)
+    deliverables_verified = False
+    successful_rerun_returncode = -1
+    if complete_workflow:
+        for _ in range(10):
+            if completed_step == "step6":
+                break
+            interaction_payload = {}
+            if interaction.is_file():
+                interaction_payload = json.loads(interaction.read_text(encoding="utf-8"))
+            step_id = str(interaction_payload.get("step_id") or "")
+            response = {"action": "continue", "notes": "contract workflow"}
+            response_properties = dict(
+                (interaction_payload.get("response_schema") or {}).get("properties")
+                or {}
+            )
+            if step_id == "step2" and "source_dirs" in response_properties:
+                response["source_dirs"] = [str(source_root)]
+            if step_id == "step5" and "allow_degraded" in response_properties:
+                response["allow_degraded"] = True
+            resume_command = [
+                sys.executable, str(skill_root / "scripts" / "run_step.py"),
+                "--step", "auto",
+                "--project-dir", str(fixture),
+                "--report-dir", str(report_dir),
+            ]
+            if step_id:
+                resume_command.extend(["--response-json", json.dumps(response)])
+            resumed = _run(resume_command, fixture)
+            if resumed.returncode not in (0, 4):
+                errors.append(
+                    f"workflow_resume_failed:{step_id}:{resumed.returncode}:"
+                    f"{resumed.stderr[-500:]}"
+                )
+                break
+            completed_step = _state_completed_step(state)
+        if completed_step != "step6":
+            errors.append(f"workflow_incomplete:{completed_step or 'none'}")
+        deliverables_verified = all(
+            path.is_file()
+            for path in (
+                report_dir / "deliverables" / "report.md",
+                report_dir / ".runtime" / "state" / "main_state.json",
+            )
+        )
+        if not deliverables_verified:
+            errors.append("workflow_deliverables_missing")
+        successful_rerun = _run(
+            [
+                sys.executable, str(skill_root / "scripts" / "run_step.py"),
+                "--step", "step6",
+                "--project-dir", str(fixture),
+                "--report-dir", str(report_dir),
+            ],
+            fixture,
+        )
+        successful_rerun_returncode = successful_rerun.returncode
+        if successful_rerun.returncode != 0:
+            errors.append(f"successful_rerun_failed:{successful_rerun.returncode}")
     return SkillContractReport(
         "failed" if errors else "passed",
         tuple(errors),
@@ -162,4 +319,7 @@ def run_skill_contract(repo_root: Path, workspace: Path) -> SkillContractReport:
         first_sha,
         rerun_sha,
         clean,
+        completed_step,
+        deliverables_verified,
+        successful_rerun_returncode,
     )

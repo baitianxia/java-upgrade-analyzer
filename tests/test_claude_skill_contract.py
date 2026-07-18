@@ -37,6 +37,15 @@ class ClaudeSkillContractTest(unittest.TestCase):
         self.assertTrue(report.clean_copy_without_report_state)
         self.assertNotEqual(report.failed_resume_returncode, 0)
 
+    def test_clean_copy_completes_public_step1_to_step6_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_skill_contract(ROOT, Path(tmp), complete_workflow=True)
+
+        self.assertEqual(report.status, "passed", report.errors)
+        self.assertEqual(report.completed_step, "step6")
+        self.assertTrue(report.deliverables_verified)
+        self.assertEqual(report.successful_rerun_returncode, 0)
+
     def test_repository_public_contract_has_no_undeclared_or_stale_entrypoint(self):
         self.assertEqual(audit_public_contract(ROOT), ())
 

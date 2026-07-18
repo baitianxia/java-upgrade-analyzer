@@ -222,7 +222,8 @@
         "tests.test_real_project_regression.RealProjectRegressionTest.test_every_pinned_manifest_has_an_executable_materialization_contract",
         "tests.test_determinism_gate.DeterminismGateTest.test_generated_production_matrix_is_semantically_identical",
         "tests.test_platform_contract.PlatformContractTest.test_workflow_declares_mandatory_os_jdk_tool_and_evidence_matrix",
-        "tests.test_claude_skill_contract.ClaudeSkillContractTest.test_clean_copy_starts_and_stops_at_checkpoint_idempotently"
+        "tests.test_claude_skill_contract.ClaudeSkillContractTest.test_clean_copy_starts_and_stops_at_checkpoint_idempotently",
+        "tests.test_claude_skill_contract.ClaudeSkillContractTest.test_clean_copy_completes_public_step1_to_step6_workflow"
       ],
       "negative_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_absolute_artifact_path_without_published_origin_is_not_reproducible",
