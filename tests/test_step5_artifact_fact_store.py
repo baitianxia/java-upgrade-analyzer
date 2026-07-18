@@ -3,6 +3,8 @@ import hashlib
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -15,7 +17,7 @@ from real_project_regression import (  # noqa: E402
     cold_run_metrics,
     step5_result_contract,
 )
-from step5_artifact_fact_store import Step5ArtifactFactStore  # noqa: E402
+from step5_artifact_fact_store import FactOutcome, Step5ArtifactFactStore  # noqa: E402
 
 
 class Step5ColdRunContractTest(unittest.TestCase):
@@ -183,6 +185,113 @@ class ArtifactInventoryTest(unittest.TestCase):
 
         self.assertIn("BadZipFile", inventory.failure)
         self.assertEqual(inventory.classes, ())
+
+
+class SingleFlightFactTest(unittest.TestCase):
+    def _store_and_location(self, tmp):
+        jar_path = Path(tmp) / "fixture.jar"
+        with zipfile.ZipFile(jar_path, "w") as archive:
+            archive.writestr("com/example/A.class", b"class-bytes")
+        digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+        entry = {
+            "coord": "com.example:fixture",
+            "jar_path": str(jar_path),
+            "sha256": digest,
+            "artifact_entry": "BOOT-INF/lib/fixture.jar",
+        }
+        store = Step5ArtifactFactStore.from_catalog({
+            "target_jdk": "17", "entries": [entry],
+        })
+        location = store.inventory(entry["coord"]).classes[0]
+        return store, entry["coord"], location
+
+    def test_concurrent_class_fact_runs_producer_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, coord, location = self._store_and_location(tmp)
+            calls = 0
+            calls_lock = threading.Lock()
+
+            def producer(content):
+                nonlocal calls
+                with calls_lock:
+                    calls += 1
+                time.sleep(0.02)
+                return (content.decode("ascii"),)
+
+            results = []
+            threads = [threading.Thread(
+                target=lambda: results.append(
+                    store.class_fact(coord, location, "header-v1", producer)
+                )
+            ) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(item is results[0] for item in results))
+        self.assertEqual(results[0], FactOutcome("complete", ("class-bytes",), "", "classfile"))
+
+    def test_failure_is_shared_and_never_becomes_empty_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, coord, location = self._store_and_location(tmp)
+            calls = 0
+
+            def producer(_content):
+                nonlocal calls
+                calls += 1
+                raise ValueError("broken class")
+
+            first = store.class_fact(coord, location, "header-v1", producer)
+            second = store.class_fact(coord, location, "header-v1", producer)
+
+        self.assertEqual(calls, 1)
+        self.assertIs(first, second)
+        self.assertEqual(first.status, "failed")
+        self.assertIn("ValueError: broken class", first.reason)
+        self.assertIsNone(first.value)
+
+    def test_namespaces_and_javap_profiles_do_not_collide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, coord, location = self._store_and_location(tmp)
+            calls = []
+
+            first = store.class_fact(
+                coord, location, "header-v1",
+                lambda _content: calls.append("header") or ("header",),
+            )
+            second = store.class_fact(
+                coord, location, "constant-pool-v1",
+                lambda _content: calls.append("constant-pool") or ("cp",),
+            )
+            verbose = store.javap_fact(
+                coord, location, "verbose-code-v1",
+                lambda _identity, _location, profile: calls.append(profile) or "verbose",
+            )
+            header = store.javap_fact(
+                coord, location, "header-v1",
+                lambda _identity, _location, profile: calls.append(profile) or "header",
+            )
+
+        self.assertEqual(first.value, ("header",))
+        self.assertEqual(second.value, ("cp",))
+        self.assertEqual(verbose.value, "verbose")
+        self.assertEqual(header.value, "header")
+        self.assertEqual(calls, ["header", "constant-pool", "verbose-code-v1", "header-v1"])
+
+    def test_class_bytes_are_not_retained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, coord, location = self._store_and_location(tmp)
+
+            first = store.class_bytes(coord, location)
+            second = store.class_bytes(coord, location)
+
+        self.assertEqual(first.value, b"class-bytes")
+        self.assertEqual(second.value, b"class-bytes")
+        self.assertIsNot(first, second)
+        self.assertEqual(store.metrics()["class_bytes_reads"], 2)
 
 if __name__ == "__main__":
     unittest.main()

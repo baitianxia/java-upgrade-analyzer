@@ -37,6 +37,14 @@ class ArtifactInventory:
     failure: str = ""
 
 
+@dataclass(frozen=True)
+class FactOutcome:
+    status: str
+    value: Any
+    reason: str = ""
+    parser: str = ""
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -106,6 +114,21 @@ class Step5ArtifactFactStore:
         self._identities = dict(identities)
         self._inventories: dict[str, ArtifactInventory] = {}
         self._inventory_inflight: dict[str, threading.Event] = {}
+        self._facts: dict[tuple[Any, ...], FactOutcome] = {}
+        self._fact_inflight: dict[tuple[Any, ...], threading.Event] = {}
+        self._metrics: dict[str, int | float] = {
+            "inventory_builds": 0,
+            "inventory_hits": 0,
+            "class_bytes_reads": 0,
+            "class_bytes_read": 0,
+            "fact_hits": 0,
+            "fact_misses": 0,
+            "fact_failures": 0,
+            "javap_requests": 0,
+            "javap_starts": 0,
+            "javap_shared_hits": 0,
+            "javap_failures": 0,
+        }
         self._lock = threading.Lock()
 
     @classmethod
@@ -135,6 +158,7 @@ class Step5ArtifactFactStore:
             with self._lock:
                 cached = self._inventories.get(coord)
                 if cached is not None:
+                    self._metrics["inventory_hits"] += 1
                     return cached
                 event = self._inventory_inflight.get(coord)
                 owner = event is None
@@ -157,9 +181,106 @@ class Step5ArtifactFactStore:
             )
         with self._lock:
             self._inventories[coord] = inventory
+            self._metrics["inventory_builds"] += 1
             self._inventory_inflight.pop(coord, None)
             event.set()
         return inventory
+
+    def _identity(self, coord: str) -> ArtifactIdentity:
+        identity = self._identities.get(str(coord or "").strip())
+        if identity is None:
+            raise KeyError(f"artifact_coord_missing:{coord}")
+        return identity
+
+    def class_bytes(self, coord: str, location: ClassLocation) -> FactOutcome:
+        try:
+            identity = self._identity(coord)
+            inventory = self.inventory(coord)
+            if inventory.failure:
+                raise ValueError(inventory.failure)
+            if location not in inventory.classes:
+                raise KeyError(f"class_location_not_in_inventory:{location.physical_entry}")
+            with zipfile.ZipFile(identity.path) as archive:
+                content = archive.read(location.physical_entry)
+            with self._lock:
+                self._metrics["class_bytes_reads"] += 1
+                self._metrics["class_bytes_read"] += len(content)
+            return FactOutcome("complete", content, "", "zipfile")
+        except Exception as exc:
+            return FactOutcome("failed", None, f"{type(exc).__name__}: {exc}", "zipfile")
+
+    def _single_flight(self, key, producer, *, parser: str) -> FactOutcome:
+        while True:
+            with self._lock:
+                cached = self._facts.get(key)
+                if cached is not None:
+                    self._metrics["fact_hits"] += 1
+                    return cached
+                event = self._fact_inflight.get(key)
+                owner = event is None
+                if owner:
+                    event = threading.Event()
+                    self._fact_inflight[key] = event
+                    self._metrics["fact_misses"] += 1
+            if owner:
+                break
+            event.wait()
+        try:
+            value = producer()
+            outcome = FactOutcome("complete", value, "", parser)
+        except Exception as exc:
+            outcome = FactOutcome(
+                "failed", None, f"{type(exc).__name__}: {exc}", parser,
+            )
+        with self._lock:
+            if outcome.status != "complete":
+                self._metrics["fact_failures"] += 1
+            self._facts[key] = outcome
+            self._fact_inflight.pop(key, None)
+            event.set()
+        return outcome
+
+    def class_fact(self, coord, location, namespace, producer) -> FactOutcome:
+        identity = self._identity(coord)
+        key = (
+            "class", identity.sha256, identity.target_jdk,
+            location.physical_entry, str(namespace or ""),
+        )
+
+        def produce():
+            content = self.class_bytes(coord, location)
+            if content.status != "complete":
+                raise ValueError(content.reason)
+            return producer(content.value)
+
+        return self._single_flight(key, produce, parser="classfile")
+
+    def javap_fact(self, coord, location, profile, producer) -> FactOutcome:
+        identity = self._identity(coord)
+        key = (
+            "javap", identity.sha256, identity.target_jdk,
+            location.physical_entry, str(profile or ""),
+        )
+        with self._lock:
+            self._metrics["javap_requests"] += 1
+            already_cached = key in self._facts or key in self._fact_inflight
+            if already_cached:
+                self._metrics["javap_shared_hits"] += 1
+
+        def produce():
+            with self._lock:
+                self._metrics["javap_starts"] += 1
+            return producer(identity, location, profile)
+
+        outcome = self._single_flight(key, produce, parser="javap")
+        if outcome.status != "complete":
+            with self._lock:
+                self._metrics["javap_failures"] += 1
+        return outcome
+
+    def metrics(self) -> dict[str, int | float]:
+        with self._lock:
+            return dict(self._metrics)
 
     @staticmethod
     def _build_inventory(identity: ArtifactIdentity) -> ArtifactInventory:
@@ -192,5 +313,6 @@ __all__ = [
     "ArtifactIdentity",
     "ArtifactInventory",
     "ClassLocation",
+    "FactOutcome",
     "Step5ArtifactFactStore",
 ]
