@@ -29,26 +29,32 @@ jobs:
         java: ["11", "17", "21"]
     steps:
       - name: Checkout
+        id: checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
+        id: setup_python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Setup Java
+        id: setup_java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
 
       - name: Verify Maven
+        id: verify_maven
         run: mvn -version
 
       - name: Install Declared Runtime Dependencies
+        id: install_dependencies
         run: python -m pip install "tree-sitter==0.25.2" "tree-sitter-java==0.23.5"
 
       - name: Run Platform Contract
+        id: quality_gate
         run: >-
           python scripts/quality_gate.py --profile quick --skip-real
           --report-root "${{ runner.temp }}/jua-platform-contract"
@@ -62,7 +68,20 @@ jobs:
           MATRIX_OS: ${{ matrix.os }}
           MATRIX_JAVA: ${{ matrix.java }}
           CELL_RESULT_PATH: ${{ runner.temp }}/platform-cell-${{ matrix.os }}-jdk${{ matrix.java }}.txt
-        run: printf '%s|%s|%s\n' "${CELL_STATUS}" "${MATRIX_OS}" "${MATRIX_JAVA}" > "${CELL_RESULT_PATH}"
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          SETUP_PYTHON_OUTCOME: ${{ steps.setup_python.outcome }}
+          SETUP_JAVA_OUTCOME: ${{ steps.setup_java.outcome }}
+          VERIFY_MAVEN_OUTCOME: ${{ steps.verify_maven.outcome }}
+          INSTALL_DEPENDENCIES_OUTCOME: ${{ steps.install_dependencies.outcome }}
+          QUALITY_GATE_OUTCOME: ${{ steps.quality_gate.outcome }}
+        run: |
+          printf '%s|%s|%s\n' "${CELL_STATUS}" "${MATRIX_OS}" "${MATRIX_JAVA}" > "${CELL_RESULT_PATH}"
+          printf 'step|checkout|%s\n' "${CHECKOUT_OUTCOME}" >> "${CELL_RESULT_PATH}"
+          printf 'step|setup-python|%s\n' "${SETUP_PYTHON_OUTCOME}" >> "${CELL_RESULT_PATH}"
+          printf 'step|setup-java|%s\n' "${SETUP_JAVA_OUTCOME}" >> "${CELL_RESULT_PATH}"
+          printf 'step|verify-maven|%s\n' "${VERIFY_MAVEN_OUTCOME}" >> "${CELL_RESULT_PATH}"
+          printf 'step|install-dependencies|%s\n' "${INSTALL_DEPENDENCIES_OUTCOME}" >> "${CELL_RESULT_PATH}"
+          printf 'step|quality-gate|%s\n' "${QUALITY_GATE_OUTCOME}" >> "${CELL_RESULT_PATH}"
 
       - name: Upload Platform Evidence
         if: always()
@@ -126,6 +145,12 @@ jobs:
               *) exit 1 ;;
             esac
             publish_tag "platform-contract-cell-${CELL_STATUS}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}"
+            while IFS='|' read -r RECORD_KIND STEP_NAME STEP_OUTCOME; do
+              if [[ "${RECORD_KIND}" != "step" || "${STEP_OUTCOME}" = "success" ]]; then
+                continue
+              fi
+              publish_tag "platform-contract-step-${STEP_OUTCOME}-${STEP_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}"
+            done < "${result_file}"
           done
 
           if [[ "${MATRIX_RESULT}" = "success" ]]; then
