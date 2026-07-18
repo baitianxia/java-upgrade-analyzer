@@ -4565,7 +4565,8 @@ def ensure_changed_apis(case: RealProjectCase, changed_apis: Path, materialized_
 
 
 def resolve_constant_oracle_provider(
-    manifest: dict, *, maven_repository: Path | None = None
+    manifest: dict, *, project_root: Path | None = None,
+    maven_repository: Path | None = None,
 ) -> Path:
     provider = dict((manifest.get("constant_oracle") or {}).get("provider") or {})
     coordinate = str(provider.get("coordinate") or "").strip()
@@ -4575,16 +4576,25 @@ def resolve_constant_oracle_provider(
     expected_sha = str(provider.get("sha256") or "").strip()
     if not _valid_sha256(expected_sha):
         raise ValueError("constant_oracle_provider_sha256_invalid")
-    group_id, artifact_id, version = parts
-    repository = Path(
-        maven_repository
-        or os.environ.get("JUA_MAVEN_REPOSITORY")
-        or (Path.home() / ".m2" / "repository")
-    )
-    artifact = (
-        repository / Path(*group_id.split(".")) / artifact_id / version
-        / f"{artifact_id}-{version}.jar"
-    )
+    artifact_path = str(provider.get("artifact_path") or "").strip()
+    if artifact_path:
+        if project_root is None:
+            raise ValueError("constant_oracle_provider_project_root_required")
+        root = Path(project_root).resolve()
+        artifact = (root / artifact_path).resolve()
+        if artifact != root and root not in artifact.parents:
+            raise ValueError("constant_oracle_provider_path_outside_project")
+    else:
+        group_id, artifact_id, version = parts
+        repository = Path(
+            maven_repository
+            or os.environ.get("JUA_MAVEN_REPOSITORY")
+            or (Path.home() / ".m2" / "repository")
+        )
+        artifact = (
+            repository / Path(*group_id.split(".")) / artifact_id / version
+            / f"{artifact_id}-{version}.jar"
+        )
     if not artifact.is_file():
         raise ValueError(f"constant_oracle_provider_missing:{artifact}")
     actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
@@ -4640,7 +4650,8 @@ def materialize_constant_evidence_input(
 
 
 def prepare_constant_project_input(
-    manifest: dict, changed_apis: Path, report_dir: Path
+    manifest: dict, changed_apis: Path, report_dir: Path,
+    project_root: Path | None = None,
 ) -> dict:
     if not manifest.get("constant_oracle"):
         return {
@@ -4649,7 +4660,9 @@ def prepare_constant_project_input(
             "errors": [],
         }
     try:
-        provider = resolve_constant_oracle_provider(manifest)
+        provider = resolve_constant_oracle_provider(
+            manifest, project_root=project_root
+        )
         output = (
             Path(report_dir) / "evidence" / "api_changes"
             / "constant_evidence_apis.csv"
@@ -4679,6 +4692,8 @@ def reconcile_constant_project_evidence(
     summary: dict,
     output_path: Path,
     required_faults: Iterable[str] = (),
+    analyzer_edge_rows: Iterable[dict] = (),
+    consumer_artifact_sha256: str = "",
 ) -> dict:
     constant_rows = [
         dict(row) for row in selected_rows
@@ -4701,27 +4716,66 @@ def reconcile_constant_project_evidence(
     for row in constant_rows:
         selected_by_identity[serialized_api_identity(row)].append(row)
     analyzer_rows = []
+    analyzer_edge_rows = list(analyzer_edge_rows or ())
+    artifact_scan_complete = str(
+        (((summary.get("meta") or {}).get("graph_stats") or {}).get(
+            "artifact_bytecode"
+        ) or {}).get("status") or ""
+    ) == "complete"
     for summary_row in load_analyzer_rows(summary):
         identity = serialized_api_identity(summary_row)
         candidates = selected_by_identity.get(identity) or []
-        for selected in candidates:
-            try:
-                evidence = json.loads(
-                    str(selected.get("constant_field_evidence_json") or "")
-                )
-            except json.JSONDecodeError:
-                evidence = {}
+        for _selected in candidates:
+            impact = summary_row.get("constant_impact_evidence")
+            impact = dict(impact) if isinstance(impact, dict) else {}
+            old_field = impact.get("old_field")
+            old_field = dict(old_field) if isinstance(old_field, dict) else {}
+            runtime_flag = impact.get("runtime_field_edge_present")
+            exact_links = []
+            for edge in analyzer_edge_rows:
+                if str(edge.get("api_identity") or "") != identity:
+                    continue
+                exact_links.append({
+                    "consumer_owner": str(edge.get("caller_owner") or ""),
+                    "consumer_method": str(edge.get("caller_member") or ""),
+                    "consumer_descriptor": str(edge.get("caller_descriptor") or ""),
+                    "target_owner": str(edge.get("callee_owner") or ""),
+                    "target_field": str(edge.get("callee_member") or ""),
+                    "target_descriptor": str(edge.get("callee_descriptor") or ""),
+                    "opcode": str(edge.get("opcode_family") or ""),
+                    "instruction_offset": int(edge.get("instruction_offset")),
+                    "artifact_sha256": str(edge.get("artifact_sha256") or ""),
+                    "artifact_entry": str(edge.get("artifact_entry") or ""),
+                })
+            exact_links.sort(key=lambda item: tuple(str(item.get(key) or "") for key in (
+                "artifact_sha256", "artifact_entry", "consumer_owner", "consumer_method",
+                "consumer_descriptor", "instruction_offset",
+            )))
+            evidence_complete = bool(
+                artifact_scan_complete
+                and old_field.get("status") == "complete"
+                and str(old_field.get("descriptor") or "")
+                and _valid_sha256(str(old_field.get("artifact_sha256") or ""))
+                and isinstance(runtime_flag, bool)
+                and bool(str(summary_row.get("compile_impact") or ""))
+                and bool(str(summary_row.get("runtime_link_impact") or ""))
+                and _valid_sha256(consumer_artifact_sha256)
+                and runtime_flag == bool(exact_links)
+            )
             analyzer_rows.append({
                 "identity": identity,
-                "descriptor": str(selected.get("field_descriptor") or ""),
-                "has_constant_value": evidence.get("has_constant_value") is True,
-                "constant_value": evidence.get("constant_value"),
-                "runtime_link_present": (
-                    str(summary_row.get("analysis_status") or "") == "reachable"
-                ),
-                "old_artifact_sha256": str(evidence.get("artifact_sha256") or ""),
+                "descriptor": str(old_field.get("descriptor") or ""),
+                "has_constant_value": old_field.get("has_constant_value") is True,
+                "constant_value": old_field.get("constant_value"),
+                "runtime_links": exact_links,
+                "consumer_artifact_sha256s": [consumer_artifact_sha256],
+                "old_artifact_sha256": str(old_field.get("artifact_sha256") or ""),
                 "conclusion": str(summary_row.get("analysis_status") or ""),
-                "evidence_status": str(evidence.get("status") or "incomplete"),
+                "compile_impact": str(summary_row.get("compile_impact") or ""),
+                "runtime_link_impact": str(
+                    summary_row.get("runtime_link_impact") or ""
+                ),
+                "evidence_status": "complete" if evidence_complete else "incomplete",
             })
     audit = audit_constant_evidence(analyzer_rows, oracle_rows)
     incomplete_analyzer = sorted(
@@ -4763,27 +4817,81 @@ def reconcile_constant_project_evidence(
 def evaluate_constant_evidence_fault_injections(
     clean_evidence: dict, required_modes: Iterable[str]
 ) -> dict:
+    required_modes = list(required_modes or ())
     oracle_base = copy.deepcopy(
         list((clean_evidence.get("oracle") or {}).get("records") or [])
     )
     analyzer_base = copy.deepcopy(clean_evidence.get("analyzer_records") or [])
+    for row in oracle_base:
+        row["expected_conclusion"] = (
+            "reachable" if row.get("runtime_links") else
+            "uncertain" if row.get("has_constant_value") else
+            "not_found_in_static_analysis"
+        )
+    clean_oracle = clean_evidence.get("oracle") or {}
+    clean_audit = audit_constant_evidence(analyzer_base, oracle_base)
+    clean_baseline_blocking = bool(
+        not clean_evidence.get("complete")
+        or clean_evidence.get("blocking")
+        or not clean_oracle.get("complete")
+        or clean_oracle.get("failures")
+        or not oracle_base
+        or not analyzer_base
+        or clean_audit.get("blocking")
+    )
     runs = []
-    for mode in required_modes or ():
+    expected_fields = {
+        "wrong_constant_value": ["constant_value"],
+        "removed_field_link": ["runtime_links"],
+        "extra_field_link": ["runtime_links"],
+        "wrong_descriptor": ["descriptor"],
+        "stale_provider_sha256": ["old_artifact_sha256"],
+    }
+    for mode in required_modes:
         oracle_rows = copy.deepcopy(oracle_base)
         analyzer_rows = copy.deepcopy(analyzer_base)
-        if not oracle_rows or not analyzer_rows:
+        if clean_baseline_blocking:
             runs.append({
                 "mode": mode, "passed": False, "blocking": False,
-                "detected_fields": [], "error": "clean_constant_records_missing",
+                "detected_fields": [], "error": "clean_baseline_blocking",
+                "clean_audit": clean_audit,
             })
             continue
         if mode == "wrong_constant_value":
             analyzer_rows[0]["constant_value"] = "__fault_wrong_constant__"
         elif mode == "removed_field_link":
-            oracle_rows[0]["runtime_links"] = [{"fault": "expected_runtime_link"}]
+            target = next(
+                (row for row in analyzer_rows if row.get("runtime_links")), None
+            )
+            if target is None:
+                runs.append({
+                    "mode": mode, "passed": False, "blocking": False,
+                    "detected_fields": [], "error": "fault_not_applicable",
+                })
+                continue
+            target["runtime_links"] = list(target["runtime_links"])[1:]
         elif mode == "extra_field_link":
-            analyzer_rows[0]["runtime_link_present"] = True
-            analyzer_rows[0]["conclusion"] = "reachable"
+            target = next(
+                (row for row in analyzer_rows if not row.get("runtime_links")), None
+            )
+            if target is None:
+                runs.append({
+                    "mode": mode, "passed": False, "blocking": False,
+                    "detected_fields": [], "error": "fault_not_applicable",
+                })
+                continue
+            target["runtime_links"] = [{
+                "consumer_owner": "fault.Consumer",
+                "consumer_method": "read",
+                "consumer_descriptor": "()V",
+                "target_owner": "fault.Provider",
+                "target_field": "VALUE",
+                "target_descriptor": "I",
+                "opcode": "getstatic",
+                "instruction_offset": -1,
+                "artifact_sha256": "f" * 64,
+                "artifact_entry": "fault/Consumer.class",
+            }]
         elif mode == "wrong_descriptor":
             analyzer_rows[0]["descriptor"] = "__fault_descriptor__"
         elif mode == "stale_provider_sha256":
@@ -4794,12 +4902,6 @@ def evaluate_constant_evidence_fault_injections(
                 "detected_fields": [], "error": "unknown_constant_fault_mode",
             })
             continue
-        for row in oracle_rows:
-            row["expected_conclusion"] = (
-                "reachable" if row.get("runtime_links") else
-                "uncertain" if row.get("has_constant_value") else
-                "not_found_in_static_analysis"
-            )
         audit = audit_constant_evidence(analyzer_rows, oracle_rows)
         detected_fields = sorted({
             field
@@ -4808,13 +4910,16 @@ def evaluate_constant_evidence_fault_injections(
         })
         runs.append({
             "mode": mode,
-            "passed": bool(audit.get("blocking") and detected_fields),
+            "passed": bool(
+                audit.get("blocking")
+                and detected_fields == expected_fields[mode]
+            ),
             "blocking": bool(audit.get("blocking")),
             "detected_fields": detected_fields,
             "audit": audit,
         })
     return {
-        "required": list(required_modes or ()),
+        "required": required_modes,
         "passed": all(run.get("passed") for run in runs),
         "runs": runs,
     }
@@ -6246,7 +6351,7 @@ def run_case(
         }
 
     constant_input = prepare_constant_project_input(
-        pinned_manifest, changed_apis, report_dir
+        pinned_manifest, changed_apis, report_dir, project_root=project_root
     )
     if constant_input.get("complete"):
         changed_apis = Path(str(constant_input.get("changed_apis") or changed_apis))
@@ -6403,6 +6508,17 @@ def run_case(
     if constant_input.get("required"):
         if constant_input.get("complete"):
             try:
+                analyzer_edge_path = (
+                    report_dir / "evidence" / "call_chain" / "analyzer_edges.csv"
+                )
+                _edge_fields, constant_analyzer_edges = (
+                    _csv_rows(analyzer_edge_path)
+                    if analyzer_edge_path.is_file() else ([], [])
+                )
+                consumer_sha256 = (
+                    hashlib.sha256(Path(case.final_artifact).read_bytes()).hexdigest()
+                    if analyzer_edge_path.is_file() and case.final_artifact else ""
+                )
                 constant_reconciliation = reconcile_constant_project_evidence(
                     Path(str(constant_input.get("provider_artifact") or "")),
                     Path(case.final_artifact or ""),
@@ -6414,6 +6530,8 @@ def run_case(
                             "required_fault_injections"
                         ) or ()
                     ),
+                    analyzer_edge_rows=constant_analyzer_edges,
+                    consumer_artifact_sha256=consumer_sha256,
                 )
                 constant_reconciliation["required"] = True
                 constant_reconciliation["errors"] = list(

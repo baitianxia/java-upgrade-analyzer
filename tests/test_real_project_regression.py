@@ -196,6 +196,25 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(resolved, provider)
 
+    def test_constant_oracle_provider_can_use_a_project_relative_materialized_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "project"
+            provider = project_root / "target" / "oracle" / "provider.jar"
+            provider.parent.mkdir(parents=True)
+            provider.write_bytes(b"portable-provider")
+            manifest = {"constant_oracle": {"provider": {
+                "coordinate": "g:a:1",
+                "artifact_path": "target/oracle/provider.jar",
+                "sha256": hashlib.sha256(provider.read_bytes()).hexdigest(),
+            }}}
+
+            resolved = realreg.resolve_constant_oracle_provider(
+                manifest, project_root=project_root,
+                maven_repository=Path(tmp) / "empty-repository",
+            )
+
+        self.assertEqual(resolved, provider.resolve())
+
     def test_constant_oracle_provider_rejects_stale_sha(self):
         with tempfile.TemporaryDirectory() as tmp:
             repository = Path(tmp) / "repository"
@@ -269,13 +288,20 @@ class RealProjectRegressionTest(unittest.TestCase):
             }),
         }]
         identity = realreg.serialized_api_identity(selected_rows[0])
-        summary = {"uncertain_apis": [{
+        summary = {"meta": {"graph_stats": {"artifact_bytecode": {"status": "complete"}}}, "uncertain_apis": [{
             **selected_rows[0], "analysis_status": "uncertain",
+            "compile_impact": "recompile_break",
+            "runtime_link_impact": "inlined_no_link",
+            "constant_impact_evidence": {
+                "old_field": json.loads(selected_rows[0]["constant_field_evidence_json"]),
+                "runtime_field_edge_present": False,
+            },
         }]}
         record = SimpleNamespace(to_dict=lambda: {
             "identity": identity, "descriptor": "I",
             "has_constant_value": True, "constant_value": 10,
             "runtime_links": [], "old_artifact_sha256": "a" * 64,
+            "consumer_artifact_sha256s": ["b" * 64],
         })
         ledger = SimpleNamespace(complete=True, records=(record,), failures=())
 
@@ -285,6 +311,7 @@ class RealProjectRegressionTest(unittest.TestCase):
             result = realreg.reconcile_constant_project_evidence(
                 Path("provider.jar"), Path("consumer.jar"), selected_rows,
                 summary, Path(tmp) / "constant-oracle.json",
+                analyzer_edge_rows=[], consumer_artifact_sha256="b" * 64,
             )
 
         self.assertTrue(result["complete"], result)
@@ -302,14 +329,21 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "artifact_sha256": "a" * 64,
             }),
         }]
-        summary = {"reachable_apis": [{
+        summary = {"meta": {"graph_stats": {"artifact_bytecode": {"status": "complete"}}}, "reachable_apis": [{
             **selected_rows[0], "analysis_status": "reachable",
+            "compile_impact": "runtime_link",
+            "runtime_link_impact": "runtime_link",
+            "constant_impact_evidence": {
+                "old_field": json.loads(selected_rows[0]["constant_field_evidence_json"]),
+                "runtime_field_edge_present": True,
+            },
         }]}
         identity = realreg.serialized_api_identity(selected_rows[0])
         record = SimpleNamespace(to_dict=lambda: {
             "identity": identity, "descriptor": "I",
             "has_constant_value": True, "constant_value": 10,
             "runtime_links": [], "old_artifact_sha256": "a" * 64,
+            "consumer_artifact_sha256s": ["b" * 64],
         })
         ledger = SimpleNamespace(complete=True, records=(record,), failures=())
 
@@ -319,13 +353,42 @@ class RealProjectRegressionTest(unittest.TestCase):
             result = realreg.reconcile_constant_project_evidence(
                 Path("provider.jar"), Path("consumer.jar"), selected_rows,
                 summary, Path(tmp) / "constant-oracle.json",
+                analyzer_edge_rows=[], consumer_artifact_sha256="b" * 64,
             )
 
         self.assertTrue(result["blocking"])
         self.assertEqual(
             result["audit"]["incorrect_fields"][identity],
-            ["conclusion", "runtime_link_present"],
+            ["conclusion"],
         )
+
+    def test_constant_project_reconciliation_rejects_missing_step5_evidence_block(self):
+        selected = {
+            "coord": "g:a", "api_name": "p.Flags.VALUE",
+            "symbol_kind": "field", "change_type": "REMOVED",
+            "field_descriptor": "I", "compatibility_flags": "CONSTANT_REMOVED",
+        }
+        identity = realreg.serialized_api_identity(selected)
+        record = SimpleNamespace(to_dict=lambda: {
+            "identity": identity, "descriptor": "I",
+            "has_constant_value": True, "constant_value": 10,
+            "runtime_links": [], "old_artifact_sha256": "a" * 64,
+            "consumer_artifact_sha256s": ["b" * 64],
+        })
+        ledger = SimpleNamespace(complete=True, records=(record,), failures=())
+        summary = {"uncertain_apis": [{**selected, "analysis_status": "uncertain"}]}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg, "run_constant_oracle", return_value=ledger
+        ):
+            result = realreg.reconcile_constant_project_evidence(
+                Path("provider.jar"), Path("consumer.jar"), [selected], summary,
+                Path(tmp) / "constant-oracle.json", analyzer_edge_rows=[],
+                consumer_artifact_sha256="b" * 64,
+            )
+
+        self.assertTrue(result["blocking"])
+        self.assertEqual(result["incomplete_analyzer_identities"], [identity])
 
     def test_prepare_constant_project_input_returns_materialized_step5_input(self):
         manifest = {"constant_oracle": {"provider": {
@@ -371,18 +434,39 @@ class RealProjectRegressionTest(unittest.TestCase):
 
     def test_constant_fault_injections_detect_every_required_evidence_corruption(self):
         identity = "g:a|p.Flags.VALUE||field|REMOVED"
+        linked_identity = "g:a|p.Flags.DYNAMIC||field|REMOVED"
+        link = {
+            "consumer_owner": "p.Caller", "consumer_method": "read",
+            "consumer_descriptor": "()I", "target_owner": "p.Flags",
+            "target_field": "DYNAMIC", "target_descriptor": "I",
+            "opcode": "getstatic", "instruction_offset": 0,
+            "artifact_sha256": "b" * 64, "artifact_entry": "p/Caller.class",
+        }
         clean = {
-            "oracle": {"records": [{
+            "complete": True, "blocking": False,
+            "oracle": {"complete": True, "failures": [], "records": [{
                 "identity": identity, "descriptor": "I",
                 "has_constant_value": True, "constant_value": 10,
                 "runtime_links": [], "old_artifact_sha256": "a" * 64,
+                "consumer_artifact_sha256s": ["b" * 64],
+            }, {
+                "identity": linked_identity, "descriptor": "I",
+                "has_constant_value": False, "constant_value": None,
+                "runtime_links": [link], "old_artifact_sha256": "a" * 64,
+                "consumer_artifact_sha256s": ["b" * 64],
             }]},
             "analyzer_records": [{
                 "identity": identity, "descriptor": "I",
                 "has_constant_value": True, "constant_value": 10,
-                "runtime_link_present": False,
+                "runtime_links": [], "consumer_artifact_sha256s": ["b" * 64],
                 "old_artifact_sha256": "a" * 64,
                 "conclusion": "uncertain",
+            }, {
+                "identity": linked_identity, "descriptor": "I",
+                "has_constant_value": False, "constant_value": None,
+                "runtime_links": [link], "consumer_artifact_sha256s": ["b" * 64],
+                "old_artifact_sha256": "a" * 64,
+                "conclusion": "reachable",
             }],
         }
         required = [
@@ -395,7 +479,30 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(result["passed"], result)
         self.assertEqual([run["mode"] for run in result["runs"]], required)
         self.assertTrue(all(run["blocking"] for run in result["runs"]))
-        self.assertTrue(all(run["detected_fields"] for run in result["runs"]))
+        expected_fields = {
+            "wrong_constant_value": ["constant_value"],
+            "removed_field_link": ["runtime_links"],
+            "extra_field_link": ["runtime_links"],
+            "wrong_descriptor": ["descriptor"],
+            "stale_provider_sha256": ["old_artifact_sha256"],
+        }
+        self.assertEqual(
+            {run["mode"]: run["detected_fields"] for run in result["runs"]},
+            expected_fields,
+        )
+
+    def test_constant_fault_injections_refuse_a_blocking_clean_baseline(self):
+        result = realreg.evaluate_constant_evidence_fault_injections(
+            {
+                "complete": False, "blocking": True,
+                "oracle": {"records": [{"identity": "a"}]},
+                "analyzer_records": [{"identity": "a"}],
+            },
+            ["wrong_descriptor"],
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["runs"][0]["error"], "clean_baseline_blocking")
 
     def test_parse_args_accepts_final_artifact_override_for_single_case(self):
         args = realreg.parse_args([

@@ -22,6 +22,7 @@ class ConstantOracleRecord:
     has_constant_value: bool
     constant_value: object
     runtime_links: tuple[dict, ...]
+    consumer_artifact_sha256s: tuple[str, ...]
     old_artifact_sha256: str
     authority: str
     authority_version: str
@@ -181,10 +182,30 @@ def _field_links(javap_output, target_owner, field_name, descriptor, artifact_sh
         rf"{re.escape(descriptor)}\s*$"
     )
     links = []
+    consumer_method = ""
+    consumer_descriptor = ""
     for line in javap_output.splitlines():
+        method_header = re.match(
+            r"^\s{2}(?:(?:public|protected|private|static|final|synchronized|native|abstract)\s+)+"
+            r"(.+?)\((?:[^)]*)\);\s*$",
+            line,
+        )
+        if method_header:
+            consumer_method = method_header.group(1).strip().rsplit(" ", 1)[-1].rsplit(".", 1)[-1]
+            consumer_descriptor = ""
+            continue
+        descriptor_line = re.match(r"^\s+descriptor:\s+(\S+)\s*$", line)
+        if descriptor_line and consumer_method:
+            consumer_descriptor = descriptor_line.group(1)
+            continue
         match = pattern.search(line)
         if match:
             links.append({
+                "consumer_method": consumer_method,
+                "consumer_descriptor": consumer_descriptor,
+                "target_owner": target_owner,
+                "target_field": field_name,
+                "target_descriptor": descriptor,
                 "opcode": match.group(2),
                 "instruction_offset": int(match.group(1)),
                 "artifact_sha256": artifact_sha,
@@ -201,8 +222,10 @@ def run_constant_oracle(old_jar, consumer_artifacts, api_rows, javap="javap"):
         old_sha = _sha256_file(old_jar)
         old_classes = list(_iter_classes(old_jar))
         consumers = []
+        consumer_artifact_sha256s = set()
         for artifact in consumer_artifacts or ():
             artifact_sha = _sha256_file(artifact)
+            consumer_artifact_sha256s.add(artifact_sha)
             consumers.extend(
                 (owner, entry, content, artifact_sha)
                 for owner, entry, content in _iter_classes(artifact)
@@ -266,6 +289,7 @@ def run_constant_oracle(old_jar, consumer_artifacts, api_rows, javap="javap"):
                 item["artifact_sha256"], item["artifact_entry"],
                 item["instruction_offset"],
             ))),
+            consumer_artifact_sha256s=tuple(sorted(consumer_artifact_sha256s)),
             old_artifact_sha256=old_sha,
             authority="jdk-javap-constant-oracle",
             authority_version=version,
@@ -305,20 +329,37 @@ def audit_constant_evidence(analyzer_rows, oracle_rows):
         left = analyzer[identity]
         right = expected[identity]
         mismatches = []
-        expected_runtime_link = bool(
-            right.get("runtime_link_present")
-            if "runtime_link_present" in right
-            else right.get("runtime_links")
-        )
         comparisons = {
             "has_constant_value": (
                 bool(left.get("has_constant_value")),
                 bool(right.get("has_constant_value")),
             ),
-            "runtime_link_present": (
-                bool(left.get("runtime_link_present")), expected_runtime_link,
-            ),
         }
+        if "runtime_links" in right and "runtime_links" in left:
+            comparisons["runtime_links"] = (
+                sorted(
+                    (tuple(sorted(dict(item).items())) for item in left.get("runtime_links") or ()),
+                    key=repr,
+                ),
+                sorted(
+                    (tuple(sorted(dict(item).items())) for item in right.get("runtime_links") or ()),
+                    key=repr,
+                ),
+            )
+        else:
+            expected_runtime_link = bool(
+                right.get("runtime_link_present")
+                if "runtime_link_present" in right
+                else right.get("runtime_links")
+            )
+            comparisons["runtime_link_present"] = (
+                bool(left.get("runtime_link_present")), expected_runtime_link,
+            )
+        if "consumer_artifact_sha256s" in right:
+            comparisons["consumer_artifact_sha256s"] = (
+                sorted(left.get("consumer_artifact_sha256s") or ()),
+                sorted(right.get("consumer_artifact_sha256s") or ()),
+            )
         for field in ("descriptor", "constant_value", "old_artifact_sha256"):
             if field in right:
                 comparisons[field] = (left.get(field), right.get(field))

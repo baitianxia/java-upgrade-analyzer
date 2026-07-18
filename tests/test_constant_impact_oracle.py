@@ -1,3 +1,4 @@
+import ast
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,25 @@ import constant_impact_oracle as oracle  # noqa: E402
 
 @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
 class ConstantImpactOracleTest(unittest.TestCase):
+    def test_oracle_import_boundary_is_independent_from_analyzer_modules(self):
+        tree = ast.parse(
+            (ROOT / "scripts" / "constant_impact_oracle.py").read_text(encoding="utf-8")
+        )
+        imported_roots = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_roots.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_roots.add(node.module.split(".", 1)[0])
+        allowed = {
+            "dataclasses", "hashlib", "io", "pathlib", "re", "subprocess",
+            "tempfile", "zipfile", "signature_utils",
+        }
+
+        self.assertEqual(imported_roots - allowed, set())
+
     def _fixture(self, root):
         src = root / "src" / "sample"
         classes = root / "classes"
@@ -73,7 +93,19 @@ class ConstantImpactOracleTest(unittest.TestCase):
         self.assertEqual(by_name["sample.Flags.TEXT"].runtime_links, ())
         self.assertFalse(by_name["sample.Flags.DYNAMIC"].has_constant_value)
         self.assertEqual(len(by_name["sample.Flags.DYNAMIC"].runtime_links), 1)
-        self.assertEqual(by_name["sample.Flags.DYNAMIC"].runtime_links[0]["opcode"], "getstatic")
+        link = by_name["sample.Flags.DYNAMIC"].runtime_links[0]
+        self.assertEqual(link["opcode"], "getstatic")
+        self.assertEqual(link["consumer_owner"], "sample.Caller")
+        self.assertEqual(link["consumer_method"], "dynamic")
+        self.assertEqual(link["consumer_descriptor"], "()Ljava/lang/String;")
+        self.assertEqual(link["target_owner"], "sample.Flags")
+        self.assertEqual(link["target_field"], "DYNAMIC")
+        self.assertEqual(link["target_descriptor"], "Ljava/lang/String;")
+        self.assertEqual(
+            by_name["sample.Flags.TEXT"].consumer_artifact_sha256s,
+            by_name["sample.Flags.DYNAMIC"].consumer_artifact_sha256s,
+        )
+        self.assertEqual(len(by_name["sample.Flags.TEXT"].consumer_artifact_sha256s), 1)
 
     def test_oracle_does_not_import_or_call_analyzer_constant_extractor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,6 +211,33 @@ class ConstantImpactOracleTest(unittest.TestCase):
 
         self.assertTrue(audit["blocking"])
         self.assertEqual(audit["oracle_duplicate_identities"], [row["identity"]])
+
+    def test_closed_set_audit_reconciles_exact_runtime_link_multiset_and_consumer_sha(self):
+        link = {
+            "consumer_owner": "sample.Caller", "consumer_method": "dynamic",
+            "consumer_descriptor": "()Ljava/lang/String;",
+            "target_owner": "sample.Flags", "target_field": "DYNAMIC",
+            "target_descriptor": "Ljava/lang/String;", "opcode": "getstatic",
+            "instruction_offset": 0, "artifact_sha256": "b" * 64,
+            "artifact_entry": "sample/Caller.class",
+        }
+        oracle_rows = [{
+            "identity": "dynamic", "has_constant_value": False,
+            "runtime_links": [link], "consumer_artifact_sha256s": ["b" * 64],
+        }]
+        analyzer_rows = [{
+            "identity": "dynamic", "has_constant_value": False,
+            "runtime_links": [{**link, "instruction_offset": 1}],
+            "consumer_artifact_sha256s": ["c" * 64],
+        }]
+
+        audit = oracle.audit_constant_evidence(analyzer_rows, oracle_rows)
+
+        self.assertTrue(audit["blocking"])
+        self.assertEqual(
+            audit["incorrect_fields"]["dynamic"],
+            ["consumer_artifact_sha256s", "runtime_links"],
+        )
 
 
 if __name__ == "__main__":

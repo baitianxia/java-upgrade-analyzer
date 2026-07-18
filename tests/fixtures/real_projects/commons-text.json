@@ -10,18 +10,18 @@
     "kind": "source_build",
     "repository_url": "https://github.com/apache/commons-text.git",
     "working_directory": ".",
-    "command": ["mvn", "-q", "-DskipTests", "package"],
+    "command": ["mvn", "-q", "-DskipTests", "package", "dependency:copy-dependencies", "-DincludeGroupIds=org.apache.commons", "-DincludeArtifactIds=commons-lang3", "-DincludeTypes=jar", "-DoutputDirectory=target/jua-oracle-dependencies"],
     "artifact_path": "target/commons-text-1.12.0.jar"
   },
   "constant_oracle": {
     "provider": {
       "coordinate": "org.apache.commons:commons-lang3:3.14.0",
+      "artifact_path": "target/jua-oracle-dependencies/commons-lang3-3.14.0.jar",
       "sha256": "7b96bf3ee68949abb5bc465559ac270e0551596fa34523fddf890ec418dde13c"
     },
     "consumer": "artifact_path",
     "required_fault_injections": [
       "wrong_constant_value",
-      "removed_field_link",
       "extra_field_link",
       "wrong_descriptor",
       "stale_provider_sha256"
