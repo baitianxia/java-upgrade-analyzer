@@ -29,9 +29,11 @@ class PlatformContractTest(unittest.TestCase):
         self.assertIn('- "codex/**"', text)
         self.assertIn("platform-evidence:", text)
         self.assertIn("needs: platform-contract", text)
-        self.assertIn("github.event_name == 'push'", text)
+        self.assertIn("always() && github.event_name == 'push'", text)
+        self.assertIn("needs.platform-contract.result", text)
         self.assertIn("contents: write", text)
         self.assertIn("platform-contract-verified-${GITHUB_SHA}", text)
+        self.assertIn("platform-contract-failed-${GITHUB_SHA}", text)
         self.assertNotIn("continue-on-error", text)
 
     def test_run_cmd_preserves_unicode_space_and_metacharacter_arguments(self):

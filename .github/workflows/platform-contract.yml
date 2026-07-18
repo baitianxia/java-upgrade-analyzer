@@ -66,7 +66,7 @@ jobs:
 
   platform-evidence:
     needs: platform-contract
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ always() && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -78,9 +78,15 @@ jobs:
 
       - name: Publish immutable platform verification tag
         shell: bash
+        env:
+          MATRIX_RESULT: ${{ needs.platform-contract.result }}
         run: |
           set -euo pipefail
-          tag="platform-contract-verified-${GITHUB_SHA}"
+          if [[ "${MATRIX_RESULT}" = "success" ]]; then
+            tag="platform-contract-verified-${GITHUB_SHA}"
+          else
+            tag="platform-contract-failed-${GITHUB_SHA}"
+          fi
           ref="refs/tags/${tag}"
           remote_sha="$(git ls-remote --tags origin "${ref}" | awk '{print $1}')"
           if [[ -n "${remote_sha}" ]]; then
