@@ -14,6 +14,14 @@ from scripts import smoke_regression
 
 
 class SmokeCoreTest(SmokeRegressionTestCase):
+    def test_checkpoint_distinguishes_gate_stage(self):
+        self.assertEqual(
+            smoke_regression.smoke_script_checkpoint(
+                "gate.py", ["--step", "step1_scope", "--report-dir", "report"]
+            ),
+            "script-gate-step1_scope",
+        )
+
     def test_failure_writes_machine_readable_last_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "smoke-result.json"

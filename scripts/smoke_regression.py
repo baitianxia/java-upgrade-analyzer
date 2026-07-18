@@ -91,6 +91,16 @@ def write_smoke_result(path, status, error=None):
     )
 
 
+def smoke_script_checkpoint(script_name, args):
+    script = Path(script_name).stem
+    values = list(args or [])
+    if script == "gate" and "--step" in values:
+        index = values.index("--step") + 1
+        if index < len(values):
+            return f"script-gate-{values[index]}"
+    return f"script-{script}"
+
+
 @dataclass(frozen=True)
 class SmokeWorkspace:
     base_tmp: Path
@@ -116,7 +126,7 @@ def run_script(script_name, args, cwd=None, env=None, allow_awaiting=False):
         allow_awaiting: 是否允许 EXIT_AWAITING_USER。只有在明确知道是 checkpoint 场景时才设为 True。
                         设为 False 时，任何 await 都视为测试失败，暴露调度状态机问题。
     """
-    mark_smoke_checkpoint(f"script-{Path(script_name).stem}")
+    mark_smoke_checkpoint(smoke_script_checkpoint(script_name, args))
     cmd = [sys.executable, str(SCRIPT_DIR / script_name), *(args or [])]
     merged_env = dict(env or {})
     stdout, stderr, rc = compat_run_cmd(cmd, cwd=str(cwd) if cwd else None, env=merged_env)
