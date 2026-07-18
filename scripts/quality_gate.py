@@ -318,6 +318,16 @@ def _generated_complexity_task(python_exe):
     )
 
 
+def _claude_skill_contract_task(python_exe):
+    return _unittest_task(
+        python_exe,
+        "claude_skill_contract",
+        ["tests.test_claude_skill_contract"],
+        "从无用户状态和缓存的干净副本验证 Claude Code 公共 Skill 工作流",
+        heavy=True,
+    )
+
+
 def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", report_root=None):
     python_exe = python_exe or sys.executable
     required_tools = REQUIRED_TOOLS if profile in {"step5", "release"} else REQUIRED_TOOLS[:-1]
@@ -366,6 +376,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
         tasks.append(_execution_fault_task(python_exe))
         tasks.append(_determinism_task(python_exe, "full"))
         tasks.append(_generated_complexity_task(python_exe))
+        tasks.append(_claude_skill_contract_task(python_exe))
         tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all"))

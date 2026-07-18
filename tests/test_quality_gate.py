@@ -52,6 +52,12 @@ class QualityGateTest(unittest.TestCase):
 
         self.assertTrue(task.command[-1].endswith("test_real_generated_collector_produces_valid_1x_2x_4x_tiers"))
 
+    def test_release_profile_has_clean_claude_skill_contract(self):
+        tasks = quality_gate.build_plan("release", skip_real=True)
+        task = next(item for item in tasks if item.name == "claude_skill_contract")
+
+        self.assertEqual(task.command[-1], "tests.test_claude_skill_contract")
+
     def test_round_input_files_are_initialized_without_overwriting_reviews(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
