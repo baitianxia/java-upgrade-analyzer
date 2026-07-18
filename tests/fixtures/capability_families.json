@@ -97,7 +97,8 @@
         "tests.test_indirect_usage_analyzer.IndirectUsageAnalyzerTest.test_collect_indirect_usage_batch_reports_resource_read_failure_as_evidence_failure",
         "tests.test_final_artifact_edge_oracle.FinalArtifactEdgeOraclePerformanceTest.test_hung_javap_version_probe_returns_a_structured_incomplete_result",
         "tests.test_spring_activation_closure.SpringActivationClosureTest.test_security_source_read_failure_is_explicit_coverage_failure",
-        "tests.test_execution_faults.ExecutionFaultTest.test_every_fault_is_detected_with_exact_reason_and_evidence"
+        "tests.test_execution_faults.ExecutionFaultTest.test_every_fault_is_detected_with_exact_reason_and_evidence",
+        "tests.test_execution_faults.ExecutionFaultTest.test_step1_step4_and_step5_production_boundaries_fail_closed"
       ],
       "negative_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_malformed_context_cannot_fall_back_to_empty_source_scope",

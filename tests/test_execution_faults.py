@@ -7,7 +7,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from execution_faults import EXECUTION_FAULTS, run_execution_fault  # noqa: E402
+from execution_faults import (  # noqa: E402
+    EXECUTION_FAULTS,
+    run_execution_fault,
+    run_production_stage_boundary_faults,
+)
 
 
 class ExecutionFaultTest(unittest.TestCase):
@@ -53,6 +57,23 @@ class ExecutionFaultTest(unittest.TestCase):
 
         self.assertTrue(all(result.status != "passed" for result in results))
         self.assertTrue(all(result.reason_code for result in results))
+
+    def test_step1_step4_and_step5_production_boundaries_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results = run_production_stage_boundary_faults(Path(tmp))
+
+        self.assertEqual(
+            {(result.stage, result.fault_id) for result in results},
+            {
+                ("step1", "corrupt_final_artifact"),
+                ("step4", "truncated_japicmp_xml"),
+                ("step5", "replaced_business_artifact"),
+                ("step5", "corrupt_member_cache"),
+            },
+        )
+        self.assertTrue(all(result.status == "failed_closed" for result in results))
+        self.assertTrue(all(result.reason_code for result in results))
+        self.assertTrue(all(result.production_entrypoint for result in results))
 
 
 if __name__ == "__main__":

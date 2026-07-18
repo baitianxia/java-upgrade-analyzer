@@ -11,6 +11,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
+import zipfile
+
+from business_bytecode_graph import collect_business_bytecode_edges
+from confidence_weighted_tracer import _load_runtime_member_index_cache
+from s1_dep_diff import collect_packaged_deps_from_artifact_path
+from s4_jar_compare import parse_japicmp_xml
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,16 @@ class ExecutionFaultResult:
     before_sha256: str
     after_sha256: str
     cleanup_complete: bool
+
+
+@dataclass(frozen=True)
+class ProductionBoundaryFaultResult:
+    stage: str
+    fault_id: str
+    status: str
+    reason_code: str
+    production_entrypoint: str
+    evidence: str
 
 
 EXECUTION_FAULTS = (
@@ -134,3 +151,98 @@ def run_execution_fault(spec: ExecutionFaultSpec, workspace: Path) -> ExecutionF
         after,
         cleanup,
     )
+
+
+def run_production_stage_boundary_faults(
+    workspace: Path,
+) -> tuple[ProductionBoundaryFaultResult, ...]:
+    workspace = Path(workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    results = []
+
+    corrupt_artifact = workspace / "corrupt-application.jar"
+    corrupt_artifact.write_bytes(b"not-a-zip")
+    try:
+        collect_packaged_deps_from_artifact_path(corrupt_artifact)
+    except Exception as exc:
+        results.append(ProductionBoundaryFaultResult(
+            "step1",
+            "corrupt_final_artifact",
+            "failed_closed",
+            "STEP1_FINAL_ARTIFACT_INVALID",
+            "s1_dep_diff.collect_packaged_deps_from_artifact_path",
+            f"{type(exc).__name__}:{exc}",
+        ))
+    else:
+        results.append(ProductionBoundaryFaultResult(
+            "step1", "corrupt_final_artifact", "detection_failed", "",
+            "s1_dep_diff.collect_packaged_deps_from_artifact_path", "accepted",
+        ))
+
+    truncated_xml = workspace / "japicmp.xml"
+    truncated_xml.write_text("<japicmp><classes>", encoding="utf-8")
+    try:
+        parse_japicmp_xml(truncated_xml, "contract:demo", "1", "2")
+    except Exception as exc:
+        results.append(ProductionBoundaryFaultResult(
+            "step4",
+            "truncated_japicmp_xml",
+            "failed_closed",
+            "STEP4_JAPICMP_XML_INVALID",
+            "s4_jar_compare.parse_japicmp_xml",
+            f"{type(exc).__name__}:{exc}",
+        ))
+    else:
+        results.append(ProductionBoundaryFaultResult(
+            "step4", "truncated_japicmp_xml", "detection_failed", "",
+            "s4_jar_compare.parse_japicmp_xml", "accepted",
+        ))
+
+    business_jar = workspace / "business.jar"
+    with zipfile.ZipFile(business_jar, "w") as archive:
+        archive.writestr("contract/App.class", b"fixture")
+    _edges, metrics = collect_business_bytecode_edges(
+        [],
+        artifact_catalog={"by_coord": {"__business__": {
+            "jar_path": str(business_jar),
+            "sha256": "0" * 64,
+        }}},
+    )
+    artifact_reason = next(
+        (
+            reason for reason in metrics.get("failures") or ()
+            if reason == "current_final_artifact_sha_mismatch"
+        ),
+        "",
+    )
+    results.append(ProductionBoundaryFaultResult(
+        "step5",
+        "replaced_business_artifact",
+        "failed_closed" if artifact_reason else "detection_failed",
+        artifact_reason,
+        "business_bytecode_graph.collect_business_bytecode_edges",
+        json.dumps(metrics, sort_keys=True),
+    ))
+
+    corrupt_cache = workspace / "member-index.json"
+    corrupt_cache.write_text("{", encoding="utf-8")
+    try:
+        _load_runtime_member_index_cache(
+            corrupt_cache, {"schema": "fixture"}, SimpleNamespace()
+        )
+    except Exception as exc:
+        results.append(ProductionBoundaryFaultResult(
+            "step5",
+            "corrupt_member_cache",
+            "failed_closed",
+            "STEP5_MEMBER_CACHE_INVALID",
+            "confidence_weighted_tracer._load_runtime_member_index_cache",
+            f"{type(exc).__name__}:{exc}",
+        ))
+    else:
+        results.append(ProductionBoundaryFaultResult(
+            "step5", "corrupt_member_cache", "detection_failed", "",
+            "confidence_weighted_tracer._load_runtime_member_index_cache",
+            "accepted",
+        ))
+    return tuple(results)
