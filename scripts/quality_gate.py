@@ -268,6 +268,19 @@ def _oracle_independence_task(python_exe):
     )
 
 
+def _production_mutation_task(python_exe):
+    return _unittest_task(
+        python_exe,
+        "production_mutations",
+        [
+            "tests.test_production_mutation.ProductionMutationTest."
+            "test_registered_production_mutants_are_all_killed"
+        ],
+        "生产代码 AST 变异矩阵必须全部被广义回归杀死",
+        heavy=True,
+    )
+
+
 def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", report_root=None):
     python_exe = python_exe or sys.executable
     required_tools = REQUIRED_TOOLS if profile in {"step5", "release"} else REQUIRED_TOOLS[:-1]
@@ -311,6 +324,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
                 python_exe, real_json, audit_root
             ))
     elif profile == "release":
+        tasks.append(_production_mutation_task(python_exe))
         tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all"))

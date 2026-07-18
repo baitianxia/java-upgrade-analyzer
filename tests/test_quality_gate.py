@@ -21,6 +21,16 @@ class QualityGateTest(unittest.TestCase):
                 self.assertIn("scripts/oracle_independence.py", task.command)
                 self.assertIn("tests/fixtures/oracle_boundary.json", task.command)
 
+    def test_release_profile_has_explicit_production_mutation_gate(self):
+        tasks = quality_gate.build_plan("release", skip_real=True)
+        task = next(item for item in tasks if item.name == "production_mutations")
+
+        self.assertEqual(
+            task.command[-1],
+            "tests.test_production_mutation.ProductionMutationTest.test_registered_production_mutants_are_all_killed",
+        )
+        self.assertTrue(task.heavy)
+
     def test_round_input_files_are_initialized_without_overwriting_reviews(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

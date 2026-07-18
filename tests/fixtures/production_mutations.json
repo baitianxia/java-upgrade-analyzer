@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "mutations": [
+    {
+      "id": "remove_classfile_edge_emission",
+      "category": "edge_emission_removal",
+      "module": "scripts/business_bytecode_graph.py",
+      "selector": {"function": "parse_classfile_calls", "node_type": "Return", "source_contains": "return edges"},
+      "replacement": "return []",
+      "required_tests": ["tests.test_business_bytecode_graph.BusinessBytecodeGraphTest.test_collect_business_bytecode_edges_uses_classfile_fast_path_for_jar"]
+    },
+    {
+      "id": "invert_business_ownership",
+      "category": "ownership_inversion",
+      "module": "scripts/step5_evidence_model.py",
+      "selector": {"function": "classify_module_scope", "node_type": "Return", "source_contains": "return ModuleScope.BUSINESS_CLASSES"},
+      "replacement": "return ModuleScope.EXTERNAL_DEPENDENCY",
+      "required_tests": ["tests.test_step5_evidence_model.EvidenceModelTest.test_module_scope_classification"]
+    },
+    {
+      "id": "suppress_unsafe_archive_failure",
+      "category": "evidence_failure_suppression",
+      "module": "scripts/artifact_safety.py",
+      "selector": {"function": "require_safe_archive", "node_type": "Raise", "source_contains": "raise ValueError"},
+      "replacement": "return result",
+      "required_tests": ["tests.test_artifact_safety.ArtifactSafetyTest.test_rejects_archive_with_traversal_entry"]
+    },
+    {
+      "id": "drop_descriptor_coordinate_identity",
+      "category": "descriptor_coordinate_drop",
+      "module": "scripts/signature_utils.py",
+      "selector": {"function": "canonical_api_identity_tuple", "node_type": "Return", "source_contains": "return (coord, api_name, signature, kind, change_type)"},
+      "replacement": "return ('', api_name, '', kind, change_type)",
+      "required_tests": ["tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_equivalent_source_and_bytecode_spellings_have_one_identity"]
+    },
+    {
+      "id": "promote_incomplete_evidence",
+      "category": "uncertainty_promotion",
+      "module": "scripts/step5_evidence_model.py",
+      "selector": {"function": "decide_analysis", "node_type": "Return", "source_contains": "reason_code='INCOMPLETE_EVIDENCE'"},
+      "replacement": "return AnalysisDecision(analysis_status='reachable', is_reachable=True, reason_code='STATIC_PATH', reachable_note='mutated')",
+      "required_tests": ["tests.test_step5_evidence_model.EvidenceModelTest.test_incomplete_scan_is_not_analyzed"]
+    },
+    {
+      "id": "bypass_final_artifact_binding",
+      "category": "artifact_binding_bypass",
+      "module": "scripts/confidence_weighted_tracer.py",
+      "selector": {"function": "_edge_allowed_for_trace", "node_type": "Return", "source_contains": "return bool("},
+      "replacement": "return True",
+      "required_tests": ["tests.test_step5_key_matching.Step5KeyMatchingTest.test_packaged_hit_without_current_final_artifact_binding_is_uncertain"]
+    },
+    {
+      "id": "skip_unsafe_archive_check",
+      "category": "archive_skip",
+      "module": "scripts/artifact_safety.py",
+      "selector": {"function": "require_safe_archive", "node_type": "If", "source_contains": "if not result.safe"},
+      "replacement": "if False:\n    raise ValueError('mutated archive skip')",
+      "required_tests": ["tests.test_artifact_safety.ArtifactSafetyTest.test_rejects_archive_with_traversal_entry"]
+    }
+  ]
+}
