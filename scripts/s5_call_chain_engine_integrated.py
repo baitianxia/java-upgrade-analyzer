@@ -279,6 +279,23 @@ def _write_step5_timing_csv(report_dir, graph_stats):
             'by_module_elapsed_sec',
             'by_api_count',
         ],
+        'artifact_facts': [
+            'inventory_elapsed_sec',
+            'inventory_builds',
+            'inventory_hits',
+            'class_bytes_reads',
+            'class_bytes_read',
+            'resource_bytes_reads',
+            'resource_bytes_read',
+            'fact_build_elapsed_sec',
+            'fact_hits',
+            'fact_misses',
+            'fact_failures',
+            'javap_requests',
+            'javap_starts',
+            'javap_shared_hits',
+            'javap_failures',
+        ],
         'memory': [],
     }
     for section, keys in preferred_keys.items():
@@ -1306,6 +1323,7 @@ def _step5_integrated_main_impl(args):
 
     graph = graph_result['graph']
     graph.runtime_dependency_catalog = runtime_dependency_catalog
+    graph.step5_artifact_fact_store = artifact_fact_store
     type_metadata = graph_result['type_metadata']
     graph_stats = graph_result['stats']
     graph_stats.setdefault('step5_perf', {})
@@ -1628,6 +1646,7 @@ def _step5_integrated_main_impl(args):
 
     # Phase 6: 增强型输出（核心改进）
     print("\n生成分析报告...", file=sys.stderr)
+    graph_stats['step5_perf']['artifact_facts'] = artifact_fact_store.metrics()
     summary_timer = time.perf_counter()
     emit_progress("step5", "report", "开始生成汇总报告与证据视图")
     generate_enhanced_summary(all_results, output_dir, graph_stats=graph_stats)

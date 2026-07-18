@@ -18,9 +18,77 @@ if str(SCRIPTS) not in sys.path:
 
 import s5_call_chain_engine_integrated as step5
 import confidence_weighted_tracer as tracer
+from step5_artifact_fact_store import Step5ArtifactFactStore
 
 
 class ArtifactBytecodeCatalogTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
+    def test_shared_inventory_preserves_exact_packaged_scan_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src/com/acme/Consumer.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                'package com.acme; public class Consumer {'
+                ' public Object call() throws Exception {'
+                ' return Class.forName("com.vendor.Target")'
+                '.getDeclaredMethod("removed").invoke(null); }}',
+                encoding="utf-8",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            subprocess.run(["javac", "-d", str(classes), str(source)], check=True)
+            jar_path = root / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.write(classes / "com/acme/Consumer.class", "com/acme/Consumer.class")
+            entry = {
+                "coord": "com.acme:consumer", "jar_path": str(jar_path),
+                "sha256": hashlib.sha256(jar_path.read_bytes()).hexdigest(),
+                "application_owned": False,
+            }
+            api_row = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed", "api_signature": "()",
+                "symbol_kind": "method",
+            }
+            legacy_catalog = {
+                "status": "complete", "target_jdk": "17", "entries": [dict(entry)],
+            }
+            shared_catalog = {
+                "status": "complete", "target_jdk": "17", "entries": [dict(entry)],
+            }
+            legacy = tracer._scan_packaged_runtime_dependencies_for_api(
+                api_row, SimpleNamespace(runtime_dependency_catalog=legacy_catalog),
+            )
+            shared_graph = SimpleNamespace(
+                runtime_dependency_catalog=shared_catalog,
+                step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog(shared_catalog),
+            )
+            shared = tracer._scan_packaged_runtime_dependencies_for_api(
+                api_row, shared_graph,
+            )
+            exhaustive_legacy_catalog = {
+                "status": "complete", "target_jdk": "17", "entries": [dict(entry)],
+            }
+            exhaustive_shared_catalog = {
+                "status": "complete", "target_jdk": "17", "entries": [dict(entry)],
+            }
+            exhaustive_legacy = tracer._collect_exhaustive_runtime_reference_edges(
+                SimpleNamespace(runtime_dependency_catalog=exhaustive_legacy_catalog)
+            )
+            exhaustive_shared = tracer._collect_exhaustive_runtime_reference_edges(
+                SimpleNamespace(
+                    runtime_dependency_catalog=exhaustive_shared_catalog,
+                    step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog(
+                        exhaustive_shared_catalog
+                    ),
+                )
+            )
+
+        self.assertEqual(legacy, shared)
+        self.assertEqual(exhaustive_legacy, exhaustive_shared)
+
     def test_application_owned_nested_module_requires_a_business_entry_path(self):
         result = tracer._new_trace_draft({
             "api_name": "com.vendor.Legacy.removed", "api_simple": "removed",

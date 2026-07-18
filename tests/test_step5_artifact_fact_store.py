@@ -21,9 +21,27 @@ from real_project_regression import (  # noqa: E402
 )
 from step5_artifact_fact_store import FactOutcome, Step5ArtifactFactStore  # noqa: E402
 from business_bytecode_graph import collect_business_bytecode_batch  # noqa: E402
+from s5_call_chain_engine_integrated import _write_step5_timing_csv  # noqa: E402
 
 
 class Step5ColdRunContractTest(unittest.TestCase):
+    def test_step5_timing_exposes_shared_artifact_fact_cost_and_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_step5_timing_csv(tmp, {"step5_perf": {
+                "artifact_facts": {
+                    "inventory_elapsed_sec": 1.25,
+                    "inventory_builds": 2,
+                    "inventory_hits": 7,
+                    "fact_hits": 5,
+                },
+            }})
+            with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        values = {(row["section"], row["metric"]): row["value"] for row in rows}
+        self.assertEqual("1.25", values[("artifact_facts", "inventory_elapsed_sec")])
+        self.assertEqual("7", values[("artifact_facts", "inventory_hits")])
+
     def _write_report(self, root, *, status="reachable", path_text="A -> B"):
         root = Path(root)
         call_chain = root / "evidence" / "call_chain"
@@ -129,7 +147,7 @@ class ArtifactInventoryTest(unittest.TestCase):
             [(item.logical_name, item.physical_entry, item.multi_release_version)
              for item in inventory.classes],
             [
-                ("com/example/A.class", "META-INF/versions/11/com/example/A.class", "11"),
+                ("com/example/A.class", "META-INF/versions/11/com/example/A.class", 11),
                 ("com/example/B.class", "com/example/B.class", "base"),
             ],
         )
@@ -228,6 +246,31 @@ class ResourceFactTest(unittest.TestCase):
 
 
 class SingleFlightFactTest(unittest.TestCase):
+    def test_class_fact_from_bytes_reuses_the_same_sha_bound_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/example/A.class", b"class-data")
+            digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            store = Step5ArtifactFactStore.from_catalog({"entries": [{
+                "coord": "g:a", "jar_path": str(jar_path), "sha256": digest,
+            }]})
+            location = store.inventory("g:a").classes[0]
+            calls = []
+
+            first = store.class_fact_from_bytes(
+                "g:a", location, "constant-pool-summary-v1", b"class-data",
+                lambda data: calls.append(data) or ("summary", len(data)),
+            )
+            second = store.class_fact_from_bytes(
+                "g:a", location, "constant-pool-summary-v1", b"class-data",
+                lambda _data: self.fail("cached fact producer must not run twice"),
+            )
+
+            self.assertEqual(first, second)
+            self.assertEqual([b"class-data"], calls)
+            self.assertEqual(0, store.metrics()["class_bytes_reads"])
+
     def _store_and_location(self, tmp):
         jar_path = Path(tmp) / "fixture.jar"
         with zipfile.ZipFile(jar_path, "w") as archive:

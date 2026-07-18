@@ -38,6 +38,7 @@ from step5_evidence_model import (  # noqa: E402
     EvidenceFailure,
 )
 from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
+from step5_artifact_fact_store import Step5ArtifactFactStore  # noqa: E402
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
@@ -18853,6 +18854,52 @@ public class com.example.consumer.Adapter {
         self.assertNotIn("graph", index["tasks"][0])
         self.assertNotIn("catalog", index["tasks"][0])
         self.assertIs(index["graph"], graph)
+
+    def test_member_index_shared_class_facts_preserve_exact_serialized_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src"
+            caller = source_root / "com/example/Caller.java"
+            target = source_root / "com/vendor/Target.java"
+            caller.parent.mkdir(parents=True, exist_ok=True)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            caller.write_text("""
+                package com.example;
+                public class Caller {
+                    public void direct() { com.vendor.Target.removed(); }
+                    public void reflective() throws Exception {
+                        Class.forName("com.vendor.Target").getDeclaredMethod("removed");
+                    }
+                }
+                """, encoding="utf-8")
+            target.write_text("""
+                package com.vendor;
+                public class Target { public static void removed() {} }
+                """, encoding="utf-8")
+            classes = Path(tmp) / "classes"
+            self._compile_java_files(classes, [caller, target])
+            jar_path = Path(tmp) / "caller.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            entry = {
+                "coord": "sample:caller", "jar_path": str(jar_path),
+                "sha256": digest,
+            }
+            legacy = tracer._build_runtime_dependency_member_candidate_index(
+                SimpleNamespace(), [entry], 17,
+            )
+            shared_graph = SimpleNamespace(
+                step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog({
+                    "target_jdk": "17", "entries": [entry],
+                })
+            )
+            shared = tracer._build_runtime_dependency_member_candidate_index(
+                shared_graph, [entry], 17,
+            )
+
+        self.assertEqual(
+            tracer._runtime_member_index_serializable(legacy),
+            tracer._runtime_member_index_serializable(shared),
+        )
 
     def test_runtime_member_index_persists_complete_candidate_set_across_graphs(self):
         with tempfile.TemporaryDirectory() as tmp:

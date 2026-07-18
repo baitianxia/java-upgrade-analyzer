@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import re
 import threading
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,7 @@ class ClassLocation:
     logical_name: str
     binary_name: str
     physical_entry: str
-    multi_release_version: str
+    multi_release_version: str | int
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,8 @@ class ArtifactInventory:
     resources: tuple[str, ...]
     physical_classes: tuple[str, ...] = ()
     failure: str = ""
+    multi_release: bool = False
+    target_jdk_resolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -81,12 +84,12 @@ def _effective_class_locations(
     target = _target_jdk_major(target_jdk)
     result: list[ClassLocation] = []
     for logical_name in sorted(set(base) | set(versioned)):
-        selected: list[tuple[str, str]] = []
+        selected: list[tuple[str, str | int]] = []
         if target is None:
             if logical_name in base:
                 selected.append((base[logical_name], "base"))
             selected.extend(
-                (entry, str(version))
+                (entry, version)
                 for version, entry in sorted(versioned.get(logical_name, ()))
             )
         else:
@@ -95,7 +98,7 @@ def _effective_class_locations(
             for version, entry in sorted(versioned.get(logical_name, ())):
                 if version <= target:
                     selected_entry = entry
-                    selected_version = str(version)
+                    selected_version = version
             if selected_entry:
                 selected.append((selected_entry, selected_version))
         for physical_entry, selected_version in selected:
@@ -120,6 +123,7 @@ class Step5ArtifactFactStore:
         self._metrics: dict[str, int | float] = {
             "inventory_builds": 0,
             "inventory_hits": 0,
+            "inventory_elapsed_sec": 0.0,
             "class_bytes_reads": 0,
             "class_bytes_read": 0,
             "resource_bytes_reads": 0,
@@ -127,6 +131,7 @@ class Step5ArtifactFactStore:
             "fact_hits": 0,
             "fact_misses": 0,
             "fact_failures": 0,
+            "fact_build_elapsed_sec": 0.0,
             "javap_requests": 0,
             "javap_starts": 0,
             "javap_shared_hits": 0,
@@ -173,6 +178,7 @@ class Step5ArtifactFactStore:
             event.wait()
 
         identity = self._identities.get(coord) or ArtifactIdentity(coord, "", "", "", "")
+        started_at = time.perf_counter()
         try:
             inventory = self._build_inventory(identity)
         except Exception as exc:  # failure remains explicit and shared
@@ -186,6 +192,7 @@ class Step5ArtifactFactStore:
         with self._lock:
             self._inventories[coord] = inventory
             self._metrics["inventory_builds"] += 1
+            self._metrics["inventory_elapsed_sec"] += time.perf_counter() - started_at
             self._inventory_inflight.pop(coord, None)
             event.set()
         return inventory
@@ -280,6 +287,7 @@ class Step5ArtifactFactStore:
             if owner:
                 break
             event.wait()
+        started_at = time.perf_counter()
         try:
             value = producer()
             outcome = FactOutcome("complete", value, "", parser)
@@ -290,6 +298,7 @@ class Step5ArtifactFactStore:
         with self._lock:
             if outcome.status != "complete":
                 self._metrics["fact_failures"] += 1
+            self._metrics["fact_build_elapsed_sec"] += time.perf_counter() - started_at
             self._facts[key] = outcome
             self._fact_inflight.pop(key, None)
             event.set()
@@ -309,6 +318,28 @@ class Step5ArtifactFactStore:
             return producer(content.value)
 
         return self._single_flight(key, produce, parser="classfile")
+
+    def class_fact_from_bytes(
+        self, coord, location, namespace, content, producer,
+    ) -> FactOutcome:
+        """Publish/consume a class fact when the caller already streams class bytes."""
+        identity = self._identity(coord)
+        inventory = self.inventory(coord)
+        if inventory.failure:
+            return FactOutcome("failed", None, inventory.failure, "classfile")
+        if location not in inventory.classes:
+            return FactOutcome(
+                "failed", None,
+                f"class_location_not_in_inventory:{location.physical_entry}",
+                "classfile",
+            )
+        key = (
+            "class", identity.sha256, identity.target_jdk,
+            location.physical_entry, str(namespace or ""),
+        )
+        return self._single_flight(
+            key, lambda: producer(content), parser="classfile",
+        )
 
     def javap_fact(self, coord, location, profile, producer) -> FactOutcome:
         identity = self._identity(coord)
@@ -335,7 +366,10 @@ class Step5ArtifactFactStore:
 
     def metrics(self) -> dict[str, int | float]:
         with self._lock:
-            return dict(self._metrics)
+            return {
+                key: round(value, 6) if isinstance(value, float) else value
+                for key, value in self._metrics.items()
+            }
 
     @staticmethod
     def _build_inventory(identity: ArtifactIdentity) -> ArtifactInventory:
@@ -362,7 +396,14 @@ class Step5ArtifactFactStore:
         after = _sha256_file(path)
         if after != before:
             raise ValueError("artifact_changed_during_inventory")
-        return ArtifactInventory(identity, classes, resources, physical_classes)
+        return ArtifactInventory(
+            identity=identity,
+            classes=classes,
+            resources=resources,
+            physical_classes=physical_classes,
+            multi_release=multi_release,
+            target_jdk_resolved=_target_jdk_major(identity.target_jdk) is not None,
+        )
 
 
 __all__ = [
