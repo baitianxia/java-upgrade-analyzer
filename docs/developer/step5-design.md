@@ -223,6 +223,10 @@ Step5 会输出：
 - `trace.incoming_edges_cache_*`;
 - `trace.declared_signature_index_*`;
 - `trace.direct_class_usage_*`;
+- `memory.*_current_rss_mb` 与 `memory.*_peak_rss_mb`；
+- `memory.*_method_count`、`memory.*_reverse_edge_key_count` 与 `memory.*_reverse_edge_count`。
+
+内存采样只保留标量，不保留图或批次对象的引用。采样失败时记录 `0.0`，不得中断或降级分析。
 - `trace.direct_field_usage_*`;
 - `report.*`。
 

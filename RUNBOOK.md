@@ -559,6 +559,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
 - `DIRECT_CLASS_USAGE` 仅接受声明类型、import（含 wildcard import）精确命中或 FQCN 直写等正式类型证据；若 simple name 已被 import 解析到其他 FQCN，不会再升级为直接类型命中
 - 当 `reason_code` 为 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示 Step5 已在运行时依赖 jar 的字节码里稳定命中目标符号；若该依赖仍有可用源码映射，Step5 会先继续尝试回溯到业务代码，只有源码追踪未能确认业务入口时才保守收敛为 `uncertain`
 - 对依赖源码或资源配置中的明确运行时主动入口，Step5 会把 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle、Quartz `Job.execute`、Spring XML `task:scheduled`、`init-method`、`MethodInvokingJobDetailFactoryBean` 等入口视为框架/容器可触发的链路起点；这类链路即使没有业务源码调用方，也可以证明运行时影响。
+- Step5 运行时会在进度日志输出 `business_graph_ready`、`source_graph_ready`、`business_bytecode_collected`、`indirect_usage_collected`、`evidence_merged`、`trace_complete` 六个内存观测点。对应的当前/峰值 RSS、方法数和反向边规模保存在 `.upgrade-report/.runtime/observability/step5_timing.csv` 的 `memory` 段，可用于定位内存峰值阶段；这些指标不参与影响结论。
 - JPA `@PrePersist`、`@PostPersist`、`@PreUpdate`、`@PostUpdate`、`@PreRemove`、`@PostRemove`、`@PostLoad` 会记录为实体生命周期回调；若静态证据不能证明生命周期实际触发，入口保持 conditional。`@Async` 本身不触发方法，只改变已有调用的执行线程，因此不会单独制造入口。
 
 若 `uncertain` 或 `not_analyzed` 偏多，建议优先按这个顺序排查：
