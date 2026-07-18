@@ -68,6 +68,7 @@ from data_contract_analysis import compare_jar_data_contracts
 from step1_observability import peak_rss_mb
 from analysis_contract import sha256_file
 from artifact_safety import require_safe_archive
+from constant_impact import extract_constant_field_evidence
 from remote_source_refs import (
     materialize_remote_source_candidate,
     query_live_remote_refs,
@@ -2251,6 +2252,56 @@ def export_removed_jar_apis(
 # 4a. JApiCmp 二进制对比
 # ══════════════════════════════════════════════════════════════════
 
+
+def attach_constant_field_evidence(rows, old_jar_path):
+    """Attach old-artifact ConstantValue evidence without inferring absence."""
+    enriched = []
+    for original in rows or ():
+        row = dict(original)
+        flags = str(row.get("compatibility_flags") or "").upper()
+        is_candidate = bool(
+            str(row.get("symbol_kind") or "").lower() == "field"
+            and (
+                str(row.get("change_type") or "").upper()
+                == "CONSTANT_VALUE_CHANGED"
+                or "CONSTANT" in flags
+            )
+        )
+        if not is_candidate:
+            enriched.append(row)
+            continue
+        api_name = str(row.get("api_name") or "")
+        owner, separator, field_name = api_name.rpartition(".")
+        if not separator or not owner or not field_name:
+            evidence = {
+                "owner": owner,
+                "field_name": field_name,
+                "descriptor": str(row.get("field_descriptor") or ""),
+                "has_constant_value": False,
+                "constant_value": None,
+                "artifact_sha256": "",
+                "artifact_entry": "",
+                "status": "incomplete",
+                "failures": ["invalid_field_identity"],
+            }
+        else:
+            evidence = extract_constant_field_evidence(
+                old_jar_path,
+                owner,
+                field_name,
+                str(row.get("field_descriptor") or ""),
+            ).to_dict()
+        row["field_descriptor"] = str(evidence.get("descriptor") or "")
+        row["constant_field_evidence_json"] = json.dumps(
+            evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if evidence.get("status") == "complete":
+            row["old_field_has_constant_value"] = (
+                "true" if evidence.get("has_constant_value") is True else "false"
+            )
+        enriched.append(row)
+    return enriched
+
 def run_japicmp(
     coord,
     old_ver,
@@ -2390,6 +2441,9 @@ def run_japicmp(
                 try:
                     parsed_cached_rows = parse_japicmp_xml(
                         xml_file, coord, old_ver, new_ver
+                    )
+                    parsed_cached_rows = attach_constant_field_evidence(
+                        parsed_cached_rows, old_jar
                     )
                 except (ET.ParseError, OSError, ValueError):
                     cached = None
@@ -2534,6 +2588,7 @@ def run_japicmp(
     xml_error = ''
     try:
         changed_apis = parse_japicmp_xml(xml_file, coord, old_ver, new_ver)
+        changed_apis = attach_constant_field_evidence(changed_apis, old_jar)
     except (ET.ParseError, OSError, ValueError) as exc:
         parser_mode = 'text_fallback'
         xml_error = f"{type(exc).__name__}:{exc}"

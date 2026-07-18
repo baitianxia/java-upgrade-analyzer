@@ -257,8 +257,10 @@ def extract_constant_field_evidence(jar_path, owner, field_name, descriptor):
                 )
                 continue
             for name, field_descriptor, has_value, value in fields:
-                if name == field_name and field_descriptor == descriptor:
-                    candidates.append((entry, has_value, value))
+                if name == field_name and (
+                    not str(descriptor or "") or field_descriptor == descriptor
+                ):
+                    candidates.append((entry, field_descriptor, has_value, value))
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         failures.append(f"{type(exc).__name__}:{exc}")
     if failures and not candidates:
@@ -270,11 +272,13 @@ def extract_constant_field_evidence(jar_path, owner, field_name, descriptor):
         status = "field_not_found"
     else:
         status = "complete"
-    entry, has_value, value = candidates[0] if len(candidates) == 1 else ("", False, None)
+    entry, resolved_descriptor, has_value, value = (
+        candidates[0] if len(candidates) == 1 else ("", str(descriptor or ""), False, None)
+    )
     return ConstantFieldEvidence(
         owner=expected_owner,
         field_name=str(field_name or ""),
-        descriptor=str(descriptor or ""),
+        descriptor=resolved_descriptor,
         has_constant_value=bool(has_value),
         constant_value=value,
         artifact_sha256=artifact_sha,

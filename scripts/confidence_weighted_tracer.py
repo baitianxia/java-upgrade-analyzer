@@ -1866,6 +1866,40 @@ def _evidence_bool(value):
     return str(value or '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def _constant_field_evidence(api_row):
+    row = api_row or {}
+    raw = row.get('constant_field_evidence_json')
+    if isinstance(raw, Mapping):
+        payload = dict(raw)
+    elif str(raw or '').strip():
+        try:
+            decoded = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {
+                'status': 'incomplete',
+                'failures': ['constant_field_evidence_json_invalid'],
+            }
+        else:
+            payload = dict(decoded) if isinstance(decoded, Mapping) else {
+                'status': 'incomplete',
+                'failures': ['constant_field_evidence_json_not_object'],
+            }
+    else:
+        payload = {}
+    if payload:
+        complete = str(payload.get('status') or '') == 'complete'
+        return payload, complete, (
+            _evidence_bool(payload.get('has_constant_value')) if complete else False
+        )
+    if 'old_field_has_constant_value' in row:
+        value = _evidence_bool(row.get('old_field_has_constant_value'))
+        return {
+            'status': 'legacy',
+            'has_constant_value': value,
+        }, True, value
+    return {}, False, False
+
+
 def _apply_constant_impact(
     result, api_row, graph, *, runtime_field_edge_present, source_reference_present=None
 ):
@@ -1883,12 +1917,12 @@ def _apply_constant_impact(
         str((getattr(graph, 'source_artifact_alignment', {}) or {}).get('status') or '')
         == 'aligned'
     )
-    old_evidence_present = 'old_field_has_constant_value' in (api_row or {})
+    old_field_evidence, old_evidence_present, old_field_has_constant_value = (
+        _constant_field_evidence(api_row)
+    )
     impact = classify_constant_impact(
         change_type=(api_row or {}).get('change_type') or result.change_type,
-        old_field_has_constant_value=_evidence_bool(
-            (api_row or {}).get('old_field_has_constant_value')
-        ),
+        old_field_has_constant_value=old_field_has_constant_value,
         source_reference_present=bool(source_reference_present),
         runtime_field_edge_present=bool(runtime_field_edge_present),
         source_artifact_aligned=source_artifact_aligned,
@@ -1897,6 +1931,8 @@ def _apply_constant_impact(
         impact['runtime_link_impact'] = 'unverified'
     result.compile_impact = impact.pop('compile_impact')
     result.runtime_link_impact = impact.pop('runtime_link_impact')
+    if old_field_evidence:
+        impact['old_field'] = old_field_evidence
     result.constant_impact_evidence = impact
     return result
 

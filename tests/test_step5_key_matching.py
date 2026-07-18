@@ -19642,7 +19642,13 @@ public class com.example.consumer.Adapter {
             "coord": "lib:flags", "api_name": "lib.Flags.EMPTY", "api_simple": "EMPTY",
             "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
             "compatibility_flags": "CONSTANT_REMOVED", "old_value": "",
-            "old_field_has_constant_value": "true",
+            "constant_field_evidence_json": json.dumps({
+                "owner": "lib.Flags", "field_name": "EMPTY",
+                "descriptor": "Ljava/lang/String;", "has_constant_value": True,
+                "constant_value": "", "artifact_sha256": "a" * 64,
+                "artifact_entry": "lib/Flags.class", "status": "complete",
+                "failures": [],
+            }),
             "severity": "P0", "confirmed": "true",
         }
 
@@ -19663,6 +19669,10 @@ public class com.example.consumer.Adapter {
         self.assertEqual(result.evidence_paths[0][0]["evidence_type"], "field_access")
         self.assertEqual(result.compile_impact, "recompile_break")
         self.assertEqual(result.runtime_link_impact, "inlined_no_link")
+        self.assertEqual(
+            result.constant_impact_evidence["old_field"]["artifact_entry"],
+            "lib/Flags.class",
+        )
         rendered = formatter.trace_result_to_api_entry(result)
         self.assertEqual(rendered["compile_impact"], "recompile_break")
         self.assertEqual(rendered["runtime_link_impact"], "inlined_no_link")

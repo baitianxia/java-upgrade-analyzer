@@ -47,13 +47,17 @@ ALL_CHANGED_APIS_FIELDS = [
     "evidence_path", # 产生该结论的证据文件
     "old_value",     # 字段/常量旧值（如 JApiCmp XML 可提供）
     "new_value",     # 字段/常量新值
+    "field_descriptor", # JVM 字段描述符；仅 field 使用
+    "old_field_has_constant_value", # true/false；仅完整 classfile 证据时写入
+    "constant_field_evidence_json", # SHA 与 class 条目绑定的旧字段证据
 ]
 
 OPTIONAL_FIELDS = {
     "conclusion", "change_summary", "review_reason",
     "api_signature", "binary_compatible", "source_compatible",
     "compatibility_flags", "reason_code", "evidence_path",
-    "old_value", "new_value", "data_contract_evidence",
+    "old_value", "new_value", "data_contract_evidence", "field_descriptor",
+    "old_field_has_constant_value", "constant_field_evidence_json",
 }
 
 # change_type 枚举

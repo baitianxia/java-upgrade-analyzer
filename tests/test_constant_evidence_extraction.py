@@ -1,4 +1,5 @@
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import constant_impact  # noqa: E402
+import s4_jar_compare as step4  # noqa: E402
 
 
 @unittest.skipUnless(shutil.which("javac"), "javac is required")
@@ -132,6 +134,27 @@ class ConstantEvidenceExtractionTest(unittest.TestCase):
 
         self.assertEqual(evidence.status, "incomplete")
         self.assertTrue(evidence.failures)
+
+    def test_step4_automatically_attaches_old_artifact_constant_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider, _consumer = self._compile_fixture(Path(tmp))
+            rows = [{
+                "coord": "sample:provider",
+                "api_name": "sample.Flags.TEXT",
+                "api_simple": "TEXT",
+                "api_signature": "",
+                "symbol_kind": "field",
+                "change_type": "REMOVED",
+                "compatibility_flags": "CONSTANT_REMOVED",
+            }]
+
+            enriched = step4.attach_constant_field_evidence(rows, provider)
+
+        self.assertEqual(enriched[0]["field_descriptor"], "Ljava/lang/String;")
+        self.assertEqual(enriched[0]["old_field_has_constant_value"], "true")
+        payload = json.loads(enriched[0]["constant_field_evidence_json"])
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["constant_value"], "old")
 
 
 if __name__ == "__main__":
