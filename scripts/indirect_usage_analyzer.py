@@ -150,11 +150,13 @@ def parse_javap_indirect_references(text, class_binary_name=''):
             )
             if class_literal_match:
                 owner = class_literal_match.group(1).replace('/', '.').replace('$', '.')
-                active_class = {
+                class_value = {
                     'kind': 'class_value', 'owner': owner, 'offset': offset,
                 }
-                produced = active_class
-                operand_stack.append(dict(active_class))
+                if active_class is None:
+                    active_class = class_value
+                produced = class_value
+                operand_stack.append(dict(class_value))
             elif string_match:
                 literal = string_match.group(1).strip()
                 strings.append((offset, literal))
@@ -277,6 +279,7 @@ def parse_javap_indirect_references(text, class_binary_name=''):
                         'instruction_offset': offset,
                     })
                 active_member = None
+                active_class = None
                 produced = None
                 continue
             store_slot = local_slot(insn, 'astore')
