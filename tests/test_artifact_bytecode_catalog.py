@@ -27,17 +27,29 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "src/com/acme/Consumer.java"
+            target = root / "src/com/vendor/Target.java"
             source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
             source.write_text(
-                'package com.acme; public class Consumer {'
+                'package com.acme; import com.vendor.Target; public class Consumer {'
                 ' public Object call() throws Exception {'
                 ' return Class.forName("com.vendor.Target")'
-                '.getDeclaredMethod("removed").invoke(null); }}',
+                '.getDeclaredMethod("removed").invoke(null); }'
+                ' public int direct() { Target.removed(); return Target.VALUE; }'
+                ' public Target create() { return new Target(); }'
+                ' public Runnable reference() { return Target::removed; }}',
+                encoding="utf-8",
+            )
+            target.write_text(
+                'package com.vendor; public class Target {'
+                ' public static int VALUE = 7; public static void removed() {} }',
                 encoding="utf-8",
             )
             classes = root / "classes"
             classes.mkdir()
-            subprocess.run(["javac", "-d", str(classes), str(source)], check=True)
+            subprocess.run(
+                ["javac", "-d", str(classes), str(source), str(target)], check=True,
+            )
             jar_path = root / "consumer.jar"
             with zipfile.ZipFile(jar_path, "w") as archive:
                 archive.write(classes / "com/acme/Consumer.class", "com/acme/Consumer.class")
@@ -88,6 +100,83 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
 
         self.assertEqual(legacy, shared)
         self.assertEqual(exhaustive_legacy, exhaustive_shared)
+
+    @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
+    def test_large_api_batch_member_index_fast_path_preserves_exact_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src/com/acme/Consumer.java"
+            target = root / "src/com/vendor/Target.java"
+            source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            source.write_text(
+                'package com.acme; import com.vendor.Target; public class Consumer {'
+                ' public Object call() throws Exception {'
+                ' return Class.forName("com.vendor.Target")'
+                '.getDeclaredMethod("removed").invoke(null); }'
+                ' public int direct() { Target.removed(); return Target.VALUE; }'
+                ' public Target create() { return new Target(); }'
+                ' public Runnable reference() { return Target::removed; }}',
+                encoding="utf-8",
+            )
+            target.write_text(
+                'package com.vendor; public class Target {'
+                ' public static int VALUE = 7; public static void removed() {} }',
+                encoding="utf-8",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(classes), str(source), str(target)], check=True,
+            )
+            jar_path = root / "consumer.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.write(classes / "com/acme/Consumer.class", "com/acme/Consumer.class")
+            digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            entries = [{
+                "coord": f"com.acme:consumer-{index}",
+                "jar_path": str(jar_path), "sha256": digest,
+                "application_owned": False,
+            } for index in range(8)]
+            api_definitions = [{
+                "coord": "com.vendor:target", "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed", "api_signature": "()", "symbol_kind": "method",
+            }, {
+                "coord": "com.vendor:target", "api_name": "com.vendor.Target.VALUE",
+                "api_simple": "VALUE", "api_signature": "", "symbol_kind": "field",
+            }, {
+                "coord": "com.vendor:target", "api_name": "com.vendor.Target",
+                "api_simple": "Target", "api_signature": "", "symbol_kind": "class",
+            }]
+            api_rows = [dict(api_definitions[index % 3]) for index in range(32)]
+            legacy_catalog = {
+                "status": "complete", "target_jdk": "17",
+                "entries": [dict(entry) for entry in entries],
+            }
+            shared_catalog = {
+                "status": "complete", "target_jdk": "17",
+                "entries": [dict(entry) for entry in entries],
+            }
+            legacy_graph = SimpleNamespace(runtime_dependency_catalog=legacy_catalog)
+            shared_graph = SimpleNamespace(
+                runtime_dependency_catalog=shared_catalog,
+                step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog(shared_catalog),
+            )
+            legacy = tracer._build_packaged_runtime_dependency_scan_cache(
+                api_rows, legacy_graph,
+            )
+            shared = tracer._build_packaged_runtime_dependency_scan_cache(
+                api_rows, shared_graph,
+            )
+
+        self.assertEqual(legacy, shared)
+        self.assertEqual(
+            {"hit"}, {result["status"] for result in shared.values()},
+        )
+        self.assertEqual(
+            1,
+            shared_graph._step5_perf_stats["bytecode_scan"]["member_index_fast_path"],
+        )
 
     def test_application_owned_nested_module_requires_a_business_entry_path(self):
         result = tracer._new_trace_draft({

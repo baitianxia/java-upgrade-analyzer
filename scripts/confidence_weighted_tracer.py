@@ -83,7 +83,7 @@ CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
 
 ANALYZER_EDGE_PROCEDURE_VERSION = 'java-upgrade-analyzer.analyzer-edge-ledger.v1'
 ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION = 'java-upgrade-analyzer.runtime-javap.v1'
-RUNTIME_MEMBER_INDEX_CACHE_SCHEMA = 'java-upgrade-analyzer.runtime-member-index.v2'
+RUNTIME_MEMBER_INDEX_CACHE_SCHEMA = 'java-upgrade-analyzer.runtime-member-index.v3'
 ANALYZER_EDGE_PROCEDURE = (
     'Step5 executable bytecode matching at analyzer edge creation points'
 )
@@ -3796,6 +3796,79 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         f"开始批量扫描运行时依赖字节码，依赖数={len(catalog_entries)}，API数={len(missing_rows)}",
     )
 
+    scan_catalog_entries = catalog_entries
+    fact_store = getattr(graph, 'step5_artifact_fact_store', None)
+    if fact_store is not None and len(missing_rows) >= 32 and len(catalog_entries) >= 8:
+        member_index = _build_runtime_dependency_member_candidate_index(
+            graph, catalog_entries, target_jdk,
+        )
+        indexed_tasks = _batch_candidates_from_runtime_member_index(
+            member_index, target_rows_by_owner,
+        )
+        verified_inventories = {}
+        for item in catalog_entries:
+            coord = str(item.get('coord') or '').strip()
+            inventory = fact_store.inventory(coord) if coord else None
+            if not (
+                inventory is not None
+                and not inventory.failure
+                and inventory.identity.path == str(item.get('jar_path') or '').strip()
+                and inventory.identity.sha256 == str(item.get('sha256') or '').lower()
+            ):
+                verified_inventories = {}
+                indexed_tasks = None
+                break
+            verified_inventories[coord] = inventory
+        if indexed_tasks is not None:
+            member_index['_stat_snapshot'] = current_stat_snapshot
+            setattr(graph, '_runtime_dependency_member_candidate_index', member_index)
+            scan_catalog_entries = []
+            for item in catalog_entries:
+                coord = str(item.get('coord') or '').strip()
+                ownership_explicitly_external = item.get('application_owned') is False
+                eligible = any(
+                    not ownership_explicitly_external
+                    or str(row.get('coord') or '').strip() != coord
+                    for rows in target_rows_by_owner.values() for row in rows
+                )
+                if not eligible:
+                    _perf_add(graph, 'bytecode_scan', 'external_provider_jars_skipped', 1)
+                    continue
+                inventory = verified_inventories[coord]
+                jar_path = str(item.get('jar_path') or '').strip()
+                artifact_sha256 = inventory.identity.sha256
+                scanned_artifact_sha256[str(Path(jar_path).resolve())] = artifact_sha256
+                if artifact_sha256 in counted_artifacts:
+                    _perf_add(graph, 'bytecode_scan', 'duplicate_jar_scans', 1)
+                else:
+                    counted_artifacts.add(artifact_sha256)
+                    _perf_add(graph, 'bytecode_scan', 'artifact_bytes', os.path.getsize(jar_path))
+                    _perf_add(graph, 'bytecode_scan', 'artifact_count', 1)
+                scoped_classes = sum(
+                    1 for location in inventory.classes
+                    if not location.logical_name.endswith(
+                        ('module-info.class', 'package-info.class')
+                    )
+                )
+                visited_classes += scoped_classes
+                _perf_add(graph, 'bytecode_scan', 'class_entries_scoped', scoped_classes)
+                multi_release_seen = multi_release_seen or inventory.multi_release
+                if inventory.multi_release and inventory.target_jdk_resolved:
+                    multi_release_target_resolved = True
+            for task in indexed_tasks:
+                javap_tasks.append({
+                    **task,
+                    'catalog': catalog,
+                    'graph': graph,
+                    'caller_owner': task.get('class_binary_name') or '',
+                    'preparsed_references': None,
+                })
+            _perf_add(graph, 'bytecode_scan', 'member_index_fast_path', 1)
+            _perf_add(
+                graph, 'bytecode_scan',
+                'member_index_candidate_classes', len(javap_tasks),
+            )
+
     owner_packages = defaultdict(list)
     for owner, internal in owner_internal_names.items():
         internal_package = internal.rsplit('/', 1)[0] if '/' in internal else ''
@@ -3812,7 +3885,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         for (internal_package, dotted_package), grouped_owners in owner_packages.items()
     ]
 
-    for idx, item in enumerate(catalog_entries, 1):
+    for idx, item in enumerate(scan_catalog_entries, 1):
         coord = str(item.get('coord') or '').strip()
         application_owned = bool(item.get('application_owned'))
         ownership_explicitly_external = item.get('application_owned') is False
@@ -4540,6 +4613,10 @@ def _runtime_member_index_serializable(index):
                 (index.get('direct_by_owner_member') or {}).items()
             )
         ],
+        'direct_by_owner': {
+            key: sorted((value,) if isinstance(value, int) else value)
+            for key, value in sorted((index.get('direct_by_owner') or {}).items())
+        },
         'owner_string_ids': {
             key: sorted((value,) if isinstance(value, int) else value)
             for key, value in sorted((index.get('owner_string_ids') or {}).items())
@@ -4571,6 +4648,10 @@ def _runtime_member_index_from_serializable(payload, graph):
     for key, values in member_string_ids.items():
         values = tuple(sorted(set(values or ())))
         member_string_ids[key] = values[0] if len(values) == 1 else values
+    direct_by_owner = payload.pop('direct_by_owner', None) or {}
+    for key, values in direct_by_owner.items():
+        values = tuple(sorted(set(values or ())))
+        direct_by_owner[key] = values[0] if len(values) == 1 else values
     tasks = payload.pop('tasks', None) or []
     unparsed_tasks = payload.pop('unparsed_tasks', None) or []
     shared_strings = {}
@@ -4591,6 +4672,7 @@ def _runtime_member_index_from_serializable(payload, graph):
         'tasks': tasks,
         'unparsed_tasks': unparsed_tasks,
         'direct_by_owner_member': direct,
+        'direct_by_owner': direct_by_owner,
         'owner_string_ids': owner_string_ids,
         'member_string_ids': member_string_ids,
         'reflection_ids': set(payload.pop('reflection_ids', None) or ()),
@@ -4688,6 +4770,7 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
     tasks = []
     unparsed_tasks = []
     direct_by_owner_member = {}
+    direct_by_owner = {}
     owner_string_ids = {}
     member_string_ids = {}
     reflection_ids = set()
@@ -4734,22 +4817,24 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
             _record_analyzer_ledger_failure(graph, **failure)
             continue
         try:
-            catalog = _get_runtime_dependency_catalog(graph)
-            artifact_sha256 = _artifact_sha256(jar_path)
-            with zipfile.ZipFile(jar_path) as zf:
-                try:
-                    manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
-                except KeyError:
-                    manifest = ''
-                multi_release_enabled = bool(re.search(
-                    r'(?im)^Multi-Release\s*:\s*true\s*$', manifest
-                ))
-                variants, _is_multi_release, _parsed_target = _runtime_class_variants(
-                    zf.namelist(), target_jdk, multi_release_enabled=multi_release_enabled
-                )
-                for entry, logical_name, selected_version in variants:
+            fact_store = getattr(graph, 'step5_artifact_fact_store', None)
+            shared_inventory = fact_store.inventory(coord) if fact_store is not None else None
+            expected_sha256 = str(item.get('sha256') or '').lower()
+            use_shared = bool(
+                shared_inventory is not None
+                and not shared_inventory.failure
+                and shared_inventory.identity.path == jar_path
+                and shared_inventory.identity.sha256 == expected_sha256
+            )
+            artifact_sha256 = (
+                shared_inventory.identity.sha256 if use_shared
+                else _artifact_sha256(jar_path)
+            )
+
+            def consume_class(entry, logical_name, selected_version, data):
+                    nonlocal visited_classes, parse_failures
                     if logical_name.endswith(('module-info.class', 'package-info.class')):
-                        continue
+                        return
                     visited_classes += 1
                     class_binary_name = logical_name[:-6].replace('/', '.')
                     task = {
@@ -4765,14 +4850,22 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         'application_owned': item.get('application_owned'),
                         'ownership_evidence': item.get('ownership_evidence'),
                     }
-                    data = zf.read(entry)
                     summary = _parse_classfile_constant_pool_summary(data)
                     if summary is None:
                         parse_failures += 1
                         unparsed_tasks.append(task)
-                        continue
+                        return
                     task_id = len(tasks)
                     tasks.append(task)
+                    for referenced_owner in summary.get('class_internal_names') or ():
+                        normalized_owner = (
+                            str(referenced_owner or '')
+                            .replace('/', '.').replace('$', '.')
+                        )
+                        if normalized_owner:
+                            _add_runtime_member_task_id(
+                                direct_by_owner, normalized_owner, task_id,
+                            )
                     member_refs = list(summary.get('ref_members') or [])
                     for ref in member_refs:
                         owner = str(ref.get('owner') or '').replace('/', '.').replace('$', '.')
@@ -4806,6 +4899,32 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                                 )
                             if re.fullmatch(r'[A-Za-z_$][\w$]*', value):
                                 _add_runtime_member_task_id(member_string_ids, value, task_id)
+
+            if use_shared:
+                for location, data in fact_store.iter_class_bytes(coord):
+                    consume_class(
+                        location.physical_entry, location.logical_name,
+                        location.multi_release_version, data,
+                    )
+            else:
+                with zipfile.ZipFile(jar_path) as zf:
+                    try:
+                        manifest = zf.read('META-INF/MANIFEST.MF').decode(
+                            'utf-8', errors='replace',
+                        )
+                    except KeyError:
+                        manifest = ''
+                    multi_release_enabled = bool(re.search(
+                        r'(?im)^Multi-Release\s*:\s*true\s*$', manifest
+                    ))
+                    variants, _is_multi_release, _parsed_target = _runtime_class_variants(
+                        zf.namelist(), target_jdk,
+                        multi_release_enabled=multi_release_enabled,
+                    )
+                    for entry, logical_name, selected_version in variants:
+                        consume_class(
+                            entry, logical_name, selected_version, zf.read(entry),
+                        )
         except Exception as exc:
             parse_failures += 1
             failure = {
@@ -4823,7 +4942,10 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
     _perf_add(graph, 'bytecode_expand', 'member_index_tasks', len(tasks))
     _perf_add(graph, 'bytecode_expand', 'member_index_unparsed_tasks', len(unparsed_tasks))
     _perf_add(graph, 'bytecode_expand', 'member_index_parse_failures', parse_failures)
-    for buckets in (direct_by_owner_member, owner_string_ids, member_string_ids):
+    for buckets in (
+        direct_by_owner_member, direct_by_owner,
+        owner_string_ids, member_string_ids,
+    ):
         for key, task_ids in buckets.items():
             if not isinstance(task_ids, int):
                 buckets[key] = tuple(sorted(task_ids))
@@ -4833,6 +4955,7 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
         'tasks': tasks,
         'unparsed_tasks': unparsed_tasks,
         'direct_by_owner_member': direct_by_owner_member,
+        'direct_by_owner': direct_by_owner,
         'owner_string_ids': owner_string_ids,
         'member_string_ids': member_string_ids,
         'reflection_ids': reflection_ids,
@@ -5061,6 +5184,69 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
     index['last_unparsed_checked'] = unparsed_checked
     index['last_unparsed_selected'] = unparsed_selected
     return unique_candidates
+
+
+def _batch_candidates_from_runtime_member_index(index, target_rows_by_owner):
+    """Select exact parse candidates without rescanning every class per API."""
+    if not index or not index.get('complete') or index.get('unparsed_tasks'):
+        return None
+
+    def task_ids(value):
+        if value is None:
+            return set()
+        if isinstance(value, int):
+            return {value}
+        return set(value)
+
+    tasks = list(index.get('tasks') or ())
+    candidate_owners_by_task = defaultdict(set)
+    direct_by_owner_member = index.get('direct_by_owner_member') or {}
+    direct_by_owner = index.get('direct_by_owner') or {}
+    owner_string_ids = index.get('owner_string_ids') or {}
+    member_string_ids = index.get('member_string_ids') or {}
+    reflection_ids = set(index.get('reflection_ids') or ())
+    for owner, rows in (target_rows_by_owner or {}).items():
+        owner_ids = task_ids(direct_by_owner.get(owner))
+        reflected_owner_ids = task_ids(owner_string_ids.get(owner))
+        reflected_owner_ids.update(
+            task_ids(owner_string_ids.get(_jvm_internal_owner_name(owner)))
+        )
+        for row in rows or ():
+            _resolved_owner, member, symbol_kind = _extract_target_owner_and_member(row)
+            selected_ids = set(
+                owner_ids
+                if symbol_kind in {'class', 'interface', 'annotation', 'enum'}
+                else ()
+            )
+            if member:
+                selected_ids.update(
+                    task_ids(direct_by_owner_member.get((owner, member)))
+                )
+                selected_ids.update(
+                    reflected_owner_ids
+                    & task_ids(member_string_ids.get(member))
+                    & reflection_ids
+                )
+            else:
+                selected_ids.update(reflected_owner_ids & reflection_ids)
+            for task_id in selected_ids:
+                if not 0 <= task_id < len(tasks):
+                    continue
+                task = tasks[task_id]
+                if (
+                    task.get('application_owned') is False
+                    and str(task.get('coord') or '').strip()
+                    == str(row.get('coord') or '').strip()
+                ):
+                    continue
+                candidate_owners_by_task[task_id].add(owner)
+    return [
+        {
+            **tasks[task_id],
+            'candidate_owners': sorted(candidate_owners),
+        }
+        for task_id, candidate_owners in sorted(candidate_owners_by_task.items())
+    ]
 
 
 def _ensure_runtime_dependency_callers_for_key(
