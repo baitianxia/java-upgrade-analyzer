@@ -31,6 +31,15 @@ class QualityGateTest(unittest.TestCase):
         )
         self.assertTrue(task.heavy)
 
+    def test_quick_and_release_profiles_have_explicit_determinism_gates(self):
+        quick = quality_gate.build_plan("quick", skip_real=True)
+        release = quality_gate.build_plan("release", skip_real=True)
+
+        quick_task = next(item for item in quick if item.name == "determinism_core")
+        release_task = next(item for item in release if item.name == "determinism_full")
+        self.assertTrue(quick_task.command[-1].endswith("test_generated_core_matrix_is_semantically_identical"))
+        self.assertTrue(release_task.command[-1].endswith("test_generated_production_matrix_is_semantically_identical"))
+
     def test_round_input_files_are_initialized_without_overwriting_reviews(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

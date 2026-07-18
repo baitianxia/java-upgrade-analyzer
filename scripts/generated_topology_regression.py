@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import argparse
 import hashlib
 import json
 from pathlib import Path
 import zipfile
 
 from business_bytecode_graph import collect_business_bytecode_edges
-from generated_topology import GeneratedTopology, materialize_topology
+from generated_topology import (
+    GeneratedTopology,
+    GenerationDimensions,
+    generate_topology,
+    materialize_topology,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,7 @@ class GeneratedCaseResult:
     unsupported: tuple[str, ...]
     wrong_conclusions: tuple[str, ...]
     production_metrics: dict
+    semantic_ledger: dict
     report_path: str = ""
 
 
@@ -95,6 +102,7 @@ def reconcile_generated_case(
         unsupported=unsupported,
         wrong_conclusions=wrong_conclusions,
         production_metrics={},
+        semantic_ledger={},
     )
 
 
@@ -147,24 +155,41 @@ def run_generated_case(
     report_root: Path,
     *,
     analyzer_rows: tuple[AnalyzerLedgerRow, ...] | None = None,
+    order_mode: str = "normal",
+    cache_mode: str = "cold",
+    workers: int = 1,
 ) -> GeneratedCaseResult:
     report_root = Path(report_root)
     materialized = materialize_topology(case, report_root / f"seed-{case.spec.seed}")
     jar_path = materialized.root / "application.jar"
+    class_files = sorted(materialized.classes_dir.rglob("*.class"))
+    if order_mode == "reversed":
+        class_files.reverse()
+    elif order_mode != "normal":
+        raise ValueError(f"unknown order mode: {order_mode}")
     with zipfile.ZipFile(jar_path, "w") as archive:
-        for class_file in sorted(materialized.classes_dir.rglob("*.class")):
+        for class_file in class_files:
             archive.write(class_file, class_file.relative_to(materialized.classes_dir).as_posix())
+    cache_path = materialized.root / "bytecode-cache.jsonl" if cache_mode == "warm" else None
+    catalog = {
+        "by_coord": {
+            "__business__": {
+                "jar_path": str(jar_path),
+                "sha256": _sha256(jar_path),
+            }
+        }
+    }
     edges, metrics = collect_business_bytecode_edges(
         [],
-        artifact_catalog={
-            "by_coord": {
-                "__business__": {
-                    "jar_path": str(jar_path),
-                    "sha256": _sha256(jar_path),
-                }
-            }
-        },
+        artifact_catalog=catalog,
+        cache_path=str(cache_path) if cache_path else None,
     )
+    if cache_mode == "warm":
+        edges, metrics = collect_business_bytecode_edges(
+            [], artifact_catalog=catalog, cache_path=str(cache_path)
+        )
+    elif cache_mode != "cold":
+        raise ValueError(f"unknown cache mode: {cache_mode}")
     metrics = dict(metrics)
     metrics["production_edge_identities"] = sorted(
         {
@@ -176,6 +201,9 @@ def run_generated_case(
     if analyzer_rows is None:
         analyzer_rows = _derive_analyzer_rows(case, edges)
     metrics["derived_rows"] = len(analyzer_rows)
+    metrics["workers"] = workers
+    metrics["order_mode"] = order_mode
+    metrics["cache_mode"] = cache_mode
     reconciled = reconcile_generated_case(case, analyzer_rows)
     errors = list(reconciled.errors)
     if metrics.get("failures"):
@@ -183,6 +211,22 @@ def run_generated_case(
     if not edges:
         errors.append("production_collector_empty")
     report_path = report_root / f"seed-{case.spec.seed}" / "reconciliation.json"
+    semantic_ledger = {
+        "apis": sorted(
+            ({
+                "identity": row.identity,
+                "conclusion": row.conclusion,
+                "evidence_complete": row.evidence_complete,
+            } for row in analyzer_rows),
+            key=lambda row: row["identity"],
+        ),
+        "edges": [
+            {"identity": identity, "complete": True}
+            for identity in metrics["production_edge_identities"]
+        ],
+        "completeness": {"failures": sorted(metrics.get("failures") or ())},
+        "reason_codes": sorted(errors),
+    }
     result = GeneratedCaseResult(
         status="failed" if errors else "passed",
         errors=tuple(errors),
@@ -193,9 +237,37 @@ def run_generated_case(
         unsupported=reconciled.unsupported,
         wrong_conclusions=reconciled.wrong_conclusions,
         production_metrics=metrics,
+        semantic_ledger=semantic_ledger,
         report_path=str(report_path),
     )
     report_path.write_text(
         json.dumps(asdict(result), sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
     return result
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Run one generated topology case")
+    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--report-root", required=True)
+    parser.add_argument("--json-out", required=True)
+    parser.add_argument("--order-mode", choices=("normal", "reversed"), default="normal")
+    parser.add_argument("--cache-mode", choices=("cold", "warm"), default="cold")
+    parser.add_argument("--workers", type=int, default=1)
+    args = parser.parse_args(argv)
+    case = generate_topology(args.seed, GenerationDimensions.complete())
+    result = run_generated_case(
+        case,
+        Path(args.report_root),
+        order_mode=args.order_mode,
+        cache_mode=args.cache_mode,
+        workers=args.workers,
+    )
+    output = Path(args.json_out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(asdict(result), sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    return 0 if result.status == "passed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

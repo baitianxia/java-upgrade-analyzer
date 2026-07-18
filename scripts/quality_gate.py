@@ -281,6 +281,21 @@ def _production_mutation_task(python_exe):
     )
 
 
+def _determinism_task(python_exe, profile):
+    method = (
+        "test_generated_core_matrix_is_semantically_identical"
+        if profile == "core"
+        else "test_generated_production_matrix_is_semantically_identical"
+    )
+    return _unittest_task(
+        python_exe,
+        f"determinism_{profile}",
+        [f"tests.test_determinism_gate.DeterminismGateTest.{method}"],
+        f"跨进程语义确定性矩阵：{profile}",
+        heavy=profile == "full",
+    )
+
+
 def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", report_root=None):
     python_exe = python_exe or sys.executable
     required_tools = REQUIRED_TOOLS if profile in {"step5", "release"} else REQUIRED_TOOLS[:-1]
@@ -294,6 +309,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
     audit_json = str(audit_root / f"quality_signal_audit_{real_case}.json")
 
     if profile == "quick":
+        tasks.append(_determinism_task(python_exe, "core"))
         tasks.append(_accuracy_benchmark_task(python_exe, "core"))
         tasks.append(_unittest_task(
             python_exe,
@@ -325,6 +341,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
             ))
     elif profile == "release":
         tasks.append(_production_mutation_task(python_exe))
+        tasks.append(_determinism_task(python_exe, "full"))
         tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all"))
