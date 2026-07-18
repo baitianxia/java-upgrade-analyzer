@@ -63,3 +63,32 @@ jobs:
           path: |
             ${{ runner.temp }}/platform-contract.json
             ${{ runner.temp }}/jua-platform-contract
+
+  platform-evidence:
+    needs: platform-contract
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish immutable platform verification tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="platform-contract-verified-${GITHUB_SHA}"
+          ref="refs/tags/${tag}"
+          remote_sha="$(git ls-remote --tags origin "${ref}" | awk '{print $1}')"
+          if [[ -n "${remote_sha}" ]]; then
+            test "${remote_sha}" = "${GITHUB_SHA}"
+            exit 0
+          fi
+          git tag "${tag}" "${GITHUB_SHA}"
+          if ! git push origin "${ref}"; then
+            remote_sha="$(git ls-remote --tags origin "${ref}" | awk '{print $1}')"
+            test "${remote_sha}" = "${GITHUB_SHA}"
+          fi
