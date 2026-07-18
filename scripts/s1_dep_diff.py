@@ -2138,17 +2138,41 @@ def _enrich_packaged_deps_with_runtime(
     return entries, resolved, unresolved
 
 
+def _maven_reactor_has_modules(work_dir):
+    pom_path = Path(work_dir) / 'pom.xml'
+    if not pom_path.is_file():
+        return False
+    try:
+        with open_text(str(pom_path)) as handle:
+            root = ET.fromstring(handle.read())
+    except Exception:
+        return False
+    for child in list(root):
+        if _strip_xml_ns(child.tag) != 'modules':
+            continue
+        return any(
+            _strip_xml_ns(module.tag) == 'module' and (module.text or '').strip()
+            for module in list(child)
+        )
+    return False
+
+
 def collect_runtime_deps_for_workspace(
     work_dir, primary_module=None, modules=None, env=None, observer=None, side="",
 ):
     work_dir = str(Path(work_dir).resolve())
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
     pl = _normalize_maven_pl_with_workdir(target_selector, work_dir)
+    reactor_prepare = (
+        ['-Dmaven.test.skip=true', 'package']
+        if _maven_reactor_has_modules(work_dir) else []
+    )
     list_cmd = mvn_cmd() + [
         '--batch-mode',
         '--no-transfer-progress',
         *(["-pl", pl, "-am"] if pl else []),
         '-DskipTests',
+        *reactor_prepare,
         'dependency:list',
         '-DincludeScope=runtime',
         '-DoutputAbsoluteArtifactFilename=true',

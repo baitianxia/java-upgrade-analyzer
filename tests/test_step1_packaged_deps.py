@@ -18,6 +18,34 @@ from pipeline_constants import STEP1_ARTIFACTS_DIRNAME  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
+    def test_reactor_dependency_enrichment_packages_modules_before_listing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pom.xml").write_text(
+                "<project><modelVersion>4.0.0</modelVersion>"
+                "<groupId>com.acme</groupId><artifactId>parent</artifactId>"
+                "<version>1</version><packaging>pom</packaging>"
+                "<modules><module>common</module><module>app</module></modules>"
+                "</project>",
+                encoding="utf-8",
+            )
+            commands = []
+
+            def fake_run(cmd, **_kwargs):
+                commands.append(cmd)
+                return (
+                    "[INFO] com.acme:common:jar:1:compile\n",
+                    "",
+                    0,
+                )
+
+            with patch.object(s1_dep_diff, "run_cmd", side_effect=fake_run):
+                deps, _command = s1_dep_diff.collect_runtime_deps_for_workspace(root)
+
+        self.assertIn("package", commands[0])
+        self.assertLess(commands[0].index("package"), commands[0].index("dependency:list"))
+        self.assertIn("com.acme:common", deps)
+
     def test_packaged_archive_rejects_unsafe_entry_before_scanning(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "unsafe.jar"
