@@ -36,7 +36,10 @@ TYPE_INSN_RE = re.compile(
 CLASS_CP_RE = re.compile(r'^\s*#\d+\s+=\s+Class\s+.*//\s+([A-Za-z0-9_/$]+)\s*$')
 INVOKEDYNAMIC_RE = re.compile(r'\binvokedynamic\b.*//\s+InvokeDynamic\s+([^:]+):([^\s]+)')
 DESCRIPTOR_CLASS_RE = re.compile(r'L([A-Za-z0-9_/$]+);')
-METHOD_HEADER_RE = re.compile(r'^\s*(?:[\w.$<>\[\],?]+\s+)+([\w$<>]+)\([^;]*\);\s*$')
+METHOD_HEADER_RE = re.compile(
+    r'^\s*(?:[\w.$<>\[\],?]+\s+)+([\w$<>]+)\([^;]*\)'
+    r'(?:\s+throws\s+[^;]+)?;\s*$'
+)
 REFLECTION_UTF8_MARKERS = {
     'Class.forName',
     'forName',

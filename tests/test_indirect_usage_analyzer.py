@@ -86,6 +86,30 @@ def graph_for(method):
 
 
 class IndirectUsageAnalyzerTest(unittest.TestCase):
+    def test_javap_reflection_resolves_class_literal_method_lookup(self):
+        text = """
+  public java.lang.Object reflected() throws java.lang.Exception;
+    descriptor: ()Ljava/lang/Object;
+    Code:
+       0: ldc           #7                  // class com/acme/Provider
+       2: ldc           #9                  // String target
+       4: iconst_0
+       5: anewarray     #11                 // class java/lang/Class
+       8: invokevirtual #13                 // Method java/lang/Class.getMethod:(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
+      11: aload_0
+      12: iconst_0
+      13: anewarray     #2                  // class java/lang/Object
+      16: invokevirtual #17                 // Method java/lang/reflect/Method.invoke:(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
+"""
+
+        rows = parse_javap_indirect_references(text, "com.acme.Service")
+
+        self.assertTrue(any(
+            row["owner"] == "com.acme.Provider"
+            and row["name"] == "target"
+            and row["consumer_method"] == "reflected"
+            for row in rows
+        ))
     def test_collect_indirect_usage_batch_returns_exact_reflection_as_edge_and_concern(self):
         method = business_method('''
             return (Boolean) Class.forName("org.apache.commons.lang.StringUtils")

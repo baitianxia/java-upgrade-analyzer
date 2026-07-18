@@ -145,7 +145,17 @@ def parse_javap_indirect_references(text, class_binary_name=''):
 
         for offset, insn in method['instructions']:
             string_match = re.search(r'\bldc(?:_w)?\b.*//\s+String\s+(.+)$', insn)
-            if string_match:
+            class_literal_match = re.search(
+                r'\bldc(?:_w)?\b.*//\s+class\s+([A-Za-z0-9_/$]+)', insn
+            )
+            if class_literal_match:
+                owner = class_literal_match.group(1).replace('/', '.').replace('$', '.')
+                active_class = {
+                    'kind': 'class_value', 'owner': owner, 'offset': offset,
+                }
+                produced = active_class
+                operand_stack.append(dict(active_class))
+            elif string_match:
                 literal = string_match.group(1).strip()
                 strings.append((offset, literal))
                 operand_stack.append({'kind': 'string', 'value': literal, 'offset': offset})

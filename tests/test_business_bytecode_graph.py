@@ -591,6 +591,23 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         self.assertEqual(by_type["bytecode_field_access"]["callee_key"], "com.acme.Flags.ENABLED")
         self.assertTrue(all(edge["caller_name"] == "execute" for edge in edges))
 
+    def test_parse_javap_calls_switches_caller_for_method_with_throws_clause(self):
+        text = """
+  public java.lang.String before();
+    descriptor: ()Ljava/lang/String;
+    Code:
+       1: invokevirtual #7 // Method com/acme/Before.call:()V
+  public java.lang.Object reflected() throws java.lang.Exception;
+    descriptor: ()Ljava/lang/Object;
+    Code:
+       1: invokevirtual #8 // Method java/lang/Class.getMethod:(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
+"""
+
+        edges = parse_javap_calls(text, "com.acme.Service")
+        reflected = next(edge for edge in edges if "Class.getMethod" in edge["callee_key"])
+
+        self.assertEqual(reflected["caller_name"], "reflected")
+
     def test_parse_javap_calls_retains_offsets_for_repeated_physical_calls(self):
         text = """
   public void execute();
