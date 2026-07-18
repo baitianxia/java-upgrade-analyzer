@@ -260,7 +260,8 @@
       "positive_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_scope_gate_accepts_faster_run_with_identical_scope",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_envelope_exposes_complete_normalized_resource_metrics",
-        "tests.test_complexity_gate.ComplexityGateTest.test_real_generated_collector_produces_valid_1x_2x_4x_tiers"
+        "tests.test_complexity_gate.ComplexityGateTest.test_real_generated_collector_produces_valid_1x_2x_4x_tiers",
+        "tests.test_complexity_gate.ComplexityGateTest.test_production_scale_tiers_measure_step1_step4_and_step5_separately"
       ],
       "negative_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_relative_performance_baseline_is_sha_bound_and_blocks_regression",

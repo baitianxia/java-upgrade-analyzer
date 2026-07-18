@@ -10,10 +10,6 @@
 
 - 故障注入必须覆盖 Step1、Step4、Step5 的真实 subprocess、解析、制品和缓存边界，并核对生产 reason code；当前通用故障辅助器尚未证明每个生产边界都会失败关闭。
 
-## 分阶段复杂度门禁
-
-- 1x/2x/4x 规模门禁必须分别记录 Step1、Step4、Step5 的正确性范围与资源指标；当前生成规模门禁只覆盖生产字节码 collector，真实项目门禁不能替代分阶段增长验证。
-
 ## 公开运行契约
 
 - 干净副本必须仅按 `SKILL.md` 公共入口成功完成 Step1 到 Step6、checkpoint 恢复和幂等重跑；Ubuntu、macOS、Windows 的必选 CI 矩阵必须取得实际运行证据。当前只验证了首个 checkpoint 和工作流静态结构。

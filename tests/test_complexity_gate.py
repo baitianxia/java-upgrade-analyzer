@@ -7,7 +7,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from complexity_gate import evaluate_scale_tiers, run_generated_scale_tiers  # noqa: E402
+from complexity_gate import (  # noqa: E402
+    REQUIRED_STAGE_METRICS,
+    evaluate_scale_tiers,
+    evaluate_production_stage_tiers,
+    run_generated_scale_tiers,
+    run_production_stage_scale_tiers,
+)
 
 
 class ComplexityGateTest(unittest.TestCase):
@@ -72,6 +78,54 @@ class ComplexityGateTest(unittest.TestCase):
         self.assertEqual(report.status, "passed", report.errors)
         self.assertEqual([tier["scale"] for tier in tiers], [1, 2, 4])
         self.assertTrue(all(tier["metrics"]["parsed_classes"] > 0 for tier in tiers))
+
+    def test_production_scale_tiers_measure_step1_step4_and_step5_separately(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tiers = run_production_stage_scale_tiers(
+                ROOT, Path(tmp), scales=(1, 2, 4)
+            )
+
+        self.assertEqual([tier["scale"] for tier in tiers], [1, 2, 4])
+        for tier in tiers:
+            self.assertEqual(set(tier["stages"]), {"step1", "step4", "step5"})
+            for stage in tier["stages"].values():
+                self.assertEqual(
+                    set(stage["truth_identities"]),
+                    set(stage["observed_identities"]),
+                )
+                self.assertEqual(stage["scope_count"], tier["scale"])
+                self.assertGreaterEqual(stage["elapsed_sec"], 0)
+                self.assertTrue(
+                    set(REQUIRED_STAGE_METRICS).issubset(stage["metrics"])
+                )
+        verdict = evaluate_production_stage_tiers(tiers, self.budgets)
+        self.assertEqual(verdict.status, "passed", verdict.errors)
+
+    def test_stage_complexity_is_invalid_before_timing_when_step4_scope_is_lost(self):
+        stages = {
+            name: {
+                "truth_identities": [f"{name}-api"],
+                "observed_identities": [f"{name}-api"],
+                "scope_count": 1,
+                "elapsed_sec": 0.1,
+                "metrics": {
+                    name: ([] if name == "duplicate_work_keys" else 0)
+                    for name in REQUIRED_STAGE_METRICS
+                },
+            }
+            for name in ("step1", "step4", "step5")
+        }
+        stages["step4"]["observed_identities"] = []
+        stages["step4"]["scope_count"] = 0
+
+        verdict = evaluate_production_stage_tiers(
+            [{"scale": 1, "stages": stages}], self.budgets
+        )
+
+        self.assertEqual(verdict.status, "invalid")
+        self.assertIn("stage_scope_identity_mismatch:step4:1", verdict.errors)
 
 
 if __name__ == "__main__":
