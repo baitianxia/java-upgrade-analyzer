@@ -114,7 +114,13 @@ INTENT_PATCH_RESERVED_TOP_LEVEL_FIELDS = {"action", "intent_patch", "notes", "re
 
 
 class StepError(RuntimeError):
-    pass
+    def __init__(self, message, reason_codes=None):
+        super().__init__(message)
+        self.reason_codes = list(dict.fromkeys(
+            str(code).strip()
+            for code in (reason_codes or [])
+            if str(code).strip()
+        ))
 
 
 class StepInteractionRequired(StepError):
@@ -390,6 +396,7 @@ def new_main_state(report_dir, manifest_path=""):
             "completed_step": None,
             "status": "idle",
             "blocking_reason": None,
+            "blocking_reason_codes": [],
             "pending_interaction": None,
             "last_user_response": None,
             "report_dir": str(Path(report_dir).resolve()),
@@ -3272,7 +3279,22 @@ def run_gate(gate_name, report_dir, cwd, strict_risk_gate=False):
     gate_args = ["--step", gate_name, "--report-dir", str(report_dir)]
     if strict_risk_gate:
         gate_args.append("--strict-risk-gate")
-    run_python("gate.py", gate_args, cwd, report_dir=report_dir)
+    try:
+        run_python("gate.py", gate_args, cwd, report_dir=report_dir)
+    except StepError as exc:
+        reason_codes = list(exc.reason_codes)
+        if gate_name == "jar_compare":
+            coverage_file = runtime_coverage_dir(report_dir) / "s4_coverage.json"
+            if coverage_file.is_file():
+                coverage = read_json(coverage_file)
+                for section in coverage.values():
+                    if not isinstance(section, dict):
+                        continue
+                    reason_codes.extend(section.get("reason_codes") or [])
+                    for run in section.get("runs") or []:
+                        if isinstance(run, dict) and run.get("reason_code"):
+                            reason_codes.append(run["reason_code"])
+        raise StepError(str(exc), reason_codes=reason_codes) from exc
 
 
 def detect_build_tool(project_dir):
@@ -6005,6 +6027,7 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
         completed_step=step_id,
         status="completed",
         blocking_reason=None,
+        blocking_reason_codes=[],
         pending_interaction=None,
     )
     save_main_state(report_dir, main_state)
@@ -6042,6 +6065,7 @@ def persist_step_error(main_state, step_id, report_dir, exc):
         completed_step=(main_state.get("state") or {}).get("completed_step"),
         status="blocked_by_system",
         blocking_reason=str(exc),
+        blocking_reason_codes=list(getattr(exc, "reason_codes", []) or []),
         pending_interaction=None,
     )
     save_main_state(report_dir, main_state)

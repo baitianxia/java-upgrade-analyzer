@@ -80,6 +80,60 @@ class RunStepMainStateTest(unittest.TestCase):
             allow_unresolved=False,
         )
 
+    def test_jar_compare_gate_failure_carries_structured_coverage_reason_codes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            coverage_path = report_dir / ".runtime" / "coverage" / "s4_coverage.json"
+            self._write_text(
+                coverage_path,
+                json.dumps(
+                    {
+                        "binary_api_diff": {
+                            "status": "insufficient",
+                            "reason_codes": [
+                                "japicmp_or_old_jar_failed",
+                                "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
+                            ],
+                        },
+                        "behavior_diff": {"status": "complete", "reason_codes": []},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                run_step,
+                "run_python",
+                side_effect=run_step.StepError("gate.py execution failed"),
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step.run_gate("jar_compare", report_dir, Path(tmp))
+
+            self.assertEqual(
+                raised.exception.reason_codes,
+                [
+                    "japicmp_or_old_jar_failed",
+                    "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
+                ],
+            )
+
+    def test_persist_step_error_saves_machine_readable_reason_codes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            error = run_step.StepError(
+                "gate.py execution failed",
+                reason_codes=["FINAL_ARTIFACT_JAR_EVIDENCE_MISSING"],
+            )
+
+            run_step.persist_step_error(state, "step4", report_dir, error)
+
+            saved = run_step.read_json(run_step.main_state_path(report_dir))
+            self.assertEqual(saved["state"]["status"], "blocked_by_system")
+            self.assertEqual(
+                saved["state"]["blocking_reason_codes"],
+                ["FINAL_ARTIFACT_JAR_EVIDENCE_MISSING"],
+            )
+
     def test_auto_step_reads_from_main_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

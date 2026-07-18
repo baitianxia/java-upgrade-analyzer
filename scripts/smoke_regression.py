@@ -819,6 +819,17 @@ def assert_true(condition, message):
         raise AssertionError(message)
 
 
+def assert_step_blocked_with_reason(report_dir, rc, reason_code, message):
+    state = read_json(main_state_path(report_dir))
+    state_meta = main_state_meta(state)
+    assert_true(
+        rc == 1
+        and state_meta.get("status") == "blocked_by_system"
+        and reason_code in (state_meta.get("blocking_reason_codes") or []),
+        f"{message}: rc={rc}, state={state_meta}",
+    )
+
+
 def parse_smoke_args(argv):
     parser = argparse.ArgumentParser(description="java-upgrade-analyzer smoke regression")
     parser.add_argument(
@@ -1453,11 +1464,11 @@ def run_core_pipeline_smoke(workspace, dep_env):
         f"rc={runtime_expand_rc}, stdout={runtime_expand_stdout[-500:]}, "
         f"stderr={runtime_expand_stderr[-500:]}",
     )
-    assert_true(
-        "缺少最终制品 JAR 证据" in (runtime_expand_stdout + runtime_expand_stderr),
-        "只有源码映射时，Step4 应保留辅助证据并拒绝生成正式 API 结论："
-        f"rc={runtime_expand_rc}, stdout={runtime_expand_stdout[-500:]}, "
-        f"stderr={runtime_expand_stderr[-500:]}",
+    assert_step_blocked_with_reason(
+        runtime_expand_report,
+        runtime_expand_rc,
+        "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
+        "只有源码映射时，Step4 应保留辅助证据并拒绝生成正式 API 结论",
     )
     runtime_expand_rows = read_csv(
         runtime_expand_report / "evidence" / "api_changes" /
@@ -1517,9 +1528,10 @@ def run_core_pipeline_smoke(workspace, dep_env):
         cwd=project_dir,
         env=dep_env,
     )
-    assert_true(
-        dependency_source_rc == 1
-        and "缺少最终制品 JAR 证据" in (dependency_source_stdout + dependency_source_stderr),
+    assert_step_blocked_with_reason(
+        dependency_source_report,
+        dependency_source_rc,
+        "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
         "只有 dependency_source_dirs 时，Step4 应保留辅助证据并拒绝生成正式 API 结论",
     )
     dependency_source_rows = read_csv(
@@ -1574,8 +1586,10 @@ def run_core_pipeline_smoke(workspace, dep_env):
         cwd=project_dir,
         env=dep_env,
     )
-    assert_true(
-        rc == 1 and "缺少最终制品 JAR 证据" in (stdout + stderr),
+    assert_step_blocked_with_reason(
+        prefix_internal_mapping_report,
+        rc,
+        "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
         "groupId 前缀源码映射推断后仍应拒绝缺少最终制品的正式 API 结论",
     )
     prefix_internal_mapping_ckpt = read_json(main_state_path(prefix_internal_mapping_report))
@@ -1719,9 +1733,10 @@ def run_core_pipeline_smoke(workspace, dep_env):
         cwd=project_dir,
         env=dep_env,
     )
-    assert_true(
-        dependency_multi_rc == 1
-        and "缺少最终制品 JAR 证据" in (dependency_multi_stdout + dependency_multi_stderr),
+    assert_step_blocked_with_reason(
+        dependency_multi_report,
+        dependency_multi_rc,
+        "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
         "多模块源码映射不得绕过最终制品门控",
     )
     dependency_multi_ckpt = read_json(main_state_path(dependency_multi_report))
@@ -2660,9 +2675,10 @@ return ExtraApi.callLegacy();
         ],
         cwd=project_dir,
     )
-    assert_true(
-        dependency_multi_bridge_rc == 1
-        and "缺少最终制品 JAR 证据" in dependency_multi_bridge_stderr,
+    assert_step_blocked_with_reason(
+        dependency_multi_report,
+        dependency_multi_bridge_rc,
+        "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
         "多模块源码映射不得绕过 Step4 最终制品门控进入 Step5",
     )
     dependency_multi_auxiliary = read_csv(
