@@ -176,6 +176,227 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(row["compatibility_flags"], "CONSTANT_REMOVED")
         self.assertEqual(row["old_value"], "10")
 
+    def test_constant_oracle_provider_is_resolved_by_coordinate_and_verified_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp) / "repository"
+            provider = (
+                repository / "org/apache/commons/commons-lang3/3.14.0"
+                / "commons-lang3-3.14.0.jar"
+            )
+            provider.parent.mkdir(parents=True)
+            provider.write_bytes(b"pinned-provider")
+            manifest = {"constant_oracle": {"provider": {
+                "coordinate": "org.apache.commons:commons-lang3:3.14.0",
+                "sha256": hashlib.sha256(provider.read_bytes()).hexdigest(),
+            }}}
+
+            resolved = realreg.resolve_constant_oracle_provider(
+                manifest, maven_repository=repository
+            )
+
+        self.assertEqual(resolved, provider)
+
+    def test_constant_oracle_provider_rejects_stale_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp) / "repository"
+            provider = repository / "g/a/1/a-1.jar"
+            provider.parent.mkdir(parents=True)
+            provider.write_bytes(b"wrong")
+            manifest = {"constant_oracle": {"provider": {
+                "coordinate": "g:a:1", "sha256": "a" * 64,
+            }}}
+
+            with self.assertRaisesRegex(ValueError, "constant_oracle_provider_sha256_mismatch"):
+                realreg.resolve_constant_oracle_provider(
+                    manifest, maven_repository=repository
+                )
+
+    def test_constant_evidence_input_enriches_every_manifest_constant_before_step5(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "changed.csv"
+            output = root / "materialized.csv"
+            with source.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=realreg.ALL_CHANGED_APIS_FIELDS)
+                writer.writeheader()
+                writer.writerow({
+                    "coord": "g:a", "change_type": "REMOVED",
+                    "api_name": "p.Flags.VALUE", "api_simple": "VALUE",
+                    "symbol_kind": "field", "compatibility_flags": "CONSTANT_REMOVED",
+                })
+                writer.writerow({
+                    "coord": "g:a", "change_type": "REMOVED",
+                    "api_name": "p.Flags.call", "api_simple": "call",
+                    "symbol_kind": "method", "api_signature": "()",
+                })
+            manifest = {"apis": [{
+                "coord": "g:a", "owner": "p.Flags", "member": "VALUE",
+                "descriptor": "I", "symbol_kind": "field",
+            }]}
+
+            def fake_attach(rows, _provider):
+                self.assertEqual(rows[0]["field_descriptor"], "I")
+                rows[0]["constant_field_evidence_json"] = json.dumps({
+                    "status": "complete", "has_constant_value": True,
+                    "constant_value": 10, "descriptor": "I",
+                    "artifact_sha256": "a" * 64,
+                })
+                return rows
+
+            with patch.object(
+                realreg, "attach_constant_field_evidence", side_effect=fake_attach
+            ):
+                result = realreg.materialize_constant_evidence_input(
+                    source, Path("provider.jar"), manifest, output
+                )
+            with output.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result["selected_count"], 1)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["field_descriptor"], "I")
+        self.assertIn("constant_field_evidence_json", rows[0])
+
+    def test_constant_project_reconciliation_matches_independent_oracle_exactly(self):
+        selected_rows = [{
+            "coord": "g:a", "api_name": "p.Flags.VALUE",
+            "symbol_kind": "field", "change_type": "REMOVED",
+            "field_descriptor": "I", "compatibility_flags": "CONSTANT_REMOVED",
+            "constant_field_evidence_json": json.dumps({
+                "status": "complete", "descriptor": "I",
+                "has_constant_value": True, "constant_value": 10,
+                "artifact_sha256": "a" * 64,
+            }),
+        }]
+        identity = realreg.serialized_api_identity(selected_rows[0])
+        summary = {"uncertain_apis": [{
+            **selected_rows[0], "analysis_status": "uncertain",
+        }]}
+        record = SimpleNamespace(to_dict=lambda: {
+            "identity": identity, "descriptor": "I",
+            "has_constant_value": True, "constant_value": 10,
+            "runtime_links": [], "old_artifact_sha256": "a" * 64,
+        })
+        ledger = SimpleNamespace(complete=True, records=(record,), failures=())
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg, "run_constant_oracle", return_value=ledger
+        ):
+            result = realreg.reconcile_constant_project_evidence(
+                Path("provider.jar"), Path("consumer.jar"), selected_rows,
+                summary, Path(tmp) / "constant-oracle.json",
+            )
+
+        self.assertTrue(result["complete"], result)
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["audit"]["incorrect_identities"], [])
+
+    def test_constant_project_reconciliation_rejects_stronger_analyzer_conclusion(self):
+        selected_rows = [{
+            "coord": "g:a", "api_name": "p.Flags.VALUE",
+            "symbol_kind": "field", "change_type": "REMOVED",
+            "field_descriptor": "I", "compatibility_flags": "CONSTANT_REMOVED",
+            "constant_field_evidence_json": json.dumps({
+                "status": "complete", "descriptor": "I",
+                "has_constant_value": True, "constant_value": 10,
+                "artifact_sha256": "a" * 64,
+            }),
+        }]
+        summary = {"reachable_apis": [{
+            **selected_rows[0], "analysis_status": "reachable",
+        }]}
+        identity = realreg.serialized_api_identity(selected_rows[0])
+        record = SimpleNamespace(to_dict=lambda: {
+            "identity": identity, "descriptor": "I",
+            "has_constant_value": True, "constant_value": 10,
+            "runtime_links": [], "old_artifact_sha256": "a" * 64,
+        })
+        ledger = SimpleNamespace(complete=True, records=(record,), failures=())
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg, "run_constant_oracle", return_value=ledger
+        ):
+            result = realreg.reconcile_constant_project_evidence(
+                Path("provider.jar"), Path("consumer.jar"), selected_rows,
+                summary, Path(tmp) / "constant-oracle.json",
+            )
+
+        self.assertTrue(result["blocking"])
+        self.assertEqual(
+            result["audit"]["incorrect_fields"][identity],
+            ["conclusion", "runtime_link_present"],
+        )
+
+    def test_prepare_constant_project_input_returns_materialized_step5_input(self):
+        manifest = {"constant_oracle": {"provider": {
+            "coordinate": "g:a:1", "sha256": "a" * 64,
+        }}}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            changed = root / "changed.csv"
+            changed.write_text("api_name\n", encoding="utf-8")
+            expected = root / "report/evidence/api_changes/constant_evidence_apis.csv"
+            with patch.object(
+                realreg, "resolve_constant_oracle_provider",
+                return_value=Path("provider.jar"),
+            ), patch.object(
+                realreg, "materialize_constant_evidence_input",
+                return_value={"path": str(expected), "selected_count": 1},
+            ) as materialize:
+                result = realreg.prepare_constant_project_input(
+                    manifest, changed, root / "report"
+                )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["changed_apis"], str(expected))
+        materialize.assert_called_once()
+
+    def test_prepare_constant_project_input_fails_closed_on_provider_error(self):
+        manifest = {"constant_oracle": {"provider": {
+            "coordinate": "g:a:1", "sha256": "a" * 64,
+        }}}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg, "resolve_constant_oracle_provider",
+            side_effect=ValueError("constant_oracle_provider_sha256_mismatch"),
+        ):
+            result = realreg.prepare_constant_project_input(
+                manifest, Path(tmp) / "changed.csv", Path(tmp) / "report"
+            )
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["blocking"])
+        self.assertEqual(
+            result["errors"], ["constant_oracle_provider_sha256_mismatch"]
+        )
+
+    def test_constant_fault_injections_detect_every_required_evidence_corruption(self):
+        identity = "g:a|p.Flags.VALUE||field|REMOVED"
+        clean = {
+            "oracle": {"records": [{
+                "identity": identity, "descriptor": "I",
+                "has_constant_value": True, "constant_value": 10,
+                "runtime_links": [], "old_artifact_sha256": "a" * 64,
+            }]},
+            "analyzer_records": [{
+                "identity": identity, "descriptor": "I",
+                "has_constant_value": True, "constant_value": 10,
+                "runtime_link_present": False,
+                "old_artifact_sha256": "a" * 64,
+                "conclusion": "uncertain",
+            }],
+        }
+        required = [
+            "wrong_constant_value", "removed_field_link", "extra_field_link",
+            "wrong_descriptor", "stale_provider_sha256",
+        ]
+
+        result = realreg.evaluate_constant_evidence_fault_injections(clean, required)
+
+        self.assertTrue(result["passed"], result)
+        self.assertEqual([run["mode"] for run in result["runs"]], required)
+        self.assertTrue(all(run["blocking"] for run in result["runs"]))
+        self.assertTrue(all(run["detected_fields"] for run in result["runs"]))
+
     def test_parse_args_accepts_final_artifact_override_for_single_case(self):
         args = realreg.parse_args([
             "--case", "commons-text",

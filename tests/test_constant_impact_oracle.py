@@ -24,6 +24,7 @@ class ConstantImpactOracleTest(unittest.TestCase):
         (src / "Flags.java").write_text(
             'package sample; public class Flags {'
             ' public static final String TEXT = "old";'
+            ' public static final String EMPTY = "";'
             ' public static String DYNAMIC = "live"; }',
             encoding="utf-8",
         )
@@ -92,6 +93,20 @@ class ConstantImpactOracleTest(unittest.TestCase):
         self.assertTrue(ledger.complete, ledger.failures)
         self.assertTrue(ledger.records[0].has_constant_value)
 
+    def test_javap_oracle_preserves_empty_string_constant_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider, consumer = self._fixture(Path(tmp))
+            row = {
+                "coord": "sample:provider", "api_name": "sample.Flags.EMPTY",
+                "symbol_kind": "field", "field_descriptor": "Ljava/lang/String;",
+                "change_type": "REMOVED",
+            }
+
+            ledger = oracle.run_constant_oracle(provider, [consumer], [row])
+
+        self.assertTrue(ledger.complete, ledger.failures)
+        self.assertEqual(ledger.records[0].constant_value, "")
+
     def test_closed_set_audit_rejects_missing_extra_and_wrong_analyzer_evidence(self):
         oracle_rows = [
             {"identity": "a", "has_constant_value": True, "runtime_link_present": False},
@@ -108,6 +123,62 @@ class ConstantImpactOracleTest(unittest.TestCase):
         self.assertEqual(audit["missing_identities"], ["b"])
         self.assertEqual(audit["extra_identities"], ["extra"])
         self.assertEqual(audit["incorrect_identities"], ["a"])
+
+    def test_closed_set_audit_rejects_duplicates_descriptor_value_sha_and_stronger_conclusion(self):
+        oracle_rows = [{
+            "identity": "g:a|sample.Flags.TEXT|field|",
+            "descriptor": "Ljava/lang/String;",
+            "has_constant_value": True,
+            "constant_value": "old",
+            "runtime_links": [],
+            "old_artifact_sha256": "a" * 64,
+            "expected_conclusion": "uncertain",
+        }]
+        analyzer_rows = [{
+            "identity": "g:a|sample.Flags.TEXT|field|",
+            "descriptor": "I",
+            "has_constant_value": True,
+            "constant_value": "new",
+            "runtime_link_present": False,
+            "old_artifact_sha256": "b" * 64,
+            "conclusion": "reachable",
+        }, {
+            "identity": "g:a|sample.Flags.TEXT|field|",
+            "descriptor": "Ljava/lang/String;",
+            "has_constant_value": True,
+            "constant_value": "old",
+            "runtime_link_present": False,
+            "old_artifact_sha256": "a" * 64,
+            "conclusion": "uncertain",
+        }]
+
+        audit = oracle.audit_constant_evidence(analyzer_rows, oracle_rows)
+
+        self.assertTrue(audit["blocking"])
+        self.assertEqual(
+            audit["analyzer_duplicate_identities"],
+            ["g:a|sample.Flags.TEXT|field|"],
+        )
+        self.assertEqual(
+            audit["incorrect_fields"]["g:a|sample.Flags.TEXT|field|"],
+            ["conclusion", "constant_value", "descriptor", "old_artifact_sha256"],
+        )
+
+    def test_closed_set_audit_rejects_duplicate_oracle_identity(self):
+        row = {
+            "identity": "g:a|sample.Flags.TEXT|field|",
+            "descriptor": "Ljava/lang/String;",
+            "has_constant_value": True,
+            "constant_value": "old",
+            "runtime_links": [],
+            "old_artifact_sha256": "a" * 64,
+            "expected_conclusion": "uncertain",
+        }
+
+        audit = oracle.audit_constant_evidence([], [row, dict(row)])
+
+        self.assertTrue(audit["blocking"])
+        self.assertEqual(audit["oracle_duplicate_identities"], [row["identity"]])
 
 
 if __name__ == "__main__":

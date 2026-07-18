@@ -13,6 +13,20 @@
     "command": ["mvn", "-q", "-DskipTests", "package"],
     "artifact_path": "target/commons-text-1.12.0.jar"
   },
+  "constant_oracle": {
+    "provider": {
+      "coordinate": "org.apache.commons:commons-lang3:3.14.0",
+      "sha256": "7b96bf3ee68949abb5bc465559ac270e0551596fa34523fddf890ec418dde13c"
+    },
+    "consumer": "artifact_path",
+    "required_fault_injections": [
+      "wrong_constant_value",
+      "removed_field_link",
+      "extra_field_link",
+      "wrong_descriptor",
+      "stale_provider_sha256"
+    ]
+  },
   "performance_baseline": {
     "git_revision": "2c2d0818b0540c59f055f5174db51d0574af46da",
     "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",

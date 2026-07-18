@@ -122,6 +122,8 @@ def _javap_class(content, javap, *args):
 
 def _normalize_constant_value(raw):
     value = str(raw or "").strip()
+    if value == "String":
+        return ""
     if value.startswith("String "):
         return value[7:]
     for prefix in ("int ", "long "):
@@ -278,24 +280,67 @@ def run_constant_oracle(old_jar, consumer_artifacts, api_rows, javap="javap"):
 
 
 def audit_constant_evidence(analyzer_rows, oracle_rows):
-    analyzer = {str(row.get("identity") or ""): row for row in analyzer_rows or ()}
-    expected = {str(row.get("identity") or ""): row for row in oracle_rows or ()}
+    def group(rows):
+        grouped = {}
+        for row in rows or ():
+            identity = str(row.get("identity") or "")
+            grouped.setdefault(identity, []).append(row)
+        return grouped
+
+    analyzer_groups = group(analyzer_rows)
+    oracle_groups = group(oracle_rows)
+    analyzer_duplicates = sorted(
+        identity for identity, rows in analyzer_groups.items() if len(rows) != 1
+    )
+    oracle_duplicates = sorted(
+        identity for identity, rows in oracle_groups.items() if len(rows) != 1
+    )
+    analyzer = {identity: rows[0] for identity, rows in analyzer_groups.items()}
+    expected = {identity: rows[0] for identity, rows in oracle_groups.items()}
     missing = sorted(set(expected) - set(analyzer))
     extra = sorted(set(analyzer) - set(expected))
     incorrect = []
+    incorrect_fields = {}
     for identity in sorted(set(expected) & set(analyzer)):
         left = analyzer[identity]
         right = expected[identity]
-        if (
-            bool(left.get("has_constant_value"))
-            != bool(right.get("has_constant_value"))
-            or bool(left.get("runtime_link_present"))
-            != bool(right.get("runtime_link_present"))
-        ):
+        mismatches = []
+        expected_runtime_link = bool(
+            right.get("runtime_link_present")
+            if "runtime_link_present" in right
+            else right.get("runtime_links")
+        )
+        comparisons = {
+            "has_constant_value": (
+                bool(left.get("has_constant_value")),
+                bool(right.get("has_constant_value")),
+            ),
+            "runtime_link_present": (
+                bool(left.get("runtime_link_present")), expected_runtime_link,
+            ),
+        }
+        for field in ("descriptor", "constant_value", "old_artifact_sha256"):
+            if field in right:
+                comparisons[field] = (left.get(field), right.get(field))
+        if "expected_conclusion" in right:
+            comparisons["conclusion"] = (
+                str(left.get("conclusion") or ""),
+                str(right.get("expected_conclusion") or ""),
+            )
+        for field, (actual, wanted) in comparisons.items():
+            if actual != wanted:
+                mismatches.append(field)
+        if mismatches:
             incorrect.append(identity)
+            incorrect_fields[identity] = sorted(mismatches)
     return {
         "missing_identities": missing,
         "extra_identities": extra,
         "incorrect_identities": incorrect,
-        "blocking": bool(missing or extra or incorrect),
+        "incorrect_fields": incorrect_fields,
+        "analyzer_duplicate_identities": analyzer_duplicates,
+        "oracle_duplicate_identities": oracle_duplicates,
+        "blocking": bool(
+            missing or extra or incorrect or analyzer_duplicates or oracle_duplicates
+        ),
     }
