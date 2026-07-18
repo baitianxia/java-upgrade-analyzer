@@ -63,6 +63,17 @@ class GeneratedTopologyTest(unittest.TestCase):
             self.assertTrue(result.classes_dir.is_dir())
             self.assertGreater(len(list(result.classes_dir.rglob("*.class"))), 0)
 
+    def test_truth_callers_name_real_generated_methods(self):
+        generated = generate_topology(100, GenerationDimensions.complete())
+        caller_members = {
+            edge.dimension: edge.caller.split("#", 1)[1].split("(", 1)[0]
+            for edge in generated.spec.truth_edges
+        }
+
+        self.assertEqual(caller_members["same_jar"], "sameJar")
+        self.assertEqual(caller_members["same_coordinate"], "sameCoordinate")
+        self.assertEqual(caller_members["overload"], "overloaded")
+
 
 if __name__ == "__main__":
     unittest.main()

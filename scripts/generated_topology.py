@@ -134,6 +134,7 @@ public class Topology{token} {{
   public String sameJar() {{ return provider.target(); }}
   public String crossJar() {{ return bridge(); }}
   private String bridge() {{ return provider.target(); }}
+  public String sameCoordinate() {{ return provider.target(); }}
   public String overloaded() {{ return provider.target("x"); }}
   public String inherited() {{ return provider.inherited(); }}
   public String constant() {{ return Provider.CONSTANT; }}
@@ -166,8 +167,19 @@ def generate_topology(
         "reflection": ApiSpec(provider, "target", "()Ljava/lang/String;", "method"),
         "callback": ApiSpec("generated.Callback", "invoke", "()V", "method"),
     }
+    caller_members = {
+        "same_jar": "sameJar",
+        "cross_jar": "bridge",
+        "same_coordinate": "sameCoordinate",
+        "overload": "overloaded",
+        "inheritance": "inherited",
+        "constant": "constant",
+        "reflection": "reflected",
+        "callback": "callback",
+    }
     caller_by_dimension = {
-        dimension: f"{owner}#{dimension}()" for dimension in dimensions.values
+        dimension: f"{owner}#{caller_members[dimension]}()"
+        for dimension in dimensions.values
     }
     edges = tuple(
         EdgeSpec(
