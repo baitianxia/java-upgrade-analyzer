@@ -287,6 +287,15 @@ def _determinism_task(python_exe, profile):
         if profile == "core"
         else "test_generated_production_matrix_is_semantically_identical"
     )
+
+
+def _execution_fault_task(python_exe):
+    return _unittest_task(
+        python_exe,
+        "execution_faults",
+        ["tests.test_execution_faults"],
+        "执行超时、退出、截断、替换、权限、编码、中断与缓存竞态必须失败关闭",
+    )
     return _unittest_task(
         python_exe,
         f"determinism_{profile}",
@@ -341,6 +350,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
             ))
     elif profile == "release":
         tasks.append(_production_mutation_task(python_exe))
+        tasks.append(_execution_fault_task(python_exe))
         tasks.append(_determinism_task(python_exe, "full"))
         tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))

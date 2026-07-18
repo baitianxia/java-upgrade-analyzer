@@ -40,6 +40,12 @@ class QualityGateTest(unittest.TestCase):
         self.assertTrue(quick_task.command[-1].endswith("test_generated_core_matrix_is_semantically_identical"))
         self.assertTrue(release_task.command[-1].endswith("test_generated_production_matrix_is_semantically_identical"))
 
+    def test_release_profile_has_explicit_execution_fault_gate(self):
+        tasks = quality_gate.build_plan("release", skip_real=True)
+        task = next(item for item in tasks if item.name == "execution_faults")
+
+        self.assertEqual(task.command[-1], "tests.test_execution_faults")
+
     def test_round_input_files_are_initialized_without_overwriting_reviews(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
