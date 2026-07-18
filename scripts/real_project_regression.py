@@ -5279,6 +5279,29 @@ def derive_step4_inputs_from_artifacts(
     context = context_dir / "s2_context.json"
     base_source = case.base_source_project or case.default_project
     current_source = case.current_source_project or case.default_project
+    state_dir = report_dir / ".runtime" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pinned_input = {}
+    for side, revision in (("base", case.base_revision), ("current", case.current_revision)):
+        if not revision:
+            continue
+        pinned_input.update({
+            f"{side}_requested_ref": revision,
+            f"{side}_resolved_ref": revision,
+            f"{side}_resolved_commit": revision,
+            f"{side}_ref_resolution_mode": "pinned_real_project_fixture",
+            f"{side}_ref_source_status": "user_confirmed_local_source",
+            f"{side}_allow_local_source": True,
+        })
+    (state_dir / "main_state.json").write_text(
+        json.dumps({"step1": {"input": pinned_input}}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    step1_env = {
+        **os.environ,
+        "JUA_ORCHESTRATED": "1",
+        "UPGRADE_REPORT_DIR": str(report_dir.resolve()),
+    }
     step1_cmd = [
         sys.executable,
         str(ROOT_DIR / "scripts" / "s1_dep_diff.py"),
@@ -5298,7 +5321,8 @@ def derive_step4_inputs_from_artifacts(
     if case.current_revision:
         step1_cmd.extend(("--current", case.current_revision))
     step1 = subprocess.run(
-        step1_cmd, cwd=ROOT_DIR, text=True, encoding="utf-8", errors="replace", timeout=900
+        step1_cmd, cwd=ROOT_DIR, env=step1_env, text=True,
+        encoding="utf-8", errors="replace", timeout=900
     )
     runs = [{"step": "step1", "returncode": step1.returncode, "command": step1_cmd}]
     if step1.returncode != 0:

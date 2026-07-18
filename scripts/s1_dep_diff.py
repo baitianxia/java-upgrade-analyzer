@@ -2465,7 +2465,7 @@ def _collect_runtime_deps_for_artifact_input(
             )
         runtime_deps, meta = get_runtime_deps_by_switching_branch(
             resolved_commit,
-            work_dir,
+            repo_dir,
             primary_module=primary_module,
             modules=modules,
             jdk_field=jdk_field,

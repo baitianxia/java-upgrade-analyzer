@@ -1639,9 +1639,11 @@ class RealProjectRegressionTest(unittest.TestCase):
                 current_revision="current-sha",
             )
             commands = []
+            environments = []
 
-            def fake_run(cmd, **_kwargs):
+            def fake_run(cmd, **kwargs):
                 commands.append(cmd)
+                environments.append(kwargs.get("env"))
                 if str(cmd[1]).endswith("s1_dep_diff.py"):
                     Path(cmd[cmd.index("--output") + 1]).write_text(
                         "coord,old_version,new_version,change_type,scope\n"
@@ -1665,12 +1667,18 @@ class RealProjectRegressionTest(unittest.TestCase):
 
             with patch.object(realreg.subprocess, "run", side_effect=fake_run):
                 result = realreg.run_step4(case, root / "report")
+            state = json.loads(
+                (root / "report/.runtime/state/main_state.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(len(commands), 3)
         self.assertTrue(str(commands[0][1]).endswith("s1_dep_diff.py"))
         self.assertIn("--base-artifact-path", commands[0])
         self.assertEqual(commands[0][commands[0].index("--base") + 1], "base-sha")
         self.assertEqual(commands[0][commands[0].index("--current") + 1], "current-sha")
+        self.assertEqual(environments[0]["JUA_ORCHESTRATED"], "1")
+        self.assertEqual(state["step1"]["input"]["base_resolved_commit"], "base-sha")
+        self.assertTrue(state["step1"]["input"]["base_allow_local_source"])
         self.assertTrue(str(commands[1][1]).endswith("s2_context_from_deps.py"))
         self.assertIn(str(source_dir), commands[1])
         self.assertTrue(str(commands[2][1]).endswith("s4_jar_compare.py"))

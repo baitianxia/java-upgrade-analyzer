@@ -791,7 +791,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
             deps, meta = s1_dep_diff._collect_runtime_deps_for_artifact_input(
                 "/same/project",
                 "current-release",
-                "/same/project",
+                "/analysis/repository",
                 primary_module="app",
                 side="current",
                 artifact_path="/tmp/current.jar",
@@ -810,6 +810,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
         )
         branch_call.assert_called_once()
         self.assertEqual(branch_call.call_args.args[0], "a" * 40)
+        self.assertEqual(branch_call.call_args.args[1], "/same/project")
         source_call.assert_not_called()
 
     def test_artifact_coordinate_enrichment_stops_when_branch_is_ambiguous(self):
