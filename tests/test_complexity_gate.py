@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from complexity_gate import evaluate_scale_tiers  # noqa: E402
+from complexity_gate import evaluate_scale_tiers, run_generated_scale_tiers  # noqa: E402
 
 
 class ComplexityGateTest(unittest.TestCase):
@@ -61,6 +61,17 @@ class ComplexityGateTest(unittest.TestCase):
         self.assertEqual(report.status, "failed")
         self.assertIn("ratio_budget_exceeded:elapsed_sec:2->4", report.errors)
         self.assertIn("duplicate_work:step5:app.jar", report.errors)
+
+    def test_real_generated_collector_produces_valid_1x_2x_4x_tiers(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tiers = run_generated_scale_tiers(ROOT, Path(tmp), scales=(1, 2, 4))
+            report = evaluate_scale_tiers(tiers, self.budgets)
+
+        self.assertEqual(report.status, "passed", report.errors)
+        self.assertEqual([tier["scale"] for tier in tiers], [1, 2, 4])
+        self.assertTrue(all(tier["metrics"]["parsed_classes"] > 0 for tier in tiers))
 
 
 if __name__ == "__main__":

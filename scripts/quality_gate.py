@@ -287,6 +287,13 @@ def _determinism_task(python_exe, profile):
         if profile == "core"
         else "test_generated_production_matrix_is_semantically_identical"
     )
+    return _unittest_task(
+        python_exe,
+        f"determinism_{profile}",
+        [f"tests.test_determinism_gate.DeterminismGateTest.{method}"],
+        f"跨进程语义确定性矩阵：{profile}",
+        heavy=profile == "full",
+    )
 
 
 def _execution_fault_task(python_exe):
@@ -296,12 +303,18 @@ def _execution_fault_task(python_exe):
         ["tests.test_execution_faults"],
         "执行超时、退出、截断、替换、权限、编码、中断与缓存竞态必须失败关闭",
     )
+
+
+def _generated_complexity_task(python_exe):
     return _unittest_task(
         python_exe,
-        f"determinism_{profile}",
-        [f"tests.test_determinism_gate.DeterminismGateTest.{method}"],
-        f"跨进程语义确定性矩阵：{profile}",
-        heavy=profile == "full",
+        "generated_complexity",
+        [
+            "tests.test_complexity_gate.ComplexityGateTest."
+            "test_real_generated_collector_produces_valid_1x_2x_4x_tiers"
+        ],
+        "生成项目生产字节码收集路径的正确性优先缩放预算",
+        heavy=True,
     )
 
 
@@ -352,6 +365,7 @@ def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", rep
         tasks.append(_production_mutation_task(python_exe))
         tasks.append(_execution_fault_task(python_exe))
         tasks.append(_determinism_task(python_exe, "full"))
+        tasks.append(_generated_complexity_task(python_exe))
         tasks.append(_accuracy_benchmark_task(python_exe, "all"))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all"))
