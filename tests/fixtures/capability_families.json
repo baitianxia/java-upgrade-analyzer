@@ -58,13 +58,16 @@
         "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_equivalent_source_and_bytecode_spellings_have_one_identity",
         "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_trace_envelope_uses_canonical_target_identity",
         "tests.test_third_party_jdk_oracle.ThirdPartyJdkOracleTest.test_javap_certifies_only_exact_owner_and_descriptor",
-        "tests.test_third_party_jdeps_oracle.ThirdPartyJdepsOracleTest.test_scan_artifact_uses_jdeps_as_independent_class_authority"
+        "tests.test_third_party_jdeps_oracle.ThirdPartyJdepsOracleTest.test_scan_artifact_uses_jdeps_as_independent_class_authority",
+        "tests.test_oracle_independence.OracleIndependenceTest.test_repository_oracle_policy_is_clean"
       ],
       "negative_tests": [
-        "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_different_change_types_never_collapse_in_any_producer"
+        "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_different_change_types_never_collapse_in_any_producer",
+        "tests.test_oracle_independence.OracleIndependenceTest.test_rejects_direct_aliased_and_dynamic_analyzer_dependencies"
       ],
       "mutation_tests": [
-        "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_dropping_change_identity_from_oracle_fails_closed"
+        "tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_dropping_change_identity_from_oracle_fails_closed",
+        "tests.test_oracle_independence.OracleIndependenceTest.test_runtime_rows_require_independent_producer_and_artifact_sha"
       ],
       "cross_project_guards": [
         "ruoyi-full-artifact-discovery"
@@ -93,16 +96,19 @@
         "tests.test_business_bytecode_graph.BusinessBytecodeGraphTest.test_collect_business_bytecode_batch_reports_parse_failure",
         "tests.test_indirect_usage_analyzer.IndirectUsageAnalyzerTest.test_collect_indirect_usage_batch_reports_resource_read_failure_as_evidence_failure",
         "tests.test_final_artifact_edge_oracle.FinalArtifactEdgeOraclePerformanceTest.test_hung_javap_version_probe_returns_a_structured_incomplete_result",
-        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_security_source_read_failure_is_explicit_coverage_failure"
+        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_security_source_read_failure_is_explicit_coverage_failure",
+        "tests.test_execution_faults.ExecutionFaultTest.test_every_fault_is_detected_with_exact_reason_and_evidence"
       ],
       "negative_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_malformed_context_cannot_fall_back_to_empty_source_scope",
-        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_corrupt_nested_final_artifact_is_incomplete_not_verified"
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_corrupt_nested_final_artifact_is_incomplete_not_verified",
+        "tests.test_execution_faults.ExecutionFaultTest.test_malformed_or_partial_output_never_becomes_empty_success"
       ],
       "mutation_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_analyzer_collector_failure_blocks_a_negative_conclusion",
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_unreadable_preservation_artifact_cannot_be_treated_as_no_provider",
-        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_packaged_class_locator_reports_malformed_nested_jar"
+        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_packaged_class_locator_reports_malformed_nested_jar",
+        "tests.test_execution_faults.ExecutionFaultTest.test_registry_covers_every_declared_execution_boundary"
       ],
       "cross_project_guards": [
         "gs-managing-transactions",
@@ -177,17 +183,20 @@
       "positive_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_accepts_one_identical_canonical_identity_set",
         "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_audit_verifies_every_api_with_third_party_provenance",
-        "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_step4_dynamic_field_discovery_reconciles_with_independent_oracle"
+        "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_step4_dynamic_field_discovery_reconciles_with_independent_oracle",
+        "tests.test_generated_topology_regression.GeneratedTopologyRegressionTest.test_runner_compiles_and_exercises_production_bytecode_collector"
       ],
       "negative_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_uses_coordinate_and_change_type_in_closed_identity_set",
-        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_missing_analyzer_identity_is_an_explicit_closed_world_failure"
+        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_missing_analyzer_identity_is_an_explicit_closed_world_failure",
+        "tests.test_generated_topology_regression.GeneratedTopologyRegressionTest.test_wrong_conclusion_is_blocking_even_when_identity_set_matches"
       ],
       "mutation_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_rejects_equal_count_summary_with_wrong_identity_set",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_rejects_duplicate_step4_canonical_identity",
         "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_duplicate_changed_identity_is_an_explicit_closed_world_failure",
-        "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_dynamic_pipeline_gate_detects_removed_link_and_dropped_api"
+        "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_dynamic_pipeline_gate_detects_removed_link_and_dropped_api",
+        "tests.test_production_mutation.ProductionMutationTest.test_registered_production_mutants_are_all_killed"
       ],
       "cross_project_guards": [
         "ruoyi-full-artifact-discovery"
@@ -210,16 +219,22 @@
       "positive_tests": [
         "tests.test_materialize_real_project_asset.MaterializeRealProjectAssetTest.test_source_build_plan_is_revision_scoped_and_never_uses_a_shell",
         "tests.test_materialize_real_project_asset.MaterializeRealProjectAssetTest.test_published_plan_downloads_to_sha_scoped_destination",
-        "tests.test_real_project_regression.RealProjectRegressionTest.test_every_pinned_manifest_has_an_executable_materialization_contract"
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_every_pinned_manifest_has_an_executable_materialization_contract",
+        "tests.test_determinism_gate.DeterminismGateTest.test_generated_production_matrix_is_semantically_identical",
+        "tests.test_platform_contract.PlatformContractTest.test_workflow_declares_mandatory_os_jdk_tool_and_evidence_matrix",
+        "tests.test_claude_skill_contract.ClaudeSkillContractTest.test_clean_copy_starts_and_stops_at_checkpoint_idempotently"
       ],
       "negative_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_absolute_artifact_path_without_published_origin_is_not_reproducible",
-        "tests.test_real_project_regression.RealProjectRegressionTest.test_run_case_fails_closed_when_discovery_artifact_is_missing"
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_run_case_fails_closed_when_discovery_artifact_is_missing",
+        "tests.test_determinism_gate.DeterminismGateTest.test_comparison_rejects_first_semantic_difference_with_reproducer",
+        "tests.test_claude_skill_contract.ClaudeSkillContractTest.test_static_audit_rejects_stale_command_and_wrong_output_path"
       ],
       "mutation_tests": [
         "tests.test_materialize_real_project_asset.MaterializeRealProjectAssetTest.test_cli_rejects_manifest_without_reproducible_contract",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_pinned_asset_gate_rejects_missing_materialization_contract",
-        "tests.test_real_project_regression.RealProjectRegressionTest.test_run_case_fails_closed_when_topology_artifact_is_missing"
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_run_case_fails_closed_when_topology_artifact_is_missing",
+        "tests.test_metamorphic_regression.MetamorphicRegressionTest.test_semantic_digest_changes_for_every_required_semantic_field"
       ],
       "cross_project_guards": [
         "dubbo-spring6-security",
@@ -242,13 +257,16 @@
       ],
       "positive_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_scope_gate_accepts_faster_run_with_identical_scope",
-        "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_envelope_exposes_complete_normalized_resource_metrics"
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_envelope_exposes_complete_normalized_resource_metrics",
+        "tests.test_complexity_gate.ComplexityGateTest.test_real_generated_collector_produces_valid_1x_2x_4x_tiers"
       ],
       "negative_tests": [
-        "tests.test_real_project_regression.RealProjectRegressionTest.test_relative_performance_baseline_is_sha_bound_and_blocks_regression"
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_relative_performance_baseline_is_sha_bound_and_blocks_regression",
+        "tests.test_complexity_gate.ComplexityGateTest.test_rejects_superlinear_growth_and_duplicate_archive_scan"
       ],
       "mutation_tests": [
-        "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_scope_gate_rejects_faster_run_that_reduces_scan_scope"
+        "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_scope_gate_rejects_faster_run_that_reduces_scan_scope",
+        "tests.test_complexity_gate.ComplexityGateTest.test_scope_loss_invalidates_performance_before_budget_evaluation"
       ],
       "cross_project_guards": [
         "ruoyi-full-artifact-discovery"
