@@ -724,15 +724,42 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(case.default_changed_apis.is_file())
 
         manifest = realreg.load_pinned_guard_manifest(case)
-        self.assertEqual(len(manifest["apis"]), 6)
-        self.assertEqual(len(manifest["canonical_edges"]), 5)
+        api_identities = {
+            (api["owner"], api["member"], api["descriptor"], api["symbol_kind"])
+            for api in manifest["apis"]
+        }
+        self.assertIn(
+            (
+                "org.apache.commons.lang3.StringUtils",
+                "EMPTY",
+                "Ljava/lang/String;",
+                "field",
+            ),
+            api_identities,
+        )
+        self.assertIn(
+            (
+                "org.apache.commons.lang3.ArrayUtils",
+                "EMPTY_CHAR_ARRAY",
+                "[C",
+                "field",
+            ),
+            api_identities,
+        )
+        field_edges = [
+            edge
+            for edge in manifest["canonical_edges"]
+            if edge["callee_member"] == "EMPTY_CHAR_ARRAY"
+        ]
+        self.assertEqual(len(field_edges), 4)
+        self.assertEqual({edge["opcode_family"] for edge in field_edges}, {"getstatic"})
         self.assertEqual(
             sum(api["expected_conclusion"] == "uncertain" for api in manifest["apis"]),
             1,
         )
         self.assertEqual(
             manifest["performance_baseline"]["scope"]["fault_injection_detected_count"],
-            1,
+            5,
         )
 
     def test_grpc_netty_shaded_is_a_pinned_source_bytecode_conflict_guard(self):

@@ -50,7 +50,9 @@ class ConstantImpactOracleTest(unittest.TestCase):
         )
         (src / "Caller.java").write_text(
             'package sample; public class Caller {'
+            ' static String INITIAL = Flags.DYNAMIC;'
             ' public String text() { return Flags.TEXT; }'
+            ' String packageDynamic() { return Flags.DYNAMIC; }'
             ' public String dynamic() { return Flags.DYNAMIC; } }',
             encoding="utf-8",
         )
@@ -92,8 +94,17 @@ class ConstantImpactOracleTest(unittest.TestCase):
         self.assertEqual(by_name["sample.Flags.TEXT"].constant_value, "old")
         self.assertEqual(by_name["sample.Flags.TEXT"].runtime_links, ())
         self.assertFalse(by_name["sample.Flags.DYNAMIC"].has_constant_value)
-        self.assertEqual(len(by_name["sample.Flags.DYNAMIC"].runtime_links), 1)
-        link = by_name["sample.Flags.DYNAMIC"].runtime_links[0]
+        self.assertEqual(len(by_name["sample.Flags.DYNAMIC"].runtime_links), 3)
+        links = {
+            (item["consumer_method"], item["consumer_descriptor"]): item
+            for item in by_name["sample.Flags.DYNAMIC"].runtime_links
+        }
+        self.assertEqual(set(links), {
+            ("<clinit>", "()V"),
+            ("packageDynamic", "()Ljava/lang/String;"),
+            ("dynamic", "()Ljava/lang/String;"),
+        })
+        link = links[("dynamic", "()Ljava/lang/String;")]
         self.assertEqual(link["opcode"], "getstatic")
         self.assertEqual(link["consumer_owner"], "sample.Caller")
         self.assertEqual(link["consumer_method"], "dynamic")

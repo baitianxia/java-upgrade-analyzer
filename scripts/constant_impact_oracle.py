@@ -185,9 +185,12 @@ def _field_links(javap_output, target_owner, field_name, descriptor, artifact_sh
     consumer_method = ""
     consumer_descriptor = ""
     for line in javap_output.splitlines():
+        if re.match(r"^\s{2}static\s+\{\};\s*$", line):
+            consumer_method = "<clinit>"
+            consumer_descriptor = "()V"
+            continue
         method_header = re.match(
-            r"^\s{2}(?:(?:public|protected|private|static|final|synchronized|native|abstract)\s+)+"
-            r"(.+?)\((?:[^)]*)\);\s*$",
+            r"^\s{2}(.+?)\((?:[^)]*)\)(?:\s+throws\s+[^;]+)?;\s*$",
             line,
         )
         if method_header:
@@ -200,6 +203,10 @@ def _field_links(javap_output, target_owner, field_name, descriptor, artifact_sh
             continue
         match = pattern.search(line)
         if match:
+            if not consumer_method or not consumer_descriptor:
+                raise ValueError(
+                    f"field_link_method_context_missing:{entry}:{match.group(1)}"
+                )
             links.append({
                 "consumer_method": consumer_method,
                 "consumer_descriptor": consumer_descriptor,
