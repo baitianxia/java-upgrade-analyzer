@@ -128,8 +128,8 @@ def _canonicalize_step5_result_value(value, report_roots):
     return value
 
 
-def canonical_step5_result_fingerprint(report_dir):
-    """Hash stable Step5 conclusions and paths while excluding runtime telemetry."""
+def step5_result_contract(report_dir):
+    """Return stable Step5 conclusions and paths without runtime telemetry."""
     report_input = Path(report_dir).expanduser().absolute()
     report_root = report_input.resolve()
     report_roots = tuple(dict.fromkeys((str(report_input), str(report_root))))
@@ -160,10 +160,29 @@ def canonical_step5_result_fingerprint(report_dir):
         raise FileNotFoundError(
             f"no Step5 summary, alerts or query index found under {report_root}"
         )
+    return payload
+
+
+def canonical_step5_result_fingerprint(report_dir):
+    """Hash stable Step5 conclusions and paths while excluding runtime telemetry."""
+    payload = step5_result_contract(report_dir)
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def cold_run_metrics(report_dir):
+    """Read scalar Step5 observability values without interpreting conclusions."""
+    path = Path(report_dir) / ".runtime" / "observability" / "step5_timing.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"Step5 timing CSV not found: {path}")
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return {
+            f"{row.get('section', '')}.{row.get('metric', '')}": row.get("value", "")
+            for row in csv.DictReader(handle)
+            if row.get("section") and row.get("metric")
+        }
 
 
 @dataclass(frozen=True)
