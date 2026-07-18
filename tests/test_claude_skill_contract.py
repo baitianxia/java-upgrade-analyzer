@@ -7,7 +7,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from claude_skill_contract import audit_public_contract, run_skill_contract  # noqa: E402
+from claude_skill_contract import (  # noqa: E402
+    audit_public_contract,
+    run_skill_contract,
+    run_skill_contract_metamorphic_matrix,
+)
+from metamorphic_regression import TRANSFORM_IDS  # noqa: E402
 
 
 class ClaudeSkillContractTest(unittest.TestCase):
@@ -45,9 +50,28 @@ class ClaudeSkillContractTest(unittest.TestCase):
         self.assertEqual(report.completed_step, "step6")
         self.assertTrue(report.deliverables_verified)
         self.assertEqual(report.successful_rerun_returncode, 0)
+        self.assertEqual(report.step4_api_count, 1)
+        self.assertEqual(report.step5_accounted_api_count, 1)
 
     def test_repository_public_contract_has_no_undeclared_or_stale_entrypoint(self):
         self.assertEqual(audit_public_contract(ROOT), ())
+
+    def test_all_metamorphic_variants_complete_step4_to_step5_closed_world(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = run_skill_contract_metamorphic_matrix(
+                ROOT, Path(tmp), TRANSFORM_IDS
+            )
+
+        self.assertEqual(set(reports), set(TRANSFORM_IDS))
+        self.assertTrue(all(report.status == "passed" for report in reports.values()))
+        self.assertTrue(all(report.step4_api_count == 1 for report in reports.values()))
+        self.assertTrue(
+            all(report.step5_accounted_api_count == 1 for report in reports.values())
+        )
+        self.assertEqual(
+            len({report.current_artifact_sha256 for report in reports.values()}),
+            len(TRANSFORM_IDS),
+        )
 
 
 if __name__ == "__main__":

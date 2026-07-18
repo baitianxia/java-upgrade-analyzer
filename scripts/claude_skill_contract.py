@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import csv
 import hashlib
 import json
 from pathlib import Path
@@ -32,6 +33,9 @@ class SkillContractReport:
     completed_step: str = ""
     deliverables_verified: bool = False
     successful_rerun_returncode: int = -1
+    step4_api_count: int = 0
+    step5_accounted_api_count: int = 0
+    current_artifact_sha256: str = ""
 
 
 def audit_public_contract(root: Path) -> tuple[str, ...]:
@@ -106,7 +110,9 @@ def _compile_java(source: Path, output: Path, *, classpath: Path | None = None):
         raise RuntimeError(f"javac fixture failed: {completed.stderr}")
 
 
-def _write_library_jar(path: Path, classes: Path, version: str):
+def _write_library_jar(
+    path: Path, classes: Path, version: str, artifact_variant: str = ""
+):
     properties = (
         "groupId=contract\nartifactId=demo-lib\n"
         f"version={version}\n"
@@ -117,9 +123,13 @@ def _write_library_jar(path: Path, classes: Path, version: str):
         archive.writestr(
             "META-INF/maven/contract/demo-lib/pom.properties", properties
         )
+        if artifact_variant:
+            archive.writestr("META-INF/contract-variant", artifact_variant)
 
 
-def _write_fat_jar(path: Path, app_classes: Path, library: Path):
+def _write_fat_jar(
+    path: Path, app_classes: Path, library: Path, artifact_variant: str = ""
+):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
             "META-INF/MANIFEST.MF",
@@ -131,9 +141,13 @@ def _write_fat_jar(path: Path, app_classes: Path, library: Path):
                 "BOOT-INF/classes/" + class_file.relative_to(app_classes).as_posix(),
             )
         archive.write(library, f"BOOT-INF/lib/{library.name}")
+        if artifact_variant:
+            archive.writestr("META-INF/contract-variant", artifact_variant)
 
 
-def _materialize_complete_fixture(fixture: Path) -> tuple[Path, Path, Path]:
+def _materialize_complete_fixture(
+    fixture: Path, artifact_variant: str = ""
+) -> tuple[Path, Path, Path]:
     build = fixture / "contract-build"
     old_source = build / "old-src" / "contract" / "Target.java"
     new_source = build / "new-src" / "contract" / "Target.java"
@@ -153,12 +167,12 @@ def _materialize_complete_fixture(fixture: Path) -> tuple[Path, Path, Path]:
     _compile_java(app_source, app_classes, classpath=old_classes)
     old_library = build / "demo-lib-1.0.jar"
     new_library = build / "demo-lib-2.0.jar"
-    _write_library_jar(old_library, old_classes, "1.0")
-    _write_library_jar(new_library, new_classes, "2.0")
+    _write_library_jar(old_library, old_classes, "1.0", artifact_variant)
+    _write_library_jar(new_library, new_classes, "2.0", artifact_variant)
     base_artifact = build / "app-base.jar"
     current_artifact = build / "app-current.jar"
-    _write_fat_jar(base_artifact, app_classes, old_library)
-    _write_fat_jar(current_artifact, app_classes, new_library)
+    _write_fat_jar(base_artifact, app_classes, old_library, artifact_variant)
+    _write_fat_jar(current_artifact, app_classes, new_library, artifact_variant)
     return base_artifact, current_artifact, app_source.parents[2]
 
 
@@ -170,7 +184,11 @@ def _state_completed_step(state_path: Path) -> str:
 
 
 def run_skill_contract(
-    repo_root: Path, workspace: Path, *, complete_workflow: bool = False
+    repo_root: Path,
+    workspace: Path,
+    *,
+    complete_workflow: bool = False,
+    artifact_variant: str = "",
 ) -> SkillContractReport:
     repo_root = Path(repo_root)
     workspace = Path(workspace)
@@ -192,7 +210,7 @@ def run_skill_contract(
     base_artifact = current_artifact = source_root = None
     if complete_workflow:
         base_artifact, current_artifact, source_root = _materialize_complete_fixture(
-            fixture
+            fixture, artifact_variant
         )
     clean = not report_dir.exists() and not (skill_root / ".upgrade-report").exists()
     errors = list(audit_public_contract(skill_root))
@@ -253,6 +271,9 @@ def run_skill_contract(
     completed_step = _state_completed_step(state)
     deliverables_verified = False
     successful_rerun_returncode = -1
+    step4_api_count = 0
+    step5_accounted_api_count = 0
+    current_artifact_sha256 = ""
     if complete_workflow:
         for _ in range(10):
             if completed_step == "step6":
@@ -309,6 +330,24 @@ def run_skill_contract(
         successful_rerun_returncode = successful_rerun.returncode
         if successful_rerun.returncode != 0:
             errors.append(f"successful_rerun_failed:{successful_rerun.returncode}")
+        step4_apis = report_dir / "evidence" / "api_changes" / "all_changed_apis.csv"
+        if step4_apis.is_file():
+            with step4_apis.open(encoding="utf-8-sig", newline="") as handle:
+                step4_api_count = sum(1 for _row in csv.DictReader(handle))
+        step5_summary = report_dir / "evidence" / "call_chain" / "summary.json"
+        if step5_summary.is_file():
+            summary_payload = json.loads(step5_summary.read_text(encoding="utf-8"))
+            step5_accounted_api_count = int(summary_payload.get("total_apis") or 0)
+        if step4_api_count <= 0:
+            errors.append("workflow_step4_api_population_empty")
+        if step5_accounted_api_count != step4_api_count:
+            errors.append(
+                f"workflow_step4_step5_scope_mismatch:{step4_api_count}:"
+                f"{step5_accounted_api_count}"
+            )
+        current_artifact_sha256 = hashlib.sha256(
+            Path(current_artifact).read_bytes()
+        ).hexdigest()
     return SkillContractReport(
         "failed" if errors else "passed",
         tuple(errors),
@@ -322,4 +361,22 @@ def run_skill_contract(
         completed_step,
         deliverables_verified,
         successful_rerun_returncode,
+        step4_api_count,
+        step5_accounted_api_count,
+        current_artifact_sha256,
     )
+
+
+def run_skill_contract_metamorphic_matrix(
+    repo_root: Path, workspace: Path, variants
+) -> dict[str, SkillContractReport]:
+    workspace = Path(workspace)
+    return {
+        str(variant): run_skill_contract(
+            repo_root,
+            workspace / str(variant),
+            complete_workflow=True,
+            artifact_variant=str(variant),
+        )
+        for variant in variants
+    }
