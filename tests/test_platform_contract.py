@@ -25,6 +25,7 @@ class PlatformContractTest(unittest.TestCase):
         self.assertIn("actions/upload-artifact@v4", text)
         self.assertIn("platform-contract.json", text)
         self.assertIn("push:", text)
+        self.assertIn('- "main"', text)
         self.assertIn('- "codex/**"', text)
         self.assertNotIn("continue-on-error", text)
 
