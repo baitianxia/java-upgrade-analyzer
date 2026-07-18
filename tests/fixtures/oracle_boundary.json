@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "oracle_files": [
+    "scripts/exhaustive_api_oracle.py",
+    "scripts/final_artifact_edge_oracle.py",
+    "scripts/third_party_jdeps_oracle.py",
+    "scripts/third_party_jdk_oracle.py"
+  ],
+  "forbidden_modules": [
+    "business_bytecode_graph",
+    "confidence_weighted_tracer",
+    "framework_adapters",
+    "indirect_usage_analyzer",
+    "s4_jar_compare",
+    "s5_call_chain_engine_integrated",
+    "step5_evidence_ingestion"
+  ],
+  "allowed_schema_modules": [
+    "step5_evidence_model",
+    "signature_utils"
+  ]
+}

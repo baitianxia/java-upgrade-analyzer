@@ -256,10 +256,26 @@ def _diff_check_task():
     )
 
 
+def _oracle_independence_task(python_exe):
+    return GateTask(
+        name="oracle_independence",
+        command=[
+            python_exe,
+            "scripts/oracle_independence.py",
+            "tests/fixtures/oracle_boundary.json",
+        ],
+        purpose="第三方 Oracle 实现与分析器提取、过滤和裁决代码保持独立",
+    )
+
+
 def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", report_root=None):
     python_exe = python_exe or sys.executable
     required_tools = REQUIRED_TOOLS if profile in {"step5", "release"} else REQUIRED_TOOLS[:-1]
-    tasks = [_required_tools_task(required_tools), _py_compile_task(python_exe)]
+    tasks = [
+        _required_tools_task(required_tools),
+        _py_compile_task(python_exe),
+        _oracle_independence_task(python_exe),
+    ]
     audit_root = Path(report_root or "/private/tmp/jua-quality-gate")
     real_json = str(audit_root / f"real_project_{real_case}.json")
     audit_json = str(audit_root / f"quality_signal_audit_{real_case}.json")

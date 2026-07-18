@@ -13,6 +13,14 @@ import quality_gate  # noqa: E402
 
 
 class QualityGateTest(unittest.TestCase):
+    def test_quick_and_release_profiles_require_oracle_independence(self):
+        for profile in ("quick", "release"):
+            with self.subTest(profile=profile):
+                tasks = quality_gate.build_plan(profile, skip_real=True)
+                task = next(item for item in tasks if item.name == "oracle_independence")
+                self.assertIn("scripts/oracle_independence.py", task.command)
+                self.assertIn("tests/fixtures/oracle_boundary.json", task.command)
+
     def test_round_input_files_are_initialized_without_overwriting_reviews(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
