@@ -54,6 +54,16 @@ jobs:
           --report-root "${{ runner.temp }}/jua-platform-contract"
           --json-out "${{ runner.temp }}/platform-contract.json"
 
+      - name: Record Platform Cell Result
+        if: always()
+        shell: bash
+        env:
+          CELL_STATUS: ${{ job.status }}
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_JAVA: ${{ matrix.java }}
+          CELL_RESULT_PATH: ${{ runner.temp }}/platform-cell-${{ matrix.os }}-jdk${{ matrix.java }}.txt
+        run: printf '%s|%s|%s\n' "${CELL_STATUS}" "${MATRIX_OS}" "${MATRIX_JAVA}" > "${CELL_RESULT_PATH}"
+
       - name: Upload Platform Evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -62,6 +72,7 @@ jobs:
           path: |
             ${{ runner.temp }}/platform-contract.json
             ${{ runner.temp }}/jua-platform-contract
+            ${{ runner.temp }}/platform-cell-${{ matrix.os }}-jdk${{ matrix.java }}.txt
 
   platform-evidence:
     needs: platform-contract
@@ -75,25 +86,51 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Download platform cell evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: platform-contract-*
+          path: ${{ runner.temp }}/platform-cells
+          merge-multiple: true
+
       - name: Publish immutable platform verification tag
         shell: bash
         env:
           MATRIX_RESULT: ${{ needs.platform-contract.result }}
+          CELL_RESULTS_DIR: ${{ runner.temp }}/platform-cells
         run: |
           set -euo pipefail
+          publish_tag() {
+            local tag="$1"
+            local ref="refs/tags/${tag}"
+            local remote_sha
+            remote_sha="$(git ls-remote --tags origin "${ref}" | awk '{print $1}')"
+            if [[ -n "${remote_sha}" ]]; then
+              test "${remote_sha}" = "${GITHUB_SHA}"
+              return
+            fi
+            git tag "${tag}" "${GITHUB_SHA}"
+            if ! git push origin "${ref}"; then
+              remote_sha="$(git ls-remote --tags origin "${ref}" | awk '{print $1}')"
+              test "${remote_sha}" = "${GITHUB_SHA}"
+            fi
+          }
+
+          shopt -s nullglob
+          cell_files=("${CELL_RESULTS_DIR}"/platform-cell-*.txt)
+          test "${#cell_files[@]}" -eq 9
+          for result_file in "${cell_files[@]}"; do
+            IFS='|' read -r CELL_STATUS MATRIX_OS MATRIX_JAVA < "${result_file}"
+            case "${CELL_STATUS}" in
+              success|failure|cancelled) ;;
+              *) exit 1 ;;
+            esac
+            publish_tag "platform-contract-cell-${CELL_STATUS}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}"
+          done
+
           if [[ "${MATRIX_RESULT}" = "success" ]]; then
             tag="platform-contract-verified-${GITHUB_SHA}"
           else
             tag="platform-contract-failed-${GITHUB_SHA}"
           fi
-          ref="refs/tags/${tag}"
-          remote_sha="$(git ls-remote --tags origin "${ref}" | awk '{print $1}')"
-          if [[ -n "${remote_sha}" ]]; then
-            test "${remote_sha}" = "${GITHUB_SHA}"
-            exit 0
-          fi
-          git tag "${tag}" "${GITHUB_SHA}"
-          if ! git push origin "${ref}"; then
-            remote_sha="$(git ls-remote --tags origin "${ref}" | awk '{print $1}')"
-            test "${remote_sha}" = "${GITHUB_SHA}"
-          fi
+          publish_tag "${tag}"
