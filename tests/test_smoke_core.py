@@ -78,6 +78,19 @@ class SmokeCoreTest(SmokeRegressionTestCase):
             "script-gate-scan-passed",
         )
 
+    def test_failed_smoke_assertion_records_callsite(self):
+        try:
+            smoke_regression.assert_true(False, "expected failure")
+        except AssertionError:
+            pass
+        else:
+            self.fail("assert_true should fail")
+
+        self.assertRegex(
+            smoke_regression._SMOKE_CHECKPOINT,
+            r"^assert-test_failed_smoke_assertion_records_callsite-line-\d+$",
+        )
+
     def test_failure_writes_machine_readable_last_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "smoke-result.json"

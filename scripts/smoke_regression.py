@@ -13,6 +13,7 @@ import base64
 import csv
 from dataclasses import dataclass
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -811,6 +812,10 @@ def build_multimodule_maven_tree(demo_version, other_version):
 
 def assert_true(condition, message):
     if not condition:
+        caller = inspect.currentframe().f_back
+        mark_smoke_checkpoint(
+            f"assert-{caller.f_code.co_name}-line-{caller.f_lineno}"
+        )
         raise AssertionError(message)
 
 
