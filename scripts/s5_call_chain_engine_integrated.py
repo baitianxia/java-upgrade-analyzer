@@ -69,6 +69,7 @@ from indirect_usage_analyzer import (
 from framework_adapters import run_framework_adapters, serialize_framework_batches
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import CoverageRecord, thaw_evidence_value
+from step5_memory_observer import record_step5_memory
 from signature_utils import normalize_signature_for_identity, signatures_match_identity
 from analysis_contract import build_project_scope, discover_maven_modules, sha256_file
 from artifact_safety import inspect_archive
@@ -277,6 +278,7 @@ def _write_step5_timing_csv(report_dir, graph_stats):
             'by_module_elapsed_sec',
             'by_api_count',
         ],
+        'memory': [],
     }
     for section, keys in preferred_keys.items():
         bucket = perf.get(section) or {}
@@ -299,6 +301,26 @@ def _write_step5_timing_csv(report_dir, graph_stats):
         writer.writeheader()
         writer.writerows(rows)
     return str(path)
+
+
+def _observe_step5_memory(graph_stats, phase, *, graph=None, extra=None):
+    sample = record_step5_memory(
+        graph_stats,
+        phase,
+        graph=graph,
+        extra=extra,
+    )
+    emit_progress(
+        "step5",
+        "memory",
+        (
+            f"{phase}: current_rss={sample['current_rss_mb']:.1f}MB, "
+            f"peak_rss={sample['peak_rss_mb']:.1f}MB, "
+            f"methods={sample['method_count']}, "
+            f"reverse_edges={sample['reverse_edge_count']}"
+        ),
+    )
+    return sample
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1067,6 +1089,11 @@ def _step5_integrated_main_impl(args):
         allowed_business_classes=allowed_business_classes,
     )
     business_graph_elapsed = time.perf_counter() - business_graph_timer
+    business_graph_memory = _observe_step5_memory(
+        business_graph_result['stats'],
+        'business_graph_ready',
+        graph=business_graph_result['graph'],
+    )
     emit_progress(
         "step5",
         "graph",
@@ -1279,6 +1306,10 @@ def _step5_integrated_main_impl(args):
     graph_stats = graph_result['stats']
     graph_stats.setdefault('step5_perf', {})
     graph_stats['step5_perf'].setdefault('main', {})
+    graph_stats['step5_perf'].setdefault('memory', {}).update({
+        f'business_graph_ready_{key}': value
+        for key, value in business_graph_memory.items()
+    })
     graph_stats['step5_perf']['main'].update({
         'business_graph_elapsed_sec': round(business_graph_elapsed, 3),
         'dependency_graph_elapsed_sec': round(full_graph_elapsed, 3),
@@ -1288,6 +1319,11 @@ def _step5_integrated_main_impl(args):
         'dependency_source_alignment_rejected': len(rejected_source_records),
         'dependency_source_alignment_evidence': dependency_source_alignment.get('evidence_path') or '',
     })
+    _observe_step5_memory(
+        graph_stats,
+        'source_graph_ready',
+        graph=graph,
+    )
     bytecode_timer = time.perf_counter()
     bytecode_batch = collect_business_bytecode_batch(
         business_roots,
@@ -1310,6 +1346,12 @@ def _step5_integrated_main_impl(args):
     )
     graph_stats['step5_perf']['main']['business_bytecode_javap_fallback_classes'] = int(
         bytecode_stats.get('javap_fallback_classes') or 0
+    )
+    _observe_step5_memory(
+        graph_stats,
+        'business_bytecode_collected',
+        graph=graph,
+        extra={'batch_edge_count': len(bytecode_batch.edges)},
     )
     graph_stats['artifact_bytecode'] = {
         'status': runtime_dependency_catalog.get('status', 'insufficient'),
@@ -1353,6 +1395,12 @@ def _step5_integrated_main_impl(args):
         _graph_snapshot_with_bytecode_batch(graph, bytecode_batch),
         all_apis,
         source_roots,
+    )
+    _observe_step5_memory(
+        graph_stats,
+        'indirect_usage_collected',
+        graph=graph,
+        extra={'batch_edge_count': len(indirect_batch.edges)},
     )
     framework_merge_timer = time.perf_counter()
     ingestion_result = ingest_collector_batches(
@@ -1444,6 +1492,22 @@ def _step5_integrated_main_impl(args):
             indirect_stats.get('potential_legacy_method_target_pairs') or 0
         ),
     })
+    _observe_step5_memory(
+        graph_stats,
+        'evidence_merged',
+        graph=graph,
+        extra={
+            'merged_edge_count': ingestion_result.merged_edges,
+            'rejected_edge_count': ingestion_result.rejected_edges,
+        },
+    )
+    # All collector evidence, coverage and metrics have been transferred to the
+    # graph/stats. Releasing these local containers shortens their overlap with
+    # tracing caches without removing any graph edge or evidence record.
+    del bytecode_batch
+    del framework_batches
+    del indirect_batch
+    del ingestion_result
     emit_progress(
         "step5",
         "perf",
@@ -1509,6 +1573,12 @@ def _step5_integrated_main_impl(args):
         api_bridge_requirements=api_bridge_requirements,
         allow_degraded=allow_degraded,
         graph_stats=graph_stats,
+    )
+    _observe_step5_memory(
+        graph_stats,
+        'trace_complete',
+        graph=graph,
+        extra={'result_count': len(all_results)},
     )
     # Runtime bytecode closure can add methods and reverse edges while tracing.
     # Refresh the persisted query index so it describes the same graph as the report.

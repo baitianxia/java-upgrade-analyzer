@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 from real_project_regression import canonical_step5_result_fingerprint  # noqa: E402
 import s5_call_chain_engine_integrated as step5_engine  # noqa: E402
 import step5_evidence_ingestion as evidence_ingestion  # noqa: E402
+import step5_memory_observer  # noqa: E402
 
 
 class Step5ResultFingerprintTest(unittest.TestCase):
@@ -139,6 +140,83 @@ class FrameworkSnapshotTest(unittest.TestCase):
         )
         self.assertEqual(tuple(relevant_edges), snapshot["com.acme.Mapper.find(java.lang.String)"])
         self.assertIsInstance(snapshot["com.acme.Mapper.find(java.lang.String)"], tuple)
+
+
+class Step5MemoryObserverTest(unittest.TestCase):
+    def test_reads_linux_current_rss_without_subprocess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status = Path(tmp) / "status"
+            status.write_text("Name:\tpython\nVmRSS:\t2048 kB\n", encoding="utf-8")
+
+            self.assertEqual(
+                step5_memory_observer.current_rss_mb(
+                    platform_name="linux", linux_status_path=status,
+                ),
+                2.0,
+            )
+
+    def test_uses_injected_darwin_reader_and_never_raises(self):
+        self.assertEqual(
+            step5_memory_observer.current_rss_mb(
+                platform_name="darwin", darwin_reader=lambda: 12.5,
+            ),
+            12.5,
+        )
+        self.assertEqual(
+            step5_memory_observer.current_rss_mb(
+                platform_name="darwin",
+                darwin_reader=lambda: (_ for _ in ()).throw(OSError("failed")),
+            ),
+            0.0,
+        )
+
+    def test_records_graph_counts_without_mutating_graph(self):
+        first = [object(), object()]
+        second = [object()]
+        graph = SimpleNamespace(
+            methods_by_id={"a": object()},
+            reverse_edges={"x": first, "y": second},
+        )
+        stats = {"step5_perf": {}}
+
+        sample = step5_memory_observer.record_step5_memory(
+            stats,
+            "graph_ready",
+            graph=graph,
+            current_reader=lambda: 10.0,
+            peak_reader=lambda: 20.0,
+        )
+
+        self.assertEqual(sample["method_count"], 1)
+        self.assertEqual(sample["reverse_edge_key_count"], 2)
+        self.assertEqual(sample["reverse_edge_count"], 3)
+        self.assertIs(graph.reverse_edges["x"], first)
+        self.assertEqual(
+            stats["step5_perf"]["memory"]["graph_ready_current_rss_mb"],
+            10.0,
+        )
+
+    def test_memory_metrics_are_written_to_step5_timing_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            timing_path = step5_engine._write_step5_timing_csv(
+                tmp,
+                {
+                    "step5_perf": {
+                        "memory": {
+                            "graph_ready_current_rss_mb": 10.0,
+                            "graph_ready_peak_rss_mb": 20.0,
+                        },
+                    },
+                },
+            )
+            with Path(timing_path).open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        values = {(row["section"], row["metric"]): row["value"] for row in rows}
+        self.assertEqual(
+            values[("memory", "graph_ready_current_rss_mb")],
+            "10.0",
+        )
 
 
 if __name__ == "__main__":
