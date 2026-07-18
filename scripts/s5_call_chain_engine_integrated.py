@@ -1375,6 +1375,7 @@ def _step5_integrated_main_impl(args):
     framework_batches = run_framework_adapters(
         source_roots,
         artifact_catalog=runtime_dependency_catalog,
+        fact_store=artifact_fact_store,
     )
     serialize_framework_batches(framework_batches, framework_output)
     graph_stats['step5_perf']['main']['framework_adapters_elapsed_sec'] = round(

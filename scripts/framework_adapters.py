@@ -31,6 +31,26 @@ from step5_evidence_model import (
 )
 
 
+def _shared_artifact_inventory(entry, fact_store):
+    """Use a shared inventory only when it identifies this exact SHA-bound artifact."""
+    if fact_store is None:
+        return None
+    coord = str((entry or {}).get('coord') or '').strip()
+    expected_sha = str((entry or {}).get('sha256') or '').lower()
+    expected_path = str((entry or {}).get('jar_path') or '')
+    if not coord or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+        return None
+    inventory = fact_store.inventory(coord)
+    identity = inventory.identity
+    if (
+        inventory.failure
+        or identity.sha256 != expected_sha
+        or Path(identity.path) != Path(expected_path)
+    ):
+        return None
+    return inventory
+
+
 class FrameworkAdapter(Protocol):
     """Stable adapter contract; implementations never mutate the source graph."""
 
@@ -1413,7 +1433,7 @@ def _mybatis_mapper_scan_evidence(source_roots):
     return evidence, errors
 
 
-def _mybatis_runtime_entry(artifact_catalog):
+def _mybatis_runtime_entry(artifact_catalog, fact_store=None):
     matches = []
     errors = []
     for entry in (artifact_catalog or {}).get('entries') or []:
@@ -1425,16 +1445,20 @@ def _mybatis_runtime_entry(artifact_catalog):
         jar_path = Path(str(entry.get('jar_path') or ''))
         if not jar_path.is_file():
             continue
-        try:
-            content = jar_path.read_bytes()
-            if hashlib.sha256(content).hexdigest() != str(entry.get('sha256') or '').lower():
-                errors.append(f'{jar_path}:mybatis_runtime_sha256_mismatch')
+        shared_inventory = _shared_artifact_inventory(entry, fact_store)
+        if shared_inventory is not None:
+            names = set(shared_inventory.resources) | set(shared_inventory.physical_classes)
+        else:
+            try:
+                content = jar_path.read_bytes()
+                if hashlib.sha256(content).hexdigest() != str(entry.get('sha256') or '').lower():
+                    errors.append(f'{jar_path}:mybatis_runtime_sha256_mismatch')
+                    continue
+                with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                    names = set(archive.namelist())
+            except (OSError, zipfile.BadZipFile) as exc:
+                errors.append(f'{jar_path}:mybatis_runtime:{type(exc).__name__}')
                 continue
-            with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                names = set(archive.namelist())
-        except (OSError, zipfile.BadZipFile) as exc:
-            errors.append(f'{jar_path}:mybatis_runtime:{type(exc).__name__}')
-            continue
         if _MYBATIS_PROXY_RUNTIME_CLASSES.issubset(names):
             matches.append(entry)
     if len(matches) != 1:
@@ -1589,7 +1613,7 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog):
     return packaged, unregistered, activation, errors
 
 
-def _verify_mybatis_runtime_dispatch(entry):
+def _verify_mybatis_runtime_dispatch(entry, fact_store=None):
     jar_path = str(entry.get('jar_path') or '')
     classes = (
         'org.apache.ibatis.binding.MapperProxy',
@@ -1598,8 +1622,13 @@ def _verify_mybatis_runtime_dispatch(entry):
     )
     outputs = {}
     errors = []
+    shared_inventory = _shared_artifact_inventory(entry, fact_store)
+    locations = {
+        location.binary_name: location
+        for location in (shared_inventory.classes if shared_inventory else ())
+    }
     for owner in classes:
-        try:
+        def run_javap(*_args):
             completed = subprocess.run(
                 ['javap', '-c', '-p', '-s', '-classpath', jar_path, owner],
                 capture_output=True,
@@ -1608,13 +1637,29 @@ def _verify_mybatis_runtime_dispatch(entry):
                 errors='replace',
                 timeout=30,
             )
+            return completed.returncode, completed.stdout
+
+        try:
+            if fact_store is not None and owner in locations:
+                outcome = fact_store.javap_fact(
+                    str(entry.get('coord') or ''), locations[owner],
+                    'framework-mybatis-code-private-signatures-v1', run_javap,
+                )
+                if outcome.status == 'complete':
+                    returncode, stdout = outcome.value
+                else:
+                    # Preserve legacy failure classification and retry once rather than
+                    # treating a cache-layer failure as evidence that the class is safe.
+                    returncode, stdout = run_javap()
+            else:
+                returncode, stdout = run_javap()
         except (OSError, subprocess.TimeoutExpired) as exc:
             errors.append(f'{jar_path}:{owner}:{type(exc).__name__}')
             continue
-        if completed.returncode != 0:
-            errors.append(f'{jar_path}:{owner}:javap_exit_{completed.returncode}')
+        if returncode != 0:
+            errors.append(f'{jar_path}:{owner}:javap_exit_{returncode}')
             continue
-        outputs[owner] = completed.stdout
+        outputs[owner] = stdout
     checks = {
         'proxy_entry_dispatch': (
             'org.apache.ibatis.binding.MapperProxy',
@@ -1653,10 +1698,12 @@ def _mybatis_select_runtime_target(contract):
     )
 
 
-def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
+def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None, fact_store=None):
     """Resolve registered mapper calls through the exact packaged MyBatis proxy runtime."""
     mapper_scan_evidence, mapper_scan_errors = _mybatis_mapper_scan_evidence(source_roots)
-    runtime_entry, runtime_errors, runtime_matches = _mybatis_runtime_entry(artifact_catalog)
+    runtime_entry, runtime_errors, runtime_matches = _mybatis_runtime_entry(
+        artifact_catalog, fact_store=fact_store,
+    )
     if not runtime_entry:
         untrusted_runtime_hint = any(
             'mybatis' in (
@@ -1722,7 +1769,9 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None):
         })
     dispatch = {}
     if runtime_entry:
-        dispatch, dispatch_errors = _verify_mybatis_runtime_dispatch(runtime_entry)
+        dispatch, dispatch_errors = _verify_mybatis_runtime_dispatch(
+            runtime_entry, fact_store=fact_store,
+        )
         errors.extend(dispatch_errors)
         missing = sorted(name for name, present in dispatch.items() if not present)
         if missing:
@@ -2159,7 +2208,9 @@ def _spring_boot_business_activation(source_roots):
     return evidence, errors
 
 
-def _verified_spring_boot_business_activation(activation_evidence, artifact_catalog):
+def _verified_spring_boot_business_activation(
+    activation_evidence, artifact_catalog, fact_store=None,
+):
     business_entries = [
         item for item in (artifact_catalog or {}).get('entries') or []
         if str(item.get('coord') or '').strip() == '__business__'
@@ -2171,14 +2222,18 @@ def _verified_spring_boot_business_activation(activation_evidence, artifact_cata
     business = business_entries[0]
     jar_path = Path(str(business.get('jar_path') or ''))
     expected_sha256 = str(business.get('sha256') or '').lower()
-    try:
-        content = jar_path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != expected_sha256:
+    shared_inventory = _shared_artifact_inventory(business, fact_store)
+    if shared_inventory is not None:
+        names = set(shared_inventory.resources) | set(shared_inventory.physical_classes)
+    else:
+        try:
+            content = jar_path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != expected_sha256:
+                return []
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                names = set(archive.namelist())
+        except (OSError, zipfile.BadZipFile):
             return []
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            names = set(archive.namelist())
-    except (OSError, zipfile.BadZipFile):
-        return []
     verified = []
     for activation in activation_evidence or ():
         business_entry = str(activation.get('business_entry') or '').strip()
@@ -2616,12 +2671,14 @@ def _packaged_transactional_methods(jar_path, owners):
     return verified, errors
 
 
-def run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=None):
+def run_spring_transaction_proxy_adapter(
+    source_roots, artifact_catalog=None, fact_store=None,
+):
     """Resolve @Transactional business calls through exact packaged Spring AOP methods."""
     transactional_methods, errors = _spring_transactional_business_methods(source_roots)
     source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
     activation_evidence = _verified_spring_boot_business_activation(
-        source_activation_evidence, artifact_catalog,
+        source_activation_evidence, artifact_catalog, fact_store=fact_store,
     )
     custom_mode_findings, custom_mode_errors = _spring_transaction_custom_mode(source_roots)
     errors.extend(activation_errors)
@@ -2796,7 +2853,9 @@ def run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=None):
     )
 
 
-def run_spring_data_repository_adapter(source_roots, artifact_catalog=None):
+def run_spring_data_repository_adapter(
+    source_roots, artifact_catalog=None, fact_store=None,
+):
     """Resolve Spring Data repository proxies from source contracts and packaged runtime code."""
     repositories, repository_errors = _spring_data_business_repositories(source_roots)
     custom_configuration, custom_configuration_errors = (
@@ -2804,7 +2863,7 @@ def run_spring_data_repository_adapter(source_roots, artifact_catalog=None):
     )
     source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
     activation_evidence = _verified_spring_boot_business_activation(
-        source_activation_evidence, artifact_catalog,
+        source_activation_evidence, artifact_catalog, fact_store=fact_store,
     )
     business_entries = [
         item for item in (artifact_catalog or {}).get('entries') or []
@@ -3827,7 +3886,9 @@ def collect_spring_security_filter_activation(runtime_catalog, business_inventor
     )
 
 
-def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None):
+def run_runtime_spring_registration_adapter(
+    source_roots, artifact_catalog=None, fact_store=None,
+):
     """Read Spring registrations from the exact packaged runtime jars.
 
     A registration is a confirmed runtime entry only when business code proves that Spring Boot
@@ -3836,7 +3897,7 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
     """
     source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
     activation_evidence = _verified_spring_boot_business_activation(
-        source_activation_evidence, artifact_catalog,
+        source_activation_evidence, artifact_catalog, fact_store=fact_store,
     )
     trusted_activation_evidence = activation_evidence if not activation_errors else []
     spring_boot_active = bool(trusted_activation_evidence)
@@ -3875,12 +3936,24 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
                     active_callbacks += 1
             continue
         try:
-            with zipfile.ZipFile(jar_path) as jar:
-                names = set(jar.namelist())
+            shared_inventory = _shared_artifact_inventory(item, fact_store)
+            if shared_inventory is not None:
+                names = set(shared_inventory.resources) | set(shared_inventory.physical_classes)
+                def shared_resource(name):
+                    outcome = fact_store.resource_bytes(coord, name)
+                    if outcome.status != 'complete':
+                        raise OSError(outcome.reason)
+                    return outcome.value
+                jar_context = None
+            else:
+                jar_context = zipfile.ZipFile(jar_path)
+                names = set(jar_context.namelist())
+                shared_resource = jar_context.read
+            try:
                 factories_name = 'META-INF/spring.factories'
                 if factories_name in names:
                     resource_files += 1
-                    text = jar.read(factories_name).decode('utf-8', errors='replace')
+                    text = shared_resource(factories_name).decode('utf-8', errors='replace')
                     for line_no, registration_type, targets in _logical_properties(text):
                         callback_method = _SPRING_RUNTIME_CALLBACK_METHODS.get(registration_type)
                         for target_class in targets:
@@ -3939,7 +4012,7 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
                 imports_name = 'META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports'
                 if imports_name in names:
                     resource_files += 1
-                    text = jar.read(imports_name).decode('utf-8', errors='replace')
+                    text = shared_resource(imports_name).decode('utf-8', errors='replace')
                     for line_no, raw in enumerate(text.splitlines(), 1):
                         target_class = raw.split('#', 1)[0].strip()
                         if not target_class:
@@ -3966,6 +4039,9 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
                             },
                         })
                         conditional_autoconfigurations += 1
+            finally:
+                if jar_context is not None:
+                    jar_context.close()
         except (OSError, zipfile.BadZipFile, UnicodeError) as exc:
             errors.append(f'{jar_path}:{type(exc).__name__}')
     if resource_files and not spring_boot_active:
@@ -3988,7 +4064,9 @@ def run_runtime_spring_registration_adapter(source_roots, artifact_catalog=None)
     )
 
 
-def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
+def run_framework_adapters(
+    source_roots, output_path='', artifact_catalog=None, fact_store=None,
+):
     spring_security_inventory = _spring_security_source_inventory(source_roots)
     has_business_artifact = any(
         str(item.get('coord') or '') == '__business__'
@@ -4014,11 +4092,19 @@ def run_framework_adapters(source_roots, output_path='', artifact_catalog=None):
     batches = (
         run_spi_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_spring_adapter(source_roots, artifact_catalog=artifact_catalog),
-        run_runtime_spring_registration_adapter(source_roots, artifact_catalog=artifact_catalog),
-        run_spring_transaction_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
-        run_spring_data_repository_adapter(source_roots, artifact_catalog=artifact_catalog),
+        run_runtime_spring_registration_adapter(
+            source_roots, artifact_catalog=artifact_catalog, fact_store=fact_store,
+        ),
+        run_spring_transaction_proxy_adapter(
+            source_roots, artifact_catalog=artifact_catalog, fact_store=fact_store,
+        ),
+        run_spring_data_repository_adapter(
+            source_roots, artifact_catalog=artifact_catalog, fact_store=fact_store,
+        ),
         run_mybatis_adapter(source_roots, artifact_catalog=artifact_catalog),
-        run_mybatis_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
+        run_mybatis_proxy_adapter(
+            source_roots, artifact_catalog=artifact_catalog, fact_store=fact_store,
+        ),
         run_dynamic_proxy_adapter(source_roots, artifact_catalog=artifact_catalog),
         run_declarative_http_client_adapter(source_roots, artifact_catalog=artifact_catalog),
         aop_batch,

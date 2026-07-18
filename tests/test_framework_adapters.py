@@ -23,6 +23,7 @@ from framework_adapters import (
     serialize_framework_batches,
 )
 from step5_evidence_ingestion import ingest_collector_batches
+from step5_artifact_fact_store import Step5ArtifactFactStore
 from step5_evidence_model import (
     ActivationEvidence,
     CollectedEdge,
@@ -87,6 +88,56 @@ class FrameworkAdaptersTest(unittest.TestCase):
         "run_dynamic_proxy_adapter",
         "run_declarative_http_client_adapter",
     )
+
+    def test_runtime_spring_registration_shared_facts_preserve_exact_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "runtime.jar"
+            business = root / "business.jar"
+            with zipfile.ZipFile(runtime, "w") as archive:
+                archive.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener=com.acme.Listener\n",
+                )
+            with zipfile.ZipFile(business, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/com/acme/Application.class", b"application",
+                )
+            catalog = {"entries": [
+                {
+                    "coord": "com.acme:runtime",
+                    "jar_path": str(runtime),
+                    "sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
+                },
+                {
+                    "coord": "__business__",
+                    "jar_path": str(business),
+                    "sha256": hashlib.sha256(business.read_bytes()).hexdigest(),
+                },
+            ]}
+            activation = ([{
+                "file": "/src/Application.java",
+                "spring_application_run": True,
+                "spring_boot_annotation": True,
+                "business_entry": "com.acme.Application.main",
+            }], [])
+            with patch.object(
+                framework_adapter_module,
+                "_spring_boot_business_activation",
+                return_value=activation,
+            ):
+                legacy = framework_adapter_module.run_runtime_spring_registration_adapter(
+                    [], artifact_catalog=catalog,
+                )
+                shared = framework_adapter_module.run_runtime_spring_registration_adapter(
+                    [], artifact_catalog=catalog,
+                    fact_store=Step5ArtifactFactStore.from_catalog(catalog),
+                )
+
+            self.assertEqual(
+                serialize_framework_batches((legacy,)),
+                serialize_framework_batches((shared,)),
+            )
 
     def test_all_nine_public_adapters_return_immutable_typed_batches(self):
         for name in self.ADAPTER_ENTRY_POINTS:
@@ -215,6 +266,39 @@ class FrameworkAdaptersTest(unittest.TestCase):
             "plain_invoker_dispatch": False,
             "select_one_dispatch": False,
         })
+
+    def test_mybatis_runtime_dispatch_shares_exact_javap_output(self):
+        owners = (
+            "org.apache.ibatis.binding.MapperProxy",
+            "org.apache.ibatis.binding.MapperProxy$PlainMethodInvoker",
+            "org.apache.ibatis.binding.MapperMethod",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "mybatis.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                for owner in owners:
+                    archive.writestr(owner.replace(".", "/") + ".class", b"fixture")
+            entry = {
+                "coord": "org.mybatis:mybatis",
+                "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            completed = SimpleNamespace(returncode=0, stdout="fixture-output")
+            with patch.object(
+                framework_adapter_module.subprocess, "run", return_value=completed,
+            ) as run:
+                first = framework_adapter_module._verify_mybatis_runtime_dispatch(
+                    entry, fact_store=store,
+                )
+                second = framework_adapter_module._verify_mybatis_runtime_dispatch(
+                    entry, fact_store=store,
+                )
+
+            self.assertEqual(first, second)
+            self.assertEqual(3, run.call_count)
+            self.assertEqual(3, store.metrics()["javap_starts"])
+            self.assertEqual(3, store.metrics()["javap_shared_hits"])
 
     def test_framework_orchestrator_returns_tuple_and_serializer_alone_projects_v1(self):
         batches = _run_framework_adapters([], artifact_catalog={"entries": []})

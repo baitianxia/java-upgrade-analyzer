@@ -122,6 +122,8 @@ class Step5ArtifactFactStore:
             "inventory_hits": 0,
             "class_bytes_reads": 0,
             "class_bytes_read": 0,
+            "resource_bytes_reads": 0,
+            "resource_bytes_read": 0,
             "fact_hits": 0,
             "fact_misses": 0,
             "fact_failures": 0,
@@ -238,6 +240,29 @@ class Step5ArtifactFactStore:
                     self._metrics["class_bytes_reads"] += 1
                     self._metrics["class_bytes_read"] += len(content)
                 yield entry, content
+
+    def resource_bytes(self, coord: str, resource_name: str) -> FactOutcome:
+        """Return one immutable resource, with absence/failure kept explicit."""
+        identity = self._identity(coord)
+        resource_name = str(resource_name or "")
+        key = (
+            "resource", identity.sha256, identity.target_jdk, resource_name,
+        )
+
+        def produce():
+            inventory = self.inventory(coord)
+            if inventory.failure:
+                raise ValueError(inventory.failure)
+            if resource_name not in inventory.resources:
+                raise KeyError(f"resource_not_in_inventory:{resource_name}")
+            with zipfile.ZipFile(identity.path) as archive:
+                content = archive.read(resource_name)
+            with self._lock:
+                self._metrics["resource_bytes_reads"] += 1
+                self._metrics["resource_bytes_read"] += len(content)
+            return content
+
+        return self._single_flight(key, produce, parser="zipfile")
 
     def _single_flight(self, key, producer, *, parser: str) -> FactOutcome:
         while True:

@@ -190,6 +190,43 @@ class ArtifactInventoryTest(unittest.TestCase):
         self.assertEqual(inventory.classes, ())
 
 
+class ResourceFactTest(unittest.TestCase):
+    def test_resource_bytes_are_sha_bound_and_shared_without_reopening_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "runtime.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("META-INF/spring.factories", "example.Factory=example.Impl\n")
+                archive.writestr("example/Impl.class", b"class-bytes")
+            digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+            store = Step5ArtifactFactStore.from_catalog({
+                "entries": [{"coord": "g:a", "jar_path": str(jar), "sha256": digest}],
+            })
+
+            first = store.resource_bytes("g:a", "META-INF/spring.factories")
+            second = store.resource_bytes("g:a", "META-INF/spring.factories")
+
+            self.assertEqual("complete", first.status)
+            self.assertEqual(b"example.Factory=example.Impl\n", first.value)
+            self.assertEqual(first, second)
+            self.assertEqual(1, store.metrics()["resource_bytes_reads"])
+            self.assertGreaterEqual(store.metrics()["fact_hits"], 1)
+
+    def test_resource_bytes_reports_missing_resource_instead_of_empty_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "runtime.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("example/Impl.class", b"class-bytes")
+            digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+            store = Step5ArtifactFactStore.from_catalog({
+                "entries": [{"coord": "g:a", "jar_path": str(jar), "sha256": digest}],
+            })
+
+            outcome = store.resource_bytes("g:a", "META-INF/spring.factories")
+
+            self.assertEqual("failed", outcome.status)
+            self.assertIn("resource_not_in_inventory", outcome.reason)
+
+
 class SingleFlightFactTest(unittest.TestCase):
     def _store_and_location(self, tmp):
         jar_path = Path(tmp) / "fixture.jar"
