@@ -30,6 +30,7 @@ class GeneratedCaseResult:
     duplicates: tuple[str, ...]
     conflicts: tuple[str, ...]
     unsupported: tuple[str, ...]
+    wrong_conclusions: tuple[str, ...]
     production_metrics: dict
     report_path: str = ""
 
@@ -62,6 +63,15 @@ def reconcile_generated_case(
             and (not row.evidence_complete or not row.producer.strip())
         )
     )
+    expected_conclusions = {
+        edge.identity: edge.expected_conclusion for edge in case.spec.truth_edges
+    }
+    wrong_conclusions = tuple(sorted(
+        row.identity
+        for row in analyzer_rows
+        if row.identity in expected_conclusions
+        and row.conclusion != expected_conclusions[row.identity]
+    ))
     errors = []
     if missing:
         errors.append("missing_identity")
@@ -73,6 +83,8 @@ def reconcile_generated_case(
         errors.append("conflicting_identity")
     if unsupported:
         errors.append("unsupported_strong_conclusion")
+    if wrong_conclusions:
+        errors.append("wrong_conclusion")
     return GeneratedCaseResult(
         status="failed" if errors else "passed",
         errors=tuple(errors),
@@ -81,8 +93,45 @@ def reconcile_generated_case(
         duplicates=duplicates,
         conflicts=conflicts,
         unsupported=unsupported,
+        wrong_conclusions=wrong_conclusions,
         production_metrics={},
     )
+
+
+def _derive_analyzer_rows(case: GeneratedTopology, edges: list[dict]):
+    apis = {api.identity: api for api in case.spec.apis}
+    rows = []
+    for truth_edge in case.spec.truth_edges:
+        caller = truth_edge.caller.split("#", 1)[1].split("(", 1)[0]
+        api = apis[truth_edge.target]
+        if api.kind == "field":
+            matching = [
+                edge for edge in edges
+                if edge.get("caller_name") == caller
+                and str(edge.get("callee_key") or "").endswith(f".{api.member}")
+            ]
+        else:
+            matching = [
+                edge for edge in edges
+                if edge.get("caller_name") == caller
+                and f".{api.member}(" in str(edge.get("callee_key") or "")
+            ]
+        if matching:
+            conclusion = "reachable"
+            complete = True
+            producer = "+".join(sorted({str(edge.get("parser") or "javap") for edge in matching}))
+        elif truth_edge.dimension == "constant":
+            conclusion = "uncertain"
+            complete = True
+            producer = "complete_bytecode_scan_inlined_constant_absence"
+        else:
+            conclusion = "not_analyzed"
+            complete = False
+            producer = "complete_bytecode_scan_missing_expected_edge"
+        rows.append(AnalyzerLedgerRow(
+            truth_edge.identity, conclusion, complete, producer
+        ))
+    return tuple(rows)
 
 
 def _sha256(path: Path) -> str:
@@ -97,7 +146,7 @@ def run_generated_case(
     case: GeneratedTopology,
     report_root: Path,
     *,
-    analyzer_rows: tuple[AnalyzerLedgerRow, ...],
+    analyzer_rows: tuple[AnalyzerLedgerRow, ...] | None = None,
 ) -> GeneratedCaseResult:
     report_root = Path(report_root)
     materialized = materialize_topology(case, report_root / f"seed-{case.spec.seed}")
@@ -124,6 +173,9 @@ def run_generated_case(
             for edge in edges
         }
     )
+    if analyzer_rows is None:
+        analyzer_rows = _derive_analyzer_rows(case, edges)
+    metrics["derived_rows"] = len(analyzer_rows)
     reconciled = reconcile_generated_case(case, analyzer_rows)
     errors = list(reconciled.errors)
     if metrics.get("failures"):
@@ -139,6 +191,7 @@ def run_generated_case(
         duplicates=reconciled.duplicates,
         conflicts=reconciled.conflicts,
         unsupported=reconciled.unsupported,
+        wrong_conclusions=reconciled.wrong_conclusions,
         production_metrics=metrics,
         report_path=str(report_path),
     )

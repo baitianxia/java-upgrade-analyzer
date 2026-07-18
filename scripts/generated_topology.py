@@ -60,6 +60,7 @@ class EdgeSpec:
     target: str
     dimension: str
     evidence_kind: str
+    expected_conclusion: str
 
     @property
     def identity(self) -> str:
@@ -187,6 +188,7 @@ def generate_topology(
             api_by_dimension[dimension].identity,
             dimension,
             "semantic" if dimension in {"reflection", "callback"} else "bytecode",
+            "uncertain" if dimension == "constant" else "reachable",
         )
         for dimension in dimensions.values
     )

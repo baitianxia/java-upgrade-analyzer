@@ -22,7 +22,7 @@ class GeneratedTopologyRegressionTest(unittest.TestCase):
         self.clean_rows = tuple(
             AnalyzerLedgerRow(
                 identity=edge.identity,
-                conclusion="reachable",
+                conclusion=edge.expected_conclusion,
                 evidence_complete=True,
                 producer="production_classfile_or_typed_activation",
             )
@@ -62,14 +62,23 @@ class GeneratedTopologyRegressionTest(unittest.TestCase):
         self.assertIn("duplicate_identity", reconcile_generated_case(self.case, duplicate).errors)
         self.assertIn("conflicting_identity", reconcile_generated_case(self.case, conflict).errors)
 
+    def test_wrong_conclusion_is_blocking_even_when_identity_set_matches(self):
+        wrong = (
+            replace(self.clean_rows[0], conclusion="not_analyzed"),
+            *self.clean_rows[1:],
+        )
+
+        self.assertIn("wrong_conclusion", reconcile_generated_case(self.case, wrong).errors)
+
     def test_runner_compiles_and_exercises_production_bytecode_collector(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result = run_generated_case(self.case, Path(tmp), analyzer_rows=self.clean_rows)
+            result = run_generated_case(self.case, Path(tmp))
 
         self.assertEqual(result.status, "passed")
         self.assertGreater(result.production_metrics["classes_scanned"], 0)
         self.assertGreater(result.production_metrics["edges_found"], 0)
         self.assertEqual(result.production_metrics["failures"], [])
+        self.assertEqual(result.production_metrics["derived_rows"], 8)
 
 
 if __name__ == "__main__":
