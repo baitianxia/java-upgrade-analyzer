@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 from real_project_regression import canonical_step5_result_fingerprint  # noqa: E402
 import s5_call_chain_engine_integrated as step5_engine  # noqa: E402
+import step5_evidence_ingestion as evidence_ingestion  # noqa: E402
 
 
 class Step5ResultFingerprintTest(unittest.TestCase):
@@ -106,6 +107,38 @@ class ReverseEdgeOverlayTest(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             overlay["new"] = []
+
+
+class FrameworkSnapshotTest(unittest.TestCase):
+    def test_copies_only_keys_used_by_framework_proxy_projection(self):
+        relevant_edges = [SimpleNamespace(caller_symbol_id="app.Entry.run")]
+        irrelevant_edges = [SimpleNamespace(caller_symbol_id="app.Other.run")]
+        reverse_edges = {
+            "com.acme.Mapper.find(java.lang.String)": relevant_edges,
+            "com.acme.Mapper.other()": irrelevant_edges,
+            **{f"unrelated.Type{index}.call()": [object()] for index in range(100)},
+        }
+        records = [
+            (
+                SimpleNamespace(collector="mybatis"),
+                SimpleNamespace(edge_kind="mybatis_mapper_proxy_dispatch"),
+                {
+                    "source_owner": "com.acme.Mapper",
+                    "source_member": "find",
+                    "parameter_count": 1,
+                },
+            ),
+        ]
+
+        snapshot = evidence_ingestion._snapshot_framework_reverse_edges(
+            reverse_edges, records,
+        )
+
+        self.assertEqual(
+            list(snapshot), ["com.acme.Mapper.find(java.lang.String)"],
+        )
+        self.assertEqual(tuple(relevant_edges), snapshot["com.acme.Mapper.find(java.lang.String)"])
+        self.assertIsInstance(snapshot["com.acme.Mapper.find(java.lang.String)"], tuple)
 
 
 if __name__ == "__main__":

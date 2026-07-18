@@ -258,6 +258,43 @@ def _source_lookup_keys(reverse_edge_snapshot, source_identity):
     ]
 
 
+def _framework_proxy_source_identities(records):
+    identities = set()
+    for _batch, edge, edge_mapping in records:
+        if edge.edge_kind in {
+            "mybatis_mapper_proxy_dispatch",
+            "spring_transaction_proxy_dispatch",
+        }:
+            identity = (
+                str(edge_mapping.get("source_owner") or ""),
+                str(edge_mapping.get("source_member") or ""),
+                int(edge_mapping.get("parameter_count") or 0),
+            )
+        elif edge.edge_kind == "spring_data_repository_proxy_dispatch":
+            identity = (
+                str(edge_mapping.get("source") or ""),
+                str(edge_mapping.get("target_member") or ""),
+                int(edge_mapping.get("parameter_count") or 0),
+            )
+        else:
+            continue
+        if identity[0] and identity[1]:
+            identities.add(identity)
+    return identities
+
+
+def _snapshot_framework_reverse_edges(reverse_edges, records):
+    """Freeze only pre-framework keys queried by proxy projection."""
+    source_identities = _framework_proxy_source_identities(records)
+    if not source_identities:
+        return {}
+    return {
+        lookup_key: tuple(edges)
+        for lookup_key, edges in (reverse_edges or {}).items()
+        if edges and _method_key_parts(lookup_key) in source_identities
+    }
+
+
 def _caller_evidence_rank(caller):
     if str(getattr(caller, "evidence_source", "") or "") == "current_final_artifact":
         return 3
@@ -1965,10 +2002,6 @@ class EvidenceRegistry:
                 else:
                     graph.reverse_edges.pop(lookup_key, None)
 
-        reverse_edge_snapshot = {
-            key: list(edges)
-            for key, edges in graph.reverse_edges.items()
-        }
         for batch in framework_batches:
             for edge in sorted(
                 batch.edges,
@@ -2008,6 +2041,10 @@ class EvidenceRegistry:
         graph.step5_framework_records = (
             *prior_framework_records,
             *new_framework_records,
+        )
+        reverse_edge_snapshot = _snapshot_framework_reverse_edges(
+            graph.reverse_edges,
+            graph.step5_framework_records,
         )
         framework_stats = _project_framework_edges(
             graph,
