@@ -4524,17 +4524,23 @@ def _runtime_member_index_serializable(index):
         'tasks': list(index.get('tasks') or []),
         'unparsed_tasks': list(index.get('unparsed_tasks') or []),
         'direct_by_owner_member': [
-            {'owner': owner, 'member': member, 'task_ids': sorted(task_ids)}
+            {
+                'owner': owner,
+                'member': member,
+                'task_ids': sorted(
+                    (task_ids,) if isinstance(task_ids, int) else task_ids
+                ),
+            }
             for (owner, member), task_ids in sorted(
                 (index.get('direct_by_owner_member') or {}).items()
             )
         ],
         'owner_string_ids': {
-            key: sorted(value)
+            key: sorted((value,) if isinstance(value, int) else value)
             for key, value in sorted((index.get('owner_string_ids') or {}).items())
         },
         'member_string_ids': {
-            key: sorted(value)
+            key: sorted((value,) if isinstance(value, int) else value)
             for key, value in sorted((index.get('member_string_ids') or {}).items())
         },
         'reflection_ids': sorted(index.get('reflection_ids') or ()),
@@ -4546,22 +4552,39 @@ def _runtime_member_index_serializable(index):
 
 
 def _runtime_member_index_from_serializable(payload, graph):
-    direct = defaultdict(set)
+    direct = {}
     for row in payload.pop('direct_by_owner_member', None) or ():
-        direct[(str(row.get('owner') or ''), str(row.get('member') or ''))].update(
-            int(value) for value in (row.get('task_ids') or ())
+        task_ids = tuple(sorted({int(value) for value in (row.get('task_ids') or ())}))
+        direct[(str(row.get('owner') or ''), str(row.get('member') or ''))] = (
+            task_ids[0] if len(task_ids) == 1 else task_ids
         )
     owner_string_ids = payload.pop('owner_string_ids', None) or {}
     for key, values in owner_string_ids.items():
-        owner_string_ids[key] = set(values or ())
+        values = tuple(sorted(set(values or ())))
+        owner_string_ids[key] = values[0] if len(values) == 1 else values
     member_string_ids = payload.pop('member_string_ids', None) or {}
     for key, values in member_string_ids.items():
-        member_string_ids[key] = set(values or ())
+        values = tuple(sorted(set(values or ())))
+        member_string_ids[key] = values[0] if len(values) == 1 else values
+    tasks = payload.pop('tasks', None) or []
+    unparsed_tasks = payload.pop('unparsed_tasks', None) or []
+    shared_strings = {}
+    shared_keys = (
+        'coord', 'jar_path', 'artifact_container_entry', 'artifact_sha256',
+        'target_jdk', 'ownership_evidence', 'multi_release_version',
+    )
+    for task in (*tasks, *unparsed_tasks):
+        for key in shared_keys:
+            value = task.get(key)
+            if isinstance(value, str):
+                task[key] = shared_strings.setdefault(value, value)
+        if task.get('class_binary_name') == task.get('class_fqcn'):
+            task['class_fqcn'] = task.get('class_binary_name')
     return {
         'graph': graph,
         'catalog': _get_runtime_dependency_catalog(graph),
-        'tasks': payload.pop('tasks', None) or [],
-        'unparsed_tasks': payload.pop('unparsed_tasks', None) or [],
+        'tasks': tasks,
+        'unparsed_tasks': unparsed_tasks,
         'direct_by_owner_member': direct,
         'owner_string_ids': owner_string_ids,
         'member_string_ids': member_string_ids,
@@ -4643,14 +4666,25 @@ def _load_runtime_member_index_cache(path, identity, graph):
     return index
 
 
+def _add_runtime_member_task_id(buckets, key, task_id):
+    current = buckets.get(key)
+    if current is None:
+        buckets[key] = task_id
+    elif isinstance(current, int):
+        if current != task_id:
+            buckets[key] = {current, task_id}
+    else:
+        current.add(task_id)
+
+
 def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk):
     index_started_at = time.perf_counter()
     _perf_add(graph, 'bytecode_expand', 'member_index_builds', 1)
     tasks = []
     unparsed_tasks = []
-    direct_by_owner_member = defaultdict(set)
-    owner_string_ids = defaultdict(set)
-    member_string_ids = defaultdict(set)
+    direct_by_owner_member = {}
+    owner_string_ids = {}
+    member_string_ids = {}
     reflection_ids = set()
     visited_classes = 0
     parse_failures = 0
@@ -4739,7 +4773,9 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         owner = str(ref.get('owner') or '').replace('/', '.').replace('$', '.')
                         member = str(ref.get('name') or '')
                         if owner and member:
-                            direct_by_owner_member[(owner, member)].add(task_id)
+                            _add_runtime_member_task_id(
+                                direct_by_owner_member, (owner, member), task_id
+                            )
                     utf8_values = {
                         str(value or '') for value in (summary.get('utf8_values') or set())
                         if value
@@ -4755,12 +4791,16 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         reflection_ids.add(task_id)
                         for value in utf8_values:
                             if re.fullmatch(r'[A-Za-z_$][\w$]*(?:[/.][A-Za-z_$][\w$]*)+', value):
-                                owner_string_ids[value].add(task_id)
+                                _add_runtime_member_task_id(owner_string_ids, value, task_id)
                                 dotted_owner = value.replace('/', '.').replace('$', '.')
-                                owner_string_ids[dotted_owner].add(task_id)
-                                owner_string_ids[dotted_owner.replace('.', '/')].add(task_id)
+                                _add_runtime_member_task_id(
+                                    owner_string_ids, dotted_owner, task_id
+                                )
+                                _add_runtime_member_task_id(
+                                    owner_string_ids, dotted_owner.replace('.', '/'), task_id
+                                )
                             if re.fullmatch(r'[A-Za-z_$][\w$]*', value):
-                                member_string_ids[value].add(task_id)
+                                _add_runtime_member_task_id(member_string_ids, value, task_id)
         except Exception as exc:
             parse_failures += 1
             failure = {
@@ -4778,6 +4818,10 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
     _perf_add(graph, 'bytecode_expand', 'member_index_tasks', len(tasks))
     _perf_add(graph, 'bytecode_expand', 'member_index_unparsed_tasks', len(unparsed_tasks))
     _perf_add(graph, 'bytecode_expand', 'member_index_parse_failures', parse_failures)
+    for buckets in (direct_by_owner_member, owner_string_ids, member_string_ids):
+        for key, task_ids in buckets.items():
+            if not isinstance(task_ids, int):
+                buckets[key] = tuple(sorted(task_ids))
     return {
         'graph': graph,
         'catalog': _get_runtime_dependency_catalog(graph),
@@ -4954,10 +4998,19 @@ def _candidate_tasks_from_runtime_member_index(index, owner, member):
         return None
     if not bool(index.get('complete', True)):
         return None
-    task_ids = set((index.get('direct_by_owner_member') or {}).get((owner, member), set()))
-    owner_ids = set((index.get('owner_string_ids') or {}).get(owner, set()))
-    owner_ids.update((index.get('owner_string_ids') or {}).get(_jvm_internal_owner_name(owner), set()))
-    member_ids = set((index.get('member_string_ids') or {}).get(member, set()))
+    direct_ids = (index.get('direct_by_owner_member') or {}).get((owner, member), set())
+    task_ids = {direct_ids} if isinstance(direct_ids, int) else set(direct_ids)
+    owner_value = (index.get('owner_string_ids') or {}).get(owner, set())
+    owner_ids = {owner_value} if isinstance(owner_value, int) else set(owner_value)
+    internal_owner_value = (index.get('owner_string_ids') or {}).get(
+        _jvm_internal_owner_name(owner), set()
+    )
+    owner_ids.update(
+        {internal_owner_value}
+        if isinstance(internal_owner_value, int) else internal_owner_value
+    )
+    member_value = (index.get('member_string_ids') or {}).get(member, set())
+    member_ids = {member_value} if isinstance(member_value, int) else set(member_value)
     reflection_ids = set(index.get('reflection_ids') or set())
     task_ids.update(owner_ids & member_ids & reflection_ids)
     tasks = list(index.get('tasks') or [])

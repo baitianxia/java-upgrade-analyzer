@@ -19417,8 +19417,68 @@ public class com.example.consumer.Adapter {
         self.assertIs(loaded["unparsed_tasks"], unparsed_tasks)
         self.assertNotIn("direct_by_owner_member", payload)
         self.assertEqual(
-            loaded["direct_by_owner_member"][("p.Target", "removed")], {0, 1}
+            loaded["direct_by_owner_member"][("p.Target", "removed")], (0, 1)
         )
+        self.assertEqual(loaded["owner_string_ids"]["p.Target"], (0, 1))
+        self.assertEqual(loaded["member_string_ids"]["removed"], (0, 1))
+
+    def test_runtime_member_index_deserialization_deduplicates_artifact_strings(self):
+        def duplicate(value):
+            return value.encode("utf-8").decode("utf-8")
+
+        tasks = [
+            {
+                "coord": duplicate("com.example:large-artifact"),
+                "jar_path": duplicate("/tmp/large-artifact.jar"),
+                "artifact_sha256": duplicate("a" * 64),
+                "target_jdk": duplicate("17"),
+                "class_binary_name": f"p.Caller{index}",
+                "class_fqcn": f"p.Caller{index}",
+            }
+            for index in range(2)
+        ]
+        payload = {
+            "tasks": tasks,
+            "unparsed_tasks": [],
+            "direct_by_owner_member": [
+                {"owner": "p.Target", "member": "removed", "task_ids": [0]}
+            ],
+            "owner_string_ids": {"p.Target": [0]},
+            "member_string_ids": {"removed": [0]},
+            "reflection_ids": [],
+            "visited_classes": 2,
+            "parse_failures": 0,
+            "complete": True,
+            "failures": [],
+        }
+
+        loaded = tracer._runtime_member_index_from_serializable(
+            payload, SimpleNamespace()
+        )
+
+        for key in ("coord", "jar_path", "artifact_sha256", "target_jdk"):
+            self.assertIs(loaded["tasks"][0][key], loaded["tasks"][1][key])
+        self.assertEqual(
+            loaded["direct_by_owner_member"][("p.Target", "removed")], 0
+        )
+        self.assertEqual(loaded["owner_string_ids"]["p.Target"], 0)
+        self.assertEqual(loaded["member_string_ids"]["removed"], 0)
+        self.assertIs(
+            loaded["tasks"][0]["class_binary_name"],
+            loaded["tasks"][0]["class_fqcn"],
+        )
+
+    def test_runtime_member_index_adds_singletons_without_allocating_sets(self):
+        buckets = {}
+
+        tracer._add_runtime_member_task_id(buckets, "target", 7)
+        self.assertEqual(buckets["target"], 7)
+
+        tracer._add_runtime_member_task_id(buckets, "target", 7)
+        self.assertEqual(buckets["target"], 7)
+
+        tracer._add_runtime_member_task_id(buckets, "target", 9)
+        self.assertEqual(buckets["target"], {7, 9})
 
     def test_runtime_member_index_omits_string_buckets_for_non_reflective_classes(self):
         with tempfile.TemporaryDirectory() as tmp:
