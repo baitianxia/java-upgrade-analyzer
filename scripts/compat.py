@@ -176,7 +176,7 @@ def run_cmd(
       cwd          工作目录
       timeout      超时秒数
       input_text   stdin 输入（字符串）
-      env          额外的环境变量（合并到当前环境）
+      env          额外的环境变量（合并到当前环境；PYTHONIOENCODING 始终强制为 UTF-8）
       stream_output 将子进程 stdout/stderr 实时转发到当前 stderr，同时仍完整捕获返回
       stream_stdout 流式模式下是否转发 stdout；协议型子进程可仅转发 stderr
     """
@@ -184,6 +184,10 @@ def run_cmd(
     proc_env = os.environ.copy()
     if env:
         proc_env.update(env)
+
+    # Inline Python helpers do not import this module, so they cannot rely on
+    # setup_utf8_io(). Prevent Windows GBK consoles from rejecting Unicode output.
+    proc_env['PYTHONIOENCODING'] = 'utf-8'
 
     # 强制 JVM 工具（Maven）使用 UTF-8
     # 不覆盖已有设置，只追加
