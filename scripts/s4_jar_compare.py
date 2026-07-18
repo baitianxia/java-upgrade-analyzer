@@ -2263,7 +2263,8 @@ def attach_constant_field_evidence(rows, old_jar_path):
             str(row.get("symbol_kind") or "").lower() == "field"
             and (
                 str(row.get("change_type") or "").upper()
-                == "CONSTANT_VALUE_CHANGED"
+                in {"CONSTANT_VALUE_CHANGED", "REMOVED", "FIELD_REMOVED"}
+                or "FIELD_REMOVED" in flags
                 or "CONSTANT" in flags
             )
         )
@@ -2299,6 +2300,19 @@ def attach_constant_field_evidence(rows, old_jar_path):
             row["old_field_has_constant_value"] = (
                 "true" if evidence.get("has_constant_value") is True else "false"
             )
+            if (
+                evidence.get("has_constant_value") is True
+                and str(row.get("change_type") or "").upper()
+                in {"REMOVED", "FIELD_REMOVED"}
+            ):
+                compatibility_flags = [
+                    item for item in str(
+                        row.get("compatibility_flags") or ""
+                    ).split("|") if item
+                ]
+                if "CONSTANT_REMOVED" not in compatibility_flags:
+                    compatibility_flags.append("CONSTANT_REMOVED")
+                row["compatibility_flags"] = "|".join(compatibility_flags)
         enriched.append(row)
     return enriched
 

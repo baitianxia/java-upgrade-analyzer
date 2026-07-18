@@ -92,7 +92,8 @@
         "tests.test_evidence_completeness_visibility.EvidenceCompletenessVisibilityInvariantTest.test_critical_evidence_paths_have_no_bare_or_pass_handlers",
         "tests.test_business_bytecode_graph.BusinessBytecodeGraphTest.test_collect_business_bytecode_batch_reports_parse_failure",
         "tests.test_indirect_usage_analyzer.IndirectUsageAnalyzerTest.test_collect_indirect_usage_batch_reports_resource_read_failure_as_evidence_failure",
-        "tests.test_final_artifact_edge_oracle.FinalArtifactEdgeOraclePerformanceTest.test_hung_javap_version_probe_returns_a_structured_incomplete_result"
+        "tests.test_final_artifact_edge_oracle.FinalArtifactEdgeOraclePerformanceTest.test_hung_javap_version_probe_returns_a_structured_incomplete_result",
+        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_security_source_read_failure_is_explicit_coverage_failure"
       ],
       "negative_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_malformed_context_cannot_fall_back_to_empty_source_scope",
@@ -100,7 +101,8 @@
       ],
       "mutation_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_analyzer_collector_failure_blocks_a_negative_conclusion",
-        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_unreadable_preservation_artifact_cannot_be_treated_as_no_provider"
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_unreadable_preservation_artifact_cannot_be_treated_as_no_provider",
+        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_packaged_class_locator_reports_malformed_nested_jar"
       ],
       "cross_project_guards": [
         "gs-managing-transactions",
@@ -130,13 +132,17 @@
         "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_runtime_callback_verified_activation_carries_traceable_composite_provenance",
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_active_spring_registration_produces_complete_business_to_callback_chain",
         "tests.test_indirect_usage_analyzer.IndirectUsageAnalyzerTest.test_exact_reflection_chain_becomes_reachable_step5_edge",
-        "tests.test_step5_evidence_model.EvidenceModelTest.test_collected_activation_proof_is_typed_and_serialized"
+        "tests.test_step5_evidence_model.EvidenceModelTest.test_collected_activation_proof_is_typed_and_serialized",
+        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_aop_collector_scans_verified_internal_module_as_business",
+        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_security_collector_uses_verified_internal_module_catalog_entry",
+        "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_verified_spring_activation_projects_into_reverse_call_graph"
       ],
       "negative_tests": [
         "tests.test_step5_evidence_model.EvidenceModelTest.test_framework_label_without_typed_activation_proof_is_uncertain",
         "tests.test_step5_evidence_model.EvidenceModelTest.test_semantic_edge_without_independent_activation_is_uncertain",
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_dependency_scheduled_entry_is_uncertain_without_activation_proof",
-        "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_runtime_callback_source_only_activation_is_not_linked_in_final_artifact_mode"
+        "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_runtime_callback_source_only_activation_is_not_linked_in_final_artifact_mode",
+        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_security_inventory_preserves_class_level_activation_condition"
       ],
       "mutation_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_packaged_hit_requires_verified_spring_callback_activation",
@@ -170,7 +176,8 @@
       ],
       "positive_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_accepts_one_identical_canonical_identity_set",
-        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_audit_verifies_every_api_with_third_party_provenance"
+        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_audit_verifies_every_api_with_third_party_provenance",
+        "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_step4_dynamic_field_discovery_reconciles_with_independent_oracle"
       ],
       "negative_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_uses_coordinate_and_change_type_in_closed_identity_set",
@@ -179,7 +186,8 @@
       "mutation_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_rejects_equal_count_summary_with_wrong_identity_set",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_rejects_duplicate_step4_canonical_identity",
-        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_duplicate_changed_identity_is_an_explicit_closed_world_failure"
+        "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_duplicate_changed_identity_is_an_explicit_closed_world_failure",
+        "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_dynamic_pipeline_gate_detects_removed_link_and_dropped_api"
       ],
       "cross_project_guards": [
         "ruoyi-full-artifact-discovery"

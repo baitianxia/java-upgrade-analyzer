@@ -1847,15 +1847,28 @@ def _downgrade_reachable_path_details(result, path_status, stop_reason):
 
 
 def _is_inlined_constant_change(api_row):
-    return (
-        get_symbol_kind(api_row) == 'field'
-        and (
-            str(api_row.get('change_type') or '').strip() == 'CONSTANT_VALUE_CHANGED'
-            or 'CONSTANT' in str(api_row.get('compatibility_flags') or '').upper()
-            or str(api_row.get('reason_code') or '').strip().lower()
-            == 'constant_value_changed'
-        )
+    if get_symbol_kind(api_row) != 'field':
+        return False
+    evidence, complete, has_constant_value = _constant_field_evidence(api_row)
+    evidence_proves_inlining = bool(
+        evidence and complete and has_constant_value
+        and str(api_row.get('change_type') or '').strip().upper()
+        in {'CONSTANT_VALUE_CHANGED', 'REMOVED', 'FIELD_REMOVED'}
     )
+    return bool(
+        evidence_proves_inlining
+        or str(api_row.get('change_type') or '').strip() == 'CONSTANT_VALUE_CHANGED'
+        or 'CONSTANT' in str(api_row.get('compatibility_flags') or '').upper()
+        or str(api_row.get('reason_code') or '').strip().lower()
+        == 'constant_value_changed'
+    )
+
+
+def _has_constant_field_evidence(api_row):
+    if get_symbol_kind(api_row) != 'field':
+        return False
+    evidence, _complete, _has_constant = _constant_field_evidence(api_row)
+    return bool(evidence)
 
 
 def _evidence_bool(value):
@@ -1903,7 +1916,7 @@ def _constant_field_evidence(api_row):
 def _apply_constant_impact(
     result, api_row, graph, *, runtime_field_edge_present, source_reference_present=None
 ):
-    if not _is_inlined_constant_change(api_row):
+    if not _has_constant_field_evidence(api_row):
         return result
     if source_reference_present is None:
         source_reference_present = any(
@@ -7358,6 +7371,12 @@ def _collect_trace_api_with_confidence_weighting(
             })
             return built
         built = build_reachable_result(result, safe_best or best, graph)
+        _apply_constant_impact(
+            built,
+            api_row,
+            graph,
+            runtime_field_edge_present=True,
+        )
         if artifact_dependency_hits:
             built = _merge_runtime_framework_paths(
                 built,
