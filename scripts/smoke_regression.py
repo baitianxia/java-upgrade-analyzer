@@ -992,6 +992,10 @@ public class App {
     )
     write_text(workspace.fake_mvn, fake_maven_script_text())
     workspace.fake_mvn.chmod(0o755)
+    write_text(
+        workspace.fake_bin / "mvn.cmd",
+        f'@"{sys.executable}" "%~dp0mvn" %*\n',
+    )
     git = git_cmd()
     run_external_cmd(git + ["init"], project_dir)
     run_external_cmd(git + ["config", "user.name", "Trae Smoke"], project_dir)
@@ -1016,6 +1020,7 @@ public class App {
 def build_smoke_dep_env(workspace):
     dep_env = os.environ.copy()
     dep_env["HOME"] = str(workspace.fake_home)
+    dep_env["MAVEN_REPO_LOCAL"] = str(workspace.fake_home / ".m2" / "repository")
     dep_env["PATH"] = f"{workspace.fake_bin}{os.pathsep}{dep_env.get('PATH', '')}"
     return dep_env
 
