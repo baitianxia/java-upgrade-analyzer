@@ -1448,8 +1448,13 @@ def run_core_pipeline_smoke(workspace, dep_env):
         env=dep_env,
     )
     assert_true(
-        runtime_expand_rc == 1
-        and "缺少最终制品 JAR 证据" in (runtime_expand_stdout + runtime_expand_stderr),
+        runtime_expand_rc == 1,
+        "只有源码映射且缺少最终制品时，Step4 必须以失败状态结束："
+        f"rc={runtime_expand_rc}, stdout={runtime_expand_stdout[-500:]}, "
+        f"stderr={runtime_expand_stderr[-500:]}",
+    )
+    assert_true(
+        "缺少最终制品 JAR 证据" in (runtime_expand_stdout + runtime_expand_stderr),
         "只有源码映射时，Step4 应保留辅助证据并拒绝生成正式 API 结论："
         f"rc={runtime_expand_rc}, stdout={runtime_expand_stdout[-500:]}, "
         f"stderr={runtime_expand_stderr[-500:]}",
