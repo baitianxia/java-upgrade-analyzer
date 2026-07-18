@@ -100,6 +100,68 @@ STANDARD_FAULT_INJECTIONS = (
 )
 
 
+_STEP5_FINGERPRINT_VOLATILE_KEYS = frozenset({
+    "generated_at", "created_at", "updated_at", "started_at", "finished_at",
+    "elapsed", "elapsed_sec", "duration_sec", "peak_rss_mb", "current_rss_mb",
+    "memory_samples", "step5_perf",
+})
+
+
+def _canonicalize_step5_result_value(value, report_roots):
+    if isinstance(value, dict):
+        return {
+            str(key): _canonicalize_step5_result_value(item, report_roots)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _STEP5_FINGERPRINT_VOLATILE_KEYS
+            and not str(key).endswith("_elapsed_sec")
+        }
+    if isinstance(value, list):
+        return [
+            _canonicalize_step5_result_value(item, report_roots)
+            for item in value
+        ]
+    if isinstance(value, str):
+        normalized = value
+        for report_root in report_roots:
+            normalized = normalized.replace(report_root, "<REPORT_ROOT>")
+        return normalized
+    return value
+
+
+def canonical_step5_result_fingerprint(report_dir):
+    """Hash stable Step5 conclusions and paths while excluding runtime telemetry."""
+    report_input = Path(report_dir).expanduser().absolute()
+    report_root = report_input.resolve()
+    report_roots = tuple(dict.fromkeys((str(report_input), str(report_root))))
+    call_chain_dir = report_root / "evidence" / "call_chain"
+    if not call_chain_dir.is_dir():
+        call_chain_dir = report_root
+    payload = {}
+    summary_path = call_chain_dir / "summary.json"
+    if summary_path.is_file():
+        payload["summary"] = _canonicalize_step5_result_value(
+            json.loads(summary_path.read_text(encoding="utf-8-sig")),
+            report_roots,
+        )
+    alerts_path = call_chain_dir / "alerts.csv"
+    if alerts_path.is_file():
+        with alerts_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            payload["alerts"] = [
+                _canonicalize_step5_result_value(dict(row), report_roots)
+                for row in csv.DictReader(handle)
+            ]
+    query_index = report_root / ".runtime" / "indexes" / "s5_query_index.json"
+    if query_index.is_file():
+        payload["query_index"] = _canonicalize_step5_result_value(
+            json.loads(query_index.read_text(encoding="utf-8-sig")),
+            report_roots,
+        )
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 @dataclass(frozen=True)
 class BaselineSpec:
     symbol: str
