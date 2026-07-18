@@ -60,6 +60,13 @@ jobs:
           --report-root "${{ runner.temp }}/jua-platform-contract"
           --json-out "${{ runner.temp }}/platform-contract.json"
 
+      - name: Diagnose Failed Accuracy Benchmark
+        id: accuracy_diagnostic
+        if: ${{ failure() && steps.quality_gate.outcome == 'failure' }}
+        run: >-
+          python scripts/accuracy_benchmark.py --profile core --continue-on-failure
+          --json-out "${{ runner.temp }}/accuracy-benchmark-diagnostic.json"
+
       - name: Record Platform Cell Result
         if: always()
         shell: bash
@@ -69,7 +76,7 @@ jobs:
           MATRIX_JAVA: ${{ matrix.java }}
           CELL_RESULT_PATH: ${{ runner.temp }}/platform-cell-${{ matrix.os }}-jdk${{ matrix.java }}.txt
           QUALITY_GATE_JSON: ${{ runner.temp }}/platform-contract.json
-          ACCURACY_BENCHMARK_JSON: ${{ runner.temp }}/jua-platform-contract/accuracy_benchmark_core.json
+          ACCURACY_BENCHMARK_JSON: ${{ runner.temp }}/accuracy-benchmark-diagnostic.json
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           SETUP_PYTHON_OUTCOME: ${{ steps.setup_python.outcome }}
           SETUP_JAVA_OUTCOME: ${{ steps.setup_java.outcome }}
