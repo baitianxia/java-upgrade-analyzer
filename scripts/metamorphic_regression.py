@@ -41,6 +41,15 @@ class TransformedTopology:
     execution_variant: dict
 
 
+@dataclass(frozen=True)
+class MetamorphicMatrixReport:
+    status: str
+    errors: tuple[str, ...]
+    run_count: int
+    semantic_digests: dict[str, str]
+    input_sha256: dict[str, str]
+
+
 def _canonical(value):
     if isinstance(value, dict):
         return {
@@ -111,3 +120,53 @@ def apply_transform(case: GeneratedTopology, transform_id: str) -> TransformedTo
         )
         variant["layout"] = "WEB-INF/lib"
     return TransformedTopology(GeneratedTopology(spec), transform_id, variant)
+
+
+def run_production_metamorphic_matrix(
+    case: GeneratedTopology, report_root
+) -> MetamorphicMatrixReport:
+    from generated_topology_regression import run_generated_case
+
+    errors = []
+    digests = {}
+    input_sha256 = {}
+    baseline = run_generated_case(
+        case,
+        report_root / "baseline",
+        execution_variant={"transform": "baseline"},
+    )
+    digests["baseline"] = semantic_digest(baseline.semantic_ledger)
+    input_sha256["baseline"] = str(
+        baseline.production_metrics.get("input_artifact_sha256") or ""
+    )
+    if baseline.status != "passed":
+        errors.append("baseline_failed")
+    for transform_id in TRANSFORM_IDS:
+        transformed = apply_transform(case, transform_id)
+        variant = transformed.execution_variant
+        result = run_generated_case(
+            transformed.case,
+            report_root / transform_id,
+            order_mode=str(variant.get("archive_order") or "normal"),
+            workers=int(variant.get("workers") or 1),
+            execution_variant=variant,
+        )
+        digest = semantic_digest(result.semantic_ledger)
+        artifact_sha = str(
+            result.production_metrics.get("input_artifact_sha256") or ""
+        )
+        digests[transform_id] = digest
+        input_sha256[transform_id] = artifact_sha
+        if result.status != "passed":
+            errors.append(f"production_run_failed:{transform_id}")
+        if digest != digests["baseline"]:
+            errors.append(f"semantic_mismatch:{transform_id}")
+        if not artifact_sha or artifact_sha == input_sha256["baseline"]:
+            errors.append(f"input_not_transformed:{transform_id}")
+    return MetamorphicMatrixReport(
+        "failed" if errors else "passed",
+        tuple(errors),
+        1 + len(TRANSFORM_IDS),
+        digests,
+        input_sha256,
+    )

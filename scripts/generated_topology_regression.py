@@ -106,24 +106,27 @@ def reconcile_generated_case(
     )
 
 
-def _derive_analyzer_rows(case: GeneratedTopology, edges: list[dict]):
+def _matching_truth_edges(case: GeneratedTopology, truth_edge, edges: list[dict]):
     apis = {api.identity: api for api in case.spec.apis}
+    caller = truth_edge.caller.split("#", 1)[1].split("(", 1)[0]
+    api = apis[truth_edge.target]
+    if api.kind == "field":
+        return [
+            edge for edge in edges
+            if edge.get("caller_name") == caller
+            and str(edge.get("callee_key") or "").endswith(f".{api.member}")
+        ]
+    return [
+        edge for edge in edges
+        if edge.get("caller_name") == caller
+        and f".{api.member}(" in str(edge.get("callee_key") or "")
+    ]
+
+
+def _derive_analyzer_rows(case: GeneratedTopology, edges: list[dict]):
     rows = []
     for truth_edge in case.spec.truth_edges:
-        caller = truth_edge.caller.split("#", 1)[1].split("(", 1)[0]
-        api = apis[truth_edge.target]
-        if api.kind == "field":
-            matching = [
-                edge for edge in edges
-                if edge.get("caller_name") == caller
-                and str(edge.get("callee_key") or "").endswith(f".{api.member}")
-            ]
-        else:
-            matching = [
-                edge for edge in edges
-                if edge.get("caller_name") == caller
-                and f".{api.member}(" in str(edge.get("callee_key") or "")
-            ]
+        matching = _matching_truth_edges(case, truth_edge, edges)
         if matching:
             conclusion = "reachable"
             complete = True
@@ -142,6 +145,17 @@ def _derive_analyzer_rows(case: GeneratedTopology, edges: list[dict]):
     return tuple(rows)
 
 
+def _truth_relevant_edge_identities(case: GeneratedTopology, edges: list[dict]):
+    identities = set()
+    for truth_edge in case.spec.truth_edges:
+        for edge in _matching_truth_edges(case, truth_edge, edges):
+            identities.add(
+                f"{edge.get('caller_owner')}#{edge.get('caller_name')}"
+                f"->{edge.get('callee_key')}"
+            )
+    return sorted(identities)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -158,18 +172,39 @@ def run_generated_case(
     order_mode: str = "normal",
     cache_mode: str = "cold",
     workers: int = 1,
+    execution_variant: dict | None = None,
 ) -> GeneratedCaseResult:
     report_root = Path(report_root)
     materialized = materialize_topology(case, report_root / f"seed-{case.spec.seed}")
     jar_path = materialized.root / "application.jar"
+    execution_variant = dict(execution_variant or {})
     class_files = sorted(materialized.classes_dir.rglob("*.class"))
     if order_mode == "reversed":
         class_files.reverse()
     elif order_mode != "normal":
         raise ValueError(f"unknown order mode: {order_mode}")
+    layout_prefix = (
+        "WEB-INF/classes/"
+        if execution_variant.get("layout") == "WEB-INF/lib"
+        else ""
+    )
+    zip_timestamp = (
+        (2001, 2, 3, 4, 5, 6)
+        if execution_variant.get("zip_timestamp")
+        else (1980, 1, 1, 0, 0, 0)
+    )
     with zipfile.ZipFile(jar_path, "w") as archive:
         for class_file in class_files:
-            archive.write(class_file, class_file.relative_to(materialized.classes_dir).as_posix())
+            entry = layout_prefix + class_file.relative_to(
+                materialized.classes_dir
+            ).as_posix()
+            info = zipfile.ZipInfo(entry, date_time=zip_timestamp)
+            archive.writestr(info, class_file.read_bytes())
+        if execution_variant:
+            marker = json.dumps(
+                execution_variant, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            archive.writestr("META-INF/generated-transform.json", marker)
     cache_path = materialized.root / "bytecode-cache.jsonl" if cache_mode == "warm" else None
     catalog = {
         "by_coord": {
@@ -198,12 +233,17 @@ def run_generated_case(
             for edge in edges
         }
     )
+    metrics["truth_relevant_edge_identities"] = _truth_relevant_edge_identities(
+        case, edges
+    )
     if analyzer_rows is None:
         analyzer_rows = _derive_analyzer_rows(case, edges)
     metrics["derived_rows"] = len(analyzer_rows)
     metrics["workers"] = workers
     metrics["order_mode"] = order_mode
     metrics["cache_mode"] = cache_mode
+    metrics["input_artifact_sha256"] = _sha256(jar_path)
+    metrics["execution_variant"] = execution_variant
     reconciled = reconcile_generated_case(case, analyzer_rows)
     errors = list(reconciled.errors)
     if metrics.get("failures"):
@@ -222,7 +262,7 @@ def run_generated_case(
         ),
         "edges": [
             {"identity": identity, "complete": True}
-            for identity in metrics["production_edge_identities"]
+            for identity in metrics["truth_relevant_edge_identities"]
         ],
         "completeness": {"failures": sorted(metrics.get("failures") or ())},
         "reason_codes": sorted(errors),

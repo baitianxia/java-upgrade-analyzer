@@ -854,6 +854,13 @@ def parse_javap_calls(text, class_name):
     return edges
 
 
+def _logical_application_class_entry(entry):
+    for prefix in ('BOOT-INF/classes/', 'WEB-INF/classes/'):
+        if entry.startswith(prefix):
+            return entry[len(prefix):]
+    return entry
+
+
 def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_catalog=None, cache_path=None):
     evidence = []
     failures = []
@@ -955,17 +962,40 @@ def collect_business_bytecode_edges(source_roots, max_classes=10000, artifact_ca
                     if scanned >= max_classes:
                         failures.append('class_scan_limit_reached')
                         break
-                    class_name = entry[:-6].replace('/', '.')
+                    logical_entry = _logical_application_class_entry(entry)
+                    class_name = logical_entry[:-6].replace('/', '.')
                     data = zf.read(entry)
                     scanned += 1
                     parsed_edges = parse_classfile_calls(data, class_name)
                     if parsed_edges is None:
                         parser_kind = 'javap'
                         javap_fallback_classes += 1
-                        stdout, stderr, rc = run_cmd(
-                            ['javap', '-classpath', business_jar, '-c', '-s', '-p', '-v', class_name],
-                            timeout=30,
-                        )
+                        if logical_entry == entry:
+                            javap_target = ['-classpath', business_jar, class_name]
+                            temporary_class = None
+                        else:
+                            temporary_class = tempfile.NamedTemporaryFile(
+                                suffix='.class', delete=False
+                            )
+                            try:
+                                temporary_class.write(data)
+                                temporary_class.close()
+                                javap_target = [temporary_class.name]
+                            except Exception:
+                                temporary_class.close()
+                                os.unlink(temporary_class.name)
+                                raise
+                        try:
+                            stdout, stderr, rc = run_cmd(
+                                ['javap', '-c', '-s', '-p', '-v', *javap_target],
+                                timeout=30,
+                            )
+                        finally:
+                            if temporary_class is not None:
+                                try:
+                                    os.unlink(temporary_class.name)
+                                except OSError:
+                                    pass
                         if rc != 0:
                             failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
                             continue

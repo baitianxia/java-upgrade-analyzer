@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from generated_topology import GenerationDimensions, generate_topology  # noqa: 
 from metamorphic_regression import (  # noqa: E402
     TRANSFORM_IDS,
     apply_transform,
+    run_production_metamorphic_matrix,
     semantic_digest,
 )
 
@@ -64,6 +66,23 @@ class MetamorphicRegressionTest(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 self.assertNotEqual(semantic_digest(baseline), semantic_digest(mutation))
+
+    def test_every_transform_reexecutes_production_analysis_on_distinct_input(self):
+        case = generate_topology(1729, GenerationDimensions.complete())
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_production_metamorphic_matrix(case, Path(tmp))
+
+        self.assertEqual(report.status, "passed", report.errors)
+        self.assertEqual(report.run_count, 1 + len(TRANSFORM_IDS))
+        self.assertEqual(len(set(report.semantic_digests.values())), 1)
+        baseline_sha = report.input_sha256["baseline"]
+        self.assertTrue(
+            all(
+                value != baseline_sha
+                for transform, value in report.input_sha256.items()
+                if transform != "baseline"
+            )
+        )
 
 
 if __name__ == "__main__":

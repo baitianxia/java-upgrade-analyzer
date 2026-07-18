@@ -184,7 +184,8 @@
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_accepts_one_identical_canonical_identity_set",
         "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_audit_verifies_every_api_with_third_party_provenance",
         "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_step4_dynamic_field_discovery_reconciles_with_independent_oracle",
-        "tests.test_generated_topology_regression.GeneratedTopologyRegressionTest.test_runner_compiles_and_exercises_production_bytecode_collector"
+        "tests.test_generated_topology_regression.GeneratedTopologyRegressionTest.test_runner_compiles_and_exercises_production_bytecode_collector",
+        "tests.test_metamorphic_regression.MetamorphicRegressionTest.test_every_transform_reexecutes_production_analysis_on_distinct_input"
       ],
       "negative_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_uses_coordinate_and_change_type_in_closed_identity_set",

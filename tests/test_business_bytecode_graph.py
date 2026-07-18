@@ -1049,6 +1049,52 @@ public class Service {
             any(edge["callee_key"] == "com.acme.Client.call(java.lang.String)" for edge in evidence)
         )
 
+    def test_collect_business_bytecode_edges_normalizes_boot_and_war_class_prefixes(self):
+        if not shutil.which("javac"):
+            self.skipTest("javac not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src" / "com" / "acme"
+            src.mkdir(parents=True)
+            (src / "Client.java").write_text(
+                "package com.acme; public class Client { public void call() {} }\n",
+                encoding="utf-8",
+            )
+            (src / "Service.java").write_text(
+                "package com.acme; public class Service { public void run(Client c) { c.call(); } }\n",
+                encoding="utf-8",
+            )
+            out = root / "classes"
+            out.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(out), *map(str, src.glob("*.java"))],
+                check=True,
+                capture_output=True,
+            )
+            for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/"):
+                with self.subTest(prefix=prefix):
+                    jar_path = root / (prefix.split("/", 1)[0] + ".jar")
+                    with zipfile.ZipFile(jar_path, "w") as archive:
+                        for class_file in out.rglob("*.class"):
+                            archive.write(
+                                class_file,
+                                prefix + class_file.relative_to(out).as_posix(),
+                            )
+                    evidence, metrics = collect_business_bytecode_edges(
+                        [],
+                        artifact_catalog={"by_coord": {"__business__": {
+                            "jar_path": str(jar_path),
+                            "sha256": self._artifact_sha256(jar_path),
+                        }}},
+                    )
+
+                    self.assertEqual(metrics["failures"], [])
+                    self.assertTrue(any(
+                        edge["caller_owner"] == "com.acme.Service"
+                        and edge["callee_key"] == "com.acme.Client.call()"
+                        for edge in evidence
+                    ))
+
     def test_merge_business_bytecode_edges_resolves_symbol_ids_to_method_defs(self):
         method = SimpleNamespace(
             symbol_id="m1",
