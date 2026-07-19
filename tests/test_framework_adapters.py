@@ -300,6 +300,40 @@ class FrameworkAdaptersTest(unittest.TestCase):
             self.assertEqual(3, store.metrics()["javap_starts"])
             self.assertEqual(3, store.metrics()["javap_shared_hits"])
 
+    def test_mybatis_runtime_dispatch_does_not_bypass_fact_store_identity_failure(self):
+        owners = (
+            "org.apache.ibatis.binding.MapperProxy",
+            "org.apache.ibatis.binding.MapperProxy$PlainMethodInvoker",
+            "org.apache.ibatis.binding.MapperMethod",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "mybatis.jar"
+            replacement = Path(tmp) / "replacement.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                for owner in owners:
+                    archive.writestr(owner.replace(".", "/") + ".class", b"original")
+            digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+            entry = {
+                "coord": "org.mybatis:mybatis", "jar_path": str(jar),
+                "sha256": digest,
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            store.inventory(entry["coord"])
+            with zipfile.ZipFile(replacement, "w") as archive:
+                for owner in owners:
+                    archive.writestr(owner.replace(".", "/") + ".class", b"replacement")
+            replacement.replace(jar)
+
+            with patch.object(framework_adapter_module.subprocess, "run") as run:
+                verified, errors = framework_adapter_module._verify_mybatis_runtime_dispatch(
+                    entry, fact_store=store,
+                )
+
+        self.assertFalse(any(verified.values()))
+        self.assertEqual(0, run.call_count)
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(all("artifact_changed_after_inventory" in item for item in errors))
+
     def test_framework_orchestrator_returns_tuple_and_serializer_alone_projects_v1(self):
         batches = _run_framework_adapters([], artifact_catalog={"entries": []})
 

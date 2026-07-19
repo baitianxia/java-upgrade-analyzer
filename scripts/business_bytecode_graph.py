@@ -1004,7 +1004,7 @@ def collect_business_bytecode_edges(
 
                 def produce_javap(identity=None, _location=None, _profile=None):
                     artifact_path = identity.path if identity is not None else business_jar
-                    if logical_entry == entry:
+                    if identity is not None or logical_entry == entry:
                         return run_cmd(
                             [
                                 'javap', '-classpath', artifact_path,
@@ -1160,8 +1160,24 @@ def collect_business_bytecode_edges(
                     metrics['cache_write_failed'] = True
                     metrics['cache_write_error'] = str(exc)
             return evidence, metrics
-        except (OSError, zipfile.BadZipFile) as exc:
-            failures.append(f'business_artifact_scan_failed:{exc}')
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            detail = str(exc)
+            if (
+                'artifact_changed' in detail
+                or 'artifact_sha256_mismatch' in detail
+            ):
+                failures.append('current_final_artifact_changed_during_scan')
+            else:
+                failures.append(f'business_artifact_scan_failed:{exc}')
+            return [], {
+                'classes_scanned': scanned,
+                'edges_found': 0,
+                'classfile_fast_path_classes': fast_path_classes,
+                'javap_fallback_classes': javap_fallback_classes,
+                'failures': failures,
+                'evidence_source': 'unavailable',
+                'artifact_sha256': cache_key,
+            }
     failures.append('current_final_artifact_required')
     return [], {
         'classes_scanned': 0,

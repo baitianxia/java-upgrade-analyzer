@@ -97,6 +97,27 @@ from artifact_alignment import build_artifact_alignment
 EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
+EVIDENCE_FAILURE_OCCURRENCE_FIELDS = (
+    'caller_symbol', 'caller_qualified_key', 'artifact', 'artifact_entry',
+    'class_name', 'line', 'instruction_offset', 'detail',
+)
+
+
+def _serialize_ingestion_failure(collector, failure):
+    return {
+        'collector': collector,
+        'reason_code': failure.reason_code,
+        'blocking': failure.blocking,
+        'api_identity': failure.api_identity,
+        'artifact': failure.artifact,
+        'class_name': failure.class_name,
+        'detail': failure.detail,
+        'occurrences': [
+            tuple(getattr(occurrence, field_name)
+                  for field_name in EVIDENCE_FAILURE_OCCURRENCE_FIELDS)
+            for occurrence in failure.occurrences
+        ],
+    }
 
 
 def _evidence_dir(report_dir, name):
@@ -1449,25 +1470,7 @@ def _step5_integrated_main_impl(args):
         )
     }
     ingestion_failures = [
-        {
-            'collector': collector,
-            'reason_code': failure.reason_code,
-            'blocking': failure.blocking,
-            'api_identity': failure.api_identity,
-            'artifact': failure.artifact,
-            'class_name': failure.class_name,
-            'detail': failure.detail,
-            'occurrences': [{
-                'caller_symbol': occurrence.caller_symbol,
-                'caller_qualified_key': occurrence.caller_qualified_key,
-                'artifact': occurrence.artifact,
-                'artifact_entry': occurrence.artifact_entry,
-                'class_name': occurrence.class_name,
-                'line': occurrence.line,
-                'instruction_offset': occurrence.instruction_offset,
-                'detail': occurrence.detail,
-            } for occurrence in failure.occurrences],
-        }
+        _serialize_ingestion_failure(collector, failure)
         for collector, failure in ingestion_result.failures_by_collector
     ]
     graph_stats['evidence_ingestion'] = {
@@ -1475,6 +1478,7 @@ def _step5_integrated_main_impl(args):
         'duplicate_edges': ingestion_result.duplicate_edges,
         'rejected_edges': ingestion_result.rejected_edges,
         'failure_count': len(ingestion_result.failures),
+        'failure_occurrence_fields': list(EVIDENCE_FAILURE_OCCURRENCE_FIELDS),
         'failures': ingestion_failures,
         'reason_codes': sorted({item['reason_code'] for item in ingestion_failures}),
     }

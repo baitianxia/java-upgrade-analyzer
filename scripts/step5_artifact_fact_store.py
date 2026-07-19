@@ -9,8 +9,9 @@ import re
 import threading
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping
 
 
@@ -56,6 +57,15 @@ def _sha256_file(path: Path) -> str:
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def _sha256_handle(handle) -> str:
+    digest = hashlib.sha256()
+    handle.seek(0)
+    for block in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(block)
+    handle.seek(0)
     return digest.hexdigest()
 
 
@@ -221,6 +231,10 @@ class Step5ArtifactFactStore:
             raise ValueError(inventory.failure)
         self._assert_path_identity(inventory)
         return inventory
+
+    def verified_inventory(self, coord: str) -> ArtifactInventory:
+        """Return an inventory only while its catalog path still identifies it."""
+        return self._verified_inventory(coord)
 
     @staticmethod
     def _assert_path_identity(inventory: ArtifactInventory) -> None:
@@ -418,7 +432,25 @@ class Step5ArtifactFactStore:
             with self._lock:
                 self._metrics["javap_starts"] += 1
             inventory = self._verified_inventory(coord)
-            result = producer(identity, location, profile)
+            canonical_location = next((
+                item for item in inventory.classes
+                if item.physical_entry == location.physical_entry
+            ), None)
+            if canonical_location is None:
+                raise KeyError(
+                    f"class_location_not_in_inventory:{location.physical_entry}"
+                )
+            content = self.class_bytes(coord, canonical_location)
+            if content.status != "complete":
+                raise ValueError(content.reason)
+            binary_name = str(location.binary_name or "")
+            if not re.fullmatch(r"[A-Za-z0-9_$]+(?:\.[A-Za-z0-9_$]+)*", binary_name):
+                raise ValueError(f"invalid_class_binary_name:{binary_name}")
+            with tempfile.TemporaryDirectory(prefix="jua-step5-javap-") as tmp:
+                class_path = Path(tmp).joinpath(*binary_name.split(".")).with_suffix(".class")
+                class_path.parent.mkdir(parents=True, exist_ok=True)
+                class_path.write_bytes(content.value)
+                result = producer(replace(identity, path=tmp), location, profile)
             self._assert_path_identity(inventory)
             return result
 
@@ -459,27 +491,39 @@ class Step5ArtifactFactStore:
         path = Path(identity.path)
         if not path.is_file():
             raise FileNotFoundError(f"artifact_missing:{path}")
-        before_identity = _file_identity(path.stat())
-        before = _sha256_file(path)
-        if not re.fullmatch(r"[0-9a-f]{64}", identity.sha256):
-            raise ValueError("artifact_sha256_invalid")
-        if before != identity.sha256:
-            raise ValueError(f"artifact_sha256_mismatch:expected={identity.sha256}:actual={before}")
-        with zipfile.ZipFile(path) as archive:
-            names = tuple(archive.namelist())
-            try:
-                manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
-            except KeyError:
-                manifest = ""
-            multi_release = bool(re.search(r"(?im)^Multi-Release\s*:\s*true\s*$", manifest))
-            classes = _effective_class_locations(
-                names, identity.target_jdk, multi_release_enabled=multi_release,
-            )
-            resources = tuple(sorted(name for name in names if not name.endswith(".class")))
-            physical_classes = tuple(sorted(name for name in names if name.endswith(".class")))
-        after = _sha256_file(path)
-        after_identity = _file_identity(path.stat())
-        if after != before or after_identity != before_identity:
+        with path.open("rb") as handle:
+            before_identity = _file_identity(os.fstat(handle.fileno()))
+            digest = _sha256_handle(handle)
+            if not re.fullmatch(r"[0-9a-f]{64}", identity.sha256):
+                raise ValueError("artifact_sha256_invalid")
+            if digest != identity.sha256:
+                raise ValueError(
+                    f"artifact_sha256_mismatch:expected={identity.sha256}:actual={digest}"
+                )
+            with zipfile.ZipFile(handle) as archive:
+                names = tuple(archive.namelist())
+                try:
+                    manifest = archive.read("META-INF/MANIFEST.MF").decode(
+                        "utf-8", errors="replace"
+                    )
+                except KeyError:
+                    manifest = ""
+                multi_release = bool(re.search(
+                    r"(?im)^Multi-Release\s*:\s*true\s*$", manifest,
+                ))
+                classes = _effective_class_locations(
+                    names, identity.target_jdk, multi_release_enabled=multi_release,
+                )
+                resources = tuple(sorted(
+                    name for name in names if not name.endswith(".class")
+                ))
+                physical_classes = tuple(sorted(
+                    name for name in names if name.endswith(".class")
+                ))
+            after_identity = _file_identity(os.fstat(handle.fileno()))
+            if after_identity != before_identity:
+                raise ValueError("artifact_changed_during_inventory")
+        if _file_identity(path.stat()) != before_identity:
             raise ValueError("artifact_changed_during_inventory")
         return ArtifactInventory(
             identity=identity,

@@ -22,10 +22,48 @@ from real_project_regression import (  # noqa: E402
 )
 from step5_artifact_fact_store import FactOutcome, Step5ArtifactFactStore  # noqa: E402
 from business_bytecode_graph import collect_business_bytecode_batch  # noqa: E402
-from s5_call_chain_engine_integrated import _write_step5_timing_csv  # noqa: E402
+from s5_call_chain_engine_integrated import (  # noqa: E402
+    EVIDENCE_FAILURE_OCCURRENCE_FIELDS,
+    _serialize_ingestion_failure,
+    _write_step5_timing_csv,
+)
+from step5_evidence_model import EvidenceFailure, EvidenceFailureOccurrence  # noqa: E402
 
 
 class Step5ColdRunContractTest(unittest.TestCase):
+    def test_ingestion_failure_serialization_uses_compact_occurrence_rows(self):
+        occurrence = EvidenceFailureOccurrence(
+            caller_symbol="com.acme.App.run()",
+            caller_qualified_key="com.acme.App.run()",
+            artifact="/app.jar",
+            artifact_entry="com/acme/App.class",
+            class_name="com.acme.App",
+            line=12,
+            instruction_offset=4,
+            detail="lookup detail",
+        )
+        payload = _serialize_ingestion_failure(
+            "business_bytecode",
+            EvidenceFailure(
+                stage="evidence-ingestion",
+                reason_code="BYTECODE_CALLER_UNRESOLVED",
+                blocking=True,
+                api_identity="com.vendor.Legacy.call()",
+                occurrences=(occurrence,),
+            ),
+        )
+
+        self.assertEqual(
+            EVIDENCE_FAILURE_OCCURRENCE_FIELDS,
+            (
+                "caller_symbol", "caller_qualified_key", "artifact",
+                "artifact_entry", "class_name", "line",
+                "instruction_offset", "detail",
+            ),
+        )
+        self.assertEqual(len(payload["occurrences"]), 1)
+        self.assertIsInstance(payload["occurrences"][0], tuple)
+        self.assertEqual(payload["occurrences"][0][0], "com.acme.App.run()")
     def test_step5_timing_exposes_shared_artifact_fact_cost_and_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_step5_timing_csv(tmp, {"step5_perf": {
@@ -296,6 +334,44 @@ class ArtifactInventoryTest(unittest.TestCase):
         self.assertIn("BadZipFile", inventory.failure)
         self.assertEqual(inventory.classes, ())
 
+    def test_inventory_hashes_and_reads_the_same_descriptor_when_symlink_retargets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "original.jar"
+            replacement = root / "replacement.jar"
+            link = root / "runtime.jar"
+            with zipfile.ZipFile(original, "w") as archive:
+                archive.writestr("com/example/Original.class", b"original")
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("com/example/Replacement.class", b"replacement")
+            link.symlink_to(original)
+            store = Step5ArtifactFactStore.from_catalog(
+                self._catalog(
+                    link, sha256=hashlib.sha256(original.read_bytes()).hexdigest(),
+                )
+            )
+            real_zip_file = zipfile.ZipFile
+
+            def retarget_while_opening(source, *args, **kwargs):
+                link.unlink()
+                link.symlink_to(replacement)
+                opened = real_zip_file(source, *args, **kwargs)
+                link.unlink()
+                link.symlink_to(original)
+                return opened
+
+            with patch(
+                "step5_artifact_fact_store.zipfile.ZipFile",
+                side_effect=retarget_while_opening,
+            ):
+                inventory = store.inventory("com.example:fixture")
+
+        self.assertEqual("", inventory.failure)
+        self.assertEqual(
+            [item.binary_name for item in inventory.classes],
+            ["com.example.Original"],
+        )
+
 
 class ResourceFactTest(unittest.TestCase):
     def _store_with_resource(self, tmp):
@@ -381,6 +457,43 @@ class ResourceFactTest(unittest.TestCase):
 
         self.assertEqual("failed", second.status)
         self.assertIn("artifact_changed_after_inventory", second.reason)
+
+    def test_javap_uses_verified_class_bytes_when_symlink_retargets_and_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "original.jar"
+            replacement = root / "replacement.jar"
+            link = root / "runtime.jar"
+            with zipfile.ZipFile(original, "w") as archive:
+                archive.writestr("example/Impl.class", b"original-class")
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("example/Impl.class", b"replacement-class")
+            link.symlink_to(original)
+            digest = hashlib.sha256(original.read_bytes()).hexdigest()
+            store = Step5ArtifactFactStore.from_catalog({
+                "entries": [{"coord": "g:a", "jar_path": str(link), "sha256": digest}],
+            })
+            location = store.inventory("g:a").classes[0]
+
+            def producer(identity, bound_location, _profile):
+                link.unlink()
+                link.symlink_to(replacement)
+                try:
+                    class_path = (
+                        Path(identity.path)
+                        / (bound_location.binary_name.replace(".", "/") + ".class")
+                    )
+                    return class_path.read_bytes()
+                finally:
+                    link.unlink()
+                    link.symlink_to(original)
+
+            outcome = store.javap_fact(
+                "g:a", location, "verbose", producer, retain=False,
+            )
+
+        self.assertEqual("complete", outcome.status)
+        self.assertEqual(b"original-class", outcome.value)
 
     def test_resource_bytes_are_sha_bound_and_shared_without_reopening_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -672,6 +785,46 @@ class BusinessBytecodeFactParityTest(unittest.TestCase):
         self.assertEqual(
             [failure.reason_code for failure in batch.failures],
             ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"],
+        )
+
+    def test_shared_business_collector_reports_replacement_during_iteration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "business.jar"
+            replacement = Path(tmp) / "replacement.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/example/Original.class", b"original")
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("com/example/Replacement.class", b"replacement")
+            digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            entry = {
+                "coord": "__business__", "jar_path": str(jar_path),
+                "sha256": digest, "artifact_entry": "<business-classes>",
+            }
+            catalog = {
+                "target_jdk": "17", "entries": [entry],
+                "by_coord": {"__business__": entry},
+            }
+            store = Step5ArtifactFactStore.from_catalog(catalog)
+            original_iterator = __import__(
+                "business_bytecode_graph"
+            )._iter_business_class_bytes
+
+            def replacing_iterator(*args, **kwargs):
+                replacement.replace(jar_path)
+                yield from original_iterator(*args, **kwargs)
+
+            with patch(
+                "business_bytecode_graph._iter_business_class_bytes",
+                side_effect=replacing_iterator,
+            ):
+                batch = collect_business_bytecode_batch(
+                    [], catalog, None, fact_store=store,
+                )
+
+        self.assertEqual(batch.edges, ())
+        self.assertEqual(
+            [failure.reason_code for failure in batch.failures],
+            ["CURRENT_FINAL_ARTIFACT_CHANGED_DURING_SCAN"],
         )
 
     def test_nested_fat_jar_javap_fallback_queue_is_bounded(self):

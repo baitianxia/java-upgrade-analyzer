@@ -31,7 +31,7 @@ from step5_evidence_model import (
 )
 
 
-def _shared_artifact_inventory(entry, fact_store):
+def _shared_artifact_inventory(entry, fact_store, *, strict=False):
     """Use a shared inventory only when it identifies this exact SHA-bound artifact."""
     if fact_store is None:
         return None
@@ -40,13 +40,20 @@ def _shared_artifact_inventory(entry, fact_store):
     expected_path = str((entry or {}).get('jar_path') or '')
     if not coord or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
         return None
-    inventory = fact_store.inventory(coord)
+    try:
+        inventory = fact_store.verified_inventory(coord)
+    except (KeyError, ValueError) as exc:
+        if strict:
+            raise
+        return None
     identity = inventory.identity
     if (
         inventory.failure
         or identity.sha256 != expected_sha
         or Path(identity.path) != Path(expected_path)
     ):
+        if strict:
+            raise ValueError('artifact_fact_store_identity_mismatch')
         return None
     return inventory
 
@@ -1622,15 +1629,22 @@ def _verify_mybatis_runtime_dispatch(entry, fact_store=None):
     )
     outputs = {}
     errors = []
-    shared_inventory = _shared_artifact_inventory(entry, fact_store)
+    try:
+        shared_inventory = _shared_artifact_inventory(
+            entry, fact_store, strict=fact_store is not None,
+        )
+    except (KeyError, ValueError) as exc:
+        detail = f'artifact_fact_store:{type(exc).__name__}:{exc}'
+        return {}, [f'{jar_path}:{owner}:{detail}' for owner in classes]
     locations = {
         location.binary_name: location
         for location in (shared_inventory.classes if shared_inventory else ())
     }
     for owner in classes:
-        def run_javap(*_args):
+        def run_javap(identity=None, *_args):
+            classpath = identity.path if identity is not None else jar_path
             completed = subprocess.run(
-                ['javap', '-c', '-p', '-s', '-classpath', jar_path, owner],
+                ['javap', '-c', '-p', '-s', '-classpath', classpath, owner],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -1648,9 +1662,8 @@ def _verify_mybatis_runtime_dispatch(entry, fact_store=None):
                 if outcome.status == 'complete':
                     returncode, stdout = outcome.value
                 else:
-                    # Preserve legacy failure classification and retry once rather than
-                    # treating a cache-layer failure as evidence that the class is safe.
-                    returncode, stdout = run_javap()
+                    errors.append(f'{jar_path}:{owner}:{outcome.reason}')
+                    continue
             else:
                 returncode, stdout = run_javap()
         except (OSError, subprocess.TimeoutExpired) as exc:
