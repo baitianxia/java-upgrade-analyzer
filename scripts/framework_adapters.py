@@ -366,6 +366,12 @@ def _framework_failure(adapter, error):
     elif 'mybatis_internal_module_sha256_mismatch' in text:
         reason = 'MYBATIS_INTERNAL_MODULE_SHA256_MISMATCH'
         blocking = True
+    elif 'mybatis_internal_module_missing' in text:
+        reason = 'MYBATIS_INTERNAL_MODULE_MISSING'
+        blocking = True
+    elif 'mybatis_internal_module_identity_invalid' in text:
+        reason = 'MYBATIS_INTERNAL_MODULE_IDENTITY_INVALID'
+        blocking = True
     elif 'spring_class_location_failed' in text:
         reason = 'SPRING_CLASS_LOCATION_FAILED'
         blocking = True
@@ -375,11 +381,17 @@ def _framework_failure(adapter, error):
     elif 'mybatis_final_artifact_parse_failed' in text:
         reason = 'MYBATIS_FINAL_ARTIFACT_PARSE_FAILED'
         blocking = True
+    elif 'spring_boot_artifact_parse_failed' in text:
+        reason = 'SPRING_BOOT_ARTIFACT_PARSE_FAILED'
+        blocking = True
     elif 'artifact_fact_store_identity_failed' in text:
         reason = 'ARTIFACT_FACT_STORE_IDENTITY_FAILED'
         blocking = True
     elif 'framework_javap_failed' in text:
         reason = 'FRAMEWORK_JAVAP_FAILED'
+        blocking = True
+    elif 'shared_class_missing' in text:
+        reason = 'FRAMEWORK_SHARED_CLASS_MISSING'
         blocking = True
     return EvidenceFailure(
         stage=adapter,
@@ -1715,7 +1727,13 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog, fact_store=None):
                     continue
                 nested_entry = str(entry.get('artifact_entry') or '')
                 expected_sha = str(entry.get('sha256') or '').lower()
-                if nested_entry not in names or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+                if nested_entry not in names:
+                    errors.append(f'{nested_entry}:mybatis_internal_module_missing')
+                    continue
+                if not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+                    errors.append(
+                        f'{nested_entry}:mybatis_internal_module_identity_invalid'
+                    )
                     continue
                 with tempfile.NamedTemporaryFile(
                     prefix='mybatis-internal-', suffix='.jar', mode='w+b',
@@ -1825,7 +1843,9 @@ def _verify_mybatis_runtime_dispatch(entry, fact_store=None):
             entry, fact_store, strict=fact_store is not None,
         )
     except (KeyError, OSError, ValueError) as exc:
-        detail = _fact_store_identity_error(entry, 'mybatis_dispatch', exc)
+        detail = _fact_store_or_parser_error(
+            entry, 'mybatis_dispatch', exc, 'framework_javap_failed',
+        )
         return {}, [f'{detail}:{owner}' for owner in classes]
     locations = {
         location.binary_name: location
@@ -1857,18 +1877,27 @@ def _verify_mybatis_runtime_dispatch(entry, fact_store=None):
                 if outcome.status == 'complete':
                     returncode, stdout = outcome.value
                 else:
+                    marker = (
+                        'artifact_fact_store_identity_failed'
+                        if _fact_store_failure_is_identity(outcome.reason)
+                        else 'framework_javap_failed'
+                    )
                     errors.append(
-                        f'{jar_path}:artifact_fact_store_identity_failed:'
-                        f'mybatis_dispatch:{owner}:{outcome.reason}'
+                        f'{jar_path}:{marker}:mybatis_dispatch:'
+                        f'{owner}:{outcome.reason}'
                     )
                     continue
             else:
                 returncode, stdout = run_javap()
         except (OSError, subprocess.TimeoutExpired) as exc:
-            errors.append(f'{jar_path}:{owner}:{type(exc).__name__}')
+            errors.append(
+                f'{jar_path}:{owner}:framework_javap_failed:{type(exc).__name__}'
+            )
             continue
         if returncode != 0:
-            errors.append(f'{jar_path}:{owner}:javap_exit_{returncode}')
+            errors.append(
+                f'{jar_path}:{owner}:framework_javap_failed:exit_{returncode}'
+            )
             continue
         outputs[owner] = stdout
     checks = {
@@ -2446,8 +2475,9 @@ def _verified_spring_boot_business_activation(
             )
         except (KeyError, OSError, ValueError) as exc:
             if errors is not None:
-                errors.append(_fact_store_identity_error(
+                errors.append(_fact_store_or_parser_error(
                     business, 'spring_boot_activation', exc,
+                    'spring_boot_artifact_parse_failed',
                 ))
             return []
         names = set(shared_inventory.resources) | set(shared_inventory.physical_classes)
@@ -3559,7 +3589,11 @@ def collect_spring_aop_activation(
                 signatures = {
                     (method['member'], method['descriptor']) for method in methods
                 } if parsed_owner == owner else set()
-                class_fact = (location, signatures)
+                retained_location = {
+                    key: value for key, value in location.items()
+                    if key not in {'bytes', '_artifact_reader', '_records_by_owner'}
+                }
+                class_fact = (retained_location, signatures)
                 verified_join_point_classes[owner] = class_fact
             location, signatures = class_fact
             verified_join_points[identity] = (

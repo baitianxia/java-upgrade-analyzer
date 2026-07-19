@@ -31,6 +31,76 @@ from step5_evidence_model import EvidenceFailure, EvidenceFailureOccurrence  # n
 
 
 class Step5ColdRunContractTest(unittest.TestCase):
+    def test_physical_class_stream_checks_identity_when_closed_early(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "artifact.jar"
+            replacement = Path(tmp) / "replacement.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("demo/Original.class", b"original")
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("demo/Replaced.class", b"replacement")
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            stream = store.iter_physical_class_bytes("g:a")
+            next(stream)
+            replacement.replace(jar)
+
+            with self.assertRaisesRegex(ValueError, "artifact_changed_after_inventory"):
+                stream.close()
+
+    def test_verified_artifact_checks_identity_when_body_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "artifact.jar"
+            replacement = Path(tmp) / "replacement.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("demo/Original.class", b"original")
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("demo/Replaced.class", b"replacement")
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            with self.assertRaisesRegex(ValueError, "artifact_changed_after_inventory"):
+                with store.open_verified_artifact("g:a"):
+                    replacement.replace(jar)
+                    raise RuntimeError("parse")
+
+    def test_stream_reader_spools_prefetch_and_reuses_already_seen_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "artifact.jar"
+            with zipfile.ZipFile(jar, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for index in range(16):
+                    archive.writestr(
+                        f"demo/Class{index:02d}.class", b"x" * (1024 * 1024),
+                    )
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            locations = store.verified_inventory("g:a").classes
+            stream = store.iter_class_bytes_with_reader("g:a")
+            first_location, _first_content, reader = next(stream)
+
+            import tracemalloc
+            tracemalloc.start()
+            for location in locations[1:]:
+                reader(location)
+            _current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            reads_before = store.metrics()["class_bytes_reads"]
+            reader(first_location)
+            reads_after = store.metrics()["class_bytes_reads"]
+            stream.close()
+
+        self.assertLess(peak, 4 * 1024 * 1024)
+        self.assertEqual(reads_before, reads_after)
+
     def test_ingestion_failure_serialization_uses_compact_occurrence_rows(self):
         occurrence = EvidenceFailureOccurrence(
             caller_symbol="com.acme.App.run()",

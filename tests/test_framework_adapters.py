@@ -301,6 +301,39 @@ class FrameworkAdaptersTest(unittest.TestCase):
             self.assertEqual(3, store.metrics()["javap_starts"])
             self.assertEqual(3, store.metrics()["javap_shared_hits"])
 
+    def test_mybatis_runtime_dispatch_javap_failure_is_blocking(self):
+        owners = (
+            "org.apache.ibatis.binding.MapperProxy",
+            "org.apache.ibatis.binding.MapperProxy$PlainMethodInvoker",
+            "org.apache.ibatis.binding.MapperMethod",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "mybatis.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                for owner in owners:
+                    archive.writestr(owner.replace(".", "/") + ".class", b"fixture")
+            entry = {
+                "coord": "org.mybatis:mybatis", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            with patch.object(
+                framework_adapter_module.subprocess, "run",
+                return_value=SimpleNamespace(returncode=1, stdout=""),
+            ):
+                _verified, errors = (
+                    framework_adapter_module._verify_mybatis_runtime_dispatch(
+                        entry, fact_store=store,
+                    )
+                )
+
+        self.assertEqual(3, len(errors))
+        self.assertTrue(all("framework_javap_failed" in item for item in errors))
+        self.assertTrue(all(
+            framework_adapter_module._framework_failure("mybatis", item).blocking
+            for item in errors
+        ))
+
     def test_mybatis_runtime_dispatch_does_not_bypass_fact_store_identity_failure(self):
         owners = (
             "org.apache.ibatis.binding.MapperProxy",
@@ -1182,6 +1215,35 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 )
                 self.assertEqual(reason, failure.reason_code)
                 self.assertTrue(failure.blocking)
+
+    def test_mybatis_declared_internal_module_missing_is_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"fixture")
+            missing = root / "library.jar"
+            missing.write_bytes(b"declared-library")
+            catalog = {
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "entries": [{
+                    "coord": "com.acme:library", "jar_path": str(missing),
+                    "artifact_entry": "BOOT-INF/lib/library.jar",
+                    "sha256": hashlib.sha256(missing.read_bytes()).hexdigest(),
+                    "application_owned": True,
+                    "evidence_source": "current_final_artifact",
+                }],
+            }
+
+            _packaged, _unregistered, _activation, errors = (
+                framework_adapter_module._packaged_mybatis_contracts([], catalog)
+            )
+
+        self.assertTrue(any("mybatis_internal_module_missing" in item for item in errors))
+        failure = framework_adapter_module._framework_failure("mybatis", errors[0])
+        self.assertEqual("MYBATIS_INTERNAL_MODULE_MISSING", failure.reason_code)
+        self.assertTrue(failure.blocking)
 
     def test_public_framework_scanners_keep_docstrings(self):
         for function in (
@@ -2697,6 +2759,31 @@ class FrameworkAdaptersTest(unittest.TestCase):
             )
 
         self.assertEqual(verified, [])
+
+    def test_runtime_activation_bad_zip_is_blocking_parser_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            business_jar = Path(tmp) / "application.jar"
+            business_jar.write_bytes(b"not-a-zip")
+            catalog = {"entries": [{
+                "coord": "__business__", "jar_path": str(business_jar),
+                "sha256": hashlib.sha256(business_jar.read_bytes()).hexdigest(),
+            }]}
+            errors = []
+
+            verified = framework_adapter_module._verified_spring_boot_business_activation(
+                [{
+                    "business_entry": "com.acme.Application.main",
+                    "spring_application_run": True,
+                }],
+                catalog,
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
+                errors=errors,
+            )
+
+        self.assertEqual([], verified)
+        failure = framework_adapter_module._framework_failure("spring", errors[0])
+        self.assertEqual("SPRING_BOOT_ARTIFACT_PARSE_FAILED", failure.reason_code)
+        self.assertTrue(failure.blocking)
 
     @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
     def test_packaged_message_listener_adapter_registers_exact_business_callback(self):

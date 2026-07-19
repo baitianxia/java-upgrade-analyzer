@@ -252,10 +252,12 @@ class Step5ArtifactFactStore:
         """Yield one SHA-bound file descriptor and reject path changes on exit."""
         inventory = self._verified_inventory(coord)
         with self._open_verified_artifact(inventory) as handle:
-            yield handle
-            if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
-                raise ValueError("artifact_changed_after_inventory")
-        self._assert_path_identity(inventory)
+            try:
+                yield handle
+            finally:
+                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+                    raise ValueError("artifact_changed_after_inventory")
+                self._assert_path_identity(inventory)
 
     @staticmethod
     def _assert_path_identity(inventory: ArtifactInventory) -> None:
@@ -301,48 +303,55 @@ class Step5ArtifactFactStore:
         """Stream classes while allowing bounded reads from the same verified ZIP."""
         inventory = self._verified_inventory(coord)
         with self._open_verified_artifact(inventory) as handle:
-            with zipfile.ZipFile(handle) as archive:
-                prefetched = {}
+            spool = tempfile.TemporaryFile(mode="w+b")
+            spooled = {}
+            try:
+                with zipfile.ZipFile(handle) as archive:
+                    def read_location(location):
+                        if location not in inventory.classes:
+                            raise KeyError(
+                                "class_location_not_in_inventory:"
+                                f"{location.physical_entry}"
+                            )
+                        stored = spooled.get(location)
+                        if stored is not None:
+                            offset, size = stored
+                            spool.seek(offset)
+                            return spool.read(size)
+                        content = archive.read(location.physical_entry)
+                        spool.seek(0, os.SEEK_END)
+                        offset = spool.tell()
+                        spool.write(content)
+                        spooled[location] = (offset, len(content))
+                        with self._lock:
+                            self._metrics["class_bytes_reads"] += 1
+                            self._metrics["class_bytes_read"] += len(content)
+                        return content
 
-                def read_location(location, *, retain=True):
-                    if location not in inventory.classes:
-                        raise KeyError(
-                            f"class_location_not_in_inventory:{location.physical_entry}"
-                        )
-                    cached = prefetched.get(location)
-                    if cached is not None:
-                        return cached
-                    content = archive.read(location.physical_entry)
-                    with self._lock:
-                        self._metrics["class_bytes_reads"] += 1
-                        self._metrics["class_bytes_read"] += len(content)
-                    if retain:
-                        prefetched[location] = content
-                    return content
-
-                for location in inventory.classes:
-                    content = prefetched.pop(location, None)
-                    if content is None:
-                        content = read_location(location, retain=False)
-                    yield location, content, read_location
-            if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
-                raise ValueError("artifact_changed_after_inventory")
-        self._assert_path_identity(inventory)
+                    for location in inventory.classes:
+                        yield location, read_location(location), read_location
+            finally:
+                spool.close()
+                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+                    raise ValueError("artifact_changed_after_inventory")
+                self._assert_path_identity(inventory)
 
     def iter_physical_class_bytes(self, coord: str):
         """Yield all physical class entries in stable name order from one ZIP open."""
         inventory = self._verified_inventory(coord)
         with self._open_verified_artifact(inventory) as handle:
-            with zipfile.ZipFile(handle) as archive:
-                for entry in inventory.physical_classes:
-                    content = archive.read(entry)
-                    with self._lock:
-                        self._metrics["class_bytes_reads"] += 1
-                        self._metrics["class_bytes_read"] += len(content)
-                    yield entry, content
-            if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
-                raise ValueError("artifact_changed_after_inventory")
-        self._assert_path_identity(inventory)
+            try:
+                with zipfile.ZipFile(handle) as archive:
+                    for entry in inventory.physical_classes:
+                        content = archive.read(entry)
+                        with self._lock:
+                            self._metrics["class_bytes_reads"] += 1
+                            self._metrics["class_bytes_read"] += len(content)
+                        yield entry, content
+            finally:
+                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+                    raise ValueError("artifact_changed_after_inventory")
+                self._assert_path_identity(inventory)
 
     def resource_bytes(
         self, coord: str, resource_name: str, *, retain: bool = True,
