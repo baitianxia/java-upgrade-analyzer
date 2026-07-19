@@ -167,9 +167,14 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
             legacy = tracer._build_packaged_runtime_dependency_scan_cache(
                 api_rows, legacy_graph,
             )
-            shared = tracer._build_packaged_runtime_dependency_scan_cache(
-                api_rows, shared_graph,
-            )
+            with patch.object(
+                tracer, "_get_runtime_dependency_member_candidate_index",
+                wraps=tracer._get_runtime_dependency_member_candidate_index,
+            ) as unified_index:
+                shared = tracer._build_packaged_runtime_dependency_scan_cache(
+                    api_rows, shared_graph,
+                )
+            self.assertEqual(unified_index.call_count, 1)
             cache_path = (
                 root / "report/.runtime/cache/s5_runtime_member_candidate_index.json"
             )
@@ -196,6 +201,67 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
                 tracer._runtime_member_index_serializable(reloaded_index),
             )
 
+            stable_jar_path = root / "stable-consumer.jar"
+            shutil.copyfile(jar_path, stable_jar_path)
+            mutation_entries = [dict(entry) for entry in entries]
+            mutation_entries[0].update({
+                "jar_path": str(stable_jar_path),
+                "sha256": hashlib.sha256(stable_jar_path.read_bytes()).hexdigest(),
+            })
+            mutation_catalog = {
+                "status": "complete", "target_jdk": "17",
+                "entries": mutation_entries,
+            }
+            mutation_graph = SimpleNamespace(
+                runtime_dependency_catalog=mutation_catalog,
+                step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog(
+                    mutation_catalog
+                ),
+                report_dir=str(root / "mutation-report"),
+            )
+            original_write = tracer._write_runtime_member_index_cache
+
+            def mutating_write(path, identity, index):
+                original_write(path, identity, index)
+                with zipfile.ZipFile(jar_path, "a") as archive:
+                    archive.writestr("mutation-marker", b"changed")
+
+            with patch.object(
+                tracer, "_write_runtime_member_index_cache",
+                side_effect=mutating_write,
+            ):
+                mutation_results = tracer._build_packaged_runtime_dependency_scan_cache(
+                    api_rows, mutation_graph,
+                )
+            mutation_index = mutation_graph._runtime_dependency_member_candidate_index
+            mutation_cache_path = (
+                root / "mutation-report/.runtime/cache/"
+                "s5_runtime_member_candidate_index.json"
+            )
+
+            size_catalog = {
+                "status": "complete", "target_jdk": "17",
+                "entries": [{
+                    **entry,
+                    "jar_path": str(stable_jar_path),
+                    "sha256": hashlib.sha256(stable_jar_path.read_bytes()).hexdigest(),
+                } for entry in entries],
+            }
+            size_graph = SimpleNamespace(
+                runtime_dependency_catalog=size_catalog,
+                step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog(
+                    size_catalog
+                ),
+                report_dir=str(root / "size-report"),
+            )
+            with patch.object(
+                tracer.os.path, "getsize",
+                side_effect=FileNotFoundError("artifact disappeared"),
+            ):
+                size_results = tracer._build_packaged_runtime_dependency_scan_cache(
+                    api_rows, size_graph,
+                )
+
         self.assertEqual(legacy, shared)
         self.assertEqual(
             {"hit"}, {result["status"] for result in shared.values()},
@@ -203,6 +269,156 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
         self.assertEqual(
             1,
             shared_graph._step5_perf_stats["bytecode_scan"]["member_index_fast_path"],
+        )
+        self.assertFalse(mutation_index["complete"])
+        self.assertFalse(mutation_cache_path.exists())
+        self.assertEqual(
+            {"unavailable"},
+            {result["status"] for result in mutation_results.values()},
+        )
+        self.assertEqual(
+            {"BYTECODE_SCAN_INPUT_CHANGED"},
+            {result["reason"] for result in mutation_results.values()},
+        )
+        self.assertEqual(
+            {"unavailable"},
+            {result["status"] for result in size_results.values()},
+        )
+        self.assertEqual(
+            {"BYTECODE_SCAN_INPUT_CHANGED"},
+            {result["reason"] for result in size_results.values()},
+        )
+
+    @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
+    def test_large_api_fast_path_preserves_class_literal_and_loader_reflection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            literal = root / "src/com/acme/LiteralConsumer.java"
+            loader = root / "src/com/acme/LoaderConsumer.java"
+            target = root / "src/com/vendor/Target.java"
+            literal.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            literal.write_text(
+                'package com.acme; import com.vendor.Target; public class LiteralConsumer {'
+                ' public Object method() throws Exception {'
+                ' return Target.class.getDeclaredMethod("removed").invoke(null); }'
+                ' public Object field() throws Exception {'
+                ' return Target.class.getDeclaredField("VALUE").get(null); }'
+                ' public Object construct() throws Exception {'
+                ' return Target.class.getDeclaredConstructor().newInstance(); }}',
+                encoding="utf-8",
+            )
+            loader.write_text(
+                'package com.acme; public class LoaderConsumer {'
+                ' public Object load() throws Exception {'
+                ' return ClassLoader.getSystemClassLoader()'
+                '.loadClass("com.vendor.Target"); }}',
+                encoding="utf-8",
+            )
+            target.write_text(
+                'package com.vendor; public class Target {'
+                ' public static int VALUE = 7; public Target() {}'
+                ' public static void removed() {} }',
+                encoding="utf-8",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            subprocess.run(
+                ["javac", "-d", str(classes), str(literal), str(loader), str(target)],
+                check=True,
+            )
+            literal_jar = root / "literal-consumer.jar"
+            with zipfile.ZipFile(literal_jar, "w") as archive:
+                archive.write(
+                    classes / "com/acme/LiteralConsumer.class",
+                    "com/acme/LiteralConsumer.class",
+                )
+            loader_jar = root / "loader-consumer.jar"
+            with zipfile.ZipFile(loader_jar, "w") as archive:
+                archive.write(
+                    classes / "com/acme/LoaderConsumer.class",
+                    "com/acme/LoaderConsumer.class",
+                )
+            literal_definitions = [{
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.removed",
+                "api_simple": "removed", "api_signature": "()",
+                "symbol_kind": "method",
+            }, {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.VALUE",
+                "api_simple": "VALUE", "api_signature": "",
+                "symbol_kind": "field",
+            }, {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target.Target",
+                "api_simple": "Target", "api_signature": "()",
+                "symbol_kind": "constructor",
+            }]
+            class_definition = {
+                "coord": "com.vendor:target",
+                "api_name": "com.vendor.Target",
+                "api_simple": "Target", "api_signature": "",
+                "symbol_kind": "class",
+            }
+
+            def scan_pair(jar_path, definitions, label):
+                digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+                entries = [{
+                    "coord": f"com.acme:{label}-{index}",
+                    "jar_path": str(jar_path), "sha256": digest,
+                    "application_owned": False,
+                } for index in range(8)]
+                api_rows = [
+                    dict(definitions[index % len(definitions)])
+                    for index in range(32)
+                ]
+                legacy_catalog = {
+                    "status": "complete", "target_jdk": "17",
+                    "entries": [dict(entry) for entry in entries],
+                }
+                indexed_catalog = {
+                    "status": "complete", "target_jdk": "17",
+                    "entries": [dict(entry) for entry in entries],
+                }
+                legacy = tracer._build_packaged_runtime_dependency_scan_cache(
+                    api_rows, SimpleNamespace(runtime_dependency_catalog=legacy_catalog),
+                )
+                indexed_graph = SimpleNamespace(
+                    runtime_dependency_catalog=indexed_catalog,
+                    step5_artifact_fact_store=Step5ArtifactFactStore.from_catalog(
+                        indexed_catalog
+                    ),
+                    report_dir=str(root / f"{label}-indexed-report"),
+                )
+                indexed = tracer._build_packaged_runtime_dependency_scan_cache(
+                    api_rows, indexed_graph,
+                )
+                return legacy, indexed
+
+            literal_legacy, literal_indexed = scan_pair(
+                literal_jar, literal_definitions, "literal",
+            )
+            loader_legacy, loader_indexed = scan_pair(
+                loader_jar, [class_definition], "loader",
+            )
+
+        self.assertEqual(
+            {"hit"}, {result["status"] for result in literal_legacy.values()},
+        )
+        self.assertEqual(literal_legacy, literal_indexed)
+        self.assertEqual(
+            {"miss"}, {result["status"] for result in loader_legacy.values()},
+        )
+        self.assertEqual(
+            {
+                key: (value.get("status"), value.get("reason"), value.get("hits"))
+                for key, value in loader_legacy.items()
+            },
+            {
+                key: (value.get("status"), value.get("reason"), value.get("hits"))
+                for key, value in loader_indexed.items()
+            },
         )
 
     def test_application_owned_nested_module_requires_a_business_entry_path(self):
