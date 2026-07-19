@@ -267,6 +267,16 @@ class CollectorBatch:
                 "artifact": failure.artifact,
                 "class_name": failure.class_name,
                 "detail": failure.detail,
+                "occurrences": [{
+                    "caller_symbol": occurrence.caller_symbol,
+                    "caller_qualified_key": occurrence.caller_qualified_key,
+                    "artifact": occurrence.artifact,
+                    "artifact_entry": occurrence.artifact_entry,
+                    "class_name": occurrence.class_name,
+                    "line": occurrence.line,
+                    "instruction_offset": occurrence.instruction_offset,
+                    "detail": occurrence.detail,
+                } for occurrence in failure.occurrences],
             } for failure in self.failures],
             "concerns": [concern.__dict__ for concern in self.concerns],
             "coverage": [{
@@ -281,6 +291,18 @@ class CollectorBatch:
         }
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class EvidenceFailureOccurrence:
+    caller_symbol: str = ""
+    caller_qualified_key: str = ""
+    artifact: str = ""
+    artifact_entry: str = ""
+    class_name: str = ""
+    line: int = 0
+    instruction_offset: int = -1
+    detail: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceFailure:
     stage: str
@@ -290,6 +312,13 @@ class EvidenceFailure:
     artifact: str = ""
     class_name: str = ""
     detail: str = ""
+    occurrences: Tuple[EvidenceFailureOccurrence, ...] = field(default_factory=tuple)
+
+    def __post_init__(self):
+        occurrences = tuple(self.occurrences or ())
+        if any(not isinstance(item, EvidenceFailureOccurrence) for item in occurrences):
+            raise ValueError("failure occurrences must be EvidenceFailureOccurrence values")
+        object.__setattr__(self, "occurrences", tuple(sorted(set(occurrences))))
 
 
 @dataclass(frozen=True)

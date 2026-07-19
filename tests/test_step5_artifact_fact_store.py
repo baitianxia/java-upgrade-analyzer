@@ -10,6 +10,7 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -113,13 +114,23 @@ class Step5ColdRunContractTest(unittest.TestCase):
                 step5_result_contract(Path(second)),
             )
 
-    def test_contract_ignores_duplicate_ingestion_failures_but_keeps_semantics(self):
+    def test_contract_preserves_grouped_ingestion_failure_occurrences(self):
         failure = {
             "reason_code": "BYTECODE_CALLER_UNRESOLVED",
             "blocking": True,
             "api_identity": "com.vendor.Legacy.call()",
             "class_name": "com.acme.First",
             "detail": "first caller",
+            "occurrences": [{
+                "caller_symbol": "com.acme.First.run()",
+                "caller_qualified_key": "com.acme.First.run()",
+                "artifact": "/app.jar",
+                "artifact_entry": "com/acme/First.class",
+                "class_name": "com.acme.First",
+                "line": 12,
+                "instruction_offset": 4,
+                "detail": "first caller",
+            }],
         }
         with (
             tempfile.TemporaryDirectory() as first,
@@ -128,8 +139,18 @@ class Step5ColdRunContractTest(unittest.TestCase):
         ):
             self._write_report(first, evidence_ingestion={
                 "rejected_edges": 2,
-                "failure_count": 2,
-                "failures": [failure, {**failure, "class_name": "com.acme.Second"}],
+                "failure_count": 1,
+                "failures": [{**failure, "occurrences": [
+                    *failure["occurrences"],
+                    {
+                        **failure["occurrences"][0],
+                        "caller_symbol": "com.acme.Second.run()",
+                        "caller_qualified_key": "com.acme.Second.run()",
+                        "artifact_entry": "com/acme/Second.class",
+                        "class_name": "com.acme.Second",
+                        "line": 24,
+                    },
+                ]}],
                 "reason_codes": ["BYTECODE_CALLER_UNRESOLVED"],
             })
             self._write_report(second, evidence_ingestion={
@@ -139,7 +160,7 @@ class Step5ColdRunContractTest(unittest.TestCase):
                 "reason_codes": ["BYTECODE_CALLER_UNRESOLVED"],
             })
 
-            self.assertEqual(
+            self.assertNotEqual(
                 step5_result_contract(Path(first)),
                 step5_result_contract(Path(second)),
             )
@@ -277,6 +298,90 @@ class ArtifactInventoryTest(unittest.TestCase):
 
 
 class ResourceFactTest(unittest.TestCase):
+    def _store_with_resource(self, tmp):
+        jar = Path(tmp) / "runtime.jar"
+        with zipfile.ZipFile(jar, "w") as archive:
+            archive.writestr("META-INF/spring.factories", b"original-resource")
+            archive.writestr("example/Impl.class", b"original-class")
+        digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+        store = Step5ArtifactFactStore.from_catalog({
+            "entries": [{"coord": "g:a", "jar_path": str(jar), "sha256": digest}],
+        })
+        location = store.inventory("g:a").classes[0]
+        return jar, store, location
+
+    def _atomically_replace_jar(self, jar):
+        replacement = jar.with_name("replacement.jar")
+        with zipfile.ZipFile(replacement, "w") as archive:
+            archive.writestr("META-INF/spring.factories", b"replacement-resource")
+            archive.writestr("example/Impl.class", b"replacement-class")
+        replacement.replace(jar)
+
+    def test_class_bytes_rejects_artifact_replaced_after_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar, store, location = self._store_with_resource(tmp)
+            self._atomically_replace_jar(jar)
+
+            outcome = store.class_bytes("g:a", location)
+
+        self.assertEqual("failed", outcome.status)
+        self.assertIn("artifact_changed_after_inventory", outcome.reason)
+
+    def test_resource_bytes_rejects_artifact_replaced_after_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar, store, _location = self._store_with_resource(tmp)
+            self._atomically_replace_jar(jar)
+
+            outcome = store.resource_bytes("g:a", "META-INF/spring.factories")
+
+        self.assertEqual("failed", outcome.status)
+        self.assertIn("artifact_changed_after_inventory", outcome.reason)
+
+    def test_javap_rejects_artifact_replaced_after_inventory_without_running_producer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar, store, location = self._store_with_resource(tmp)
+            self._atomically_replace_jar(jar)
+            calls = []
+
+            outcome = store.javap_fact(
+                "g:a", location, "verbose",
+                lambda *_args: calls.append(1) or ("replacement", "", 0),
+                retain=False,
+            )
+
+        self.assertEqual("failed", outcome.status)
+        self.assertIn("artifact_changed_after_inventory", outcome.reason)
+        self.assertEqual([], calls)
+
+    def test_cached_resource_is_not_reused_after_artifact_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar, store, _location = self._store_with_resource(tmp)
+            first = store.resource_bytes("g:a", "META-INF/spring.factories")
+            self.assertEqual("complete", first.status)
+            self._atomically_replace_jar(jar)
+
+            second = store.resource_bytes("g:a", "META-INF/spring.factories")
+
+        self.assertEqual("failed", second.status)
+        self.assertIn("artifact_changed_after_inventory", second.reason)
+
+    def test_cached_javap_is_not_reused_after_artifact_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar, store, location = self._store_with_resource(tmp)
+            first = store.javap_fact(
+                "g:a", location, "verbose", lambda *_args: ("original", "", 0),
+            )
+            self.assertEqual("complete", first.status)
+            self._atomically_replace_jar(jar)
+
+            second = store.javap_fact(
+                "g:a", location, "verbose",
+                lambda *_args: self.fail("replaced artifact must not run producer"),
+            )
+
+        self.assertEqual("failed", second.status)
+        self.assertIn("artifact_changed_after_inventory", second.reason)
+
     def test_resource_bytes_are_sha_bound_and_shared_without_reopening_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar = Path(tmp) / "runtime.jar"
@@ -543,6 +648,60 @@ class BusinessBytecodeFactParityTest(unittest.TestCase):
 
         self.assertEqual(shared, legacy)
         self.assertTrue(shared.failures)
+
+    def test_shared_business_collector_reports_invalid_catalog_sha_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "business.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/example/Broken.class", b"broken")
+            entry = {
+                "coord": "__business__", "jar_path": str(jar_path),
+                "sha256": "invalid", "artifact_entry": "<business-classes>",
+            }
+            catalog = {
+                "target_jdk": "17", "entries": [entry],
+                "by_coord": {"__business__": entry},
+            }
+
+            batch = collect_business_bytecode_batch(
+                [], catalog, None,
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
+            )
+
+        self.assertEqual(batch.edges, ())
+        self.assertEqual(
+            [failure.reason_code for failure in batch.failures],
+            ["CURRENT_FINAL_ARTIFACT_SHA_INVALID"],
+        )
+
+    def test_nested_fat_jar_javap_fallback_queue_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "business.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                for index in range(24):
+                    archive.writestr(
+                        f"BOOT-INF/classes/com/example/Broken{index}.class",
+                        f"broken-{index}".encode("ascii"),
+                    )
+            digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            entry = {
+                "coord": "__business__", "jar_path": str(jar_path),
+                "sha256": digest, "artifact_entry": "<business-classes>",
+            }
+            catalog = {
+                "target_jdk": "17", "entries": [entry],
+                "by_coord": {"__business__": entry},
+            }
+
+            with (
+                patch.dict("os.environ", {"JUA_STEP5_BYTECODE_JAVAP_WORKERS": "2"}),
+                patch("business_bytecode_graph.run_cmd", return_value=("", "", 0)),
+            ):
+                batch = collect_business_bytecode_batch([], catalog, None)
+
+        metrics = dict(batch.metrics)
+        self.assertLessEqual(metrics["javap_peak_pending_tasks"], 4)
+        self.assertEqual(metrics["javap_pending_limit"], 4)
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,7 @@ import re
 import struct
 import tempfile
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from compat import run_cmd
@@ -915,6 +915,17 @@ def collect_business_bytecode_edges(
             'evidence_source': 'unavailable',
             'artifact_sha256': cache_key,
         }
+    if not re.fullmatch(r'[0-9a-f]{64}', cache_key):
+        failures.append('current_final_artifact_sha_invalid')
+        return [], {
+            'classes_scanned': 0,
+            'edges_found': 0,
+            'classfile_fast_path_classes': 0,
+            'javap_fallback_classes': 0,
+            'failures': failures,
+            'evidence_source': 'unavailable',
+            'artifact_sha256': cache_key,
+        }
     if business_jar and os.path.isfile(business_jar):
         try:
             actual_business_sha256 = _sha256_file(business_jar)
@@ -986,34 +997,10 @@ def collect_business_bytecode_edges(
     if business_jar and os.path.isfile(business_jar):
         try:
             class_results = []
-            javap_tasks = []
-            for entry, data in _iter_business_class_bytes(business_jar, fact_store):
-                if scanned >= max_classes:
-                    failures.append('class_scan_limit_reached')
-                    break
-                logical_entry = _logical_application_class_entry(entry)
-                class_name = logical_entry[:-6].replace('/', '.')
-                scanned += 1
-                parsed_edges = parse_classfile_calls(data, class_name)
-                if parsed_edges is None:
-                    javap_fallback_classes += 1
-                    class_results.append(None)
-                    javap_tasks.append({
-                        'result_index': len(class_results) - 1,
-                        'entry': entry,
-                        'logical_entry': logical_entry,
-                        'class_name': class_name,
-                        'data': data if logical_entry != entry else None,
-                    })
-                else:
-                    fast_path_classes += 1
-                    class_results.append((entry, class_name, 'classfile', parsed_edges, ''))
-
             def parse_javap_task(task):
                 entry = task['entry']
                 logical_entry = task['logical_entry']
                 class_name = task['class_name']
-                nested_data = task['data']
 
                 def produce_javap(identity=None, _location=None, _profile=None):
                     artifact_path = identity.path if identity is not None else business_jar
@@ -1025,6 +1012,8 @@ def collect_business_bytecode_edges(
                             ],
                             timeout=30,
                         )
+                    with zipfile.ZipFile(artifact_path) as archive:
+                        nested_data = archive.read(entry)
                     temporary_class = tempfile.NamedTemporaryFile(
                         suffix='.class', delete=False
                     )
@@ -1070,19 +1059,58 @@ def collect_business_bytecode_edges(
                     )
                 return entry, class_name, 'javap', parse_javap_calls(stdout, class_name), ''
 
-            workers = min(_business_javap_workers(), len(javap_tasks))
-            if workers <= 1:
-                for task in javap_tasks:
-                    class_results[task['result_index']] = parse_javap_task(task)
-            else:
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {
-                        executor.submit(parse_javap_task, task): task
-                        for task in javap_tasks
+            workers = _business_javap_workers()
+            pending_limit = max(1, workers * 2)
+            peak_pending = 0
+            executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+            pending = {}
+
+            def drain_pending():
+                completed, _remaining = wait(
+                    tuple(pending), return_when=FIRST_COMPLETED,
+                )
+                for future in completed:
+                    task = pending.pop(future)
+                    class_results[task['result_index']] = future.result()
+
+            try:
+                for entry, data in _iter_business_class_bytes(business_jar, fact_store):
+                    if scanned >= max_classes:
+                        failures.append('class_scan_limit_reached')
+                        break
+                    logical_entry = _logical_application_class_entry(entry)
+                    class_name = logical_entry[:-6].replace('/', '.')
+                    scanned += 1
+                    parsed_edges = parse_classfile_calls(data, class_name)
+                    if parsed_edges is not None:
+                        fast_path_classes += 1
+                        class_results.append(
+                            (entry, class_name, 'classfile', parsed_edges, '')
+                        )
+                        continue
+
+                    javap_fallback_classes += 1
+                    class_results.append(None)
+                    task = {
+                        'result_index': len(class_results) - 1,
+                        'entry': entry,
+                        'logical_entry': logical_entry,
+                        'class_name': class_name,
                     }
-                    for future in as_completed(futures):
-                        task = futures[future]
-                        class_results[task['result_index']] = future.result()
+                    if executor is None:
+                        class_results[task['result_index']] = parse_javap_task(task)
+                        peak_pending = max(peak_pending, 1)
+                        continue
+                    future = executor.submit(parse_javap_task, task)
+                    pending[future] = task
+                    peak_pending = max(peak_pending, len(pending))
+                    if len(pending) >= pending_limit:
+                        drain_pending()
+                while pending:
+                    drain_pending()
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=True, cancel_futures=True)
 
             for entry, class_name, parser_kind, parsed_edges, failure in class_results:
                 if failure:
@@ -1106,6 +1134,8 @@ def collect_business_bytecode_edges(
                 'invokedynamic_edges': sum(item.get('evidence_type') == 'bytecode_invokedynamic' for item in evidence),
                 'classfile_fast_path_classes': fast_path_classes,
                 'javap_fallback_classes': javap_fallback_classes,
+                'javap_peak_pending_tasks': peak_pending,
+                'javap_pending_limit': pending_limit,
                 'failures': failures,
                 'evidence_source': 'current_final_artifact',
                 'artifact_sha256': cache_key,
@@ -1265,7 +1295,10 @@ def _business_bytecode_batch(
                 ("artifact_sha256", artifact_sha),
             ),
         ))
-    typed_failures = [*(_bytecode_failure(item) for item in failure_values), *typed_failures]
+    typed_failures = list(dict.fromkeys((
+        *(_bytecode_failure(item) for item in failure_values),
+        *typed_failures,
+    )))
     if metrics.get("cache_write_failed"):
         concerns.append(EvidenceConcern(
             stage="business-bytecode",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import threading
 import time
@@ -39,6 +40,7 @@ class ArtifactInventory:
     failure: str = ""
     multi_release: bool = False
     target_jdk_resolved: bool = False
+    file_identity: tuple[int, int, int, int, int] = ()
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,16 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _file_identity(stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_size),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+    )
 
 
 def _target_jdk_major(value: str) -> int | None:
@@ -203,16 +215,41 @@ class Step5ArtifactFactStore:
             raise KeyError(f"artifact_coord_missing:{coord}")
         return identity
 
+    def _verified_inventory(self, coord: str) -> ArtifactInventory:
+        inventory = self.inventory(coord)
+        if inventory.failure:
+            raise ValueError(inventory.failure)
+        self._assert_path_identity(inventory)
+        return inventory
+
+    @staticmethod
+    def _assert_path_identity(inventory: ArtifactInventory) -> None:
+        try:
+            current = _file_identity(Path(inventory.identity.path).stat())
+        except OSError as exc:
+            raise ValueError(f"artifact_changed_after_inventory:{exc}") from exc
+        if current != inventory.file_identity:
+            raise ValueError("artifact_changed_after_inventory")
+
+    @staticmethod
+    def _open_verified_artifact(inventory: ArtifactInventory):
+        handle = Path(inventory.identity.path).open("rb")
+        if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+            handle.close()
+            raise ValueError("artifact_changed_after_inventory")
+        return handle
+
     def class_bytes(self, coord: str, location: ClassLocation) -> FactOutcome:
         try:
-            identity = self._identity(coord)
-            inventory = self.inventory(coord)
-            if inventory.failure:
-                raise ValueError(inventory.failure)
+            inventory = self._verified_inventory(coord)
             if location not in inventory.classes:
                 raise KeyError(f"class_location_not_in_inventory:{location.physical_entry}")
-            with zipfile.ZipFile(identity.path) as archive:
-                content = archive.read(location.physical_entry)
+            with self._open_verified_artifact(inventory) as handle:
+                with zipfile.ZipFile(handle) as archive:
+                    content = archive.read(location.physical_entry)
+                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+                    raise ValueError("artifact_changed_after_inventory")
+            self._assert_path_identity(inventory)
             with self._lock:
                 self._metrics["class_bytes_reads"] += 1
                 self._metrics["class_bytes_read"] += len(content)
@@ -222,48 +259,58 @@ class Step5ArtifactFactStore:
 
     def iter_class_bytes(self, coord: str):
         """Yield effective classes in inventory order from one ZIP open."""
-        identity = self._identity(coord)
-        inventory = self.inventory(coord)
-        if inventory.failure:
-            raise ValueError(inventory.failure)
-        with zipfile.ZipFile(identity.path) as archive:
-            for location in inventory.classes:
-                content = archive.read(location.physical_entry)
-                with self._lock:
-                    self._metrics["class_bytes_reads"] += 1
-                    self._metrics["class_bytes_read"] += len(content)
-                yield location, content
+        inventory = self._verified_inventory(coord)
+        with self._open_verified_artifact(inventory) as handle:
+            with zipfile.ZipFile(handle) as archive:
+                for location in inventory.classes:
+                    content = archive.read(location.physical_entry)
+                    with self._lock:
+                        self._metrics["class_bytes_reads"] += 1
+                        self._metrics["class_bytes_read"] += len(content)
+                    yield location, content
+            if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+                raise ValueError("artifact_changed_after_inventory")
+        self._assert_path_identity(inventory)
 
     def iter_physical_class_bytes(self, coord: str):
         """Yield all physical class entries in stable name order from one ZIP open."""
-        identity = self._identity(coord)
-        inventory = self.inventory(coord)
-        if inventory.failure:
-            raise ValueError(inventory.failure)
-        with zipfile.ZipFile(identity.path) as archive:
-            for entry in inventory.physical_classes:
-                content = archive.read(entry)
-                with self._lock:
-                    self._metrics["class_bytes_reads"] += 1
-                    self._metrics["class_bytes_read"] += len(content)
-                yield entry, content
+        inventory = self._verified_inventory(coord)
+        with self._open_verified_artifact(inventory) as handle:
+            with zipfile.ZipFile(handle) as archive:
+                for entry in inventory.physical_classes:
+                    content = archive.read(entry)
+                    with self._lock:
+                        self._metrics["class_bytes_reads"] += 1
+                        self._metrics["class_bytes_read"] += len(content)
+                    yield entry, content
+            if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+                raise ValueError("artifact_changed_after_inventory")
+        self._assert_path_identity(inventory)
 
     def resource_bytes(self, coord: str, resource_name: str) -> FactOutcome:
         """Return one immutable resource, with absence/failure kept explicit."""
         identity = self._identity(coord)
+        try:
+            self._verified_inventory(coord)
+        except Exception as exc:
+            return FactOutcome(
+                "failed", None, f"{type(exc).__name__}: {exc}", "zipfile",
+            )
         resource_name = str(resource_name or "")
         key = (
             "resource", identity.sha256, identity.target_jdk, resource_name,
         )
 
         def produce():
-            inventory = self.inventory(coord)
-            if inventory.failure:
-                raise ValueError(inventory.failure)
+            inventory = self._verified_inventory(coord)
             if resource_name not in inventory.resources:
                 raise KeyError(f"resource_not_in_inventory:{resource_name}")
-            with zipfile.ZipFile(identity.path) as archive:
-                content = archive.read(resource_name)
+            with self._open_verified_artifact(inventory) as handle:
+                with zipfile.ZipFile(handle) as archive:
+                    content = archive.read(resource_name)
+                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+                    raise ValueError("artifact_changed_after_inventory")
+            self._assert_path_identity(inventory)
             with self._lock:
                 self._metrics["resource_bytes_reads"] += 1
                 self._metrics["resource_bytes_read"] += len(content)
@@ -324,9 +371,12 @@ class Step5ArtifactFactStore:
     ) -> FactOutcome:
         """Publish/consume a class fact when the caller already streams class bytes."""
         identity = self._identity(coord)
-        inventory = self.inventory(coord)
-        if inventory.failure:
-            return FactOutcome("failed", None, inventory.failure, "classfile")
+        try:
+            inventory = self._verified_inventory(coord)
+        except Exception as exc:
+            return FactOutcome(
+                "failed", None, f"{type(exc).__name__}: {exc}", "classfile",
+            )
         if location not in inventory.classes:
             return FactOutcome(
                 "failed", None,
@@ -345,6 +395,15 @@ class Step5ArtifactFactStore:
         self, coord, location, profile, producer, *, retain: bool = True,
     ) -> FactOutcome:
         identity = self._identity(coord)
+        try:
+            self._verified_inventory(coord)
+        except Exception as exc:
+            with self._lock:
+                self._metrics["javap_requests"] += 1
+                self._metrics["javap_failures"] += 1
+            return FactOutcome(
+                "failed", None, f"{type(exc).__name__}: {exc}", "javap",
+            )
         key = (
             "javap", identity.sha256, identity.target_jdk,
             location.physical_entry, str(profile or ""),
@@ -358,7 +417,10 @@ class Step5ArtifactFactStore:
         def produce():
             with self._lock:
                 self._metrics["javap_starts"] += 1
-            return producer(identity, location, profile)
+            inventory = self._verified_inventory(coord)
+            result = producer(identity, location, profile)
+            self._assert_path_identity(inventory)
+            return result
 
         if retain:
             outcome = self._single_flight(key, produce, parser="javap")
@@ -397,6 +459,7 @@ class Step5ArtifactFactStore:
         path = Path(identity.path)
         if not path.is_file():
             raise FileNotFoundError(f"artifact_missing:{path}")
+        before_identity = _file_identity(path.stat())
         before = _sha256_file(path)
         if not re.fullmatch(r"[0-9a-f]{64}", identity.sha256):
             raise ValueError("artifact_sha256_invalid")
@@ -415,7 +478,8 @@ class Step5ArtifactFactStore:
             resources = tuple(sorted(name for name in names if not name.endswith(".class")))
             physical_classes = tuple(sorted(name for name in names if name.endswith(".class")))
         after = _sha256_file(path)
-        if after != before:
+        after_identity = _file_identity(path.stat())
+        if after != before or after_identity != before_identity:
             raise ValueError("artifact_changed_during_inventory")
         return ArtifactInventory(
             identity=identity,
@@ -424,6 +488,7 @@ class Step5ArtifactFactStore:
             physical_classes=physical_classes,
             multi_release=multi_release,
             target_jdk_resolved=_target_jdk_major(identity.target_jdk) is not None,
+            file_identity=before_identity,
         )
 
 

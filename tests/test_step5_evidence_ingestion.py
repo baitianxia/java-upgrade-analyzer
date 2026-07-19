@@ -485,6 +485,15 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual(result.rejected_edges, 2)
         self.assertEqual(len(result.failures), 1)
         self.assertEqual(result.failures[0].api_identity, first.callee_symbol)
+        self.assertEqual(
+            [item.class_name for item in result.failures[0].occurrences],
+            ["com.acme.Application", "com.acme.Other"],
+        )
+        self.assertEqual(
+            [item.caller_symbol for item in result.failures[0].occurrences],
+            ["com.acme.Application.run()", "com.acme.Other.run()"],
+        )
+        self.assertTrue(all(item.artifact for item in result.failures[0].occurrences))
 
     def test_incremental_ingestion_preserves_prior_diagnostics_and_coverage(self):
         graph = SimpleNamespace(reverse_edges={})

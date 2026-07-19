@@ -104,6 +104,7 @@ _STEP5_FINGERPRINT_VOLATILE_KEYS = frozenset({
     "generated_at", "created_at", "updated_at", "started_at", "finished_at",
     "elapsed", "elapsed_sec", "duration_sec", "peak_rss_mb", "current_rss_mb",
     "memory_samples", "step5_perf",
+    "javap_peak_pending_tasks", "javap_pending_limit",
 })
 
 
@@ -127,25 +128,29 @@ def _canonicalize_step5_result_value(value, report_roots):
                     )
                     if str(inner_key) not in {"failure_count", "failures"}
                 }
-                failure_semantics = sorted({
-                    (
-                        str(failure.get("collector") or ""),
-                        str(failure.get("reason_code") or ""),
-                        bool(failure.get("blocking")),
-                        str(failure.get("api_identity") or ""),
+                failure_semantics = {}
+                for failure in (item.get("failures") or ()):
+                    if not isinstance(failure, dict):
+                        continue
+                    canonical_failure = _canonicalize_step5_result_value(
+                        failure, report_roots,
                     )
-                    for failure in (item.get("failures") or ())
-                    if isinstance(failure, dict)
-                })
+                    occurrences = canonical_failure.get("occurrences")
+                    if isinstance(occurrences, list):
+                        canonical_failure["occurrences"] = sorted(
+                            occurrences,
+                            key=lambda occurrence: json.dumps(
+                                occurrence, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    identity = json.dumps(
+                        canonical_failure, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    failure_semantics[identity] = canonical_failure
                 ingestion["failure_semantics"] = [
-                    {
-                        "collector": collector,
-                        "reason_code": reason_code,
-                        "blocking": blocking,
-                        "api_identity": api_identity,
-                    }
-                    for collector, reason_code, blocking, api_identity
-                    in failure_semantics
+                    failure_semantics[key] for key in sorted(failure_semantics)
                 ]
                 result[key] = ingestion
                 continue

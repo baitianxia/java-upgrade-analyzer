@@ -1456,6 +1456,17 @@ def _step5_integrated_main_impl(args):
             'api_identity': failure.api_identity,
             'artifact': failure.artifact,
             'class_name': failure.class_name,
+            'detail': failure.detail,
+            'occurrences': [{
+                'caller_symbol': occurrence.caller_symbol,
+                'caller_qualified_key': occurrence.caller_qualified_key,
+                'artifact': occurrence.artifact,
+                'artifact_entry': occurrence.artifact_entry,
+                'class_name': occurrence.class_name,
+                'line': occurrence.line,
+                'instruction_offset': occurrence.instruction_offset,
+                'detail': occurrence.detail,
+            } for occurrence in failure.occurrences],
         }
         for collector, failure in ingestion_result.failures_by_collector
     ]

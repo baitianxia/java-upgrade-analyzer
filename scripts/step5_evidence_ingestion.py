@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import io
 import json
@@ -21,6 +21,7 @@ from step5_evidence_model import (
     CollectedEdge,
     CollectorBatch,
     EvidenceFailure,
+    EvidenceFailureOccurrence,
     ModuleScope,
     thaw_evidence_value,
 )
@@ -1836,11 +1837,15 @@ class EvidenceRegistry:
             for batch in self.batches
             for failure in batch.failures
         ]
-        failure_api_keys = {
-            (collector, failure.reason_code, failure.api_identity)
-            for collector, failure in failures_by_collector
-            if failure.api_identity
+        unresolved_failure_positions = {
+            (collector, failure.reason_code, failure.api_identity): index
+            for index, (collector, failure) in enumerate(failures_by_collector)
+            if (
+                failure.reason_code == "BYTECODE_CALLER_UNRESOLVED"
+                and failure.api_identity
+            )
         }
+        unresolved_occurrences = {}
         concerns = tuple(
             concern
             for batch in self.batches
@@ -1915,20 +1920,22 @@ class EvidenceRegistry:
                         "BYTECODE_CALLER_UNRESOLVED",
                         edge.callee_symbol,
                     )
-                    if failure_key in failure_api_keys:
-                        continue
-                    failure_api_keys.add(failure_key)
-                    failure = EvidenceFailure(
-                        stage="evidence-ingestion",
-                        reason_code="BYTECODE_CALLER_UNRESOLVED",
-                        blocking=True,
-                        api_identity=edge.callee_symbol,
+                    metadata = _edge_metadata(edge)
+                    detail = f"无法将字节码调用方映射到源码方法：{caller_qualified_key}"
+                    occurrence = EvidenceFailureOccurrence(
+                        caller_symbol=edge.caller_symbol,
+                        caller_qualified_key=caller_qualified_key,
                         artifact=edge.provenance.artifact_path,
-                        class_name=str(_edge_metadata(edge).get("caller_owner") or ""),
-                        detail=f"无法将字节码调用方映射到源码方法：{caller_qualified_key}",
+                        artifact_entry=(
+                            edge.provenance.artifact_entry
+                            or edge.provenance.class_or_resource_entry
+                        ),
+                        class_name=str(metadata.get("caller_owner") or ""),
+                        line=edge.provenance.line,
+                        instruction_offset=edge.provenance.instruction_offset,
+                        detail=detail,
                     )
-                    failures.append(failure)
-                    failures_by_collector.append((batch.collector, failure))
+                    unresolved_occurrences.setdefault(failure_key, set()).add(occurrence)
                     continue
                 identity = ("ordinary", *_edge_identity(edge))
                 if identity in seen:
@@ -2068,6 +2075,35 @@ class EvidenceRegistry:
         call_edge_identity_index.clear()
         for batch in post_framework_batches:
             ingest_ordinary_batch(batch)
+
+        for failure_key in sorted(unresolved_occurrences):
+            collector, reason_code, api_identity = failure_key
+            occurrences = tuple(sorted(unresolved_occurrences[failure_key]))
+            position = unresolved_failure_positions.get(failure_key)
+            if position is None:
+                first = occurrences[0]
+                failure = EvidenceFailure(
+                    stage="evidence-ingestion",
+                    reason_code=reason_code,
+                    blocking=True,
+                    api_identity=api_identity,
+                    artifact=first.artifact,
+                    class_name=first.class_name,
+                    detail=(
+                        f"无法将 {len(occurrences)} 个字节码调用方映射到源码方法；"
+                        "详见 occurrences"
+                    ),
+                    occurrences=occurrences,
+                )
+                failures_by_collector.append((collector, failure))
+                unresolved_failure_positions[failure_key] = len(failures_by_collector) - 1
+                continue
+            existing_collector, existing = failures_by_collector[position]
+            failures_by_collector[position] = (
+                existing_collector,
+                replace(existing, occurrences=(*existing.occurrences, *occurrences)),
+            )
+        failures = [failure for _collector, failure in failures_by_collector]
 
         def cumulative(existing, additions):
             merged = list(existing or ())
