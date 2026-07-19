@@ -23,7 +23,7 @@ from framework_adapters import (
     serialize_framework_batches,
 )
 from step5_evidence_ingestion import ingest_collector_batches
-from step5_artifact_fact_store import Step5ArtifactFactStore
+from step5_artifact_fact_store import FactOutcome, Step5ArtifactFactStore
 from step5_evidence_model import (
     ActivationEvidence,
     CollectedEdge,
@@ -429,6 +429,68 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     "org.springframework.context.ApplicationListener=com.acme.Replaced\n",
                 )
             replacement.replace(jar)
+
+            batch = framework_adapter_module.run_runtime_spring_registration_adapter(
+                [], artifact_catalog=catalog, fact_store=store,
+            )
+
+        self.assertFalse(batch.edges)
+        self.assertEqual(
+            {failure.reason_code for failure in batch.failures},
+            {"ARTIFACT_FACT_STORE_IDENTITY_FAILED"},
+        )
+        self.assertTrue(all(failure.blocking for failure in batch.failures))
+
+    def test_runtime_spring_registration_preserves_resource_identity_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "spring-runtime.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener=com.acme.Listener\n",
+                )
+            entry = {
+                "coord": "com.acme:spring-runtime",
+                "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            catalog = {"entries": [entry]}
+            store = Step5ArtifactFactStore.from_catalog(catalog)
+            with patch.object(
+                store, "resource_bytes",
+                return_value=FactOutcome(
+                    "failed", None,
+                    "ValueError: artifact_changed_after_inventory", "zipfile",
+                ),
+            ):
+                batch = framework_adapter_module.run_runtime_spring_registration_adapter(
+                    [], artifact_catalog=catalog, fact_store=store,
+                )
+
+        self.assertFalse(batch.edges)
+        self.assertEqual(
+            {failure.reason_code for failure in batch.failures},
+            {"ARTIFACT_FACT_STORE_IDENTITY_FAILED"},
+        )
+        self.assertTrue(all(failure.blocking for failure in batch.failures))
+
+    def test_runtime_spring_registration_blocks_deleted_shared_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "spring-runtime.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener=com.acme.Listener\n",
+                )
+            entry = {
+                "coord": "com.acme:spring-runtime",
+                "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            catalog = {"entries": [entry]}
+            store = Step5ArtifactFactStore.from_catalog(catalog)
+            store.inventory(entry["coord"])
+            jar.unlink()
 
             batch = framework_adapter_module.run_runtime_spring_registration_adapter(
                 [], artifact_catalog=catalog, fact_store=store,

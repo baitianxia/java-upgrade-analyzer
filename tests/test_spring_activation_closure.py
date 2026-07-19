@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import framework_adapters  # noqa: E402
+from step5_artifact_fact_store import Step5ArtifactFactStore  # noqa: E402
 
 
 @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
@@ -217,12 +218,14 @@ class SpringActivationClosureTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = self._compile_aop_fixture(Path(tmp))
             digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            catalog = {"entries": [{
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": digest,
+            }]}
 
             batches = framework_adapters.run_framework_adapters(
-                [], artifact_catalog={"entries": [{
-                    "coord": "__business__", "jar_path": str(artifact),
-                    "sha256": digest,
-                }]},
+                [], artifact_catalog=catalog,
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
             )
 
         batch = next(item for item in batches if item.collector == "spring_aop_activation")
@@ -269,6 +272,54 @@ class SpringActivationClosureTest(unittest.TestCase):
         self.assertEqual(edge.callee_symbol, "demo.ActiveAspect.before()")
         self.assertEqual(edge.provenance.artifact_sha256, entries[1]["sha256"])
         self.assertEqual(len(edge.activation_evidence), 2)
+
+    def test_aop_collector_blocks_changed_shared_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = self._compile_aop_fixture(root)
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            store.inventory(entry["coord"])
+            replacement = root / "replacement.jar"
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("demo/Fake.class", b"replacement")
+            replacement.replace(artifact)
+
+            batch = framework_adapters.collect_spring_aop_activation(
+                {"entries": [entry]}, {}, fact_store=store,
+            )
+
+        self.assertFalse(batch.edges)
+        self.assertEqual(
+            {failure.reason_code for failure in batch.failures},
+            {"ARTIFACT_FACT_STORE_IDENTITY_FAILED"},
+        )
+        self.assertTrue(all(failure.blocking for failure in batch.failures))
+
+    def test_aop_collector_turns_javap_timeout_into_blocking_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = self._compile_aop_fixture(Path(tmp))
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            with patch.object(
+                framework_adapters.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired("javap", 30),
+            ):
+                batch = framework_adapters.collect_spring_aop_activation(
+                    {"entries": [entry]}, {},
+                )
+
+        self.assertFalse(batch.edges)
+        self.assertIn(
+            "FRAMEWORK_JAVAP_FAILED",
+            {failure.reason_code for failure in batch.failures},
+        )
+        self.assertTrue(any(failure.blocking for failure in batch.failures))
 
     def _compile_security_fixture(self, root, *, nested_support=False):
         source = root / "security-src"
@@ -467,6 +518,74 @@ class SpringActivationClosureTest(unittest.TestCase):
             entries[2]["sha256"],
         )
 
+    def test_security_collector_blocks_changed_shared_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = self._compile_security_fixture(root)
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            store.inventory(entry["coord"])
+            replacement = root / "replacement.jar"
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("demo/Fake.class", b"replacement")
+            replacement.replace(artifact)
+
+            batch = framework_adapters.collect_spring_security_filter_activation(
+                {"entries": [entry]}, {"security_filter_chains": [{
+                    "config_owner": "demo.SecurityConfig",
+                    "chain_member": "chain",
+                    "filter_owner": "demo.CustomFilter",
+                    "before_filter_owner": "demo.AnchorFilter",
+                    "condition_status": "resolved",
+                }]}, fact_store=store,
+            )
+
+        self.assertFalse(batch.edges)
+        self.assertIn(
+            "ARTIFACT_FACT_STORE_IDENTITY_FAILED",
+            {failure.reason_code for failure in batch.failures},
+        )
+        self.assertTrue(any(failure.blocking for failure in batch.failures))
+
+    def test_security_collector_turns_javap_timeout_into_blocking_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = self._compile_security_fixture(root)
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            inventory = {"security_filter_chains": [{
+                "config_owner": "demo.SecurityConfig",
+                "chain_member": "chain",
+                "chain_descriptor": (
+                    "(Lorg/springframework/security/config/annotation/web/builders/"
+                    "HttpSecurity;Ldemo/CustomFilter;)Lorg/springframework/security/web/"
+                    "SecurityFilterChain;"
+                ),
+                "filter_owner": "demo.CustomFilter",
+                "before_filter_owner": "demo.AnchorFilter",
+                "condition_status": "resolved",
+                "registration_style": "security_filter_chain",
+            }]}
+            with patch.object(
+                framework_adapters.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired("javap", 30),
+            ):
+                batch = framework_adapters.collect_spring_security_filter_activation(
+                    {"entries": [entry]}, inventory,
+                )
+
+        self.assertFalse(batch.edges)
+        self.assertIn(
+            "FRAMEWORK_JAVAP_FAILED",
+            {failure.reason_code for failure in batch.failures},
+        )
+        self.assertTrue(any(failure.blocking for failure in batch.failures))
+
     def test_packaged_class_locator_reports_malformed_nested_jar(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "broken-app.jar"
@@ -532,13 +651,15 @@ class SpringActivationClosureTest(unittest.TestCase):
             root = Path(tmp)
             artifact = self._compile_security_fixture(root)
             digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            catalog = {"entries": [{
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": digest,
+            }]}
 
             batches = framework_adapters.run_framework_adapters(
                 [{"root": str(root / "security-src")}],
-                artifact_catalog={"entries": [{
-                    "coord": "__business__", "jar_path": str(artifact),
-                    "sha256": digest,
-                }]},
+                artifact_catalog=catalog,
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
             )
 
         batch = next(
