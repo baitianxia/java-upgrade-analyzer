@@ -29,6 +29,7 @@ from step5_evidence_model import (
     ModuleScope,
     thaw_evidence_value,
 )
+from step5_artifact_fact_store import ClassLocation
 
 
 def _shared_artifact_inventory(entry, fact_store, *, strict=False):
@@ -39,6 +40,8 @@ def _shared_artifact_inventory(entry, fact_store, *, strict=False):
     expected_sha = str((entry or {}).get('sha256') or '').lower()
     expected_path = str((entry or {}).get('jar_path') or '')
     if not coord or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+        if strict:
+            raise ValueError('artifact_fact_store_identity_invalid')
         return None
     try:
         inventory = fact_store.verified_inventory(coord)
@@ -56,6 +59,68 @@ def _shared_artifact_inventory(entry, fact_store, *, strict=False):
             raise ValueError('artifact_fact_store_identity_mismatch')
         return None
     return inventory
+
+
+def _fact_store_identity_error(entry, context, exc):
+    return (
+        f"{entry.get('jar_path') or ''}:artifact_fact_store_identity_failed:"
+        f"{context}:{type(exc).__name__}:{exc}"
+    )
+
+
+def _artifact_class_location(inventory, owner):
+    expected = str(owner or '').replace('.', '/') + '.class'
+    matches = [
+        location for location in inventory.classes
+        if (
+            location.physical_entry == expected
+            or location.physical_entry.endswith('/' + expected)
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError(f'artifact_class_location_count:{owner}:{len(matches)}')
+    location = matches[0]
+    return ClassLocation(
+        logical_name=expected,
+        binary_name=owner,
+        physical_entry=location.physical_entry,
+        multi_release_version=location.multi_release_version,
+    )
+
+
+def _artifact_javap(entry, owner, flags, profile, fact_store=None):
+    jar_path = str((entry or {}).get('jar_path') or '')
+
+    def run(identity=None, *_args):
+        classpath = identity.path if identity is not None else jar_path
+        return subprocess.run(
+            ['javap', *flags, '-classpath', classpath, owner],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=30,
+        )
+
+    if fact_store is None:
+        try:
+            return run(), ''
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, f'{jar_path}:{owner}:{type(exc).__name__}'
+    try:
+        inventory = _shared_artifact_inventory(entry, fact_store, strict=True)
+        location = _artifact_class_location(inventory, owner)
+        outcome = fact_store.javap_fact(
+            str(entry.get('coord') or ''), location, profile, run,
+        )
+    except (KeyError, ValueError) as exc:
+        return None, _fact_store_identity_error(entry, f'javap:{owner}', exc)
+    if outcome.status != 'complete':
+        return None, (
+            f"{jar_path}:artifact_fact_store_identity_failed:javap:{owner}:"
+            f"{outcome.reason}"
+        )
+    return outcome.value, ''
 
 
 class FrameworkAdapter(Protocol):
@@ -222,6 +287,7 @@ def _framework_failure(adapter, error):
     if artifact.startswith('/private/var/'):
         artifact = '/var/' + artifact[len('/private/var/'):]
     reason = 'FRAMEWORK_ADAPTER_COLLECTION_FAILED'
+    blocking = False
     if 'spring_xml:ParseError' in text:
         reason = 'SPRING_XML_PARSE_FAILED'
     elif 'mybatis_xml:ParseError' in text:
@@ -250,10 +316,13 @@ def _framework_failure(adapter, error):
         reason = 'SPRING_NESTED_ARTIFACT_INVALID'
     elif 'spring_packaged_class_ambiguous' in text:
         reason = 'SPRING_PACKAGED_CLASS_AMBIGUOUS'
+    elif 'artifact_fact_store_identity_failed' in text:
+        reason = 'ARTIFACT_FACT_STORE_IDENTITY_FAILED'
+        blocking = True
     return EvidenceFailure(
         stage=adapter,
         reason_code=reason,
-        blocking=False,
+        blocking=blocking,
         artifact=artifact if separator else '',
         detail=detail if separator else text,
     )
@@ -1452,8 +1521,14 @@ def _mybatis_runtime_entry(artifact_catalog, fact_store=None):
         jar_path = Path(str(entry.get('jar_path') or ''))
         if not jar_path.is_file():
             continue
-        shared_inventory = _shared_artifact_inventory(entry, fact_store)
-        if shared_inventory is not None:
+        if fact_store is not None:
+            try:
+                shared_inventory = _shared_artifact_inventory(
+                    entry, fact_store, strict=True,
+                )
+            except (KeyError, ValueError) as exc:
+                errors.append(_fact_store_identity_error(entry, 'mybatis_runtime', exc))
+                continue
             names = set(shared_inventory.resources) | set(shared_inventory.physical_classes)
         else:
             try:
@@ -1634,8 +1709,8 @@ def _verify_mybatis_runtime_dispatch(entry, fact_store=None):
             entry, fact_store, strict=fact_store is not None,
         )
     except (KeyError, ValueError) as exc:
-        detail = f'artifact_fact_store:{type(exc).__name__}:{exc}'
-        return {}, [f'{jar_path}:{owner}:{detail}' for owner in classes]
+        detail = _fact_store_identity_error(entry, 'mybatis_dispatch', exc)
+        return {}, [f'{detail}:{owner}' for owner in classes]
     locations = {
         location.binary_name: location
         for location in (shared_inventory.classes if shared_inventory else ())
@@ -1654,15 +1729,22 @@ def _verify_mybatis_runtime_dispatch(entry, fact_store=None):
             return completed.returncode, completed.stdout
 
         try:
-            if fact_store is not None and owner in locations:
+            if fact_store is not None:
+                location = locations.get(owner)
+                if location is None:
+                    errors.append(f'{jar_path}:{owner}:shared_class_missing')
+                    continue
                 outcome = fact_store.javap_fact(
-                    str(entry.get('coord') or ''), locations[owner],
+                    str(entry.get('coord') or ''), location,
                     'framework-mybatis-code-private-signatures-v1', run_javap,
                 )
                 if outcome.status == 'complete':
                     returncode, stdout = outcome.value
                 else:
-                    errors.append(f'{jar_path}:{owner}:{outcome.reason}')
+                    errors.append(
+                        f'{jar_path}:artifact_fact_store_identity_failed:'
+                        f'mybatis_dispatch:{owner}:{outcome.reason}'
+                    )
                     continue
             else:
                 returncode, stdout = run_javap()
@@ -2222,7 +2304,7 @@ def _spring_boot_business_activation(source_roots):
 
 
 def _verified_spring_boot_business_activation(
-    activation_evidence, artifact_catalog, fact_store=None,
+    activation_evidence, artifact_catalog, fact_store=None, errors=None,
 ):
     business_entries = [
         item for item in (artifact_catalog or {}).get('entries') or []
@@ -2235,8 +2317,17 @@ def _verified_spring_boot_business_activation(
     business = business_entries[0]
     jar_path = Path(str(business.get('jar_path') or ''))
     expected_sha256 = str(business.get('sha256') or '').lower()
-    shared_inventory = _shared_artifact_inventory(business, fact_store)
-    if shared_inventory is not None:
+    if fact_store is not None:
+        try:
+            shared_inventory = _shared_artifact_inventory(
+                business, fact_store, strict=True,
+            )
+        except (KeyError, ValueError) as exc:
+            if errors is not None:
+                errors.append(_fact_store_identity_error(
+                    business, 'spring_boot_activation', exc,
+                ))
+            return []
         names = set(shared_inventory.resources) | set(shared_inventory.physical_classes)
     else:
         try:
@@ -2619,21 +2710,17 @@ def _spring_transaction_custom_mode(source_roots):
     return findings, errors
 
 
-def _packaged_transactional_methods(jar_path, owners):
+def _packaged_transactional_methods(entry, owners, fact_store=None):
     verified = {}
     errors = []
+    jar_path = str(entry.get('jar_path') or '')
     for owner in sorted(set(owners)):
-        try:
-            completed = subprocess.run(
-                ['javap', '-v', '-p', '-classpath', str(jar_path), owner],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            errors.append(f'{jar_path}:{owner}:{type(exc).__name__}')
+        completed, error = _artifact_javap(
+            entry, owner, ('-v', '-p'),
+            'framework-spring-transaction-annotations-v1', fact_store,
+        )
+        if error:
+            errors.append(error)
             continue
         if completed.returncode != 0:
             errors.append(f'{jar_path}:{owner}:javap_exit_{completed.returncode}')
@@ -2692,6 +2779,7 @@ def run_spring_transaction_proxy_adapter(
     source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
     activation_evidence = _verified_spring_boot_business_activation(
         source_activation_evidence, artifact_catalog, fact_store=fact_store,
+        errors=activation_errors,
     )
     custom_mode_findings, custom_mode_errors = _spring_transaction_custom_mode(source_roots)
     errors.extend(activation_errors)
@@ -2706,8 +2794,9 @@ def run_spring_transaction_proxy_adapter(
     if transactional_methods and len(business_entries) == 1:
         business_entry = business_entries[0]
         packaged, packaged_errors = _packaged_transactional_methods(
-            business_entry.get('jar_path'),
+            business_entry,
             [item['owner'] for item in transactional_methods],
+            fact_store=fact_store,
         )
         errors.extend(packaged_errors)
         for method in transactional_methods:
@@ -2768,17 +2857,12 @@ def run_spring_transaction_proxy_adapter(
         for role, owner, member, parameter_count in _SPRING_TRANSACTION_TARGETS:
             entry = entries_by_role[role][0]
             jar_path = str(entry.get('jar_path') or '')
-            try:
-                completed = subprocess.run(
-                    ['javap', '-p', '-s', '-classpath', jar_path, owner],
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    timeout=30,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                errors.append(f'{jar_path}:{owner}:{type(exc).__name__}')
+            completed, error = _artifact_javap(
+                entry, owner, ('-p', '-s'),
+                'framework-spring-transaction-methods-v1', fact_store,
+            )
+            if error:
+                errors.append(error)
                 continue
             if completed.returncode != 0:
                 errors.append(f'{jar_path}:{owner}:javap_exit_{completed.returncode}')
@@ -2877,6 +2961,7 @@ def run_spring_data_repository_adapter(
     source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
     activation_evidence = _verified_spring_boot_business_activation(
         source_activation_evidence, artifact_catalog, fact_store=fact_store,
+        errors=activation_errors,
     )
     business_entries = [
         item for item in (artifact_catalog or {}).get('entries') or []
@@ -2920,15 +3005,13 @@ def run_spring_data_repository_adapter(
     ):
         entry = entries[0]
         jar_path = str(entry.get('jar_path') or '')
-        try:
-            completed = subprocess.run(
-                ['javap', '-p', '-s', '-classpath', jar_path, _SIMPLE_JPA_REPOSITORY],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=30,
-            )
+        completed, error = _artifact_javap(
+            entry, _SIMPLE_JPA_REPOSITORY, ('-p', '-s'),
+            'framework-spring-data-methods-v1', fact_store,
+        )
+        if error:
+            errors.append(error)
+        else:
             if completed.returncode != 0:
                 errors.append(f'{jar_path}:{_SIMPLE_JPA_REPOSITORY}:javap_exit_{completed.returncode}')
             else:
@@ -2949,9 +3032,6 @@ def run_spring_data_repository_adapter(
                             'parameters': parameters,
                             'descriptor': method['descriptor'],
                         })
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            errors.append(f'{jar_path}:{_SIMPLE_JPA_REPOSITORY}:{type(exc).__name__}')
-
         for repository in repositories:
             for method in implementation_methods:
                 target = (
@@ -3021,7 +3101,30 @@ def _aload_slot(instruction):
     return None
 
 
-def _message_listener_adapter_callbacks(jar_path, coord, activation_evidence):
+def _message_listener_adapter_callbacks(
+    jar_path, coord, activation_evidence, fact_store=None, entry=None,
+    provenance_jar_path=None,
+):
+    provenance_jar_path = provenance_jar_path or jar_path
+    if fact_store is not None:
+        entry = entry or {'coord': coord, 'jar_path': jar_path}
+        try:
+            _shared_artifact_inventory(entry, fact_store, strict=True)
+            with tempfile.TemporaryDirectory(
+                prefix='spring-message-listener-snapshot-'
+            ) as temporary:
+                snapshot = Path(temporary) / 'verified-classes.jar'
+                with zipfile.ZipFile(snapshot, 'w') as archive:
+                    for name, content in fact_store.iter_physical_class_bytes(coord):
+                        archive.writestr(name, content)
+                return _message_listener_adapter_callbacks(
+                    str(snapshot), coord, activation_evidence,
+                    provenance_jar_path=provenance_jar_path,
+                )
+        except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+            return [], [_fact_store_identity_error(
+                entry, 'message_listener', exc,
+            )]
     parsed = []
     errors = []
     try:
@@ -3163,7 +3266,7 @@ def _message_listener_adapter_callbacks(jar_path, coord, activation_evidence):
                     'runtime_activation': 'active' if activation_evidence else 'unproven',
                     'provenance': {
                         'coord': coord,
-                        'jar': str(jar_path),
+                        'jar': str(provenance_jar_path),
                         'artifact_entry': item['entry'],
                         'line': instruction['offset'],
                         'registration_owner': item['owner'],
@@ -3911,6 +4014,7 @@ def run_runtime_spring_registration_adapter(
     source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
     activation_evidence = _verified_spring_boot_business_activation(
         source_activation_evidence, artifact_catalog, fact_store=fact_store,
+        errors=activation_errors,
     )
     trusted_activation_evidence = activation_evidence if not activation_errors else []
     spring_boot_active = bool(trusted_activation_evidence)
@@ -3927,7 +4031,8 @@ def run_runtime_spring_registration_adapter(
             continue
         if coord == '__business__':
             callbacks, callback_errors = _message_listener_adapter_callbacks(
-                jar_path, coord, trusted_activation_evidence
+                jar_path, coord, trusted_activation_evidence,
+                fact_store=fact_store, entry=item,
             )
             errors.extend(callback_errors)
             for edge in callbacks:
@@ -3949,8 +4054,10 @@ def run_runtime_spring_registration_adapter(
                     active_callbacks += 1
             continue
         try:
-            shared_inventory = _shared_artifact_inventory(item, fact_store)
-            if shared_inventory is not None:
+            if fact_store is not None:
+                shared_inventory = _shared_artifact_inventory(
+                    item, fact_store, strict=True,
+                )
                 names = set(shared_inventory.resources) | set(shared_inventory.physical_classes)
                 def shared_resource(name):
                     outcome = fact_store.resource_bytes(coord, name)
@@ -4055,6 +4162,10 @@ def run_runtime_spring_registration_adapter(
             finally:
                 if jar_context is not None:
                     jar_context.close()
+        except (KeyError, ValueError) as exc:
+            errors.append(_fact_store_identity_error(
+                item, 'spring_runtime_registration', exc,
+            ))
         except (OSError, zipfile.BadZipFile, UnicodeError) as exc:
             errors.append(f'{jar_path}:{type(exc).__name__}')
     if resource_files and not spring_boot_active:

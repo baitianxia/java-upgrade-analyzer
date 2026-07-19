@@ -324,15 +324,151 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     archive.writestr(owner.replace(".", "/") + ".class", b"replacement")
             replacement.replace(jar)
 
-            with patch.object(framework_adapter_module.subprocess, "run") as run:
+            completed = SimpleNamespace(returncode=0, stdout="")
+            with patch.object(
+                framework_adapter_module.subprocess, "run", return_value=completed,
+            ) as run:
                 verified, errors = framework_adapter_module._verify_mybatis_runtime_dispatch(
                     entry, fact_store=store,
                 )
+            runtime_entry, runtime_errors, count = framework_adapter_module._mybatis_runtime_entry(
+                {"entries": [{**entry, "evidence_source": "current_final_artifact"}]},
+                fact_store=store,
+            )
 
         self.assertFalse(any(verified.values()))
         self.assertEqual(0, run.call_count)
         self.assertEqual(len(errors), 3)
         self.assertTrue(all("artifact_changed_after_inventory" in item for item in errors))
+
+        self.assertIsNone(runtime_entry)
+        self.assertEqual(0, count)
+        self.assertEqual(len(runtime_errors), 1)
+        self.assertIn("artifact_fact_store_identity_failed", runtime_errors[0])
+
+    def test_mybatis_runtime_dispatch_does_not_bypass_missing_shared_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "mybatis.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr(
+                    "org/apache/ibatis/binding/MapperProxy.class", b"fixture",
+                )
+            entry = {
+                "coord": "org.mybatis:mybatis",
+                "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            completed = SimpleNamespace(returncode=0, stdout="")
+            with patch.object(
+                framework_adapter_module.subprocess, "run", return_value=completed,
+            ) as run:
+                verified, errors = framework_adapter_module._verify_mybatis_runtime_dispatch(
+                    entry, fact_store=store,
+                )
+
+        self.assertFalse(any(verified.values()))
+        self.assertEqual(1, run.call_count)
+        self.assertEqual(2, len(errors))
+        self.assertTrue(all("shared_class_missing" in item for item in errors))
+
+    def test_artifact_javap_does_not_run_after_fact_store_identity_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "runtime.jar"
+            replacement = Path(tmp) / "replacement.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("com/acme/Target.class", b"original")
+            digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+            entry = {"coord": "g:a", "jar_path": str(jar), "sha256": digest}
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            store.inventory("g:a")
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("com/acme/Target.class", b"replacement")
+            replacement.replace(jar)
+
+            with patch.object(framework_adapter_module.subprocess, "run") as run:
+                completed, error = framework_adapter_module._artifact_javap(
+                    entry, "com.acme.Target", ("-p", "-s"),
+                    "test-profile", store,
+                )
+
+        self.assertIsNone(completed)
+        self.assertIn("artifact_fact_store_identity_failed", error)
+        self.assertEqual(0, run.call_count)
+
+    def test_fact_store_identity_failure_is_typed_and_blocking(self):
+        failure = framework_adapter_module._framework_failure(
+            "spring_data_repository_proxy",
+            "/runtime.jar:artifact_fact_store_identity_failed:artifact_changed_after_inventory",
+        )
+
+        self.assertEqual("ARTIFACT_FACT_STORE_IDENTITY_FAILED", failure.reason_code)
+        self.assertTrue(failure.blocking)
+
+    def test_runtime_spring_registration_blocks_changed_fact_store_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "spring-runtime.jar"
+            replacement = Path(tmp) / "replacement.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener=com.acme.Listener\n",
+                )
+            entry = {
+                "coord": "com.acme:spring-runtime",
+                "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            catalog = {"entries": [entry]}
+            store = Step5ArtifactFactStore.from_catalog(catalog)
+            store.inventory(entry["coord"])
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr(
+                    "META-INF/spring.factories",
+                    "org.springframework.context.ApplicationListener=com.acme.Replaced\n",
+                )
+            replacement.replace(jar)
+
+            batch = framework_adapter_module.run_runtime_spring_registration_adapter(
+                [], artifact_catalog=catalog, fact_store=store,
+            )
+
+        self.assertFalse(batch.edges)
+        self.assertEqual(
+            {failure.reason_code for failure in batch.failures},
+            {"ARTIFACT_FACT_STORE_IDENTITY_FAILED"},
+        )
+        self.assertTrue(all(failure.blocking for failure in batch.failures))
+
+    def test_message_listener_does_not_scan_changed_fact_store_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "business.jar"
+            replacement = Path(tmp) / "replacement.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("com/acme/Application.class", b"original")
+            entry = {
+                "coord": "__business__",
+                "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            store.inventory(entry["coord"])
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("com/acme/Application.class", b"replacement")
+            replacement.replace(jar)
+
+            with patch.object(framework_adapter_module.subprocess, "run") as run:
+                callbacks, errors = (
+                    framework_adapter_module._message_listener_adapter_callbacks(
+                        str(jar), entry["coord"], [], fact_store=store, entry=entry,
+                    )
+                )
+
+        self.assertEqual([], callbacks)
+        self.assertEqual(0, run.call_count)
+        self.assertEqual(1, len(errors))
+        self.assertIn("artifact_fact_store_identity_failed", errors[0])
 
     def test_framework_orchestrator_returns_tuple_and_serializer_alone_projects_v1(self):
         batches = _run_framework_adapters([], artifact_catalog={"entries": []})
