@@ -42,7 +42,10 @@ class Step5ColdRunContractTest(unittest.TestCase):
         self.assertEqual("1.25", values[("artifact_facts", "inventory_elapsed_sec")])
         self.assertEqual("7", values[("artifact_facts", "inventory_hits")])
 
-    def _write_report(self, root, *, status="reachable", path_text="A -> B"):
+    def _write_report(
+        self, root, *, status="reachable", path_text="A -> B",
+        evidence_ingestion=None,
+    ):
         root = Path(root)
         call_chain = root / "evidence" / "call_chain"
         call_chain.mkdir(parents=True)
@@ -50,7 +53,11 @@ class Step5ColdRunContractTest(unittest.TestCase):
             json.dumps({
                 "generated_at": "volatile",
                 "reachable": int(status == "reachable"),
-                "meta": {"graph_stats": {"step5_perf": {"trace": {"elapsed_sec": 1.0}}}},
+                "meta": {"graph_stats": {
+                    "step5_perf": {"trace": {"elapsed_sec": 1.0}},
+                    **({"evidence_ingestion": evidence_ingestion}
+                       if evidence_ingestion is not None else {}),
+                }},
             }),
             encoding="utf-8",
         )
@@ -84,6 +91,67 @@ class Step5ColdRunContractTest(unittest.TestCase):
             self.assertNotEqual(
                 step5_result_contract(Path(first)),
                 step5_result_contract(Path(second)),
+            )
+
+    def test_contract_treats_query_reverse_edge_bucket_as_unordered(self):
+        edges = [
+            {"caller_symbol_id": "B", "callee_key": "target()", "line": 2},
+            {"caller_symbol_id": "A", "callee_key": "target()", "line": 1},
+        ]
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for root, bucket in ((Path(first), edges), (Path(second), list(reversed(edges)))):
+                self._write_report(root)
+                index = root / ".runtime" / "indexes" / "s5_query_index.json"
+                index.parent.mkdir(parents=True)
+                index.write_text(json.dumps({
+                    "methods_by_id": {},
+                    "reverse_edges": {"target()": bucket},
+                }), encoding="utf-8")
+
+            self.assertEqual(
+                step5_result_contract(Path(first)),
+                step5_result_contract(Path(second)),
+            )
+
+    def test_contract_ignores_duplicate_ingestion_failures_but_keeps_semantics(self):
+        failure = {
+            "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+            "blocking": True,
+            "api_identity": "com.vendor.Legacy.call()",
+            "class_name": "com.acme.First",
+            "detail": "first caller",
+        }
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+            tempfile.TemporaryDirectory() as changed,
+        ):
+            self._write_report(first, evidence_ingestion={
+                "rejected_edges": 2,
+                "failure_count": 2,
+                "failures": [failure, {**failure, "class_name": "com.acme.Second"}],
+                "reason_codes": ["BYTECODE_CALLER_UNRESOLVED"],
+            })
+            self._write_report(second, evidence_ingestion={
+                "rejected_edges": 2,
+                "failure_count": 1,
+                "failures": [failure],
+                "reason_codes": ["BYTECODE_CALLER_UNRESOLVED"],
+            })
+
+            self.assertEqual(
+                step5_result_contract(Path(first)),
+                step5_result_contract(Path(second)),
+            )
+            self._write_report(changed, evidence_ingestion={
+                "rejected_edges": 1,
+                "failure_count": 1,
+                "failures": [{**failure, "api_identity": "com.vendor.Other.call()"}],
+                "reason_codes": ["BYTECODE_CALLER_UNRESOLVED"],
+            })
+            self.assertNotEqual(
+                step5_result_contract(Path(first)),
+                step5_result_contract(Path(changed)),
             )
 
     def test_contract_rejects_missing_step5_outputs(self):
@@ -363,6 +431,26 @@ class SingleFlightFactTest(unittest.TestCase):
         self.assertEqual(verbose.value, "verbose")
         self.assertEqual(header.value, "header")
         self.assertEqual(calls, ["header", "constant-pool", "verbose-code-v1", "header-v1"])
+
+    def test_non_retained_javap_fact_does_not_accumulate_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, coord, location = self._store_and_location(tmp)
+            starts = []
+
+            def produce(*_args):
+                starts.append(1)
+                return ("large javap output", "", 0)
+
+            first = store.javap_fact(
+                coord, location, "business", produce, retain=False,
+            )
+            second = store.javap_fact(
+                coord, location, "business", produce, retain=False,
+            )
+
+        self.assertEqual(first.value, second.value)
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(store.metrics()["retained_facts"], 0)
 
     def test_class_bytes_are_not_retained(self):
         with tempfile.TemporaryDirectory() as tmp:

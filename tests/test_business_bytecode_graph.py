@@ -3,6 +3,8 @@ import sys
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -27,6 +29,61 @@ from business_bytecode_graph import (
 class BusinessBytecodeGraphTest(unittest.TestCase):
     def _artifact_sha256(self, path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def test_business_javap_fallbacks_run_in_parallel_and_keep_class_order(self):
+        import business_bytecode_graph as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                for index in range(6):
+                    archive.writestr(f"com/acme/Class{index}.class", b"class")
+            artifact_sha256 = self._artifact_sha256(jar_path)
+            active = 0
+            max_active = 0
+            lock = threading.Lock()
+
+            def run_javap(command, timeout):
+                nonlocal active, max_active
+                class_name = command[-1]
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.03 if class_name.endswith("0") else 0.005)
+                with lock:
+                    active -= 1
+                return f"edge:{class_name}", "", 0
+
+            def parse_javap(text, class_name):
+                return [{
+                    "caller_owner": class_name,
+                    "caller_name": "run",
+                    "caller_signature": "()",
+                    "callee_key": text,
+                    "callee_simple_key": text,
+                    "evidence_type": "bytecode_method_invocation",
+                    "line": 1,
+                }]
+
+            with (
+                patch.object(module, "parse_classfile_calls", return_value=None),
+                patch.object(module, "parse_javap_calls", side_effect=parse_javap),
+                patch.object(module, "run_cmd", side_effect=run_javap),
+                patch.dict(module.os.environ, {"JUA_STEP5_BYTECODE_JAVAP_WORKERS": "3"}),
+            ):
+                evidence, metrics = collect_business_bytecode_edges(
+                    [],
+                    artifact_catalog={"by_coord": {"__business__": {
+                        "jar_path": str(jar_path), "sha256": artifact_sha256,
+                    }}},
+                )
+
+            self.assertGreater(max_active, 1)
+            self.assertEqual(metrics["javap_fallback_classes"], 6)
+            self.assertEqual(
+                [item["caller_owner"] for item in evidence],
+                [f"com.acme.Class{index}" for index in range(6)],
+            )
 
     def test_incomplete_business_bytecode_scan_is_not_persisted(self):
         import business_bytecode_graph as module

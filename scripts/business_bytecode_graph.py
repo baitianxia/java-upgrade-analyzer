@@ -10,6 +10,7 @@ import re
 import struct
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from compat import run_cmd
@@ -58,6 +59,16 @@ REFLECTION_UTF8_MARKERS = {
     'unreflect',
 }
 BYTECODE_CACHE_SCHEMA = 'java-upgrade-analyzer.bytecode-index.v3'
+
+
+def _business_javap_workers():
+    value = str(os.environ.get('JUA_STEP5_BYTECODE_JAVAP_WORKERS') or '').strip()
+    if value:
+        try:
+            return max(1, min(16, int(value)))
+        except ValueError:
+            return 4
+    return 4
 
 
 def _sha256_file(path):
@@ -974,6 +985,8 @@ def collect_business_bytecode_edges(
             }
     if business_jar and os.path.isfile(business_jar):
         try:
+            class_results = []
+            javap_tasks = []
             for entry, data in _iter_business_class_bytes(business_jar, fact_store):
                 if scanned >= max_classes:
                     failures.append('class_scan_limit_reached')
@@ -983,63 +996,98 @@ def collect_business_bytecode_edges(
                 scanned += 1
                 parsed_edges = parse_classfile_calls(data, class_name)
                 if parsed_edges is None:
-                    parser_kind = 'javap'
                     javap_fallback_classes += 1
-
-                    def produce_javap(identity=None, _location=None, _profile=None):
-                        artifact_path = identity.path if identity is not None else business_jar
-                        if logical_entry == entry:
-                            return run_cmd(
-                                [
-                                    'javap', '-classpath', artifact_path,
-                                    '-c', '-s', '-p', '-v', class_name,
-                                ],
-                                timeout=30,
-                            )
-                        temporary_class = tempfile.NamedTemporaryFile(
-                            suffix='.class', delete=False
-                        )
-                        try:
-                            temporary_class.write(data)
-                            temporary_class.close()
-                            return run_cmd(
-                                [
-                                    'javap', '-c', '-s', '-p', '-v',
-                                    temporary_class.name,
-                                ],
-                                timeout=30,
-                            )
-                        finally:
-                            try:
-                                os.unlink(temporary_class.name)
-                            except OSError:
-                                pass
-
-                    if fact_store is None:
-                        stdout, stderr, rc = produce_javap()
-                    else:
-                        from step5_artifact_fact_store import ClassLocation
-                        location = ClassLocation(
-                            logical_name=logical_entry,
-                            binary_name=class_name,
-                            physical_entry=entry,
-                            multi_release_version='base',
-                        )
-                        outcome = fact_store.javap_fact(
-                            '__business__', location,
-                            'verbose-code-private-signatures-v1', produce_javap,
-                        )
-                        if outcome.status == 'complete':
-                            stdout, stderr, rc = outcome.value
-                        else:
-                            stdout, stderr, rc = '', outcome.reason, 1
-                    if rc != 0:
-                        failures.append(f'javap_failed:{class_name}:{(stderr or "")[:80]}')
-                        continue
-                    parsed_edges = parse_javap_calls(stdout, class_name)
+                    class_results.append(None)
+                    javap_tasks.append({
+                        'result_index': len(class_results) - 1,
+                        'entry': entry,
+                        'logical_entry': logical_entry,
+                        'class_name': class_name,
+                        'data': data if logical_entry != entry else None,
+                    })
                 else:
-                    parser_kind = 'classfile'
                     fast_path_classes += 1
+                    class_results.append((entry, class_name, 'classfile', parsed_edges, ''))
+
+            def parse_javap_task(task):
+                entry = task['entry']
+                logical_entry = task['logical_entry']
+                class_name = task['class_name']
+                nested_data = task['data']
+
+                def produce_javap(identity=None, _location=None, _profile=None):
+                    artifact_path = identity.path if identity is not None else business_jar
+                    if logical_entry == entry:
+                        return run_cmd(
+                            [
+                                'javap', '-classpath', artifact_path,
+                                '-c', '-s', '-p', '-v', class_name,
+                            ],
+                            timeout=30,
+                        )
+                    temporary_class = tempfile.NamedTemporaryFile(
+                        suffix='.class', delete=False
+                    )
+                    try:
+                        temporary_class.write(nested_data)
+                        temporary_class.close()
+                        return run_cmd(
+                            [
+                                'javap', '-c', '-s', '-p', '-v',
+                                temporary_class.name,
+                            ],
+                            timeout=30,
+                        )
+                    finally:
+                        try:
+                            os.unlink(temporary_class.name)
+                        except OSError:
+                            pass
+
+                if fact_store is None:
+                    stdout, stderr, rc = produce_javap()
+                else:
+                    from step5_artifact_fact_store import ClassLocation
+                    location = ClassLocation(
+                        logical_name=logical_entry,
+                        binary_name=class_name,
+                        physical_entry=entry,
+                        multi_release_version='base',
+                    )
+                    outcome = fact_store.javap_fact(
+                        '__business__', location,
+                        'verbose-code-private-signatures-v1', produce_javap,
+                        retain=False,
+                    )
+                    if outcome.status == 'complete':
+                        stdout, stderr, rc = outcome.value
+                    else:
+                        stdout, stderr, rc = '', outcome.reason, 1
+                if rc != 0:
+                    return (
+                        entry, class_name, 'javap', [],
+                        f'javap_failed:{class_name}:{(stderr or "")[:80]}',
+                    )
+                return entry, class_name, 'javap', parse_javap_calls(stdout, class_name), ''
+
+            workers = min(_business_javap_workers(), len(javap_tasks))
+            if workers <= 1:
+                for task in javap_tasks:
+                    class_results[task['result_index']] = parse_javap_task(task)
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(parse_javap_task, task): task
+                        for task in javap_tasks
+                    }
+                    for future in as_completed(futures):
+                        task = futures[future]
+                        class_results[task['result_index']] = future.result()
+
+            for entry, class_name, parser_kind, parsed_edges, failure in class_results:
+                if failure:
+                    failures.append(failure)
+                    continue
                 for item in parsed_edges:
                     item['class_file'] = f'{business_jar}!/{entry}'
                     item['artifact_sha256'] = actual_business_sha256

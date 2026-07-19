@@ -1836,6 +1836,11 @@ class EvidenceRegistry:
             for batch in self.batches
             for failure in batch.failures
         ]
+        failure_api_keys = {
+            (collector, failure.reason_code, failure.api_identity)
+            for collector, failure in failures_by_collector
+            if failure.api_identity
+        }
         concerns = tuple(
             concern
             for batch in self.batches
@@ -1905,6 +1910,14 @@ class EvidenceRegistry:
                     rejected_by_collector[batch.collector] = (
                         rejected_by_collector.get(batch.collector, 0) + 1
                     )
+                    failure_key = (
+                        batch.collector,
+                        "BYTECODE_CALLER_UNRESOLVED",
+                        edge.callee_symbol,
+                    )
+                    if failure_key in failure_api_keys:
+                        continue
+                    failure_api_keys.add(failure_key)
                     failure = EvidenceFailure(
                         stage="evidence-ingestion",
                         reason_code="BYTECODE_CALLER_UNRESOLVED",

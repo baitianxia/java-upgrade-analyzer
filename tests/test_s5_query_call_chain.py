@@ -60,6 +60,29 @@ def edge(caller, callee, owner_type="dependency", owner_coord="com.example:dep",
 
 
 class S5QueryCallChainTest(unittest.TestCase):
+    def test_query_index_is_stable_when_reverse_edge_input_order_changes(self):
+        first = method("first", "com.app.First.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        second = method("second", "com.app.Second.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        target = "com.vendor.Target.removed()"
+
+        def graph_with(edges):
+            return SimpleNamespace(
+                methods_by_id={item.symbol_id: item for item in (first, second)},
+                lookup_keys_by_symbol={
+                    "first": ["com.app.First.run"],
+                    "second": ["com.app.Second.run"],
+                },
+                reverse_edges={target: edges},
+            )
+
+        first_edge = edge(first, target, owner_type="business", owner_coord="BUSINESS", module="app")
+        second_edge = edge(second, target, owner_type="business", owner_coord="BUSINESS", module="app")
+
+        forward = build_query_index(graph_with([first_edge, second_edge]))
+        reversed_input = build_query_index(graph_with([second_edge, first_edge]))
+
+        self.assertEqual(forward, reversed_input)
+
     def test_query_returns_complete_business_to_dependency_chain(self):
         app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
         dep_a = method("a", "com.depa.FacadeA.entry", owner_coord="com.example:dep-a", module="dep-a")

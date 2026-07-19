@@ -341,7 +341,9 @@ class Step5ArtifactFactStore:
             key, lambda: producer(content), parser="classfile",
         )
 
-    def javap_fact(self, coord, location, profile, producer) -> FactOutcome:
+    def javap_fact(
+        self, coord, location, profile, producer, *, retain: bool = True,
+    ) -> FactOutcome:
         identity = self._identity(coord)
         key = (
             "javap", identity.sha256, identity.target_jdk,
@@ -358,7 +360,24 @@ class Step5ArtifactFactStore:
                 self._metrics["javap_starts"] += 1
             return producer(identity, location, profile)
 
-        outcome = self._single_flight(key, produce, parser="javap")
+        if retain:
+            outcome = self._single_flight(key, produce, parser="javap")
+        else:
+            started_at = time.perf_counter()
+            with self._lock:
+                self._metrics["fact_misses"] += 1
+            try:
+                outcome = FactOutcome("complete", produce(), "", "javap")
+            except Exception as exc:
+                outcome = FactOutcome(
+                    "failed", None, f"{type(exc).__name__}: {exc}", "javap",
+                )
+            with self._lock:
+                if outcome.status != "complete":
+                    self._metrics["fact_failures"] += 1
+                self._metrics["fact_build_elapsed_sec"] += (
+                    time.perf_counter() - started_at
+                )
         if outcome.status != "complete":
             with self._lock:
                 self._metrics["javap_failures"] += 1
@@ -366,10 +385,12 @@ class Step5ArtifactFactStore:
 
     def metrics(self) -> dict[str, int | float]:
         with self._lock:
-            return {
+            metrics = {
                 key: round(value, 6) if isinstance(value, float) else value
                 for key, value in self._metrics.items()
             }
+            metrics["retained_facts"] = len(self._facts)
+            return metrics
 
     @staticmethod
     def _build_inventory(identity: ArtifactIdentity) -> ArtifactInventory:

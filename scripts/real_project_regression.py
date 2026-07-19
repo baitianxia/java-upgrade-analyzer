@@ -109,12 +109,48 @@ _STEP5_FINGERPRINT_VOLATILE_KEYS = frozenset({
 
 def _canonicalize_step5_result_value(value, report_roots):
     if isinstance(value, dict):
-        return {
-            str(key): _canonicalize_step5_result_value(item, report_roots)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            if str(key) not in _STEP5_FINGERPRINT_VOLATILE_KEYS
-            and not str(key).endswith("_elapsed_sec")
-        }
+        result = {}
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            key = str(key)
+            if (
+                key in _STEP5_FINGERPRINT_VOLATILE_KEYS
+                or key.endswith("_elapsed_sec")
+            ):
+                continue
+            if key == "evidence_ingestion" and isinstance(item, dict):
+                ingestion = {
+                    str(inner_key): _canonicalize_step5_result_value(
+                        inner_value, report_roots
+                    )
+                    for inner_key, inner_value in sorted(
+                        item.items(), key=lambda pair: str(pair[0])
+                    )
+                    if str(inner_key) not in {"failure_count", "failures"}
+                }
+                failure_semantics = sorted({
+                    (
+                        str(failure.get("collector") or ""),
+                        str(failure.get("reason_code") or ""),
+                        bool(failure.get("blocking")),
+                        str(failure.get("api_identity") or ""),
+                    )
+                    for failure in (item.get("failures") or ())
+                    if isinstance(failure, dict)
+                })
+                ingestion["failure_semantics"] = [
+                    {
+                        "collector": collector,
+                        "reason_code": reason_code,
+                        "blocking": blocking,
+                        "api_identity": api_identity,
+                    }
+                    for collector, reason_code, blocking, api_identity
+                    in failure_semantics
+                ]
+                result[key] = ingestion
+                continue
+            result[key] = _canonicalize_step5_result_value(item, report_roots)
+        return result
     if isinstance(value, list):
         return [
             _canonicalize_step5_result_value(item, report_roots)
@@ -126,6 +162,21 @@ def _canonicalize_step5_result_value(value, report_roots):
             normalized = normalized.replace(report_root, "<REPORT_ROOT>")
         return normalized
     return value
+
+
+def _canonicalize_step5_query_index(value, report_roots):
+    canonical = _canonicalize_step5_result_value(value, report_roots)
+    reverse_edges = canonical.get("reverse_edges") if isinstance(canonical, dict) else None
+    if isinstance(reverse_edges, dict):
+        for lookup_key, edges in reverse_edges.items():
+            if isinstance(edges, list):
+                reverse_edges[lookup_key] = sorted(
+                    edges,
+                    key=lambda item: json.dumps(
+                        item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                    ),
+                )
+    return canonical
 
 
 def step5_result_contract(report_dir):
@@ -152,7 +203,7 @@ def step5_result_contract(report_dir):
             ]
     query_index = report_root / ".runtime" / "indexes" / "s5_query_index.json"
     if query_index.is_file():
-        payload["query_index"] = _canonicalize_step5_result_value(
+        payload["query_index"] = _canonicalize_step5_query_index(
             json.loads(query_index.read_text(encoding="utf-8-sig")),
             report_roots,
         )

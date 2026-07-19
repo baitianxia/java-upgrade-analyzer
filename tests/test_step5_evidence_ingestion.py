@@ -457,6 +457,35 @@ class EvidenceIngestionTest(unittest.TestCase):
             "com.vendor.Legacy.call()",
         )
 
+    def test_unresolved_edges_keep_count_but_deduplicate_api_failure(self):
+        first = replace(self._edge(), metadata=(
+            ("caller_owner", "com.acme.Application"),
+            ("caller_name", "run"),
+            ("caller_signature", "()"),
+        ))
+        second = replace(
+            first,
+            caller_symbol="com.acme.Other.run()",
+            provenance=replace(first.provenance, line=24),
+            metadata=(
+                ("caller_owner", "com.acme.Other"),
+                ("caller_name", "run"),
+                ("caller_signature", "()"),
+            ),
+        )
+        graph = SimpleNamespace(
+            reverse_edges={}, methods_by_id={}, methods_by_qualified={},
+            lookup_keys_by_symbol={},
+        )
+
+        result = ingest_collector_batches(graph, (CollectorBatch(
+            collector="business_bytecode", version="2", edges=(first, second),
+        ),))
+
+        self.assertEqual(result.rejected_edges, 2)
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(result.failures[0].api_identity, first.callee_symbol)
+
     def test_incremental_ingestion_preserves_prior_diagnostics_and_coverage(self):
         graph = SimpleNamespace(reverse_edges={})
         first = CollectorBatch(

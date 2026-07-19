@@ -79,6 +79,28 @@ class EvidenceModelTest(unittest.TestCase):
             ),
         )
 
+    def test_high_volume_evidence_records_use_compact_slots(self):
+        edge = self._final_artifact_edge()
+        failure = EvidenceFailure(
+            stage="ingestion",
+            reason_code="BYTECODE_CALLER_UNRESOLVED",
+            blocking=True,
+        )
+        batch = CollectorBatch(
+            collector="business_bytecode",
+            version="1",
+            edges=(edge,),
+            failures=(failure,),
+        )
+
+        self.assertFalse(hasattr(edge, "__dict__"))
+        self.assertFalse(hasattr(edge.provenance, "__dict__"))
+        self.assertFalse(hasattr(failure, "__dict__"))
+        self.assertEqual(
+            batch.to_mapping()["failures"][0]["reason_code"],
+            "BYTECODE_CALLER_UNRESOLVED",
+        )
+
     def test_collector_batch_requires_identity_and_valid_sha(self):
         with self.assertRaisesRegex(ValueError, "collector identity"):
             CollectorBatch(collector="", version="1")

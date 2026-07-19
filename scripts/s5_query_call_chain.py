@@ -76,11 +76,15 @@ def build_query_index(graph, graph_stats=None):
     lookup_keys_by_symbol = getattr(graph, "lookup_keys_by_symbol", {}) or {}
     methods = {
         _clean(symbol_id): _method_to_record(method_def)
-        for symbol_id, method_def in methods_by_id.items()
+        for symbol_id, method_def in sorted(
+            methods_by_id.items(), key=lambda item: _clean(item[0])
+        )
         if _clean(symbol_id)
     }
     lookup_keys = {}
-    for symbol_id, method_def in methods_by_id.items():
+    for symbol_id, method_def in sorted(
+        methods_by_id.items(), key=lambda item: _clean(item[0])
+    ):
         keys = []
         for value in lookup_keys_by_symbol.get(symbol_id) or []:
             text = _clean(value)
@@ -102,11 +106,14 @@ def build_query_index(graph, graph_stats=None):
                 keys.append(text)
         lookup_keys[_clean(symbol_id)] = keys
     indexed_reverse_edges = {}
-    for key, edges in reverse_edges.items():
+    for key, edges in sorted(
+        reverse_edges.items(), key=lambda item: _clean(item[0])
+    ):
         clean_key = _clean(key)
         if not clean_key:
             continue
-        indexed_reverse_edges[clean_key] = [_edge_to_record(edge) for edge in edges or []]
+        records = [_edge_to_record(edge) for edge in edges or []]
+        indexed_reverse_edges[clean_key] = sorted(records, key=_edge_sort_key)
     return {
         "schema": SCHEMA,
         "methods": methods,

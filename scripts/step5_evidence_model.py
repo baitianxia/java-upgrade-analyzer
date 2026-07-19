@@ -72,7 +72,7 @@ class EvidenceAuthority(str, Enum):
     RUNTIME_OBSERVATION = "runtime_observation"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EvidenceProvenance:
     authority: EvidenceAuthority
     artifact_path: str = ""
@@ -95,7 +95,7 @@ class EvidenceProvenance:
             raise ValueError("final-artifact evidence requires artifact SHA-256")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ActivationEvidence:
     """Independent proof that a semantic edge is active in the analyzed runtime."""
 
@@ -118,7 +118,7 @@ class ActivationEvidence:
             raise ValueError("packaged activation evidence requires artifact SHA-256")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CollectedEdge:
     caller_symbol: str
     callee_symbol: str
@@ -259,7 +259,15 @@ class CollectorBatch:
                 "provenance": provenance_mapping(edge.provenance),
                 "metadata": thaw_evidence_value(dict(edge.metadata)),
             } for edge in self.edges],
-            "failures": [failure.__dict__ for failure in self.failures],
+            "failures": [{
+                "stage": failure.stage,
+                "reason_code": failure.reason_code,
+                "blocking": failure.blocking,
+                "api_identity": failure.api_identity,
+                "artifact": failure.artifact,
+                "class_name": failure.class_name,
+                "detail": failure.detail,
+            } for failure in self.failures],
             "concerns": [concern.__dict__ for concern in self.concerns],
             "coverage": [{
                 "collector": item.collector,
@@ -273,7 +281,7 @@ class CollectorBatch:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EvidenceFailure:
     stage: str
     reason_code: str
