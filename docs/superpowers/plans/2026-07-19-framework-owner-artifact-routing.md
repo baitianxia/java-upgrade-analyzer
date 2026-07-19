@@ -84,7 +84,7 @@ Confirm the prior `GenTableServiceImpl` lookup no longer emits a global
 `FRAMEWORK_JAVAP_FAILED`, then compare every API conclusion and every physical edge to
 the independent Oracle. Run all configured fault injections and relative performance gates.
 
-- [ ] **Step 4: Commit only verified behavior**
+- [x] **Step 4: Commit only verified behavior**
 
 Commit the generalized fix and its regression evidence; do not merge merely because the
 focused RuoYi symptom disappears.
