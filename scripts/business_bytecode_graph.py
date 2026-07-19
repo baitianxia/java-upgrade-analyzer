@@ -902,7 +902,13 @@ def collect_business_bytecode_edges(
     scanned = 0
     fast_path_classes = 0
     javap_fallback_classes = 0
-    business_item = ((artifact_catalog or {}).get('by_coord') or {}).get('__business__') or {}
+    catalog = artifact_catalog or {}
+    business_item = ((catalog.get('by_coord') or {}).get('__business__') or {})
+    if not business_item:
+        business_item = next((
+            item for item in (catalog.get('entries') or ())
+            if str((item or {}).get('coord') or '') == '__business__'
+        ), {})
     business_jar = str(business_item.get('jar_path') or '').strip()
     cache_key = str(business_item.get('sha256') or '').strip()
     if not business_jar or not os.path.isfile(business_jar):

@@ -381,6 +381,12 @@ def _framework_failure(adapter, error):
     elif 'mybatis_final_artifact_parse_failed' in text:
         reason = 'MYBATIS_FINAL_ARTIFACT_PARSE_FAILED'
         blocking = True
+    elif 'mybatis_runtime_artifact_parse_failed' in text:
+        reason = 'MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED'
+        blocking = True
+    elif 'spring_message_listener_artifact_parse_failed' in text:
+        reason = 'SPRING_MESSAGE_LISTENER_ARTIFACT_PARSE_FAILED'
+        blocking = True
     elif 'spring_boot_artifact_parse_failed' in text:
         reason = 'SPRING_BOOT_ARTIFACT_PARSE_FAILED'
         blocking = True
@@ -1603,7 +1609,10 @@ def _mybatis_runtime_entry(artifact_catalog, fact_store=None):
                     entry, fact_store, strict=True,
                 )
             except (KeyError, OSError, ValueError) as exc:
-                errors.append(_fact_store_identity_error(entry, 'mybatis_runtime', exc))
+                errors.append(_fact_store_or_parser_error(
+                    entry, 'mybatis_runtime', exc,
+                    'mybatis_runtime_artifact_parse_failed',
+                ))
                 continue
             names = set(shared_inventory.resources) | set(shared_inventory.physical_classes)
         else:
@@ -3290,8 +3299,9 @@ def _message_listener_adapter_callbacks(
                     provenance_jar_path=provenance_jar_path,
                 )
         except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
-            return [], [_fact_store_identity_error(
+            return [], [_fact_store_or_parser_error(
                 entry, 'message_listener', exc,
+                'spring_message_listener_artifact_parse_failed',
             )]
     parsed = []
     errors = []

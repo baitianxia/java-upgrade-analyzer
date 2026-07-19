@@ -566,6 +566,50 @@ class FrameworkAdaptersTest(unittest.TestCase):
         self.assertEqual(1, len(errors))
         self.assertIn("artifact_fact_store_identity_failed", errors[0])
 
+    def test_message_listener_bad_zip_is_blocking_parser_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "business.jar"
+            jar.write_bytes(b"not-a-zip")
+            entry = {
+                "coord": "__business__", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            callbacks, errors = (
+                framework_adapter_module._message_listener_adapter_callbacks(
+                    str(jar), entry["coord"], [], fact_store=store, entry=entry,
+                )
+            )
+
+        self.assertEqual([], callbacks)
+        failure = framework_adapter_module._framework_failure("spring", errors[0])
+        self.assertEqual(
+            "SPRING_MESSAGE_LISTENER_ARTIFACT_PARSE_FAILED", failure.reason_code,
+        )
+        self.assertTrue(failure.blocking)
+
+    def test_mybatis_runtime_bad_zip_is_blocking_parser_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "runtime.jar"
+            jar.write_bytes(b"not-a-zip")
+            entry = {
+                "coord": "org.mybatis:runtime", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+                "evidence_source": "current_final_artifact",
+            }
+            catalog = {"entries": [entry]}
+
+            runtime, errors, matches = framework_adapter_module._mybatis_runtime_entry(
+                catalog, Step5ArtifactFactStore.from_catalog(catalog),
+            )
+
+        self.assertIsNone(runtime)
+        self.assertEqual(0, matches)
+        failure = framework_adapter_module._framework_failure("mybatis", errors[0])
+        self.assertEqual("MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED", failure.reason_code)
+        self.assertTrue(failure.blocking)
+
     def test_framework_orchestrator_returns_tuple_and_serializer_alone_projects_v1(self):
         batches = _run_framework_adapters([], artifact_catalog={"entries": []})
 

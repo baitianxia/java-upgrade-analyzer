@@ -845,6 +845,19 @@ class BusinessBytecodeFactParityTest(unittest.TestCase):
 
         self.assertEqual(shared, legacy)
 
+    def test_business_batch_accepts_entries_only_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = self._compiled_business_catalog(tmp)
+            entries_only = {
+                "target_jdk": catalog["target_jdk"],
+                "entries": catalog["entries"],
+            }
+
+            batch = collect_business_bytecode_batch([], entries_only, None)
+
+        self.assertTrue(batch.edges)
+        self.assertFalse(batch.failures)
+
     def test_shared_business_collector_preserves_malformed_class_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "business.jar"
