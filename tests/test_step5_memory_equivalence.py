@@ -75,6 +75,57 @@ class Step5ResultFingerprintTest(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 canonical_step5_result_fingerprint(Path(tmp))
 
+    def test_normalizes_expanded_and_compact_failure_occurrences(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            first_root = Path(first)
+            second_root = Path(second)
+            self._write_report(first_root)
+            self._write_report(second_root)
+            first_summary = first_root / "evidence" / "call_chain" / "summary.json"
+            second_summary = second_root / "evidence" / "call_chain" / "summary.json"
+            common = {
+                "collector": "business_bytecode",
+                "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+                "blocking": True,
+                "api_identity": "vendor.Target.call()",
+            }
+            legacy = json.loads(first_summary.read_text(encoding="utf-8"))
+            legacy["meta"]["graph_stats"]["evidence_ingestion"] = {
+                "failure_count": 1,
+                "failures": [{
+                    **common,
+                    "artifact": str(first_root / "business.jar"),
+                    "class_name": "app.Entry",
+                    "detail": "1 occurrence",
+                    "occurrences": [{
+                        "artifact": str(first_root / "business.jar"),
+                        "class_name": "app.Entry",
+                        "detail": "detail",
+                    }],
+                }],
+            }
+            first_summary.write_text(json.dumps(legacy), encoding="utf-8")
+            compact = json.loads(second_summary.read_text(encoding="utf-8"))
+            compact["meta"]["graph_stats"]["evidence_ingestion"] = {
+                "failure_count": 1,
+                "failure_occurrence_fields": ["artifact", "class_name", "detail"],
+                "failures": [{
+                    **common,
+                    "artifact": str(second_root / "business.jar"),
+                    "class_name": "app.Entry",
+                    "detail": "1 occurrence",
+                    "occurrences": [[
+                        str(second_root / "business.jar"), "app.Entry", "detail",
+                    ]],
+                }],
+            }
+            second_summary.write_text(json.dumps(compact), encoding="utf-8")
+
+            self.assertEqual(
+                canonical_step5_result_fingerprint(first_root),
+                canonical_step5_result_fingerprint(second_root),
+            )
+
 
 class ReverseEdgeOverlayTest(unittest.TestCase):
     def test_reuses_untouched_base_lists_and_combines_only_overlay_keys(self):

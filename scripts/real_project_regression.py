@@ -126,29 +126,52 @@ def _canonicalize_step5_result_value(value, report_roots):
                     for inner_key, inner_value in sorted(
                         item.items(), key=lambda pair: str(pair[0])
                     )
-                    if str(inner_key) not in {"failure_count", "failures"}
+                    if str(inner_key) not in {
+                        "failure_count", "failure_occurrence_fields", "failures",
+                    }
                 }
+                occurrence_fields = tuple(
+                    str(field) for field in item.get("failure_occurrence_fields") or ()
+                )
                 failure_semantics = {}
                 for failure in (item.get("failures") or ()):
                     if not isinstance(failure, dict):
                         continue
-                    canonical_failure = _canonicalize_step5_result_value(
-                        failure, report_roots,
-                    )
-                    occurrences = canonical_failure.get("occurrences")
-                    if isinstance(occurrences, list):
-                        canonical_failure["occurrences"] = sorted(
-                            occurrences,
-                            key=lambda occurrence: json.dumps(
-                                occurrence, ensure_ascii=False, sort_keys=True,
-                                separators=(",", ":"),
-                            ),
+                    occurrences = failure.get("occurrences") or ()
+                    normalized_occurrences = []
+                    for occurrence in occurrences:
+                        if isinstance(occurrence, dict):
+                            normalized_occurrences.append(occurrence)
+                        elif occurrence_fields and isinstance(
+                            occurrence, (list, tuple)
+                        ):
+                            normalized_occurrences.append(dict(zip(
+                                occurrence_fields, occurrence,
+                            )))
+                    if not normalized_occurrences:
+                        normalized_occurrences.append(failure)
+                    for occurrence in normalized_occurrences:
+                        canonical_failure = {
+                            "collector": failure.get("collector"),
+                            "reason_code": failure.get("reason_code"),
+                            "blocking": bool(failure.get("blocking")),
+                            "api_identity": failure.get("api_identity"),
+                        }
+                        canonical_failure.update(occurrence)
+                        canonical_failure.setdefault(
+                            "artifact", failure.get("artifact"),
                         )
-                    identity = json.dumps(
-                        canonical_failure, ensure_ascii=False, sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    failure_semantics[identity] = canonical_failure
+                        canonical_failure.setdefault(
+                            "class_name", failure.get("class_name"),
+                        )
+                        canonical_failure = _canonicalize_step5_result_value(
+                            canonical_failure, report_roots,
+                        )
+                        identity = json.dumps(
+                            canonical_failure, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        failure_semantics[identity] = canonical_failure
                 ingestion["failure_semantics"] = [
                     failure_semantics[key] for key in sorted(failure_semantics)
                 ]
