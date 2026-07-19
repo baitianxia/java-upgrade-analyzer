@@ -263,7 +263,8 @@ class SpringActivationClosureTest(unittest.TestCase):
             }]
 
             batch = framework_adapters.collect_spring_aop_activation(
-                {"entries": entries}, {}
+                {"entries": entries}, {},
+                fact_store=Step5ArtifactFactStore.from_catalog({"entries": entries}),
             )
 
         self.assertEqual(len(batch.edges), 1)
@@ -417,11 +418,12 @@ class SpringActivationClosureTest(unittest.TestCase):
             artifact = self._compile_security_fixture(root, nested_support=True)
             digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
 
+            catalog = {"entries": [{
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": digest,
+            }]}
             batch = framework_adapters.collect_spring_security_filter_activation(
-                {"entries": [{
-                    "coord": "__business__", "jar_path": str(artifact),
-                    "sha256": digest,
-                }]},
+                catalog,
                 {"security_filter_chains": [{
                     "config_owner": "demo.SecurityConfig",
                     "chain_member": "chain",
@@ -435,6 +437,7 @@ class SpringActivationClosureTest(unittest.TestCase):
                     "condition_status": "resolved",
                     "registration_style": "security_filter_chain",
                 }]},
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
             )
 
         self.assertEqual(len(batch.edges), 1)
@@ -502,6 +505,7 @@ class SpringActivationClosureTest(unittest.TestCase):
                     "condition_status": "resolved",
                     "registration_style": "security_filter_chain",
                 }]},
+                fact_store=Step5ArtifactFactStore.from_catalog({"entries": entries}),
             )
 
         self.assertEqual(len(batch.edges), 1)
@@ -599,6 +603,47 @@ class SpringActivationClosureTest(unittest.TestCase):
         self.assertIsNone(locations["demo.Missing"])
         self.assertEqual(len(diagnostics), 1)
         self.assertIn("spring_nested_artifact_invalid", diagnostics[0])
+
+    def test_shared_class_locator_rejects_duplicate_logical_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "duplicate.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("demo/Config.class", b"root")
+                archive.writestr("BOOT-INF/classes/demo/Config.class", b"boot")
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            locations, diagnostics = framework_adapters._locate_catalog_classes(
+                [entry], {"demo.Config"}, fact_store=store,
+            )
+
+        self.assertIsNone(locations["demo.Config"])
+        self.assertTrue(any(
+            "spring_packaged_class_ambiguous" in item for item in diagnostics
+        ))
+
+    def test_shared_class_locator_reads_only_requested_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "large.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                for index in range(100):
+                    archive.writestr(f"demo/Class{index}.class", f"{index}".encode())
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            locations, diagnostics = framework_adapters._locate_catalog_classes(
+                [entry], {"demo.Class42"}, fact_store=store,
+            )
+
+        self.assertFalse(diagnostics)
+        self.assertEqual(b"42", locations["demo.Class42"]["bytes"])
+        self.assertEqual(1, store.metrics()["class_bytes_reads"])
 
     def test_security_collector_requires_exact_chain_membership_and_resolved_condition(self):
         with tempfile.TemporaryDirectory() as tmp:

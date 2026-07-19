@@ -68,6 +68,15 @@ def _fact_store_identity_error(entry, context, exc):
     )
 
 
+def _fact_store_failure_is_identity(reason):
+    text = str(reason or '').lower()
+    return any(marker in text for marker in (
+        'artifact_changed', 'artifact_missing', 'artifact_sha256',
+        'identity_mismatch', 'identity_invalid', 'inventory',
+        'class_location_not_in_inventory', 'resource_not_in_inventory',
+    ))
+
+
 def _artifact_class_location(inventory, owner):
     expected = str(owner or '').replace('.', '/') + '.class'
     matches = [
@@ -104,9 +113,15 @@ def _artifact_javap(entry, owner, flags, profile, fact_store=None):
 
     if fact_store is None:
         try:
-            return run(), ''
+            completed = run()
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return None, f'{jar_path}:{owner}:{type(exc).__name__}'
+            return None, f'{jar_path}:{owner}:framework_javap_failed:{type(exc).__name__}'
+        if completed.returncode != 0:
+            return None, (
+                f'{jar_path}:{owner}:framework_javap_failed:'
+                f'exit_{completed.returncode}'
+            )
+        return completed, ''
     try:
         inventory = _shared_artifact_inventory(entry, fact_store, strict=True)
         location = _artifact_class_location(inventory, owner)
@@ -116,11 +131,21 @@ def _artifact_javap(entry, owner, flags, profile, fact_store=None):
     except (KeyError, OSError, ValueError) as exc:
         return None, _fact_store_identity_error(entry, f'javap:{owner}', exc)
     if outcome.status != 'complete':
+        if _fact_store_failure_is_identity(outcome.reason):
+            return None, (
+                f"{jar_path}:artifact_fact_store_identity_failed:javap:{owner}:"
+                f"{outcome.reason}"
+            )
         return None, (
-            f"{jar_path}:artifact_fact_store_identity_failed:javap:{owner}:"
-            f"{outcome.reason}"
+            f'{jar_path}:{owner}:framework_javap_failed:{outcome.reason}'
         )
-    return outcome.value, ''
+    completed = outcome.value
+    if completed.returncode != 0:
+        return None, (
+            f'{jar_path}:{owner}:framework_javap_failed:'
+            f'exit_{completed.returncode}'
+        )
+    return completed, ''
 
 
 class FrameworkAdapter(Protocol):
@@ -1565,17 +1590,33 @@ def _verified_final_artifact(artifact_catalog):
     return path, ''
 
 
-def _packaged_mybatis_contracts(candidates, artifact_catalog):
+def _packaged_mybatis_contracts(candidates, artifact_catalog, fact_store=None):
     """Validate mapper registration, binding, and activation in one SHA-bound artifact."""
-    artifact, artifact_error = _verified_final_artifact(artifact_catalog)
-    if not artifact:
-        return [], list(candidates), [], [artifact_error]
+    artifact = Path(str((artifact_catalog or {}).get('final_artifact_path') or ''))
+    final_entry = {
+        'coord': '__final_artifact__',
+        'jar_path': str(artifact),
+        'sha256': str((artifact_catalog or {}).get('final_artifact_sha256') or '').lower(),
+    }
+    if fact_store is not None:
+        try:
+            _shared_artifact_inventory(final_entry, fact_store, strict=True)
+        except (KeyError, OSError, ValueError) as exc:
+            return [], list(candidates), [], [
+                _fact_store_identity_error(final_entry, 'mybatis_final_artifact', exc)
+            ]
+        artifact_context = fact_store.open_verified_artifact('__final_artifact__')
+    else:
+        artifact, artifact_error = _verified_final_artifact(artifact_catalog)
+        if not artifact:
+            return [], list(candidates), [], [artifact_error]
+        artifact_context = artifact.open('rb')
     packaged = []
     unregistered = []
     activation = []
     errors = []
     try:
-        with zipfile.ZipFile(artifact) as outer:
+        with artifact_context as artifact_handle, zipfile.ZipFile(artifact_handle) as outer:
             names = set(outer.namelist())
             class_entries = {
                 name: outer.read(name) for name in names
@@ -1692,8 +1733,13 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog):
                     ),
                 }
                 packaged.append(verified)
-    except (OSError, zipfile.BadZipFile) as exc:
-        errors.append(f'{artifact}:mybatis_final_artifact:{type(exc).__name__}')
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        if fact_store is not None:
+            errors.append(_fact_store_identity_error(
+                final_entry, 'mybatis_final_artifact', exc,
+            ))
+        else:
+            errors.append(f'{artifact}:mybatis_final_artifact:{type(exc).__name__}')
         return [], list(candidates), [], errors
     return packaged, unregistered, activation, errors
 
@@ -1835,7 +1881,8 @@ def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None, fact_store=No
     source_contracts, source_unregistered, errors = _mybatis_mapper_contracts(source_roots)
     errors.extend(mapper_scan_errors)
     contracts, unregistered, activation_evidence, packaged_errors = _packaged_mybatis_contracts(
-        source_contracts + source_unregistered, artifact_catalog
+        source_contracts + source_unregistered, artifact_catalog,
+        fact_store=fact_store,
     )
     errors.extend(runtime_errors)
     errors.extend(packaged_errors)
@@ -3753,7 +3800,7 @@ def _fact_store_class_records(item, fact_store, *, include_nested=False):
             and name.startswith(('BOOT-INF/lib/', 'WEB-INF/lib/'))
         )
         for nested_name in nested_names:
-            outcome = fact_store.resource_bytes(coord, nested_name)
+            outcome = fact_store.resource_bytes(coord, nested_name, retain=False)
             if outcome.status != 'complete':
                 raise ValueError(
                     f'artifact_fact_store_resource_failed:{nested_name}:{outcome.reason}'
@@ -3775,19 +3822,67 @@ def _locate_catalog_classes(
     if fact_store is not None:
         for item in entries:
             try:
-                records = _fact_store_class_records(
-                    item, fact_store, include_nested=include_nested,
+                inventory = _shared_artifact_inventory(
+                    item, fact_store, strict=True,
                 )
+                coord = str(item.get('coord') or '')
+                catalog_entry = str(item.get('artifact_entry') or '')
+                for owner in requested:
+                    expected = owner.replace('.', '/') + '.class'
+                    matches = [
+                        location for location in inventory.classes
+                        if location.physical_entry == expected
+                        or location.physical_entry.endswith('/' + expected)
+                    ]
+                    for location in matches:
+                        outcome = fact_store.class_bytes(coord, location)
+                        if outcome.status != 'complete':
+                            raise ValueError(outcome.reason)
+                        class_entry = location.physical_entry
+                        if catalog_entry and catalog_entry != '<business-classes>':
+                            class_entry = f'{catalog_entry}!/{class_entry}'
+                        candidates[owner].append({
+                            'entry': class_entry,
+                            'logical_entry': expected,
+                            'bytes': outcome.value,
+                            'artifact_path': str(item.get('jar_path') or ''),
+                            'artifact_sha256': str(item.get('sha256') or '').lower(),
+                            'coord': coord,
+                        })
+                if include_nested:
+                    nested_names = sorted(
+                        name for name in inventory.resources
+                        if name.endswith('.jar')
+                        and name.startswith(('BOOT-INF/lib/', 'WEB-INF/lib/'))
+                    )
+                    for nested_name in nested_names:
+                        outcome = fact_store.resource_bytes(
+                            coord, nested_name, retain=False,
+                        )
+                        if outcome.status != 'complete':
+                            raise ValueError(outcome.reason)
+                        with zipfile.ZipFile(io.BytesIO(outcome.value)) as nested:
+                            names = set(nested.namelist())
+                            for owner in requested:
+                                expected = owner.replace('.', '/') + '.class'
+                                if expected not in names:
+                                    continue
+                                class_entry = f'{nested_name}!/{expected}'
+                                if catalog_entry and catalog_entry != '<business-classes>':
+                                    class_entry = f'{catalog_entry}!/{class_entry}'
+                                candidates[owner].append({
+                                    'entry': class_entry,
+                                    'logical_entry': expected,
+                                    'bytes': nested.read(expected),
+                                    'artifact_path': str(item.get('jar_path') or ''),
+                                    'artifact_sha256': str(item.get('sha256') or '').lower(),
+                                    'coord': coord,
+                                })
             except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
                 diagnostics.append(_fact_store_identity_error(
                     item, 'spring_class_location', exc,
                 ))
                 continue
-            by_logical = {record['logical_entry']: record for record in records}
-            for owner in requested:
-                location = by_logical.get(owner.replace('.', '/') + '.class')
-                if location is not None:
-                    candidates[owner].append(location)
         for owner, values in candidates.items():
             if len(values) > 1:
                 diagnostics.append(

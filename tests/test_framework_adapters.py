@@ -898,6 +898,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             adapter = run_mybatis_proxy_adapter(
                 [{"root": str(module / "src/main/java"), "owner_type": "business"}],
                 artifact_catalog=catalog,
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
             )
             verified_final_sha256 = catalog["final_artifact_sha256"]
             corrupt_sha_catalog = {
@@ -969,6 +970,57 @@ class FrameworkAdaptersTest(unittest.TestCase):
             finding["reason_code"] == "mybatis_runtime_implementation_unresolved"
             for finding in fallback["findings"]
         ))
+
+    def test_mybatis_final_artifact_replacement_is_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "application.jar"
+            replacement = Path(tmp) / "replacement.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"original")
+            catalog = {
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "entries": [],
+            }
+            store = Step5ArtifactFactStore.from_catalog(catalog)
+            store.inventory("__final_artifact__")
+            with zipfile.ZipFile(replacement, "w") as archive:
+                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"replacement")
+            replacement.replace(artifact)
+
+            packaged, unregistered, activation, errors = (
+                framework_adapter_module._packaged_mybatis_contracts(
+                    [], catalog, fact_store=store,
+                )
+            )
+
+        self.assertEqual(([], [], []), (packaged, unregistered, activation))
+        self.assertEqual(1, len(errors))
+        self.assertIn("artifact_fact_store_identity_failed", errors[0])
+
+    def test_artifact_javap_nonzero_exit_is_blocking_parser_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "runtime.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("com/acme/Target.class", b"fixture")
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            completed = SimpleNamespace(returncode=1, stdout="")
+            with patch.object(
+                framework_adapter_module.subprocess, "run", return_value=completed,
+            ):
+                result, error = framework_adapter_module._artifact_javap(
+                    entry, "com.acme.Target", ("-p", "-s"), "test", store,
+                )
+
+        self.assertIsNone(result)
+        self.assertIn("framework_javap_failed", error)
+        failure = framework_adapter_module._framework_failure("test", error)
+        self.assertEqual("FRAMEWORK_JAVAP_FAILED", failure.reason_code)
+        self.assertTrue(failure.blocking)
 
     def test_mybatis_mapper_scan_is_partial_instead_of_not_applicable(self):
         with tempfile.TemporaryDirectory() as tmp:

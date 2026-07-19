@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 import tempfile
@@ -180,6 +181,16 @@ class Step5ArtifactFactStore:
                 artifact_entry=str(item.get("artifact_entry") or ""),
                 target_jdk=target_jdk,
             )
+        final_path = str(catalog.get("final_artifact_path") or "")
+        final_sha = str(catalog.get("final_artifact_sha256") or "").lower()
+        if final_path and "__final_artifact__" not in identities:
+            identities["__final_artifact__"] = ArtifactIdentity(
+                coord="__final_artifact__",
+                path=final_path,
+                sha256=final_sha,
+                artifact_entry="<final-artifact>",
+                target_jdk=target_jdk,
+            )
         return cls(identities)
 
     def inventory(self, coord: str) -> ArtifactInventory:
@@ -235,6 +246,16 @@ class Step5ArtifactFactStore:
     def verified_inventory(self, coord: str) -> ArtifactInventory:
         """Return an inventory only while its catalog path still identifies it."""
         return self._verified_inventory(coord)
+
+    @contextmanager
+    def open_verified_artifact(self, coord: str):
+        """Yield one SHA-bound file descriptor and reject path changes on exit."""
+        inventory = self._verified_inventory(coord)
+        with self._open_verified_artifact(inventory) as handle:
+            yield handle
+            if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+                raise ValueError("artifact_changed_after_inventory")
+        self._assert_path_identity(inventory)
 
     @staticmethod
     def _assert_path_identity(inventory: ArtifactInventory) -> None:
@@ -301,7 +322,9 @@ class Step5ArtifactFactStore:
                 raise ValueError("artifact_changed_after_inventory")
         self._assert_path_identity(inventory)
 
-    def resource_bytes(self, coord: str, resource_name: str) -> FactOutcome:
+    def resource_bytes(
+        self, coord: str, resource_name: str, *, retain: bool = True,
+    ) -> FactOutcome:
         """Return one immutable resource, with absence/failure kept explicit."""
         identity = self._identity(coord)
         try:
@@ -330,7 +353,16 @@ class Step5ArtifactFactStore:
                 self._metrics["resource_bytes_read"] += len(content)
             return content
 
-        return self._single_flight(key, produce, parser="zipfile")
+        if retain:
+            return self._single_flight(key, produce, parser="zipfile")
+        try:
+            return FactOutcome("complete", produce(), "", "zipfile")
+        except Exception as exc:
+            with self._lock:
+                self._metrics["fact_failures"] += 1
+            return FactOutcome(
+                "failed", None, f"{type(exc).__name__}: {exc}", "zipfile",
+            )
 
     def _single_flight(self, key, producer, *, parser: str) -> FactOutcome:
         while True:
