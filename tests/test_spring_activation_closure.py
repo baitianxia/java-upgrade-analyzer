@@ -186,15 +186,22 @@ class SpringActivationClosureTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = self._compile_aop_fixture(Path(tmp))
             digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            catalog = {"entries": [{
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": digest,
+            }]}
+            store = Step5ArtifactFactStore.from_catalog(catalog)
             batch = framework_adapters.collect_spring_aop_activation(
-                {"entries": [{
-                    "coord": "__business__", "jar_path": str(artifact),
-                    "sha256": digest,
-                }]},
+                catalog,
                 {"join_points": [{
                     "owner": "demo.Service", "member": "run", "descriptor": "()V",
                 }]},
+                fact_store=store,
             )
+            with zipfile.ZipFile(artifact) as archive:
+                class_count = sum(
+                    name.endswith(".class") for name in archive.namelist()
+                )
 
         self.assertEqual(batch.collector, "spring_aop_activation")
         self.assertEqual(len(batch.edges), 1)
@@ -214,6 +221,27 @@ class SpringActivationClosureTest(unittest.TestCase):
             {failure.reason_code for failure in batch.failures},
         )
         self.assertEqual(batch.coverage[0].status, "partial")
+        self.assertEqual(class_count, store.metrics()["class_bytes_reads"])
+
+    def test_aop_bad_zip_is_blocking_parser_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "broken.jar"
+            artifact.write_bytes(b"not-a-zip")
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+
+            batch = framework_adapters.collect_spring_aop_activation(
+                {"entries": [entry]}, {},
+                fact_store=Step5ArtifactFactStore.from_catalog({"entries": [entry]}),
+            )
+
+        self.assertEqual(
+            {"SPRING_AOP_CLASS_PARSE_FAILED"},
+            {failure.reason_code for failure in batch.failures},
+        )
+        self.assertTrue(all(failure.blocking for failure in batch.failures))
 
     def test_framework_runner_discovers_aop_join_points_from_current_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

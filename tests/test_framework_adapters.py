@@ -1120,6 +1120,78 @@ class FrameworkAdaptersTest(unittest.TestCase):
         self.assertEqual(([], [], [], []), result)
         self.assertLess(peak, 12 * 1024 * 1024)
 
+    def test_mybatis_packaged_contract_streams_large_internal_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "library.jar"
+            with zipfile.ZipFile(nested, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("com/acme/Filler.class", b"x" * (16 * 1024 * 1024))
+            nested_sha = hashlib.sha256(nested.read_bytes()).hexdigest()
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.write(nested, "BOOT-INF/lib/library.jar")
+            catalog = {
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "entries": [{
+                    "coord": "com.acme:library", "jar_path": str(nested),
+                    "artifact_entry": "BOOT-INF/lib/library.jar",
+                    "sha256": nested_sha,
+                    "application_owned": True,
+                    "evidence_source": "current_final_artifact",
+                }],
+            }
+
+            tracemalloc.start()
+            result = framework_adapter_module._packaged_mybatis_contracts([], catalog)
+            _current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+        self.assertEqual(([], [], [], []), result)
+        self.assertLess(peak, 24 * 1024 * 1024)
+
+    def test_mybatis_bad_zip_is_blocking_parser_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "application.jar"
+            artifact.write_bytes(b"not-a-zip")
+            catalog = {
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "entries": [],
+            }
+
+            _packaged, _unregistered, _activation, errors = (
+                framework_adapter_module._packaged_mybatis_contracts([], catalog)
+            )
+
+        failure = framework_adapter_module._framework_failure("mybatis", errors[0])
+        self.assertEqual("MYBATIS_FINAL_ARTIFACT_PARSE_FAILED", failure.reason_code)
+        self.assertTrue(failure.blocking)
+
+    def test_mybatis_internal_module_failures_are_blocking(self):
+        for marker, reason in (
+            ("mybatis_internal_module_bad_zip", "MYBATIS_INTERNAL_MODULE_BAD_ZIP"),
+            (
+                "mybatis_internal_module_sha256_mismatch",
+                "MYBATIS_INTERNAL_MODULE_SHA256_MISMATCH",
+            ),
+        ):
+            with self.subTest(marker=marker):
+                failure = framework_adapter_module._framework_failure(
+                    "mybatis", f"BOOT-INF/lib/library.jar:{marker}",
+                )
+                self.assertEqual(reason, failure.reason_code)
+                self.assertTrue(failure.blocking)
+
+    def test_public_framework_scanners_keep_docstrings(self):
+        for function in (
+            framework_adapter_module.run_spring_transaction_proxy_adapter,
+            framework_adapter_module.run_spring_data_repository_adapter,
+            framework_adapter_module.run_runtime_spring_registration_adapter,
+        ):
+            with self.subTest(function=function.__name__):
+                self.assertIsNotNone(function.__doc__)
+
     def test_artifact_javap_nonzero_exit_is_blocking_parser_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar = Path(tmp) / "runtime.jar"

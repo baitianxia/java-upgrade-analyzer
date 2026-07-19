@@ -294,15 +294,37 @@ class Step5ArtifactFactStore:
 
     def iter_class_bytes(self, coord: str):
         """Yield effective classes in inventory order from one ZIP open."""
+        for location, content, _reader in self.iter_class_bytes_with_reader(coord):
+            yield location, content
+
+    def iter_class_bytes_with_reader(self, coord: str):
+        """Stream classes while allowing bounded reads from the same verified ZIP."""
         inventory = self._verified_inventory(coord)
         with self._open_verified_artifact(inventory) as handle:
             with zipfile.ZipFile(handle) as archive:
-                for location in inventory.classes:
+                prefetched = {}
+
+                def read_location(location, *, retain=True):
+                    if location not in inventory.classes:
+                        raise KeyError(
+                            f"class_location_not_in_inventory:{location.physical_entry}"
+                        )
+                    cached = prefetched.get(location)
+                    if cached is not None:
+                        return cached
                     content = archive.read(location.physical_entry)
                     with self._lock:
                         self._metrics["class_bytes_reads"] += 1
                         self._metrics["class_bytes_read"] += len(content)
-                    yield location, content
+                    if retain:
+                        prefetched[location] = content
+                    return content
+
+                for location in inventory.classes:
+                    content = prefetched.pop(location, None)
+                    if content is None:
+                        content = read_location(location, retain=False)
+                    yield location, content, read_location
             if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
                 raise ValueError("artifact_changed_after_inventory")
         self._assert_path_identity(inventory)
