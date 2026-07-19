@@ -29,7 +29,7 @@ from step5_evidence_model import (
     ModuleScope,
     thaw_evidence_value,
 )
-from step5_artifact_fact_store import ClassLocation
+from step5_artifact_fact_store import ClassLocation, Step5ArtifactFactStore
 
 
 def _shared_artifact_inventory(entry, fact_store, *, strict=False):
@@ -75,6 +75,15 @@ def _fact_store_failure_is_identity(reason):
         'identity_mismatch', 'identity_invalid', 'inventory',
         'class_location_not_in_inventory', 'resource_not_in_inventory',
     ))
+
+
+def _fact_store_or_parser_error(entry, context, exc, parser_marker):
+    if _fact_store_failure_is_identity(exc):
+        return _fact_store_identity_error(entry, context, exc)
+    return (
+        f"{entry.get('jar_path') or ''}:{parser_marker}:"
+        f"{context}:{type(exc).__name__}:{exc}"
+    )
 
 
 def _artifact_class_location(inventory, owner):
@@ -129,7 +138,9 @@ def _artifact_javap(entry, owner, flags, profile, fact_store=None):
             str(entry.get('coord') or ''), location, profile, run,
         )
     except (KeyError, OSError, ValueError) as exc:
-        return None, _fact_store_identity_error(entry, f'javap:{owner}', exc)
+        return None, _fact_store_or_parser_error(
+            entry, f'javap:{owner}', exc, 'framework_javap_failed',
+        )
     if outcome.status != 'complete':
         if _fact_store_failure_is_identity(outcome.reason):
             return None, (
@@ -339,8 +350,25 @@ def _framework_failure(adapter, error):
         reason = 'SPRING_SECURITY_SOURCE_READ_FAILED'
     elif 'spring_nested_artifact_invalid' in text:
         reason = 'SPRING_NESTED_ARTIFACT_INVALID'
+        blocking = True
     elif 'spring_packaged_class_ambiguous' in text:
         reason = 'SPRING_PACKAGED_CLASS_AMBIGUOUS'
+        blocking = True
+    elif 'mybatis_mapper_class_ambiguous' in text:
+        reason = 'MYBATIS_MAPPER_CLASS_AMBIGUOUS'
+        blocking = True
+    elif 'mybatis_xml_binding_ambiguous' in text:
+        reason = 'MYBATIS_XML_BINDING_AMBIGUOUS'
+        blocking = True
+    elif 'spring_class_location_failed' in text:
+        reason = 'SPRING_CLASS_LOCATION_FAILED'
+        blocking = True
+    elif 'spring_aop_class_parse_failed' in text:
+        reason = 'SPRING_AOP_CLASS_PARSE_FAILED'
+        blocking = True
+    elif 'mybatis_final_artifact_parse_failed' in text:
+        reason = 'MYBATIS_FINAL_ARTIFACT_PARSE_FAILED'
+        blocking = True
     elif 'artifact_fact_store_identity_failed' in text:
         reason = 'ARTIFACT_FACT_STORE_IDENTITY_FAILED'
         blocking = True
@@ -1538,6 +1566,8 @@ def _mybatis_mapper_scan_evidence(source_roots):
 
 
 def _mybatis_runtime_entry(artifact_catalog, fact_store=None):
+    if fact_store is None and artifact_catalog:
+        fact_store = Step5ArtifactFactStore.from_catalog(artifact_catalog)
     matches = []
     errors = []
     for entry in (artifact_catalog or {}).get('entries') or []:
@@ -1592,42 +1622,82 @@ def _verified_final_artifact(artifact_catalog):
 
 def _packaged_mybatis_contracts(candidates, artifact_catalog, fact_store=None):
     """Validate mapper registration, binding, and activation in one SHA-bound artifact."""
+    if fact_store is None:
+        fact_store = Step5ArtifactFactStore.from_catalog(artifact_catalog)
     artifact = Path(str((artifact_catalog or {}).get('final_artifact_path') or ''))
     final_entry = {
         'coord': '__final_artifact__',
         'jar_path': str(artifact),
         'sha256': str((artifact_catalog or {}).get('final_artifact_sha256') or '').lower(),
     }
-    if fact_store is not None:
-        try:
-            _shared_artifact_inventory(final_entry, fact_store, strict=True)
-        except (KeyError, OSError, ValueError) as exc:
-            return [], list(candidates), [], [
-                _fact_store_identity_error(final_entry, 'mybatis_final_artifact', exc)
-            ]
-        artifact_context = fact_store.open_verified_artifact('__final_artifact__')
-    else:
-        artifact, artifact_error = _verified_final_artifact(artifact_catalog)
-        if not artifact:
-            return [], list(candidates), [], [artifact_error]
-        artifact_context = artifact.open('rb')
+    try:
+        _shared_artifact_inventory(final_entry, fact_store, strict=True)
+    except (KeyError, OSError, ValueError) as exc:
+        return [], list(candidates), [], [
+            _fact_store_identity_error(final_entry, 'mybatis_final_artifact', exc)
+        ]
+    artifact_context = fact_store.open_verified_artifact('__final_artifact__')
     packaged = []
     unregistered = []
     activation = []
     errors = []
+    expected_classes = {
+        str(item.get('owner') or ''): str(item.get('owner') or '').replace('.', '/') + '.class'
+        for item in candidates
+    }
+    class_candidates = {owner: [] for owner in expected_classes}
+    xml_statements = {}
+
+    def scan_archive(archive, *, entry_prefix='', outer_layout=False):
+        for name in sorted(archive.namelist()):
+            qualified = f'{entry_prefix}!/{name}' if entry_prefix else name
+            logical = name
+            if outer_layout:
+                prefix = next((
+                    value for value in ('BOOT-INF/classes/', 'WEB-INF/classes/')
+                    if logical.startswith(value)
+                ), '')
+                if not prefix:
+                    continue
+                logical = logical[len(prefix):]
+            if name.endswith('.class'):
+                content = archive.read(name)
+                if (
+                    b'Lorg/springframework/boot/autoconfigure/SpringBootApplication;' in content
+                    or b'Lorg/springframework/boot/autoconfigure/EnableAutoConfiguration;' in content
+                ) and b'org/springframework/boot/SpringApplication' in content and b'run' in content:
+                    activation.append({
+                        'artifact_path': str(artifact),
+                        'artifact_entry': qualified,
+                        'artifact_sha256': str(artifact_catalog.get('final_artifact_sha256') or ''),
+                        'authority': 'current_final_artifact_classfile',
+                    })
+                for owner, expected in expected_classes.items():
+                    if logical == expected:
+                        class_candidates[owner].append((qualified, content))
+                continue
+            if not name.endswith('.xml'):
+                continue
+            try:
+                root = _parse_mybatis_xml_bytes(archive.read(name))
+            except ET.ParseError as exc:
+                errors.append(f'{qualified}:mybatis_xml:{type(exc).__name__}')
+                continue
+            if str(root.tag).rsplit('}', 1)[-1] != 'mapper':
+                continue
+            namespace = str(root.attrib.get('namespace') or '').strip()
+            for child in root:
+                command = str(child.tag).rsplit('}', 1)[-1]
+                member = str(child.attrib.get('id') or '').strip()
+                if namespace and member and command in {'select', 'insert', 'update', 'delete'}:
+                    xml_statements.setdefault((namespace, member), []).append(
+                        (command, qualified)
+                    )
+
     try:
         with artifact_context as artifact_handle, zipfile.ZipFile(artifact_handle) as outer:
             names = set(outer.namelist())
-            class_entries = {
-                name: outer.read(name) for name in names
-                if name.endswith('.class')
-                and name.startswith(('BOOT-INF/classes/', 'WEB-INF/classes/'))
-            }
-            xml_entries = {
-                name: outer.read(name) for name in names
-                if name.endswith('.xml')
-                and name.startswith(('BOOT-INF/classes/', 'WEB-INF/classes/'))
-            }
+            scan_archive(outer, outer_layout=True)
             for entry in (artifact_catalog or {}).get('entries') or []:
                 if not (
                     entry.get('application_owned')
@@ -1644,52 +1714,23 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog, fact_store=None):
                     continue
                 try:
                     with zipfile.ZipFile(io.BytesIO(nested_blob)) as nested:
-                        for name in nested.namelist():
-                            qualified = f'{nested_entry}!/{name}'
-                            if name.endswith('.class'):
-                                class_entries[qualified] = nested.read(name)
-                            elif name.endswith('.xml'):
-                                xml_entries[qualified] = nested.read(name)
+                        scan_archive(nested, entry_prefix=nested_entry)
                 except zipfile.BadZipFile:
                     errors.append(f'{nested_entry}:mybatis_internal_module_bad_zip')
-            xml_statements = {}
-            for name, xml_content in sorted(xml_entries.items()):
-                try:
-                    root = _parse_mybatis_xml_bytes(xml_content)
-                except ET.ParseError as exc:
-                    errors.append(f'{name}:mybatis_xml:{type(exc).__name__}')
-                    continue
-                if str(root.tag).rsplit('}', 1)[-1] != 'mapper':
-                    continue
-                namespace = str(root.attrib.get('namespace') or '').strip()
-                for child in root:
-                    command = str(child.tag).rsplit('}', 1)[-1]
-                    member = str(child.attrib.get('id') or '').strip()
-                    if namespace and member and command in {'select', 'insert', 'update', 'delete'}:
-                        xml_statements[(namespace, member)] = (command, name)
-            for name, content in sorted(class_entries.items()):
-                if (
-                    b'Lorg/springframework/boot/autoconfigure/SpringBootApplication;' in content
-                    or b'Lorg/springframework/boot/autoconfigure/EnableAutoConfiguration;' in content
-                ) and b'org/springframework/boot/SpringApplication' in content and b'run' in content:
-                    activation.append({
-                        'artifact_path': str(artifact),
-                        'artifact_entry': name,
-                        'artifact_sha256': str(artifact_catalog.get('final_artifact_sha256') or ''),
-                        'authority': 'current_final_artifact_classfile',
-                    })
             final_artifact_sha256 = str(
                 (artifact_catalog or {}).get('final_artifact_sha256') or ''
             ).lower()
             for item in candidates:
-                class_suffix = item['owner'].replace('.', '/') + '.class'
-                class_entry = next(
-                    (name for name in class_entries if name.endswith('/' + class_suffix)), ''
-                )
-                if not class_entry:
+                matches = class_candidates.get(item['owner']) or []
+                if len(matches) != 1:
+                    if len(matches) > 1:
+                        errors.append(
+                            f"{item['owner']}:mybatis_mapper_class_ambiguous:"
+                            + ','.join(name for name, _content in matches)
+                        )
                     unregistered.append({**item, '_unproven_reason': 'registration'})
                     continue
-                content = class_entries[class_entry]
+                class_entry, content = matches[0]
                 registered = b'Lorg/apache/ibatis/annotations/Mapper;' in content
                 annotation_markers = {
                     'select': (b'Lorg/apache/ibatis/annotations/Select;', b'Lorg/apache/ibatis/annotations/SelectProvider;'),
@@ -1697,7 +1738,15 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog, fact_store=None):
                     'update': (b'Lorg/apache/ibatis/annotations/Update;', b'Lorg/apache/ibatis/annotations/UpdateProvider;'),
                     'delete': (b'Lorg/apache/ibatis/annotations/Delete;', b'Lorg/apache/ibatis/annotations/DeleteProvider;'),
                 }
-                xml_binding = xml_statements.get((item['owner'], item['member']))
+                xml_matches = xml_statements.get((item['owner'], item['member'])) or []
+                if len(xml_matches) > 1:
+                    errors.append(
+                        f"{item['owner']}.{item['member']}:mybatis_xml_binding_ambiguous:"
+                        + ','.join(name for _command, name in xml_matches)
+                    )
+                    unregistered.append({**item, '_unproven_reason': 'binding'})
+                    continue
+                xml_binding = xml_matches[0] if xml_matches else None
                 annotation_binding = any(
                     marker in content for marker in annotation_markers.get(item['command'], ())
                 ) and item['member'].encode('utf-8') in content
@@ -1734,12 +1783,10 @@ def _packaged_mybatis_contracts(candidates, artifact_catalog, fact_store=None):
                 }
                 packaged.append(verified)
     except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
-        if fact_store is not None:
-            errors.append(_fact_store_identity_error(
-                final_entry, 'mybatis_final_artifact', exc,
-            ))
-        else:
-            errors.append(f'{artifact}:mybatis_final_artifact:{type(exc).__name__}')
+        errors.append(_fact_store_or_parser_error(
+            final_entry, 'mybatis_final_artifact', exc,
+            'mybatis_final_artifact_parse_failed',
+        ))
         return [], list(candidates), [], errors
     return packaged, unregistered, activation, errors
 
@@ -1844,6 +1891,8 @@ def _mybatis_select_runtime_target(contract):
 
 def run_mybatis_proxy_adapter(source_roots, artifact_catalog=None, fact_store=None):
     """Resolve registered mapper calls through the exact packaged MyBatis proxy runtime."""
+    if fact_store is None and artifact_catalog:
+        fact_store = Step5ArtifactFactStore.from_catalog(artifact_catalog)
     mapper_scan_evidence, mapper_scan_errors = _mybatis_mapper_scan_evidence(source_roots)
     runtime_entry, runtime_errors, runtime_matches = _mybatis_runtime_entry(
         artifact_catalog, fact_store=fact_store,
@@ -2827,6 +2876,8 @@ def _packaged_transactional_methods(entry, owners, fact_store=None):
 def run_spring_transaction_proxy_adapter(
     source_roots, artifact_catalog=None, fact_store=None,
 ):
+    if fact_store is None and artifact_catalog:
+        fact_store = Step5ArtifactFactStore.from_catalog(artifact_catalog)
     """Resolve @Transactional business calls through exact packaged Spring AOP methods."""
     transactional_methods, errors = _spring_transactional_business_methods(source_roots)
     source_activation_evidence, activation_errors = _spring_boot_business_activation(source_roots)
@@ -3012,6 +3063,8 @@ def run_spring_transaction_proxy_adapter(
 def run_spring_data_repository_adapter(
     source_roots, artifact_catalog=None, fact_store=None,
 ):
+    if fact_store is None and artifact_catalog:
+        fact_store = Step5ArtifactFactStore.from_catalog(artifact_catalog)
     """Resolve Spring Data repository proxies from source contracts and packaged runtime code."""
     repositories, repository_errors = _spring_data_business_repositories(source_roots)
     custom_configuration, custom_configuration_errors = (
@@ -3420,6 +3473,8 @@ def collect_spring_aop_activation(
     runtime_catalog, business_inventory, fact_store=None,
 ):
     """Collect only exact, packaged and registered Spring AOP activation paths."""
+    if fact_store is None:
+        fact_store = Step5ArtifactFactStore.from_catalog(runtime_catalog)
     business_entries = [
         item for item in (runtime_catalog or {}).get('entries') or ()
         if _catalog_entry_is_application_owned(item)
@@ -3432,7 +3487,7 @@ def collect_spring_aop_activation(
         business_entries, fact_store=fact_store,
     )
     raw_edges = []
-    errors = list(class_errors)
+    errors = class_errors
     aspect_count = 0
     registered_count = 0
     with tempfile.TemporaryDirectory(prefix='spring-aop-activation-') as temporary:
@@ -3471,7 +3526,28 @@ def collect_spring_aop_activation(
 
         for index, record in enumerate(class_records):
             name = record['entry']
-            class_bytes = record['bytes']
+            if 'bytes' in record:
+                class_bytes = record['bytes']
+            elif 'location' in record:
+                outcome = fact_store.class_bytes(
+                    record['coord'], record['location'],
+                )
+                if outcome.status != 'complete':
+                    errors.append(_fact_store_or_parser_error(
+                        {
+                            'coord': record['coord'],
+                            'jar_path': record['artifact_path'],
+                            'sha256': record['artifact_sha256'],
+                        },
+                        f'spring_aop_class:{name}',
+                        ValueError(outcome.reason),
+                        'spring_aop_class_parse_failed',
+                    ))
+                    continue
+                class_bytes = outcome.value
+            else:
+                errors.append(f'{name}:spring_aop_class_bytes_unavailable')
+                continue
             if b'Lorg/aspectj/lang/annotation/Aspect;' not in class_bytes:
                 continue
             aspect_count += 1
@@ -3861,26 +3937,32 @@ def _locate_catalog_classes(
                         )
                         if outcome.status != 'complete':
                             raise ValueError(outcome.reason)
-                        with zipfile.ZipFile(io.BytesIO(outcome.value)) as nested:
-                            names = set(nested.namelist())
-                            for owner in requested:
-                                expected = owner.replace('.', '/') + '.class'
-                                if expected not in names:
-                                    continue
-                                class_entry = f'{nested_name}!/{expected}'
-                                if catalog_entry and catalog_entry != '<business-classes>':
-                                    class_entry = f'{catalog_entry}!/{class_entry}'
-                                candidates[owner].append({
-                                    'entry': class_entry,
-                                    'logical_entry': expected,
-                                    'bytes': nested.read(expected),
-                                    'artifact_path': str(item.get('jar_path') or ''),
-                                    'artifact_sha256': str(item.get('sha256') or '').lower(),
-                                    'coord': coord,
-                                })
+                        try:
+                            with zipfile.ZipFile(io.BytesIO(outcome.value)) as nested:
+                                names = set(nested.namelist())
+                                for owner in requested:
+                                    expected = owner.replace('.', '/') + '.class'
+                                    if expected not in names:
+                                        continue
+                                    class_entry = f'{nested_name}!/{expected}'
+                                    if catalog_entry and catalog_entry != '<business-classes>':
+                                        class_entry = f'{catalog_entry}!/{class_entry}'
+                                    candidates[owner].append({
+                                        'entry': class_entry,
+                                        'logical_entry': expected,
+                                        'bytes': nested.read(expected),
+                                        'artifact_path': str(item.get('jar_path') or ''),
+                                        'artifact_sha256': str(item.get('sha256') or '').lower(),
+                                        'coord': coord,
+                                    })
+                        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                            diagnostics.append(
+                                f'{nested_name}:spring_nested_artifact_invalid:{exc}'
+                            )
             except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
-                diagnostics.append(_fact_store_identity_error(
+                diagnostics.append(_fact_store_or_parser_error(
                     item, 'spring_class_location', exc,
+                    'spring_class_location_failed',
                 ))
                 continue
         for owner, values in candidates.items():
@@ -3969,13 +4051,32 @@ def _catalog_class_records(entries, fact_store=None):
     for item in entries:
         if fact_store is not None:
             try:
-                item_records = _fact_store_class_records(item, fact_store)
+                inventory = _shared_artifact_inventory(
+                    item, fact_store, strict=True,
+                )
             except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
                 diagnostics.append(_fact_store_identity_error(
                     item, 'spring_class_inventory', exc,
                 ))
                 continue
-            for record in item_records:
+            catalog_entry = str(item.get('artifact_entry') or '')
+            for location in inventory.classes:
+                logical = location.physical_entry
+                for prefix in ('BOOT-INF/classes/', 'WEB-INF/classes/'):
+                    if logical.startswith(prefix):
+                        logical = logical[len(prefix):]
+                        break
+                full_entry = location.physical_entry
+                if catalog_entry and catalog_entry != '<business-classes>':
+                    full_entry = f'{catalog_entry}!/{full_entry}'
+                record = {
+                    'entry': full_entry,
+                    'logical_entry': logical,
+                    'location': location,
+                    'artifact_path': str(item.get('jar_path') or ''),
+                    'artifact_sha256': str(item.get('sha256') or '').lower(),
+                    'coord': str(item.get('coord') or ''),
+                }
                 identities.setdefault(record['logical_entry'], []).append(record)
                 records.append(record)
             continue
@@ -4034,13 +4135,38 @@ def _catalog_class_records(entries, fact_store=None):
             record for record in records
             if record['logical_entry'] not in duplicate_entries
         ]
-    return tuple(records), diagnostics
+    if fact_store is None:
+        return tuple(records), diagnostics
+
+    grouped = {}
+    for record in records:
+        grouped.setdefault(record['coord'], {})[
+            record['location'].physical_entry
+        ] = record
+
+    def stream_records():
+        for coord, records_by_entry in grouped.items():
+            try:
+                for location, content in fact_store.iter_class_bytes(coord):
+                    record = records_by_entry.get(location.physical_entry)
+                    if record is not None:
+                        yield {**record, 'bytes': content}
+            except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                sample = next(iter(records_by_entry.values()), {})
+                diagnostics.append(_fact_store_or_parser_error(
+                    sample, 'spring_class_stream', exc,
+                    'spring_aop_class_parse_failed',
+                ))
+
+    return stream_records(), diagnostics
 
 
 def collect_spring_security_filter_activation(
     runtime_catalog, business_inventory, fact_store=None,
 ):
     """Verify exact SecurityFilterChain membership from source inventory and bytes."""
+    if fact_store is None:
+        fact_store = Step5ArtifactFactStore.from_catalog(runtime_catalog)
     runtime_entries = list((runtime_catalog or {}).get('entries') or ())
     business_entries = [
         item for item in runtime_entries if _catalog_entry_is_application_owned(item)
@@ -4228,6 +4354,8 @@ def collect_spring_security_filter_activation(
 def run_runtime_spring_registration_adapter(
     source_roots, artifact_catalog=None, fact_store=None,
 ):
+    if fact_store is None and artifact_catalog:
+        fact_store = Step5ArtifactFactStore.from_catalog(artifact_catalog)
     """Read Spring registrations from the exact packaged runtime jars.
 
     A registration is a confirmed runtime entry only when business code proves that Spring Boot
@@ -4418,6 +4546,8 @@ def run_runtime_spring_registration_adapter(
 def run_framework_adapters(
     source_roots, output_path='', artifact_catalog=None, fact_store=None,
 ):
+    if fact_store is None and artifact_catalog:
+        fact_store = Step5ArtifactFactStore.from_catalog(artifact_catalog)
     spring_security_inventory = _spring_security_source_inventory(source_roots)
     has_business_artifact = any(
         str(item.get('coord') or '') == '__business__'

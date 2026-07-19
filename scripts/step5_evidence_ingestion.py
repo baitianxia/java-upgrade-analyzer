@@ -2177,6 +2177,9 @@ class EvidenceRegistry:
             for coverage in batch.coverage
             ),
         )
+        graph.reverse_edge_count = sum(
+            len(edges) for edges in graph.reverse_edges.values()
+        )
         return IngestionResult(
             merged_edges=len(accepted_edges),
             duplicate_edges=duplicates,

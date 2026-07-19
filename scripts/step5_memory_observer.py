@@ -117,12 +117,15 @@ def record_step5_memory(
     """Record scalar metrics only; never retain the graph or its collections."""
     methods = getattr(graph, "methods_by_id", {}) if graph is not None else {}
     reverse_edges = getattr(graph, "reverse_edges", {}) if graph is not None else {}
+    reverse_edge_count = getattr(graph, "reverse_edge_count", None)
+    if reverse_edge_count is None:
+        reverse_edge_count = sum(len(edges) for edges in reverse_edges.values())
     sample: dict[str, Any] = {
         "current_rss_mb": _safe_read(current_reader),
         "peak_rss_mb": _safe_read(peak_reader),
         "method_count": len(methods),
         "reverse_edge_key_count": len(reverse_edges),
-        "reverse_edge_count": sum(len(edges) for edges in reverse_edges.values()),
+        "reverse_edge_count": int(reverse_edge_count),
     }
     if extra:
         sample.update(extra)

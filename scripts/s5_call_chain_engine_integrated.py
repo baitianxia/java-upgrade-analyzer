@@ -2957,6 +2957,7 @@ def build_enhanced_source_graph(
         methods_by_qualified: dict
         methods_by_simple: dict
         reverse_edges: dict
+        reverse_edge_count: int
         lookup_keys_by_symbol: dict
         type_metadata: dict  # 必须填充，否则接口/继承分析失效
 
@@ -3819,6 +3820,7 @@ def build_enhanced_source_graph(
         methods_by_qualified=dict(methods_by_qualified),
         methods_by_simple=dict(methods_by_simple),
         reverse_edges=dict(reverse_edges),
+        reverse_edge_count=int(stats.get('reverse_edges_indexed') or 0),
         lookup_keys_by_symbol=lookup_keys_by_symbol,
         type_metadata=type_metadata  # 现在有数据了
     )

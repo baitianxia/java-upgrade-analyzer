@@ -201,6 +201,24 @@ class Step5MemoryObserverTest(unittest.TestCase):
             10.0,
         )
 
+    def test_uses_graph_edge_count_without_rescanning_reverse_edge_buckets(self):
+        class NoValues(dict):
+            def values(self):
+                raise AssertionError("reverse-edge buckets were rescanned")
+
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges=NoValues({"x": [object()]}),
+            reverse_edge_count=7,
+        )
+
+        sample = step5_memory_observer.record_step5_memory(
+            {"step5_perf": {}}, "graph_ready", graph=graph,
+            current_reader=lambda: 1.0, peak_reader=lambda: 2.0,
+        )
+
+        self.assertEqual(7, sample["reverse_edge_count"])
+
     def test_memory_metrics_are_written_to_step5_timing_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             timing_path = step5_engine._write_step5_timing_csv(

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 import zipfile
 from pathlib import Path
@@ -698,6 +699,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 runtime_batch = framework_adapter_module.run_runtime_spring_registration_adapter(
                     [], artifact_catalog={"entries": [{
                         "coord": "com.acme:runtime", "jar_path": str(runtime),
+                        "sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
                     }]}
                 )
 
@@ -957,7 +959,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
         ))
         self.assertEqual(corrupt_sha["edges"], [])
         self.assertTrue(any(
-            "mybatis_runtime_sha256_mismatch" in error
+            "artifact_fact_store_identity_failed" in error
             for error in corrupt_sha["errors"]
         ))
         self.assertEqual(unregistered["edges"], [])
@@ -998,6 +1000,126 @@ class FrameworkAdaptersTest(unittest.TestCase):
         self.assertEqual(1, len(errors))
         self.assertIn("artifact_fact_store_identity_failed", errors[0])
 
+    def test_mybatis_packaged_contract_rejects_duplicate_mapper_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "application.jar"
+            mapper_bytes = (
+                b"Lorg/apache/ibatis/annotations/Mapper;"
+                b"Lorg/apache/ibatis/annotations/Select;find"
+            )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/com/acme/CityMapper.class", mapper_bytes,
+                )
+                archive.writestr(
+                    "WEB-INF/classes/com/acme/CityMapper.class", mapper_bytes,
+                )
+            catalog = {
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "entries": [],
+            }
+            candidate = {
+                "owner": "com.acme.CityMapper", "member": "find",
+                "command": "select", "file": "CityMapper.java",
+            }
+
+            packaged, unregistered, _activation, errors = (
+                framework_adapter_module._packaged_mybatis_contracts(
+                    [candidate], catalog,
+                )
+            )
+
+        self.assertFalse(packaged)
+        self.assertEqual("registration", unregistered[0]["_unproven_reason"])
+        self.assertTrue(any("mybatis_mapper_class_ambiguous" in item for item in errors))
+        failure = framework_adapter_module._framework_failure("mybatis", errors[0])
+        self.assertEqual("MYBATIS_MAPPER_CLASS_AMBIGUOUS", failure.reason_code)
+        self.assertTrue(failure.blocking)
+
+    def test_mybatis_packaged_contract_rejects_duplicate_xml_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "application.jar"
+            mapper_bytes = b"Lorg/apache/ibatis/annotations/Mapper;find"
+            mapping = (
+                b'<mapper namespace="com.acme.CityMapper">'
+                b'<select id="find">select 1</select></mapper>'
+            )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/com/acme/CityMapper.class", mapper_bytes,
+                )
+                archive.writestr("BOOT-INF/classes/mapper/one.xml", mapping)
+                archive.writestr("WEB-INF/classes/mapper/two.xml", mapping)
+            catalog = {
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "entries": [],
+            }
+            candidate = {
+                "owner": "com.acme.CityMapper", "member": "find",
+                "command": "select", "file": "CityMapper.java",
+            }
+
+            packaged, unregistered, _activation, errors = (
+                framework_adapter_module._packaged_mybatis_contracts(
+                    [candidate], catalog,
+                )
+            )
+
+        self.assertFalse(packaged)
+        self.assertEqual("binding", unregistered[0]["_unproven_reason"])
+        self.assertTrue(any("mybatis_xml_binding_ambiguous" in item for item in errors))
+        failure = framework_adapter_module._framework_failure("mybatis", errors[0])
+        self.assertEqual("MYBATIS_XML_BINDING_AMBIGUOUS", failure.reason_code)
+        self.assertTrue(failure.blocking)
+
+    def test_mybatis_packaged_contract_creates_fact_store_when_omitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"fixture")
+            catalog = {
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "entries": [],
+            }
+
+            with patch.object(
+                framework_adapter_module, "_verified_final_artifact",
+                side_effect=AssertionError("legacy path used"),
+            ):
+                result = framework_adapter_module._packaged_mybatis_contracts(
+                    [], catalog,
+                )
+
+        self.assertEqual(([], [], [], []), result)
+
+    def test_mybatis_packaged_contract_streams_large_class_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(
+                artifact, "w", compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                for index in range(24):
+                    archive.writestr(
+                        f"BOOT-INF/classes/com/acme/Filler{index}.class",
+                        b"x" * (1024 * 1024),
+                    )
+            catalog = {
+                "final_artifact_path": str(artifact),
+                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "entries": [],
+            }
+
+            tracemalloc.start()
+            result = framework_adapter_module._packaged_mybatis_contracts([], catalog)
+            _current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+        self.assertEqual(([], [], [], []), result)
+        self.assertLess(peak, 12 * 1024 * 1024)
+
     def test_artifact_javap_nonzero_exit_is_blocking_parser_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar = Path(tmp) / "runtime.jar"
@@ -1021,6 +1143,25 @@ class FrameworkAdaptersTest(unittest.TestCase):
         failure = framework_adapter_module._framework_failure("test", error)
         self.assertEqual("FRAMEWORK_JAVAP_FAILED", failure.reason_code)
         self.assertTrue(failure.blocking)
+
+    def test_artifact_javap_missing_class_is_parser_failure_not_identity_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "runtime.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("com/acme/Present.class", b"fixture")
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            result, error = framework_adapter_module._artifact_javap(
+                entry, "com.acme.Missing", ("-p", "-s"), "test", store,
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("framework_javap_failed", error)
+        self.assertNotIn("artifact_fact_store_identity_failed", error)
 
     def test_mybatis_mapper_scan_is_partial_instead_of_not_applicable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1456,17 +1597,19 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     jar.write(class_file, class_file.relative_to(business_classes).as_posix())
                 jar.writestr("com/acme/Application.class", b"packaged-application")
             business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+            tx_sha = hashlib.sha256(tx_jar.read_bytes()).hexdigest()
+            aop_sha = hashlib.sha256(aop_jar.read_bytes()).hexdigest()
 
             payload = run_framework_adapters(
                 [{"root": str(module / "src/main/java"), "owner_type": "business"}],
                 artifact_catalog={"entries": [
                     {
                         "coord": "org.springframework:spring-tx", "jar_path": str(tx_jar),
-                        "artifact_entry": "BOOT-INF/lib/spring-tx-7.0.8.jar", "sha256": "a" * 64,
+                        "artifact_entry": "BOOT-INF/lib/spring-tx-7.0.8.jar", "sha256": tx_sha,
                     },
                     {
                         "coord": "runtime:spring-aop-7.0.8", "jar_path": str(aop_jar),
-                        "artifact_entry": "BOOT-INF/lib/spring-aop-7.0.8.jar", "sha256": "b" * 64,
+                        "artifact_entry": "BOOT-INF/lib/spring-aop-7.0.8.jar", "sha256": aop_sha,
                     },
                     {
                         "coord": "__business__", "jar_path": str(business_jar),
@@ -1656,6 +1799,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             with zipfile.ZipFile(business_jar, "w") as jar:
                 jar.writestr("BOOT-INF/classes/com/acme/Application.class", b"application")
             business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+            implementation_sha = hashlib.sha256(jar_path.read_bytes()).hexdigest()
 
             payload = run_framework_adapters(
                 [{"root": str(module / "src/main/java"), "owner_type": "business"}],
@@ -1664,7 +1808,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                         "coord": "org.springframework.data:spring-data-jpa",
                         "jar_path": str(jar_path),
                         "artifact_entry": "BOOT-INF/lib/spring-data-jpa.jar",
-                        "sha256": "a" * 64,
+                        "sha256": implementation_sha,
                     },
                     {
                         "coord": "__business__",
@@ -2339,6 +2483,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             with zipfile.ZipFile(business_jar, "w") as jar:
                 jar.writestr("BOOT-INF/classes/com/acme/Application.class", b"application")
             business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+            runtime_sha = hashlib.sha256(runtime_jar.read_bytes()).hexdigest()
             payload = run_framework_adapters(
                 [{"root": str(module / "src/main/java")}],
                 artifact_catalog={"entries": [
@@ -2351,7 +2496,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                         "coord": "com.vendor:runtime",
                         "jar_path": str(runtime_jar),
                         "artifact_entry": "BOOT-INF/lib/runtime.jar",
-                        "sha256": "b" * 64,
+                        "sha256": runtime_sha,
                     },
                 ]},
             )
@@ -2389,6 +2534,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     "org.springframework.context.ApplicationListener="
                     "com.vendor.RuntimeListener\n",
                 )
+            runtime_sha = hashlib.sha256(runtime_jar.read_bytes()).hexdigest()
             catalog = {"entries": [
                 {
                     "coord": "__business__",
@@ -2399,7 +2545,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     "coord": "com.vendor:runtime",
                     "jar_path": str(runtime_jar),
                     "artifact_entry": "BOOT-INF/lib/runtime.jar",
-                    "sha256": "b" * 64,
+                    "sha256": runtime_sha,
                 },
             ]}
 
@@ -2434,7 +2580,10 @@ class FrameworkAdaptersTest(unittest.TestCase):
         provenance = framework_adapter_module.thaw_evidence_value(
             metadata["framework_provenance"]
         )
-        self.assertEqual(provenance["artifact_sha256"], "b" * 64)
+        self.assertEqual(
+            provenance["artifact_sha256"],
+            runtime_sha,
+        )
         self.assertEqual(provenance["artifact_entry"], "BOOT-INF/lib/runtime.jar")
         activation = provenance["business_activation"]
         self.assertEqual(len(activation), 1)
@@ -2582,6 +2731,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                     "META-INF/spring.factories",
                     "org.springframework.context.ApplicationListener=com.vendor.RuntimeListener\n",
                 )
+            runtime_sha = hashlib.sha256(runtime_jar.read_bytes()).hexdigest()
 
             payload = run_framework_adapters(
                 [
@@ -2591,6 +2741,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 artifact_catalog={"entries": [{
                     "coord": "com.vendor:runtime",
                     "jar_path": str(runtime_jar),
+                    "sha256": runtime_sha,
                 }]},
             )
 

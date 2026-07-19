@@ -4390,6 +4390,9 @@ def _add_runtime_dependency_caller_edge(
 ):
     methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
     reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    reverse_edge_count = getattr(graph, 'reverse_edge_count', None)
+    if reverse_edge_count is None:
+        reverse_edge_count = sum(len(edges) for edges in reverse_edges.values())
     consumer_method = matched.get('consumer_method') or '<unknown>'
     consumer_signature = matched.get('consumer_signature') or ''
     caller = _runtime_method_def_for_packaged_caller(
@@ -4452,8 +4455,10 @@ def _add_runtime_dependency_caller_edge(
         ) == identity for old in bucket):
             continue
         bucket.append(edge)
+        reverse_edge_count += 1
     graph.methods_by_id = methods_by_id
     graph.reverse_edges = reverse_edges
+    graph.reverse_edge_count = reverse_edge_count
     return edge
 
 

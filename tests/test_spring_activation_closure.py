@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 import zipfile
 from pathlib import Path
@@ -644,6 +645,58 @@ class SpringActivationClosureTest(unittest.TestCase):
         self.assertFalse(diagnostics)
         self.assertEqual(b"42", locations["demo.Class42"]["bytes"])
         self.assertEqual(1, store.metrics()["class_bytes_reads"])
+
+    def test_shared_class_locator_classifies_malformed_nested_jar_as_parser_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "broken-app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/broken.jar", b"not-a-zip")
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            locations, diagnostics = framework_adapters._locate_catalog_classes(
+                [entry], {"demo.Missing"}, include_nested=True, fact_store=store,
+            )
+
+        self.assertIsNone(locations["demo.Missing"])
+        self.assertTrue(any("spring_nested_artifact_invalid" in item for item in diagnostics))
+        self.assertFalse(any("artifact_fact_store_identity_failed" in item for item in diagnostics))
+        failure = framework_adapters._framework_failure("spring", diagnostics[0])
+        self.assertEqual("SPRING_NESTED_ARTIFACT_INVALID", failure.reason_code)
+        self.assertTrue(failure.blocking)
+
+    def test_aop_collector_streams_large_non_aspect_class_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "large.jar"
+            with zipfile.ZipFile(
+                artifact, "w", compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                for index in range(24):
+                    archive.writestr(
+                        f"demo/Filler{index}.class", b"x" * (1024 * 1024),
+                    )
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "application_owned": True,
+                "ownership_evidence": {"authority": "fixture"},
+            }
+            catalog = {"entries": [entry]}
+            store = Step5ArtifactFactStore.from_catalog(catalog)
+
+            tracemalloc.start()
+            batch = framework_adapters.collect_spring_aop_activation(
+                catalog, {}, fact_store=store,
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+        self.assertFalse(batch.edges)
+        self.assertLess(peak, 12 * 1024 * 1024)
+        self.assertEqual(24, store.metrics()["class_bytes_reads"])
 
     def test_security_collector_requires_exact_chain_membership_and_resolved_condition(self):
         with tempfile.TemporaryDirectory() as tmp:
