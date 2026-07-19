@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import zipfile
+from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -159,6 +160,8 @@ class Step5ArtifactFactStore:
             "javap_starts": 0,
             "javap_shared_hits": 0,
             "javap_failures": 0,
+            "stream_cache_peak_bytes": 0,
+            "stream_cache_evictions": 0,
         }
         self._lock = threading.Lock()
 
@@ -167,11 +170,15 @@ class Step5ArtifactFactStore:
         catalog = catalog or {}
         target_jdk = str(catalog.get("target_jdk") or "")
         identities: dict[str, ArtifactIdentity] = {}
-        entries = list(catalog.get("entries") or ())
+        entries = [
+            ("", item) for item in (catalog.get("entries") or ())
+        ]
         if not entries:
-            entries = list((catalog.get("by_coord") or {}).values())
-        for item in entries:
-            coord = str((item or {}).get("coord") or "").strip()
+            entries = list((catalog.get("by_coord") or {}).items())
+        for catalog_coord, item in entries:
+            coord = str(
+                (item or {}).get("coord") or catalog_coord or ""
+            ).strip()
             if not coord or coord in identities:
                 continue
             identities[coord] = ArtifactIdentity(
@@ -303,35 +310,52 @@ class Step5ArtifactFactStore:
         """Stream classes while allowing bounded reads from the same verified ZIP."""
         inventory = self._verified_inventory(coord)
         with self._open_verified_artifact(inventory) as handle:
-            spool = tempfile.TemporaryFile(mode="w+b")
-            spooled = {}
+            cache_limit = 4 * 1024 * 1024
+            cached = OrderedDict()
+            cached_bytes = 0
             try:
                 with zipfile.ZipFile(handle) as archive:
-                    def read_location(location):
-                        if location not in inventory.classes:
-                            raise KeyError(
-                                "class_location_not_in_inventory:"
-                                f"{location.physical_entry}"
-                            )
-                        stored = spooled.get(location)
-                        if stored is not None:
-                            offset, size = stored
-                            spool.seek(offset)
-                            return spool.read(size)
+                    def read_archive(location):
                         content = archive.read(location.physical_entry)
-                        spool.seek(0, os.SEEK_END)
-                        offset = spool.tell()
-                        spool.write(content)
-                        spooled[location] = (offset, len(content))
                         with self._lock:
                             self._metrics["class_bytes_reads"] += 1
                             self._metrics["class_bytes_read"] += len(content)
                         return content
 
+                    def read_location(location):
+                        nonlocal cached_bytes
+                        if location not in inventory.classes:
+                            raise KeyError(
+                                "class_location_not_in_inventory:"
+                                f"{location.physical_entry}"
+                            )
+                        if location in cached:
+                            content = cached.pop(location)
+                            cached[location] = content
+                            return content
+                        content = read_archive(location)
+                        if len(content) <= cache_limit:
+                            while cached and cached_bytes + len(content) > cache_limit:
+                                _discarded_location, discarded = cached.popitem(last=False)
+                                cached_bytes -= len(discarded)
+                                with self._lock:
+                                    self._metrics["stream_cache_evictions"] += 1
+                            cached[location] = content
+                            cached_bytes += len(content)
+                            with self._lock:
+                                self._metrics["stream_cache_peak_bytes"] = max(
+                                    self._metrics["stream_cache_peak_bytes"], cached_bytes,
+                                )
+                        return content
+
                     for location in inventory.classes:
-                        yield location, read_location(location), read_location
+                        content = cached.pop(location, None)
+                        if content is not None:
+                            cached_bytes -= len(content)
+                        else:
+                            content = read_archive(location)
+                        yield location, content, read_location
             finally:
-                spool.close()
                 if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
                     raise ValueError("artifact_changed_after_inventory")
                 self._assert_path_identity(inventory)
@@ -565,6 +589,13 @@ class Step5ArtifactFactStore:
                 )
             with zipfile.ZipFile(handle) as archive:
                 names = tuple(archive.namelist())
+                duplicates = sorted(
+                    name for name, count in Counter(names).items() if count > 1
+                )
+                if duplicates:
+                    raise ValueError(
+                        "artifact_duplicate_entries:" + ",".join(duplicates[:20])
+                    )
                 try:
                     manifest = archive.read("META-INF/MANIFEST.MF").decode(
                         "utf-8", errors="replace"

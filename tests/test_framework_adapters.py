@@ -2785,6 +2785,28 @@ class FrameworkAdaptersTest(unittest.TestCase):
         self.assertEqual("SPRING_BOOT_ARTIFACT_PARSE_FAILED", failure.reason_code)
         self.assertTrue(failure.blocking)
 
+    def test_runtime_registration_bad_zip_is_blocking_parser_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_jar = Path(tmp) / "runtime.jar"
+            runtime_jar.write_bytes(b"not-a-zip")
+            entry = {
+                "coord": "com.acme:runtime", "jar_path": str(runtime_jar),
+                "sha256": hashlib.sha256(runtime_jar.read_bytes()).hexdigest(),
+            }
+            catalog = {"entries": [entry]}
+
+            batch = framework_adapter_module.run_runtime_spring_registration_adapter(
+                [], artifact_catalog=catalog,
+                fact_store=Step5ArtifactFactStore.from_catalog(catalog),
+            )
+
+        self.assertFalse(batch.edges)
+        self.assertEqual(
+            {"SPRING_BOOT_ARTIFACT_PARSE_FAILED"},
+            {failure.reason_code for failure in batch.failures},
+        )
+        self.assertTrue(all(failure.blocking for failure in batch.failures))
+
     @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
     def test_packaged_message_listener_adapter_registers_exact_business_callback(self):
         with tempfile.TemporaryDirectory() as tmp:

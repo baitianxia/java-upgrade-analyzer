@@ -16,6 +16,7 @@ from pathlib import Path
 from compat import run_cmd
 from indirect_usage_analyzer import parse_javap_indirect_references
 from step5_evidence_ingestion import ingest_collector_batches
+from step5_artifact_fact_store import Step5ArtifactFactStore
 from step5_evidence_model import (
     CollectedEdge,
     CollectorBatch,
@@ -1345,6 +1346,8 @@ def collect_business_bytecode_batch(
     source_roots, artifact_catalog, cache_path, *, fact_store=None,
 ):
     """Collect immutable current-final-artifact bytecode evidence without a graph."""
+    if fact_store is None:
+        fact_store = Step5ArtifactFactStore.from_catalog(artifact_catalog)
     evidence, metrics = collect_business_bytecode_edges(
         source_roots,
         artifact_catalog=artifact_catalog,

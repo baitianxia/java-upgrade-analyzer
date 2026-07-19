@@ -31,6 +31,38 @@ from step5_evidence_model import EvidenceFailure, EvidenceFailureOccurrence  # n
 
 
 class Step5ColdRunContractTest(unittest.TestCase):
+    def test_stream_reader_does_not_spool_archive_to_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "artifact.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("demo/One.class", b"one")
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            with patch(
+                "step5_artifact_fact_store.tempfile.TemporaryFile",
+                side_effect=AssertionError("disk spool must not be used"),
+            ):
+                self.assertEqual(1, len(list(store.iter_class_bytes("g:a"))))
+
+    def test_inventory_rejects_exact_duplicate_class_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "artifact.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("demo/Duplicate.class", b"first")
+                archive.writestr("demo/Duplicate.class", b"second")
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            with self.assertRaisesRegex(ValueError, "artifact_duplicate_entries"):
+                store.verified_inventory("g:a")
+
     def test_physical_class_stream_checks_identity_when_closed_early(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar = Path(tmp) / "artifact.jar"
@@ -70,7 +102,7 @@ class Step5ColdRunContractTest(unittest.TestCase):
                     replacement.replace(jar)
                     raise RuntimeError("parse")
 
-    def test_stream_reader_spools_prefetch_and_reuses_already_seen_class(self):
+    def test_stream_reader_bounds_prefetch_cache_and_rereads_evicted_class(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar = Path(tmp) / "artifact.jar"
             with zipfile.ZipFile(jar, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -98,8 +130,10 @@ class Step5ColdRunContractTest(unittest.TestCase):
             reads_after = store.metrics()["class_bytes_reads"]
             stream.close()
 
-        self.assertLess(peak, 4 * 1024 * 1024)
-        self.assertEqual(reads_before, reads_after)
+        self.assertLess(peak, 8 * 1024 * 1024)
+        self.assertLessEqual(store.metrics()["stream_cache_peak_bytes"], 4 * 1024 * 1024)
+        self.assertGreater(store.metrics()["stream_cache_evictions"], 0)
+        self.assertEqual(reads_before + 1, reads_after)
 
     def test_ingestion_failure_serialization_uses_compact_occurrence_rows(self):
         occurrence = EvidenceFailureOccurrence(
@@ -925,6 +959,35 @@ class BusinessBytecodeFactParityTest(unittest.TestCase):
         metrics = dict(batch.metrics)
         self.assertLessEqual(metrics["javap_peak_pending_tasks"], 4)
         self.assertEqual(metrics["javap_pending_limit"], 4)
+
+    def test_business_batch_automatically_uses_artifact_fact_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "business.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("com/example/App.class", b"class")
+            digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            entry = {
+                "coord": "__business__", "jar_path": str(jar_path),
+                "sha256": digest, "artifact_entry": "<business-classes>",
+            }
+            catalog = {
+                "target_jdk": "17", "entries": [entry],
+                "by_coord": {"__business__": entry},
+            }
+            observed = []
+
+            def no_classes(_path, fact_store):
+                observed.append(fact_store)
+                return iter(())
+
+            with patch(
+                "business_bytecode_graph._iter_business_class_bytes",
+                side_effect=no_classes,
+            ):
+                collect_business_bytecode_batch([], catalog, None)
+
+        self.assertEqual(1, len(observed))
+        self.assertIsInstance(observed[0], Step5ArtifactFactStore)
 
 if __name__ == "__main__":
     unittest.main()

@@ -72,7 +72,7 @@ def _fact_store_failure_is_identity(reason):
     text = str(reason or '').lower()
     return any(marker in text for marker in (
         'artifact_changed', 'artifact_missing', 'artifact_sha256',
-        'identity_mismatch', 'identity_invalid', 'inventory',
+        'artifact_coord_missing', 'identity_mismatch', 'identity_invalid', 'inventory',
         'class_location_not_in_inventory', 'resource_not_in_inventory',
     ))
 
@@ -4606,8 +4606,9 @@ def run_runtime_spring_registration_adapter(
                 if jar_context is not None:
                     jar_context.close()
         except (KeyError, OSError, ValueError) as exc:
-            errors.append(_fact_store_identity_error(
+            errors.append(_fact_store_or_parser_error(
                 item, 'spring_runtime_registration', exc,
+                'spring_boot_artifact_parse_failed',
             ))
         except (OSError, zipfile.BadZipFile, UnicodeError) as exc:
             errors.append(f'{jar_path}:{type(exc).__name__}')
