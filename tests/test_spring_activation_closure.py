@@ -288,6 +288,9 @@ class SpringActivationClosureTest(unittest.TestCase):
                 "application_owned": True,
                 "ownership_evidence": {
                     "authority": "reactor_coordinate_and_final_artifact_entry",
+                    "reactor_coord": "com.acme:internal-aspects",
+                    "artifact_entry": "BOOT-INF/lib/internal-aspects.jar",
+                    "final_artifact_sha256": "a" * 64,
                 },
             }]
 
@@ -511,6 +514,9 @@ class SpringActivationClosureTest(unittest.TestCase):
                 "application_owned": True,
                 "ownership_evidence": {
                     "authority": "reactor_coordinate_and_final_artifact_entry",
+                    "reactor_coord": "com.acme:internal-security",
+                    "artifact_entry": "BOOT-INF/lib/internal-security.jar",
+                    "final_artifact_sha256": "a" * 64,
                 },
             }, {
                 "coord": "org.springframework.security:spring-security-web",

@@ -27,6 +27,7 @@ from step5_evidence_model import (
     EvidenceFailure,
     EvidenceProvenance,
     ModuleScope,
+    classify_module_scope,
     thaw_evidence_value,
 )
 from step5_artifact_fact_store import ClassLocation, Step5ArtifactFactStore
@@ -74,6 +75,7 @@ def _fact_store_failure_is_identity(reason):
         'artifact_changed', 'artifact_missing', 'artifact_sha256',
         'artifact_coord_missing', 'identity_mismatch', 'identity_invalid', 'inventory',
         'class_location_not_in_inventory', 'resource_not_in_inventory',
+        'artifact_coord_identity_conflict',
     ))
 
 
@@ -353,6 +355,12 @@ def _framework_failure(adapter, error):
         blocking = True
     elif 'spring_packaged_class_ambiguous' in text:
         reason = 'SPRING_PACKAGED_CLASS_AMBIGUOUS'
+        blocking = True
+    elif 'spring_transaction_business_class_ambiguous' in text:
+        reason = 'SPRING_TRANSACTION_BUSINESS_CLASS_AMBIGUOUS'
+        blocking = True
+    elif 'spring_transaction_owner_location_failed' in text:
+        reason = 'SPRING_TRANSACTION_OWNER_LOCATION_FAILED'
         blocking = True
     elif 'mybatis_mapper_class_ambiguous' in text:
         reason = 'MYBATIS_MAPPER_CLASS_AMBIGUOUS'
@@ -2932,6 +2940,47 @@ def _packaged_transactional_methods(entry, owners, fact_store=None):
     return verified, errors
 
 
+def _application_owned_entries_by_owner(entries, owners, fact_store):
+    requested = sorted({str(owner) for owner in owners if str(owner or '').strip()})
+    candidates = {owner: [] for owner in requested}
+    errors = []
+    seen_identities = set()
+    for entry in entries or []:
+        if not _catalog_entry_is_application_owned(entry):
+            continue
+        identity = (
+            str(entry.get('coord') or ''),
+            str(Path(str(entry.get('jar_path') or ''))),
+            str(entry.get('sha256') or '').lower(),
+            str(entry.get('artifact_entry') or ''),
+        )
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        try:
+            inventory = _shared_artifact_inventory(entry, fact_store, strict=True)
+        except (KeyError, OSError, ValueError) as exc:
+            errors.append(_fact_store_or_parser_error(
+                entry, 'spring_transaction_owner_location', exc,
+                'spring_transaction_owner_location_failed',
+            ))
+            continue
+        logical_names = {location.logical_name for location in inventory.classes}
+        for owner in requested:
+            if owner.replace('.', '/') + '.class' in logical_names:
+                candidates[owner].append(entry)
+    resolved = {}
+    for owner, matches in candidates.items():
+        if len(matches) == 1:
+            resolved[owner] = matches[0]
+        elif len(matches) > 1:
+            errors.append(
+                f'{owner}:spring_transaction_business_class_ambiguous:'
+                + ','.join(str(item.get('coord') or '') for item in matches)
+            )
+    return resolved, errors
+
+
 def run_spring_transaction_proxy_adapter(
     source_roots, artifact_catalog=None, fact_store=None,
 ):
@@ -2950,25 +2999,38 @@ def run_spring_transaction_proxy_adapter(
     findings = list(custom_mode_findings)
     business_entries = [
         item for item in (artifact_catalog or {}).get('entries') or []
-        if str(item.get('coord') or '') == '__business__'
+        if _catalog_entry_is_application_owned(item)
         and (
             fact_store is not None
             or Path(str(item.get('jar_path') or '')).is_file()
         )
     ]
     verified_methods = []
-    if transactional_methods and len(business_entries) == 1:
-        business_entry = business_entries[0]
-        packaged, packaged_errors = _packaged_transactional_methods(
-            business_entry,
+    if transactional_methods:
+        entries_by_owner, routing_errors = _application_owned_entries_by_owner(
+            business_entries,
             [item['owner'] for item in transactional_methods],
-            fact_store=fact_store,
+            fact_store,
         )
-        errors.extend(packaged_errors)
+        errors.extend(routing_errors)
+        entries_by_coord = {
+            str(entry.get('coord') or ''): entry for entry in entries_by_owner.values()
+        }
+        owners_by_coord = {}
+        for owner, entry in entries_by_owner.items():
+            owners_by_coord.setdefault(str(entry.get('coord') or ''), []).append(owner)
+        packaged = {}
+        for coord, owners in owners_by_coord.items():
+            artifact_methods, packaged_errors = _packaged_transactional_methods(
+                entries_by_coord[coord], owners, fact_store=fact_store,
+            )
+            packaged.update(artifact_methods)
+            errors.extend(packaged_errors)
         for method in transactional_methods:
             identity = (method['owner'], method['member'], method['parameter_count'])
             packaged_method = packaged.get(identity)
-            if not packaged_method:
+            business_entry = entries_by_owner.get(method['owner'])
+            if not packaged_method or business_entry is None:
                 findings.append({
                     'reason_code': 'spring_transaction_business_annotation_unverified',
                     'subject': f"{method['owner']}.{method['member']}/{method['parameter_count']}",
@@ -2980,12 +3042,6 @@ def run_spring_transaction_proxy_adapter(
                 'annotation_scope': packaged_method['annotation_scope'],
                 'business_artifact': business_entry,
             })
-    elif transactional_methods:
-        findings.append({
-            'reason_code': 'spring_transaction_business_annotation_unverified',
-            'subject': '__business__',
-            'candidate_count': len(business_entries),
-        })
     entries_by_role = {}
     for role in ('spring-tx', 'spring-aop'):
         entries_by_role[role] = [
@@ -3917,13 +3973,10 @@ def _locate_packaged_classes(archive, owners):
 
 
 def _catalog_entry_is_application_owned(item):
-    if str(item.get('coord') or '') == '__business__':
-        return True
-    ownership = item.get('ownership_evidence') or {}
-    return bool(
-        item.get('application_owned') is True
-        and str(ownership.get('authority') or '').strip()
-    )
+    return classify_module_scope(item) in {
+        ModuleScope.BUSINESS_CLASSES,
+        ModuleScope.INTERNAL_MODULE,
+    }
 
 
 def _fact_store_class_records(item, fact_store, *, include_nested=False):

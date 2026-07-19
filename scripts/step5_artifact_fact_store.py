@@ -138,8 +138,13 @@ def _effective_class_locations(
 class Step5ArtifactFactStore:
     """Shares immutable archive inventories inside one Step5 process."""
 
-    def __init__(self, identities: Mapping[str, ArtifactIdentity]):
+    def __init__(
+        self,
+        identities: Mapping[str, ArtifactIdentity],
+        identity_failures: Mapping[str, str] | None = None,
+    ):
         self._identities = dict(identities)
+        self._identity_failures = dict(identity_failures or {})
         self._inventories: dict[str, ArtifactInventory] = {}
         self._inventory_inflight: dict[str, threading.Event] = {}
         self._facts: dict[tuple[Any, ...], FactOutcome] = {}
@@ -170,6 +175,7 @@ class Step5ArtifactFactStore:
         catalog = catalog or {}
         target_jdk = str(catalog.get("target_jdk") or "")
         identities: dict[str, ArtifactIdentity] = {}
+        identity_failures: dict[str, str] = {}
         entries = [
             ("", item) for item in (catalog.get("entries") or ())
         ]
@@ -179,26 +185,38 @@ class Step5ArtifactFactStore:
             coord = str(
                 (item or {}).get("coord") or catalog_coord or ""
             ).strip()
-            if not coord or coord in identities:
+            if not coord:
                 continue
-            identities[coord] = ArtifactIdentity(
+            identity = ArtifactIdentity(
                 coord=coord,
                 path=str(item.get("jar_path") or ""),
                 sha256=str(item.get("sha256") or "").lower(),
                 artifact_entry=str(item.get("artifact_entry") or ""),
                 target_jdk=target_jdk,
             )
+            previous = identities.get(coord)
+            if previous is None:
+                identities[coord] = identity
+            elif previous != identity:
+                identity_failures[coord] = f"artifact_coord_identity_conflict:{coord}"
         final_path = str(catalog.get("final_artifact_path") or "")
         final_sha = str(catalog.get("final_artifact_sha256") or "").lower()
-        if final_path and "__final_artifact__" not in identities:
-            identities["__final_artifact__"] = ArtifactIdentity(
+        if final_path:
+            final_identity = ArtifactIdentity(
                 coord="__final_artifact__",
                 path=final_path,
                 sha256=final_sha,
                 artifact_entry="<final-artifact>",
                 target_jdk=target_jdk,
             )
-        return cls(identities)
+            previous = identities.get("__final_artifact__")
+            if previous is None:
+                identities["__final_artifact__"] = final_identity
+            elif previous != final_identity:
+                identity_failures["__final_artifact__"] = (
+                    "artifact_coord_identity_conflict:__final_artifact__"
+                )
+        return cls(identities, identity_failures)
 
     def inventory(self, coord: str) -> ArtifactInventory:
         coord = str(coord or "").strip()
@@ -220,6 +238,8 @@ class Step5ArtifactFactStore:
         identity = self._identities.get(coord) or ArtifactIdentity(coord, "", "", "", "")
         started_at = time.perf_counter()
         try:
+            if coord in self._identity_failures:
+                raise ValueError(self._identity_failures[coord])
             inventory = self._build_inventory(identity)
         except Exception as exc:  # failure remains explicit and shared
             inventory = ArtifactInventory(

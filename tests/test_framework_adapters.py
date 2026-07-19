@@ -821,6 +821,14 @@ class FrameworkAdaptersTest(unittest.TestCase):
                         "annotation_scope": "method",
                     }
                 }, []),
+            ), patch.object(
+                framework_adapter_module,
+                "_application_owned_entries_by_owner",
+                return_value=({
+                    "com.acme.BookingService": {
+                        "coord": "__business__", "jar_path": str(business),
+                    },
+                }, []),
             ):
                 transaction_batch = framework_adapter_module.run_spring_transaction_proxy_adapter(
                     [], artifact_catalog={"entries": [
@@ -1692,6 +1700,258 @@ class FrameworkAdaptersTest(unittest.TestCase):
         self.assertTrue(any(
             finding["reason_code"] == "spring_transaction_business_annotation_unverified"
             for finding in adapter["findings"]
+        ))
+
+    def test_transaction_collector_routes_internal_module_owner_to_its_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            classes = root / "classes"
+            source.mkdir()
+            classes.mkdir()
+            files = {
+                "org/springframework/transaction/annotation/Transactional.java": (
+                    "package org.springframework.transaction.annotation; "
+                    "@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) "
+                    "@java.lang.annotation.Target({java.lang.annotation.ElementType.TYPE, "
+                    "java.lang.annotation.ElementType.METHOD}) public @interface Transactional {}"
+                ),
+                "com/acme/AppService.java": (
+                    "package com.acme; public class AppService { "
+                    "@org.springframework.transaction.annotation.Transactional "
+                    "public void appWork() {} }"
+                ),
+                "com/acme/library/LibraryService.java": (
+                    "package com.acme.library; public class LibraryService { "
+                    "@org.springframework.transaction.annotation.Transactional "
+                    "public void libraryWork() {} }"
+                ),
+            }
+            source_paths = []
+            for relative, content in files.items():
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                source_paths.append(str(path))
+            subprocess.run(
+                ["javac", "-d", str(classes), *source_paths],
+                check=True, capture_output=True, text=True,
+            )
+            business_jar = root / "business-classes.jar"
+            internal_jar = root / "library.jar"
+            with zipfile.ZipFile(business_jar, "w") as archive:
+                archive.write(
+                    classes / "com/acme/AppService.class",
+                    "com/acme/AppService.class",
+                )
+            with zipfile.ZipFile(internal_jar, "w") as archive:
+                archive.write(
+                    classes / "com/acme/library/LibraryService.class",
+                    "com/acme/library/LibraryService.class",
+                )
+            entries = [
+                {
+                    "coord": "__business__",
+                    "jar_path": str(business_jar),
+                    "artifact_entry": "<business-classes>",
+                    "sha256": hashlib.sha256(business_jar.read_bytes()).hexdigest(),
+                },
+                {
+                    "coord": "com.acme:library",
+                    "jar_path": str(internal_jar),
+                    "artifact_entry": "BOOT-INF/lib/library.jar",
+                    "sha256": hashlib.sha256(internal_jar.read_bytes()).hexdigest(),
+                    "application_owned": True,
+                    "ownership_evidence": {
+                        "authority": "reactor_coordinate_and_final_artifact_entry",
+                        "reactor_coord": "com.acme:library",
+                        "artifact_entry": "BOOT-INF/lib/library.jar",
+                        "final_artifact_sha256": "a" * 64,
+                    },
+                },
+            ]
+            methods = ([
+                {
+                    "owner": "com.acme.AppService", "member": "appWork",
+                    "parameter_count": 0, "file": "/src/AppService.java", "line": 1,
+                    "annotation_scope": "method",
+                },
+                {
+                    "owner": "com.acme.library.LibraryService", "member": "libraryWork",
+                    "parameter_count": 0, "file": "/src/LibraryService.java", "line": 1,
+                    "annotation_scope": "method",
+                },
+            ], [])
+            with (
+                patch.object(
+                    framework_adapter_module,
+                    "_spring_transactional_business_methods",
+                    return_value=methods,
+                ),
+                patch.object(
+                    framework_adapter_module,
+                    "_spring_boot_business_activation",
+                    return_value=([], []),
+                ),
+            ):
+                batch = framework_adapter_module.run_spring_transaction_proxy_adapter(
+                    [], artifact_catalog={"entries": entries},
+                )
+
+        self.assertNotIn(
+            "FRAMEWORK_JAVAP_FAILED",
+            {failure.reason_code for failure in batch.failures},
+        )
+        self.assertNotIn(
+            "spring_transaction_business_annotation_unverified",
+            {concern.reason_code for concern in batch.concerns},
+        )
+
+    def test_transaction_collector_blocks_ambiguous_application_owned_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries = []
+            for index in range(2):
+                artifact = root / f"module-{index}.jar"
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr("com/acme/SharedService.class", b"fixture")
+                entries.append({
+                    "coord": f"com.acme:module-{index}",
+                    "jar_path": str(artifact),
+                    "artifact_entry": f"BOOT-INF/lib/module-{index}.jar",
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    "application_owned": True,
+                    "ownership_evidence": {
+                        "authority": "reactor_coordinate_and_final_artifact_entry",
+                        "reactor_coord": f"com.acme:module-{index}",
+                        "artifact_entry": f"BOOT-INF/lib/module-{index}.jar",
+                        "final_artifact_sha256": "a" * 64,
+                    },
+                })
+            methods = ([{
+                "owner": "com.acme.SharedService", "member": "work",
+                "parameter_count": 0, "file": "/src/SharedService.java", "line": 1,
+                "annotation_scope": "method",
+            }], [])
+            with (
+                patch.object(
+                    framework_adapter_module,
+                    "_spring_transactional_business_methods",
+                    return_value=methods,
+                ),
+                patch.object(
+                    framework_adapter_module,
+                    "_spring_boot_business_activation",
+                    return_value=([], []),
+                ),
+            ):
+                batch = framework_adapter_module.run_spring_transaction_proxy_adapter(
+                    [], artifact_catalog={"entries": entries},
+                )
+
+        ambiguity = [
+            failure for failure in batch.failures
+            if failure.reason_code == "SPRING_TRANSACTION_BUSINESS_CLASS_AMBIGUOUS"
+        ]
+        self.assertEqual(1, len(ambiguity), batch.failures)
+        self.assertTrue(ambiguity[0].blocking)
+
+    def test_transaction_owner_inventory_failure_is_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "module.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"first")
+                archive.writestr("com/acme/Service.class", b"second")
+            entry = {
+                "coord": "com.acme:module",
+                "jar_path": str(artifact),
+                "artifact_entry": "BOOT-INF/lib/module.jar",
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "application_owned": True,
+                "ownership_evidence": {
+                    "authority": "reactor_coordinate_and_final_artifact_entry",
+                    "reactor_coord": "com.acme:module",
+                    "artifact_entry": "BOOT-INF/lib/module.jar",
+                    "final_artifact_sha256": "a" * 64,
+                },
+            }
+            methods = ([{
+                "owner": "com.acme.Service", "member": "work",
+                "parameter_count": 0, "file": "/src/Service.java", "line": 1,
+                "annotation_scope": "method",
+            }], [])
+            with (
+                patch.object(
+                    framework_adapter_module,
+                    "_spring_transactional_business_methods",
+                    return_value=methods,
+                ),
+                patch.object(
+                    framework_adapter_module,
+                    "_spring_boot_business_activation",
+                    return_value=([], []),
+                ),
+            ):
+                batch = framework_adapter_module.run_spring_transaction_proxy_adapter(
+                    [], artifact_catalog={"entries": [entry]},
+                )
+
+        failures = [
+            failure for failure in batch.failures
+            if failure.reason_code == "SPRING_TRANSACTION_OWNER_LOCATION_FAILED"
+        ]
+        self.assertEqual(1, len(failures), batch.failures)
+        self.assertTrue(failures[0].blocking)
+
+    def test_catalog_application_ownership_requires_complete_authority(self):
+        self.assertFalse(framework_adapter_module._catalog_entry_is_application_owned({
+            "coord": "com.vendor:external",
+            "application_owned": True,
+            "ownership_evidence": {"authority": "anything"},
+        }))
+        self.assertTrue(framework_adapter_module._catalog_entry_is_application_owned({
+            "coord": "com.acme:module",
+            "application_owned": True,
+            "ownership_evidence": {
+                "authority": "reactor_coordinate_and_final_artifact_entry",
+                "reactor_coord": "com.acme:module",
+                "artifact_entry": "BOOT-INF/lib/module.jar",
+                "final_artifact_sha256": "a" * 64,
+            },
+        }))
+
+    def test_transaction_owner_resolver_deduplicates_exact_catalog_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "module.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("com/acme/Service.class", b"fixture")
+            entry = {
+                "coord": "com.acme:module",
+                "jar_path": str(artifact),
+                "artifact_entry": "BOOT-INF/lib/module.jar",
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "application_owned": True,
+                "ownership_evidence": {
+                    "authority": "reactor_coordinate_and_final_artifact_entry",
+                    "reactor_coord": "com.acme:module",
+                    "artifact_entry": "BOOT-INF/lib/module.jar",
+                    "final_artifact_sha256": "a" * 64,
+                },
+            }
+            catalog = {"entries": [entry, dict(entry)]}
+            resolved, errors = (
+                framework_adapter_module._application_owned_entries_by_owner(
+                    catalog["entries"], ["com.acme.Service"],
+                    Step5ArtifactFactStore.from_catalog(catalog),
+                )
+            )
+
+        self.assertEqual([], errors)
+        self.assertEqual(entry, resolved["com.acme.Service"])
+
+    def test_coordinate_identity_conflict_is_fact_store_identity_failure(self):
+        self.assertTrue(framework_adapter_module._fact_store_failure_is_identity(
+            "artifact_coord_identity_conflict:g:a",
         ))
 
     def test_spring_transaction_adapter_uses_packaged_aop_implementation_methods(self):

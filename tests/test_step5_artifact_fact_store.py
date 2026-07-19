@@ -31,6 +31,57 @@ from step5_evidence_model import EvidenceFailure, EvidenceFailureOccurrence  # n
 
 
 class Step5ColdRunContractTest(unittest.TestCase):
+    def test_catalog_rejects_same_coordinate_with_different_artifact_identities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries = []
+            for index in range(2):
+                artifact = root / f"artifact-{index}.jar"
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr(f"demo/Version{index}.class", bytes([index]))
+                entries.append({
+                    "coord": "g:a",
+                    "jar_path": str(artifact),
+                    "artifact_entry": f"BOOT-INF/lib/artifact-{index}.jar",
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                })
+
+            for ordered in (entries, list(reversed(entries))):
+                with self.subTest(first=Path(ordered[0]["jar_path"]).name):
+                    store = Step5ArtifactFactStore.from_catalog({"entries": ordered})
+                    with self.assertRaisesRegex(
+                        ValueError, "artifact_coord_identity_conflict:g:a",
+                    ):
+                        store.verified_inventory("g:a")
+
+    def test_catalog_rejects_entry_that_shadows_final_artifact_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = []
+            for name in ("catalog", "final"):
+                artifact = root / f"{name}.jar"
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr(f"demo/{name.title()}.class", name.encode())
+                artifacts.append(artifact)
+            catalog_entry, final_artifact = artifacts
+            store = Step5ArtifactFactStore.from_catalog({
+                "entries": [{
+                    "coord": "__final_artifact__",
+                    "jar_path": str(catalog_entry),
+                    "artifact_entry": "BOOT-INF/lib/not-final.jar",
+                    "sha256": hashlib.sha256(catalog_entry.read_bytes()).hexdigest(),
+                }],
+                "final_artifact_path": str(final_artifact),
+                "final_artifact_sha256": hashlib.sha256(
+                    final_artifact.read_bytes(),
+                ).hexdigest(),
+            })
+
+            with self.assertRaisesRegex(
+                ValueError, "artifact_coord_identity_conflict:__final_artifact__",
+            ):
+                store.verified_inventory("__final_artifact__")
+
     def test_stream_reader_does_not_spool_archive_to_disk(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar = Path(tmp) / "artifact.jar"
