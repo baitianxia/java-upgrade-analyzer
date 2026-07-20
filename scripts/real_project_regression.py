@@ -2047,6 +2047,65 @@ def infer_final_artifact_java_version(artifact_path: Path) -> str:
     return str(max(versions)) if versions else ""
 
 
+def _load_matching_build_provenance(
+    provenance_path: Path, artifact_sha256: str
+) -> dict | None:
+    try:
+        raw = provenance_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RuntimeError(
+            f"EXISTING_BUILD_PROVENANCE_INVALID:{provenance_path}:"
+            f"{type(error).__name__}:{error}"
+        ) from error
+    try:
+        existing = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"EXISTING_BUILD_PROVENANCE_INVALID:{provenance_path}:"
+            f"{type(error).__name__}:{error}"
+        ) from error
+    if not isinstance(existing, dict):
+        raise RuntimeError(
+            f"EXISTING_BUILD_PROVENANCE_INVALID:{provenance_path}:root_not_object"
+        )
+    sides = existing.get("sides")
+    if (
+        not isinstance(sides, list)
+        or not sides
+        or any(not isinstance(side, dict) for side in sides)
+    ):
+        raise RuntimeError(
+            f"EXISTING_BUILD_PROVENANCE_INVALID:{provenance_path}:invalid_sides"
+        )
+    current_sides = [
+        side for side in sides if str(side.get("side") or "") == "current"
+    ]
+    if len(current_sides) != 1:
+        raise RuntimeError(
+            f"EXISTING_BUILD_PROVENANCE_INVALID:{provenance_path}:"
+            f"current_side_count={len(current_sides)}"
+        )
+    current = current_sides[0]
+    existing_sha = str(
+        current.get("artifact_sha256")
+        or current.get("actual_artifact_sha256")
+        or ""
+    ).strip()
+    if not existing_sha:
+        raise RuntimeError(
+            f"EXISTING_BUILD_PROVENANCE_INVALID:{provenance_path}:"
+            "current_artifact_sha256_missing"
+        )
+    if existing_sha != artifact_sha256:
+        raise RuntimeError(
+            f"EXISTING_BUILD_PROVENANCE_ARTIFACT_MISMATCH:{provenance_path}:"
+            f"existing={existing_sha}:actual={artifact_sha256}"
+        )
+    return existing
+
+
 def write_pinned_final_artifact_provenance(
     report_dir: Path,
     asset_gate: dict,
@@ -2093,24 +2152,21 @@ def write_pinned_final_artifact_provenance(
         ):
             current_side.update(project_scope_provenance_fields(scope))
     provenance = {"sides": [current_side]}
-    try:
-        existing = json.loads(output.read_text(encoding="utf-8"))
-        existing_sides = list(existing.get("sides") or [])
+    existing = _load_matching_build_provenance(output, artifact_sha256)
+    if existing is not None:
+        existing_sides = existing["sides"]
         existing_current = next(
             side for side in existing_sides
             if str(side.get("side") or "") == "current"
         )
-        if str(existing_current.get("artifact_sha256") or "") == artifact_sha256:
-            merged_current = {**existing_current, **current_side}
-            provenance = dict(existing)
-            provenance["sides"] = [
-                merged_current
-                if str(side.get("side") or "") == "current"
-                else side
-                for side in existing_sides
-            ]
-    except (OSError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
-        pass
+        merged_current = {**existing_current, **current_side}
+        provenance = dict(existing)
+        provenance["sides"] = [
+            merged_current
+            if str(side.get("side") or "") == "current"
+            else side
+            for side in existing_sides
+        ]
     output.write_text(
         json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -2238,21 +2294,15 @@ def write_declared_final_artifact_provenance(
     dependencies_dir = Path(report_dir) / "evidence" / "dependencies"
     provenance_path = dependencies_dir / "build_provenance.json"
     resolved_path = dependencies_dir / "deps_current_resolved.csv"
-    try:
-        existing = json.loads(provenance_path.read_text(encoding="utf-8"))
-        current = next(
-            item for item in (existing.get("sides") or [])
-            if str(item.get("side") or "") == "current"
-        )
-        existing_sha = str(
-            current.get("artifact_sha256")
-            or current.get("actual_artifact_sha256")
-            or ""
-        )
-        if existing_sha == artifact_sha256 and resolved_path.is_file() and resolved_path.stat().st_size:
-            return provenance_path
-    except (OSError, StopIteration, ValueError, json.JSONDecodeError):
-        existing = {}
+    existing = _load_matching_build_provenance(
+        provenance_path, artifact_sha256
+    )
+    if (
+        existing is not None
+        and resolved_path.is_file()
+        and resolved_path.stat().st_size
+    ):
+        return provenance_path
     return write_pinned_final_artifact_provenance(
         report_dir,
         {

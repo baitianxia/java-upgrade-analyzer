@@ -1823,6 +1823,40 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(preserved, "coord\ng:a\n")
 
+    def test_declared_artifact_provenance_rejects_sha_mismatch_without_erasing_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "app.jar"
+            artifact.write_bytes(b"current-artifact")
+            report = root / "report"
+            dependencies = report / "evidence/dependencies"
+            dependencies.mkdir(parents=True)
+            provenance = dependencies / "build_provenance.json"
+            original = json.dumps({
+                "schema": "java-upgrade-analyzer.build-provenance.v1",
+                "sides": [
+                    {"side": "base", "artifact_sha256": "a" * 64},
+                    {"side": "current", "artifact_sha256": "b" * 64},
+                ],
+            }, indent=2).encode("utf-8")
+            provenance.write_bytes(original)
+            original_sha = hashlib.sha256(original).hexdigest()
+            case = realreg.RealProjectCase(
+                name="mismatch", default_project=root,
+                default_changed_apis=Path(""), baseline_specs=(),
+                final_artifact=artifact,
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "EXISTING_BUILD_PROVENANCE_ARTIFACT_MISMATCH"
+            ):
+                realreg.write_declared_final_artifact_provenance(report, case)
+
+            after = provenance.read_bytes()
+
+        self.assertEqual(after, original)
+        self.assertEqual(hashlib.sha256(after).hexdigest(), original_sha)
+
     def test_guard_coverage_declares_probe_scope(self):
         coverage = realreg.compute_api_coverage("guard", 5440, 9, 9)
 
@@ -7380,6 +7414,38 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(written["sides"][1]["source_mode"], "checkout_build")
         self.assertEqual(written["sides"][1]["project_scope_hash"], "c" * 64)
         self.assertEqual(resolved.read_text(encoding="utf-8"), original_resolved)
+
+    def test_pinned_provenance_rejects_malformed_existing_evidence_without_overwrite(self):
+        case = realreg.CASES["gs-managing-transactions"]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            dependencies = report_dir / "evidence" / "dependencies"
+            dependencies.mkdir(parents=True)
+            provenance = dependencies / "build_provenance.json"
+            original = b'{"sides": [{"side": "current"}'
+            provenance.write_bytes(original)
+            original_sha = hashlib.sha256(original).hexdigest()
+            artifact = Path(tmp) / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("app/App.class", b"class")
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+            with self.assertRaisesRegex(
+                RuntimeError, "EXISTING_BUILD_PROVENANCE_INVALID"
+            ):
+                realreg.write_pinned_final_artifact_provenance(
+                    report_dir,
+                    {
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": artifact_sha,
+                    },
+                    case,
+                )
+
+            after = provenance.read_bytes()
+
+        self.assertEqual(after, original)
+        self.assertEqual(hashlib.sha256(after).hexdigest(), original_sha)
 
     def test_published_artifact_manifest_does_not_claim_checkout_build_alignment(self):
         self.assertEqual(
