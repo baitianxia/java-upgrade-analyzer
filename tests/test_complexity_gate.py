@@ -43,6 +43,27 @@ class ComplexityGateTest(unittest.TestCase):
             },
         }
 
+    def _with_timing_trials(self, tier, elapsed_samples):
+        trials = []
+        for elapsed in elapsed_samples:
+            trial_metrics = dict(tier["metrics"])
+            trial_metrics["elapsed_sec"] = elapsed
+            trial_metrics["per_api_latency_ms"] = (
+                elapsed * 1000 / max(1, len(tier["truth_identities"]))
+            )
+            trials.append({
+                "truth_identities": list(tier["truth_identities"]),
+                "observed_identities": list(tier["observed_identities"]),
+                "metrics": trial_metrics,
+            })
+        median_elapsed = sorted(elapsed_samples)[len(elapsed_samples) // 2]
+        tier["metrics"]["elapsed_sec"] = median_elapsed
+        tier["metrics"]["per_api_latency_ms"] = (
+            median_elapsed * 1000 / max(1, len(tier["truth_identities"]))
+        )
+        tier["trials"] = trials
+        return tier
+
     def test_accepts_linear_tiers_only_after_correctness_scope_matches(self):
         report = evaluate_scale_tiers(
             [self._tier(1), self._tier(2), self._tier(4)], self.budgets
@@ -68,6 +89,48 @@ class ComplexityGateTest(unittest.TestCase):
         self.assertIn("ratio_budget_exceeded:elapsed_sec:2->4", report.errors)
         self.assertIn("duplicate_work:step5:app.jar", report.errors)
 
+    def test_complete_timing_trials_use_median_without_hiding_scope_loss(self):
+        tiers = [
+            self._with_timing_trials(self._tier(1), [0.10, 4.00, 0.11]),
+            self._with_timing_trials(self._tier(2), [0.20, 0.21, 8.00]),
+            self._with_timing_trials(self._tier(4), [0.40, 20.00, 0.42]),
+        ]
+
+        report = evaluate_scale_tiers(tiers, self.budgets)
+
+        self.assertEqual(report.status, "passed", report.errors)
+        tiers[-1]["trials"][1]["observed_identities"].pop()
+
+        invalid = evaluate_scale_tiers(tiers, self.budgets)
+
+        self.assertEqual(invalid.status, "invalid")
+        self.assertIn("trial_scope_identity_mismatch:4:2", invalid.errors)
+
+    def test_timing_trial_aggregate_must_be_the_observed_median(self):
+        tier = self._with_timing_trials(
+            self._tier(1), [0.10, 0.11, 9.00]
+        )
+        tier["metrics"]["elapsed_sec"] = 0.01
+
+        report = evaluate_scale_tiers([tier], self.budgets)
+
+        self.assertEqual(report.status, "invalid")
+        self.assertIn("trial_elapsed_median_mismatch:1", report.errors)
+
+    def test_two_slow_complete_trials_still_fail_the_ratio_budget(self):
+        tiers = [
+            self._with_timing_trials(self._tier(1), [0.10, 0.11, 5.00]),
+            self._with_timing_trials(self._tier(2), [0.20, 0.21, 8.00]),
+            self._with_timing_trials(self._tier(4), [0.40, 3.00, 3.10]),
+        ]
+
+        report = evaluate_scale_tiers(tiers, self.budgets)
+
+        self.assertEqual(report.status, "failed")
+        self.assertIn(
+            "ratio_budget_exceeded:elapsed_sec:2->4", report.errors
+        )
+
     def test_real_generated_collector_produces_valid_1x_2x_4x_tiers(self):
         import tempfile
 
@@ -78,6 +141,19 @@ class ComplexityGateTest(unittest.TestCase):
         self.assertEqual(report.status, "passed", report.errors)
         self.assertEqual([tier["scale"] for tier in tiers], [1, 2, 4])
         self.assertTrue(all(tier["metrics"]["parsed_classes"] > 0 for tier in tiers))
+        for tier in tiers:
+            self.assertEqual(len(tier["trials"]), 3)
+            samples = [
+                trial["metrics"]["elapsed_sec"] for trial in tier["trials"]
+            ]
+            self.assertEqual(
+                tier["metrics"]["elapsed_sec"], sorted(samples)[1]
+            )
+            self.assertTrue(all(
+                set(trial["truth_identities"])
+                == set(trial["observed_identities"])
+                for trial in tier["trials"]
+            ))
 
     def test_production_scale_tiers_measure_step1_step4_and_step5_separately(self):
         import tempfile
@@ -100,6 +176,12 @@ class ComplexityGateTest(unittest.TestCase):
                 self.assertTrue(
                     set(REQUIRED_STAGE_METRICS).issubset(stage["metrics"])
                 )
+                self.assertEqual(len(stage["trials"]), 3)
+                samples = [
+                    trial["metrics"]["elapsed_sec"]
+                    for trial in stage["trials"]
+                ]
+                self.assertEqual(stage["elapsed_sec"], sorted(samples)[1])
         verdict = evaluate_production_stage_tiers(tiers, self.budgets)
         self.assertEqual(verdict.status, "passed", verdict.errors)
 
