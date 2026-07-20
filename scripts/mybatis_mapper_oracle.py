@@ -410,6 +410,7 @@ def inspect_mybatis_artifact(
             "binding": binding,
             "artifact_entry": method["artifact_entry"],
             "binding_entry": binding_entry,
+            "artifact_sha256": artifact_sha256,
         }
         contracts.append(contract)
         statement_bindings.append({
@@ -417,6 +418,7 @@ def inspect_mybatis_artifact(
             "member": method["member"],
             "binding": binding,
             "artifact_entry": binding_entry,
+            "artifact_sha256": artifact_sha256,
         })
 
     mapper_execute = (

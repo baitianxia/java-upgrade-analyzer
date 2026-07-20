@@ -1,3 +1,4 @@
+import hashlib
 import io
 import subprocess
 import sys
@@ -146,6 +147,31 @@ def complete_scan_result(edges=None):
 
 
 class MybatisMapperOracleTest(unittest.TestCase):
+    @patch("mybatis_mapper_oracle.scan_final_artifact")
+    @patch("mybatis_mapper_oracle._run_javap", return_value=XML_MAPPER_JAVAP)
+    def test_mapper_evidence_records_bind_to_raw_final_artifact_sha(
+        self, _run_javap, scan_final_artifact
+    ):
+        scan_final_artifact.return_value = complete_scan_result()
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "sample.jar"
+            write_fake_fat_jar(artifact)
+            expected_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+            result = oracle.inspect_mybatis_artifact(
+                artifact, timeout_seconds=5.0
+            )
+
+        evidence_records = [
+            *result["mapper_contracts"],
+            *result["statement_bindings"],
+        ]
+        self.assertTrue(evidence_records)
+        self.assertEqual(
+            {item.get("artifact_sha256") for item in evidence_records},
+            {expected_sha256},
+        )
+
     @patch("mybatis_mapper_oracle.subprocess.run")
     def test_runtime_activation_refuses_empty_review_expectation(self, run):
         result = oracle.verify_runtime_activation(Path("sample.jar"), [])
@@ -235,6 +261,7 @@ class MybatisMapperOracleTest(unittest.TestCase):
             "binding": "mapper_xml",
             "artifact_entry": "BOOT-INF/classes/sample/mybatis/xml/mapper/HotelMapper.class",
             "binding_entry": "BOOT-INF/classes/sample/mybatis/xml/mapper/HotelMapper.xml",
+            "artifact_sha256": result["artifact_sha256"],
         }])
         self.assertEqual(len(result["proxy_dispatch_links"]), 1)
         self.assertEqual(
