@@ -58,9 +58,12 @@ def _materialize_classes(
     java_major: int,
     *,
     prefix: str = "",
+    deadline: float | None = None,
 ) -> int:
     count = 0
     for logical, physical in _effective_class_entries(archive, java_major).items():
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
         if prefix:
             if not logical.startswith(prefix):
                 continue
@@ -78,11 +81,16 @@ def scan_artifact_class_references(
     *,
     excluded_nested_jars: set[str] | None = None,
     application_owned_nested_jars: set[str] | None = None,
+    provider_nested_jars_by_coord: dict[str, set[str]] | None = None,
+    provider_nested_jars_by_api_identity: dict[str, set[str]] | None = None,
     jdeps: str = "jdeps",
     max_workers: int = 4,
     timeout_seconds: float = 60.0,
+    time_budget_seconds: float | None = None,
 ) -> dict:
+    application_owned_nested_jars = set(application_owned_nested_jars or ())
     targets: dict[str, list[str]] = defaultdict(list)
+    target_coords: dict[str, str] = {}
     for row in selected_rows:
         api_name = str(row.get("api_name") or "").strip()
         if (
@@ -90,6 +98,9 @@ def scan_artifact_class_references(
             and api_name
         ):
             targets[api_name].append(serialized_api_identity(row))
+            target_coords[serialized_api_identity(row)] = str(
+                row.get("coord") or ""
+            ).strip()
     reachability = {
         identity: "not_found_in_static_analysis"
         for identities in targets.values() for identity in identities
@@ -100,12 +111,28 @@ def scan_artifact_class_references(
             "references": [], "errors": [], "metrics": {"jdeps_invocations": 0},
         }
     started = time.perf_counter()
+    deadline = (
+        started + max(0.0, float(time_budget_seconds))
+        if time_budget_seconds is not None else None
+    )
+    if deadline is not None and time.perf_counter() >= deadline:
+        return {
+            "complete": False, "api_reachability": reachability,
+            "references": [], "errors": ["oracle_time_budget_exceeded"],
+            "metrics": {
+                "jdeps_invocations": 0, "elapsed_seconds": time.perf_counter() - started,
+                "worker_count": max(1, int(max_workers)), "timed_out": True,
+            },
+        }
     artifact = Path(artifact)
     snapshot = artifact.read_bytes()
     artifact_sha256 = hashlib.sha256(snapshot).hexdigest()
+    version_timeout = 10.0
+    if deadline is not None:
+        version_timeout = min(version_timeout, max(0.001, deadline - time.perf_counter()))
     version = subprocess.run(
         [jdeps, "--version"], capture_output=True, text=True,
-        encoding="utf-8", errors="replace", check=False, timeout=10,
+        encoding="utf-8", errors="replace", check=False, timeout=version_timeout,
     )
     if version.returncode != 0:
         return {
@@ -126,16 +153,19 @@ def scan_artifact_class_references(
         with zipfile.ZipFile(io.BytesIO(snapshot)) as outer:
             business_dir = root / "business"
             business_count = _materialize_classes(
-                outer, business_dir, java_major, prefix="BOOT-INF/classes/"
+                outer, business_dir, java_major, prefix="BOOT-INF/classes/", deadline=deadline
             )
             if not business_count:
                 business_count = _materialize_classes(
-                    outer, business_dir, java_major, prefix="WEB-INF/classes/"
+                    outer, business_dir, java_major, prefix="WEB-INF/classes/", deadline=deadline
                 )
             if business_count:
                 jobs.append(("BOOT-INF/classes/", business_dir, True, business_count))
             nested_index = 0
             for name in sorted(outer.namelist()):
+                if deadline is not None and time.perf_counter() >= deadline:
+                    errors.append("oracle_time_budget_exceeded")
+                    break
                 if (
                     not name.endswith(".jar")
                     or not name.startswith(("BOOT-INF/lib/", "WEB-INF/lib/"))
@@ -146,7 +176,9 @@ def scan_artifact_class_references(
                 destination = root / f"nested-{nested_index}"
                 try:
                     with zipfile.ZipFile(io.BytesIO(outer.read(name))) as nested:
-                        count = _materialize_classes(nested, destination, java_major)
+                        count = _materialize_classes(
+                            nested, destination, java_major, deadline=deadline
+                        )
                 except (KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
                     errors.append(f"{name}:{type(error).__name__}:{error}")
                     continue
@@ -155,11 +187,17 @@ def scan_artifact_class_references(
 
         def run_job(job):
             entry, directory, business_owned, class_count = job
+            job_timeout = float(timeout_seconds)
+            if deadline is not None:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    return entry, business_owned, class_count, [], "oracle_time_budget_exceeded"
+                job_timeout = min(job_timeout, max(0.001, remaining))
             try:
                 completed = subprocess.run(
                     [jdeps, "--ignore-missing-deps", "-verbose:class", "-filter:none", str(directory)],
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    check=False, timeout=timeout_seconds,
+                    check=False, timeout=job_timeout,
                 )
             except (OSError, subprocess.TimeoutExpired) as error:
                 return entry, business_owned, class_count, [], f"{type(error).__name__}:{error}"
@@ -180,7 +218,21 @@ def scan_artifact_class_references(
                     if not identities:
                         continue
                     for identity in identities:
-                        if business_owned:
+                        coord = target_coords.get(identity, "")
+                        if (
+                            entry in (provider_nested_jars_by_api_identity or {}).get(
+                                identity, set()
+                            )
+                            or entry in (provider_nested_jars_by_coord or {}).get(
+                                coord, set()
+                            )
+                        ) and caller.replace("$", ".") == target.replace("$", "."):
+                            continue
+                        effective_business_owned = bool(
+                            business_owned
+                            and entry not in application_owned_nested_jars
+                        )
+                        if effective_business_owned:
                             reachability[identity] = "reachable"
                         elif reachability[identity] != "reachable":
                             reachability[identity] = "uncertain"
@@ -190,9 +242,10 @@ def scan_artifact_class_references(
                             "target_class": target,
                             "artifact_entry": entry,
                             "artifact_sha256": artifact_sha256,
-                            "business_owned": business_owned,
+                            "business_owned": effective_business_owned,
                         })
 
+    timed_out = any("oracle_time_budget_exceeded" in error for error in errors)
     return {
         "complete": not errors,
         "api_reachability": reachability,
@@ -205,5 +258,6 @@ def scan_artifact_class_references(
             "class_count": sum(job[3] for job in jobs),
             "elapsed_seconds": time.perf_counter() - started,
             "worker_count": max(1, int(max_workers)),
+            "timed_out": timed_out,
         },
     }

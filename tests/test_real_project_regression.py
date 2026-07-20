@@ -33,7 +33,7 @@ def minimal_classfile_with_utf8(*values):
     )
 
 
-def minimal_classfile_with_methodref(owner, member, descriptor):
+def minimal_classfile_with_methodref(owner, member, descriptor, *, tag=10):
     values = (owner, member, descriptor)
     utf8_entries = []
     for value in values:
@@ -45,7 +45,7 @@ def minimal_classfile_with_methodref(owner, member, descriptor):
         utf8_entries[1],
         utf8_entries[2],
         b"\x0c" + struct.pack(">HH", 3, 4),
-        b"\x0a" + struct.pack(">HH", 2, 5),
+        bytes((tag,)) + struct.pack(">HH", 2, 5),
     ]
     return (
         b"\xca\xfe\xba\xbe"
@@ -54,7 +54,74 @@ def minimal_classfile_with_methodref(owner, member, descriptor):
     )
 
 
+def bind_internal_module_scope(scope, artifact_sha, revision):
+    scope.update({
+        "maven_model_hash": "m" * 64,
+        "source_state_hash": "s" * 64,
+        "active_maven_profiles": [],
+    })
+    scope.pop("scope_hash", None)
+    scope["scope_hash"] = hashlib.sha256(json.dumps(
+        scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    return {
+        "side": "current", "revision": revision,
+        "artifact_sha256": artifact_sha,
+        "project_scope_hash": scope["scope_hash"],
+        "source_state_hash": scope["source_state_hash"],
+        "maven_model_hash": scope["maven_model_hash"],
+        "active_maven_profiles": [],
+    }
+
+
 class RealProjectRegressionTest(unittest.TestCase):
+    def test_artifact_derived_state_persists_explicit_maven_profile_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pom.xml").write_text(
+                """<project><modelVersion>4.0.0</modelVersion>
+                <groupId>com.acme</groupId><artifactId>root</artifactId><version>1</version>
+                <packaging>pom</packaging><profiles><profile><id>boot</id>
+                <modules><module>application</module></modules></profile></profiles>
+                </project>""",
+                encoding="utf-8",
+            )
+            (root / "application").mkdir()
+            (root / "application/pom.xml").write_text(
+                """<project><modelVersion>4.0.0</modelVersion>
+                <groupId>com.acme</groupId><artifactId>application</artifactId>
+                <version>1</version></project>""",
+                encoding="utf-8",
+            )
+            case = realreg.RealProjectCase(
+                name="profile-scope",
+                default_project=root,
+                default_changed_apis=Path(""),
+                baseline_specs=(),
+                target_module="application",
+                active_maven_profiles=("boot",),
+                derive_step1_from_artifacts=True,
+                base_final_artifact=root / "base.jar",
+                final_artifact=root / "current.jar",
+                base_source_project=root,
+                current_source_project=root,
+            )
+            report = root / "report"
+            with patch.object(
+                realreg.subprocess, "run",
+                return_value=SimpleNamespace(returncode=1),
+            ):
+                realreg.derive_step4_inputs_from_artifacts(case, report)
+            state = json.loads(
+                (report / ".runtime/state/main_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        scope = state["step1"]["input"]["project_scope"]
+        self.assertEqual(scope["included_modules"], ["application"])
+        self.assertEqual(scope["active_maven_profiles"], ["boot"])
+
     def test_formatter_output_satisfies_real_project_output_audit_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -114,6 +181,44 @@ class RealProjectRegressionTest(unittest.TestCase):
             manifest["performance_baseline"]["artifact_sha256"],
             manifest["current_artifact_sha256"],
         )
+
+    def test_pig_v4_discovery_uses_fixed_fat_jars_and_full_api_population(self):
+        case = realreg.CASES["pig-v4-full-artifact-discovery"]
+        manifest = json.loads(case.performance_manifest.read_text(encoding="utf-8"))
+
+        self.assertEqual(case.case_mode, "discovery")
+        self.assertTrue(case.derive_step1_from_artifacts)
+        self.assertEqual(case.default_changed_apis, Path(""))
+        self.assertEqual(case.base_revision, "7197ec39e16e45f35ef8b47d381f2c833eaf66ed")
+        self.assertEqual(case.current_revision, "f4e5a3a4b902dc00c192b878d7587cec93698803")
+        self.assertEqual(case.base_final_artifact.name, "pig-boot.jar")
+        self.assertEqual(case.final_artifact.name, "pig-boot.jar")
+        self.assertEqual(case.target_module, "pig-boot")
+        self.assertEqual(case.source_dirs, (Path("."),))
+        self.assertEqual(
+            case.manual_coord_overrides,
+            ("lombok:1.18.46 -> org.projectlombok:lombok",),
+        )
+        self.assertEqual(
+            case.required_fault_injections,
+            realreg.STANDARD_FAULT_INJECTIONS,
+        )
+        self.assertEqual(case.required_topologies, (
+            "cross_jar_bridge",
+            "field_access",
+            "overloaded_method",
+            "same_jar_bridge",
+            "virtual_dispatch",
+        ))
+        self.assertTrue(case.require_relative_performance_baseline)
+        self.assertEqual(manifest["population_contract"]["step4_changed_apis"], 804)
+        self.assertEqual(manifest["oracle_contract"]["verified_apis"], 804)
+        self.assertEqual(
+            manifest["performance_baseline"]["artifact_sha256"],
+            manifest["current_artifact_sha256"],
+        )
+        self.assertFalse(case.changed_api_rows)
+        self.assertFalse(case.expected_step4_api_names)
 
     def test_topology_coordinate_entries_include_split_runtime_provider_set(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1464,7 +1569,10 @@ class RealProjectRegressionTest(unittest.TestCase):
             prior = realreg.resolve_discovery_prior_coverage(case, root)
 
         self.assertTrue(prior["valid"])
-        self.assertEqual(set(prior["covered_ids"]), {"business_direct", "static_dispatch", "spi"})
+        self.assertEqual(
+            set(prior["covered_ids"]),
+            {"business_direct", "static_dispatch", "spi"},
+        )
 
     def test_convergence_rejects_tampered_report_root_prior_matrix(self):
         case = realreg.replace(realreg.CASES["dubbo"], case_mode="convergence")
@@ -1683,7 +1791,10 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertIn(str(source_dir), commands[1])
         self.assertTrue(str(commands[2][1]).endswith("s4_jar_compare.py"))
         self.assertEqual(result["population_source"], "step1_final_artifacts")
-        self.assertIn("evidence/dependencies/s1_dep_changes.csv", result["dep_changes"])
+        self.assertIn("evidence/dependencies/dep_changes.csv", result["dep_changes"])
+        self.assertFalse(
+            (root / "report/evidence/dependencies/s1_dep_changes.csv").exists()
+        )
         self.assertIn("evidence/context/s2_context.json", result["context"])
 
     def test_declared_artifact_provenance_preserves_matching_step1_evidence(self):
@@ -1804,6 +1915,8 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "cache_misses": 0,
                 "timed_out": False,
                 "interrupted": False,
+                "javap_class_invocations": 7,
+                "javap_class_elapsed_seconds": 1.75,
             },
         )
         envelope.update({
@@ -1838,6 +1951,8 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(envelope["oracle_cache_hits"], 1)
         self.assertFalse(envelope["oracle_timed_out"])
         self.assertFalse(envelope["oracle_interrupted"])
+        self.assertEqual(envelope["javap_class_invocations"], 7)
+        self.assertEqual(envelope["javap_class_elapsed_seconds"], 1.75)
 
     def test_performance_envelope_exposes_complete_normalized_resource_metrics(self):
         envelope = realreg.collect_performance_envelope(
@@ -1983,6 +2098,9 @@ class RealProjectRegressionTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             realreg, "_verified_current_final_artifact", return_value=(Path("artifact.jar"), "a" * 64, [])
+        ), patch.object(
+            realreg, "_materialize_verified_oracle_snapshot",
+            return_value=(Path("artifact-snapshot.jar"), []),
         ), patch.object(realreg, "_csv_rows", return_value=([], [])), patch.object(
             realreg, "_artifact_class_entries", return_value={"fixture/A.class"}
         ), patch.object(realreg, "scan_final_artifact", return_value=scan) as scan_oracle:
@@ -1996,7 +2114,7 @@ class RealProjectRegressionTest(unittest.TestCase):
             )
 
         scan_oracle.assert_called_once_with(
-            Path("artifact.jar"),
+            Path("artifact-snapshot.jar"),
             time_budget_seconds=12.5,
             selected_targets=[{
                 "owner": "fixture.Target",
@@ -2007,7 +2125,429 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(result["oracle_metrics"]["class_count"], 9)
         self.assertEqual(result["oracle_metrics"]["parse_seconds"], 1.25)
 
-    def test_final_artifact_oracle_excludes_explicitly_external_target_provider_jar(self):
+    def test_incomplete_positive_only_jdeps_is_advisory_not_oracle_failure(self):
+        scan = {"complete": True, "failures": []}
+        jdeps = {
+            "complete": False,
+            "errors": ["nested.jar:oracle_time_budget_exceeded"],
+            "api_reachability": {"api": "reachable"},
+            "references": [{"target_api_identity": "api"}],
+            "metrics": {"jdeps_invocations": 3, "elapsed_seconds": 2.0},
+        }
+
+        realreg.merge_positive_only_jdeps_evidence(scan, jdeps)
+
+        self.assertTrue(scan["complete"])
+        self.assertEqual(scan["failures"], [])
+        self.assertEqual(scan["jdeps_class_reachability"], {"api": "reachable"})
+        self.assertIn(
+            "jdeps_class_scan:nested.jar:oracle_time_budget_exceeded",
+            scan["advisories"],
+        )
+
+    def test_oracle_deadline_overrun_during_dynamic_scan_fails_closed(self):
+        clock = [0.0]
+        primary = {
+            "artifact_sha256": "a" * 64, "complete": True,
+            "edges": [], "failures": [],
+        }
+        complete_component = {
+            "artifact_sha256": "a" * 64, "complete": True,
+            "api_reachability": {}, "references": [], "errors": [],
+            "metrics": {},
+        }
+
+        def overrun_dynamic(*_args, **_kwargs):
+            clock[0] = 2.0
+            return []
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg.time, "perf_counter", side_effect=lambda: clock[0]
+        ), patch.object(
+            realreg, "_verified_current_final_artifact",
+            return_value=(Path("artifact.jar"), "a" * 64, []),
+        ), patch.object(
+            realreg, "_materialize_verified_oracle_snapshot",
+            return_value=(Path("artifact-snapshot.jar"), []),
+        ), patch.object(realreg, "_csv_rows", return_value=([], [])), patch.object(
+            realreg, "scan_final_artifact", return_value=primary,
+        ), patch.object(
+            realreg, "_oracle_provider_entries", return_value=({}, {}, []),
+        ), patch.object(
+            realreg, "_oracle_application_owned_nested_jars", return_value=(set(), []),
+        ), patch.object(
+            realreg, "scan_final_artifact_class_references",
+            return_value=complete_component,
+        ), patch.object(
+            realreg, "scan_final_artifact_javap_class_references",
+            return_value=complete_component,
+        ), patch.object(
+            realreg, "scan_final_artifact_member_references",
+            return_value=complete_component,
+        ), patch.object(
+            realreg, "scan_final_artifact_dynamic_class_references",
+            side_effect=overrun_dynamic,
+        ), patch.object(
+            realreg, "_artifact_class_entries", return_value=set(),
+        ), patch.object(
+            realreg, "_record_oracle_component_provenance",
+        ), patch.object(
+            realreg, "seal_oracle_scan", side_effect=lambda value: value,
+        ), patch.object(
+            realreg, "validate_oracle_scan", side_effect=lambda value, _sha: (value, {}),
+        ), patch.object(
+            realreg, "reconcile_selected_api_edges",
+            side_effect=lambda _report, _rows, _edges, scan: scan,
+        ):
+            result = realreg.reconcile_final_artifact_edges(
+                Path(tmp), [], oracle_time_budget_seconds=1.0,
+            )
+
+        self.assertFalse(result["complete"])
+        self.assertIn(
+            "dynamic_class_reference_scan:oracle_time_budget_exceeded",
+            result["failures"],
+        )
+
+    def test_provider_and_inventory_scans_enforce_zero_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/classes/app/App.class", b"class")
+
+            _coords, _identities, errors = realreg._oracle_provider_entries(
+                artifact, [], time_budget_seconds=0.0,
+            )
+            with self.assertRaises(TimeoutError):
+                realreg._artifact_class_entries(
+                    artifact, time_budget_seconds=0.0,
+                )
+            with self.assertRaises(TimeoutError):
+                realreg.scan_final_artifact_dynamic_class_references(
+                    artifact, [{
+                        "coord": "vendor:api", "api_name": "vendor.Target",
+                        "symbol_kind": "class", "change_type": "REMOVED",
+                    }], time_budget_seconds=0.0,
+                )
+
+        self.assertIn("oracle_time_budget_exceeded", errors)
+
+    def test_complete_javap_class_authority_skips_redundant_jdeps_scan(self):
+        self.assertFalse(realreg.requires_positive_only_jdeps({
+            "javap_class_authority_complete": True,
+        }))
+        self.assertTrue(realreg.requires_positive_only_jdeps({
+            "javap_class_authority_complete": False,
+        }))
+
+    def test_step5_semantic_fingerprint_ignores_cache_hit_telemetry(self):
+        cold = {"graph_stats": {"business_bytecode": {"methods": 3}}}
+        warm = {"graph_stats": {"business_bytecode": {
+            "methods": 3,
+            "cache_hit": True,
+        }}}
+
+        self.assertEqual(
+            realreg._canonicalize_step5_result_value(cold, ()),
+            realreg._canonicalize_step5_result_value(warm, ()),
+        )
+
+    def test_cache_equivalence_executes_cold_and_warm_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            stale_cache = report / ".runtime/cache/s5_artifact_bytecode/stale"
+            stale_cache.mkdir(parents=True)
+            stale_index = report / ".runtime/cache/s5_artifact_bytecode_index.json"
+            stale_index.write_text("stale", encoding="utf-8")
+            stale_member_index = (
+                report / ".runtime/cache/s5_runtime_member_candidate_index.json"
+            )
+            stale_member_index.write_text("stale", encoding="utf-8")
+            changed = root / "changed.csv"
+            changed.write_text("api_name\n", encoding="utf-8")
+            case = realreg.RealProjectCase(
+                name="cache-equivalence",
+                default_project=root,
+                default_changed_apis=changed,
+                baseline_specs=(),
+                require_relative_performance_baseline=True,
+            )
+            calls = []
+
+            def fake_run(_case, _project, _changed, report_dir):
+                calls.append(len(calls) + 1)
+                if len(calls) == 1:
+                    self.assertFalse(stale_cache.exists())
+                    self.assertFalse(stale_index.exists())
+                    self.assertFalse(stale_member_index.exists())
+                output = report_dir / "evidence/call_chain"
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "summary.json").write_text(json.dumps({
+                    "total_apis": 1,
+                    "reachable": 1, "uncertain": 0, "not_impacted": 0,
+                    "not_analyzed": 0, "not_found_in_static_analysis": 0,
+                    "reachable_apis": [{"api_identity": "g:a|A.m|()|method|REMOVED"}],
+                    "meta": {"graph_stats": {"step5_perf": {"main": {
+                        "cache_hit": len(calls) > 1,
+                    }}}},
+                }), encoding="utf-8")
+                (output / "alerts.csv").write_text(
+                    "api_identity,path_status\n"
+                    "g:a|A.m|()|method|REMOVED,reachable\n",
+                    encoding="utf-8",
+                )
+                (output / "alerts_reachable.csv").write_text(
+                    "api_identity,path_status\n"
+                    "g:a|A.m|()|method|REMOVED,reachable\n",
+                    encoding="utf-8",
+                )
+                query_index = report_dir / ".runtime/indexes/s5_query_index.json"
+                query_index.parent.mkdir(parents=True, exist_ok=True)
+                query_index.write_text("{}\n", encoding="utf-8")
+                timing = report_dir / ".runtime/observability/step5_timing.csv"
+                timing.parent.mkdir(parents=True, exist_ok=True)
+                timing.write_text(
+                    "section,metric,value\nmain,cache_hit,"
+                    + ("1" if len(calls) > 1 else "0") + "\n",
+                    encoding="utf-8",
+                )
+                return 0, float(len(calls))
+
+            with patch.object(realreg, "run_step5", side_effect=fake_run):
+                result = realreg.run_step5_cache_equivalence(
+                    case, root, changed, report
+                )
+
+        self.assertEqual(calls, [1, 2])
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["cold_fingerprint"], result["warm_fingerprint"])
+        self.assertEqual(result["cold_elapsed_seconds"], 1.0)
+        self.assertEqual(result["warm_elapsed_seconds"], 2.0)
+
+    def test_cache_equivalence_blocks_semantic_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            changed = root / "changed.csv"
+            changed.write_text("api_name\n", encoding="utf-8")
+            case = realreg.RealProjectCase(
+                name="cache-drift", default_project=root,
+                default_changed_apis=changed, baseline_specs=(),
+                require_relative_performance_baseline=True,
+            )
+            calls = 0
+
+            def fake_run(_case, _project, _changed, report_dir):
+                nonlocal calls
+                calls += 1
+                output = report_dir / "evidence/call_chain"
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "summary.json").write_text(json.dumps({
+                    "total_apis": 1,
+                    "reachable": 1, "uncertain": 0, "not_impacted": 0,
+                    "not_analyzed": 0, "not_found_in_static_analysis": 0,
+                    "semantic_revision": calls,
+                }), encoding="utf-8")
+                (output / "alerts.csv").write_text(
+                    "api_identity,path_status\ng:a|A.m|()|method|REMOVED,reachable\n",
+                    encoding="utf-8",
+                )
+                (output / "alerts_reachable.csv").write_text(
+                    "api_identity,path_status\ng:a|A.m|()|method|REMOVED,reachable\n",
+                    encoding="utf-8",
+                )
+                query_index = report_dir / ".runtime/indexes/s5_query_index.json"
+                query_index.parent.mkdir(parents=True, exist_ok=True)
+                query_index.write_text(
+                    json.dumps({"run": calls}), encoding="utf-8"
+                )
+                timing = report_dir / ".runtime/observability/step5_timing.csv"
+                timing.parent.mkdir(parents=True, exist_ok=True)
+                timing.write_text("section,metric,value\nmain,x,1\n", encoding="utf-8")
+                return 0, 1.0
+
+            with patch.object(realreg, "run_step5", side_effect=fake_run):
+                result = realreg.run_step5_cache_equivalence(
+                    case, root, changed, report
+                )
+
+        self.assertFalse(result["passed"])
+        self.assertIn("cold_warm_semantic_fingerprint_mismatch", result["errors"])
+
+    def test_cache_equivalence_rejects_stale_summary_not_written_by_cold_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            output = report / "evidence/call_chain"
+            output.mkdir(parents=True)
+            stale_summary = output / "summary.json"
+            stale_summary.write_text('{"total_apis": 99}\n', encoding="utf-8")
+            changed = root / "changed.csv"
+            changed.write_text("api_name\n", encoding="utf-8")
+            case = realreg.RealProjectCase(
+                name="stale-cold-output", default_project=root,
+                default_changed_apis=changed, baseline_specs=(),
+            )
+
+            with patch.object(realreg, "run_step5", return_value=(0, 0.1)):
+                result = realreg.run_step5_cache_equivalence(
+                    case, root, changed, report
+                )
+
+        self.assertFalse(result["passed"])
+        self.assertIn("cold_step5_failed_or_summary_missing", result["errors"])
+        self.assertFalse(result["cold_summary"])
+
+    def test_cache_equivalence_removes_stale_alert_partitions_and_requires_full_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            output = report / "evidence/call_chain"
+            output.mkdir(parents=True)
+            stale_partition = output / "alerts_reachable.csv"
+            stale_partition.write_text("api_identity\nstale\n", encoding="utf-8")
+            changed = root / "changed.csv"
+            changed.write_text("api_name\n", encoding="utf-8")
+            case = realreg.RealProjectCase(
+                name="stale-partition", default_project=root,
+                default_changed_apis=changed, baseline_specs=(),
+            )
+
+            def summary_only(_case, _project, _changed, report_dir):
+                target = report_dir / "evidence/call_chain/summary.json"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('{"total_apis": 1}\n', encoding="utf-8")
+                return 0, 0.1
+
+            with patch.object(realreg, "run_step5", side_effect=summary_only):
+                result = realreg.run_step5_cache_equivalence(
+                    case, root, changed, report
+                )
+
+        self.assertFalse(result["passed"])
+        self.assertIn("cold_step5_failed_or_summary_missing", result["errors"])
+        self.assertFalse(stale_partition.exists())
+
+    def test_cache_equivalence_rejects_stale_cold_summary_on_warm_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            changed = root / "changed.csv"
+            changed.write_text("api_name\n", encoding="utf-8")
+            case = realreg.RealProjectCase(
+                name="stale-warm-output", default_project=root,
+                default_changed_apis=changed, baseline_specs=(),
+                require_relative_performance_baseline=True,
+            )
+            calls = 0
+
+            def fake_run(_case, _project, _changed, report_dir):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    output = report_dir / "evidence/call_chain"
+                    output.mkdir(parents=True, exist_ok=True)
+                    (output / "summary.json").write_text(
+                        '{"total_apis":1,"reachable":0,"uncertain":1,'
+                        '"not_impacted":0,"not_analyzed":0,'
+                        '"not_found_in_static_analysis":0}\n', encoding="utf-8"
+                    )
+                    (output / "alerts.csv").write_text(
+                        "api_identity,path_status\napi,uncertain\n",
+                        encoding="utf-8",
+                    )
+                    (output / "alerts_uncertain.csv").write_text(
+                        "api_identity,path_status\napi,uncertain\n",
+                        encoding="utf-8",
+                    )
+                    query_index = report_dir / ".runtime/indexes/s5_query_index.json"
+                    query_index.parent.mkdir(parents=True, exist_ok=True)
+                    query_index.write_text("{}\n", encoding="utf-8")
+                    timing = report_dir / ".runtime/observability/step5_timing.csv"
+                    timing.parent.mkdir(parents=True, exist_ok=True)
+                    timing.write_text(
+                        "section,metric,value\nmain,classes,1\n", encoding="utf-8"
+                    )
+                return 0, 0.1
+
+            with patch.object(realreg, "run_step5", side_effect=fake_run):
+                result = realreg.run_step5_cache_equivalence(
+                    case, root, changed, report
+                )
+
+        self.assertFalse(result["passed"])
+        self.assertIn("warm_step5_failed_or_summary_missing", result["errors"])
+
+    def test_cache_equivalence_failure_is_blocking_even_with_ground_truth_signal(self):
+        case = realreg.RealProjectCase(
+            name="cache-blocking", default_project=Path("."),
+            default_changed_apis=Path("changed.csv"), baseline_specs=(),
+            case_mode="discovery", ground_truth_status="unreviewed",
+        )
+        cache_signals = realreg.build_cache_equivalence_signals(case, {
+            "passed": False,
+            "errors": ["cold_warm_semantic_fingerprint_mismatch"],
+            "cold_returncode": 0,
+            "warm_returncode": 0,
+            "cold_fingerprint": "a" * 64,
+            "warm_fingerprint": "b" * 64,
+        }, Path("report"))
+        signals = [{
+            "signal_type": "ground_truth_insufficient",
+            "blocking": True,
+        }] + cache_signals
+
+        self.assertTrue(cache_signals[0]["blocking"])
+        self.assertEqual(
+            realreg.derive_case_status(True, signals, "unreviewed"),
+            "failed",
+        )
+
+    def test_stage_performance_reads_step1_and_step4_total_timings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observability = Path(tmp) / ".runtime" / "observability"
+            observability.mkdir(parents=True)
+            (observability / "step1_timing.csv").write_text(
+                "phase,elapsed_sec\nstep1_total,36.02\n",
+                encoding="utf-8",
+            )
+            (observability / "step4_timing.csv").write_text(
+                "phase,elapsed_sec\nstep4.total,116.68\n",
+                encoding="utf-8",
+            )
+
+            metrics = realreg.collect_stage_performance(Path(tmp))
+
+        self.assertEqual(metrics["step1_elapsed_seconds"], 36.02)
+        self.assertEqual(metrics["step4_elapsed_seconds"], 116.68)
+
+    def test_relative_performance_rejects_missing_stage_timings(self):
+        case = realreg.replace(
+            realreg.CASES["pig-v4-full-artifact-discovery"],
+            require_relative_performance_baseline=True,
+        )
+        manifest = json.loads(case.performance_manifest.read_text(encoding="utf-8"))
+        performance = {
+            name: float(policy.get("value") or 0.0)
+            for name, policy in manifest["performance_baseline"]["metrics"].items()
+        }
+        performance.update(manifest["performance_baseline"]["scope"])
+        performance.update({
+            "step1_elapsed_seconds": 0.0,
+            "step4_elapsed_seconds": 0.0,
+            "per_api_timing_complete": True,
+        })
+
+        result = realreg.evaluate_relative_performance_baseline(
+            case, manifest, performance
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertIn("performance_metric_nonpositive:step1_elapsed_seconds", result["errors"])
+        self.assertIn("performance_metric_nonpositive:step4_elapsed_seconds", result["errors"])
+
+    def test_final_artifact_oracle_does_not_globally_exclude_target_provider_jar(self):
         scan = {
             "artifact_sha256": "a" * 64,
             "complete": True,
@@ -2035,6 +2575,9 @@ class RealProjectRegressionTest(unittest.TestCase):
             with patch.object(
                 realreg, "_verified_current_final_artifact",
                 return_value=(Path("artifact.jar"), "a" * 64, []),
+            ), patch.object(
+                realreg, "_materialize_verified_oracle_snapshot",
+                return_value=(Path("artifact-snapshot.jar"), []),
             ), patch.object(realreg, "_csv_rows", return_value=([], [])), patch.object(
                 realreg, "_artifact_class_entries",
                 return_value={"BOOT-INF/classes/app/App.class"},
@@ -2044,14 +2587,13 @@ class RealProjectRegressionTest(unittest.TestCase):
                 realreg.reconcile_final_artifact_edges(report, selected)
 
         scan_oracle.assert_called_once_with(
-            Path("artifact.jar"),
+            Path("artifact-snapshot.jar"),
             time_budget_seconds=None,
             selected_targets=[{
                 "owner": "vendor.Target",
                 "member": "changed",
                 "descriptor": "",
             }],
-            excluded_nested_jars={"BOOT-INF/lib/provider-1.0.jar"},
         )
 
     def test_oracle_budget_failure_emits_blocking_incomplete_and_performance_signals(self):
@@ -2247,6 +2789,10 @@ class RealProjectRegressionTest(unittest.TestCase):
             result = realreg.reconcile_selected_api_edges(
                 Path(tmp), [target], [direct], {"artifact_sha256": artifact_sha256,
                 "complete": True, "edges": [direct, intermediate], "failures": [],
+                "javap_class_metrics": {
+                    "javap_invocations": 11,
+                    "elapsed_seconds": 2.25,
+                },
                 "artifact_entries": [direct["artifact_entry"], intermediate["artifact_entry"]]},
             )
             with open(result["oracle_edges"], encoding="utf-8") as handle:
@@ -2258,6 +2804,8 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(result["reconciliation"]["verdict_counts"]["missing"], 1)
         self.assertEqual(len(oracle_rows), 2)
         self.assertEqual(len(ledger_rows), 3)
+        self.assertEqual(result["oracle_metrics"]["javap_class_invocations"], 11)
+        self.assertEqual(result["oracle_metrics"]["javap_class_elapsed_seconds"], 2.25)
 
     def test_fault_injection_drops_analyzer_edge_and_proves_gate_detects_false_negative(self):
         artifact_sha256 = "a" * 64
@@ -2282,13 +2830,13 @@ class RealProjectRegressionTest(unittest.TestCase):
             baseline_specs=(),
             required_fault_injections=("drop_analyzer_edge",),
         )
-        oracle_scan = {
+        oracle_scan = realreg.seal_oracle_scan({
             "artifact_sha256": artifact_sha256,
             "complete": True,
             "edges": [edge],
             "failures": [],
             "artifact_entries": [edge["artifact_entry"]],
-        }
+        })
 
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
@@ -2568,6 +3116,364 @@ class RealProjectRegressionTest(unittest.TestCase):
             result["errors"],
         )
 
+    def test_external_provider_uncertain_path_reconciles_only_direct_target_edges(self):
+        artifact_sha256 = "e" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        direct = self._edge_row(
+            artifact_sha256, "vendor.Bridge", "call", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/vendor.jar!/vendor/Bridge.class",
+        )
+        upstream = self._edge_row(
+            artifact_sha256, "vendor.Entry", "run", "()V",
+            "vendor.Bridge", "call", "()V", "invokevirtual",
+            "BOOT-INF/lib/vendor.jar!/vendor/Entry.class",
+        )
+        direct["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp),
+                [target],
+                [direct],
+                {
+                    "artifact_sha256": artifact_sha256,
+                    "complete": True,
+                    "edges": [direct, upstream],
+                    "failures": [],
+                    "artifact_entries": [
+                        direct["artifact_entry"], upstream["artifact_entry"],
+                    ],
+                },
+            )
+
+        identity = realreg.serialized_api_identity(target)
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["api_reachability"][identity], "uncertain")
+        self.assertEqual(result["counts"]["oracle_edge_count"], 1)
+        self.assertEqual(result["counts"]["analyzer_edge_count"], 1)
+
+    def test_external_provider_same_owner_field_edge_is_not_project_usage(self):
+        artifact_sha256 = "e" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Settings.enabled",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "DATA_FIELD_ADDED",
+        }
+        internal = self._edge_row(
+            artifact_sha256,
+            "vendor.Settings", "enabled", "()Z",
+            "vendor.Settings", "enabled", "Z", "getfield",
+            "BOOT-INF/lib/vendor-api.jar!/vendor/Settings.class",
+        )
+        internal["api_identity"] = realreg.serialized_api_identity(target)
+        scan = {
+            "artifact_sha256": artifact_sha256,
+            "complete": True,
+            "edges": [internal],
+            "failures": [],
+            "artifact_entries": [internal["artifact_entry"]],
+            "provider_nested_jars_by_coord": {
+                "vendor:api": ["BOOT-INF/lib/vendor-api.jar"],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [internal], scan
+            )
+
+        identity = realreg.serialized_api_identity(target)
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["api_reachability"][identity], "not_found_in_static_analysis")
+        self.assertEqual(result["counts"]["oracle_edge_count"], 0)
+        self.assertEqual(result["counts"]["analyzer_edge_count"], 0)
+
+    def test_application_owned_nested_module_is_a_business_entry_boundary(self):
+        artifact_sha256 = "f" * 64
+        target = {
+            "coord": "com.example:library",
+            "api_name": "com.example.LibraryApi.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        internal = self._edge_row(
+            artifact_sha256,
+            "com.example.LibraryCaller", "run", "()V",
+            "com.example.LibraryApi", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/library-1.0.jar!/com/example/LibraryCaller.class",
+        )
+
+        retained, reachability, errors = realreg._retain_authoritative_api_path(
+            [target],
+            [internal],
+            absence_is_authoritative=True,
+            application_owned_nested_jars={"BOOT-INF/lib/library-1.0.jar"},
+        )
+
+        identity = realreg.serialized_api_identity(target)
+        self.assertFalse(errors)
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(reachability[identity], "reachable")
+
+    def test_physical_provider_keeps_other_class_internal_bridges(self):
+        selected = [
+            {
+                "coord": "vendor:a", "api_name": "vendor.a.Api.changed",
+                "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            },
+            {
+                "coord": "vendor:b", "api_name": "vendor.b.Api.changed",
+                "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            },
+        ]
+        artifact_sha256 = "f" * 64
+        provider_entry = "BOOT-INF/lib/provider-a.jar!/vendor/a/Bridge.class"
+        edge_to_a = self._edge_row(
+            artifact_sha256,
+            "vendor.a.Bridge", "callA", "()V",
+            "vendor.a.Api", "changed", "()V", "invokestatic",
+            provider_entry,
+        )
+        edge_to_b = self._edge_row(
+            artifact_sha256,
+            "vendor.a.Bridge", "callB", "()V",
+            "vendor.b.Api", "changed", "()V", "invokestatic",
+            provider_entry,
+        )
+
+        retained, reachability, errors = realreg._retain_authoritative_api_path(
+            selected,
+            [edge_to_a, edge_to_b],
+            absence_is_authoritative=True,
+            provider_nested_jars_by_coord={
+                "vendor:a": {"BOOT-INF/lib/provider-a.jar"},
+            },
+        )
+
+        identity_a = realreg.serialized_api_identity(selected[0])
+        identity_b = realreg.serialized_api_identity(selected[1])
+        self.assertEqual(errors, [])
+        self.assertEqual(reachability[identity_a], "uncertain")
+        self.assertEqual(reachability[identity_b], "uncertain")
+        self.assertEqual(
+            {item["api_identity"] for item in retained},
+            {identity_a, identity_b},
+        )
+
+    def test_provider_inventory_is_rebuilt_from_final_artifact_not_step5_catalog(self):
+        selected = [
+            {
+                "coord": "vendor:a", "api_name": "vendor.Api.changed",
+                "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            },
+            {
+                "coord": "vendor:b", "api_name": "vendor.Api.changed",
+                "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "report"
+            artifact = Path(tmp) / "app.jar"
+            nested_payloads = []
+            for artifact_id in ("a", "b"):
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, "w") as nested:
+                    nested.writestr("vendor/Api.class", b"fixture")
+                    nested.writestr(
+                        f"META-INF/maven/vendor/{artifact_id}/pom.properties",
+                        f"groupId=vendor\nartifactId={artifact_id}\nversion=1.0\n",
+                    )
+                nested_payloads.append(buffer.getvalue())
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr("BOOT-INF/lib/provider-a.jar", nested_payloads[0])
+                outer.writestr("BOOT-INF/lib/provider-b.jar", nested_payloads[1])
+            catalog_path = (
+                report / ".runtime" / "cache" / "s5_artifact_bytecode_catalog.json"
+            )
+            catalog_path.parent.mkdir(parents=True)
+            catalog_path.write_text(json.dumps({"entries": [
+                {
+                    "coord": "wrong:coord",
+                    "artifact_entry": "BOOT-INF/lib/wrong.jar",
+                    "application_owned": False,
+                }
+            ]}), encoding="utf-8")
+
+            by_coord, by_identity, errors = realreg._oracle_provider_entries(
+                artifact, selected
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(by_coord, {
+            "vendor:a": {"BOOT-INF/lib/provider-a.jar"},
+            "vendor:b": {"BOOT-INF/lib/provider-b.jar"},
+        })
+        expected_physical_providers = {
+            "BOOT-INF/lib/provider-a.jar", "BOOT-INF/lib/provider-b.jar",
+        }
+        self.assertEqual(set(by_identity), {
+            realreg.serialized_api_identity(row) for row in selected
+        })
+        self.assertTrue(all(
+            entries == expected_physical_providers
+            for entries in by_identity.values()
+        ))
+
+    def test_provider_filter_excludes_only_target_owner_self_references(self):
+        api = {
+            "coord": "vendor:api", "api_name": "vendor.Target.value",
+            "api_signature": "", "symbol_kind": "field", "change_type": "REMOVED",
+        }
+        providers = {"vendor:api": {"BOOT-INF/lib/api.jar"}}
+
+        self.assertTrue(realreg._is_external_provider_for_api(
+            "BOOT-INF/lib/api.jar!/vendor/Target.class", api, providers, {}
+        ))
+        self.assertFalse(realreg._is_external_provider_for_api(
+            "BOOT-INF/lib/api.jar!/vendor/Bridge.class", api, providers, {}
+        ))
+
+    def test_oracle_provider_inventory_rejects_bad_metadata_and_sha_mismatch(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Api.changed",
+            "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr("vendor/Api.class", b"fixture")
+                archive.writestr(
+                    "META-INF/maven/vendor/api/pom.properties",
+                    b"\xff\xfeinvalid",
+                )
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr("BOOT-INF/lib/api.jar", nested.getvalue())
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+            _coord, _identity, metadata_errors = realreg._oracle_provider_entries(
+                artifact, selected, digest
+            )
+            _coord, _identity, sha_errors = realreg._oracle_provider_entries(
+                artifact, selected, "0" * 64
+            )
+
+        self.assertTrue(any("pom.properties" in item for item in metadata_errors))
+        self.assertIn("final_artifact_sha256_mismatch", sha_errors)
+
+    def test_oracle_provider_inventory_uses_exact_owner_without_embedded_maven_metadata(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Api.changed",
+            "api_signature": "()", "symbol_kind": "method",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr("vendor/Api.class", b"fixture")
+            artifact = root / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr("BOOT-INF/lib/api.jar", nested.getvalue())
+
+            by_coord, by_identity, errors = realreg._oracle_provider_entries(
+                artifact, selected, hashlib.sha256(artifact.read_bytes()).hexdigest()
+            )
+
+        identity = realreg.serialized_api_identity(selected[0])
+        self.assertFalse(errors)
+        self.assertEqual(by_coord, {"vendor:api": {"BOOT-INF/lib/api.jar"}})
+        self.assertEqual(by_identity, {identity: {"BOOT-INF/lib/api.jar"}})
+
+    def test_oracle_provider_inventory_rejects_same_owner_from_multiple_coordinates(self):
+        selected = [
+            {
+                "coord": "vendor:api", "api_name": "vendor.Api.changed",
+                "api_signature": "()", "symbol_kind": "method",
+            },
+            {
+                "coord": "vendor:other", "api_name": "vendor.Api.changed",
+                "api_signature": "()", "symbol_kind": "method",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ambiguous = root / "ambiguous.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr("vendor/Api.class", b"fixture")
+            with zipfile.ZipFile(ambiguous, "w") as outer:
+                outer.writestr("BOOT-INF/lib/api.jar", nested.getvalue())
+
+            ambiguous_errors = realreg._oracle_provider_entries(
+                ambiguous, selected, hashlib.sha256(ambiguous.read_bytes()).hexdigest()
+            )[2]
+
+        self.assertTrue(any("provider_identity_ambiguous" in item for item in ambiguous_errors))
+
+    def test_oracle_provider_inventory_accepts_explicit_copackaged_coordinate_aliases(self):
+        selected = [
+            {
+                "coord": "vendor:api", "api_name": "vendor.Api.changed",
+                "api_signature": "()", "symbol_kind": "method",
+            },
+            {
+                "coord": "vendor:runtime", "api_name": "vendor.Api.changed",
+                "api_signature": "()", "symbol_kind": "method",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr("vendor/Api.class", b"fixture")
+                for artifact_id in ("api", "runtime"):
+                    archive.writestr(
+                        f"META-INF/maven/vendor/{artifact_id}/pom.properties",
+                        f"groupId=vendor\nartifactId={artifact_id}\n",
+                    )
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr("BOOT-INF/lib/provider.jar", nested.getvalue())
+
+            by_coord, by_identity, errors = realreg._oracle_provider_entries(
+                artifact, selected, hashlib.sha256(artifact.read_bytes()).hexdigest()
+            )
+
+        self.assertFalse(errors)
+        self.assertEqual(by_coord, {
+            "vendor:api": {"BOOT-INF/lib/provider.jar"},
+            "vendor:runtime": {"BOOT-INF/lib/provider.jar"},
+        })
+        self.assertEqual(set(by_identity), {
+            realreg.serialized_api_identity(row) for row in selected
+        })
+
+    def test_oracle_snapshot_remains_stable_after_source_artifact_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "app.jar"
+            original = b"verified-final-artifact"
+            artifact.write_bytes(original)
+            digest = hashlib.sha256(original).hexdigest()
+
+            snapshot, errors = realreg._materialize_verified_oracle_snapshot(
+                root / "report", artifact, digest
+            )
+            artifact.write_bytes(b"mutated-after-verification")
+
+            self.assertFalse(errors)
+            self.assertEqual(snapshot.read_bytes(), original)
+            self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), digest)
+
     def test_class_api_is_not_misrepresented_as_an_executable_member_target(self):
         targets = realreg._oracle_selected_targets([{
             "api_name": "com.vendor.OptionalSecurityType",
@@ -2709,6 +3615,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 [reachable, internal],
                 {
                     "complete": True,
+                    "trusted_artifact_sha": "d" * 64,
                     "oracle_edges": str(evidence),
                     "api_reachability": {
                         realreg.serialized_api_identity(reachable): "reachable",
@@ -2721,7 +3628,13 @@ class RealProjectRegressionTest(unittest.TestCase):
             {row["api_name"]: row["oracle_conclusion"] for row in records},
             {"vendor.Api.call": "reachable", "vendor.Api.internal": "uncertain"},
         )
-        self.assertTrue(all(row["authority"] == "final-artifact-classfile" for row in records))
+        self.assertTrue(all(row["authority"] == "jdk-javap" for row in records))
+        self.assertTrue(all(
+            set(row["capabilities"].split(";")) == {
+                "artifact_bound", "closed_world_static", "executable_edges",
+            }
+            for row in records
+        ))
         self.assertEqual(records[0]["change_type"], "REMOVED")
         self.assertTrue(all(len(row["evidence_sha256"]) == 64 for row in records))
 
@@ -2738,6 +3651,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 [absent],
                 {
                     "complete": True,
+                    "trusted_artifact_sha": "d" * 64,
                     "oracle_edges": str(evidence),
                     "api_reachability": {
                         realreg.serialized_api_identity(absent):
@@ -2764,6 +3678,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 [constant],
                 {
                     "complete": True,
+                    "trusted_artifact_sha": "d" * 64,
                     "oracle_edges": str(evidence),
                     "api_reachability": {
                         realreg.serialized_api_identity(constant):
@@ -2791,6 +3706,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 [constant],
                 {
                     "complete": True,
+                    "trusted_artifact_sha": "d" * 64,
                     "oracle_edges": str(evidence),
                     "api_reachability": {
                         realreg.serialized_api_identity(constant):
@@ -2836,6 +3752,7 @@ class RealProjectRegressionTest(unittest.TestCase):
                 [constant],
                 {
                     "complete": True,
+                    "trusted_artifact_sha": "d" * 64,
                     "oracle_edges": str(evidence),
                     "api_reachability": {
                         realreg.serialized_api_identity(constant): "uncertain",
@@ -2845,58 +3762,39 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(records[0]["compile_impact"], "unverified")
         self.assertEqual(records[0]["runtime_link_impact"], "unverified")
+        self.assertIn("compile-time constant", records[0]["procedure"])
 
-    def test_constant_pool_oracle_records_are_a_distinct_member_authority(self):
-        absent = {
+    def test_automatic_oracle_does_not_promote_constant_pool_diagnostics(self):
+        target = {
             "coord": "vendor:api", "api_name": "vendor.Api.removed",
             "api_signature": "()", "symbol_kind": "method",
             "change_type": "REMOVED",
         }
         with tempfile.TemporaryDirectory() as tmp:
-            evidence = Path(tmp) / "member-references.json"
-            evidence.write_text("[]\n", encoding="utf-8")
-            records = realreg.build_constant_pool_api_oracle_records(
-                [absent],
-                {
-                    "complete": True,
-                    "member_reference_evidence": str(evidence),
-                    "member_reference_reachability": {
-                        realreg.serialized_api_identity(absent):
-                            "not_found_in_static_analysis",
-                    },
+            edge_evidence = Path(tmp) / "oracle-edges.csv"
+            edge_evidence.write_text("header\n", encoding="utf-8")
+            member_evidence = Path(tmp) / "member-references.json"
+            member_evidence.write_text("[]\n", encoding="utf-8")
+            records = realreg.build_automatic_oracle_records([target], {
+                "complete": True,
+                "trusted_artifact_sha": "d" * 64,
+                "oracle_edges": str(edge_evidence),
+                "api_reachability": {
+                    realreg.serialized_api_identity(target): "uncertain",
                 },
-            )
+                "member_reference_evidence": str(member_evidence),
+                "member_reference_reachability": {
+                    realreg.serialized_api_identity(target):
+                        "not_found_in_static_analysis",
+                },
+            })
 
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["authority"], "raw-classfile-constant-pool")
-        self.assertEqual(records[0]["change_type"], "REMOVED")
-        self.assertEqual(records[0]["oracle_conclusion"], "not_found_in_static_analysis")
-
-    def test_constant_pool_oracle_treats_compile_time_constant_absence_as_uncertain(self):
-        constant = {
-            "coord": "vendor:api", "api_name": "vendor.Flags.EMPTY",
-            "api_signature": "", "symbol_kind": "field",
-            "change_type": "REMOVED", "compatibility_flags": "CONSTANT_REMOVED",
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            evidence = Path(tmp) / "member-references.json"
-            evidence.write_text("[]\n", encoding="utf-8")
-            records = realreg.build_constant_pool_api_oracle_records(
-                [constant],
-                {
-                    "complete": True,
-                    "member_reference_evidence": str(evidence),
-                    "member_reference_reachability": {
-                        realreg.serialized_api_identity(constant):
-                            "not_found_in_static_analysis",
-                    },
-                },
-            )
-
+        self.assertEqual(records[0]["authority"], "jdk-javap")
+        self.assertIn("executable_edges", records[0]["capabilities"].split(";"))
         self.assertEqual(records[0]["oracle_conclusion"], "uncertain")
-        self.assertIn("compile-time constant", records[0]["procedure"])
 
-    def test_jdeps_oracle_records_are_a_distinct_class_authority(self):
+    def test_jdeps_absence_is_not_authoritative_for_class_metadata(self):
         target = {
             "coord": "vendor:api", "api_name": "vendor.RemovedType",
             "api_signature": "", "symbol_kind": "class",
@@ -2917,9 +3815,35 @@ class RealProjectRegressionTest(unittest.TestCase):
                 },
             )
 
+        self.assertEqual(records, [])
+
+    def test_javap_verbose_oracle_records_complete_class_absence(self):
+        target = {
+            "coord": "vendor:api", "api_name": "vendor.RemovedType",
+            "api_signature": "", "symbol_kind": "class",
+            "change_type": "REMOVED",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "javap-references.json"
+            evidence.write_text("[]\n", encoding="utf-8")
+            records = realreg.build_javap_verbose_api_oracle_records(
+                [target],
+                {
+                    "complete": True,
+                    "trusted_artifact_sha": "d" * 64,
+                    "javap_class_reference_evidence": str(evidence),
+                    "javap_class_reachability": {
+                        realreg.serialized_api_identity(target):
+                            "not_found_in_static_analysis",
+                    },
+                },
+            )
+
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["authority"], "jdk-jdeps")
-        self.assertEqual(records[0]["change_type"], "REMOVED")
+        self.assertEqual(records[0]["authority"], "jdk-javap-verbose")
+        self.assertEqual(
+            records[0]["oracle_conclusion"], "not_found_in_static_analysis"
+        )
 
     def test_final_artifact_class_reference_oracle_uses_packaged_constant_pool(self):
         selected = [{
@@ -2943,6 +3867,431 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(result["api_reachability"][identity], "reachable")
         self.assertEqual(result["references"][0]["artifact_entry"], "BOOT-INF/classes/demo/App.class")
 
+    def test_class_reference_oracle_ignores_target_class_self_declaration(self):
+        selected = [{
+            "coord": "com.example:library",
+            "api_name": "com.example.Target",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "SIGNATURE_CHANGED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as library:
+                library.writestr(
+                    "com/example/Target.class",
+                    minimal_classfile_with_utf8("com/example/Target"),
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/library.jar", nested.getvalue())
+
+            result = realreg.scan_final_artifact_class_references(
+                artifact,
+                selected,
+                application_owned_nested_jars={"BOOT-INF/lib/library.jar"},
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(
+            result["api_reachability"][identity],
+            "not_found_in_static_analysis",
+        )
+        self.assertEqual(result["references"], [])
+
+    def test_class_reference_oracle_treats_cross_class_internal_usage_as_business(self):
+        selected = [{
+            "coord": "com.example:library",
+            "api_name": "com.example.Target",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "SIGNATURE_CHANGED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as library:
+                library.writestr(
+                    "com/example/Consumer.class",
+                    minimal_classfile_with_utf8("com/example/Target"),
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/library.jar", nested.getvalue())
+
+            result = realreg.scan_final_artifact_class_references(
+                artifact,
+                selected,
+                application_owned_nested_jars={"BOOT-INF/lib/library.jar"},
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["api_reachability"][identity], "reachable")
+        self.assertTrue(result["references"][0]["business_owned"])
+
+    def test_class_reference_oracle_accepts_internal_module_business_boundary(self):
+        selected = [{
+            "coord": "vendor:api",
+            "api_name": "vendor.RemovedType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as library:
+                library.writestr(
+                    "com/example/Consumer.class",
+                    minimal_classfile_with_utf8("vendor/RemovedType"),
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/demo/App.class",
+                    minimal_classfile_with_utf8("com/example/Consumer"),
+                )
+                archive.writestr(
+                    "BOOT-INF/lib/library.jar", nested.getvalue()
+                )
+
+            result = realreg.scan_final_artifact_class_references(
+                artifact,
+                selected,
+                application_owned_nested_jars={"BOOT-INF/lib/library.jar"},
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["api_reachability"][identity], "reachable")
+        self.assertTrue(result["references"][0]["business_owned"])
+        self.assertEqual(
+            result["references"][0]["business_path"],
+            ["com.example.Consumer"],
+        )
+
+    def test_external_duplicate_owner_cannot_borrow_internal_business_path(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.RemovedType",
+            "api_signature": "", "symbol_kind": "class",
+            "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            internal = io.BytesIO()
+            with zipfile.ZipFile(internal, "w") as archive:
+                archive.writestr(
+                    "dup/Consumer.class", minimal_classfile_with_utf8("java/lang/Object")
+                )
+            external = io.BytesIO()
+            with zipfile.ZipFile(external, "w") as archive:
+                archive.writestr(
+                    "dup/Consumer.class",
+                    minimal_classfile_with_utf8("vendor/RemovedType"),
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/app/App.class",
+                    minimal_classfile_with_utf8("dup/Consumer"),
+                )
+                archive.writestr("BOOT-INF/lib/internal.jar", internal.getvalue())
+                archive.writestr("BOOT-INF/lib/external.jar", external.getvalue())
+
+            result = realreg.scan_final_artifact_class_references(
+                artifact,
+                selected,
+                application_owned_nested_jars={"BOOT-INF/lib/internal.jar"},
+            )
+
+        self.assertEqual(result["api_reachability"][identity], "uncertain")
+        external_reference = next(
+            item for item in result["references"]
+            if item["artifact_entry"].startswith("BOOT-INF/lib/external.jar!/")
+        )
+        self.assertFalse(external_reference["business_owned"])
+        self.assertEqual(external_reference["business_path"], [])
+
+    def test_executable_edge_cannot_cross_duplicate_class_owners(self):
+        artifact_sha256 = "a" * 64
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }
+        root_edge = self._edge_row(
+            artifact_sha256,
+            "app.App", "run", "()V",
+            "dup.Bridge", "call", "()V", "invokevirtual",
+            "BOOT-INF/classes/app/App.class",
+        )
+        external_target_edge = self._edge_row(
+            artifact_sha256,
+            "dup.Bridge", "call", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/external.jar!/dup/Bridge.class",
+        )
+        external_target_edge["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp),
+                [target],
+                [external_target_edge],
+                {
+                    "artifact_sha256": artifact_sha256,
+                    "complete": True,
+                    "edges": [root_edge, external_target_edge],
+                    "failures": [],
+                    "artifact_entries": [
+                        root_edge["artifact_entry"],
+                        "BOOT-INF/lib/internal.jar!/dup/Bridge.class",
+                        external_target_edge["artifact_entry"],
+                    ],
+                    "application_owned_nested_jars": {
+                        "BOOT-INF/lib/internal.jar",
+                    },
+                },
+            )
+
+        identity = realreg.serialized_api_identity(target)
+        self.assertEqual(result["api_reachability"][identity], "uncertain")
+
+    def test_class_reference_provider_exclusion_is_scoped_to_each_api_coord(self):
+        selected = [
+            {
+                "coord": "vendor:a", "api_name": "vendor.a.TargetA",
+                "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+            },
+            {
+                "coord": "vendor:b", "api_name": "vendor.b.TargetB",
+                "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+            },
+        ]
+        identity_a = realreg.serialized_api_identity(selected[0])
+        identity_b = realreg.serialized_api_identity(selected[1])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            provider_a = io.BytesIO()
+            with zipfile.ZipFile(provider_a, "w") as nested:
+                nested.writestr(
+                    "vendor/a/TargetA.class",
+                    minimal_classfile_with_utf8("vendor/a/TargetA"),
+                )
+                nested.writestr(
+                    "vendor/a/UsesB.class",
+                    minimal_classfile_with_utf8("vendor/b/TargetB"),
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/provider-a.jar", provider_a.getvalue())
+
+            result = realreg.scan_final_artifact_class_references(
+                artifact,
+                selected,
+                provider_nested_jars_by_coord={
+                    "vendor:a": {"BOOT-INF/lib/provider-a.jar"},
+                },
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(
+            result["api_reachability"][identity_a],
+            "not_found_in_static_analysis",
+        )
+        self.assertEqual(result["api_reachability"][identity_b], "uncertain")
+        self.assertEqual(
+            {item["api_identity"] for item in result["references"]},
+            {identity_b},
+        )
+
+    def test_class_reference_oracle_matches_dotted_nested_class_identity(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Outer.Inner",
+            "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/app/UsesNested.class",
+                    minimal_classfile_with_utf8("vendor/Outer$Inner"),
+                )
+
+            result = realreg.scan_final_artifact_class_references(
+                artifact, selected
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["api_reachability"][identity], "reachable")
+        self.assertEqual(len(result["references"]), 1)
+
+    def test_javap_verbose_parser_matches_annotation_and_nested_class_metadata(self):
+        targets = {
+            "outer": "org.checkerframework.framework.qual.DefaultQualifier",
+            "nested": "org.checkerframework.framework.qual.DefaultQualifier.List",
+            "location": "org.checkerframework.framework.qual.TypeUseLocation",
+        }
+        output = '''
+   #8 = Utf8 Lorg/checkerframework/framework/qual/DefaultQualifier$List;
+  #13 = Utf8 Lorg/checkerframework/framework/qual/TypeUseLocation;
+  #18 = Class #19 // org/checkerframework/framework/qual/DefaultQualifier$List
+  #20 = Class #21 // org/checkerframework/framework/qual/DefaultQualifier
+'''
+
+        matched = realreg._javap_verbose_matched_class_targets(output, targets)
+
+        self.assertEqual(matched, {"outer", "nested", "location"})
+
+    def test_javap_verbose_class_oracle_proves_complete_absence_without_candidates(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Absent",
+            "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/app/Present.class",
+                    minimal_classfile_with_utf8("app/Present"),
+                )
+
+            result = realreg.scan_final_artifact_javap_class_references(
+                artifact, selected, time_budget_seconds=30
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(
+            result["api_reachability"][identity],
+            "not_found_in_static_analysis",
+        )
+        self.assertEqual(result["metrics"]["javap_invocations"], 0)
+
+    def test_javap_verbose_class_oracle_batches_candidates_without_losing_identity(self):
+        selected = [
+            {
+                "coord": "vendor:api", "api_name": "vendor.TypeA",
+                "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+            },
+            {
+                "coord": "vendor:api", "api_name": "vendor.TypeB",
+                "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+            },
+        ]
+
+        def fake_javap(command, **_kwargs):
+            sections = []
+            for class_path in command[2:]:
+                target = "TypeA" if str(class_path).endswith("000000.class") else "TypeB"
+                sections.append(
+                    f"Classfile {class_path}\n  #1 = Utf8 Lvendor/{target};\n"
+                )
+            return SimpleNamespace(returncode=0, stdout="".join(sections), stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/app/UsesA.class",
+                    minimal_classfile_with_utf8("vendor/TypeA"),
+                )
+                archive.writestr(
+                    "BOOT-INF/classes/app/UsesB.class",
+                    minimal_classfile_with_utf8("vendor/TypeB"),
+                )
+            with patch.object(realreg.subprocess, "run", side_effect=fake_javap):
+                result = realreg.scan_final_artifact_javap_class_references(
+                    artifact, selected, max_workers=1, time_budget_seconds=30
+                )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["metrics"]["candidate_class_count"], 2)
+        self.assertEqual(result["metrics"]["javap_invocations"], 1)
+        self.assertEqual(
+            {item["target_class"] for item in result["references"]},
+            {"vendor.TypeA", "vendor.TypeB"},
+        )
+
+    def test_javap_verbose_class_oracle_marks_nested_scan_over_budget_incomplete(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Absent",
+            "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            nested_bytes = io.BytesIO()
+            with zipfile.ZipFile(nested_bytes, "w") as nested:
+                nested.writestr(
+                    "vendor/Present.class",
+                    minimal_classfile_with_utf8("vendor/Present"),
+                )
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/vendor.jar", nested_bytes.getvalue())
+            with patch.object(
+                realreg.time, "perf_counter", side_effect=[0.0, 0.5, 2.0, 2.0]
+            ):
+                result = realreg.scan_final_artifact_javap_class_references(
+                    artifact, selected, time_budget_seconds=1
+                )
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["metrics"]["timed_out"])
+        self.assertIn("oracle_time_budget_exceeded", result["errors"])
+
+    def test_final_artifact_class_reference_oracle_indexes_targets_once(self):
+        selected = [
+            {
+                "coord": "vendor:api", "api_name": f"vendor.Type{index}",
+                "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+            }
+            for index in range(1000)
+        ]
+        matched_identity = realreg.serialized_api_identity(selected[731])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/demo/App.class",
+                    minimal_classfile_with_utf8("vendor/Type731"),
+                )
+
+            with patch.object(
+                realreg,
+                "_constant_pool_references_class",
+                side_effect=AssertionError("per-target constant-pool scan"),
+            ):
+                result = realreg.scan_final_artifact_class_references(
+                    artifact, selected
+                )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["api_reachability"][matched_identity], "reachable")
+        self.assertEqual(len(result["references"]), 1)
+
+    def test_final_artifact_class_reference_oracle_honors_exhausted_budget(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Target",
+            "api_signature": "", "symbol_kind": "class", "change_type": "REMOVED",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/demo/App.class",
+                    minimal_classfile_with_utf8("vendor/Target"),
+                )
+
+            result = realreg.scan_final_artifact_class_references(
+                artifact, selected, time_budget_seconds=0.0
+            )
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["timed_out"])
+        self.assertIn("oracle_time_budget_exceeded", result["errors"])
+
     def test_final_artifact_member_reference_oracle_parses_exact_constant_pool_reference(self):
         selected = [{
             "coord": "vendor:api", "api_name": "vendor.Api.call",
@@ -2965,8 +4314,144 @@ class RealProjectRegressionTest(unittest.TestCase):
             )
 
         self.assertTrue(result["complete"])
+        self.assertEqual(
+            result["api_reachability"][identity], "reachable"
+        )
+        self.assertEqual(len(result["references"]), 1)
+        self.assertTrue(result["references"][0]["business_owned"])
+
+    def test_member_reference_oracle_requires_entry_for_application_owned_nested_jar(self):
+        selected = [{
+            "coord": "com.example:library",
+            "api_name": "com.example.LibraryApi.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as library:
+                library.writestr(
+                    "com/example/LibraryCaller.class",
+                    minimal_classfile_with_methodref(
+                        "com/example/LibraryApi", "call", "()V"
+                    ),
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/library-1.0.jar", nested.getvalue())
+
+            result = realreg.scan_final_artifact_member_references(
+                artifact,
+                selected,
+                application_owned_nested_jars={"BOOT-INF/lib/library-1.0.jar"},
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(
+            result["api_reachability"][identity], "reachable"
+        )
+        self.assertEqual(len(result["references"]), 1)
+
+    def test_member_reference_oracle_detects_constructor_reference(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Api",
+            "api_signature": "()", "symbol_kind": "constructor",
+            "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/demo/App.class",
+                    minimal_classfile_with_methodref(
+                        "vendor/Api", "<init>", "()V"
+                    ),
+                )
+
+            result = realreg.scan_final_artifact_member_references(
+                artifact, selected
+            )
+
+        self.assertTrue(result["complete"])
         self.assertEqual(result["api_reachability"][identity], "reachable")
-        self.assertEqual(result["references"][0]["callee_member"], "call")
+        self.assertEqual(result["references"][0]["opcode_family"], "invokespecial")
+
+    def test_member_reference_oracle_detects_field_reference(self):
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.Api.enabled",
+            "api_signature": "", "symbol_kind": "field",
+            "change_type": "DATA_FIELD_ADDED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/demo/App.class",
+                    minimal_classfile_with_methodref(
+                        "vendor/Api", "enabled", "Z", tag=9
+                    ),
+                )
+
+            result = realreg.scan_final_artifact_member_references(
+                artifact, selected
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["api_reachability"][identity], "reachable")
+        self.assertEqual(result["references"][0]["reference_kind"], "field")
+
+    def test_member_reference_provider_keeps_other_class_internal_bridges(self):
+        selected = [
+            {
+                "coord": "vendor:a", "api_name": "vendor.a.Api.changed",
+                "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            },
+            {
+                "coord": "vendor:b", "api_name": "vendor.b.Api.changed",
+                "api_signature": "()", "symbol_kind": "method", "change_type": "REMOVED",
+            },
+        ]
+        identity_a = realreg.serialized_api_identity(selected[0])
+        identity_b = realreg.serialized_api_identity(selected[1])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            provider_a = io.BytesIO()
+            with zipfile.ZipFile(provider_a, "w") as nested:
+                nested.writestr(
+                    "vendor/a/UsesA.class",
+                    minimal_classfile_with_methodref(
+                        "vendor/a/Api", "changed", "()V"
+                    ),
+                )
+                nested.writestr(
+                    "vendor/a/UsesB.class",
+                    minimal_classfile_with_methodref(
+                        "vendor/b/Api", "changed", "()V"
+                    ),
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/provider-a.jar", provider_a.getvalue())
+
+            result = realreg.scan_final_artifact_member_references(
+                artifact,
+                selected,
+                provider_nested_jars_by_coord={
+                    "vendor:a": {"BOOT-INF/lib/provider-a.jar"},
+                },
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(
+            result["api_reachability"][identity_a], "uncertain"
+        )
+        self.assertEqual(
+            result["api_reachability"][identity_b], "uncertain"
+        )
+        self.assertEqual(len(result["references"]), 2)
 
     def test_analyzer_path_cannot_import_an_edge_labeled_for_another_api(self):
         artifact_sha256 = "e" * 64
@@ -3139,6 +4624,458 @@ class RealProjectRegressionTest(unittest.TestCase):
         )
 
         self.assertTrue(realreg._api_target_matches(target, edge))
+
+    def test_edge_truth_field_target_rejects_same_named_method_invocation(self):
+        target = {
+            "coord": "vendor:api",
+            "api_name": "vendor.Api.value",
+            "api_signature": "",
+            "symbol_kind": "field",
+            "change_type": "DATA_FIELD_ADDED",
+        }
+        method_edge = self._edge_row(
+            "c" * 64, "app.Entry", "run", "()V",
+            "vendor.Api", "value", "()Z", "invokevirtual",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+        field_edge = self._edge_row(
+            "c" * 64, "app.Entry", "run", "()V",
+            "vendor.Api", "value", "Z", "getfield",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+
+        self.assertFalse(realreg._api_target_matches(target, method_edge))
+        self.assertTrue(realreg._api_target_matches(target, field_edge))
+
+    def test_edge_truth_method_and_constructor_require_invoke_opcodes(self):
+        method = {
+            "api_name": "vendor.Api.call", "api_signature": "()",
+            "symbol_kind": "method",
+        }
+        constructor = {
+            "api_name": "vendor.Api.Api", "api_signature": "()",
+            "symbol_kind": "constructor",
+        }
+        bad_method = self._edge_row(
+            "c" * 64, "app.Entry", "run", "()V",
+            "vendor.Api", "call", "()V", "getstatic",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+        bad_constructor = self._edge_row(
+            "c" * 64, "app.Entry", "run", "()V",
+            "vendor.Api", "<init>", "()V", "invokevirtual",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+
+        self.assertFalse(realreg._api_target_matches(method, bad_method))
+        self.assertFalse(realreg._api_target_matches(constructor, bad_constructor))
+        self.assertFalse(realreg._api_target_matches(method, {
+            **bad_method, "opcode_family": "", "reference_kind": "method",
+        }))
+        self.assertFalse(realreg._api_target_matches(constructor, {
+            **bad_constructor, "opcode_family": "", "reference_kind": "method",
+        }))
+
+    def test_edge_truth_field_requires_an_executable_field_opcode(self):
+        field = {
+            "api_name": "vendor.Api.value", "api_signature": "",
+            "symbol_kind": "field",
+        }
+        constant_pool_only = {
+            "callee_owner": "vendor.Api", "callee_member": "value",
+            "callee_descriptor": "I", "opcode_family": "",
+            "reference_kind": "field",
+        }
+
+        self.assertFalse(realreg._api_target_matches(field, constant_pool_only))
+
+    def test_oracle_component_rejects_evidence_from_a_different_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "locked.jar"
+            artifact.write_bytes(b"locked artifact")
+            expected_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            component = {
+                "artifact_sha256": expected_sha,
+                "references": [{"artifact_sha256": "b" * 64}],
+            }
+
+            errors = realreg._oracle_component_provenance_errors(
+                component, "member_reference_scan", expected_sha, artifact,
+                require_declaration=True,
+            )
+
+        self.assertTrue(any("component_sha_mismatch" in item for item in errors))
+
+    def test_oracle_component_requires_declared_artifact_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "locked.jar"
+            artifact.write_bytes(b"locked artifact")
+            expected_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+            errors = realreg._oracle_component_provenance_errors(
+                {"references": []}, "member_reference_scan",
+                expected_sha, artifact, require_declaration=True,
+            )
+
+        self.assertIn("member_reference_scan:artifact_sha_missing", errors)
+
+    def test_oracle_component_requires_each_child_evidence_to_bind_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "locked.jar"
+            artifact.write_bytes(b"locked artifact")
+            expected_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            component = {
+                "artifact_sha256": expected_sha,
+                "references": [{
+                    "caller_owner": "app.Entry",
+                    "callee_owner": "vendor.Api",
+                    "callee_member": "call",
+                }],
+            }
+
+            errors = realreg._oracle_component_provenance_errors(
+                component, "member_reference_scan", expected_sha, artifact,
+                require_declaration=True,
+            )
+
+        self.assertIn(
+            "member_reference_scan:child_artifact_sha_missing:references[0]",
+            errors,
+        )
+
+    def test_oracle_component_requires_serialized_edge_identity_to_bind_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "locked.jar"
+            artifact.write_bytes(b"locked artifact")
+            expected_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            component = {
+                "artifact_sha256": expected_sha,
+                "references": [{"identity": "serialized-edge-identity"}],
+            }
+
+            errors = realreg._oracle_component_provenance_errors(
+                component, "edge_scan", expected_sha, artifact,
+                require_declaration=True,
+            )
+
+        self.assertIn(
+            "edge_scan:child_artifact_sha_missing:references[0]", errors
+        )
+
+    def test_oracle_internal_module_entries_require_scope_and_locked_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            artifact = root / "app.jar"
+            nested_entry = "BOOT-INF/lib/library-1.0.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr(
+                    "META-INF/maven/com.acme/library/pom.properties",
+                    "groupId=com.acme\nartifactId=library\nversion=1.0\n",
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(nested_entry, nested.getvalue())
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            dependencies = report / "evidence/dependencies"
+            dependencies.mkdir(parents=True)
+            (dependencies / "deps_current_resolved.csv").write_text(
+                "coord,lib_entry,resolution_status\n"
+                f"com.acme:library,{nested_entry},resolved\n",
+                encoding="utf-8",
+            )
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [{
+                    "side": "current", "revision": "current-revision",
+                    "artifact_sha256": artifact_sha,
+                }],
+            }), encoding="utf-8")
+            state = report / ".runtime/state/main_state.json"
+            state.parent.mkdir(parents=True)
+            scope = {
+                "included_module_coords": ["com.acme:app", "com.acme:library"],
+                "source_revision": "current-revision",
+            }
+            scope["scope_hash"] = hashlib.sha256(json.dumps(
+                scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [bind_internal_module_scope(
+                    scope, artifact_sha, "current-revision"
+                )],
+            }), encoding="utf-8")
+            state.write_text(json.dumps({
+                "step1": {"input": {"project_scope": scope}},
+            }), encoding="utf-8")
+
+            entries, errors = realreg._oracle_application_owned_nested_jars(
+                report, artifact, artifact_sha
+            )
+            with patch.object(
+                realreg, "project_scope_provenance_errors",
+                return_value=["build_source_state_mismatch"],
+            ):
+                mismatched_entries, mismatched_errors = (
+                    realreg._oracle_application_owned_nested_jars(
+                        report, artifact, artifact_sha
+                    )
+                )
+
+        self.assertEqual(entries, {nested_entry})
+        self.assertEqual(errors, [])
+        self.assertEqual(mismatched_entries, set())
+        self.assertIn(
+            "internal_module_build_source_state_mismatch",
+            mismatched_errors,
+        )
+
+    def test_oracle_internal_module_rejects_step1_coordinate_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            artifact = root / "app.jar"
+            nested_entry = "BOOT-INF/lib/vendor.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr(
+                    "META-INF/maven/vendor/lib/pom.properties",
+                    "groupId=vendor\nartifactId=lib\nversion=1\n",
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(nested_entry, nested.getvalue())
+            dependencies = report / "evidence/dependencies"
+            dependencies.mkdir(parents=True)
+            (dependencies / "deps_current_resolved.csv").write_text(
+                "coord,lib_entry,resolution_status\n"
+                f"com.acme:library,{nested_entry},resolved\n",
+                encoding="utf-8",
+            )
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [{
+                    "side": "current", "revision": "current-revision",
+                    "artifact_sha256": artifact_sha,
+                }],
+            }), encoding="utf-8")
+            scope = {
+                "included_module_coords": ["com.acme:library"],
+                "source_revision": "current-revision",
+            }
+            scope["scope_hash"] = hashlib.sha256(json.dumps(
+                scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [bind_internal_module_scope(
+                    scope, artifact_sha, "current-revision"
+                )],
+            }), encoding="utf-8")
+            state = report / ".runtime/state/main_state.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "step1": {"input": {"project_scope": scope}},
+            }), encoding="utf-8")
+
+            entries, errors = realreg._oracle_application_owned_nested_jars(
+                report, artifact, artifact_sha
+            )
+
+        self.assertEqual(entries, set())
+        self.assertTrue(any(
+            error.startswith("internal_module_coordinate_mismatch:")
+            for error in errors
+        ), errors)
+
+    def test_oracle_internal_module_rejects_mixed_nested_coordinates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            artifact = root / "app.jar"
+            nested_entry = "BOOT-INF/lib/mixed.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr(
+                    "META-INF/maven/com.acme/library/pom.properties",
+                    "groupId=com.acme\nartifactId=library\nversion=1\n",
+                )
+                archive.writestr(
+                    "META-INF/maven/vendor/lib/pom.properties",
+                    "groupId=vendor\nartifactId=lib\nversion=1\n",
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(nested_entry, nested.getvalue())
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            dependencies = report / "evidence/dependencies"
+            dependencies.mkdir(parents=True)
+            (dependencies / "deps_current_resolved.csv").write_text(
+                "coord,lib_entry,resolution_status\n"
+                f"com.acme:library,{nested_entry},resolved\n",
+                encoding="utf-8",
+            )
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [{
+                    "side": "current", "revision": "current-revision",
+                    "artifact_sha256": artifact_sha,
+                }],
+            }), encoding="utf-8")
+            scope = {
+                "included_module_coords": ["com.acme:library"],
+                "source_revision": "current-revision",
+            }
+            scope["scope_hash"] = hashlib.sha256(json.dumps(
+                scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [bind_internal_module_scope(
+                    scope, artifact_sha, "current-revision"
+                )],
+            }), encoding="utf-8")
+            state = report / ".runtime/state/main_state.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "step1": {"input": {"project_scope": scope}},
+            }), encoding="utf-8")
+
+            entries, errors = realreg._oracle_application_owned_nested_jars(
+                report, artifact, artifact_sha
+            )
+
+        self.assertEqual(entries, set())
+        self.assertTrue(any(
+            error.startswith("internal_module_coordinate_ambiguous:")
+            for error in errors
+        ), errors)
+
+    def test_oracle_internal_module_rejects_scope_from_different_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            artifact = root / "app.jar"
+            nested_entry = "BOOT-INF/lib/library.jar"
+            nested = io.BytesIO()
+            with zipfile.ZipFile(nested, "w") as archive:
+                archive.writestr(
+                    "META-INF/maven/com.acme/library/pom.properties",
+                    "groupId=com.acme\nartifactId=library\nversion=1\n",
+                )
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(nested_entry, nested.getvalue())
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            dependencies = report / "evidence/dependencies"
+            dependencies.mkdir(parents=True)
+            (dependencies / "deps_current_resolved.csv").write_text(
+                "coord,lib_entry,resolution_status\n"
+                f"com.acme:library,{nested_entry},resolved\n",
+                encoding="utf-8",
+            )
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [{
+                    "side": "current", "revision": "current-revision",
+                    "artifact_sha256": artifact_sha,
+                }],
+            }), encoding="utf-8")
+            scope = {
+                "included_module_coords": ["com.acme:library"],
+                "source_revision": "stale-revision",
+            }
+            scope["scope_hash"] = hashlib.sha256(json.dumps(
+                scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            (dependencies / "build_provenance.json").write_text(json.dumps({
+                "sides": [bind_internal_module_scope(
+                    scope, artifact_sha, "current-revision"
+                )],
+            }), encoding="utf-8")
+            state = report / ".runtime/state/main_state.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "step1": {"input": {"project_scope": scope}},
+            }), encoding="utf-8")
+
+            entries, errors = realreg._oracle_application_owned_nested_jars(
+                report, artifact, artifact_sha
+            )
+
+        self.assertEqual(entries, set())
+        self.assertIn("internal_module_project_revision_mismatch", errors)
+
+    def test_reconciliation_passes_internal_module_entries_to_class_oracle(self):
+        nested_entry = "BOOT-INF/lib/library.jar"
+        selected = [{
+            "coord": "vendor:api", "api_name": "vendor.RemovedType",
+            "api_signature": "", "symbol_kind": "class",
+        }]
+        primary_scan = {
+            "artifact_sha256": "a" * 64,
+            "complete": True,
+            "edges": [],
+            "failures": [],
+            "artifact_entries": ["BOOT-INF/classes/app/App.class"],
+        }
+        class_scan = {
+            "artifact_sha256": "a" * 64,
+            "complete": True,
+            "api_reachability": {
+                realreg.serialized_api_identity(selected[0]):
+                    "not_found_in_static_analysis",
+            },
+            "references": [], "errors": [],
+        }
+        javap_scan = {
+            **class_scan,
+            "metrics": {"javap_invocations": 0},
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg, "_verified_current_final_artifact",
+            return_value=(Path("artifact.jar"), "a" * 64, []),
+        ), patch.object(
+            realreg, "_materialize_verified_oracle_snapshot",
+            return_value=(Path("artifact-snapshot.jar"), []),
+        ), patch.object(
+            realreg, "_csv_rows", return_value=([], []),
+        ), patch.object(
+            realreg, "_artifact_class_entries",
+            return_value={"BOOT-INF/classes/app/App.class"},
+        ), patch.object(
+            realreg, "scan_final_artifact", return_value=primary_scan,
+        ), patch.object(
+            realreg, "_oracle_application_owned_nested_jars",
+            return_value=({nested_entry}, []),
+        ), patch.object(
+            realreg, "scan_final_artifact_class_references",
+            return_value=class_scan,
+        ) as class_oracle, patch.object(
+            realreg, "scan_final_artifact_javap_class_references",
+            return_value=javap_scan,
+        ), patch.object(
+            realreg, "_record_oracle_component_provenance",
+        ):
+            realreg.reconcile_final_artifact_edges(Path(tmp), selected)
+
+        self.assertEqual(
+            class_oracle.call_args.kwargs["application_owned_nested_jars"],
+            {nested_entry},
+        )
+
+    def test_final_artifact_oracle_records_require_trusted_artifact_sha(self):
+        target = {
+            "coord": "vendor:api", "api_name": "vendor.Api.call",
+            "api_signature": "()", "symbol_kind": "method",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "oracle_edges.csv"
+            evidence.write_text("header\n", encoding="utf-8")
+
+            records = realreg.build_final_artifact_api_oracle_records(
+                [target], {
+                    "complete": True,
+                    "oracle_edges": str(evidence),
+                    "api_reachability": {
+                        realreg.serialized_api_identity(target): "reachable",
+                    },
+                },
+            )
+
+        self.assertEqual(records, [])
 
     def test_oracle_target_selection_normalizes_repeated_constructor_name(self):
         targets = realreg._oracle_selected_targets([{
@@ -4039,11 +5976,51 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertTrue(any(item.startswith("graph_stats: methods_indexed") for item in result["failures"]))
         self.assertTrue(any(item.startswith("graph_stats: reverse_edges_indexed") for item in result["failures"]))
         self.assertTrue(any(item.startswith("performance:") for item in result["failures"]))
-        self.assertIn("alerts_reachable.csv missing", result["warnings"])
+        self.assertIn("alerts_reachable.csv missing", result["failures"])
         self.assertTrue(
             any(item["signal_type"] == "performance_regression" for item in result["quality_signals"])
         )
         self.assertFalse(result["performance_envelope"]["within_budget"])
+
+    def test_missing_alert_partition_warns_only_when_summary_has_that_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output = report_dir / "evidence" / "call_chain"
+            output.mkdir(parents=True)
+            (output / "alerts.csv").write_text(
+                "api_identity,path_status\n"
+                "r,reachable\n"
+                "u,uncertain\n"
+                "n,not_analyzed\n"
+                "f,not_found_in_static_analysis\n",
+                encoding="utf-8",
+            )
+
+            summary = {
+                "reachable": 1, "uncertain": 1, "not_impacted": 0,
+                "not_analyzed": 1, "not_found_in_static_analysis": 1,
+            }
+            errors = realreg.validate_alert_partition_contract(report_dir, summary)
+            self.assertIn("alerts_reachable.csv missing", errors)
+            self.assertIn("alerts_uncertain.csv missing", errors)
+
+            (output / "alerts_reachable_001.csv").write_text(
+                "api_identity,path_status\nr,reachable\n", encoding="utf-8"
+            )
+            (output / "alerts_uncertain.csv").write_text(
+                "api_identity,path_status\nu,uncertain\n", encoding="utf-8"
+            )
+            (output / "alerts_not_analyzed_001.csv").write_text(
+                "api_identity,path_status\nn,not_analyzed\n", encoding="utf-8"
+            )
+            (output / "alerts_not_found_in_static_analysis.csv").write_text(
+                "api_identity,path_status\nf,not_found_in_static_analysis\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                realreg.validate_alert_partition_contract(report_dir, summary),
+                [],
+            )
 
     def test_run_case_emits_quality_signals_for_blocking_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5245,6 +7222,9 @@ class RealProjectRegressionTests(unittest.TestCase):
         reconcile.assert_not_called()
         self.assertEqual(result["status"], "failed")
         self.assertIn("step5_returncode=124", result["failures"])
+        signals = {signal["signal_type"]: signal for signal in result["quality_signals"]}
+        self.assertTrue(signals["step5_execution_failure"]["blocking"])
+        self.assertTrue(signals["cache_semantic_equivalence_failure"]["blocking"])
 
     def test_full_step4_run_uses_full_api_budget_for_step5_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5326,13 +7306,80 @@ class RealProjectRegressionTests(unittest.TestCase):
                 "source_mode": "checkout_build",
             }
 
-            output = realreg.write_pinned_final_artifact_provenance(
-                report_dir, asset_gate, case
-            )
+            with patch.object(realreg, "build_project_scope", return_value={
+                "status": "complete",
+                "source_revision": revision,
+                "scope_hash": "b" * 64,
+                "source_state_hash": "c" * 64,
+                "maven_model_hash": "d" * 64,
+                "active_maven_profiles": ["boot"],
+            }):
+                output = realreg.write_pinned_final_artifact_provenance(
+                    report_dir, asset_gate, case
+                )
             current = json.loads(output.read_text(encoding="utf-8"))["sides"][0]
 
         self.assertEqual(current["revision"], revision)
         self.assertEqual(current["source_mode"], "checkout_build")
+        self.assertEqual(current["project_scope_hash"], "b" * 64)
+        self.assertEqual(current["source_state_hash"], "c" * 64)
+        self.assertEqual(current["maven_model_hash"], "d" * 64)
+        self.assertEqual(current["active_maven_profiles"], ["boot"])
+
+    def test_pinned_source_build_binding_enriches_step1_provenance_without_erasing_it(self):
+        case = realreg.CASES["gs-managing-transactions"]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report"
+            dependencies = report_dir / "evidence" / "dependencies"
+            dependencies.mkdir(parents=True)
+            artifact = Path(tmp) / "application.jar"
+            with realreg.zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("app/App.class", b"class")
+            artifact_sha = realreg.hashlib.sha256(artifact.read_bytes()).hexdigest()
+            provenance = dependencies / "build_provenance.json"
+            provenance.write_text(json.dumps({
+                "schema": "java-upgrade-analyzer.build-provenance.v1",
+                "both_builds_succeeded": True,
+                "sides": [
+                    {"side": "base", "artifact_sha256": "a" * 64},
+                    {
+                        "side": "current",
+                        "artifact_sha256": artifact_sha,
+                        "source_mode": "provided_artifact",
+                    },
+                ],
+            }), encoding="utf-8")
+            resolved = dependencies / "deps_current_resolved.csv"
+            original_resolved = "coord,lib_entry\ncom.acme:lib,BOOT-INF/lib/lib.jar\n"
+            resolved.write_text(original_resolved, encoding="utf-8")
+            revision = "b" * 40
+            asset_gate = {
+                "artifact_path": str(artifact),
+                "artifact_sha256": artifact_sha,
+                "actual_git_revision": revision,
+                "source_mode": "checkout_build",
+            }
+
+            with patch.object(realreg, "build_project_scope", return_value={
+                "status": "complete",
+                "source_revision": revision,
+                "scope_hash": "c" * 64,
+                "source_state_hash": "d" * 64,
+                "maven_model_hash": "e" * 64,
+                "active_maven_profiles": ["boot"],
+            }):
+                output = realreg.write_pinned_final_artifact_provenance(
+                    report_dir, asset_gate, case
+                )
+
+            written = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertTrue(written["both_builds_succeeded"])
+        self.assertEqual([side["side"] for side in written["sides"]], ["base", "current"])
+        self.assertEqual(written["sides"][0]["artifact_sha256"], "a" * 64)
+        self.assertEqual(written["sides"][1]["source_mode"], "checkout_build")
+        self.assertEqual(written["sides"][1]["project_scope_hash"], "c" * 64)
+        self.assertEqual(resolved.read_text(encoding="utf-8"), original_resolved)
 
     def test_published_artifact_manifest_does_not_claim_checkout_build_alignment(self):
         self.assertEqual(

@@ -41,6 +41,7 @@ class IngestionResult:
     unmatched_callback_edges: int = 0
     framework_entry_methods: int = 0
     runtime_framework_entry_methods: int = 0
+    runtime_framework_entry_classes: int = 0
     framework_activation_linked_methods: int = 0
     framework_proxy_dispatch_edges: int = 0
     framework_mybatis_proxy_dispatch_edges: int = 0
@@ -54,6 +55,7 @@ class IngestionResult:
             "unmatched_callback_edges": self.unmatched_callback_edges,
             "framework_entry_methods": self.framework_entry_methods,
             "runtime_framework_entry_methods": self.runtime_framework_entry_methods,
+            "runtime_framework_entry_classes": self.runtime_framework_entry_classes,
             "framework_activation_linked_methods": self.framework_activation_linked_methods,
             "framework_proxy_dispatch_edges": self.framework_proxy_dispatch_edges,
             "framework_mybatis_proxy_dispatch_edges": (
@@ -1615,6 +1617,7 @@ def _project_framework_entries(graph, records):
     methods, methods_by_qualified, methods_by_unsigned = _framework_method_indexes(graph)
     entries = {}
     runtime_entries = {}
+    runtime_class_entries = {}
     activation_linked_symbols = set()
     matched = 0
     unmatched = 0
@@ -1653,6 +1656,27 @@ def _project_framework_entries(graph, records):
             and str(edge_mapping.get("runtime_activation") or "") == "active"
             and (verified_activations or not final_artifact_mode)
         )
+        provenance = edge_mapping.get("provenance") or {}
+        autoconfiguration_is_active = bool(
+            edge.edge_kind == "spring_runtime_autoconfiguration_registration"
+            and verified_activations
+            and _artifact_evidence_matches_bytes(
+                provenance.get("artifact_path") or provenance.get("jar"),
+                provenance.get("artifact_sha256"),
+                (
+                    provenance.get("class_or_resource_entry"),
+                    provenance.get("artifact_entry"),
+                    provenance.get("resource"),
+                ),
+            )
+        )
+        if autoconfiguration_is_active:
+            runtime_class_entries.setdefault(target, []).append({
+                **edge_mapping,
+                "adapter": batch.collector,
+                "adapter_version": batch.version,
+                "activation_verified": True,
+            })
         runtime_entry_record = None
         if callback_is_active:
             runtime_entry_record = {
@@ -1734,12 +1758,14 @@ def _project_framework_entries(graph, records):
 
     graph.framework_entry_symbols = entries
     graph.framework_runtime_entry_methods = runtime_entries
+    graph.framework_runtime_entry_classes = runtime_class_entries
     graph.framework_activation_linked_symbols = activation_linked_symbols
     return {
         "matched_callback_edges": matched,
         "unmatched_callback_edges": unmatched,
         "framework_entry_methods": len(entries),
         "runtime_framework_entry_methods": len(runtime_entries),
+        "runtime_framework_entry_classes": len(runtime_class_entries),
         "framework_activation_linked_methods": len(activation_linked_symbols),
     }
 

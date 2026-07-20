@@ -1954,6 +1954,66 @@ def _run_javap_public_api_dump(jar_path, class_binary_name):
     return stdout
 
 
+def _split_javap_public_api_dump(text, class_binary_names):
+    sections = {}
+    starts = []
+    output = str(text or '')
+    for class_binary_name in class_binary_names:
+        names = {
+            str(class_binary_name), str(class_binary_name).replace('$', '.'),
+        }
+        matches = []
+        for name in names:
+            pattern = re.compile(
+                rf'(?m)^[^\n]*\b(?:class|interface|enum|record)\s+'
+                rf'{re.escape(name)}(?:[\s<{{]|$)[^\n]*$'
+            )
+            matches.extend(pattern.finditer(output))
+        unique_starts = {match.start() for match in matches}
+        if len(unique_starts) != 1:
+            continue
+        starts.append((next(iter(unique_starts)), str(class_binary_name)))
+    starts.sort()
+    for index, (start, class_binary_name) in enumerate(starts):
+        end = starts[index + 1][0] if index + 1 < len(starts) else len(output)
+        sections[class_binary_name] = output[start:end]
+    return sections
+
+
+def _run_javap_public_api_dumps(jar_path, class_binary_names, batch_size=64):
+    names = [str(item) for item in class_binary_names]
+    dumps = {}
+    errors = []
+    invocations = 0
+    size = max(1, int(batch_size))
+    for offset in range(0, len(names), size):
+        batch = names[offset:offset + size]
+        invocations += 1
+        if len(batch) == 1:
+            try:
+                dumps[batch[0]] = _run_javap_public_api_dump(jar_path, batch[0])
+            except Exception as exc:
+                errors.append(f'{batch[0]}:{str(exc)[:120]}')
+            continue
+        stdout, stderr, rc = run_cmd(
+            ['javap', '-classpath', jar_path, '-public', '-s', *batch],
+            timeout=max(60, min(300, len(batch) * 5)),
+        )
+        if rc != 0:
+            errors.append(
+                f'batch[{batch[0]}..{batch[-1]}]:'
+                f'{(stderr or stdout or "javap failed").strip()[:300]}'
+            )
+            continue
+        sections = _split_javap_public_api_dump(stdout, batch)
+        for class_binary_name in batch:
+            if class_binary_name not in sections:
+                errors.append(f'{class_binary_name}:javap_class_section_missing')
+                continue
+            dumps[class_binary_name] = sections[class_binary_name]
+    return dumps, errors, invocations
+
+
 def _build_removed_api_row(coord, old_ver, api_name, api_simple, symbol_kind, api_signature=''):
     return {
         'coord': coord,
@@ -2061,13 +2121,20 @@ def _jar_public_api_index(jar_path, coord='', version='', target_classes=None):
         index['errors'].append(f'jar_read_failed:{str(exc)[:120]}')
         return index
 
+    selected_class_entries = []
     for class_binary_name in class_entries:
         class_fqcn = class_binary_name.replace('$', '.')
         if wanted_classes and class_fqcn not in wanted_classes:
             continue
         index['classes'].add(class_fqcn)
+        selected_class_entries.append(class_binary_name)
+    javap_dumps, javap_errors, _invocations = _run_javap_public_api_dumps(
+        jar_path, selected_class_entries
+    )
+    index['errors'].extend(javap_errors)
+    for class_binary_name in selected_class_entries:
         try:
-            javap_text = _run_javap_public_api_dump(jar_path, class_binary_name)
+            javap_text = javap_dumps[class_binary_name]
             rows = _parse_removed_jar_javap_output(
                 javap_text,
                 coord or 'unknown:unknown',
@@ -2220,10 +2287,15 @@ def export_removed_jar_apis(
     apis = []
     errors = []
     class_count = 0
-    for class_binary_name in _iter_jar_class_entries(old_jar):
-        class_count += 1
+    class_entries = list(_iter_jar_class_entries(old_jar))
+    class_count = len(class_entries)
+    javap_dumps, javap_errors, javap_invocations = _run_javap_public_api_dumps(
+        old_jar, class_entries
+    )
+    errors.extend(javap_errors[:20])
+    for class_binary_name in class_entries:
         try:
-            javap_text = _run_javap_public_api_dump(old_jar, class_binary_name)
+            javap_text = javap_dumps[class_binary_name]
             apis.extend(_parse_removed_jar_javap_output(javap_text, coord, old_ver, class_binary_name))
         except Exception as exc:
             if len(errors) < 20:
@@ -2243,9 +2315,13 @@ def export_removed_jar_apis(
     return out_file, apis, {
         "old_jar": old_jar,
         "old_jar_source": old_jar_source,
+        "javap_invocations": javap_invocations,
         "old_jar_evidence": old_jar_evidence or {},
         "errors": errors,
-    }, (None if apis else "未导出到任何 public/protected API")
+    }, (
+        "removed JAR javap 导出不完整"
+        if errors else None if apis else "未导出到任何 public/protected API"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════

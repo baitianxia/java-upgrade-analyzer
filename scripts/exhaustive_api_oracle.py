@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import csv
+import hashlib
 from pathlib import Path
 
 from csv_io import open_csv_read, open_csv_write
@@ -20,19 +21,91 @@ PROVENANCE_FIELDS = (
     "generated_at",
 )
 SELF_AUTHORITIES = {"java-upgrade-analyzer", "jua", "self", "analyzer"}
+AUTHORITY_FAMILIES = {
+    "jdk-javap": "jdk-javap",
+    "jdk-javap-verbose": "jdk-javap",
+    "final-artifact-classfile": "final-artifact-classfile",
+    "jdk-jdeps": "jdk-jdeps",
+    "project-tests": "project-execution",
+    "project-runtime": "project-execution",
+}
+AUTHORITY_CAPABILITIES = {
+    "jdk-javap": {
+        "artifact_bound", "closed_world_static", "executable_edges",
+    },
+    "jdk-javap-verbose": {
+        "artifact_bound", "closed_world_static", "metadata_references",
+    },
+    "final-artifact-classfile": {
+        "artifact_bound", "closed_world_static", "metadata_references",
+    },
+    "jdk-jdeps": {"artifact_bound", "positive_only", "metadata_references"},
+    "project-tests": {"artifact_bound", "executable_runtime"},
+    "project-runtime": {"artifact_bound", "executable_runtime"},
+}
+STRONG_STATIC_NEGATIVE_CAPABILITIES = {
+    "artifact_bound", "closed_world_static", "executable_edges",
+}
 
 
 def canonical_identity(row: dict) -> str:
     return canonical_api_identity(row)
 
 
-def _valid_provenance(record: dict) -> bool:
+def _valid_provenance(
+    record: dict, *, expected_artifact_sha256: str = "",
+    require_artifact_binding: bool = False,
+) -> bool:
     if str(record.get("authority") or "").strip().lower() in SELF_AUTHORITIES:
         return False
     if any(not str(record.get(field) or "").strip() for field in PROVENANCE_FIELDS):
         return False
     digest = str(record.get("evidence_sha256") or "").strip().lower()
-    return len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        return False
+    evidence_path = Path(str(record.get("evidence_path") or "").strip())
+    try:
+        content_digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    if not evidence_path.is_file() or content_digest != digest:
+        return False
+    if require_artifact_binding:
+        artifact_digest = str(record.get("artifact_sha256") or "").strip().lower()
+        expected_digest = expected_artifact_sha256.strip().lower()
+        if (
+            len(expected_digest) != 64
+            or any(char not in "0123456789abcdef" for char in expected_digest)
+            or artifact_digest != expected_digest
+        ):
+            return False
+    return True
+
+
+def _authority_family(record: dict) -> str:
+    authority = str(record.get("authority") or "").strip().lower()
+    return AUTHORITY_FAMILIES.get(authority, "")
+
+
+def _verified_capabilities(
+    record: dict, expected_artifact_sha256: str = "", *, trusted: bool = False,
+) -> set[str]:
+    if not trusted:
+        return set()
+    authority = str(record.get("authority") or "").strip().lower()
+    declared = {
+        item.strip().lower()
+        for item in str(record.get("capabilities") or "").replace(",", ";").split(";")
+        if item.strip()
+    }
+    verified = declared.intersection(AUTHORITY_CAPABILITIES.get(authority, set()))
+    declared_artifact_sha = str(record.get("artifact_sha256") or "").strip().lower()
+    if (
+        not expected_artifact_sha256
+        or declared_artifact_sha != expected_artifact_sha256.strip().lower()
+    ):
+        verified.discard("artifact_bound")
+    return verified
 
 
 def load_analyzer_rows(summary: dict) -> list[dict]:
@@ -98,7 +171,14 @@ def _resolve_oracle_conclusions(records: list[dict]) -> set[str]:
     return conclusions
 
 
-def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle_rows: list[dict]) -> dict:
+def audit_api_oracle(
+    changed_rows: list[dict], analyzer_rows: list[dict], oracle_rows: list[dict],
+    *, expected_artifact_sha256: str = "",
+    trusted_capability_records: list[dict] | tuple[dict, ...] = (),
+) -> dict:
+    trusted_capability_record_ids = {
+        id(record) for record in trusted_capability_records
+    }
     changed_counts = Counter(canonical_identity(row) for row in changed_rows)
     changed_by_id = {canonical_identity(row): row for row in changed_rows}
     analyzer_rows_by_id: dict[str, list[dict]] = defaultdict(list)
@@ -137,7 +217,12 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
         records = oracle_by_id.get(identity) or []
         valid_records = []
         for record in records:
-            if _valid_provenance(record):
+            trusted_record = id(record) in trusted_capability_record_ids
+            if _valid_provenance(
+                record,
+                expected_artifact_sha256=expected_artifact_sha256,
+                require_artifact_binding=trusted_record,
+            ):
                 valid_records.append(record)
             else:
                 invalid_provenance.append(identity)
@@ -156,20 +241,34 @@ def audit_api_oracle(changed_rows: list[dict], analyzer_rows: list[dict], oracle
             oracle_conclusion = next(iter(conclusions), "uncertain")
             severity = str(changed_by_id[identity].get("severity") or "").upper()
             requires_two = severity in {"P0", "P1", "HIGH"} and analyzer_conclusion in {
-                "not_impacted", "not_found_in_static_analysis", "uncertain",
+                "not_impacted", "not_found_in_static_analysis",
             }
             supporting_records = [
                 item for item in valid_records
                 if str(item.get("oracle_conclusion") or "") == oracle_conclusion
             ]
             authority_count = len({
-                str(item.get("authority") or "") for item in supporting_records
+                family for item in supporting_records
+                if id(item) in trusted_capability_record_ids
+                and "artifact_bound" in _verified_capabilities(
+                    item, expected_artifact_sha256, trusted=True
+                )
+                and (family := _authority_family(item))
             })
-            has_project_test = any(
-                str(item.get("evidence_mode") or "") == "project_test"
+            has_strong_static_negative = any(
+                STRONG_STATIC_NEGATIVE_CAPABILITIES.issubset(
+                    _verified_capabilities(
+                        item, expected_artifact_sha256, trusted=True
+                    )
+                    if id(item) in trusted_capability_record_ids else set()
+                )
                 for item in supporting_records
             )
-            if requires_two and authority_count < 2 and not has_project_test:
+            if (
+                requires_two
+                and authority_count < 2
+                and not has_strong_static_negative
+            ):
                 verdict = "unverified"
             else:
                 verdict = "correct" if analyzer_conclusion == oracle_conclusion else "incorrect"

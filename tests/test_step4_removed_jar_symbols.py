@@ -72,6 +72,81 @@ public class com.example.LegacyApi {
                 self.assertEqual(jar_info["old_jar"], str(old_jar))
                 self.assertEqual([row["symbol_kind"] for row in apis], ["class", "constructor", "method"])
 
+    def test_export_removed_jar_batches_classes_without_cross_attributing_members(self):
+        javap_output = """
+Compiled from "LegacyA.java"
+public class com.example.LegacyA {
+  public com.example.LegacyA();
+  public void alpha();
+}
+Compiled from "LegacyB.java"
+public class com.example.LegacyB {
+  public com.example.LegacyB();
+  public void beta();
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            old_jar = Path(tmp) / "legacy.jar"
+            old_jar.write_bytes(b"final-artifact-jar")
+            with patch.object(
+                step4,
+                "_iter_jar_class_entries",
+                return_value=["com.example.LegacyA", "com.example.LegacyB"],
+            ), patch.object(
+                step4,
+                "run_cmd",
+                return_value=(javap_output, "", 0),
+            ) as run_cmd:
+                _out, apis, details, error = step4.export_removed_jar_apis(
+                    coord="com.example:legacy",
+                    old_ver="1.0",
+                    output_dir=tmp,
+                    old_jar_path=str(old_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                )
+
+        self.assertIsNone(error)
+        self.assertEqual(run_cmd.call_count, 1)
+        self.assertEqual(details["javap_invocations"], 1)
+        methods = {
+            row["api_name"] for row in apis if row["symbol_kind"] == "method"
+        }
+        self.assertEqual(methods, {
+            "com.example.LegacyA.alpha",
+            "com.example.LegacyB.beta",
+        })
+
+    def test_export_removed_jar_is_incomplete_when_any_javap_batch_fails(self):
+        class_names = [f"com.example.Legacy{index}" for index in range(65)]
+        first_batch_output = "\n".join(
+            f"public class {name} {{\n  public {name}();\n}}"
+            for name in class_names[:64]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            old_jar = Path(tmp) / "legacy.jar"
+            old_jar.write_bytes(b"final-artifact-jar")
+            with patch.object(
+                step4, "_iter_jar_class_entries", return_value=class_names,
+            ), patch.object(
+                step4,
+                "run_cmd",
+                side_effect=[
+                    (first_batch_output, "", 0),
+                    ("", "simulated javap failure", 1),
+                ],
+            ):
+                _out, apis, details, error = step4.export_removed_jar_apis(
+                    coord="com.example:legacy",
+                    old_ver="1.0",
+                    output_dir=tmp,
+                    old_jar_path=str(old_jar),
+                    old_jar_evidence={"source": "step1_final_artifact"},
+                )
+
+        self.assertTrue(apis)
+        self.assertTrue(details["errors"])
+        self.assertIsNotNone(error)
+
 
 if __name__ == "__main__":
     unittest.main()

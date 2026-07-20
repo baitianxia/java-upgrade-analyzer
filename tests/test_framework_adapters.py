@@ -2945,6 +2945,11 @@ class FrameworkAdaptersTest(unittest.TestCase):
         self.assertEqual(callback["target"], "com.vendor.RuntimeListener.onApplicationEvent")
         self.assertEqual(callback["runtime_activation"], "active")
         self.assertEqual(autoconfig["runtime_activation"], "conditional")
+        self.assertEqual(autoconfig["provenance"]["artifact_sha256"], runtime_sha)
+        self.assertEqual(
+            autoconfig["provenance"]["class_or_resource_entry"],
+            "META-INF/spring.factories",
+        )
 
         graph = SimpleNamespace(methods_by_id={})
         stats = ingest_framework_payload(graph, payload)

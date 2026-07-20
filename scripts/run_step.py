@@ -77,6 +77,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "allow_degraded",
     "accept_suggested_mappings",
     "analysis_mode",
+    "active_maven_profiles",
     "base_artifact_path",
     "base_branch",
     "base_allow_local_source",
@@ -881,6 +882,15 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         # the next Step1 run can re-detect module-specific source directories.
         updated.pop("source_dirs", None)
         updated.pop("source_dirs_status", None)
+
+    if response.get("active_maven_profiles") is not None:
+        previous_profiles = list(updated.get("active_maven_profiles") or [])
+        updated["active_maven_profiles"] = _dedupe_strings(
+            response.get("active_maven_profiles") or []
+        )
+        if updated["active_maven_profiles"] != previous_profiles:
+            updated.pop("source_dirs", None)
+            updated.pop("source_dirs_status", None)
 
     source_dirs = normalize_source_dirs(response.get("source_dirs"), project_dir)
     if source_dirs is not None:
@@ -2058,6 +2068,7 @@ def infer_non_pending_target_step_from_payload(user_response):
             "step1",
             {
                 "analysis_mode",
+                "active_maven_profiles",
                 "base_artifact_path",
                 "base_branch",
                 "base_jdk_home",
@@ -3001,6 +3012,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             if "current_allow_dirty_local_source" in merged else False
         ),
         "modules": resolve_value(cli_list(args.modules), merged, "modules", []),
+        "active_maven_profiles": resolve_value(
+            cli_list(getattr(args, "active_maven_profiles", None)),
+            merged,
+            "active_maven_profiles",
+            [],
+        ),
         "source_dirs": resolve_value(cli_list(args.source_dirs), merged, "source_dirs"),
         "dependency_source_dirs": resolve_value(cli_list(args.dependency_source_dirs), merged, "dependency_source_dirs", []),
         "dependency_source_mappings": resolve_value(
@@ -3151,6 +3168,9 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             result[timeout_key] = None
     modules_value = normalize_modules_value(result.get("modules")) or []
     result["modules"] = modules_value
+    result["active_maven_profiles"] = _dedupe_strings(
+        result.get("active_maven_profiles") or []
+    )
     if result.get("target_module"):
         result["primary_module"] = result["target_module"]
         result["modules"] = [result["target_module"]]
@@ -3160,7 +3180,11 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     if result.get("primary_module") and not result.get("target_module"):
         result["target_module"] = result["primary_module"]
     if result.get("target_module"):
-        result["project_scope"] = build_project_scope(project_dir, result["target_module"])
+        result["project_scope"] = build_project_scope(
+            project_dir,
+            result["target_module"],
+            active_profiles=set(result["active_maven_profiles"]),
+        )
     else:
         discovery = discover_maven_modules(project_dir)
         result["project_scope"] = {
@@ -3557,6 +3581,12 @@ def build_step1_response_properties():
         "modules": {
             "type": "array",
             "description": "可选。仅支持单模块；可传单元素数组，与 primary_module 表达同一含义。",
+        },
+        "active_maven_profiles": {
+            "type": "array",
+            "description": (
+                "可选。本次构建显式激活的 Maven profile ID；必须与最终制品的实际构建命令一致。"
+            ),
         },
         "manual_coord_overrides": {
             "type": "array",
@@ -6387,6 +6417,12 @@ def main():
     ap.add_argument("--base-branch")
     ap.add_argument("--current-branch")
     ap.add_argument("--modules", action="append", nargs="+", default=None)
+    ap.add_argument(
+        "--active-maven-profile",
+        dest="active_maven_profiles",
+        action="append",
+        default=None,
+    )
     ap.add_argument("--source-dirs", action="append", nargs="+")
     ap.add_argument("--dependency-source-dirs", action="append", nargs="+", default=[])
     ap.add_argument("--dependency-source-mappings", action="append", nargs="+", default=[])
@@ -6421,6 +6457,9 @@ def main():
     )
     args = ap.parse_args()
     args.modules = _dedupe_strings(flatten_cli_values(args.modules)) if args.modules else None
+    args.active_maven_profiles = _dedupe_strings(
+        args.active_maven_profiles or []
+    ) if args.active_maven_profiles is not None else None
     args.source_dirs = flatten_cli_values(args.source_dirs)
     args.dependency_source_dirs = _dedupe_strings(flatten_cli_values(args.dependency_source_dirs))
     args.dependency_source_mappings = _dedupe_strings(flatten_cli_values(args.dependency_source_mappings))

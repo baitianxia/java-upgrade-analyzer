@@ -20,15 +20,19 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import zipfile
@@ -39,6 +43,11 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from csv_io import open_csv_read, open_csv_write
+from analysis_contract import (
+    build_project_scope,
+    project_scope_provenance_errors,
+    project_scope_provenance_fields,
+)
 from constant_impact import classify_constant_impact
 from constant_impact_oracle import audit_constant_evidence, run_constant_oracle
 from s4_jar_compare import attach_constant_field_evidence
@@ -51,12 +60,16 @@ from exhaustive_api_oracle import (
 )
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity, reconcile_edges
 from final_artifact_edge_oracle import scan_final_artifact
-from fault_injection import apply_fault_injection, detect_oracle_mutation
+from fault_injection import (
+    apply_fault_injection,
+    detect_oracle_mutation,
+    oracle_payload_sha256,
+    seal_oracle_scan,
+)
 from mybatis_mapper_oracle import (
     inspect_mybatis_artifact,
     verify_runtime_activation,
 )
-from pipeline_constants import STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
 from s4_contract import ALL_CHANGED_APIS_FIELDS
 from signature_utils import (
     canonical_api_identity,
@@ -98,6 +111,10 @@ STANDARD_FAULT_INJECTIONS = (
     "corrupt_oracle_digest",
     "truncate_oracle_scan",
 )
+ORACLE_INTEGRITY_FAULT_INJECTIONS = (
+    "corrupt_oracle_digest",
+    "truncate_oracle_scan",
+)
 
 
 _STEP5_FINGERPRINT_VOLATILE_KEYS = frozenset({
@@ -105,6 +122,7 @@ _STEP5_FINGERPRINT_VOLATILE_KEYS = frozenset({
     "elapsed", "elapsed_sec", "duration_sec", "peak_rss_mb", "current_rss_mb",
     "memory_samples", "step5_perf",
     "javap_peak_pending_tasks", "javap_pending_limit",
+    "cache_hit",
 })
 
 
@@ -280,6 +298,9 @@ class RealProjectCase:
     default_project: Path
     default_changed_apis: Path
     baseline_specs: tuple[BaselineSpec, ...]
+    target_module: str = ""
+    active_maven_profiles: tuple[str, ...] = field(default_factory=tuple)
+    manual_coord_overrides: tuple[str, ...] = field(default_factory=tuple)
     source_dirs: tuple[Path, ...] = field(default_factory=tuple)
     changed_api_rows: tuple[dict[str, str], ...] = field(default_factory=tuple)
     prefer_embedded_changed_api_rows: bool = False
@@ -1393,6 +1414,55 @@ CASES["ruoyi-full-artifact-discovery"] = RealProjectCase(
     max_oracle_seconds=240.0,
 )
 
+CASES["pig-v4-full-artifact-discovery"] = RealProjectCase(
+    name="pig-v4-full-artifact-discovery",
+    default_project=Path("/private/tmp/jua-target-pig-min"),
+    default_changed_apis=Path(""),
+    baseline_specs=(),
+    target_module="pig-boot",
+    active_maven_profiles=("boot",),
+    manual_coord_overrides=(
+        "lombok:1.18.46 -> org.projectlombok:lombok",
+    ),
+    source_dirs=(Path("."),),
+    run_step4=True,
+    derive_step1_from_artifacts=True,
+    base_final_artifact=Path(
+        "/private/tmp/jua-target-pig-v4.0/pig-boot/target/pig-boot.jar"
+    ),
+    final_artifact=Path(
+        "/private/tmp/jua-target-pig-min/pig-boot/target/pig-boot.jar"
+    ),
+    base_source_project=Path("/private/tmp/jua-target-pig-v4.0"),
+    current_source_project=Path("/private/tmp/jua-target-pig-min"),
+    base_revision="7197ec39e16e45f35ef8b47d381f2c833eaf66ed",
+    current_revision="f4e5a3a4b902dc00c192b878d7587cec93698803",
+    require_valid_git=True,
+    min_project_java_files=500,
+    min_main_java_files=500,
+    max_generated_java_ratio=0.1,
+    case_mode="discovery",
+    ground_truth_status="unreviewed",
+    required_topologies=(
+        "cross_jar_bridge",
+        "field_access",
+        "overloaded_method",
+        "same_jar_bridge",
+        "virtual_dispatch",
+    ),
+    prior_topology_matrix=(
+        ROOT_DIR / "tests" / "fixtures" / "topologies" / "prior_matrix.json"
+    ),
+    required_fault_injections=STANDARD_FAULT_INJECTIONS,
+    require_relative_performance_baseline=True,
+    performance_manifest=(
+        ROOT_DIR / "tests" / "fixtures" / "real_projects" /
+        "pig-v4-full-artifact-discovery.json"
+    ),
+    max_step4_elapsed_seconds=300.0,
+    max_oracle_seconds=600.0,
+)
+
 CASES = {
     name: apply_real_case_performance_budget(case)
     for name, case in CASES.items()
@@ -2008,9 +2078,43 @@ def write_pinned_final_artifact_provenance(
         current_side["revision"] = revision
     if source_mode:
         current_side["source_mode"] = source_mode
-    output.write_text(json.dumps({
-        "sides": [current_side],
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    source_project = Path(
+        case.current_source_project or case.default_project
+    ).resolve()
+    if source_mode == "checkout_build" and source_project.is_dir():
+        scope = build_project_scope(
+            source_project,
+            case.target_module or ".",
+            active_profiles=set(case.active_maven_profiles or ()),
+        )
+        if (
+            scope.get("status") != "insufficient"
+            and str(scope.get("source_revision") or "") == revision
+        ):
+            current_side.update(project_scope_provenance_fields(scope))
+    provenance = {"sides": [current_side]}
+    try:
+        existing = json.loads(output.read_text(encoding="utf-8"))
+        existing_sides = list(existing.get("sides") or [])
+        existing_current = next(
+            side for side in existing_sides
+            if str(side.get("side") or "") == "current"
+        )
+        if str(existing_current.get("artifact_sha256") or "") == artifact_sha256:
+            merged_current = {**existing_current, **current_side}
+            provenance = dict(existing)
+            provenance["sides"] = [
+                merged_current
+                if str(side.get("side") or "") == "current"
+                else side
+                for side in existing_sides
+            ]
+    except (OSError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    output.write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     context_path = report_dir / "evidence" / "context" / "context.json"
     context_path.parent.mkdir(parents=True, exist_ok=True)
     context_path.write_text(json.dumps({
@@ -2018,9 +2122,13 @@ def write_pinned_final_artifact_provenance(
     }, indent=2) + "\n", encoding="utf-8")
     coordinate = str(case.bytecode_coord or "").strip()
     artifact_id = coordinate.split(":", 1)[-1] if ":" in coordinate else ""
+    resolved_output = output.parent / "deps_current_resolved.csv"
+    preserve_resolved_output = bool(
+        resolved_output.is_file() and resolved_output.stat().st_size
+    )
     nested_entry = ""
     runtime_entries: list[dict[str, str]] = []
-    if artifact_id and artifact_path.is_file():
+    if not preserve_resolved_output and artifact_id and artifact_path.is_file():
         try:
             with zipfile.ZipFile(artifact_path) as archive:
                 candidates = [
@@ -2083,30 +2191,31 @@ def write_pinned_final_artifact_provenance(
         ),
         "pinned",
     )
-    with open_csv_write(output.parent / "deps_current_resolved.csv") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"],
-        )
-        writer.writeheader()
-        if nested_entry:
-            writer.writerow({
-                "coord": coordinate,
-                "version": version,
-                "scope": "compile",
-                "lib_entry": nested_entry,
-                "resolution_status": "resolved",
-            })
-        for runtime_item in runtime_entries:
-            if runtime_item["lib_entry"] == nested_entry:
-                continue
-            writer.writerow({
-                "coord": runtime_item["coord"],
-                "version": runtime_item["version"],
-                "scope": "runtime",
-                "lib_entry": runtime_item["lib_entry"],
-                "resolution_status": "resolved",
-            })
+    if not preserve_resolved_output:
+        with open_csv_write(resolved_output) as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"],
+            )
+            writer.writeheader()
+            if nested_entry:
+                writer.writerow({
+                    "coord": coordinate,
+                    "version": version,
+                    "scope": "compile",
+                    "lib_entry": nested_entry,
+                    "resolution_status": "resolved",
+                })
+            for runtime_item in runtime_entries:
+                if runtime_item["lib_entry"] == nested_entry:
+                    continue
+                writer.writerow({
+                    "coord": runtime_item["coord"],
+                    "version": runtime_item["version"],
+                    "scope": "runtime",
+                    "lib_entry": runtime_item["lib_entry"],
+                    "resolution_status": "resolved",
+                })
     return output
 
 
@@ -2265,6 +2374,86 @@ def collect_alert_files(
                 if len(candidates) == 1:
                     files.add(str(candidates[0].resolve()))
     return files
+
+
+def validate_alert_partition_contract(report_dir: Path, summary: dict) -> list[str]:
+    call_chain_dir = report_dir / "evidence" / "call_chain"
+    main_fields, main_rows = _csv_rows(call_chain_dir / "alerts.csv")
+    if not main_fields:
+        return ["alerts.csv missing_or_headerless"]
+    required_partitions = {
+        "reachable": {"reachable"},
+        "uncertain": {"uncertain"},
+        "not_impacted": {"not_impacted"},
+        "not_found_in_static_analysis": {
+            "not_found_in_static_analysis", "not_reachable",
+        },
+        "not_analyzed": {"not_analyzed"},
+    }
+    errors = []
+    known_path_statuses = set().union(*required_partitions.values())
+    unknown_statuses = sorted({
+        str(row.get("path_status") or "") for row in main_rows
+        if str(row.get("path_status") or "") not in known_path_statuses
+    })
+    if unknown_statuses:
+        errors.append(
+            "alerts.csv:unknown_or_missing_path_status:" + ",".join(unknown_statuses)
+        )
+    for status, path_statuses in required_partitions.items():
+        try:
+            count = int(summary.get(status) or 0)
+        except (TypeError, ValueError):
+            errors.append(f"summary_{status}_invalid")
+            continue
+        stem = f"alerts_{status}"
+        base = call_chain_dir / f"{stem}.csv"
+        shards = sorted(
+            path for path in call_chain_dir.glob(f"{stem}_*.csv")
+            if re.fullmatch(rf"{re.escape(stem)}_\d{{3}}\.csv", path.name)
+        )
+        expected_rows = [
+            row for row in main_rows
+            if str(row.get("path_status") or "") in path_statuses
+        ]
+        expected_api_count = len({
+            str(row.get("api_identity") or "") for row in expected_rows
+            if str(row.get("api_identity") or "")
+        })
+        if expected_api_count != count:
+            errors.append(
+                f"{stem}:summary_api_count_mismatch:{expected_api_count}!={count}"
+            )
+        files = ([base] if base.is_file() else []) + shards
+        if count > 0 and not files:
+            errors.append(f"{base.name} missing")
+            continue
+        if base.is_file() and shards:
+            errors.append(f"{stem}:base_and_shards_both_present")
+        if shards:
+            expected_names = [
+                f"{stem}_{index:03d}.csv"
+                for index in range(1, len(shards) + 1)
+            ]
+            if [path.name for path in shards] != expected_names:
+                errors.append(f"{stem}:non_contiguous_shards")
+        actual_rows = []
+        for path in files:
+            fields, rows = _csv_rows(path)
+            if fields != main_fields:
+                errors.append(f"{path.name}:header_mismatch")
+            actual_rows.extend(rows)
+        if actual_rows != expected_rows:
+            errors.append(
+                f"{stem}:row_reconciliation_mismatch:"
+                f"{len(actual_rows)}!={len(expected_rows)}"
+            )
+    return sorted(set(errors))
+
+
+def missing_alert_partition_warnings(report_dir: Path, summary: dict) -> list[str]:
+    """Compatibility alias; partition defects are now blocking contract errors."""
+    return validate_alert_partition_contract(report_dir, summary)
 
 
 def _csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -2850,6 +3039,29 @@ def derive_run_status(results: list[dict]) -> str:
     return "incomplete"
 
 
+def collect_stage_performance(report_dir: Path) -> dict:
+    observability = Path(report_dir) / ".runtime" / "observability"
+    stage_specs = {
+        "step1_elapsed_seconds": ("step1_timing.csv", "step1_total"),
+        "step4_elapsed_seconds": ("step4_timing.csv", "step4.total"),
+    }
+    metrics = {}
+    for metric, (filename, total_phase) in stage_specs.items():
+        value = 0.0
+        try:
+            with (observability / filename).open(
+                "r", encoding="utf-8-sig", newline=""
+            ) as handle:
+                for row in csv.DictReader(handle):
+                    if str(row.get("phase") or "").strip() == total_phase:
+                        value = float(row.get("elapsed_sec") or 0.0)
+                        break
+        except (OSError, TypeError, ValueError):
+            value = 0.0
+        metrics[metric] = value
+    return metrics
+
+
 def collect_performance_envelope(
     summary: dict,
     elapsed: float,
@@ -2919,6 +3131,10 @@ def collect_performance_envelope(
         "jdeps_invocations": int(oracle_metrics.get("jdeps_invocations") or 0),
         "jdeps_class_count": int(oracle_metrics.get("jdeps_class_count") or 0),
         "jdeps_elapsed_seconds": float(oracle_metrics.get("jdeps_elapsed_seconds") or 0.0),
+        "javap_class_invocations": int(oracle_metrics.get("javap_class_invocations") or 0),
+        "javap_class_elapsed_seconds": float(
+            oracle_metrics.get("javap_class_elapsed_seconds") or 0.0
+        ),
     }
 
 
@@ -3036,6 +3252,11 @@ def evaluate_relative_performance_baseline(
             continue
         baseline_value = float(policy.get("value") or 0.0)
         actual_value = float(performance.get(name) or 0.0)
+        if baseline_value > 0 and (
+            not math.isfinite(actual_value) or actual_value <= 0
+        ):
+            errors.append(f"performance_metric_nonpositive:{name}")
+            continue
         max_absolute = policy.get("max_absolute")
         max_ratio = float(policy.get("max_ratio") or 0.0)
         limit = (
@@ -3090,6 +3311,30 @@ def build_relative_performance_signals(
     )]
 
 
+def build_cache_equivalence_signals(
+    case: RealProjectCase, cache_equivalence: dict, report_dir: Path
+) -> list[dict]:
+    if cache_equivalence.get("passed"):
+        return []
+    return [make_signal(
+        "cache_semantic_equivalence_failure",
+        "P0",
+        case.name,
+        step="step5-cache-equivalence",
+        message="Step5 cold/warm execution did not preserve the same semantic result",
+        expected="both runs succeed and canonical semantic fingerprints are identical",
+        actual=json.dumps({
+            "errors": cache_equivalence.get("errors") or [],
+            "cold_returncode": cache_equivalence.get("cold_returncode"),
+            "warm_returncode": cache_equivalence.get("warm_returncode"),
+            "cold_fingerprint": cache_equivalence.get("cold_fingerprint") or "",
+            "warm_fingerprint": cache_equivalence.get("warm_fingerprint") or "",
+        }, sort_keys=True),
+        evidence=[Path(report_dir) / "evidence" / "call_chain" / "summary.json"],
+        blocking=True,
+    )]
+
+
 def serialized_api_identity(api_row: dict) -> str:
     """Use the shared analyzer/Oracle API identity."""
     return canonical_api_identity(api_row)
@@ -3125,7 +3370,18 @@ def _api_target_matches(api_row: dict, edge: dict) -> bool:
     ):
         return False
     if symbol_kind == "field":
-        return True
+        opcode = str(edge.get("opcode_family") or "").strip().lower()
+        return (
+            opcode in {"getfield", "putfield", "getstatic", "putstatic"}
+            and not str(edge.get("callee_descriptor") or "").strip().startswith("(")
+        )
+    opcode = str(edge.get("opcode_family") or "").strip().lower()
+    if symbol_kind == "constructor":
+        if opcode != "invokespecial":
+            return False
+    elif symbol_kind == "method":
+        if not opcode.startswith("invoke"):
+            return False
     descriptor = str(edge.get("callee_descriptor") or "").strip()
     if not descriptor.startswith("("):
         return False
@@ -3149,12 +3405,53 @@ def _callee_identity(edge: dict) -> tuple[str, str, str]:
     ))
 
 
-def _business_artifact_entry(entry: str) -> bool:
+def _business_artifact_entry(
+    entry: str, application_owned_nested_jars: set[str] | None = None
+) -> bool:
     value = str(entry or "").strip()
+    nested_jar = _nested_jar_entry(value)
     return bool(
         value.startswith(("BOOT-INF/classes/", "WEB-INF/classes/"))
         or (value.endswith(".class") and "!/" not in value)
+        or (
+            nested_jar
+            and nested_jar in set(application_owned_nested_jars or set())
+        )
     )
+
+
+def _nested_jar_entry(artifact_entry: str) -> str:
+    value = str(artifact_entry or "").strip()
+    return value.split("!/", 1)[0] if "!/" in value else ""
+
+
+def _is_external_provider_for_api(
+    artifact_entry: str,
+    api_row: dict,
+    provider_nested_jars_by_coord: dict[str, set[str]] | None,
+    provider_nested_jars_by_api_identity: dict[str, set[str]] | None = None,
+) -> bool:
+    coord = str((api_row or {}).get("coord") or "").strip()
+    identity = serialized_api_identity(api_row or {})
+    nested_jar = _nested_jar_entry(artifact_entry)
+    provider_match = bool(
+        nested_jar
+        and (
+            nested_jar in (provider_nested_jars_by_api_identity or {}).get(
+                identity, set()
+            )
+            or (
+                coord
+                and nested_jar
+                in (provider_nested_jars_by_coord or {}).get(coord, set())
+            )
+        )
+    )
+    if not provider_match:
+        return False
+    caller_owner = _artifact_entry_class_owner(artifact_entry).replace("$", ".")
+    target_owner = _selected_api_owner(api_row).replace("$", ".")
+    return bool(caller_owner and target_owner and caller_owner == target_owner)
 
 
 def _artifact_entry_class_owner(entry: str) -> str:
@@ -3169,6 +3466,20 @@ def _artifact_entry_class_owner(entry: str) -> str:
     if not value.endswith(".class"):
         return ""
     return value[:-6].replace("/", ".")
+
+
+def _duplicate_artifact_class_owners(entries) -> set[str]:
+    """Return class owners whose physical implementation is ambiguous in one artifact."""
+    owner_entries: dict[str, set[str]] = defaultdict(set)
+    for raw_entry in entries or ():
+        entry = str(raw_entry or "").strip()
+        owner = _artifact_entry_class_owner(entry)
+        if owner:
+            owner_entries[owner].add(entry)
+    return {
+        owner for owner, physical_entries in owner_entries.items()
+        if len(physical_entries) > 1
+    }
 
 
 def _oracle_edge_identity_errors(rows: list[dict]) -> list[str]:
@@ -3200,12 +3511,54 @@ def physical_edge_occurrence(edge: dict) -> str:
     ))
 
 
+def _retain_path_to_business_boundary(
+    identity: str,
+    direct_edges: list[dict],
+    upstream_edges,
+    application_owned_nested_jars: set[str] | None = None,
+    ambiguous_class_owners: set[str] | None = None,
+) -> tuple[dict[tuple[str, str], dict], bool]:
+    direct_keys = {
+        (identity, physical_edge_occurrence(edge)) for edge in direct_edges
+    }
+    discovered: dict[tuple[str, str], dict] = {}
+    pending = deque(direct_edges)
+    reached_boundary = False
+    while pending:
+        edge = pending.popleft()
+        physical_key = (identity, physical_edge_occurrence(edge))
+        if physical_key in discovered:
+            continue
+        discovered[physical_key] = {**edge, "api_identity": identity}
+        if {
+            str(edge.get("caller_owner") or "").strip(),
+            str(edge.get("callee_owner") or "").strip(),
+        } & set(ambiguous_class_owners or set()):
+            continue
+        if _business_artifact_entry(
+            str(edge.get("artifact_entry") or ""),
+            application_owned_nested_jars,
+        ):
+            reached_boundary = True
+            continue
+        pending.extend(upstream_edges(edge))
+    if reached_boundary:
+        return discovered, True
+    return {
+        key: row for key, row in discovered.items() if key in direct_keys
+    }, False
+
+
 def _retain_authoritative_api_path(
     selected_rows: list[dict], oracle_rows: list[dict],
     semantic_targets: set[str] | None = None,
     *,
     absence_is_authoritative: bool = False,
     class_reachability: dict[str, str] | None = None,
+    application_owned_nested_jars: set[str] | None = None,
+    provider_nested_jars_by_coord: dict[str, set[str]] | None = None,
+    provider_nested_jars_by_api_identity: dict[str, set[str]] | None = None,
+    ambiguous_class_owners: set[str] | None = None,
 ) -> tuple[list[dict], dict[str, str], list[str]]:
     """Keep every physical path and classify whether it reaches packaged business code."""
     incoming: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
@@ -3216,7 +3569,20 @@ def _retain_authoritative_api_path(
     errors: list[str] = []
     for api_row in selected_rows:
         identity = serialized_api_identity(api_row)
-        direct = [edge for edge in oracle_rows if _api_target_matches(api_row, edge)]
+        direct = [
+            edge for edge in oracle_rows
+            if _api_target_matches(api_row, edge)
+            and not (
+                _nested_jar_entry(str(edge.get("artifact_entry") or ""))
+                not in set(application_owned_nested_jars or set())
+                and _is_external_provider_for_api(
+                    str(edge.get("artifact_entry") or ""),
+                    api_row,
+                    provider_nested_jars_by_coord,
+                    provider_nested_jars_by_api_identity,
+                )
+            )
+        ]
         if not direct:
             if identity in (semantic_targets or set()):
                 api_reachability[identity] = "uncertain"
@@ -3234,21 +3600,14 @@ def _retain_authoritative_api_path(
 
     retained: dict[tuple[str, str], dict] = {}
     for identity, direct_edges in selected.items():
-        pending = deque(direct_edges)
-        visited = set()
-        reached_boundary = False
-        while pending:
-            edge = pending.popleft()
-            physical_key = (identity, physical_edge_occurrence(edge))
-            if physical_key in visited:
-                continue
-            visited.add(physical_key)
-            retained[physical_key] = {**edge, "api_identity": identity}
-            if _business_artifact_entry(str(edge.get("artifact_entry") or "")):
-                reached_boundary = True
-                continue
-            for upstream in incoming.get(_caller_identity(edge), []):
-                pending.append(upstream)
+        path_rows, reached_boundary = _retain_path_to_business_boundary(
+            identity,
+            direct_edges,
+            lambda edge: incoming.get(_caller_identity(edge), []),
+            application_owned_nested_jars,
+            ambiguous_class_owners,
+        )
+        retained.update(path_rows)
         api_reachability[identity] = "reachable" if reached_boundary else "uncertain"
     return sorted(retained.values(), key=lambda row: (
         str(row.get("api_identity") or ""), canonical_edge_identity(row),
@@ -3256,7 +3615,14 @@ def _retain_authoritative_api_path(
     )), api_reachability, sorted(errors)
 
 
-def _retain_analyzer_api_path(selected_rows: list[dict], analyzer_rows: list[dict]) -> list[dict]:
+def _retain_analyzer_api_path(
+    selected_rows: list[dict],
+    analyzer_rows: list[dict],
+    application_owned_nested_jars: set[str] | None = None,
+    provider_nested_jars_by_coord: dict[str, set[str]] | None = None,
+    provider_nested_jars_by_api_identity: dict[str, set[str]] | None = None,
+    ambiguous_class_owners: set[str] | None = None,
+) -> list[dict]:
     """Associate upstream analyzer edges by bytecode graph path from a labeled target edge."""
     incoming: dict[tuple[str, tuple[str, str, str]], list[dict]] = defaultdict(list)
     for edge in analyzer_rows:
@@ -3265,23 +3631,35 @@ def _retain_analyzer_api_path(selected_rows: list[dict], analyzer_rows: list[dic
     retained: dict[tuple[str, str], dict] = {}
     for api_row in selected_rows:
         identity = serialized_api_identity(api_row)
-        pending = deque(
+        direct_edges = list(
             edge for edge in analyzer_rows
-            if str(edge.get("api_identity") or "") == identity and _api_target_matches(api_row, edge)
+            if str(edge.get("api_identity") or "") == identity
+            and _api_target_matches(api_row, edge)
+            and not (
+                _nested_jar_entry(str(edge.get("artifact_entry") or ""))
+                not in set(application_owned_nested_jars or set())
+                and _is_external_provider_for_api(
+                    str(edge.get("artifact_entry") or ""),
+                    api_row,
+                    provider_nested_jars_by_coord,
+                    provider_nested_jars_by_api_identity,
+                )
+            )
         )
-        visited: set[tuple[str, str]] = set()
-        while pending:
-            edge = pending.popleft()
-            physical_key = (identity, physical_edge_occurrence(edge))
-            if physical_key in visited:
-                continue
-            visited.add(physical_key)
-            retained[physical_key] = {**edge, "api_identity": identity}
-            if _business_artifact_entry(str(edge.get("artifact_entry") or "")):
-                continue
+        def upstream(edge):
             caller = _caller_identity(edge)
-            pending.extend(incoming.get((identity, caller), []))
-            pending.extend(incoming.get(("", caller), []))
+            return (
+                list(incoming.get((identity, caller), []))
+                + list(incoming.get(("", caller), []))
+            )
+        path_rows, _reached_boundary = _retain_path_to_business_boundary(
+            identity,
+            direct_edges,
+            upstream,
+            application_owned_nested_jars,
+            ambiguous_class_owners,
+        )
+        retained.update(path_rows)
     return sorted(retained.values(), key=lambda row: (
         str(row.get("api_identity") or ""), physical_edge_occurrence(row),
     ))
@@ -3476,6 +3854,12 @@ def _classfile_member_references(content: bytes) -> list[dict]:
             "callee_member": utf8(name_type[1]),
             "callee_descriptor": utf8(name_type[2]),
             "reference_kind": {9: "field", 10: "method", 11: "interface_method"}[tag],
+            "opcode_family": (
+                "getfield" if tag == 9
+                else "invokespecial" if utf8(name_type[1]) == "<init>"
+                else "invokeinterface" if tag == 11
+                else "invokevirtual"
+            ),
         })
     return references
 
@@ -3485,6 +3869,10 @@ def scan_final_artifact_member_references(
     selected_rows: list[dict],
     *,
     excluded_nested_jars: set[str] | None = None,
+    application_owned_nested_jars: set[str] | None = None,
+    provider_nested_jars_by_coord: dict[str, set[str]] | None = None,
+    provider_nested_jars_by_api_identity: dict[str, set[str]] | None = None,
+    time_budget_seconds: float | None = None,
 ) -> dict:
     """Independently account for exact member refs in a packaged artifact."""
     targets = [
@@ -3513,6 +3901,11 @@ def scan_final_artifact_member_references(
     excluded = set(excluded_nested_jars or set())
     references: list[dict] = []
     errors: list[str] = []
+    deadline = (
+        time.perf_counter() + max(0.0, float(time_budget_seconds))
+        if time_budget_seconds is not None else None
+    )
+    timed_out = False
     snapshot = Path(artifact).read_bytes()
     artifact_sha256 = hashlib.sha256(snapshot).hexdigest()
 
@@ -3528,6 +3921,11 @@ def scan_final_artifact_member_references(
             )) or []
             for row in candidates:
                 if not _api_target_matches(row, reference):
+                    continue
+                if _is_external_provider_for_api(
+                    artifact_entry, row, provider_nested_jars_by_coord,
+                    provider_nested_jars_by_api_identity,
+                ):
                     continue
                 identity = serialized_api_identity(row)
                 if business_owned:
@@ -3551,6 +3949,9 @@ def scan_final_artifact_member_references(
             if any(name.startswith(prefix) and name.endswith(".class") for name in names)
         ), "")
         for name in sorted(names):
+            if deadline is not None and time.perf_counter() >= deadline:
+                timed_out = True
+                break
             if name.endswith(".class") and not name.startswith("META-INF/"):
                 is_business = not application_prefix or name.startswith(application_prefix)
                 if is_business:
@@ -3565,20 +3966,36 @@ def scan_final_artifact_member_references(
             try:
                 with zipfile.ZipFile(io.BytesIO(archive.read(name))) as nested:
                     for nested_name in sorted(nested.namelist()):
+                        if deadline is not None and time.perf_counter() >= deadline:
+                            timed_out = True
+                            break
                         if nested_name.endswith(".class") and not nested_name.startswith("META-INF/"):
-                            inspect(nested.read(nested_name), f"{name}!/{nested_name}", False)
+                            artifact_entry = f"{name}!/{nested_name}"
+                            inspect(
+                                nested.read(nested_name),
+                                artifact_entry,
+                                _business_artifact_entry(
+                                    artifact_entry,
+                                    application_owned_nested_jars,
+                                ),
+                            )
             except (KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
                 errors.append(f"{name}:{type(error).__name__}:{error}")
+    if timed_out:
+        errors.append("oracle_time_budget_exceeded")
     return {
+        "artifact_sha256": artifact_sha256,
         "complete": not errors,
         "api_reachability": reachability,
         "references": references,
         "errors": sorted(errors),
+        "timed_out": timed_out,
     }
 
 
 def scan_final_artifact_dynamic_class_references(
-    artifact: Path, selected_rows: list[dict]
+    artifact: Path, selected_rows: list[dict],
+    *, time_budget_seconds: float | None = None,
 ) -> list[dict]:
     """Independently identify exact class-name constants coupled to a loader API.
 
@@ -3595,6 +4012,10 @@ def scan_final_artifact_dynamic_class_references(
         return []
     snapshot = Path(artifact).read_bytes()
     artifact_sha256 = hashlib.sha256(snapshot).hexdigest()
+    deadline = (
+        time.perf_counter() + max(0.0, float(time_budget_seconds))
+        if time_budget_seconds is not None else None
+    )
     references = []
     with zipfile.ZipFile(io.BytesIO(snapshot)) as archive:
         names = archive.namelist()
@@ -3606,6 +4027,8 @@ def scan_final_artifact_dynamic_class_references(
             "",
         )
         for name in sorted(names):
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise TimeoutError("oracle_time_budget_exceeded")
             if not name.endswith(".class") or name.startswith("META-INF/"):
                 continue
             if business_prefix and not name.startswith(business_prefix):
@@ -3653,12 +4076,278 @@ def _constant_pool_references_class(constants: set[bytes], internal_name: bytes)
     )
 
 
+def _class_reference_target_index(targets: dict[str, str]) -> dict[bytes, set[str]]:
+    index: dict[bytes, set[str]] = defaultdict(set)
+    for identity, owner in targets.items():
+        parts = [part for part in owner.split(".") if part]
+        class_boundaries = [
+            offset for offset, part in enumerate(parts)
+            if part[:1].isupper()
+        ] or ([len(parts) - 1] if parts else [])
+        internal_names = {owner.replace(".", "/")}
+        for boundary in class_boundaries:
+            package = "/".join(parts[:boundary])
+            binary_name = "$".join(parts[boundary:])
+            internal_names.add(f"{package}/{binary_name}" if package else binary_name)
+        for value in internal_names:
+            internal_name = value.encode("utf-8")
+            index[internal_name].add(identity)
+            index[b"L" + internal_name + b";"].add(identity)
+    return index
+
+
+def _class_internal_name_candidates(owner: str) -> set[str]:
+    parts = [part for part in str(owner or "").split(".") if part]
+    class_boundaries = [
+        offset for offset, part in enumerate(parts) if part[:1].isupper()
+    ] or ([len(parts) - 1] if parts else [])
+    names = {str(owner or "").replace(".", "/")}
+    for boundary in class_boundaries:
+        package = "/".join(parts[:boundary])
+        binary_name = "$".join(parts[boundary:])
+        names.add(f"{package}/{binary_name}" if package else binary_name)
+    return {name for name in names if name}
+
+
+def _javap_verbose_matched_class_targets(
+    output: str, targets: dict[str, str]
+) -> set[str]:
+    matched = set()
+    lines = str(output or "").splitlines()
+    for identity, owner in targets.items():
+        for internal_name in _class_internal_name_candidates(owner):
+            escaped = re.escape(internal_name)
+            if any(
+                re.search(rf"=\s+Class\b.*//\s*{escaped}\s*$", line)
+                or re.search(rf"=\s+Utf8\s+(?:\[*)L{escaped};\s*$", line)
+                for line in lines
+            ):
+                matched.add(identity)
+                break
+    return matched
+
+
+def _javap_verbose_sections_by_class_path(text: str) -> dict[str, str]:
+    """Split one batched javap response without losing physical class identity."""
+    matches = list(re.finditer(r"(?m)^Classfile (.+?)\s*$", str(text or "")))
+    sections = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        class_path = str(Path(match.group(1).strip()).resolve())
+        sections[class_path] = str(text)[match.start():end]
+    return sections
+
+
+def scan_final_artifact_javap_class_references(
+    artifact: Path,
+    selected_rows: list[dict],
+    *,
+    application_owned_nested_jars: set[str] | None = None,
+    provider_nested_jars_by_coord: dict[str, set[str]] | None = None,
+    provider_nested_jars_by_api_identity: dict[str, set[str]] | None = None,
+    javap: str = "javap",
+    max_workers: int = 4,
+    batch_size: int = 32,
+    time_budget_seconds: float | None = None,
+) -> dict:
+    """Use JDK javap verbose metadata as a second complete class authority."""
+    target_rows = {
+        serialized_api_identity(row): row
+        for row in selected_rows
+        if str(row.get("symbol_kind") or "").strip().lower() == "class"
+        and str(row.get("api_name") or "").strip()
+    }
+    targets = {
+        identity: str(row.get("api_name") or "").strip()
+        for identity, row in target_rows.items()
+    }
+    reachability = {
+        identity: "not_found_in_static_analysis" for identity in targets
+    }
+    if not targets:
+        return {
+            "complete": True, "api_reachability": reachability,
+            "references": [], "errors": [], "metrics": {"javap_invocations": 0},
+        }
+    started = time.perf_counter()
+    deadline = (
+        started + max(0.0, float(time_budget_seconds))
+        if time_budget_seconds is not None else None
+    )
+    snapshot = Path(artifact).read_bytes()
+    artifact_sha256 = hashlib.sha256(snapshot).hexdigest()
+    application_owned = set(application_owned_nested_jars or set())
+    needles = {
+        identity: {
+            value.encode("utf-8")
+            for value in _class_internal_name_candidates(owner)
+        }
+        for identity, owner in targets.items()
+    }
+    candidates = []
+    errors = []
+    timed_out = False
+
+    def collect(content: bytes, artifact_entry: str, business_owned: bool) -> None:
+        matched = set()
+        class_owner = _artifact_entry_class_owner(artifact_entry).replace("$", ".")
+        for identity, values in needles.items():
+            if class_owner == targets[identity].replace("$", "."):
+                continue
+            if _is_external_provider_for_api(
+                artifact_entry, target_rows[identity],
+                provider_nested_jars_by_coord,
+                provider_nested_jars_by_api_identity,
+            ):
+                continue
+            if any(value in content for value in values):
+                matched.add(identity)
+        if matched:
+            candidates.append((content, artifact_entry, business_owned, matched))
+
+    with zipfile.ZipFile(io.BytesIO(snapshot)) as archive:
+        names = archive.namelist()
+        application_prefix = next((
+            prefix for prefix in ("BOOT-INF/classes/", "WEB-INF/classes/")
+            if any(name.startswith(prefix) and name.endswith(".class") for name in names)
+        ), "")
+        for name in sorted(names):
+            if deadline is not None and time.perf_counter() >= deadline:
+                timed_out = True
+                break
+            if name.endswith(".class") and not name.startswith("META-INF/"):
+                is_business = not application_prefix or name.startswith(application_prefix)
+                if is_business:
+                    collect(archive.read(name), name, True)
+                continue
+            if not name.endswith(".jar") or not name.startswith(("BOOT-INF/lib/", "WEB-INF/lib/")):
+                continue
+            try:
+                with zipfile.ZipFile(io.BytesIO(archive.read(name))) as nested:
+                    for nested_name in sorted(nested.namelist()):
+                        if deadline is not None and time.perf_counter() >= deadline:
+                            timed_out = True
+                            break
+                        if not nested_name.endswith(".class") or nested_name.startswith("META-INF/"):
+                            continue
+                        artifact_entry = f"{name}!/{nested_name}"
+                        collect(
+                            nested.read(nested_name),
+                            artifact_entry,
+                            _business_artifact_entry(
+                                artifact_entry,
+                                application_owned_nested_jars,
+                            ),
+                        )
+            except (KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
+                errors.append(f"{name}:{type(error).__name__}:{error}")
+
+    references = []
+    with tempfile.TemporaryDirectory(prefix="jua-javap-class-oracle-") as tmp:
+        root = Path(tmp)
+        jobs = []
+        for index, (content, entry, business_owned, identities) in enumerate(candidates):
+            class_path = root / f"class-{index:06d}.class"
+            class_path.write_bytes(content)
+            jobs.append((class_path, entry, business_owned, identities))
+
+        batches = [
+            jobs[offset:offset + max(1, int(batch_size))]
+            for offset in range(0, len(jobs), max(1, int(batch_size)))
+        ]
+
+        def run_batch(batch):
+            timeout = 30.0
+            if deadline is not None:
+                timeout = max(0.001, min(timeout, deadline - time.perf_counter()))
+            try:
+                proc = subprocess.run(
+                    [javap, "-verbose", *[str(job[0]) for job in batch]],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    check=False, timeout=timeout,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                message = f"{type(error).__name__}:{error}"
+                return [], [(job[1], message) for job in batch]
+            sections = _javap_verbose_sections_by_class_path(proc.stdout)
+            results = []
+            batch_errors = []
+            for class_path, entry, business_owned, identities in batch:
+                section = sections.get(str(class_path.resolve()))
+                if section is None:
+                    batch_errors.append((entry, "javap_class_section_missing"))
+                    continue
+                subset = {identity: targets[identity] for identity in identities}
+                results.append((
+                    entry,
+                    business_owned,
+                    _javap_verbose_matched_class_targets(section, subset),
+                ))
+            if proc.returncode != 0:
+                batch_errors.append((
+                    ",".join(job[1] for job in batch),
+                    f"returncode={proc.returncode}",
+                ))
+            return results, batch_errors
+
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
+            futures = [executor.submit(run_batch, batch) for batch in batches]
+            for future in as_completed(futures):
+                results, batch_errors = future.result()
+                errors.extend(f"{entry}:{error}" for entry, error in batch_errors)
+                for entry, business_owned, identities in results:
+                    for identity in identities:
+                        references.append({
+                            "api_identity": identity,
+                            "target_class": targets[identity],
+                            "artifact_entry": entry,
+                            "artifact_sha256": artifact_sha256,
+                            "business_owned": business_owned,
+                            "authority": "jdk-javap-verbose",
+                            "authority_version": "1",
+                        })
+                        if business_owned:
+                            reachability[identity] = "reachable"
+                        elif reachability[identity] != "reachable":
+                            reachability[identity] = "uncertain"
+    if timed_out:
+        errors.append("oracle_time_budget_exceeded")
+    return {
+        "artifact_sha256": artifact_sha256,
+        "complete": not errors,
+        "api_reachability": reachability,
+        "references": references,
+        "errors": sorted(errors),
+        "metrics": {
+            "candidate_class_count": len(candidates),
+            "javap_invocations": len(batches),
+            "javap_batch_size": max(1, int(batch_size)),
+            "elapsed_seconds": time.perf_counter() - started,
+            "timed_out": timed_out,
+        },
+    }
+
+
+def _matched_class_reference_targets(
+    constants: set[bytes], target_index: dict[bytes, set[str]]
+) -> set[str]:
+    matches = set()
+    for value in constants:
+        matches.update(target_index.get(value) or set())
+        if value.startswith(b"["):
+            matches.update(target_index.get(value.lstrip(b"[")) or set())
+    return matches
+
+
 def scan_final_artifact_class_references(
     artifact: Path,
     selected_rows: list[dict],
     *,
     excluded_nested_jars: set[str] | None = None,
     application_owned_nested_jars: set[str] | None = None,
+    provider_nested_jars_by_coord: dict[str, set[str]] | None = None,
+    provider_nested_jars_by_api_identity: dict[str, set[str]] | None = None,
+    time_budget_seconds: float | None = None,
 ) -> dict:
     """Account for every class-level API using exact packaged class constants."""
     targets = {
@@ -3667,31 +4356,67 @@ def scan_final_artifact_class_references(
         if str(row.get("symbol_kind") or "").strip().lower() == "class"
         and str(row.get("api_name") or "").strip()
     }
+    target_rows = {
+        serialized_api_identity(row): row
+        for row in selected_rows
+        if serialized_api_identity(row) in targets
+    }
     if not targets:
         return {"complete": True, "api_reachability": {}, "references": [], "errors": []}
     excluded = set(excluded_nested_jars or set())
     application_owned = set(application_owned_nested_jars or set())
+    target_index = _class_reference_target_index(targets)
     references: list[dict] = []
+    class_records: list[dict] = []
     errors: list[str] = []
+    deadline = (
+        time.perf_counter() + max(0.0, float(time_budget_seconds))
+        if time_budget_seconds is not None else None
+    )
+    timed_out = False
     snapshot = Path(artifact).read_bytes()
     artifact_sha256 = hashlib.sha256(snapshot).hexdigest()
 
-    def inspect(content: bytes, artifact_entry: str, business_owned: bool) -> None:
+    def inspect(
+        content: bytes, artifact_entry: str, location: str,
+    ) -> None:
         try:
             constants = _classfile_utf8_constants(content)
         except ValueError as error:
             errors.append(f"{artifact_entry}:{error}")
             return
-        for identity, owner in targets.items():
-            internal_name = owner.replace(".", "/").encode("utf-8")
-            if not _constant_pool_references_class(constants, internal_name):
+        class_records.append({
+            "owner": _artifact_entry_class_owner(artifact_entry),
+            "artifact_entry": artifact_entry,
+            "location": location,
+            "constants": constants,
+        })
+
+    def target_references(record: dict, reachable_paths: dict[str, list[str]]) -> None:
+        owner_path = (
+            reachable_paths.get(record["owner"])
+            if record["location"] != "external" else None
+        )
+        for identity in sorted(_matched_class_reference_targets(
+            record["constants"], target_index
+        )):
+            owner = targets[identity]
+            if record["owner"] == owner:
+                continue
+            if _is_external_provider_for_api(
+                record["artifact_entry"],
+                target_rows[identity],
+                provider_nested_jars_by_coord,
+                provider_nested_jars_by_api_identity,
+            ):
                 continue
             references.append({
                 "api_identity": identity,
                 "target_class": owner,
                 "artifact_sha256": artifact_sha256,
-                "artifact_entry": artifact_entry,
-                "business_owned": business_owned,
+                "artifact_entry": record["artifact_entry"],
+                "business_owned": owner_path is not None,
+                "business_path": list(owner_path or []),
                 "authority": "final-artifact-classfile-constants",
                 "authority_version": "1",
                 "procedure": "exact CONSTANT_Class or JVM type descriptor in SHA-verified final artifact",
@@ -3707,10 +4432,13 @@ def scan_final_artifact_class_references(
             "",
         )
         for name in sorted(names):
+            if deadline is not None and time.perf_counter() >= deadline:
+                timed_out = True
+                break
             if name.endswith(".class") and not name.startswith("META-INF/"):
                 is_business = not application_prefix or name.startswith(application_prefix)
                 if is_business:
-                    inspect(archive.read(name), name, True)
+                    inspect(archive.read(name), name, "business_root")
                 continue
             if not name.endswith(".jar") or not name.startswith(("BOOT-INF/lib/", "WEB-INF/lib/")):
                 continue
@@ -3719,15 +4447,56 @@ def scan_final_artifact_class_references(
             try:
                 with zipfile.ZipFile(io.BytesIO(archive.read(name))) as nested:
                     for nested_name in sorted(nested.namelist()):
+                        if deadline is not None and time.perf_counter() >= deadline:
+                            timed_out = True
+                            break
                         if not nested_name.endswith(".class") or nested_name.startswith("META-INF/"):
                             continue
                         inspect(
                             nested.read(nested_name),
                             f"{name}!/{nested_name}",
-                            name in application_owned,
+                            "internal_module" if name in application_owned else "external",
                         )
             except (KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
                 errors.append(f"{name}:{type(error).__name__}:{error}")
+
+    if timed_out:
+        errors.append("oracle_time_budget_exceeded")
+
+    duplicate_owners = _duplicate_artifact_class_owners(
+        record["artifact_entry"] for record in class_records
+    )
+    traversable_records = [
+        record for record in class_records
+        if record["location"] in {"business_root", "internal_module"}
+        and record["owner"] not in duplicate_owners
+    ]
+    traversable_owners = {record["owner"] for record in traversable_records}
+    owner_index = _class_reference_target_index({
+        owner: owner for owner in traversable_owners
+    })
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    for record in traversable_records:
+        adjacency[record["owner"]].update(
+            matched_owner for matched_owner in _matched_class_reference_targets(
+                record["constants"], owner_index
+            )
+            if matched_owner != record["owner"]
+        )
+    reachable_paths = {
+        record["owner"]: [record["owner"]]
+        for record in traversable_records
+    }
+    frontier = deque(reachable_paths)
+    while frontier:
+        caller = frontier.popleft()
+        for callee in sorted(adjacency.get(caller) or set()):
+            if callee in reachable_paths:
+                continue
+            reachable_paths[callee] = reachable_paths[caller] + [callee]
+            frontier.append(callee)
+    for record in class_records:
+        target_references(record, reachable_paths)
 
     by_identity: dict[str, list[dict]] = defaultdict(list)
     for reference in references:
@@ -3742,10 +4511,12 @@ def scan_final_artifact_class_references(
         else:
             reachability[identity] = "not_found_in_static_analysis"
     return {
+        "artifact_sha256": artifact_sha256,
         "complete": not errors,
         "api_reachability": reachability,
         "references": references,
         "errors": sorted(errors),
+        "timed_out": timed_out,
     }
 
 
@@ -3847,15 +4618,11 @@ def reconcile_selected_api_edges(
         str(item.get("api_identity") or "") for item in semantic_references
         if str(item.get("api_identity") or "")
     )
-    retained_oracle_rows, api_reachability, path_errors = _retain_authoritative_api_path(
-        selected_rows,
-        oracle_rows,
-        semantic_targets,
-        absence_is_authoritative=bool(oracle_scan.get("complete")),
-        class_reachability=dict(oracle_scan.get("class_reachability") or {}),
-    )
-    path_errors.extend(_oracle_edge_identity_errors(oracle_rows))
-    retained_analyzer_rows = _retain_analyzer_api_path(selected_rows, [dict(row) for row in (analyzer_rows or [])])
+    application_owned_nested_jars = {
+        str(item or "").strip()
+        for item in (oracle_scan.get("application_owned_nested_jars") or [])
+        if str(item or "").strip()
+    }
     artifact_entries = {
         str(entry).strip() for entry in (oracle_scan.get("artifact_entries") or [])
         if str(entry).strip()
@@ -3865,6 +4632,47 @@ def reconcile_selected_api_edges(
             str(row.get("artifact_entry") or "").strip() for row in oracle_rows
             if str(row.get("artifact_entry") or "").strip()
         }
+    ambiguous_class_owners = _duplicate_artifact_class_owners(artifact_entries)
+    retained_oracle_rows, api_reachability, path_errors = _retain_authoritative_api_path(
+        selected_rows,
+        oracle_rows,
+        semantic_targets,
+        absence_is_authoritative=bool(oracle_scan.get("complete")),
+        class_reachability=dict(oracle_scan.get("class_reachability") or {}),
+        application_owned_nested_jars=application_owned_nested_jars,
+        provider_nested_jars_by_coord={
+            str(coord): {str(entry) for entry in entries}
+            for coord, entries in dict(
+                oracle_scan.get("provider_nested_jars_by_coord") or {}
+            ).items()
+        },
+        provider_nested_jars_by_api_identity={
+            str(identity): {str(entry) for entry in entries}
+            for identity, entries in dict(
+                oracle_scan.get("provider_nested_jars_by_api_identity") or {}
+            ).items()
+        },
+        ambiguous_class_owners=ambiguous_class_owners,
+    )
+    path_errors.extend(_oracle_edge_identity_errors(oracle_rows))
+    retained_analyzer_rows = _retain_analyzer_api_path(
+        selected_rows,
+        [dict(row) for row in (analyzer_rows or [])],
+        application_owned_nested_jars=application_owned_nested_jars,
+        provider_nested_jars_by_coord={
+            str(coord): {str(entry) for entry in entries}
+            for coord, entries in dict(
+                oracle_scan.get("provider_nested_jars_by_coord") or {}
+            ).items()
+        },
+        provider_nested_jars_by_api_identity={
+            str(identity): {str(entry) for entry in entries}
+            for identity, entries in dict(
+                oracle_scan.get("provider_nested_jars_by_api_identity") or {}
+            ).items()
+        },
+        ambiguous_class_owners=ambiguous_class_owners,
+    )
     complete = bool(oracle_scan.get("complete")) and not path_errors
     reconciliation = {
         "ledger": [],
@@ -3929,6 +4737,17 @@ def reconcile_selected_api_edges(
         ) + "\n",
         encoding="utf-8",
     )
+    javap_class_reference_path = (
+        report_dir / "evidence" / "call_chain" / "oracle_javap_class_references.json"
+    )
+    javap_class_reference_path.write_text(
+        json.dumps(
+            oracle_scan.get("javap_class_references") or [],
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
     counts = {
         "oracle_edge_count": len(retained_oracle_rows),
         "analyzer_edge_count": len(retained_analyzer_rows),
@@ -3947,10 +4766,17 @@ def reconcile_selected_api_edges(
         )
     }
     jdeps_metrics = dict(oracle_scan.get("jdeps_metrics") or {})
+    javap_class_metrics = dict(oracle_scan.get("javap_class_metrics") or {})
     oracle_metrics.update({
         "jdeps_invocations": int(jdeps_metrics.get("jdeps_invocations") or 0),
         "jdeps_class_count": int(jdeps_metrics.get("class_count") or 0),
         "jdeps_elapsed_seconds": float(jdeps_metrics.get("elapsed_seconds") or 0.0),
+        "javap_class_invocations": int(
+            javap_class_metrics.get("javap_invocations") or 0
+        ),
+        "javap_class_elapsed_seconds": float(
+            javap_class_metrics.get("elapsed_seconds") or 0.0
+        ),
     })
     return {
         "complete": complete,
@@ -3971,6 +4797,10 @@ def reconcile_selected_api_edges(
         "jdeps_class_reachability": dict(
             oracle_scan.get("jdeps_class_reachability") or {}
         ),
+        "javap_class_reference_evidence": str(javap_class_reference_path),
+        "javap_class_reachability": dict(
+            oracle_scan.get("javap_class_reachability") or {}
+        ),
         "trusted_artifact_sha": str(oracle_scan.get("artifact_sha256") or ""),
         "oracle_metrics": oracle_metrics,
         "oracle_physical_occurrences": [
@@ -3981,19 +4811,27 @@ def reconcile_selected_api_edges(
     }
 
 
-def _artifact_class_entries(artifact: Path) -> set[str]:
+def _artifact_class_entries(
+    artifact: Path, *, time_budget_seconds: float | None = None,
+) -> set[str]:
     entries: set[str] = set()
+    deadline = (
+        time.perf_counter() + max(0.0, float(time_budget_seconds))
+        if time_budget_seconds is not None else None
+    )
     with zipfile.ZipFile(artifact) as archive:
         for info in archive.infolist():
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise TimeoutError("oracle_time_budget_exceeded")
             if not info.is_dir() and info.filename.endswith(".class"):
                 entries.add(info.filename)
             elif not info.is_dir() and info.filename.endswith(".jar") and info.filename.startswith(("BOOT-INF/lib/", "WEB-INF/lib/")):
                 with zipfile.ZipFile(io.BytesIO(archive.read(info))) as nested:
-                    entries.update(
-                        f"{info.filename}!/{nested_info.filename}"
-                        for nested_info in nested.infolist()
-                        if not nested_info.is_dir() and nested_info.filename.endswith(".class")
-                    )
+                    for nested_info in nested.infolist():
+                        if deadline is not None and time.perf_counter() >= deadline:
+                            raise TimeoutError("oracle_time_budget_exceeded")
+                        if not nested_info.is_dir() and nested_info.filename.endswith(".class"):
+                            entries.add(f"{info.filename}!/{nested_info.filename}")
     return entries
 
 
@@ -4002,7 +4840,11 @@ def validate_oracle_scan(oracle_scan: dict, expected_artifact_sha256: str) -> tu
     validated = dict(oracle_scan or {})
     failures = list(validated.get("failures") or [])
     signal = ""
-    if str(validated.get("artifact_sha256") or "") != str(expected_artifact_sha256 or ""):
+    declared_payload_sha = str(validated.get("oracle_payload_sha256") or "")
+    if not declared_payload_sha or declared_payload_sha != oracle_payload_sha256(validated):
+        failures.append("oracle_payload_sha_mismatch")
+        signal = "oracle_invalid"
+    elif str(validated.get("artifact_sha256") or "") != str(expected_artifact_sha256 or ""):
         failures.append("oracle_artifact_sha_mismatch")
         signal = "oracle_invalid"
     elif validated.get("complete") is not True:
@@ -4056,48 +4898,405 @@ def _oracle_selected_targets(selected_rows: list[dict]) -> list[dict]:
     ]
 
 
-def _external_target_provider_entries(
-    report_dir: Path, selected_rows: list[dict]
-) -> set[str]:
-    target_coords = {
-        str(row.get("coord") or "").strip() for row in selected_rows or []
-        if str(row.get("coord") or "").strip()
-    }
-    catalog_path = (
-        Path(report_dir) / ".runtime" / "cache"
-        / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+def _materialize_verified_oracle_snapshot(
+    report_dir: Path, artifact: Path, expected_sha256: str
+) -> tuple[Path | None, list[str]]:
+    try:
+        snapshot = Path(artifact).read_bytes()
+    except OSError as error:
+        return None, [f"final_artifact_snapshot:{type(error).__name__}:{error}"]
+    actual_sha256 = hashlib.sha256(snapshot).hexdigest()
+    if expected_sha256 and actual_sha256 != expected_sha256:
+        return None, ["final_artifact_sha256_mismatch"]
+    snapshot_dir = Path(report_dir) / ".runtime" / "oracle" / "input"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshot_dir / f"{actual_sha256}.jar"
+    if snapshot_path.exists():
+        try:
+            if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() == actual_sha256:
+                return snapshot_path, []
+        except OSError as error:
+            return None, [
+                f"final_artifact_snapshot_read:{type(error).__name__}:{error}"
+            ]
+    temporary = snapshot_path.with_suffix(".tmp")
+    try:
+        temporary.write_bytes(snapshot)
+        os.replace(temporary, snapshot_path)
+        snapshot_path.chmod(0o444)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        return None, [f"final_artifact_snapshot_write:{type(error).__name__}:{error}"]
+    return snapshot_path, []
+
+
+def _oracle_provider_entries(
+    artifact: Path, selected_rows: list[dict], expected_sha256: str = "",
+    *, time_budget_seconds: float | None = None,
+) -> tuple[dict[str, set[str]], dict[str, set[str]], list[str]]:
+    """Rebuild target-provider identity directly from the verified final artifact."""
+    identities_by_owner: dict[str, set[str]] = defaultdict(set)
+    coordinate_by_identity: dict[str, str] = {}
+    for row in selected_rows or []:
+        owner = _selected_api_owner(row)
+        if owner:
+            identity = serialized_api_identity(row)
+            identities_by_owner[owner].add(identity)
+            coordinate_by_identity[identity] = str(row.get("coord") or "").strip()
+    providers_by_coord: dict[str, set[str]] = defaultdict(set)
+    providers_by_identity: dict[str, set[str]] = defaultdict(set)
+    errors: list[str] = []
+    deadline = (
+        time.perf_counter() + max(0.0, float(time_budget_seconds))
+        if time_budget_seconds is not None else None
+    )
+
+    def budget_exceeded() -> bool:
+        if deadline is None or time.perf_counter() < deadline:
+            return False
+        if "oracle_time_budget_exceeded" not in errors:
+            errors.append("oracle_time_budget_exceeded")
+        return True
+
+    try:
+        snapshot = Path(artifact).read_bytes()
+        if expected_sha256 and hashlib.sha256(snapshot).hexdigest() != expected_sha256:
+            return {}, {}, ["final_artifact_sha256_mismatch"]
+        with zipfile.ZipFile(io.BytesIO(snapshot)) as outer:
+            for artifact_entry in sorted(outer.namelist()):
+                if budget_exceeded():
+                    break
+                if (
+                    not artifact_entry.startswith(("BOOT-INF/lib/", "WEB-INF/lib/"))
+                    or not artifact_entry.endswith(".jar")
+                ):
+                    continue
+                try:
+                    with zipfile.ZipFile(io.BytesIO(outer.read(artifact_entry))) as nested:
+                        names = nested.namelist()
+                        coords = set()
+                        for name in names:
+                            if budget_exceeded():
+                                break
+                            if not (
+                                name.startswith("META-INF/maven/")
+                                and name.endswith("/pom.properties")
+                            ):
+                                continue
+                            properties = {}
+                            try:
+                                metadata_text = nested.read(name).decode("utf-8")
+                            except UnicodeDecodeError as error:
+                                errors.append(
+                                    f"{artifact_entry}!/{name}:UnicodeDecodeError:{error}"
+                                )
+                                continue
+                            for line in metadata_text.splitlines():
+                                line = line.strip()
+                                if not line or line.startswith(("#", "!")):
+                                    continue
+                                key, separator, value = line.partition("=")
+                                if not separator:
+                                    key, separator, value = line.partition(":")
+                                if separator:
+                                    properties[key.strip()] = value.strip()
+                            group_id = properties.get("groupId", "")
+                            artifact_id = properties.get("artifactId", "")
+                            if group_id and artifact_id:
+                                coords.add(f"{group_id}:{artifact_id}")
+                            else:
+                                errors.append(
+                                    f"{artifact_entry}!/{name}:"
+                                    "pom_properties_coordinate_missing"
+                                )
+                        matched_owners = set()
+                        for name in names:
+                            if budget_exceeded():
+                                break
+                            logical_name = re.sub(r"^META-INF/versions/\d+/", "", name)
+                            if not logical_name.endswith(".class"):
+                                continue
+                            owner = logical_name[:-6].replace("/", ".").replace("$", ".")
+                            if owner in identities_by_owner:
+                                matched_owners.add(owner)
+                        for owner in sorted(matched_owners):
+                            candidates = identities_by_owner[owner]
+                            for identity in candidates:
+                                providers_by_identity[identity].add(artifact_entry)
+                            candidate_coords = {
+                                coordinate_by_identity.get(identity, "")
+                                for identity in candidates
+                                if coordinate_by_identity.get(identity, "")
+                            }
+                            resolved = set(candidates)
+                            if len(candidate_coords) > 1:
+                                metadata_matches = candidate_coords & coords
+                                if metadata_matches == candidate_coords:
+                                    resolved = set(candidates)
+                                elif len(metadata_matches) == 1:
+                                    selected_coord = next(iter(metadata_matches))
+                                    resolved = {
+                                        identity for identity in candidates
+                                        if coordinate_by_identity.get(identity) == selected_coord
+                                    }
+                                else:
+                                    errors.append(
+                                        f"{artifact_entry}:provider_identity_ambiguous:"
+                                        f"{owner}:" f"{','.join(sorted(candidate_coords))}"
+                                    )
+                                    continue
+                            for identity in resolved:
+                                coord = coordinate_by_identity.get(identity, "")
+                                if coord:
+                                    providers_by_coord[coord].add(artifact_entry)
+                except (KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
+                    errors.append(
+                        f"{artifact_entry}:{type(error).__name__}:{error}"
+                    )
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        errors.append(f"final_artifact:{type(error).__name__}:{error}")
+    return dict(providers_by_coord), dict(providers_by_identity), sorted(errors)
+
+
+def _oracle_application_owned_nested_jars(
+    report_dir: Path, artifact: Path, expected_sha256: str,
+    *, time_budget_seconds: float | None = None,
+) -> tuple[set[str], list[str]]:
+    """Bind reactor-owned dependency entries to the locked final artifact."""
+    try:
+        snapshot = Path(artifact).read_bytes()
+    except OSError as error:
+        return set(), [f"internal_module_artifact_unreadable:{error}"]
+    if hashlib.sha256(snapshot).hexdigest() != expected_sha256:
+        return set(), ["internal_module_artifact_sha_mismatch"]
+    deadline = (
+        time.perf_counter() + max(0.0, float(time_budget_seconds))
+        if time_budget_seconds is not None else None
+    )
+
+    def budget_exceeded() -> bool:
+        return deadline is not None and time.perf_counter() >= deadline
+
+    if budget_exceeded():
+        return set(), ["oracle_time_budget_exceeded"]
+
+    state_path = Path(report_dir) / ".runtime" / "state" / "main_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set(), []
+    current_scope = {}
+    for step in ("step5", "step4", "step3", "step2", "step1"):
+        candidate = (((state.get(step) or {}).get("input") or {}).get(
+            "project_scope"
+        ) or {})
+        if candidate:
+            current_scope = candidate
+            break
+    declared_scope_hash = str(current_scope.get("scope_hash") or "").strip()
+    scope_payload = dict(current_scope)
+    scope_payload.pop("scope_hash", None)
+    actual_scope_hash = hashlib.sha256(json.dumps(
+        scope_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    if not declared_scope_hash or declared_scope_hash != actual_scope_hash:
+        return set(), ["internal_module_project_scope_hash_invalid"]
+    provenance_path = (
+        Path(report_dir) / "evidence" / "dependencies" /
+        "build_provenance.json"
     )
     try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set()
-    return {
-        str(item.get("artifact_entry") or "").strip()
-        for item in (catalog.get("entries") or [])
-        if str(item.get("coord") or "").strip() in target_coords
-        and item.get("application_owned") is False
-        and str(item.get("artifact_entry") or "").startswith(
-            ("BOOT-INF/lib/", "WEB-INF/lib/")
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        current_provenance = next(
+            item for item in (provenance.get("sides") or [])
+            if str(item.get("side") or "") == "current"
         )
-        and str(item.get("artifact_entry") or "").endswith(".jar")
+    except (OSError, StopIteration, json.JSONDecodeError):
+        return set(), ["internal_module_build_provenance_unavailable"]
+    if str(current_provenance.get("artifact_sha256") or "") != expected_sha256:
+        return set(), ["internal_module_build_artifact_sha_mismatch"]
+    scope_revision = str(current_scope.get("source_revision") or "").strip()
+    build_revision = str(
+        current_provenance.get("revision")
+        or current_provenance.get("ref")
+        or ""
+    ).strip()
+    if not scope_revision or not build_revision:
+        return set(), ["internal_module_project_revision_missing"]
+    if scope_revision != build_revision:
+        return set(), ["internal_module_project_revision_mismatch"]
+    scope_binding_errors = project_scope_provenance_errors(
+        current_scope, current_provenance,
+    )
+    if scope_binding_errors:
+        return set(), [
+            f"internal_module_{reason}" for reason in scope_binding_errors
+        ]
+    included_coords = {
+        str(coord).strip()
+        for coord in (current_scope.get("included_module_coords") or [])
+        if str(coord).strip()
     }
+    if not included_coords:
+        return set(), []
 
-
-def _application_owned_provider_entries(report_dir: Path) -> set[str]:
-    catalog_path = (
-        Path(report_dir) / ".runtime" / "cache"
-        / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
+    dependencies_path = (
+        Path(report_dir) / "evidence" / "dependencies" /
+        "deps_current_resolved.csv"
     )
     try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set()
-    return {
-        str(item.get("artifact_entry") or "").strip()
-        for item in (catalog.get("entries") or [])
-        if item.get("application_owned") is True
-        and str(item.get("artifact_entry") or "").strip()
+        with open_csv_read(dependencies_path) as handle:
+            rows = list(csv.DictReader(handle))
+        with zipfile.ZipFile(io.BytesIO(snapshot)) as archive:
+            artifact_entries = set(archive.namelist())
+    except (OSError, csv.Error, zipfile.BadZipFile) as error:
+        return set(), [f"internal_module_inventory_unreadable:{error}"]
+
+    entries = set()
+    errors = []
+    for row in rows:
+        if budget_exceeded():
+            errors.append("oracle_time_budget_exceeded")
+            break
+        coord = str(row.get("coord") or "").strip()
+        if coord not in included_coords:
+            continue
+        entry = str(row.get("lib_entry") or "").strip()
+        if str(row.get("resolution_status") or "").strip() == "unresolved":
+            errors.append(f"internal_module_unresolved:{coord}")
+        elif not entry:
+            errors.append(f"internal_module_entry_missing:{coord}")
+        elif (
+            not entry.startswith(("BOOT-INF/lib/", "WEB-INF/lib/"))
+            or not entry.endswith(".jar")
+            or entry not in artifact_entries
+        ):
+            errors.append(f"internal_module_entry_invalid:{coord}:{entry}")
+        else:
+            try:
+                with zipfile.ZipFile(io.BytesIO(snapshot)) as outer_archive:
+                    nested_bytes = outer_archive.read(entry)
+                with zipfile.ZipFile(
+                    io.BytesIO(nested_bytes)
+                ) as nested_archive:
+                    declared_coords = set()
+                    for name in nested_archive.namelist():
+                        if not (
+                            name.startswith("META-INF/maven/")
+                            and name.endswith("/pom.properties")
+                        ):
+                            continue
+                        properties = {}
+                        text_value = nested_archive.read(name).decode("utf-8")
+                        for line in text_value.splitlines():
+                            key, separator, value = line.strip().partition("=")
+                            if separator:
+                                properties[key.strip()] = value.strip()
+                        if properties.get("groupId") and properties.get("artifactId"):
+                            declared_coords.add(
+                                f'{properties["groupId"]}:{properties["artifactId"]}'
+                            )
+            except (KeyError, OSError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+                errors.append(
+                    f"internal_module_metadata_unreadable:{coord}:{entry}:"
+                    f"{type(error).__name__}"
+                )
+                continue
+            if len(declared_coords) != 1:
+                errors.append(
+                    f"internal_module_coordinate_ambiguous:{coord}:{entry}:"
+                    f"{','.join(sorted(declared_coords)) or '<missing>'}"
+                )
+                continue
+            if coord not in declared_coords:
+                errors.append(
+                    f"internal_module_coordinate_mismatch:{coord}:{entry}:"
+                    f"{','.join(sorted(declared_coords)) or '<missing>'}"
+                )
+                continue
+            entries.add(entry)
+    return entries, sorted(set(errors))
+
+
+def _selected_api_owner(api_row: dict) -> str:
+    api_name = str((api_row or {}).get("api_name") or "").strip()
+    symbol_kind = str((api_row or {}).get("symbol_kind") or "method").strip().lower()
+    if symbol_kind == "class":
+        return api_name.replace("$", ".")
+    if symbol_kind == "constructor":
+        return _constructor_owner_from_api_name(api_name).replace("$", ".")
+    owner, separator, _member = api_name.rpartition(".")
+    return owner.replace("$", ".") if separator else ""
+
+
+def merge_positive_only_jdeps_evidence(scan: dict, jdeps_scan: dict) -> None:
+    """Keep jdeps positives without treating its missing coverage as absence proof."""
+    scan["jdeps_class_reachability"] = dict(
+        jdeps_scan.get("api_reachability") or {}
+    )
+    scan["jdeps_class_references"] = list(jdeps_scan.get("references") or [])
+    scan["jdeps_metrics"] = dict(jdeps_scan.get("metrics") or {})
+    if not jdeps_scan.get("complete"):
+        scan.setdefault("advisories", []).extend(
+            f"jdeps_class_scan:{item}" for item in (jdeps_scan.get("errors") or [])
+        )
+
+
+def requires_positive_only_jdeps(scan: dict) -> bool:
+    return not bool(scan.get("javap_class_authority_complete"))
+
+
+def _oracle_component_provenance_errors(
+    component, label: str, expected_sha256: str, artifact: Path,
+    *, require_declaration: bool = False,
+) -> list[str]:
+    """Reject child evidence that is not tied to the locked artifact snapshot."""
+    errors = []
+    actual_sha256 = _file_sha256(artifact)
+    if actual_sha256 != expected_sha256:
+        errors.append(
+            f"{label}:snapshot_sha_mismatch:{actual_sha256 or '<unreadable>'}"
+        )
+    declared = []
+    evidence_markers = {
+        "api_identity", "artifact_entry", "caller_owner", "callee_owner",
+        "target_class", "identity", "physical_occurrence",
     }
+
+    def collect(value, path: str = "") -> None:
+        if isinstance(value, dict):
+            digest = str(value.get("artifact_sha256") or "").strip()
+            if digest:
+                declared.append(digest)
+            if path and evidence_markers.intersection(value) and not digest:
+                errors.append(f"{label}:child_artifact_sha_missing:{path}")
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                collect(child, child_path)
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                collect(child, f"{path}[{index}]")
+
+    collect(component)
+    invalid = sorted({digest for digest in declared if digest != expected_sha256})
+    if invalid:
+        errors.append(f"{label}:component_sha_mismatch:{','.join(invalid)}")
+    if require_declaration and expected_sha256 not in declared:
+        errors.append(f"{label}:artifact_sha_missing")
+    return errors
+
+
+def _record_oracle_component_provenance(
+    scan: dict, component, label: str, expected_sha256: str, artifact: Path,
+    *, require_declaration: bool = False,
+) -> None:
+    errors = _oracle_component_provenance_errors(
+        component, label, expected_sha256, artifact,
+        require_declaration=require_declaration,
+    )
+    if errors:
+        scan["complete"] = False
+        scan.setdefault("failures", []).extend(errors)
 
 
 def reconcile_final_artifact_edges(
@@ -4106,7 +5305,32 @@ def reconcile_final_artifact_edges(
     oracle_time_budget_seconds: float | None = None,
     pinned_manifest: dict | None = None,
 ) -> dict:
+    oracle_deadline = (
+        time.perf_counter() + max(0.0, float(oracle_time_budget_seconds))
+        if oracle_time_budget_seconds is not None else None
+    )
+
+    def remaining_oracle_budget() -> float | None:
+        if oracle_deadline is None:
+            return None
+        return max(0.0, oracle_deadline - time.perf_counter())
+
+    def oracle_budget_available(component: str) -> bool:
+        if oracle_deadline is None or remaining_oracle_budget() > 0:
+            return True
+        failure = f"{component}:oracle_time_budget_exceeded"
+        scan["complete"] = False
+        failures = scan.setdefault("failures", [])
+        if failure not in failures:
+            failures.append(failure)
+        return False
+
     artifact, expected_sha, errors = _verified_current_final_artifact(report_dir)
+    if artifact is not None:
+        artifact, snapshot_errors = _materialize_verified_oracle_snapshot(
+            report_dir, artifact, expected_sha
+        )
+        errors.extend(snapshot_errors)
     analyzer_path = Path(report_dir) / "evidence" / "call_chain" / "analyzer_edges.csv"
     _fields, analyzer_rows = _csv_rows(analyzer_path)
     if artifact is None:
@@ -4123,7 +5347,11 @@ def reconcile_final_artifact_edges(
         if mybatis_selected:
             mapper_oracle = inspect_mybatis_artifact(
                 artifact,
-                timeout_seconds=float(oracle_time_budget_seconds or 120.0),
+                timeout_seconds=max(
+                    0.001,
+                    float(remaining_oracle_budget() or 0.001)
+                    if oracle_deadline is not None else 120.0,
+                ),
             )
             scan = dict(mapper_oracle.get("physical_scan") or {})
             runtime_spec = dict((pinned_manifest or {}).get("runtime_verification") or {})
@@ -4131,12 +5359,23 @@ def reconcile_final_artifact_edges(
                 str(item) for item in (runtime_spec.get("required_output") or [])
                 if str(item)
             ]
-            runtime_activation = verify_runtime_activation(
-                artifact,
-                required_output,
-                timeout_seconds=min(float(oracle_time_budget_seconds or 120.0), 30.0),
-            )
             scan.setdefault("failures", [])
+            if oracle_budget_available("mybatis_oracle"):
+                runtime_activation = verify_runtime_activation(
+                    artifact,
+                    required_output,
+                    timeout_seconds=max(
+                        0.001,
+                        min(30.0, float(remaining_oracle_budget() or 0.001)),
+                    ),
+                )
+                oracle_budget_available("mybatis_runtime")
+            else:
+                runtime_activation = {
+                    "active": False,
+                    "failures": ["oracle_time_budget_exceeded"],
+                    "elapsed_seconds": 0.0,
+                }
             if not mapper_oracle.get("complete"):
                 scan["complete"] = False
                 scan["failures"].extend(
@@ -4163,21 +5402,60 @@ def reconcile_final_artifact_edges(
                 "time_budget_seconds": oracle_time_budget_seconds,
                 "selected_targets": _oracle_selected_targets(selected_rows),
             }
-            excluded_provider_entries = _external_target_provider_entries(
-                report_dir, selected_rows
-            )
-            if excluded_provider_entries:
-                scan_kwargs["excluded_nested_jars"] = excluded_provider_entries
             scan = scan_final_artifact(artifact, **scan_kwargs)
-        excluded_provider_entries = _external_target_provider_entries(
-            report_dir, selected_rows
+        _record_oracle_component_provenance(
+            scan, scan, "primary_edge_scan", expected_sha, artifact,
+            require_declaration=True,
+        )
+        oracle_budget_available("primary_edge_scan")
+        (
+            provider_entries_by_coord,
+            provider_entries_by_api_identity,
+            provider_inventory_errors,
+        ) = _oracle_provider_entries(
+            artifact, selected_rows, expected_sha,
+            time_budget_seconds=remaining_oracle_budget(),
+        )
+        oracle_budget_available("oracle_provider_inventory")
+        if provider_inventory_errors:
+            scan["complete"] = False
+            scan.setdefault("failures", []).extend(
+                f"oracle_provider_inventory:{item}"
+                for item in provider_inventory_errors
+            )
+        (
+            application_owned_provider_entries,
+            internal_module_inventory_errors,
+        ) = _oracle_application_owned_nested_jars(
+            report_dir, artifact, expected_sha,
+            time_budget_seconds=remaining_oracle_budget(),
+        )
+        oracle_budget_available("oracle_internal_module_inventory")
+        if internal_module_inventory_errors:
+            scan["complete"] = False
+            scan.setdefault("failures", []).extend(
+                f"oracle_internal_module_inventory:{item}"
+                for item in internal_module_inventory_errors
+            )
+        scan["application_owned_nested_jars"] = sorted(
+            application_owned_provider_entries
         )
         try:
             class_reference_scan = scan_final_artifact_class_references(
                 artifact,
                 selected_rows,
-                excluded_nested_jars=excluded_provider_entries,
-                application_owned_nested_jars=_application_owned_provider_entries(report_dir),
+                application_owned_nested_jars=application_owned_provider_entries,
+                provider_nested_jars_by_coord=provider_entries_by_coord,
+                provider_nested_jars_by_api_identity=provider_entries_by_api_identity,
+                time_budget_seconds=remaining_oracle_budget(),
+            )
+            _record_oracle_component_provenance(
+                scan, class_reference_scan, "class_reference_scan",
+                expected_sha, artifact,
+                require_declaration=any(
+                    str(row.get("symbol_kind") or "").strip().lower() == "class"
+                    for row in selected_rows
+                ),
             )
             scan["class_reachability"] = class_reference_scan["api_reachability"]
             scan["class_references"] = class_reference_scan["references"]
@@ -4187,16 +5465,63 @@ def reconcile_final_artifact_edges(
                     f"class_reference_scan:{item}"
                     for item in class_reference_scan["errors"]
                 )
+            oracle_budget_available("class_reference_scan")
         except (OSError, ValueError, zipfile.BadZipFile) as error:
             scan["complete"] = False
             scan.setdefault("failures", []).append(
                 f"class_reference_scan_failed:{error}"
             )
         try:
+            javap_class_scan = scan_final_artifact_javap_class_references(
+                artifact,
+                selected_rows,
+                application_owned_nested_jars=application_owned_provider_entries,
+                provider_nested_jars_by_coord=provider_entries_by_coord,
+                provider_nested_jars_by_api_identity=provider_entries_by_api_identity,
+                time_budget_seconds=remaining_oracle_budget(),
+            )
+            _record_oracle_component_provenance(
+                scan, javap_class_scan, "javap_class_scan",
+                expected_sha, artifact,
+                require_declaration=any(
+                    str(row.get("symbol_kind") or "").strip().lower() == "class"
+                    for row in selected_rows
+                ),
+            )
+            scan["javap_class_reachability"] = javap_class_scan["api_reachability"]
+            scan["javap_class_references"] = javap_class_scan["references"]
+            scan["javap_class_metrics"] = javap_class_scan["metrics"]
+            scan["javap_class_authority_complete"] = bool(
+                javap_class_scan["complete"]
+            )
+            if not javap_class_scan["complete"]:
+                scan["complete"] = False
+                scan.setdefault("failures", []).extend(
+                    f"javap_class_scan:{item}" for item in javap_class_scan["errors"]
+                )
+            oracle_budget_available("javap_class_scan")
+        except (OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
+            scan["javap_class_authority_complete"] = False
+            scan["complete"] = False
+            scan.setdefault("failures", []).append(
+                f"javap_class_scan_failed:{error}"
+            )
+        try:
             member_reference_scan = scan_final_artifact_member_references(
                 artifact,
                 selected_rows,
-                excluded_nested_jars=excluded_provider_entries,
+                application_owned_nested_jars=application_owned_provider_entries,
+                provider_nested_jars_by_coord=provider_entries_by_coord,
+                provider_nested_jars_by_api_identity=provider_entries_by_api_identity,
+                time_budget_seconds=remaining_oracle_budget(),
+            )
+            _record_oracle_component_provenance(
+                scan, member_reference_scan, "member_reference_scan",
+                expected_sha, artifact,
+                require_declaration=any(
+                    str(row.get("symbol_kind") or "").strip().lower() != "class"
+                    for row in selected_rows
+                ),
             )
             scan["member_reference_reachability"] = member_reference_scan["api_reachability"]
             scan["member_references"] = member_reference_scan["references"]
@@ -4206,40 +5531,69 @@ def reconcile_final_artifact_edges(
                     f"member_reference_scan:{item}"
                     for item in member_reference_scan["errors"]
                 )
+            oracle_budget_available("member_reference_scan")
         except (OSError, ValueError, zipfile.BadZipFile) as error:
             scan["complete"] = False
             scan.setdefault("failures", []).append(
                 f"member_reference_scan_failed:{error}"
             )
         try:
-            jdeps_class_scan = scan_jdeps_class_references(
-                artifact,
-                selected_rows,
-                excluded_nested_jars=excluded_provider_entries,
-                application_owned_nested_jars=_application_owned_provider_entries(report_dir),
-            )
-            scan["jdeps_class_reachability"] = jdeps_class_scan["api_reachability"]
-            scan["jdeps_class_references"] = jdeps_class_scan["references"]
-            scan["jdeps_metrics"] = jdeps_class_scan["metrics"]
-            if not jdeps_class_scan["complete"]:
+            if oracle_deadline is not None and remaining_oracle_budget() <= 0:
                 scan["complete"] = False
-                scan.setdefault("failures", []).extend(
-                    f"jdeps_class_scan:{item}" for item in jdeps_class_scan["errors"]
+                scan.setdefault("failures", []).append(
+                    "dynamic_class_reference_scan:oracle_time_budget_exceeded"
                 )
-        except (OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
+                scan["semantic_references"] = []
+            else:
+                scan["semantic_references"] = scan_final_artifact_dynamic_class_references(
+                    artifact, selected_rows,
+                    time_budget_seconds=remaining_oracle_budget(),
+                )
+                _record_oracle_component_provenance(
+                    scan, scan["semantic_references"], "dynamic_class_reference_scan",
+                    expected_sha, artifact,
+                )
+                oracle_budget_available("dynamic_class_reference_scan")
+        except (OSError, TimeoutError, ValueError, zipfile.BadZipFile) as error:
             scan["complete"] = False
-            scan.setdefault("failures", []).append(
-                f"jdeps_class_scan_failed:{error}"
+            reason = (
+                "dynamic_class_reference_scan:oracle_time_budget_exceeded"
+                if isinstance(error, TimeoutError)
+                else f"dynamic_class_reference_scan_failed:{error}"
             )
-        try:
-            scan["semantic_references"] = scan_final_artifact_dynamic_class_references(
-                artifact, selected_rows
-            )
-        except (OSError, ValueError, zipfile.BadZipFile) as error:
-            scan["complete"] = False
-            scan.setdefault("failures", []).append(
-                f"dynamic_class_reference_scan_failed:{error}"
-            )
+            scan.setdefault("failures", []).append(reason)
+        if requires_positive_only_jdeps(scan):
+            try:
+                jdeps_class_scan = scan_jdeps_class_references(
+                    artifact,
+                    selected_rows,
+                    application_owned_nested_jars=application_owned_provider_entries,
+                    provider_nested_jars_by_coord=provider_entries_by_coord,
+                    provider_nested_jars_by_api_identity=provider_entries_by_api_identity,
+                    timeout_seconds=min(60.0, remaining_oracle_budget() or 0.001)
+                    if oracle_deadline is not None else 60.0,
+                    time_budget_seconds=remaining_oracle_budget(),
+                )
+                _record_oracle_component_provenance(
+                    scan, jdeps_class_scan, "jdeps_class_scan",
+                    expected_sha, artifact,
+                )
+                merge_positive_only_jdeps_evidence(scan, jdeps_class_scan)
+                oracle_budget_available("jdeps_class_scan")
+            except (OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
+                scan.setdefault("advisories", []).append(
+                    f"jdeps_class_scan_failed:{error}"
+                )
+        else:
+            scan["jdeps_class_reachability"] = {}
+            scan["jdeps_class_references"] = []
+            scan["jdeps_metrics"] = {
+                "skipped": True,
+                "skip_reason": "complete_javap_class_authority",
+                "jdeps_invocations": 0,
+                "class_count": 0,
+                "elapsed_seconds": 0.0,
+            }
         if mapper_oracle is not None and runtime_activation is not None:
             scan.setdefault("semantic_references", []).extend(
                 build_mybatis_semantic_references(
@@ -4250,11 +5604,31 @@ def reconcile_final_artifact_edges(
                 )
             )
         try:
-            scan["artifact_entries"] = sorted(_artifact_class_entries(artifact))
-        except (OSError, zipfile.BadZipFile) as error:
+            if not oracle_budget_available("artifact_class_inventory"):
+                scan["artifact_entries"] = []
+            else:
+                scan["artifact_entries"] = sorted(_artifact_class_entries(
+                    artifact, time_budget_seconds=remaining_oracle_budget(),
+                ))
+                oracle_budget_available("artifact_class_inventory")
+        except (OSError, TimeoutError, zipfile.BadZipFile) as error:
             scan["complete"] = False
-            scan.setdefault("failures", []).append(f"artifact_class_inventory_failed:{error}")
+            reason = (
+                "artifact_class_inventory:oracle_time_budget_exceeded"
+                if isinstance(error, TimeoutError)
+                else f"artifact_class_inventory_failed:{error}"
+            )
+            scan.setdefault("failures", []).append(reason)
             scan["artifact_entries"] = []
+        scan["provider_nested_jars_by_coord"] = {
+            coord: sorted(entries)
+            for coord, entries in provider_entries_by_coord.items()
+        }
+        scan["provider_nested_jars_by_api_identity"] = {
+            identity: sorted(entries)
+            for identity, entries in provider_entries_by_api_identity.items()
+        }
+        scan = seal_oracle_scan(scan)
         scan, _validation_signal = validate_oracle_scan(scan, expected_sha)
     return reconcile_selected_api_edges(report_dir, selected_rows, analyzer_rows, scan)
 
@@ -4464,6 +5838,9 @@ def build_final_artifact_api_oracle_records(
         return []
     reachability = edge_truth.get("api_reachability") or {}
     records = []
+    trusted_artifact_sha = str(edge_truth.get("trusted_artifact_sha") or "")
+    if not _valid_sha256(trusted_artifact_sha):
+        return records
     for row in selected_rows:
         conclusion = str(reachability.get(serialized_api_identity(row)) or "")
         conclusion = _constant_aware_oracle_conclusion(row, conclusion)
@@ -4471,11 +5848,10 @@ def build_final_artifact_api_oracle_records(
             "reachable", "uncertain", "not_found_in_static_analysis"
         }:
             continue
+        is_class = str(row.get("symbol_kind") or "").strip().lower() == "class"
         evidence_path = Path(str(
             edge_truth.get("class_reference_evidence")
-            if str(row.get("symbol_kind") or "").strip().lower() == "class"
-            else edge_truth.get("oracle_edges")
-            or ""
+            if is_class else edge_truth.get("oracle_edges") or ""
         ))
         try:
             evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
@@ -4490,7 +5866,7 @@ def build_final_artifact_api_oracle_records(
                 )
             },
             "oracle_conclusion": conclusion,
-            "authority": "final-artifact-classfile",
+            "authority": "final-artifact-classfile" if is_class else "jdk-javap",
             "authority_version": "1",
             "procedure": (
                 "SHA-verified final artifact classfile graph; exact target edge; "
@@ -4505,57 +5881,12 @@ def build_final_artifact_api_oracle_records(
             "generated_at": date.today().isoformat(),
             "evidence_mode": "bytecode",
             "conclusion_scope": "static_analysis",
-            **_constant_impact_record(row, conclusion),
-        })
-    return records
-
-
-def build_constant_pool_api_oracle_records(
-    selected_rows: list[dict], edge_truth: dict
-) -> list[dict]:
-    """Produce a second per-member authority from a raw classfile parser."""
-    if not edge_truth.get("complete"):
-        return []
-    evidence_path = Path(str(edge_truth.get("member_reference_evidence") or ""))
-    try:
-        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
-    except OSError:
-        return []
-    reachability = edge_truth.get("member_reference_reachability") or {}
-    records = []
-    for row in selected_rows:
-        if str(row.get("symbol_kind") or "").strip().lower() == "class":
-            continue
-        conclusion = str(reachability.get(serialized_api_identity(row)) or "")
-        conclusion = _constant_aware_oracle_conclusion(row, conclusion)
-        if conclusion not in {
-            "reachable", "uncertain", "not_found_in_static_analysis",
-        }:
-            continue
-        records.append({
-            **{
-                key: str(row.get(key) or "")
-                for key in (
-                    "coord", "api_name", "api_signature", "symbol_kind",
-                    "change_type",
-                )
-            },
-            "oracle_conclusion": conclusion,
-            "authority": "raw-classfile-constant-pool",
-            "authority_version": "1",
-            "procedure": (
-                "independent JVM constant-pool parser; exact owner, member, and descriptor "
-                "reference in the SHA-verified final artifact; compile-time constant absence "
-                "remains uncertain because javac may inline the value"
-                if _is_compile_time_constant_candidate(row)
-                else "independent JVM constant-pool parser; exact owner, member, and "
-                "descriptor reference in the SHA-verified final artifact"
+            "artifact_sha256": trusted_artifact_sha,
+            "capabilities": (
+                "artifact_bound;closed_world_static;metadata_references"
+                if is_class else
+                "artifact_bound;closed_world_static;executable_edges"
             ),
-            "evidence_path": str(evidence_path),
-            "evidence_sha256": evidence_sha256,
-            "generated_at": date.today().isoformat(),
-            "evidence_mode": "bytecode",
-            "conclusion_scope": "static_analysis",
             **_constant_impact_record(row, conclusion),
         })
     return records
@@ -4573,6 +5904,57 @@ def build_jdeps_api_oracle_records(
     except OSError:
         return []
     reachability = edge_truth.get("jdeps_class_reachability") or {}
+    trusted_artifact_sha = str(edge_truth.get("trusted_artifact_sha") or "")
+    if not _valid_sha256(trusted_artifact_sha):
+        return []
+    records = []
+    for row in selected_rows:
+        if str(row.get("symbol_kind") or "").strip().lower() != "class":
+            continue
+        conclusion = str(reachability.get(serialized_api_identity(row)) or "")
+        if conclusion not in {"reachable", "uncertain"}:
+            continue
+        records.append({
+            **{
+                key: str(row.get(key) or "")
+                for key in (
+                    "coord", "api_name", "api_signature", "symbol_kind",
+                    "change_type",
+                )
+            },
+            "oracle_conclusion": conclusion,
+            "authority": "jdk-jdeps",
+            "authority_version": "1",
+            "procedure": (
+                "Positive-only JDK jdeps -verbose:class reference over effective classes "
+                "in every non-target container of the SHA-verified final artifact; absence "
+                "is not authoritative because jdeps omits some annotation metadata"
+            ),
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": evidence_sha256,
+            "generated_at": date.today().isoformat(),
+            "evidence_mode": "bytecode",
+            "artifact_sha256": trusted_artifact_sha,
+            "capabilities": "artifact_bound;metadata_references;positive_only",
+        })
+    return records
+
+
+def build_javap_verbose_api_oracle_records(
+    selected_rows: list[dict], edge_truth: dict
+) -> list[dict]:
+    """Produce a complete class-metadata authority from JDK javap verbose."""
+    if not edge_truth.get("complete"):
+        return []
+    evidence_path = Path(str(edge_truth.get("javap_class_reference_evidence") or ""))
+    try:
+        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    except OSError:
+        return []
+    reachability = edge_truth.get("javap_class_reachability") or {}
+    trusted_artifact_sha = str(edge_truth.get("trusted_artifact_sha") or "")
+    if not _valid_sha256(trusted_artifact_sha):
+        return []
     records = []
     for row in selected_rows:
         if str(row.get("symbol_kind") or "").strip().lower() != "class":
@@ -4591,17 +5973,32 @@ def build_jdeps_api_oracle_records(
                 )
             },
             "oracle_conclusion": conclusion,
-            "authority": "jdk-jdeps",
+            "authority": "jdk-javap-verbose",
             "authority_version": "1",
             "procedure": (
-                "JDK jdeps -verbose:class over effective classes in every non-target "
-                "container of the SHA-verified final artifact"
+                "Exhaustive class-byte candidate inventory followed by exact JDK javap "
+                "-verbose CONSTANT_Class and JVM descriptor confirmation"
             ),
             "evidence_path": str(evidence_path),
             "evidence_sha256": evidence_sha256,
             "generated_at": date.today().isoformat(),
             "evidence_mode": "bytecode",
+            "conclusion_scope": "static_analysis",
+            "artifact_sha256": trusted_artifact_sha,
+            "capabilities": (
+                "artifact_bound;closed_world_static;metadata_references"
+            ),
         })
+    return records
+
+
+def build_automatic_oracle_records(
+    selected_rows: list[dict], edge_truth: dict
+) -> list[dict]:
+    """Build verdict authorities; diagnostic constant-pool candidates are excluded."""
+    records = build_final_artifact_api_oracle_records(selected_rows, edge_truth)
+    records.extend(build_jdeps_api_oracle_records(selected_rows, edge_truth))
+    records.extend(build_javap_verbose_api_oracle_records(selected_rows, edge_truth))
     return records
 
 
@@ -5439,7 +6836,7 @@ def derive_step4_inputs_from_artifacts(
     context_dir = report_dir / "evidence" / "context"
     dependency_dir.mkdir(parents=True, exist_ok=True)
     context_dir.mkdir(parents=True, exist_ok=True)
-    dep_changes = dependency_dir / "s1_dep_changes.csv"
+    dep_changes = dependency_dir / "dep_changes.csv"
     context = context_dir / "s2_context.json"
     base_source = case.base_source_project or case.default_project
     current_source = case.current_source_project or case.default_project
@@ -5456,6 +6853,19 @@ def derive_step4_inputs_from_artifacts(
             f"{side}_ref_resolution_mode": "pinned_real_project_fixture",
             f"{side}_ref_source_status": "user_confirmed_local_source",
             f"{side}_allow_local_source": True,
+        })
+    if case.target_module:
+        project_scope = build_project_scope(
+            current_source,
+            case.target_module,
+            active_profiles=set(case.active_maven_profiles),
+        )
+        pinned_input.update({
+            "target_module": case.target_module,
+            "primary_module": case.target_module,
+            "modules": [case.target_module],
+            "active_maven_profiles": list(case.active_maven_profiles),
+            "project_scope": project_scope,
         })
     (state_dir / "main_state.json").write_text(
         json.dumps({"step1": {"input": pinned_input}}, ensure_ascii=False, indent=2) + "\n",
@@ -5484,6 +6894,10 @@ def derive_step4_inputs_from_artifacts(
         step1_cmd.extend(("--base", case.base_revision))
     if case.current_revision:
         step1_cmd.extend(("--current", case.current_revision))
+    if case.target_module:
+        step1_cmd.extend(("--primary-module", case.target_module))
+    for override in case.manual_coord_overrides:
+        step1_cmd.extend(("--manual-coord-override", override))
     step1 = subprocess.run(
         step1_cmd, cwd=ROOT_DIR, env=step1_env, text=True,
         encoding="utf-8", errors="replace", timeout=900
@@ -5655,6 +7069,100 @@ def run_step5(case: RealProjectCase, project_root: Path, changed_apis: Path, rep
             "command": cmd,
         }, indent=2) + "\n", encoding="utf-8")
         return 124, elapsed
+
+
+def run_step5_cache_equivalence(
+    case: RealProjectCase,
+    project_root: Path,
+    changed_apis: Path,
+    report_dir: Path,
+) -> dict:
+    """Run a cache-cold Step5 and, when gated, prove a warm run is semantic-equivalent."""
+    def clear_result_contract() -> None:
+        call_chain_dir = Path(report_dir) / "evidence" / "call_chain"
+        for path in call_chain_dir.glob("alerts*.csv"):
+            path.unlink(missing_ok=True)
+        (call_chain_dir / "summary.json").unlink(missing_ok=True)
+        shutil.rmtree(call_chain_dir / "by_api", ignore_errors=True)
+        (
+            Path(report_dir) / ".runtime" / "indexes" / "s5_query_index.json"
+        ).unlink(missing_ok=True)
+
+    def result_contract_complete() -> bool:
+        files_complete = all(path.is_file() for path in (
+            Path(report_dir) / "evidence" / "call_chain" / "summary.json",
+            Path(report_dir) / "evidence" / "call_chain" / "alerts.csv",
+            Path(report_dir) / ".runtime" / "indexes" / "s5_query_index.json",
+        ))
+        if not files_complete:
+            return False
+        return not validate_alert_partition_contract(
+            Path(report_dir), load_summary(Path(report_dir))
+        )
+
+    required = bool(case.require_relative_performance_baseline)
+    if required:
+        cache_dir = Path(report_dir) / ".runtime" / "cache"
+        for cache_path in cache_dir.glob("s5_*"):
+            if cache_path.is_dir():
+                shutil.rmtree(cache_path, ignore_errors=True)
+            else:
+                cache_path.unlink(missing_ok=True)
+    clear_result_contract()
+    cold_returncode, cold_elapsed = run_step5(
+        case, project_root, changed_apis, report_dir
+    )
+    result = {
+        "required": required,
+        "passed": cold_returncode == 0,
+        "cold_returncode": cold_returncode,
+        "cold_elapsed_seconds": cold_elapsed,
+        "cold_fingerprint": "",
+        "cold_summary": load_summary(report_dir),
+        "cold_metrics": {},
+        "warm_returncode": None,
+        "warm_elapsed_seconds": None,
+        "warm_fingerprint": "",
+        "errors": [],
+    }
+    if (
+        cold_returncode != 0
+        or not result["cold_summary"]
+        or not result_contract_complete()
+    ):
+        result["passed"] = False
+        result["errors"].append("cold_step5_failed_or_summary_missing")
+        return result
+    result["cold_fingerprint"] = canonical_step5_result_fingerprint(report_dir)
+    if not required:
+        return result
+    try:
+        result["cold_metrics"] = cold_run_metrics(report_dir)
+    except (OSError, ValueError) as error:
+        result["passed"] = False
+        result["errors"].append(
+            f"cold_step5_timing_missing_or_invalid:{type(error).__name__}"
+        )
+        return result
+    clear_result_contract()
+    warm_returncode, warm_elapsed = run_step5(
+        case, project_root, changed_apis, report_dir
+    )
+    result["warm_returncode"] = warm_returncode
+    result["warm_elapsed_seconds"] = warm_elapsed
+    if (
+        warm_returncode != 0
+        or not load_summary(report_dir)
+        or not result_contract_complete()
+    ):
+        result["passed"] = False
+        result["errors"].append("warm_step5_failed_or_summary_missing")
+        return result
+    result["warm_fingerprint"] = canonical_step5_result_fingerprint(report_dir)
+    if result["warm_fingerprint"] != result["cold_fingerprint"]:
+        result["passed"] = False
+        result["errors"].append("cold_warm_semantic_fingerprint_mismatch")
+    return result
 
 
 def run_step6(report_dir: Path) -> dict:
@@ -6433,6 +7941,10 @@ def run_case(
     warnings = []
     if case.run_step4:
         step4_result = run_step4(case, report_dir)
+        if pinned_asset_gate.get("passed"):
+            write_pinned_final_artifact_provenance(
+                report_dir, pinned_asset_gate, case
+            )
         step4_all_changed_apis = Path(step4_result.get("all_changed_apis") or "")
         if step4_result.get("returncode") != 0:
             failures.append(f"step4_returncode={step4_result.get('returncode')}")
@@ -6567,7 +8079,17 @@ def run_case(
         if performance_budget != case.max_elapsed_seconds
         else case
     )
-    returncode, elapsed = run_step5(execution_case, project_root, changed_apis, report_dir)
+    cache_equivalence = run_step5_cache_equivalence(
+        execution_case, project_root, changed_apis, report_dir
+    )
+    returncode = (
+        cache_equivalence.get("warm_returncode")
+        if cache_equivalence.get("warm_returncode") is not None
+        else cache_equivalence.get("cold_returncode")
+    )
+    elapsed = float(cache_equivalence.get("cold_elapsed_seconds") or 0.0)
+    if not cache_equivalence.get("passed"):
+        failures.extend(cache_equivalence.get("errors") or [])
     summary = load_summary(report_dir)
     if returncode != 0 or not summary:
         execution_failures = list(failures)
@@ -6579,6 +8101,20 @@ def run_case(
             execution_failures.append(
                 f"performance: elapsed={elapsed:.2f}s over_budget={performance_budget:.2f}s"
             )
+        execution_signal = make_signal(
+            "step5_execution_failure",
+            "P0",
+            case.name,
+            step="step5",
+            message="Step5 failed or did not produce a complete summary; edge truth audit was skipped",
+            expected="returncode=0 and readable summary.json before edge reconciliation",
+            actual="; ".join(execution_failures),
+            evidence=[
+                report_dir / "evidence" / "quality" / "step5_timeout.json",
+                report_dir / "evidence" / "call_chain" / "summary.json",
+            ],
+            blocking=True,
+        )
         return {
             "case": case.name,
             "status": "failed",
@@ -6589,24 +8125,15 @@ def run_case(
             "elapsed_seconds": round(elapsed, 3),
             "performance_budget_seconds": performance_budget,
             "step5_returncode": returncode,
+            "cache_equivalence": cache_equivalence,
             "summary": summary,
             "failures": execution_failures,
             "warnings": [],
             "project_asset_health": project_asset_health,
             "matrix_policy": real_project_matrix_policy(),
-            "quality_signals": [make_signal(
-                "step5_execution_failure",
-                "P0",
-                case.name,
-                step="step5",
-                message="Step5 failed or did not produce a complete summary; edge truth audit was skipped",
-                expected="returncode=0 and readable summary.json before edge reconciliation",
-                actual="; ".join(execution_failures),
-                evidence=[
-                    report_dir / "evidence" / "quality" / "step5_timeout.json",
-                    report_dir / "evidence" / "call_chain" / "summary.json",
-                ],
-            )],
+            "quality_signals": [execution_signal] + build_cache_equivalence_signals(
+                case, cache_equivalence, report_dir
+            ),
         }
     graph_stats = extract_graph_stats(summary)
     source_shape_metrics = collect_source_shape_metrics(project_root, case.source_shape_patterns)
@@ -6640,8 +8167,7 @@ def run_case(
         failures.append("alerts.csv missing")
     elif alerts_csv.stat().st_size == 0:
         failures.append("alerts.csv empty")
-    if (report_dir / "evidence" / "call_chain" / "alerts_reachable.csv").exists() is False:
-        warnings.append("alerts_reachable.csv missing")
+    failures.extend(validate_alert_partition_contract(report_dir, summary))
 
     result_audit = audit_analysis_outputs(changed_apis, alerts_csv, summary)
     failures.extend(result_audit.get("failures") or [])
@@ -6775,11 +8301,12 @@ def run_case(
     )
     source_conflicts = validate_source_bytecode_conflicts(summary, edge_truth)
     performance_envelope = collect_performance_envelope(
-        summary,
+        cache_equivalence.get("cold_summary") or summary,
         elapsed,
         selected_count,
         oracle_metrics=edge_truth.get("oracle_metrics"),
     )
+    performance_envelope.update(collect_stage_performance(report_dir))
     performance_envelope.update(edge_truth["counts"])
     performance_envelope["fault_injection_detected_count"] = sum(
         1 for run in (fault_injection.get("runs") or []) if run.get("passed")
@@ -6801,9 +8328,10 @@ def run_case(
     effective_ground_truth_status = case.ground_truth_status
     if case.case_mode in {"discovery", "convergence"}:
         oracle_rows = load_oracle_manifest(oracle_manifest or case.oracle_manifest)
-        oracle_rows.extend(build_final_artifact_api_oracle_records(selected_rows, edge_truth))
-        oracle_rows.extend(build_constant_pool_api_oracle_records(selected_rows, edge_truth))
-        oracle_rows.extend(build_jdeps_api_oracle_records(selected_rows, edge_truth))
+        automatic_oracle_rows = build_automatic_oracle_records(
+            selected_rows, edge_truth
+        )
+        oracle_rows.extend(automatic_oracle_rows)
         if case.enable_jdk_oracle:
             try:
                 if case.final_artifact:
@@ -6826,6 +8354,10 @@ def run_case(
             selected_rows,
             load_analyzer_rows(summary),
             oracle_rows,
+            expected_artifact_sha256=str(
+                edge_truth.get("trusted_artifact_sha") or ""
+            ),
+            trusted_capability_records=automatic_oracle_rows,
         )
         oracle_ledger_path = report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"
         write_oracle_ledger(oracle_ledger_path, oracle_audit)
@@ -6873,6 +8405,9 @@ def run_case(
             == "not_found_in_static_analysis"
         ),
     )
+    quality_signals.extend(build_cache_equivalence_signals(
+        case, cache_equivalence, report_dir
+    ))
     quality_signals.extend(build_policy_signals(
         case,
         coverage=coverage,
@@ -6919,6 +8454,7 @@ def run_case(
         "performance_budget_seconds": performance_budget,
         "performance_envelope": performance_envelope,
         "relative_performance": relative_performance,
+        "cache_equivalence": cache_equivalence,
         "fault_injection": fault_injection,
         "constant_evidence": constant_reconciliation,
         "edge_truth": {

@@ -1,5 +1,6 @@
 import sys
 import csv
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import exhaustive_api_oracle as oracle  # noqa: E402
+
+
+EVIDENCE_PATH = Path(__file__).resolve()
+EVIDENCE_SHA256 = hashlib.sha256(EVIDENCE_PATH.read_bytes()).hexdigest()
 
 
 def authority(api_name, signature, conclusion, authority="jdk-javap"):
@@ -21,14 +26,266 @@ def authority(api_name, signature, conclusion, authority="jdk-javap"):
         "authority": authority,
         "authority_version": "21.0.2",
         "procedure": "javap -c -s target/classes",
-        "evidence_path": "evidence/javap.txt",
-        "evidence_sha256": "a" * 64,
+        "evidence_path": str(EVIDENCE_PATH),
+        "evidence_sha256": EVIDENCE_SHA256,
         "generated_at": "2026-07-11T00:00:00Z",
         "evidence_mode": "bytecode",
     }
 
 
 class ExhaustiveApiOracleTest(unittest.TestCase):
+    def test_missing_evidence_file_invalidates_provenance(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+        record = authority("p.A.one", "()", "reachable")
+        record["evidence_path"] = str(EVIDENCE_PATH.with_name("missing-evidence.txt"))
+
+        result = oracle.audit_api_oracle(changed, analyzed, [record])
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["invalid_provenance_count"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_evidence_digest_mismatch_invalidates_provenance(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+        record = authority("p.A.one", "()", "reachable")
+        record["evidence_sha256"] = "a" * 64
+
+        result = oracle.audit_api_oracle(changed, analyzed, [record])
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["invalid_provenance_count"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_invented_authority_names_do_not_satisfy_high_risk_independence(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        records = [
+            authority(
+                "p.A.one", "()", "not_found_in_static_analysis",
+                authority="invented-authority-one",
+            ),
+            authority(
+                "p.A.one", "()", "not_found_in_static_analysis",
+                authority="invented-authority-two",
+            ),
+        ]
+
+        result = oracle.audit_api_oracle(changed, analyzed, records)
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["unverified"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_invented_project_test_authority_cannot_bypass_high_risk_independence(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        record = authority(
+            "p.A.one", "()", "not_found_in_static_analysis",
+            authority="invented-project-runner",
+        )
+        record["evidence_mode"] = "project_test"
+
+        result = oracle.audit_api_oracle(changed, analyzed, [record])
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["unverified"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_one_closed_world_executable_artifact_bound_authority_verifies_static_negative(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        record = authority("p.A.one", "()", "not_found_in_static_analysis")
+        record["capabilities"] = (
+            "artifact_bound;closed_world_static;executable_edges"
+        )
+        record["artifact_sha256"] = "b" * 64
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, [record], expected_artifact_sha256="b" * 64,
+            trusted_capability_records=[record],
+        )
+
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(result["unverified"], 0)
+        self.assertFalse(result["blocking"])
+
+    def test_known_authority_cannot_self_declare_strong_capabilities_from_manifest(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        record = authority("p.A.one", "()", "not_found_in_static_analysis")
+        record["capabilities"] = (
+            "artifact_bound;closed_world_static;executable_edges"
+        )
+        record["artifact_sha256"] = "b" * 64
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, [record], expected_artifact_sha256="b" * 64
+        )
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["unverified"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_strong_capabilities_do_not_apply_to_a_different_artifact(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        record = authority("p.A.one", "()", "not_found_in_static_analysis")
+        record["capabilities"] = (
+            "artifact_bound;closed_world_static;executable_edges"
+        )
+        record["artifact_sha256"] = "a" * 64
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, [record], expected_artifact_sha256="b" * 64
+        )
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["unverified"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_trusted_automatic_positive_record_requires_locked_artifact_sha(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+        record = authority("p.A.one", "()", "reachable")
+        record["capabilities"] = (
+            "artifact_bound;closed_world_static;executable_edges"
+        )
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, [record],
+            expected_artifact_sha256="b" * 64,
+            trusted_capability_records=[record],
+        )
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["invalid_provenance_count"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_unknown_authority_cannot_self_declare_strong_capabilities(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        record = authority(
+            "p.A.one", "()", "not_found_in_static_analysis",
+            authority="invented-closed-world-tool",
+        )
+        record["capabilities"] = (
+            "artifact_bound;closed_world_static;executable_edges"
+        )
+
+        result = oracle.audit_api_oracle(changed, analyzed, [record])
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["unverified"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_two_recognized_weaker_tool_families_verify_static_negative(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        records = [
+            authority("p.A.one", "()", "not_found_in_static_analysis"),
+            authority(
+                "p.A.one", "()", "not_found_in_static_analysis",
+                authority="final-artifact-classfile",
+            ),
+        ]
+        for record in records:
+            record["capabilities"] = "artifact_bound;closed_world_static"
+            record["artifact_sha256"] = "b" * 64
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, records,
+            expected_artifact_sha256="b" * 64,
+            trusted_capability_records=records,
+        )
+
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(result["unverified"], 0)
+        self.assertFalse(result["blocking"])
+
+    def test_two_known_authority_names_from_manifest_are_not_trusted_independence(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        records = [
+            authority("p.A.one", "()", "not_found_in_static_analysis"),
+            authority(
+                "p.A.one", "()", "not_found_in_static_analysis",
+                authority="final-artifact-classfile",
+            ),
+        ]
+        for record in records:
+            record["capabilities"] = "artifact_bound;closed_world_static"
+            record["artifact_sha256"] = "b" * 64
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, records, expected_artifact_sha256="b" * 64
+        )
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["unverified"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_two_trusted_weaker_tools_reject_one_artifact_sha_mismatch(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "HIGH",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "not_found_in_static_analysis"}]
+        records = [
+            authority("p.A.one", "()", "not_found_in_static_analysis"),
+            authority(
+                "p.A.one", "()", "not_found_in_static_analysis",
+                authority="final-artifact-classfile",
+            ),
+        ]
+        for record, digest in zip(records, ("b" * 64, "c" * 64)):
+            record["capabilities"] = "artifact_bound;closed_world_static"
+            record["artifact_sha256"] = digest
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, records,
+            expected_artifact_sha256="b" * 64,
+            trusted_capability_records=records,
+        )
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["unverified"], 1)
+        self.assertTrue(result["blocking"])
+
     def test_canonical_identity_includes_owner_signature_and_kind(self):
         row = {
             "coord": "g:a", "api_name": "p.Owner.call",
@@ -231,6 +488,22 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
 
         self.assertEqual(result["unverified"], 1)
         self.assertEqual(result["ledger"][0]["verdict"], "unverified")
+
+    def test_conservative_uncertain_conclusion_accepts_one_executable_authority(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method", "severity": "P0",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "uncertain"}]
+        records = [authority(
+            "p.A.one", "()", "uncertain", authority="final-artifact-classfile"
+        )]
+
+        result = oracle.audit_api_oracle(changed, analyzed, records)
+
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(result["unverified"], 0)
+        self.assertEqual(result["ledger"][0]["verdict"], "correct")
 
     def test_uncertain_authority_does_not_count_as_support_for_negative_conclusion(self):
         changed = [{

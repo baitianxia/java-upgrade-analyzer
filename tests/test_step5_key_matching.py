@@ -19176,6 +19176,95 @@ public class com.example.consumer.Adapter {
             tracer.ModuleScope.INTERNAL_MODULE,
         )
 
+    def test_packaged_application_owned_class_hit_uses_verified_framework_entry(self):
+        result = tracer.TraceResult(
+            api_name="com.example.LibraryApi", api_simple="LibraryApi",
+            api_signature="", symbol_kind="class", change_type="SIGNATURE_CHANGED",
+            coord="com.example:library", severity="P1", confirmed=True,
+            source="classfile_contract", analysis_scope="class_usage",
+            analysis_status="not_analyzed", direct_callers=0,
+            is_reachable=False, reachable_note="", business_reach_depth=0,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[],
+            reason_code="", verification_commands=[], hops=[],
+            confidence_score=1.0, critical_nodes_hit=[],
+        )
+        hit = {
+            "coord": "com.example:library",
+            "application_owned": True,
+            "edge_role": "internal_bridge",
+            "class_fqcn": "com.example.RegisteredService",
+            "consumer_method": "<class-constant>",
+            "consumer_signature": "",
+            "target_display": "com.example.LibraryApi",
+            "evidence_type": "bytecode_class_constant_reference",
+            "jar_path": "app.jar!/BOOT-INF/lib/library.jar",
+        }
+        graph = SimpleNamespace(framework_runtime_entry_classes={
+            "com.example.RegisteredService": [{
+                "source": "framework:spring-autoconfiguration",
+                "target": "com.example.RegisteredService",
+                "edge_kind": "spring_runtime_autoconfiguration_registration",
+                "confidence": "high",
+                "activation_verified": True,
+                "provenance": {
+                    "coord": "com.example:library",
+                    "jar": "app.jar!/BOOT-INF/lib/library.jar",
+                    "artifact_sha256": "a" * 64,
+                    "resource": (
+                        "META-INF/spring/org.springframework.boot.autoconfigure."
+                        "AutoConfiguration.imports"
+                    ),
+                    "business_activation": [{
+                        "business_entry": "com.example.Application.main",
+                    }],
+                },
+            }],
+        })
+
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit], graph)
+        built = tracer._finalize_trace_draft(draft)
+
+        self.assertEqual(built.analysis_status, "reachable")
+        self.assertTrue(built.is_reachable)
+        self.assertIn("com.example.Application.main", built.call_paths[1])
+        self.assertEqual(
+            built.path_details[1]["stop_reason"],
+            "RUNTIME_FRAMEWORK_ENTRY_REACHED",
+        )
+
+    def test_external_provider_same_owner_field_access_is_not_project_usage(self):
+        result = tracer.TraceResult(
+            api_name="vendor.Settings.enabled", api_simple="enabled",
+            api_signature="", symbol_kind="field", change_type="DATA_FIELD_ADDED",
+            coord="vendor:api", severity="P1", confirmed=True,
+            source="classfile_contract", analysis_scope="field",
+            analysis_status="not_analyzed", direct_callers=0,
+            is_reachable=False, reachable_note="", business_reach_depth=0,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[],
+            reason_code="", verification_commands=[], hops=[],
+            confidence_score=1.0, critical_nodes_hit=[],
+        )
+        hit = {
+            "coord": "vendor:api",
+            "application_owned": False,
+            "edge_role": "internal_bridge",
+            "class_fqcn": "vendor.Settings",
+            "consumer_method": "enabled",
+            "consumer_signature": "()",
+            "target_display": "vendor.Settings.enabled",
+            "evidence_type": "bytecode_field_access",
+            "jar_path": "/tmp/vendor-api.jar",
+        }
+
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit])
+        built = tracer._finalize_trace_draft(draft)
+
+        self.assertEqual(built.analysis_status, "not_found_in_static_analysis")
+        self.assertEqual(built.call_paths, [])
+        self.assertEqual(built.evidence_paths, [])
+
     def test_packaged_weak_class_constant_in_business_code_is_not_reachable(self):
         result = tracer.TraceResult(
             api_name="com.vendor.TargetType", api_simple="TargetType",

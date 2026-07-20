@@ -2095,6 +2095,62 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual(result.framework_activation_linked_methods, 0)
         self.assertNotIn(callback.declared_qualified_key, graph.reverse_edges)
 
+    def test_verified_spring_autoconfiguration_projects_class_runtime_entry(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        business_jar = Path(temp_dir.name) / "application.jar"
+        framework_jar = Path(temp_dir.name) / "library.jar"
+        business_entry = "BOOT-INF/classes/com/acme/Application.class"
+        resource_entry = (
+            "META-INF/spring/org.springframework.boot.autoconfigure."
+            "AutoConfiguration.imports"
+        )
+        with zipfile.ZipFile(business_jar, "w") as archive:
+            archive.writestr(business_entry, b"business-class")
+        with zipfile.ZipFile(framework_jar, "w") as archive:
+            archive.writestr(resource_entry, "com.acme.RegisteredService\n")
+        business_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+        framework_sha = hashlib.sha256(framework_jar.read_bytes()).hexdigest()
+        target = "com.acme.RegisteredService"
+        edge = self._framework_edge(
+            "spring_runtime_autoconfiguration_registration",
+            target=target,
+            metadata=(
+                ("framework_source", "framework:spring-autoconfiguration"),
+                ("framework_target", target),
+                ("runtime_activation", "conditional"),
+                ("framework_provenance", {
+                    "jar": str(framework_jar),
+                    "artifact_entry": resource_entry,
+                    "artifact_sha256": framework_sha,
+                    "resource": resource_entry,
+                    "business_activation": [{
+                        "business_entry": "com.acme.Application.main",
+                        "artifact_path": str(business_jar),
+                        "artifact_entry": business_entry,
+                        "artifact_sha256": business_sha,
+                        "authority": "current_final_artifact_classfile",
+                    }],
+                }),
+            ),
+        )
+        graph = SimpleNamespace(
+            methods_by_id={}, reverse_edges={},
+            require_current_final_artifact_business_edges=True,
+        )
+
+        result = ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_runtime_artifact", version="1", edges=(edge,),
+        ),))
+
+        self.assertEqual(result.runtime_framework_entry_classes, 1)
+        self.assertIn(target, graph.framework_runtime_entry_classes)
+        projected = graph.framework_runtime_entry_classes[target][0]
+        self.assertTrue(projected["activation_verified"])
+        self.assertEqual(
+            projected["provenance"]["artifact_sha256"], framework_sha,
+        )
+
     def test_runtime_callback_verified_activation_carries_traceable_composite_provenance(self):
         from confidence_weighted_tracer import _edge_allowed_for_trace
 

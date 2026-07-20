@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +19,67 @@ from pipeline_constants import STEP1_ARTIFACTS_DIRNAME  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
+    def test_explicit_profile_is_used_even_when_target_module_is_unprofiled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pom.xml").write_text(
+                "<project><modelVersion>4.0.0</modelVersion>"
+                "<groupId>com.acme</groupId><artifactId>parent</artifactId>"
+                "<version>1</version><packaging>pom</packaging>"
+                "<modules><module>app</module></modules>"
+                "<profiles><profile><id>prod</id></profile></profiles></project>",
+                encoding="utf-8",
+            )
+            commands = []
+            with patch.object(
+                s1_dep_diff, "run_cmd",
+                side_effect=lambda cmd, **_kwargs: (
+                    commands.append(cmd) or "[INFO] com.acme:common:jar:1:runtime\n",
+                    "", 0,
+                ),
+            ):
+                s1_dep_diff.collect_runtime_deps_for_workspace(
+                    root,
+                    primary_module="app",
+                    active_maven_profiles=["prod"],
+                )
+
+        self.assertIn("-Pprod", commands[0])
+
+    def test_dependency_enrichment_activates_profile_that_owns_target_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pom.xml").write_text(
+                "<project><modelVersion>4.0.0</modelVersion>"
+                "<groupId>com.acme</groupId><artifactId>parent</artifactId>"
+                "<version>1</version><packaging>pom</packaging>"
+                "<profiles><profile><id>boot</id><modules>"
+                "<module>app</module>"
+                "</modules></profile></profiles>"
+                "</project>",
+                encoding="utf-8",
+            )
+            (root / "app").mkdir()
+            (root / "app/pom.xml").write_text(
+                "<project><modelVersion>4.0.0</modelVersion>"
+                "<artifactId>app</artifactId></project>",
+                encoding="utf-8",
+            )
+            commands = []
+
+            def fake_run(cmd, **_kwargs):
+                commands.append(cmd)
+                return "[INFO] com.acme:common:jar:1:runtime\n", "", 0
+
+            with patch.object(s1_dep_diff, "run_cmd", side_effect=fake_run):
+                s1_dep_diff.collect_runtime_deps_for_workspace(
+                    root, primary_module="app"
+                )
+
+        self.assertIn("-Pboot", commands[0])
+        self.assertIn("-pl", commands[0])
+        self.assertEqual(commands[0][commands[0].index("-pl") + 1], "app")
+
     def test_reactor_dependency_enrichment_packages_modules_before_listing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -103,6 +165,119 @@ class Step1PackagedDepsTest(unittest.TestCase):
             for name, content in entries:
                 nested.writestr(name, content)
         return buffer.getvalue()
+
+    def test_duplicate_embedded_maven_metadata_with_same_gav_is_collapsed(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            nested_bytes = self._nested_jar_bytes([
+                (
+                    "META-INF/maven/org.example/demo/pom.properties",
+                    "# first\ngroupId=org.example\nartifactId=demo\nversion=1.0\n",
+                ),
+                (
+                    "META-INF/maven/org.example/demo/pom.properties",
+                    "# repackaged\ngroupId=org.example\nartifactId=demo\nversion=1.0\n",
+                ),
+            ])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr("BOOT-INF/lib/demo-1.0.jar", nested_bytes)
+
+            rows = s1_dep_diff._inspect_packaged_archive(artifact)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coord"], "org.example:demo")
+        self.assertEqual(rows[0]["version"], "1.0")
+        self.assertEqual(rows[0]["metadata_anomalies"], [])
+
+    def test_conflicting_duplicate_maven_metadata_is_reconciled_by_filename(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            nested_bytes = self._nested_jar_bytes([
+                (
+                    "META-INF/maven/org.example/demo/pom.properties",
+                    "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+                ),
+                (
+                    "META-INF/maven/org.example/demo/pom.properties",
+                    "groupId=org.example\nartifactId=demo\nversion=2.0\n",
+                ),
+            ])
+
+        row = s1_dep_diff._extract_packaged_dep_from_nested_jar(
+            nested_bytes, "BOOT-INF/lib/demo-2.0.jar"
+        )
+
+        self.assertEqual(row["coord"], "org.example:demo")
+        self.assertEqual(row["version"], "2.0")
+        self.assertEqual(row["match_source"], "embedded-pom-filename-match")
+        self.assertTrue(any(
+            item.startswith("maven_metadata_coordinate_conflict:")
+            for item in row["metadata_anomalies"]
+        ), row["metadata_anomalies"])
+        entries, _resolved, unresolved = s1_dep_diff._enrich_packaged_deps_with_runtime(
+            [row], {}
+        )
+        self.assertEqual(unresolved, [])
+        self.assertIn("metadata_anomalies=", entries[0]["remark"])
+
+    def test_step1_does_not_read_unrelated_nested_class_payloads(self):
+        class_payload = b"step1-must-not-read-this-class"
+        nested = bytearray(self._nested_jar_bytes([
+            (
+                "META-INF/maven/org.example/demo/pom.properties",
+                "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+            ),
+            ("org/example/Broken.class", class_payload),
+        ]))
+        nested[nested.index(class_payload)] ^= 0x01
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr("BOOT-INF/lib/demo-1.0.jar", bytes(nested))
+
+            rows = s1_dep_diff._inspect_packaged_archive(artifact)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coord"], "org.example:demo")
+
+    def test_step1_dependency_inventory_has_no_nested_entry_count_gate(self):
+        nested_buffer = io.BytesIO()
+        with zipfile.ZipFile(nested_buffer, "w", compression=zipfile.ZIP_STORED) as nested:
+            nested.writestr(
+                "META-INF/maven/org.example/demo/pom.properties",
+                "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+            )
+            for index in range(100_001):
+                nested.writestr(f"org/example/generated/C{index}.class", b"")
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_STORED) as outer:
+                outer.writestr("BOOT-INF/lib/demo-1.0.jar", nested_buffer.getvalue())
+
+            rows = s1_dep_diff._inspect_packaged_archive(artifact)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coord"], "org.example:demo")
+
+    def test_step1_rejects_duplicate_outer_dependency_paths(self):
+        nested = self._nested_jar_bytes([])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(artifact, "w") as outer:
+                    outer.writestr("BOOT-INF/lib/demo-1.0.jar", nested)
+                    outer.writestr("BOOT-INF/lib/demo-1.0.jar", nested)
+
+            result = s1_dep_diff._scan_packaged_archive(artifact)
+
+        self.assertFalse(result.complete)
+        self.assertTrue(any(
+            item.get("error") == "ARCHIVE_DUPLICATE_DEPENDENCY_ENTRY"
+            for item in result.failures
+        ), result.failures)
 
     def test_retain_artifact_for_analysis_preserves_exact_bytes_and_updates_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -443,7 +618,8 @@ class Step1PackagedDepsTest(unittest.TestCase):
             original_read = zipfile.ZipFile.read
 
             def fail_embedded_metadata_read(zf, name, *args, **kwargs):
-                if str(name).endswith("/pom.properties"):
+                logical_name = getattr(name, "filename", str(name))
+                if logical_name.endswith("/pom.properties"):
                     raise OSError("metadata read failed")
                 return original_read(zf, name, *args, **kwargs)
 
@@ -487,6 +663,68 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(row["artifact_id"], "demo-lib")
         self.assertEqual(row["version"], "1.2.3")
         self.assertEqual(row["read_error"], "")
+
+    def test_embedded_pom_selection_matches_outer_jar_filename(self):
+        nested_bytes = self._nested_jar_bytes([
+            (
+                "META-INF/maven/org.glassfish.jaxb/jaxb-runtime/pom.properties",
+                "groupId=org.glassfish.jaxb\n"
+                "artifactId=jaxb-runtime\nversion=4.0.6\n",
+            ),
+            (
+                "META-INF/maven/com.sun.xml.bind/jaxb-impl/pom.properties",
+                "groupId=com.sun.xml.bind\n"
+                "artifactId=jaxb-impl\nversion=4.0.6\n",
+            ),
+        ])
+
+        row = s1_dep_diff._extract_packaged_dep_from_nested_jar(
+            nested_bytes,
+            "BOOT-INF/lib/jaxb-impl-4.0.6.jar",
+        )
+
+        self.assertEqual(row["coord"], "com.sun.xml.bind:jaxb-impl")
+        self.assertEqual(row["artifact_id"], "jaxb-impl")
+        self.assertEqual(row["version"], "4.0.6")
+        self.assertEqual(row["match_source"], "embedded-pom-filename-match")
+
+    def test_embedded_pom_selection_defers_unmatched_identity_to_runtime_metadata(self):
+        nested_bytes = self._nested_jar_bytes([
+            (
+                "META-INF/maven/org.example/first/pom.properties",
+                "groupId=org.example\nartifactId=first\nversion=1.0.0\n",
+            ),
+            (
+                "META-INF/maven/org.example/second/pom.properties",
+                "groupId=org.example\nartifactId=second\nversion=1.0.0\n",
+            ),
+        ])
+
+        row = s1_dep_diff._extract_packaged_dep_from_nested_jar(
+            nested_bytes,
+            "BOOT-INF/lib/unrelated-name-1.0.0.jar",
+        )
+
+        self.assertEqual(row["coord"], "")
+        self.assertEqual(row["artifact_id"], "unrelated-name")
+        self.assertEqual(row["match_source"], "filename")
+        self.assertEqual(row["read_error"], "")
+
+        _, resolved, unresolved = s1_dep_diff._enrich_packaged_deps_with_runtime(
+            [row],
+            {
+                "org.example:first": {
+                    "group_id": "org.example", "artifact_id": "first", "version": "1.0.0",
+                },
+                "org.example:second": {
+                    "group_id": "org.example", "artifact_id": "second", "version": "1.0.0",
+                },
+            },
+        )
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0]["artifact_id"], "unrelated-name")
 
     def test_packaged_archive_reports_archive_bytes_and_nested_entry_count(self):
         with tempfile.TemporaryDirectory() as tmp:

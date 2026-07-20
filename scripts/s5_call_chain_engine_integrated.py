@@ -1461,6 +1461,7 @@ def _step5_integrated_main_impl(args):
             'unmatched_callback_edges',
             'framework_entry_methods',
             'runtime_framework_entry_methods',
+            'runtime_framework_entry_classes',
             'framework_activation_linked_methods',
             'framework_proxy_dispatch_edges',
             'framework_mybatis_proxy_dispatch_edges',
@@ -1856,7 +1857,9 @@ def _maven_coordinates_from_archive(archive):
     return sorted(set(coordinates))
 
 
-def _recover_reactor_module_coords(business_source_dirs, artifact_path):
+def _recover_reactor_module_coords(
+    business_source_dirs, artifact_path, *, active_profiles=None,
+):
     source_paths = [
         Path(value).resolve() for value in (business_source_dirs or [])
         if str(value or '').strip()
@@ -1885,14 +1888,18 @@ def _recover_reactor_module_coords(business_source_dirs, artifact_path):
 
     recovered_scopes = []
     for candidate in sorted(candidate_roots, key=lambda path: len(path.parts), reverse=True):
-        discovery = discover_maven_modules(candidate)
+        discovery = discover_maven_modules(
+            candidate, active_profiles=active_profiles
+        )
         reactor_coords = {
             str(item.get('coord') or '').strip()
             for item in discovery.get('modules') or []
             if str(item.get('coord') or '').strip()
         }
         for target_coord in sorted(artifact_coords & reactor_coords):
-            scope = build_project_scope(candidate, target_coord)
+            scope = build_project_scope(
+                candidate, target_coord, active_profiles=active_profiles
+            )
             included = {
                 str(item).strip()
                 for item in scope.get('included_module_coords') or []
@@ -1915,18 +1922,32 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
         'target_jdk': '',
     }
     application_module_coords = set()
+    active_maven_profiles = set()
     state_path = _state_path(report_dir)
     if state_path.is_file():
         try:
             state_payload = json.loads(state_path.read_text(encoding='utf-8'))
             for step in ('step5', 'step4', 'step3', 'step2', 'step1'):
                 section = state_payload.get(step) or {}
-                for view in ('input', 'output', 'derived'):
-                    scope = (section.get(view) or {}).get('project_scope') or {}
-                    application_module_coords.update(
-                        str(item).strip() for item in scope.get('included_module_coords') or []
-                        if str(item).strip()
+                state_view = section.get('input') or {}
+                scope = state_view.get('project_scope') or {}
+                if not scope:
+                    continue
+                application_module_coords = {
+                    str(item).strip()
+                    for item in scope.get('included_module_coords') or []
+                    if str(item).strip()
+                }
+                active_maven_profiles = {
+                    str(item).strip()
+                    for item in (
+                        state_view.get('active_maven_profiles')
+                        or scope.get('active_maven_profiles')
+                        or []
                     )
+                    if str(item).strip()
+                }
+                break
         except (OSError, json.JSONDecodeError, AttributeError):
             catalog['reason_codes'].append('project_scope_unreadable')
     context_path = str(_context_path(report_dir))
@@ -1986,6 +2007,7 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
                 _recover_reactor_module_coords(
                     business_source_dirs,
                     artifact_path,
+                    active_profiles=active_maven_profiles,
                 )
             )
 
@@ -2166,20 +2188,21 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
 
 
 def runtime_business_class_index(runtime_dependency_catalog):
-    """Return the classes physically packaged as application code, or None if unknown."""
+    """Return only classes packaged at the executable application's entry boundary."""
     business_item = ((runtime_dependency_catalog or {}).get('by_coord') or {}).get('__business__') or {}
     jar_path = str(business_item.get('jar_path') or '').strip()
     if not jar_path or not os.path.isfile(jar_path):
         return None
+    classes = set()
     try:
         with zipfile.ZipFile(jar_path) as jar:
-            classes = {
+            classes.update(
                 entry[:-6].replace('/', '.')
                 for entry in jar.namelist()
                 if entry.endswith('.class')
                 and not entry.startswith('META-INF/')
                 and not entry.endswith('module-info.class')
-            }
+            )
     except (OSError, zipfile.BadZipFile):
         return None
     return classes

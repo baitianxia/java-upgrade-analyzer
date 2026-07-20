@@ -1,0 +1,117 @@
+{
+  "schema": "java-upgrade-analyzer.real-project-discovery.v1",
+  "case": "pig-v4-full-artifact-discovery",
+  "repository": "pig-mesh/pig",
+  "base_revision": "7197ec39e16e45f35ef8b47d381f2c833eaf66ed",
+  "current_revision": "f4e5a3a4b902dc00c192b878d7587cec93698803",
+  "git_revision": "f4e5a3a4b902dc00c192b878d7587cec93698803",
+  "base_artifact": "pig-boot/target/pig-boot.jar",
+  "base_artifact_sha256": "3b0dfd807b3c8f811453e9c43078624f213c98d8169d23f323e980cd43fe2f06",
+  "current_artifact": "pig-boot/target/pig-boot.jar",
+  "current_artifact_sha256": "47c3b267c75fa41c382d4d540dcb22a15086e471793d563e793b2988c642dfd0",
+  "artifact_sha256": "47c3b267c75fa41c382d4d540dcb22a15086e471793d563e793b2988c642dfd0",
+  "materialization": {
+    "kind": "source_build",
+    "repository_url": "https://github.com/pig-mesh/pig.git",
+    "working_directory": ".",
+    "command": ["mvn", "-q", "-Pboot", "-pl", "pig-boot", "-am", "-DskipTests", "package"],
+    "artifacts": [
+      {
+        "revision": "7197ec39e16e45f35ef8b47d381f2c833eaf66ed",
+        "artifact_path": "pig-boot/target/pig-boot.jar",
+        "artifact_sha256": "3b0dfd807b3c8f811453e9c43078624f213c98d8169d23f323e980cd43fe2f06"
+      },
+      {
+        "revision": "f4e5a3a4b902dc00c192b878d7587cec93698803",
+        "artifact_path": "pig-boot/target/pig-boot.jar",
+        "artifact_sha256": "47c3b267c75fa41c382d4d540dcb22a15086e471793d563e793b2988c642dfd0"
+      }
+    ]
+  },
+  "population_contract": {
+    "step1_changed_dependencies": 362,
+    "step4_logical_dependencies": 24,
+    "step4_changed_apis": 804,
+    "step5_selected_apis": 804,
+    "step5_accounted_apis": 804
+  },
+  "expected_conclusions": {
+    "reachable": 0,
+    "uncertain": 24,
+    "not_found_in_static_analysis": 780,
+    "not_analyzed": 0
+  },
+  "oracle_contract": {
+    "verified_apis": 804,
+    "incorrect": 0,
+    "unverified": 0,
+    "oracle_conflicts": 0,
+    "analyzer_edges": 4,
+    "oracle_edges": 4,
+    "reconciled_correct_rows": 8
+  },
+  "required_topologies": [
+    "cross_jar_bridge",
+    "field_access",
+    "overloaded_method",
+    "same_jar_bridge",
+    "virtual_dispatch"
+  ],
+  "required_fault_injections": [
+    "drop_analyzer_edge",
+    "add_analyzer_edge",
+    "wrong_analyzer_descriptor",
+    "corrupt_oracle_digest",
+    "truncate_oracle_scan"
+  ],
+  "performance_baseline": {
+    "git_revision": "f4e5a3a4b902dc00c192b878d7587cec93698803",
+    "artifact_sha256": "47c3b267c75fa41c382d4d540dcb22a15086e471793d563e793b2988c642dfd0",
+    "scope": {
+      "selected_api_count": 804,
+      "accounted_api_count": 804,
+      "artifact_count": 362,
+      "class_count": 89609,
+      "analyzer_edge_count": 4,
+      "oracle_edge_count": 4,
+      "fault_injection_detected_count": 5
+    },
+    "metrics": {
+      "step1_elapsed_seconds": {"value": 36.02, "max_ratio": 1.5},
+      "step4_elapsed_seconds": {"value": 116.68, "max_ratio": 1.5},
+      "elapsed_seconds_per_api": {"value": 0.221, "max_ratio": 1.5},
+      "scan_seconds_per_1000_classes": {"value": 0.464, "max_ratio": 1.5},
+      "max_api_elapsed_seconds": {"value": 5.673, "max_ratio": 1.5},
+      "javap_invocations": {"value": 422, "max_ratio": 1.25},
+      "javap_class_invocations": {"value": 374, "max_absolute": 374},
+      "javap_class_elapsed_seconds": {"value": 107.801, "max_ratio": 1.5},
+      "jdeps_invocations": {"value": 0, "max_absolute": 0},
+      "jdeps_elapsed_seconds": {"value": 0, "max_absolute": 0},
+      "duplicate_jar_scans": {"value": 0, "max_absolute": 0},
+      "duplicate_class_scans": {"value": 0, "max_absolute": 0},
+      "peak_rss_mb": {"value": 1404.4, "max_ratio": 1.25}
+    }
+  },
+  "findings": [
+    "fat_jar_entry_budget",
+    "profile_owned_target_module",
+    "embedded_pom_identity",
+    "application_owned_nested_modules",
+    "canonical_step1_artifact_contract",
+    "weak_class_metadata_evidence",
+    "package_annotation_metadata",
+    "per_api_provider_exclusion",
+    "duplicate_class_provider_inventory",
+    "nested_class_identity",
+    "self_owner_class_reference",
+    "positive_only_jdeps_fallback",
+    "complete_javap_verbose_class_oracle",
+    "target_provider_self_reference_exclusion",
+    "same_coordinate_external_provider_internal_bridge",
+    "oracle_symbol_kind_opcode_validation",
+    "oracle_component_artifact_identity",
+    "runtime_closure_exclusion_cache_identity",
+    "reflection_field_opcode_semantics",
+    "alert_partition_shard_reconciliation"
+  ]
+}

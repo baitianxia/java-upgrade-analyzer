@@ -32,7 +32,7 @@ from analysis_contract import (
     project_scope_provenance_fields,
     sha256_file,
 )
-from artifact_safety import inspect_archive
+from artifact_safety import _unsafe_entry_name
 from pipeline_constants import STEP1_ARTIFACTS_DIRNAME
 from step1_observability import Step1Observer
 from step1_ref_resolution import resolve_step1_ref
@@ -43,8 +43,11 @@ STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
 NESTED_JAR_SPOOL_MAX_MEMORY_BYTES = 8 * 1024 * 1024
 NESTED_JAR_COPY_CHUNK_BYTES = 1024 * 1024
-PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION = 2
+PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION = 3
 PACKAGED_INVENTORY_CACHE_DIRNAME = 'step1_packaged_inventory'
+STEP1_MAX_DEPENDENCY_JAR_BYTES = 1024 * 1024 * 1024
+STEP1_MAX_TOTAL_DEPENDENCY_BYTES = 2 * 1024 * 1024 * 1024
+STEP1_MAX_DEPENDENCY_EXPANSION_RATIO = 200
 
 
 def _observed_phase(observer, phase, **kwargs):
@@ -1332,6 +1335,7 @@ def _classifier_from_filename(name, artifact_id, version):
 
 
 def _runtime_candidate_filename_stems(item):
+    group_id = str(item.get('group_id') or '').strip()
     artifact_id = str(item.get('artifact_id') or '').strip()
     version = str(item.get('version') or '').strip()
     classifier = str(item.get('classifier') or '').strip()
@@ -1340,6 +1344,8 @@ def _runtime_candidate_filename_stems(item):
     stems = {
         f"{artifact_id}-{version}",
     }
+    if group_id:
+        stems.add(f"{group_id}-{artifact_id}-{version}")
     if classifier:
         stems.add(f"{artifact_id}-{classifier}-{version}")
         stems.add(f"{artifact_id}-{version}-{classifier}")
@@ -1372,6 +1378,7 @@ def _build_packaged_entry(entry_name):
         'match_source': '',
         'resolution_status': 'resolved',
         'read_error': '',
+        'metadata_anomalies': [],
     }
 
 
@@ -1386,15 +1393,19 @@ def _is_ignorable_packaging_support_dep(entry):
 def _extract_packaged_dep_from_nested_jar_source(source, entry_name, content_sha256):
     entry = _build_packaged_entry(entry_name)
     entry['content_sha256'] = str(content_sha256 or '')
+    candidates = []
+    metadata_errors = []
     try:
         with zipfile.ZipFile(source) as nested_zip:
-            for nested_name in nested_zip.namelist():
+            metadata_identities = defaultdict(set)
+            for nested_info in nested_zip.infolist():
+                nested_name = nested_info.filename
                 if not nested_name.startswith('META-INF/maven/') or not nested_name.endswith('/pom.properties'):
                     continue
                 try:
-                    props_text = nested_zip.read(nested_name).decode('utf-8', errors='replace')
+                    props_text = nested_zip.read(nested_info).decode('utf-8', errors='replace')
                 except Exception as exc:
-                    entry['read_error'] = (
+                    metadata_errors.append(
                         f"metadata_read_error:{nested_name}:"
                         f"{exc.__class__.__name__}:{exc}"
                     )
@@ -1405,10 +1416,12 @@ def _extract_packaged_dep_from_nested_jar_source(source, entry_name, content_sha
                 version = (props.get('version') or '').strip()
                 if artifact_id and version:
                     classifier = _classifier_from_filename(entry_name, artifact_id, version)
+                    identity = (group_id, artifact_id, version, classifier)
+                    metadata_identities[nested_name].add(identity)
                     coord = f"{group_id}:{artifact_id}" if group_id else ''
                     if coord and classifier:
                         coord = f"{coord}:{classifier}"
-                    entry.update({
+                    candidates.append({
                         'coord': coord,
                         'group_id': group_id,
                         'artifact_id': artifact_id,
@@ -1416,11 +1429,22 @@ def _extract_packaged_dep_from_nested_jar_source(source, entry_name, content_sha
                         'classifier': classifier,
                         'match_source': 'embedded-pom',
                     })
-                    return entry
+            for nested_name, identities in sorted(metadata_identities.items()):
+                if len(identities) <= 1:
+                    continue
+                declarations = '|'.join(
+                    ':'.join(identity) for identity in sorted(identities)
+                )
+                entry['metadata_anomalies'].append(
+                    f"maven_metadata_coordinate_conflict:{nested_name}:{declarations}"
+                )
     except zipfile.BadZipFile as exc:
         entry['read_error'] = f"bad_nested_zip:{exc}"
     except Exception as exc:
         entry['read_error'] = f"nested_zip_error:{exc}"
+
+    if metadata_errors:
+        entry['read_error'] = ';'.join(metadata_errors)
 
     if entry['read_error']:
         entry.update({
@@ -1428,6 +1452,34 @@ def _extract_packaged_dep_from_nested_jar_source(source, entry_name, content_sha
             'resolution_status': 'unresolved',
         })
         return entry
+
+    distinct_candidates = {}
+    for candidate in candidates:
+        identity = (
+            candidate['group_id'], candidate['artifact_id'],
+            candidate['version'], candidate['classifier'],
+        )
+        distinct_candidates.setdefault(identity, candidate)
+    candidates = list(distinct_candidates.values())
+
+    if len(candidates) == 1:
+        entry.update(candidates[0])
+        return entry
+
+    if candidates:
+        filename_stem = _filename_stem(entry_name)
+        matches = [
+            candidate for candidate in candidates
+            if filename_stem in _runtime_candidate_filename_stems(candidate)
+        ]
+        if len(matches) == 1:
+            entry.update(matches[0])
+            entry['match_source'] = 'embedded-pom-filename-match'
+            return entry
+
+        # Shaded/aggregate JARs may contain only dependency POMs. Keep their
+        # owner coordinate empty and let the independently resolved Maven
+        # runtime inventory perform the unique filename match below.
 
     stem = _filename_stem(entry_name)
     artifact_id, version = _parse_artifact_version_from_filename(entry_name)
@@ -1446,14 +1498,14 @@ def _extract_packaged_dep_from_nested_jar(blob, entry_name):
     )
 
 
-def _stream_nested_jar_to_spool(outer_zip, entry_name):
+def _stream_nested_jar_to_spool(outer_zip, entry):
     digest = hashlib.sha256()
     spool = tempfile.SpooledTemporaryFile(
         max_size=NESTED_JAR_SPOOL_MAX_MEMORY_BYTES,
         mode='w+b',
     )
     try:
-        with outer_zip.open(entry_name, 'r') as source:
+        with outer_zip.open(entry, 'r') as source:
             while True:
                 chunk = source.read(NESTED_JAR_COPY_CHUNK_BYTES)
                 if not chunk:
@@ -1480,6 +1532,7 @@ def _packaged_inventory_rows_are_valid(rows):
         'entry_id', 'lib_entry', 'lib_name', 'coord', 'group_id',
         'artifact_id', 'version', 'classifier', 'filename_stem',
         'match_source', 'resolution_status', 'read_error', 'content_sha256',
+        'metadata_anomalies',
     }
     return all(isinstance(row, dict) and required.issubset(row) for row in rows)
 
@@ -1564,7 +1617,6 @@ def _write_packaged_inventory_cache(cache_path, artifact_sha256, scan_result):
 def _scan_packaged_archive(artifact_path):
     artifact_path = Path(artifact_path)
     deps = []
-    informative_paths = 0
     failures = []
     try:
         archive_bytes = artifact_path.stat().st_size
@@ -1579,27 +1631,6 @@ def _scan_packaged_archive(artifact_path):
             }],
             archive_bytes=0,
             nested_entries=0,
-        )
-    safety = inspect_archive(artifact_path)
-    if not safety.safe:
-        return _PackagedArchiveScanResult(
-            rows=[],
-            complete=False,
-            failures=[{
-                'stage': (
-                    'archive_open'
-                    if reason == 'ARCHIVE_FORMAT_INVALID'
-                    else 'archive_safety'
-                ),
-                'entry': '',
-                'error': (
-                    f'archive open failed: {reason}'
-                    if reason == 'ARCHIVE_FORMAT_INVALID'
-                    else reason
-                ),
-            } for reason in safety.reason_codes],
-            archive_bytes=archive_bytes,
-            nested_entries=safety.nested_archives,
         )
     try:
         outer_zip = zipfile.ZipFile(str(artifact_path))
@@ -1618,7 +1649,53 @@ def _scan_packaged_archive(artifact_path):
 
     try:
         with outer_zip:
-            for name in outer_zip.namelist():
+            outer_infos = outer_zip.infolist()
+            unsafe_names = sorted({
+                info.filename for info in outer_infos
+                if _unsafe_entry_name(info.filename)
+            })
+            if unsafe_names:
+                return _PackagedArchiveScanResult(
+                    rows=[], complete=False,
+                    failures=[{
+                        'stage': 'archive_safety',
+                        'entry': name,
+                        'error': 'ARCHIVE_ENTRY_PATH_UNSAFE',
+                    } for name in unsafe_names],
+                    archive_bytes=archive_bytes, nested_entries=0,
+                )
+
+            infos_by_name = defaultdict(list)
+            for info in outer_infos:
+                infos_by_name[info.filename].append(info)
+            duplicate_names = sorted(
+                name for name, infos in infos_by_name.items() if len(infos) > 1
+            )
+            if duplicate_names:
+                dependency_duplicates = {
+                    name for name in duplicate_names
+                    if name.lower().endswith('.jar') and name.lower().startswith(
+                        ('boot-inf/lib/', 'web-inf/lib/', 'lib/')
+                    )
+                }
+                return _PackagedArchiveScanResult(
+                    rows=[], complete=False,
+                    failures=[{
+                        'stage': 'archive_safety',
+                        'entry': name,
+                        'error': (
+                            'ARCHIVE_DUPLICATE_DEPENDENCY_ENTRY'
+                            if name in dependency_duplicates
+                            else 'ARCHIVE_DUPLICATE_ENTRY'
+                        ),
+                    } for name in duplicate_names],
+                    archive_bytes=archive_bytes,
+                    nested_entries=len(dependency_duplicates),
+                )
+
+            dependency_infos = []
+            for info in outer_infos:
+                name = info.filename
                 lower_name = name.lower()
                 if not lower_name.endswith('.jar'):
                     continue
@@ -1628,10 +1705,48 @@ def _scan_packaged_archive(artifact_path):
                     or lower_name.startswith('lib/')
                 ):
                     continue
-                informative_paths += 1
+                dependency_infos.append(info)
+
+            informative_paths = len(dependency_infos)
+            total_dependency_bytes = sum(
+                max(int(info.file_size), 0) for info in dependency_infos
+            )
+            if total_dependency_bytes > STEP1_MAX_TOTAL_DEPENDENCY_BYTES:
+                return _PackagedArchiveScanResult(
+                    rows=[], complete=False,
+                    failures=[{
+                        'stage': 'archive_safety',
+                        'entry': '',
+                        'error': 'ARCHIVE_DEPENDENCY_BYTES_EXCEEDED',
+                    }],
+                    archive_bytes=archive_bytes,
+                    nested_entries=informative_paths,
+                )
+
+            for info in dependency_infos:
+                name = info.filename
+                compressed = max(int(info.compress_size), 0)
+                ratio = (
+                    float('inf') if compressed == 0 and info.file_size
+                    else info.file_size / max(compressed, 1)
+                )
+                if info.file_size > STEP1_MAX_DEPENDENCY_JAR_BYTES:
+                    failures.append({
+                        'stage': 'archive_safety',
+                        'entry': name,
+                        'error': 'ARCHIVE_NESTED_SIZE_EXCEEDED',
+                    })
+                    continue
+                if ratio > STEP1_MAX_DEPENDENCY_EXPANSION_RATIO:
+                    failures.append({
+                        'stage': 'archive_safety',
+                        'entry': name,
+                        'error': 'ARCHIVE_EXPANSION_RATIO_EXCEEDED',
+                    })
+                    continue
                 try:
                     nested_source, content_sha256 = _stream_nested_jar_to_spool(
-                        outer_zip, name
+                        outer_zip, info
                     )
                 except Exception as exc:
                     dep = _build_packaged_entry(name)
@@ -1955,6 +2070,15 @@ def parse_maven_dependency_list(text):
     return deps
 
 
+def _packaged_metadata_anomaly_suffix(item):
+    anomalies = sorted({
+        str(value).strip()
+        for value in ((item or {}).get('metadata_anomalies') or [])
+        if str(value).strip()
+    })
+    return f";metadata_anomalies={'|'.join(anomalies)}" if anomalies else ''
+
+
 def _enrich_packaged_deps_with_runtime(
     packaged_deps,
     runtime_deps,
@@ -2047,12 +2171,16 @@ def _enrich_packaged_deps_with_runtime(
                 'version': enriched.get('version', ''),
                 'classifier': enriched.get('classifier', ''),
                 'scope': 'packaged',
-                'remark': f"source:final_artifact_unresolved({confirmed_unresolved.get('source') or enriched.get('match_source', 'archive')})",
+                'remark': (
+                    f"source:final_artifact_unresolved({confirmed_unresolved.get('source') or enriched.get('match_source', 'archive')})"
+                    f"{_packaged_metadata_anomaly_suffix(enriched)}"
+                ),
                 'packaged_present': 'true',
                 'packaged_match_source': confirmed_unresolved.get('source') or enriched.get('match_source', 'archive'),
                 'resolution_status': 'unresolved',
                 'match_source': enriched.get('match_source', ''),
                 'read_error': enriched.get('read_error', ''),
+                'metadata_anomalies': list(enriched.get('metadata_anomalies') or []),
             })
             continue
         if runtime_match:
@@ -2104,12 +2232,16 @@ def _enrich_packaged_deps_with_runtime(
                 'version': version,
                 'classifier': enriched.get('classifier', ''),
                 'scope': 'packaged',
-                'remark': f"source:final_artifact_unresolved({enriched.get('match_source', 'archive')})",
+                'remark': (
+                    f"source:final_artifact_unresolved({enriched.get('match_source', 'archive')})"
+                    f"{_packaged_metadata_anomaly_suffix(enriched)}"
+                ),
                 'packaged_present': 'true',
                 'packaged_match_source': enriched.get('match_source', 'archive'),
                 'resolution_status': 'unresolved',
                 'match_source': enriched.get('match_source', ''),
                 'read_error': enriched.get('read_error', ''),
+                'metadata_anomalies': list(enriched.get('metadata_anomalies') or []),
             })
             continue
         key = coord or f"{artifact_id}:{version}"
@@ -2120,7 +2252,10 @@ def _enrich_packaged_deps_with_runtime(
             'version': version,
             'classifier': enriched.get('classifier', ''),
             'scope': 'packaged',
-            'remark': f"source:final_artifact({enriched.get('match_source', 'archive')})",
+            'remark': (
+                f"source:final_artifact({enriched.get('match_source', 'archive')})"
+                f"{_packaged_metadata_anomaly_suffix(enriched)}"
+            ),
             'packaged_present': 'true',
             'packaged_match_source': enriched.get('match_source', 'archive'),
         }
@@ -2138,6 +2273,7 @@ def _enrich_packaged_deps_with_runtime(
             'resolution_status': 'resolved',
             'match_source': enriched.get('match_source', ''),
             'read_error': enriched.get('read_error', ''),
+            'metadata_anomalies': list(enriched.get('metadata_anomalies') or []),
         })
     return entries, resolved, unresolved
 

@@ -108,6 +108,15 @@ class ArtifactIdentityOwnershipInvariantTest(unittest.TestCase):
         })
         self.assertEqual(classify_module_scope(item), ModuleScope.INTERNAL_MODULE)
 
+    def test_reactor_nested_module_classes_are_not_business_entry_alignment(self):
+        catalog, _artifact_sha = self.build_catalog(
+            ["com.acme:application", "com.acme:library"]
+        )
+
+        classes = step5.runtime_business_class_index(catalog)
+
+        self.assertEqual(classes, {"com.acme.App"})
+
     def test_missing_orchestrator_state_recovers_scope_from_reactor_and_artifact(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

@@ -47,13 +47,13 @@
 - Consumes: Oracle record, evidence path, declared digest, locked artifact digest, capability declaration.
 - Produces: verified record or explicit provenance failure.
 
-- [ ] Add regressions for missing evidence files, digest mismatch, duplicate invented authorities, and child records without artifact SHA.
-- [ ] Verify each regression fails under current validation.
-- [ ] Read evidence bytes at audit time and compare the actual SHA-256.
-- [ ] Require every evidence-bearing child record to declare the locked artifact SHA.
-- [ ] Replace authority-count trust with explicit closed-world/executable/artifact-bound capability checks.
-- [ ] Preserve the two-authority rule for weaker negative evidence.
-- [ ] Run Oracle tests and request independent review of this cluster.
+- [x] Add regressions for missing evidence files, digest mismatch, duplicate invented authorities, and child records without artifact SHA.
+- [x] Verify each regression fails under current validation.
+- [x] Read evidence bytes at audit time and compare the actual SHA-256.
+- [x] Require every evidence-bearing child record to declare the locked artifact SHA.
+- [x] Replace authority-count trust with explicit closed-world/executable/artifact-bound capability checks.
+- [x] Preserve the two-authority rule for weaker negative evidence.
+- [x] Run Oracle tests and request independent review of this cluster.
 
 ### Task 3: Effective Maven Ownership And Fat Jar Paths
 

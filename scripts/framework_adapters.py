@@ -4628,6 +4628,9 @@ def run_runtime_spring_registration_adapter(
                                     'provenance': {
                                         'coord': coord,
                                         'jar': jar_path,
+                                        'artifact_entry': item.get('artifact_entry'),
+                                        'artifact_sha256': item.get('sha256'),
+                                        'class_or_resource_entry': factories_name,
                                         'resource': factories_name,
                                         'line': line_no,
                                         'registration_type': registration_type,
@@ -4659,6 +4662,9 @@ def run_runtime_spring_registration_adapter(
                             'provenance': {
                                 'coord': coord,
                                 'jar': jar_path,
+                                'artifact_entry': item.get('artifact_entry'),
+                                'artifact_sha256': item.get('sha256'),
+                                'class_or_resource_entry': imports_name,
                                 'resource': imports_name,
                                 'line': line_no,
                                 'business_activation': trusted_activation_evidence,

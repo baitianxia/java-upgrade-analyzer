@@ -22,6 +22,48 @@ from step5_artifact_fact_store import Step5ArtifactFactStore
 
 
 class ArtifactBytecodeCatalogTest(unittest.TestCase):
+    def test_reactor_recovery_uses_only_explicitly_active_profile_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pom.xml").write_text(
+                """<project><modelVersion>4.0.0</modelVersion>
+                <groupId>com.acme</groupId><artifactId>root</artifactId><version>1</version>
+                <packaging>pom</packaging><modules><module>library</module></modules>
+                <profiles><profile><id>boot</id><modules><module>application</module>
+                </modules></profile></profiles></project>""",
+                encoding="utf-8",
+            )
+            for module, dependencies in (
+                ("library", ""),
+                ("application", "<dependencies><dependency><groupId>com.acme</groupId>"
+                 "<artifactId>library</artifactId></dependency></dependencies>"),
+            ):
+                module_root = root / module
+                (module_root / "src/main/java").mkdir(parents=True)
+                (module_root / "pom.xml").write_text(
+                    "<project><modelVersion>4.0.0</modelVersion>"
+                    f"<groupId>com.acme</groupId><artifactId>{module}</artifactId>"
+                    f"<version>1</version>{dependencies}</project>",
+                    encoding="utf-8",
+                )
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "META-INF/maven/com.acme/application/pom.properties",
+                    "groupId=com.acme\nartifactId=application\nversion=1\n",
+                )
+
+            inactive = step5._recover_reactor_module_coords(
+                [root], artifact
+            )
+            active = step5._recover_reactor_module_coords(
+                [root], artifact,
+                active_profiles={"boot"},
+            )
+
+        self.assertEqual(inactive, set())
+        self.assertEqual(active, {"com.acme:application", "com.acme:library"})
+
     @unittest.skipUnless(shutil.which("javac") and shutil.which("javap"), "JDK tools required")
     def test_shared_inventory_preserves_exact_packaged_scan_result(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -697,6 +739,7 @@ BootstrapMethods:
             refs = {"method_refs": [{
                 "owner": "com.vendor.Client", "name": "removedMethod", "signature": "()",
                 "consumer_method": "use", "consumer_signature": "()",
+                "opcode_family": "invokevirtual", "instruction_offset": 7,
             }], "field_refs": [], "class_refs": []}
             with patch.object(
                 tracer, "_load_runtime_dependency_class_references", return_value=refs

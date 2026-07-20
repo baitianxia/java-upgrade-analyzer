@@ -579,6 +579,44 @@ class FinalArtifactEdgeOracleTest(unittest.TestCase):
         self.assertIn(("fixture.Bridge", "top", "fixture.Bridge", "middle"), relations)
         self.assertIn(("fixture.App", "run", "fixture.Bridge", "top"), relations)
 
+    def test_selected_api_scan_keeps_same_class_field_edges(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = _write_source(
+                root / "src",
+                "fixture/Settings.java",
+                "package fixture; public class Settings { "
+                "private boolean enabled; "
+                "public boolean enabled() { return enabled; } "
+                "public void enable() { enabled = true; } }",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            _compile(classes, [source])
+            artifact = root / "application.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.write(
+                    classes / "fixture/Settings.class",
+                    "BOOT-INF/classes/fixture/Settings.class",
+                )
+
+            result = oracle.scan_final_artifact(
+                artifact,
+                selected_targets=[{
+                    "owner": "fixture.Settings",
+                    "member": "enabled",
+                    "descriptor": "Z",
+                }],
+            )
+
+        self.assertTrue(result["complete"], result["failures"])
+        relations = {
+            (row["caller_member"], row["callee_member"], row["opcode_family"])
+            for row in result["edges"]
+        }
+        self.assertIn(("enabled", "enabled", "getfield"), relations)
+        self.assertIn(("enable", "enabled", "putfield"), relations)
+
     def test_selected_api_scan_excludes_unrelated_edges_from_a_candidate_class(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -17,6 +17,64 @@ import run_step  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    def test_user_response_merges_active_maven_profiles_into_step1_context(self):
+        updated = run_step.merge_user_response_into_run_context(
+            {
+                "active_maven_profiles": [],
+                "source_dirs": ["/project/profile-a/src/main/java"],
+                "source_dirs_status": "project_scope",
+            },
+            {"active_maven_profiles": ["boot", "boot"]},
+            Path("/project"),
+        )
+
+        self.assertEqual(updated["active_maven_profiles"], ["boot"])
+        self.assertNotIn("source_dirs", updated)
+        self.assertNotIn("source_dirs_status", updated)
+        self.assertEqual(
+            run_step.infer_non_pending_target_step_from_payload(
+                {"active_maven_profiles": ["boot"]}
+            ),
+            "step1",
+        )
+
+    def test_run_context_applies_explicit_maven_profiles_to_project_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            (root / "pom.xml").write_text(
+                """<project><modelVersion>4.0.0</modelVersion>
+                <groupId>com.acme</groupId><artifactId>root</artifactId><version>1</version>
+                <packaging>pom</packaging><profiles><profile><id>boot</id>
+                <modules><module>application</module></modules></profile></profiles>
+                </project>""",
+                encoding="utf-8",
+            )
+            (root / "application/src/main/java").mkdir(parents=True)
+            (root / "application/pom.xml").write_text(
+                """<project><modelVersion>4.0.0</modelVersion>
+                <groupId>com.acme</groupId><artifactId>application</artifactId>
+                <version>1</version></project>""",
+                encoding="utf-8",
+            )
+            args = self._make_default_args(root, report)
+            args.target_module = ""
+            args.active_maven_profiles = None
+
+            context = run_step.build_run_context(
+                args,
+                existing={},
+                seed_payload={
+                    "target_module": "application",
+                    "active_maven_profiles": ["boot"],
+                },
+            )
+
+        self.assertEqual(context["active_maven_profiles"], ["boot"])
+        self.assertEqual(
+            context["project_scope"]["included_modules"], ["application"]
+        )
+
     def _dep_dir(self, report_dir):
         return run_step.evidence_dependencies_dir(report_dir)
 

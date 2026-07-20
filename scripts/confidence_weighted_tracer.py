@@ -32,6 +32,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Event, Lock
+from types import SimpleNamespace
 
 from compat import run_cmd
 from csv_io import open_csv_read, open_csv_write
@@ -6048,17 +6049,35 @@ def _packaged_hit_runtime_framework_entry(hit, graph):
         return None, []
     class_fqcn = str(hit.get('class_fqcn') or '').strip()
     consumer_method = str(hit.get('consumer_method') or '').strip()
-    if not class_fqcn or not consumer_method or consumer_method == '<class>':
+    if not class_fqcn:
         return None, []
-    method = _runtime_method_def_for_packaged_caller(
-        str(hit.get('coord') or ''),
-        str(hit.get('jar_path') or ''),
-        class_fqcn,
-        consumer_method,
-        str(hit.get('consumer_signature') or ''),
+    if consumer_method and consumer_method != '<class>':
+        method = _runtime_method_def_for_packaged_caller(
+            str(hit.get('coord') or ''),
+            str(hit.get('jar_path') or ''),
+            class_fqcn,
+            consumer_method,
+            str(hit.get('consumer_signature') or ''),
+        )
+        entries = _runtime_framework_entries_for_method(method, graph)
+        if entries:
+            return method, entries
+    class_entries = list(
+        (getattr(graph, 'framework_runtime_entry_classes', {}) or {}).get(class_fqcn)
+        or []
     )
-    entries = _runtime_framework_entries_for_method(method, graph)
-    return (method, entries) if entries else (None, [])
+    class_entries = [
+        entry for entry in class_entries if entry.get('activation_verified')
+    ]
+    if not class_entries:
+        return None, []
+    class_entry = SimpleNamespace(
+        qualified_key=class_fqcn,
+        class_fqcn=class_fqcn,
+        owner_type='dependency',
+        owner_coord=str(hit.get('coord') or ''),
+    )
+    return class_entry, class_entries
 
 
 def _packaged_hit_is_external_consumer(hit):
@@ -6125,8 +6144,36 @@ def _select_canonical_packaged_hits(hits):
     return unique
 
 
+def _is_external_provider_self_reference(result, hit):
+    if (
+        bool((hit or {}).get('application_owned'))
+        or str((hit or {}).get('edge_role') or '') != 'internal_bridge'
+        or str((hit or {}).get('coord') or '') != str(result.coord or '')
+    ):
+        return False
+    api_name = str(result.api_name or '').strip()
+    symbol_kind = str(result.symbol_kind or '').strip().lower()
+    if symbol_kind == 'class':
+        target_owner = api_name
+    elif symbol_kind == 'constructor':
+        target_owner = api_name.rsplit('.', 1)[0]
+    else:
+        target_owner = api_name.rpartition('.')[0]
+    caller_owner = str((hit or {}).get('class_fqcn') or '').strip()
+    return bool(
+        target_owner
+        and caller_owner
+        and target_owner.replace('$', '.') == caller_owner.replace('$', '.')
+    )
+
+
 def _build_packaged_dependency_hit_result(result, hits, graph=None):
-    physical_hits = _deduplicate_physical_packaged_hits(hits)
+    physical_hits = _deduplicate_physical_packaged_hits(
+        hit for hit in (hits or ())
+        if not _is_external_provider_self_reference(result, hit)
+    )
+    if not physical_hits:
+        return _apply_evidence_decision(result, complete_scan=True)
     hits = _select_canonical_packaged_hits(physical_hits)
     ambiguous_hits = [
         item for item in physical_hits if item.get('signature_ambiguous')
@@ -6260,6 +6307,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
                 'file': provenance.get('jar') or '',
                 'line': provenance.get('line') or 0,
                 'owner_coord': provenance.get('coord') or '',
+                'artifact_sha256': provenance.get('artifact_sha256') or '',
                 'resource': provenance.get('resource') or '',
                 'business_activation': provenance.get('business_activation') or [],
                 'semantic': True,
