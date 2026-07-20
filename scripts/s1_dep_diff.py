@@ -27,7 +27,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, mvn_cmd, git_cmd, IS_WINDOWS, require_human_confirm
 from csv_io import open_csv_write
-from analysis_contract import sha256_file
+from analysis_contract import (
+    build_project_scope,
+    project_scope_provenance_fields,
+    sha256_file,
+)
 from artifact_safety import inspect_archive
 from pipeline_constants import STEP1_ARTIFACTS_DIRNAME
 from step1_observability import Step1Observer
@@ -2138,6 +2142,84 @@ def _enrich_packaged_deps_with_runtime(
     return entries, resolved, unresolved
 
 
+def _pom_module_values(element):
+    for child in list(element):
+        if _strip_xml_ns(child.tag) != 'modules':
+            continue
+        return tuple(
+            (module.text or '').strip()
+            for module in list(child)
+            if _strip_xml_ns(module.tag) == 'module' and (module.text or '').strip()
+        )
+    return ()
+
+
+def _module_selector_matches(module_value, target_selector, work_dir):
+    module_path = str(module_value or '').replace('\\', '/').strip().strip('/')
+    target_raw = str(target_selector or '').replace('\\', '/').strip().strip('/')
+    if target_raw.startswith(':'):
+        target_raw = target_raw[1:]
+    if not module_path or not target_raw:
+        return False
+    if module_path == target_raw:
+        return True
+    target_id = normalize_primary_module(target_raw) or target_raw
+    if Path(module_path).name == target_id:
+        return True
+    _group_id, artifact_id = _read_pom_identity(Path(work_dir) / module_path / 'pom.xml')
+    return bool(artifact_id and artifact_id == target_id)
+
+
+def _maven_profile_args_for_module(work_dir, target_selector, active_profiles=None):
+    explicit_profiles = list(dict.fromkeys(
+        str(profile).strip() for profile in (active_profiles or [])
+        if str(profile).strip()
+    ))
+    if explicit_profiles:
+        return [f'-P{",".join(explicit_profiles)}']
+    if not target_selector or str(target_selector).strip() in ('.', './'):
+        return []
+    pom_path = Path(work_dir) / 'pom.xml'
+    if not pom_path.is_file():
+        return []
+    try:
+        with open_text(str(pom_path)) as handle:
+            root = ET.fromstring(handle.read())
+    except (OSError, ET.ParseError, UnicodeError):
+        return []
+
+    if any(
+        _module_selector_matches(module, target_selector, work_dir)
+        for module in _pom_module_values(root)
+    ):
+        return []
+
+    profile_ids = []
+    for child in list(root):
+        if _strip_xml_ns(child.tag) != 'profiles':
+            continue
+        for profile in list(child):
+            if _strip_xml_ns(profile.tag) != 'profile':
+                continue
+            profile_id = ''
+            for profile_child in list(profile):
+                if _strip_xml_ns(profile_child.tag) == 'id':
+                    profile_id = (profile_child.text or '').strip()
+                    break
+            if profile_id and any(
+                _module_selector_matches(module, target_selector, work_dir)
+                for module in _pom_module_values(profile)
+            ):
+                profile_ids.append(profile_id)
+    profile_ids = list(dict.fromkeys(profile_ids))
+    if len(profile_ids) > 1:
+        raise RuntimeError(
+            f"目标模块 {target_selector} 同时属于多个 Maven profile："
+            + ', '.join(profile_ids)
+        )
+    return [f'-P{profile_ids[0]}'] if profile_ids else []
+
+
 def _maven_reactor_has_modules(work_dir):
     pom_path = Path(work_dir) / 'pom.xml'
     if not pom_path.is_file():
@@ -2147,22 +2229,22 @@ def _maven_reactor_has_modules(work_dir):
             root = ET.fromstring(handle.read())
     except Exception:
         return False
-    for child in list(root):
-        if _strip_xml_ns(child.tag) != 'modules':
-            continue
-        return any(
-            _strip_xml_ns(module.tag) == 'module' and (module.text or '').strip()
-            for module in list(child)
-        )
-    return False
+    return any(
+        _strip_xml_ns(element.tag) == 'module' and (element.text or '').strip()
+        for element in root.iter()
+    )
 
 
 def collect_runtime_deps_for_workspace(
     work_dir, primary_module=None, modules=None, env=None, observer=None, side="",
+    active_maven_profiles=None,
 ):
     work_dir = str(Path(work_dir).resolve())
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
     pl = _normalize_maven_pl_with_workdir(target_selector, work_dir)
+    profile_args = _maven_profile_args_for_module(
+        work_dir, target_selector, active_maven_profiles
+    )
     reactor_prepare = (
         ['-Dmaven.test.skip=true', 'package']
         if _maven_reactor_has_modules(work_dir) else []
@@ -2170,6 +2252,7 @@ def collect_runtime_deps_for_workspace(
     list_cmd = mvn_cmd() + [
         '--batch-mode',
         '--no-transfer-progress',
+        *profile_args,
         *(["-pl", pl, "-am"] if pl else []),
         '-DskipTests',
         *reactor_prepare,
@@ -2210,6 +2293,7 @@ def collect_maven_deps_for_workspace(
     confirmed_unresolved_items=None,
     observer=None,
     side="",
+    active_maven_profiles=None,
 ):
     work_dir = str(Path(work_dir).resolve())
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
@@ -2218,9 +2302,18 @@ def collect_maven_deps_for_workspace(
         raise RuntimeError(f"无法解析目标模块目录：{target_selector}")
 
     pl = _normalize_maven_pl_with_workdir(target_selector, work_dir)
+    build_scope = build_project_scope(
+        work_dir,
+        target_selector or ".",
+        active_profiles=set(active_maven_profiles or []),
+    )
+    profile_args = _maven_profile_args_for_module(
+        work_dir, target_selector, active_maven_profiles
+    )
     package_cmd = mvn_cmd() + [
         '--batch-mode',
         '--no-transfer-progress',
+        *profile_args,
         *(["-pl", pl, "-am"] if pl else []),
         '-DskipTests',
         'package',
@@ -2241,6 +2334,19 @@ def collect_maven_deps_for_workspace(
         )
         if rc != 0:
             raise RuntimeError(f"mvn package 失败（退出码 {rc}）：\n{stderr[:1000] or stdout[:1000]}")
+    post_build_scope = build_project_scope(
+        work_dir,
+        target_selector or ".",
+        active_profiles=set(active_maven_profiles or []),
+    )
+    if (
+        build_scope.get("source_state_hash")
+        != post_build_scope.get("source_state_hash")
+    ):
+        raise RuntimeError(
+            "MAVEN_SOURCE_STATE_CHANGED_DURING_BUILD: "
+            "POM/effective-model/profile state changed while packaging"
+        )
 
     with _observed_phase(
         observer,
@@ -2296,6 +2402,7 @@ def collect_maven_deps_for_workspace(
                 env=env,
                 observer=observer,
                 side=side,
+                active_maven_profiles=active_maven_profiles,
             )
             list_cmd_text = list_command_text or ''
         with _observed_phase(
@@ -2329,6 +2436,7 @@ def collect_maven_deps_for_workspace(
                 'unresolved_items': unresolved_items,
                 'runtime_only_count': 0,
                 'runtime_only_coords': [],
+                **project_scope_provenance_fields(build_scope),
             }
 
     raise RuntimeError(
@@ -2446,6 +2554,7 @@ def _collect_runtime_deps_for_artifact_input(
     source_resolution=None,
     allow_local_source=False,
     allow_dirty_local_source=False,
+    active_maven_profiles=None,
 ):
     source_dir = str(source_project_dir or '').strip()
     if branch:
@@ -2497,6 +2606,7 @@ def _collect_runtime_deps_for_artifact_input(
             side=side,
             artifact_path=artifact_path,
             observer=observer,
+            active_maven_profiles=active_maven_profiles,
         )
         return runtime_deps, {
             **meta,
@@ -2559,6 +2669,7 @@ def get_packaged_deps_by_switching_branch(
     confirmed_unresolved_items=None,
     artifact_cache_dir=None,
     observer=None,
+    active_maven_profiles=None,
 ):
     blocked_error = None
     env = None
@@ -2612,6 +2723,7 @@ def get_packaged_deps_by_switching_branch(
                 confirmed_unresolved_items=confirmed_unresolved_items,
                 observer=observer,
                 side=side,
+                active_maven_profiles=active_maven_profiles,
             )
             meta['branch'] = branch
             meta['jdk_home'] = resolve_effective_jdk_home(jdk_home)
@@ -2680,7 +2792,7 @@ def get_packaged_deps_by_switching_branch(
 
 def get_runtime_deps_by_switching_branch(
     branch, work_dir, primary_module=None, modules=None, jdk_field="", jdk_home="",
-    side="", artifact_path="", observer=None,
+    side="", artifact_path="", observer=None, active_maven_profiles=None,
 ):
     blocked_error = None
     env = None
@@ -2733,6 +2845,7 @@ def get_runtime_deps_by_switching_branch(
                 env=add_branch_hint_to_env(env, branch),
                 observer=observer,
                 side=side,
+                active_maven_profiles=active_maven_profiles,
             )
             result = (
                 runtime_deps,
@@ -3025,6 +3138,8 @@ def main():
                     help='仅支持单模块；指定目标模块（如 app / :app / groupId:artifactId / 模块路径）')
     ap.add_argument('--modules', nargs='*', default=None,
                     help='仅支持单模块；可与 --primary-module 等价传单个模块，不允许传多个值。')
+    ap.add_argument('--active-maven-profile', action='append', default=[],
+                    help='显式激活 Maven profile，可重复传入。正式流程从主状态读取。')
     ap.add_argument('--manual-coord-override', action='append', default=[],
                     help='人工补充坐标，格式 artifact:version -> group:artifact，可重复传入。')
     ap.add_argument('--confirmed-unresolved-item', action='append', default=[],
@@ -3059,6 +3174,10 @@ def main():
         args.primary_module = args.primary_module or orchestrated_input.get("primary_module", "")
         if args.modules is None:
             args.modules = orchestrated_input.get("modules")
+        if not args.active_maven_profile:
+            args.active_maven_profile = list(
+                orchestrated_input.get("active_maven_profiles") or []
+            )
         if not args.manual_coord_override:
             args.manual_coord_override = list(orchestrated_input.get("manual_coord_overrides") or [])
         if not args.confirmed_unresolved_item:
@@ -3177,6 +3296,7 @@ def main():
                         side="base",
                         artifact_path=args.base_artifact_path,
                         observer=observer,
+                        active_maven_profiles=args.active_maven_profile,
                         source_resolution=confirmed_source_resolution("base"),
                         allow_local_source=bool(orchestrated_input.get("base_allow_local_source")),
                         allow_dirty_local_source=bool(orchestrated_input.get("base_allow_dirty_local_source")),
@@ -3197,6 +3317,7 @@ def main():
                         side="current",
                         artifact_path=args.current_artifact_path,
                         observer=observer,
+                        active_maven_profiles=args.active_maven_profile,
                         source_resolution=confirmed_source_resolution("current"),
                         allow_local_source=bool(orchestrated_input.get("current_allow_local_source")),
                         allow_dirty_local_source=bool(orchestrated_input.get("current_allow_dirty_local_source")),
@@ -3370,7 +3491,8 @@ def main():
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
-                    observer=observer,
+                observer=observer,
+                active_maven_profiles=args.active_maven_profile,
             )
             curr_deps, curr_meta = get_packaged_deps_by_switching_branch(
                     args.current_branch, args.work_dir, args.primary_module, args.modules,
@@ -3379,7 +3501,8 @@ def main():
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
-                    observer=observer,
+                observer=observer,
+                active_maven_profiles=args.active_maven_profile,
             )
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
@@ -3590,6 +3713,14 @@ def main():
             'original_artifact_path': str((meta or {}).get('original_artifact_path') or artifact_path),
             'artifact_sha256': artifact_hash,
             'build_succeeded': bool(artifact_path),
+            'project_scope_hash': str((meta or {}).get('project_scope_hash') or ''),
+            'source_state_hash': str((meta or {}).get('source_state_hash') or ''),
+            'maven_model_hash': str((meta or {}).get('maven_model_hash') or ''),
+            'active_maven_profiles': sorted({
+                str(profile).strip()
+                for profile in ((meta or {}).get('active_maven_profiles') or [])
+                if str(profile).strip()
+            }),
         })
     provenance_path = out_dir / 'build_provenance.json'
     provenance_path.write_text(

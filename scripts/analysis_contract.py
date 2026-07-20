@@ -27,39 +27,124 @@ def _text(element, name):
     return (child.text or "").strip() if child is not None else ""
 
 
-def _pom_model(pom_path, inherited_group="", inherited_version="", inherited_properties=None):
+def _pom_model(
+    pom_path, inherited_group="", inherited_version="",
+    inherited_properties=None, active_profiles=None, *,
+    inherited_artifact="", inherited_dependencies=None,
+    inherited_plugins=None, inherited_source_paths=None,
+    inherited_resource_paths=None,
+):
     root = ET.parse(str(pom_path)).getroot()
     parent = root.find("{*}parent")
+    inherits_reactor_parent = bool(
+        parent is not None
+        and inherited_artifact
+        and _text(parent, "artifactId") == inherited_artifact
+        and (not _text(parent, "groupId") or _text(parent, "groupId") == inherited_group)
+        and (not _text(parent, "version") or _text(parent, "version") == inherited_version)
+    )
     group_id = _text(root, "groupId") or _text(parent, "groupId") or inherited_group
     artifact_id = _text(root, "artifactId")
     version = _text(root, "version") or _text(parent, "version") or inherited_version
     packaging = _text(root, "packaging") or "jar"
-    module_paths = [
-        (item.text or "").strip()
-        for item in root.findall("{*}modules/{*}module")
-        if (item.text or "").strip()
-    ]
-    dependencies = []
-    for dep in root.findall("{*}dependencies/{*}dependency"):
-        dep_group = _text(dep, "groupId")
-        dep_artifact = _text(dep, "artifactId")
-        if dep_artifact:
-            dependencies.append(f"{dep_group}:{dep_artifact}" if dep_group else dep_artifact)
-    plugins = {
-        _text(plugin, "artifactId")
-        for plugin in root.findall(".//{*}plugins/{*}plugin")
-        if _text(plugin, "artifactId")
+    selected_profiles = {
+        str(profile).strip() for profile in (active_profiles or set())
+        if str(profile).strip()
     }
-    properties = dict(inherited_properties or {})
+    profile_nodes = root.findall("{*}profiles/{*}profile")
+    explicitly_active = [
+        profile for profile in profile_nodes
+        if _text(profile, "id") in selected_profiles
+    ]
+    default_active = [
+        profile for profile in profile_nodes
+        if _text(profile.find("{*}activation"), "activeByDefault").lower()
+        == "true"
+    ]
+    active_profile_nodes = explicitly_active or default_active
+    properties = dict(inherited_properties or {}) if inherits_reactor_parent else {}
     properties.update({
         str(child.tag).rsplit('}', 1)[-1]: (child.text or '').strip()
         for child in root.findall('{*}properties/*')
         if (child.text or '').strip()
     })
-    build = root.find('{*}build')
-    source_paths = []
-    resource_paths = []
-    if build is not None:
+    for profile in active_profile_nodes:
+        properties.update({
+            str(child.tag).rsplit('}', 1)[-1]: (child.text or '').strip()
+            for child in profile.findall('{*}properties/*')
+            if (child.text or '').strip()
+        })
+    builtin_properties = {
+        "project.groupId": group_id,
+        "pom.groupId": group_id,
+        "project.artifactId": artifact_id,
+        "pom.artifactId": artifact_id,
+        "project.version": version,
+        "pom.version": version,
+    }
+
+    def resolve_value(value):
+        result = str(value or "").strip()
+        replacements = {**properties, **builtin_properties}
+        for _ in range(8):
+            updated = re.sub(
+                r'\$\{([^}]+)\}',
+                lambda match: replacements.get(match.group(1), match.group(0)),
+                result,
+            )
+            if updated == result:
+                break
+            result = updated
+        return result
+
+    module_nodes = list(root.findall("{*}modules/{*}module"))
+    for profile in active_profile_nodes:
+        module_nodes.extend(profile.findall("{*}modules/{*}module"))
+    module_paths = list(dict.fromkeys(
+        (item.text or "").strip()
+        for item in module_nodes
+        if (item.text or "").strip()
+    ))
+    dependency_nodes = list(root.findall("{*}dependencies/{*}dependency"))
+    for profile in active_profile_nodes:
+        dependency_nodes.extend(
+            profile.findall("{*}dependencies/{*}dependency")
+        )
+    dependency_edges = [
+        dict(item) for item in (inherited_dependencies or [])
+    ] if inherits_reactor_parent else []
+    for dep in dependency_nodes:
+        scope = resolve_value(_text(dep, "scope") or "compile").lower()
+        optional = resolve_value(_text(dep, "optional")).lower() == "true"
+        if scope not in {"compile", "runtime"}:
+            continue
+        dep_group = resolve_value(_text(dep, "groupId"))
+        dep_artifact = resolve_value(_text(dep, "artifactId"))
+        if dep_artifact:
+            dependency_edges.append({
+                "coord": (
+                    f"{dep_group}:{dep_artifact}" if dep_group else dep_artifact
+                ),
+                "optional": optional,
+                "scope": scope,
+            })
+    plugin_nodes = list(root.findall("{*}build/{*}plugins/{*}plugin"))
+    for profile in active_profile_nodes:
+        plugin_nodes.extend(profile.findall("{*}build/{*}plugins/{*}plugin"))
+    plugins = set(inherited_plugins or []) if inherits_reactor_parent else set()
+    plugins.update({
+        _text(plugin, "artifactId")
+        for plugin in plugin_nodes
+        if _text(plugin, "artifactId")
+    })
+    build_nodes = [node for node in [root.find('{*}build')] if node is not None]
+    build_nodes.extend(
+        node for node in (profile.find('{*}build') for profile in active_profile_nodes)
+        if node is not None
+    )
+    source_paths = list(inherited_source_paths or []) if inherits_reactor_parent else []
+    resource_paths = list(inherited_resource_paths or []) if inherits_reactor_parent else []
+    for build in build_nodes:
         source_dir = _text(build, 'sourceDirectory')
         if source_dir:
             source_paths.append(source_dir)
@@ -67,7 +152,7 @@ def _pom_model(pom_path, inherited_group="", inherited_version="", inherited_pro
             directory = _text(resource, 'directory')
             if directory:
                 resource_paths.append(directory)
-    for plugin in root.findall('.//{*}plugins/{*}plugin'):
+    for plugin in plugin_nodes:
         if _text(plugin, 'artifactId') != 'build-helper-maven-plugin':
             continue
         for execution in plugin.findall('{*}executions/{*}execution'):
@@ -88,15 +173,17 @@ def _pom_model(pom_path, inherited_group="", inherited_version="", inherited_pro
         "version": version,
         "packaging": packaging,
         "module_paths": module_paths,
-        "dependencies": dependencies,
+        "dependencies": [item["coord"] for item in dependency_edges],
+        "dependency_edges": dependency_edges,
         "plugins": sorted(plugins),
         "properties": properties,
         "source_paths": source_paths,
         "resource_paths": resource_paths,
+        "pom_sha256": sha256_file(pom_path),
     }
 
 
-def discover_maven_modules(project_dir):
+def discover_maven_modules(project_dir, *, active_profiles=None):
     """Discover the reactor without executing Maven or scanning unrelated repositories."""
     root = Path(project_dir).resolve()
     root_pom = root / "pom.xml"
@@ -107,7 +194,12 @@ def discover_maven_modules(project_dir):
     problems = []
     visited = set()
 
-    def visit(module_dir, inherited_group="", inherited_version="", inherited_properties=None):
+    def visit(
+        module_dir, inherited_group="", inherited_version="",
+        inherited_properties=None, inherited_artifact="",
+        inherited_dependencies=None, inherited_plugins=None,
+        inherited_source_paths=None, inherited_resource_paths=None,
+    ):
         module_dir = module_dir.resolve()
         if module_dir in visited:
             return
@@ -117,7 +209,15 @@ def discover_maven_modules(project_dir):
             problems.append(f"module_pom_missing:{module_dir.relative_to(root)}")
             return
         try:
-            model = _pom_model(pom_path, inherited_group, inherited_version, inherited_properties)
+            model = _pom_model(
+                pom_path, inherited_group, inherited_version,
+                inherited_properties, active_profiles,
+                inherited_artifact=inherited_artifact,
+                inherited_dependencies=inherited_dependencies,
+                inherited_plugins=inherited_plugins,
+                inherited_source_paths=inherited_source_paths,
+                inherited_resource_paths=inherited_resource_paths,
+            )
         except (ET.ParseError, OSError) as exc:
             problems.append(f"module_pom_unreadable:{module_dir.relative_to(root)}:{type(exc).__name__}")
             return
@@ -139,21 +239,58 @@ def discover_maven_modules(project_dir):
                 "version": model["version"],
                 "packaging": model["packaging"],
                 "dependencies": model["dependencies"],
+                "dependency_edges": model["dependency_edges"],
                 "deploy_hints": deploy_hints,
                 "properties": model["properties"],
                 "declared_source_paths": model["source_paths"],
                 "declared_resource_paths": model["resource_paths"],
+                "pom_sha256": model["pom_sha256"],
             }
         )
         for child in model["module_paths"]:
-            visit(module_dir / child, model["group_id"], model["version"], model["properties"])
+            visit(
+                module_dir / child,
+                model["group_id"],
+                model["version"],
+                model["properties"],
+                model["artifact_id"],
+                model["dependency_edges"],
+                model["plugins"],
+                model["source_paths"],
+                model["resource_paths"],
+            )
 
     visit(root)
     modules.sort(key=lambda item: (item["module"] != ".", item["module"]))
+    active_profile_ids = sorted({
+        str(profile).strip() for profile in (active_profiles or set())
+        if str(profile).strip()
+    })
+    model_payload = {
+        "active_maven_profiles": active_profile_ids,
+        "modules": [{
+            "module": item["module"],
+            "coord": item["coord"],
+            "version": item["version"],
+            "packaging": item["packaging"],
+            "dependency_edges": item["dependency_edges"],
+            "deploy_hints": item["deploy_hints"],
+            "properties": item["properties"],
+            "declared_source_paths": item["declared_source_paths"],
+            "declared_resource_paths": item["declared_resource_paths"],
+            "pom_sha256": item["pom_sha256"],
+        } for item in modules],
+    }
+    model_canonical = json.dumps(
+        model_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return {
         "status": "partial" if problems else "complete",
         "reason_codes": problems,
         "modules": modules,
+        "maven_model_hash": hashlib.sha256(
+            model_canonical.encode("utf-8")
+        ).hexdigest(),
     }
 
 
@@ -174,10 +311,10 @@ def _resolve_target(modules, target_module):
     return matches[0] if len(matches) == 1 else None
 
 
-def build_project_scope(project_dir, target_module):
+def build_project_scope(project_dir, target_module, *, active_profiles=None):
     """Build one canonical source/resource scope from the confirmed target module."""
     root = Path(project_dir).resolve()
-    discovery = discover_maven_modules(root)
+    discovery = discover_maven_modules(root, active_profiles=active_profiles)
     modules = discovery["modules"]
     target = _resolve_target(modules, target_module)
     if not target:
@@ -190,6 +327,10 @@ def build_project_scope(project_dir, target_module):
             "included_modules": [],
             "source_roots": [],
             "resource_roots": [],
+            "active_maven_profiles": sorted({
+                str(profile).strip() for profile in (active_profiles or set())
+                if str(profile).strip()
+            }),
         }
 
     by_coord = {item["coord"]: item for item in modules if item.get("coord")}
@@ -206,7 +347,14 @@ def build_project_scope(project_dir, target_module):
             return
         seen.add(key)
         included.append(item)
-        for dep in item.get("dependencies") or []:
+        dependency_edges = item.get("dependency_edges") or [
+            {"coord": dep, "optional": False}
+            for dep in (item.get("dependencies") or [])
+        ]
+        for edge in dependency_edges:
+            if edge.get("optional") and item["module"] != target["module"]:
+                continue
+            dep = str(edge.get("coord") or "")
             dep_item = by_coord.get(dep)
             if not dep_item and ":" not in dep:
                 candidates = by_artifact.get(dep) or []
@@ -267,11 +415,57 @@ def build_project_scope(project_dir, target_module):
     if missing_declared_roots:
         reason_codes.append('declared_source_roots_missing')
     status = "insufficient" if not source_roots else ("partial" if reason_codes else "complete")
+    active_profile_ids = sorted({
+        str(profile).strip() for profile in (active_profiles or set())
+        if str(profile).strip()
+    })
+    source_revision = git_revision(root)
+    reactor_root = next(
+        (item for item in modules if item.get("module") == "."), {}
+    )
+    effective_model_payload = {
+        "active_maven_profiles": active_profile_ids,
+        "target_module": target["module"],
+        "reactor_root_pom_sha256": reactor_root.get("pom_sha256", ""),
+        "included_modules": [{
+            "module": item["module"],
+            "coord": item["coord"],
+            "version": item["version"],
+            "packaging": item["packaging"],
+            "dependency_edges": item["dependency_edges"],
+            "deploy_hints": item["deploy_hints"],
+            "properties": item["properties"],
+            "declared_source_paths": item["declared_source_paths"],
+            "declared_resource_paths": item["declared_resource_paths"],
+            "pom_sha256": item["pom_sha256"],
+        } for item in included],
+    }
+    maven_model_hash = hashlib.sha256(json.dumps(
+        effective_model_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    source_state_payload = {
+        "source_revision": source_revision,
+        "maven_model_hash": maven_model_hash,
+        "active_maven_profiles": active_profile_ids,
+        "target_module": target["module"],
+    }
+    source_state_hash = hashlib.sha256(json.dumps(
+        source_state_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
     payload = {
         "schema": "java-upgrade-analyzer.project-scope.v1",
         "status": status,
         "reason_codes": reason_codes,
         "system_source": str(root),
+        "source_revision": source_revision,
+        "maven_model_hash": maven_model_hash,
+        "source_state_hash": source_state_hash,
         "target_module": target["module"],
         "target_coord": target.get("coord", ""),
         "included_modules": [item["module"] for item in included],
@@ -281,6 +475,7 @@ def build_project_scope(project_dir, target_module):
         "excluded_modules": sorted(item["module"] for item in modules if item["module"] not in seen),
         "candidate_modules": [item["module"] for item in modules],
         "missing_declared_roots": sorted(set(missing_declared_roots)),
+        "active_maven_profiles": active_profile_ids,
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     payload["scope_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -310,8 +505,61 @@ def git_revision(project_dir, ref="HEAD"):
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def build_provenance(project_dir, side, ref, module, build_command, artifact_path="", jdk_home=""):
+def project_scope_provenance_fields(project_scope):
+    scope = dict(project_scope or {})
+    return {
+        "project_scope_hash": str(scope.get("scope_hash") or ""),
+        "source_state_hash": str(scope.get("source_state_hash") or ""),
+        "maven_model_hash": str(scope.get("maven_model_hash") or ""),
+        "active_maven_profiles": sorted({
+            str(profile).strip()
+            for profile in (scope.get("active_maven_profiles") or [])
+            if str(profile).strip()
+        }),
+    }
+
+
+def project_scope_provenance_errors(project_scope, provenance_side):
+    expected = project_scope_provenance_fields(project_scope)
+    actual = project_scope_provenance_fields({
+        "scope_hash": (provenance_side or {}).get("project_scope_hash"),
+        "source_state_hash": (provenance_side or {}).get("source_state_hash"),
+        "maven_model_hash": (provenance_side or {}).get("maven_model_hash"),
+        "active_maven_profiles": (
+            (provenance_side or {}).get("active_maven_profiles") or []
+        ),
+    })
+    errors = []
+    for key, reason in (
+        ("project_scope_hash", "build_project_scope_mismatch"),
+        ("source_state_hash", "build_source_state_mismatch"),
+        ("maven_model_hash", "build_maven_model_mismatch"),
+    ):
+        if not expected[key]:
+            errors.append(f"project_{key}_missing")
+        elif not actual[key]:
+            errors.append(f"build_{key}_missing")
+        elif expected[key] != actual[key]:
+            errors.append(reason)
+    if "active_maven_profiles" not in (project_scope or {}):
+        errors.append("project_active_profiles_missing")
+    elif "active_maven_profiles" not in (provenance_side or {}):
+        errors.append("build_active_profiles_missing")
+    elif expected["active_maven_profiles"] != actual["active_maven_profiles"]:
+        errors.append("build_active_profiles_mismatch")
+    return errors
+
+
+def build_provenance(
+    project_dir, side, ref, module, build_command, artifact_path="", jdk_home="",
+    *, project_scope=None, active_profiles=None,
+):
     artifact = Path(artifact_path).resolve() if artifact_path else None
+    scope = project_scope
+    if scope is None and module:
+        scope = build_project_scope(
+            project_dir, module, active_profiles=set(active_profiles or [])
+        )
     return {
         "schema": "java-upgrade-analyzer.build-provenance.v1",
         "side": side,
@@ -322,6 +570,7 @@ def build_provenance(project_dir, side, ref, module, build_command, artifact_pat
         "build_command": str(build_command or ""),
         "artifact_path": str(artifact) if artifact else "",
         "artifact_sha256": sha256_file(artifact) if artifact and artifact.is_file() else "",
+        **project_scope_provenance_fields(scope),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -370,10 +619,23 @@ def derive_coverage_report(report_dir, project_scope=None):
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         both_ok = bool(provenance.get("both_builds_succeeded"))
         complete_hashes = all(item.get("artifact_sha256") for item in provenance.get("sides") or [])
-        provenance_status = "complete" if both_ok and complete_hashes else ("partial" if both_ok else "insufficient")
-        provenance_reasons = [] if provenance_status == "complete" else [
-            "artifact_hash_missing" if both_ok else "base_or_current_build_not_succeeded"
-        ]
+        current_side = next((
+            item for item in (provenance.get("sides") or [])
+            if str(item.get("side") or "") == "current"
+        ), {})
+        binding_errors = project_scope_provenance_errors(scope, current_side)
+        if not both_ok:
+            provenance_status = "insufficient"
+            provenance_reasons = ["base_or_current_build_not_succeeded"]
+        elif not complete_hashes:
+            provenance_status = "partial"
+            provenance_reasons = ["artifact_hash_missing"]
+        elif binding_errors:
+            provenance_status = "insufficient"
+            provenance_reasons = binding_errors
+        else:
+            provenance_status = "complete"
+            provenance_reasons = []
     else:
         provenance_status, provenance_reasons = "not_applicable", ["step1_not_executed"]
     components.append({
