@@ -7384,8 +7384,11 @@ class RealProjectRegressionTests(unittest.TestCase):
                 ],
             }), encoding="utf-8")
             resolved = dependencies / "deps_current_resolved.csv"
-            original_resolved = "coord,lib_entry\ncom.acme:lib,BOOT-INF/lib/lib.jar\n"
-            resolved.write_text(original_resolved, encoding="utf-8")
+            original_resolved = (
+                b"coord,lib_entry\ncom.acme:lib,BOOT-INF/lib/lib.jar\n"
+            )
+            original_resolved_sha = hashlib.sha256(original_resolved).hexdigest()
+            resolved.write_bytes(original_resolved)
             revision = "b" * 40
             asset_gate = {
                 "artifact_path": str(artifact),
@@ -7407,13 +7410,20 @@ class RealProjectRegressionTests(unittest.TestCase):
                 )
 
             written = json.loads(output.read_text(encoding="utf-8"))
+            resolved_exists = resolved.is_file()
+            preserved_resolved = resolved.read_bytes()
+            preserved_resolved_sha = hashlib.sha256(
+                preserved_resolved
+            ).hexdigest()
 
         self.assertTrue(written["both_builds_succeeded"])
         self.assertEqual([side["side"] for side in written["sides"]], ["base", "current"])
         self.assertEqual(written["sides"][0]["artifact_sha256"], "a" * 64)
         self.assertEqual(written["sides"][1]["source_mode"], "checkout_build")
         self.assertEqual(written["sides"][1]["project_scope_hash"], "c" * 64)
-        self.assertEqual(resolved.read_text(encoding="utf-8"), original_resolved)
+        self.assertTrue(resolved_exists)
+        self.assertEqual(preserved_resolved, original_resolved)
+        self.assertEqual(preserved_resolved_sha, original_resolved_sha)
 
     def test_pinned_provenance_rejects_malformed_existing_evidence_without_overwrite(self):
         case = realreg.CASES["gs-managing-transactions"]
