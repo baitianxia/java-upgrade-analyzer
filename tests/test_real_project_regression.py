@@ -6016,7 +6016,7 @@ class RealProjectRegressionTest(unittest.TestCase):
         )
         self.assertFalse(result["performance_envelope"]["within_budget"])
 
-    def test_missing_alert_partition_warns_only_when_summary_has_that_status(self):
+    def test_missing_alert_partition_is_driven_by_main_ledger_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
             output = report_dir / "evidence" / "call_chain"
@@ -6055,6 +6055,44 @@ class RealProjectRegressionTest(unittest.TestCase):
                 realreg.validate_alert_partition_contract(report_dir, summary),
                 [],
             )
+
+    def test_alert_partitions_reconcile_path_rows_not_final_api_buckets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output = report_dir / "evidence" / "call_chain"
+            output.mkdir(parents=True)
+            header = "api_identity,path_status,caller_symbol\n"
+            reachable = "api-1,reachable,app.Entry.call\n"
+            uncertain = "api-1,uncertain,vendor.Bridge.call\n"
+            (output / "alerts.csv").write_text(
+                header + reachable + uncertain, encoding="utf-8"
+            )
+            (output / "alerts_reachable.csv").write_text(
+                header + reachable, encoding="utf-8"
+            )
+            (output / "alerts_uncertain.csv").write_text(
+                header + uncertain, encoding="utf-8"
+            )
+            summary = {
+                "total_apis": 1,
+                "reachable": 1,
+                "uncertain": 0,
+                "not_impacted": 0,
+                "not_analyzed": 0,
+                "not_found_in_static_analysis": 0,
+            }
+
+            errors = realreg.validate_alert_partition_contract(
+                report_dir, summary
+            )
+
+            (output / "alerts_uncertain.csv").unlink()
+            missing_errors = realreg.validate_alert_partition_contract(
+                report_dir, summary
+            )
+
+        self.assertEqual(errors, [])
+        self.assertIn("alerts_uncertain.csv missing", missing_errors)
 
     def test_run_case_emits_quality_signals_for_blocking_failures(self):
         with tempfile.TemporaryDirectory() as tmp:

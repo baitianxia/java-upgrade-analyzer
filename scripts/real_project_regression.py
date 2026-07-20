@@ -2452,7 +2452,7 @@ def validate_alert_partition_contract(report_dir: Path, summary: dict) -> list[s
         )
     for status, path_statuses in required_partitions.items():
         try:
-            count = int(summary.get(status) or 0)
+            int(summary.get(status) or 0)
         except (TypeError, ValueError):
             errors.append(f"summary_{status}_invalid")
             continue
@@ -2466,16 +2466,11 @@ def validate_alert_partition_contract(report_dir: Path, summary: dict) -> list[s
             row for row in main_rows
             if str(row.get("path_status") or "") in path_statuses
         ]
-        expected_api_count = len({
-            str(row.get("api_identity") or "") for row in expected_rows
-            if str(row.get("api_identity") or "")
-        })
-        if expected_api_count != count:
-            errors.append(
-                f"{stem}:summary_api_count_mismatch:{expected_api_count}!={count}"
-            )
         files = ([base] if base.is_file() else []) + shards
-        if count > 0 and not files:
+        # Summary buckets classify each API once, while alert partitions retain
+        # every path. A reachable API may therefore also have uncertain paths
+        # through dependencies that lack a confirmed business entry.
+        if expected_rows and not files:
             errors.append(f"{base.name} missing")
             continue
         if base.is_file() and shards:
