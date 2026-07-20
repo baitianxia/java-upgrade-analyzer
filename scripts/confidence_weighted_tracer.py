@@ -83,7 +83,7 @@ CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
 
 ANALYZER_EDGE_PROCEDURE_VERSION = 'java-upgrade-analyzer.analyzer-edge-ledger.v1'
 ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION = 'java-upgrade-analyzer.runtime-javap.v1'
-RUNTIME_MEMBER_INDEX_CACHE_SCHEMA = 'java-upgrade-analyzer.runtime-member-index.v3'
+RUNTIME_MEMBER_INDEX_CACHE_SCHEMA = 'java-upgrade-analyzer.runtime-member-index.v6'
 ANALYZER_EDGE_PROCEDURE = (
     'Step5 executable bytecode matching at analyzer edge creation points'
 )
@@ -2254,8 +2254,15 @@ def _parse_classfile_constant_pool_summary(data):
                 })
         ref_member_descriptors = {item.get('descriptor') or '' for item in ref_members if item.get('descriptor')}
         utf8_values = set(utf8.values())
+        descriptor_internal_names = {
+            match
+            for value in utf8_values
+            for match in re.findall(r'L([A-Za-z0-9_/$]+);', value)
+        }
         return {
-            'class_internal_names': {item for item in class_internal if item},
+            'class_internal_names': {
+                item for item in (class_internal | descriptor_internal_names) if item
+            },
             'ref_internal_names': {item for item in ref_class_internal if item},
             'ref_member_names': {item for item in ref_member_names if item},
             'ref_member_descriptors': ref_member_descriptors,
@@ -2279,6 +2286,33 @@ def _run_javap_bytecode_dump(jar_path, class_binary_name, multi_release_version=
     return stdout if rc == 0 else ''
 
 
+def _constant_pool_requires_javap(summary):
+    """Return whether constant-pool facts cannot prove all executable semantics."""
+    if not summary or summary.get('has_dynamic_reference'):
+        return True
+    reflection_members = {
+        ('java/lang/Class', 'forName'),
+        ('java/lang/Class', 'getMethod'),
+        ('java/lang/Class', 'getDeclaredMethod'),
+        ('java/lang/Class', 'getField'),
+        ('java/lang/Class', 'getDeclaredField'),
+        ('java/lang/Class', 'getConstructor'),
+        ('java/lang/Class', 'getDeclaredConstructor'),
+        ('java/lang/reflect/Method', 'invoke'),
+        ('java/lang/reflect/Field', 'get'),
+        ('java/lang/reflect/Field', 'set'),
+        ('java/lang/reflect/Constructor', 'newInstance'),
+    }
+    for member in summary.get('ref_members') or ():
+        owner = str(member.get('owner') or '')
+        name = str(member.get('name') or '')
+        if (owner, name) in reflection_members:
+            return True
+        if owner.startswith('java/lang/invoke/MethodHandles'):
+            return True
+    return False
+
+
 _CLASSFILE_OPCODE_NAMES = {
     0xb2: 'getstatic', 0xb3: 'putstatic', 0xb4: 'getfield', 0xb5: 'putfield',
     0xb6: 'invokevirtual', 0xb7: 'invokespecial', 0xb8: 'invokestatic',
@@ -2289,6 +2323,7 @@ _CLASSFILE_OPCODE_NAMES = {
 
 def _references_from_executable_classfile_edges(edges, class_binary_name=''):
     references = {
+        'caller_owner': str(class_binary_name or '').replace('$', '.'),
         'method_refs': [],
         'field_refs': [],
         'class_refs': set(),
@@ -2383,6 +2418,7 @@ def _references_from_executable_classfile_edges(edges, class_binary_name=''):
 
 def _parse_javap_bytecode_references(text, class_binary_name=''):
     references = {
+        'caller_owner': str(class_binary_name or '').replace('$', '.'),
         'method_refs': [],
         'field_refs': [],
         'class_refs': set(),
@@ -2743,7 +2779,7 @@ def _load_direct_classfile_references(
         artifact_sha256, target_jdk, class_binary_name, multi_release_version,
         class_entry=class_entry,
     )
-    cache_key = ('classfile-executable-v3', *base_key)
+    cache_key = ('classfile-executable-v4', *base_key)
     generation = _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
     if _valid_sha256(artifact_sha256):
         with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
@@ -2766,11 +2802,16 @@ def _load_direct_classfile_references(
         )
     if direct_edges is None:
         return None
-    if summary is None or summary.get('has_dynamic_reference'):
+    if _constant_pool_requires_javap(summary):
         return None
     references = _references_from_executable_classfile_edges(
         direct_edges, class_binary_name=class_binary_name
     )
+    references['class_refs'] = sorted(set(references.get('class_refs') or ()) | {
+        str(owner or '').replace('/', '.').replace('$', '.')
+        for owner in (summary.get('class_internal_names') or ())
+        if owner
+    })
     _perf_add(graph, 'bytecode_scan', 'artifact_cache_misses', 1)
     _record_actual_artifact_class_parse(
         graph, artifact_sha256, target_jdk, class_binary_name, multi_release_version,
@@ -2879,6 +2920,21 @@ def _runtime_reference_signature_matches(
     )
 
 
+def _runtime_opcode_matches_symbol_kind(symbol_kind, opcode_family, evidence_type=''):
+    symbol_kind = str(symbol_kind or '').strip().lower()
+    opcode = str(opcode_family or '').strip().lower()
+    evidence_type = str(evidence_type or '').strip().lower()
+    if symbol_kind == 'field' and 'reflection' in evidence_type:
+        return opcode.startswith('invoke')
+    if symbol_kind == 'field':
+        return opcode in {'getfield', 'putfield', 'getstatic', 'putstatic'}
+    if symbol_kind == 'constructor' and 'reflection' not in evidence_type:
+        return opcode == 'invokespecial'
+    if symbol_kind in {'method', 'constructor'}:
+        return opcode.startswith('invoke')
+    return True
+
+
 def _match_runtime_dependency_references(api_row, references):
     references = references or {}
     owner, member_name, symbol_kind = _extract_target_owner_and_member(api_row)
@@ -2888,6 +2944,11 @@ def _match_runtime_dependency_references(api_row, references):
     target_lookup_signature = normalize_signature_for_lookup(target_signature) or target_signature
 
     if symbol_kind == 'class' or str(api_row.get('analysis_scope') or '').strip() == 'class_usage':
+        if (
+            str(references.get('caller_owner') or '').replace('$', '.')
+            == str(owner).replace('$', '.')
+        ):
+            return []
         matches = []
         for item in references.get('class_instruction_refs') or []:
             if str(item.get('owner') or '').replace('$', '.') != str(owner).replace('$', '.'):
@@ -2918,6 +2979,12 @@ def _match_runtime_dependency_references(api_row, references):
             if (
                 str(item.get('owner') or '').replace('$', '.') != str(owner or '').replace('$', '.')
                 or item.get('name') != member_name
+            ):
+                continue
+            if not _runtime_opcode_matches_symbol_kind(
+                symbol_kind,
+                item.get('opcode_family'),
+                item.get('reference_kind'),
             ):
                 continue
             if (
@@ -2969,6 +3036,12 @@ def _match_runtime_dependency_references(api_row, references):
                 or item.get('name') != member_name
             ):
                 continue
+            if not _runtime_opcode_matches_symbol_kind(
+                symbol_kind,
+                item.get('opcode_family'),
+                item.get('reference_kind'),
+            ):
+                continue
             if (
                 str(item.get('reference_kind') or '').startswith('reflection_')
                 and (not item.get('opcode_family') or item.get('instruction_offset') is None)
@@ -2995,6 +3068,67 @@ def _match_runtime_dependency_references(api_row, references):
         return _dedupe_runtime_matches(matches)
 
     return []
+
+
+def _match_runtime_dependency_class_constants(
+    api_row, references, *, caller_owner=''
+):
+    owner, _member_name, symbol_kind = _extract_target_owner_and_member(api_row)
+    if (
+        not owner
+        or (
+            symbol_kind != 'class'
+            and str(api_row.get('analysis_scope') or '').strip() != 'class_usage'
+        )
+    ):
+        return []
+    normalized_owner = str(owner).replace('$', '.')
+    if str(caller_owner or '').replace('$', '.') == normalized_owner:
+        return []
+    class_refs = {
+        str(item or '').replace('/', '.').replace('$', '.')
+        for item in (references or {}).get('class_refs') or ()
+        if item
+    }
+    if normalized_owner not in class_refs:
+        return []
+    return [{
+        'evidence_type': 'bytecode_class_constant_reference',
+        'target_display': owner,
+        'consumer_method': '<class-constant>',
+        'consumer_signature': '',
+        'consumer_descriptor': '',
+        'callee_owner': owner,
+        'callee_member': '',
+        'callee_descriptor': '',
+        'opcode_family': '',
+        'instruction_offset': None,
+        'weak_reference': True,
+    }]
+
+
+def _is_exact_target_self_reference(api_row, caller_owner, reference):
+    owner, member_name, symbol_kind = _extract_target_owner_and_member(api_row)
+    if symbol_kind not in {'method', 'constructor'}:
+        return False
+    if (
+        not owner
+        or str(owner).replace('$', '.')
+        != str(caller_owner or '').replace('$', '.')
+        or str((reference or {}).get('consumer_method') or '') != member_name
+    ):
+        return False
+    caller_descriptor = str(
+        (reference or {}).get('consumer_descriptor') or ''
+    ).strip()
+    callee_descriptor = str(
+        (reference or {}).get('callee_descriptor') or ''
+    ).strip()
+    return bool(
+        caller_descriptor.startswith('(')
+        and callee_descriptor.startswith('(')
+        and caller_descriptor == callee_descriptor
+    )
 
 
 def _dedupe_runtime_matches(matches):
@@ -3078,8 +3212,14 @@ def _runtime_reference_edge_matches_api(api_row, edge):
         or str((edge or {}).get('callee_member') or '') != member
     ):
         return False
+    if not _runtime_opcode_matches_symbol_kind(
+        symbol_kind,
+        (edge or {}).get('opcode_family'),
+        (edge or {}).get('evidence_type'),
+    ):
+        return False
     if symbol_kind == 'field':
-        return True
+        return not str((edge or {}).get('callee_descriptor') or '').startswith('(')
     descriptor = str((edge or {}).get('callee_descriptor') or '')
     if not descriptor.startswith('('):
         return False
@@ -3498,9 +3638,6 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
     for item in catalog_entries:
         coord = str(item.get('coord') or '').strip()
         same_coord = coord == str(api_row.get('coord') or '').strip()
-        if same_coord and item.get('application_owned') is False:
-            _perf_add(graph, 'bytecode_scan', 'external_provider_jars_skipped', 1)
-            continue
         jar_path = str(item.get('jar_path') or '').strip()
         if not jar_path or not os.path.exists(jar_path):
             scan_failures.append({
@@ -3526,7 +3663,7 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                 if is_multi_release and parsed_target is not None:
                     multi_release_target_resolved = True
                 for entry, logical_name, selected_version in variants:
-                    if logical_name.endswith('module-info.class') or logical_name.endswith('package-info.class'):
+                    if logical_name.endswith('module-info.class'):
                         continue
                     visited_classes += 1
                     data = zf.read(entry)
@@ -3548,9 +3685,29 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                         continue
                     scanned_classes += 1
                     matches = _match_runtime_dependency_references(api_row, references)
+                    if not matches and (
+                        _symbol_kind == 'class'
+                        or str(api_row.get('analysis_scope') or '').strip()
+                        == 'class_usage'
+                    ):
+                        constant_summary = _parse_classfile_constant_pool_summary(data) or {}
+                        matches = _match_runtime_dependency_class_constants(
+                            api_row,
+                            {
+                                **references,
+                                'class_refs': constant_summary.get(
+                                    'class_internal_names'
+                                ) or (),
+                            },
+                            caller_owner=class_binary_name,
+                        )
                     if not matches:
                         continue
                     for matched in matches:
+                        if _is_exact_target_self_reference(
+                            api_row, class_binary_name, matched
+                        ):
+                            continue
                         hit = {
                             'coord': coord,
                             'target_coord': str(api_row.get('coord') or '').strip(),
@@ -3572,12 +3729,14 @@ def _scan_packaged_runtime_dependencies_for_api(api_row, graph):
                             'instruction_offset': matched.get('instruction_offset'),
                             'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
                             'signature_ambiguous': bool(matched.get('signature_ambiguous')),
+                            'weak_reference': bool(matched.get('weak_reference')),
                             'target_display': matched.get('target_display') or owner,
                             'class_entry': entry,
                             'multi_release_version': selected_version,
                         }
                         hits.append(hit)
-                        record_analyzer_edge(graph, api_row, hit)
+                        if not hit.get('weak_reference'):
+                            record_analyzer_edge(graph, api_row, hit)
         except Exception as exc:
             scan_failures.append({
                 'reason': 'BYTECODE_SCAN_FAILED', 'coord': coord,
@@ -3651,6 +3810,8 @@ def _commit_packaged_analyzer_edges_transaction(graph, api_hit_pairs):
     committed = []
     try:
         for api_row, hit in api_hit_pairs or ():
+            if hit.get('weak_reference'):
+                continue
             row = record_analyzer_edge(graph, api_row, hit)
             if row is not None:
                 committed.append(row)
@@ -3824,15 +3985,6 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             scan_catalog_entries = []
             for item in catalog_entries:
                 coord = str(item.get('coord') or '').strip()
-                ownership_explicitly_external = item.get('application_owned') is False
-                eligible = any(
-                    not ownership_explicitly_external
-                    or str(row.get('coord') or '').strip() != coord
-                    for rows in target_rows_by_owner.values() for row in rows
-                )
-                if not eligible:
-                    _perf_add(graph, 'bytecode_scan', 'external_provider_jars_skipped', 1)
-                    continue
                 inventory = verified_inventories[coord]
                 jar_path = str(item.get('jar_path') or '').strip()
                 artifact_sha256 = inventory.identity.sha256
@@ -3857,9 +4009,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     _perf_add(graph, 'bytecode_scan', 'artifact_count', 1)
                 scoped_classes = sum(
                     1 for location in inventory.classes
-                    if not location.logical_name.endswith(
-                        ('module-info.class', 'package-info.class')
-                    )
+                    if not location.logical_name.endswith('module-info.class')
                 )
                 visited_classes += scoped_classes
                 _perf_add(graph, 'bytecode_scan', 'class_entries_scoped', scoped_classes)
@@ -3867,8 +4017,11 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 if inventory.multi_release and inventory.target_jdk_resolved:
                     multi_release_target_resolved = True
             for task in indexed_tasks:
+                candidate_owners = list(task.get('candidate_owners') or [])
                 javap_tasks.append({
                     **task,
+                    'candidate_owners': candidate_owners,
+                    'weak_candidate_owners': candidate_owners,
                     'catalog': catalog,
                     'graph': graph,
                     'caller_owner': task.get('class_binary_name') or '',
@@ -3899,17 +4052,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     for idx, item in enumerate(scan_catalog_entries, 1):
         coord = str(item.get('coord') or '').strip()
         application_owned = bool(item.get('application_owned'))
-        ownership_explicitly_external = item.get('application_owned') is False
-        eligible_owners = {
-            owner
-            for owner, rows in target_rows_by_owner.items()
-            if not ownership_explicitly_external or any(
-                str(row.get('coord') or '').strip() != coord for row in rows
-            )
-        }
-        if not eligible_owners:
-            _perf_add(graph, 'bytecode_scan', 'external_provider_jars_skipped', 1)
-            continue
+        eligible_owners = set(target_rows_by_owner)
         jar_path = str(item.get('jar_path') or '').strip()
         jar_started_at = time.perf_counter()
         jar_visited_classes = 0
@@ -3985,7 +4128,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 if is_multi_release and parsed_target is not None:
                     multi_release_target_resolved = True
                 for entry, logical_name, selected_version in variants:
-                    if logical_name.endswith('module-info.class') or logical_name.endswith('package-info.class'):
+                    if logical_name.endswith('module-info.class'):
                         continue
                     visited_classes += 1
                     jar_visited_classes += 1
@@ -4016,6 +4159,36 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                     if preparsed_references is not None:
                         jar_constant_pool_hits += 1
                         _perf_add(graph, 'bytecode_scan', 'classfile_fast_path_hits', 1)
+                    class_candidate_owners = {
+                        owner for owner in candidate_owners
+                        if any(
+                            _extract_target_owner_and_member(row)[2] == 'class'
+                            or str(row.get('analysis_scope') or '').strip()
+                            == 'class_usage'
+                            for row in target_rows_by_owner.get(owner, ())
+                        )
+                    }
+                    if preparsed_references is not None:
+                        exact_constant_owners = {
+                            str(value or '').replace('/', '.').replace('$', '.')
+                            for value in (
+                                preparsed_references.get('class_refs') or ()
+                            )
+                            if value
+                        }
+                    elif class_candidate_owners:
+                        constant_summary = (
+                            _parse_classfile_constant_pool_summary(data) or {}
+                        )
+                        exact_constant_owners = {
+                            str(value or '').replace('/', '.').replace('$', '.')
+                            for value in (
+                                constant_summary.get('class_internal_names') or ()
+                            )
+                            if value
+                        }
+                    else:
+                        exact_constant_owners = set()
                     javap_tasks.append({
                         'catalog': catalog,
                         'coord': coord,
@@ -4030,6 +4203,9 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         'target_jdk': target_jdk,
                         'graph': graph,
                         'candidate_owners': sorted(set(candidate_owners)),
+                        'weak_candidate_owners': sorted(
+                            set(candidate_owners) & exact_constant_owners
+                        ),
                         'preparsed_references': preparsed_references,
                         'application_owned': bool(item.get('application_owned')),
                         'ownership_evidence': item.get('ownership_evidence'),
@@ -4109,26 +4285,20 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 'elapsed_sec': task_elapsed,
                 'failed': False,
             })
-            referenced_owners = {
-                str(value or '').replace('$', '.')
-                for value in (references.get('class_refs') or [])
-                if value
-            }
-            referenced_owners.update(
-                str(item.get('owner') or '').replace('$', '.')
-                for item in references.get('method_refs') or []
-                if item.get('owner')
-            )
-            referenced_owners.update(
-                str(item.get('owner') or '').replace('$', '.')
-                for item in references.get('field_refs') or []
-                if item.get('owner')
-            )
             matched_api_keys = set()
-            for owner in set(candidate_owners) & {item for item in referenced_owners if item}:
+            for owner in set(candidate_owners):
                 for api_row in target_rows_by_owner.get(owner, []):
+                    caller_owner = task.get('caller_owner') or class_binary_name
                     same_coord = coord == str(api_row.get('coord') or '').strip()
                     matches = _match_runtime_dependency_references(api_row, references)
+                    if not matches:
+                        weak_refs = set(references.get('class_refs') or ())
+                        weak_refs.update(task.get('weak_candidate_owners') or ())
+                        matches = _match_runtime_dependency_class_constants(
+                            api_row,
+                            {**references, 'class_refs': weak_refs},
+                            caller_owner=caller_owner,
+                        )
                     if not matches:
                         continue
                     key = build_api_identity_key(api_row)
@@ -4141,6 +4311,10 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                         )
                         _perf_add(graph, 'bytecode_scan', metric, 1)
                     for matched in matches:
+                        if _is_exact_target_self_reference(
+                            api_row, caller_owner, matched
+                        ):
+                            continue
                         hit = {
                             'coord': coord,
                             'target_coord': str(api_row.get('coord') or '').strip(),
@@ -4162,6 +4336,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                             'instruction_offset': matched.get('instruction_offset'),
                             'evidence_type': matched.get('evidence_type') or 'bytecode_reference',
                             'signature_ambiguous': bool(matched.get('signature_ambiguous')),
+                            'weak_reference': bool(matched.get('weak_reference')),
                             'target_display': matched.get('target_display') or owner,
                             'class_entry': task.get('class_entry') or '',
                             'multi_release_version': selected_version,
@@ -4861,7 +5036,7 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
 
             def consume_class(entry, logical_name, selected_version, data):
                     nonlocal visited_classes, parse_failures
-                    if logical_name.endswith(('module-info.class', 'package-info.class')):
+                    if logical_name.endswith('module-info.class'):
                         return
                     visited_classes += 1
                     class_binary_name = logical_name[:-6].replace('/', '.')
@@ -4906,13 +5081,7 @@ def _build_runtime_dependency_member_candidate_index(graph, catalog_entries, tar
                         str(value or '') for value in (summary.get('utf8_values') or set())
                         if value
                     }
-                    reflective = summary.get('has_dynamic_reference') or any(
-                        marker in utf8_values
-                        for marker in (
-                            'java/lang/Class', 'java/lang/reflect/Method',
-                            'java/lang/reflect/Constructor', 'java/lang/invoke/MethodHandles',
-                        )
-                    )
+                    reflective = _constant_pool_requires_javap(summary)
                     if reflective:
                         reflection_ids.add(task_id)
                         for value in utf8_values:
@@ -5260,13 +5429,6 @@ def _batch_candidates_from_runtime_member_index(index, target_rows_by_owner):
             for task_id in selected_ids:
                 if not 0 <= task_id < len(tasks):
                     continue
-                task = tasks[task_id]
-                if (
-                    task.get('application_owned') is False
-                    and str(task.get('coord') or '').strip()
-                    == str(row.get('coord') or '').strip()
-                ):
-                    continue
                 candidate_owners_by_task[task_id].add(owner)
     return [
         {
@@ -5278,7 +5440,7 @@ def _batch_candidates_from_runtime_member_index(index, target_rows_by_owner):
 
 
 def _ensure_runtime_dependency_callers_for_key(
-    graph, lookup_key, *, excluded_provider_coord=''
+    graph, lookup_key, *, excluded_provider_coord='', excluded_self_owner=''
 ):
     expand_started_at = time.perf_counter()
     _perf_add(graph, 'bytecode_expand', 'calls', 1)
@@ -5291,10 +5453,10 @@ def _ensure_runtime_dependency_callers_for_key(
     if expanded is None:
         expanded = set()
         setattr(graph, '_runtime_dependency_caller_expanded', expanded)
-    normalized_excluded_coord = str(excluded_provider_coord or '').strip()
     expansion_key = (
-        (lookup_key, normalized_excluded_coord)
-        if normalized_excluded_coord else lookup_key
+        lookup_key,
+        str(excluded_provider_coord or ''),
+        str(excluded_self_owner or '').replace('$', '.'),
     )
     if expansion_key in expanded:
         _perf_add(graph, 'bytecode_expand', 'already_expanded_hits', 1)
@@ -5347,10 +5509,7 @@ def _ensure_runtime_dependency_callers_for_key(
     # Candidate discovery depends only on owner/member, not on the specific
     # spelling of the signature.  Cache it so String/java.lang.String variants
     # and repeated paths do not rescan every runtime JAR.
-    candidate_cache_key = (
-        (owner, member, normalized_excluded_coord)
-        if normalized_excluded_coord else (owner, member)
-    )
+    candidate_cache_key = (owner, member)
     cached_candidates = candidate_cache.get(candidate_cache_key)
     if cached_candidates is not None:
         _perf_add(graph, 'bytecode_expand', 'candidate_cache_hits', 1)
@@ -5387,14 +5546,6 @@ def _ensure_runtime_dependency_callers_for_key(
             member_index = _get_runtime_dependency_member_candidate_index(graph, catalog_entries, target_jdk)
             indexed_tasks = _candidate_tasks_from_runtime_member_index(member_index, owner, member)
         if indexed_tasks is not None:
-            indexed_tasks = [
-                task for task in indexed_tasks
-                if not (
-                    str(task.get('coord') or '').strip()
-                    == str(excluded_provider_coord or '').strip()
-                    and task.get('application_owned') is False
-                )
-            ]
             candidate_source = 'member_index'
             _perf_add(graph, 'bytecode_expand', 'member_index_candidate_queries', 1)
             member_index_unparsed_checked = int((member_index or {}).get('last_unparsed_checked') or 0)
@@ -5412,15 +5563,6 @@ def _ensure_runtime_dependency_callers_for_key(
             progress_interval = suggest_log_interval(len(catalog_entries), target_updates=6, minimum=1)
             for idx, item in enumerate(catalog_entries, 1):
                 coord = str(item.get('coord') or '').strip()
-                if (
-                    coord == str(excluded_provider_coord or '').strip()
-                    and item.get('application_owned') is False
-                ):
-                    _perf_add(
-                        graph, 'bytecode_expand',
-                        'external_provider_jars_skipped', 1,
-                    )
-                    continue
                 if should_log_progress(idx, len(catalog_entries), progress_interval):
                     emit_progress(
                         "step5",
@@ -5450,7 +5592,7 @@ def _ensure_runtime_dependency_callers_for_key(
                             zf.namelist(), target_jdk, multi_release_enabled=multi_release_enabled
                         )
                         for entry, logical_name, selected_version in variants:
-                            if logical_name.endswith(('module-info.class', 'package-info.class')):
+                            if logical_name.endswith('module-info.class'):
                                 continue
                             visited_classes += 1
                             data = zf.read(entry)
@@ -5510,8 +5652,11 @@ def _ensure_runtime_dependency_callers_for_key(
             })
             return
         javap_classes += 1
+        caller_owner = task.get('class_binary_name') or ''
         matches = _match_runtime_dependency_references(api_row, references)
         for matched in matches:
+            if _is_exact_target_self_reference(api_row, caller_owner, matched):
+                continue
             analyzer_hit = {
                 'coord': task.get('coord') or '',
                 'jar_path': task.get('jar_path') or '',
@@ -5634,6 +5779,9 @@ def _collect_target_runtime_reference_closure(graph, api_rows):
     scan_results = catalog.get('_packaged_api_scan_results') or {}
     for api_row in api_rows or []:
         api_name = str(api_row.get('api_name') or '').strip()
+        target_owner, _target_member, _target_kind = (
+            _extract_target_owner_and_member(api_row)
+        )
         api_signature = normalize_signature_for_lookup(
             str(api_row.get('api_signature') or '')
         )
@@ -5652,10 +5800,18 @@ def _collect_target_runtime_reference_closure(graph, api_rows):
             if lookup_key in visited:
                 continue
             visited.add(lookup_key)
+            parsed_lookup = _parse_runtime_method_lookup_key(lookup_key)
+            lookup_owner = parsed_lookup[0] if parsed_lookup else ''
             _ensure_runtime_dependency_callers_for_key(
                 graph,
                 lookup_key,
                 excluded_provider_coord=str(api_row.get('coord') or '').strip(),
+                excluded_self_owner=(
+                    target_owner
+                    if str(lookup_owner).replace('$', '.')
+                    == str(target_owner).replace('$', '.')
+                    else ''
+                ),
             )
             reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
             methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
@@ -5853,7 +6009,6 @@ def _find_business_callers_for_packaged_hit(hit, graph, max_depth=None):
         _ensure_runtime_dependency_callers_for_key(
             graph,
             current_key,
-            excluded_provider_coord=str(hit.get('target_coord') or '').strip(),
         )
         incoming_edges = (
             edge for edge in (reverse_edges.get(current_key, []) or [])
@@ -5978,11 +6133,15 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
     ]
     business_hits = [
         item for item in physical_hits
-        if item.get('coord') == '__business__' and not item.get('signature_ambiguous')
+        if item.get('coord') == '__business__'
+        and not item.get('signature_ambiguous')
+        and not item.get('weak_reference')
     ]
     display_business_hits = [
         item for item in hits
-        if item.get('coord') == '__business__' and not item.get('signature_ambiguous')
+        if item.get('coord') == '__business__'
+        and not item.get('signature_ambiguous')
+        and not item.get('weak_reference')
     ]
     if graph is not None and len([
         item for item in physical_hits if item not in business_hits
@@ -5990,7 +6149,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
         setattr(graph, '_prefer_runtime_dependency_member_candidate_index', True)
     bridged_hits = []
     for item in physical_hits:
-        if item.get('signature_ambiguous'):
+        if item.get('signature_ambiguous') or item.get('weak_reference'):
             continue
         runtime_entry, framework_entries = _packaged_hit_runtime_framework_entry(item, graph)
         if runtime_entry is not None:
@@ -6001,7 +6160,7 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
                 'framework_entries': framework_entries,
             })
             continue
-        if item in business_hits:
+        if item.get('coord') == '__business__':
             continue
         for business_entry, bridge_edges, framework_entries in _find_business_callers_for_packaged_hit(item, graph):
             bridged_hits.append({
@@ -6162,6 +6321,12 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             detail['path_status'] = 'uncertain'
             detail['business_reachable'] = None
             detail['stop_reason'] = 'UNQUALIFIED_SIGNATURE_TYPE_AMBIGUOUS'
+    weak_hits = [item for item in physical_hits if item.get('weak_reference')]
+    if weak_hits and not has_business_path:
+        for detail in result.path_details:
+            detail['path_status'] = 'uncertain'
+            detail['business_reachable'] = False
+            detail['stop_reason'] = 'WEAK_CLASS_REFERENCE_ONLY'
 
     hit_by_consumer = {
         (
@@ -6242,7 +6407,20 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
             depth=int(detail.get('depth') or 1),
             evidence=typed_evidence,
         ))
-    _apply_evidence_decision(result, paths=tuple(typed_paths))
+    concerns = ()
+    if weak_hits and not has_business_path:
+        concerns = (EvidenceConcern(
+            stage='packaged-bytecode',
+            reason_code='WEAK_CLASS_REFERENCE_ONLY',
+            detail=(
+                '最终制品仅包含目标类的常量池或描述符引用，没有可执行字节码指令；'
+                '该证据不能证明运行时触达'
+            ),
+            api_identity=_trace_target_identity(result),
+        ),)
+    _apply_evidence_decision(
+        result, paths=tuple(typed_paths), concerns=concerns
+    )
     result.verification_commands = [
         '如需继续证明是否回到系统源码，请补充 dependency_source_dirs 或检查业务对这些依赖的入口调用',
         '优先审查命中的无源码依赖及其对外暴露入口'

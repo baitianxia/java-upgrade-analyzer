@@ -28,12 +28,12 @@
 - Consumes: runtime bytecode matches with caller owner, method, and descriptor.
 - Produces: one exact self-recursion predicate shared by single, batch, and closure scans.
 
-- [ ] Add compiled-class regressions for `Target.entry -> Target.changed` in single, batch, and closure paths.
-- [ ] Add an order-invariance regression proving closure expansion does not delete pre-existing graph edges.
-- [ ] Run the regressions and verify failures identify owner-wide exclusion and graph mutation.
-- [ ] Replace owner-wide exclusion with exact caller method plus descriptor comparison.
-- [ ] Remove shared `reverse_edges` deletion and use lookup-local filtering only.
-- [ ] Run focused Step5 tests and request independent review of this cluster.
+- [x] Add compiled-class regressions for `Target.entry -> Target.changed` in single, batch, and closure paths.
+- [x] Add an order-invariance regression proving closure expansion does not delete pre-existing graph edges.
+- [x] Run the regressions and verify failures identify owner-wide exclusion and graph mutation.
+- [x] Replace owner-wide exclusion with exact caller method plus descriptor comparison.
+- [x] Remove shared `reverse_edges` deletion and use lookup-local filtering only.
+- [x] Run focused Step5 tests and request independent review of this cluster.
 
 ### Task 2: Oracle Trust Boundary
 

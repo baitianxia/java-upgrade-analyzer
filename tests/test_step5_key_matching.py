@@ -1198,6 +1198,173 @@ class Step5KeyMatchingTest(unittest.TestCase):
         }
         return api_row, jar_path
 
+    def _same_class_bridge_fixture(self, tmp):
+        src = Path(tmp) / "src"
+        target = src / "com/vendor/Target.java"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "package com.vendor; public class Target { "
+            "public static String changed(String value) { return value; } "
+            "public static String entry(String value) { return changed(value); } }",
+            encoding="utf-8",
+        )
+        classes = self._compile_java_files(Path(tmp) / "classes", [target])
+        jar_path = Path(tmp) / "target.jar"
+        self._jar_compiled_classes(jar_path, classes)
+        return {
+            "coord": "com.vendor:target",
+            "api_name": "com.vendor.Target.changed",
+            "api_simple": "changed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+        }, jar_path
+
+    def _same_class_overloaded_bridge_fixture(self, tmp):
+        src = Path(tmp) / "src"
+        foo = src / "com/foo/Request.java"
+        bar = src / "com/bar/Request.java"
+        target = src / "com/vendor/Target.java"
+        foo.parent.mkdir(parents=True, exist_ok=True)
+        bar.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        foo.write_text("package com.foo; public class Request {}", encoding="utf-8")
+        bar.write_text("package com.bar; public class Request {}", encoding="utf-8")
+        target.write_text(
+            "package com.vendor; public class Target { "
+            "public static Object changed(com.foo.Request value) { "
+            "return changed(new com.bar.Request()); } "
+            "public static Object changed(com.bar.Request value) { return value; } }",
+            encoding="utf-8",
+        )
+        classes = self._compile_java_files(
+            Path(tmp) / "classes", [foo, bar, target]
+        )
+        jar_path = Path(tmp) / "target.jar"
+        self._jar_compiled_classes(jar_path, classes)
+        return {
+            "coord": "com.vendor:target",
+            "api_name": "com.vendor.Target.changed",
+            "api_simple": "changed",
+            "api_signature": "(com.bar.Request)",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+        }, jar_path
+
+    def test_same_class_different_method_bridge_is_kept_by_single_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_class_bridge_fixture(tmp)
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={"force_single_scan": []},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+
+            with patch.object(
+                tracer, "_build_packaged_runtime_dependency_scan_cache",
+                return_value={},
+            ):
+                scan = tracer._scan_packaged_runtime_dependencies_for_api(
+                    api_row, graph
+                )
+
+        self.assertEqual(scan["status"], "hit")
+        self.assertTrue(any(
+            hit["class_fqcn"] == "com.vendor.Target"
+            and hit["consumer_method"] == "entry"
+            for hit in scan["hits"]
+        ))
+
+    def test_same_class_different_method_bridge_is_kept_by_batch_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_class_bridge_fixture(tmp)
+            graph = SimpleNamespace(
+                methods_by_id={}, reverse_edges={},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache(
+                [api_row], graph
+            )
+
+        scan = scans[tracer.build_api_identity_key(api_row)]
+        self.assertEqual(scan["status"], "hit")
+        self.assertTrue(any(
+            hit["class_fqcn"] == "com.vendor.Target"
+            and hit["consumer_method"] == "entry"
+            for hit in scan["hits"]
+        ))
+
+    def test_same_class_same_named_overload_with_different_fqcn_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_class_overloaded_bridge_fixture(tmp)
+            graph = SimpleNamespace(
+                methods_by_id={}, reverse_edges={},
+                runtime_dependency_catalog=self._runtime_catalog(((api_row["coord"], jar_path),)),
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache(
+                [api_row], graph
+            )
+
+        scan = scans[tracer.build_api_identity_key(api_row)]
+        self.assertEqual(scan["status"], "hit")
+        self.assertTrue(any(
+            hit["consumer_descriptor"].startswith("(Lcom/foo/Request;)")
+            and hit["callee_descriptor"].startswith("(Lcom/bar/Request;)")
+            for hit in scan["hits"]
+        ))
+
+    def test_same_class_different_method_bridge_is_kept_by_runtime_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_class_bridge_fixture(tmp)
+            catalog = self._runtime_catalog(((api_row["coord"], jar_path),))
+            catalog["by_coord"][api_row["coord"]]["application_owned"] = False
+            graph = SimpleNamespace(
+                methods_by_id={}, reverse_edges={}, runtime_dependency_catalog=catalog,
+            )
+
+            expansion = tracer._ensure_runtime_dependency_callers_for_key(
+                graph,
+                "com.vendor.Target.changed(String)",
+                excluded_provider_coord=api_row["coord"],
+                excluded_self_owner="com.vendor.Target",
+            )
+
+        self.assertEqual(expansion["edges_added"], 1)
+        self.assertTrue(any(
+            "com.vendor.Target.entry" in edge.caller_qualified_key
+            for edges in graph.reverse_edges.values()
+            for edge in edges
+        ))
+
+    def test_runtime_closure_does_not_delete_preexisting_shared_graph_edges(self):
+        preserved = SimpleNamespace(
+            caller_qualified_key="com.vendor.Target.entry()",
+            runtime_analyzer_hit=None,
+        )
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={"com.vendor.Other.call()": [preserved]},
+            reverse_edge_count=1,
+            runtime_dependency_catalog={"status": "complete", "by_coord": {}},
+        )
+
+        tracer._ensure_runtime_dependency_callers_for_key(
+            graph,
+            "com.vendor.Target.changed(String)",
+            excluded_self_owner="com.vendor.Target",
+        )
+
+        self.assertEqual(
+            graph.reverse_edges["com.vendor.Other.call()"], [preserved]
+        )
+        self.assertEqual(graph.reverse_edge_count, 1)
+
     def test_same_coordinate_single_scan_retains_internal_bridge(self):
         with tempfile.TemporaryDirectory() as tmp:
             api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
@@ -1232,7 +1399,39 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertEqual(bridge["edge_role"], "internal_bridge")
         self.assertFalse(bridge["direct_consumer"])
 
-    def test_same_coordinate_external_provider_is_not_scanned_as_an_internal_bridge(self):
+    def test_member_index_batch_keeps_external_provider_same_coord_candidates(self):
+        api_row = {
+            "coord": "com.vendor:target",
+            "api_name": "com.vendor.Target.removed",
+            "api_simple": "removed",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+        }
+        task = {
+            "coord": api_row["coord"],
+            "application_owned": False,
+            "class_binary_name": "com.vendor.InternalBridge",
+        }
+        index = {
+            "complete": True,
+            "tasks": [task],
+            "unparsed_tasks": [],
+            "direct_by_owner_member": {("com.vendor.Target", "removed"): {0}},
+            "direct_by_owner": {},
+            "owner_string_ids": {},
+            "member_string_ids": {},
+            "reflection_ids": set(),
+        }
+
+        candidates = tracer._batch_candidates_from_runtime_member_index(
+            index, {"com.vendor.Target": [api_row]},
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["candidate_owners"], ["com.vendor.Target"])
+
+    def test_same_coordinate_external_provider_retains_other_class_internal_bridge(self):
         with tempfile.TemporaryDirectory() as tmp:
             api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
             catalog = self._runtime_catalog(((api_row["coord"], jar_path),))
@@ -1246,13 +1445,49 @@ class Step5KeyMatchingTest(unittest.TestCase):
             scans = tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
 
         scan = scans[tracer.build_api_identity_key(api_row)]
-        self.assertEqual(scan.get("hits", []), [])
+        self.assertEqual(scan["status"], "hit")
+        bridge = next(
+            hit for hit in scan["hits"]
+            if hit["class_fqcn"] == "com.vendor.InternalBridge"
+        )
+        self.assertEqual(bridge["edge_role"], "internal_bridge")
+        self.assertFalse(bridge["direct_consumer"])
+        self.assertFalse(any(
+            hit["class_fqcn"] == "com.vendor.Target"
+            for hit in scan["hits"]
+        ))
+
+    def test_duplicate_external_class_providers_are_not_consumers_of_each_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            catalog = self._runtime_catalog((
+                ("com.vendor:target", jar_path),
+                ("com.vendor:target-alias", jar_path),
+            ))
+            for item in catalog["by_coord"].values():
+                item["application_owned"] = False
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                runtime_dependency_catalog=catalog,
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache(
+                [api_row], graph
+            )
+
+        scan = scans[tracer.build_api_identity_key(api_row)]
+        self.assertTrue(scan.get("hits"))
         self.assertEqual(
-            tracer._step5_perf_stats(graph)["bytecode_scan"]["external_provider_jars_skipped"],
-            1,
+            {hit["class_fqcn"] for hit in scan["hits"]},
+            {"com.vendor.InternalBridge"},
+        )
+        self.assertEqual(
+            {hit["coord"] for hit in scan["hits"]},
+            {"com.vendor:target", "com.vendor:target-alias"},
         )
 
-    def test_runtime_closure_does_not_expand_through_an_external_target_provider(self):
+    def test_runtime_closure_expands_other_classes_in_external_target_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
             api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
             catalog = self._runtime_catalog(((api_row["coord"], jar_path),))
@@ -1267,10 +1502,44 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 graph,
                 "com.vendor.Target.removed(String)",
                 excluded_provider_coord=api_row["coord"],
+                excluded_self_owner="com.vendor.Target",
             )
 
-        self.assertEqual(expansion["edges_added"], 0)
-        self.assertFalse(graph.reverse_edges)
+        self.assertEqual(expansion["edges_added"], 1)
+        callers = [
+            edge.caller_qualified_key
+            for edges in graph.reverse_edges.values()
+            for edge in edges
+        ]
+        self.assertTrue(any("com.vendor.InternalBridge.use" in item for item in callers))
+        self.assertFalse(any("com.vendor.Target.removed" in item for item in callers))
+
+    def test_runtime_closure_never_materializes_target_self_recursion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
+            catalog = self._runtime_catalog(((api_row["coord"], jar_path),))
+            catalog["by_coord"][api_row["coord"]]["application_owned"] = False
+            graph = SimpleNamespace(
+                methods_by_id={}, reverse_edges={}, runtime_dependency_catalog=catalog,
+            )
+
+            tracer._ensure_runtime_dependency_callers_for_key(
+                graph, "com.vendor.Target.removed(String)"
+            )
+            tracer._ensure_runtime_dependency_callers_for_key(
+                graph,
+                "com.vendor.Target.removed(String)",
+                excluded_provider_coord=api_row["coord"],
+                excluded_self_owner="com.vendor.Target",
+            )
+
+        callers = [
+            edge.caller_qualified_key
+            for edges in graph.reverse_edges.values()
+            for edge in edges
+        ]
+        self.assertTrue(any("com.vendor.InternalBridge.use" in item for item in callers))
+        self.assertFalse(any("com.vendor.Target.removed" in item for item in callers))
 
     def test_same_coordinate_batch_javap_retains_internal_bridge(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1288,6 +1557,45 @@ class Step5KeyMatchingTest(unittest.TestCase):
         bridge = next(hit for hit in scan["hits"] if hit["class_fqcn"] == "com.vendor.InternalBridge")
         self.assertEqual(bridge["edge_role"], "internal_bridge")
         self.assertFalse(bridge["direct_consumer"])
+
+    def test_external_provider_retains_outer_class_call_to_nested_target_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            source = src / "org/example/Container.java"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(
+                "package org.example; public class Container { "
+                "public static class Nested { public String removed() { return null; } } "
+                "public String bridge(Nested value) { return value.removed(); } }",
+                encoding="utf-8",
+            )
+            classes = self._compile_java_files(Path(tmp) / "classes", [source])
+            jar_path = Path(tmp) / "target.jar"
+            self._jar_compiled_classes(jar_path, classes)
+            api_row = {
+                "coord": "org.example:target",
+                "api_name": "org.example.Container.Nested.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+                "severity": "P1",
+                "confirmed": "true",
+            }
+            catalog = self._runtime_catalog(((api_row["coord"], jar_path),))
+            catalog["by_coord"][api_row["coord"]]["application_owned"] = False
+            graph = SimpleNamespace(
+                methods_by_id={}, reverse_edges={}, runtime_dependency_catalog=catalog,
+            )
+
+            scans = tracer._build_packaged_runtime_dependency_scan_cache([api_row], graph)
+
+        scan = scans[tracer.build_api_identity_key(api_row)]
+        self.assertEqual(scan["status"], "hit")
+        self.assertEqual(
+            {hit["class_fqcn"] for hit in scan["hits"]},
+            {"org.example.Container"},
+        )
 
     def test_light_expansion_reuses_batch_classfile_parse_for_same_physical_class(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3120,6 +3428,59 @@ public class com.example.TargetBridge {
         self.assertEqual(matches[0]["opcode_family"], "invokestatic")
         self.assertEqual(matches[0]["instruction_offset"], 0)
 
+    def test_runtime_member_matchers_reject_wrong_opcode_families(self):
+        method = {
+            "api_name": "com.vendor.Target.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+        }
+        field = {
+            "api_name": "com.vendor.Target.value",
+            "api_signature": "",
+            "symbol_kind": "field",
+        }
+        bad_method = {
+            "callee_owner": "com.vendor.Target", "callee_member": "call",
+            "callee_descriptor": "()V", "opcode_family": "getstatic",
+        }
+        bad_field = {
+            "callee_owner": "com.vendor.Target", "callee_member": "value",
+            "callee_descriptor": "I", "opcode_family": "invokevirtual",
+        }
+        references = {
+            "method_refs": [{
+                "owner": "com.vendor.Target", "name": "call",
+                "descriptor": "()V", "opcode_family": "getstatic",
+                "instruction_offset": 0, "consumer_method": "run",
+                "consumer_signature": "()",
+            }],
+        }
+
+        self.assertFalse(tracer._runtime_reference_edge_matches_api(method, bad_method))
+        self.assertFalse(tracer._runtime_reference_edge_matches_api(field, bad_field))
+        self.assertEqual(tracer._match_runtime_dependency_references(method, references), [])
+
+    def test_runtime_field_matcher_accepts_verified_reflection_invocation_opcode(self):
+        field = {
+            "api_name": "com.vendor.Target.value",
+            "api_signature": "",
+            "symbol_kind": "field",
+        }
+        references = {
+            "field_refs": [{
+                "owner": "com.vendor.Target", "name": "value",
+                "descriptor": "", "opcode_family": "invokevirtual",
+                "instruction_offset": 12, "consumer_method": "run",
+                "consumer_signature": "()", "reference_kind": "reflection_field",
+            }],
+        }
+
+        matches = tracer._match_runtime_dependency_references(field, references)
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["evidence_type"], "bytecode_reflection_field_access")
+        self.assertEqual(matches[0]["opcode_family"], "invokevirtual")
+
     def test_class_topology_requires_executable_type_instruction(self):
         api_row = {
             "api_name": "com.vendor.TargetType",
@@ -3151,6 +3512,117 @@ public class com.example.TargetBridge {
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["opcode_family"], "checkcast")
         self.assertEqual(matches[0]["instruction_offset"], 0)
+
+    def test_class_topology_ignores_self_member_instructions(self):
+        api_row = {
+            "api_name": "com.vendor.TargetType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "analysis_scope": "class_usage",
+        }
+        javap_output = '''
+public class com.vendor.TargetType {
+  private java.lang.Object value;
+  public java.lang.Object read();
+    descriptor: ()Ljava/lang/Object;
+    Code:
+       0: aload_0
+       1: getfield #7 // Field value:Ljava/lang/Object;
+       4: areturn
+}
+'''
+        references = tracer._parse_javap_bytecode_references(
+            javap_output, "com.vendor.TargetType"
+        )
+
+        self.assertEqual(
+            tracer._match_runtime_dependency_references(api_row, references),
+            [],
+        )
+
+    def test_external_class_constant_is_weak_usage_but_self_declaration_is_not(self):
+        api_row = {
+            "api_name": "com.vendor.TargetType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "analysis_scope": "class_usage",
+        }
+        references = {"class_refs": {"com.vendor.TargetType"}}
+
+        external = tracer._match_runtime_dependency_class_constants(
+            api_row, references, caller_owner="com.consumer.Adapter"
+        )
+        self_reference = tracer._match_runtime_dependency_class_constants(
+            api_row, references, caller_owner="com.vendor.TargetType"
+        )
+
+        self.assertEqual(len(external), 1)
+        self.assertEqual(
+            external[0]["evidence_type"], "bytecode_class_constant_reference"
+        )
+        self.assertTrue(external[0]["weak_reference"])
+        self.assertEqual(self_reference, [])
+
+    def test_only_exact_target_method_self_call_is_excluded(self):
+        api_row = {
+            "api_name": "com.vendor.Target.changed",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+        }
+
+        self.assertTrue(tracer._is_exact_target_self_reference(
+            api_row,
+            "com.vendor.Target",
+            {
+                "consumer_method": "changed",
+                "consumer_descriptor": "(Ljava/lang/String;)Ljava/lang/String;",
+                "callee_descriptor": "(Ljava/lang/String;)Ljava/lang/String;",
+            },
+        ))
+        self.assertFalse(tracer._is_exact_target_self_reference(
+            api_row,
+            "com.vendor.Target",
+            {
+                "consumer_method": "entry",
+                "consumer_descriptor": "(Ljava/lang/String;)Ljava/lang/String;",
+                "callee_descriptor": "(Ljava/lang/String;)Ljava/lang/String;",
+            },
+        ))
+        self.assertFalse(tracer._is_exact_target_self_reference(
+            {**api_row, "api_name": "com.vendor.Target.value", "symbol_kind": "field"},
+            "com.vendor.Target",
+            {"consumer_method": "changed", "consumer_descriptor": "()V"},
+        ))
+
+    def test_same_named_fqcn_overload_and_constructor_delegate_are_not_self_recursion(self):
+        overloaded = {
+            "api_name": "com.vendor.Target.changed",
+            "api_signature": "(com.bar.Request)",
+            "symbol_kind": "method",
+        }
+        constructor = {
+            "api_name": "com.vendor.Target.Target",
+            "api_signature": "(com.bar.Request)",
+            "symbol_kind": "constructor",
+        }
+        reference = {
+            "consumer_method": "changed",
+            "consumer_descriptor": "(Lcom/foo/Request;)Ljava/lang/Object;",
+            "callee_descriptor": "(Lcom/bar/Request;)Ljava/lang/Object;",
+        }
+
+        self.assertFalse(tracer._is_exact_target_self_reference(
+            overloaded, "com.vendor.Target", reference
+        ))
+        self.assertFalse(tracer._is_exact_target_self_reference(
+            constructor,
+            "com.vendor.Target",
+            {
+                "consumer_method": "<init>",
+                "consumer_descriptor": "(Lcom/foo/Request;)V",
+                "callee_descriptor": "(Lcom/bar/Request;)V",
+            },
+        ))
 
     def test_batch_runtime_scan_ignores_constant_pool_match_without_instruction(self):
         api_row = {
@@ -17376,6 +17848,24 @@ public class StringOnly {
             cached = graph.runtime_dependency_catalog["_packaged_api_scan_results"]
             self.assertEqual(cached[tracer.build_api_identity_key(apis[0])]["status"], "miss")
 
+    def test_constant_pool_does_not_require_javap_for_non_lookup_class_method(self):
+        summary = {
+            "has_dynamic_reference": False,
+            "ref_members": [{"owner": "java/lang/Class", "name": "getName"}],
+        }
+
+        self.assertFalse(tracer._constant_pool_requires_javap(summary))
+
+    def test_constant_pool_requires_javap_for_reflective_member_lookup(self):
+        summary = {
+            "has_dynamic_reference": False,
+            "ref_members": [{
+                "owner": "java/lang/Class", "name": "getDeclaredMethod",
+            }],
+        }
+
+        self.assertTrue(tracer._constant_pool_requires_javap(summary))
+
     def test_batch_packaged_bytecode_keeps_reflection_string_candidates_for_javap(self):
         with tempfile.TemporaryDirectory() as tmp:
             classes_root = self._compile_java_fixture(
@@ -18370,6 +18860,7 @@ public class com.example.consumer.Adapter {
                 "method_refs": [{
                     "owner": "org.apache.commons.lang.StringUtils", "name": "isBlank",
                     "signature": "(String)", "descriptor": "(Ljava/lang/String;)Z",
+                    "opcode_family": "invokestatic", "instruction_offset": 0,
                 }],
                 "field_refs": [], "class_refs": [],
             }
@@ -18642,6 +19133,77 @@ public class com.example.consumer.Adapter {
         user_view = formatter.summarize_user_facing_outcome(built)
         self.assertIn("简写参数类型", user_view["user_reason"])
         self.assertIn("限定包名", user_view["recommended_action"])
+
+    def test_packaged_application_owned_module_hit_without_entry_is_uncertain(self):
+        result = tracer.TraceResult(
+            api_name="com.example.LibraryApi.changed", api_simple="changed",
+            api_signature="()", symbol_kind="method", change_type="REMOVED",
+            coord="com.example:library", severity="P1", confirmed=True,
+            source="git_diff", analysis_scope="method",
+            analysis_status="not_analyzed", direct_callers=0,
+            is_reachable=False, reachable_note="", business_reach_depth=0,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[],
+            reason_code="", verification_commands=[], hops=[],
+            confidence_score=1.0, critical_nodes_hit=[],
+        )
+        hit = {
+            "coord": "com.example:library",
+            "application_owned": True,
+            "ownership_evidence": {
+                "authority": "reactor_coordinate_and_final_artifact_entry",
+                "reactor_coord": "com.example:library",
+                "artifact_entry": "BOOT-INF/lib/library.jar",
+                "final_artifact_sha256": "a" * 64,
+            },
+            "edge_role": "internal_bridge",
+            "class_fqcn": "com.example.LibraryCaller",
+            "consumer_method": "run",
+            "consumer_signature": "()",
+            "target_display": "com.example.LibraryApi.changed()",
+            "evidence_type": "bytecode_method_invocation",
+            "jar_path": "app.jar!/BOOT-INF/lib/library.jar",
+        }
+
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit])
+        built = tracer._finalize_trace_draft(draft)
+
+        self.assertEqual(built.analysis_status, "uncertain")
+        self.assertIsNone(built.is_reachable)
+        self.assertFalse(built.path_details[0]["business_reachable"])
+        self.assertEqual(
+            draft.envelope_paths[0].entry_scope,
+            tracer.ModuleScope.INTERNAL_MODULE,
+        )
+
+    def test_packaged_weak_class_constant_in_business_code_is_not_reachable(self):
+        result = tracer.TraceResult(
+            api_name="com.vendor.TargetType", api_simple="TargetType",
+            api_signature="", symbol_kind="class", change_type="REMOVED",
+            coord="com.vendor:api", severity="P1", confirmed=True,
+            source="git_diff", analysis_scope="class_usage",
+            analysis_status="not_analyzed", direct_callers=0,
+            is_reachable=False, reachable_note="", business_reach_depth=0,
+            dependency_chain_coords=[], call_paths=[], evidence_paths=[],
+            reason_code="", verification_commands=[], hops=[],
+            confidence_score=1.0, critical_nodes_hit=[],
+        )
+        hit = {
+            "coord": "__business__", "class_fqcn": "app.Entry",
+            "consumer_method": "<class-constant>", "consumer_signature": "",
+            "target_display": "com.vendor.TargetType",
+            "evidence_type": "bytecode_class_constant_reference",
+            "weak_reference": True, "instruction_offset": None,
+        }
+
+        draft = self._draft_from_result(result)
+        tracer._build_packaged_dependency_hit_result(draft, [hit])
+        built = tracer._finalize_trace_draft(draft)
+
+        self.assertEqual(built.analysis_status, "uncertain")
+        self.assertIsNone(built.is_reachable)
+        self.assertEqual(built.reason_code, "WEAK_CLASS_REFERENCE_ONLY")
+        self.assertFalse(built.path_details[0]["business_reachable"])
 
     def test_ambiguous_business_hit_cannot_promote_exact_internal_hit(self):
         result = tracer.TraceResult(
@@ -19260,7 +19822,9 @@ public class com.example.consumer.Adapter {
                 package com.acme;
                 public class TargetBridge {
                     public static void removed() {}
-                    public static void caller() { removed(); }
+                }
+                class Caller {
+                    public static void caller() { TargetBridge.removed(); }
                 }
                 """,
             )
@@ -19552,6 +20116,41 @@ public class com.example.consumer.Adapter {
         self.assertEqual(index["reflection_ids"], set())
         self.assertEqual(dict(index["owner_string_ids"]), {})
         self.assertEqual(dict(index["member_string_ids"]), {})
+
+    def test_runtime_member_index_keeps_package_annotation_class_references(self):
+        target = "org.checkerframework.framework.qual.DefaultQualifier"
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "caller.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("org/postgresql/package-info.class", b"fixture")
+            summary = {
+                "class_internal_names": {
+                    "org/checkerframework/framework/qual/DefaultQualifier",
+                },
+                "ref_members": [],
+                "utf8_values": set(),
+                "has_dynamic_reference": False,
+            }
+            with patch.object(
+                tracer, "_parse_classfile_constant_pool_summary",
+                return_value=summary,
+            ):
+                index = tracer._build_runtime_dependency_member_candidate_index(
+                    SimpleNamespace(),
+                    [{"coord": "org.postgresql:postgresql", "jar_path": str(jar_path)}],
+                    17,
+                )
+
+        tasks = tracer._batch_candidates_from_runtime_member_index(
+            index,
+            {target: [{
+                "coord": "org.checkerframework:checker-qual",
+                "api_name": target,
+                "symbol_kind": "class",
+            }]},
+        )
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["class_entry"], "org/postgresql/package-info.class")
 
     def test_runtime_reference_signature_resolves_nested_type_from_owner_package(self):
         range_reference = {
