@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -12,6 +13,33 @@ import auto_discover_bridge_sources as bridges  # noqa: E402
 
 
 class AutoDiscoverBridgeSourcesTest(unittest.TestCase):
+    def test_iter_repo_modules_does_not_resolve_every_walked_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".git").mkdir()
+            for branch in range(8):
+                current = repo / f"branch-{branch}"
+                for depth in range(20):
+                    current = current / f"depth-{depth}"
+                    current.mkdir(parents=True, exist_ok=True)
+
+            original_resolve = Path.resolve
+            resolve_calls = []
+
+            def counted_resolve(path, *args, **kwargs):
+                resolve_calls.append(str(path))
+                return original_resolve(path, *args, **kwargs)
+
+            with patch.object(Path, "resolve", counted_resolve):
+                modules = list(bridges._iter_repo_modules(str(repo)))
+
+        self.assertEqual(modules, [])
+        self.assertLess(
+            len(resolve_calls),
+            20,
+            f"bridge repository walk performed {len(resolve_calls)} realpath resolutions",
+        )
+
     def test_load_source_mapping_inputs_reads_from_main_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

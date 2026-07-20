@@ -490,7 +490,11 @@ def _artifact_id_from_gradle_build_file(build_file):
 
 
 def _iter_gradle_build_files(module_dir):
-    module_dir = Path(module_dir).resolve()
+    # Callers that scan repositories already pass an absolute path rooted at a
+    # resolved repository directory.  Resolving every visited directory is
+    # especially expensive on Windows, where Path.resolve() canonicalizes
+    # reparse points through ntpath.realpath().
+    module_dir = Path(module_dir)
     seen = set()
     for name in ('build.gradle', 'build.gradle.kts'):
         candidate = module_dir / name
@@ -614,8 +618,11 @@ def _find_git_root(path_value):
 
 
 def _is_embedded_resource_fixture_dir(path_value, repo_root):
-    current = Path(path_value).resolve()
-    base = Path(repo_root).resolve()
+    # Repository walkers pass paths derived from the same resolved root, so a
+    # lexical relative check is sufficient and avoids a realpath call for every
+    # directory and every child considered by os.walk().
+    current = Path(path_value)
+    base = Path(repo_root)
     try:
         rel_parts = current.relative_to(base).parts
     except Exception:
@@ -636,7 +643,7 @@ def _has_child_module_manifests(root_path, max_depth=4):
     if not base.exists() or not base.is_dir():
         return False
     for current_root, dirs, files in os.walk(str(base)):
-        current = Path(current_root).resolve()
+        current = Path(current_root)
         if _is_embedded_resource_fixture_dir(current, base):
             dirs[:] = []
             continue
@@ -712,7 +719,9 @@ def infer_maven_coord_locations(project_dir, max_poms=None):
 
         for root, dirs, files in os.walk(probe_root):
             files = sorted(files)
-            current_root = Path(root).resolve()
+            # probe_root is resolved once above and os.walk() preserves that
+            # absolute prefix.  Avoid resolving every directory in the tree.
+            current_root = Path(root)
             if _is_embedded_resource_fixture_dir(current_root, probe_root):
                 dirs[:] = []
                 continue
@@ -723,7 +732,7 @@ def infer_maven_coord_locations(project_dir, max_poms=None):
             ]
             dirs.sort()
             if 'pom.xml' in files:
-                if skip_probe_root_as_module and current_root == probe_root.resolve():
+                if skip_probe_root_as_module and current_root == probe_root:
                     pass
                 else:
                     pom_path = Path(root) / 'pom.xml'
@@ -733,7 +742,7 @@ def infer_maven_coord_locations(project_dir, max_poms=None):
             for build_path in _iter_gradle_build_files(current_root):
                 if build_path.name not in files:
                     continue
-                if skip_probe_root_as_module and current_root == probe_root.resolve():
+                if skip_probe_root_as_module and current_root == probe_root:
                     continue
                 c = _parse_gradle_coord_with_repo_context(str(build_path), repo_root)
                 add_location(c, root, repo_root)

@@ -876,6 +876,14 @@ def _filter_inferred_coords_by_prefix(inferred_coords, coord_prefix):
     return [item for item in (inferred_coords or []) if item.startswith(coord_prefix + ":")]
 
 
+def _cached_maven_coord_locations(repo_path, cache):
+    """Infer repository coordinates once per lexical absolute repository path."""
+    cache_key = os.path.normcase(os.path.abspath(str(repo_path or "")))
+    if cache_key not in cache:
+        cache[cache_key] = infer_maven_coord_locations(cache_key)
+    return cache[cache_key]
+
+
 def _list_repo_refs(repo_dir: str):
     repo_dir = os.path.abspath(repo_dir)
     cached = _REPO_REFS_CACHE.get(repo_dir)
@@ -5289,6 +5297,7 @@ def main():
     # 解析依赖源码仓库映射
     dependency_paths = {}
     dependency_path_meta = {}
+    maven_coord_locations_cache = {}
     source_mapping_timer = time.perf_counter()
 
     def register_dependency_path(mapped_coord, repo_path, module_path, input_spec, input_coord, mapping_mode, repo_inferred_coords):
@@ -5317,7 +5326,10 @@ def main():
             coord = coord.strip()
             path = path.strip()
             abs_path = os.path.abspath(path)
-            coord_locations = infer_maven_coord_locations(abs_path)
+            coord_locations = _cached_maven_coord_locations(
+                abs_path,
+                maven_coord_locations_cache,
+            )
             inferred_coords = [item.get("coord") for item in coord_locations if item.get("coord")]
             location_by_coord = {item.get("coord"): item for item in coord_locations if item.get("coord")}
             if inferred_coords and coord:
@@ -5368,7 +5380,10 @@ def main():
             continue
 
         abs_path = os.path.abspath(mapping)
-        coord_locations = infer_maven_coord_locations(abs_path)
+        coord_locations = _cached_maven_coord_locations(
+            abs_path,
+            maven_coord_locations_cache,
+        )
         coords = [item.get("coord") for item in coord_locations if item.get("coord")]
         for item in coord_locations:
             coord = item.get("coord")

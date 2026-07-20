@@ -108,7 +108,7 @@ def _has_child_module_manifests(root_path, max_depth=4):
     if not base.exists() or not base.is_dir():
         return False
     for current_root, dirs, files in os.walk(str(base)):
-        current = Path(current_root).resolve()
+        current = Path(current_root)
         if _is_embedded_resource_fixture_dir(current, base):
             dirs[:] = []
             continue
@@ -218,7 +218,10 @@ def _iter_repo_modules(root_path, max_manifests=120):
     )
     count = 0
     for root, dirs, files in os.walk(normalized_root):
-        current_root = Path(root).resolve()
+        # normalized_root_path is resolved once above; os.walk() returns paths
+        # under that absolute root, so per-directory realpath calls add no
+        # correctness value and are very costly on Windows repositories.
+        current_root = Path(root)
         if _is_embedded_resource_fixture_dir(current_root, normalized_root_path):
             dirs[:] = []
             continue

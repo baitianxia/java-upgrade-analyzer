@@ -1832,6 +1832,56 @@ class Step4StabilityTest(unittest.TestCase):
             self.assertEqual(coords[0], "com.example:module-000")
             self.assertEqual(coords[-1], "com.example:module-119")
 
+    def test_infer_maven_coord_locations_does_not_resolve_every_walked_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            for branch in range(8):
+                current = root / f"branch-{branch}"
+                for depth in range(20):
+                    current = current / f"depth-{depth}"
+                    current.mkdir(parents=True, exist_ok=True)
+
+            original_resolve = Path.resolve
+            resolve_calls = []
+
+            def counted_resolve(path, *args, **kwargs):
+                resolve_calls.append(str(path))
+                return original_resolve(path, *args, **kwargs)
+
+            with patch.object(Path, "resolve", counted_resolve):
+                locations = compat.infer_maven_coord_locations(str(root))
+
+        self.assertEqual(locations, [])
+        self.assertLess(
+            len(resolve_calls),
+            20,
+            f"repository walk performed {len(resolve_calls)} realpath resolutions",
+        )
+
+    def test_step4_reuses_maven_coord_locations_for_the_same_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            inferred = [
+                {
+                    "coord": "com.example:demo",
+                    "module_dir": str(repo),
+                    "repo_root": str(repo),
+                }
+            ]
+            cache = {}
+            with patch.object(
+                step4,
+                "infer_maven_coord_locations",
+                return_value=inferred,
+            ) as infer_mock:
+                first = step4._cached_maven_coord_locations(str(repo), cache)
+                second = step4._cached_maven_coord_locations(str(repo / "."), cache)
+
+        self.assertIs(first, second)
+        infer_mock.assert_called_once_with(os.path.abspath(str(repo)))
+
     def test_infer_maven_coord_locations_infers_gradle_submodule_group_from_repo_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
