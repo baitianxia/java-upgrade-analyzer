@@ -57,6 +57,7 @@ from confidence_weighted_tracer import (
     trace_all_apis_with_confidence_weighting,
 )
 from enhanced_output_formatter import generate_enhanced_summary, register_step5_summary_artifacts
+import compat as compat_module
 from compat import run_cmd
 from csv_io import open_csv_read, open_csv_write
 from progress_logging import PhaseTimer, emit_progress
@@ -69,7 +70,13 @@ from indirect_usage_analyzer import (
 from framework_adapters import run_framework_adapters, serialize_framework_batches
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_evidence_model import CoverageRecord, thaw_evidence_value
-from step5_memory_observer import record_step5_memory
+from step5_memory_observer import (
+    ProcessTreeObserver,
+    Step5ResourceBudgetExceeded,
+    evaluate_process_tree_budget,
+    record_step5_memory,
+    set_active_process_tree_observer,
+)
 from step5_artifact_fact_store import Step5ArtifactFactStore
 from signature_utils import normalize_signature_for_identity, signatures_match_identity
 from analysis_contract import build_project_scope, discover_maven_modules, sha256_file
@@ -349,6 +356,29 @@ def _observe_step5_memory(graph_stats, phase, *, graph=None, extra=None):
         graph=graph,
         extra=extra,
     )
+    try:
+        soft_limit_mb = float(os.environ.get('JUA_STEP5_PROCESS_TREE_SOFT_RSS_MB') or 0.0)
+        hard_limit_mb = float(os.environ.get('JUA_STEP5_PROCESS_TREE_HARD_RSS_MB') or 0.0)
+    except ValueError as exc:
+        raise ValueError(
+            'JUA_STEP5_PROCESS_TREE_SOFT_RSS_MB and '
+            'JUA_STEP5_PROCESS_TREE_HARD_RSS_MB must be numeric'
+        ) from exc
+    budget = evaluate_process_tree_budget(
+        sample,
+        soft_limit_mb=soft_limit_mb,
+        hard_limit_mb=hard_limit_mb,
+    )
+    budget_metrics = graph_stats.setdefault('step5_perf', {}).setdefault(
+        'resource_budget', {}
+    )
+    budget_metrics.update({
+        'status': budget['status'],
+        'reason_code': budget['reason_code'],
+        'observed_peak_rss_mb': budget['peak_rss_mb'],
+        'limit_mb': budget['limit_mb'],
+        'checked_phase': phase,
+    })
     emit_progress(
         "step5",
         "memory",
@@ -359,6 +389,32 @@ def _observe_step5_memory(graph_stats, phase, *, graph=None, extra=None):
             f"reverse_edges={sample['reverse_edge_count']}"
         ),
     )
+    if budget['status'] == 'warning':
+        os.environ['JUA_STEP5_BYTECODE_JAVAP_WORKERS'] = '1'
+        body_cache_evictions = 0
+        for method_def in getattr(graph, 'methods_by_id', {}).values() if graph is not None else ():
+            if getattr(method_def, '_body_text_cached', ''):
+                method_def._body_text_cached = ''
+                body_cache_evictions += 1
+        budget_metrics.update({
+            'adaptive_javap_workers': 1,
+            'body_cache_evictions': int(
+                budget_metrics.get('body_cache_evictions') or 0
+            ) + body_cache_evictions,
+        })
+        emit_progress(
+            'step5',
+            'resource-budget',
+            (
+                f"{budget['reason_code']}: peak={budget['peak_rss_mb']:.1f}MB, "
+                f"soft_limit={budget['limit_mb']:.1f}MB"
+            ),
+        )
+    if budget['status'] == 'blocked':
+        raise Step5ResourceBudgetExceeded(
+            f"{budget['reason_code']}: peak={budget['peak_rss_mb']:.1f}MB, "
+            f"hard_limit={budget['limit_mb']:.1f}MB, phase={phase}"
+        )
     return sample
 
 
@@ -683,13 +739,22 @@ def build_tree_sitter_missing_interaction(output_dir, details_path, status):
 def step5_integrated_main(args):
     previous_debug = os.environ.get('JUA_STEP5_DEBUG')
     previous_break = os.environ.get('JUA_STEP5_DEBUG_BREAK')
+    previous_javap_workers = os.environ.get('JUA_STEP5_BYTECODE_JAVAP_WORKERS')
     if getattr(args, 'debug_analysis', False):
         os.environ['JUA_STEP5_DEBUG'] = '1'
     if getattr(args, 'debug_break', False):
         os.environ['JUA_STEP5_DEBUG_BREAK'] = '1'
+    process_observer = ProcessTreeObserver(
+        temporary_paths=(Path(infer_step5_report_dir(args)) / '.runtime',),
+    ).start()
+    previous_memory_observer = set_active_process_tree_observer(process_observer)
+    previous_command_observer = compat_module.set_process_observer(process_observer)
     try:
         return _step5_integrated_main_impl(args)
     finally:
+        compat_module.set_process_observer(previous_command_observer)
+        process_observer.stop()
+        set_active_process_tree_observer(previous_memory_observer)
         if previous_debug is None:
             os.environ.pop('JUA_STEP5_DEBUG', None)
         else:
@@ -698,6 +763,10 @@ def step5_integrated_main(args):
             os.environ.pop('JUA_STEP5_DEBUG_BREAK', None)
         else:
             os.environ['JUA_STEP5_DEBUG_BREAK'] = previous_break
+        if previous_javap_workers is None:
+            os.environ.pop('JUA_STEP5_BYTECODE_JAVAP_WORKERS', None)
+        else:
+            os.environ['JUA_STEP5_BYTECODE_JAVAP_WORKERS'] = previous_javap_workers
 
 
 def infer_step5_report_dir(args):
@@ -1669,6 +1738,12 @@ def _step5_integrated_main_impl(args):
     summary_timer = time.perf_counter()
     emit_progress("step5", "report", "开始生成汇总报告与证据视图")
     generate_enhanced_summary(all_results, output_dir, graph_stats=graph_stats)
+    _observe_step5_memory(
+        graph_stats,
+        'report_ready',
+        graph=graph,
+        extra={'result_count': len(all_results)},
+    )
     emit_progress(
         "step5",
         "report",

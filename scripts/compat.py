@@ -91,6 +91,24 @@ def _detect_subprocess_encoding():
 
 # 模块加载时检测一次，后续复用
 _SUBPROCESS_ENCODING = _detect_subprocess_encoding()
+_PROCESS_OBSERVER = None
+
+
+def set_process_observer(observer):
+    """Install an optional command lifecycle observer; return the previous one."""
+    global _PROCESS_OBSERVER
+    previous = _PROCESS_OBSERVER
+    _PROCESS_OBSERVER = observer
+    return previous
+
+
+def _finish_observed_command(observer, token, result):
+    if observer is not None and token is not None:
+        try:
+            observer.command_finished(token)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return result
 
 
 def _extract_maven_repo_local_from_opts(text):
@@ -180,6 +198,12 @@ def run_cmd(
       stream_output 将子进程 stdout/stderr 实时转发到当前 stderr，同时仍完整捕获返回
       stream_stdout 流式模式下是否转发 stdout；协议型子进程可仅转发 stderr
     """
+    observer = _PROCESS_OBSERVER
+    try:
+        observer_token = observer.command_started(cmd) if observer is not None else None
+    except (AttributeError, TypeError, ValueError):
+        observer_token = None
+
     # 构建环境变量：强制 Maven/Git 使用 UTF-8 输出
     proc_env = os.environ.copy()
     if env:
@@ -244,14 +268,14 @@ def run_cmd(
                 proc.wait()
                 stdout_thread.join(timeout=5)
                 stderr_thread.join(timeout=5)
-                return '', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1
+                return _finish_observed_command(observer, observer_token, ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
             stdout_thread.join()
             stderr_thread.join()
-            return (
+            return _finish_observed_command(observer, observer_token, (
                 _decode_subprocess_output(b''.join(stdout_chunks)),
                 _decode_subprocess_output(b''.join(stderr_chunks)),
                 return_code,
-            )
+            ))
         proc = subprocess.run(
             cmd,
             cwd=cwd,
@@ -265,17 +289,17 @@ def run_cmd(
         # 解码输出：先尝试 UTF-8，失败则用系统编码，再失败则替换非法字符
         stdout = _decode_subprocess_output(proc.stdout)
         stderr = _decode_subprocess_output(proc.stderr)
-        return stdout, stderr, proc.returncode
+        return _finish_observed_command(observer, observer_token, (stdout, stderr, proc.returncode))
 
     except subprocess.TimeoutExpired:
-        return '', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1
+        return _finish_observed_command(observer, observer_token, ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
     except FileNotFoundError:
         cmd_name = cmd[0] if cmd else '(空命令)'
-        return '', f'命令未找到：{cmd_name}（请确认已安装并在 PATH 中）', -1
+        return _finish_observed_command(observer, observer_token, ('', f'命令未找到：{cmd_name}（请确认已安装并在 PATH 中）', -1))
     except PermissionError:
-        return '', f'权限不足，无法执行：{cmd[0]}', -1
+        return _finish_observed_command(observer, observer_token, ('', f'权限不足，无法执行：{cmd[0]}', -1))
     except Exception as e:
-        return '', f'执行异常：{type(e).__name__}: {e}', -1
+        return _finish_observed_command(observer, observer_token, ('', f'执行异常：{type(e).__name__}: {e}', -1))
 
 
 def open_text(path, mode='r', encoding='utf-8', errors='replace'):

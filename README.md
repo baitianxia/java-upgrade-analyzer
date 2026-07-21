@@ -336,6 +336,13 @@ Step5 慢时，让 Claude Code 查看：
 .upgrade-report/.runtime/observability/step5_timing.csv
 ```
 
+其中 `memory.*_process_tree_peak_rss_mb` 是 Python、`javap`、`jdeps` 等全部后代进程的
+瞬时 RSS 总和峰值；`memory.*_external_process_count_<tool>` 和
+`memory.*_external_process_peak_concurrency`、`memory.*_temporary_file_peak_bytes` 和
+`memory.*_external_process_wall_sec` 用于区分进程启动、临时文件与 Python 建图压力。需要限制内存时，
+可设置 `JUA_STEP5_PROCESS_TREE_SOFT_RSS_MB`（告警）或
+`JUA_STEP5_PROCESS_TREE_HARD_RSS_MB`（在阶段边界失败关闭），单位均为 MiB。
+
 重点关注：
 
 - `business_bytecode`

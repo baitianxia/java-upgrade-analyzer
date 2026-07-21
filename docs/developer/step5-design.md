@@ -223,10 +223,24 @@ Step5 会输出：
 - `trace.incoming_edges_cache_*`;
 - `trace.declared_signature_index_*`;
 - `trace.direct_class_usage_*`;
-- `memory.*_current_rss_mb` 与 `memory.*_peak_rss_mb`；
+- `memory.*_current_rss_mb` 与 `memory.*_peak_rss_mb`（Python 主进程）；
+- `memory.*_process_tree_peak_rss_mb` 与 `memory.*_child_process_peak_rss_mb`（Python 与全部后代进程）；
+- `memory.*_self_cpu_sec`、`memory.*_child_cpu_sec`、`memory.*_external_process_wall_sec`；
+- `memory.*_external_process_count`、`memory.*_external_process_peak_concurrency` 与按工具拆分的 `memory.*_external_process_count_<tool>`；
+- `memory.*_temporary_file_current_bytes` 与 `memory.*_temporary_file_peak_bytes`（报告 `.runtime` 临时/缓存目录）；
 - `memory.*_method_count`、`memory.*_reverse_edge_key_count` 与 `memory.*_reverse_edge_count`。
 
-内存采样只保留标量，不保留图或批次对象的引用。采样失败时记录 `0.0`，不得中断或降级分析。
+进程树采样只保留标量和工具计数，不保留图、批次或进程对象的引用。Linux 读取 `/proc`，
+macOS 优先使用 `libproc`（仅在系统库不可用时回退 `ps`）；其他平台显式记录
+`process_tree_observer_supported=false`。采样失败会增加
+`process_tree_sample_failures`，不会把缺失样本当作零内存证明。
+
+可通过 `JUA_STEP5_PROCESS_TREE_SOFT_RSS_MB` 设置软阈值：超过后保留完整结果并写入
+`STEP5_PROCESS_TREE_RSS_SOFT_LIMIT_EXCEEDED` 告警。通过
+`JUA_STEP5_PROCESS_TREE_HARD_RSS_MB` 设置硬阈值：在下一个阶段观测边界以
+`STEP5_PROCESS_TREE_RSS_HARD_LIMIT_EXCEEDED` 失败关闭，避免继续扩大内存压力直至 OOM。
+触发软阈值后，后续 `javap` 自动收敛为单 worker，并释放可从源码重新加载的方法正文字符串缓存；
+不会删除图边、证据或缩小分析范围。阈值默认不启用，必须填写正数 MiB。
 - `trace.direct_field_usage_*`;
 - `report.*`。
 
