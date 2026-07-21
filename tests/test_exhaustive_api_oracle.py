@@ -508,6 +508,31 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
         self.assertEqual(result["verified"], 1)
         self.assertEqual(result["ledger"][0]["oracle_conclusion"], "reachable")
 
+    def test_dynamic_uncertainty_dominates_closed_world_static_absence(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.OptionalType", "api_signature": "",
+            "symbol_kind": "class",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "uncertain"}]
+        dynamic = authority(
+            "p.OptionalType", "", "uncertain",
+            authority="final-artifact-classfile-constants",
+        )
+        dynamic["symbol_kind"] = "class"
+        dynamic["conclusion_scope"] = "dynamic_resolution"
+        static = authority(
+            "p.OptionalType", "", "not_found_in_static_analysis",
+            authority="jdk-javap-verbose",
+        )
+        static["symbol_kind"] = "class"
+        static["conclusion_scope"] = "static_analysis"
+
+        result = oracle.audit_api_oracle(changed, analyzed, [dynamic, static])
+
+        self.assertEqual(result["oracle_conflicts"], 0)
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(result["ledger"][0]["oracle_conclusion"], "uncertain")
+
     def test_uncertain_static_authority_alone_cannot_verify_reachable(self):
         changed = [{"coord": "g:a", "api_name": "p.A.one", "api_signature": "()", "symbol_kind": "method"}]
         analyzed = [{**changed[0], "analysis_status": "reachable"}]

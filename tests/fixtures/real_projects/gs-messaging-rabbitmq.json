@@ -24,8 +24,8 @@
       "accounted_api_count": 3,
       "artifact_count": 30,
       "class_count": 9413,
-      "analyzer_edge_count": 1611,
-      "oracle_edge_count": 1611,
+      "analyzer_edge_count": 1609,
+      "oracle_edge_count": 1609,
       "fault_injection_detected_count": 1
     },
     "metrics": {

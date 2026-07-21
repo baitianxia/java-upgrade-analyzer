@@ -26,6 +26,8 @@ AUTHORITY_FAMILIES = {
     "jdk-javap-verbose": "jdk-javap",
     "final-artifact-classfile": "final-artifact-classfile",
     "jdk-jdeps": "jdk-jdeps",
+    "final-artifact-classfile-constants": "final-artifact-classfile",
+    "final-artifact-mybatis-proxy-runtime": "project-execution",
     "project-tests": "project-execution",
     "project-runtime": "project-execution",
     "jacoco-runtime": "jacoco-runtime",
@@ -41,6 +43,12 @@ AUTHORITY_CAPABILITIES = {
         "artifact_bound", "closed_world_static", "metadata_references",
     },
     "jdk-jdeps": {"artifact_bound", "positive_only", "metadata_references"},
+    "final-artifact-classfile-constants": {
+        "artifact_bound", "positive_only", "metadata_references",
+    },
+    "final-artifact-mybatis-proxy-runtime": {
+        "artifact_bound", "executable_runtime",
+    },
     "project-tests": {"artifact_bound", "executable_runtime"},
     "project-runtime": {"artifact_bound", "executable_runtime"},
     "jacoco-runtime": {"artifact_bound", "executable_runtime"},
@@ -156,6 +164,28 @@ def _resolve_oracle_conclusions(records: list[dict]) -> set[str]:
         for item in records
     } - {"", "uncertain"}
     if "reachable" not in conclusions:
+        dynamic_uncertainties = [
+            item for item in records
+            if str(item.get("oracle_conclusion") or "").strip() == "uncertain"
+            and str(item.get("conclusion_scope") or "").strip()
+            == "dynamic_resolution"
+        ]
+        static_absences = [
+            item for item in records
+            if str(item.get("oracle_conclusion") or "").strip()
+            == "not_found_in_static_analysis"
+        ]
+        if (
+            conclusions == {"not_found_in_static_analysis"}
+            and dynamic_uncertainties
+            and static_absences
+            and all(
+                str(item.get("conclusion_scope") or "").strip()
+                == "static_analysis"
+                for item in static_absences
+            )
+        ):
+            return {"uncertain"}
         return conclusions
     alternatives = conclusions - {"reachable"}
     if alternatives != {"not_found_in_static_analysis"}:

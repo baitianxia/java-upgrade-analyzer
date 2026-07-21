@@ -3260,8 +3260,7 @@ def collect_performance_envelope(
         "artifact_cache_hits": int(bytecode_scan.get("artifact_cache_hits") or 0),
         "javap_fallbacks": int(bytecode_scan.get("javap_fallbacks") or 0),
         "javap_invocations": (
-            int(bytecode_scan.get("javap_tasks") or 0)
-            + int(bytecode_expand.get("javap_classes") or 0)
+            int(bytecode_scan.get("javap_fallbacks") or 0)
         ),
         "duplicate_jar_scans": int(bytecode_scan.get("duplicate_jar_scans") or 0),
         "duplicate_class_scans": int(bytecode_scan.get("duplicate_class_scans") or 0),
@@ -3412,8 +3411,14 @@ def evaluate_relative_performance_baseline(
             continue
         baseline_value = float(policy.get("value") or 0.0)
         actual_value = float(performance.get(name) or 0.0)
+        zero_is_valid = name in {
+            "javap_invocations", "duplicate_jar_scans",
+            "duplicate_class_scans",
+        }
         if baseline_value > 0 and (
-            not math.isfinite(actual_value) or actual_value <= 0
+            not math.isfinite(actual_value)
+            or actual_value < 0
+            or (actual_value == 0 and not zero_is_valid)
         ):
             errors.append(f"performance_metric_nonpositive:{name}")
             continue
@@ -3701,7 +3706,10 @@ def _retain_path_to_business_boundary(
         ):
             reached_boundary = True
             continue
-        pending.extend(upstream_edges(edge))
+        pending.extend(
+            upstream for upstream in upstream_edges(edge)
+            if _caller_identity(upstream) != _callee_identity(upstream)
+        )
     if reached_boundary:
         return discovered, True
     return {
@@ -6152,6 +6160,76 @@ def build_javap_verbose_api_oracle_records(
     return records
 
 
+def build_semantic_api_oracle_records(
+    selected_rows: list[dict], edge_truth: dict
+) -> list[dict]:
+    """Turn independently generated semantic evidence into API verdicts."""
+    if not edge_truth.get("complete"):
+        return []
+    trusted_artifact_sha = str(edge_truth.get("trusted_artifact_sha") or "")
+    if not _valid_sha256(trusted_artifact_sha):
+        return []
+    evidence_path = Path(str(edge_truth.get("semantic_reference_evidence") or ""))
+    try:
+        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    except OSError:
+        return []
+    references_by_identity: dict[str, list[dict]] = defaultdict(list)
+    for reference in edge_truth.get("semantic_references") or []:
+        if str(reference.get("artifact_sha256") or "") != trusted_artifact_sha:
+            continue
+        identity = str(reference.get("api_identity") or "")
+        if identity:
+            references_by_identity[identity].append(reference)
+
+    records = []
+    for row in selected_rows:
+        identity = serialized_api_identity(row)
+        for reference in references_by_identity.get(identity) or []:
+            authority = str(reference.get("authority") or "").strip()
+            if authority == "final-artifact-classfile-constants":
+                conclusion = "uncertain"
+                conclusion_scope = "dynamic_resolution"
+                evidence_mode = "bytecode"
+                capabilities = "artifact_bound;positive_only;metadata_references"
+            elif (
+                authority == "final-artifact-mybatis-proxy-runtime"
+                and _valid_sha256(str(reference.get("runtime_output_sha256") or ""))
+                and int(reference.get("proxy_dispatch_edge_count") or 0) >= 2
+                and int(reference.get("physical_evidence_count") or 0) >= 1
+                and int(reference.get("mapper_contract_count") or 0) >= 1
+            ):
+                conclusion = "reachable"
+                conclusion_scope = "runtime_analysis"
+                evidence_mode = "project_test"
+                capabilities = "artifact_bound;executable_runtime"
+            else:
+                continue
+            records.append({
+                **{
+                    key: str(row.get(key) or "")
+                    for key in (
+                        "coord", "api_name", "api_signature", "symbol_kind",
+                        "change_type",
+                    )
+                },
+                "oracle_conclusion": conclusion,
+                "authority": authority,
+                "authority_version": str(
+                    reference.get("authority_version") or "1"
+                ),
+                "procedure": str(reference.get("procedure") or "").strip(),
+                "evidence_path": str(evidence_path),
+                "evidence_sha256": evidence_sha256,
+                "generated_at": date.today().isoformat(),
+                "evidence_mode": evidence_mode,
+                "conclusion_scope": conclusion_scope,
+                "artifact_sha256": trusted_artifact_sha,
+                "capabilities": capabilities,
+            })
+    return records
+
+
 def build_automatic_oracle_records(
     selected_rows: list[dict], edge_truth: dict
 ) -> list[dict]:
@@ -6159,7 +6237,188 @@ def build_automatic_oracle_records(
     records = build_final_artifact_api_oracle_records(selected_rows, edge_truth)
     records.extend(build_jdeps_api_oracle_records(selected_rows, edge_truth))
     records.extend(build_javap_verbose_api_oracle_records(selected_rows, edge_truth))
+    records.extend(build_semantic_api_oracle_records(selected_rows, edge_truth))
     return records
+
+
+def _artifact_entry_bytes(artifact: Path, artifact_entry: str) -> bytes:
+    outer_entry, separator, inner_entry = str(artifact_entry or "").partition("!/")
+    with zipfile.ZipFile(artifact) as archive:
+        if not separator:
+            return archive.read(outer_entry)
+        nested_bytes = archive.read(outer_entry)
+    with zipfile.ZipFile(io.BytesIO(nested_bytes)) as nested:
+        return nested.read(inner_entry)
+
+
+def build_runtime_bound_oracle_records(
+    case: RealProjectCase,
+    selected_rows: list[dict],
+    manifest_rows: list[dict],
+    edge_truth: dict,
+    report_dir: Path,
+    pinned_manifest: dict | None,
+) -> tuple[list[dict], list[str]]:
+    """Regenerate reviewed runtime Oracle evidence for a runtime-bound build."""
+    manifest = dict(pinned_manifest or {})
+    runtime_spec = dict(manifest.get("runtime_verification") or {})
+    if (
+        artifact_verification_mode(manifest) != "runtime"
+        or not runtime_spec.get("oracle_rebinding")
+    ):
+        return [], []
+    artifact = Path(case.final_artifact or "")
+    trusted_artifact_sha = str(edge_truth.get("trusted_artifact_sha") or "")
+    reference_artifact_sha = str(manifest.get("reference_artifact_sha256") or "")
+    required_output = [
+        str(item) for item in (runtime_spec.get("required_output") or [])
+        if str(item)
+    ]
+    warnings = []
+    if (
+        not artifact.is_file()
+        or not _valid_sha256(trusted_artifact_sha)
+        or hashlib.sha256(artifact.read_bytes()).hexdigest() != trusted_artifact_sha
+        or not _valid_sha256(reference_artifact_sha)
+        or not required_output
+    ):
+        return [], ["runtime_oracle_rebinding_input_invalid"]
+
+    timeout_seconds = max(0.1, float(runtime_spec.get("timeout_seconds") or 30.0))
+    try:
+        completed = subprocess.run(
+            ["java", "-jar", str(artifact)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return [], [f"runtime_oracle_execution_failed:{type(error).__name__}:{error}"]
+    runtime_output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    missing_output = [item for item in required_output if item not in runtime_output]
+    if completed.returncode != 0 or missing_output:
+        return [], [
+            "runtime_oracle_verification_failed:"
+            f"exit={completed.returncode}:missing={','.join(missing_output)}"
+        ]
+
+    manifest_apis = {
+        (str(item.get("owner") or ""), str(item.get("member") or "")): item
+        for item in (manifest.get("apis") or [])
+    }
+    declaration_checks = []
+    for row in selected_rows:
+        api_name = str(row.get("api_name") or "")
+        owner, separator, member = api_name.rpartition(".")
+        expected = manifest_apis.get((owner, member))
+        entries = tuple(case.target_owner_entries.get(owner) or ())
+        if not separator or expected is None or len(entries) != 1:
+            return [], [f"runtime_oracle_declaration_contract_missing:{api_name}"]
+        descriptor = str(expected.get("descriptor") or "")
+        try:
+            content = _artifact_entry_bytes(artifact, entries[0])
+            with tempfile.TemporaryDirectory(prefix="runtime-oracle-javap-") as temporary:
+                class_file = Path(temporary) / "target.class"
+                class_file.write_bytes(content)
+                javap = subprocess.run(
+                    ["javap", "-p", "-s", str(class_file)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+        except (KeyError, OSError, subprocess.TimeoutExpired, zipfile.BadZipFile) as error:
+            return [], [
+                f"runtime_oracle_declaration_failed:{api_name}:"
+                f"{type(error).__name__}:{error}"
+            ]
+        declaration_output = f"{javap.stdout or ''}\n{javap.stderr or ''}"
+        passed = bool(
+            javap.returncode == 0
+            and member in declaration_output
+            and descriptor
+            and f"descriptor: {descriptor}" in declaration_output
+        )
+        declaration_checks.append({
+            "api_identity": serialized_api_identity(row),
+            "artifact_entry": entries[0],
+            "member": member,
+            "descriptor": descriptor,
+            "passed": passed,
+            "javap_output_sha256": hashlib.sha256(
+                declaration_output.encode("utf-8")
+            ).hexdigest(),
+        })
+    if not declaration_checks or not all(item["passed"] for item in declaration_checks):
+        return [], ["runtime_oracle_declaration_verification_failed"]
+
+    quality_dir = Path(report_dir) / "evidence" / "quality"
+    quality_dir.mkdir(parents=True, exist_ok=True)
+    runtime_path = quality_dir / "runtime_oracle_output.txt"
+    runtime_path.write_text(runtime_output, encoding="utf-8")
+    evidence_path = quality_dir / "runtime_oracle_evidence.json"
+    evidence_payload = {
+        "artifact_sha256": trusted_artifact_sha,
+        "reference_artifact_sha256": reference_artifact_sha,
+        "git_revision": str(manifest.get("git_revision") or ""),
+        "runtime_exit_code": completed.returncode,
+        "runtime_output": str(runtime_path),
+        "runtime_output_sha256": hashlib.sha256(
+            runtime_output.encode("utf-8")
+        ).hexdigest(),
+        "required_output": required_output,
+        "declaration_checks": declaration_checks,
+    }
+    evidence_path.write_text(
+        json.dumps(evidence_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+
+    reviewed_by_identity = {
+        serialized_api_identity(row): row for row in manifest_rows
+        if str(row.get("oracle_conclusion") or "") == "reachable"
+        and str(row.get("artifact_sha256") or "") == reference_artifact_sha
+        and str(row.get("authority_version") or "")
+        == str(manifest.get("git_revision") or "")
+    }
+    records = []
+    for row in selected_rows:
+        identity = serialized_api_identity(row)
+        if identity not in reviewed_by_identity:
+            warnings.append(f"runtime_oracle_review_record_missing:{identity}")
+            continue
+        records.append({
+            **{
+                key: str(row.get(key) or "")
+                for key in (
+                    "coord", "api_name", "api_signature", "symbol_kind",
+                    "change_type",
+                )
+            },
+            "oracle_conclusion": "reachable",
+            "authority": "project-runtime",
+            "authority_version": str(manifest.get("git_revision") or ""),
+            "procedure": (
+                "Execute the current runtime-bound artifact, verify reviewed rollback "
+                "outputs, and confirm each exact target declaration with JDK javap"
+            ),
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": evidence_sha256,
+            "generated_at": date.today().isoformat(),
+            "evidence_mode": "project_test",
+            "conclusion_scope": "runtime_analysis",
+            "artifact_sha256": trusted_artifact_sha,
+            "capabilities": "artifact_bound;executable_runtime",
+        })
+    if len(records) != len(selected_rows):
+        return [], warnings
+    return records, warnings
 
 
 def run_dual_line_accuracy_audit(
@@ -6170,15 +6429,31 @@ def run_dual_line_accuracy_audit(
     report_dir: Path,
     *,
     oracle_manifest: Path | None = None,
+    pinned_manifest: dict | None = None,
 ) -> tuple[dict, list[str]]:
     """Build the independent line, then reconcile it with analyzer output."""
     warnings: list[str] = []
     oracle_rows = load_oracle_manifest(oracle_manifest or case.oracle_manifest)
+    runtime_oracle_rows, runtime_warnings = build_runtime_bound_oracle_records(
+        case, selected_rows, oracle_rows, edge_truth, report_dir, pinned_manifest
+    )
+    warnings.extend(runtime_warnings)
+    if runtime_oracle_rows:
+        rebound_identities = {
+            serialized_api_identity(row) for row in runtime_oracle_rows
+        }
+        oracle_rows = [
+            row for row in oracle_rows
+            if serialized_api_identity(row) not in rebound_identities
+        ]
+        oracle_rows.extend(runtime_oracle_rows)
     automatic_oracle_rows = build_automatic_oracle_records(
         selected_rows, edge_truth
     )
     oracle_rows.extend(automatic_oracle_rows)
-    trusted_capability_records = list(automatic_oracle_rows)
+    trusted_capability_records = list(automatic_oracle_rows) + list(
+        runtime_oracle_rows
+    )
     automatic_identities = {
         serialized_api_identity(row) for row in automatic_oracle_rows
     }
@@ -8590,6 +8865,7 @@ def run_case(
             edge_truth,
             report_dir,
             oracle_manifest=oracle_manifest,
+            pinned_manifest=pinned_manifest,
         )
         warnings.extend(oracle_warnings)
         oracle_ledger = str(

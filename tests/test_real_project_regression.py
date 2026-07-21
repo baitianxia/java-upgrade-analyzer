@@ -946,6 +946,7 @@ class RealProjectRegressionTest(unittest.TestCase):
         )
 
         self.assertEqual(len(references), 3)
+
         self.assertTrue(all(
             item["authority"] == "final-artifact-mybatis-proxy-runtime"
             for item in references
@@ -991,6 +992,93 @@ class RealProjectRegressionTest(unittest.TestCase):
                 "org.apache.ibatis.binding.MapperMethod.execute",
             },
         )
+
+    def test_runtime_bound_oracle_rebuilds_current_artifact_evidence(self):
+        selected = [{
+            "coord": "org.springframework:spring-tx",
+            "api_name": "org.springframework.transaction.Tx.invoke",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+        }]
+        identity = realreg.serialized_api_identity(selected[0])
+        reference_sha = "b" * 64
+        revision = "c" * 40
+        manifest_rows = [{
+            **selected[0],
+            "oracle_conclusion": "reachable",
+            "artifact_sha256": reference_sha,
+            "authority_version": revision,
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested_buffer = io.BytesIO()
+            with zipfile.ZipFile(nested_buffer, "w") as nested:
+                nested.writestr("org/springframework/transaction/Tx.class", b"class")
+            artifact = root / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/spring-tx.jar", nested_buffer.getvalue())
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            case = realreg.RealProjectCase(
+                name="runtime-oracle",
+                default_project=root,
+                default_changed_apis=Path("changed.csv"),
+                baseline_specs=(),
+                final_artifact=artifact,
+                target_owner_entries={
+                    "org.springframework.transaction.Tx": (
+                        "BOOT-INF/lib/spring-tx.jar!/org/springframework/transaction/Tx.class",
+                    ),
+                },
+            )
+            manifest = {
+                "git_revision": revision,
+                "reference_artifact_sha256": reference_sha,
+                "materialization": {
+                    "kind": "source_build",
+                    "artifact_verification": "runtime",
+                },
+                "runtime_verification": {
+                    "oracle_rebinding": True,
+                    "required_output": ["rollback verified"],
+                },
+                "apis": [{
+                    "owner": "org.springframework.transaction.Tx",
+                    "member": "invoke",
+                    "descriptor": "()Ljava/lang/Object;",
+                }],
+            }
+
+            def completed(command, **_kwargs):
+                if command[0] == "java":
+                    return SimpleNamespace(
+                        returncode=0, stdout="rollback verified", stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "public java.lang.Object invoke();\n"
+                        "  descriptor: ()Ljava/lang/Object;\n"
+                    ),
+                    stderr="",
+                )
+
+            with patch.object(realreg.subprocess, "run", side_effect=completed):
+                records, warnings = realreg.build_runtime_bound_oracle_records(
+                    case,
+                    selected,
+                    manifest_rows,
+                    {"trusted_artifact_sha": artifact_sha},
+                    root / "report",
+                    manifest,
+                )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(realreg.serialized_api_identity(records[0]), identity)
+        self.assertEqual(records[0]["artifact_sha256"], artifact_sha)
+        self.assertEqual(records[0]["authority"], "project-runtime")
+        self.assertTrue(Path(records[0]["evidence_path"]).name.endswith(".json"))
 
     def test_v3_edge_gate_propagates_missing_semantic_reference(self):
         semantic = {
@@ -2011,7 +2099,7 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(envelope["elapsed_seconds_per_api"], 1.0)
         self.assertEqual(envelope["scan_seconds_per_1000_classes"], 2.0)
         self.assertEqual(envelope["duplicate_jar_scans"], 2)
-        self.assertEqual(envelope["javap_invocations"], 10)
+        self.assertEqual(envelope["javap_invocations"], 0)
         self.assertEqual(envelope["peak_rss_mb"], 256.5)
         self.assertEqual(len(envelope["per_api_timings"]), 2)
 
@@ -2840,6 +2928,47 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertEqual(len(ledger_rows), 3)
         self.assertEqual(result["oracle_metrics"]["javap_class_invocations"], 11)
         self.assertEqual(result["oracle_metrics"]["javap_class_elapsed_seconds"], 2.25)
+
+    def test_edge_truth_path_ignores_traversal_neutral_recursive_self_loop(self):
+        artifact_sha256 = "a" * 64
+        target = {
+            "coord": "vendor:api", "api_name": "vendor.Api.call",
+            "api_signature": "()", "symbol_kind": "method",
+        }
+        direct = self._edge_row(
+            artifact_sha256, "bridge.Adapter", "call", "()V",
+            "vendor.Api", "call", "()V", "invokestatic",
+            "BOOT-INF/lib/bridge.jar!/bridge/Adapter.class",
+        )
+        boundary = self._edge_row(
+            artifact_sha256, "app.Entry", "run", "()V",
+            "bridge.Adapter", "call", "()V", "invokestatic",
+            "BOOT-INF/classes/app/Entry.class",
+        )
+        recursive = self._edge_row(
+            artifact_sha256, "bridge.Adapter", "call", "()V",
+            "bridge.Adapter", "call", "()V", "invokevirtual",
+            "BOOT-INF/lib/bridge.jar!/bridge/Adapter.class",
+            instruction_offset=20,
+        )
+        direct["api_identity"] = realreg.serialized_api_identity(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = realreg.reconcile_selected_api_edges(
+                Path(tmp), [target], [direct, boundary], {
+                    "artifact_sha256": artifact_sha256,
+                    "complete": True,
+                    "edges": [direct, boundary, recursive],
+                    "failures": [],
+                    "artifact_entries": [
+                        direct["artifact_entry"], boundary["artifact_entry"],
+                    ],
+                },
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["counts"]["oracle_edge_count"], 2)
 
     def test_fault_injection_drops_analyzer_edge_and_proves_gate_detects_false_negative(self):
         artifact_sha256 = "a" * 64
