@@ -122,6 +122,29 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(allowed["status"], "user_confirmed_local_source")
         self.assertEqual(allowed["resolved_commit"], self.current_commit)
 
+    def test_remote_tracking_ref_shorthand_requires_explicit_confirmation(self):
+        self.git(self.repo, "update-ref", "refs/remotes/origin/release", self.current_commit)
+
+        denied = resolve_local_source_ref(self.repo, "origin/release")
+        allowed = resolve_local_source_ref(self.repo, "origin/release", allow_local_source=True)
+
+        self.assertEqual(denied["status"], "awaiting_local_source_confirmation")
+        self.assertEqual(denied["local_candidate_commit"], self.current_commit)
+        self.assertEqual(allowed["status"], "user_confirmed_local_source")
+        self.assertEqual(allowed["resolved_ref"], "origin/release")
+        self.assertEqual(allowed["resolved_commit"], self.current_commit)
+        self.assertEqual(allowed["resolution_mode"], "user_confirmed_local_source")
+
+    def test_fully_qualified_remote_tracking_ref_remains_supported(self):
+        canonical_ref = "refs/remotes/origin/release"
+        self.git(self.repo, "update-ref", canonical_ref, self.current_commit)
+
+        result = resolve_local_source_ref(self.repo, canonical_ref, allow_local_source=True)
+
+        self.assertEqual(result["status"], "user_confirmed_local_source")
+        self.assertEqual(result["resolved_ref"], canonical_ref)
+        self.assertEqual(result["resolved_commit"], self.current_commit)
+
     def test_dirty_local_repository_requires_separate_confirmation(self):
         self.git(self.repo, "branch", "release", self.current_commit)
         (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")

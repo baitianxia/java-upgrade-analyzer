@@ -255,6 +255,8 @@ def _verify_local_commit(repo_dir, requested_ref):
         candidates.append(requested)
     else:
         candidates.extend((f"refs/heads/{requested}", f"refs/tags/{requested}"))
+        if "/" in requested:
+            candidates.append(f"refs/remotes/{requested}")
     if requested == "HEAD" or _COMMIT_RE.fullmatch(requested):
         candidates.append(requested)
     for candidate in candidates:
