@@ -8,6 +8,11 @@
 2. 它依赖哪些技术与内部契约
 3. 它如何在当前静态分析边界内保证结果的准确性、可追溯性和可恢复性
 
+本文于 2026-07-21 以 `main@69b60af` 为代码复核基线。五态裁决以
+`scripts/step5_evidence_model.py` 为准，发布裁决以 `scripts/quality_gate.py`
+为准；后续 HEAD 若发生变化，应以对应代码和当前提交上的测试结果更新本文，
+不能把本页的复核日期当成新鲜验证证据。
+
 本文档面向维护者、新工程师和其他需要理解或复现当前逻辑的模型。本文档描述的是当前实现，不承担运行期交互规则，也不替代：
 
 - `SKILL.md`
@@ -484,12 +489,13 @@ Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系�
 - `evidence/call_chain/by_module/*_impacts.json`
 - `evidence/api_changes/s4_per_dependency/<coord>/candidate_hits.csv`
 - `reachable`
+- `not_impacted`
 - `uncertain`
 - `not_analyzed`
 - `not_found_in_static_analysis`
 - `evidence/api_changes/s4_per_dependency/<coord>/summary.json` 中的单依赖结果视图
 
-四态属于正式语义，不是展示标签。
+五态属于正式语义，不是展示标签。`not_impacted` 仅在当前制品中的其他运行时依赖以完全相同的类字节码保留目标 API 时成立；它不等于宽泛的“没有风险”。
 
 #### Step5 的 per-dependency 汇总
 
@@ -650,7 +656,7 @@ all_changed_apis.csv
 - 追踪状态：`direct_callers`、`business_reach_depth`、`dependency_chain_coords`、`confidence_score`
 - 人工复核：`verification_commands`
 
-四态、`reason_code` 和路径证据字段共同构成正式结论。
+五态、`reason_code` 和路径证据字段共同构成正式结论。
 
 #### AST 构建与类型推测
 
@@ -821,7 +827,7 @@ Step5 在正式回溯前执行 `bridge-check`，判断是否必须跨依赖边�
 5. 以 BFS 方式扩展回溯前沿
 6. 用 `cost`、`confidence` 和关键节点控制搜索边界
 7. 基于 `type_metadata` 处理多态扩展
-8. 将候选收敛成正式四态结果
+8. 将候选收敛成正式五态结果
 
 当前评分与停止条件固定为：
 
@@ -843,9 +849,10 @@ Step5 在正式回溯前执行 `bridge-check`，判断是否必须跨依赖边�
 
 #### Step5 的正式结果语义
 
-Step5 最终收敛到以下四态：
+Step5 最终收敛到以下五态：
 
 - `reachable`
+- `not_impacted`
 - `uncertain`
 - `not_analyzed`
 - `not_found_in_static_analysis`
@@ -868,6 +875,7 @@ Step5 最终收敛到以下四态：
 | 需要跨依赖回溯且源码映射、无码字节码路径都不可用 | 默认阻塞或待交互 | `not_analyzed` / 阻塞 |
 | 图明显不完整 | 不把未命中解释为无影响 | 保守语义 |
 | 命中业务代码 | 停止继续扩展 | `reachable` |
+| removed API 的旧类与当前其他运行时依赖中的同名类字节码完全一致 | 记录制品保留证据，不再把该 API 当作已消失符号 | `not_impacted` |
 | 命中框架边界且无法再静态证明 | 收敛为不确定候选 | `uncertain` |
 | 没有任何静态路径 | 不伪装成影响 | `not_found_in_static_analysis` |
 
@@ -887,7 +895,7 @@ Step6 的职责是读取和重组前序结构化产物，回填 `reason_code` �
 当前 Step6 主要消费以下产物：
 
 - `evidence/call_chain/summary.json`
-  - 四态统计、`user_conclusion_summary`、`quality_gate`
+  - 五态统计、`user_conclusion_summary`、`quality_gate`
 - `evidence/call_chain/by_api/*.json`
   - 单条 API 的 `reason_code`、`call_paths`、`evidence_paths`
 - `evidence/api_changes/all_changed_apis.csv`
@@ -976,7 +984,7 @@ Step6 不是新的分析层，而是对 Step4 和 Step5 的正式证据做收敛
 - `core`
   - 验证 Step1 到 Step4 的基础分析链路
 - `step5`
-  - 验证调用链、bridge source、四态语义和门控行为
+  - 验证调用链、bridge source、五态语义和门控行为
 - `orchestrator`
   - 验证 `run_step.py` 的主状态机、checkpoint 恢复、结构化答复和状态落盘
 
@@ -993,7 +1001,7 @@ Step6 不是新的分析层，而是对 Step4 和 Step5 的正式证据做收敛
 `smoke_regression.py` 当前负责：
 
 - 固定 `summary.json`、`main_state.json`、`interaction.json` 等核心产物口径
-- 固定 Step5 的 `reason_code`、四态语义和旧字段迁移行为
+- 固定 Step5 的 `reason_code`、五态语义和旧字段迁移行为
 - 固定 orchestrator 的 checkpoint 恢复、自愈和重跑边界
 
 因此，当前正式行为不仅由实现定义，也由 gate 和 smoke 共同约束。
@@ -1036,6 +1044,6 @@ Step6 不是新的分析层，而是对 Step4 和 Step5 的正式证据做收敛
 - 是否让 `interaction.json` 或报告产物重新参与求值
 - 是否让 CLI 重新成为步骤之间透传业务参数的主路径
 - 是否破坏了结构化恢复协议
-- 是否破坏了 Step5 的四态语义
+- 是否破坏了 Step5 的五态语义
 - 是否破坏了 Step5 的精度优先、overload 保护或 bridge-check 规则
 - 是否修改程序行为但未同步更新本文档和相关测试

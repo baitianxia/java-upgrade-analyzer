@@ -465,7 +465,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：最终制品内缺失嵌套 JAR、坐标 unresolved、SHA 不一致或字节码解析失败时，必须记录覆盖缺口；未命中不得解释为无影响，也不得以本地 Maven JAR 填补缺口
 - 规则：依赖源码只有在 Step4 记录包含固定 commit 且来源为 `remote_source_resolved` 或 `user_confirmed_local_source` 时，才允许进入 Step5 增强图；来源未确认、仓库不一致、源码类不在当前最终制品 JAR 中时必须拒绝该源码边并记录覆盖缺口，不能降级成确定无影响
 - 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4
-- `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
+- `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / not_impacted / uncertain / not_found_in_static_analysis / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
 - 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`
 - 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中保留 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` / `RUNTIME_DEPENDENCY_USES_REMOVED_API` 事实，但若该依赖存在源码映射，Step5 必须先继续尝试回溯到业务代码，只有未能证明业务入口时才收敛为 `uncertain`
 - 规则：若依赖源码或资源配置中存在明确运行时主动入口（如 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle、Quartz `Job.execute`、Spring XML `task:scheduled`、`init-method`、`MethodInvokingJobDetailFactoryBean`），且该入口链路触达变更 API，即使没有业务源码显式调用方，也应作为 Step5 影响链路处理，不得仅因未回溯到业务源码而降为静态未找到。JPA `@PrePersist` / `@PostUpdate` 等生命周期回调必须进入框架证据，但在没有实体生命周期激活证据时保留为条件入口；`@Async` 只改变执行线程，不得单独伪造成调用入口

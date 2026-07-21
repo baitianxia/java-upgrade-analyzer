@@ -251,7 +251,7 @@
 - 是否来自 JApiCmp、git diff、removed jar export 或其他证据；
 - Step5 是如何找到或没找到调用链的；
 - 哪个消费者 jar 或业务入口参与了链路；
-- 为什么是 reachable、uncertain、not_found 或 not_analyzed。
+- 为什么是 reachable、not_impacted、uncertain、not_found 或 not_analyzed。
 
 ## 15. 修改文档不能偏离实际代码
 

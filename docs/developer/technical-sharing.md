@@ -25,7 +25,7 @@
 - [七、关键技术三：用反向图证明变化是否触达业务](#七关键技术三用反向图证明变化是否触达业务)
 - [八、关键技术四：把框架和动态调用纳入证据体系](#八关键技术四把框架和动态调用纳入证据体系)
 - [九、关键技术五：用状态机约束 Agent 执行](#九关键技术五用状态机约束-agent-执行)
-- [十、结果表达：四态而不是二值判断](#十结果表达四态而不是二值判断)
+- [十、结果表达：五态而不是二值判断](#十结果表达五态而不是二值判断)
 - [十一、端到端示例：removed jar 风险如何被证明](#十一端到端示例removed-jar-风险如何被证明)
 - [十二、工程保障：可复核、可恢复、可回归](#十二工程保障可复核可恢复可回归)
 - [十三、代码阅读地图](#十三代码阅读地图)
@@ -122,7 +122,7 @@ Step1 构建事实
 | Step3 | 背景风险有哪些 | 规则包扫描、源码/资源文本扫描、JDK/Jakarta/Spring 规则 | `s3_*.csv`、`s3_*.txt` |
 | Step4 | API 真实变了什么 | JApiCmp、git diff、removed jar 符号导出、CSV 契约 | `all_changed_apis.csv` |
 | Step5 | 变化是否触达业务 | AST、字节码、反向图、置信度追踪、动态调用补偿 | `alerts.csv`、`summary.json`、`by_api/*.json` |
-| Step6 | 如何交付复核 | 多源证据聚合、四态分桶、Markdown 报告生成 | `.runtime/findings/s6_findings.json`、`deliverables/report.md` |
+| Step6 | 如何交付复核 | 多源证据聚合、五态分桶、Markdown 报告生成 | `.runtime/findings/s6_findings.json`、`deliverables/report.md` |
 
 正式流程由 `scripts/run_step.py` 编排，并通过 `.upgrade-report/` 持久化所有关键证据。最终报告不是黑盒结论，而是可以沿文件回溯到每一步的输入、输出和证据来源。
 
@@ -290,7 +290,7 @@ evidence/call_chain/by_api/*.json
 
 这解决的是分析流程的可信度问题。
 
-## 十、结果表达：四态而不是二值判断
+## 十、结果表达：五态而不是二值判断
 
 ### 为什么需要
 
@@ -300,18 +300,19 @@ evidence/call_chain/by_api/*.json
 
 ### 用了什么模型
 
-Step5 使用四态表达证据强度：
+Step5 使用五态表达证据强度：
 
 | 状态 | 语义 |
 |---|---|
 | `reachable` | 已找到确认链路并触达业务代码 |
+| `not_impacted` | 当前制品中的其他运行时依赖以完全相同的类字节码保留目标 API；只证明该 API 未实际消失 |
 | `uncertain` | 有候选证据，但不足以确认 |
 | `not_found_in_static_analysis` | 静态分析执行过，但当前证据未找到路径 |
 | `not_analyzed` | 输入或能力不足，无法有效分析 |
 
 ### 达成的效果
 
-四态结果把“确认影响”“候选风险”“静态未找到”“未有效分析”分开。
+五态结果把“确认影响”“符号被相同字节码保留”“候选风险”“静态未找到”“未有效分析”分开。
 
 因此报告既能给出明确风险，也能表达分析盲区，不会把静态分析边界伪装成“确定无风险”。
 
@@ -357,6 +358,7 @@ Step5 对目标执行多证据追踪：
 | 结果 | 含义 |
 |---|---|
 | `reachable` | 已找到业务代码到 removed API 的链路 |
+| `not_impacted` | 当前制品中的其他依赖以完全相同的类字节码保留该 API；不覆盖资源、SPI 等非 API 内容 |
 | `uncertain` | 运行时依赖命中 removed API，但无法确认是否被业务入口触发 |
 | `not_found_in_static_analysis` | 静态分析执行过，当前没找到路径 |
 | `not_analyzed` | 缺少关键输入或能力覆盖不足 |
@@ -421,7 +423,7 @@ python3 scripts/quality_gate.py --profile release
 | API 变化事实池 | `scripts/s4_jar_compare.py`、`scripts/s4_contract.py` |
 | 源码图 | `scripts/enhanced_source_analyzer.py` |
 | 字节码证据 | `scripts/business_bytecode_graph.py` |
-| 反向追踪和四态结果 | `scripts/confidence_weighted_tracer.py` |
+| 反向追踪和五态结果 | `scripts/confidence_weighted_tracer.py` |
 | 动态调用补偿 | `scripts/framework_adapters.py`、`scripts/indirect_usage_analyzer.py` |
 | 报告生成 | `scripts/s6_report.py` |
 | 质量门 | `scripts/quality_gate.py`、`tests/` |
@@ -461,7 +463,7 @@ run_step.py
 ```text
 状态机保障：输入不可信时不自动推进。
 契约保障：跨 Step 数据有稳定结构和语义。
-四态保障：不把静态分析边界伪装成无风险。
+五态保障：只在相同类字节码保留目标 API 时输出 `not_impacted`，并且不把静态分析边界伪装成无风险。
 ```
 
 这套设计的目标不是让工具替代人的判断，而是让升级评估从“靠经验猜风险”变成“沿证据链复核风险”。

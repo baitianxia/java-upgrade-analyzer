@@ -260,7 +260,7 @@ runner 状态必须由质量信号派生。存在 blocking signal 时状态必�
 - 依赖数量；
 - API 变化数量；
 - Step1~Step6 每步耗时；
-- reachable / uncertain / not_found / not_analyzed 分布；
+- reachable / not_impacted / uncertain / not_found / not_analyzed 分布；
 - 逐 API oracle 核对结果；
 - 与 jdeps 或人工预期不一致的差异。
 

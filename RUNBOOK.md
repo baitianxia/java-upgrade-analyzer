@@ -583,7 +583,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
 - `max_depth` 默认值为 `5`，表示最大累计追踪代价，不是固定跳数
 - 全高置信度边时通常可追踪约 5 跳；混合高/中置信度边时可达跳数会相应减少
 - 只要回溯到系统代码即可记为 `reachable`，不要求必须到达最外层 HTTP 入口
-- `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / uncertain / not_analyzed 的成因；`by_api/*.json` 中的 `evidence_paths` 是逐边证据
+- `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / not_impacted / uncertain / not_found_in_static_analysis / not_analyzed 的成因；`by_api/*.json` 中的 `evidence_paths` 是逐边证据
 - 若 `all_changed_apis.csv` 为空，直接跳过并说明“Step4 未提取到可追踪的变更 API”
 - 若指定 `selected_targets`，优先按依赖包完整坐标精确匹配；结构化自动化输入仍可使用 `selection_key`。解析后归一化为程序内部的 `step5_selected_coords` / `step5_selected_names`
 - Step4 checkpoint 若只展示前若干个候选，这只影响展示，不影响正式匹配；未展示的合法目标仍会参与 `selected_targets` 解析
