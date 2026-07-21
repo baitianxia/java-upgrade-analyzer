@@ -20730,11 +20730,12 @@ public class com.example.consumer.Adapter {
             class_fqcn="app.App", method_name="run",
         )
         draft = tracer._new_trace_draft(api_row)
-        tracer._build_direct_usage_results(
+        tracer._build_direct_usage_result(
             draft,
-            [(method, "field_access")],
+            method,
             "DIRECT_FIELD_USAGE",
             "source field usage",
+            "field_access",
             "lib.Api.FLAG",
         )
 
