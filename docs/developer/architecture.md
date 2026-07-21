@@ -344,7 +344,7 @@ Step1 负责识别依赖变化范围，并建立后续分析所需的最小可�
 - 输入不足时优先进入前置交互，而不是直接失败
 - base/current 可共享同一个源码仓库路径；revision 才是两侧身份，解析后持久化 requested ref、resolved ref 与 immutable commit
 - `artifact_inputs` 先解析最终 JAR，只有坐标缺失的一侧才按需解析 ref 并运行 Maven 补全；`checkout_build` 在构建前解析两侧 ref
-- ref 解析只读取本地及现有远端跟踪 refs，不隐式 fetch；候选按 commit 去重，唯一 commit 自动采用，歧义在 Maven 前形成硬 checkpoint
+- ref 解析通过实时 `ls-remote` 获取候选并定向 fetch 所选 ref；不会执行 pull 或改变当前 checkout。候选按 commit 去重，唯一 commit 自动采用，歧义在 Maven 前形成硬 checkpoint；交互选择同时绑定 expected commit，执行前再次校验 ref 未移动
 - 坐标补全同时拿到 source directory 与 ref 时始终优先 ref；source-only 输入必须确认 HEAD 对应的 commit，不能直接分析可变工作区
 - 所有分支构建和坐标补全使用 detached worktree，不改变用户仓库当前 HEAD 与未提交内容
 - 首轮确认的模块范围必须尽早写入主状态

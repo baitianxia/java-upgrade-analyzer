@@ -120,10 +120,26 @@ def build_step1_ref_resolution_interaction(error):
     resolution = dict(getattr(error, "resolution", {}) or {})
     candidates = [dict(item) for item in (resolution.get("candidates") or [])]
     status = str(resolution.get("status") or "not_found")
+    source_status = str(resolution.get("source_status") or "")
+    for candidate in candidates:
+        payload = {
+            "side": side,
+            "ref": str(candidate.get("ref") or ""),
+            "commit": str(candidate.get("commit") or ""),
+        }
+        candidate["selection_key"] = "s1ref:" + hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
     source_only = isinstance(error, SourceRevisionConfirmationRequiredError)
     if source_only:
         reason_code = "step1_source_revision_confirmation_required"
         summary = f"{side_cn}只提供了源码目录，无法证明它对应当前制品的 revision。"
+    elif status == "fetch_failed":
+        reason_code = "step1_remote_fetch_failed"
+        summary = f"{side_cn}远端查询或 fetch 在受控重试后仍失败；无需猜测分支。"
+    elif status == "ref_moved":
+        reason_code = "step1_remote_ref_moved"
+        summary = f"{side_cn}远端 ref 已指向新的 commit，需要基于刷新后的候选重新确认。"
     elif status == "ambiguous":
         reason_code = "ambiguous_step1_source_ref"
         summary = f"{side_cn}分支匹配到多个不同 commit，不能自动选择。"
@@ -139,6 +155,11 @@ def build_step1_ref_resolution_interaction(error):
         "artifact_path": str(error.artifact_path or ""),
         "candidates": candidates,
         "fingerprint": str(resolution.get("fingerprint") or ""),
+        "source_status": source_status,
+        "expected_commit": str(resolution.get("expected_commit") or ""),
+        "remote_failures": [dict(item) for item in (resolution.get("failures") or [])],
+        "local_candidate_commit": str(resolution.get("local_candidate_commit") or ""),
+        "dirty": bool(resolution.get("dirty")),
     }
     detected_commit = str(
         resolution.get("resolved_commit") or resolution.get("local_candidate_commit") or ""
@@ -154,6 +175,23 @@ def build_step1_ref_resolution_interaction(error):
                 "kind": "detected_source_head",
             }],
         })
+    for candidate in request.get("candidates") or []:
+        if candidate.get("selection_key"):
+            continue
+        payload = {
+            "side": side,
+            "ref": str(candidate.get("ref") or candidate.get("display_ref") or ""),
+            "commit": str(candidate.get("commit") or ""),
+        }
+        candidate["selection_key"] = "s1ref:" + hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+    required_fields = [] if status == "fetch_failed" else [field]
+    question = (
+        f"{side_cn}远端操作失败；请在网络或权限恢复后确认重试。"
+        if status == "fetch_failed"
+        else f"请为{side_cn}选择或填写明确的 branch、tag 或 commit；确认后才会执行 Maven 坐标补全。"
+    )
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
         "checkpoint": True,
@@ -164,13 +202,13 @@ def build_step1_ref_resolution_interaction(error):
         "reason_code": reason_code,
         "title": "Step1 需要确认源码版本",
         "summary": summary,
-        "question": f"请为{side_cn}填写明确的 branch、tag 或 commit；确认后才会执行 Maven 坐标补全。",
-        "required_fields": [field],
+        "question": question,
+        "required_fields": required_fields,
         "missing_inputs": [{
             "field": field,
             "label": f"{side_cn}源码 ref",
             "side": side,
-            "required": True,
+            "required": status != "fetch_failed",
             "recommended": True,
             "reason": summary,
             "value_type": "branch",
@@ -178,6 +216,14 @@ def build_step1_ref_resolution_interaction(error):
         "fallback_inputs": [],
         "files_to_review": [str(error.source_project_dir)] if error.source_project_dir else [],
         "ref_resolution_requests": [request],
+        "source_ref_decision_items": [{
+            "side": side,
+            "field": field,
+            "status": request.get("status"),
+            "source_status": source_status,
+            "requested_ref": request.get("requested_ref"),
+            "candidates": list(request.get("candidates") or []),
+        }],
         "checklist_lines": [
             f"{side_cn}待补全产物: {error.artifact_path}",
             *(
@@ -191,22 +237,36 @@ def build_step1_ref_resolution_interaction(error):
         ],
         "options": [
             {"id": "continue", "label": "确认 ref 后继续", "description": "固定 commit 后重新执行 Step1。"},
+            {"id": "confirm_local_source", "label": "确认使用本地源码兜底", "description": "仅在远端不可用时固定本地 commit。"},
             {"id": "cancel", "label": "取消", "description": "停止本次分析。"},
         ],
         "response_schema": {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["continue", "cancel"]},
+                "action": {"type": "string", "enum": ["continue", "confirm_local_source", "cancel"]},
                 field: {"type": "string", "description": f"{side_cn}明确的 branch、tag 或 commit。"},
+                f"{side}_expected_commit": {"type": "string", "description": "内部固定值：所选 ref 对应的 commit。"},
+                "source_ref_selections": {"type": "array", "description": "选择当前卡片中的 ref 方案。"},
+                "retry_remote_fetch": {"type": "boolean", "description": "重试远端查询或 fetch。"},
+                f"{side}_allow_local_source": {"type": "boolean", "description": "明确允许使用本地 commit 兜底。"},
+                f"{side}_allow_dirty_local_source": {"type": "boolean", "description": "明确允许使用含未提交修改的本地源码。"},
                 "notes": {"type": "string", "description": "可选。记录 revision 的确认依据。"},
             },
         },
-        "action_requirements": {"continue": {"required_fields": [field]}},
+        "action_requirements": {
+            "continue": {"required_fields": required_fields},
+            "confirm_local_source": {
+                "required_fields": [
+                    f"{side}_allow_local_source",
+                    *([f"{side}_allow_dirty_local_source"] if resolution.get("dirty") else []),
+                ],
+            },
+        },
         "input_normalization": {
             "enabled": True,
             "mode": "llm_assisted_structuring",
-            "required_fields": [field],
+            "required_fields": required_fields,
             "rules": ["必须提供能够唯一解析到 commit 的明确 ref。"],
         },
         "runtime_rules": ["确认前不得执行 Maven 坐标补全。"],
@@ -2688,6 +2748,7 @@ def _collect_runtime_deps_for_artifact_input(
     artifact_path="",
     observer=None,
     source_resolution=None,
+    expected_commit="",
     allow_local_source=False,
     allow_dirty_local_source=False,
     active_maven_profiles=None,
@@ -2704,12 +2765,13 @@ def _collect_runtime_deps_for_artifact_input(
                 "user_confirmed_local_source",
             }
         ):
-            resolution = resolve_step1_ref(
-                repo_dir,
-                branch,
-                allow_local_source=allow_local_source,
-                allow_dirty_local_source=allow_dirty_local_source,
-            )
+            resolve_kwargs = {
+                "allow_local_source": allow_local_source,
+                "allow_dirty_local_source": allow_dirty_local_source,
+            }
+            if str(expected_commit or "").strip():
+                resolve_kwargs["expected_commit"] = str(expected_commit).strip()
+            resolution = resolve_step1_ref(repo_dir, branch, **resolve_kwargs)
         if resolution.get("status") != "resolved":
             raise Step1RefResolutionRequiredError(
                 side, repo_dir, artifact_path, resolution,
@@ -3434,6 +3496,7 @@ def main():
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
                         source_resolution=confirmed_source_resolution("base"),
+                        expected_commit=str(orchestrated_input.get("base_expected_commit") or ""),
                         allow_local_source=bool(orchestrated_input.get("base_allow_local_source")),
                         allow_dirty_local_source=bool(orchestrated_input.get("base_allow_dirty_local_source")),
                     )
@@ -3455,6 +3518,7 @@ def main():
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
                         source_resolution=confirmed_source_resolution("current"),
+                        expected_commit=str(orchestrated_input.get("current_expected_commit") or ""),
                         allow_local_source=bool(orchestrated_input.get("current_allow_local_source")),
                         allow_dirty_local_source=bool(orchestrated_input.get("current_allow_dirty_local_source")),
                     )

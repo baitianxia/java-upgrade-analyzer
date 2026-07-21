@@ -258,7 +258,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 
 若 direct artifact 模式的两侧产物已经齐全，Step1 可以直接进入执行；`base_branch/current_branch` 属于强烈推荐的补全来源，不是 direct artifact 入口的执行前硬前置。
 
-需要源码时必须遵循统一来源顺序：先用 `git ls-remote` 查询所有配置 remote 的实时分支/tag，选定后定向 fetch 并固定 commit；不得用本地 `refs/remotes/*` 冒充远端最新状态，不得执行 `git pull`、checkout、merge 或 rebase。未指定 remote 的同名候选只有在 commit 唯一时才能自动采用；多个不同 commit 必须 checkpoint。远端不存在、认证失败、网络失败、超时或 fetch 失败时，不得自动使用本地分支；只有结构化答复明确设置对应侧 `allow_local_source=true` 后才允许本地兜底，dirty 工作区还必须明确 `allow_dirty_local_source=true`。来源状态必须记录为 `remote_source_resolved` 或 `user_confirmed_local_source`。
+需要源码时必须遵循统一来源顺序：先用 `git ls-remote` 查询所有配置 remote 的实时分支/tag，选定后定向 fetch 并固定 commit；不得用本地 `refs/remotes/*` 冒充远端最新状态，不得执行 `git pull`、checkout、merge 或 rebase。未指定 remote 的同名候选只有在 commit 唯一时才能自动采用；多个不同 commit 必须 checkpoint。裸 SHA 也必须先与实时远端记录的 `commit` 匹配。确认卡必须同时绑定 ref 和当时的 expected commit，执行前 ref 移动或消失必须重新确认。远端瞬时错误最多尝试 3 次，间隔 1 秒、3 秒；认证失败、ref 不存在和 ref 移动不自动重试。远端失败时必须保留远端失败为主状态，本地对象只能作为 `local_fallback_available` 附加信息，不得自动使用；只有结构化答复明确设置对应侧 `allow_local_source=true` 后才允许本地兜底，dirty 工作区还必须明确 `allow_dirty_local_source=true`。成功来源状态必须记录为 `remote_source_resolved` 或 `user_confirmed_local_source`。
 
 若用户已明确只分析某个模块，第一次执行 `step1` 时必须直接带模块参数，不得先跑 root 范围：
 
@@ -407,8 +407,9 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 重点：JApiCmp XML 是机器解析主证据，stdout 仅用于人读和 XML 失败回退；分别保留 binary/source compatibility，不能把“二进制兼容但源码重编译不兼容”合并掉
 - 规则：Step4 必须且只能复用 Step1 `evidence/dependencies/build_provenance.json` 指向的 base/current 最终构建产物，并按 `evidence/dependencies/dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 JAR；最终制品中无法定位时必须输出明确的证据缺失原因，不得回退本地 Maven 仓库或下载同坐标 JAR 替代
 - 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
-- 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应超时
-- 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且非 `DEV/dev` 分支优先于 `DEV/dev` 分支。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；同名候选只有 commit 相同才可自动合并。选定后必须定向 fetch 并用 commit SHA 执行 diff。未匹配、歧义或远程失败必须进入人工确认，不得直接套用主项目分支名或静默使用本地 ref
+- 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应超时；Git fetch 与 JApiCmp 工具安装不得共用一个超时字段
+- 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；不同 commit pair 的真实歧义、未匹配或远程失败才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
+- 规则：Step1/Step4 的 ref checkpoint 必须按同一语义处理：唯一 commit 自动继续，歧义或 ref 移动才选择方案，未找到时补明确 remote/ref，fetch 失败时只询问重试。Step4 必须在一张决策卡中展示全部待确认依赖；每项给出按稳定顺序排列、按 commit pair 去重的方案编号、old/new ref 和 commit 摘要。卡片最多展示 6 个方案时必须标明总数和完整候选文件。用户可以一次回复各依赖的方案编号，也可以直接给 old_ref/new_ref；恢复前必须校验本轮所有待确认依赖均已覆盖，已确认覆盖项按坐标合并保留，不得逐项重复询问
 - 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
 - 门控：`step4` 完成后执行 `jar_compare`
 

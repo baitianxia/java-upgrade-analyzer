@@ -89,10 +89,15 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "current_branch",
     "current_allow_local_source",
     "current_allow_dirty_local_source",
+    "base_expected_commit",
+    "current_expected_commit",
     "current_jdk_home",
     "current_source_project_dir",
     "dependency_git_ref_overrides",
+    "dependency_git_ref_selections",
+    "source_ref_selections",
     "dependency_source_dirs",
+    "retry_remote_fetch",
     "manual_coord_overrides",
     "max_depth",
     "modules",
@@ -101,6 +106,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "source_repo_hints",
     "selected_targets",
     "step4_fetch_timeout",
+    "step4_tool_install_timeout",
     "step4_git_diff_timeout",
     "step4_japicmp_timeout",
     "step4_workers",
@@ -862,6 +868,12 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
                     "ref_candidate_count",
                 ):
                     updated.pop(f"{side}_{suffix}", None)
+                updated.pop(f"{side}_expected_commit", None)
+    for side in ("base", "current"):
+        expected_field = f"{side}_expected_commit"
+        value = response.get(expected_field)
+        if isinstance(value, str) and value.strip():
+            updated[expected_field] = value.strip()
     for key in ("base_jdk_home", "current_jdk_home"):
         value = response.get(key)
         if isinstance(value, str) and value.strip():
@@ -920,7 +932,23 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         "dependency_git_ref_overrides",
     )
     if dependency_git_ref_overrides is not None:
-        updated["dependency_git_ref_overrides"] = dependency_git_ref_overrides
+        # Checkpoint replies may arrive incrementally.  Preserve already
+        # confirmed dependencies and replace only entries explicitly supplied
+        # in the latest reply, keyed by the stable Maven coordinate.
+        previous_overrides = normalize_dependency_git_ref_overrides(
+            updated.get("dependency_git_ref_overrides"),
+            "dependency_git_ref_overrides",
+        ) or []
+        merged_overrides = {
+            str(item.get("coord") or "").strip(): dict(item)
+            for item in previous_overrides
+            if str(item.get("coord") or "").strip()
+        }
+        for item in dependency_git_ref_overrides:
+            merged_overrides[str(item.get("coord") or "").strip()] = dict(item)
+        updated["dependency_git_ref_overrides"] = [
+            merged_overrides[coord] for coord in sorted(merged_overrides)
+        ]
     for key in ("step5_selected_coords", "step5_selected_names"):
         value = normalize_step5_target_list(response.get(key), key)
         if value is not None:
@@ -948,6 +976,7 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         "step4_git_diff_timeout",
         "step4_japicmp_timeout",
         "step4_fetch_timeout",
+        "step4_tool_install_timeout",
         "step4_workers",
         "step5_timeout",
     ):
@@ -1636,6 +1665,9 @@ def normalize_dependency_git_ref_overrides(raw_value, config_key="dependency_git
         new_ref = ""
         allow_local_source = False
         allow_dirty_local_source = False
+        expected_old_commit = ""
+        expected_new_commit = ""
+        selection_key = ""
         if isinstance(item, str):
             raw = item.strip()
             if not raw:
@@ -1647,6 +1679,8 @@ def normalize_dependency_git_ref_overrides(raw_value, config_key="dependency_git
                         nested_item.get("coord", ""),
                         nested_item.get("old_ref", ""),
                         nested_item.get("new_ref", ""),
+                        nested_item.get("expected_old_commit", ""),
+                        nested_item.get("expected_new_commit", ""),
                     )
                     if key in seen:
                         continue
@@ -1664,6 +1698,9 @@ def normalize_dependency_git_ref_overrides(raw_value, config_key="dependency_git
             coord = str(item.get("coord") or item.get("coord_hint") or "").strip()
             old_ref = str(item.get("old_ref") or item.get("base_ref") or "").strip()
             new_ref = str(item.get("new_ref") or item.get("current_ref") or "").strip()
+            expected_old_commit = str(item.get("expected_old_commit") or item.get("old_commit") or "").strip()
+            expected_new_commit = str(item.get("expected_new_commit") or item.get("new_commit") or "").strip()
+            selection_key = str(item.get("selection_key") or "").strip()
             if "allow_local_source" in item:
                 allow_local_source = parse_bool_like(item.get("allow_local_source"), "allow_local_source")
             if "allow_dirty_local_source" in item:
@@ -1680,11 +1717,25 @@ def normalize_dependency_git_ref_overrides(raw_value, config_key="dependency_git
             raise StepError(f"当前步骤输入中的 {config_key} 每项都必须包含 coord/old_ref/new_ref")
         if allow_dirty_local_source and not allow_local_source:
             raise StepError("allow_dirty_local_source=true 时必须同时明确 allow_local_source=true")
-        key = (coord, old_ref, new_ref, allow_local_source, allow_dirty_local_source)
+        key = (
+            coord,
+            old_ref,
+            new_ref,
+            expected_old_commit,
+            expected_new_commit,
+            allow_local_source,
+            allow_dirty_local_source,
+        )
         if key in seen:
             continue
         seen.add(key)
         normalized_item = {"coord": coord, "old_ref": old_ref, "new_ref": new_ref}
+        if expected_old_commit:
+            normalized_item["expected_old_commit"] = expected_old_commit
+        if expected_new_commit:
+            normalized_item["expected_new_commit"] = expected_new_commit
+        if selection_key:
+            normalized_item["selection_key"] = selection_key
         if allow_local_source:
             normalized_item["allow_local_source"] = True
         if allow_dirty_local_source:
@@ -2105,6 +2156,7 @@ def infer_non_pending_target_step_from_payload(user_response):
             {
                 "dependency_git_ref_overrides",
                 "step4_fetch_timeout",
+                "step4_tool_install_timeout",
                 "step4_git_diff_timeout",
                 "step4_japicmp_timeout",
                 "step4_workers",
@@ -2981,6 +3033,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "base_requested_ref": resolve_value(None, merged, "base_requested_ref", ""),
         "base_resolved_ref": resolve_value(None, merged, "base_resolved_ref", ""),
         "base_resolved_commit": resolve_value(None, merged, "base_resolved_commit", ""),
+        "base_expected_commit": resolve_value(None, merged, "base_expected_commit", ""),
         "base_ref_resolution_mode": resolve_value(None, merged, "base_ref_resolution_mode", ""),
         "base_ref_resolution_fingerprint": resolve_value(
             None, merged, "base_ref_resolution_fingerprint", "",
@@ -2998,6 +3051,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "current_requested_ref": resolve_value(None, merged, "current_requested_ref", ""),
         "current_resolved_ref": resolve_value(None, merged, "current_resolved_ref", ""),
         "current_resolved_commit": resolve_value(None, merged, "current_resolved_commit", ""),
+        "current_expected_commit": resolve_value(None, merged, "current_expected_commit", ""),
         "current_ref_resolution_mode": resolve_value(None, merged, "current_ref_resolution_mode", ""),
         "current_ref_resolution_fingerprint": resolve_value(
             None, merged, "current_ref_resolution_fingerprint", "",
@@ -3075,6 +3129,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             cli_scalar(getattr(args, "step4_fetch_timeout", None)),
             merged,
             "step4_fetch_timeout",
+            None,
+        ),
+        "step4_tool_install_timeout": resolve_value(
+            cli_scalar(getattr(args, "step4_tool_install_timeout", None)),
+            merged,
+            "step4_tool_install_timeout",
             None,
         ),
         "step4_workers": resolve_value(
@@ -3159,6 +3219,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "step4_git_diff_timeout",
         "step4_japicmp_timeout",
         "step4_fetch_timeout",
+        "step4_tool_install_timeout",
         "step4_workers",
         "step5_timeout",
     ):
@@ -3979,6 +4040,15 @@ def _step1_ref_repository(run_context, side, project_dir):
 
 def _step1_ref_request(side, field, source_dir, resolution, *, source_only=False):
     candidates = [dict(item) for item in (resolution.get("candidates") or [])]
+    for candidate in candidates:
+        payload = {
+            "side": side,
+            "ref": str(candidate.get("ref") or ""),
+            "commit": str(candidate.get("commit") or ""),
+        }
+        candidate["selection_key"] = "s1ref:" + hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
     request = {
         "side": side,
         "field": field,
@@ -3991,6 +4061,8 @@ def _step1_ref_request(side, field, source_dir, resolution, *, source_only=False
         "remote_failures": [dict(item) for item in (resolution.get("failures") or resolution.get("remote_failures") or [])],
         "local_candidate_commit": str(resolution.get("local_candidate_commit") or ""),
         "dirty": bool(resolution.get("dirty")),
+        "expected_commit": str(resolution.get("expected_commit") or ""),
+        "observed_commit": str(resolution.get("observed_commit") or ""),
     }
     detected_commit = str(
         resolution.get("resolved_commit") or resolution.get("local_candidate_commit") or ""
@@ -4008,6 +4080,17 @@ def _step1_ref_request(side, field, source_dir, resolution, *, source_only=False
                 "score": 0,
             }],
         })
+    for candidate in request.get("candidates") or []:
+        if candidate.get("selection_key"):
+            continue
+        payload = {
+            "side": side,
+            "ref": str(candidate.get("ref") or candidate.get("display_ref") or ""),
+            "commit": str(candidate.get("commit") or ""),
+        }
+        candidate["selection_key"] = "s1ref:" + hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
     return request
 
 
@@ -4016,13 +4099,22 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
     required_fields = [
         str(item.get("field") or "").strip()
         for item in requests
+        if item.get("status") != "fetch_failed"
         if str(item.get("field") or "").strip()
     ]
     reason_codes = {
         "source_only" if item.get("status") == "confirmation_required" else item.get("status")
         for item in requests
     }
-    if "source_only" in reason_codes:
+    if "fetch_failed" in reason_codes:
+        reason_code = "step1_remote_fetch_failed"
+        title = "Step1 远端源码 fetch 失败"
+        summary = "远端查询或 fetch 按错误类型完成受控重试后仍失败；无需重新选择分支。"
+    elif "ref_moved" in reason_codes:
+        reason_code = "step1_remote_ref_moved"
+        title = "Step1 远端分支已移动"
+        summary = "确认或解析期间远端 ref 指向了新的 commit，需要基于刷新后的候选重新确认。"
+    elif "source_only" in reason_codes:
         reason_code = "step1_source_revision_confirmation_required"
         title = "Step1 需要确认源码 revision"
         summary = "仅有源码目录不能证明其对应 base 或 current 制品，必须先确认并固定 commit。"
@@ -4044,6 +4136,14 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         summary = "提供的分支无法从远程仓库解析并固定为 commit。"
     properties = {
         "action": {"type": "string", "enum": ["continue", "confirm_local_source", "cancel"]},
+        "source_ref_selections": {
+            "type": "array",
+            "description": "按 base/current 侧选择候选 selection_key；系统会同时写回 ref 与 expected commit。",
+        },
+        "retry_remote_fetch": {
+            "type": "boolean",
+            "description": "仅重试已经唯一定位 ref、但 3 次受控 fetch 均失败的侧。",
+        },
         "notes": {"type": "string", "description": "可选。记录分支或 revision 的确认依据。"},
     }
     missing_inputs = []
@@ -4054,6 +4154,10 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         properties[field] = {
             "type": "string",
             "description": f"{side_cn}明确的远程分支或 tag；指定 remote 时使用 origin/release 形式。",
+        }
+        properties[f"{request.get('side')}_expected_commit"] = {
+            "type": "string",
+            "description": f"内部固定值：{side_cn}确认卡中所选 ref 对应的 commit。",
         }
         allow_local_field = f"{request.get('side')}_allow_local_source"
         allow_dirty_field = f"{request.get('side')}_allow_dirty_local_source"
@@ -4070,7 +4174,7 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             "field": field,
             "label": f"{side_cn}源码 ref",
             "side": request.get("side"),
-            "required": True,
+            "required": request.get("status") != "fetch_failed",
             "recommended": True,
             "reason": summary,
             "value_type": "branch",
@@ -4100,6 +4204,28 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         ensure_ascii=False,
         sort_keys=True,
     ).encode("utf-8")
+    source_ref_decision_items = [
+        {
+            "side": item.get("side"),
+            "field": item.get("field"),
+            "status": item.get("status"),
+            "source_status": item.get("source_status"),
+            "requested_ref": item.get("requested_ref"),
+            "candidates": list(item.get("candidates") or []),
+        }
+        for item in requests
+    ]
+    fetch_only = reason_codes == {"fetch_failed"}
+    question = (
+        "远端查询或 fetch 失败；请在网络或权限恢复后确认重试。"
+        if fetch_only
+        else "请为列出的每一侧选择或填写一个明确 ref；确认后 Step1 会固定 commit 再执行。"
+    )
+    continue_option = (
+        {"id": "continue", "label": "重试远端 fetch", "description": "保持已唯一定位的 ref，并重新执行受控 fetch。"}
+        if fetch_only
+        else {"id": "continue", "label": "确认 ref 后继续", "description": "重新查询远程，并验证所选 ref 仍指向确认卡中的 commit。"}
+    )
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
         "checkpoint": True,
@@ -4110,7 +4236,7 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         "reason_code": reason_code,
         "summary": summary,
         "title": title,
-        "question": "请为列出的每一侧选择或填写一个明确 ref；确认后 Step1 会固定 commit 再执行。",
+        "question": question,
         "files_to_review": [
             item.get("source_project_dir") for item in requests if item.get("source_project_dir")
         ],
@@ -4119,9 +4245,10 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         "fallback_inputs": [],
         "checklist_lines": checklist_lines,
         "ref_resolution_requests": requests,
+        "source_ref_decision_items": source_ref_decision_items,
         "ref_resolution_fingerprint": hashlib.sha256(fingerprint_payload).hexdigest(),
         "options": [
-            {"id": "continue", "label": "更正远程 ref 后继续", "description": "重新查询远程并固定所选 commit。"},
+            continue_option,
             {"id": "confirm_local_source", "label": "确认使用本地源码兜底", "description": "仅在远程不可用时使用用户明确确认的本地 commit。"},
             {"id": "cancel", "label": "取消", "description": "停止本次分析。"},
         ],
@@ -4131,7 +4258,7 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             "properties": properties,
         },
         "action_requirements": {
-            "continue": {"required_fields": required_fields},
+            "continue": {"required_fields": []},
             "confirm_local_source": {
                 "required_fields": [
                     field
@@ -4181,13 +4308,21 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
         source_dir = str(updated.get(source_field) or "").strip()
         repo_dir = _step1_ref_repository(updated, side, project_dir)
         if requested_ref:
+            expected_commit = str(
+                updated.get(f"{side}_expected_commit")
+                or updated.get(f"{side}_resolved_commit")
+                or ""
+            ).strip()
             resolution = resolve_step1_ref(
                 repo_dir,
                 requested_ref,
+                expected_commit=expected_commit,
                 allow_local_source=bool(updated.get(f"{side}_allow_local_source")),
                 allow_dirty_local_source=bool(updated.get(f"{side}_allow_dirty_local_source")),
             )
             if resolution.get("status") != "resolved":
+                if resolution.get("expected_commit"):
+                    updated[f"{side}_expected_commit"] = str(resolution.get("expected_commit") or "")
                 requests.append(
                     _step1_ref_request(side, branch_field, source_dir or str(repo_dir), resolution)
                 )
@@ -4195,6 +4330,9 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
             updated[f"{side}_requested_ref"] = requested_ref
             updated[f"{side}_resolved_ref"] = str(resolution.get("resolved_ref") or requested_ref)
             updated[f"{side}_resolved_commit"] = str(resolution.get("resolved_commit") or "")
+            updated[f"{side}_expected_commit"] = str(
+                resolution.get("resolved_commit") or expected_commit
+            )
             updated[f"{side}_ref_resolution_mode"] = str(resolution.get("resolution_mode") or "exact")
             updated[f"{side}_ref_resolution_fingerprint"] = str(resolution.get("fingerprint") or "")
             updated[f"{side}_ref_candidate_count"] = len(resolution.get("candidates") or [])
@@ -4422,13 +4560,17 @@ def _user_field_label(field):
         "dependency_source_dirs": "依赖源码目录",
         "source_repo_hints": "源码仓库线索",
         "dependency_git_ref_overrides": "依赖 git ref 确认",
+        "dependency_git_ref_selections": "依赖 git ref 方案",
+        "source_ref_selections": "主项目源码 ref 方案",
+        "retry_remote_fetch": "重试远端 Git 操作",
         "step5_selected_coords": "系统触达证据要分析的依赖坐标",
         "step5_selected_names": "系统触达证据要分析的依赖名称",
         "selected_targets": "选择的依赖包",
         "strict_risk_gate": "严格门控",
         "step4_git_diff_timeout": "源码差异对比超时秒数",
         "step4_japicmp_timeout": "JApiCmp 对比超时秒数",
-        "step4_fetch_timeout": "JApiCmp 工具自动安装超时秒数",
+        "step4_fetch_timeout": "远端 Git fetch 超时秒数",
+        "step4_tool_install_timeout": "JApiCmp 工具自动安装超时秒数",
         "restart_step_id": "重跑起点",
         "notes": "备注",
     }
@@ -4448,6 +4590,9 @@ def _user_field_description(field, meta=None):
         "current_artifact_path": "升级后构建出的 jar/war 路径。",
         "dependency_source_dirs": "相关依赖源码仓库或多模块仓库根目录。",
         "dependency_git_ref_overrides": "当依赖版本无法自动匹配 git ref 时，显式给出 old_ref/new_ref。",
+        "dependency_git_ref_selections": "从当前决策卡中按依赖选择方案编号。",
+        "source_ref_selections": "从当前决策卡中按 base/current 侧选择源码 ref 方案。",
+        "retry_remote_fetch": "仅重试已经按错误类型完成自动尝试的远端查询或 fetch。",
         "selected_targets": "从 changed_dependencies.md 的“依赖包”列复制完整坐标。",
         "step5_selected_coords": "只分析这些依赖坐标的系统触达证据。",
         "step5_selected_names": "只分析这些依赖名称的系统触达证据。",
@@ -4503,7 +4648,32 @@ def _decision_card_reply_examples(interaction, selection_options, options):
             fields.add(field)
     examples = []
     option_ids = {str((item or {}).get("id") or "").strip() for item in options}
-    if selection_options:
+    git_ref_items = list(interaction.get("git_ref_decision_items") or [])
+    source_ref_items = list(interaction.get("source_ref_decision_items") or [])
+    if source_ref_items:
+        choices = [
+            f"{'基准侧' if item.get('side') == 'base' else '当前侧'}选方案 1"
+            for item in source_ref_items
+            if item.get("status") != "fetch_failed" and item.get("candidates")
+        ]
+        if choices:
+            examples.append("；".join(choices) + "，确认后继续")
+        if any(item.get("status") == "fetch_failed" for item in source_ref_items):
+            examples.append("网络已恢复，重试 fetch")
+    elif git_ref_items:
+        selections = []
+        for item in git_ref_items:
+            coord = str(item.get("coord") or "").strip()
+            pair_options = list(item.get("pair_options") or [])
+            if coord and pair_options:
+                selections.append(f"{coord} 选方案 1")
+        if selections:
+            examples.append("；".join(selections) + "，确认后重跑")
+        if any(item.get("pending_kind") in {"fetch_failed", "remote_query_failed"} for item in git_ref_items):
+            examples.append("网络已恢复，重试全部 fetch 失败项")
+        if any(item.get("pending_kind") not in {"fetch_failed", "remote_query_failed"} for item in git_ref_items):
+            examples.append("我直接提供每个依赖的 old_ref/new_ref，并一次性确认后重跑")
+    elif selection_options:
         first_key = selection_options[0].get("coord") or selection_options[0].get("name") or "指定依赖包"
         examples.append("全量继续")
         examples.append(f"只分析 {first_key}")
@@ -4520,7 +4690,12 @@ def _decision_card_reply_examples(interaction, selection_options, options):
         examples.append("依赖源码目录是 /path/to/dependency-repo，补充后重跑")
     if "dependency_git_ref_overrides" in fields:
         examples.append('依赖 com.acme:lib 的 old_ref 是 v1.0.0，new_ref 是 v2.0.0，补充后重跑')
-    if {"step4_git_diff_timeout", "step4_japicmp_timeout", "step4_fetch_timeout"} & fields:
+    if {
+        "step4_git_diff_timeout",
+        "step4_japicmp_timeout",
+        "step4_fetch_timeout",
+        "step4_tool_install_timeout",
+    } & fields:
         examples.append("把 JApiCmp 对比超时放宽到 1800 秒后重新分析")
     if "restart_from_step" in option_ids:
         examples.append("从升级上下文重新分析")
@@ -4581,6 +4756,66 @@ def build_user_decision_card(interaction):
                 lines.append(f"- {label}：需要 " + "、".join(required_fields))
             else:
                 lines.append(f"- {label}")
+
+    git_ref_decision_items = list(interaction.get("git_ref_decision_items") or [])
+    source_ref_decision_items = list(interaction.get("source_ref_decision_items") or [])
+    if source_ref_decision_items:
+        lines.append("需要确认的主项目源码 ref：")
+        for item in source_ref_decision_items:
+            side = str(item.get("side") or "")
+            side_label = "基准侧" if side == "base" else "当前侧"
+            status = str(item.get("status") or "")
+            candidates = list(item.get("candidates") or [])
+            if status == "fetch_failed":
+                lines.append(f"- {side_label}：远端查询或 fetch 在受控重试后仍失败；无需猜测分支。")
+                continue
+            lines.append(f"- {side_label}（原输入 `{item.get('requested_ref') or '-'}`）：")
+            for index, candidate in enumerate(candidates[:6], start=1):
+                ref = candidate.get("ref") or candidate.get("display_ref") or "-"
+                commit = str(candidate.get("commit") or "")[:8]
+                lines.append(f"  - 方案 {index}：`{ref}`（commit {commit or '?'}）")
+            if len(candidates) > 6:
+                lines.append(f"  - 当前展示 6 / {len(candidates)} 个候选。")
+    if git_ref_decision_items:
+        lines.append(f"需要确认的依赖版本（共 {len(git_ref_decision_items)} 个，请一次答全）：")
+        for item in git_ref_decision_items:
+            coord = str(item.get("coord") or "未知依赖").strip()
+            old_version = str(item.get("old_version") or "-").strip()
+            new_version = str(item.get("new_version") or "-").strip()
+            reason_text = _humanize_interaction_text(item.get("reason") or "").strip()
+            lines.append(f"- `{coord}`：{old_version} → {new_version}")
+            if reason_text:
+                lines.append(f"  - 暂停原因：{reason_text}")
+            pair_options = list(item.get("pair_options") or [])
+            if not pair_options:
+                if item.get("pending_kind") in {"fetch_failed", "remote_query_failed"}:
+                    lines.append("  - 无需猜测分支；请检查网络/权限后回复“重试远端操作”。")
+                else:
+                    lines.append("  - 当前没有可供选择的完整远端 ref 组合；请修正源码仓库或直接提供 old/new ref。")
+                continue
+            for option in pair_options:
+                rank = int(option.get("rank") or 0)
+                old_ref = str(option.get("old_ref") or "-")
+                new_ref = str(option.get("new_ref") or "-")
+                old_commit = str(option.get("old_commit") or "")[:8]
+                new_commit = str(option.get("new_commit") or "")[:8]
+                commit_text = ""
+                if old_commit or new_commit:
+                    commit_text = f"（commit {old_commit or '?'} → {new_commit or '?'}）"
+                traits = []
+                if option.get("same_remote"):
+                    traits.append("同一 remote")
+                if option.get("same_prefix"):
+                    traits.append("同一分支族")
+                if option.get("version_delta_match") == "exact":
+                    traits.append("版本后缀变化一致")
+                trait_text = f"；{'、'.join(traits)}" if traits else ""
+                lines.append(f"  - 方案 {rank}：`{old_ref}` → `{new_ref}`{commit_text}{trait_text}")
+            if item.get("pair_options_truncated"):
+                lines.append(
+                    f"  - 当前展示 {item.get('displayed_pair_option_count')} / "
+                    f"{item.get('pair_option_count')} 个方案；可在 git_ref_pending.json 查看完整候选。"
+                )
 
     options = list(interaction.get("options") or [])
     selection_options = list(interaction.get("selection_options") or [])
@@ -4781,6 +5016,7 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
                     "recommended_candidate_count", 0
                 ),
                 "selection_resolution": interaction.get("selection_resolution", {}),
+                "git_ref_decision_items": interaction.get("git_ref_decision_items", []),
                 "runtime_rules": runtime_rules,
                 "next_action_rule": interaction.get("next_action_rule"),
                 "must_wait_for_user_reply": interaction.get("must_wait_for_user_reply", True),
@@ -5477,9 +5713,204 @@ def step2_continue_requires_refresh(user_response):
     return bool(user_response.get("accept_suggested_mappings"))
 
 
+def expand_step1_ref_selections(pending_interaction, user_response):
+    """Bind a Step1 ref choice to the commit shown on the current decision card."""
+    response = dict(user_response or {})
+    if str((pending_interaction or {}).get("step_id") or "") != "step1":
+        return response
+    decision_items = {
+        str(item.get("side") or "").strip(): dict(item)
+        for item in ((pending_interaction or {}).get("source_ref_decision_items") or [])
+        if str(item.get("side") or "").strip()
+    }
+    raw_selections = response.get("source_ref_selections")
+    if raw_selections not in (None, "", []):
+        if isinstance(raw_selections, dict):
+            selections = [raw_selections]
+        elif isinstance(raw_selections, list):
+            selections = raw_selections
+        else:
+            raise StepError("source_ref_selections 必须是对象或对象数组。")
+        seen_sides = set()
+        for selection in selections:
+            if not isinstance(selection, dict):
+                raise StepError("source_ref_selections 的每项都必须是对象。")
+            side = str(selection.get("side") or "").strip()
+            if side not in decision_items:
+                raise StepError(f"Step1 ref 方案中的 side 不存在于当前确认项：{side or '(空)'}")
+            if side in seen_sides:
+                raise StepError(f"Step1 的 {side} 侧只能选择一个 ref 方案。")
+            seen_sides.add(side)
+            candidates = list(decision_items[side].get("candidates") or [])
+            selection_key = str(selection.get("selection_key") or "").strip()
+            raw_option = selection.get("option", selection.get("rank"))
+            chosen = None
+            if selection_key:
+                chosen = next(
+                    (item for item in candidates if str(item.get("selection_key") or "") == selection_key),
+                    None,
+                )
+            elif raw_option not in (None, ""):
+                try:
+                    option_number = int(raw_option)
+                except (TypeError, ValueError) as exc:
+                    raise StepError(f"Step1 {side} 侧的 ref 方案编号必须是正整数。") from exc
+                if 1 <= option_number <= len(candidates):
+                    chosen = candidates[option_number - 1]
+            if not chosen:
+                raise StepError(f"Step1 {side} 侧选择的 ref 方案不存在或已过期。")
+            field = str(decision_items[side].get("field") or f"{side}_branch")
+            response[field] = str(chosen.get("ref") or chosen.get("display_ref") or "")
+            response[f"{side}_expected_commit"] = str(chosen.get("commit") or "")
+
+    if response.get("retry_remote_fetch") is True:
+        for side, item in decision_items.items():
+            if str(item.get("source_status") or "") != "remote_fetch_failed":
+                continue
+            candidates = list(item.get("candidates") or [])
+            commits = {str(candidate.get("commit") or "") for candidate in candidates if candidate.get("commit")}
+            refs = {str(candidate.get("ref") or "") for candidate in candidates if candidate.get("ref")}
+            if len(commits) != 1 or len(refs) != 1:
+                continue
+            field = str(item.get("field") or f"{side}_branch")
+            response[field] = next(iter(refs))
+            response[f"{side}_expected_commit"] = next(iter(commits))
+
+    # A manually entered remote-qualified ref can still be bound automatically
+    # when it identifies exactly one commit in the current card.
+    for side, item in decision_items.items():
+        field = str(item.get("field") or f"{side}_branch")
+        selected_ref = str(response.get(field) or "").strip()
+        if not selected_ref or response.get(f"{side}_expected_commit"):
+            continue
+        matches = [
+            candidate for candidate in (item.get("candidates") or [])
+            if selected_ref in {
+                str(candidate.get("ref") or ""),
+                str(candidate.get("canonical_ref") or ""),
+                str(candidate.get("display_ref") or ""),
+            }
+        ]
+        commits = {str(candidate.get("commit") or "") for candidate in matches if candidate.get("commit")}
+        if len(commits) == 1:
+            response[f"{side}_expected_commit"] = next(iter(commits))
+    return response
+
+
+def expand_dependency_git_ref_selections(pending_interaction, user_response):
+    """Translate compact Step4 option selections into canonical ref overrides."""
+    response = dict(user_response or {})
+    raw_selections = response.get("dependency_git_ref_selections")
+    if raw_selections in (None, "", []):
+        selections = []
+    elif isinstance(raw_selections, dict):
+        selections = [raw_selections]
+    elif isinstance(raw_selections, list):
+        selections = raw_selections
+    else:
+        raise StepError("dependency_git_ref_selections 必须是对象或对象数组。")
+
+    decision_items = {
+        str(item.get("coord") or "").strip(): dict(item)
+        for item in ((pending_interaction or {}).get("git_ref_decision_items") or [])
+        if str(item.get("coord") or "").strip()
+    }
+    selected_overrides = []
+    seen_coords = set()
+    for selection in selections:
+        if not isinstance(selection, dict):
+            raise StepError("dependency_git_ref_selections 的每项都必须是对象。")
+        coord = str(selection.get("coord") or "").strip()
+        if not coord or coord not in decision_items:
+            raise StepError(f"git ref 方案中的依赖坐标不存在于当前确认项：{coord or '(空)'}")
+        if coord in seen_coords:
+            raise StepError(f"同一依赖只能选择一个 git ref 方案：{coord}")
+        seen_coords.add(coord)
+        pair_options = list(decision_items[coord].get("pair_options") or [])
+        selection_key = str(selection.get("selection_key") or "").strip()
+        raw_option = selection.get("option", selection.get("rank"))
+        chosen = None
+        if selection_key:
+            chosen = next(
+                (item for item in pair_options if str(item.get("selection_key") or "") == selection_key),
+                None,
+            )
+        elif raw_option not in (None, ""):
+            try:
+                option_number = int(raw_option)
+            except (TypeError, ValueError) as exc:
+                raise StepError(f"{coord} 的 git ref 方案编号必须是正整数。") from exc
+            chosen = next(
+                (item for item in pair_options if int(item.get("rank") or 0) == option_number),
+                None,
+            )
+        if not chosen:
+            raise StepError(f"{coord} 选择的 git ref 方案不存在或已过期，请按当前决策卡重新选择。")
+        selected_overrides.append({
+            "coord": coord,
+            "old_ref": str(chosen.get("old_ref") or ""),
+            "new_ref": str(chosen.get("new_ref") or ""),
+            "expected_old_commit": str(chosen.get("old_commit") or ""),
+            "expected_new_commit": str(chosen.get("new_commit") or ""),
+            "selection_key": str(chosen.get("selection_key") or ""),
+        })
+
+    if response.get("retry_remote_fetch") is True or response.get("step4_fetch_timeout") not in (None, ""):
+        for item in (pending_interaction or {}).get("pending_git_ref_items") or []:
+            if str(item.get("pending_kind") or "") not in {"fetch_failed", "remote_query_failed"}:
+                continue
+            coord = str(item.get("coord") or "").strip()
+            old_ref = str(item.get("selected_old_ref") or item.get("old_ref_override") or "").strip()
+            new_ref = str(item.get("selected_new_ref") or item.get("new_ref_override") or "").strip()
+            if not (coord and old_ref and new_ref):
+                continue
+
+            def commit_for_ref(candidates, selected_ref):
+                commits = {
+                    str(candidate.get("commit") or "")
+                    for candidate in (candidates or [])
+                    if str(candidate.get("ref") or "") == selected_ref
+                    and str(candidate.get("commit") or "")
+                }
+                return next(iter(commits)) if len(commits) == 1 else ""
+
+            selected_overrides.append({
+                "coord": coord,
+                "old_ref": old_ref,
+                "new_ref": new_ref,
+                "expected_old_commit": str(
+                    item.get("expected_old_commit")
+                    or commit_for_ref(item.get("old_candidates"), old_ref)
+                    or ""
+                ),
+                "expected_new_commit": str(
+                    item.get("expected_new_commit")
+                    or commit_for_ref(item.get("new_candidates"), new_ref)
+                    or ""
+                ),
+                "selection_key": "automatic_fetch_retry",
+            })
+
+    existing = normalize_dependency_git_ref_overrides(
+        response.get("dependency_git_ref_overrides"),
+        "dependency_git_ref_overrides",
+    ) or []
+    merged = {
+        str(item.get("coord") or "").strip(): dict(item)
+        for item in existing
+        if str(item.get("coord") or "").strip()
+    }
+    for item in selected_overrides:
+        merged[item["coord"]] = item
+    if merged:
+        response["dependency_git_ref_overrides"] = [merged[coord] for coord in sorted(merged)]
+    return response
+
+
 def validate_pending_interaction_response(pending_interaction, user_response):
     pending_interaction = dict(pending_interaction or {})
-    user_response = dict(user_response or {})
+    user_response = expand_step1_ref_selections(pending_interaction, user_response)
+    user_response = expand_dependency_git_ref_selections(pending_interaction, user_response)
     step_id = str(pending_interaction.get("step_id") or "").strip()
     reason_code = str(pending_interaction.get("reason_code") or "").strip()
     action = str(user_response.get("action") or "").strip()
@@ -5511,6 +5942,22 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         for field in confirmation_fields:
             if user_response.get(field) is not True:
                 raise StepError(f"当前动作 confirm_local_source 要求 {field}=true，不能隐式确认本地源码。")
+    if step_id == "step1" and action == "continue" and pending_interaction.get("ref_resolution_requests"):
+        retry_remote_fetch = user_response.get("retry_remote_fetch") is True
+        fetch_failed_sides = {
+            str(item.get("side") or "")
+            for item in (pending_interaction.get("ref_resolution_requests") or [])
+            if item.get("status") == "fetch_failed"
+        }
+        for request in pending_interaction.get("ref_resolution_requests") or []:
+            side = str(request.get("side") or "")
+            field = str(request.get("field") or "").strip()
+            if request.get("status") == "fetch_failed" and retry_remote_fetch:
+                continue
+            if field and not str(user_response.get(field) or "").strip():
+                raise StepError(f"Step1 请一次性处理全部待确认侧；本次仍缺少：{field}")
+        if retry_remote_fetch and not fetch_failed_sides:
+            raise StepError("当前 Step1 确认项中没有可直接重试的 fetch 失败侧。")
     step5_missing_source_rerun = (
         step_id == "step5"
         and reason_code == "step5_dependency_source_mapping_missing"
@@ -5580,11 +6027,42 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             user_response.get("dependency_git_ref_overrides"),
             "dependency_git_ref_overrides",
         ) or []
-        if not overrides and not dependency_source_dirs:
+        retry_remote_fetch = (
+            user_response.get("retry_remote_fetch") is True
+            or user_response.get("step4_fetch_timeout") not in (None, "")
+        )
+        if not overrides and not dependency_source_dirs and not retry_remote_fetch:
             raise StepError(
                 "Step4 当前检查点要求先确认依赖 old_ref/new_ref，"
-                "或修正依赖源码目录后，再重跑当前步骤。"
+                "确认重试 fetch，或修正依赖源码目录后，再重跑当前步骤。"
             )
+        if not dependency_source_dirs:
+            pending_items = list(pending_interaction.get("pending_git_ref_items") or [])
+            pending_coords = {
+                str(item.get("coord") or "").strip()
+                for item in pending_items
+                if str(item.get("coord") or "").strip()
+            }
+            retryable_coords = {
+                str(item.get("coord") or "").strip()
+                for item in pending_items
+                if str(item.get("pending_kind") or "") in {"fetch_failed", "remote_query_failed"}
+                and str(item.get("coord") or "").strip()
+            }
+            supplied_coords = {
+                str(item.get("coord") or "").strip()
+                for item in overrides
+                if str(item.get("coord") or "").strip()
+            }
+            covered_by_retry = retryable_coords if retry_remote_fetch else set()
+            missing_coords = sorted(pending_coords - supplied_coords - covered_by_retry)
+            if missing_coords:
+                raise StepError(
+                    "Step4 请一次性处理当前全部待处理依赖；"
+                    f"本次仍缺少：{', '.join(missing_coords)}"
+                )
+            if retry_remote_fetch and not retryable_coords:
+                raise StepError("当前 Step4 确认项中没有可直接重试的 fetch 失败条目。")
     if (
         step_id == "step4"
         and reason_code == "step4_timeouts_need_resolution"
@@ -5599,6 +6077,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             "step4_git_diff_timeout",
             "step4_japicmp_timeout",
             "step4_fetch_timeout",
+            "step4_tool_install_timeout",
         ]
         has_timeout_override = any(user_response.get(field) not in (None, "") for field in timeout_fields)
         if not has_timeout_override and not dependency_source_dirs:
@@ -5633,6 +6112,8 @@ def validate_pending_interaction_response(pending_interaction, user_response):
 
 def apply_user_response_to_main_state(main_state, pending_interaction, user_response, project_dir, target_step_id=""):
     user_response = build_canonical_user_response(user_response)
+    user_response = expand_step1_ref_selections(pending_interaction, user_response)
+    user_response = expand_dependency_git_ref_selections(pending_interaction, user_response)
     if user_response.get("selected_targets") is not None:
         selection_result = resolve_selected_targets(
             (pending_interaction or {}).get("selection_resolution") or {},
@@ -6296,6 +6777,8 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
         ensure_exists(dep_changes, "Step2 缺少 evidence/dependencies/dep_changes.csv，请先执行 Step1")
         base_branch = run_context.get("base_branch")
         current_branch = run_context.get("current_branch")
+        base_revision = str(run_context.get("base_resolved_commit") or base_branch or "").strip()
+        current_revision = str(run_context.get("current_resolved_commit") or current_branch or "").strip()
         if not (base_branch and current_branch):
             if run_context.get("artifact_input_mode"):
                 raise StepError(
@@ -6307,9 +6790,9 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
                 "Step2 需要基准分支和当前分支。请检查 .runtime/state/main_state.json 中的 step2.input / step1.output，"
                 "或回到最近的 checkpoint 通过 --response-json / --response-file 把分支写回主状态后再继续。"
             )
-        if is_git_repo(project_dir) and base_branch == current_branch:
+        if is_git_repo(project_dir) and base_revision == current_revision:
             raise StepError(
-                f"Step2 检测到 base_branch 与 current_branch 相同（{base_branch}），无法进行 git diff/推断。"
+                f"Step2 检测到 base/current 执行 revision 相同（{base_revision}），无法进行 git diff/推断。"
                 "请回到最近的 checkpoint 或修正 .runtime/state/main_state.json，明确写入两个不同分支后再继续。"
             )
         cmd = [
@@ -6434,6 +6917,7 @@ def main():
     ap.add_argument("--step4-git-diff-timeout", type=int, default=None)
     ap.add_argument("--step4-japicmp-timeout", type=int, default=None)
     ap.add_argument("--step4-fetch-timeout", type=int, default=None)
+    ap.add_argument("--step4-tool-install-timeout", type=int, default=None)
     ap.add_argument("--step4-workers", type=int, default=None)
     ap.add_argument("--step5-timeout", type=int, default=None)
     ap.add_argument("--base-artifact-path", default="")

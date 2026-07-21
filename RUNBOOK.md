@@ -154,6 +154,7 @@ python3.12 scripts/quality_gate.py --profile quick --skip-real
 - `dependency_source_dirs` 是推荐主入口；只要提供源码工程目录或仓库根目录，调度层就会优先扫描仓库 `pom.xml` / `build.gradle` 并展开所有推断出的 `groupId:artifactId`。
 - 路径支持相对路径（相对 `project-dir`）和绝对路径。
 - `dependency_source_dirs` 一旦提供，Step4 会通过 `git ls-remote` 查询源码仓库的实时远程分支，再按依赖 `old_version/new_version` 做严格边界匹配；old/new 两侧优先选择 remote 和版本前缀家族一致的 ref pair，同名候选只有 commit 相同才会自动合并。选定 ref 后会定向 fetch 并固定 commit，再执行源码 diff；不会以本地远端跟踪分支冒充远端最新状态。
+- 唯一匹配会自动继续；确认卡中的方案会把 `old_ref/new_ref` 与 `expected_old_commit/expected_new_commit` 一起写回。执行前再次校验远端 ref：commit 不一致或 ref 消失时标记 `remote_ref_moved`，重新确认后才继续。`refs/heads/*` 在多个 remote 上指向不同 commit 时仍视为歧义，不能按排序取第一个。
 - `dependency_source_dirs` 是唯一推荐用户入口；系统会自动推断后续所需映射。
 - `main_state.json` 是唯一主状态和业务参数来源；步骤执行时不应再由 CLI 覆盖已确认的业务参数。
 - 上述约束同样适用于正式恢复/重建路径；即使是重建 `step2` 上下文，也只能传壳层参数，不能把 `base_branch/current_branch/source_dirs` 之类的业务参数重新塞回单步脚本 CLI。
@@ -397,7 +398,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 - 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支执行 `mvn dependency:list` 补全坐标；但这不是 direct artifact 模式的执行前硬前置
 - `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
 - 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧源码并运行 Maven 补全；自动构建模式则在构建前解析两侧 ref。解析时先查询实时远程 refs，候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在 Maven 执行前暂停确认；选定后仅定向 fetch 所需 ref，不执行 `git pull`，也不修改用户当前分支。
-- 远端不存在、认证失败、网络失败、超时或定向 fetch 失败时会暂停。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地 commit；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。依赖源码 ref 使用 `dependency_git_ref_overrides` 中对应的 `allow_local_source` / `allow_dirty_local_source`，不得由 Claude Code 代替用户填写确认。
+- 远端不存在、认证失败、网络失败、超时或定向 fetch 失败时会暂停。瞬时网络错误在暂停前最多尝试 3 次（间隔 1 秒、3 秒），认证失败、ref 不存在和 ref 移动不重试；fetch 已唯一定位但失败时，卡片提供“重试 fetch”，不再要求重新选分支。裸 SHA 必须先与实时远端记录的 `commit` 匹配并按 expected commit 固定；远端无法提供时以 `remote_source_unavailable` / fetch 失败为主状态，本地对象仅记录为 `local_fallback_available`。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地 commit；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。依赖源码 ref 使用 `dependency_git_ref_overrides` 中对应的 `allow_local_source` / `allow_dirty_local_source`，不得由 Agent 代替用户填写确认。
 - 同时提供 branch/ref 与 source directory 时，以确认后的 branch/ref 为准；只有 source directory 时不得直接使用当前 checkout 执行坐标补全
 - 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源
 - 若这两个分支是在 Step1 review checkpoint 才补充，恢复 `continue` 后调度器会先把确认值写入 `step2.input`，再进入 Step2
@@ -550,7 +551,7 @@ JApiCmp 是 Java 依赖升级分析的必需工具，不允许降级继续。缺
 - 其他执行失败项
 - Step4 只复用 Step1 成功构建产物中的 `base_lib_entry/current_lib_entry` JAR，并将提取缓存写入 `.upgrade-report/evidence/api_changes/step4_artifact_jars/`；无法从最终制品定位时会明确报告证据缺失，不读取本地 Maven 仓库，也不下载同坐标 JAR 替代
 - Step4 默认 `step4_workers=4` 进行依赖级并行；如果本机 CPU/磁盘压力过高，可在主状态或命令行设为 1/2
-- 正式流程默认不设置 Step4 超时；仅在主状态中显式写入 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` 时才启用对应限制
+- 正式流程默认不设置 Step4 超时；仅在主状态中显式写入 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应限制。`step4_fetch_timeout` 只控制远端 Git 查询/抓取，JApiCmp 自动安装使用独立的 `step4_tool_install_timeout`
 - 正式流程会向 `stderr` 输出 `[progress][step4][dependency|gitdiff|japicmp|done]` 日志，展示当前处理到哪个依赖、子阶段和耗时
 
 ## Step 5：调用链影响分析

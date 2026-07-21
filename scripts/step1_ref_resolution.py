@@ -173,15 +173,28 @@ def resolve_step1_ref(
     repo_dir,
     requested_ref,
     *,
+    expected_commit="",
     allow_local_source=False,
     allow_dirty_local_source=False,
 ):
     """Resolve Step1 auxiliary source from live remotes, with confirmed local fallback."""
-    remote = resolve_remote_source_ref(repo_dir, requested_ref)
+    remote = resolve_remote_source_ref(
+        repo_dir,
+        requested_ref,
+        expected_commit=expected_commit,
+    )
     if remote.get("status") == "remote_source_resolved":
         return {**remote, "status": "resolved", "source_status": "remote_source_resolved"}
     if remote.get("status") == "remote_source_ambiguous":
         return {**remote, "status": "ambiguous", "source_status": "remote_source_ambiguous"}
+    if remote.get("status") == "remote_ref_moved":
+        return {**remote, "status": "ref_moved", "source_status": "remote_ref_moved"}
+    if remote.get("status") in {"remote_fetch_failed", "remote_query_failed"}:
+        return {
+            **remote,
+            "status": "fetch_failed",
+            "source_status": str(remote.get("status") or "remote_fetch_failed"),
+        }
 
     local = resolve_local_source_ref(
         repo_dir,

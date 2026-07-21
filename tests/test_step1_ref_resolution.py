@@ -11,6 +11,33 @@ from step1_ref_resolution import resolve_step1_ref  # noqa: E402
 
 
 class Step1RefResolutionTest(unittest.TestCase):
+    def test_expected_commit_is_forwarded_to_remote_resolver(self):
+        remote = {
+            "status": "remote_source_resolved",
+            "resolved_ref": "origin/release",
+            "resolved_commit": "a" * 40,
+        }
+        with patch("step1_ref_resolution.resolve_remote_source_ref", return_value=remote) as resolver:
+            result = resolve_step1_ref("/repo", "release", expected_commit="a" * 40)
+
+        self.assertEqual(result["status"], "resolved")
+        resolver.assert_called_once_with("/repo", "release", expected_commit="a" * 40)
+
+    def test_remote_query_failure_does_not_fall_back_to_local(self):
+        remote = {
+            "status": "remote_query_failed",
+            "requested_ref": "release",
+            "failures": [{"stage": "ls_remote", "reason": "timed out"}],
+        }
+        with patch("step1_ref_resolution.resolve_remote_source_ref", return_value=remote), patch(
+            "step1_ref_resolution.resolve_local_source_ref"
+        ) as local_resolver:
+            result = resolve_step1_ref("/repo", "release")
+
+        self.assertEqual(result["status"], "fetch_failed")
+        self.assertEqual(result["source_status"], "remote_query_failed")
+        local_resolver.assert_not_called()
+
     def test_remote_resolution_is_exposed_as_resolved(self):
         remote = {
             "status": "remote_source_resolved",

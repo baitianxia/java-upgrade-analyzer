@@ -651,12 +651,15 @@ def detect_jdk_versions(base_branch, cur_branch, work_dir, build_tool):
 
 def detect_build_tool(cur_branch, work_dir):
     """通过 git 检测构建工具（只读）"""
-    # 优先尊重 work_dir 当前目录，兼容 Git 仓库中的子模块目录
-    base = Path(work_dir)
-    if (base / 'pom.xml').exists():
-        return 'maven'
-    if (base / 'build.gradle').exists() or (base / 'build.gradle.kts').exists():
-        return 'gradle'
+    # 固定 commit 存在时不能让当前 checkout 覆盖它；分支模式仍优先尊重
+    # work_dir 当前目录，以兼容 Git 仓库中的子模块目录。
+    fixed_commit = bool(re.fullmatch(r"[0-9a-fA-F]{40}", str(cur_branch or "").strip()))
+    if not fixed_commit:
+        base = Path(work_dir)
+        if (base / 'pom.xml').exists():
+            return 'maven'
+        if (base / 'build.gradle').exists() or (base / 'build.gradle.kts').exists():
+            return 'gradle'
 
     if is_git_repo(work_dir):
         for candidate in build_manifest_candidates(work_dir, 'pom.xml'):
@@ -717,6 +720,10 @@ def main():
     ap.add_argument('--current-branch', '--current',
                     dest='current_branch',
                     help='Git 当前分支名（也可用 --current）')
+    ap.add_argument('--base-revision', default='',
+                    help='已固定的 Git 基准 commit；提供时优先于可变分支名执行只读查询')
+    ap.add_argument('--current-revision', default='',
+                    help='已固定的 Git 当前 commit；提供时优先于可变分支名执行只读查询')
     ap.add_argument('--work-dir',        default='.',
                     help='项目根目录（git 命令的工作目录）')
     ap.add_argument('--source-dirs', nargs='+', default=None,
@@ -730,10 +737,14 @@ def main():
     if orchestrated_input:
         args.base_branch = args.base_branch or orchestrated_input.get("base_branch", "")
         args.current_branch = args.current_branch or orchestrated_input.get("current_branch", "")
+        args.base_revision = args.base_revision or orchestrated_input.get("base_resolved_commit", "")
+        args.current_revision = args.current_revision or orchestrated_input.get("current_resolved_commit", "")
         if not args.source_dirs:
             args.source_dirs = list(orchestrated_input.get("source_dirs") or [])
     if not args.base_branch or not args.current_branch:
         ap.error('the following arguments are required: --base-branch --current-branch')
+    base_revision = str(args.base_revision or args.base_branch).strip()
+    current_revision = str(args.current_revision or args.current_branch).strip()
 
     print(f"\nStep 2：推断项目上下文", file=sys.stderr)
     print(f"  基准分支：{args.base_branch}", file=sys.stderr)
@@ -743,7 +754,7 @@ def main():
     deps = load_dep_changes(args.dep_changes)
 
     # ── 2. 构建工具识别 ─────────────────────────────────────────
-    build_tool = detect_build_tool(args.current_branch, args.work_dir)
+    build_tool = detect_build_tool(current_revision, args.work_dir)
     print(f"  构建工具：{build_tool}", file=sys.stderr)
 
     # ── 2.5. 业务源码目录自动检测 ────────────────────────────────
@@ -771,7 +782,7 @@ def main():
 
     # ── 5. JDK 版本（从 git 只读 pom.xml）──────────────────────
     jdk_base, jdk_cur = detect_jdk_versions(
-        args.base_branch, args.current_branch,
+        base_revision, current_revision,
         args.work_dir, build_tool
     )
     print(f"  JDK：{jdk_base or '❓未知'} → {jdk_cur or '❓未知'}", file=sys.stderr)
@@ -794,7 +805,7 @@ def main():
 
     # ── 9. JVM 参数变更 ──────────────────────────────────────────
     jvm_changes = detect_jvm_param_changes(
-        args.base_branch, args.current_branch, args.work_dir
+        base_revision, current_revision, args.work_dir
     )
 
     # ── 10. 统计变更依赖 ─────────────────────────────────────────
@@ -817,6 +828,9 @@ def main():
         'generated_at':    datetime.now().isoformat(),
         'base_branch':     args.base_branch,
         'current_branch':  args.current_branch,
+        'base_revision':   base_revision,
+        'current_revision': current_revision,
+        'revision_source': 'resolved_commit' if args.base_revision and args.current_revision else 'branch_name',
         'build_tool':      build_tool,
 
         # JDK

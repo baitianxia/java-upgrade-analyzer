@@ -1348,6 +1348,128 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertEqual(reason, "no_ref_match_for_version=3.0.7")
         self.assertEqual(candidates, [])
 
+    def test_resolve_repo_ref_for_version_accepts_explicit_live_remote_outside_version_heuristic(self):
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={
+                "tags": [],
+                "heads": [],
+                "remotes": ["origin/production-stable"],
+                "remote_records": [
+                    {
+                        "ref": "origin/production-stable",
+                        "short_name": "production-stable",
+                        "commit": commit,
+                        "canonical_ref": "refs/heads/production-stable",
+                        "remote": "origin",
+                    }
+                ],
+            },
+        ):
+            resolved, reason, candidates = step4.resolve_repo_ref_for_version(
+                tmp,
+                "3.0.7",
+                selected_ref="origin/production-stable",
+            )
+
+        self.assertEqual(resolved, "origin/production-stable")
+        self.assertEqual(reason, "selected_by_user(kind=remote,score=-1,version=3.0.7)")
+        self.assertEqual(candidates[0]["commit"], commit)
+
+    def test_resolve_repo_ref_for_version_does_not_demote_non_dev_substring(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={
+                "tags": [],
+                "heads": [],
+                "remotes": ["origin/device-3.0.7"],
+            },
+        ):
+            resolved, reason, candidates = step4.resolve_repo_ref_for_version(tmp, "3.0.7")
+
+        self.assertEqual(resolved, "origin/device-3.0.7")
+        self.assertEqual(reason, "matched_by_version(kind=remote,score=140,version=3.0.7)")
+        self.assertEqual(candidates[0]["score"], 140)
+
+    def test_git_ref_pair_options_deduplicate_remote_aliases_by_commit_pair(self):
+        old_commit = "a" * 40
+        new_commit = "b" * 40
+        item = {
+            "coord": "com.acme:demo",
+            "repo_path": "/repo/demo",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "old_candidates": [
+                {
+                    "ref": "origin/release-1.0.0", "commit": old_commit,
+                    "score": 140, "prefix": "release", "remote_name": "origin",
+                    "branch_name": "release-1.0.0",
+                },
+                {
+                    "ref": "upstream/release-1.0.0", "commit": old_commit,
+                    "score": 140, "prefix": "release", "remote_name": "upstream",
+                    "branch_name": "release-1.0.0",
+                },
+            ],
+            "new_candidates": [
+                {
+                    "ref": "origin/release-2.0.0", "commit": new_commit,
+                    "score": 140, "prefix": "release", "remote_name": "origin",
+                    "branch_name": "release-2.0.0",
+                },
+                {
+                    "ref": "upstream/release-2.0.0", "commit": new_commit,
+                    "score": 140, "prefix": "release", "remote_name": "upstream",
+                    "branch_name": "release-2.0.0",
+                },
+            ],
+        }
+
+        first = step4.build_git_ref_pair_options(item)
+        second = step4.build_git_ref_pair_options(item)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["old_commit"], old_commit)
+        self.assertEqual(first[0]["new_commit"], new_commit)
+        self.assertEqual(
+            first[0]["old_aliases"],
+            ["origin/release-1.0.0", "upstream/release-1.0.0"],
+        )
+
+    def test_remote_materialization_is_reused_within_one_step4_run(self):
+        candidate = {
+            "ref": "origin/release-1.0.0",
+            "commit": "a" * 40,
+            "canonical_ref": "refs/heads/release-1.0.0",
+            "remote": "origin",
+        }
+        step4._REMOTE_SOURCE_MATERIALIZATION_CACHE.clear()
+        with patch.object(
+            step4,
+            "materialize_remote_source_candidate",
+            return_value={
+                "status": "remote_source_resolved",
+                "resolved_commit": "a" * 40,
+                "remote": "origin",
+                "remote_ref": "refs/heads/release-1.0.0",
+            },
+        ) as materialize:
+            first, first_error = step4._materialize_resolved_remote_ref(
+                "/repo/demo", candidate["ref"], [candidate]
+            )
+            second, second_error = step4._materialize_resolved_remote_ref(
+                "/repo/demo", candidate["ref"], [candidate]
+            )
+
+        self.assertEqual(first_error, "")
+        self.assertEqual(second_error, "")
+        self.assertEqual(first, second)
+        materialize.assert_called_once()
+
     def test_preflight_gitdiff_refs_reports_pending_before_expensive_work(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_dir = Path(tmp) / "acct-sdk"
@@ -1437,6 +1559,54 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertEqual(plan["base_ref"], "a" * 40)
         self.assertEqual(plan["cur_ref"], "b" * 40)
         self.assertEqual(plan["old_source"]["status"], "remote_source_resolved")
+
+    def test_preflight_does_not_prompt_when_only_one_remote_pair_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "acct-sdk"
+            repo_dir.mkdir()
+            (repo_dir / ".git").mkdir()
+            old_candidate = {
+                "ref": "origin/release-1.0.0", "commit": "a" * 40,
+                "canonical_ref": "refs/heads/release-1.0.0", "remote": "origin",
+            }
+            new_candidate = {
+                "ref": "origin/release-2.0.0", "commit": "b" * 40,
+                "canonical_ref": "refs/heads/release-2.0.0", "remote": "origin",
+            }
+            with patch.object(
+                step4,
+                "resolve_repo_ref_pair_for_versions",
+                return_value=(
+                    old_candidate["ref"], new_candidate["ref"],
+                    "unique-old", "unique-new", [old_candidate], [new_candidate],
+                ),
+            ), patch.object(
+                step4,
+                "materialize_remote_source_candidate",
+                side_effect=[
+                    {"status": "remote_source_resolved", "resolved_commit": "a" * 40},
+                    {"status": "remote_source_resolved", "resolved_commit": "b" * 40},
+                ],
+            ):
+                matched, pending = step4.preflight_gitdiff_refs(
+                    [{
+                        "coord": "com.acme:acct-sdk",
+                        "old_version": "1.0.0",
+                        "new_version": "2.0.0",
+                        "change_type": "小版本升级",
+                    }],
+                    {
+                        "com.acme:acct-sdk": {
+                            "repo_path": str(repo_dir),
+                            "module_path": str(repo_dir),
+                        }
+                    },
+                    {"com.acme:acct-sdk": {"mapping_mode": "explicit"}},
+                    {},
+                )
+
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(pending, [])
 
     def test_main_preflights_git_refs_before_japicmp_or_removed_jar_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1585,7 +1755,7 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertEqual(refs["remote_records"][0]["commit"], "a" * 40)
         query.assert_called_once()
 
-    def test_resolve_repo_ref_for_version_rejects_unconfirmed_local_override(self):
+    def test_resolve_repo_ref_for_version_keeps_remote_failure_primary_with_unconfirmed_local_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
                 step4,
@@ -1610,7 +1780,10 @@ class Step4StabilityTest(unittest.TestCase):
                 )
 
         self.assertIsNone(resolved)
-        self.assertEqual(reason, "local_source_confirmation_required=mybatis-3.5.14")
+        self.assertEqual(
+            reason,
+            f"remote_source_unavailable=mybatis-3.5.14;local_fallback_available={'b' * 40}",
+        )
         self.assertEqual(candidates, [])
 
     def test_resolve_repo_ref_for_version_accepts_confirmed_local_override(self):
@@ -3107,6 +3280,120 @@ class Step4StabilityTest(unittest.TestCase):
                     {"coord": "com.foo:bar", "old_ref": "v1", "new_ref": "v2"}
                 ],
             },
+        )
+
+    def test_step4_rerun_requires_all_pending_git_refs_in_one_reply(self):
+        pending_interaction = {
+            "step_id": "step4",
+            "reason_code": "step4_git_refs_need_confirmation",
+            "pending_git_ref_items": [
+                {"coord": "com.foo:bar"},
+                {"coord": "com.foo:baz"},
+            ],
+        }
+        with self.assertRaisesRegex(run_step.StepError, "com.foo:baz"):
+            run_step.validate_pending_interaction_response(
+                pending_interaction,
+                {
+                    "action": "rerun_current_step",
+                    "dependency_git_ref_overrides": [
+                        {"coord": "com.foo:bar", "old_ref": "v1", "new_ref": "v2"}
+                    ],
+                },
+            )
+
+        run_step.validate_pending_interaction_response(
+            pending_interaction,
+            {
+                "action": "rerun_current_step",
+                "dependency_git_ref_overrides": [
+                    {"coord": "com.foo:bar", "old_ref": "v1", "new_ref": "v2"},
+                    {"coord": "com.foo:baz", "old_ref": "v3", "new_ref": "v4"},
+                ],
+            },
+        )
+
+    def test_step4_git_ref_decision_card_accepts_compact_pair_selections(self):
+        pending_items = []
+        for index, coord in enumerate(("com.foo:bar", "com.foo:baz"), start=1):
+            pending_items.append({
+                "coord": coord,
+                "repo_path": f"/repo/{index}",
+                "old_version": "1.0.0",
+                "new_version": "2.0.0",
+                "reason": "无法定位唯一 ref pair",
+                "old_candidates": [
+                    {
+                        "ref": f"origin/release-{index}-1.0.0", "commit": str(index) * 40,
+                        "score": 140, "prefix": f"release-{index}", "remote_name": "origin",
+                        "branch_name": f"release-{index}-1.0.0",
+                    }
+                ],
+                "new_candidates": [
+                    {
+                        "ref": f"origin/release-{index}-2.0.0", "commit": str(index + 2) * 40,
+                        "score": 140, "prefix": f"release-{index}", "remote_name": "origin",
+                        "branch_name": f"release-{index}-2.0.0",
+                    }
+                ],
+            })
+        with tempfile.TemporaryDirectory() as tmp:
+            interaction = step4.build_git_ref_confirmation_interaction(tmp, pending_items)
+
+        selections = [
+            {"coord": item["coord"], "option": 1}
+            for item in interaction["git_ref_decision_items"]
+        ]
+        response = {
+            "action": "rerun_current_step",
+            "dependency_git_ref_selections": selections,
+        }
+        run_step.validate_pending_interaction_response(interaction, response)
+        expanded = run_step.expand_dependency_git_ref_selections(interaction, response)
+        card = "\n".join(run_step.build_user_decision_card(interaction))
+
+        self.assertEqual(len(expanded["dependency_git_ref_overrides"]), 2)
+        self.assertIn("共 2 个，请一次答全", card)
+        self.assertIn("com.foo:bar 选方案 1；com.foo:baz 选方案 1", card)
+        self.assertNotIn("refpair:", card)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = run_step.new_main_state(Path(tmp) / ".upgrade-report")
+            updated_state, updated_context = run_step.apply_user_response_to_main_state(
+                state,
+                interaction,
+                response,
+                tmp,
+                target_step_id="step4",
+            )
+        self.assertEqual(len(updated_context["dependency_git_ref_overrides"]), 2)
+        self.assertEqual(
+            updated_state["step4"]["input"]["dependency_git_ref_overrides"],
+            updated_context["dependency_git_ref_overrides"],
+        )
+
+    def test_merge_user_response_preserves_previous_git_ref_overrides_by_coord(self):
+        merged = run_step.merge_user_response_into_run_context(
+            {
+                "dependency_git_ref_overrides": [
+                    {"coord": "com.foo:bar", "old_ref": "v1", "new_ref": "v2"},
+                    {"coord": "com.foo:baz", "old_ref": "v3", "new_ref": "v4"},
+                ]
+            },
+            {
+                "dependency_git_ref_overrides": [
+                    {"coord": "com.foo:bar", "old_ref": "release-1", "new_ref": "release-2"}
+                ]
+            },
+            "/tmp/project",
+        )
+
+        self.assertEqual(
+            merged["dependency_git_ref_overrides"],
+            [
+                {"coord": "com.foo:bar", "old_ref": "release-1", "new_ref": "release-2"},
+                {"coord": "com.foo:baz", "old_ref": "v3", "new_ref": "v4"},
+            ],
         )
 
     def test_step4_rerun_accepts_dependency_source_dirs_fix(self):
