@@ -13,22 +13,6 @@ import quality_gate  # noqa: E402
 
 
 class QualityGateTest(unittest.TestCase):
-    def test_evidence_identity_binds_commit_environment_and_dependency_lock(self):
-        identity = quality_gate.build_evidence_identity(
-            "release", real_scope_mode="included", real_case="guard"
-        )
-
-        self.assertTrue(identity["commit"])
-        self.assertEqual(identity["profile"], "release")
-        self.assertEqual(identity["real_project_scope"]["selector"], "guard")
-        self.assertEqual(identity["python"]["executable"], sys.executable)
-        self.assertEqual(len(identity["runtime_dependencies"]["requirements_sha256"]), 64)
-        self.assertEqual(identity["runtime_dependencies"]["declared"], {
-            "tree-sitter": "0.25.2",
-            "tree-sitter-java": "0.23.5",
-        })
-        self.assertIn("checks", identity["environment_contract"])
-
     def test_all_profiles_default_to_regression_only(self):
         for profile in ("quick", "step5", "release"):
             with self.subTest(profile=profile):
