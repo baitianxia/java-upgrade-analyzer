@@ -13,6 +13,37 @@ import quality_gate  # noqa: E402
 
 
 class QualityGateTest(unittest.TestCase):
+    def test_all_profiles_default_to_regression_only(self):
+        for profile in ("quick", "step5", "release"):
+            with self.subTest(profile=profile):
+                tasks = quality_gate.build_plan(profile)
+
+                self.assertFalse(
+                    any(task.real_project for task in tasks),
+                    f"{profile} must not run real projects without explicit opt-in",
+                )
+
+    def test_cli_requires_explicit_real_project_opt_in(self):
+        import subprocess
+
+        default = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "quality_gate.py"),
+             "--profile", "step5", "--dry-run"],
+            cwd=str(ROOT), capture_output=True, text=True,
+        )
+        included = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "quality_gate.py"),
+             "--profile", "step5", "--include-real", "--dry-run"],
+            cwd=str(ROOT), capture_output=True, text=True,
+        )
+
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertEqual(included.returncode, 0, included.stderr)
+        default_tasks = json.loads(default.stdout)["tasks"]
+        included_tasks = json.loads(included.stdout)["tasks"]
+        self.assertFalse(any(task["real_project"] for task in default_tasks))
+        self.assertTrue(any(task["real_project"] for task in included_tasks))
+
     def test_quick_and_release_profiles_require_oracle_independence(self):
         for profile in ("quick", "release"):
             with self.subTest(profile=profile):
@@ -99,7 +130,7 @@ class QualityGateTest(unittest.TestCase):
             )
             self.assertEqual(json.loads(history.read_text(encoding="utf-8")), [])
 
-    def test_step5_default_real_matrix_uses_reproducible_guards(self):
+    def test_step5_explicit_real_matrix_uses_reproducible_guards(self):
         tasks = quality_gate.build_plan(
             "step5", python_exe="python3", skip_real=False,
             report_root="/tmp/jua-real",

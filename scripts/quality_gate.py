@@ -346,7 +346,7 @@ def _claude_skill_contract_task(python_exe):
     )
 
 
-def build_plan(profile, python_exe=None, skip_real=False, real_case="guard", report_root=None):
+def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", report_root=None):
     python_exe = python_exe or sys.executable
     required_tools = REQUIRED_TOOLS if profile in {"step5", "release"} else REQUIRED_TOOLS[:-1]
     tasks = [
@@ -525,7 +525,20 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Run java-upgrade-analyzer quality gates")
     parser.add_argument("--profile", choices=["quick", "step5", "release"], default="quick")
     parser.add_argument("--python", default=sys.executable, help="Python executable used by gate commands")
-    parser.add_argument("--skip-real", action="store_true", help="Skip real project regression matrix")
+    real_project_group = parser.add_mutually_exclusive_group()
+    real_project_group.add_argument(
+        "--include-real",
+        dest="skip_real",
+        action="store_false",
+        help="Explicitly include the real project regression matrix",
+    )
+    real_project_group.add_argument(
+        "--skip-real",
+        dest="skip_real",
+        action="store_true",
+        help="Skip the real project regression matrix (default)",
+    )
+    parser.set_defaults(skip_real=True)
     parser.add_argument(
         "--real-case", default="guard",
         help="real_project_regression.py selector; default: guard (reproducible guardian matrix)",

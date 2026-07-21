@@ -27,6 +27,9 @@
 
 ## 常用质量门
 
+所有 profile 默认只运行可复现的本地回归，不自动启动真实项目矩阵。只有明确需要真实项目证据时，
+才使用 `--include-real` 显式加入；`--skip-real` 保留为兼容写法。
+
 快速检查：
 
 ```bash
@@ -39,10 +42,16 @@ Step5 相关修改：
 python3 scripts/quality_gate.py --profile step5
 ```
 
-发布或重要提交前：
+发布或重要提交前的本地回归：
 
 ```bash
 python3 scripts/quality_gate.py --profile release
+```
+
+需要同时运行真实项目守护矩阵时：
+
+```bash
+python3 scripts/quality_gate.py --profile release --include-real --real-case guard
 ```
 
 完整 unittest：
