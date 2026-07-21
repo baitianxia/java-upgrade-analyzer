@@ -25,11 +25,9 @@ enhanced_source_analyzer.py
 """
 
 import argparse
-import importlib
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -39,13 +37,8 @@ from signature_utils import normalize_signature_for_lookup, split_signature_para
 
 
 def _current_python_pip_install_cmd():
-    python_exe = sys.executable or "python"
-    if " " in python_exe:
-        python_exe = f'"{python_exe}"'
-    return (
-        f"{python_exe} -m pip install --target {_tree_sitter_tool_dir()} "
-        "tree-sitter tree-sitter-java"
-    )
+    bootstrap = Path(__file__).resolve().parent / "bootstrap_runtime.py"
+    return f'"{sys.executable or "python"}" "{bootstrap}"'
 
 
 def _env_flag_enabled(name):
@@ -226,8 +219,8 @@ def resolve_invocation_signature_from_partial_hints(receiver_type, method_name, 
             )
     return ''
 
-# 降级方案：如果 tree-sitter 未安装，Step5 首次需要 Java AST 时会先尝试自动安装；
-# 正式流程应在 Step5 入口处先做 preflight，安装失败时由 checkpoint 要求用户确认后才降级。
+# tree-sitter 由显式 bootstrap 安装；运行时绝不联网修改环境。
+# 正式流程在 Step5 入口处做 preflight，缺失时由 checkpoint 要求用户安装。
 # analyze_file() 仍保留兜底降级能力，避免调试脚本或单文件分析直接崩溃。
 def _tree_sitter_tool_dir():
     configured = str(os.environ.get('JUA_TREE_SITTER_TOOL_DIR') or '').strip()
@@ -259,31 +252,6 @@ MAX_TREE_SITTER_SOURCE_BYTES = max(
     1,
     int(os.environ.get("JUA_MAX_TREE_SITTER_SOURCE_BYTES", str(32 * 1024 * 1024)) or str(32 * 1024 * 1024)),
 )
-
-
-def _tree_sitter_auto_install_enabled():
-    # 默认启用；离线 CI / 严格无网络环境可显式关闭。
-    return not _env_flag_disabled('JUA_TREE_SITTER_AUTO_INSTALL')
-
-
-def _tree_sitter_auto_install_timeout():
-    raw = str(os.environ.get('JUA_TREE_SITTER_AUTO_INSTALL_TIMEOUT') or '').strip()
-    if not raw:
-        return 120
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 120
-
-
-def _reload_tree_sitter_modules():
-    global TREE_SITTER_AVAILABLE, tsjava, Language, Parser
-    tsjava = importlib.import_module('tree_sitter_java')
-    tree_sitter_module = importlib.import_module('tree_sitter')
-    Language = tree_sitter_module.Language
-    Parser = tree_sitter_module.Parser
-    TREE_SITTER_AVAILABLE = True
-    return True
 
 
 def decode_java_source_bytes(source_code):
@@ -328,80 +296,8 @@ def tree_sitter_source_limit_reason(file_path):
 
 
 def _ensure_tree_sitter_available():
-    """Ensure tree-sitter is available; by default try installing once before regex fallback."""
-    global TREE_SITTER_AUTO_INSTALL_ATTEMPTED, TREE_SITTER_AUTO_INSTALL_ERROR
-    if TREE_SITTER_AVAILABLE:
-        return True
-    if not _tree_sitter_auto_install_enabled():
-        TREE_SITTER_AUTO_INSTALL_ERROR = "auto_install_disabled"
-        return False
-    if TREE_SITTER_AUTO_INSTALL_ATTEMPTED:
-        return TREE_SITTER_AVAILABLE
-    TREE_SITTER_AUTO_INSTALL_ATTEMPTED = True
-
-    cmd = [
-        sys.executable or "python",
-        "-m",
-        "pip",
-        "install",
-        "--target",
-        str(_TREE_SITTER_TOOL_DIR),
-        "--disable-pip-version-check",
-        "tree-sitter",
-        "tree-sitter-java",
-    ]
-    print(
-        "⚙️  tree-sitter 未安装，正在尝试使用当前 Python 自动安装："
-        + " ".join(cmd),
-        file=sys.stderr,
-    )
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            check=False,
-            timeout=_tree_sitter_auto_install_timeout(),
-        )
-        if result.returncode != 0:
-            details = (result.stderr or result.stdout or '').strip().splitlines()
-            TREE_SITTER_AUTO_INSTALL_ERROR = details[-1] if details else f"pip_returncode={result.returncode}"
-            print(
-                "⚠️  tree-sitter 自动安装失败；正式分析会暂停并要求确认，未经确认不会降级；"
-                f"如需手动处理，请使用当前解释器安装：{_current_python_pip_install_cmd()}",
-                file=sys.stderr,
-            )
-            if TREE_SITTER_AUTO_INSTALL_ERROR:
-                print(f"   安装失败原因：{TREE_SITTER_AUTO_INSTALL_ERROR}", file=sys.stderr)
-            return False
-        try:
-            if str(_TREE_SITTER_TOOL_DIR) not in sys.path:
-                sys.path.insert(0, str(_TREE_SITTER_TOOL_DIR))
-            importlib.invalidate_caches()
-            _reload_tree_sitter_modules()
-        except Exception as exc:
-            TREE_SITTER_AUTO_INSTALL_ERROR = f"reload_failed:{exc.__class__.__name__}"
-            print(
-                "⚠️  tree-sitter 已安装但当前进程加载失败；正式分析会暂停并要求确认；"
-                f"原因：{TREE_SITTER_AUTO_INSTALL_ERROR}",
-                file=sys.stderr,
-            )
-            return False
-        print("✅ tree-sitter 自动安装成功，Java 源码将优先使用 AST 主链路分析", file=sys.stderr)
-        TREE_SITTER_AUTO_INSTALL_ERROR = ""
-        return True
-    except Exception as exc:
-        TREE_SITTER_AUTO_INSTALL_ERROR = f"{exc.__class__.__name__}: {exc}"
-        print(
-            "⚠️  tree-sitter 自动安装失败；正式分析会暂停并要求确认，未经确认不会降级；"
-            f"如需手动处理，请使用当前解释器安装：{_current_python_pip_install_cmd()}",
-            file=sys.stderr,
-        )
-        print(f"   安装失败原因：{TREE_SITTER_AUTO_INSTALL_ERROR}", file=sys.stderr)
-        return False
+    """Return availability without installing packages or accessing the network."""
+    return TREE_SITTER_AVAILABLE
 
 
 def ensure_tree_sitter_available():
@@ -414,9 +310,10 @@ def tree_sitter_status():
         "available": bool(TREE_SITTER_AVAILABLE),
         "auto_install_attempted": bool(TREE_SITTER_AUTO_INSTALL_ATTEMPTED),
         "auto_install_error": TREE_SITTER_AUTO_INSTALL_ERROR,
-        "auto_install_enabled": bool(_tree_sitter_auto_install_enabled()),
+        "auto_install_enabled": False,
         "install_command": _current_python_pip_install_cmd(),
-        "isolated_install_dir": str(_TREE_SITTER_TOOL_DIR),
+        "isolated_install_dir": "",
+        "requirements_file": str(Path(__file__).resolve().parents[1] / "requirements-runtime.txt"),
         "python_executable": sys.executable or "python",
     }
 
@@ -1278,7 +1175,7 @@ class TreeSitterAnalyzer:
 
     需安装：
       使用当前执行解释器安装，避免装到错误环境：
-      <当前 Python> -m pip install tree-sitter tree-sitter-java
+      <CPython 3.12> scripts/bootstrap_runtime.py
     """
 
     def __init__(self, file_path, source_root):

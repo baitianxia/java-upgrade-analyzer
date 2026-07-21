@@ -587,7 +587,7 @@ def write_tree_sitter_preflight_details(output_dir, status, source_dirs):
             "tree-sitter 是 Java 源码调用链分析的必需工具；未安装时不会生成后续分析结论。",
         ],
         "manual_install": [
-            (status or {}).get("install_command") or "python -m pip install tree-sitter tree-sitter-java",
+            (status or {}).get("install_command") or "python scripts/bootstrap_runtime.py",
         ],
     }
     with open(details_path, "w", encoding="utf-8") as f:
@@ -596,7 +596,7 @@ def write_tree_sitter_preflight_details(output_dir, status, source_dirs):
 
 
 def build_tree_sitter_missing_interaction(output_dir, details_path, status):
-    install_command = (status or {}).get("install_command") or "python -m pip install tree-sitter tree-sitter-java"
+    install_command = (status or {}).get("install_command") or "python scripts/bootstrap_runtime.py"
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
         "checkpoint": True,
@@ -607,7 +607,7 @@ def build_tree_sitter_missing_interaction(output_dir, details_path, status):
         "title": "step5 缺少 tree-sitter，Java AST 主链路不可用",
         "question": (
             "Step5 需要 tree-sitter/tree-sitter-java 提升 Java 源码调用链分析准确性。"
-            "系统已尝试自动安装但失败。请安装 tree-sitter 后重跑 Step5。"
+            "运行环境未通过依赖预检。请执行显式 bootstrap 后重跑 Step5。"
         ),
         "summary": "tree-sitter 不可用；Step5 已停止，未使用增强正则生成分析结论。",
         "reason_code": "step5_tree_sitter_missing_need_resolution",
@@ -977,14 +977,14 @@ def _step5_integrated_main_impl(args):
 
     # Phase 2.6: Java AST parser preflight.
     # tree-sitter 不是“可有可无”的小优化：它直接影响 Step5 源码图的准确性。
-    # 因此正式流程中，若存在 Java 源码但自动安装失败，必须停止；不允许 regex 降级。
+    # 因此正式流程中，若存在 Java 源码但依赖预检失败，必须停止；不允许 regex 降级。
     tree_sitter_source_dirs = list(business_source_dirs or []) + _dependency_mapping_source_dirs(dependency_source_mappings)
     if has_java_source_file(tree_sitter_source_dirs):
         if not ensure_tree_sitter_available():
             status = tree_sitter_status()
             print("\n❌ tree-sitter 不可用，无法执行 Java 源码调用链分析。", file=sys.stderr)
             if status.get("auto_install_error"):
-                print(f"自动安装失败原因：{status.get('auto_install_error')}", file=sys.stderr)
+                print(f"依赖预检失败原因：{status.get('auto_install_error')}", file=sys.stderr)
             print(f"请安装：{status.get('install_command')}", file=sys.stderr)
             details_path = write_tree_sitter_preflight_details(
                 output_dir,

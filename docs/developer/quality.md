@@ -39,6 +39,13 @@
 
 CI 分层为：PR 运行 quick，主干 push 增加 Step5，定时/手工 release 物化全部 SHA 固定的 guard 并运行完整发布门禁；平台契约在 Linux、macOS、Windows 与 JDK 11/17/21 矩阵上运行。
 
+运行环境契约固定为 CPython 3.12.x、`tree-sitter==0.25.2`、
+`tree-sitter-java==0.23.5`、Linux/macOS/Windows、JDK 11/17/21 和 Maven 3.8+。
+`scripts/bootstrap_runtime.py` 是唯一依赖安装入口，支持联网安装或通过 `--wheel-dir`
+使用带 `--no-index` 的受控离线缓存。quality gate 的首项会实际执行 Git/JDK/Maven
+命令、核对 Python 包精确版本与 import，并验证 Java 工具和 Maven 使用同一 JDK；
+运行分析时不得隐式联网修复环境。
+
 快速检查：
 
 ```bash

@@ -11,12 +11,12 @@ from dataclasses import dataclass, asdict
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
 
 from compat import setup_utf8_io
+from runtime_contract import contract_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,36 +65,32 @@ CORE_SEMANTIC_TESTS = [
     "tests.test_s5_query_call_chain.S5QueryCallChainTest.test_query_avoids_cycles_while_finding_business_chain",
 ]
 
-REQUIRED_TOOLS = ("git", "java", "javac", "javap", "jdeps", "mvn")
 RELEASE_REAL_PROJECT_SCOPES = frozenset({"guard", "all"})
 
 
-def validate_required_tools(names=REQUIRED_TOOLS):
-    """Return every mandatory executable missing from PATH."""
-    return [name for name in names if shutil.which(name) is None]
-
-
-def _required_tools_task(names=REQUIRED_TOOLS):
+def _environment_contract_task(require_maven=True):
     return GateTask(
-        name="required_tools",
-        command=list(names),
-        purpose="必需工具预检：" + ", ".join(names),
+        name="environment_contract",
+        command=["with_maven" if require_maven else "without_maven"],
+        purpose="运行契约预检：Python、固定依赖、平台及 Java/Maven 工具链",
     )
 
 
-def _run_required_tools_task(task):
+def _run_environment_contract_task(task):
     started = time.perf_counter()
-    missing = validate_required_tools(tuple(task.command))
-    status = "failed" if missing else "passed"
-    purpose = task.purpose
-    if missing:
-        purpose = f"{purpose}；缺失：{', '.join(missing)}"
+    payload = contract_payload(require_maven=task.command == ["with_maven"])
+    failures = [item for item in payload["checks"] if item["status"] != "passed"]
+    status = payload["status"]
+    purpose = task.purpose + (
+        "；失败：" + ", ".join(item["component"] for item in failures)
+        if failures else ""
+    )
     result = GateResult(
         name=task.name,
         command=task.command,
         status=status,
         elapsed_sec=round(time.perf_counter() - started, 3),
-        returncode=1 if missing else 0,
+        returncode=1 if failures else 0,
         purpose=purpose,
     )
     print(
@@ -102,8 +98,13 @@ def _run_required_tools_task(task):
         f"elapsed={result.elapsed_sec:.2f}s rc={result.returncode}",
         flush=True,
     )
-    if missing:
-        print(f"[quality-gate] missing required tools: {', '.join(missing)}", flush=True)
+    for failure in failures:
+        print(
+            "[quality-gate] environment contract failure: "
+            f"{failure['component']} observed={failure['observed']} "
+            f"expected={failure['expected']} reason={failure['reason']}",
+            flush=True,
+        )
     return result
 
 
@@ -352,9 +353,8 @@ def _claude_skill_contract_task(python_exe):
 
 def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", report_root=None):
     python_exe = python_exe or sys.executable
-    required_tools = REQUIRED_TOOLS if profile in {"step5", "release"} else REQUIRED_TOOLS[:-1]
     tasks = [
-        _required_tools_task(required_tools),
+        _environment_contract_task(require_maven=profile in {"step5", "release"}),
         _py_compile_task(python_exe),
         _oracle_independence_task(python_exe),
     ]
@@ -431,8 +431,8 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
 
 
 def _run_task(task, env=None):
-    if task.name == "required_tools":
-        return _run_required_tools_task(task)
+    if task.name == "environment_contract":
+        return _run_environment_contract_task(task)
     for raw_path in task.output_paths:
         output = Path(raw_path)
         if output.is_file():

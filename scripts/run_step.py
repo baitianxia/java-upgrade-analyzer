@@ -49,6 +49,7 @@ from s4_contract import (
     STEP3_RISK_CANDIDATES_FILE,
 )
 from step1_ref_resolution import resolve_step1_ref
+from runtime_contract import contract_payload
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -6471,6 +6472,23 @@ def main():
         return 0
     if not args.step:
         ap.error("--step 是必填参数；若只想读取前置协议，请改用 --describe-step1-contract")
+
+    environment = contract_payload(require_maven=True)
+    if environment["status"] != "passed":
+        print("❌ 运行环境不满足 java-upgrade-analyzer 契约，分析尚未开始。", file=sys.stderr)
+        for check in environment["checks"]:
+            if check["status"] == "passed":
+                continue
+            print(
+                f"- {check['component']}: observed={check['observed']}; "
+                f"expected={check['expected']}; reason={check['reason']}",
+                file=sys.stderr,
+            )
+        print(
+            f"请使用 CPython 3.12 在 {SKILL_DIR} 执行 scripts/bootstrap_runtime.py 后重试。",
+            file=sys.stderr,
+        )
+        return 1
 
     project_dir = Path(args.project_dir).resolve()
     if not project_dir.is_dir():

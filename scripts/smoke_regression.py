@@ -874,6 +874,7 @@ def fake_maven_script_text():
 import base64
 import io
 import os
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -984,6 +985,14 @@ def print_dependency_list(module, branch):
 
 def main():
     args = sys.argv[1:]
+    if "-version" in args or "--version" in args:
+        javac = subprocess.run(
+            ["javac", "-version"], capture_output=True, text=True, check=False
+        )
+        java_version = (javac.stdout or javac.stderr).strip().split()[-1]
+        print("Apache Maven 3.9.9")
+        print(f"Java version: {java_version}, vendor: smoke-fixture")
+        return 0
     root = find_git_root(os.getcwd())
     branch = current_branch(root)
     module = select_module(args)
@@ -1100,7 +1109,23 @@ def build_smoke_dep_env(workspace):
     dep_env = os.environ.copy()
     dep_env["HOME"] = str(workspace.fake_home)
     dep_env["MAVEN_REPO_LOCAL"] = str(workspace.fake_home / ".m2" / "repository")
-    dep_env["PATH"] = f"{workspace.fake_bin}{os.pathsep}{dep_env.get('PATH', '')}"
+    java_stdout, java_stderr, _java_rc = compat_run_cmd(
+        ["java", "-XshowSettings:properties", "-version"]
+    )
+    java_home_match = re.search(
+        r"^\s*java\.home\s*=\s*(.+?)\s*$",
+        f"{java_stdout}\n{java_stderr}",
+        re.MULTILINE,
+    )
+    java_bin = (
+        str(Path(java_home_match.group(1)).resolve() / "bin")
+        if java_home_match else ""
+    )
+    path_parts = [str(workspace.fake_bin)]
+    if java_bin:
+        path_parts.append(java_bin)
+    path_parts.append(dep_env.get("PATH", ""))
+    dep_env["PATH"] = os.pathsep.join(path_parts)
     return dep_env
 
 
@@ -1463,6 +1488,11 @@ def run_core_pipeline_smoke(workspace, dep_env):
         "只有源码映射且缺少最终制品时，Step4 必须以失败状态结束："
         f"rc={runtime_expand_rc}, stdout={runtime_expand_stdout[-500:]}, "
         f"stderr={runtime_expand_stderr[-500:]}",
+    )
+    assert_true(
+        main_state_path(runtime_expand_report).is_file(),
+        "Step4 失败前必须持久化主状态："
+        f"stdout={runtime_expand_stdout[-500:]}, stderr={runtime_expand_stderr[-1000:]}",
     )
     assert_step_blocked_with_reason(
         runtime_expand_report,
@@ -2272,11 +2302,7 @@ public interface com.example.service.DemoService extends java.lang.Object {
             assert_true(parser_info.get("actual_parser") == "skipped", "tree-sitter 不可用时不得用正则生成 Java 分析结论")
             assert_true(parser_info.get("fallback_reason") == "tree_sitter_unavailable", "tree-sitter 缺失时应记录明确未分析原因")
 
-        with mock.patch.object(source_analyzer_module, "TREE_SITTER_AVAILABLE", False), mock.patch.object(
-            source_analyzer_module,
-            "_tree_sitter_auto_install_enabled",
-            return_value=False,
-        ):
+        with mock.patch.object(source_analyzer_module, "TREE_SITTER_AVAILABLE", False):
             _, forced_regex_info = analyze_file(
                 str(source_dir / "AstMainlineApp.java"),
                 analyzer_root,

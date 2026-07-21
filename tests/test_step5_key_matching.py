@@ -4035,7 +4035,7 @@ public class com.example.TargetBridge {
                 [("com.example.Demo", "live")],
             )
 
-    def test_analyze_file_auto_installs_tree_sitter_before_java_analysis(self):
+    def test_analyze_file_uses_preinstalled_tree_sitter_without_runtime_install(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"
             java_file.write_text(
@@ -4067,8 +4067,6 @@ public class com.example.TargetBridge {
 
             def fake_ensure_tree_sitter_available():
                 source_analyzer.TREE_SITTER_AVAILABLE = True
-                source_analyzer.TREE_SITTER_AUTO_INSTALL_ATTEMPTED = True
-                source_analyzer.TREE_SITTER_AUTO_INSTALL_ERROR = ""
                 return True
 
             with patch.object(source_analyzer, "TREE_SITTER_AVAILABLE", False), patch.object(
@@ -4098,10 +4096,10 @@ public class com.example.TargetBridge {
             self.assertEqual(methods, [sentinel_method])
             self.assertEqual(parser_info["actual_parser"], "tree_sitter")
             self.assertTrue(parser_info["tree_sitter_available"])
-            self.assertTrue(parser_info["tree_sitter_auto_install_attempted"])
+            self.assertFalse(parser_info["tree_sitter_auto_install_attempted"])
             self.assertEqual(parser_info["tree_sitter_auto_install_error"], "")
 
-    def test_analyze_file_records_tree_sitter_auto_install_failure_without_degrading(self):
+    def test_analyze_file_records_missing_tree_sitter_without_runtime_install(self):
         with tempfile.TemporaryDirectory() as tmp:
             java_file = Path(tmp) / "Demo.java"
             java_file.write_text(
@@ -4110,8 +4108,6 @@ public class com.example.TargetBridge {
             )
 
             def fake_ensure_tree_sitter_available():
-                source_analyzer.TREE_SITTER_AUTO_INSTALL_ATTEMPTED = True
-                source_analyzer.TREE_SITTER_AUTO_INSTALL_ERROR = "pip_returncode=1"
                 return False
 
             with patch.object(source_analyzer, "TREE_SITTER_AVAILABLE", False), patch.object(
@@ -4137,8 +4133,8 @@ public class com.example.TargetBridge {
             self.assertEqual(methods, [])
             self.assertEqual(parser_info["actual_parser"], "skipped")
             self.assertEqual(parser_info["fallback_reason"], "tree_sitter_unavailable")
-            self.assertTrue(parser_info["tree_sitter_auto_install_attempted"])
-            self.assertEqual(parser_info["tree_sitter_auto_install_error"], "pip_returncode=1")
+            self.assertFalse(parser_info["tree_sitter_auto_install_attempted"])
+            self.assertEqual(parser_info["tree_sitter_auto_install_error"], "")
 
     def test_format_call_chain_outputs_every_hop_in_forward_order(self):
         direct = SimpleNamespace(

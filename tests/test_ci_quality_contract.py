@@ -88,28 +88,18 @@ class CiQualityContractTest(unittest.TestCase):
         self.assertIn('java: ["11", "17", "21"]', text)
         self.assertIn("python-version: \"3.12\"", text)
 
-    def test_required_tools_report_every_missing_executable(self):
-        with patch.object(quality_gate.shutil, "which", return_value=None):
-            missing = quality_gate.validate_required_tools(
-                ("java", "javac", "javap", "jdeps", "mvn", "git")
-            )
-
-        self.assertEqual(
-            missing, ["java", "javac", "javap", "jdeps", "mvn", "git"]
-        )
-
-    def test_every_gate_profile_starts_with_required_tool_preflight(self):
+    def test_every_gate_profile_starts_with_environment_contract(self):
         for profile in ("quick", "step5", "release"):
             with self.subTest(profile=profile):
                 plan = quality_gate.build_plan(profile, skip_real=True)
-                self.assertEqual(plan[0].name, "required_tools")
+                self.assertEqual(plan[0].name, "environment_contract")
 
     def test_tool_preflight_matches_profile_dependencies(self):
         quick = quality_gate.build_plan("quick", skip_real=True)[0]
         step5 = quality_gate.build_plan("step5", skip_real=True)[0]
 
-        self.assertNotIn("mvn", quick.command)
-        self.assertIn("mvn", step5.command)
+        self.assertEqual(quick.command, ["without_maven"])
+        self.assertEqual(step5.command, ["with_maven"])
 
     def test_release_diff_check_includes_committed_branch_changes(self):
         task = next(
@@ -148,12 +138,21 @@ class CiQualityContractTest(unittest.TestCase):
                 patch.object(git_change_check, "_git", side_effect=fake_git):
             self.assertEqual(git_change_check.comparison_base(), "HEAD^")
 
-    def test_required_tool_preflight_fails_instead_of_skipping(self):
-        task = quality_gate._required_tools_task()
+    def test_environment_preflight_fails_instead_of_skipping(self):
+        task = quality_gate._environment_contract_task()
         with patch.object(
-            quality_gate, "validate_required_tools", return_value=["javap"]
+            quality_gate,
+            "contract_payload",
+            return_value={
+                "status": "failed",
+                "checks": [{
+                    "component": "tool:javap", "status": "failed",
+                    "observed": "missing", "expected": "executable",
+                    "reason": "tool_missing_or_not_executable",
+                }],
+            },
         ):
-            result = quality_gate._run_required_tools_task(task)
+            result = quality_gate._run_environment_contract_task(task)
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.returncode, 1)

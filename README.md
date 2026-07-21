@@ -359,6 +359,6 @@ Step4 需要 JApiCmp 做 jar API 对比。
 
 默认会先阻断确认，不会静默降级。
 
-Step5 会把 `tree-sitter` 和 `tree-sitter-java` 自动安装到工具自己的缓存目录，不修改系统 Python 或项目虚拟环境，并设置安装超时。如果自动安装或加载失败，Claude Code 会停下来提示你手动安装；安装完成前不会使用增强正则继续分析。
+运行环境使用 CPython 3.12.x，并在 Skill 根目录显式执行 `python3.12 scripts/bootstrap_runtime.py` 安装固定版本的 `tree-sitter` 与 `tree-sitter-java`。离线环境可增加 `--wheel-dir /abs/path/to/wheels`，安装过程会禁止访问包索引。分析运行时不会联网安装；依赖缺失、版本不符或加载失败时会在分析前明确停止，安装完成前不会使用增强正则继续分析。
 
 不安装 tree-sitter 的后果是：Java AST 主链路不可用，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。

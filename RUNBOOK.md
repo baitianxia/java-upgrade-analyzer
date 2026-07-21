@@ -101,35 +101,27 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ### tree-sitter 安装
 
-- Step5 默认会在缺少 `tree-sitter` / `tree-sitter-java` 时，使用执行本 Skill 的解释器把依赖安装到工具专用缓存目录（默认 `~/.cache/java-upgrade-analyzer/python/pyXY`），不会修改系统 Python 或当前项目虚拟环境。
-- 自动安装有超时限制；可用 `JUA_TREE_SITTER_TOOL_DIR` 指定隔离目录，用 `JUA_TREE_SITTER_AUTO_INSTALL_TIMEOUT` 调整超时。
-- 自动安装成功后，Java 源码走 AST 主链路；自动安装失败后，Step5 会进入 checkpoint，不允许静默降级。
-- 用户手动安装完成后，恢复时传回 `action=rerun_current_step` 与 `tree_sitter_installed=true`；若用户明确接受准确性下降，才传回 `allow_degraded=true` 继续增强正则降级。
-- 不要在正式流程开始前要求用户手动安装；只有自动安装失败、网络/权限受限，或用户明确要提前准备环境时，才使用下面命令。
-- 不要直接使用裸 `pip install`，否则很容易安装到错误的 Python 环境：
+- 正式支持 CPython 3.12.x、Linux/macOS/Windows、JDK 11/17/21 与 Maven 3.8+。
+- 安装版本以根目录 `requirements-runtime.txt` 为唯一清单；Step5 运行时不会联网安装或修改 Python 环境。
+- 在仓库根目录使用 CPython 3.12 执行显式 bootstrap：
 
 ```bash
-python3 -m pip install --target ~/.cache/java-upgrade-analyzer/python/pyXY tree-sitter tree-sitter-java
+python3.12 scripts/bootstrap_runtime.py
 ```
 
-- 若机器上有多个 Python / venv，先确认当前解释器：
+- 离线环境先准备受控 wheel 目录，再禁止索引访问安装：
 
 ```bash
-python3 -c "import sys; print(sys.executable)"
-python3 -m pip install --target ~/.cache/java-upgrade-analyzer/python/pyXY tree-sitter tree-sitter-java
+python3.12 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels
 ```
 
-- 若已知 `run_step.py` 实际由某个绝对路径的解释器执行，直接对该解释器安装最稳：
+- 安装后运行门禁；它会实际执行外部命令、核对解析器 import/精确版本，并确认 Java 工具与 Maven 使用同一 JDK：
 
 ```bash
-"/abs/path/to/python" -m pip install --target ~/.cache/java-upgrade-analyzer/python/pyXY tree-sitter tree-sitter-java
+python3.12 scripts/quality_gate.py --profile quick --skip-real
 ```
 
-- 如需在离线 CI 或严格无网络环境关闭自动安装：
-
-```bash
-JUA_TREE_SITTER_AUTO_INSTALL=0
-```
+- 环境不满足契约时，分析在开始前给出明确失败；Step5 缺少解析器时仍进入 checkpoint，且不会用正则静默生成结论。
 
 ## main_state.json（推荐）
 

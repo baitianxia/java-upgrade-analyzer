@@ -82,7 +82,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
 8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
-9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。缺失时会先自动尝试安装；安装或加载失败后必须 checkpoint，安装/提供工具后重跑。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
+9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。tree-sitter 必须按固定清单显式 bootstrap，运行时不联网安装；安装、版本或加载检查失败后必须 checkpoint，修复环境后重跑。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
 10. **CSV 编码统一**：所有 CSV 产物统一使用 UTF-8 BOM；程序读取时同时兼容带 BOM 与历史无 BOM 的 UTF-8 文件，保证 Excel 直接打开中文不乱码。
 11. **准确性双线验证**：真实项目验证必须并行生成分析器结果与独立 Oracle 结果，只共享同一最终制品、API 身份协议和运行输入，不得复用分析器的解析、筛选或结论实现。必须逐 API 闭集对账；缺失、重复、额外、冲突、错误结论或无法绑定本次最终制品的 Oracle 均不得标记为已验证。接入新项目只增加数据输入和独立证据，不得在生产代码中登记项目、坐标或类名特例。失效的辅助证据必须报告，但不能推翻同一 API 已存在的有效强证据。
 
@@ -160,15 +160,15 @@ if gate failed or step blocked:
 2. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本不等价于完整主状态流程。
 3. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
 
-Step5 必须使用 `tree-sitter` 做 Java AST 分析。若当前 Python 环境缺少 `tree-sitter` / `tree-sitter-java`，正式流程会先用**当前实际执行 Skill 的 Python 解释器**自动尝试安装一次；安装或加载失败后必须进入 checkpoint，提示用户手动安装并重跑。正式流程不允许继续用增强正则生成分析结论。
+Step5 必须使用 `tree-sitter` 做 Java AST 分析。正式运行契约为 CPython 3.12.x、Linux/macOS/Windows、JDK 11/17/21、Maven 3.8+，Python 依赖版本由 `requirements-runtime.txt` 固定。运行时不得联网安装；缺少或版本不符时必须在分析前失败，Step5 仍进入 checkpoint，正式流程不允许继续用增强正则生成分析结论。
 
-不要在用户未要求时先让用户手动安装。只有自动安装失败、网络/权限受限，或用户明确要提前准备环境时，才提示手动安装命令：
+首次准备环境时，在 Skill 根目录使用 CPython 3.12 执行显式 bootstrap：
 
 ```bash
-python3 -m pip install tree-sitter tree-sitter-java
+python3.12 scripts/bootstrap_runtime.py
 ```
 
-用户安装完成后恢复 checkpoint 时，应将自然语言“已安装，重跑 Step5”归一化为 `action=rerun_current_step` 与 `tree_sitter_installed=true`。可通过 `JUA_TREE_SITTER_AUTO_INSTALL=0` 关闭自动安装；这通常只用于离线 CI 或严格无网络环境。
+离线环境使用 `python3.12 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels`，该模式带 `--no-index`，只读取受控缓存。用户安装完成后恢复 checkpoint 时，应将自然语言“已安装，重跑 Step5”归一化为 `action=rerun_current_step` 与 `tree_sitter_installed=true`。
 
 首次进入任务时，先确认：
 
