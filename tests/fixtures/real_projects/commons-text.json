@@ -1,13 +1,17 @@
 {
-  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "schema": "java-upgrade-analyzer.real-project-guard.v4",
   "case": "commons-text",
+  "guard_lifecycle": "core",
+  "capability_ids": ["source_bytecode_agree"],
   "repository": "apache/commons-text",
   "checkout_root": "/private/tmp/jua-real-system-commons-text-20260716-c",
   "git_revision": "2c2d0818b0540c59f055f5174db51d0574af46da",
   "artifact_path": "target/commons-text-1.12.0.jar",
-  "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+  "reference_artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
+  "canonical_edge_binding": "semantic",
   "materialization": {
     "kind": "source_build",
+    "artifact_verification": "runtime",
     "repository_url": "https://github.com/apache/commons-text.git",
     "working_directory": ".",
     "command": ["mvn", "-q", "-DskipTests", "package", "dependency:copy-dependencies", "-DincludeGroupIds=org.apache.commons", "-DincludeArtifactIds=commons-lang3", "-DincludeTypes=jar", "-DoutputDirectory=target/jua-oracle-dependencies"],
@@ -30,7 +34,6 @@
   },
   "performance_baseline": {
     "git_revision": "2c2d0818b0540c59f055f5174db51d0574af46da",
-    "artifact_sha256": "fed0f41ee183a70764bd752f3bd0c7fccdba976563c795f6aff2818226861f79",
     "scope": {
       "selected_api_count": 7,
       "accounted_api_count": 7,

@@ -37,7 +37,24 @@
 - `real_project_status` 区分通过、失败、显式跳过和未评估；
 - `release_decision` 只有在 `release` profile、本地任务、完整 `guard`（或其超集 `all`）、质量信号审计全部通过，且没有 infra skip、阻塞信号或 fixture debt 时才会是 `release_allowed`。其他 profile 或未加入真实项目时为 `not_evaluated`。
 
-CI 分层为：PR 运行 quick，主干 push 增加 Step5，定时/手工 release 物化全部 SHA 固定的 guard 并运行完整发布门禁；平台契约在 Linux、macOS、Windows 与 JDK 11/17/21 矩阵上运行。
+CI 分层为：PR 运行 quick，主干 push 增加 Step5，定时/手工 release 物化完整 guard 并运行发布门禁；平台契约在 Linux、macOS、Windows 与 JDK 11/17/21 矩阵上运行。
+
+真实项目 guard v4 将“源码身份”和“构建产物身份”分开：
+
+- `source_build` 固定 Git revision、源码树、构建命令和相对制品路径；构建完成后计算本次 JAR/WAR 的实际 SHA-256，并用该值绑定缓存、provenance、Analyzer 与独立 Oracle。默认不拿历史构建的原始 ZIP SHA 拒绝当前构建，因为 ZIP 时间戳、JDK 和打包工具可能改变字节而不改变受测语义。只有显式声明 `artifact_verification: sha256` 的可复现构建才比较预期 SHA。
+- `published_artifact` 下载不可变发布制品，仍必须同时满足清单中的 SHA-1/SHA-256；任一摘要不一致都阻断。
+- source-build 清单中的 canonical edge 是稳定语义锚点（entry、caller/callee descriptor、opcode），不固定编译器相关 instruction offset；本次制品的全部物理边仍必须由 Analyzer 与独立 Oracle 按实际 SHA 和 offset 完整 reconciliation。
+- `capability_ids` 与 `required_topologies` 构成能力矩阵；`guard_lifecycle` 为 `core`、`capability` 或 `exploratory`。
+
+可按层运行：
+
+```bash
+python3 scripts/real_project_regression.py --case guard-core
+python3 scripts/real_project_regression.py --case guard-capability
+python3 scripts/real_project_regression.py --case guard-exploratory
+```
+
+`guard` 是 `core + capability` 的发布集合；`exploratory` 用于候选项目观察，不计入发布充分条件。物化脚本接受相同 selector，并在输出中记录本次实际 artifact SHA-256。
 
 运行环境契约固定为 CPython 3.12.x、`tree-sitter==0.25.2`、
 `tree-sitter-java==0.23.5`、Linux/macOS/Windows、JDK 11/17/21 和 Maven 3.8+。
@@ -224,6 +241,11 @@ Step5 性能验证优先看：
 - `trace.declared_signature_index_elapsed_sec`;
 - `trace.direct_class_usage_elapsed_sec`;
 - `trace.direct_field_usage_elapsed_sec`;
+- `trace.direct_source_fact_index_elapsed_sec`;
+- `trace.direct_source_fact_index_scanned_methods`;
+- `trace.direct_source_fact_index_body_reads`;
+- `trace.direct_source_fact_index_body_cache_evictions`;
+- `trace.direct_source_fact_index_class_keys` / `field_keys`;
 - `report.elapsed_sec`。
 
 ## 真实项目验证口径
@@ -413,15 +435,15 @@ ISO 日期。缺失状态、缺失必填字段和已过期 waiver 都会让 `fix
 ### `gs-multi-module` pinned guard
 
 `tests/fixtures/real_projects/gs-multi-module.json` 固定了 `spring-guides/gs-multi-module` 的 Git
-revision、最终 application artifact 的相对路径和 SHA-256。runner 在启动 Step5 之前校验 HEAD、
-ZIP/class 完整性和 artifact SHA；任何不一致都会直接返回 `failed`，不会读取 `target/classes`、
+revision、源码构建命令和最终 application artifact 的相对路径。runner 在启动 Step5 之前校验 HEAD、
+ZIP/class 完整性并记录本次 artifact SHA；任何源码 revision 或制品结构不一致都会直接返回 `failed`，不会读取 `target/classes`、
 IDE 输出或其他 jar 作为替代真值。允许的本地 checkout 位置是
 `/private/tmp/gs-multi-module/complete`，最终制品是
 `application/target/application-0.0.1-SNAPSHOT.jar`。
 
 守护链必须精确为 `DemoApplication.home -> MyService.message ->
-ServiceProperties.getMessage()`，目标 descriptor 为 `()Ljava/lang/String;`。两个 manifest 中固定的
-physical edge 必须都以 `correct` 完成 reconciliation，并同时观察到
+ServiceProperties.getMessage()`，目标 descriptor 为 `()Ljava/lang/String;`。两个 manifest 语义边必须
+在本次制品的 physical reconciliation 中找到 Analyzer/Oracle 双方均为 `correct` 的对应边，并同时观察到
 `business_to_same_jar_bridge` 和 `same_coord_multimodule`。出现
 `SOURCE_BYTECODE_EDGE_CONFLICT` 时 `conclusion` gate 必须失败。
 
@@ -437,8 +459,8 @@ python3 scripts/real_project_regression.py --case gs-multi-module
 same-coordinate finding 只有在完整守护契约通过时才保持 `fixed`；任一精确边、拓扑、链或结论
 回归都会重新打开该 debt 并阻塞。
 
-精确边校验读取 reconciliation ledger 的 `analyzer_row` / `oracle_row` 生产结构，
-同时校验 `correct` verdict 和 `physical_occurrence`；调用链按实际节点分隔后精确比较，
+精确边校验读取 reconciliation ledger 的 `analyzer_row` / `oracle_row` 生产结构。ledger 内仍同时校验
+`correct` verdict 和本次制品的 `physical_occurrence`，source-build 清单层只比较稳定语义锚点；调用链按实际节点分隔后精确比较，
 仅对末节点的 `变更 API：` 标记做归一化。Fixture debt 先独立计算 finding lifecycle；
 `fixed` 行的 fixture 必须能由 unittest loader 解析到真实测试，且 `asset`、`api_coverage`、
 `topology_coverage`、`edge_truth`、`conclusion`、`performance`、`fixture_debt` 七个显式门禁状态

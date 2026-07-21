@@ -1305,6 +1305,14 @@ def _source_attestation_evidence(
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
         )
         live_digest = compute_source_tree_sha256(source_path_resolved)
+        artifact_binding = str(attestation.get("artifact_binding") or "sha256")
+        artifact_binding_valid = bool(
+            artifact_binding == "runtime"
+            or (
+                artifact_binding == "sha256"
+                and attestation.get("artifact_sha256") == artifact_sha256
+            )
+        )
         valid = bool(
             attestation.get("authority")
             and "analyzer" not in str(attestation.get("authority")).lower()
@@ -1324,7 +1332,7 @@ def _source_attestation_evidence(
             and worktree_diff.returncode == 0
             and index_diff.returncode == 0
             and status.returncode == 0 and not status.stdout.strip()
-            and attestation.get("artifact_sha256") == artifact_sha256
+            and artifact_binding_valid
             and attestation.get("evidence_sha256") == evidence_sha
         )
     except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
@@ -1334,6 +1342,8 @@ def _source_attestation_evidence(
         list(evidence.get("source_conflicts") or []) if valid else [],
         {
             **attestation,
+            "artifact_binding": artifact_binding,
+            "bound_artifact_sha256": artifact_sha256,
             "computed_evidence_sha256": evidence_sha,
             "computed_git_source_tree_sha256": revision_digest.hexdigest(),
             "computed_live_source_tree_sha256": live_digest,
@@ -1653,7 +1663,18 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
         and "analyzer" not in str(provenance.get("authority")).lower()
         and provenance.get("valid") is True
         and re.fullmatch(r"[0-9a-f]{40}", str(provenance.get("git_revision") or ""))
-        and provenance.get("artifact_sha256") == artifact_layout.get("artifact_sha256")
+        and (
+            (
+                provenance.get("artifact_binding") == "runtime"
+                and provenance.get("bound_artifact_sha256")
+                == artifact_layout.get("artifact_sha256")
+            )
+            or (
+                provenance.get("artifact_binding", "sha256") == "sha256"
+                and provenance.get("artifact_sha256")
+                == artifact_layout.get("artifact_sha256")
+            )
+        )
         and provenance.get("evidence_sha256") == provenance.get("computed_evidence_sha256")
     )
     if source_valid:

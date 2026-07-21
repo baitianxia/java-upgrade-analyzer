@@ -1,16 +1,20 @@
 {
-  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "schema": "java-upgrade-analyzer.real-project-guard.v4",
   "case": "gs-multi-module",
+  "guard_lifecycle": "core",
+  "capability_ids": ["business_to_same_jar_bridge", "same_coord_multimodule"],
   "repository": "spring-guides/gs-multi-module",
   "checkout_root": "/private/tmp/gs-multi-module/complete",
   "git_revision": "d88a2b721bda3798a6a934987157498e66da06c5",
   "artifact_path": "application/target/application-0.0.1-SNAPSHOT.jar",
-  "artifact_sha256": "609d58279a4c509da5cf453cf57ae2e28b41f3e42ec2f4789710db6c68e2c523",
+  "reference_artifact_sha256": "609d58279a4c509da5cf453cf57ae2e28b41f3e42ec2f4789710db6c68e2c523",
+  "canonical_edge_binding": "semantic",
   "materialization": {
     "kind": "source_build",
+    "artifact_verification": "runtime",
     "repository_url": "https://github.com/spring-guides/gs-multi-module.git",
     "working_directory": "complete",
-    "command": ["./mvnw", "-q", "-DskipTests", "-Dproject.build.outputTimestamp=1980-02-01T00:00:00Z", "clean", "package"],
+    "command": ["mvn", "-q", "-DskipTests", "clean", "package"],
     "artifact_path": "application/target/application-0.0.1-SNAPSHOT.jar"
   },
   "api": {

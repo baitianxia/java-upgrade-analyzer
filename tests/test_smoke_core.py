@@ -129,5 +129,13 @@ class SmokeCoreTest(SmokeRegressionTestCase):
                 str(workspace.fake_home / ".m2" / "repository"),
             )
 
+    def test_fixture_path_keeps_current_python_for_fake_maven_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = smoke_regression.create_smoke_workspace(Path(tmp))
+            env = smoke_regression.build_smoke_dep_env(workspace)
+
+        path_parts = env["PATH"].split(os.pathsep)
+        self.assertIn(str(Path(sys.executable).resolve().parent), path_parts[:3])
+
     def test_core_group(self):
         self.run_smoke_group("core")

@@ -10113,6 +10113,14 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
                         "direct_field_usage_scanned_methods": 52662,
                         "direct_field_usage_cache_hits": 20,
                         "direct_field_usage_cache_misses": 4,
+                        "direct_source_fact_index_builds": 1,
+                        "direct_source_fact_index_hits": 15,
+                        "direct_source_fact_index_elapsed_sec": 0.75,
+                        "direct_source_fact_index_scanned_methods": 26331,
+                        "direct_source_fact_index_body_reads": 26331,
+                        "direct_source_fact_index_body_cache_evictions": 12000,
+                        "direct_source_fact_index_class_keys": 900,
+                        "direct_source_fact_index_field_keys": 300,
                         "declared_signature_index_builds": 1,
                         "declared_signature_index_size": 1234,
                     },
@@ -10142,6 +10150,15 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         self.assertEqual(values[("trace", "critical_node_fast_none")], "29")
         self.assertEqual(values[("trace", "direct_class_usage_cache_hits")], "10")
         self.assertEqual(values[("trace", "direct_field_usage_scanned_methods")], "52662")
+        self.assertEqual(values[("trace", "direct_source_fact_index_builds")], "1")
+        self.assertEqual(
+            values[("trace", "direct_source_fact_index_scanned_methods")],
+            "26331",
+        )
+        self.assertEqual(
+            values[("trace", "direct_source_fact_index_body_cache_evictions")],
+            "12000",
+        )
         self.assertEqual(values[("trace", "declared_signature_index_builds")], "1")
         self.assertEqual(values[("trace", "declared_signature_index_size")], "1234")
 
@@ -10364,7 +10381,22 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         self.assertEqual(perf["declared_signature_index_builds"], 1)
         self.assertEqual(perf["declared_signature_index_size"], 100)
 
-    def test_direct_business_usage_scans_are_cached_per_target(self):
+    def test_direct_business_usage_builds_one_source_fact_index_for_many_targets(self):
+        cached_method = SimpleNamespace(
+            symbol_id="second",
+            owner_type="business",
+            return_type="",
+            param_types={},
+            field_types={},
+            local_var_types={"value": "com.changed.Target"},
+            imports={"Flags": "com.changed.Flags"},
+            wildcard_imports=[],
+            static_imports={},
+            package_name="com.app",
+            body_text="",
+            _body_text_cached="return Flags.ENABLED;",
+        )
+        cached_method.get_body_text = lambda: cached_method._body_text_cached
         methods = {
             "first": SimpleNamespace(
                 symbol_id="first",
@@ -10379,19 +10411,7 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
                 package_name="com.app",
                 get_body_text=lambda: "",
             ),
-            "second": SimpleNamespace(
-                symbol_id="second",
-                owner_type="business",
-                return_type="",
-                param_types={},
-                field_types={},
-                local_var_types={"value": "com.changed.Target"},
-                imports={"Flags": "com.changed.Flags"},
-                wildcard_imports=[],
-                static_imports={},
-                package_name="com.app",
-                get_body_text=lambda: "return Flags.ENABLED;",
-            ),
+            "second": cached_method,
         }
         graph = SimpleNamespace(methods_by_id=methods)
         trace_cache = tracer.ensure_trace_cache()
@@ -10435,10 +10455,65 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         perf = tracer._finalize_step5_perf_stats(graph)["trace"]
         self.assertEqual(perf["direct_class_usage_cache_misses"], 1)
         self.assertEqual(perf["direct_class_usage_cache_hits"], 1)
-        self.assertEqual(perf["direct_class_usage_scanned_methods"], 2)
         self.assertEqual(perf["direct_field_usage_cache_misses"], 1)
         self.assertEqual(perf["direct_field_usage_cache_hits"], 1)
-        self.assertEqual(perf["direct_field_usage_scanned_methods"], 2)
+        self.assertEqual(perf["direct_source_fact_index_builds"], 1)
+        self.assertEqual(perf["direct_source_fact_index_scanned_methods"], 2)
+        self.assertEqual(perf["direct_source_fact_index_body_reads"], 2)
+        self.assertEqual(perf["direct_source_fact_index_body_cache_evictions"], 1)
+        self.assertGreaterEqual(perf["direct_source_fact_index_hits"], 1)
+        self.assertEqual(cached_method._body_text_cached, "")
+
+    def test_source_fact_index_preserves_package_and_wildcard_type_candidates(self):
+        method = SimpleNamespace(
+            symbol_id="consumer",
+            owner_type="business",
+            local_var_types={"value": "Target"},
+            imports={},
+            wildcard_imports=["com.changed"],
+            static_imports={},
+            package_name="com.app",
+            get_body_text=lambda: "",
+        )
+        graph = SimpleNamespace(methods_by_id={"consumer": method})
+        trace_cache = tracer.ensure_trace_cache()
+
+        for target_class in ("com.app.Target", "com.changed.Target"):
+            matches = tracer._find_direct_business_class_usages(
+                {"api_name": target_class, "matched_class": target_class},
+                graph,
+                trace_cache=trace_cache,
+            )
+            self.assertEqual([item[0].symbol_id for item in matches], ["consumer"])
+
+        perf = tracer._finalize_step5_perf_stats(graph)["trace"]
+        self.assertEqual(perf["direct_source_fact_index_builds"], 1)
+        self.assertEqual(perf["direct_source_fact_index_scanned_methods"], 1)
+
+    def test_source_fact_index_rejects_ambiguous_known_type_candidates(self):
+        method = SimpleNamespace(
+            symbol_id="consumer",
+            owner_type="business",
+            local_var_types={"value": "Target"},
+            known_classes_by_simple={
+                "Target": {"com.app.Target", "com.changed.Target"},
+            },
+            imports={},
+            wildcard_imports=["com.changed"],
+            static_imports={},
+            package_name="com.app",
+            get_body_text=lambda: "",
+        )
+        graph = SimpleNamespace(methods_by_id={"consumer": method})
+        trace_cache = tracer.ensure_trace_cache()
+
+        for target_class in ("com.app.Target", "com.changed.Target"):
+            matches = tracer._find_direct_business_class_usages(
+                {"api_name": target_class, "matched_class": target_class},
+                graph,
+                trace_cache=trace_cache,
+            )
+            self.assertEqual(matches, [])
 
     def test_trace_all_apis_merges_step5_perf_without_dropping_main_stats(self):
         graph = SimpleNamespace()
@@ -21044,12 +21119,11 @@ public class com.example.consumer.Adapter {
             class_fqcn="app.App", method_name="run",
         )
         draft = tracer._new_trace_draft(api_row)
-        tracer._build_direct_usage_result(
+        tracer._build_direct_usage_results(
             draft,
-            method,
+            [(method, "field_access")],
             "DIRECT_FIELD_USAGE",
             "source field usage",
-            "field_access",
             "lib.Api.FLAG",
         )
 

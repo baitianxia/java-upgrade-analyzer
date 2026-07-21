@@ -30,10 +30,10 @@
 
 ## 1. 建立当前 HEAD 的新鲜质量基线
 
-- 优先级：P0。执行状态：待执行。验证状态：未验证。
-- 已核实事实：在 `d064f61` 上执行 quick 时，语法检查、Oracle 独立性、核心确定性、核心准确性基准和 21 项核心语义测试通过；`smoke_core` 因 Python 3.14/tree-sitter 环境不兼容失败，整轮约 31.9 秒。
-- 无法确认：当前 HEAD 是否通过 Step5、完整 release 和最新真实项目守护矩阵；历史提交上的通过记录不能替代当前证据。
-- 待办：环境收敛后依次运行 quick、Step5、Smoke、release，并用 `--include-real --real-case guard` 明确加入完整守护矩阵；保存 JSON、质量信号审计、复盘和 capability closure。
+- 优先级：P0。执行状态：部分完成。验证状态：核心层已验证，能力层待验证。
+- 已核实事实：当前工作树在 CPython 3.12/JDK 21 下通过 quick 7/7、完整 unittest 1996 项（跳过 1 项）以及后续针对性回归；`guard-core` 的 Commons Text、gs-multi-module、Spring Security Config 已分别通过 8 项门禁。
+- 无法确认：`guard-capability` 与包含完整 `guard` 的 release 聚合尚未执行；核心层通过不能替代能力层证据。
+- 待办：真实 guard v4 已消除 source-build 对历史原始 JAR SHA 的环境耦合，Commons Text 使用本次运行时 SHA `497b…a190`。下一步物化并运行 `guard-capability`，通过后执行完整 `guard` 发布聚合，保存 JSON、质量信号审计、复盘和 capability closure。
 - 验收：结果绑定 commit、OS、Python/JDK/Maven、依赖锁、profile 和真实项目集合；没有失败、未解释跳过、fixture debt、阻塞信号或范围缩水。
 
 ## 2. 明确 Kotlin 与混合语言工程的能力边界
@@ -47,10 +47,11 @@
 
 ## 3. 建立一次扫描、多目标复用的源码事实索引
 
-- 优先级：P1。执行状态：待执行。验证状态：未验证。
-- 已核实事实：类型和字段直接使用按目标遍历全部业务方法；每个唯一目标至少进行一次扫描，方法正文还会被懒加载后长期缓存。API 多、方法多时接近 `O(API × method)`，并放大常驻内存。
+- 优先级：P1。执行状态：阶段一已完成，批量反向传播待执行。验证状态：完整 unittest、quick 与三个 `guard-core` 工程均已通过；`guard-capability` 和完整发布聚合待执行。
+- 已核实事实：类型和字段直接使用已共享惰性 `direct_source_fact_index`；首次目标查询只遍历全部业务方法一次，并复用声明类型、AST 类型引用、正文类型 token、字段访问和静态导入事实。索引物化后会释放可从源文件重新读取的正文缓存。
+- 已核实事实：索引构建次数、复用命中、扫描方法数、正文读取/缓存释放次数和类型/字段 key 数已进入 Step5 timing；多目标测试确认同一图只构建一次索引。
 - 已核实事实：当前 API 逐个串行回溯，虽然共享部分图和缓存，但没有从所有目标反向批量传播或复用相同子图的完整结果。
-- 待办：建图时一次性生成 FQCN/成员/声明类型/正文 token 到调用点的倒排索引；按坐标、owner 和目标 key 分组追踪；对共同前驱使用多源反向遍历或 memoized 子图结果。
+- 待办：按坐标、owner 和目标 key 分组追踪；对共同前驱使用多源反向遍历或 memoized 子图结果；修复真实项目资产物化的 SHA 可复现性后补跑完整结果指纹对比。
 - 验收：结果指纹与完整 `alerts.csv` 逐行等价；在 1×/2×/4× API 与源码规模上扫描次数近线性、同一正文不被重复解析；记录索引构建成本、命中率和单 API P50/P95/P99。
 
 ## 4. 拆分超大模块并收紧异常处理

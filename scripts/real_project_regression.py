@@ -108,6 +108,8 @@ V3_GATE_NAMES = (
     "asset", "api_coverage", "topology_coverage", "edge_truth",
     "conclusion", "oracle_accuracy", "performance", "fixture_debt",
 )
+GUARD_LIFECYCLES = ("core", "capability", "exploratory")
+GUARD_SELECTORS = ("guard", "guard-core", "guard-capability", "guard-exploratory")
 STANDARD_FAULT_INJECTIONS = (
     "drop_analyzer_edge",
     "add_analyzer_edge",
@@ -1573,6 +1575,49 @@ def _correct_reconciled_physical_edges(ledger: list[dict]) -> set[str]:
     return {occurrence for occurrence, sides in matched_sides.items() if sides == {"analyzer", "oracle"}}
 
 
+def _stable_edge_anchor(edge: dict) -> tuple[str, ...]:
+    """Compiler-independent edge identity retained by source-build manifests."""
+    return (
+        str((edge or {}).get("artifact_entry") or "").strip(),
+        *(str((edge or {}).get(field) or "").strip() for field in EDGE_COMPARISON_FIELDS),
+    )
+
+
+def _correct_reconciled_edge_anchors(ledger: list[dict]) -> set[tuple[str, ...]]:
+    rows_by_occurrence: dict[str, dict[str, dict]] = defaultdict(dict)
+    for entry in ledger or []:
+        side = str(entry.get("side") or "")
+        nested_key = "analyzer_row" if side == "analyzer" else "oracle_row"
+        row = entry.get(nested_key)
+        if side not in {"analyzer", "oracle"} or not isinstance(row, dict):
+            continue
+        identity = canonical_edge_identity(row)
+        occurrence = physical_edge_occurrence(row)
+        if (
+            str(entry.get("verdict") or "") == "correct"
+            and str(entry.get("identity") or "") == identity
+            and str(entry.get("physical_occurrence") or "") == occurrence
+        ):
+            rows_by_occurrence[occurrence][side] = row
+    return {
+        _stable_edge_anchor(rows["oracle"])
+        for rows in rows_by_occurrence.values()
+        if set(rows) == {"analyzer", "oracle"}
+    }
+
+
+def artifact_verification_mode(manifest: dict) -> str:
+    """Return the declared artifact identity policy for a pinned fixture."""
+    materialization = manifest.get("materialization") or {}
+    kind = str(materialization.get("kind") or "").strip()
+    declared = str(materialization.get("artifact_verification") or "").strip()
+    if kind == "published_artifact":
+        return "sha256"
+    if kind == "source_build" and declared == "runtime":
+        return "runtime"
+    return "sha256"
+
+
 def _expected_physical_occurrence(edge: dict) -> str:
     identity = canonical_edge_identity(edge)
     entry = str((edge or {}).get("artifact_entry") or "").strip()
@@ -1663,14 +1708,22 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
     edge_truth = result.get("edge_truth") or {}
     if not edge_truth.get("complete") or edge_truth.get("blocking"):
         errors.append("edge_truth_failed")
-    correct_physical_edges = _correct_reconciled_physical_edges(edge_truth.get("ledger") or [])
+    runtime_artifact = artifact_verification_mode(manifest) == "runtime"
+    ledger = edge_truth.get("ledger") or []
+    correct_physical_edges = _correct_reconciled_physical_edges(ledger)
     expected_physical_edges = {
         _expected_physical_occurrence(row)
         for row in (manifest.get("canonical_edges") or [])
-    }
+    } if not runtime_artifact else set()
+    correct_edge_anchors = _correct_reconciled_edge_anchors(ledger)
+    expected_edge_anchors = {
+        _stable_edge_anchor(row) for row in (manifest.get("canonical_edges") or [])
+    } if runtime_artifact else set()
     expected_semantic = list(manifest.get("canonical_semantic_references") or [])
     actual_semantic = list(edge_truth.get("semantic_references") or [])
     semantic_fields = (
+        "api_identity", "target_class", "artifact_entry", "authority",
+    ) if runtime_artifact else (
         "api_identity", "target_class", "artifact_sha256", "artifact_entry", "authority",
     )
     actual_semantic_identities = {
@@ -1686,20 +1739,24 @@ def evaluate_pinned_guard_contract(manifest: dict, result: dict) -> dict:
         or not expected_physical_edges.issubset(correct_physical_edges)
     ):
         errors.append("expected_physical_edge_missing")
+    if expected_edge_anchors and not expected_edge_anchors.issubset(correct_edge_anchors):
+        errors.append("expected_semantic_edge_missing")
     if expected_semantic_identities and not expected_semantic_identities.issubset(
         actual_semantic_identities
     ):
         errors.append("expected_semantic_reference_missing")
     if actual_semantic_identities - expected_semantic_identities:
         errors.append("unexpected_semantic_reference")
-    if not expected_physical_edges and not expected_semantic_identities:
+    if not expected_physical_edges and not expected_edge_anchors and not expected_semantic_identities:
         errors.append("expected_physical_edge_missing")
     return {
         "passed": not errors,
         "errors": errors,
         "api_count": len(expected_apis),
         "expected_physical_edge_count": len(expected_physical_edges),
+        "expected_semantic_edge_count": len(expected_edge_anchors),
         "expected_semantic_reference_count": len(expected_semantic_identities),
+        "artifact_verification": artifact_verification_mode(manifest),
     }
 
 
@@ -1707,12 +1764,13 @@ def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
     errors: list[str] = validate_reproducible_asset_contract(manifest)
     expected_revision = str(manifest.get("git_revision") or "")
     expected_sha = str(manifest.get("artifact_sha256") or "")
+    verification_mode = artifact_verification_mode(manifest)
     artifact = project_root / str(manifest.get("artifact_path") or "")
     actual_revision = ""
     actual_sha = ""
     if not re.fullmatch(r"[0-9a-f]{40}", expected_revision):
         errors.append("git_revision_pin_invalid")
-    if not _valid_sha256(expected_sha):
+    if verification_mode == "sha256" and not _valid_sha256(expected_sha):
         errors.append("final_artifact_sha256_pin_invalid")
     if not project_root.is_dir():
         errors.append("project_checkout_missing")
@@ -1734,7 +1792,7 @@ def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
         errors.append("final_artifact_missing")
     else:
         actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        if actual_sha != expected_sha:
+        if verification_mode == "sha256" and actual_sha != expected_sha:
             errors.append("final_artifact_sha256_mismatch")
         try:
             with zipfile.ZipFile(artifact) as archive:
@@ -1751,6 +1809,7 @@ def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
         "artifact_path": str(artifact),
         "expected_artifact_sha256": expected_sha,
         "actual_artifact_sha256": actual_sha,
+        "artifact_verification": verification_mode,
     }
 
 
@@ -1760,7 +1819,36 @@ def validate_reproducible_asset_contract(manifest: dict) -> list[str]:
     if not isinstance(materialization, dict):
         return ["materialization_contract_missing"]
     kind = str(materialization.get("kind") or "").strip()
+    schema = str(manifest.get("schema") or "").strip()
+    verification = str(materialization.get("artifact_verification") or "").strip()
+    if schema == "java-upgrade-analyzer.real-project-guard.v4":
+        lifecycle = str(manifest.get("guard_lifecycle") or "").strip()
+        capabilities = manifest.get("capability_ids")
+        if lifecycle not in GUARD_LIFECYCLES:
+            errors.append("guard_lifecycle_invalid")
+        if (
+            not isinstance(capabilities, list)
+            or not capabilities
+            or any(not isinstance(item, str) or not item.strip() for item in capabilities)
+            or len(capabilities) != len(set(capabilities or []))
+        ):
+            errors.append("guard_capability_ids_invalid")
+        elif set(capabilities) != set(manifest.get("required_topologies") or []):
+            errors.append("guard_capability_matrix_mismatch")
     if kind == "source_build":
+        if schema == "java-upgrade-analyzer.real-project-guard.v4" and verification not in {
+            "runtime", "sha256",
+        }:
+            errors.append("source_build_artifact_verification_invalid")
+        if (
+            schema == "java-upgrade-analyzer.real-project-guard.v4"
+            and verification == "runtime"
+            and manifest.get("canonical_edge_binding") != "semantic"
+        ):
+            errors.append("source_build_canonical_edge_binding_invalid")
+        reference_sha = str(manifest.get("reference_artifact_sha256") or "")
+        if reference_sha and not _valid_sha256(reference_sha):
+            errors.append("source_build_reference_artifact_sha256_invalid")
         repository_url = str(materialization.get("repository_url") or "").strip()
         if not re.fullmatch(r"https://github\.com/[^/]+/[^/]+(?:\.git)?", repository_url):
             errors.append("source_build_repository_url_invalid")
@@ -1797,9 +1885,11 @@ def validate_reproducible_asset_contract(manifest: dict) -> list[str]:
                 errors.append(f"{prefix}_revision_invalid")
             if not str(artifact_path) or artifact_path.is_absolute() or ".." in artifact_path.parts:
                 errors.append("source_build_artifact_path_not_relative")
-            if not _valid_sha256(digest):
+            if artifact_verification_mode(manifest) == "sha256" and not _valid_sha256(digest):
                 errors.append(f"{prefix}_sha256_invalid")
     elif kind == "published_artifact":
+        if schema == "java-upgrade-analyzer.real-project-guard.v4" and verification != "sha256":
+            errors.append("published_artifact_verification_invalid")
         url = str(materialization.get("url") or "").strip()
         coordinate = str(materialization.get("coordinate") or "").strip()
         sha1 = str(materialization.get("sha1") or "").strip()
@@ -1946,6 +2036,7 @@ def build_v3_gates(
     edge_errors = sorted(contract_errors & {
         "edge_truth_failed",
         "expected_physical_edge_missing",
+        "expected_semantic_edge_missing",
         "expected_semantic_reference_missing",
         "unexpected_semantic_reference",
     })
@@ -2161,7 +2252,7 @@ def write_pinned_final_artifact_provenance(
     source_project = Path(
         case.current_source_project or case.default_project
     ).resolve()
-    if source_mode == "checkout_build" and source_project.is_dir():
+    if source_mode == "checkout_build":
         scope = build_project_scope(
             source_project,
             case.target_module or ".",
@@ -3282,7 +3373,10 @@ def evaluate_relative_performance_baseline(
         errors.append("performance_baseline_missing")
     if baseline.get("git_revision") != manifest.get("git_revision"):
         errors.append("performance_baseline_git_revision_mismatch")
-    if baseline.get("artifact_sha256") != manifest.get("artifact_sha256"):
+    if (
+        artifact_verification_mode(manifest) == "sha256"
+        and baseline.get("artifact_sha256") != manifest.get("artifact_sha256")
+    ):
         errors.append("performance_baseline_artifact_sha_mismatch")
     metrics = baseline.get("metrics") if isinstance(baseline.get("metrics"), dict) else {}
     if not metrics:
@@ -3362,7 +3456,7 @@ def build_relative_performance_signals(
         "P1",
         case.name,
         step="real-project-gate",
-        message="SHA-bound relative performance baseline failed",
+        message="revision/artifact-bound relative performance baseline failed",
         count=(
             len(relative_performance.get("errors") or [])
             + len(relative_performance.get("regressions") or {})
@@ -6085,14 +6179,21 @@ def run_dual_line_accuracy_audit(
     )
     oracle_rows.extend(automatic_oracle_rows)
     trusted_capability_records = list(automatic_oracle_rows)
-    if case.enable_jdk_oracle:
+    automatic_identities = {
+        serialized_api_identity(row) for row in automatic_oracle_rows
+    }
+    jdk_selected_rows = [
+        row for row in selected_rows
+        if serialized_api_identity(row) not in automatic_identities
+    ]
+    if case.enable_jdk_oracle and jdk_selected_rows:
         try:
             class_files = (
                 load_materialized_class_inventory(report_dir, case.final_artifact)
                 if case.final_artifact else []
             )
             jdk_rows = scan_class_files(
-                selected_rows,
+                jdk_selected_rows,
                 class_files,
                 report_dir / "evidence" / "quality" / "jdk-javap",
                 business_class_files=[
@@ -7967,7 +8068,10 @@ def run_case(
             asset_signal = make_signal(
                 "project_asset_invalid", "P1", case.name,
                 message="; ".join(pinned_asset_gate.get("errors") or []),
-                expected="pinned Git revision and SHA-verified final artifact",
+                expected=(
+                    "pinned Git revision and valid runtime-identified source artifact, "
+                    "or exact SHA-verified published artifact"
+                ),
                 actual=json.dumps(pinned_asset_gate, sort_keys=True),
                 evidence=[project_root, case.fixture_manifest],
                 fixture_status="missing",
@@ -8659,7 +8763,9 @@ def run_case(
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run real-project regression probes for Step5.")
-    parser.add_argument("--case", choices=sorted(CASES.keys()) + ["all", "guard"], default="all")
+    parser.add_argument(
+        "--case", choices=sorted(CASES.keys()) + ["all", *GUARD_SELECTORS], default="all"
+    )
     parser.add_argument("--project-root", help="Override project root for a single --case run.")
     parser.add_argument("--changed-apis", help="Override all_changed_apis.csv for a single --case run.")
     parser.add_argument(
@@ -8694,10 +8800,32 @@ def parse_args(argv=None):
 def select_case_names(selector: str) -> list[str]:
     if selector == "all":
         return sorted(CASES)
-    if selector == "guard":
+    if selector in GUARD_SELECTORS:
+        lifecycle_by_selector = {
+            "guard": {"core", "capability"},
+            "guard-core": {"core"},
+            "guard-capability": {"capability"},
+            "guard-exploratory": {"exploratory"},
+        }
+        accepted = lifecycle_by_selector[selector]
+        def selected(case: RealProjectCase) -> bool:
+            try:
+                manifest = json.loads(Path(case.fixture_manifest).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"guard manifest unavailable or invalid: {case.fixture_manifest}: {error}"
+                ) from error
+            lifecycle = str(manifest.get("guard_lifecycle") or "")
+            if lifecycle not in GUARD_LIFECYCLES:
+                raise ValueError(
+                    f"guard lifecycle missing or invalid: {case.fixture_manifest}"
+                )
+            return lifecycle in accepted
         return sorted(
             name for name, case in CASES.items()
-            if case.case_mode == "guard" and case.fixture_manifest is not None
+            if case.case_mode == "guard"
+            and case.fixture_manifest is not None
+            and selected(case)
         )
     return [selector]
 
@@ -8709,7 +8837,7 @@ def main(argv=None):
     results = []
     for name in case_names:
         case = CASES[name]
-        if args.case in {"all", "guard"} and (
+        if args.case in {"all", *GUARD_SELECTORS} and (
             args.project_root
             or args.changed_apis
             or args.final_artifact

@@ -1,6 +1,8 @@
 {
-  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "schema": "java-upgrade-analyzer.real-project-guard.v4",
   "case": "grpc-netty-shaded",
+  "guard_lifecycle": "capability",
+  "capability_ids": ["source_bytecode_true_conflict"],
   "repository": "grpc/grpc-java",
   "checkout_root": "/private/tmp/jua-real-grpc-java-1.81.0",
   "git_revision": "6951542f66c59f63cbf5348b38a2306a3964adda",
@@ -11,6 +13,7 @@
   "artifact_sha256": "37bc04a00311f268726c92dad9f8211d24551a442ef19dbcc907d5751d36ef12",
   "materialization": {
     "kind": "published_artifact",
+    "artifact_verification": "sha256",
     "coordinate": "io.grpc:grpc-netty-shaded:1.81.0",
     "url": "https://repo1.maven.org/maven2/io/grpc/grpc-netty-shaded/1.81.0/grpc-netty-shaded-1.81.0.jar",
     "sha1": "134b4014a4140c3ca54fe9d758b160a76210bfb0",

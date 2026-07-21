@@ -6811,6 +6811,48 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertFalse(result["blocking"], result)
         self.assertEqual(result["verified"], 1)
 
+    def test_guard_does_not_duplicate_jdk_oracle_when_final_artifact_oracle_is_complete(self):
+        selected = [{
+            "coord": "example:library",
+            "api_name": "sample.Entry.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+        }]
+        oracle_row = {
+            **selected[0],
+            "oracle_conclusion": "reachable",
+            "authority": "jdk-javap",
+            "authority_version": "21",
+            "procedure": "independent final artifact scan",
+            "evidence_path": str(Path(__file__).resolve()),
+            "evidence_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "generated_at": "2026-07-21T00:00:00Z",
+            "evidence_mode": "bytecode",
+            "artifact_sha256": "a" * 64,
+            "capabilities": "artifact_bound;closed_world_static;executable_edges",
+        }
+        summary = {"reachable_apis": [{
+            **selected[0], "analysis_status": "reachable",
+        }]}
+        case = realreg.replace(
+            realreg.CASES["gs-multi-module"], enable_jdk_oracle=True
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg, "build_automatic_oracle_records", return_value=[oracle_row]
+        ), patch.object(
+            realreg, "scan_class_files", side_effect=AssertionError("duplicate JDK scan")
+        ):
+            result, warnings = realreg.run_dual_line_accuracy_audit(
+                case, selected, summary,
+                {"trusted_artifact_sha": "a" * 64}, Path(tmp),
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertFalse(result["blocking"], result)
+        self.assertEqual(result["line_counts"]["oracle"], 1)
+
     def test_guard_selector_contains_only_guard_cases(self):
         selected = realreg.select_case_names("guard")
 
@@ -6820,6 +6862,17 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertTrue(all(realreg.CASES[name].fixture_manifest for name in selected))
         self.assertNotIn("spring-petclinic", selected)
         self.assertNotIn("seata", selected)
+
+    def test_layered_guard_selectors_form_the_release_guard(self):
+        core = set(realreg.select_case_names("guard-core"))
+        capability = set(realreg.select_case_names("guard-capability"))
+        exploratory = set(realreg.select_case_names("guard-exploratory"))
+
+        self.assertTrue(core)
+        self.assertTrue(capability)
+        self.assertFalse(core & capability)
+        self.assertEqual(core | capability, set(realreg.select_case_names("guard")))
+        self.assertFalse(exploratory & set(realreg.select_case_names("guard")))
 
     def test_complete_edge_oracle_treats_exact_absence_as_a_fact(self):
         selected = [{
@@ -6944,9 +6997,10 @@ class RealProjectRegressionTests(unittest.TestCase):
 
         self.assertEqual(manifest["git_revision"], "d88a2b721bda3798a6a934987157498e66da06c5")
         self.assertEqual(
-            manifest["artifact_sha256"],
+            manifest["reference_artifact_sha256"],
             "609d58279a4c509da5cf453cf57ae2e28b41f3e42ec2f4789710db6c68e2c523",
         )
+        self.assertEqual(realreg.artifact_verification_mode(manifest), "runtime")
 
         self.assertEqual(case.required_topologies, (
             "business_to_same_jar_bridge",
@@ -7006,7 +7060,7 @@ class RealProjectRegressionTests(unittest.TestCase):
             "3e112f5e956bf61e6cc1ec92c8a5a9a96f738d86",
         )
         self.assertEqual(
-            manifest["artifact_sha256"],
+            manifest["reference_artifact_sha256"],
             "6dd4d51c963f6826ec2bba476d1f4e2d763378491e28e0c763ba7066ad852688",
         )
         self.assertEqual(case.default_changed_apis, changed_path)
@@ -7023,10 +7077,7 @@ class RealProjectRegressionTests(unittest.TestCase):
             manifest["performance_baseline"]["git_revision"],
             manifest["git_revision"],
         )
-        self.assertEqual(
-            manifest["performance_baseline"]["artifact_sha256"],
-            manifest["artifact_sha256"],
-        )
+        self.assertNotIn("artifact_sha256", manifest["performance_baseline"])
         self.assertEqual(
             manifest["performance_baseline"]["scope"]["fault_injection_detected_count"],
             1,
@@ -7102,7 +7153,7 @@ class RealProjectRegressionTests(unittest.TestCase):
             "efa693451b6a6ca123476c9c6e65eedab9048e2c",
         )
         self.assertEqual(
-            manifest["artifact_sha256"],
+            manifest["reference_artifact_sha256"],
             "fd0b8883214c641685ab8f0e7b583ec2f8150112f9679161908eb6829bd98b90",
         )
         self.assertEqual(case.case_mode, "guard")
@@ -7114,7 +7165,7 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertTrue(all(row["oracle_conclusion"] == "reachable" for row in oracle_rows))
         self.assertTrue(all(row["evidence_mode"] == "project_test" for row in oracle_rows))
         self.assertTrue(all(
-            row["artifact_sha256"] == manifest["artifact_sha256"]
+            row["artifact_sha256"] == manifest["reference_artifact_sha256"]
             for row in oracle_rows
         ))
         identity = lambda row: (
@@ -7192,8 +7243,10 @@ class RealProjectRegressionTests(unittest.TestCase):
             "passed": True,
             "errors": [],
             "api_count": 3,
-            "expected_physical_edge_count": 5,
+            "expected_physical_edge_count": 0,
+            "expected_semantic_edge_count": 5,
             "expected_semantic_reference_count": 0,
+            "artifact_verification": "runtime",
         })
 
     def test_callback_chain_match_ignores_business_artifact_display_prefix(self):
@@ -7609,17 +7662,32 @@ class RealProjectRegressionTests(unittest.TestCase):
         }])
         self.assertEqual(context["jdk_current"], "17")
 
-    def test_pinned_asset_gate_rejects_revision_and_final_artifact_sha_mismatch(self):
+    def test_published_asset_gate_rejects_revision_and_final_artifact_sha_mismatch(self):
         manifest = {
+            "schema": "java-upgrade-analyzer.real-project-guard.v4",
+            "case": "published",
+            "guard_lifecycle": "core",
+            "capability_ids": ["business_direct"],
+            "required_topologies": ["business_direct"],
             "git_revision": "a" * 40,
             "artifact_path": "application/target/application.jar",
             "artifact_sha256": "b" * 64,
+            "artifact_sha1": "d" * 40,
+            "materialization": {
+                "kind": "published_artifact",
+                "artifact_verification": "sha256",
+                "coordinate": "example:application:1.0",
+                "url": "https://repo.example/application.jar",
+                "sha1": "d" * 40,
+                "sha256": "b" * 64,
+            },
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifact = root / manifest["artifact_path"]
             artifact.parent.mkdir(parents=True)
-            artifact.write_bytes(b"wrong artifact")
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("app/App.class", b"class")
             completed = realreg.subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="c" * 40 + "\n", stderr=""
             )
@@ -7629,6 +7697,43 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertIn("git_revision_mismatch", gate["errors"])
         self.assertIn("final_artifact_sha256_mismatch", gate["errors"])
+
+    def test_source_build_asset_gate_binds_runtime_sha_without_historical_sha(self):
+        manifest = {
+            "schema": "java-upgrade-analyzer.real-project-guard.v4",
+            "case": "source",
+            "guard_lifecycle": "core",
+            "capability_ids": ["business_direct"],
+            "required_topologies": ["business_direct"],
+            "git_revision": "a" * 40,
+            "artifact_path": "target/application.jar",
+            "reference_artifact_sha256": "b" * 64,
+            "canonical_edge_binding": "semantic",
+            "materialization": {
+                "kind": "source_build",
+                "artifact_verification": "runtime",
+                "repository_url": "https://github.com/example/project.git",
+                "working_directory": ".",
+                "command": ["mvn", "package"],
+                "artifact_path": "target/application.jar",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / manifest["artifact_path"]
+            artifact.parent.mkdir(parents=True)
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("app/App.class", b"class")
+            actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            completed = realreg.subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="a" * 40 + "\n", stderr=""
+            )
+            with patch.object(realreg.subprocess, "run", return_value=completed):
+                gate = realreg.validate_pinned_asset(manifest, root)
+
+        self.assertTrue(gate["passed"], gate["errors"])
+        self.assertEqual(gate["actual_artifact_sha256"], actual_sha)
+        self.assertEqual(gate["artifact_verification"], "runtime")
 
     def test_pinned_guard_requires_reachable_exact_chain_and_two_correct_physical_edges(self):
         manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
@@ -7646,7 +7751,7 @@ class RealProjectRegressionTests(unittest.TestCase):
 
         self.assertTrue(passing["passed"], passing["errors"])
         self.assertFalse(missing_edge["passed"])
-        self.assertIn("expected_physical_edge_missing", missing_edge["errors"])
+        self.assertIn("expected_semantic_edge_missing", missing_edge["errors"])
 
     def test_pinned_guard_accepts_a_zero_instruction_offset_physical_edge(self):
         manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
@@ -7675,7 +7780,7 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertFalse(guard["passed"])
         self.assertIn("expected_conclusion_missing", guard["errors"])
 
-    def test_pinned_guard_rejects_nested_reconciliation_rows_at_wrong_instruction_offset(self):
+    def test_source_build_guard_accepts_compiler_specific_instruction_offsets(self):
         manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
         manifest = self._manifest_with_expected_physical_edges(
             json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -7693,8 +7798,7 @@ class RealProjectRegressionTests(unittest.TestCase):
 
         guard = realreg.evaluate_pinned_guard_contract(manifest, result)
 
-        self.assertFalse(guard["passed"])
-        self.assertIn("expected_physical_edge_missing", guard["errors"])
+        self.assertTrue(guard["passed"], guard["errors"])
 
     def test_pinned_guard_accepts_production_reconciliation_ledger_shape(self):
         manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"

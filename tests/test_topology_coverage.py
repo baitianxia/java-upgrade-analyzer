@@ -574,7 +574,9 @@ class TopologyCoverageTest(unittest.TestCase):
         manifest = json.loads((FIXTURE / "manifest.json").read_text(encoding="utf-8"))
         return artifact, manifest
 
-    def _source_attestation(self, root: Path, artifact: Path, expectations: dict) -> tuple[Path, Path]:
+    def _source_attestation(
+        self, root: Path, artifact: Path, expectations: dict, *, runtime_binding: bool = False
+    ) -> tuple[Path, Path]:
         repository = root / "source-repository"
         shutil.copytree(FIXTURE / "src", repository / "src")
         subprocess.run(["git", "init", "-q", str(repository)], check=True)
@@ -593,7 +595,7 @@ class TopologyCoverageTest(unittest.TestCase):
             ],
         }, sort_keys=True), encoding="utf-8")
         attestation_path = root / "source_attestation.json"
-        attestation_path.write_text(json.dumps({
+        attestation = {
             "authority": "external-fixture-source-attestor",
             "authority_version": "1",
             "procedure": "compile and enumerate exact source JVM descriptors",
@@ -604,8 +606,40 @@ class TopologyCoverageTest(unittest.TestCase):
             "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
             "evidence_path": str(evidence_path),
             "evidence_sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
-        }, sort_keys=True), encoding="utf-8")
+        }
+        if runtime_binding:
+            attestation["artifact_binding"] = "runtime"
+            attestation["reference_artifact_sha256"] = "0" * 64
+            attestation.pop("artifact_sha256")
+        attestation_path.write_text(json.dumps(attestation, sort_keys=True), encoding="utf-8")
         return repository, attestation_path
+
+    def test_runtime_source_attestation_binds_current_artifact_sha(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            source_root, source_attestation = self._source_attestation(
+                root, artifact, expectations, runtime_binding=True
+            )
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": ["BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+                source_root=source_root,
+                source_attestation=source_attestation,
+            )
+
+        layout = evidence["artifact_layout"]
+        provenance = layout["source_provenance"]
+        self.assertTrue(provenance["valid"], provenance)
+        self.assertEqual(provenance["bound_artifact_sha256"], layout["artifact_sha256"])
+        self.assertIn(
+            "source_bytecode_agree",
+            topology_coverage.classify_topologies(evidence["edges"], layout),
+        )
 
     def test_real_final_artifact_oracle_classifies_every_stable_topology(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,6 +1,8 @@
 {
-  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "schema": "java-upgrade-analyzer.real-project-guard.v4",
   "case": "mybatis-sample-xml",
+  "guard_lifecycle": "capability",
+  "capability_ids": ["business_direct", "mybatis_mapper_proxy"],
   "repository": "mybatis/spring-boot-starter",
   "checkout_root": "/private/tmp/jua-real-project-mybatis-spring-boot-4.0.1",
   "git_revision": "bb8bac144e4677cf1bab5a6d27ced2521972adfc",
@@ -11,6 +13,7 @@
   "artifact_sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7",
   "materialization": {
     "kind": "published_artifact",
+    "artifact_verification": "sha256",
     "coordinate": "org.mybatis.spring.boot:mybatis-spring-boot-sample-xml:4.0.1",
     "url": "https://repo1.maven.org/maven2/org/mybatis/spring/boot/mybatis-spring-boot-sample-xml/4.0.1/mybatis-spring-boot-sample-xml-4.0.1.jar",
     "sha1": "f8d22314dae4a96ca7fe2f454cf6adc2b7628dd2",

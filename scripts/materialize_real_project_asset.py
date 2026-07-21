@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize SHA-pinned real-project assets from executable manifests."""
+"""Materialize revision-pinned source builds or SHA-pinned published artifacts."""
 
 from __future__ import annotations
 
@@ -10,9 +10,17 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+import urllib.error
+import zipfile
 from pathlib import Path
 
-from real_project_regression import CASES, validate_reproducible_asset_contract
+from real_project_regression import (
+    CASES,
+    GUARD_SELECTORS,
+    artifact_verification_mode,
+    select_case_names,
+    validate_reproducible_asset_contract,
+)
 
 
 def _source_artifacts(manifest: dict, materialization: dict) -> list[dict]:
@@ -62,6 +70,17 @@ def build_materialization_plan(manifest: dict, output_root: Path) -> list[dict]:
         revision = str(artifact["revision"])
         artifact_path = Path(str(artifact["artifact_path"]))
         destination = case_root / revision / artifact_path.name
+        copy_step = {
+            "operation": (
+                "copy_and_verify"
+                if artifact_verification_mode(manifest) == "sha256"
+                else "copy_artifact"
+            ),
+            "source": str(checkout / working_directory / artifact_path),
+            "destination": str(destination),
+        }
+        if artifact_verification_mode(manifest) == "sha256":
+            copy_step["sha256"] = str(artifact["artifact_sha256"])
         plan.extend([
             {
                 "operation": "command",
@@ -73,12 +92,7 @@ def build_materialization_plan(manifest: dict, output_root: Path) -> list[dict]:
                 "argv": list(materialization["command"]),
                 "cwd": str(checkout / working_directory),
             },
-            {
-                "operation": "copy_and_verify",
-                "source": str(checkout / working_directory / artifact_path),
-                "destination": str(destination),
-                "sha256": str(artifact["artifact_sha256"]),
-            },
+            copy_step,
         ])
     return plan
 
@@ -134,6 +148,16 @@ def build_declared_materialization_plan(manifest: dict) -> list[dict]:
     working_directory = Path(str(materialization["working_directory"]))
     for artifact in _source_artifacts(manifest, materialization):
         artifact_path = repository_root / working_directory / Path(str(artifact["artifact_path"]))
+        verify_step = {
+            "operation": (
+                "verify"
+                if artifact_verification_mode(manifest) == "sha256"
+                else "verify_artifact"
+            ),
+            "path": str(artifact_path),
+        }
+        if artifact_verification_mode(manifest) == "sha256":
+            verify_step["sha256"] = str(artifact["artifact_sha256"])
         plan.extend([
             {
                 "operation": "command",
@@ -145,20 +169,14 @@ def build_declared_materialization_plan(manifest: dict) -> list[dict]:
                 "argv": list(materialization["command"]),
                 "cwd": str(repository_root / working_directory),
             },
-            {
-                "operation": "verify",
-                "path": str(artifact_path),
-                "sha256": str(artifact["artifact_sha256"]),
-            },
+            verify_step,
         ])
     return plan
 
 
-def select_guard_manifests() -> list[Path]:
+def select_guard_manifests(selector: str = "guard") -> list[Path]:
     return sorted({
-        Path(case.fixture_manifest)
-        for case in CASES.values()
-        if case.case_mode == "guard" and case.fixture_manifest is not None
+        Path(CASES[name].fixture_manifest) for name in select_case_names(selector)
     })
 
 
@@ -170,7 +188,35 @@ def _digest(path: Path, algorithm: str) -> str:
     return digest.hexdigest()
 
 
-def execute_materialization_plan(plan: list[dict]) -> None:
+def _validate_artifact(path: Path) -> None:
+    if not path.is_file():
+        raise ValueError(f"artifact missing: {path}")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if not any(name.endswith(".class") for name in archive.namelist()):
+                raise ValueError(f"artifact has no class files: {path}")
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"artifact is not a valid ZIP: {path}") from error
+
+
+def _download(url: str, destination: Path) -> None:
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response:
+            temporary.write_bytes(response.read())
+    except urllib.error.URLError:
+        curl = shutil.which("curl")
+        if not curl:
+            raise
+        subprocess.run([
+            curl, "--fail", "--location", "--silent", "--show-error",
+            "--output", str(temporary), url,
+        ], check=True)
+    temporary.replace(destination)
+
+
+def execute_materialization_plan(plan: list[dict]) -> list[dict]:
+    artifacts = []
     for step in plan:
         operation = step["operation"]
         if operation == "git_clone":
@@ -184,31 +230,41 @@ def execute_materialization_plan(plan: list[dict]) -> None:
         elif operation == "download":
             destination = Path(step["destination"])
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_suffix(destination.suffix + ".part")
-            with urllib.request.urlopen(step["url"], timeout=120) as response:
-                temporary.write_bytes(response.read())
-            temporary.replace(destination)
-        elif operation == "copy_and_verify":
+            _download(step["url"], destination)
+        elif operation in {"copy_and_verify", "copy_artifact"}:
             source = Path(step["source"])
-            if _digest(source, "sha256") != step["sha256"]:
+            _validate_artifact(source)
+            if step.get("sha256") and _digest(source, "sha256") != step["sha256"]:
                 raise ValueError(f"artifact SHA-256 mismatch: {source}")
             destination = Path(step["destination"])
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
-        elif operation == "verify":
+            artifacts.append({
+                "path": str(destination),
+                "sha256": _digest(destination, "sha256"),
+                "verification": "sha256" if step.get("sha256") else "runtime",
+            })
+        elif operation in {"verify", "verify_artifact"}:
             path = Path(step["path"])
+            _validate_artifact(path)
             if step.get("sha1") and _digest(path, "sha1") != step["sha1"]:
                 raise ValueError(f"artifact SHA-1 mismatch: {path}")
             if step.get("sha256") and _digest(path, "sha256") != step["sha256"]:
                 raise ValueError(f"artifact SHA-256 mismatch: {path}")
+            artifacts.append({
+                "path": str(path),
+                "sha256": _digest(path, "sha256"),
+                "verification": "sha256" if step.get("sha256") else "runtime",
+            })
         else:
             raise ValueError(f"unsupported materialization operation: {operation}")
+    return artifacts
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path, nargs="?")
-    parser.add_argument("--selector", choices=["guard"])
+    parser.add_argument("--selector", choices=list(GUARD_SELECTORS))
     parser.add_argument("--output-root", type=Path)
     parser.add_argument(
         "--declared-locations",
@@ -227,7 +283,7 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     try:
-        manifest_paths = select_guard_manifests() if args.selector == "guard" else [args.manifest]
+        manifest_paths = select_guard_manifests(args.selector) if args.selector else [args.manifest]
         plan = []
         cases = []
         for manifest_path in manifest_paths:
@@ -249,11 +305,12 @@ def main(argv=None) -> int:
         if args.plan_only:
             print(json.dumps(plan, ensure_ascii=False, indent=2))
             return 0
-        execute_materialization_plan(plan)
+        artifacts = execute_materialization_plan(plan)
         print(json.dumps({
             "status": "materialized",
             "cases": cases,
             "steps": len(plan),
+            "artifacts": artifacts,
         }))
         return 0
     except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError) as error:

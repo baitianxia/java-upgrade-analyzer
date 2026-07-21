@@ -217,7 +217,7 @@ def _load_persistent_artifact_fact(graph, namespace, immutable_key, tool_identit
             return True, result
         _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_invalid', 1)
     except FileNotFoundError:
-        pass
+        _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_absent', 1)
     except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, TypeError):
         _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_invalid', 1)
     _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_misses', 1)
@@ -267,7 +267,12 @@ def _store_persistent_artifact_fact(
             try:
                 temporary_path.unlink(missing_ok=True)
             except OSError:
-                pass
+                _perf_add(
+                    graph,
+                    'bytecode_scan',
+                    'persistent_artifact_cache_cleanup_failures',
+                    1,
+                )
 
 
 def _immutable_artifact_parse_cache_key(
@@ -1386,6 +1391,231 @@ def _normalize_direct_usage_matches(matches):
     return unique_matches
 
 
+_DIRECT_SOURCE_FACT_FQCN_ACCESS_RE = re.compile(
+    r'(?<![\w$])([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*\.\s*([A-Za-z_$][\w$]*)\b'
+)
+_DIRECT_SOURCE_FACT_SIMPLE_ACCESS_RE = re.compile(
+    r'\b([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\b'
+)
+_DIRECT_SOURCE_FACT_SIMPLE_TYPE_RES = (
+    re.compile(r'\bnew\s+([A-Za-z_$][\w$]*)\b'),
+    re.compile(r'\b([A-Za-z_$][\w$]*)\s*\.class\b'),
+    re.compile(r'\binstanceof\s+([A-Za-z_$][\w$]*)\b'),
+    re.compile(r'\(\s*([A-Za-z_$][\w$]*)\s*\)'),
+)
+_JAVA_NON_REFERENCE_TYPES = {
+    'boolean', 'byte', 'char', 'double', 'float', 'int', 'long', 'short',
+    'void', 'var', 'extends', 'super',
+}
+
+
+def _resolved_type_targets_for_index(type_expression, method_def):
+    """Resolve every unambiguous type token using the same rules as direct lookup."""
+    targets = set()
+    imports = getattr(method_def, 'imports', {}) or {}
+    package_name = str(getattr(method_def, 'package_name', '') or '').strip()
+    wildcard_imports = {
+        str(value or '').strip()
+        for value in (getattr(method_def, 'wildcard_imports', []) or [])
+        if str(value or '').strip()
+    }
+    for raw_token in _JAVA_TYPE_TOKEN_RE.findall(str(type_expression or '')):
+        token = str(raw_token or '').strip().replace('$', '.')
+        if not token or token in _JAVA_NON_REFERENCE_TYPES:
+            continue
+        if '.' in token:
+            targets.add(token)
+            continue
+        imported = str(imports.get(token) or '').strip().replace('$', '.')
+        if imported:
+            targets.add(imported)
+            continue
+        known_candidates = _known_type_candidates(method_def, token)
+        if known_candidates:
+            if len(known_candidates) == 1:
+                targets.update(known_candidates)
+            continue
+        if package_name:
+            targets.add(f'{package_name}.{token}')
+        if len(wildcard_imports) == 1:
+            targets.add(f'{next(iter(wildcard_imports))}.{token}')
+    return targets
+
+
+def _body_simple_type_targets(simple_name, method_def):
+    """Return every target that the legacy import/wildcard body fallback accepted."""
+    targets = set()
+    imports = getattr(method_def, 'imports', {}) or {}
+    imported = str(imports.get(simple_name) or '').strip().replace('$', '.')
+    if imported:
+        targets.add(imported)
+    for package_name in getattr(method_def, 'wildcard_imports', []) or []:
+        package_name = str(package_name or '').strip()
+        if package_name:
+            targets.add(f'{package_name}.{simple_name}')
+    return targets
+
+
+def _field_owner_targets(owner_simple, method_def):
+    targets = set(_body_simple_type_targets(owner_simple, method_def))
+    package_name = str(getattr(method_def, 'package_name', '') or '').strip()
+    if package_name:
+        targets.add(f'{package_name}.{owner_simple}')
+    return targets
+
+
+def _structured_type_candidates(method_def, graph):
+    expressions = (
+        [getattr(method_def, 'return_type', '')]
+        + list((getattr(method_def, 'param_types', {}) or {}).values())
+        + list((getattr(method_def, 'field_types', {}) or {}).values())
+        + list((getattr(method_def, 'local_var_types', {}) or {}).values())
+        + [getattr(method_def, 'return_declared_type', '')]
+        + list((getattr(method_def, 'param_declared_types', {}) or {}).values())
+        + list((getattr(method_def, 'field_declared_types', {}) or {}).values())
+        + [
+            site.get('declared_type', '')
+            for site in (getattr(method_def, 'ast_local_var_sites', []) or [])
+        ]
+        + list(getattr(method_def, 'annotations', []) or [])
+        + list(getattr(method_def, 'class_annotations', []) or [])
+        + list(getattr(method_def, 'throws_declared_types', []) or [])
+        + [
+            site.get('declared_type', '')
+            for site in (getattr(method_def, 'ast_type_reference_sites', []) or [])
+        ]
+        + [
+            site.get('receiver_expr') or site.get('receiver_type') or ''
+            for site in (getattr(method_def, 'ast_call_sites', []) or [])
+        ]
+    )
+    class_meta = (
+        (getattr(graph, 'type_metadata', {}) or {})
+        .get(getattr(method_def, 'class_fqcn', ''), {})
+    )
+    expressions += (
+        list(class_meta.get('extends', []) or [])
+        + list(class_meta.get('implements', []) or [])
+    )
+    targets = set()
+    for expression in expressions:
+        targets.update(_resolved_type_targets_for_index(expression, method_def))
+    return targets
+
+
+def _build_direct_source_fact_index(graph):
+    """Scan business methods once and materialize reusable type/member facts."""
+    started_at = time.perf_counter()
+    class_matches = defaultdict(list)
+    field_matches = defaultdict(list)
+    scanned_methods = 0
+    body_reads = 0
+    body_cache_evictions = 0
+
+    for method_def in _iter_business_methods(graph):
+        scanned_methods += 1
+        method_class_matches = {}
+        for target_class in sorted(_structured_type_candidates(method_def, graph)):
+            evidence_type = _find_structured_type_usage_evidence(
+                method_def, target_class, graph
+            )
+            if evidence_type:
+                method_class_matches.setdefault(target_class, evidence_type)
+
+        static_imports = getattr(method_def, 'static_imports', {}) or {}
+        method_field_matches = {
+            str(api_name or '').strip(): 'static_import'
+            for field_name, api_name in static_imports.items()
+            if (
+                str(api_name or '').strip()
+                and str(api_name or '').strip().rsplit('.', 1)[-1]
+                == str(field_name or '').strip()
+            )
+        }
+
+        body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
+        body_reads += 1
+        code_text = _strip_strings_and_comments(body_text)
+        for pattern in _DIRECT_SOURCE_FACT_SIMPLE_TYPE_RES:
+            for simple_name in pattern.findall(code_text):
+                for target_class in _body_simple_type_targets(simple_name, method_def):
+                    method_class_matches.setdefault(target_class, 'imported_type')
+
+        # Index every dotted prefix.  This preserves the old FQCN substring
+        # lookup for expressions such as ``pkg.Target.CONSTANT``.
+        for token in _JAVA_TYPE_TOKEN_RE.findall(code_text):
+            normalized = str(token or '').strip().replace('$', '.')
+            parts = normalized.split('.')
+            for size in range(2, len(parts) + 1):
+                method_class_matches.setdefault('.'.join(parts[:size]), 'body_reference')
+
+        for match in _DIRECT_SOURCE_FACT_FQCN_ACCESS_RE.finditer(body_text):
+            owner_class = str(match.group(1) or '').strip()
+            field_name = str(match.group(2) or '').strip()
+            if owner_class and field_name:
+                owner_parts = owner_class.split('.')
+                # The legacy field matcher had no left boundary, so retain all
+                # dotted suffixes that it could have matched.
+                for offset in range(len(owner_parts)):
+                    suffix = '.'.join(owner_parts[offset:])
+                    method_field_matches.setdefault(
+                        f'{suffix}.{field_name}', 'field_access'
+                    )
+        for match in _DIRECT_SOURCE_FACT_SIMPLE_ACCESS_RE.finditer(body_text):
+            owner_simple = str(match.group(1) or '').strip()
+            field_name = str(match.group(2) or '').strip()
+            if not owner_simple or not field_name:
+                continue
+            for owner_class in _field_owner_targets(owner_simple, method_def):
+                method_field_matches.setdefault(
+                    f'{owner_class}.{field_name}', 'field_access'
+                )
+
+        for target_class, evidence_type in method_class_matches.items():
+            class_matches[target_class].append((method_def, evidence_type))
+        for api_name, evidence_type in method_field_matches.items():
+            field_matches[api_name].append((method_def, evidence_type))
+
+        if (
+            not getattr(method_def, 'body_text', '')
+            and getattr(method_def, '_body_text_cached', '')
+        ):
+            method_def._body_text_cached = ''
+            body_cache_evictions += 1
+
+    index = {
+        'owner': id(getattr(graph, 'methods_by_id', {}) or {}),
+        'classes': {
+            key: tuple(_normalize_direct_usage_matches(value))
+            for key, value in class_matches.items()
+        },
+        'fields': {
+            key: tuple(_normalize_direct_usage_matches(value))
+            for key, value in field_matches.items()
+        },
+    }
+    _perf_add(graph, 'trace', 'direct_source_fact_index_builds', 1)
+    _perf_add(graph, 'trace', 'direct_source_fact_index_scanned_methods', scanned_methods)
+    _perf_add(graph, 'trace', 'direct_source_fact_index_body_reads', body_reads)
+    _perf_add(graph, 'trace', 'direct_source_fact_index_body_cache_evictions', body_cache_evictions)
+    _perf_add(graph, 'trace', 'direct_source_fact_index_elapsed_sec', time.perf_counter() - started_at)
+    _perf_max(graph, 'trace', 'direct_source_fact_index_class_keys', len(index['classes']))
+    _perf_max(graph, 'trace', 'direct_source_fact_index_field_keys', len(index['fields']))
+    return index
+
+
+def _get_direct_source_fact_index(graph, trace_cache):
+    methods_owner = id(getattr(graph, 'methods_by_id', {}) or {})
+    index = trace_cache.get('direct_source_fact_index')
+    if not isinstance(index, dict) or index.get('owner') != methods_owner:
+        index = _build_direct_source_fact_index(graph)
+        trace_cache['direct_source_fact_index'] = index
+        trace_cache['direct_source_fact_index_owner'] = methods_owner
+    else:
+        _perf_add(graph, 'trace', 'direct_source_fact_index_hits', 1)
+    return index
+
+
 def _build_direct_usage_results(result, matches, reason_code, note, display_target):
     unique_matches = _normalize_direct_usage_matches(matches)
 
@@ -1450,45 +1680,10 @@ def _find_direct_business_class_usages(api_row, graph, trace_cache=None):
         return list(cache[target_class] or [])
     _perf_add(graph, 'trace', 'direct_class_usage_cache_misses', 1)
     started_at = time.perf_counter()
-    scanned_methods = 0
     target_class = target_class.replace('$', '.')
-    simple_name = target_class.rsplit('.', 1)[-1]
-    simple_name_patterns = [
-        re.compile(r'\bnew\s+' + re.escape(simple_name) + r'\b'),
-        re.compile(r'\b' + re.escape(simple_name) + r'\s*\.class\b'),
-        re.compile(r'\binstanceof\s+' + re.escape(simple_name) + r'\b'),
-        re.compile(r'\(\s*' + re.escape(simple_name) + r'\s*\)'),
-    ]
-    fqcn_pattern = re.compile(
-        r'(?<![\w$.])' + re.escape(target_class) + r'(?![\w$])'
-    )
-    matches = []
-    for method_def in _iter_business_methods(graph):
-        scanned_methods += 1
-        structured_evidence = _find_structured_type_usage_evidence(
-            method_def,
-            target_class,
-            graph,
-        )
-        if structured_evidence:
-            matches.append((method_def, structured_evidence))
-            continue
-        imports = getattr(method_def, 'imports', {}) or {}
-        wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
-        body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
-        code_text = _strip_strings_and_comments(body_text)
-        import_matches_target = imports.get(simple_name) == target_class
-        wildcard_matches_target = any(f"{pkg}.{simple_name}" == target_class for pkg in wildcard_imports)
-        if (import_matches_target or wildcard_matches_target) and any(
-            pattern.search(code_text) for pattern in simple_name_patterns
-        ):
-            matches.append((method_def, 'imported_type'))
-            continue
-        if fqcn_pattern.search(code_text):
-            matches.append((method_def, 'body_reference'))
-    matches = _normalize_direct_usage_matches(matches)
+    index = _get_direct_source_fact_index(graph, trace_cache)
+    matches = list((index.get('classes') or {}).get(target_class) or ())
     cache[target_class] = tuple(matches)
-    _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
     _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
     _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
     return matches
@@ -1654,7 +1849,6 @@ def _find_direct_business_field_usages(api_row, graph, trace_cache=None):
     api_name = str(api_row.get('api_name') or '').strip()
     field_name = str(api_row.get('api_simple') or '').strip() or (api_name.rsplit('.', 1)[-1] if '.' in api_name else '')
     owner_class = api_name.rsplit('.', 1)[0] if '.' in api_name else ''
-    owner_simple = owner_class.rsplit('.', 1)[-1] if owner_class else ''
     if not field_name:
         return []
     cache_key = api_name or f"{owner_class}.{field_name}"
@@ -1665,37 +1859,9 @@ def _find_direct_business_field_usages(api_row, graph, trace_cache=None):
         return list(cache[cache_key] or [])
     _perf_add(graph, 'trace', 'direct_field_usage_cache_misses', 1)
     started_at = time.perf_counter()
-    scanned_methods = 0
-    simple_access_pattern = (
-        re.compile(r'\b' + re.escape(owner_simple) + r'\s*\.\s*' + re.escape(field_name) + r'\b')
-        if owner_simple else None
-    )
-    fqcn_access_pattern = (
-        re.compile(re.escape(owner_class) + r'\s*\.\s*' + re.escape(field_name) + r'\b')
-        if owner_class else None
-    )
-    matches = []
-    for method_def in _iter_business_methods(graph):
-        scanned_methods += 1
-        static_imports = getattr(method_def, 'static_imports', {}) or {}
-        if static_imports.get(field_name) == api_name:
-            matches.append((method_def, 'static_import'))
-            continue
-        body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
-        if fqcn_access_pattern and fqcn_access_pattern.search(body_text):
-            matches.append((method_def, 'field_access'))
-            continue
-        if simple_access_pattern and simple_access_pattern.search(body_text):
-            imports = getattr(method_def, 'imports', {}) or {}
-            wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
-            package_name = getattr(method_def, 'package_name', '') or ''
-            if imports.get(owner_simple) == owner_class or any(
-                f"{pkg}.{owner_simple}" == owner_class for pkg in wildcard_imports
-            ) or (package_name and f"{package_name}.{owner_simple}" == owner_class):
-                matches.append((method_def, 'field_access'))
-    matches = _normalize_direct_usage_matches(matches)
+    index = _get_direct_source_fact_index(graph, trace_cache)
+    matches = list((index.get('fields') or {}).get(cache_key) or ())
     cache[cache_key] = tuple(matches)
-    _perf_add(graph, 'trace', 'direct_field_usage_scanned_methods', scanned_methods)
     _perf_add(graph, 'trace', 'direct_field_usage_elapsed_sec', time.perf_counter() - started_at)
     _perf_max(graph, 'trace', 'direct_field_usage_cache_size', len(cache))
     return matches
@@ -8555,6 +8721,8 @@ def ensure_trace_cache(trace_cache=None):
     trace_cache.setdefault('critical_node_by_symbol_id', {})
     trace_cache.setdefault('direct_business_class_usage', {})
     trace_cache.setdefault('direct_business_field_usages', {})
+    trace_cache.setdefault('direct_source_fact_index', None)
+    trace_cache.setdefault('direct_source_fact_index_owner', None)
     trace_cache.setdefault('declared_method_signature_index', None)
     trace_cache.setdefault('declared_method_signature_index_owner', None)
     trace_cache.setdefault('overload_signature_index', None)
@@ -11198,6 +11366,14 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                 ) not in identical_providers
             ]
             _build_packaged_runtime_dependency_scan_cache(scan_apis, graph)
+            # Building the shared source-fact index is a batch preparation cost,
+            # not latency attributable to whichever class/field API happens to
+            # be traced first.
+            if any(
+                str(row.get('symbol_kind') or '').strip().lower() in {'class', 'field'}
+                for row in all_apis
+            ):
+                _get_direct_source_fact_index(graph, trace_cache)
         except BaseException:
             graph._active_packaged_scan_trace_serial = 0
             catalog['_packaged_api_scan_validated_trace_serial'] = 0

@@ -1,13 +1,17 @@
 {
-  "schema": "java-upgrade-analyzer.real-project-guard.v3",
+  "schema": "java-upgrade-analyzer.real-project-guard.v4",
   "case": "gs-managing-transactions",
+  "guard_lifecycle": "capability",
+  "capability_ids": ["framework_proxy"],
   "repository": "spring-guides/gs-managing-transactions",
   "checkout_root": "/private/tmp/jua-real-project-gs-managing-transactions/complete",
   "git_revision": "efa693451b6a6ca123476c9c6e65eedab9048e2c",
   "artifact_path": "target/managing-transactions-complete-0.0.1-SNAPSHOT.jar",
-  "artifact_sha256": "fd0b8883214c641685ab8f0e7b583ec2f8150112f9679161908eb6829bd98b90",
+  "reference_artifact_sha256": "fd0b8883214c641685ab8f0e7b583ec2f8150112f9679161908eb6829bd98b90",
+  "canonical_edge_binding": "semantic",
   "materialization": {
     "kind": "source_build",
+    "artifact_verification": "runtime",
     "repository_url": "https://github.com/spring-guides/gs-managing-transactions.git",
     "working_directory": "complete",
     "command": ["mvn", "-q", "-DskipTests", "package"],
@@ -15,7 +19,6 @@
   },
   "performance_baseline": {
     "git_revision": "efa693451b6a6ca123476c9c6e65eedab9048e2c",
-    "artifact_sha256": "fd0b8883214c641685ab8f0e7b583ec2f8150112f9679161908eb6829bd98b90",
     "scope": {
       "selected_api_count": 3,
       "accounted_api_count": 3,

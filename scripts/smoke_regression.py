@@ -1124,6 +1124,10 @@ def build_smoke_dep_env(workspace):
     path_parts = [str(workspace.fake_bin)]
     if java_bin:
         path_parts.append(java_bin)
+    # The fake Maven launcher uses ``#!/usr/bin/env python3``.  Keep the
+    # interpreter that is running the smoke suite ahead of platform shims so
+    # an isolated HOME does not accidentally select a different Python.
+    path_parts.append(str(Path(sys.executable).resolve().parent))
     path_parts.append(dep_env.get("PATH", ""))
     dep_env["PATH"] = os.pathsep.join(path_parts)
     return dep_env

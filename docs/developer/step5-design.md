@@ -239,6 +239,8 @@ Step5 会输出：
 - `trace.incoming_edges_cache_*`;
 - `trace.declared_signature_index_*`;
 - `trace.direct_class_usage_*`;
+- `trace.direct_field_usage_*`;
+- `trace.direct_source_fact_index_*`（类型/字段源码事实的一次扫描构建成本、复用命中、正文读取与缓存释放、索引 key 数）；
 - `memory.*_current_rss_mb` 与 `memory.*_peak_rss_mb`（Python 主进程）；
 - `memory.*_process_tree_peak_rss_mb` 与 `memory.*_child_process_peak_rss_mb`（Python 与全部后代进程）；
 - `memory.*_self_cpu_sec`、`memory.*_child_cpu_sec`、`memory.*_external_process_wall_sec`；
@@ -257,8 +259,11 @@ macOS 优先使用 `libproc`（仅在系统库不可用时回退 `ps`）；其�
 `STEP5_PROCESS_TREE_RSS_HARD_LIMIT_EXCEEDED` 失败关闭，避免继续扩大内存压力直至 OOM。
 触发软阈值后，后续 `javap` 自动收敛为单 worker，并释放可从源码重新加载的方法正文字符串缓存；
 不会删除图边、证据或缩小分析范围。阈值默认不启用，必须填写正数 MiB。
-- `trace.direct_field_usage_*`;
 - `report.*`。
+
+类型与字段直接使用共享 `direct_source_fact_index`：首次查询时遍历业务方法一次，收集声明类型、
+AST 类型引用、正文类型 token、字段访问与静态导入，后续目标只做索引查询。索引物化后会释放可从
+源文件重新加载的 `_body_text_cached`，不释放内嵌 `body_text`，也不改变证据排序和结论语义。
 
 ## 维护检查清单
 
