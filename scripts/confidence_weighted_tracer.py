@@ -21,6 +21,7 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -84,6 +85,7 @@ CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
 
 ANALYZER_EDGE_PROCEDURE_VERSION = 'java-upgrade-analyzer.analyzer-edge-ledger.v1'
 ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION = 'java-upgrade-analyzer.runtime-javap.v1'
+ARTIFACT_FACT_CACHE_SCHEMA = 'java-upgrade-analyzer.artifact-fact-cache.v1'
 RUNTIME_MEMBER_INDEX_CACHE_SCHEMA = 'java-upgrade-analyzer.runtime-member-index.v6'
 ANALYZER_EDGE_PROCEDURE = (
     'Step5 executable bytecode matching at analyzer edge creation points'
@@ -92,6 +94,8 @@ _IMMUTABLE_ARTIFACT_PARSE_CACHE = {}
 _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK = Lock()
 _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT = {}
 _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION = 0
+_JAVAP_TOOL_IDENTITY = None
+_JAVAP_TOOL_IDENTITY_LOCK = Lock()
 _STEP5_PERF_STATS_INIT_LOCK = Lock()
 ANALYZER_EDGE_FIELDS = (
     'artifact_sha256',
@@ -137,6 +141,133 @@ def _artifact_sha256(path):
         for block in iter(lambda: handle.read(1024 * 1024), b''):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _persistent_artifact_cache_root(graph):
+    configured = str(os.environ.get('JUA_ARTIFACT_FACT_CACHE_DIR') or '').strip()
+    if configured:
+        return Path(configured)
+    graph_root = str(
+        getattr(graph, 'persistent_artifact_cache_dir', '') if graph is not None else ''
+    ).strip()
+    return Path(graph_root) if graph_root else None
+
+
+def _javap_tool_identity():
+    global _JAVAP_TOOL_IDENTITY
+    with _JAVAP_TOOL_IDENTITY_LOCK:
+        if _JAVAP_TOOL_IDENTITY is not None:
+            return _JAVAP_TOOL_IDENTITY
+        try:
+            stdout, stderr, returncode = run_cmd(['javap', '-version'], timeout=10)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            stdout, stderr, returncode = '', '', 1
+        version = str(stdout or stderr or '').strip().replace('\n', ' ')
+        executable = shutil.which('javap')
+        resolved_executable = str(Path(executable).resolve()) if executable else ''
+        _JAVAP_TOOL_IDENTITY = (
+            f'javap:{resolved_executable}:{version}'
+            if returncode == 0 and resolved_executable and version
+            else 'javap:unavailable'
+        )
+        return _JAVAP_TOOL_IDENTITY
+
+
+def _persistent_artifact_cache_identity(namespace, immutable_key, tool_identity):
+    return {
+        'schema': ARTIFACT_FACT_CACHE_SCHEMA,
+        'namespace': str(namespace or ''),
+        'immutable_key': list(immutable_key),
+        'tool_identity': str(tool_identity or ''),
+    }
+
+
+def _persistent_artifact_cache_path(root, identity):
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    ).encode('utf-8')
+    digest = hashlib.sha256(encoded).hexdigest()
+    return Path(root) / digest[:2] / f'{digest}.json', digest
+
+
+def _load_persistent_artifact_fact(graph, namespace, immutable_key, tool_identity):
+    root = _persistent_artifact_cache_root(graph)
+    if root is None:
+        return False, None
+    identity = _persistent_artifact_cache_identity(
+        namespace, immutable_key, tool_identity,
+    )
+    path, expected_key_digest = _persistent_artifact_cache_path(root, identity)
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        result = payload.get('result') if isinstance(payload, dict) else None
+        result_json = json.dumps(
+            result, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+        )
+        valid = bool(
+            isinstance(result, dict)
+            and payload.get('schema') == ARTIFACT_FACT_CACHE_SCHEMA
+            and payload.get('identity') == identity
+            and payload.get('key_digest') == expected_key_digest
+            and payload.get('result_sha256')
+            == hashlib.sha256(result_json.encode('utf-8')).hexdigest()
+        )
+        if valid:
+            _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_hits', 1)
+            return True, result
+        _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_invalid', 1)
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, TypeError):
+        _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_invalid', 1)
+    _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_misses', 1)
+    return False, None
+
+
+def _store_persistent_artifact_fact(
+    graph, namespace, immutable_key, tool_identity, result,
+):
+    root = _persistent_artifact_cache_root(graph)
+    if root is None or not isinstance(result, dict):
+        return False
+    identity = _persistent_artifact_cache_identity(
+        namespace, immutable_key, tool_identity,
+    )
+    path, key_digest = _persistent_artifact_cache_path(root, identity)
+    temporary_path = None
+    try:
+        result_json = json.dumps(
+            result, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+        )
+        payload = {
+            'schema': ARTIFACT_FACT_CACHE_SCHEMA,
+            'identity': identity,
+            'key_digest': key_digest,
+            'result_sha256': hashlib.sha256(result_json.encode('utf-8')).hexdigest(),
+            'result': result,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent),
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_writes', 1)
+        return True
+    except (OSError, TypeError, ValueError):
+        _perf_add(graph, 'bytecode_scan', 'persistent_artifact_cache_write_failures', 1)
+        return False
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _immutable_artifact_parse_cache_key(
@@ -2682,6 +2813,37 @@ def _load_immutable_artifact_parse(
         if not owns_parse:
             parse_event.wait()
             continue
+        persistent_enabled = _persistent_artifact_cache_root(graph) is not None
+        tool_identity = _javap_tool_identity() if persistent_enabled else ''
+        persistent_enabled = bool(
+            persistent_enabled and tool_identity != 'javap:unavailable'
+        )
+        if persistent_enabled:
+            persistent_hit, persistent_value = _load_persistent_artifact_fact(
+                graph,
+                'javap-runtime-references',
+                immutable_key,
+                tool_identity,
+            )
+        else:
+            persistent_hit, persistent_value = False, None
+        if persistent_hit:
+            serialized = json.dumps(
+                persistent_value,
+                sort_keys=True,
+                separators=(',', ':'),
+            )
+            with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+                inflight_key = (generation, immutable_key)
+                if (
+                    _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION == generation
+                    and _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.get(inflight_key) is parse_event
+                ):
+                    _IMMUTABLE_ARTIFACT_PARSE_CACHE[immutable_key] = serialized
+                    _IMMUTABLE_ARTIFACT_PARSE_INFLIGHT.pop(inflight_key, None)
+                    parse_event.set()
+            _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
+            return persistent_value
         _perf_add(graph, 'bytecode_scan', 'artifact_cache_misses', 1)
         parse_started_at = time.perf_counter()
         try:
@@ -2704,6 +2866,14 @@ def _load_immutable_artifact_parse(
             sort_keys=True,
             separators=(',', ':'),
         )
+        if persistent_enabled:
+            _store_persistent_artifact_fact(
+                graph,
+                'javap-runtime-references',
+                immutable_key,
+                tool_identity,
+                parsed,
+            )
         with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
             inflight_key = (generation, immutable_key)
             if (
@@ -2783,6 +2953,25 @@ def _load_direct_classfile_references(
         if isinstance(cached, str):
             _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
             return json.loads(cached)
+        tool_identity = (
+            f'inprocess-classfile:{ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION}:'
+            f'python-{sys.version_info.major}.{sys.version_info.minor}'
+        )
+        persistent_hit, persistent_value = _load_persistent_artifact_fact(
+            graph,
+            'classfile-executable-references',
+            cache_key,
+            tool_identity,
+        )
+        if persistent_hit:
+            serialized = json.dumps(
+                persistent_value, sort_keys=True, separators=(',', ':'),
+            )
+            with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+                if _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION == generation:
+                    _IMMUTABLE_ARTIFACT_PARSE_CACHE[cache_key] = serialized
+            _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
+            return persistent_value
 
     parse_started_at = time.perf_counter()
     direct_edges = None
@@ -2815,6 +3004,13 @@ def _load_direct_classfile_references(
     )
     if _valid_sha256(artifact_sha256):
         serialized = json.dumps(references, sort_keys=True, separators=(',', ':'))
+        _store_persistent_artifact_fact(
+            graph,
+            'classfile-executable-references',
+            cache_key,
+            tool_identity,
+            references,
+        )
         with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
             if _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION == generation:
                 _IMMUTABLE_ARTIFACT_PARSE_CACHE[cache_key] = serialized

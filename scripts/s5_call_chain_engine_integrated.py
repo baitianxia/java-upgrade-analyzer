@@ -1562,6 +1562,9 @@ def _step5_integrated_main_impl(args):
         ),
     )
     graph.report_dir = str(report_dir)
+    graph.persistent_artifact_cache_dir = str(
+        Path(report_dir) / '.runtime' / 'artifact_fact_cache'
+    )
 
     print(f"  方法数：{len(graph.methods_by_id)}", file=sys.stderr)
     print(f"  反向边数：{len(graph.reverse_edges)}", file=sys.stderr)

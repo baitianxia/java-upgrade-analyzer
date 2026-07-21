@@ -47,6 +47,7 @@ class GateResult:
 
 STEP5_TESTS = [
     "tests.test_step5_key_matching",
+    "tests.test_persistent_artifact_fact_cache",
     "tests.test_business_bytecode_graph",
     "tests.test_artifact_bytecode_catalog",
     "tests.test_indirect_usage_analyzer",
@@ -56,6 +57,7 @@ STEP5_TESTS = [
 
 CORE_SEMANTIC_TESTS = [
     "tests.test_artifact_bytecode_catalog",
+    "tests.test_persistent_artifact_fact_cache",
     "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_business_to_transitive_packaged_hit",
     "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_three_hop_packaged_hit",
     "tests.test_step5_key_matching.Step5KeyMatchingTest.test_runtime_dependency_bytecode_graph_connects_business_to_changed_field_hit",

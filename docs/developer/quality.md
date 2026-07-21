@@ -171,6 +171,8 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 
 oracle 使用进程内不可变缓存，key 必须同时包含最终制品 SHA-256、oracle procedure/version 和完整 JDK `javap` version。缓存值采用序列化快照，命中时返回独立副本；不同 SHA、procedure 或 JDK 之间禁止复用。只有已经穷举结束的扫描可以写缓存；超时或中断结果禁止缓存。
 
+Step5 报告运行还会在报告目录的 `.runtime/artifact_fact_cache` 中持久化已经成功解析的字节码事实。该缓存只替代重复的事实提取，不参与候选裁剪、边合并、深度预算或结论判断。缓存身份必须绑定制品 SHA-256、class entry、目标 JDK、解析 procedure/schema 和解析工具版本；内容另带结果摘要并在读取时完整校验。损坏、制品替换、工具升级、schema 变化、读取失败或写入失败都必须回退到原始解析路径，失败或不完整的解析结果不得落盘。写入采用同目录临时文件、`fsync` 和原子替换，保证并发读者不会看到半写入内容。
+
 每个真实项目 case 必须配置 `max_oracle_seconds`，默认预算为 120 秒。超过预算或收到中断时，oracle 必须终止在途 `javap`、禁止 traceback、标记结果不完整，并同时输出 blocking `oracle_incomplete` 和 `performance_regression`。禁止为了满足预算减少 class、edge 或 failure 范围。
 
 runner 的 `performance_envelope` 至少保留以下 oracle 指标：
