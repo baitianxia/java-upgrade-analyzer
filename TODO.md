@@ -5,7 +5,7 @@
 状态快照日期：2026-07-21。完整原则和移交上下文见
 [`docs/developer/handoff.md`](docs/developer/handoff.md)。
 
-当前共 12 项：已完成 0、正在执行 0、待执行 12、阻塞 0、失败 0。
+当前共 11 项：已完成 0、正在执行 0、待执行 11、阻塞 0、失败 0。
 所有条目的交付验证状态均为未验证。优先级含义：P0 为可能影响结论正确性或发布判断，P1 为性能、容量或测试门禁，P2 为维护与移交治理。
 
 ## 性能专项建议
@@ -53,7 +53,7 @@
 
 ## 3. 建立当前 HEAD 的新鲜质量基线
 
-- 优先级：P0。执行状态：待执行，依赖第 2、12 项。验证状态：未验证。
+- 优先级：P0。执行状态：待执行，依赖第 2 项。验证状态：未验证。
 - 已核实事实：在 `d064f61` 上执行 quick 时，语法检查、Oracle 独立性、核心确定性、核心准确性基准和 21 项核心语义测试通过；`smoke_core` 因 Python 3.14/tree-sitter 环境不兼容失败，整轮约 31.9 秒。
 - 无法确认：当前 HEAD 是否通过 Step5、完整 release 和最新真实项目守护矩阵；历史提交上的通过记录不能替代当前证据。
 - 待办：环境收敛后依次运行 quick、Step5、Smoke、release，并用 `--include-real --real-case guard` 明确加入完整守护矩阵；保存 JSON、质量信号审计、复盘和 capability closure。
@@ -115,15 +115,7 @@
 - 待办：建立按 capability family 的测试清单和自动发现；对规范化、重载匹配、图路径、去重、状态单调性使用 property-based/metamorphic tests；扩大 mutation testing，并把未杀死变异、分支覆盖缺口和 flaky/时长排行纳入门禁。
 - 验收：核心结论模块有分支覆盖门槛而非只看行覆盖；每个线上缺陷都有广义正例、负例、边界例和至少一个可杀死变异；测试可分片且 quick 的范围由声明式标签生成。
 
-## 11. 修正质量门禁决策语义并扩大 CI 守护范围
-
-- 优先级：P0。执行状态：待执行。验证状态：未验证。
-- 已核实事实：所有 profile 默认省略真实项目；只要已计划的本地任务通过，JSON 就输出 `decision=release_allowed`。当真实项目任务完全未加入计划时，`real_project_skipped` 仍可能为 0，无法区分“未执行”和“执行且无 infra skip”。
-- 已核实事实：定时 release workflow 显式包含真实项目，但只运行 `commons-text`，而 `real_project_regression.py --case guard` 可选择多个带 fixture manifest 的守护项目。
-- 待办：把结果拆成 `local_regression_status`、`real_project_scope/status`、`release_decision`；非 release profile 或真实项目省略时使用 `not_evaluated`，不得输出允许发布；在 PR、主干、定时任务之间明确 quick/Step5/完整 guard 的分层和平台矩阵。
-- 验收：dry-run、成功、失败、显式跳过、任务未计划和 infra skip 均有契约测试；只有固定依赖、完整必需 profile、声明的真实项目范围和质量审计全部通过时才允许发布。
-
-## 12. 确认历史压缩包的归属与去向
+## 11. 确认历史压缩包的归属与去向
 
 - 优先级：P2。执行状态：待执行。验证状态：未验证。
 - 已核实事实：移交文档编写时曾记录两个旧版完整打包快照；当前 `main` 工作区干净，仓库目录内已不存在这两个 ZIP。

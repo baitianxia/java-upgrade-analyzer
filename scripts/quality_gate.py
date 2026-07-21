@@ -64,6 +64,7 @@ CORE_SEMANTIC_TESTS = [
 ]
 
 REQUIRED_TOOLS = ("git", "java", "javac", "javap", "jdeps", "mvn")
+RELEASE_REAL_PROJECT_SCOPES = frozenset({"guard", "all"})
 
 
 def validate_required_tools(names=REQUIRED_TOOLS):
@@ -170,6 +171,7 @@ def _quality_signal_audit_task(python_exe, real_json, audit_json):
             python_exe,
             "scripts/quality_signal_audit.py",
             real_json,
+            "--fail-on-blocking",
             "--json-out",
             audit_json,
         ],
@@ -461,7 +463,12 @@ def _write_json(path, payload):
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _read_audit_summary(tasks):
+def _read_audit_summary(tasks, results=None):
+    if results is not None:
+        result_by_name = {result.name: result for result in results}
+        audit_result = result_by_name.get("quality_signal_audit")
+        if audit_result is None or audit_result.status != "passed":
+            return {}
     for task in tasks:
         if task.name != "quality_signal_audit":
             continue
@@ -496,6 +503,81 @@ def _execute_tasks(tasks, env, continue_on_failure=False):
             overall = "failed"
             failure_seen = True
     return results, overall
+
+
+def _task_group_status(tasks, results, *, real_project):
+    planned = [task for task in tasks if task.real_project is real_project]
+    if not planned:
+        return "not_evaluated"
+    result_by_name = {result.name: result for result in results}
+    observed = [result_by_name.get(task.name) for task in planned]
+    if any(result is not None and result.status != "passed" for result in observed):
+        return "failed"
+    if any(result is None for result in observed):
+        return "not_evaluated"
+    return "passed"
+
+
+def build_gate_decision_summary(
+    profile,
+    tasks,
+    results,
+    *,
+    real_scope_mode,
+    real_case,
+    audit_summary=None,
+    dry_run=False,
+):
+    """Build the release contract without conflating regression success with approval."""
+    audit_summary = audit_summary if isinstance(audit_summary, dict) else {}
+    real_tasks = [task for task in tasks if task.real_project]
+    real_scope = {
+        "mode": real_scope_mode,
+        "selector": real_case if real_scope_mode == "included" else "",
+        "planned_task_count": len(real_tasks),
+        "release_required_selectors": sorted(RELEASE_REAL_PROJECT_SCOPES),
+    }
+    if dry_run:
+        local_status = "not_evaluated"
+        real_status = "skipped" if real_scope_mode == "explicitly_skipped" else "not_evaluated"
+    else:
+        local_status = _task_group_status(tasks, results, real_project=False)
+        if real_scope_mode == "explicitly_skipped":
+            real_status = "skipped"
+        elif real_scope_mode != "included":
+            real_status = "not_evaluated"
+        else:
+            real_status = _task_group_status(tasks, results, real_project=True)
+
+    infra_skips = int((audit_summary.get("by_type") or {}).get("infra_skip") or 0)
+    blocking_signals = int(audit_summary.get("blocking_signals") or 0)
+    fixture_debt = int(audit_summary.get("fixture_debt") or 0)
+    if real_scope_mode == "included" and infra_skips:
+        real_status = "skipped"
+
+    release_decision = "not_evaluated"
+    if not dry_run and profile == "release" and real_scope_mode == "included":
+        audit_complete = bool(audit_summary) and "blocking_signals" in audit_summary
+        release_decision = (
+            "release_allowed"
+            if (
+                local_status == "passed"
+                and real_status == "passed"
+                and real_case in RELEASE_REAL_PROJECT_SCOPES
+                and audit_complete
+                and blocking_signals == 0
+                and fixture_debt == 0
+                and infra_skips == 0
+            )
+            else "release_blocked"
+        )
+
+    return {
+        "local_regression_status": local_status,
+        "real_project_scope": real_scope,
+        "real_project_status": real_status,
+        "release_decision": release_decision,
+    }
 
 
 def ensure_round_input_files(tasks):
@@ -538,7 +620,7 @@ def main(argv=None):
         action="store_true",
         help="Skip the real project regression matrix (default)",
     )
-    parser.set_defaults(skip_real=True)
+    parser.set_defaults(skip_real=None)
     parser.add_argument(
         "--real-case", default="guard",
         help="real_project_regression.py selector; default: guard (reproducible guardian matrix)",
@@ -549,10 +631,16 @@ def main(argv=None):
     parser.add_argument("--json-out", default="", help="Write structured gate results to JSON")
     args = parser.parse_args(argv)
 
+    skip_real = args.skip_real is not False
+    real_scope_mode = (
+        "included"
+        if args.skip_real is False
+        else ("explicitly_skipped" if args.skip_real is True else "not_planned")
+    )
     tasks = build_plan(
         args.profile,
         python_exe=args.python,
-        skip_real=args.skip_real,
+        skip_real=skip_real,
         real_case=args.real_case,
         report_root=args.report_root,
     )
@@ -563,6 +651,15 @@ def main(argv=None):
             "dry_run": True,
             "tasks": [asdict(task) for task in tasks],
         }
+        payload.update(build_gate_decision_summary(
+            args.profile,
+            tasks,
+            [],
+            real_scope_mode=real_scope_mode,
+            real_case=args.real_case,
+            dry_run=True,
+        ))
+        payload["decision"] = payload["release_decision"]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         _write_json(args.json_out, payload)
         return 0
@@ -574,11 +671,19 @@ def main(argv=None):
         tasks, env=env, continue_on_failure=args.continue_on_failure
     )
 
-    audit_summary = _read_audit_summary(tasks)
+    audit_summary = _read_audit_summary(tasks, results)
+    decision_summary = build_gate_decision_summary(
+        args.profile,
+        tasks,
+        results,
+        real_scope_mode=real_scope_mode,
+        real_case=args.real_case,
+        audit_summary=audit_summary,
+    )
     payload = {
         "profile": args.profile,
         "status": overall,
-        "decision": "release_blocked" if overall == "failed" else "release_allowed",
+        "decision": decision_summary["release_decision"],
         "elapsed_sec": round(time.perf_counter() - started, 3),
         "blocking_signals": int(audit_summary.get("blocking_signals") or 0),
         "non_blocking_signals": int(audit_summary.get("non_blocking_signals") or 0),
@@ -587,9 +692,13 @@ def main(argv=None):
         "results": [asdict(result) for result in results],
         "skipped_tasks": [asdict(task) for task in tasks[len(results):]],
     }
+    payload.update(decision_summary)
     _write_json(args.json_out, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0 if overall == "passed" else 1
+    return 0 if (
+        overall == "passed"
+        and decision_summary["release_decision"] != "release_blocked"
+    ) else 1
 
 
 if __name__ == "__main__":

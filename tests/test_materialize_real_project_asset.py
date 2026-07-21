@@ -67,6 +67,65 @@ class MaterializeRealProjectAssetTest(unittest.TestCase):
 
         self.assertEqual(returncode, 2)
 
+    def test_declared_source_plan_builds_at_guard_checkout_root(self):
+        manifest = {
+            "case": "guide",
+            "repository": "example/guide",
+            "checkout_root": "/private/tmp/guide/complete",
+            "git_revision": "a" * 40,
+            "artifact_path": "target/app.jar",
+            "artifact_sha256": "b" * 64,
+            "materialization": {
+                "kind": "source_build",
+                "repository_url": "https://github.com/example/guide.git",
+                "working_directory": "complete",
+                "command": ["mvn", "package"],
+                "artifact_path": "target/app.jar",
+            },
+        }
+
+        plan = materializer.build_declared_materialization_plan(manifest)
+
+        self.assertEqual(plan[0]["argv"][-1], "/private/tmp/guide")
+        self.assertEqual(plan[2]["cwd"], "/private/tmp/guide/complete")
+        self.assertEqual(plan[3]["path"], "/private/tmp/guide/complete/target/app.jar")
+        self.assertEqual(plan[3]["sha256"], "b" * 64)
+
+    def test_declared_published_plan_clones_source_and_downloads_exact_artifact(self):
+        manifest = {
+            "case": "published",
+            "repository": "example/project",
+            "checkout_root": "/private/tmp/project",
+            "git_revision": "a" * 40,
+            "artifact_path": "/private/tmp/project.jar",
+            "materialization": {
+                "kind": "published_artifact",
+                "url": "https://repo.example/project.jar",
+                "sha1": "b" * 40,
+                "sha256": "c" * 64,
+            },
+        }
+
+        plan = materializer.build_declared_materialization_plan(manifest)
+
+        self.assertEqual(
+            [step["operation"] for step in plan],
+            ["git_clone", "command", "download", "verify"],
+        )
+        self.assertEqual(plan[0]["argv"][3], "https://github.com/example/project.git")
+        self.assertEqual(plan[2]["destination"], "/private/tmp/project.jar")
+
+    def test_guard_selector_matches_every_executable_guard_case(self):
+        selected = materializer.select_guard_manifests()
+        expected = sorted({
+            Path(case.fixture_manifest)
+            for case in materializer.CASES.values()
+            if case.case_mode == "guard" and case.fixture_manifest is not None
+        })
+
+        self.assertEqual(selected, expected)
+        self.assertGreater(len(selected), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

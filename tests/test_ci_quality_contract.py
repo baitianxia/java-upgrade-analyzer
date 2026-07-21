@@ -45,7 +45,26 @@ class CiQualityContractTest(unittest.TestCase):
         self.assertIn("--continue-on-failure", text)
         self.assertIn("--json-out", text)
         self.assertIn("materialize_real_project_asset.py", text)
-        self.assertIn("--real-case commons-text", text)
+        self.assertIn("--selector guard --declared-locations", text)
+        self.assertIn("--real-case guard", text)
+        self.assertNotIn("--real-case commons-text", text)
+
+    def test_ci_layers_quick_on_pr_step5_on_main_and_full_guard_on_schedule(self):
+        smoke = (ROOT / ".github/workflows/smoke-regression.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (ROOT / ".github/workflows/release-regression.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("pull_request:", smoke)
+        self.assertIn("quick-regression:", smoke)
+        self.assertIn("--profile quick", smoke)
+        self.assertIn("github.ref == 'refs/heads/main'", smoke)
+        self.assertIn("--profile step5", smoke)
+        self.assertIn("schedule:", release)
+        self.assertIn("--profile release", release)
+        self.assertIn("--include-real --real-case guard", release)
 
     def test_release_workflow_runs_artifact_matrix_on_multiple_jdks(self):
         text = (ROOT / ".github/workflows/release-regression.yml").read_text(
@@ -57,6 +76,17 @@ class CiQualityContractTest(unittest.TestCase):
         self.assertIn("java-version: ${{ matrix.java }}", text)
         self.assertIn("tests.test_runtime_topology_matrix", text)
         self.assertIn("tests.test_artifact_bytecode_catalog", text)
+
+    def test_platform_contract_covers_pr_and_main_on_supported_os_jdk_matrix(self):
+        text = (ROOT / ".github/workflows/platform-contract.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("pull_request:", text)
+        self.assertIn('- "main"', text)
+        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", text)
+        self.assertIn('java: ["11", "17", "21"]', text)
+        self.assertIn("python-version: \"3.12\"", text)
 
     def test_required_tools_report_every_missing_executable(self):
         with patch.object(quality_gate.shutil, "which", return_value=None):

@@ -30,6 +30,15 @@
 所有 profile 默认只运行可复现的本地回归，不自动启动真实项目矩阵。只有明确需要真实项目证据时，
 才使用 `--include-real` 显式加入；`--skip-real` 保留为兼容写法。
 
+结构化结果把“回归执行成功”和“允许发布”严格分开：
+
+- `local_regression_status` 表示当前 profile 的本地任务是否完整通过；
+- `real_project_scope.mode` 区分未计划、显式跳过和已加入，`selector` 记录真实项目范围；
+- `real_project_status` 区分通过、失败、显式跳过和未评估；
+- `release_decision` 只有在 `release` profile、本地任务、完整 `guard`（或其超集 `all`）、质量信号审计全部通过，且没有 infra skip、阻塞信号或 fixture debt 时才会是 `release_allowed`。其他 profile 或未加入真实项目时为 `not_evaluated`。
+
+CI 分层为：PR 运行 quick，主干 push 增加 Step5，定时/手工 release 物化全部 SHA 固定的 guard 并运行完整发布门禁；平台契约在 Linux、macOS、Windows 与 JDK 11/17/21 矩阵上运行。
+
 快速检查：
 
 ```bash

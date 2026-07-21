@@ -39,10 +39,31 @@ class QualityGateTest(unittest.TestCase):
 
         self.assertEqual(default.returncode, 0, default.stderr)
         self.assertEqual(included.returncode, 0, included.stderr)
-        default_tasks = json.loads(default.stdout)["tasks"]
-        included_tasks = json.loads(included.stdout)["tasks"]
+        default_payload = json.loads(default.stdout)
+        included_payload = json.loads(included.stdout)
+        default_tasks = default_payload["tasks"]
+        included_tasks = included_payload["tasks"]
         self.assertFalse(any(task["real_project"] for task in default_tasks))
         self.assertTrue(any(task["real_project"] for task in included_tasks))
+        self.assertEqual(default_payload["real_project_scope"]["mode"], "not_planned")
+        self.assertEqual(included_payload["real_project_scope"]["mode"], "included")
+        self.assertEqual(default_payload["release_decision"], "not_evaluated")
+        self.assertEqual(included_payload["release_decision"], "not_evaluated")
+
+    def test_cli_distinguishes_explicit_real_project_skip(self):
+        import subprocess
+
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "quality_gate.py"),
+             "--profile", "release", "--skip-real", "--dry-run"],
+            cwd=str(ROOT), capture_output=True, text=True,
+        )
+        payload = json.loads(completed.stdout)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(payload["real_project_scope"]["mode"], "explicitly_skipped")
+        self.assertEqual(payload["real_project_status"], "skipped")
+        self.assertEqual(payload["release_decision"], "not_evaluated")
 
     def test_quick_and_release_profiles_require_oracle_independence(self):
         for profile in ("quick", "release"):
@@ -213,6 +234,20 @@ class QualityGateTest(unittest.TestCase):
 
             self.assertFalse(stale.exists())
 
+    def test_unexecuted_audit_cannot_reuse_stale_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_json = Path(tmp) / "audit.json"
+            audit_json.write_text(json.dumps({
+                "summary": {"blocking_signals": 0, "by_type": {}},
+            }), encoding="utf-8")
+            task = quality_gate._quality_signal_audit_task(
+                "python3", str(Path(tmp) / "real.json"), str(audit_json)
+            )
+
+            summary = quality_gate._read_audit_summary([task], results=[])
+
+        self.assertEqual(summary, {})
+
     def test_release_plan_runs_signal_audit_after_real_project_matrix(self):
         tasks = quality_gate.build_plan(
             "release",
@@ -227,7 +262,7 @@ class QualityGateTest(unittest.TestCase):
         self.assertIn("quality_signal_audit", names)
         self.assertGreater(names.index("quality_signal_audit"), names.index("real_project_all"))
         audit = next(task for task in tasks if task.name == "quality_signal_audit")
-        self.assertNotIn("--fail-on-blocking", audit.command)
+        self.assertIn("--fail-on-blocking", audit.command)
         self.assertTrue(audit.run_after_failure)
 
         self.assertIn("test_round_retrospective", names)
@@ -317,6 +352,129 @@ class QualityGateTest(unittest.TestCase):
             ["real", "audit", "retro", "closure"],
         )
         self.assertEqual(overall, "failed")
+
+    def test_release_decision_requires_complete_guard_and_clean_audit(self):
+        tasks = quality_gate.build_plan("release", skip_real=False, real_case="guard")
+        results = [
+            quality_gate.GateResult(task.name, task.command, "passed")
+            for task in tasks
+        ]
+        summary = quality_gate.build_gate_decision_summary(
+            "release", tasks, results,
+            real_scope_mode="included", real_case="guard",
+            audit_summary={
+                "blocking_signals": 0,
+                "non_blocking_signals": 1,
+                "fixture_debt": 0,
+                "by_type": {},
+            },
+        )
+
+        self.assertEqual(summary["local_regression_status"], "passed")
+        self.assertEqual(summary["real_project_status"], "passed")
+        self.assertEqual(summary["release_decision"], "release_allowed")
+
+    def test_release_decision_blocks_narrow_failed_or_infra_skipped_runs(self):
+        tasks = quality_gate.build_plan("release", skip_real=False, real_case="commons-text")
+        passed = [quality_gate.GateResult(task.name, task.command, "passed") for task in tasks]
+
+        narrow = quality_gate.build_gate_decision_summary(
+            "release", tasks, passed,
+            real_scope_mode="included", real_case="commons-text",
+            audit_summary={"blocking_signals": 0, "fixture_debt": 0, "by_type": {}},
+        )
+        infra_skipped = quality_gate.build_gate_decision_summary(
+            "release", tasks, passed,
+            real_scope_mode="included", real_case="guard",
+            audit_summary={
+                "blocking_signals": 1,
+                "fixture_debt": 0,
+                "by_type": {"infra_skip": 1},
+            },
+        )
+        failed = list(passed)
+        failed[0] = quality_gate.GateResult(
+            tasks[0].name, tasks[0].command, "failed", returncode=1
+        )
+        local_failed = quality_gate.build_gate_decision_summary(
+            "release", tasks, failed,
+            real_scope_mode="included", real_case="guard",
+            audit_summary={"blocking_signals": 0, "fixture_debt": 0, "by_type": {}},
+        )
+        real_failed_results = list(passed)
+        real_index = next(index for index, task in enumerate(tasks) if task.real_project)
+        real_failed_results[real_index] = quality_gate.GateResult(
+            tasks[real_index].name, tasks[real_index].command, "failed", returncode=1
+        )
+        real_failed = quality_gate.build_gate_decision_summary(
+            "release", tasks, real_failed_results,
+            real_scope_mode="included", real_case="guard",
+            audit_summary={"blocking_signals": 0, "fixture_debt": 0, "by_type": {}},
+        )
+
+        self.assertEqual(narrow["release_decision"], "release_blocked")
+        self.assertEqual(infra_skipped["real_project_status"], "skipped")
+        self.assertEqual(infra_skipped["release_decision"], "release_blocked")
+        self.assertEqual(local_failed["local_regression_status"], "failed")
+        self.assertEqual(local_failed["release_decision"], "release_blocked")
+        self.assertEqual(real_failed["real_project_status"], "failed")
+        self.assertEqual(real_failed["release_decision"], "release_blocked")
+
+    def test_release_decision_blocks_when_planned_tasks_or_audit_are_missing(self):
+        tasks = quality_gate.build_plan("release", skip_real=False, real_case="guard")
+        partial_results = [
+            quality_gate.GateResult(task.name, task.command, "passed")
+            for task in tasks[:-1]
+        ]
+
+        summary = quality_gate.build_gate_decision_summary(
+            "release", tasks, partial_results,
+            real_scope_mode="included", real_case="guard", audit_summary={},
+        )
+
+        self.assertEqual(summary["local_regression_status"], "not_evaluated")
+        self.assertEqual(summary["release_decision"], "release_blocked")
+
+    def test_successful_non_release_profile_never_allows_release(self):
+        tasks = quality_gate.build_plan("quick", skip_real=True)
+        results = [quality_gate.GateResult(task.name, task.command, "passed") for task in tasks]
+
+        summary = quality_gate.build_gate_decision_summary(
+            "quick", tasks, results,
+            real_scope_mode="not_planned", real_case="guard", audit_summary={},
+        )
+
+        self.assertEqual(summary["local_regression_status"], "passed")
+        self.assertEqual(summary["real_project_status"], "not_evaluated")
+        self.assertEqual(summary["release_decision"], "not_evaluated")
+
+    def test_release_cli_fails_when_requested_scope_cannot_allow_release(self):
+        def all_pass(tasks, env=None, continue_on_failure=False):
+            return ([
+                quality_gate.GateResult(task.name, task.command, "passed")
+                for task in tasks
+            ], "passed")
+
+        clean_audit = {
+            "blocking_signals": 0,
+            "non_blocking_signals": 0,
+            "fixture_debt": 0,
+            "by_type": {},
+        }
+        with patch.object(quality_gate, "_execute_tasks", side_effect=all_pass), \
+                patch.object(quality_gate, "_read_audit_summary", return_value=clean_audit), \
+                patch.object(quality_gate, "ensure_round_input_files"), \
+                patch("builtins.print"):
+            narrow_returncode = quality_gate.main([
+                "--profile", "release", "--include-real",
+                "--real-case", "commons-text",
+            ])
+            guard_returncode = quality_gate.main([
+                "--profile", "release", "--include-real", "--real-case", "guard",
+            ])
+
+        self.assertEqual(narrow_returncode, 1)
+        self.assertEqual(guard_returncode, 0)
 
 
 if __name__ == "__main__":
