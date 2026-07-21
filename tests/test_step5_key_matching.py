@@ -7379,6 +7379,104 @@ public class com.example.TargetBridge {
         self.assertIn("com.biz.Entry.handle", result.call_paths[0])
         self.assertIn("com.lib.TargetType", result.call_paths[0])
 
+    def test_trace_api_keeps_all_distinct_direct_class_usage_entries_in_stable_order(self):
+        api_row = {
+            "api_name": "com.lib.TargetType",
+            "api_simple": "TargetType",
+            "api_signature": "",
+            "symbol_kind": "class",
+            "change_type": "REMOVED",
+            "coord": "lib:demo",
+            "severity": "P1",
+            "confirmed": "false",
+            "source": "candidate_scan",
+            "analysis_scope": "class_usage",
+            "matched_class": "com.lib.TargetType",
+        }
+
+        def method(symbol_id, qualified_key, line, *, is_test=False):
+            class_name = qualified_key.rsplit(".", 2)[-2]
+            return SimpleNamespace(
+                symbol_id=symbol_id,
+                qualified_key=qualified_key,
+                class_fqcn=qualified_key.rsplit(".", 1)[0],
+                method_name=qualified_key.rsplit(".", 1)[-1],
+                return_type="void",
+                file=f"/repo/{class_name.lower()}-app/src/main/java/com/biz/{class_name}.java",
+                line=line,
+                owner_type="business",
+                is_test=is_test,
+                param_types={},
+                field_types={},
+                local_var_types={"target": "com.lib.TargetType"},
+                imports={},
+                wildcard_imports=[],
+                get_body_text=lambda: "",
+            )
+
+        second = method("second", "com.biz.Second.handle", 20)
+        first = method("first", "com.biz.First.handle", 10)
+        duplicate_first = method("first-alias", "com.biz.First.handle", 10)
+        test_entry = method("test", "com.biz.TargetTypeTest.handle", 30, is_test=True)
+        graph = SimpleNamespace(
+            methods_by_id={
+                "second": second,
+                "test": test_entry,
+                "first-alias": duplicate_first,
+                "first": first,
+            },
+            reverse_edges={},
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(
+            api_row, graph, {}, max_total_cost=5
+        )
+
+        self.assertEqual(result.analysis_status, "reachable")
+        self.assertEqual(result.reason_code, "DIRECT_CLASS_USAGE")
+        self.assertEqual(result.direct_callers, 2)
+        self.assertEqual(result.call_paths, [
+            "com.biz.First.handle -> com.lib.TargetType",
+            "com.biz.Second.handle -> com.lib.TargetType",
+        ])
+        self.assertEqual(len(result.evidence_paths), 2)
+        self.assertEqual(len(result.path_details), 2)
+        self.assertEqual(
+            [detail["business_entry"] for detail in result.path_details],
+            ["com.biz.First.handle", "com.biz.Second.handle"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "call_chain"
+            formatter.generate_enhanced_summary([result], output_dir)
+            output = output_dir / "alerts.csv"
+            with output.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            by_api_path = output_dir / "by_api" / (
+                formatter.build_by_api_safe_filename(result) + ".txt"
+            )
+            by_api_text = by_api_path.read_text(encoding="utf-8")
+            first_module = json.loads(
+                (output_dir / "by_module" / "first-app_impacts.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            second_module = json.loads(
+                (output_dir / "by_module" / "second-app_impacts.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {(row["consumer_class"], row["consumer_method"]) for row in rows},
+            {("com.biz.First", "handle"), ("com.biz.Second", "handle")},
+        )
+        self.assertIn("com.biz.First.handle -> com.lib.TargetType", by_api_text)
+        self.assertIn("com.biz.Second.handle -> com.lib.TargetType", by_api_text)
+        self.assertEqual(len(first_module["impacts"]), 1)
+        self.assertEqual(len(second_module["impacts"]), 1)
+
     def test_trace_api_does_not_treat_fqcn_string_as_direct_class_usage(self):
         api_row = {
             "api_name": "com.lib.OptionalType",

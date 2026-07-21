@@ -1220,44 +1220,43 @@ def _iter_business_methods(graph):
             yield method_def
 
 
-def _build_direct_usage_result(result, method_def, reason_code, note, evidence_type, display_target):
-    caller_name = getattr(method_def, 'qualified_key', '') or getattr(method_def, 'symbol_id', '')
-    result.call_paths = [f"{caller_name} -> {display_target}"]
-    result.evidence_paths = [[
-        {
-            'caller_symbol': caller_name,
-            'callee_key': display_target,
-            'evidence_type': evidence_type,
-            'confidence': 'high',
-            'file': getattr(method_def, 'file', ''),
-            'line': getattr(method_def, 'line', 0),
-        }
-    ]]
-    return _apply_evidence_decision(result, paths=(ReachabilityPath(
-        path_text=result.call_paths[0],
-        entry_scope=ModuleScope.BUSINESS_CLASSES,
-        complete=True,
-        reason_code=reason_code,
-        note=note,
-        depth=1,
-    ),))
+def _direct_usage_match_sort_key(match):
+    method_def, evidence_type = match
+    evidence_rank = {
+        'declared_type': 0,
+        'imported_type': 1,
+        'body_reference': 2,
+        'static_import': 0,
+        'field_access': 1,
+    }
+    return (
+        getattr(method_def, 'qualified_key', '') or getattr(method_def, 'symbol_id', ''),
+        getattr(method_def, 'file', ''),
+        getattr(method_def, 'line', 0),
+        evidence_rank.get(evidence_type, 9),
+        evidence_type,
+    )
 
 
-def _build_direct_usage_results(result, matches, reason_code, note, display_target):
+def _normalize_direct_usage_matches(matches):
     unique_matches = []
     seen = set()
-    for method_def, evidence_type in matches or []:
+    for method_def, evidence_type in sorted(matches or [], key=_direct_usage_match_sort_key):
         caller_name = getattr(method_def, 'qualified_key', '') or getattr(method_def, 'symbol_id', '')
         identity = (
             caller_name,
-            evidence_type,
             getattr(method_def, 'file', ''),
             getattr(method_def, 'line', 0),
         )
         if not caller_name or identity in seen:
             continue
         seen.add(identity)
-        unique_matches.append((method_def, evidence_type, caller_name))
+        unique_matches.append((method_def, evidence_type))
+    return unique_matches
+
+
+def _build_direct_usage_results(result, matches, reason_code, note, display_target):
+    unique_matches = _normalize_direct_usage_matches(matches)
 
     if not unique_matches:
         return result
@@ -1266,7 +1265,8 @@ def _build_direct_usage_results(result, matches, reason_code, note, display_targ
     result.evidence_paths = []
     result.path_details = []
 
-    for method_def, evidence_type, caller_name in unique_matches:
+    for method_def, evidence_type in unique_matches:
+        caller_name = getattr(method_def, 'qualified_key', '') or getattr(method_def, 'symbol_id', '')
         path_text = f"{caller_name} -> {display_target}"
         evidence = [{
             'caller_symbol': caller_name,
@@ -1308,15 +1308,15 @@ def _build_direct_usage_results(result, matches, reason_code, note, display_targ
     ))
 
 
-def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
+def _find_direct_business_class_usages(api_row, graph, trace_cache=None):
     target_class = str(api_row.get('matched_class') or api_row.get('api_name') or '').strip()
     if not target_class:
-        return None
+        return []
     trace_cache = ensure_trace_cache(trace_cache)
     cache = trace_cache['direct_business_class_usage']
     if target_class in cache:
         _perf_add(graph, 'trace', 'direct_class_usage_cache_hits', 1)
-        return cache[target_class]
+        return list(cache[target_class] or [])
     _perf_add(graph, 'trace', 'direct_class_usage_cache_misses', 1)
     started_at = time.perf_counter()
     scanned_methods = 0
@@ -1328,6 +1328,7 @@ def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
         re.compile(r'\(\s*' + re.escape(simple_name) + r'\s*\)'),
     ]
     fqcn_pattern = re.compile(re.escape(target_class))
+    matches = []
     for method_def in _iter_business_methods(graph):
         scanned_methods += 1
         declared_types = (
@@ -1337,11 +1338,8 @@ def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
             + list((getattr(method_def, 'local_var_types', {}) or {}).values())
         )
         if target_class in declared_types:
-            cache[target_class] = (method_def, 'declared_type')
-            _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
-            _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
-            _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
-            return cache[target_class]
+            matches.append((method_def, 'declared_type'))
+            continue
         imports = getattr(method_def, 'imports', {}) or {}
         wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
         body_text = getattr(method_def, 'get_body_text', lambda: '')() or ''
@@ -1351,22 +1349,21 @@ def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
         if (import_matches_target or wildcard_matches_target) and any(
             pattern.search(code_text) for pattern in simple_name_patterns
         ):
-            cache[target_class] = (method_def, 'imported_type')
-            _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
-            _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
-            _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
-            return cache[target_class]
+            matches.append((method_def, 'imported_type'))
+            continue
         if fqcn_pattern.search(code_text):
-            cache[target_class] = (method_def, 'body_reference')
-            _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
-            _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
-            _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
-            return cache[target_class]
-    cache[target_class] = None
+            matches.append((method_def, 'body_reference'))
+    matches = _normalize_direct_usage_matches(matches)
+    cache[target_class] = tuple(matches)
     _perf_add(graph, 'trace', 'direct_class_usage_scanned_methods', scanned_methods)
     _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
     _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
-    return None
+    return matches
+
+
+def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
+    usages = _find_direct_business_class_usages(api_row, graph, trace_cache=trace_cache)
+    return usages[0] if usages else None
 
 
 def _find_direct_business_field_usages(api_row, graph, trace_cache=None):
@@ -1412,6 +1409,7 @@ def _find_direct_business_field_usages(api_row, graph, trace_cache=None):
                 f"{pkg}.{owner_simple}" == owner_class for pkg in wildcard_imports
             ) or (package_name and f"{package_name}.{owner_simple}" == owner_class):
                 matches.append((method_def, 'field_access'))
+    matches = _normalize_direct_usage_matches(matches)
     cache[cache_key] = tuple(matches)
     _perf_add(graph, 'trace', 'direct_field_usage_scanned_methods', scanned_methods)
     _perf_add(graph, 'trace', 'direct_field_usage_elapsed_sec', time.perf_counter() - started_at)
@@ -1429,21 +1427,18 @@ def _try_build_direct_usage_result(api_row, result, graph, trace_cache=None):
         return None
 
     trace_cache = ensure_trace_cache(trace_cache)
-    matched = None
     symbol_kind = str(result.symbol_kind or '').strip()
     analysis_scope = str(result.analysis_scope or '').strip()
 
     if analysis_scope == 'class_usage' or symbol_kind == 'class':
-        matched = _find_direct_business_class_usage(api_row, graph, trace_cache=trace_cache)
-        if matched:
-            method_def, evidence_type = matched
+        matches = _find_direct_business_class_usages(api_row, graph, trace_cache=trace_cache)
+        if matches:
             note = '已在系统源码中找到目标类型的直接使用证据'
-            return _build_direct_usage_result(
+            return _build_direct_usage_results(
                 result,
-                method_def,
+                matches,
                 'DIRECT_CLASS_USAGE',
                 note,
-                evidence_type,
                 str(api_row.get('matched_class') or api_row.get('api_name') or '').strip(),
             )
 
