@@ -250,6 +250,11 @@ Step5 结构化统计同时给出 `analyzer_edge_count`、`duplicate_edge_count`
 - 如果一条长链路已经包含短后缀链路，可抑制同一命中的纯后缀重复行；
 - 同一消费方法内的重复命中会合并，并通过 `path_occurrence_count` 标记次数。
 
+当 `stop_reason=DEPTH_LIMIT_REACHED` 时，`coverage_details` 会明确列出本次实际使用的
+预算、被截断的目标 key 和深度截断候选总数。该行属于覆盖未完成信号，不能解读为
+“静态分析未发现使用”或“确认不受影响”。完整结构化值同时保留在 `summary.json` 和
+`by_api` JSON 的 `path_details` 中。
+
 ### alerts 拆分文件
 
 当 `alerts.csv` 太大时，Step5 会生成按状态拆分的阅读文件：

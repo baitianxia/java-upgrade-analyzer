@@ -40,6 +40,12 @@ Step5 当前不是单一源码扫描，而是多证据融合。
 | framework adapters | 补充 SPI、Spring、MyBatis、动态代理、运行时主动入口等隐式边 |
 | indirect usage analyzer | 识别反射、MethodHandle、资源、表达式语言等候选 |
 
+Java 类级使用优先读取 AST 与类型元数据中的结构化事实：返回值/参数/字段/局部变量声明、
+泛型参数、方法和类注解、extends/implements、throws、方法引用、构造器和静态限定调用。
+简单类型名必须能由显式 import、唯一已知 FQCN、同包或唯一通配包解析到目标；同名候选、
+其他 import 以及遮蔽类型名的局部值不会升级为确定命中。正文模式只保留给解析器降级路径，
+最终制品中的类引用仍由独立字节码证据确认。
+
 ## 分析流程
 
 简化流程：
@@ -107,6 +113,16 @@ callee_key -> caller edges
 `max_depth` 表示最大累计 cost，不是简单 hop 数。
 
 高置信边 cost 较低，可以走更深；低置信边 cost 较高，会更早停止。
+
+当一条路径的目标匹配来源始终属于 `exact`，且沿途全部是高置信物理边时，追踪器会按
+当前图的物理边数自适应放宽 cost 预算。放宽后的上限不超过调用方显式预算的 3 倍，
+默认预算下最多为 15，且系统绝对自适应上限为 20；调用方显式给出的更大预算不会被
+该上限反向缩小。只要出现 medium/low、polymorphic 或 fallback 证据，整条路径立即恢复
+使用原始预算。
+
+深度停止仍然失败关闭。`path_details` 会记录 `budget_limit`、`truncated_target` 和
+`truncated_candidate_count`，`alerts.csv` 的 `coverage_details` 同步给出这三个值，
+不得把截断解释为没有影响。
 
 这样做的目的：
 

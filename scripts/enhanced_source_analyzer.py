@@ -346,6 +346,8 @@ class MethodDef:
     is_test: bool
     param_types: dict = field(default_factory=dict)
     param_declared_types: dict = field(default_factory=dict)
+    return_declared_type: str = ""
+    throws_declared_types: list = field(default_factory=list)
     imports: dict = field(default_factory=dict)
     static_imports: dict = field(default_factory=dict)
     wildcard_imports: list = field(default_factory=list)
@@ -364,6 +366,7 @@ class MethodDef:
     local_var_types: dict = field(default_factory=dict)
     ast_local_var_sites: list = field(default_factory=list)
     ast_call_sites: list = field(default_factory=list)
+    ast_type_reference_sites: list = field(default_factory=list)
     declared_signature: str = ""
     declared_qualified_key: str = ""
     # 【内存优化】可选的延迟加载
@@ -834,6 +837,12 @@ class EnhancedRegexAnalyzer:
             return_type = self._extract_return_type(line, method_name)
             param_types = self._extract_param_types(params_part)
             param_declared_types = dict(param_types)
+            throws_match = re.search(r'\bthrows\s+([^\{;=]+)', stripped)
+            throws_declared_types = [
+                value.strip()
+                for value in (throws_match.group(1).split(',') if throws_match else [])
+                if value.strip()
+            ]
 
             # 关键修复：提取多行注解（回溯查找方法前的注解）
             annotations = self._extract_annotations_multiline(lines, idx)
@@ -898,6 +907,8 @@ class EnhancedRegexAnalyzer:
                 is_test='/test/' in self.file_path or 'Test' in class_name,
                 param_types=param_types,
                 param_declared_types=param_declared_types,
+                return_declared_type=return_type,
+                throws_declared_types=throws_declared_types,
                 imports=dict(self.imports),
                 static_imports=dict(self.static_imports),
                 wildcard_imports=list(self.wildcard_imports),
@@ -1341,6 +1352,24 @@ class TreeSitterAnalyzer:
             raw_return_type = self._field_text(node, 'type', source_code) or ""
             return_type = self.helper._resolve_type(raw_return_type) if raw_return_type else ""
 
+        throws_node = node.child_by_field_name('throws')
+        if throws_node is None:
+            throws_node = next(
+                (child for child in node.children if child.type == 'throws'),
+                None,
+            )
+        throws_declared_types = []
+        if throws_node is not None:
+            for child in throws_node.children:
+                if child.type in {
+                    'type_identifier',
+                    'scoped_type_identifier',
+                    'generic_type',
+                }:
+                    declared_type = self._node_text(child, source_code).strip()
+                    if declared_type:
+                        throws_declared_types.append(declared_type)
+
         param_types, param_declared_types = self._parse_params(
             node.child_by_field_name('parameters'), source_code
         )
@@ -1375,6 +1404,8 @@ class TreeSitterAnalyzer:
             is_test=False,
             param_types=param_types,
             param_declared_types=param_declared_types,
+            return_declared_type=raw_return_type.strip(),
+            throws_declared_types=throws_declared_types,
             imports=dict(self.helper.imports),
             static_imports=dict(self.helper.static_imports),
             wildcard_imports=list(self.helper.wildcard_imports),
@@ -1395,6 +1426,10 @@ class TreeSitterAnalyzer:
             method_def.local_var_types = local_var_types
             method_def.ast_local_var_sites = local_var_sites
             method_def.ast_call_sites = self._collect_call_sites(body_node, source_code, method_def, local_var_types)
+        method_def.ast_type_reference_sites = self._collect_type_reference_sites(
+            node,
+            source_code,
+        )
 
         return method_def
 
@@ -1656,6 +1691,69 @@ class TreeSitterAnalyzer:
 
         collect(body_node, dict(local_var_types), declared_local_types)
         return call_sites
+
+    def _collect_type_reference_sites(self, method_node, source_code):
+        sites = []
+        seen = set()
+
+        def walk(node):
+            yield node
+            for child in node.children:
+                if child is not method_node and child.type in {
+                    'method_declaration', 'constructor_declaration',
+                }:
+                    continue
+                yield from walk(child)
+
+        def add(kind, type_node, owner_node):
+            if type_node is None:
+                return
+            declared_type = self._node_text(type_node, source_code).strip()
+            identity = (kind, declared_type, owner_node.start_point.row)
+            if not declared_type or identity in seen:
+                return
+            seen.add(identity)
+            sites.append({
+                'kind': kind,
+                'declared_type': declared_type,
+                'line': owner_node.start_point.row + 1,
+            })
+
+        for node in walk(method_node):
+            if node.type == 'class_literal':
+                type_node = next(
+                    (child for child in node.children if child.type in {
+                        'type_identifier', 'scoped_type_identifier', 'generic_type',
+                    }),
+                    None,
+                )
+                add('class_literal_type', type_node, node)
+            elif node.type == 'instanceof_expression':
+                add('instanceof_type', node.child_by_field_name('right'), node)
+            elif node.type == 'cast_expression':
+                add('cast_type', node.child_by_field_name('type'), node)
+            elif node.type == 'object_creation_expression':
+                add('constructor_type', node.child_by_field_name('type'), node)
+            elif node.type == 'field_access':
+                object_node = node.child_by_field_name('object')
+                if object_node is not None and object_node.type in {
+                    'identifier', 'type_identifier', 'scoped_identifier',
+                    'scoped_type_identifier', 'field_access',
+                }:
+                    add('static_qualified_type', object_node, node)
+            elif node.type in {'marker_annotation', 'annotation'}:
+                annotation_text = self._node_text(node, source_code).strip()
+                match = re.match(r'@([A-Za-z_][\w.]*)', annotation_text)
+                if match:
+                    identity = ('annotation_type', match.group(1), node.start_point.row)
+                    if identity not in seen:
+                        seen.add(identity)
+                        sites.append({
+                            'kind': 'annotation_type',
+                            'declared_type': match.group(1),
+                            'line': node.start_point.row + 1,
+                        })
+        return sites
 
     def _infer_lambda_parameter_types(self, lambda_node, source_code, method_def, scoped_declared_types):
         lambda_local_types = {}

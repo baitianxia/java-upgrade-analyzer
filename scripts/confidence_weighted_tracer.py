@@ -7,7 +7,7 @@ confidence_weighted_tracer.py
 目标：证明变更 API 是否触达系统代码（不要求最外层入口）。
 
 核心改进：
-  ✓ 置信度加权深度（High:最多5跳, Medium:最多3跳, Low:立即停止）
+  ✓ 置信度加权深度（全精确 High 路径自适应加深，Medium/Low 保守停止）
   ✓ 系统代码触达识别（Service/Facade/Manager/Handler 等业务层）
   ✓ 框架边界识别
   ✓ 精确四态分类（reachable/uncertain/not_analyzed/not_found_in_static_analysis）
@@ -1451,6 +1451,7 @@ def _find_direct_business_class_usages(api_row, graph, trace_cache=None):
     _perf_add(graph, 'trace', 'direct_class_usage_cache_misses', 1)
     started_at = time.perf_counter()
     scanned_methods = 0
+    target_class = target_class.replace('$', '.')
     simple_name = target_class.rsplit('.', 1)[-1]
     simple_name_patterns = [
         re.compile(r'\bnew\s+' + re.escape(simple_name) + r'\b'),
@@ -1458,18 +1459,19 @@ def _find_direct_business_class_usages(api_row, graph, trace_cache=None):
         re.compile(r'\binstanceof\s+' + re.escape(simple_name) + r'\b'),
         re.compile(r'\(\s*' + re.escape(simple_name) + r'\s*\)'),
     ]
-    fqcn_pattern = re.compile(re.escape(target_class))
+    fqcn_pattern = re.compile(
+        r'(?<![\w$.])' + re.escape(target_class) + r'(?![\w$])'
+    )
     matches = []
     for method_def in _iter_business_methods(graph):
         scanned_methods += 1
-        declared_types = (
-            [getattr(method_def, 'return_type', '')]
-            + list((getattr(method_def, 'param_types', {}) or {}).values())
-            + list((getattr(method_def, 'field_types', {}) or {}).values())
-            + list((getattr(method_def, 'local_var_types', {}) or {}).values())
+        structured_evidence = _find_structured_type_usage_evidence(
+            method_def,
+            target_class,
+            graph,
         )
-        if target_class in declared_types:
-            matches.append((method_def, 'declared_type'))
+        if structured_evidence:
+            matches.append((method_def, structured_evidence))
             continue
         imports = getattr(method_def, 'imports', {}) or {}
         wildcard_imports = getattr(method_def, 'wildcard_imports', {}) or []
@@ -1490,6 +1492,157 @@ def _find_direct_business_class_usages(api_row, graph, trace_cache=None):
     _perf_add(graph, 'trace', 'direct_class_usage_elapsed_sec', time.perf_counter() - started_at)
     _perf_max(graph, 'trace', 'direct_class_usage_cache_size', len(cache))
     return matches
+
+
+_JAVA_TYPE_TOKEN_RE = re.compile(
+    r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*'
+)
+
+
+def _known_type_candidates(method_def, simple_name):
+    values = (getattr(method_def, 'known_classes_by_simple', {}) or {}).get(simple_name, ())
+    if isinstance(values, str):
+        values = (values,)
+    elif not isinstance(values, (list, tuple, set, frozenset)):
+        values = ()
+    return {
+        str(value or '').strip().replace('$', '.')
+        for value in values
+        if str(value or '').strip()
+    }
+
+
+def _type_token_matches_target(token, target_class, method_def):
+    token = str(token or '').strip().replace('$', '.')
+    target_class = str(target_class or '').strip().replace('$', '.')
+    if not token or not target_class:
+        return False
+    if token == target_class:
+        return True
+
+    simple_name = target_class.rsplit('.', 1)[-1]
+    if token != simple_name:
+        return False
+
+    imports = getattr(method_def, 'imports', {}) or {}
+    imported = str(imports.get(simple_name) or '').strip().replace('$', '.')
+    if imported:
+        return imported == target_class
+
+    known_candidates = _known_type_candidates(method_def, simple_name)
+    if known_candidates:
+        return known_candidates == {target_class}
+
+    package_name = str(getattr(method_def, 'package_name', '') or '').strip()
+    if package_name and f'{package_name}.{simple_name}' == target_class:
+        return True
+
+    wildcard_imports = {
+        str(value or '').strip()
+        for value in (getattr(method_def, 'wildcard_imports', []) or [])
+        if str(value or '').strip()
+    }
+    target_package = target_class.rsplit('.', 1)[0] if '.' in target_class else ''
+    return wildcard_imports == {target_package}
+
+
+def _type_expression_matches_target(type_expression, target_class, method_def):
+    return any(
+        _type_token_matches_target(token, target_class, method_def)
+        for token in _JAVA_TYPE_TOKEN_RE.findall(str(type_expression or ''))
+    )
+
+
+def _find_structured_type_usage_evidence(method_def, target_class, graph):
+    resolved_types = (
+        [getattr(method_def, 'return_type', '')]
+        + list((getattr(method_def, 'param_types', {}) or {}).values())
+        + list((getattr(method_def, 'field_types', {}) or {}).values())
+        + list((getattr(method_def, 'local_var_types', {}) or {}).values())
+    )
+    if any(
+        _type_expression_matches_target(type_name, target_class, method_def)
+        for type_name in resolved_types
+    ):
+        return 'declared_type'
+
+    raw_declared_types = (
+        [getattr(method_def, 'return_declared_type', '')]
+        + list((getattr(method_def, 'param_declared_types', {}) or {}).values())
+        + list((getattr(method_def, 'field_declared_types', {}) or {}).values())
+        + [
+            site.get('declared_type', '')
+            for site in (getattr(method_def, 'ast_local_var_sites', []) or [])
+        ]
+    )
+    if any(
+        _type_expression_matches_target(type_name, target_class, method_def)
+        for type_name in raw_declared_types
+    ):
+        return 'generic_or_declared_type'
+
+    annotations = (
+        list(getattr(method_def, 'annotations', []) or [])
+        + list(getattr(method_def, 'class_annotations', []) or [])
+    )
+    if any(
+        _type_expression_matches_target(annotation, target_class, method_def)
+        for annotation in annotations
+    ):
+        return 'annotation_type'
+
+    class_meta = (
+        (getattr(graph, 'type_metadata', {}) or {})
+        .get(getattr(method_def, 'class_fqcn', ''), {})
+    )
+    inherited_types = (
+        list(class_meta.get('extends', []) or [])
+        + list(class_meta.get('implements', []) or [])
+    )
+    if any(
+        _type_expression_matches_target(type_name, target_class, method_def)
+        for type_name in inherited_types
+    ):
+        return 'inheritance_type'
+
+    if any(
+        _type_expression_matches_target(type_name, target_class, method_def)
+        for type_name in (getattr(method_def, 'throws_declared_types', []) or [])
+    ):
+        return 'throws_type'
+
+    value_names = set((getattr(method_def, 'param_types', {}) or {}).keys())
+    value_names.update((getattr(method_def, 'field_types', {}) or {}).keys())
+    value_names.update((getattr(method_def, 'local_var_types', {}) or {}).keys())
+    for site in getattr(method_def, 'ast_type_reference_sites', []) or []:
+        kind = str(site.get('kind') or '')
+        declared_type = str(site.get('declared_type') or '').strip()
+        if kind == 'static_qualified_type' and declared_type.split('.', 1)[0] in value_names:
+            continue
+        if _type_expression_matches_target(declared_type, target_class, method_def):
+            return kind
+
+    for site in getattr(method_def, 'ast_call_sites', []) or []:
+        kind = str(site.get('kind') or '')
+        receiver_expr = str(
+            site.get('receiver_expr') or site.get('receiver_type') or ''
+        ).strip()
+        receiver_root = receiver_expr.split('.', 1)[0]
+        site_value_names = value_names | set(
+            (site.get('scope_local_var_types', {}) or {}).keys()
+        )
+        if kind in {'method_reference', 'method_invocation'} and receiver_root in site_value_names:
+            continue
+        if not _type_expression_matches_target(receiver_expr, target_class, method_def):
+            continue
+        if kind == 'method_reference':
+            return 'method_reference_type'
+        if kind == 'method_invocation':
+            return 'static_qualified_type'
+        if kind == 'constructor_invocation':
+            return 'constructor_type'
+
+    return ''
 
 
 def _find_direct_business_class_usage(api_row, graph, trace_cache=None):
@@ -7225,7 +7378,7 @@ def calculate_depth_cost(confidence):
     """
     计算深度代价（置信度加权）
 
-    High confidence: cost = 1（可追踪5跳）
+    High confidence: cost = 1（全精确路径可按图规模自适应加深）
     Medium confidence: cost = 2（可追踪3跳）
     Low confidence: cost = 5（立即停止）
     """
@@ -7287,6 +7440,25 @@ def should_stop_tracing(current_cost, max_cost, confidence_score, critical_node_
         return True, 'FRAMEWORK_BOUNDARY'
 
     return False, None
+
+
+def adaptive_exact_high_confidence_cost_limit(graph, base_limit, path, provenance_family):
+    """Relax the depth budget only for paths backed entirely by exact, high-confidence edges."""
+    base_limit = max(1, int(base_limit or 1))
+    if provenance_family != 'exact' or not path:
+        return base_limit
+    if any(getattr(edge, 'confidence', '') != 'high' for edge in path):
+        return base_limit
+
+    edge_count = int(getattr(graph, 'reverse_edge_count', 0) or 0)
+    if edge_count <= 0:
+        edge_count = sum(
+            len(edges or [])
+            for edges in (getattr(graph, 'reverse_edges', {}) or {}).values()
+        )
+    # The graph size bounds useful work, while the 3x/20 caps prevent an exact
+    # but cyclic graph from turning one API trace into an unbounded traversal.
+    return max(base_limit, min(20, edge_count + 1, base_limit * 3))
 
 
 def calculate_confidence_decay(current_score, edge_confidence):
@@ -7730,17 +7902,27 @@ def _collect_trace_api_with_confidence_weighting(
                 trace_cache=trace_cache,
             )
 
+            # 构建新路径后才能判断它是否仍是“全程精确 + 高置信”。仅这类路径
+            # 可以按图规模放宽预算；中/低置信及多态/fallback 路径保持原上限。
+            new_path = current_path + [edge]
+            effective_cost_limit = adaptive_exact_high_confidence_cost_limit(
+                graph,
+                max_total_cost,
+                new_path,
+                frontier.get('provenance_family', 'exact'),
+            )
+            if effective_cost_limit > max_total_cost and new_cost >= max_total_cost:
+                _perf_add(graph, 'trace', 'adaptive_exact_high_frontier_steps', 1)
+                _perf_max(graph, 'trace', 'adaptive_exact_high_cost_limit', effective_cost_limit)
+
             # 判断是否停止
             should_stop, stop_reason = should_stop_tracing(
                 new_cost,
-                max_total_cost,
+                effective_cost_limit,
                 new_confidence,
                 critical_node,
                 edge.confidence,
             )
-
-            # 构建新路径
-            new_path = current_path + [edge]
 
             # 分类处理
             if critical_node and critical_node['type'] == 'system_code_touched':
@@ -7768,7 +7950,7 @@ def _collect_trace_api_with_confidence_weighting(
                 # alerts.csv 通常只展示第一个业务调用点 C -> D。现在在不改变
                 # reachable 判定的前提下，若仍在 cost/confidence 边界内，继续
                 # 沿高/中置信业务边向上游扩展，直到 max_total_cost 或图边界。
-                if new_cost < max_total_cost and new_confidence >= 0.3 and edge.confidence in ('high', 'medium'):
+                if new_cost < effective_cost_limit and new_confidence >= 0.3 and edge.confidence in ('high', 'medium'):
                     matched_lookup_groups, method_overload_block = get_cached_method_lookup_resolution(
                         method_def,
                         type_metadata,
@@ -7859,7 +8041,10 @@ def _collect_trace_api_with_confidence_weighting(
                         'depth': new_depth,
                         'provenance': frontier.get('provenance', ''),
                         'match_tier': frontier.get('match_tier', -1),
+                        'budget_limit': effective_cost_limit,
+                        'truncated_target': current_key,
                     })
+                    _perf_add(graph, 'trace', 'depth_truncated_candidate_count', 1)
                 elif stop_reason == 'CONFIDENCE_DECAYED':
                     uncertain_candidates.append({
                         'path': new_path,
@@ -8775,6 +8960,11 @@ def changed_api_display_target(result):
 
 def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph, final_target=''):
     details = []
+    depth_truncated_candidate_count = sum(
+        1
+        for candidate in (uncertain or [])
+        if candidate.get('reason') == 'DEPTH_LIMIT_REACHED'
+    )
     groups = (
         ('reachable', 'SYSTEM_CODE_REACHED', reachable or []),
         ('uncertain', '', uncertain or []),
@@ -8810,7 +9000,7 @@ def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph, 
             effective_stop_reason = stop_reason
             if path_status == 'reachable' and entry_scope == 'runtime_dependency_entry':
                 effective_stop_reason = 'RUNTIME_DEPENDENCY_ENTRY_REACHED'
-            details.append({
+            detail = {
                 'path_status': path_status,
                 'stop_reason': effective_stop_reason,
                 'business_entry': business_entry,
@@ -8825,7 +9015,14 @@ def build_all_candidate_path_details(reachable, uncertain, not_analyzed, graph, 
                 'depth': int(candidate.get('depth') or len(path_edges)),
                 'evidence': evidence,
                 'terminal_symbol': last.get('caller_symbol') or business_entry,
-            })
+            }
+            if stop_reason == 'DEPTH_LIMIT_REACHED':
+                detail.update({
+                    'budget_limit': int(candidate.get('budget_limit') or 0),
+                    'truncated_target': str(candidate.get('truncated_target') or ''),
+                    'truncated_candidate_count': depth_truncated_candidate_count,
+                })
+            details.append(detail)
     return sorted(details, key=lambda item: (
         {'reachable': 0, 'uncertain': 1, 'not_analyzed': 2}.get(item.get('path_status'), 9),
         item.get('path_text') or '',

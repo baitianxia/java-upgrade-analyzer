@@ -398,7 +398,7 @@ def _get_next_action(next_step):
         'step2': '运行 s2_context_from_deps.py 推断项目上下文，并同步产出依赖关系图。',
         'step3': '根据 evidence/context/context.json 的标志位运行对应的 Step 3 扫描脚本。',
         'step4': '运行 s4_jar_compare.py 做 jar 包变更对比。',
-        'step5': '对 evidence/api_changes/all_changed_apis.csv 逐条执行反向调用链追踪（默认 max_depth=5，高/中/低置信度边分别消耗 1/2/5 单位代价，详见 SKILL.md）。',
+        'step5': '对 evidence/api_changes/all_changed_apis.csv 逐条执行反向调用链追踪（默认 max_depth=5，高/中/低置信度边分别消耗 1/2/5 单位代价；全精确高置信路径可按图规模自适应加深，详见 SKILL.md）。',
         'step6': '运行 s6_report.py 生成最终报告。',
         None: '分析已完成，查看 deliverables/report.md。'
     }

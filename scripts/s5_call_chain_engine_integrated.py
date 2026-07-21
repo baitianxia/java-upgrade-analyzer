@@ -284,6 +284,9 @@ def _write_step5_timing_csv(report_dir, graph_stats):
             'critical_node_cache_misses',
             'critical_node_cache_size',
             'critical_node_fast_none',
+            'adaptive_exact_high_frontier_steps',
+            'adaptive_exact_high_cost_limit',
+            'depth_truncated_candidate_count',
             'direct_class_usage_elapsed_sec',
             'direct_class_usage_scanned_methods',
             'direct_class_usage_cache_hits',
@@ -1665,7 +1668,7 @@ def _step5_integrated_main_impl(args):
 
     # Key clarification: max_depth semantics
     # SKILL.md defines:
-    #   - High confidence edge: depth_cost=1 (max_depth=5 allows 5 hops)
+    #   - High confidence edge: depth_cost=1 (全精确 High 路径可按图规模自适应加深)
     #   - Medium confidence edge: depth_cost=2 (max_depth=5 allows 2-3 hops)
     #   - Low confidence edge: depth_cost=5 (stops immediately)
     # max_depth controls "max cumulative cost", not "max hop count"

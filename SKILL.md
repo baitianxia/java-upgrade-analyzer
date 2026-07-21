@@ -490,12 +490,12 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 **置信度加权深度策略**：
   - `max_depth`参数含义：最大累计追踪代价（不是最大跳数）
-  - High confidence 边：每跳消耗 1 单位代价（max_depth=5时可追踪最多 5 跳）
+  - High confidence 边：每跳消耗 1 单位代价；全精确 High 路径按图规模自适应放宽，默认最多 15 cost、绝对自适应上限 20
   - Medium confidence 边：每跳消耗 2 单位代价（max_depth=5时可追踪最多 2-3 跳）
   - Low confidence 边：每跳消耗 5 单位代价（立即停止，相当于不追踪）
   
 示例：
-  - max_depth=5，全High边链路：最多5跳（cost累计5）
+  - max_depth=5，全精确 High 边链路：按图规模最多放宽到 15 跳；出现非精确来源时仍按 5 cost 停止
   - max_depth=5，全Medium边链路：最多2跳（cost累计4）
   - max_depth=5，混合链路：3High+1Medium=cost=5（达到上限）
 - 关键节点识别：业务入口（Controller/Service）标记为 `reachable`，框架边界（@Autowired/动态代理）标记为 `not_analyzed`

@@ -56,6 +56,98 @@ class Step5KeyMatchingTest(unittest.TestCase):
         }
         return tracer.TraceDraft(**values)
 
+    def _exact_chain_fixture(self, hops, *, first_edge_confidence="high"):
+        api_row = {
+            "api_name": "com.vendor.Api.changed",
+            "api_simple": "changed",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "coord": "com.vendor:api",
+            "severity": "P0",
+            "confirmed": "true",
+            "source": "oracle_fixture",
+            "analysis_scope": "method",
+        }
+
+        methods = {}
+        callers = []
+        for index in range(max(0, hops - 1)):
+            method = SimpleNamespace(
+                symbol_id=f"dep-{index}",
+                qualified_key=f"com.example.dep.C{index}.call{index}",
+                simple_key=f"method:call{index}",
+                class_fqcn=f"com.example.dep.C{index}",
+                class_name=f"C{index}",
+                method_name=f"call{index}",
+                param_types={},
+                param_declared_types={},
+                declared_signature="()",
+                owner_type="dependency",
+                owner_coord="com.example:dep",
+                module="dep",
+                is_test=False,
+                annotations=[],
+                class_annotations=[],
+                modifiers=["public"],
+                is_interface=False,
+                file=f"/tmp/C{index}.java",
+                line=index + 1,
+            )
+            methods[method.symbol_id] = method
+            callers.append(method)
+
+        entry = SimpleNamespace(
+            symbol_id="business-entry",
+            qualified_key="com.example.app.Controller.handle",
+            simple_key="method:handle",
+            class_fqcn="com.example.app.Controller",
+            class_name="Controller",
+            method_name="handle",
+            param_types={},
+            param_declared_types={},
+            declared_signature="()",
+            owner_type="business",
+            owner_coord="BUSINESS",
+            module="app",
+            is_test=False,
+            annotations=["GetMapping"],
+            class_annotations=["RestController"],
+            modifiers=["public"],
+            is_interface=False,
+            file="/tmp/Controller.java",
+            line=100,
+        )
+        methods[entry.symbol_id] = entry
+        callers.append(entry)
+
+        reverse_edges = {}
+        current_key = "com.vendor.Api.changed()"
+        for index, caller in enumerate(callers):
+            confidence = first_edge_confidence if index == 0 else "high"
+            reverse_edges[current_key] = [SimpleNamespace(
+                caller_symbol_id=caller.symbol_id,
+                caller_qualified_key=caller.qualified_key,
+                callee_key=current_key,
+                callee_simple_key=current_key.rsplit(".", 1)[-1],
+                confidence=confidence,
+                evidence_type="ast_method_invocation",
+                file=caller.file,
+                line=caller.line,
+                owner_type=caller.owner_type,
+                owner_coord=caller.owner_coord,
+                module=caller.module,
+                is_test=False,
+            )]
+            current_key = f"{caller.qualified_key}()"
+
+        graph = SimpleNamespace(
+            methods_by_id=methods,
+            reverse_edges=reverse_edges,
+            reverse_edge_count=len(callers),
+        )
+        return api_row, graph
+
     def test_malformed_context_cannot_fall_back_to_empty_source_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             context_path = Path(tmp) / "context.json"
@@ -7658,6 +7750,228 @@ public class com.example.TargetBridge {
 
         self.assertEqual(result.analysis_status, "reachable")
         self.assertEqual(result.reason_code, "DIRECT_CLASS_USAGE")
+
+    def test_direct_class_usage_covers_structured_java_type_syntaxes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "TypeUses.java"
+            source.write_text(
+                """package com.example.app;
+import com.vendor.Target;
+import java.util.List;
+import java.util.function.Supplier;
+@Target class AnnotationUse { void use() {} }
+class GenericUse { List<Target> use() { return null; } }
+class InheritanceUse extends Target { void use() {} }
+class ThrowsUse { void use() throws Target {} }
+class ClassLiteralUse { Class<?> use() { return Target.class; } }
+class InstanceofUse { boolean use(Object value) { return value instanceof Target; } }
+class CastUse { Object use(Object value) { return (Target) value; } }
+class ConstructorUse { Object use() { return new Target(); } }
+class MethodReferenceUse { Runnable use() { return Target::make; } }
+class StaticQualifiedUse { void use() { Target.make(); } }
+class StaticFieldUse { int use() { return Target.FIELD; } }
+""",
+                encoding="utf-8",
+            )
+            graph_result = step5.build_enhanced_source_graph([{
+                "root": tmp,
+                "owner_type": "business",
+                "owner_coord": "BUSINESS",
+                "module": "app",
+            }])
+            graph = graph_result["graph"]
+            usages = tracer._find_direct_business_class_usages({
+                "api_name": "com.vendor.Target",
+                "matched_class": "com.vendor.Target",
+            }, graph)
+
+        evidence_by_class = {
+            method.class_name: evidence_type
+            for method, evidence_type in usages
+        }
+        self.assertEqual(graph_result["stats"]["parser_usage"]["tree_sitter"], 1)
+        self.assertEqual(evidence_by_class, {
+            "AnnotationUse": "annotation_type",
+            "GenericUse": "generic_or_declared_type",
+            "InheritanceUse": "inheritance_type",
+            "ThrowsUse": "throws_type",
+            "ClassLiteralUse": "class_literal_type",
+            "InstanceofUse": "instanceof_type",
+            "CastUse": "cast_type",
+            "ConstructorUse": "constructor_type",
+            "MethodReferenceUse": "method_reference_type",
+            "StaticQualifiedUse": "static_qualified_type",
+            "StaticFieldUse": "static_qualified_type",
+        })
+
+    def test_structured_type_usage_rejects_same_simple_name_from_other_import(self):
+        method = SimpleNamespace(
+            class_fqcn="com.example.app.Use",
+            package_name="com.example.app",
+            return_type="java.util.List",
+            param_types={},
+            field_types={},
+            local_var_types={},
+            return_declared_type="List<Target>",
+            param_declared_types={},
+            field_declared_types={},
+            ast_local_var_sites=[],
+            annotations=["Target"],
+            class_annotations=[],
+            throws_declared_types=["Target"],
+            ast_call_sites=[{
+                "kind": "method_invocation",
+                "receiver_expr": "Target",
+            }],
+            imports={"Target": "com.other.Target"},
+            wildcard_imports=[],
+            known_classes_by_simple={
+                "Target": ("com.vendor.Target", "com.other.Target"),
+            },
+        )
+        graph = SimpleNamespace(type_metadata={
+            "com.example.app.Use": {
+                "extends": ["com.other.Target"],
+                "implements": [],
+            },
+        })
+
+        evidence = tracer._find_structured_type_usage_evidence(
+            method,
+            "com.vendor.Target",
+            graph,
+        )
+
+        self.assertEqual(evidence, "")
+
+    def test_static_type_usage_rejects_a_value_that_shadows_the_type_name(self):
+        method = SimpleNamespace(
+            class_fqcn="com.example.app.Use",
+            package_name="com.example.app",
+            return_type="void",
+            param_types={"Target": "java.lang.Object"},
+            field_types={},
+            local_var_types={},
+            return_declared_type="void",
+            param_declared_types={"Target": "Object"},
+            field_declared_types={},
+            ast_local_var_sites=[],
+            annotations=[],
+            class_annotations=[],
+            throws_declared_types=[],
+            ast_call_sites=[{
+                "kind": "method_invocation",
+                "receiver_expr": "Target",
+                "scope_local_var_types": {},
+            }],
+            imports={"Target": "com.vendor.Target"},
+            wildcard_imports=[],
+        )
+
+        evidence = tracer._find_structured_type_usage_evidence(
+            method,
+            "com.vendor.Target",
+            SimpleNamespace(type_metadata={}),
+        )
+
+        self.assertEqual(evidence, "")
+
+    def test_exact_high_confidence_tracing_covers_1_2_5_and_10_plus_hops(self):
+        for hops in (1, 2, 5, 12):
+            with self.subTest(hops=hops):
+                api_row, graph = self._exact_chain_fixture(hops)
+                result = tracer.trace_api_with_confidence_weighting(
+                    api_row,
+                    graph,
+                    {},
+                    max_total_cost=5,
+                )
+
+                self.assertEqual(result.analysis_status, "reachable")
+                self.assertEqual(result.reason_code, "SYSTEM_CODE_REACHED")
+                self.assertTrue(any(
+                    detail["depth"] == hops
+                    for detail in result.path_details
+                    if detail["path_status"] == "reachable"
+                ))
+                if hops > 5:
+                    perf = tracer._finalize_step5_perf_stats(graph)["trace"]
+                    self.assertGreater(perf["adaptive_exact_high_frontier_steps"], 0)
+                    self.assertGreaterEqual(perf["adaptive_exact_high_cost_limit"], hops)
+
+    def test_adaptive_budget_does_not_expand_a_medium_confidence_path(self):
+        api_row, graph = self._exact_chain_fixture(
+            12,
+            first_edge_confidence="medium",
+        )
+
+        result = tracer.trace_api_with_confidence_weighting(
+            api_row,
+            graph,
+            {},
+            max_total_cost=5,
+        )
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "DEPTH_LIMIT_REACHED")
+        truncated = [
+            detail for detail in result.path_details
+            if detail["stop_reason"] == "DEPTH_LIMIT_REACHED"
+        ]
+        self.assertEqual(len(truncated), 1)
+        self.assertEqual(truncated[0]["budget_limit"], 5)
+        self.assertTrue(truncated[0]["truncated_target"])
+        self.assertEqual(truncated[0]["truncated_candidate_count"], 1)
+        perf = tracer._finalize_step5_perf_stats(graph)["trace"]
+        self.assertEqual(perf.get("adaptive_exact_high_frontier_steps", 0), 0)
+
+    def test_exact_path_reports_explicit_coverage_when_adaptive_cap_is_reached(self):
+        api_row, graph = self._exact_chain_fixture(25)
+
+        result = tracer.trace_api_with_confidence_weighting(
+            api_row,
+            graph,
+            {},
+            max_total_cost=5,
+        )
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(result.reason_code, "DEPTH_LIMIT_REACHED")
+        truncated = [
+            detail for detail in result.path_details
+            if detail["stop_reason"] == "DEPTH_LIMIT_REACHED"
+        ]
+        self.assertEqual(len(truncated), 1)
+        self.assertEqual(truncated[0]["budget_limit"], 15)
+        self.assertEqual(truncated[0]["depth"], 15)
+        self.assertTrue(truncated[0]["truncated_target"])
+        self.assertEqual(truncated[0]["truncated_candidate_count"], 1)
+        alert_rows = formatter._alert_rows_for_result(result)
+        self.assertIn("预算=15", alert_rows[0]["coverage_details"])
+        self.assertIn("候选数=1", alert_rows[0]["coverage_details"])
+        self.assertIn(truncated[0]["truncated_target"], alert_rows[0]["coverage_details"])
+
+    def test_increasing_exact_path_budget_preserves_confirmed_evidence(self):
+        api_row, base_graph = self._exact_chain_fixture(12)
+        base = tracer.trace_api_with_confidence_weighting(
+            api_row,
+            base_graph,
+            {},
+            max_total_cost=5,
+        )
+        api_row, raised_graph = self._exact_chain_fixture(12)
+        raised = tracer.trace_api_with_confidence_weighting(
+            api_row,
+            raised_graph,
+            {},
+            max_total_cost=8,
+        )
+
+        self.assertEqual(base.analysis_status, "reachable")
+        self.assertEqual(raised.analysis_status, "reachable")
+        self.assertEqual(base.reason_code, raised.reason_code)
+        self.assertEqual(base.call_paths, raised.call_paths)
+        self.assertEqual(base.evidence_paths, raised.evidence_paths)
 
     def test_trace_api_marks_field_static_import_usage_as_reachable(self):
         api_row = {

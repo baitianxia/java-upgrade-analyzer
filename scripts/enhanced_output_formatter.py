@@ -1433,7 +1433,7 @@ def _write_alert_rows_csv(path, rows):
         writer.writerows(rows)
 
 
-def _compact_coverage_details(capability_coverage):
+def _compact_coverage_details(capability_coverage, path_detail=None):
     """Return a spreadsheet-friendly coverage summary for alerts.csv.
 
     The complete structured coverage remains in summary.json and by_api JSON;
@@ -1453,6 +1453,14 @@ def _compact_coverage_details(capability_coverage):
         for name, status in sorted(analyzers.items())
         if str(status or '').strip() and str(status).strip() != 'not_applicable'
     ]
+    path_detail = path_detail or {}
+    if path_detail.get('stop_reason') == 'DEPTH_LIMIT_REACHED':
+        items.append(
+            '深度截断：'
+            f"预算={int(path_detail.get('budget_limit') or 0)}，"
+            f"目标={path_detail.get('truncated_target') or '未知'}，"
+            f"候选数={int(path_detail.get('truncated_candidate_count') or 0)}"
+        )
     return '；'.join(items)
 
 
@@ -1581,7 +1589,7 @@ def _alert_rows_for_result(result):
             'depth': int(detail.get('depth') or 0) if has_chain else -1,
             'path_occurrence_count': int(detail.get('_path_occurrence_count') or 1) if has_chain else 0,
             'coverage_status': capability_coverage.get('status') or '',
-            'coverage_details': _compact_coverage_details(capability_coverage),
+            'coverage_details': _compact_coverage_details(capability_coverage, detail),
             'evidence_types': '|'.join(sorted({str(item.get('evidence_type') or '') for item in evidence if item.get('evidence_type')})),
             'evidence_files': '|'.join(sorted({str(item.get('file') or '') for item in evidence if item.get('file')})),
             'detail_file': detail_file,
