@@ -28,6 +28,7 @@ AUTHORITY_FAMILIES = {
     "jdk-jdeps": "jdk-jdeps",
     "project-tests": "project-execution",
     "project-runtime": "project-execution",
+    "jacoco-runtime": "jacoco-runtime",
 }
 AUTHORITY_CAPABILITIES = {
     "jdk-javap": {
@@ -42,6 +43,7 @@ AUTHORITY_CAPABILITIES = {
     "jdk-jdeps": {"artifact_bound", "positive_only", "metadata_references"},
     "project-tests": {"artifact_bound", "executable_runtime"},
     "project-runtime": {"artifact_bound", "executable_runtime"},
+    "jacoco-runtime": {"artifact_bound", "executable_runtime"},
 }
 STRONG_STATIC_NEGATIVE_CAPABILITIES = {
     "artifact_bound", "closed_world_static", "executable_edges",
@@ -175,6 +177,7 @@ def audit_api_oracle(
     changed_rows: list[dict], analyzer_rows: list[dict], oracle_rows: list[dict],
     *, expected_artifact_sha256: str = "",
     trusted_capability_records: list[dict] | tuple[dict, ...] = (),
+    require_artifact_binding_for_all: bool = False,
 ) -> dict:
     trusted_capability_record_ids = {
         id(record) for record in trusted_capability_records
@@ -221,7 +224,9 @@ def audit_api_oracle(
             if _valid_provenance(
                 record,
                 expected_artifact_sha256=expected_artifact_sha256,
-                require_artifact_binding=trusted_record,
+                require_artifact_binding=(
+                    require_artifact_binding_for_all or trusted_record
+                ),
             ):
                 valid_records.append(record)
             else:
@@ -322,6 +327,5 @@ def audit_api_oracle(
         result["changed_duplicate_identities"],
         result["analyzer_duplicate_identities"],
         result["analyzer_conflict_identities"],
-        result["invalid_provenance"],
     ))
     return result

@@ -53,10 +53,14 @@ from constant_impact_oracle import audit_constant_evidence, run_constant_oracle
 from s4_jar_compare import attach_constant_field_evidence
 from artifact_safety import inspect_archive
 from exhaustive_api_oracle import (
-    audit_api_oracle,
     load_analyzer_rows,
     load_oracle_manifest,
     write_oracle_ledger,
+)
+from dual_line_accuracy import (
+    reconcile_accuracy_lines,
+    write_accuracy_result,
+    write_line_payload,
 )
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity, reconcile_edges
 from final_artifact_edge_oracle import scan_final_artifact
@@ -102,7 +106,7 @@ EDGE_RECONCILIATION_VERDICTS = (
 )
 V3_GATE_NAMES = (
     "asset", "api_coverage", "topology_coverage", "edge_truth",
-    "conclusion", "performance", "fixture_debt",
+    "conclusion", "oracle_accuracy", "performance", "fixture_debt",
 )
 STANDARD_FAULT_INJECTIONS = (
     "drop_analyzer_edge",
@@ -1948,6 +1952,19 @@ def build_v3_gates(
     conclusion_errors = sorted(contract_errors & {
         "SOURCE_BYTECODE_EDGE_CONFLICT", "expected_conclusion_missing", "expected_chain_missing",
     })
+    oracle_audit = result.get("oracle_audit")
+    oracle_errors: list[str] = []
+    if not isinstance(oracle_audit, dict) or "selected" not in oracle_audit:
+        oracle_errors.append("oracle_audit_missing")
+    else:
+        selected = int(oracle_audit.get("selected") or 0)
+        verified = int(oracle_audit.get("verified") or 0)
+        if oracle_audit.get("blocking"):
+            oracle_errors.append("oracle_reconciliation_blocking")
+        if verified != selected:
+            oracle_errors.append(
+                f"oracle_coverage_incomplete:{verified}/{selected}"
+            )
     performance_errors = [
         str(signal.get("message") or signal.get("signal_type") or "performance_regression")
         for signal in (result.get("quality_signals") or [])
@@ -1978,6 +1995,10 @@ def build_v3_gates(
         },
         "conclusion": {
             "name": "conclusion", "passed": not conclusion_errors, "errors": conclusion_errors,
+        },
+        "oracle_accuracy": {
+            "name": "oracle_accuracy", "passed": not oracle_errors,
+            "errors": oracle_errors,
         },
         "performance": {
             "name": "performance", "passed": not performance_errors, "errors": performance_errors,
@@ -6047,6 +6068,89 @@ def build_automatic_oracle_records(
     return records
 
 
+def run_dual_line_accuracy_audit(
+    case: RealProjectCase,
+    selected_rows: list[dict],
+    summary: dict,
+    edge_truth: dict,
+    report_dir: Path,
+    *,
+    oracle_manifest: Path | None = None,
+) -> tuple[dict, list[str]]:
+    """Build the independent line, then reconcile it with analyzer output."""
+    warnings: list[str] = []
+    oracle_rows = load_oracle_manifest(oracle_manifest or case.oracle_manifest)
+    automatic_oracle_rows = build_automatic_oracle_records(
+        selected_rows, edge_truth
+    )
+    oracle_rows.extend(automatic_oracle_rows)
+    trusted_capability_records = list(automatic_oracle_rows)
+    if case.enable_jdk_oracle:
+        try:
+            class_files = (
+                load_materialized_class_inventory(report_dir, case.final_artifact)
+                if case.final_artifact else []
+            )
+            jdk_rows = scan_class_files(
+                selected_rows,
+                class_files,
+                report_dir / "evidence" / "quality" / "jdk-javap",
+                business_class_files=[
+                    path for path in class_files if "nested" not in path.parts
+                ],
+            )
+            oracle_rows.extend(jdk_rows)
+            trusted_capability_records.extend(jdk_rows)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            warnings.append(
+                f"jdk_oracle_unavailable:{type(error).__name__}:{error}"
+            )
+    analyzer_rows = load_analyzer_rows(summary)
+    expected_artifact_sha256 = str(
+        edge_truth.get("trusted_artifact_sha") or ""
+    )
+    result = reconcile_accuracy_lines(
+        selected_rows,
+        analyzer_rows,
+        oracle_rows,
+        expected_artifact_sha256=expected_artifact_sha256,
+        trusted_capability_records=trusted_capability_records,
+    )
+    result["oracle_authorities"] = sorted({
+        str(row.get("authority") or "") for row in oracle_rows
+        if str(row.get("authority") or "")
+    })
+    quality_dir = Path(report_dir) / "evidence" / "quality"
+    analyzer_line = write_line_payload(
+        quality_dir / "analyzer_api_line.json", "analyzer", analyzer_rows
+    )
+    oracle_line = write_line_payload(
+        quality_dir / "oracle_api_line.json", "oracle", oracle_rows
+    )
+    ledger_path = quality_dir / "exhaustive_api_oracle.csv"
+    write_oracle_ledger(ledger_path, result)
+    result_path = quality_dir / "dual_line_accuracy.json"
+    result["line_outputs"] = {
+        "analyzer": analyzer_line,
+        "oracle": oracle_line,
+        "reconciliation": str(result_path),
+        "ledger": str(ledger_path),
+    }
+    write_accuracy_result(result_path, result)
+    return result, warnings
+
+
+def requires_dual_line_accuracy(
+    case: RealProjectCase, *, oracle_manifest: Path | None = None
+) -> bool:
+    return bool(
+        case.fixture_manifest
+        or case.oracle_manifest
+        or oracle_manifest
+        or case.case_mode in {"discovery", "convergence"}
+    )
+
+
 def _valid_sha256(value: str) -> bool:
     value = str(value or "").strip()
     return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
@@ -7515,7 +7619,10 @@ def build_policy_signals(
         if oracle_audit is not None
         else case.ground_truth_status != "reviewed"
     )
-    if case.case_mode in {"discovery", "convergence"} and needs_ground_truth:
+    if needs_ground_truth and (
+        oracle_audit is not None
+        or case.case_mode in {"discovery", "convergence"}
+    ):
         has_oracle_audit = oracle_audit is not None
         oracle_audit = oracle_audit or {}
         selected = int(oracle_audit.get("selected") or 0)
@@ -8371,43 +8478,22 @@ def run_case(
     oracle_audit = None
     oracle_ledger = ""
     effective_ground_truth_status = case.ground_truth_status
-    if case.case_mode in {"discovery", "convergence"}:
-        oracle_rows = load_oracle_manifest(oracle_manifest or case.oracle_manifest)
-        automatic_oracle_rows = build_automatic_oracle_records(
-            selected_rows, edge_truth
-        )
-        oracle_rows.extend(automatic_oracle_rows)
-        if case.enable_jdk_oracle:
-            try:
-                if case.final_artifact:
-                    class_files = load_materialized_class_inventory(
-                        report_dir, case.final_artifact
-                    )
-                else:
-                    class_files = []
-                oracle_rows.extend(scan_class_files(
-                    selected_rows,
-                    class_files,
-                    report_dir / "evidence" / "quality" / "jdk-javap",
-                    business_class_files=[
-                        path for path in class_files if "nested" not in path.parts
-                    ],
-                ))
-            except (OSError, ValueError, json.JSONDecodeError) as error:
-                warnings.append(f"jdk_oracle_unavailable:{type(error).__name__}:{error}")
-        oracle_audit = audit_api_oracle(
+    if requires_dual_line_accuracy(case, oracle_manifest=oracle_manifest):
+        oracle_audit, oracle_warnings = run_dual_line_accuracy_audit(
+            case,
             selected_rows,
-            load_analyzer_rows(summary),
-            oracle_rows,
-            expected_artifact_sha256=str(
-                edge_truth.get("trusted_artifact_sha") or ""
-            ),
-            trusted_capability_records=automatic_oracle_rows,
+            summary,
+            edge_truth,
+            report_dir,
+            oracle_manifest=oracle_manifest,
         )
-        oracle_ledger_path = report_dir / "evidence" / "quality" / "exhaustive_api_oracle.csv"
-        write_oracle_ledger(oracle_ledger_path, oracle_audit)
-        oracle_ledger = str(oracle_ledger_path)
-        effective_ground_truth_status = "reviewed" if not oracle_audit.get("blocking") else "unreviewed"
+        warnings.extend(oracle_warnings)
+        oracle_ledger = str(
+            (oracle_audit.get("line_outputs") or {}).get("ledger") or ""
+        )
+        effective_ground_truth_status = (
+            "reviewed" if not oracle_audit.get("blocking") else "unreviewed"
+        )
     topology_evidence = extract_case_topology_evidence(
         case, report_dir, selected_rows, project_root,
         oracle_scan=edge_truth.get("oracle_scan"),
@@ -8528,9 +8614,9 @@ def run_case(
             }
         },
         "oracle_ledger": oracle_ledger,
-        "third_party_authorities": sorted({
-            str(row.get("authority") or "") for row in oracle_rows
-        }) if case.case_mode in {"discovery", "convergence"} else [],
+        "third_party_authorities": list(
+            (oracle_audit or {}).get("oracle_authorities") or []
+        ),
         "topology_coverage": topology_coverage,
         "topology_coverage_files": topology_coverage_files,
         "topology_artifact_layout": topology_evidence.get("layout_path"),

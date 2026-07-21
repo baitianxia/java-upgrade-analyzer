@@ -27,6 +27,44 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step <step1|step2|step3|step
   --report-dir .upgrade-report
 ```
 
+### 项目无关的准确性双线对账
+
+真实项目的分析结果与独立 Oracle 分别产出后，用统一数据入口逐 API 对账。接入新项目无需修改脚本或登记项目名；三个输入集合必须使用相同的 API 身份字段，Oracle 每条记录必须绑定本次最终制品 SHA-256，并提供可校验的独立证据来源。
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scripts/dual_line_accuracy.py" \
+  --api-universe /abs/path/to/independent_api_universe.csv \
+  --analyzer-summary /abs/path/to/summary.json \
+  --oracle-ledger /abs/path/to/independent_oracle.csv \
+  --artifact-sha256 <final-artifact-sha256> \
+  --ledger-out /abs/path/to/exhaustive_api_oracle.csv \
+  --json-out /abs/path/to/dual_line_accuracy.json
+```
+
+API universe 必须来自独立 API diff、人工审核契约或其他外部事实源，不能直接复制分析器结果充当分母；空集合按失败处理。退出码 `0` 表示所有 API 身份与结论均验证一致，`1` 表示发现漏报、误报、冲突或未验证项，`2` 表示输入或证据协议无效。对账器不负责生成 Oracle；Oracle 应来自项目测试、运行时观测、JDK `javap`/`jdeps` 或其他不复用分析器实现的方法。
+
+框架代理、反射或回调无法由静态字节码 Oracle 证明为 `reachable` 时，可用 `runtime_coverage_oracle.py` 执行项目自己的测试并读取 JaCoCo 原始覆盖。测试命令通过 JSON 字符串数组传入，不登记项目名；解析器要求测试实际执行且通过、覆盖 class ID 匹配，并要求被解析的 class JAR 是最终制品本身或其中 SHA-256 完全一致的嵌套 JAR。未覆盖只能输出 `uncertain`。
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scripts/runtime_coverage_oracle.py" \
+  --api-universe /abs/path/to/independent_api_universe.csv \
+  --artifact /abs/path/to/final-application.jar \
+  --classfiles /abs/path/to/extracted-provider.jar \
+  --jacoco-exec /abs/path/to/jacoco.exec \
+  --jacoco-classpath /abs/path/to/org.jacoco.core.jar \
+  --jacoco-classpath /abs/path/to/asm.jar \
+  --jacoco-classpath /abs/path/to/asm-commons.jar \
+  --jacoco-classpath /abs/path/to/asm-tree.jar \
+  --command-json /abs/path/to/test-command.json \
+  --run-cwd /abs/path/to/project \
+  --command-log-out /abs/path/to/runtime-test.log \
+  --test-result-glob '/abs/path/to/target/surefire-reports/TEST-*.xml' \
+  --evidence-out /abs/path/to/runtime-oracle-evidence.json \
+  --oracle-out /abs/path/to/runtime-oracle.csv
+```
+
+若项目没有自行配置 JaCoCo，再额外传 `--jacoco-agent /abs/path/to/org.jacoco.agent-runtime.jar`；项目已有 agent 时不要重复注入。
+
 若需要在首次执行前预置首轮输入，使用 `--seed-json` 建立主状态，不要手写 `.upgrade-report/.runtime/state/main_state.json`。
 
 推荐模板：

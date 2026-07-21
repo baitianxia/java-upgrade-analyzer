@@ -64,6 +64,28 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
         self.assertEqual(result["invalid_provenance_count"], 1)
         self.assertTrue(result["blocking"])
 
+    def test_invalid_auxiliary_record_does_not_override_valid_stronger_record(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+        valid = authority("p.A.one", "()", "reachable")
+        invalid = authority(
+            "p.A.one", "()", "reachable", authority="project-tests"
+        )
+        invalid["evidence_path"] = str(
+            EVIDENCE_PATH.with_name("missing-auxiliary-evidence.txt")
+        )
+
+        result = oracle.audit_api_oracle(
+            changed, analyzed, [valid, invalid]
+        )
+
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(result["invalid_provenance_count"], 1)
+        self.assertFalse(result["blocking"], result)
+
     def test_invented_authority_names_do_not_satisfy_high_risk_independence(self):
         changed = [{
             "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
@@ -181,6 +203,26 @@ class ExhaustiveApiOracleTest(unittest.TestCase):
             changed, analyzed, [record],
             expected_artifact_sha256="b" * 64,
             trusted_capability_records=[record],
+        )
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["invalid_provenance_count"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_dual_line_external_positive_record_requires_locked_artifact_sha(self):
+        changed = [{
+            "coord": "g:a", "api_name": "p.A.one", "api_signature": "()",
+            "symbol_kind": "method",
+        }]
+        analyzed = [{**changed[0], "analysis_status": "reachable"}]
+        record = authority("p.A.one", "()", "reachable", authority="project-tests")
+
+        result = oracle.audit_api_oracle(
+            changed,
+            analyzed,
+            [record],
+            expected_artifact_sha256="b" * 64,
+            require_artifact_binding_for_all=True,
         )
 
         self.assertEqual(result["verified"], 0)

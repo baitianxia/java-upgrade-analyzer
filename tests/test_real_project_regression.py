@@ -6765,6 +6765,52 @@ class RealProjectRegressionTest(unittest.TestCase):
 
 
 class RealProjectRegressionTests(unittest.TestCase):
+    def test_guard_dual_line_audit_writes_independent_line_artifacts(self):
+        selected = [{
+            "coord": "example:library",
+            "api_name": "sample.Entry.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+        }]
+        analyzer_summary = {
+            "reachable_apis": [{**selected[0], "analysis_status": "reachable"}],
+        }
+        evidence_path = Path(__file__).resolve()
+        oracle_row = {
+            **selected[0],
+            "oracle_conclusion": "reachable",
+            "authority": "jdk-javap",
+            "authority_version": "21",
+            "procedure": "independent final artifact scan",
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+            "generated_at": "2026-07-21T00:00:00Z",
+            "evidence_mode": "bytecode",
+            "artifact_sha256": "a" * 64,
+            "capabilities": "artifact_bound;closed_world_static;executable_edges",
+        }
+        case = realreg.replace(
+            realreg.CASES["gs-multi-module"], enable_jdk_oracle=False
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            realreg, "build_automatic_oracle_records", return_value=[oracle_row]
+        ):
+            result, warnings = realreg.run_dual_line_accuracy_audit(
+                case,
+                selected,
+                analyzer_summary,
+                {"trusted_artifact_sha": "a" * 64},
+                Path(tmp),
+            )
+            outputs = result["line_outputs"]
+            self.assertTrue(all(Path(path).is_file() for path in outputs.values()))
+
+        self.assertEqual(warnings, [])
+        self.assertFalse(result["blocking"], result)
+        self.assertEqual(result["verified"], 1)
+
     def test_guard_selector_contains_only_guard_cases(self):
         selected = realreg.select_case_names("guard")
 
@@ -6852,6 +6898,14 @@ class RealProjectRegressionTests(unittest.TestCase):
                     })
         return {
             "api_coverage_complete": True,
+            "oracle_audit": {
+                "selected": 1,
+                "verified": 1,
+                "incorrect": 0,
+                "unverified": 0,
+                "oracle_conflicts": 0,
+                "blocking": False,
+            },
             "summary": {
                 "reachable": 1,
                 "uncertain": 0,
@@ -7059,6 +7113,10 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(len(oracle_rows), len(changed_rows))
         self.assertTrue(all(row["oracle_conclusion"] == "reachable" for row in oracle_rows))
         self.assertTrue(all(row["evidence_mode"] == "project_test" for row in oracle_rows))
+        self.assertTrue(all(
+            row["artifact_sha256"] == manifest["artifact_sha256"]
+            for row in oracle_rows
+        ))
         identity = lambda row: (
             row["coord"], row["api_name"], row["symbol_kind"], row["api_signature"]
         )
@@ -7779,7 +7837,7 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertIn("missing-gap:missing_state", result["errors"])
         self.assertIn("expired-gap:waiver_expired", result["errors"])
 
-    def test_fixed_fixture_debt_requires_real_unittest_and_all_seven_gates(self):
+    def test_fixed_fixture_debt_requires_real_unittest_and_all_eight_gates(self):
         declarations = [{
             "finding_id": "fixed-gap",
             "state": "fixed",
@@ -7827,7 +7885,7 @@ class RealProjectRegressionTests(unittest.TestCase):
             result["errors"],
         )
 
-    def test_v3_guard_reports_all_seven_independent_gates(self):
+    def test_v3_guard_reports_dual_line_accuracy_as_an_independent_gate(self):
         manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
         manifest = self._manifest_with_expected_physical_edges(
             json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -7845,9 +7903,48 @@ class RealProjectRegressionTests(unittest.TestCase):
 
         self.assertEqual(list(gates), [
             "asset", "api_coverage", "topology_coverage", "edge_truth",
-            "conclusion", "performance", "fixture_debt",
+            "conclusion", "oracle_accuracy", "performance", "fixture_debt",
         ])
         self.assertTrue(all(gate["passed"] for gate in gates.values()), gates)
+
+    def test_v3_guard_rejects_missing_dual_line_oracle_audit(self):
+        manifest_path = ROOT / "tests" / "fixtures" / "real_projects" / "gs-multi-module.json"
+        manifest = self._manifest_with_expected_physical_edges(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        result = self._passing_gs_guard_result(manifest)
+        result.pop("oracle_audit")
+        asset = {"name": "asset", "passed": True, "errors": []}
+        debt = {"passed": True, "errors": []}
+
+        gates = realreg.build_v3_gates(manifest, result, asset, debt)
+
+        self.assertFalse(gates["oracle_accuracy"]["passed"])
+        self.assertIn("oracle_audit_missing", gates["oracle_accuracy"]["errors"])
+
+    def test_guard_mode_emits_oracle_correctness_signal(self):
+        case = realreg.CASES["gs-multi-module"]
+        audit = {
+            "selected": 1,
+            "verified": 0,
+            "incorrect": 1,
+            "unverified": 0,
+            "oracle_conflicts": 0,
+            "blocking": True,
+        }
+
+        signals = realreg.build_policy_signals(
+            case,
+            coverage={"complete": True},
+            performance={},
+            report_dir=Path("/tmp/dual-line-guard"),
+            oracle_audit=audit,
+        )
+
+        self.assertTrue(any(
+            signal.get("signal_type") == "correctness_failure"
+            for signal in signals
+        ))
 
     def test_run_case_checks_pinned_final_artifact_before_step5_and_writes_gate_outputs(self):
         case = realreg.CASES["gs-multi-module"]
@@ -7869,7 +7966,7 @@ class RealProjectRegressionTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(set(result["gates"]), {
             "asset", "api_coverage", "topology_coverage", "edge_truth",
-            "conclusion", "performance", "fixture_debt",
+            "conclusion", "oracle_accuracy", "performance", "fixture_debt",
         })
         self.assertFalse(result["gates"]["asset"]["passed"])
         self.assertIn("project_checkout_missing", result["gates"]["asset"]["errors"])
@@ -7905,10 +8002,10 @@ class RealProjectRegressionTests(unittest.TestCase):
             failing["fixture_debt"]["errors"],
         )
 
-    def test_cli_prints_all_seven_gate_results_on_asset_failure(self):
+    def test_cli_prints_all_eight_gate_results_on_asset_failure(self):
         gate_names = (
             "asset", "api_coverage", "topology_coverage", "edge_truth",
-            "conclusion", "performance", "fixture_debt",
+            "conclusion", "oracle_accuracy", "performance", "fixture_debt",
         )
         result = {
             "case": "gs-multi-module",

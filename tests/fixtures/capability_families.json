@@ -173,29 +173,38 @@
       ],
       "state": "enforced",
       "production_paths": [
+        "scripts/dual_line_accuracy.py",
         "scripts/enhanced_output_formatter.py",
         "scripts/exhaustive_api_oracle.py",
         "scripts/quality_gate.py",
         "scripts/real_project_regression.py",
+        "scripts/runtime_coverage_oracle.py",
         "scripts/s4_jar_compare.py",
         "scripts/s5_call_chain_engine_integrated.py",
         "scripts/signature_utils.py"
       ],
       "positive_tests": [
+        "tests.test_dual_line_accuracy.DualLineAccuracyTest.test_reconciles_arbitrary_project_without_registered_case",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_accepts_one_identical_canonical_identity_set",
+        "tests.test_runtime_coverage_oracle.RuntimeCoverageOracleTest.test_runtime_coverage_matches_exact_owner_member_and_overload",
         "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_audit_verifies_every_api_with_third_party_provenance",
         "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_step4_dynamic_field_discovery_reconciles_with_independent_oracle",
         "tests.test_generated_topology_regression.GeneratedTopologyRegressionTest.test_runner_compiles_and_exercises_production_bytecode_collector",
         "tests.test_metamorphic_regression.MetamorphicRegressionTest.test_every_transform_reexecutes_production_analysis_on_distinct_input"
       ],
       "negative_tests": [
+        "tests.test_dual_line_accuracy.DualLineAccuracyTest.test_missing_oracle_identity_blocks_instead_of_sampling",
+        "tests.test_dual_line_accuracy.DualLineAccuracyTest.test_oracle_from_different_artifact_is_invalid",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_uses_coordinate_and_change_type_in_closed_identity_set",
         "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_missing_analyzer_identity_is_an_explicit_closed_world_failure",
+        "tests.test_runtime_coverage_oracle.RuntimeCoverageOracleTest.test_unrelated_classfiles_are_rejected_even_with_valid_artifact",
         "tests.test_generated_topology_regression.GeneratedTopologyRegressionTest.test_wrong_conclusion_is_blocking_even_when_identity_set_matches"
       ],
       "mutation_tests": [
+        "tests.test_dual_line_accuracy.DualLineAccuracyTest.test_wrong_analyzer_conclusion_is_incorrect",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_rejects_equal_count_summary_with_wrong_identity_set",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_output_audit_rejects_duplicate_step4_canonical_identity",
+        "tests.test_runtime_coverage_oracle.RuntimeCoverageOracleTest.test_absent_or_unsupported_runtime_coverage_remains_uncertain",
         "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_duplicate_changed_identity_is_an_explicit_closed_world_failure",
         "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_dynamic_pipeline_gate_detects_removed_link_and_dropped_api",
         "tests.test_production_mutation.ProductionMutationTest.test_registered_production_mutants_are_all_killed"

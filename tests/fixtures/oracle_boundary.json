@@ -1,8 +1,10 @@
 {
   "schema_version": 1,
   "oracle_files": [
+    "scripts/dual_line_accuracy.py",
     "scripts/exhaustive_api_oracle.py",
     "scripts/final_artifact_edge_oracle.py",
+    "scripts/runtime_coverage_oracle.py",
     "scripts/third_party_jdeps_oracle.py",
     "scripts/third_party_jdk_oracle.py"
   ],
