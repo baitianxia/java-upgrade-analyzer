@@ -2648,6 +2648,7 @@ return ExtraApi.callLegacy();
             ),
         ],
         cwd=project_dir,
+        env={**dep_env},
     )
     assert_true(
         multi_bridge_rc == EXIT_AWAITING_USER,
@@ -2700,6 +2701,7 @@ return ExtraApi.callLegacy();
             "--report-dir", str(dependency_multi_report),
         ],
         cwd=project_dir,
+        env={**dep_env},
     )
     assert_step_blocked_with_reason(
         dependency_multi_report,
