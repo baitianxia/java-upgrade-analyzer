@@ -8,15 +8,17 @@ single repeatable entry point.
 
 import argparse
 from dataclasses import dataclass, asdict
+import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 import time
 
 from compat import setup_utf8_io
-from runtime_contract import contract_payload
+from runtime_contract import REQUIRED_PACKAGES, REQUIREMENTS_FILE, contract_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -465,6 +467,46 @@ def _write_json(path, payload):
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _git_output(*args):
+    completed = subprocess.run(
+        ["git", *args], cwd=str(ROOT), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+        check=False, timeout=15,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def build_evidence_identity(profile, *, real_scope_mode, real_case):
+    requirements_bytes = REQUIREMENTS_FILE.read_bytes()
+    return {
+        "commit": _git_output("rev-parse", "HEAD"),
+        "worktree_clean": not bool(_git_output("status", "--porcelain")),
+        "os": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+        },
+        "python": {
+            "implementation": platform.python_implementation(),
+            "version": platform.python_version(),
+            "executable": sys.executable,
+        },
+        "runtime_dependencies": {
+            "requirements_file": str(REQUIREMENTS_FILE.relative_to(ROOT)),
+            "requirements_sha256": hashlib.sha256(requirements_bytes).hexdigest(),
+            "declared": dict(sorted(REQUIRED_PACKAGES.items())),
+        },
+        "environment_contract": contract_payload(
+            require_maven=profile in {"step5", "release"}
+        ),
+        "profile": profile,
+        "real_project_scope": {
+            "mode": real_scope_mode,
+            "selector": real_case if real_scope_mode == "included" else "",
+        },
+    }
+
+
 def _read_audit_summary(tasks, results=None):
     if results is not None:
         result_by_name = {result.name: result for result in results}
@@ -651,6 +693,11 @@ def main(argv=None):
         payload = {
             "profile": args.profile,
             "dry_run": True,
+            "evidence_identity": build_evidence_identity(
+                args.profile,
+                real_scope_mode=real_scope_mode,
+                real_case=args.real_case,
+            ),
             "tasks": [asdict(task) for task in tasks],
         }
         payload.update(build_gate_decision_summary(
@@ -685,6 +732,11 @@ def main(argv=None):
     payload = {
         "profile": args.profile,
         "status": overall,
+        "evidence_identity": build_evidence_identity(
+            args.profile,
+            real_scope_mode=real_scope_mode,
+            real_case=args.real_case,
+        ),
         "decision": decision_summary["release_decision"],
         "elapsed_sec": round(time.perf_counter() - started, 3),
         "blocking_signals": int(audit_summary.get("blocking_signals") or 0),
