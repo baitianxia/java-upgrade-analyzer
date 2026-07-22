@@ -139,6 +139,7 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 - 删除依赖、升级依赖、字段变化、构造器变化、多依赖链路都要覆盖；
 - 反射、MethodHandle、资源、表达式语言不能静默当成未命中；
 - `reachable` / `not_impacted` / `uncertain` / `not_found_in_static_analysis` / `not_analyzed` 语义不能混淆；`not_impacted` 必须有当前制品中的相同类字节码证据；
+- Kotlin/KTS 当前属于 partial capability：相关降级文件不得产生确定的负结论或 `not_impacted`；源码范围必须先与当前最终制品 class 闭集对齐，测试代码只能按标准源集路径识别；
 - `alerts.csv` 必须是完整链路台账，不是样例；
 - 性能优化不能通过减少分析范围实现。
 - 重载匹配必须同时校验全限定类名和参数描述符；最终制品已完整扫描且精确描述符未命中时，不得被无签名别名阻塞为 `not_analyzed`。
@@ -160,6 +161,52 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 | Smoke | 验证主流程可跑通 |
 | 压力模型 | 验证大 API、大依赖、大边数下的复杂度 |
 | 真实项目验证 | 验证工程化输入和真实依赖结构 |
+
+## 声明式测试目录与发布健康门
+
+`tests/fixtures/capability_families.json` 是能力不变量与广义回归的注册表，
+`tests/fixtures/test_profiles.json` 只声明 profile 选择哪些能力族、测试角色和附加性质测试。
+`scripts/capability_test_catalog.py` 在运行时通过 unittest loader 自动解析注册引用、去重并
+生成确定性测试闭集；quick 与 Step5 不再在 `quality_gate.py` 中维护第二份手写模块列表。
+
+目录使用测试完整 ID 的 SHA-256 做稳定分片，支持 `--shard-index` / `--shard-count`。
+同一 profile 无论文件枚举顺序如何，所有 shard 必须互斥且并集等于完整测试闭集。任何 enforced
+能力的陈旧或无法加载引用都会在测试执行前失败；不能等到真实项目 closure 阶段才发现。
+
+release profile 额外执行三类阻塞门：
+
+- `branch_coverage_core` 使用 Python 运行时 line-arc 跟踪计算 `if` 的 true/false decision
+  branch，而不是把行覆盖冒充分支覆盖。`signature_utils.py` 与
+  `step5_evidence_model.py` 的最低门槛为 75%，纯追踪策略 `step5_trace_policy.py` 为 90%；
+  缺失函数、无可测分支或低于门槛都会失败。
+- `production_mutations` 对生产 AST 应用 owner、签名、坐标、change identity、证据完整性、
+  深度预算、最终制品绑定与归档安全等变异。任一 survived 或 infrastructure failure 都会失败。
+- `test_health` 对声明式 health 闭集重复运行，输出每个测试的结果序列和耗时降序排行；结果波动
+  视为 flaky，单测平均耗时超过 profile 预算视为 slow，二者都阻塞 release。
+
+规范化、重载兼容、路径去重、结论状态单调性、深度边界与失败关闭使用固定随机种子的生成式/
+metamorphic 测试。它们不依赖在线安装 property-testing 包，离线发布环境与 CI 使用同一输入序列。
+
+可单独复核：
+
+```bash
+python3 scripts/capability_test_catalog.py --profile quick --validate-only
+python3 scripts/capability_test_catalog.py --profile health
+python3 scripts/branch_coverage_gate.py --profile branch_core
+python3 -m unittest tests.test_production_mutation.ProductionMutationTest.test_registered_production_mutants_are_all_killed
+```
+
+## 模块与外部工具失败门
+
+Step5 的事实提取、身份解析、图存储、纯追踪策略、结论收敛与输出渲染使用单向 import
+边界；测试会解析这些模块的 AST 并拒绝循环依赖。核心 cost/confidence/frontier/stop policy
+只依赖内存参数，不读取文件、不运行命令，可由纯 fixture 完整复核。
+
+迁移到 `scripts/tool_execution.py` 的外部工具必须使用 argv 列表，并为失败保留：
+`stage`、完整 `command`、`timeout_seconds`、`stderr`、`returncode`、`reason_code` 与
+`blocking`。超时、命令缺失、权限不足、启动异常、非零退出和要求输出却为空分别使用稳定
+reason code。上层必须把失败投影到 coverage/EvidenceFailure；禁止捕获后返回空字符串，
+也禁止后续 collector ingestion 覆盖已经记录的工具失败。
 
 ## 正例和负例
 
@@ -246,7 +293,19 @@ Step5 性能验证优先看：
 - `trace.direct_source_fact_index_body_reads`;
 - `trace.direct_source_fact_index_body_cache_evictions`;
 - `trace.direct_source_fact_index_class_keys` / `field_keys`;
+- `trace.multi_target_group_count` / `multi_target_target_count` / `multi_target_shared_key_count`;
+- `trace.reverse_transition_cache_builds` / `reverse_transition_cache_hits`;
+- `trace.reverse_transition_edges_materialized` / `reverse_transition_edges_reused`;
 - `report.elapsed_sec`。
+
+多目标复用的定向门禁必须同时比较开启与关闭复用后的五态结论、`path_details` 指纹和完整
+`alerts.csv` 字节，并以 1×/2×/4× 共享前驱图验证转换物化次数近线性增长。命中率提升只
+是性能信号，不能替代上述语义等价与闭集范围校验。
+
+真实项目的亚 50ms 单 API 墙钟指标可能受操作系统调度抖动影响。只有 pinned manifest
+显式声明 `scheduler_jitter_floor` 时，相对阈值才可提升到该绝对 floor；未声明时仍严格使用
+baseline ratio，超过 floor 仍阻塞。该例外只适用于对应微计时指标，不放宽总耗时、扫描速率、
+RSS、外部命令数或范围闭集门，并且必须有 floor 内/外成对边界测试。
 
 ## 真实项目验证口径
 

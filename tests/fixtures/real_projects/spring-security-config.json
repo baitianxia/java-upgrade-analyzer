@@ -34,7 +34,12 @@
     "metrics": {
       "elapsed_seconds_per_api": {"value": 5.616, "max_ratio": 2.0},
       "scan_seconds_per_1000_classes": {"value": 3.738, "max_ratio": 2.0},
-      "max_api_elapsed_seconds": {"value": 0.008, "max_ratio": 3.0},
+      "max_api_elapsed_seconds": {
+        "value": 0.008,
+        "max_ratio": 3.0,
+        "scheduler_jitter_floor": 0.05,
+        "notes": "Sub-50ms per-API wall timings are scheduler-sensitive; total, scan and RSS gates remain independently blocking."
+      },
       "javap_invocations": {"value": 122, "max_ratio": 1.5},
       "duplicate_jar_scans": {"value": 0, "max_absolute": 0},
       "peak_rss_mb": {"value": 261.469, "max_ratio": 1.5}

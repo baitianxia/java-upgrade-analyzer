@@ -304,6 +304,48 @@ def _production_mutation_task(python_exe):
     )
 
 
+def _capability_profile_task(python_exe, name, profile, audit_root, *, validate_only=False, heavy=False):
+    json_out = str(audit_root / f"{name}.json")
+    command = [
+        python_exe,
+        "scripts/capability_test_catalog.py",
+        "--profile",
+        profile,
+        "--json-out",
+        json_out,
+    ]
+    if validate_only:
+        command.append("--validate-only")
+    return GateTask(
+        name=name,
+        command=command,
+        purpose=(
+            f"声明式 capability-family 测试目录：{profile}；"
+            "自动校验引用、稳定分片、重复结果与时长排行"
+        ),
+        heavy=heavy,
+        output_paths=(json_out,),
+    )
+
+
+def _branch_coverage_task(python_exe, audit_root):
+    json_out = str(audit_root / "branch_coverage_core.json")
+    return GateTask(
+        name="branch_coverage_core",
+        command=[
+            python_exe,
+            "scripts/branch_coverage_gate.py",
+            "--profile",
+            "branch_core",
+            "--json-out",
+            json_out,
+        ],
+        purpose="核心身份规范化与五态结论策略的 decision branch 覆盖门槛",
+        heavy=True,
+        output_paths=(json_out,),
+    )
+
+
 def _determinism_task(python_exe, profile):
     method = (
         "test_generated_core_matrix_is_semantically_identical"
@@ -323,7 +365,7 @@ def _execution_fault_task(python_exe):
     return _unittest_task(
         python_exe,
         "execution_faults",
-        ["tests.test_execution_faults"],
+        ["tests.test_tool_execution", "tests.test_execution_faults"],
         "执行超时、退出、截断、替换、权限、编码、中断与缓存竞态必须失败关闭",
     )
 
@@ -369,11 +411,8 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
             "core",
             str(audit_root / "accuracy_benchmark_core.json"),
         ))
-        tasks.append(_unittest_task(
-            python_exe,
-            "unit_core_semantics",
-            CORE_SEMANTIC_TESTS,
-            "核心准确性契约：jdeps 对照、多依赖链路、字段链路",
+        tasks.append(_capability_profile_task(
+            python_exe, "unit_core_semantics", "quick", audit_root
         ))
         tasks.append(_smoke_task(python_exe, "core", str(audit_root / "smoke_core.json")))
     elif profile == "step5":
@@ -382,12 +421,8 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
             "step5",
             str(audit_root / "accuracy_benchmark_step5.json"),
         ))
-        tasks.append(_unittest_task(
-            python_exe,
-            "unit_step5_semantics",
-            STEP5_TESTS,
-            "Step5 语义回归：owner/signature/字节码/反射/间接引用",
-            heavy=True,
+        tasks.append(_capability_profile_task(
+            python_exe, "unit_step5_semantics", "step5", audit_root, heavy=True
         ))
         tasks.append(_smoke_task(python_exe, "core", str(audit_root / "smoke_core.json")))
         tasks.append(_smoke_task(python_exe, "step5", str(audit_root / "smoke_step5.json")))
@@ -402,6 +437,17 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
                 python_exe, real_json, audit_root
             ))
     elif profile == "release":
+        tasks.append(_capability_profile_task(
+            python_exe,
+            "capability_test_catalog",
+            "quick",
+            audit_root,
+            validate_only=True,
+        ))
+        tasks.append(_branch_coverage_task(python_exe, audit_root))
+        tasks.append(_capability_profile_task(
+            python_exe, "test_health", "health", audit_root
+        ))
         tasks.append(_production_mutation_task(python_exe))
         tasks.append(_execution_fault_task(python_exe))
         tasks.append(_determinism_task(python_exe, "full"))

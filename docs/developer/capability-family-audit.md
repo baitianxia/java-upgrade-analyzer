@@ -4,12 +4,15 @@ This audit records architecture capability closure. It is development evidence, 
 
 ## Validation Boundary
 
-The implementation descriptions below were reconciled against `main@69b60af` on
-2026-07-21. The real-project results in this document were last recorded by
-`616df58` on 2026-07-16; they are historical evidence for that commit, not a
-fresh guard result or release authorization for the current HEAD. A current
-`closed` claim requires a new release profile with the complete `guard` (or
-`all`) selector and a passing quality-signal audit.
+The implementation descriptions below were reconciled against the current working
+tree based on `main@5b4183492cf1d026ade20590dfa20a4173aa7c7a` on 2026-07-22. That
+working tree passed the complete release profile with the `guard` selector,
+quality-signal audit, retrospective, and capability closure. The run covered 2,035
+unit tests (one skipped) and all nine registered real projects, reported zero
+blocking or non-blocking signals, and returned `release_allowed`. Local evidence is
+stored at `/private/tmp/jua-final-release-2-quality-gate.json`; because the changes
+are not yet committed and the path is ephemeral, a future commit or environment
+must generate fresh authorization rather than inheriting this result.
 
 ## Status Vocabulary
 
@@ -20,15 +23,17 @@ fresh guard result or release authorization for the current HEAD. A current
 
 ## Current Audit
 
-| Capability family | Implementation state at `69b60af` | Last recorded guard evidence (`616df58`) | Missing current closure evidence |
+| Capability family | Implementation state | Current closure evidence | Remaining closure work |
 |---|---|---|---|
-| `artifact_identity_ownership` | enforced | five-project guard passed | rerun the complete current guard and quality audit |
-| `canonical_evidence_identity` | enforced | five-project guard passed | rerun the complete current guard and quality audit |
-| `evidence_completeness_visibility` | enforced | five-project guard passed | rerun the complete current guard and quality audit |
-| `framework_activation_semantics` | enforced | Dubbo reflection and two MyBatis guards passed | rerun the complete current guard and quality audit |
-| `closed_world_pipeline` | enforced | formal Step5 gate passed | rerun API coverage, edge truth, conclusion, performance, fixture debt, retrospective, and capability closure together |
-| `reproducible_test_assets` | enforced | materialization plans valid; five pinned guards passed | rematerialize assets and rerun the complete current guard |
-| `performance_without_scope_loss` | enforced | five-project guard passed | rerun the scope and performance envelopes against current artifacts |
+| `artifact_identity_ownership` | enforced | nine-project guard and closure passed | none for this working tree |
+| `canonical_evidence_identity` | enforced | closed-set API and edge reconciliation passed | none for this working tree |
+| `evidence_completeness_visibility` | enforced | conclusion, evidence and fault gates passed | none for this working tree |
+| `framework_activation_semantics` | enforced | Dubbo, Spring, RabbitMQ and two MyBatis guards passed | none for this working tree |
+| `closed_world_pipeline` | enforced | API coverage, edge truth, conclusion, performance, fixture debt, retrospective and closure passed together | none for this working tree |
+| `reproducible_test_assets` | enforced | all nine pinned guard assets materialized and passed | none for this working tree |
+| `performance_without_scope_loss` | enforced | scope contracts and performance envelopes passed for all nine guards | none for this working tree |
+| `test_gate_integrity` | enforced | declarative catalog, branch, health, mutation, full unit and closure gates passed | none for this working tree |
+| `module_and_tool_failure_boundaries` | enforced | one-way import, typed failure, ingestion preservation, execution fault and closure gates passed | none for this working tree |
 
 ## Artifact Identity And Ownership Finding
 
@@ -122,6 +127,51 @@ lower. The `616df58` five-project guard satisfied the new scope values with that
 commit's envelope schema. It included the 9,413-class RabbitMQ Fat Jar run, all
 declared API and edge reconciliation, fault-injection detection, and per-case
 performance budgets in the same formal gate execution.
+
+Step5 additionally groups changed APIs by dependency coordinate and target
+owner, prewarms a multi-source reverse plan, and memoizes target-independent
+reverse transitions. An enabled/disabled equivalence guard compares the full
+five-state result, path details, and `alerts.csv` bytes. Generated 1×/2×/4×
+shared-predecessor graphs verify near-linear transition materialization rather
+than accepting a timing-only claim.
+
+## Test Gate Integrity Finding
+
+Quick and Step5 test selection previously lived in handwritten Python lists,
+while capability-family references were resolved only during a real-project
+closure run. A stale Spring test reference could therefore remain invisible to
+ordinary local profiles. There was no branch threshold or uniform flaky/slow
+result artifact, and the production mutation registry did not independently
+exercise signature identity, change identity, depth budget, or negative
+fail-closed promotion.
+
+The test catalog now derives profiles from capability-family tags, validates
+every enforced reference, and exposes deterministic SHA-256 shards. The release
+profile measures true/false line arcs in core identity and conclusion functions,
+kills the expanded production AST mutation matrix, and repeats the health
+profile while recording outcome histories and duration rankings. The first
+catalog validation found and removed the stale Spring reference, demonstrating
+that this is an executable gate rather than documentation-only metadata.
+
+## Module And Tool Failure Boundary Finding
+
+The tracing cost, confidence decay, frontier dominance, adaptive depth and stop
+policy previously lived inside the 11k-line tracer, while the graph contract was
+a function-local class in the Step5 orchestrator. They now have dependency-light
+`step5_trace_policy` and `step5_graph` contracts. The established one-way order is
+fact extraction and identity normalization, graph storage and pure policy, graph
+query orchestration, evidence conclusion, then output rendering. An AST test
+rejects a reverse import or cycle, and the legacy tracer re-exports the policy
+functions only for caller compatibility.
+
+Two Step5 `javap` boundaries previously represented failure as an empty string.
+They now use one typed result/failure contract containing stage, argv, timeout,
+stderr, return code, reason code and blocking impact. A full pipeline review also
+found that evidence ingestion could overwrite a pre-existing JAR-metadata tool
+failure; snapshot replacement now removes only stale collector-owned failures
+and preserves unscoped tool failures. Failure-injection tests cover timeout,
+missing command, permission, nonzero exit, startup exception, empty output and
+post-ingestion survival.
 
 ## Canonical Evidence Identity Finding
 

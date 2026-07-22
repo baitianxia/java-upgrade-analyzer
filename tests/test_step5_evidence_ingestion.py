@@ -545,6 +545,42 @@ class EvidenceIngestionTest(unittest.TestCase):
             ],
         )
 
+    def test_ingestion_preserves_unscoped_external_tool_failure(self):
+        tool_failure = EvidenceFailure(
+            stage="step5.jar-metadata.javap",
+            reason_code="STEP5_JAR_METADATA_JAVAP_TIMEOUT",
+            blocking=True,
+            artifact="/artifact/dependency.jar",
+            class_name="com.vendor.Target",
+        )
+        graph = SimpleNamespace(
+            reverse_edges={},
+            step5_evidence_failures=(tool_failure,),
+        )
+        collector_failure = EvidenceFailure(
+            stage="business-bytecode",
+            reason_code="CURRENT_FINAL_ARTIFACT_SHA_INVALID",
+            blocking=True,
+        )
+
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="business_bytecode",
+            version="2",
+            failures=(collector_failure,),
+        ),))
+        ingest_collector_batches(graph, (CollectorBatch(
+            collector="spring_runtime_artifact",
+            version="1",
+        ),))
+
+        self.assertEqual(
+            [failure.reason_code for failure in graph.step5_evidence_failures],
+            [
+                "STEP5_JAR_METADATA_JAVAP_TIMEOUT",
+                "CURRENT_FINAL_ARTIFACT_SHA_INVALID",
+            ],
+        )
+
     def test_incremental_non_framework_batch_preserves_framework_projection(self):
         graph, edge, _caller_sha = self._verified_mybatis_fixture()
         ingest_collector_batches(graph, (CollectorBatch(

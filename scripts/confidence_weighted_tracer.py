@@ -71,11 +71,18 @@ from step5_evidence_model import (
     decide_envelope,
     thaw_evidence_value,
 )
+from step5_trace_policy import (
+    adaptive_exact_high_confidence_cost_limit,
+    calculate_confidence_decay,
+    calculate_depth_cost,
+    should_stop_tracing,
+    update_path_frontier,
+)
+from tool_execution import ExternalToolError, execute_external_tool
 
 
 NON_BLOCKING_PARSER_FALLBACK_REASONS = {
     'prefer_tree_sitter_disabled',
-    'unsupported_language_kotlin',
 }
 
 CALL_GRAPH_LIMITED_SYMBOL_KINDS = {
@@ -557,7 +564,7 @@ def _record_analyzer_ledger_failure(graph, reason, **fields):
         tuple(sorted((str(key), str(value or '')) for key, value in fields.items())),
     ))
     typed_failure = EvidenceFailure(
-        stage='analyzer-edge-collection',
+        stage=str(fields.get('stage') or 'analyzer-edge-collection'),
         reason_code=reason_code,
         blocking=True,
         api_identity=str(fields.get('api_identity') or ''),
@@ -908,7 +915,10 @@ def _emit_step5_perf_summary(graph):
             f"expand_calls={int(expand.get('calls', 0))}，"
             f"expand_cache_hits={int(expand.get('candidate_cache_hits', 0))}，"
             f"member_index_builds={int(expand.get('member_index_builds', 0))}，"
-            f"trace_elapsed={trace.get('elapsed_sec', 0)}s"
+            f"trace_elapsed={trace.get('elapsed_sec', 0)}s，"
+            f"multi_target_groups={int(trace.get('multi_target_group_count', 0))}，"
+            f"shared_reverse_keys={int(trace.get('multi_target_shared_key_count', 0))}，"
+            f"transition_cache_hits={int(trace.get('reverse_transition_cache_hits', 0))}"
         ),
     )
     slow_apis = (trace.get('slow_api_traces') or [])[:5]
@@ -2049,7 +2059,7 @@ def _build_identical_current_class_provider_index(all_apis, graph):
                         'old_jar': jar_path,
                         'old_class_entry': entry,
                     }
-        except Exception as exc:
+        except (OSError, KeyError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
             _record_analyzer_ledger_failure(
                 graph,
                 'PRESERVATION_BASE_ARTIFACT_UNREADABLE',
@@ -2085,7 +2095,7 @@ def _build_identical_current_class_provider_index(all_apis, graph):
                             'class_sha256': digest,
                             **old,
                         })
-        except Exception as exc:
+        except (OSError, KeyError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
             _record_analyzer_ledger_failure(
                 graph,
                 'PRESERVATION_PROVIDER_ARTIFACT_UNREADABLE',
@@ -2716,7 +2726,15 @@ def _parse_classfile_constant_pool_summary(data):
             'has_dynamic_reference': has_dynamic_reference,
             'utf8_values': utf8_values,
         }
-    except Exception:
+    except (
+        IndexError,
+        KeyError,
+        OverflowError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        struct.error,
+    ):
         return None
 
 
@@ -2725,11 +2743,16 @@ def _run_javap_bytecode_dump(jar_path, class_binary_name, multi_release_version=
     if multi_release_version not in (None, '', 'base'):
         command.extend(['--multi-release', str(multi_release_version)])
     command.append(class_binary_name)
-    stdout, _stderr, rc = run_cmd(
+    execution = execute_external_tool(
         command,
-        timeout=30,
-    )
-    return stdout if rc == 0 else ''
+        stage='step5.bytecode.javap',
+        reason_prefix='STEP5_JAVAP',
+        timeout_seconds=30,
+        blocking=True,
+        require_stdout=True,
+        runner=run_cmd,
+    ).require_success()
+    return execution.stdout
 
 
 def _constant_pool_requires_javap(summary):
@@ -3225,10 +3248,21 @@ def _load_runtime_dependency_class_references(
         cache_generations.pop(cache_key, None)
 
     def parse():
-        text = _run_javap_bytecode_dump(
-            jar_path, class_binary_name, multi_release_version=multi_release_version
-        )
         _perf_add(graph, 'bytecode_scan', 'javap_fallbacks', 1)
+        try:
+            text = _run_javap_bytecode_dump(
+                jar_path, class_binary_name, multi_release_version=multi_release_version
+            )
+        except ExternalToolError as exc:
+            failure = exc.failure
+            details = failure.to_mapping()
+            details.pop('reason_code', None)
+            details.update({
+                'jar_path': jar_path,
+                'class_binary_name': class_binary_name,
+            })
+            _record_analyzer_ledger_failure(graph, failure.reason_code, **details)
+            return None
         if not text:
             return None
         parsed = _parse_javap_bytecode_references(text, class_binary_name)
@@ -7295,10 +7329,45 @@ def _fallback_file_may_reference_api(file_path, api_row):
         return True
     if member and f"{owner_simple}.{member}" in text:
         return True
-    if owner_package and re.search(rf"\bimport\s+{re.escape(owner_package)}\.\*\s*;", text):
+    if member and owner_simple in text and re.search(rf"\b{re.escape(member)}\b", text):
+        return True
+    if owner_package and re.search(
+        rf"\bimport\s+{re.escape(owner_package)}\.\*\s*;?", text
+    ):
         if owner_simple in text or (member and member in text):
             return True
     return False
+
+
+def partial_language_fallback_reasons_relevant_to_api(graph_stats, api_row):
+    return {
+        reason: count
+        for reason, count in parser_fallback_reasons_relevant_to_api(
+            graph_stats, api_row
+        ).items()
+        if reason.startswith('unsupported_language_')
+    }
+
+
+def build_partial_language_analysis_result(result, fallback_reasons):
+    items = ', '.join(
+        f"{reason}={count}" for reason, count in sorted(fallback_reasons.items())
+    )
+    note = (
+        f'相关源码仅具备部分语言分析能力（{items}）；'
+        '当前线索可用于发现候选调用，但不能据此产生确定的未影响结论。'
+    )
+    _apply_blocking_failure(
+        result,
+        'source-graph-analysis',
+        'PARTIAL_LANGUAGE_ANALYSIS',
+        note,
+    )
+    result.verification_commands = [
+        '使用 Kotlin 编译器/PSI 前端补齐语义分析，或提供当前最终制品字节码闭集后重跑 Step 5',
+        '核对 alerts.csv 中记录的 partial language 文件与目标 API 引用',
+    ]
+    return result
 
 
 def parser_fallback_reasons_relevant_to_api(graph_stats, api_row):
@@ -7537,114 +7606,6 @@ def is_utility_class(method_def):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 置信度加权深度策略
-# ══════════════════════════════════════════════════════════════════
-
-def calculate_depth_cost(confidence):
-    """
-    计算深度代价（置信度加权）
-
-    High confidence: cost = 1（全精确路径可按图规模自适应加深）
-    Medium confidence: cost = 2（可追踪3跳）
-    Low confidence: cost = 5（立即停止）
-    """
-    if confidence == 'high':
-        return 1
-    elif confidence == 'medium':
-        return 2
-    else:  # low
-        return 5
-
-
-def update_path_frontier(frontier, *, cost, confidence):
-    """Maintain the non-dominated (cost, confidence) states for one symbol.
-
-    Cost and confidence are independent dimensions: a shorter path may be less
-    trustworthy, while a longer path may consist entirely of exact bytecode or
-    AST edges.  Collapsing both into a cost-first tuple can discard the latter
-    before candidate selection gets a chance to prefer its stronger evidence.
-    """
-    states = list(frontier or [])
-    if any(old_cost <= cost and old_confidence >= confidence for old_cost, old_confidence in states):
-        return True, states
-    states = [
-        (old_cost, old_confidence)
-        for old_cost, old_confidence in states
-        if not (cost <= old_cost and confidence >= old_confidence)
-    ]
-    states.append((cost, confidence))
-    states.sort(key=lambda item: (item[0], -item[1]))
-    return False, states
-
-
-def should_stop_tracing(current_cost, max_cost, confidence_score, critical_node_hit, last_edge_confidence=''):
-    """
-    判断是否应该停止追踪
-
-    停止条件：
-      1. 代价超过限制（max_cost=5）
-      2. 置信度衰减至阈值以下（< 0.3）
-      3. 触达系统代码（已证明变更 API 被系统代码使用）
-      4. 遇到框架边界（无法继续静态分析）
-    """
-    # 代价限制
-    if current_cost >= max_cost:
-        if last_edge_confidence == 'low':
-            return True, 'LOW_CONFIDENCE_EDGE'
-        return True, 'DEPTH_LIMIT_REACHED'
-
-    # 置信度衰减
-    if confidence_score < 0.3:
-        return True, 'CONFIDENCE_DECAYED'
-
-    # 系统代码触达（成功回溯）
-    if critical_node_hit and critical_node_hit.get('type') == 'system_code_touched':
-        return True, 'SYSTEM_CODE_REACHED'
-
-    # 框架边界（无法继续）
-    if critical_node_hit and critical_node_hit.get('type') == 'framework_boundary':
-        return True, 'FRAMEWORK_BOUNDARY'
-
-    return False, None
-
-
-def adaptive_exact_high_confidence_cost_limit(graph, base_limit, path, provenance_family):
-    """Relax the depth budget only for paths backed entirely by exact, high-confidence edges."""
-    base_limit = max(1, int(base_limit or 1))
-    if provenance_family != 'exact' or not path:
-        return base_limit
-    if any(getattr(edge, 'confidence', '') != 'high' for edge in path):
-        return base_limit
-
-    edge_count = int(getattr(graph, 'reverse_edge_count', 0) or 0)
-    if edge_count <= 0:
-        edge_count = sum(
-            len(edges or [])
-            for edges in (getattr(graph, 'reverse_edges', {}) or {}).values()
-        )
-    # The graph size bounds useful work, while the 3x/20 caps prevent an exact
-    # but cyclic graph from turning one API trace into an unbounded traversal.
-    return max(base_limit, min(20, edge_count + 1, base_limit * 3))
-
-
-def calculate_confidence_decay(current_score, edge_confidence):
-    """
-    计算置信度衰减
-
-    规则：
-      - High confidence边：衰减5%（×0.95）
-      - Medium confidence边：衰减20%（×0.8）
-      - Low confidence边：衰减50%（×0.5）
-    """
-    if edge_confidence == 'high':
-        return current_score * 0.95
-    elif edge_confidence == 'medium':
-        return current_score * 0.8
-    else:  # low
-        return current_score * 0.5
-
-
-# ══════════════════════════════════════════════════════════════════
 # 核心追踪逻辑
 # ══════════════════════════════════════════════════════════════════
 
@@ -7659,6 +7620,7 @@ def _collect_trace_api_with_confidence_weighting(
     allow_degraded=False,
     graph_stats=None,
     trace_cache=None,
+    enable_multi_target_reuse=True,
 ):
     """
     置信度加权反向追踪
@@ -7736,6 +7698,21 @@ def _collect_trace_api_with_confidence_weighting(
         _debug_trace_result('trace_api_result', result)
         return result
 
+    partial_language_reasons = partial_language_fallback_reasons_relevant_to_api(
+        graph_stats, api_row
+    )
+    owner = _changed_api_owner_fqcn(api_row)
+    has_preservation_provider = bool(
+        (getattr(graph, 'identical_current_class_providers', {}) or {}).get(
+            (str(api_row.get('coord') or '').strip(), owner)
+        )
+    )
+    if partial_language_reasons and has_preservation_provider:
+        built = build_partial_language_analysis_result(
+            result, partial_language_reasons
+        )
+        _debug_trace_result('trace_api_result', built)
+        return built
     preserved_result = _build_runtime_symbol_preserved_result(result, api_row, graph)
     if preserved_result is not None:
         _debug_trace_result('trace_api_result', preserved_result)
@@ -7996,16 +7973,19 @@ def _collect_trace_api_with_confidence_weighting(
             provenance=frontier.get('provenance', ''),
         )
 
-        # 查询反向索引
-        incoming_edges = get_cached_sorted_incoming_edges(
+        # 查询目标无关的反向子图 transition；多个 API 汇合到相同 key 时
+        # 复用排序、关键节点分类和精确 caller-key 解析结果。
+        transition_batch = get_cached_reverse_trace_transitions(
             reverse_edges,
             current_key,
+            methods_by_id,
+            graph,
+            type_metadata,
             trace_cache=trace_cache,
-            graph=graph,
+            use_cache=enable_multi_target_reuse,
         )
-        _perf_add(graph, 'trace', 'incoming_edges_scanned', len(incoming_edges))
 
-        if not incoming_edges:
+        if not transition_batch.get('incoming_edge_count'):
             # 链路终点
             if current_depth > 0:
                 not_analyzed_candidates.append({
@@ -8024,16 +8004,14 @@ def _collect_trace_api_with_confidence_weighting(
             continue
 
         # 处理每条边
-        for edge in incoming_edges:
-            # 过滤test方法
-            method_def = methods_by_id.get(edge.caller_symbol_id)
-            if not method_def or method_def.is_test:
-                continue
+        for transition in transition_batch.get('transitions') or ():
+            edge = transition['edge']
+            method_def = transition['method_def']
 
             # 关键修复：加权去重策略
             # 只保留 cost 更低的路径（cost 越低越好）
             # 计算新代价和置信度
-            edge_cost = calculate_depth_cost(edge.confidence)
+            edge_cost = transition['edge_cost']
             new_cost = current_cost + edge_cost
             new_confidence = calculate_confidence_decay(current_confidence, edge.confidence)
             new_depth = current_depth + 1
@@ -8061,12 +8039,7 @@ def _collect_trace_api_with_confidence_weighting(
             # 这里同时保留 provenance_family，避免 exact / polymorphic / fallback 互相误剪枝。
 
             # 检查关键节点
-            critical_node = get_cached_critical_node(
-                method_def,
-                graph,
-                type_metadata,
-                trace_cache=trace_cache,
-            )
+            critical_node = transition['critical_node']
 
             # 构建新路径后才能判断它是否仍是“全程精确 + 高置信”。仅这类路径
             # 可以按图规模放宽预算；中/低置信及多态/fallback 路径保持原上限。
@@ -8117,12 +8090,10 @@ def _collect_trace_api_with_confidence_weighting(
                 # reachable 判定的前提下，若仍在 cost/confidence 边界内，继续
                 # 沿高/中置信业务边向上游扩展，直到 max_total_cost 或图边界。
                 if new_cost < effective_cost_limit and new_confidence >= 0.3 and edge.confidence in ('high', 'medium'):
-                    matched_lookup_groups, method_overload_block = get_cached_method_lookup_resolution(
-                        method_def,
-                        type_metadata,
-                        graph,
-                        trace_cache=trace_cache,
+                    matched_lookup_groups = list(
+                        transition['matched_lookup_groups']
                     )
+                    method_overload_block = transition['method_overload_block']
                     # 上游补全只走精确签名。这里的目标是让报告展示更完整的
                     # A -> B -> C -> D 证据链，而不是扩大召回。若沿用
                     # fallback_simple / polymorphic，真实大项目里容易因为 init/close
@@ -8235,12 +8206,8 @@ def _collect_trace_api_with_confidence_weighting(
                 continue
 
             # 继续追踪
-            matched_lookup_groups, method_overload_block = get_cached_method_lookup_resolution(
-                method_def,
-                type_metadata,
-                graph,
-                trace_cache=trace_cache,
-            )
+            matched_lookup_groups = transition['matched_lookup_groups']
+            method_overload_block = transition['method_overload_block']
             if method_overload_block:
                 _step5_debug(
                     'trace_overload_intermediate',
@@ -8584,6 +8551,7 @@ def trace_api_with_confidence_weighting(
     allow_degraded=False,
     graph_stats=None,
     trace_cache=None,
+    enable_multi_target_reuse=True,
 ):
     draft = _collect_trace_api_with_confidence_weighting(
         api_row,
@@ -8596,6 +8564,7 @@ def trace_api_with_confidence_weighting(
         allow_degraded=allow_degraded,
         graph_stats=graph_stats,
         trace_cache=trace_cache,
+        enable_multi_target_reuse=enable_multi_target_reuse,
     )
     if not isinstance(draft, TraceDraft):
         raise TypeError(
@@ -8727,7 +8696,192 @@ def ensure_trace_cache(trace_cache=None):
     trace_cache.setdefault('declared_method_signature_index_owner', None)
     trace_cache.setdefault('overload_signature_index', None)
     trace_cache.setdefault('overload_signature_index_owner', None)
+    trace_cache.setdefault('reverse_trace_transitions_by_key', {})
+    trace_cache.setdefault('multi_target_reverse_plan', {})
     return trace_cache
+
+
+def get_cached_reverse_trace_transitions(
+    reverse_edges,
+    current_key,
+    methods_by_id,
+    graph,
+    type_metadata,
+    trace_cache=None,
+    *,
+    use_cache=True,
+):
+    """Materialize one target-independent reverse-subgraph transition.
+
+    The expensive parts of a frontier expansion (edge filtering/sorting,
+    method lookup, critical-node classification, and precise caller-key
+    resolution) depend on the graph key, not on the changed API.  Caching this
+    immutable transition lets APIs that converge on the same predecessor reuse
+    the subgraph work while each API still runs its own cost/confidence policy
+    and renders its own complete paths.
+    """
+    trace_cache = ensure_trace_cache(trace_cache)
+    cache = trace_cache['reverse_trace_transitions_by_key']
+    raw_edge_count = len((reverse_edges or {}).get(current_key, []) or [])
+    cached = cache.get(current_key) if use_cache else None
+    if cached is not None and cached.get('raw_edge_count') == raw_edge_count:
+        transitions = cached.get('transitions') or ()
+        _perf_add(graph, 'trace', 'reverse_transition_cache_hits', 1)
+        _perf_add(
+            graph, 'trace', 'reverse_transition_edges_reused', len(transitions)
+        )
+        return cached
+    if cached is not None:
+        cache.pop(current_key, None)
+        trace_cache['sorted_incoming_edges_by_key'].pop(current_key, None)
+
+    incoming_edges = get_cached_sorted_incoming_edges(
+        reverse_edges,
+        current_key,
+        trace_cache=trace_cache,
+        graph=graph,
+    )
+    transitions = []
+    for edge in incoming_edges:
+        method_def = methods_by_id.get(edge.caller_symbol_id)
+        if not method_def or method_def.is_test:
+            continue
+        critical_node = get_cached_critical_node(
+            method_def,
+            graph,
+            type_metadata,
+            trace_cache=trace_cache,
+        )
+        matched_lookup_groups, method_overload_block = (
+            get_cached_method_lookup_resolution(
+                method_def,
+                type_metadata,
+                graph,
+                trace_cache=trace_cache,
+            )
+        )
+        transitions.append({
+            'edge': edge,
+            'method_def': method_def,
+            'edge_cost': calculate_depth_cost(edge.confidence),
+            'critical_node': critical_node,
+            'matched_lookup_groups': matched_lookup_groups,
+            'method_overload_block': method_overload_block,
+        })
+    batch = {
+        'raw_edge_count': raw_edge_count,
+        'incoming_edge_count': len(incoming_edges),
+        'transitions': tuple(transitions),
+    }
+    _perf_add(graph, 'trace', 'reverse_transition_cache_builds', 1)
+    _perf_add(graph, 'trace', 'reverse_transition_edges_materialized', len(transitions))
+    _perf_add(graph, 'trace', 'incoming_edges_scanned', len(incoming_edges))
+    if use_cache:
+        cache[current_key] = batch
+        _perf_max(graph, 'trace', 'reverse_transition_cache_size', len(cache))
+    return batch
+
+
+def prepare_multi_target_reverse_plan(
+    all_apis,
+    graph,
+    type_metadata,
+    trace_cache=None,
+):
+    """Propagate grouped target bitsets through shared reverse subgraphs once."""
+    trace_cache = ensure_trace_cache(trace_cache)
+    if graph is None or len(all_apis or []) < 2:
+        return {}
+    reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
+    methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    grouped = defaultdict(list)
+    for index, api_row in enumerate(all_apis or []):
+        owner, _member = _api_owner_and_member(api_row)
+        group_key = (str(api_row.get('coord') or '').strip(), owner)
+        key_groups = build_api_target_key_groups(
+            api_row, graph=graph, type_metadata=type_metadata
+        )
+        matched = select_matching_key_groups(key_groups, reverse_edges)
+        matched, overload_block = filter_target_match_groups_for_overload_safety(
+            api_row,
+            matched,
+            graph,
+            type_metadata=type_metadata,
+            trace_cache=trace_cache,
+        )
+        if overload_block:
+            continue
+        seeds = tuple(sorted({
+            key
+            for group in matched
+            for key in (group.get('matched_keys') or [])
+        }))
+        if seeds:
+            grouped[group_key].append((index, seeds))
+
+    plan = {}
+    shared_key_count = 0
+    propagated_states = 0
+    for group_key, targets in sorted(grouped.items()):
+        seen_bits = defaultdict(int)
+        pending_bits = defaultdict(int)
+        queue = deque()
+        queued = set()
+        for target_index, seeds in targets:
+            target_bit = 1 << target_index
+            for seed in seeds:
+                pending_bits[seed] |= target_bit
+                if seed not in queued:
+                    queue.append(seed)
+                    queued.add(seed)
+        while queue:
+            current_key = queue.popleft()
+            queued.discard(current_key)
+            unseen_bits = pending_bits.pop(current_key, 0) & ~seen_bits[current_key]
+            if not unseen_bits:
+                continue
+            seen_bits[current_key] |= unseen_bits
+            propagated_states += 1
+            batch = get_cached_reverse_trace_transitions(
+                reverse_edges,
+                current_key,
+                methods_by_id,
+                graph,
+                type_metadata,
+                trace_cache=trace_cache,
+            )
+            for transition in batch.get('transitions') or ():
+                if transition.get('method_overload_block'):
+                    continue
+                for matched_group in transition.get('matched_lookup_groups') or ():
+                    for next_key in matched_group.get('matched_keys') or ():
+                        new_bits = unseen_bits & ~seen_bits[next_key]
+                        if not new_bits:
+                            continue
+                        pending_bits[next_key] |= new_bits
+                        if next_key not in queued:
+                            queue.append(next_key)
+                            queued.add(next_key)
+        shared_key_count += sum(
+            1 for bits in seen_bits.values() if int(bits).bit_count() > 1
+        )
+        plan[group_key] = {
+            'target_count': len(targets),
+            'target_indexes': tuple(index for index, _seeds in targets),
+            'keys_reached': len(seen_bits),
+            'shared_keys': sum(
+                1 for bits in seen_bits.values() if int(bits).bit_count() > 1
+            ),
+        }
+    trace_cache['multi_target_reverse_plan'] = plan
+    _perf_add(graph, 'trace', 'multi_target_group_count', len(plan))
+    _perf_add(
+        graph, 'trace', 'multi_target_target_count',
+        sum(item['target_count'] for item in plan.values()),
+    )
+    _perf_add(graph, 'trace', 'multi_target_shared_key_count', shared_key_count)
+    _perf_add(graph, 'trace', 'multi_target_propagated_states', propagated_states)
+    return plan
 
 
 def _valid_projected_sha256(value):
@@ -11294,7 +11448,8 @@ def format_call_chain(path_edges, final_target):
 
 def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max_total_cost=5,
                                             api_bridge_requirements=None, allow_degraded=False,
-                                            graph_stats=None):
+                                            graph_stats=None,
+                                            enable_multi_target_reuse=True):
     """
     批量追踪所有变更API
 
@@ -11374,6 +11529,13 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                 for row in all_apis
             ):
                 _get_direct_source_fact_index(graph, trace_cache)
+            if enable_multi_target_reuse:
+                prepare_multi_target_reverse_plan(
+                    scan_apis,
+                    graph,
+                    type_metadata,
+                    trace_cache=trace_cache,
+                )
         except BaseException:
             graph._active_packaged_scan_trace_serial = 0
             catalog['_packaged_api_scan_validated_trace_serial'] = 0
@@ -11440,6 +11602,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                 allow_degraded=allow_degraded,
                 graph_stats=graph_stats,
                 trace_cache=trace_cache,
+                enable_multi_target_reuse=enable_multi_target_reuse,
             )
         except BaseException:
             if graph is not None:

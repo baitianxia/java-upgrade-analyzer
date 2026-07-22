@@ -30,8 +30,24 @@
       "category": "descriptor_coordinate_drop",
       "module": "scripts/signature_utils.py",
       "selector": {"function": "canonical_api_identity_tuple", "node_type": "Return", "source_contains": "return (coord, api_name, signature, kind, change_type)"},
-      "replacement": "return ('', api_name, '', kind, change_type)",
+      "replacement": "return ('', api_name, signature, kind, change_type)",
       "required_tests": ["tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_equivalent_source_and_bytecode_spellings_have_one_identity"]
+    },
+    {
+      "id": "drop_descriptor_signature_identity",
+      "category": "signature_identity_drop",
+      "module": "scripts/signature_utils.py",
+      "selector": {"function": "canonical_api_identity_tuple", "node_type": "Return", "source_contains": "return (coord, api_name, signature, kind, change_type)"},
+      "replacement": "return (coord, api_name, '', kind, change_type)",
+      "required_tests": ["tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_equivalent_source_and_bytecode_spellings_have_one_identity"]
+    },
+    {
+      "id": "drop_change_type_identity",
+      "category": "change_identity_drop",
+      "module": "scripts/signature_utils.py",
+      "selector": {"function": "canonical_api_identity_tuple", "node_type": "Return", "source_contains": "return (coord, api_name, signature, kind, change_type)"},
+      "replacement": "return (coord, api_name, signature, kind, '')",
+      "required_tests": ["tests.test_canonical_evidence_identity.CanonicalEvidenceIdentityInvariantTest.test_different_change_types_never_collapse_in_any_producer"]
     },
     {
       "id": "promote_incomplete_evidence",
@@ -48,6 +64,22 @@
       "selector": {"function": "_edge_allowed_for_trace", "node_type": "Return", "source_contains": "return bool("},
       "replacement": "return True",
       "required_tests": ["tests.test_step5_key_matching.Step5KeyMatchingTest.test_packaged_hit_without_current_final_artifact_binding_is_uncertain"]
+    },
+    {
+      "id": "disable_depth_budget",
+      "category": "depth_budget_bypass",
+      "module": "scripts/step5_trace_policy.py",
+      "selector": {"function": "should_stop_tracing", "node_type": "If", "source_contains": "current_cost >= max_cost"},
+      "replacement": "if False:\n    return True, 'DEPTH_LIMIT_REACHED'",
+      "required_tests": ["tests.test_semantic_properties.SemanticPropertyTest.test_depth_budget_stops_at_every_generated_boundary"]
+    },
+    {
+      "id": "promote_incomplete_to_static_miss",
+      "category": "fail_closed_bypass",
+      "module": "scripts/step5_evidence_model.py",
+      "selector": {"function": "decide_analysis", "node_type": "Return", "source_contains": "reason_code='INCOMPLETE_EVIDENCE'"},
+      "replacement": "return AnalysisDecision(analysis_status='not_found_in_static_analysis', is_reachable=False, reason_code='NO_STATIC_PATH', reachable_note='mutated')",
+      "required_tests": ["tests.test_semantic_properties.SemanticPropertyTest.test_incomplete_evidence_never_promotes_to_a_negative_or_reachable_state"]
     },
     {
       "id": "skip_unsafe_archive_check",

@@ -48,6 +48,7 @@ from enhanced_source_analyzer import (
     analyze_file,
     ensure_tree_sitter_available,
     extract_call_edges_enhanced,
+    is_test_source_path,
     tree_sitter_status,
 )
 from confidence_weighted_tracer import (
@@ -69,7 +70,9 @@ from indirect_usage_analyzer import (
 )
 from framework_adapters import run_framework_adapters, serialize_framework_batches
 from step5_evidence_ingestion import ingest_collector_batches
-from step5_evidence_model import CoverageRecord, thaw_evidence_value
+from step5_evidence_model import CoverageRecord, EvidenceFailure, thaw_evidence_value
+from step5_graph import SourceGraph
+from tool_execution import ExternalToolError, execute_external_tool
 from step5_memory_observer import (
     ProcessTreeObserver,
     Step5ResourceBudgetExceeded,
@@ -280,6 +283,15 @@ def _write_step5_timing_csv(report_dir, graph_stats):
             'incoming_edges_cache_hits',
             'incoming_edges_cache_misses',
             'incoming_edges_cache_size',
+            'multi_target_group_count',
+            'multi_target_target_count',
+            'multi_target_shared_key_count',
+            'multi_target_propagated_states',
+            'reverse_transition_cache_builds',
+            'reverse_transition_cache_hits',
+            'reverse_transition_cache_size',
+            'reverse_transition_edges_materialized',
+            'reverse_transition_edges_reused',
             'critical_node_cache_hits',
             'critical_node_cache_misses',
             'critical_node_cache_size',
@@ -2453,12 +2465,15 @@ def _build_signature_from_params(param_types):
 
 
 def _run_javap_for_class(jar_path, class_fqcn):
-    from compat import run_cmd
-    stdout, _stderr, rc = run_cmd(
+    return execute_external_tool(
         ['javap', '-classpath', jar_path, '-s', '-p', class_fqcn],
-        timeout=30,
-    )
-    return stdout if rc == 0 else ''
+        stage='step5.jar-metadata.javap',
+        reason_prefix='STEP5_JAR_METADATA_JAVAP',
+        timeout_seconds=30,
+        blocking=True,
+        require_stdout=True,
+        runner=run_cmd,
+    ).require_success().stdout
 
 
 def _parse_javap_signature_block(text, class_fqcn):
@@ -2602,8 +2617,18 @@ def hydrate_jar_metadata_for_classes(metadata, target_classes, source_known_clas
         if not located:
             continue
         coord, jar_path, binary_name = located
-        javap_text = _run_javap_for_class(jar_path, binary_name)
-        if not javap_text:
+        try:
+            javap_text = _run_javap_for_class(jar_path, binary_name)
+        except ExternalToolError as exc:
+            failure = exc.failure.to_mapping()
+            failure.update({
+                'coord': coord,
+                'jar_path': jar_path,
+                'class_fqcn': class_fqcn,
+                'class_binary_name': binary_name,
+            })
+            metadata.setdefault('failures', []).append(failure)
+            metadata['complete'] = False
             continue
         class_meta = _parse_javap_signature_block(javap_text, class_fqcn)
         by_class[class_fqcn] = class_meta
@@ -2665,6 +2690,8 @@ def _index_jar_classes_for_source_resolution(metadata):
 
 def build_jar_metadata_for_source_roots(source_roots, report_dir, runtime_dependency_catalog=None):
     metadata = {
+        'complete': True,
+        'failures': [],
         'by_coord': {},
         'by_class': {},
         'jar_paths': {},
@@ -2970,6 +2997,7 @@ def _collect_source_file_entries(
         file_path = os.path.abspath(str(entry.get('file_path') or ''))
         if not file_path or file_path in seen_files:
             continue
+        included = False
         if entry.get('file_path') != file_path:
             copied = dict(entry)
             copied['file_path'] = file_path
@@ -2981,6 +3009,7 @@ def _collect_source_file_entries(
             ) if (allowed_business_classes is not None or allowed_dependency_classes_by_coord is not None) else copied
             if filtered is not None:
                 entries.append(filtered)
+                included = True
         else:
             filtered = _filter_source_entry(
                 entry,
@@ -2989,8 +3018,10 @@ def _collect_source_file_entries(
             ) if (allowed_business_classes is not None or allowed_dependency_classes_by_coord is not None) else entry
             if filtered is not None:
                 entries.append(filtered)
+                included = True
         seen_files.add(file_path)
-        _record_parser_info(stats, file_path, entry.get('parser_info') or {})
+        if included:
+            _record_parser_info(stats, file_path, entry.get('parser_info') or {})
 
     for root in sorted(
         source_roots or [],
@@ -3005,14 +3036,12 @@ def _collect_source_file_entries(
         if not root_path or not os.path.isdir(root_path):
             continue
         for current_root, dirs, files in os.walk(root_path):
-            normalized_current = current_root.replace(os.sep, '/')
             dirs[:] = sorted(
                 d for d in dirs
                 if d not in skip_dirs
-                and not (d == 'test' and normalized_current.endswith('/src'))
             )
             for filename in sorted(files):
-                if not (filename.endswith('.java') or filename.endswith('.kt')):
+                if not filename.endswith(('.java', '.kt', '.kts')):
                     continue
                 file_path = os.path.abspath(os.path.join(current_root, filename))
                 if file_path in seen_files:
@@ -3028,7 +3057,8 @@ def _collect_source_file_entries(
                 if entry is not None:
                     entries.append(entry)
                 seen_files.add(file_path)
-                _record_parser_info(stats, file_path, parser_info)
+                if entry is not None:
+                    _record_parser_info(stats, file_path, parser_info)
     _step5_debug(
         'graph_source_collection',
         'collected source file entries for graph build',
@@ -3060,18 +3090,7 @@ def build_enhanced_source_graph(
       - 泛型类型完整解析
       - 填充type_metadata（关键修复）
     """
-    from dataclasses import dataclass
     from collections import defaultdict
-
-    @dataclass
-    class SourceGraph:
-        methods_by_id: dict
-        methods_by_qualified: dict
-        methods_by_simple: dict
-        reverse_edges: dict
-        reverse_edge_count: int
-        lookup_keys_by_symbol: dict
-        type_metadata: dict  # 必须填充，否则接口/继承分析失效
 
     methods_by_id = {}
     methods_by_qualified = defaultdict(list)
@@ -3462,8 +3481,10 @@ def build_enhanced_source_graph(
                 owner_coord=owner_coord,
                 module=module,
                 source_root=source_root,
-                language='java',
-                is_test='/src/test/' in file_path,
+                language=(
+                    'kotlin' if file_path.endswith(('.kt', '.kts')) else 'java'
+                ),
+                is_test=is_test_source_path(file_path),
                 imports=imports,
                 static_imports=static_imports,
                 body_text=line,
@@ -3584,7 +3605,7 @@ def build_enhanced_source_graph(
                         owner_type=owner_type,
                         owner_coord=owner_coord,
                         module=module,
-                        is_test='/src/test/' in file_path,
+                        is_test=is_test_source_path(file_path),
                     ))
         return synthetic_methods, synthetic_edges
 
@@ -3936,6 +3957,33 @@ def build_enhanced_source_graph(
         lookup_keys_by_symbol=lookup_keys_by_symbol,
         type_metadata=type_metadata  # 现在有数据了
     )
+    jar_metadata_failures = list((jar_metadata or {}).get('failures') or [])
+    if jar_metadata_failures:
+        stats['parser_fallback_reasons']['jar_metadata_tool_failure'] = len(
+            jar_metadata_failures
+        )
+        for failure in jar_metadata_failures[:20]:
+            stats['parser_fallback_files'].append({
+                'file': str(failure.get('jar_path') or ''),
+                'reason': str(failure.get('reason_code') or 'JAR_METADATA_TOOL_FAILURE'),
+            })
+        graph.step5_evidence_failures = tuple(
+            EvidenceFailure(
+                stage=str(failure.get('stage') or 'step5.jar-metadata.javap'),
+                reason_code=str(
+                    failure.get('reason_code') or 'STEP5_JAR_METADATA_JAVAP_FAILED'
+                ),
+                blocking=bool(failure.get('blocking', True)),
+                artifact=str(failure.get('jar_path') or ''),
+                class_name=str(failure.get('class_fqcn') or ''),
+                detail='; '.join(
+                    f'{key}={value}'
+                    for key, value in sorted(failure.items())
+                    if value not in (None, '', [], ())
+                ),
+            )
+            for failure in jar_metadata_failures
+        )
     _step5_debug(
         'graph_build_complete',
         'finished enhanced source graph build',

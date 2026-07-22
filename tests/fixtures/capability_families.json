@@ -98,18 +98,22 @@
         "tests.test_final_artifact_edge_oracle.FinalArtifactEdgeOraclePerformanceTest.test_hung_javap_version_probe_returns_a_structured_incomplete_result",
         "tests.test_spring_activation_closure.SpringActivationClosureTest.test_security_source_read_failure_is_explicit_coverage_failure",
         "tests.test_execution_faults.ExecutionFaultTest.test_every_fault_is_detected_with_exact_reason_and_evidence",
-        "tests.test_execution_faults.ExecutionFaultTest.test_step1_step4_and_step5_production_boundaries_fail_closed"
+        "tests.test_execution_faults.ExecutionFaultTest.test_step1_step4_and_step5_production_boundaries_fail_closed",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_source_collection_includes_kts_and_standard_source_sets",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_mixed_java_kotlin_fixture_keeps_bidirectional_source_edges"
       ],
       "negative_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_malformed_context_cannot_fall_back_to_empty_source_scope",
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_corrupt_nested_final_artifact_is_incomplete_not_verified",
-        "tests.test_execution_faults.ExecutionFaultTest.test_malformed_or_partial_output_never_becomes_empty_success"
+        "tests.test_execution_faults.ExecutionFaultTest.test_malformed_or_partial_output_never_becomes_empty_success",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_kotlin_partial_capability_blocks_not_impacted_preservation_shortcut"
       ],
       "mutation_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_analyzer_collector_failure_blocks_a_negative_conclusion",
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_unreadable_preservation_artifact_cannot_be_treated_as_no_provider",
         "tests.test_spring_activation_closure.SpringActivationClosureTest.test_packaged_class_locator_reports_malformed_nested_jar",
-        "tests.test_execution_faults.ExecutionFaultTest.test_registry_covers_every_declared_execution_boundary"
+        "tests.test_execution_faults.ExecutionFaultTest.test_registry_covers_every_declared_execution_boundary",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_mixed_language_source_scope_is_closed_by_final_business_classes"
       ],
       "cross_project_guards": [
         "gs-managing-transactions",
@@ -137,7 +141,6 @@
         "tests.test_step5_evidence_model.EvidenceModelTest.test_framework_activated_path_is_reachable",
         "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_mybatis_high_confidence_requires_one_sha_bound_complete_evidence_chain",
         "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_runtime_callback_verified_activation_carries_traceable_composite_provenance",
-        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_active_spring_registration_produces_complete_business_to_callback_chain",
         "tests.test_indirect_usage_analyzer.IndirectUsageAnalyzerTest.test_exact_reflection_chain_becomes_reachable_step5_edge",
         "tests.test_step5_evidence_model.EvidenceModelTest.test_collected_activation_proof_is_typed_and_serialized",
         "tests.test_spring_activation_closure.SpringActivationClosureTest.test_aop_collector_scans_verified_internal_module_as_business",
@@ -190,7 +193,8 @@
         "tests.test_exhaustive_api_oracle.ExhaustiveApiOracleTest.test_audit_verifies_every_api_with_third_party_provenance",
         "tests.test_production_constant_pipeline.ProductionConstantPipelineTest.test_step4_dynamic_field_discovery_reconciles_with_independent_oracle",
         "tests.test_generated_topology_regression.GeneratedTopologyRegressionTest.test_runner_compiles_and_exercises_production_bytecode_collector",
-        "tests.test_metamorphic_regression.MetamorphicRegressionTest.test_every_transform_reexecutes_production_analysis_on_distinct_input"
+        "tests.test_metamorphic_regression.MetamorphicRegressionTest.test_every_transform_reexecutes_production_analysis_on_distinct_input",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_mixed_language_source_scope_is_closed_by_final_business_classes"
       ],
       "negative_tests": [
         "tests.test_dual_line_accuracy.DualLineAccuracyTest.test_missing_oracle_identity_blocks_instead_of_sampling",
@@ -272,7 +276,8 @@
         "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_scope_gate_accepts_faster_run_with_identical_scope",
         "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_envelope_exposes_complete_normalized_resource_metrics",
         "tests.test_complexity_gate.ComplexityGateTest.test_real_generated_collector_produces_valid_1x_2x_4x_tiers",
-        "tests.test_complexity_gate.ComplexityGateTest.test_production_scale_tiers_measure_step1_step4_and_step5_separately"
+        "tests.test_complexity_gate.ComplexityGateTest.test_production_scale_tiers_measure_step1_step4_and_step5_separately",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_multi_target_reverse_transition_work_scales_linearly_at_1x_2x_4x"
       ],
       "negative_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_relative_performance_baseline_is_sha_bound_and_blocks_regression",
@@ -280,11 +285,83 @@
       ],
       "mutation_tests": [
         "tests.test_real_project_regression.RealProjectRegressionTest.test_performance_scope_gate_rejects_faster_run_that_reduces_scan_scope",
-        "tests.test_complexity_gate.ComplexityGateTest.test_scope_loss_invalidates_performance_before_budget_evaluation"
+        "tests.test_complexity_gate.ComplexityGateTest.test_scope_loss_invalidates_performance_before_budget_evaluation",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_multi_target_reverse_reuse_preserves_full_alerts_and_path_fingerprint"
       ],
       "cross_project_guards": [
         "ruoyi-full-artifact-discovery"
       ],
+      "architecture_review_on_repeat": true
+    },
+    {
+      "family_id": "test_gate_integrity",
+      "invariant_id": "declarative_tests_measure_branches_mutants_and_health",
+      "invariant": "Enforced capability references must be loadable; core decision branches, mutation survivors, flaky outcomes, and slow-test budgets must be explicit blocking signals.",
+      "root_cause_families": [
+        "workflow_gate"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/capability_test_catalog.py",
+        "scripts/branch_coverage_gate.py",
+        "scripts/production_mutation.py",
+        "scripts/quality_gate.py"
+      ],
+      "positive_tests": [
+        "tests.test_capability_test_catalog.CapabilityTestCatalogTest.test_every_enforced_capability_reference_is_automatically_loadable",
+        "tests.test_capability_test_catalog.CapabilityTestCatalogTest.test_quick_profile_is_generated_from_family_tags_and_explicit_properties",
+        "tests.test_capability_test_catalog.CapabilityTestCatalogTest.test_stable_shards_are_disjoint_and_exhaustive",
+        "tests.test_semantic_properties.SemanticPropertyTest"
+      ],
+      "negative_tests": [
+        "tests.test_capability_test_catalog.CapabilityTestCatalogTest.test_repeat_runner_reports_flaky_outcomes_and_duration_ranking",
+        "tests.test_capability_test_catalog.CapabilityTestCatalogTest.test_branch_arc_model_counts_true_false_decisions_not_lines",
+        "tests.test_quality_gate.QualityGateTest.test_release_profile_blocks_on_branch_flaky_duration_and_catalog_gates"
+      ],
+      "mutation_tests": [
+        "tests.test_production_mutation.ProductionMutationTest.test_registered_production_mutations_have_unique_ast_selectors",
+        "tests.test_production_mutation.ProductionMutationTest.test_registered_production_mutants_are_all_killed"
+      ],
+      "cross_project_guards": [],
+      "architecture_review_on_repeat": true
+    },
+    {
+      "family_id": "module_and_tool_failure_boundaries",
+      "invariant_id": "pure_trace_policy_and_typed_tool_failures_fail_closed",
+      "invariant": "Trace policy remains a pure one-way dependency, while every migrated external-tool failure retains stage, argv, timeout, stderr, reason code, and blocking coverage.",
+      "root_cause_families": [
+        "error_visibility",
+        "workflow_gate"
+      ],
+      "state": "enforced",
+      "production_paths": [
+        "scripts/step5_trace_policy.py",
+        "scripts/step5_graph.py",
+        "scripts/tool_execution.py",
+        "scripts/confidence_weighted_tracer.py",
+        "scripts/s5_call_chain_engine_integrated.py"
+      ],
+      "positive_tests": [
+        "tests.test_step5_trace_policy.Step5TracePolicyTest.test_policy_module_is_pure_and_tracer_only_reexports_its_stable_interface",
+        "tests.test_step5_trace_policy.Step5TracePolicyTest.test_step5_module_dependencies_form_one_way_boundaries",
+        "tests.test_step5_trace_policy.Step5TracePolicyTest.test_cost_and_decay_tables_are_total_for_unknown_confidence",
+        "tests.test_step5_trace_policy.Step5TracePolicyTest.test_frontier_dominance_keeps_orthogonal_cost_confidence_states",
+        "tests.test_tool_execution.ToolExecutionTest.test_success_retains_stdout_without_failure"
+      ],
+      "negative_tests": [
+        "tests.test_step5_trace_policy.Step5TracePolicyTest.test_stop_reasons_are_deterministic_and_fail_closed",
+        "tests.test_tool_execution.ToolExecutionTest.test_timeout_missing_permission_and_nonzero_have_exact_reason_codes",
+        "tests.test_tool_execution.ToolExecutionTest.test_runner_exception_is_a_structured_start_failure",
+        "tests.test_tool_execution.ToolExecutionTest.test_required_empty_stdout_is_a_structured_failure",
+        "tests.test_step5_evidence_ingestion.EvidenceIngestionTest.test_ingestion_preserves_unscoped_external_tool_failure",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_batch_packaged_bytecode_javap_failure_does_not_poison_unrelated_api",
+        "tests.test_step5_key_matching.Step5KeyMatchingTest.test_hydrate_jar_metadata_maps_javap_failure_to_blocking_coverage"
+      ],
+      "mutation_tests": [
+        "tests.test_semantic_properties.SemanticPropertyTest.test_depth_budget_stops_at_every_generated_boundary",
+        "tests.test_production_mutation.ProductionMutationTest.test_registered_production_mutants_are_all_killed"
+      ],
+      "cross_project_guards": [],
       "architecture_review_on_repeat": true
     }
   ]

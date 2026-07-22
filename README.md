@@ -371,3 +371,7 @@ Step4 需要 JApiCmp 做 jar API 对比。
 运行环境使用 CPython 3.12.x，并在 Skill 根目录显式执行 `python3.12 scripts/bootstrap_runtime.py` 安装固定版本的 `tree-sitter` 与 `tree-sitter-java`。离线环境可增加 `--wheel-dir /abs/path/to/wheels`，安装过程会禁止访问包索引。分析运行时不会联网安装；依赖缺失、版本不符或加载失败时会在分析前明确停止，安装完成前不会使用增强正则继续分析。
 
 不安装 tree-sitter 的后果是：Java AST 主链路不可用，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。
+
+### Kotlin 与 KTS 的结论边界是什么？
+
+当前 Kotlin/KTS 是 partial capability：工具会收集 `.kt`、`.kts` 并用增强正则提供候选线索，但不会把它宣称为 Kotlin 编译器级语义。只要与目标 API 相关的 Kotlin/KTS 文件进入当前最终制品闭集，静态未命中和 `not_impacted` 捷径都会失败关闭为 `PARTIAL_LANGUAGE_ANALYSIS`。生产与测试代码依据 `src/<sourceSet>/...` 分类，生产类名包含 `Test` 不会被误判为测试代码。

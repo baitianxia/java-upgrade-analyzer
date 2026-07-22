@@ -2156,21 +2156,33 @@ class EvidenceRegistry:
             if _edge_identity(edge) not in stale_registry_identities
         )
         graph.step5_evidence_registry = cumulative(prior_registry, accepted_edges)
+        prior_failures_by_collector_all = tuple(
+            getattr(graph, "step5_evidence_failures_by_collector", ()) or ()
+        )
+        prior_scoped_failures = tuple(
+            failure for _collector, failure in prior_failures_by_collector_all
+        )
+        prior_unscoped_failures = tuple(
+            failure
+            for failure in (getattr(graph, "step5_evidence_failures", ()) or ())
+            if failure not in prior_scoped_failures
+        )
         prior_failures_by_collector = tuple(
             item
-            for item in (
-                getattr(graph, "step5_evidence_failures_by_collector", ()) or ()
-            )
+            for item in prior_failures_by_collector_all
             if item[0] not in replaced_framework_collectors
         )
         graph.step5_evidence_failures_by_collector = cumulative(
             prior_failures_by_collector,
             failures_by_collector,
         )
-        graph.step5_evidence_failures = cumulative((), tuple(
-            failure
-            for _collector, failure in graph.step5_evidence_failures_by_collector
-        ))
+        graph.step5_evidence_failures = cumulative(
+            prior_unscoped_failures,
+            tuple(
+                failure
+                for _collector, failure in graph.step5_evidence_failures_by_collector
+            ),
+        )
         prior_concerns_by_collector = tuple(
             item
             for item in (

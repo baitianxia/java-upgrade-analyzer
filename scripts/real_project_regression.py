@@ -3424,10 +3424,23 @@ def evaluate_relative_performance_baseline(
             continue
         max_absolute = policy.get("max_absolute")
         max_ratio = float(policy.get("max_ratio") or 0.0)
+        ratio_limit = baseline_value * max_ratio
+        scheduler_jitter_floor = policy.get("scheduler_jitter_floor")
+        try:
+            scheduler_jitter_floor = (
+                float(scheduler_jitter_floor)
+                if scheduler_jitter_floor is not None else 0.0
+            )
+        except (TypeError, ValueError):
+            errors.append(f"performance_scheduler_jitter_floor_invalid:{name}")
+            continue
+        if not math.isfinite(scheduler_jitter_floor) or scheduler_jitter_floor < 0:
+            errors.append(f"performance_scheduler_jitter_floor_invalid:{name}")
+            continue
         limit = (
             float(max_absolute)
             if max_absolute is not None
-            else baseline_value * max_ratio
+            else max(ratio_limit, scheduler_jitter_floor)
         )
         if max_absolute is None and max_ratio <= 0:
             errors.append(f"performance_baseline_threshold_missing:{name}")
@@ -3437,6 +3450,9 @@ def evaluate_relative_performance_baseline(
             "actual": actual_value,
             "limit": limit,
         }
+        if scheduler_jitter_floor:
+            comparisons[name]["ratio_limit"] = ratio_limit
+            comparisons[name]["scheduler_jitter_floor"] = scheduler_jitter_floor
         if actual_value > limit:
             regressions[name] = comparisons[name]
     return {

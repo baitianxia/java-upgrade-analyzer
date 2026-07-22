@@ -148,6 +148,95 @@ class Step5KeyMatchingTest(unittest.TestCase):
         )
         return api_row, graph
 
+    def _shared_predecessor_batch_fixture(self, target_count):
+        def method(symbol_id, qualified_key, owner_type):
+            class_fqcn, method_name = qualified_key.rsplit(".", 1)
+            return source_analyzer.MethodDef(
+                symbol_id=symbol_id,
+                qualified_key=qualified_key,
+                simple_key=f"method:{method_name}",
+                class_fqcn=class_fqcn,
+                class_name=class_fqcn.rsplit(".", 1)[-1],
+                method_name=method_name,
+                return_type="void",
+                file=f"/{symbol_id}.java",
+                line=1,
+                end_line=2,
+                package_name=class_fqcn.rsplit(".", 1)[0],
+                owner_type=owner_type,
+                owner_coord=("BUSINESS" if owner_type == "business" else "com.example:bridge"),
+                module=("app" if owner_type == "business" else "bridge"),
+                source_root="/src/main/java",
+                language="java",
+                is_test=False,
+                declared_signature="()",
+                declared_qualified_key=f"{qualified_key}()",
+                annotations=(['GetMapping'] if owner_type == "business" else []),
+                class_annotations=(['RestController'] if owner_type == "business" else []),
+                modifiers=['public'],
+            )
+
+        def edge(caller, callee_key):
+            return source_analyzer.CallEdge(
+                caller_symbol_id=caller.symbol_id,
+                caller_qualified_key=caller.qualified_key,
+                callee_key=callee_key,
+                callee_simple_key=f"method:{callee_key.rsplit('.', 1)[-1]}",
+                evidence_type="ast_method_invocation",
+                confidence="high",
+                file=caller.file,
+                line=caller.line,
+                content=callee_key,
+                owner_type=caller.owner_type,
+                owner_coord=caller.owner_coord,
+                module=caller.module,
+                is_test=False,
+            )
+
+        shared = method("shared", "com.example.bridge.Shared.route", "dependency")
+        entry = method("entry", "com.example.app.BatchController.handle", "business")
+        methods = {shared.symbol_id: shared, entry.symbol_id: entry}
+        reverse_edges = {
+            "com.example.bridge.Shared.route()": [
+                edge(entry, "com.example.bridge.Shared.route()")
+            ]
+        }
+        apis = []
+        for index in range(target_count):
+            leaf = method(
+                f"leaf-{index}",
+                f"com.example.bridge.Leaf{index}.call",
+                "dependency",
+            )
+            methods[leaf.symbol_id] = leaf
+            target_key = f"com.vendor.Target.api{index}()"
+            reverse_edges[target_key] = [edge(leaf, target_key)]
+            leaf_key = f"{leaf.qualified_key}()"
+            reverse_edges[leaf_key] = [edge(shared, leaf_key)]
+            apis.append({
+                "coord": "com.vendor:target",
+                "api_name": f"com.vendor.Target.api{index}",
+                "api_simple": f"api{index}",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P1",
+                "confirmed": "true",
+                "source": "performance-fixture",
+                "analysis_scope": "method",
+            })
+        type_metadata = {
+            method_def.class_fqcn: {"kind": "class", "annotations": []}
+            for method_def in methods.values()
+        }
+        graph = SimpleNamespace(
+            methods_by_id=methods,
+            reverse_edges=reverse_edges,
+            reverse_edge_count=sum(len(edges) for edges in reverse_edges.values()),
+            type_metadata=type_metadata,
+        )
+        return apis, graph, type_metadata
+
     def test_malformed_context_cannot_fall_back_to_empty_source_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             context_path = Path(tmp) / "context.json"
@@ -6124,7 +6213,7 @@ public class com.example.TargetBridge {
         self.assertEqual(result.analysis_status, "uncertain")
         self.assertEqual(result.reason_code, "DYNAMIC_GAP")
 
-    def test_assess_graph_completeness_ignores_kotlin_only_fallbacks(self):
+    def test_assess_graph_completeness_fails_closed_for_kotlin_partial_capability(self):
         completeness = tracer.assess_graph_completeness(
             {
                 "truncated": False,
@@ -6133,8 +6222,101 @@ public class com.example.TargetBridge {
             }
         )
 
-        self.assertFalse(completeness["incomplete"])
-        self.assertEqual(completeness["reasons"], [])
+        self.assertTrue(completeness["incomplete"])
+        self.assertIn("unsupported_language_kotlin=3", completeness["reasons"][0])
+
+    def test_kotlin_partial_capability_blocks_not_impacted_preservation_shortcut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kotlin_source = Path(tmp) / "src/main/kotlin/com/acme/Consumer.kt"
+            kotlin_source.parent.mkdir(parents=True)
+            kotlin_source.write_text(
+                "package com.acme\n"
+                "import com.vendor.LegacyApi\n"
+                "class Consumer { fun run(api: LegacyApi) = api.removed() }\n",
+                encoding="utf-8",
+            )
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                identical_current_class_providers={
+                    ("com.vendor:legacy", "com.vendor.LegacyApi"): [{
+                        "provider_coord": "com.vendor:replacement",
+                        "provider_jar": str(Path(tmp) / "replacement.jar"),
+                        "provider_class_entry": "com/vendor/LegacyApi.class",
+                        "class_sha256": "a" * 64,
+                        "old_jar": str(Path(tmp) / "legacy.jar"),
+                        "old_class_entry": "com/vendor/LegacyApi.class",
+                    }]
+                },
+            )
+            api_row = {
+                "coord": "com.vendor:legacy",
+                "api_name": "com.vendor.LegacyApi.removed",
+                "api_simple": "removed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            }
+
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                graph_stats={
+                    "parser_fallback_reasons": {"unsupported_language_kotlin": 1},
+                    "parser_fallback_files": [{
+                        "file": str(kotlin_source),
+                        "reason": "unsupported_language_kotlin",
+                    }],
+                },
+            )
+
+        self.assertEqual("not_analyzed", result.analysis_status)
+        self.assertEqual("PARTIAL_LANGUAGE_ANALYSIS", result.reason_code)
+
+    def test_irrelevant_kotlin_partial_file_does_not_block_preservation_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kotlin_source = Path(tmp) / "src/main/kotlin/com/acme/Unrelated.kt"
+            kotlin_source.parent.mkdir(parents=True)
+            kotlin_source.write_text(
+                "package com.acme\nclass Unrelated { fun value() = 1 }\n",
+                encoding="utf-8",
+            )
+            graph = SimpleNamespace(
+                methods_by_id={},
+                reverse_edges={},
+                identical_current_class_providers={
+                    ("com.vendor:legacy", "com.vendor.LegacyApi"): [{
+                        "provider_coord": "com.vendor:replacement",
+                        "provider_jar": str(Path(tmp) / "replacement.jar"),
+                        "provider_class_entry": "com/vendor/LegacyApi.class",
+                        "class_sha256": "a" * 64,
+                        "old_jar": str(Path(tmp) / "legacy.jar"),
+                        "old_class_entry": "com/vendor/LegacyApi.class",
+                    }]
+                },
+            )
+            result = tracer.trace_api_with_confidence_weighting(
+                {
+                    "coord": "com.vendor:legacy",
+                    "api_name": "com.vendor.LegacyApi.removed",
+                    "api_simple": "removed",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                },
+                graph,
+                {},
+                graph_stats={
+                    "parser_fallback_reasons": {"unsupported_language_kotlin": 1},
+                    "parser_fallback_files": [{
+                        "file": str(kotlin_source),
+                        "reason": "unsupported_language_kotlin",
+                    }],
+                },
+            )
+
+        self.assertEqual("not_impacted", result.analysis_status)
 
     def test_assess_graph_completeness_ignores_explicit_parser_disable(self):
         completeness = tracer.assess_graph_completeness(
@@ -10123,6 +10305,14 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
                         "direct_source_fact_index_field_keys": 300,
                         "declared_signature_index_builds": 1,
                         "declared_signature_index_size": 1234,
+                        "multi_target_group_count": 3,
+                        "multi_target_target_count": 12,
+                        "multi_target_shared_key_count": 7,
+                        "multi_target_propagated_states": 31,
+                        "reverse_transition_cache_builds": 8,
+                        "reverse_transition_cache_hits": 21,
+                        "reverse_transition_edges_materialized": 19,
+                        "reverse_transition_edges_reused": 44,
                     },
                 }
             }
@@ -10161,6 +10351,13 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         )
         self.assertEqual(values[("trace", "declared_signature_index_builds")], "1")
         self.assertEqual(values[("trace", "declared_signature_index_size")], "1234")
+        self.assertEqual(values[("trace", "multi_target_group_count")], "3")
+        self.assertEqual(values[("trace", "multi_target_target_count")], "12")
+        self.assertEqual(values[("trace", "multi_target_shared_key_count")], "7")
+        self.assertEqual(values[("trace", "reverse_transition_cache_hits")], "21")
+        self.assertEqual(
+            values[("trace", "reverse_transition_edges_materialized")], "19"
+        )
 
     def test_trace_cache_reuses_sorted_incoming_edges_and_critical_node_checks(self):
         trace_cache = tracer.ensure_trace_cache()
@@ -13670,7 +13867,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertFalse(info["needs_bridge"])
         self.assertEqual(info["reason"], "business_graph_precheck_incomplete")
 
-    def test_bridge_precheck_ignores_kotlin_only_parser_fallbacks(self):
+    def test_bridge_precheck_fails_closed_for_kotlin_partial_capability(self):
         requirements = step5.check_apis_that_need_bridge(
             [
                 {
@@ -13694,8 +13891,212 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         )
 
         info = next(iter(requirements.values()))
-        self.assertTrue(info["needs_bridge"])
-        self.assertEqual(info["reason"], "no_direct_call_found")
+        self.assertFalse(info["needs_bridge"])
+        self.assertEqual(info["reason"], "business_graph_precheck_incomplete")
+
+    def test_source_collection_includes_kts_and_standard_source_sets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            production = root / "src/main/kotlin/com/acme/ProductionTest.kt"
+            test_source = root / "src/test/kotlin/com/acme/ActualSpec.kt"
+            script = root / "src/main/kotlin/com/acme/Bootstrap.kts"
+            for path in (production, test_source, script):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            production.write_text(
+                "package com.acme\n"
+                "class ProductionTest {\n"
+                "  fun run() = Unit\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            test_source.write_text(
+                "package com.acme\n"
+                "class ActualSpec {\n"
+                "  fun run() = Unit\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            script.write_text(
+                "package com.acme\n"
+                "class Bootstrap {\n"
+                "  fun run() = Unit\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            entries, stats = step5._collect_source_file_entries([{
+                "root": str(root),
+                "owner_type": "business",
+                "owner_coord": "BUSINESS",
+                "module": "app",
+            }])
+
+        by_name = {Path(entry["file_path"]).name: entry for entry in entries}
+        self.assertEqual(
+            {"ProductionTest.kt", "ActualSpec.kt", "Bootstrap.kts"},
+            set(by_name),
+        )
+        self.assertFalse(by_name["ProductionTest.kt"]["methods"][0].is_test)
+        self.assertTrue(by_name["ActualSpec.kt"]["methods"][0].is_test)
+        self.assertEqual("kotlin", by_name["Bootstrap.kts"]["methods"][0].language)
+        self.assertEqual(3, stats["parser_fallback_reasons"]["unsupported_language_kotlin"])
+
+    def test_mixed_java_kotlin_fixture_keeps_bidirectional_source_edges(self):
+        fixture_root = ROOT_DIR / "tests/fixtures/step5_mixed_language"
+        graph_result = step5.build_enhanced_source_graph([{
+            "root": str(fixture_root),
+            "owner_type": "business",
+            "owner_coord": "BUSINESS",
+            "module": "mixed",
+        }])
+        graph = graph_result["graph"]
+
+        java_to_kotlin = graph.reverse_edges.get("com.acme.KotlinService.kotlinCall", [])
+        kotlin_to_java = graph.reverse_edges.get(
+            "com.acme.JavaCaller.javaCall()", []
+        )
+        self.assertTrue(java_to_kotlin, sorted(graph.reverse_edges)[:30])
+        self.assertTrue(kotlin_to_java, sorted(graph.reverse_edges)[:30])
+        test_methods = [
+            method for method in graph.methods_by_id.values()
+            if method.class_name == "KotlinServiceSpec"
+        ]
+        self.assertTrue(test_methods)
+        self.assertTrue(all(method.is_test for method in test_methods))
+
+    def test_mixed_language_source_scope_is_closed_by_final_business_classes(self):
+        fixture_root = ROOT_DIR / "tests/fixtures/step5_mixed_language"
+        source_roots = [{
+            "root": str(fixture_root),
+            "owner_type": "business",
+            "owner_coord": "BUSINESS",
+            "module": "mixed",
+        }]
+
+        complete_entries, complete_stats = step5._collect_source_file_entries(
+            source_roots,
+            allowed_business_classes={
+                "com.acme.JavaCaller",
+                "com.acme.KotlinService",
+                "com.acme.KotlinServiceSpec",
+            },
+        )
+        packaged_entries, packaged_stats = step5._collect_source_file_entries(
+            source_roots,
+            allowed_business_classes={"com.acme.JavaCaller"},
+        )
+
+        self.assertEqual(3, len(complete_entries))
+        self.assertEqual(
+            2,
+            complete_stats["parser_fallback_reasons"]["unsupported_language_kotlin"],
+        )
+        self.assertEqual(
+            ["JavaCaller.java"],
+            [Path(entry["file_path"]).name for entry in packaged_entries],
+        )
+        self.assertEqual({}, packaged_stats["parser_fallback_reasons"])
+
+    def test_multi_target_reverse_reuse_preserves_full_alerts_and_path_fingerprint(self):
+        def run(enable_reuse):
+            apis, graph, type_metadata = self._shared_predecessor_batch_fixture(4)
+            graph_stats = {}
+            with patch.object(
+                tracer, "_build_packaged_runtime_dependency_scan_cache"
+            ), patch.object(
+                tracer, "_build_identical_current_class_provider_index", return_value={}
+            ), patch.object(
+                tracer, "collect_graph_analyzer_edges"
+            ), patch.object(
+                tracer, "write_analyzer_edge_ledger"
+            ), patch.object(
+                tracer, "_emit_step5_perf_summary"
+            ):
+                results = tracer.trace_all_apis_with_confidence_weighting(
+                    apis,
+                    graph,
+                    type_metadata,
+                    graph_stats=graph_stats,
+                    enable_multi_target_reuse=enable_reuse,
+                )
+            return results, graph_stats
+
+        baseline, baseline_stats = run(False)
+        optimized, optimized_stats = run(True)
+
+        semantic_fields = (
+            "api_name", "api_signature", "analysis_status", "reason_code",
+            "call_paths", "evidence_paths", "path_details", "hops",
+            "confidence_score", "match_provenance", "match_tier",
+        )
+        baseline_fingerprint = [
+            {field: getattr(result, field) for field in semantic_fields}
+            for result in baseline
+        ]
+        optimized_fingerprint = [
+            {field: getattr(result, field) for field in semantic_fields}
+            for result in optimized
+        ]
+        self.assertEqual(baseline_fingerprint, optimized_fingerprint)
+        self.assertTrue(all(result.analysis_status == "reachable" for result in optimized))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline_dir = Path(tmp) / "baseline"
+            optimized_dir = Path(tmp) / "optimized"
+            formatter.generate_enhanced_summary(baseline, baseline_dir)
+            formatter.generate_enhanced_summary(optimized, optimized_dir)
+            self.assertEqual(
+                (baseline_dir / "alerts.csv").read_bytes(),
+                (optimized_dir / "alerts.csv").read_bytes(),
+            )
+
+        baseline_perf = baseline_stats["step5_perf"]["trace"]
+        optimized_perf = optimized_stats["step5_perf"]["trace"]
+        self.assertEqual(1, optimized_perf["multi_target_group_count"])
+        self.assertEqual(4, optimized_perf["multi_target_target_count"])
+        self.assertGreaterEqual(optimized_perf["multi_target_shared_key_count"], 1)
+        self.assertGreater(optimized_perf["reverse_transition_cache_hits"], 0)
+        self.assertLess(
+            optimized_perf["incoming_edges_scanned"],
+            baseline_perf["incoming_edges_scanned"],
+        )
+
+    def test_multi_target_reverse_transition_work_scales_linearly_at_1x_2x_4x(self):
+        observed = []
+        for scale in (1, 2, 4):
+            apis, graph, type_metadata = self._shared_predecessor_batch_fixture(scale)
+            graph_stats = {}
+            with patch.object(
+                tracer, "_build_packaged_runtime_dependency_scan_cache"
+            ), patch.object(
+                tracer, "_build_identical_current_class_provider_index", return_value={}
+            ), patch.object(
+                tracer, "collect_graph_analyzer_edges"
+            ), patch.object(
+                tracer, "write_analyzer_edge_ledger"
+            ), patch.object(
+                tracer, "_emit_step5_perf_summary"
+            ):
+                results = tracer.trace_all_apis_with_confidence_weighting(
+                    apis,
+                    graph,
+                    type_metadata,
+                    graph_stats=graph_stats,
+                )
+            perf = graph_stats["step5_perf"]["trace"]
+            observed.append((
+                scale,
+                perf["reverse_transition_edges_materialized"],
+                perf.get("multi_target_shared_key_count", 0),
+            ))
+            self.assertEqual(scale, len(results))
+            self.assertTrue(all(result.analysis_status == "reachable" for result in results))
+
+        self.assertEqual([1, 2, 4], [item[0] for item in observed])
+        self.assertEqual([3, 5, 9], [item[1] for item in observed])
+        self.assertEqual(0, observed[0][2])
+        self.assertGreaterEqual(observed[1][2], 1)
+        self.assertGreaterEqual(observed[2][2], 1)
 
     def test_framework_api_requires_bridge_when_no_direct_business_usage_exists(self):
         requirements = step5.check_apis_that_need_bridge(
@@ -14302,6 +14703,50 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             self.assertIn("com.example.Target", metadata["by_class"])
             self.assertNotIn("com.example.Unused", metadata["by_class"])
             mocked_javap.assert_called_once_with(str(jar_path), "com.example.Target")
+
+    def test_hydrate_jar_metadata_maps_javap_failure_to_blocking_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "demo.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr("com/example/Target.class", b"")
+            metadata = {
+                "complete": True,
+                "failures": [],
+                "by_coord": {"com.example:demo": {
+                    "coord": "com.example:demo",
+                    "version": "1.0.0",
+                    "jar_path": str(jar_path),
+                    "classes": {},
+                }},
+                "by_class": {},
+                "jar_paths": {"com.example:demo": str(jar_path)},
+            }
+
+            with patch.object(step5, "run_cmd", return_value=("", "javap failed", 7)):
+                step5.hydrate_jar_metadata_for_classes(
+                    metadata, {"com.example.Target"}
+                )
+            graph_result = step5.build_enhanced_source_graph([], jar_metadata=metadata)
+
+        self.assertFalse(metadata["complete"])
+        self.assertEqual(len(metadata["failures"]), 1)
+        failure = metadata["failures"][0]
+        self.assertEqual(
+            failure["reason_code"], "STEP5_JAR_METADATA_JAVAP_NONZERO_EXIT"
+        )
+        self.assertEqual(failure["stage"], "step5.jar-metadata.javap")
+        self.assertEqual(failure["command"][0], "javap")
+        self.assertEqual(failure["timeout_seconds"], 30.0)
+        self.assertEqual(failure["stderr"], "javap failed")
+        self.assertTrue(failure["blocking"])
+        self.assertEqual(
+            graph_result["stats"]["parser_fallback_reasons"],
+            {"jar_metadata_tool_failure": 1},
+        )
+        projected = graph_result["graph"].step5_evidence_failures[0]
+        self.assertEqual(projected.reason_code, failure["reason_code"])
+        self.assertEqual(projected.stage, failure["stage"])
+        self.assertTrue(projected.blocking)
 
     def test_build_enhanced_source_graph_hydrates_only_referenced_jar_classes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -18478,6 +18923,15 @@ public class com.example.consumer.ReflectiveCall {
                 cached[tracer.build_api_identity_key(apis[1])]["status"],
                 "miss",
             )
+            tool_failure = next(
+                item for item in graph.step5_evidence_failures
+                if item.reason_code == "STEP5_JAVAP_NONZERO_EXIT"
+            )
+            self.assertEqual(tool_failure.stage, "step5.bytecode.javap")
+            self.assertTrue(tool_failure.blocking)
+            self.assertIn("command=['javap'", tool_failure.detail)
+            self.assertIn("stderr=javap failed", tool_failure.detail)
+            self.assertIn("timeout_seconds=30", tool_failure.detail)
 
     def test_packaged_dependency_hit_is_reachable_when_business_bytecode_calls_consumer(self):
         result = tracer.TraceResult(

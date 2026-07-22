@@ -145,6 +145,7 @@ callee_key -> caller edges
 - `not_found_in_static_analysis` 不是“确定不影响”。
 - `not_analyzed` 不能被当成无风险。
 - `not_impacted` 只证明目标 API 符号仍被相同字节码提供，不证明被删除 jar 的资源、SPI、清单或其他非 API 内容没有影响。
+- Kotlin/KTS 使用部分能力分析；相关源码仅由正则解析且可能引用目标 API 时，负向裁决与制品保留捷径都必须失败关闭为 `PARTIAL_LANGUAGE_ANALYSIS`。
 - 字节码命中运行时依赖使用目标 API，但无法回溯到业务入口时，通常应进入 `uncertain`，并保留消费依赖、消费类和消费方法。
 
 ## 删除依赖 jar 的语义
@@ -205,6 +206,7 @@ Step5 的性能优化必须保持分析语义不变。
 
 - 缓存重复排序结果；
 - 构建等价索引；
+- 按坐标与 owner 对多个目标执行多源反向传播，复用与目标无关的前驱转换；
 - 复用字节码扫描结果；
 - 对业务 class 使用 classfile 直接解析作为快路径，但解析失败、遇到反射/MethodHandle 线索或格式不确定时必须回退 `javap`；
 - 记录耗时指标；
@@ -241,6 +243,9 @@ Step5 会输出：
 - `trace.direct_class_usage_*`;
 - `trace.direct_field_usage_*`;
 - `trace.direct_source_fact_index_*`（类型/字段源码事实的一次扫描构建成本、复用命中、正文读取与缓存释放、索引 key 数）；
+- `trace.multi_target_group_count` / `multi_target_target_count` / `multi_target_shared_key_count`；
+- `trace.reverse_transition_cache_builds` / `reverse_transition_cache_hits`；
+- `trace.reverse_transition_edges_materialized` / `reverse_transition_edges_reused`；
 - `memory.*_current_rss_mb` 与 `memory.*_peak_rss_mb`（Python 主进程）；
 - `memory.*_process_tree_peak_rss_mb` 与 `memory.*_child_process_peak_rss_mb`（Python 与全部后代进程）；
 - `memory.*_self_cpu_sec`、`memory.*_child_cpu_sec`、`memory.*_external_process_wall_sec`；
@@ -264,6 +269,19 @@ macOS 优先使用 `libproc`（仅在系统库不可用时回退 `ps`）；其�
 类型与字段直接使用共享 `direct_source_fact_index`：首次查询时遍历业务方法一次，收集声明类型、
 AST 类型引用、正文类型 token、字段访问与静态导入，后续目标只做索引查询。索引物化后会释放可从
 源文件重新加载的 `_body_text_cached`，不释放内嵌 `body_text`，也不改变证据排序和结论语义。
+
+## 模块与失败边界
+
+Step5 使用以下单向边界：`enhanced_source_analyzer` 提取事实，`signature_utils` 规范身份，
+`step5_graph` 承载图，`step5_trace_policy` 承载纯追踪策略，
+`confidence_weighted_tracer` 编排图查询，`step5_evidence_model` 收敛五态，
+`enhanced_output_formatter` 只渲染结果。最外层 `s5_call_chain_engine_integrated` 可以依赖这些
+模块，底层模块不能反向导入编排器。
+
+运行时字节码与 JAR 元数据的 `javap` 失败都通过 `tool_execution` 形成结构化失败。
+失败必须进入 analyzer ledger 或 `step5_evidence_failures`，同时产生 parser fallback；
+collector 合并不得覆盖这类非 collector 失败。退出码为 0 但缺少要求的 stdout 也属于阻塞失败，
+不能解释为“扫描完成且未命中”。
 
 ## 维护检查清单
 

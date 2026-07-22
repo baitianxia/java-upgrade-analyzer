@@ -2159,6 +2159,66 @@ class RealProjectRegressionTest(unittest.TestCase):
         self.assertFalse(stale["passed"])
         self.assertIn("performance_baseline_artifact_sha_mismatch", stale["errors"])
 
+    def test_relative_performance_uses_only_explicit_scheduler_jitter_floor(self):
+        case = realreg.RealProjectCase(
+            name="micro-timing",
+            default_project=Path("."),
+            default_changed_apis=Path("changed.csv"),
+            baseline_specs=(),
+            require_relative_performance_baseline=True,
+        )
+        scope = {
+            "selected_api_count": 1,
+            "accounted_api_count": 1,
+            "artifact_count": 1,
+            "class_count": 1,
+            "analyzer_edge_count": 1,
+            "oracle_edge_count": 1,
+            "fault_injection_detected_count": 1,
+        }
+        manifest = {
+            "git_revision": "a" * 40,
+            "artifact_sha256": "b" * 64,
+            "performance_baseline": {
+                "git_revision": "a" * 40,
+                "artifact_sha256": "b" * 64,
+                "scope": scope,
+                "metrics": {
+                    "max_api_elapsed_seconds": {
+                        "value": 0.008,
+                        "max_ratio": 3.0,
+                        "scheduler_jitter_floor": 0.05,
+                    },
+                },
+            },
+        }
+
+        within_floor = realreg.evaluate_relative_performance_baseline(
+            case,
+            manifest,
+            {
+                **scope,
+                "per_api_timing_complete": True,
+                "max_api_elapsed_seconds": 0.044,
+            },
+        )
+        above_floor = realreg.evaluate_relative_performance_baseline(
+            case,
+            manifest,
+            {
+                **scope,
+                "per_api_timing_complete": True,
+                "max_api_elapsed_seconds": 0.051,
+            },
+        )
+
+        self.assertTrue(within_floor["passed"])
+        comparison = within_floor["comparisons"]["max_api_elapsed_seconds"]
+        self.assertEqual(comparison["ratio_limit"], 0.024)
+        self.assertEqual(comparison["limit"], 0.05)
+        self.assertFalse(above_floor["passed"])
+        self.assertIn("max_api_elapsed_seconds", above_floor["regressions"])
+
     def test_performance_scope_gate_accepts_faster_run_with_identical_scope(self):
         baseline = {
             "selected_api_count": 3,

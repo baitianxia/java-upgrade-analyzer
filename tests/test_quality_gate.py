@@ -83,6 +83,29 @@ class QualityGateTest(unittest.TestCase):
         )
         self.assertTrue(task.heavy)
 
+    def test_profiles_are_generated_from_declarative_capability_catalog(self):
+        quick = quality_gate.build_plan("quick", skip_real=True)
+        step5 = quality_gate.build_plan("step5", skip_real=True)
+
+        quick_task = next(item for item in quick if item.name == "unit_core_semantics")
+        step5_task = next(item for item in step5 if item.name == "unit_step5_semantics")
+        self.assertIn("scripts/capability_test_catalog.py", quick_task.command)
+        self.assertEqual(quick_task.command[quick_task.command.index("--profile") + 1], "quick")
+        self.assertEqual(step5_task.command[step5_task.command.index("--profile") + 1], "step5")
+        self.assertTrue(step5_task.heavy)
+
+    def test_release_profile_blocks_on_branch_flaky_duration_and_catalog_gates(self):
+        tasks = quality_gate.build_plan("release", skip_real=True)
+        names = [task.name for task in tasks]
+
+        self.assertIn("capability_test_catalog", names)
+        self.assertIn("branch_coverage_core", names)
+        self.assertIn("test_health", names)
+        branch = next(item for item in tasks if item.name == "branch_coverage_core")
+        health = next(item for item in tasks if item.name == "test_health")
+        self.assertIn("scripts/branch_coverage_gate.py", branch.command)
+        self.assertEqual(health.command[health.command.index("--profile") + 1], "health")
+
     def test_quick_and_release_profiles_have_explicit_determinism_gates(self):
         quick = quality_gate.build_plan("quick", skip_real=True)
         release = quality_gate.build_plan("release", skip_real=True)

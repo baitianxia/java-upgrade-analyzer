@@ -168,9 +168,21 @@
 #### 共享能力层
 
 - `scripts/enhanced_source_analyzer.py`
-  - AST、正则补充、调用边提取和类型推测
+  - 事实提取：AST、正则补充、调用边提取和类型推测
+- `scripts/signature_utils.py`
+  - 身份解析：签名规范化、descriptor 对齐和 canonical API identity
+- `scripts/step5_graph.py`
+  - 图存储：Step5 内存图的稳定数据契约
+- `scripts/step5_trace_policy.py`
+  - 追踪策略：cost、confidence、Pareto frontier 和停止条件；不依赖工程内其他模块
 - `scripts/confidence_weighted_tracer.py`
-  - 反向回溯、签名过滤、多态扩展和候选收敛
+  - 图查询编排：反向回溯、签名过滤、多态扩展和候选收集；为兼容旧调用方重导出纯策略接口
+- `scripts/step5_evidence_model.py`
+  - 结论收敛：覆盖、失败与五态 envelope 的唯一规则
+- `scripts/enhanced_output_formatter.py`
+  - 输出渲染：把已收敛结果写为稳定 JSON/CSV，不反向参与结论求值
+- `scripts/tool_execution.py`
+  - 外部工具边界：统一 stage、argv、timeout、stderr、reason code 与 blocking 属性
 - `scripts/auto_discover_bridge_sources.py`
   - 依赖源码桥接发现
 - `scripts/progress_logging.py`
@@ -179,6 +191,15 @@
   - 统一错误承载
 - `scripts/compat.py`
   - 运行兼容与命令封装
+
+Step5 的依赖方向固定为“事实/身份/图契约/纯策略 → 图查询 → 结论 → 渲染”，
+`s5_call_chain_engine_integrated.py` 只在最外层编排这些能力。自动化架构测试解析模块 import
+图并拒绝回边或循环；`step5_graph.py` 与 `step5_trace_policy.py` 不导入上层实现。
+
+Step5 的两条 `javap` 路径已迁移到 `tool_execution.py`。命令启动失败、超时、命令缺失、
+权限不足、非零退出和空输出都产生结构化失败；字节码扫描失败进入 analyzer ledger，JAR 元数据
+失败进入 `step5_evidence_failures` 与 parser fallback。collector ingestion 在替换同一 collector
+快照时会保留这些非 collector 失败，任何失败都不能被转换成正常空结果。
 
 #### 契约与辅助层
 
@@ -669,6 +690,18 @@ all_changed_apis.csv
 - 增强正则
   - 补充包名、imports、字段、嵌套类和类型推断辅助信息
 
+Kotlin 当前是明确的 partial capability，而不是与 Java 等价的完整语义前端：
+
+- `.kt` 与 `.kts` 都会进入源码闭集并记录 `unsupported_language_kotlin`；
+- 正则结果可以提供正向候选线索，但相关文件存在时，静态未命中不能收敛为完整负结论；
+- 即使当前其他依赖以相同 class 字节码保留目标 API，相关 Kotlin/KTS 源码仍会以
+  `PARTIAL_LANGUAGE_ANALYSIS` 失败关闭，不输出确定的 `not_impacted`；
+- 源码先按当前最终业务制品中的 class 集合过滤，未打包的 Kotlin 源码不会扩大正式分析闭集；
+- 生产/测试分类只依据 `src/<sourceSet>/...`，其中 `main`/`*Main` 为生产源集，
+  `test`/`*Test`/`testFixtures` 为测试源集，不再依据类名是否包含 `Test`。
+
+只有接入 Kotlin PSI/compiler frontend 并补齐对应 Oracle 后，才可把这项能力升级为完整语义分析。
+
 当前类型推测直接决定 `callee_key`、调用签名和调用边质量。系统显式推测以下类型：
 
 - 方法返回类型
@@ -813,6 +846,22 @@ Step5 在正式回溯前执行 `bridge-check`，判断是否必须跨依赖边�
 - 需要跨依赖继续回溯时，先尝试依赖源码映射；若缺映射，则继续尝试当前 packaged runtime jar 的字节码稳定符号匹配
 - 只有依赖源码与无源码字节码两条正式路径都不可用时，才进入待交互或 `not_analyzed`
 - 图明显不完整时，不将“未命中”解释为“未影响”
+
+#### 多目标反向复用
+
+`trace_all_apis_with_confidence_weighting()` 会先按依赖坐标与目标 owner 对 API 分组，
+为组内目标 key 执行一次多源反向传播。传播结果只用于预热不可变的前驱转换缓存和统计共享
+子图；每个 API 仍独立执行 overload 过滤、cost/confidence 预算、关键节点停止规则与五态收敛。
+
+共享转换缓存保存的是与目标 API 无关的事实：确定性排序后的入边、边成本、调用者声明、
+关键节点以及精确签名分组。它不缓存最终候选或结论，因此不能让一个 API 的深度、置信度、
+多态或失败关闭状态泄漏到另一个 API。若同一 key 的原始入边数量发生变化，缓存立即失效并
+重新物化。
+
+这条路径把共同前驱子图的排序、签名索引和节点事实提取从逐 API 重复工作收敛为按 key
+一次物化，同时保持 `path_details` 和 `alerts.csv` 的确定性字节输出不变。核心观测指标为
+`multi_target_*`、`reverse_transition_cache_*`、`reverse_transition_edges_materialized` 和
+`reverse_transition_edges_reused`。
 
 #### 回溯与候选收敛
 

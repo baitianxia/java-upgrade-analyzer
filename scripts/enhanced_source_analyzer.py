@@ -36,6 +36,32 @@ from dataclasses import dataclass, field
 from signature_utils import normalize_signature_for_lookup, split_signature_params
 
 
+def source_set_role(file_path):
+    """Return the standard JVM source-set role for *file_path*.
+
+    Source-set membership is a path contract (``src/<sourceSet>/...``), not a
+    class-name convention.  Kotlin multiplatform and custom Gradle source sets
+    commonly use names such as ``commonMain`` and ``integrationTest``; the
+    suffix keeps those standard conventions deterministic without treating a
+    production class named ``*Test`` as test code.
+    """
+    parts = [part for part in str(file_path or '').replace('\\', '/').split('/') if part]
+    for index, part in enumerate(parts[:-1]):
+        if part.lower() != 'src' or index + 1 >= len(parts):
+            continue
+        source_set = parts[index + 1].lower()
+        if source_set in {'testfixtures', 'tests'} or source_set.endswith('test'):
+            return 'test'
+        if source_set == 'main' or source_set.endswith('main'):
+            return 'production'
+        return 'unknown'
+    return 'unknown'
+
+
+def is_test_source_path(file_path):
+    return source_set_role(file_path) == 'test'
+
+
 def _current_python_pip_install_cmd():
     bootstrap = Path(__file__).resolve().parent / "bootstrap_runtime.py"
     return f'"{sys.executable or "python"}" "{bootstrap}"'
@@ -513,7 +539,7 @@ class EnhancedRegexAnalyzer:
     def __init__(self, file_path, source_root):
         self.file_path = file_path
         self.source_root = source_root
-        self.language = "kotlin" if file_path.endswith(".kt") else "java"
+        self.language = "kotlin" if file_path.endswith((".kt", ".kts")) else "java"
         self.package_name = ""
         self.imports = {}
         self.static_imports = {}
@@ -904,7 +930,7 @@ class EnhancedRegexAnalyzer:
                 module=self.source_root.get('module', 'root'),
                 source_root=self.source_root.get('root', ''),
                 language=self.language,
-                is_test='/test/' in self.file_path or 'Test' in class_name,
+                is_test=is_test_source_path(self.file_path),
                 param_types=param_types,
                 param_declared_types=param_declared_types,
                 return_declared_type=return_type,
@@ -1401,7 +1427,7 @@ class TreeSitterAnalyzer:
             module=self.source_root.get('module', 'root'),
             source_root=self.source_root.get('root', ''),
             language=self.language,
-            is_test=False,
+            is_test=is_test_source_path(self.file_path),
             param_types=param_types,
             param_declared_types=param_declared_types,
             return_declared_type=raw_return_type.strip(),

@@ -99,8 +99,12 @@ class ProductionMutationTest(unittest.TestCase):
                 "ownership_inversion",
                 "evidence_failure_suppression",
                 "descriptor_coordinate_drop",
+                "signature_identity_drop",
+                "change_identity_drop",
                 "uncertainty_promotion",
                 "artifact_binding_bypass",
+                "depth_budget_bypass",
+                "fail_closed_bypass",
                 "archive_skip",
             },
         )
