@@ -2642,25 +2642,16 @@ return ExtraApi.callLegacy();
             "--step", "auto",
             "--project-dir", str(project_dir),
             "--report-dir", str(runtime_full_expand_report),
-            "--response-json",
-            json.dumps(
-                {
-                    "action": "continue",
-                    "notes": "Step4 结果已复核，继续验证多模块依赖源码映射自动发现",
-                },
-                ensure_ascii=False,
-            ),
         ],
         cwd=project_dir,
     )
     assert_true(
-        multi_bridge_rc == EXIT_AWAITING_USER,
-        f"多模块依赖源码映射自动发现后，Step5 应在确认点进入 awaiting_user_input: {multi_bridge_stderr}",
+        multi_bridge_rc == 0,
+        f"只有一个变化依赖时应自动以全量范围执行 Step5: {multi_bridge_stderr}",
     )
-    multi_bridge_interaction = read_json(interaction_path(runtime_full_expand_report))
     assert_true(
-        multi_bridge_interaction.get("step_id") == "step5",
-        "多模块依赖源码映射自动发现后，Step5 未进入正确的交互确认点",
+        not interaction_path(runtime_full_expand_report).exists(),
+        "Step5 成功后不应残留例行确认 interaction.json",
     )
     multi_bridge_summary = read_json(runtime_full_expand_report / "evidence" / "call_chain" / "summary.json")
     multi_bridge_per_dependency = read_json(
@@ -2769,99 +2760,52 @@ return ExtraApi.callLegacy();
         cwd=project_dir,
         env={**dep_env},
     )
-    assert_true(rc == EXIT_AWAITING_USER, "Step4 待交互应返回 awaiting user 退出码")
+    assert_true(rc == 0, "Step4 只有一个变化依赖时不应伪造部分范围选择")
     interactive_step4_ckpt = read_json(main_state_path(interactive_step4_report))
-    interactive_step4_json = read_json(interaction_path(interactive_step4_report))
     assert_true(
-        main_state_meta(interactive_step4_ckpt).get("status") == "awaiting_user_input",
-        "Step4 无自动确认时应进入 awaiting_user_input",
-    )
-    assert_true(interactive_step4_json.get("step_id") == "step4", "Step4 interaction.json 未写入正确 step_id")
-    assert_true(interactive_step4_json.get("files_to_review"), "Step4 待交互未提供 files_to_review")
-    assert_true(
-        any(str(item).endswith("evidence/api_changes/changed_dependencies.md") for item in interactive_step4_json.get("files_to_review", [])),
-        "依赖 API 变化确认未提供依赖包维度的人读选择页",
+        main_state_meta(interactive_step4_ckpt).get("status") == "completed"
+        and main_state_meta(interactive_step4_ckpt).get("current_step") == "step5",
+        "Step4 单一候选成功后应直接进入 Step5",
     )
     assert_true(
-        any(str(item).endswith("evidence/api_changes/all_changed_apis.csv") for item in interactive_step4_json.get("files_to_review", [])),
-        "依赖 API 变化确认未提供完整 API 事实文件",
+        (interactive_step4_report / "evidence" / "api_changes" / "changed_dependencies.md").exists(),
+        "Step4 完成后应保留依赖变化概览",
     )
     assert_true(
-        ((interactive_step4_json.get("response_schema") or {}).get("properties") or {}).get("action"),
-        "Step4 待交互未提供 response_schema.action",
+        (interactive_step4_report / "evidence" / "api_changes" / "all_changed_apis.csv").exists(),
+        "Step4 完成后应保留完整 API 事实文件",
     )
     assert_true(
-        ((interactive_step4_json.get("response_schema") or {}).get("properties") or {}).get("dependency_source_dirs"),
-        "Step4 待交互未提供 dependency_source_dirs 修改入口",
+        not interaction_path(interactive_step4_report).exists(),
+        "Step4 单一候选成功后不应留下范围确认交互文件",
     )
     assert_true(
-        (interactive_step4_json.get("input_normalization") or {}).get("enabled") is True,
-        "Step4 待交互未提供 input_normalization.enabled",
+        "JUA_CONFIRMATION_JSON:" not in stdout,
+        "Step4 单一候选成功后不应输出伪确认事件",
     )
     assert_true(
-        "rerun_current_step" in ((interactive_step4_json.get("input_normalization") or {}).get("allowed_actions") or []),
-        "Step4 input_normalization 未暴露 rerun_current_step 动作",
+        main_state_step_output(interactive_step4_ckpt, "step4").get("dependency_repo_mappings") == [expected_internal_mapping],
+        "Step4 完成后，派生的 dependency_repo_mappings 未写回 step4.output",
     )
-    assert_true(interactive_step4_json.get("runtime_rules"), "Step4 待交互未提供 runtime_rules")
-    assert_true(interactive_step4_json.get("rules_file"), "Step4 待交互未提供 rules_file")
-    assert_true(
-        interactive_step4_json.get("must_wait_for_user_reply") is True,
-        "Step4 待交互未标记 must_wait_for_user_reply",
-    )
-    assert_true(interactive_step4_json.get("resume_command_examples"), "Step4 待交互未提供恢复命令模板")
-    step4_actions = {item.get("action") for item in interactive_step4_json.get("resume_command_examples", []) if isinstance(item, dict)}
-    assert_true("continue" in step4_actions, "Step4 恢复模板未包含 continue")
-    assert_true("rerun_current_step" in step4_actions, "Step4 恢复模板未包含 rerun_current_step")
-    assert_true("restart_from_step" in step4_actions, "Step4 恢复模板未包含 restart_from_step")
-    assert_true("cancel" in step4_actions, "Step4 恢复模板未包含 cancel")
-    assert_true(
-        "rerun_current_step" in {item.get("id") for item in interactive_step4_json.get("options", [])},
-        "Step4 待交互未提供修正映射后重跑动作",
-    )
-    assert_true(
-        "restart_from_step" in {item.get("id") for item in interactive_step4_json.get("options", [])},
-        "Step4 待交互未提供从指定步骤重跑动作",
-    )
-    assert_true('"files_to_review"' in stdout, "stdout 未输出 files_to_review")
-    assert_true('"runtime_rules"' in stdout, "stdout 未输出 runtime_rules")
-    assert_true("【分析已暂停，等待你的确认】" in stderr, "依赖 API 变化确认未输出用户任务卡")
-    assert_true("为什么暂停" in stderr, "依赖 API 变化确认未解释暂停原因")
-    assert_true("AWAITING USER INPUT" not in stderr, "用户任务卡仍暴露英文状态机提示")
-    assert_true("awaiting_*" not in stderr, "用户任务卡仍暴露内部运行规则")
-    step4_event_line = next(line for line in stdout.splitlines() if line.startswith("JUA_CONFIRMATION_JSON:"))
-    step4_stdout_event = json.loads(step4_event_line.split(":", 1)[1])
-    assert_true(step4_stdout_event.get("schema") == "java-upgrade-analyzer.confirmation.v1", "机器输出不是单个 confirmation JSON")
-    assert_true(step4_stdout_event.get("must_wait_for_user_reply") is True, "机器 confirmation JSON 未暴露 must_wait_for_user_reply")
-    assert_true('"input_normalization"' in stdout, "Step4 stdout 未输出 input_normalization")
     stdout, stderr, rc = run_script_with_rc(
         "run_step.py",
         [
             "--step", "auto",
             "--project-dir", str(project_dir),
             "--report-dir", str(interactive_step4_report),
-            "--response-json",
-            json.dumps(
-                {
-                    "action": "rerun_current_step",
-                    "dependency_source_dirs": [str(dep_repo)],
-                    "notes": "通过对话修正依赖源码目录后重跑 Step4",
-                },
-                ensure_ascii=False,
-            ),
         ],
         cwd=project_dir,
         env={**dep_env},
     )
-    assert_true(rc == EXIT_AWAITING_USER, "Step4 通过对话修正 dependency_source_dirs 后应重跑并进入待交互退出码")
-    interactive_step4_ckpt = read_json(main_state_path(interactive_step4_report))
-    interactive_step4_json = read_json(interaction_path(interactive_step4_report))
-    assert_true(main_state_meta(interactive_step4_ckpt).get("completed_step") == "step4", "Step4 修正映射后应重跑并停回 step4 确认点")
-    assert_true(main_state_meta(interactive_step4_ckpt).get("status") == "awaiting_user_input", "Step4 修正映射后应重新进入 awaiting_user_input")
-    assert_true(
-        main_state_step_output(interactive_step4_ckpt, "step4").get("dependency_repo_mappings") == [expected_internal_mapping],
-        "Step4 通过对话修正 dependency_source_dirs 后，派生的 dependency_repo_mappings 未写回 step4.output",
+    assert_true(rc == 0, f"Step4 单一候选应自动以全量范围完成 Step5: {stderr}")
+    interactive_scope = read_json(
+        interactive_step4_report / ".runtime" / "cache" / "step5_selection.json"
     )
-    assert_true(interactive_step4_json.get("step_id") == "step4", "Step4 重跑后 interaction 应仍指向 step4")
+    assert_true(
+        interactive_scope.get("mode") == "full"
+        and interactive_scope.get("included_dependency_coords") == ["com.example:demo-lib"],
+        "Step4 单一候选全量范围没有被写入 Step5 范围快照",
+    )
 
     interactive_step4_restart_report = project_dir / ".upgrade-report-step4-restart"
     interactive_step4_restart_report.mkdir(parents=True, exist_ok=True)
@@ -2894,7 +2838,7 @@ return ExtraApi.callLegacy();
         cwd=project_dir,
         env={**dep_env},
     )
-    assert_true(rc == EXIT_AWAITING_USER, "Step4 restart 场景首次待交互应返回 awaiting user 退出码")
+    assert_true(rc == 0, "Step4 restart 场景首次单候选执行应自动进入 Step5")
     stdout, stderr, rc = run_script_with_rc(
         "run_step.py",
         [
@@ -2904,9 +2848,11 @@ return ExtraApi.callLegacy();
             "--response-json",
             json.dumps(
                 {
-                    "action": "restart_from_step",
-                    "restart_step_id": "step2",
-                    "notes": "从 step2 重新开始",
+                    "intent_patch": {
+                        "action": "restart_from_step",
+                        "restart_step_id": "step2",
+                        "notes": "从 step2 重新开始",
+                    }
                 },
                 ensure_ascii=False,
             ),
@@ -2914,12 +2860,21 @@ return ExtraApi.callLegacy();
         cwd=project_dir,
         env={**dep_env},
     )
-    assert_true(rc == EXIT_AWAITING_USER, "Step4 应支持通过对话指定 restart_from_step 并进入待交互退出码")
+    assert_true(
+        rc == 0,
+        "Step4 应支持通过正式意图指定 restart_from_step，且输入完整时不增加无效确认\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}",
+    )
     interactive_step4_restart_ckpt = read_json(main_state_path(interactive_step4_restart_report))
-    interactive_step4_restart_json = read_json(interaction_path(interactive_step4_restart_report))
-    assert_true(main_state_meta(interactive_step4_restart_ckpt).get("completed_step") == "step2", "restart_from_step=step2 后应重新执行 step2")
-    assert_true(main_state_meta(interactive_step4_restart_ckpt).get("status") == "awaiting_user_input", "restart_from_step=step2 后应停在 step2 确认点")
-    assert_true(interactive_step4_restart_json.get("step_id") == "step2", "restart_from_step=step2 后 interaction 应指向 step2")
+    assert_true(
+        main_state_meta(interactive_step4_restart_ckpt).get("completed_step") == "step6"
+        and main_state_meta(interactive_step4_restart_ckpt).get("current_step") == "done",
+        "restart_from_step=step2 后应从 Step2 重建后续产物并完成流程",
+    )
+    assert_true(
+        not interaction_path(interactive_step4_restart_report).exists(),
+        "restart_from_step=step2 后输入完整时不应留下无实质决策的交互点",
+    )
 
     s4_dir = report_dir / "evidence" / "api_changes"
     s4_dir.mkdir(parents=True, exist_ok=True)
@@ -4806,7 +4761,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             f"Step1 前置输入契约交互未向 agent 暴露 {field_name}",
         )
     assert_true(
-        "可选输入方式" in stderr and "自动切分支构建" in stderr,
+        "可选输入方式" in stderr and "隔离分支构建" in stderr,
         "分析对象前置交互未向用户说明可选输入方式",
     )
 
@@ -5404,9 +5359,14 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "step1 待交互未提供从指定步骤重跑动作",
     )
     manifest_steps = read_json(SCRIPT_DIR / "step_manifest.json").get("steps", [])
-    manifest_statuses = {step.get("id"): ((step.get("interaction") or {}).get("status")) for step in manifest_steps}
-    assert_true(manifest_statuses.get("step4") == "awaiting_user_input", "step_manifest step4 仍未同步为 awaiting_user_input")
-    assert_true(manifest_statuses.get("step5") == "awaiting_user_input", "step_manifest step5 仍未同步为 awaiting_user_input")
+    manifest_root = read_json(SCRIPT_DIR / "step_manifest.json")
+    manifest_auto_continue = {step.get("id"): step.get("auto_continue_on_success") for step in manifest_steps}
+    manifest_scope_confirmation = {step.get("id"): step.get("requires_scope_confirmation") for step in manifest_steps}
+    assert_true(manifest_auto_continue.get("step4") is not True, "step_manifest step4 不应启用成功后自动继续")
+    assert_true(manifest_scope_confirmation.get("step4") is True, "step_manifest step4 未声明范围确认约束")
+    assert_true(manifest_root.get("auto_run_until_checkpoint") is True, "step_manifest 未启用自动运行到必要确认点")
+    assert_true(manifest_auto_continue.get("step2") is True, "step_manifest step2 未启用条件式自动继续")
+    assert_true(manifest_auto_continue.get("step5") is True, "step_manifest step5 未启用成功后自动继续")
     continue_response = project_dir / "step1_continue_response.json"
     write_text(
         continue_response,
@@ -5425,13 +5385,19 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     assert_true(
         rc in {0, EXIT_AWAITING_USER},
-        "结构化 continue 答复后应要么完成 step2 返回 0，要么进入下一个待交互状态返回 awaiting user 退出码",
+        "结构化 continue 答复后应自动运行到完成或下一个必要确认点",
     )
     interaction_ckpt = read_json(main_state_path(interactive_report))
-    assert_true(main_state_meta(interaction_ckpt).get("completed_step") == "step2", "待交互恢复后应推进到 step2")
+    assert_true(
+        main_state_meta(interaction_ckpt).get("completed_step") in {"step2", "step4", "step6"},
+        "待交互恢复后不应停在没有用户决策的 step3/step5",
+    )
     if rc == EXIT_AWAITING_USER:
         resumed_interaction = read_json(interaction_path(interactive_report))
-        assert_true(resumed_interaction.get("step_id") == "step2", "待交互恢复后若继续停顿，应停在 step2 交互点")
+        assert_true(
+            resumed_interaction.get("step_id") in {"step2", "step4"},
+            "待交互恢复后只能停在上下文事实缺失或分析范围选择点",
+        )
     assert_true(
         ((main_state_meta(interaction_ckpt).get("last_user_response") or {}).get("payload") or {}).get("notes") == "最终打包依赖范围可信，继续",
         "response-file 未写回主状态 state.last_user_response",
@@ -5473,38 +5439,50 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         cwd=project_dir,
         env={**dep_env},
     )
-    assert_true(rc == EXIT_AWAITING_USER, "Step2 待交互应返回 awaiting user 退出码")
-    step2_interaction = read_json(interaction_path(step2_resume_report))
-    assert_true(step2_interaction.get("step_id") == "step2", "Step2 交互点未正确写入 interaction.json")
-    stdout, stderr, rc = run_script_with_rc(
-        "run_step.py",
-        [
-            "--step", "auto",
-            "--project-dir", str(project_dir),
-            "--report-dir", str(step2_resume_report),
-            "--response-json",
-            json.dumps(
-                {
-                    "action": "continue",
-                    "base_branch": "base",
-                    "current_branch": "current",
-                    "notes": "修正 Step2 上下文口径",
-                },
-                ensure_ascii=False,
-            ),
-        ],
-        cwd=project_dir,
-        env={**dep_env},
+    assert_true(rc in {0, EXIT_AWAITING_USER}, "自动流程应完成，或仅在上下文实质缺口停顿")
+    step2_interaction = (
+        read_json(interaction_path(step2_resume_report))
+        if rc == EXIT_AWAITING_USER else {}
     )
-    assert_true(
-        rc == 0,
-        "Step2 恢复后应成功进入 Step3\n"
-        f"stdout:\n{stdout}\n"
-        f"stderr:\n{stderr}",
-    )
+    if rc == EXIT_AWAITING_USER:
+        assert_true(
+            step2_interaction.get("step_id") == "step2",
+            "单一变化依赖不应在 Step4 制造无实质选择的停顿",
+        )
+        required = set(step2_interaction.get("required_fields") or [])
+        response_payload = {"action": "continue", "notes": "补齐无法自动确定的升级上下文"}
+        if "jdk_base" in required:
+            response_payload["jdk_base"] = "8"
+        if "jdk_current" in required:
+            response_payload["jdk_current"] = "17"
+        if "source_dirs" in required:
+            response_payload["source_dirs"] = [str(project_dir / "src/main/java")]
+        stdout, stderr, rc = run_script_with_rc(
+            "run_step.py",
+            [
+                "--step", "auto",
+                "--project-dir", str(project_dir),
+                "--report-dir", str(step2_resume_report),
+                "--response-json", json.dumps(response_payload, ensure_ascii=False),
+            ],
+            cwd=project_dir,
+            env={**dep_env},
+        )
+        assert_true(
+            rc == 0,
+            "补齐上下文后应自动完成无分歧的后续流程",
+        )
     step2_resume_ckpt = read_json(main_state_path(step2_resume_report))
     step2_resume_ctx = read_json(context_path(step2_resume_report))
-    assert_true(main_state_meta(step2_resume_ckpt).get("completed_step") == "step3", "Step2 恢复后应继续执行到 step3")
+    assert_true(
+        main_state_meta(step2_resume_ckpt).get("completed_step") == "step6"
+        and main_state_meta(step2_resume_ckpt).get("current_step") == "done",
+        "上下文完整且只有单一变化依赖时应连续完成流程",
+    )
+    assert_true(
+        not interaction_path(step2_resume_report).exists(),
+        "无实质决策的后续流程不应留下交互文件",
+    )
     assert_true(step2_resume_ctx.get("base_branch") == "base", "Step2 恢复后未回写 s2_context.json.base_branch")
     assert_true(step2_resume_ctx.get("current_branch") == "current", "Step2 恢复后未回写 s2_context.json.current_branch")
     assert_true(
@@ -5522,6 +5500,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--base-branch", "base",
             "--current-branch", "current",
             "--target-module", ".",
+            "--source-repo-hints", str(dep_repo),
         ],
         cwd=project_dir,
         env=dep_env,
@@ -5548,7 +5527,13 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         cwd=project_dir,
         env={},
     )
-    assert_true(rc == EXIT_AWAITING_USER, "source_repo_hints 场景下 Step2 待交互应返回 awaiting user 退出码")
+    assert_true(rc == EXIT_AWAITING_USER, "source_repo_hints 生成映射建议时 Step2 应等待明确采用或拒绝")
+    step2_hint_interaction = read_json(interaction_path(step2_hint_accept_report))
+    assert_true(
+        step2_hint_interaction.get("step_id") == "step2"
+        and step2_hint_interaction.get("reason_code") == "step2_source_mapping_decision_required",
+        "source_repo_hints 建议不得被静默接受，也不应制造无关的上下文确认",
+    )
     stdout, stderr, rc = run_script_with_rc(
         "run_step.py",
         [
@@ -5573,7 +5558,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     assert_true(
         rc == 0,
-        "接受 source_repo_hints 建议后应成功进入 Step3\n"
+        "接受 source_repo_hints 建议后应自动完成无分歧的后续流程\n"
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}",
     )
@@ -5589,6 +5574,12 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true(
         main_state_step_input(step2_hint_accept_ckpt, "step2").get("dependency_source_dirs") == [str(dep_repo.resolve())],
         "接受 source_repo_hints 建议后，step2.input 未保留 dependency_source_dirs",
+    )
+    assert_true(
+        main_state_meta(step2_hint_accept_ckpt).get("completed_step") == "step6"
+        and main_state_meta(step2_hint_accept_ckpt).get("current_step") == "done"
+        and not interaction_path(step2_hint_accept_report).exists(),
+        "接受源码映射建议后，单一变化依赖不应制造范围选择点",
     )
 
     module_report = project_dir / ".upgrade-report-module-scope"
@@ -5776,15 +5767,22 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     assert_true(
         rc in {0, EXIT_AWAITING_USER},
-        "run_step auto 从 step1 恢复后应要么完成到 step3，要么停在 step2 待交互",
+        "run_step auto 从 step1 恢复后应要么完成流程，要么仅停在 step2 的实质缺口",
     )
     orchestrated_ckpt = read_json(main_state_path(orchestrated_report))
-    assert_true(main_state_meta(orchestrated_ckpt).get("completed_step") == "step2", "run_step auto 未从主状态续跑到 step2")
     if rc == EXIT_AWAITING_USER:
         orchestrated_interaction = read_json(interaction_path(orchestrated_report))
         assert_true(orchestrated_interaction.get("step_id") == "step2", "run_step auto 首次恢复后若停顿，应停在 step2")
+        assert_true(
+            main_state_meta(orchestrated_ckpt).get("completed_step") == "step2",
+            "run_step auto 在上下文缺口停顿时应已完成 step2 事实采集",
+        )
     else:
-        assert_true(main_state_meta(orchestrated_ckpt).get("current_step") == "step3", "run_step Step2 未指向 step3")
+        assert_true(
+            main_state_meta(orchestrated_ckpt).get("completed_step") == "step6"
+            and main_state_meta(orchestrated_ckpt).get("current_step") == "done",
+            "run_step 在输入完整且只有单一变化依赖时应连续完成流程",
+        )
 
     if main_state_meta(orchestrated_ckpt).get("status") == "awaiting_user_input":
         stdout, stderr, rc = run_script_with_rc(
@@ -5825,13 +5823,15 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--report-dir", str(orchestrated_report),
             "--base-branch", "base",
             "--current-branch", "current",
+            "--dependency-repo-mappings", f"com.example:demo-lib={dep_repo}",
         ],
         cwd=project_dir,
         env=dep_env,
     )
     assert_true(
         rc in {0, EXIT_AWAITING_USER},
-        "checkpoint 自愈后应要么完成 step1->step2，要么重跑 step1 后重新进入待交互",
+        "checkpoint 自愈后应要么完成 step1->step2，要么重跑 step1 后重新进入待交互\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}",
     )
     repaired_ckpt = read_json(main_state_path(orchestrated_report))
     assert_true(main_state_meta(repaired_ckpt).get("completed_step") == "step1", "主状态自愈后应回退到缺失产物对应的 step1")
@@ -5920,67 +5920,52 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--step", "step4",
             "--project-dir", str(project_dir),
             "--report-dir", str(orchestrated_report),
-            "--base-branch", "base",
-            "--current-branch", "current",
+            "--response-json", json.dumps(
+                {
+                    "intent_patch": {
+                        "action": "restart_from_step",
+                        "restart_step_id": "step4",
+                        "set": {
+                            "dependency_source_dirs": [str(dep_repo)]
+                        },
+                    }
+                },
+                ensure_ascii=False,
+            ),
         ],
         cwd=project_dir,
         env=dep_env,
     )
     assert_true(
-        rc in {0, EXIT_AWAITING_USER},
-        "step4 首轮应要么完成，要么进入待交互 checkpoint\n"
+        rc == 0,
+        "step4 只有一个变化依赖时应直接进入 Step5\n"
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}",
     )
-
-    # Step4 完成后的 checkpoint 确认
     step4_ckpt = read_json(main_state_path(orchestrated_report))
-    step5_invoked_via_resume = False
-    step5_stdout = ""
-    step5_stderr = ""
-    step5_rc = None
-    if main_state_meta(step4_ckpt).get("status") == "awaiting_user_input":
-        stdout, stderr, rc = run_script_with_rc(
-            "run_step.py",
-            [
-                "--step", "auto",
-                "--project-dir", str(project_dir),
-                "--report-dir", str(orchestrated_report),
-                "--response-json",
-                json.dumps({"action": "continue", "notes": "接受 Step4 证据池"}, ensure_ascii=False),
-            ],
-            cwd=project_dir,
-        )
-        assert_true(
-            rc in {0, EXIT_AWAITING_USER},
-            "Step4 恢复后应要么完成 step5，要么进入 step5 待交互\n"
-            f"stdout:\n{stdout}\n"
-            f"stderr:\n{stderr}",
-        )
-        if rc == EXIT_AWAITING_USER:
-            resumed_interaction = read_json(interaction_path(orchestrated_report))
-            assert_true(resumed_interaction.get("step_id") == "step5", "Step4 恢复后若继续停顿，应停在 step5")
-            step5_invoked_via_resume = True
-            step5_stdout, step5_stderr, step5_rc = stdout, stderr, rc
-
-    if not step5_invoked_via_resume:
-        step5_stdout, step5_stderr, step5_rc = run_script_with_rc(
-            "run_step.py",
-            [
-                "--step", "step5",
-                "--project-dir", str(project_dir),
-                "--report-dir", str(orchestrated_report),
-                # 【修复】不显式传 --source-dirs，测试从 context 恢复的场景
-                # 但提供 --allow-degraded 以避免阻塞
-                "--allow-degraded",
-                "--max-depth", "3",
-            ],
-            cwd=project_dir,
-            env={},
-        )
     assert_true(
-        step5_rc == EXIT_AWAITING_USER,
-        "Step5 在无自动确认时应进入待交互状态\n"
+        main_state_meta(step4_ckpt).get("status") == "completed"
+        and main_state_meta(step4_ckpt).get("current_step") == "step5",
+        "step4 单一候选完成后主状态未指向 Step5",
+    )
+    assert_true(not interaction_path(orchestrated_report).exists(), "step4 单一候选不应生成伪范围确认")
+
+    step5_stdout, step5_stderr, step5_rc = run_script_with_rc(
+        "run_step.py",
+        [
+            "--step", "auto",
+            "--project-dir", str(project_dir),
+            "--report-dir", str(orchestrated_report),
+            # 不显式传 --source-dirs，测试从 context 恢复的场景。
+            "--allow-degraded",
+            "--max-depth", "3",
+        ],
+        cwd=project_dir,
+        env={},
+    )
+    assert_true(
+        step5_rc == 0,
+        "Step5 成功后应直接推进到 Step6，不进入例行确认\n"
         f"stdout:\n{step5_stdout}\n"
         f"stderr:\n{step5_stderr}",
     )
@@ -5993,13 +5978,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     orchestrated_total = orchestrated_summary.get("total_apis", 0)
     assert_true(orchestrated_total >= 1, "orchestrated step5 应处理 all_changed_apis.csv 中的全部 API")
-    step5_interaction = read_json(interaction_path(orchestrated_report))
-    step5_actions = {item.get("id") for item in step5_interaction.get("options", [])}
-    step5_props = (step5_interaction.get("response_schema") or {}).get("properties", {})
-    assert_true(step5_interaction.get("step_id") == "step5", "Step5 交互点未正确写入 interaction.json")
-    assert_true("rerun_current_step" in step5_actions, "Step5 交互未提供 rerun_current_step")
-    assert_true("dependency_source_dirs" in step5_props, "Step5 交互未暴露 dependency_source_dirs 字段")
-    assert_true("dependency_source_mappings" not in step5_props, "Step5 交互不应再暴露 dependency_source_mappings 字段")
+    assert_true(not interaction_path(orchestrated_report).exists(), "Step5 成功后不应生成例行确认 interaction.json")
     assert_true(
         orchestrated_per_dependency.get("step5", {}).get("final_status"),
         "orchestrated Step5 未写出 per_dependency final_status",
@@ -6011,8 +5990,6 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--step", "auto",
             "--project-dir", str(project_dir),
             "--report-dir", str(orchestrated_report),
-            "--response-json",
-            json.dumps({"action": "continue", "notes": "接受 Step5 影响结论，生成最终报告"}, ensure_ascii=False),
         ],
         cwd=project_dir,
     )

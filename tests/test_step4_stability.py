@@ -23,6 +23,192 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_javap_method_body_parser_ignores_constant_pool_slot_numbers(self):
+        old_dump = """
+public class com.acme.Api {
+  public com.acme.Api();
+    descriptor: ()V
+    Code:
+       0: aload_0
+       1: invokespecial #1                  // Method java/lang/Object."<init>":()V
+       4: return
+}
+"""
+        new_dump = old_dump.replace("#1", "#99")
+
+        old_methods = step4._parse_javap_method_bodies(old_dump, "com.acme.Api")
+        new_methods = step4._parse_javap_method_bodies(new_dump, "com.acme.Api")
+
+        self.assertEqual(set(old_methods), set(new_methods))
+        identity = next(iter(old_methods))
+        self.assertEqual(old_methods[identity]["body_sha256"], new_methods[identity]["body_sha256"])
+
+    def test_javap_method_body_parser_includes_static_initializer(self):
+        dump = """
+public class com.acme.Api {
+  static {};
+    descriptor: ()V
+    Code:
+       0: iconst_1
+       1: putstatic     #7                  // Field enabled:Z
+       4: return
+}
+"""
+
+        methods = step4._parse_javap_method_bodies(dump, "com.acme.Api")
+
+        self.assertIn(("com.acme.Api", "class", "()V"), methods)
+
+    def test_class_variant_hash_includes_multi_release_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            manifest = "Manifest-Version: 1.0\nMulti-Release: true\n\n"
+            for jar_path, versioned_body in ((old_jar, b"old"), (new_jar, b"new")):
+                with zipfile.ZipFile(jar_path, "w") as archive:
+                    archive.writestr("META-INF/MANIFEST.MF", manifest)
+                    archive.writestr("com/acme/Api.class", b"same-base")
+                    archive.writestr("META-INF/versions/17/com/acme/Api.class", versioned_body)
+
+            old_hashes, old_multi_release = step4._jar_class_variant_hash_map(old_jar)
+            new_hashes, new_multi_release = step4._jar_class_variant_hash_map(new_jar)
+
+        self.assertTrue(old_multi_release)
+        self.assertTrue(new_multi_release)
+        self.assertNotEqual(old_hashes["com.acme.Api"], new_hashes["com.acme.Api"])
+
+    def test_javap_behavior_batch_failure_isolated_by_per_class_retry(self):
+        good_dump = """
+public class com.acme.Good {
+  public int run();
+    descriptor: ()I
+    Code:
+       0: iconst_1
+       1: ireturn
+}
+"""
+        with patch.object(
+            step4,
+            "run_cmd",
+            side_effect=[
+                ("", "batch failed", 1),
+                (good_dump, "", 0),
+                ("", "bad class", 1),
+            ],
+        ):
+            dumps, errors, invocations = step4._run_javap_behavior_dumps(
+                "dependency.jar",
+                ["com.acme.Good", "com.acme.Bad"],
+                batch_size=32,
+            )
+
+        self.assertEqual(set(dumps), {"com.acme.Good"})
+        self.assertEqual(errors, ["com.acme.Bad:bad class"])
+        self.assertEqual(invocations, 3)
+
+    def test_compare_jar_method_bodies_finds_same_signature_private_change(self):
+        old_dump = """
+public class com.acme.Api {
+  public int run(int);
+    descriptor: (I)I
+    Code:
+       0: aload_0
+       1: iload_1
+       2: invokevirtual #7                  // Method helper:(I)I
+       5: ireturn
+  private int helper(int);
+    descriptor: (I)I
+    Code:
+       0: iload_1
+       1: iconst_1
+       2: iadd
+       3: ireturn
+}
+"""
+        new_dump = old_dump.replace("iconst_1", "iconst_2")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_jar = root / "old.jar"
+            new_jar = root / "new.jar"
+            with zipfile.ZipFile(old_jar, "w") as archive:
+                archive.writestr("com/acme/Api.class", b"old-class")
+            with zipfile.ZipFile(new_jar, "w") as archive:
+                archive.writestr("com/acme/Api.class", b"new-class")
+            with patch.object(
+                step4,
+                "_run_javap_behavior_dumps",
+                side_effect=[
+                    ({"com.acme.Api": old_dump}, [], 1),
+                    ({"com.acme.Api": new_dump}, [], 1),
+                ],
+            ):
+                result = step4.compare_jar_method_bodies(
+                    old_jar,
+                    new_jar,
+                    coord="com.acme:api",
+                    old_version="1",
+                    new_version="2",
+                    output_dir=root,
+                )
+
+            evidence = json.loads(Path(result["evidence_path"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(len(result["rows"]), 1)
+        self.assertEqual(result["rows"][0]["api_name"], "com.acme.Api.helper")
+        self.assertEqual(result["rows"][0]["api_signature"], "(int)")
+        self.assertEqual(result["rows"][0]["source"], "jar_bytecode")
+        self.assertEqual(result["rows"][0]["reason_code"], "FINAL_JAR_METHOD_BODY_CHANGED")
+        self.assertEqual(evidence["changed_methods"][0]["descriptor"], "(I)I")
+
+    def test_compare_jar_method_bodies_with_real_jdk_toolchain(self):
+        if not step4.shutil.which("javac") or not step4.shutil.which("javap"):
+            self.skipTest("JDK toolchain is unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jars = []
+            for label, increment in (("old", 1), ("new", 2)):
+                source_dir = root / label / "src" / "com" / "acme"
+                classes_dir = root / label / "classes"
+                source_dir.mkdir(parents=True)
+                classes_dir.mkdir(parents=True)
+                (source_dir / "Api.java").write_text(
+                    "package com.acme;\n"
+                    "public class Api {\n"
+                    "  public int run(int value) { return helper(value); }\n"
+                    f"  private int helper(int value) {{ return value + {increment}; }}\n"
+                    "}\n",
+                    encoding="utf-8",
+                )
+                stdout, stderr, rc = step4.run_cmd(
+                    ["javac", "-g:none", "-d", str(classes_dir), str(source_dir / "Api.java")]
+                )
+                self.assertEqual(rc, 0, msg=stderr or stdout)
+                jar_path = root / f"{label}.jar"
+                with zipfile.ZipFile(jar_path, "w") as archive:
+                    archive.write(
+                        classes_dir / "com" / "acme" / "Api.class",
+                        "com/acme/Api.class",
+                    )
+                jars.append(jar_path)
+
+            result = step4.compare_jar_method_bodies(
+                jars[0],
+                jars[1],
+                coord="com.acme:api",
+                old_version="1",
+                new_version="2",
+                output_dir=root,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(
+            [(row["api_name"], row["api_signature"]) for row in result["rows"]],
+            [("com.acme.Api.helper", "(int)")],
+        )
+
     def test_runtime_provider_set_jar_is_byte_deterministic_across_build_times(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -268,8 +454,9 @@ class Step4StabilityTest(unittest.TestCase):
             self.assertIn("## 如何选择定向分析范围", md_text)
             self.assertIn("复制“依赖包”列中的完整坐标", md_text)
             self.assertIn("只分析 com.example:demo-lib", md_text)
-            self.assertIn("推荐依据是：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", md_text)
-            self.assertIn("| 推荐候选 | 依赖包 |", md_text)
+            self.assertIn("排序依据是：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", md_text)
+            self.assertIn("不表示系统建议缩小范围", md_text)
+            self.assertIn("| 部分分析优先项 | 依赖包 |", md_text)
             self.assertIn("| 是 | `com.acme:alpha` |", md_text)
             self.assertIn("为什么先看", md_text)
             self.assertIn("含高风险 API，优先做系统触达分析", md_text)
@@ -371,13 +558,15 @@ class Step4StabilityTest(unittest.TestCase):
 
         self.assertIn("【Step4 摘要】依赖 API 变化识别完成", output)
         self.assertIn("先看什么：", output)
-        self.assertIn("本次是否能进入 Step5：", output)
+        self.assertIn("确认 Step5 分析范围：", output)
+        self.assertIn("全量分析：", output)
+        self.assertIn("部分分析：", output)
         self.assertIn("changed_dependencies.md", output)
         self.assertIn("复核文件：", output)
         self.assertNotIn("人工抽查节点", output)
         self.assertNotIn("建议优先查看", output)
 
-    def test_main_emits_japicmp_missing_checkpoint_before_degraded_step4(self):
+    def test_main_blocks_as_system_error_when_japicmp_auto_install_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / ".upgrade-report"
             output_dir = report_dir / "s4_jar_compare"
@@ -417,18 +606,11 @@ class Step4StabilityTest(unittest.TestCase):
             ) as install_mock, redirect_stdout(stdout), redirect_stderr(stderr):
                 rc = step4.main()
 
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 2)
             install_mock.assert_called_once()
             output = stdout.getvalue()
-            self.assertIn(step4.INTERACTION_PREFIX, output)
-            payload = json.loads(output.split(step4.INTERACTION_PREFIX, 1)[1].strip())
-            self.assertEqual(payload["reason_code"], "step4_japicmp_missing_need_resolution")
-            self.assertNotIn("allow_degraded", payload["response_schema"]["properties"])
-            self.assertIn("japicmp_jar", payload["response_schema"]["properties"])
-            self.assertEqual(
-                payload["action_requirements"]["rerun_current_step"]["required_fields"],
-                ["japicmp_jar"],
-            )
+            self.assertNotIn(step4.INTERACTION_PREFIX, output)
+            self.assertIn("系统环境阻塞", stderr.getvalue())
             self.assertTrue((output_dir / "japicmp_preflight.json").exists())
 
     def test_parse_japicmp_xml_preserves_binary_and_source_compatibility(self):
@@ -538,6 +720,32 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertFalse(identity["complete"])
         self.assertEqual(identity["release_sha256"], "")
         self.assertIn("java_release_file_missing", identity["failures"])
+
+    def test_java_runtime_identity_resolves_literal_shell_launcher_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "launcher" / "java"
+            runtime_java = root / "jdk" / "bin" / "java"
+            release = root / "jdk" / "release"
+            launcher.parent.mkdir()
+            runtime_java.parent.mkdir(parents=True)
+            runtime_java.write_bytes(b"runtime-java")
+            release.write_text('JAVA_VERSION="21"\n', encoding="utf-8")
+            launcher.write_text(
+                f'#!/bin/sh\nexec {runtime_java} "$@"\n', encoding="utf-8"
+            )
+
+            with patch.object(
+                step4.shutil, "which", return_value=str(launcher)
+            ), patch.dict(os.environ, {}, clear=True):
+                identity = step4.effective_java_runtime_identity()
+
+        self.assertTrue(identity["complete"])
+        self.assertEqual(identity["runtime_java"], str(runtime_java.resolve()))
+        self.assertEqual(identity["java_home"], str(runtime_java.parent.parent.resolve()))
+        self.assertTrue(identity["runtime_java_sha256"])
+        self.assertTrue(identity["release_sha256"])
+        self.assertEqual(identity["failures"], [])
 
     def test_parse_japicmp_xml_keeps_all_compatibility_flags_without_downgrading(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1512,6 +1720,76 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertEqual(pending[0]["coord"], "com.acme:acct-sdk")
         self.assertEqual(pending[0]["reason"], "无法定位对比 ref")
 
+    def test_partition_git_ref_pending_only_prompts_for_distinct_commit_ranges(self):
+        internal_item = {
+            "coord": "com.acme:network-failure",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "pending_kind": "remote_query_failed",
+            "reason": "remote_query_failed=timed out",
+        }
+        ambiguous_item = {
+            "coord": "com.acme:ambiguous",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "pending_kind": "ambiguous",
+            "old_candidates": [
+                {"ref": "origin/release-1", "commit": "a" * 40, "score": 140},
+                {"ref": "origin/support-1", "commit": "b" * 40, "score": 140},
+            ],
+            "new_candidates": [
+                {"ref": "origin/release-2", "commit": "c" * 40, "score": 140},
+                {"ref": "origin/support-2", "commit": "d" * 40, "score": 140},
+            ],
+        }
+
+        user_confirmation, internally_skipped = step4.partition_git_ref_pending_items(
+            [internal_item, ambiguous_item]
+        )
+
+        self.assertEqual([item["coord"] for item in user_confirmation], ["com.acme:ambiguous"])
+        self.assertEqual([item["coord"] for item in internally_skipped], ["com.acme:network-failure"])
+        self.assertEqual(
+            internally_skipped[0]["reason_code"],
+            "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
+        )
+        self.assertEqual(
+            internally_skipped[0]["resolution"],
+            "continue_with_final_artifact_analysis",
+        )
+        self.assertFalse(internally_skipped[0]["user_attention_required"])
+
+    def test_partition_git_ref_pending_treats_operational_failures_as_internal(self):
+        for pending_kind in (
+            "fetch_failed",
+            "remote_query_failed",
+            "remote_ref_moved",
+            "remote_unavailable",
+            "not_found",
+            "local_confirmation_required",
+        ):
+            with self.subTest(pending_kind=pending_kind):
+                user_confirmation, internally_skipped = step4.partition_git_ref_pending_items([
+                    {
+                        "coord": f"com.acme:{pending_kind}",
+                        "old_version": "1.0.0",
+                        "new_version": "2.0.0",
+                        "pending_kind": pending_kind,
+                        "old_candidates": [
+                            {"ref": "origin/old-a", "commit": "a" * 40, "score": 140},
+                            {"ref": "origin/old-b", "commit": "b" * 40, "score": 140},
+                        ],
+                        "new_candidates": [
+                            {"ref": "origin/new-a", "commit": "c" * 40, "score": 140},
+                            {"ref": "origin/new-b", "commit": "d" * 40, "score": 140},
+                        ],
+                    }
+                ])
+
+                self.assertEqual(user_confirmation, [])
+                self.assertEqual(len(internally_skipped), 1)
+                self.assertFalse(internally_skipped[0]["user_attention_required"])
+
     def test_preflight_materializes_remote_refs_to_immutable_commits(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_dir = Path(tmp) / "acct-sdk"
@@ -1631,6 +1909,14 @@ class Step4StabilityTest(unittest.TestCase):
                 json.dumps({"changed_dependencies": [{"coord": "com.acme:acct-sdk"}]}, ensure_ascii=False),
                 encoding="utf-8",
             )
+            old_candidates = [
+                {"ref": "origin/release-1", "commit": "a" * 40, "score": 140},
+                {"ref": "origin/support-1", "commit": "b" * 40, "score": 140},
+            ]
+            new_candidates = [
+                {"ref": "origin/release-2", "commit": "c" * 40, "score": 140},
+                {"ref": "origin/support-2", "commit": "d" * 40, "score": 140},
+            ]
 
             with patch.object(
                 sys,
@@ -1651,7 +1937,14 @@ class Step4StabilityTest(unittest.TestCase):
             ), patch.object(
                 step4,
                 "resolve_repo_ref_pair_for_versions",
-                return_value=(None, None, "miss-old", "miss-new", [], []),
+                return_value=(
+                    None,
+                    None,
+                    "ambiguous_ref_matches=2",
+                    "ambiguous_ref_matches=2",
+                    old_candidates,
+                    new_candidates,
+                ),
             ), patch.object(
                 step4,
                 "run_japicmp",
@@ -1682,6 +1975,309 @@ class Step4StabilityTest(unittest.TestCase):
         self.assertIn("preflight.git_refs", {row["phase"] for row in timing_rows})
         self.assertIn("step4.total", {row["phase"] for row in timing_rows})
         self.assertEqual(timing_rows[-1]["status"], "awaiting_git_ref_confirmation")
+
+    def test_main_internal_source_ref_failure_continues_binary_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s4_jar_compare"
+            repo_dir = report_dir / "acct-sdk"
+            repo_dir.mkdir()
+            (repo_dir / ".git").mkdir()
+            japicmp_jar = report_dir / "japicmp.jar"
+            japicmp_jar.write_bytes(b"test")
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            dep_changes.write_text(
+                "\n".join(
+                    [
+                        "coord,old_version,new_version,change_type,scope",
+                        "com.acme:acct-sdk,1.0.0,2.0.0,小版本升级,compile",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps({"changed_dependencies": [{"coord": "com.acme:acct-sdk"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            binary_output = output_dir / "acct-sdk_binary.txt"
+            binary_info = {
+                "old_jar": None,
+                "new_jar": None,
+                "external_process_count": 0,
+                "parser_mode": "xml",
+            }
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes",
+                    str(dep_changes),
+                    "--context",
+                    str(context_json),
+                    "--output-dir",
+                    str(output_dir),
+                    "--japicmp-jar",
+                    str(japicmp_jar),
+                    "--dependency-repo-mappings",
+                    f"com.acme:acct-sdk={repo_dir}",
+                    "--skip-changed-classes",
+                ],
+            ), patch.object(
+                step4,
+                "resolve_repo_ref_pair_for_versions",
+                return_value=(None, None, "remote_query_failed=timeout", "", [], []),
+            ), patch.object(
+                step4,
+                "run_japicmp",
+                return_value=(str(binary_output), [], binary_info, None),
+            ) as run_japicmp:
+                exit_code = step4.main()
+
+            matches = json.loads((output_dir / "git_ref_matches.json").read_text(encoding="utf-8"))
+            pending = json.loads((output_dir / "git_ref_pending.json").read_text(encoding="utf-8"))
+            coverage = json.loads(
+                (report_dir / ".runtime/coverage/s4_coverage.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(exit_code, 0)
+        run_japicmp.assert_called_once()
+        self.assertFalse(matches["need_user_confirmation"])
+        self.assertEqual(matches["summary"]["pending"], 0)
+        self.assertEqual(matches["summary"]["skipped"], 1)
+        self.assertEqual(
+            matches["skipped_items"][0]["reason_code"],
+            "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
+        )
+        self.assertEqual(pending["items"], [])
+        self.assertEqual(coverage["binary_api_diff"]["status"], "complete")
+        self.assertEqual(coverage["behavior_diff"]["status"], "insufficient")
+        self.assertIn(
+            "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
+            coverage["behavior_diff"]["reason_codes"],
+        )
+
+    def test_main_recovers_source_ref_failure_with_final_jar_bytecode_diff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s4_jar_compare"
+            repo_dir = report_dir / "acct-sdk"
+            repo_dir.mkdir()
+            (repo_dir / ".git").mkdir()
+            japicmp_jar = report_dir / "japicmp.jar"
+            japicmp_jar.write_bytes(b"tool")
+            old_jar = report_dir / "old.jar"
+            new_jar = report_dir / "new.jar"
+            for path, payload in ((old_jar, b"old"), (new_jar, b"new")):
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("com/acme/Api.class", payload)
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,scope\n"
+                "com.acme:acct-sdk,1.0.0,2.0.0,小版本升级,compile\n",
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps({"changed_dependencies": [{"coord": "com.acme:acct-sdk"}]}),
+                encoding="utf-8",
+            )
+            evidence_path = output_dir / "acct-sdk_bytecode_behavior.json"
+            behavior_row = {
+                "coord": "com.acme:acct-sdk",
+                "old_version": "1.0.0",
+                "new_version": "2.0.0",
+                "change_type": "BEHAVIOR_CHANGED",
+                "api_name": "com.acme.Api.run",
+                "api_simple": "run",
+                "symbol_kind": "method",
+                "api_signature": "()",
+                "confirmed": "true",
+                "severity": "P2",
+                "source": "jar_bytecode",
+                "reason_code": "FINAL_JAR_METHOD_BODY_CHANGED",
+                "evidence_path": str(evidence_path),
+            }
+            binary_info = {
+                "old_jar": str(old_jar),
+                "new_jar": str(new_jar),
+                "external_process_count": 0,
+                "parser_mode": "xml",
+            }
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes", str(dep_changes),
+                    "--context", str(context_json),
+                    "--output-dir", str(output_dir),
+                    "--japicmp-jar", str(japicmp_jar),
+                    "--dependency-repo-mappings", f"com.acme:acct-sdk={repo_dir}",
+                    "--skip-changed-classes",
+                ],
+            ), patch.object(
+                step4,
+                "resolve_repo_ref_pair_for_versions",
+                return_value=(None, None, "remote_query_failed=timeout", "", [], []),
+            ), patch.object(
+                step4,
+                "run_japicmp",
+                return_value=(str(output_dir / "binary.txt"), [], binary_info, None),
+            ), patch.object(
+                step4,
+                "collect_data_contract_changes",
+                return_value=[],
+            ), patch.object(
+                step4,
+                "compare_jar_method_bodies",
+                return_value={
+                    "status": "complete",
+                    "reason_code": "",
+                    "rows": [behavior_row],
+                    "modified_classes": 1,
+                    "scanned_classes": 1,
+                    "javap_invocations": 2,
+                    "evidence_path": str(evidence_path),
+                    "errors": [],
+                },
+            ) as compare_behavior:
+                exit_code = step4.main()
+
+            coverage = json.loads(
+                (report_dir / ".runtime/coverage/s4_coverage.json").read_text(encoding="utf-8")
+            )
+            with (output_dir / "all_changed_apis.csv").open(encoding="utf-8-sig") as api_file:
+                api_rows = list(csv.DictReader(api_file))
+            matches = json.loads((output_dir / "git_ref_matches.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        compare_behavior.assert_called_once()
+        self.assertEqual(coverage["behavior_diff"]["status"], "complete")
+        self.assertEqual(coverage["behavior_diff"]["reason_codes"], [])
+        self.assertEqual(
+            coverage["behavior_diff"]["metrics"]["jar_bytecode_fallback_dependencies"],
+            1,
+        )
+        self.assertEqual(len(api_rows), 1)
+        self.assertEqual(api_rows[0]["source"], "jar_bytecode")
+        self.assertEqual(
+            matches["skipped_items"][0]["resolution"],
+            "recovered_with_final_jar_method_bytecode_diff",
+        )
+
+    def test_main_recovers_source_ref_failure_that_occurs_after_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s4_jar_compare"
+            repo_dir = report_dir / "acct-sdk"
+            repo_dir.mkdir()
+            (repo_dir / ".git").mkdir()
+            japicmp_jar = report_dir / "japicmp.jar"
+            japicmp_jar.write_bytes(b"tool")
+            old_jar = report_dir / "old.jar"
+            new_jar = report_dir / "new.jar"
+            for path, payload in ((old_jar, b"old"), (new_jar, b"new")):
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("com/acme/Api.class", payload)
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,scope\n"
+                "com.acme:acct-sdk,1.0.0,2.0.0,小版本升级,compile\n",
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps({"changed_dependencies": [{"coord": "com.acme:acct-sdk"}]}),
+                encoding="utf-8",
+            )
+            fixed_plan = {
+                "coord": "com.acme:acct-sdk",
+                "base_ref": "a" * 40,
+                "cur_ref": "b" * 40,
+                "old_source": {"status": "remote_verified"},
+                "new_source": {"status": "remote_verified"},
+            }
+            binary_info = {
+                "old_jar": str(old_jar),
+                "new_jar": str(new_jar),
+                "external_process_count": 0,
+                "parser_mode": "xml",
+            }
+            evidence_path = output_dir / "late_bytecode_behavior.json"
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes", str(dep_changes),
+                    "--context", str(context_json),
+                    "--output-dir", str(output_dir),
+                    "--japicmp-jar", str(japicmp_jar),
+                    "--dependency-repo-mappings", f"com.acme:acct-sdk={repo_dir}",
+                    "--skip-changed-classes",
+                ],
+            ), patch.object(
+                step4,
+                "preflight_gitdiff_refs",
+                return_value=([fixed_plan], []),
+            ), patch.object(
+                step4,
+                "run_gitdiff",
+                return_value={
+                    "status": "needs_user_confirmation",
+                    "error": "remote_ref_moved=branch changed after preflight",
+                    "out_file": str(output_dir / "late_gitdiff.txt"),
+                    "apis": [],
+                    "meta": {
+                        "reason": "remote_ref_moved=branch changed after preflight",
+                        "old_reason": "remote_ref_moved",
+                        "new_reason": "remote_ref_moved",
+                    },
+                },
+            ), patch.object(
+                step4,
+                "run_japicmp",
+                return_value=(str(output_dir / "binary.txt"), [], binary_info, None),
+            ), patch.object(
+                step4,
+                "collect_data_contract_changes",
+                return_value=[],
+            ), patch.object(
+                step4,
+                "compare_jar_method_bodies",
+                return_value={
+                    "status": "complete",
+                    "reason_code": "",
+                    "rows": [],
+                    "modified_classes": 1,
+                    "scanned_classes": 1,
+                    "javap_invocations": 2,
+                    "evidence_path": str(evidence_path),
+                    "errors": [],
+                },
+            ) as compare_behavior:
+                exit_code = step4.main()
+
+            coverage = json.loads(
+                (report_dir / ".runtime/coverage/s4_coverage.json").read_text(encoding="utf-8")
+            )
+            matches = json.loads((output_dir / "git_ref_matches.json").read_text(encoding="utf-8"))
+            pending = json.loads((output_dir / "git_ref_pending.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        compare_behavior.assert_called_once()
+        self.assertEqual(pending["items"], [])
+        self.assertFalse(matches["need_user_confirmation"])
+        self.assertEqual(
+            matches["skipped_items"][0]["reason_code"],
+            "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
+        )
+        self.assertEqual(coverage["behavior_diff"]["status"], "complete")
 
     def test_main_writes_step4_timing_csv_on_success(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2886,7 +3482,7 @@ class Step4StabilityTest(unittest.TestCase):
             text = Path(txt_path).read_text(encoding="utf-8")
 
         self.assertFalse(payload["need_user_confirmation"])
-        self.assertIn("Step4 依赖源码 git ref 匹配结果（自动匹配完成）", text)
+        self.assertIn("Step4 依赖源码版本解析结果（无需用户确认）", text)
         self.assertIn("一、结论总览", text)
         self.assertNotIn("generated_at=", text)
 
@@ -3190,10 +3786,10 @@ class Step4StabilityTest(unittest.TestCase):
 
         output = stderr.getvalue()
         self.assertEqual(exit_code, 0)
-        self.assertIn("[progress][step4][plan]", output)
-        self.assertIn("[progress][step4][dependency]", output)
-        self.assertIn("[progress][step4][japicmp]", output)
-        self.assertIn("[progress][step4][done]", output)
+        self.assertIn("[进度][依赖 API 变化][准备]", output)
+        self.assertIn("[进度][依赖 API 变化][处理依赖]", output)
+        self.assertIn("[进度][依赖 API 变化][制品 API 对比]", output)
+        self.assertIn("[进度][依赖 API 变化][完成]", output)
 
     def test_step4_timeout_rerun_requires_timeout_override(self):
         pending_interaction = {
@@ -3353,7 +3949,10 @@ class Step4StabilityTest(unittest.TestCase):
         card = "\n".join(run_step.build_user_decision_card(interaction))
 
         self.assertEqual(len(expanded["dependency_git_ref_overrides"]), 2)
+        self.assertIn("需要确认的依赖源码版本", card)
         self.assertIn("共 2 个，请一次答全", card)
+        self.assertIn("升级前", card)
+        self.assertIn("升级后", card)
         self.assertIn("com.foo:bar 选方案 1；com.foo:baz 选方案 1", card)
         self.assertNotIn("refpair:", card)
 

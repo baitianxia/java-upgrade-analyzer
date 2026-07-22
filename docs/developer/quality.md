@@ -56,7 +56,7 @@ python3 scripts/real_project_regression.py --case guard-exploratory
 
 `guard` 是 `core + capability` 的发布集合；`exploratory` 用于候选项目观察，不计入发布充分条件。物化脚本接受相同 selector，并在输出中记录本次实际 artifact SHA-256。
 
-运行环境契约固定为 CPython 3.12.x、`tree-sitter==0.25.2`、
+运行环境契约支持 CPython 3.12.x、3.13.x 和 3.14.x，并固定 `tree-sitter==0.25.2`、
 `tree-sitter-java==0.23.5`、Linux/macOS/Windows、JDK 11/17/21 和 Maven 3.8+。
 `scripts/bootstrap_runtime.py` 是唯一依赖安装入口，支持联网安装或通过 `--wheel-dir`
 使用带 `--no-index` 的受控离线缓存。quality gate 的首项会实际执行 Git/JDK/Maven
@@ -132,6 +132,11 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 - JApiCmp XML/文本、git diff、removed jar symbol export 都应保留可追溯证据；
 - JDK 标准类、第三方无关类不能误归入目标依赖 API 变化；
 - removed jar 场景必须导出旧版 public/protected 符号。
+- Step4 内部源码 ref 故障不得要求用户修复：应验证 `DEPENDENCY_SOURCE_REF_UNAVAILABLE` 可追溯、最终 JAR 方法字节码兜底会发现同签名实现变化，并且成功兜底后 `behavior_diff=complete`。若兜底失败，应验证 `behavior_diff` 进入 `critical_incomplete`，报告不出现完整或无影响结论；只有不同 commit pair 会改变源码范围时才允许进入确认 checkpoint。
+- Step4 成功后必须生成有实际意义的范围确认，让用户选择 Step5 全量或部分分析；部分分析必须限制最终结论范围。Step5 成功后不生成例行确认，直接生成报告。Step4 超时和 Step5 依赖源码缺失在标准模式下自动记录证据缺口后继续，不得伪装成范围选择要求用户修复；严格模式或关键覆盖约束仍必须阻止无边界结论。
+- `--step auto` 必须连续运行到下一个必要确认点或流程完成：Step2 只有在 JDK、业务源码范围或源码映射歧义等会改变分析口径的事实无法可靠确定时暂停；Step3 和 Step5 不得生成例行成功确认。默认 manifest 的流程控制语义必须有端到端测试覆盖。
+- JApiCmp、tree-sitter 等内部能力在自动准备失败后必须进入 `blocked_by_system`，不得生成伪业务 checkpoint 要求用户确认“修复后继续”；同时不得为保持流程表面连续而降低准确性。
+- 应验证 Step4 即使误配 `auto_continue_on_success` 也不会跳过范围确认；Step5 必须写入 `.runtime/cache/step5_selection.json`，Step6 对部分范围或范围快照缺失都不得输出全量/全局无影响措辞。
 
 ### Step5
 

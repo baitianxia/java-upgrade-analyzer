@@ -14,6 +14,8 @@ import urllib.error
 import zipfile
 from pathlib import Path
 
+from compat import resolve_command
+
 from real_project_regression import (
     CASES,
     GUARD_SELECTORS,
@@ -224,9 +226,9 @@ def execute_materialization_plan(plan: list[dict]) -> list[dict]:
             if destination.is_dir():
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(step["argv"], cwd=step["cwd"], check=True)
+            subprocess.run(resolve_command(step["argv"]), cwd=step["cwd"], check=True)
         elif operation == "command":
-            subprocess.run(step["argv"], cwd=step["cwd"], check=True)
+            subprocess.run(resolve_command(step["argv"]), cwd=step["cwd"], check=True)
         elif operation == "download":
             destination = Path(step["destination"])
             destination.parent.mkdir(parents=True, exist_ok=True)

@@ -90,9 +90,9 @@ Claude Code 会负责：
 - 标准 Maven 结构下，业务系统源码路径通常不需要你提供，Skill 会从目标模块推断。
 - 依赖源码路径指的是依赖包自己的源码仓库路径，不是当前业务系统源码路径。
 - base/current 可以使用同一个工程目录；两侧身份由各自确认后的远程分支、tag 或 commit 决定。Skill 会查询远端最新 ref、定向 fetch 并固定到具体 commit，在隔离快照中分析，不会切换或拉取你的当前分支。
-- 直接产物模式会先解析 JAR；只有依赖坐标仍缺失时才使用对应侧源码补全。源码默认只取远端：唯一 ref pair 或多个名称指向同一 commit pair 时自动采用，不再询问；只有不同 commit pair 的真实歧义才会把所有待确认依赖及方案编号汇总到一张决策卡中，用户可一次答全。远端不可用时不会静默使用本地分支；只有用户明确确认本地兜底后才可使用，本地仓库有未提交修改时还会再次确认。
-- 分支名只用于定位和展示，确认卡选择会同时绑定当时的 commit SHA；Step1 构建、Step2 Git 读取和 Step4 源码 diff 都优先使用固定 SHA。若执行前 ref 已移动，会要求基于新 commit 重新确认，绝不按旧分支名静默继续。
-- 远端 `ls-remote`/`fetch` 对超时、连接重置、临时 DNS/HTTP 5xx 等瞬时错误最多尝试 3 次，重试间隔为 1 秒、3 秒；认证失败、ref 不存在和 ref 已移动不自动重试。自动重试耗尽后，确认卡只询问是否重试，不要求用户重新选择已经唯一确定的分支。裸 commit SHA 会先与远端实时清单中的 commit 匹配；远端不可用时，即使本地存在同一对象也只展示为可选兜底，只有明确设置 `allow_local_source=true` 后才会采用。
+- 直接产物模式会先解析 JAR；只有依赖坐标仍缺失时才使用对应侧源码补全。Step4 的依赖源码默认只取远端：唯一 ref pair 或多个名称指向同一 commit pair 时自动采用；只有两个以上不同 commit pair、且选择会改变源码对比范围时，才把全部歧义依赖及方案编号汇总到一张决策卡中，用户可一次答全。
+- 分支名只用于定位和展示，确认卡选择会同时绑定当时的 commit SHA。Step1 构建来源发生 ref 移动时会基于新 commit 重新确认；Step4 的依赖源码 ref 移动或不可用时不要求用户修复，而是从升级前后最终 JAR 比较同签名方法的规范化字节码，继续识别实现变化。两种情况都不会按旧分支名静默继续。
+- 远端 `ls-remote`/`fetch` 对超时、连接重置、临时 DNS/HTTP 5xx 等瞬时错误最多尝试 3 次，重试间隔为 1 秒、3 秒；认证失败、ref 不存在和 ref 已移动不自动重试。Step4 自动重试耗尽后会记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不会生成要求用户处理网络、权限或 ref 的确认卡，也不会静默使用本地对象；只有运行前已经明确提供 `allow_local_source=true` 时才允许采用本地兜底。若最终 JAR 方法字节码兜底也无法完成，行为变化覆盖会成为关键缺口，报告不得输出“完整”或“不受影响”结论。
 - 无论是否提供源码，依赖范围、版本、JAR 内容和字节码调用边始终以 base/current 最终制品为准；源码只用于补坐标、行为差异和可读性解释，不能把最终制品中不存在的模块扩展进确定性结论。
 - 只提供源码目录不能证明它对应哪一侧制品；这种输入会先要求确认 revision，确认前不会执行 Maven。
 - 如果存在多个可部署模块且无法唯一判断，Claude Code 必须让你选择目标模块。
@@ -103,16 +103,23 @@ Claude Code 会负责：
 
 ## Claude Code 停下来问问题怎么办
 
-分析过程中，Skill 可能会遇到需要人工确认的信息。Claude Code 会停下来向你确认，而不是继续猜。
+使用 `--step auto` 时，流程会连续执行到下一个确实需要用户决定的检查点，不再每完成一个步骤就退出。Claude Code 只在缺少外部事实、需要授权或不同选择会实质改变分析结果时停下来；其余步骤自动继续。
 
 常见确认点：
 
 - 目标模块不明确；
 - 输入方式不完整；
+- 两侧最终制品已经提供，但后续上下文仍缺少基准侧或当前侧分支；该信息会合并到已有的依赖范围确认中，不新增一次确认；
+- JDK 版本或业务源码范围无法从制品、构建文件和项目结构可靠确定；
+- 用户提供了源码仓库线索，并产生了会改变源码行为覆盖率的映射建议；系统会要求明确采用或拒绝，拒绝后不会重复询问；
 - 依赖坐标或版本无法安全补齐；
-- 依赖 API 变化证据不完整，是否补充材料后重新分析；
-- 系统触达证据缺少依赖源码，是否补充后重新分析；
+- 依赖源码存在两个以上不同 commit pair，且选择会改变源码差异范围；
+- Step4 识别出至少两个可分析依赖后，选择 Step5 的全量或部分分析范围；0 个或 1 个候选不存在实际范围取舍，系统会直接继续；
 - 是否从某项任务重新分析。
+
+正常流程中的确认顺序是：先确认分析对象与实际依赖范围；升级上下文只有在关键事实缺失时才确认；依赖 API 变化完成后确认全量或部分系统触达范围。兼容性线索扫描、证据完整的升级上下文、系统触达分析和最终报告都会自动衔接。
+
+Step4 识别出至少两个可分析依赖后会让你选择 Step5 的分析范围：全量分析覆盖更完整，部分分析可以降低耗时，但最终结论只适用于所选范围。范围卡会同时展示依赖数、变化 API 数和高风险 API 数。0 个或 1 个候选不存在实际范围取舍，系统会直接继续。确认范围后，系统会连续执行 Step5 和 Step6，不再要求点击“继续”。超时、依赖源码缺失等内部证据故障会自动记录覆盖缺口并生成受限结论，不会混入范围选择要求用户修复。
 
 你只需要用自然语言回答即可，例如：
 
@@ -130,25 +137,33 @@ Claude Code 会负责：
 
 Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢复执行。
 
+暂停、等待确认或系统阻塞时，`.upgrade-report/README.md` 会同时写明“已保留到哪项任务”和“恢复后从哪里继续”。从较早任务重新分析时，终端会明确说明哪些既有产物继续保留、哪些任务及之后的产物会按新输入重建，避免把恢复误解为整条流程从头开始。
+
+长任务即使暂时没有新结果，也会定期输出“仍在运行 + 已用时间”心跳；有可靠进度分母时同时显示粗略预计剩余时间。按 `Ctrl-C` 主动停止时，系统会终止当前子进程、清理当前任务的半成品，保留之前已完成任务及当前输入；再次运行即可从当前任务安全重试。
+
 ---
 
 ## 如何阅读结果
 
 运行后 `.upgrade-report/README.md` 是产物目录的落地阅读入口；它会把 `deliverables/`、`evidence/`、`.runtime/` 的用途分开说明。
 
-1. 先看 `.upgrade-report/deliverables/report.md`，了解客观分析结果和结论限制。
-2. 如果需要核对依赖 API 变化，先看 `.upgrade-report/evidence/api_changes/changed_dependencies.md`。
-3. 如果需要核对完整 API 明细，再看 `.upgrade-report/evidence/api_changes/all_changed_apis.csv`。
-4. 如果需要核对调用链证据，看 `.upgrade-report/evidence/call_chain/alerts.csv`。
-5. `.upgrade-report/.runtime/` 是程序状态目录，普通阅读不需要进入。
+1. 先打开 `.upgrade-report/README.md`；这里只链接本轮已经生成的文件，并在等待确认时保留问题、选项和可直接使用的回复示例。
+2. 看 `.upgrade-report/deliverables/report.md`，了解客观分析结果和结论限制。
+3. 看 `.upgrade-report/deliverables/analysis-scope.md`，核对本轮实际纳入和排除的变化依赖、API 数量及结论边界。
+4. 如果需要核对依赖 API 变化，先看 `.upgrade-report/evidence/api_changes/changed_dependencies.md`。
+5. 如果需要核对完整 API 明细，再看 `.upgrade-report/evidence/api_changes/all_changed_apis.csv`。
+6. 如果需要核对调用链证据，看 `.upgrade-report/evidence/call_chain/alerts.csv`。
+7. `.upgrade-report/.runtime/` 是程序状态目录，普通阅读不需要进入。
 
-依赖 API 变化分析完成后，系统会提供三层范围选择：
+流程完成状态会区分“分析已完成”和“分析已完成，但存在结论限制”。部分范围、关键证据覆盖不完整、可能影响、需人工复核、本次未完成或证据读取异常都不会被包装成无限制的完整结论。
 
-1. **全量分析**：分析全部发生 API 变化的依赖包，直接回复“全量继续”。
-2. **从推荐候选中选择**：优先展示含高风险 API、删除或签名变化，或变化 API 数不少于 20 个的依赖包。
-3. **从全部候选中选择**：打开 `.upgrade-report/evidence/api_changes/changed_dependencies.md`，从完整清单复制“依赖包”列中的坐标，例如：`只分析 com.foo:bar、com.foo:baz`。
+依赖 API 变化分析完成后，系统会在执行 Step5 前确认分析范围：
 
-不需要从 `all_changed_apis.csv` 逐行挑选 API。推荐候选只是缩小范围的入口，不代表已经确认影响当前系统。
+1. **全量分析**：覆盖全部发生 API 变化的依赖包，结论覆盖最完整。
+2. **部分分析（仅在明确控制耗时时）**：可优先查看含高风险 API、删除或签名变化，或变化 API 数不少于 20 个的依赖包。
+3. **从全部候选中选择部分范围**：打开 `.upgrade-report/evidence/api_changes/changed_dependencies.md`，从完整清单复制“依赖包”列中的坐标，例如：`只分析 com.foo:bar、com.foo:baz`。
+
+不需要从 `all_changed_apis.csv` 逐行挑选 API。“部分分析优先项”只用于用户已经决定缩小范围后的排序，不表示系统建议缩小范围，也不代表已经确认影响当前系统。
 
 ---
 
@@ -229,7 +244,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 | 文件 | 用途 |
 |---|---|
 | `.upgrade-report/README.md` | 唯一产物入口；显示当前任务、暂停原因、下一步和按问题找文件 |
-| `.upgrade-report/deliverables/report.md` | 最终客观分析结果、证据和结论限制 |
+| `.upgrade-report/deliverables/report.md` | 最终客观分析结果、证据、结论限制和下一步复核顺序 |
 | `.upgrade-report/evidence/context/review.md` | 给人看的升级上下文确认页 |
 | `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 依赖包维度的 API 变化和范围选择入口 |
 | `.upgrade-report/evidence/call_chain/alerts.csv` | 完整系统触达证据台账 |
@@ -238,7 +253,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 | 顺序 | 文件 | 用途 |
 |---:|---|---|
-| 1 | `.upgrade-report/deliverables/report.md` | 查看最终客观分析结果和结论限制 |
+| 1 | `.upgrade-report/deliverables/report.md` | 查看最终客观分析结果、结论限制和下一步复核顺序 |
 | 2 | `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 查看依赖包维度的 API 变化摘要和定向分析范围 |
 | 3 | `.upgrade-report/evidence/api_changes/all_changed_apis.csv` | 查看完整 API 变化事实 |
 | 4 | `.upgrade-report/evidence/call_chain/alerts.csv` | 查看每个变化 API 的完整调用链台账 |
@@ -360,15 +375,15 @@ Step5 慢时，让 Claude Code 查看：
 
 Step4 需要 JApiCmp 做 jar API 对比。
 
-如果缺失，Skill 会先自动尝试安装 JApiCmp。自动安装失败时，Claude Code 会停下来提示你手动安装或提供 JApiCmp 工具路径；安装完成前不会继续分析。
+如果缺失，Skill 会先自动尝试安装 JApiCmp。自动安装失败时，本次执行会记录为系统环境阻塞，不会生成一项让用户决定如何处理的业务确认；安装完成前也不会继续生成不完整的 API 结论。
 
 不安装 JApiCmp 的后果是：二进制 API 对比证据不完整，可能漏掉删除方法、签名变化、字段变化、源码重编译不兼容等风险。
 
 ### tree-sitter 缺失会中断吗？
 
-默认会先阻断确认，不会静默降级。
+默认会按系统环境错误阻断，不会生成用户确认，也不会静默降级。
 
-运行环境使用 CPython 3.12.x，并在 Skill 根目录显式执行 `python3.12 scripts/bootstrap_runtime.py` 安装固定版本的 `tree-sitter` 与 `tree-sitter-java`。离线环境可增加 `--wheel-dir /abs/path/to/wheels`，安装过程会禁止访问包索引。分析运行时不会联网安装；依赖缺失、版本不符或加载失败时会在分析前明确停止，安装完成前不会使用增强正则继续分析。
+运行环境支持 CPython 3.12.x、3.13.x 和 3.14.x，并在 Skill 根目录用当前受支持的解释器显式执行 `python3 scripts/bootstrap_runtime.py` 安装固定版本的 `tree-sitter` 与 `tree-sitter-java`。PR quick 门禁会在三个 Python 小版本上分别执行。离线环境可增加 `--wheel-dir /abs/path/to/wheels`，安装过程会禁止访问包索引。分析运行时不会联网安装；依赖缺失、版本不符或加载失败时会在分析前明确停止，安装完成前不会使用增强正则继续分析。
 
 不安装 tree-sitter 的后果是：Java AST 主链路不可用，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。
 

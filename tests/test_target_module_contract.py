@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -38,6 +39,43 @@ class TargetModuleContractTest(unittest.TestCase):
         self.assertEqual(updated['target_module'], 'service-a')
         self.assertEqual(updated['primary_module'], 'service-a')
         self.assertEqual(updated['modules'], ['service-a'])
+
+    def test_large_module_candidate_set_has_complete_user_review_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / '.upgrade-report'
+            candidates = [
+                {
+                    'module': f'library-{index}',
+                    'coord': f'com.acme:library-{index}',
+                    'packaging': 'jar',
+                    'deploy_hints': [],
+                }
+                for index in range(21)
+            ]
+            candidates.append(
+                {
+                    'module': 'application',
+                    'coord': 'com.acme:application',
+                    'packaging': 'jar',
+                    'deploy_hints': ['spring-boot-maven-plugin'],
+                }
+            )
+
+            interaction = run_step.build_step1_preflight_interaction(
+                {
+                    'base_branch': 'main',
+                    'current_branch': 'upgrade',
+                    'report_dir': str(report_dir),
+                    'project_scope': {'candidate_module_details': candidates},
+                }
+            )
+            candidate_file = Path(interaction['files_to_review'][0])
+            text = candidate_file.read_text(encoding='utf-8')
+
+        self.assertEqual(interaction['module_candidates'][0]['module'], 'application')
+        self.assertTrue(candidate_file.name == 'module_candidates.md')
+        self.assertIn('library-20', text)
+        self.assertIn('spring-boot-maven-plugin', text)
 
 
 if __name__ == '__main__':

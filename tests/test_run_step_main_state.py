@@ -1,9 +1,11 @@
 import csv
 import io
 import json
+import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +19,647 @@ import run_step  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    def test_internal_tool_failure_reason_is_recorded_as_system_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            diagnostic = run_step.step4_api_changes_dir(report_dir) / "japicmp_preflight.json"
+            diagnostic.parent.mkdir(parents=True)
+            diagnostic.write_text(
+                json.dumps(
+                    {
+                        "status": "blocked_by_system",
+                        "reason_code": "step4_japicmp_missing_need_resolution",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            reason_codes = run_step.read_step_system_block_reason_codes(
+                "s4_jar_compare.py", report_dir
+            )
+
+        self.assertEqual(reason_codes, ["step4_japicmp_missing_need_resolution"])
+
+    def test_step1_artifact_preflight_asks_only_for_missing_module_and_shows_candidates(self):
+        interaction = run_step.build_step1_preflight_interaction(
+            {
+                "base_artifact_path": "/artifacts/base.jar",
+                "current_artifact_path": "/artifacts/current.jar",
+                "project_scope": {
+                    "candidate_modules": ["app", "services/order-service"],
+                },
+            }
+        )
+
+        card = "\n".join(run_step.build_user_decision_card(interaction))
+
+        self.assertEqual(interaction["required_fields"], ["target_module"])
+        self.assertIn("两侧编译产物已经齐全", interaction["question"])
+        self.assertNotIn("source_project_dir", interaction["question"])
+        self.assertNotIn("补齐缺失侧的 branch", interaction["question"])
+        self.assertIn("检测到的目标模块候选", card)
+        self.assertIn("`app`", card)
+        self.assertIn("`services/order-service`", card)
+
+    def test_step1_artifact_review_collects_missing_context_refs_in_existing_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            manifest_steps = {
+                "step1": {
+                    "title": "分析对象与依赖范围",
+                    "interaction": {
+                        "type": "review",
+                        "question": "请确认依赖范围。",
+                        "required_fields": ["action"],
+                        "options": [{"id": "continue", "label": "继续"}],
+                    },
+                    "outputs": [],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step1",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={
+                    "base_artifact_path": "/artifacts/base.jar",
+                    "current_artifact_path": "/artifacts/current.jar",
+                    "target_module": "app",
+                },
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        self.assertEqual(payload["reason_code"], "step1_context_refs_required")
+        self.assertEqual(payload["required_fields"], ["base_branch", "current_branch"])
+        self.assertEqual(
+            payload["action_requirements"]["continue"]["required_fields"],
+            ["base_branch", "current_branch"],
+        )
+        self.assertIn("制品和依赖变化范围已经生成", payload["question"])
+
+    def test_step2_skips_repeated_confirmation_when_context_facts_are_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            context_dir = report_dir / "evidence" / "context"
+            source_dir = project_dir / "src" / "main" / "java"
+            context_dir.mkdir(parents=True)
+            source_dir.mkdir(parents=True)
+            (context_dir / "context.json").write_text(
+                json.dumps(
+                    {
+                        "base_branch": "main",
+                        "current_branch": "upgrade",
+                        "jdk_base": "8",
+                        "jdk_current": "17",
+                        "springboot_base": "2.7.18",
+                        "springboot_current": "3.3.1",
+                        "changed_dependencies": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (context_dir / "dep_graph.json").write_text("{}\n", encoding="utf-8")
+            manifest_steps = {
+                "step2": {
+                    "title": "升级上下文",
+                    "conditional_confirmation": True,
+                    "interaction": {
+                        "type": "decision",
+                        "question": "请确认上下文。",
+                        "options": [{"id": "continue", "label": "继续"}],
+                    },
+                    "outputs": [],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step2",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={
+                    "target_module": "app",
+                    "source_dirs": [str(source_dir)],
+                    "source_dirs_status": "explicit",
+                },
+                main_state=run_step.new_main_state(report_dir),
+            )
+            review_exists = (context_dir / "review.md").is_file()
+
+        self.assertIsNone(payload)
+        self.assertTrue(review_exists)
+
+    def test_step2_stops_once_when_material_context_facts_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            context_dir = report_dir / "evidence" / "context"
+            source_dir = project_dir / "src" / "main" / "java"
+            context_dir.mkdir(parents=True)
+            source_dir.mkdir(parents=True)
+            (context_dir / "context.json").write_text(
+                json.dumps(
+                    {
+                        "base_branch": "main",
+                        "current_branch": "upgrade",
+                        "jdk_base": None,
+                        "jdk_current": None,
+                        "changed_dependencies": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (context_dir / "dep_graph.json").write_text("{}\n", encoding="utf-8")
+            manifest_steps = {
+                "step2": {
+                    "title": "升级上下文",
+                    "conditional_confirmation": True,
+                    "interaction": {
+                        "type": "decision",
+                        "question": "请确认上下文。",
+                        "options": [{"id": "continue", "label": "继续"}],
+                    },
+                    "outputs": [],
+                }
+            }
+
+            payload = run_step.build_interaction_payload(
+                "step2",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={
+                    "target_module": "app",
+                    "source_dirs": [str(source_dir)],
+                    "source_dirs_status": "explicit",
+                },
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        self.assertEqual(payload["reason_code"], "step2_context_facts_unresolved")
+        self.assertEqual(payload["required_fields"], ["jdk_base", "jdk_current"])
+        self.assertIn("升级前 JDK", payload["question"])
+        self.assertIn("升级后 JDK", payload["question"])
+        self.assertNotIn("依赖源码目录", payload["question"])
+        self.assertIn("jdk_base", payload["response_schema"]["properties"])
+        self.assertIn("jdk_current", payload["response_schema"]["properties"])
+
+    def test_step2_stops_for_explicit_source_hint_decision_without_forcing_acceptance(self):
+        confirmation = run_step.build_step2_confirmation_requirements(
+            {"jdk_base": "8", "jdk_current": "17"},
+            {
+                "source_dirs": ["/project/src/main/java"],
+                "source_dirs_status": "explicit",
+                "source_repo_hint_suggestions": {
+                    "proposed": [
+                        {
+                            "coord": "com.example:demo-lib",
+                            "repo_path": "/repos/demo-lib",
+                        }
+                    ]
+                },
+            },
+        )
+        pending = {
+            "step_id": "step2",
+            "reason_code": confirmation["reason_code"],
+            "response_schema": {
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "accept_suggested_mappings": {"type": "boolean"},
+                },
+            },
+            "action_requirements": {
+                "continue": {
+                    "required_fields": confirmation["required_fields"],
+                }
+            },
+        }
+
+        self.assertEqual(
+            confirmation["reason_code"],
+            "step2_source_mapping_decision_required",
+        )
+        self.assertEqual(
+            confirmation["required_fields"], ["accept_suggested_mappings"]
+        )
+        run_step.validate_pending_interaction_response(
+            pending,
+            {"action": "continue", "accept_suggested_mappings": False},
+        )
+        persisted_decline = run_step.merge_user_response_into_run_context(
+            {},
+            {"action": "continue", "accept_suggested_mappings": False},
+            Path("/project"),
+        )
+        self.assertIs(persisted_decline["accept_suggested_mappings"], False)
+        with self.assertRaisesRegex(run_step.StepError, "accept_suggested_mappings"):
+            run_step.validate_pending_interaction_response(
+                pending,
+                {"action": "continue"},
+            )
+        declined = run_step.build_step2_confirmation_requirements(
+            {"jdk_base": "8", "jdk_current": "17"},
+            {
+                "source_dirs": ["/project/src/main/java"],
+                "source_dirs_status": "explicit",
+                "source_repo_hint_suggestions": {
+                    "proposed": confirmation["proposed_mappings"]
+                },
+            },
+            {"accept_suggested_mappings": False},
+        )
+        self.assertFalse(declined["required"])
+
+    def test_step2_version_corrections_work_through_intent_patch(self):
+        canonical = run_step.build_canonical_user_response(
+            {
+                "intent_patch": {
+                    "action": "continue",
+                    "set": {
+                        "jdk_base": "11",
+                        "jdk_current": "21",
+                        "springboot_base": "2.7.18",
+                        "springboot_current": "3.3.2",
+                    },
+                }
+            }
+        )
+        updated = run_step.merge_user_response_into_run_context(
+            {}, canonical, Path("/project")
+        )
+
+        self.assertEqual(updated["jdk_base"], "11")
+        self.assertEqual(updated["jdk_current"], "21")
+        self.assertEqual(updated["springboot_base"], "2.7.18")
+        self.assertEqual(updated["springboot_current"], "3.3.2")
+        self.assertEqual(run_step.infer_non_pending_target_step_from_payload(canonical), "step2")
+
+    def test_auto_mode_runs_until_next_material_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            source_dir = project_dir / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            report_dir = project_dir / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            state["state"].update({"current_step": "step3", "completed_step": "step2"})
+            state["step3"]["input"] = {
+                "target_module": ".",
+                "source_dirs": [str(source_dir)],
+                "source_dirs_status": "explicit",
+            }
+            run_step.save_main_state(report_dir, state)
+            executed = []
+
+            def fake_execute(step_id, _args, _steps, _context, **_kwargs):
+                executed.append(step_id)
+                if step_id == "step4":
+                    return {
+                        "kind": "review",
+                        "status": "awaiting_user_input",
+                        "step_id": "step4",
+                        "question": "请选择全量或部分分析范围。",
+                        "options": [{"id": "continue"}, {"id": "cancel"}],
+                    }
+                return None
+
+            manifest = {
+                "auto_run_until_checkpoint": True,
+            }
+            steps = {
+                "step3": {"gate": "scan", "interaction": None},
+                "step4": {
+                    "gate": "jar_compare",
+                    "requires_scope_confirmation": True,
+                },
+            }
+            with patch.object(
+                run_step, "contract_payload", return_value={"status": "passed", "checks": []}
+            ), patch.object(
+                run_step, "load_manifest", return_value=(manifest, steps)
+            ), patch.object(
+                run_step, "detect_integrity_repair_step", return_value=None
+            ), patch.object(
+                run_step, "detect_current_branch", return_value=""
+            ), patch.object(
+                run_step, "detect_build_tool", return_value="maven"
+            ), patch.object(
+                run_step, "execute_step", side_effect=fake_execute
+            ):
+                exit_code = run_step.main(
+                    [
+                        "--step", "auto",
+                        "--project-dir", str(project_dir),
+                        "--report-dir", str(report_dir),
+                    ]
+                )
+
+            saved = run_step.load_main_state(report_dir)
+
+        self.assertEqual(exit_code, run_step.EXIT_AWAITING_USER)
+        self.assertEqual(executed, ["step3", "step4"])
+        self.assertEqual(saved["state"]["completed_step"], "step4")
+        self.assertEqual(saved["state"]["pending_interaction"]["step_id"], "step4")
+
+    def test_step2_input_reply_rebuilds_step2_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            source_dir = project_dir / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            report_dir = project_dir / ".upgrade-report"
+            pending = {
+                "status": "awaiting_user_input",
+                "kind": "input_request",
+                "step_id": "step2",
+                "options": [{"id": "continue"}],
+                "response_schema": {
+                    "required": ["action"],
+                    "properties": {
+                        "action": {"type": "string"},
+                        "jdk_base": {"type": "string"},
+                        "jdk_current": {"type": "string"},
+                    },
+                },
+                "action_requirements": {
+                    "continue": {"required_fields": ["jdk_base", "jdk_current"]}
+                },
+            }
+            state = run_step.new_main_state(report_dir)
+            state["state"].update(
+                {
+                    "current_step": "step2",
+                    "completed_step": "step1",
+                    "status": "awaiting_user_input",
+                    "pending_interaction": pending,
+                }
+            )
+            state["step2"]["input"] = {
+                "base_branch": "base",
+                "current_branch": "upgrade",
+                "target_module": ".",
+                "source_dirs": [str(source_dir)],
+                "source_dirs_status": "explicit",
+            }
+            state["step2"]["output"] = {"jdk_base": "unknown", "jdk_current": "unknown"}
+            run_step.save_main_state(report_dir, state)
+            executed = []
+
+            def fake_execute(step_id, _args, _steps, run_context, **_kwargs):
+                executed.append((step_id, run_context["jdk_base"], run_context["jdk_current"]))
+                return None
+
+            with patch.object(
+                run_step, "contract_payload", return_value={"status": "passed", "checks": []}
+            ), patch.object(
+                run_step,
+                "load_manifest",
+                return_value=(
+                    {"auto_run_until_checkpoint": False},
+                    {"step2": {"gate": "context", "auto_continue_on_success": True}},
+                ),
+            ), patch.object(
+                run_step, "detect_integrity_repair_step", return_value=None
+            ), patch.object(
+                run_step, "detect_current_branch", return_value=""
+            ), patch.object(
+                run_step, "detect_build_tool", return_value="maven"
+            ), patch.object(
+                run_step, "execute_step", side_effect=fake_execute
+            ):
+                exit_code = run_step.main(
+                    [
+                        "--step",
+                        "auto",
+                        "--project-dir",
+                        str(project_dir),
+                        "--report-dir",
+                        str(report_dir),
+                        "--response-json",
+                        json.dumps(
+                            {
+                                "action": "continue",
+                                "jdk_base": "8",
+                                "jdk_current": "17",
+                            }
+                        ),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(executed, [("step2", "8", "17")])
+
+    def test_legacy_step2_review_only_reruns_when_reply_changes_step2_input(self):
+        pending = {"step_id": "step2", "kind": "review"}
+
+        self.assertEqual(
+            run_step.resolve_resume_step_id(
+                "step3", pending, "continue", {"action": "continue"}
+            ),
+            "step3",
+        )
+        self.assertEqual(
+            run_step.resolve_resume_step_id(
+                "step3",
+                pending,
+                "continue",
+                {"action": "continue", "jdk_current": "21"},
+            ),
+            "step2",
+        )
+
+    def test_auto_mode_runs_system_reachability_and_report_without_extra_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            source_dir = project_dir / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            report_dir = project_dir / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            state["state"].update({"current_step": "step5", "completed_step": "step4"})
+            state["step5"]["input"] = {
+                "target_module": ".",
+                "source_dirs": [str(source_dir)],
+                "source_dirs_status": "explicit",
+            }
+            run_step.save_main_state(report_dir, state)
+            executed = []
+
+            def fake_execute(step_id, _args, _steps, _context, **_kwargs):
+                executed.append(step_id)
+                return None
+
+            manifest = {"auto_run_until_checkpoint": True}
+            steps = {
+                "step5": {
+                    "gate": "call_chain",
+                    "auto_continue_on_success": True,
+                    "interaction": None,
+                },
+                "step6": {"gate": "report", "interaction": None},
+            }
+            with patch.object(
+                run_step, "contract_payload", return_value={"status": "passed", "checks": []}
+            ), patch.object(
+                run_step, "load_manifest", return_value=(manifest, steps)
+            ), patch.object(
+                run_step, "detect_integrity_repair_step", return_value=None
+            ), patch.object(
+                run_step, "detect_current_branch", return_value=""
+            ), patch.object(
+                run_step, "detect_build_tool", return_value="maven"
+            ), patch.object(
+                run_step, "execute_step", side_effect=fake_execute
+            ):
+                exit_code = run_step.main(
+                    [
+                        "--step", "auto",
+                        "--project-dir", str(project_dir),
+                        "--report-dir", str(report_dir),
+                    ]
+                )
+
+            saved = run_step.load_main_state(report_dir)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(executed, ["step5", "step6"])
+        self.assertEqual(saved["state"]["current_step"], "done")
+        self.assertEqual(saved["state"]["completed_step"], "step6")
+
+    def test_step4_scope_review_is_preserved_and_step5_success_review_auto_continues(self):
+        interaction = {
+            "status": "awaiting_user_input",
+            "options": [{"id": "continue"}, {"id": "cancel"}],
+        }
+        manifest = {
+            "step4": {
+                "auto_continue_on_success": True,
+                "requires_scope_confirmation": True,
+            },
+            "step5": {"auto_continue_on_success": True},
+        }
+
+        self.assertFalse(
+            run_step.should_auto_continue_success_review("step4", interaction, manifest)
+        )
+        self.assertTrue(
+            run_step.should_auto_continue_success_review("step5", interaction, manifest)
+        )
+        self.assertFalse(
+            run_step.should_auto_continue_success_review(
+                "step4",
+                {**interaction, "reason_code": "step4_git_refs_need_confirmation"},
+                manifest,
+            )
+        )
+        self.assertFalse(
+            run_step.should_auto_continue_success_review("step2", interaction, manifest)
+        )
+
+    def test_main_auto_continues_routine_step5_success_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            project_dir.mkdir(parents=True)
+            report_dir = project_dir / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            state["state"]["current_step"] = "step5"
+            state["state"]["completed_step"] = "step4"
+            run_step.save_main_state(report_dir, state)
+            routine_review = {
+                "status": "awaiting_user_input",
+                "step_id": "step5",
+                "options": [{"id": "continue"}, {"id": "cancel"}],
+            }
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_step.py",
+                    "--step", "step5",
+                    "--project-dir", str(project_dir),
+                    "--report-dir", str(report_dir),
+                ],
+            ), patch.object(
+                run_step,
+                "load_manifest",
+                return_value=(
+                    {},
+                    {
+                        "step5": {
+                            "gate": "call_chain",
+                            "auto_continue_on_success": True,
+                        }
+                    },
+                ),
+            ), patch.object(
+                run_step,
+                "execute_step",
+                return_value=routine_review,
+            ):
+                exit_code = run_step.main()
+
+            saved = run_step.load_main_state(report_dir)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(saved["state"]["current_step"], "step6")
+        self.assertEqual(saved["state"]["completed_step"], "step5")
+        self.assertIsNone(saved["state"]["pending_interaction"])
+
+    def test_main_keeps_step4_scope_confirmation_even_if_auto_continue_is_misconfigured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            project_dir.mkdir(parents=True)
+            report_dir = project_dir / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            state["state"]["current_step"] = "step4"
+            state["state"]["completed_step"] = "step3"
+            run_step.save_main_state(report_dir, state)
+            scope_review = {
+                "status": "awaiting_user_input",
+                "step_id": "step4",
+                "question": "请选择 Step5 的分析范围",
+                "options": [{"id": "continue"}, {"id": "cancel"}],
+            }
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_step.py",
+                    "--step", "step4",
+                    "--project-dir", str(project_dir),
+                    "--report-dir", str(report_dir),
+                ],
+            ), patch.object(
+                run_step,
+                "load_manifest",
+                return_value=(
+                    {},
+                    {
+                        "step4": {
+                            "gate": "jar_compare",
+                            "auto_continue_on_success": True,
+                            "requires_scope_confirmation": True,
+                        }
+                    },
+                ),
+            ), patch.object(
+                run_step,
+                "execute_step",
+                return_value=scope_review,
+            ):
+                exit_code = run_step.main()
+
+            saved = run_step.load_main_state(report_dir)
+
+        self.assertEqual(exit_code, run_step.EXIT_AWAITING_USER)
+        self.assertEqual(saved["state"]["current_step"], "step5")
+        self.assertEqual(saved["state"]["status"], "awaiting_user_input")
+        self.assertEqual(saved["state"]["pending_interaction"]["step_id"], "step4")
+
     def test_user_response_merges_active_maven_profiles_into_step1_context(self):
         updated = run_step.merge_user_response_into_run_context(
             {
@@ -346,6 +989,11 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(materialized_path, all_changed_path)
             self.assertEqual(len(selection_summary["matched_rows"]), 1)
             self.assertEqual(selection_summary["matched_rows"][0]["source"], "japicmp")
+            scope = json.loads(
+                (report_dir / ".runtime" / "cache" / "step5_selection.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(scope["mode"], "full")
+            self.assertEqual(scope["included_dependency_count"], 1)
 
     def test_materialize_step5_input_name_filter_keeps_all_matching_coords(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -376,6 +1024,13 @@ class RunStepMainStateTest(unittest.TestCase):
                 {row["coord"] for row in selection_summary["matched_rows"]},
                 {"com.example:demo-lib", "org.example:demo-lib"},
             )
+            scope = json.loads(
+                (report_dir / ".runtime" / "cache" / "step5_selection.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(scope["mode"], "partial")
+            self.assertEqual(scope["available_dependency_count"], 3)
+            self.assertEqual(scope["included_dependency_count"], 2)
+            self.assertEqual(scope["excluded_dependency_coords"], ["com.example:core-lib"])
 
     def test_step1_review_continue_propagates_confirmed_branches_to_step2_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -562,7 +1217,8 @@ class RunStepMainStateTest(unittest.TestCase):
             api_dir.mkdir(parents=True, exist_ok=True)
             (api_dir / "changed_dependencies.csv").write_text(
                 "selection_key,coord,dependency_name,changed_api_count,high_risk_api_count,change_types,symbol_kinds,recommended,detail\n"
-                "coord:com.acme:alpha,com.acme:alpha,alpha,42,5,removed,method,true,s4_per_dependency/com.acme__alpha/summary.json\n",
+                "coord:com.acme:alpha,com.acme:alpha,alpha,42,5,removed,method,true,s4_per_dependency/com.acme__alpha/summary.json\n"
+                "coord:com.acme:beta,com.acme:beta,beta,3,0,modified,method,false,s4_per_dependency/com.acme__beta/summary.json\n",
                 encoding="utf-8",
             )
 
@@ -577,6 +1233,64 @@ class RunStepMainStateTest(unittest.TestCase):
             summary = run_step.build_step5_dependency_selection_summary(report_dir)
             self.assertEqual(summary["recommended_target_count"], 1)
             self.assertEqual(summary["recommended_targets"][0]["coord"], "com.acme:alpha")
+
+            _, manifest_steps = run_step.load_manifest(ROOT_DIR / "scripts" / "step_manifest.json")
+            interaction = run_step.build_interaction_payload(
+                "step4",
+                report_dir,
+                manifest_steps,
+                project_dir,
+                run_context={},
+                main_state=run_step.new_main_state(report_dir),
+            )
+            properties = interaction["response_schema"]["properties"]
+            self.assertIn("分析范围", interaction["question"])
+            self.assertIn("selected_targets", properties)
+            self.assertNotIn("dependency_source_dirs", properties)
+            self.assertNotIn("dependency_git_ref_overrides", properties)
+            self.assertNotIn("step4_git_diff_timeout", properties)
+            self.assertEqual(
+                interaction["scope_preview"],
+                {
+                    "available_dependency_count": 2,
+                    "total_api_count": 45,
+                    "high_risk_api_count": 5,
+                    "partial_scope_effect": "未选择的变化依赖不会进入系统触达分析；最终报告只适用于所选范围。",
+                },
+            )
+            self.assertEqual(
+                interaction["files_to_review"],
+                [str((api_dir / "changed_dependencies.md").resolve())],
+            )
+
+    def test_step4_scope_checkpoint_is_skipped_when_no_real_scope_choice_exists(self):
+        _, manifest_steps = run_step.load_manifest(ROOT_DIR / "scripts" / "step_manifest.json")
+        for dependency_rows in (
+            [],
+            ["coord:com.acme:alpha,com.acme:alpha,alpha,1,1,removed,method,true,detail"],
+        ):
+            with self.subTest(candidate_count=len(dependency_rows)), tempfile.TemporaryDirectory() as tmp:
+                project_dir = Path(tmp) / "project"
+                report_dir = project_dir / ".upgrade-report"
+                api_dir = report_dir / "evidence" / "api_changes"
+                api_dir.mkdir(parents=True, exist_ok=True)
+                (api_dir / "changed_dependencies.csv").write_text(
+                    "selection_key,coord,dependency_name,changed_api_count,high_risk_api_count,change_types,symbol_kinds,recommended,detail\n"
+                    + "\n".join(dependency_rows)
+                    + ("\n" if dependency_rows else ""),
+                    encoding="utf-8",
+                )
+
+                interaction = run_step.build_interaction_payload(
+                    "step4",
+                    report_dir,
+                    manifest_steps,
+                    project_dir,
+                    run_context={},
+                    main_state=run_step.new_main_state(report_dir),
+                )
+
+                self.assertIsNone(interaction)
 
     def test_report_landing_doc_is_single_dynamic_user_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -607,7 +1321,21 @@ class RunStepMainStateTest(unittest.TestCase):
                     "completed_step": "step4",
                     "status": "awaiting_user_input",
                     "blocking_reason": "请确认系统触达证据的分析范围。",
+                    "pending_interaction": {
+                        "question": "请选择全量分析或部分分析。",
+                        "options": [
+                            {"id": "continue", "label": "全量分析"},
+                            {"id": "continue_with_selection", "label": "部分分析"},
+                        ],
+                        "selection_options": [{"coord": "com.acme:alpha"}],
+                        "files_to_review": [
+                            str(report_dir / "evidence" / "api_changes" / "changed_dependencies.md")
+                        ],
+                    },
                 }
+            )
+            (report_dir / "evidence" / "api_changes" / "changed_dependencies.md").write_text(
+                "# 变化依赖\n", encoding="utf-8"
             )
             run_step.write_report_landing_docs(report_dir, state)
 
@@ -615,8 +1343,14 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertIn("当前状态：等待你确认", root_readme)
             self.assertIn("当前任务：系统触达证据", root_readme)
             self.assertIn("请确认系统触达证据的分析范围", root_readme)
-            self.assertIn("依赖包范围", root_readme)
-            self.assertIn("最终分析结果", root_readme)
+            self.assertIn("## 当前需要你决定", root_readme)
+            self.assertIn("请选择全量分析或部分分析", root_readme)
+            self.assertIn("`全量继续`", root_readme)
+            self.assertIn(
+                "[evidence/api_changes/changed_dependencies.md](evidence/api_changes/changed_dependencies.md)",
+                root_readme,
+            )
+            self.assertNotIn("deliverables/report.md", root_readme)
             self.assertNotIn("Step1", root_readme)
             self.assertNotIn("Step5", root_readme)
             self.assertEqual((report_dir / "deliverables" / "README.md").read_text(encoding="utf-8"), "旧导航\n")
@@ -637,11 +1371,136 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("deliverables/report.md", finished)
         self.assertIn("依赖 API 变化未完成", failed)
         self.assertIn("无法读取依赖包", failed)
-        self.assertIn("修正上述原因后重新分析", failed)
+        self.assertIn("系统已停止当前任务", failed)
+        self.assertIn("已有证据会保留", failed)
         for text in (start, complete, finished, failed):
             self.assertNotRegex(text, r"\b[Ss]tep\d+\b")
             self.assertNotIn("main_state", text)
             self.assertNotIn("退出码", text)
+
+    def test_environment_block_message_names_only_failed_prerequisites_and_preserves_business_input(self):
+        text = "\n".join(
+            run_step.build_environment_block_message(
+                {
+                    "status": "failed",
+                    "checks": [
+                        {
+                            "component": "python",
+                            "status": "passed",
+                            "observed": "CPython 3.12.9",
+                            "expected": "CPython 3.12.x",
+                        },
+                        {
+                            "component": "tool:mvn",
+                            "status": "failed",
+                            "observed": "未检测到",
+                            "expected": "installed and executable",
+                        },
+                    ],
+                }
+            )
+        )
+
+        self.assertIn("命令行工具 mvn", text)
+        self.assertNotIn("Python 运行时：", text)
+        self.assertIn("业务输入和分析范围无需修改", text)
+        self.assertNotIn("action=", text)
+
+    def test_final_completion_summary_marks_partial_scope_and_uncertainty_as_limited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            findings_path = report_dir / ".runtime" / "findings" / "s6_findings.json"
+            findings_path.parent.mkdir(parents=True)
+            findings_path.write_text(
+                json.dumps(
+                    {
+                        "coverage": {"overall_status": "complete"},
+                        "analysis_scope": {
+                            "mode": "partial",
+                            "included_dependency_count": 1,
+                            "available_dependency_count": 3,
+                            "analyzed_api_count": 7,
+                            "total_api_count": 19,
+                        },
+                        "p0": [{"api": "a"}],
+                        "p1": [],
+                        "p2": [],
+                        "probable_impact": [],
+                        "uncertain": [{"api": "b"}],
+                        "needs_input": [],
+                        "not_analyzed": [],
+                        "diagnostics": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = run_step.build_final_completion_summary(report_dir)
+            message = "\n".join(
+                run_step.build_user_runtime_message(
+                    "complete", "step6", completion_summary=summary
+                )
+            )
+
+        self.assertEqual(summary["status"], "completed_with_limits")
+        self.assertEqual(summary["confirmed_count"], 1)
+        self.assertIn("用户选择了部分变化依赖", summary["limitations"])
+        self.assertIn("1 项需要人工复核", summary["limitations"])
+        self.assertIn("分析已完成，但存在结论限制", message)
+        self.assertIn("部分依赖（1/3）", message)
+        self.assertIn("deliverables/analysis-scope.md", message)
+
+    def test_landing_status_does_not_hide_completion_limits(self):
+        state = {
+            "state": {
+                "current_step": "done",
+                "status": "completed_with_limits",
+            }
+        }
+
+        text = "\n".join(run_step._landing_status_lines(state))
+
+        self.assertIn("分析已完成，但存在结论限制", text)
+        self.assertIn("以本轮分析范围为解释边界", text)
+
+    def test_completed_landing_page_links_only_existing_outputs_and_shows_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            deliverables = report_dir / "deliverables"
+            deliverables.mkdir(parents=True)
+            (deliverables / "report.md").write_text("# 报告\n", encoding="utf-8")
+            (deliverables / "analysis-scope.md").write_text("# 范围\n", encoding="utf-8")
+            state = run_step.new_main_state(report_dir)
+            state["state"].update(
+                {
+                    "current_step": "done",
+                    "completed_step": "step6",
+                    "status": "completed_with_limits",
+                    "completion_summary": {
+                        "scope_mode": "partial",
+                        "included_dependency_count": 1,
+                        "available_dependency_count": 3,
+                        "confirmed_count": 2,
+                        "probable_count": 1,
+                        "uncertain_count": 4,
+                        "not_analyzed_count": 0,
+                        "limitations": ["用户选择了部分变化依赖"],
+                    },
+                }
+            )
+
+            run_step.write_report_landing_docs(report_dir, state)
+            text = (report_dir / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("分析范围：部分依赖（1/3）", text)
+        self.assertIn("已确认影响 2（其中高风险 0），可能影响 1，需人工复核 4", text)
+        self.assertIn("主要限制：用户选择了部分变化依赖", text)
+        self.assertIn("[deliverables/report.md](deliverables/report.md)", text)
+        self.assertIn(
+            "[deliverables/analysis-scope.md](deliverables/analysis-scope.md)", text
+        )
+        self.assertNotIn("evidence/dependencies/dep_changes.csv", text)
 
     def test_upgrade_context_checkpoint_generates_one_human_review_page(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -713,7 +1572,10 @@ class RunStepMainStateTest(unittest.TestCase):
             interaction = {
                 "step_id": "step4",
                 "status": "awaiting_user_input",
-                "options": [{"id": "cancel", "label": "稍后处理"}],
+                "options": [
+                    {"id": "continue", "label": "全量继续"},
+                    {"id": "cancel", "label": "稍后处理"},
+                ],
             }
             state["state"].update(
                 {
@@ -741,8 +1603,11 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertEqual(result["early_exit_code"], 0)
         self.assertEqual(saved["state"]["status"], "paused_by_user")
+        self.assertEqual(saved["state"]["current_step"], "step5")
         self.assertEqual(saved["state"]["pending_interaction"]["step_id"], "step4")
         self.assertIn("当前状态：已暂停", landing)
+        self.assertIn("已保留：依赖 API 变化及之前的正式产物", landing)
+        self.assertIn("恢复后：从系统触达证据继续，不重复已完成任务", landing)
         self.assertIn("再次运行分析时，会回到当前确认任务", landing)
 
     def test_user_decision_card_hides_internal_fields_and_shows_direct_replies(self):
@@ -817,10 +1682,10 @@ class RunStepMainStateTest(unittest.TestCase):
 
         text = "\n".join(run_step.build_user_decision_card(interaction))
 
-        self.assertIn("覆盖全部 37 个候选依赖包", text)
+        self.assertIn("覆盖全部 37 个变化依赖", text)
         self.assertIn("推荐 12 个，展示 10 / 12 个", text)
         self.assertIn(
-            "其余 2 个推荐候选见 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md` 的“推荐候选”列",
+            "其余 2 个高优先级项见 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md` 的“部分分析优先项”列",
             text,
         )
         self.assertNotIn("完整候选请看下面的文件", text)
@@ -873,16 +1738,17 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertIn("请选择分析范围：", text)
         self.assertIn("1. 全量分析", text)
-        self.assertIn("覆盖全部 2 个候选依赖包", text)
-        self.assertIn("2. 从推荐候选中选择", text)
+        self.assertIn("覆盖全部 2 个变化依赖", text)
+        self.assertIn("2. 部分分析（仅在明确控制耗时时）", text)
         self.assertIn("推荐 1 个，展示 1 / 1 个", text)
-        self.assertIn("推荐依据：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", text)
-        self.assertIn("3. 从全部候选中选择", text)
+        self.assertIn("高优先级项依据：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", text)
+        self.assertIn("不表示系统建议缩小范围，也不代表已经确认影响", text)
+        self.assertIn("3. 从全部变化依赖中选择部分范围", text)
         self.assertIn(
             "打开 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md`；这里列出了全部 2 个候选依赖包",
             text,
         )
-        self.assertIn("查看“推荐候选”“依赖包”“高风险 API 数”和“为什么先看”", text)
+        self.assertIn("查看“部分分析优先项”“依赖包”“高风险 API 数”和“为什么先看”", text)
         self.assertIn("复制“依赖包”列中的完整坐标", text)
         self.assertIn("只分析 com.acme:alpha", text)
 
@@ -931,6 +1797,22 @@ class RunStepMainStateTest(unittest.TestCase):
         machine_event = json.loads(machine_line.split(":", 1)[1])
         self.assertEqual(machine_event["schema"], "java-upgrade-analyzer.confirmation.v1")
         self.assertEqual(machine_event["event"], "interaction_required")
+
+    def test_human_interaction_output_mode_hides_machine_protocol(self):
+        interaction = {
+            "step_id": "step4",
+            "question": "请选择分析范围。",
+            "options": [{"id": "continue", "label": "全量继续"}],
+        }
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        with patch.dict(os.environ, {"JUA_INTERACTION_OUTPUT": "human"}), \
+                patch.object(sys, "stderr", stderr), patch.object(sys, "stdout", stdout):
+            run_step.print_interaction_to_streams(interaction, Path("/tmp/.upgrade-report"))
+
+        self.assertIn("请选择分析范围", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_user_task_names_and_manifest_checkpoint_copy_are_human_facing(self):
         expected_names = {
@@ -1009,9 +1891,9 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("完整依赖包清单见 changed_dependencies.md", checklist_text)
         self.assertIn("API 级明细不作为普通选择入口", checklist_text)
         self.assertIn("changed_dependencies.md", review_files)
-        self.assertIn("summary.txt", review_files)
-        self.assertIn("git_ref_matches.txt", review_files)
-        self.assertIn("all_changed_apis.csv", review_files)
+        self.assertNotIn("summary.txt", review_files)
+        self.assertNotIn("git_ref_matches.txt", review_files)
+        self.assertNotIn("all_changed_apis.csv", review_files)
 
     def test_user_decision_card_covers_step1_missing_input_request(self):
         interaction = run_step.build_step1_preflight_interaction({})
@@ -1268,7 +2150,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 ["new-lib:2.0 -> com.example:new-lib"],
             )
 
-    def test_step2_continue_with_clear_rebuilds_outputs_before_advancing(self):
+    def test_step2_continue_with_clear_invalidates_outputs_for_one_normal_rerun(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
@@ -1312,37 +2194,20 @@ class RunStepMainStateTest(unittest.TestCase):
                 target_step_id="step2",
             )
 
-            refreshed_context = {
-                "base_branch": "base",
-                "current_branch": "current",
-                "source_dirs": [str(source_dir.resolve())],
-                "source_dirs_status": "explicit",
-                "dependency_source_dirs": [],
-                "dependency_repo_mappings": [],
-                "dependency_source_mappings": [],
-                "report_dir": str(report_dir.resolve()),
-            }
-            args = self._make_default_args(project_dir, report_dir)
-
-            with patch.object(run_step, "build_run_context", return_value=refreshed_context), patch.object(
-                run_step, "refresh_step2_outputs"
-            ) as refresh_mock:
+            with patch.object(run_step, "refresh_step2_outputs") as refresh_mock:
                 run_step.handle_step2_resume_followups(
-                    args,
                     updated_state,
                     report_dir,
-                    project_dir,
+                    "step2",
                     "step2",
                     "continue",
                     user_response,
                 )
 
-            refresh_mock.assert_called_once_with(report_dir, project_dir, refreshed_context)
-            self.assertEqual(updated_state["step2"]["input"]["dependency_source_dirs"], [])
-            self.assertEqual(updated_state["step2"]["output"]["dependency_source_dirs"], [])
-            self.assertEqual(updated_state["step2"]["output"]["dependency_repo_mappings"], [])
-            self.assertEqual(updated_state["step3"]["input"]["dependency_source_dirs"], [])
-            self.assertEqual(updated_state["step3"]["input"]["dependency_repo_mappings"], [])
+            refresh_mock.assert_not_called()
+            self.assertNotIn("dependency_source_dirs", updated_state["step2"]["input"])
+            self.assertEqual(updated_state["step2"]["output"], {})
+            self.assertEqual(updated_state["step3"], run_step.empty_step_state())
 
     def test_apply_user_response_prefers_current_input_over_current_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1416,7 +2281,7 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
             self.assertTrue(annotated["dependency_source_dirs_state"]["provided"])
-            self.assertIn("已收到依赖源码目录", annotated["question"])
+            self.assertEqual(annotated["question"], "请确认 git refs 后重跑 Step4。")
             self.assertIn("仅当现有目录不正确", annotated["response_schema"]["properties"]["dependency_source_dirs"]["description"])
 
     def test_step5_review_does_not_require_removed_target_source_when_analysis_did_not_need_it(self):
@@ -1471,7 +2336,7 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
         self.assertNotIn("仍未覆盖这些目标依赖坐标", annotated["question"])
-        self.assertIn("本轮没有因依赖源码缺失而中断的 API", annotated["question"])
+        self.assertEqual(annotated["question"], "请确认 Step5 结果。")
 
     def test_validate_pending_interaction_response_rejects_empty_step5_rerun(self):
         interaction = {
@@ -1674,6 +2539,42 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("依赖包完整坐标", command)
         self.assertNotIn("dependency_source_dirs", command)
         self.assertNotIn("strict_risk_gate", command)
+
+    def test_continue_resume_example_fills_every_required_context_field(self):
+        examples = run_step.build_resume_command_examples(
+            [{"id": "continue", "label": "补齐后继续"}],
+            ["jdk_base", "jdk_current", "source_dirs"],
+            {
+                "action": {"type": "string"},
+                "jdk_base": {"type": "string"},
+                "jdk_current": {"type": "string"},
+                "source_dirs": {"type": "array"},
+            },
+            Path("/tmp/project"),
+            Path("/tmp/project/.upgrade-report"),
+        )
+
+        command = examples[0]["command"]
+        self.assertIn('"jdk_base": "8"', command)
+        self.assertIn('"jdk_current": "17"', command)
+        self.assertIn('"source_dirs"', command)
+
+    def test_source_mapping_resume_examples_cover_accept_and_decline(self):
+        examples = run_step.build_resume_command_examples(
+            [{"id": "continue", "label": "说明后继续"}],
+            ["accept_suggested_mappings"],
+            {
+                "action": {"type": "string"},
+                "accept_suggested_mappings": {"type": "boolean"},
+            },
+            Path("/tmp/project"),
+            Path("/tmp/project/.upgrade-report"),
+        )
+
+        decision_examples = [item for item in examples if item["action"] == "continue"]
+        self.assertEqual(len(decision_examples), 2)
+        self.assertIn('"accept_suggested_mappings": true', decision_examples[0]["command"])
+        self.assertIn('"accept_suggested_mappings": false', decision_examples[1]["command"])
 
     def test_build_input_normalization_contract_uses_intent_patch_examples(self):
         contract = run_step.build_input_normalization_contract(
@@ -2128,6 +3029,29 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(run_context["base_branch"], "")
         self.assertEqual(run_context["current_branch"], "")
 
+    def test_build_run_context_normalizes_string_source_repo_hints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            repo_dir = project_dir / "dependency-repo"
+            repo_dir.mkdir()
+            (repo_dir / "pom.xml").write_text(
+                "<project><modelVersion>4.0.0</modelVersion>"
+                "<groupId>com.example</groupId><artifactId>demo-lib</artifactId>"
+                "<version>1.0</version></project>",
+                encoding="utf-8",
+            )
+            args = self._make_default_args(project_dir, project_dir / ".upgrade-report")
+            args.source_repo_hints = [str(repo_dir)]
+
+            run_context = run_step.build_run_context(args, {}, {})
+
+        self.assertEqual(len(run_context["source_repo_hints"]), 1)
+        self.assertEqual(run_context["source_repo_hints"][0]["repo_path"], str(repo_dir.resolve()))
+        self.assertEqual(
+            run_context["source_repo_hints"][0]["repo_inferred_coords"],
+            ["com.example:demo-lib"],
+        )
+
     def test_step1_preflight_triggers_when_entry_mode_is_still_unknown(self):
         interaction = run_step.build_step1_preflight_interaction({})
 
@@ -2274,6 +3198,43 @@ class RunStepMainStateTest(unittest.TestCase):
             )
             self.assertEqual(updated_state["step2"]["input"]["base_branch"], "fresh-base")
             self.assertEqual(updated_state["step2"]["input"]["current_branch"], "fresh-current")
+
+    def test_non_pending_restart_reuses_latest_step_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            state["state"].update({
+                "current_step": "step5",
+                "completed_step": "step4",
+                "status": "completed",
+            })
+            state["step2"]["input"] = {"source_dirs": [str(project_dir / "src/main/java")]}
+            state["step5"]["input"] = {
+                "base_branch": "base",
+                "current_branch": "current",
+                "source_dirs": [str(project_dir / "src/main/java")],
+            }
+            args = SimpleNamespace(step="auto")
+            stderr = io.StringIO()
+
+            with patch.object(sys, "stderr", stderr):
+                result = run_step.apply_non_pending_structured_response(
+                    args,
+                    project_dir,
+                    report_dir,
+                    state,
+                    {
+                        "action": "restart_from_step",
+                        "restart_step_id": "step2",
+                    },
+                )
+
+            self.assertEqual(result["step_id"], "step2")
+            self.assertEqual(result["main_state"]["step2"]["input"]["base_branch"], "base")
+            self.assertEqual(result["main_state"]["step2"]["input"]["current_branch"], "current")
+            self.assertIn("分析对象与依赖范围及之前的正式产物继续保留", stderr.getvalue())
+            self.assertIn("升级上下文及之后的产物会按新输入重建", stderr.getvalue())
 
     def test_execute_step1_does_not_pass_business_inputs_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2520,6 +3481,136 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertIsNone(captured["timeout"])
         self.assertEqual(captured["cwd"], tmp)
+
+    def test_run_python_emits_heartbeat_during_silent_long_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            stderr = io.StringIO()
+
+            def slow_run_cmd(*_args, **_kwargs):
+                time.sleep(0.06)
+                return "", "", 0
+
+            with patch.dict(
+                os.environ,
+                {"JUA_HEARTBEAT_INTERVAL_SECONDS": "0.01"},
+            ), patch.object(
+                run_step,
+                "run_cmd",
+                side_effect=slow_run_cmd,
+            ), patch.object(sys, "stderr", stderr):
+                run_step.run_python(
+                    "s3_scan.py",
+                    ["--all"],
+                    tmp,
+                    report_dir=report_dir,
+                )
+
+            progress_path = report_dir / ".runtime" / "observability" / "progress.jsonl"
+            events = [
+                json.loads(line)
+                for line in progress_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIn("[进度][兼容性线索][运行中]", stderr.getvalue())
+        self.assertTrue(any(item.get("phase") == "heartbeat" for item in events))
+
+    def test_keyboard_interrupt_cleans_partial_current_step_and_can_resume_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            report_dir = project_dir / ".upgrade-report"
+            project_dir.mkdir(parents=True)
+            state = run_step.new_main_state(report_dir)
+            state["state"].update(
+                {
+                    "current_step": "step3",
+                    "completed_step": "step2",
+                    "status": "ready",
+                }
+            )
+            state["step3"]["input"] = {"source_dirs": [str(project_dir)]}
+            run_step.save_main_state(report_dir, state)
+            partial_output = (
+                report_dir / "evidence" / "static_scan" / "s3_jdk_removed_api.csv"
+            )
+            partial_output.parent.mkdir(parents=True)
+            partial_output.write_text("partial\n", encoding="utf-8")
+            stderr = io.StringIO()
+
+            with patch.object(
+                run_step,
+                "load_manifest",
+                return_value=({}, {"step3": {"gate": "scan", "interaction": None}}),
+            ), patch.object(
+                run_step,
+                "detect_integrity_repair_step",
+                return_value="",
+            ), patch.object(
+                run_step,
+                "execute_step",
+                side_effect=KeyboardInterrupt,
+            ), patch.object(sys, "stderr", stderr):
+                exit_code = run_step.main(
+                    [
+                        "--step", "auto",
+                        "--project-dir", str(project_dir),
+                        "--report-dir", str(report_dir),
+                    ],
+                    _skip_environment_contract=True,
+                )
+
+            saved = run_step.load_main_state(report_dir)
+            landing = (report_dir / "README.md").read_text(encoding="utf-8")
+            partial_exists_after = partial_output.exists()
+
+        self.assertEqual(exit_code, run_step.EXIT_INTERRUPTED)
+        self.assertEqual(saved["state"]["status"], "paused_by_user")
+        self.assertEqual(saved["state"]["current_step"], "step3")
+        self.assertEqual(saved["state"]["completed_step"], "step2")
+        self.assertFalse(partial_exists_after)
+        self.assertIn("已安全停止当前任务", stderr.getvalue())
+        self.assertIn("从兼容性线索重新开始", stderr.getvalue())
+        self.assertIn("从当前任务安全重试", landing)
+
+    def test_completed_integrity_check_repairs_from_earliest_missing_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            for relative_path in (
+                "evidence/context/context.json",
+                "evidence/api_changes/all_changed_apis.csv",
+                "evidence/call_chain/summary.json",
+            ):
+                path = report_dir / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+
+            repair_step = run_step.detect_integrity_repair_step("step6", report_dir)
+
+        self.assertEqual(repair_step, "step1")
+
+    def test_cli_main_hides_unexpected_traceback_and_records_internal_diagnostic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            stderr = io.StringIO()
+
+            with patch.object(
+                run_step,
+                "main",
+                side_effect=RuntimeError("internal detail must stay private"),
+            ), patch.object(sys, "stderr", stderr):
+                exit_code = run_step.cli_main(["--report-dir", str(report_dir)])
+
+            diagnostic_path = (
+                report_dir / ".runtime" / "observability" / "internal_error.json"
+            )
+            diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertNotIn("internal detail must stay private", stderr.getvalue())
+        self.assertIn("已停止以避免生成不完整结论", stderr.getvalue())
+        self.assertEqual(diagnostic["error_type"], "RuntimeError")
+        self.assertIn("internal detail must stay private", diagnostic["traceback"])
 
     def test_handle_step4_resume_followups_seeds_step5_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3747,6 +4838,15 @@ class RunStepMainStateTest(unittest.TestCase):
                 "coord,class_name,member\ncom.example:demo-lib,com.example.Demo,run()\n",
                 encoding="utf-8",
             )
+            dependencies_dir = report_dir / "evidence" / "dependencies"
+            dependencies_dir.mkdir(parents=True, exist_ok=True)
+            (dependencies_dir / "dep_changes.csv").write_text(
+                "coord,old_version,new_version\ncom.example:demo-lib,1,2\n",
+                encoding="utf-8",
+            )
+            context_dir = report_dir / "evidence" / "context"
+            context_dir.mkdir(parents=True, exist_ok=True)
+            (context_dir / "context.json").write_text("{}\n", encoding="utf-8")
             captured = {}
 
             def fake_execute_step(step_id, _args, _manifest_steps, run_context, **_kwargs):

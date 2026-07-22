@@ -275,6 +275,9 @@ def run_skill_contract(
     step5_accounted_api_count = 0
     current_artifact_sha256 = ""
     if complete_workflow:
+        javac_probe = _run(["javac", "-version"], fixture)
+        javac_match = re.search(r"(?:javac\s+)?(\d+)(?:\.|\s|$)", f"{javac_probe.stdout}\n{javac_probe.stderr}")
+        fixture_jdk = javac_match.group(1) if javac_match else "17"
         for _ in range(10):
             if completed_step == "step6":
                 break
@@ -287,6 +290,22 @@ def run_skill_contract(
                 (interaction_payload.get("response_schema") or {}).get("properties")
                 or {}
             )
+            required_fields = list(interaction_payload.get("required_fields") or [])
+            known_fixture_values = {
+                "target_module": ".",
+                "primary_module": ".",
+                "base_branch": "base-artifact",
+                "current_branch": "current-artifact",
+                "jdk_base": fixture_jdk,
+                "jdk_current": fixture_jdk,
+                "source_dirs": [str(source_root)],
+                "allow_degraded": True,
+                "accept_suggested_mappings": True,
+                "tree_sitter_installed": True,
+            }
+            for field in required_fields:
+                if field in response_properties and field in known_fixture_values:
+                    response[field] = known_fixture_values[field]
             if step_id == "step2" and "source_dirs" in response_properties:
                 response["source_dirs"] = [str(source_root)]
             if step_id == "step5" and "allow_degraded" in response_properties:

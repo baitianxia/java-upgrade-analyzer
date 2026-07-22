@@ -15,6 +15,61 @@ import gate  # noqa: E402
 
 
 class Step2SourceDirsTest(unittest.TestCase):
+    def test_orchestrated_confirmed_versions_override_auto_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dep_changes = tmp_path / "s1_dep_changes.csv"
+            output_json = tmp_path / "s2_context.json"
+            source_dir = tmp_path / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,scope\n"
+                "org.springframework.boot:spring-boot,2.7.18,3.2.5,升级,compile\n",
+                encoding="utf-8",
+            )
+            argv = [
+                "s2_context_from_deps.py",
+                "--dep-changes",
+                str(dep_changes),
+                "--work-dir",
+                str(tmp_path),
+                "--output",
+                str(output_json),
+            ]
+            confirmed = {
+                "base_branch": "main",
+                "current_branch": "upgrade",
+                "source_dirs": [str(source_dir)],
+                "jdk_base": "11",
+                "jdk_current": "21",
+                "springboot_base": "2.6.15",
+                "springboot_current": "3.3.2",
+            }
+
+            with patch.object(sys, "argv", argv), patch.object(
+                step2, "load_orchestrated_step2_input", return_value=confirmed
+            ), patch.object(
+                step2, "detect_build_tool", return_value="maven"
+            ), patch.object(
+                step2, "detect_jdk_versions", return_value=("8", "17")
+            ), patch.object(
+                step2, "detect_spring_cloud", return_value=(False, None)
+            ), patch.object(
+                step2, "detect_tech_flags", return_value={}
+            ), patch.object(
+                step2, "detect_jvm_param_changes", return_value=[]
+            ):
+                step2.main()
+
+            payload = json.loads(output_json.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["jdk_base"], "11")
+        self.assertEqual(payload["jdk_current"], "21")
+        self.assertEqual(payload["jdk_source"], "user_confirmed")
+        self.assertEqual(payload["springboot_base"], "2.6.15")
+        self.assertEqual(payload["springboot_current"], "3.3.2")
+        self.assertEqual(payload["springboot_version_source"], "user_confirmed")
+
     def test_load_dep_changes_rejects_duplicate_artifact_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             dep_changes = Path(tmp) / "dep_changes.csv"

@@ -62,6 +62,8 @@ class CiQualityContractTest(unittest.TestCase):
         self.assertIn("--profile quick", smoke)
         self.assertIn("github.ref == 'refs/heads/main'", smoke)
         self.assertIn("--profile step5", smoke)
+        self.assertIn('python: ["3.12", "3.13", "3.14"]', smoke)
+        self.assertIn("python-version: ${{ matrix.python }}", smoke)
         self.assertIn("schedule:", release)
         self.assertIn("--profile release", release)
         self.assertIn("--include-real --real-case guard", release)

@@ -3742,7 +3742,7 @@ def main():
         elif not (args.base_branch and args.current_branch):
             print("❌ 必须提供 --base + --current。", file=sys.stderr)
         else:
-            print("❌ 自动切分支构建模式需要同时提供 --base + --current。", file=sys.stderr)
+            print("❌ 隔离分支构建模式需要同时提供 --base + --current。", file=sys.stderr)
             print_manual_instructions(
                 args.base_branch,
                 args.current_branch,

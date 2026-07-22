@@ -59,6 +59,8 @@ ALERTS_CSV_FIELDNAMES = [
 
 ALERTS_SPLIT_MAX_ROWS = 50000
 ALERTS_SPLIT_MAX_BYTES = 8 * 1024 * 1024
+_SUMMARY_JSON_ELAPSED_PLACEHOLDER = 999999.999
+_REPORT_ELAPSED_PLACEHOLDER = 999998.999
 
 ALERTS_REVIEW_BUCKETS = [
     ('reachable', {'reachable'}),
@@ -1056,6 +1058,72 @@ def cleanup_generated_output_dir(dir_path, allowed_suffixes=None):
         os.remove(path)
 
 
+def _patch_report_timing_metrics(
+    summary_json_path,
+    *,
+    summary_json_elapsed_sec,
+    report_elapsed_sec,
+):
+    """Patch two fixed-width diagnostics without loading the full report.
+
+    Large real-project reports can exceed 100 MiB because they intentionally
+    retain every evidence-failure occurrence.  Re-reading that JSON merely to
+    persist two timings duplicates the complete report object in memory and
+    rewrites the same bytes.  The unique numeric sentinels let us update only
+    those values while leaving every semantic byte untouched.
+    """
+    replacements = {
+        b'"summary_json_elapsed_sec": 999999.999': (
+            b'"summary_json_elapsed_sec": ', summary_json_elapsed_sec
+        ),
+        b'"elapsed_sec": 999998.999': (
+            b'"elapsed_sec": ', report_elapsed_sec
+        ),
+    }
+    patch_values = {}
+    for pattern, (prefix, value) in replacements.items():
+        numeric = f"{float(value):10.3f}".encode("ascii")
+        if len(numeric) != len(b"999999.999"):
+            raise ValueError(f"report timing cannot be patched safely: {value!r}")
+        patch_values[pattern] = (len(prefix), numeric)
+
+    positions = {pattern: set() for pattern in patch_values}
+    max_pattern = max(map(len, patch_values))
+    offset = 0
+    tail = b""
+    with open(summary_json_path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            data = tail + chunk
+            data_offset = offset - len(tail)
+            for pattern in patch_values:
+                start = 0
+                while True:
+                    found = data.find(pattern, start)
+                    if found < 0:
+                        break
+                    positions[pattern].add(data_offset + found)
+                    start = found + 1
+            tail = data[-(max_pattern - 1):]
+            offset += len(chunk)
+
+    invalid = {
+        pattern.decode("ascii"): sorted(found)
+        for pattern, found in positions.items()
+        if len(found) != 1
+    }
+    if invalid:
+        raise ValueError(f"report timing placeholders are not unique: {invalid}")
+
+    with open(summary_json_path, "r+b") as handle:
+        for pattern, found in positions.items():
+            prefix_length, numeric = patch_values[pattern]
+            handle.seek(next(iter(found)) + prefix_length)
+            handle.write(numeric)
+
+
 def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     """
     生成 Step5 调用链台账和结构化汇总。
@@ -1131,12 +1199,6 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
             file=sys.stderr,
         )
 
-    # 生成 summary.json（s6_report.py 需要的契约格式）
-    summary_json_timer = time.perf_counter()
-    summary_json_path = write_summary_json(all_results, output_dir, graph_stats=graph_stats)
-    if report_perf is not None:
-        report_perf['summary_json_elapsed_sec'] = round(time.perf_counter() - summary_json_timer, 3)
-
     # Key fix: generate by_module aggregation (document promise)
     by_module_timer = time.perf_counter()
     module_dir = os.path.join(output_dir, "by_module")
@@ -1145,17 +1207,40 @@ def generate_enhanced_summary(all_results, output_dir, graph_stats=None):
     aggregate_by_module(all_results, output_dir)
     if report_perf is not None:
         report_perf['by_module_elapsed_sec'] = round(time.perf_counter() - by_module_timer, 3)
-        report_perf['elapsed_sec'] = round(time.perf_counter() - report_started_at, 3)
+
+    # Generate summary.json last so report timings can be persisted in one
+    # pass.  Fixed-width placeholders are patched in place after the write;
+    # unlike the former json.load/json.dump cycle this does not materialize or
+    # rewrite the complete failure ledger a second time.
+    if report_perf is not None:
+        report_perf['summary_json_elapsed_sec'] = _SUMMARY_JSON_ELAPSED_PLACEHOLDER
+        report_perf['elapsed_sec'] = _REPORT_ELAPSED_PLACEHOLDER
+    summary_json_timer = time.perf_counter()
+    summary_json_path = write_summary_json(all_results, output_dir, graph_stats=graph_stats)
+    if report_perf is not None:
+        summary_json_elapsed_sec = round(
+            time.perf_counter() - summary_json_timer, 3
+        )
+        report_elapsed_sec = round(time.perf_counter() - report_started_at, 3)
+        report_perf['summary_json_elapsed_sec'] = summary_json_elapsed_sec
+        report_perf['elapsed_sec'] = report_elapsed_sec
         try:
+            _patch_report_timing_metrics(
+                summary_json_path,
+                summary_json_elapsed_sec=summary_json_elapsed_sec,
+                report_elapsed_sec=report_elapsed_sec,
+            )
+        except (OSError, ValueError):
+            # Preserve the diagnostics contract if an unexpected serializer
+            # changes the sentinel representation.  This correctness fallback
+            # is intentionally the old, more expensive path.
             with open(summary_json_path, 'r', encoding='utf-8') as f:
                 summary_payload = json.load(f)
-            summary_payload.setdefault('meta', {})['graph_stats'] = thaw_evidence_value(
-                graph_stats or {}
+            summary_payload.setdefault('meta', {})['graph_stats'] = (
+                thaw_evidence_value(graph_stats or {})
             )
             with open(summary_json_path, 'w', encoding='utf-8', newline='\n') as f:
                 json.dump(summary_payload, f, ensure_ascii=False, indent=2)
-        except (OSError, json.JSONDecodeError):
-            pass
 
     return summary_path, summary_json_path
 

@@ -1010,7 +1010,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("复制“依赖包”列中的完整坐标", md_text)
         self.assertIn("完整 API 明细：`all_changed_apis.csv`", md_text)
         self.assertIn("依赖包明细目录：`s4_per_dependency/`", md_text)
-        self.assertIn("| 推荐候选 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |", md_text)
+        self.assertIn("| 部分分析优先项 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |", md_text)
         self.assertIn("含高风险 API，优先做系统触达分析", md_text)
 
     def test_alerts_generation_does_not_write_low_value_summary_markdown(self):
@@ -1074,7 +1074,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertFalse(summary_exists)
 
-    def test_step5_emits_tree_sitter_missing_checkpoint_before_regex_degrade(self):
+    def test_step5_blocks_as_system_error_before_regex_degrade_when_tree_sitter_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / ".upgrade-report"
             output_dir = self._call_chain_dir(report_dir)
@@ -1115,15 +1115,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
             ), redirect_stdout(stdout), redirect_stderr(stderr):
                 rc = step5.step5_integrated_main(args)
 
-            self.assertEqual(rc, step5.EXIT_AWAITING_USER)
-            payload = json.loads(stdout.getvalue().split(step5.STEP_INTERACTION_PREFIX, 1)[1].strip())
-            self.assertEqual(payload["reason_code"], "step5_tree_sitter_missing_need_resolution")
-            self.assertNotIn("allow_degraded", payload["response_schema"]["properties"])
-            self.assertIn("tree_sitter_installed", payload["response_schema"]["properties"])
-            self.assertEqual(
-                payload["action_requirements"]["rerun_current_step"]["required_fields"],
-                ["tree_sitter_installed"],
-            )
+            self.assertEqual(rc, 1)
+            self.assertNotIn(step5.STEP_INTERACTION_PREFIX, stdout.getvalue())
+            self.assertIn("系统环境阻塞", stderr.getvalue())
             self.assertTrue((output_dir / "tree_sitter_preflight.json").exists())
 
     def _compile_java_fixture(self, tmp, relative_path, source):
@@ -10266,6 +10260,52 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         self.assertIn("elapsed_sec", perf["report"])
         self.assertEqual(perf["report"]["by_api_count"], 1)
 
+    def test_generate_enhanced_summary_patches_timings_without_reloading_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            graph_stats = {"step5_perf": {"main": {}}}
+            result = tracer.TraceResult(
+                coord="a:b",
+                api_name="com.example.Service.run",
+                api_simple="run",
+                api_signature="()",
+                symbol_kind="method",
+                change_type="method_changed",
+                severity="P1",
+                confirmed=True,
+                source="gitdiff",
+                analysis_scope="method",
+                analysis_status="reachable",
+                direct_callers=1,
+                is_reachable=True,
+                reachable_note="已找到调用链",
+                business_reach_depth=1,
+                dependency_chain_coords=[],
+                reason_code="SYSTEM_CODE_REACHABLE",
+                call_paths=["Service.run -> Api.call"],
+                evidence_paths=[],
+                verification_commands=[],
+                hops=[],
+                confidence_score=1.0,
+                critical_nodes_hit=[],
+            )
+
+            with patch.object(
+                formatter.json,
+                "load",
+                side_effect=AssertionError("summary must not be loaded again"),
+            ):
+                _, summary_json_path = formatter.generate_enhanced_summary(
+                    [result], output_dir, graph_stats=graph_stats
+                )
+            summary = json.loads(Path(summary_json_path).read_text(encoding="utf-8"))
+
+        report = summary["meta"]["graph_stats"]["step5_perf"]["report"]
+        self.assertIsInstance(report["summary_json_elapsed_sec"], float)
+        self.assertIsInstance(report["elapsed_sec"], float)
+        self.assertLess(report["summary_json_elapsed_sec"], 999998.0)
+        self.assertLess(report["elapsed_sec"], 999998.0)
+
     def test_step5_timing_csv_includes_hotspot_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -12550,7 +12590,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertEqual(summary_payload["not_impacted"], 1)
         self.assertEqual(alert_rows[0]["path_status"], "not_impacted")
         self.assertIn("已确认不受影响", final_report)
-        self.assertIn("### 3.1 符号保留证据", final_report)
+        self.assertIn("### 4.1 符号保留证据", final_report)
         self.assertIn("com.vendor:aggregate", final_report)
         self.assertIn("不包含被删除 JAR 中的 SPI 配置、资源文件、清单等非 API 内容", final_report)
 
@@ -12935,8 +12975,9 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertIn("## 报告目录", report_text)
         self.assertIn("## 一、核心结论", report_text)
         self.assertIn("## 二、结论限制", report_text)
-        self.assertIn("## 三、分析结果总表", report_text)
-        self.assertIn("## 四、附录", report_text)
+        self.assertIn("## 三、下一步复核顺序", report_text)
+        self.assertIn("## 四、分析结果总表", report_text)
+        self.assertIn("## 五、附录", report_text)
         self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |", report_text)
         self.assertNotIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |", report_text)
         self.assertLess(
@@ -12945,15 +12986,15 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         )
         self.assertLess(
             report_text.index("## 二、结论限制"),
-            report_text.index("## 三、分析结果总表"),
+            report_text.index("## 四、分析结果总表"),
         )
         self.assertLess(
-            report_text.index("## 三、分析结果总表"),
-            report_text.index("## 四、附录"),
+            report_text.index("## 四、分析结果总表"),
+            report_text.index("## 五、附录"),
         )
         self.assertIn("com.vendor.LegacyApi.removed", report_text)
         self.assertIn("com.acme.OrderService.submit", report_text)
-        self.assertIn("### 3.1 调用链证据", report_text)
+        self.assertIn("### 4.1 调用链证据", report_text)
         self.assertIn("已确认链路 2 条", report_text)
         self.assertIn("com.acme.OrderService.submit -> com.vendor.LegacyApi.removed(String)", report_text)
 
@@ -13401,34 +13442,34 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             self.assertTrue(not_found_md.exists())
             with not_found_csv.open(encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 100)
-            self.assertIn("## 三、分析结果总表", report_text)
+            self.assertIn("## 四、分析结果总表", report_text)
             self.assertIn("本表共有 100 条 API 分析结果，当前展示 20 条，省略 80 条", report_text)
-            self.assertIn("完整逐链路台账见 `evidence/call_chain/alerts.csv`", report_text)
-            self.assertIn("`deliverables/s6_not_found_apis.csv/md`", report_text)
-            self.assertNotIn("`deliverables/s6_probable_impact_apis.csv/md`", report_text)
+            self.assertIn("完整结果见[逐链路证据台账](../evidence/call_chain/alerts.csv)", report_text)
+            self.assertIn("[未发现调用路径清单](s6_not_found_apis.md)", report_text)
+            self.assertNotIn("s6_probable_impact_apis.md", report_text)
             self.assertIn("### 运行产物阅读分层", report_text)
             self.assertIn("#### 给用户看的产物", report_text)
             self.assertIn("#### 用户深入排查时看的产物", report_text)
             self.assertIn("#### 程序使用的产物", report_text)
             self.assertIn("| `deliverables/report.md` | 最终报告；优先阅读这一份 |", report_text)
             self.assertIn("| `evidence/static_scan/s3_*.csv/.txt` | JDK、Spring Boot、反射等静态扫描命中 |", report_text)
-            self.assertIn("| `evidence/api_changes/changed_dependencies.md` | 依赖包维度的 Step4 变化摘要；用于选择 Step5 分析范围 |", report_text)
+            self.assertIn("| `evidence/api_changes/changed_dependencies.md` | 依赖包维度的变化摘要；用于选择系统触达分析范围 |", report_text)
             self.assertIn("| `evidence/api_changes/changed_dependencies.csv` | 依赖包维度的结构化清单；供筛选和自动化使用 |", report_text)
             self.assertIn("| `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化全集 |", report_text)
             self.assertIn("| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 500 条一份） |", report_text)
             self.assertNotIn("all_changed_apis_alerts.csv", report_text)
             self.assertIn("| `evidence/call_chain/alerts_<status>.csv` / `alerts_<status>_NNN.csv` | 按链路状态拆分的台账 |", report_text)
-            self.assertNotIn("| `deliverables/s6_probable_impact_apis.csv/md` |", report_text)
-            self.assertNotIn("| `deliverables/s6_uncertain_apis.csv/md` |", report_text)
-            self.assertNotIn("| `deliverables/s6_needs_input_apis.csv/md` |", report_text)
-            self.assertNotIn("| `deliverables/s6_not_analyzed_apis.csv/md` |", report_text)
-            self.assertIn("| `deliverables/s6_not_found_apis.csv/md` | 未发现调用路径清单 |", report_text)
+            self.assertNotIn("s6_probable_impact_apis.md", report_text)
+            self.assertNotIn("s6_uncertain_apis.md", report_text)
+            self.assertNotIn("s6_needs_input_apis.md", report_text)
+            self.assertNotIn("s6_not_analyzed_apis.md", report_text)
+            self.assertIn("| [未发现调用路径清单](s6_not_found_apis.md) | 未发现调用路径清单 |", report_text)
             self.assertNotIn("### 产物索引", report_text)
             self.assertIn("## 二、结论限制", report_text)
             self.assertIn("| 分析完整度 | 部分完整 |", report_text)
             self.assertIn("动态调用可能漏报", report_text)
             self.assertIn("反射调用可能漏报。", report_text)
-            self.assertIn("排序：已确认/高风险、可能影响、需人工复核、已确认不受影响、缺少依赖源码/构建产物、本次未完成分析、未发现调用路径。", report_text)
+            self.assertIn("排序：先按结论状态，再在已确认影响中按严重级别 P0、P1、P2 排序；严重级别不等于结论确定性。", report_text)
             self.assertIn("静态分析未找到调用路径", report_text)
             self.assertNotIn("NO_STATIC_PATH", report_text)
             self.assertNotIn("当前无法确认清单", report_text)
@@ -13446,7 +13487,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             self.assertNotIn("### 依赖变更概览", report_text)
             self.assertNotIn("机器可消费", report_text)
             self.assertNotIn("scan_stats", report_text)
-            self.assertIn("| `.runtime/findings/s6_findings.json` | Step6 结构化结果；供程序读取，不作为人工优先阅读文件 |", report_text)
+            self.assertIn("| `.runtime/findings/s6_findings.json` | 最终结构化结果；供程序读取，不作为人工优先阅读文件 |", report_text)
             self.assertIn("| `.runtime/observability/step*_timing.csv` / `step1_progress.jsonl` | 运行进度与分阶段耗时；供 Agent 监控和性能排查 |", report_text)
             self.assertIn("主报告按结论类型各展示前 20 条", report_text)
             self.assertIn("com.example.Api0.removed", report_text)
@@ -13537,7 +13578,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
 
             with (report_dir / findings["artifacts"]["not_analyzed_csv"]).open(encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 30)
-            self.assertIn("## 三、分析结果总表", report_text)
+            self.assertIn("## 四、分析结果总表", report_text)
             self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |", report_text)
             self.assertIn("| 可能影响 | Probable reason |", report_text)
             self.assertIn("| 需人工复核 | 字节码命中但未确认回业务入口 |", report_text)
@@ -13724,7 +13765,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertEqual(findings["module_impacts"]["app"]["probable_impact"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["needs_input"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["not_analyzed"], 1)
-        self.assertIn("## 三、分析结果总表", report_text)
+        self.assertIn("## 四、分析结果总表", report_text)
         self.assertIn("com.example.Demo.behavior", report_text)
         self.assertIn("com.example.Demo.bridge", report_text)
         self.assertIn("com.example.Demo.unknown", report_text)
@@ -13805,7 +13846,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertTrue(findings["per_dependency_results"][0]["reaches_system_source"])
         self.assertEqual(findings["impacted_dependencies"][0]["change_type"], "移除")
         self.assertNotIn("单依赖包最终结论", report_text)
-        self.assertIn("## 三、分析结果总表", report_text)
+        self.assertIn("## 四、分析结果总表", report_text)
         self.assertIn("com.example.Demo.call", report_text)
         self.assertNotIn("| a:b | 移除 | 是 | reachable |  |  | strong | com.example.Demo.call |", report_text)
 
@@ -14190,7 +14231,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertEqual(exit_code, 0)
         self.assertEqual(captured["report_dir"], "")
 
-    def test_step5_requires_interaction_when_dependency_source_mapping_is_missing(self):
+    def test_step5_auto_degrades_when_dependency_source_mapping_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
@@ -14239,32 +14280,51 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                              "has_dependency_source_mapping": False,
                          }
                      },
-                 ):
+                ):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     exit_code = step5.step5_integrated_main(args)
-                self.assertEqual(exit_code, step5.EXIT_AWAITING_USER)
+                self.assertEqual(exit_code, 0)
                 self.assertIn("缺失映射的依赖坐标：com.example:demo", stderr.getvalue())
+                self.assertIn("不会要求用户批准降级", stderr.getvalue())
 
                 stdout_lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
-                self.assertTrue(stdout_lines)
-                self.assertTrue(stdout_lines[-1].startswith(step5.STEP_INTERACTION_PREFIX))
-                interaction = json.loads(stdout_lines[-1][len(step5.STEP_INTERACTION_PREFIX):])
-                action_ids = {item.get("id") for item in interaction.get("options", [])}
-                properties = (interaction.get("response_schema") or {}).get("properties", {})
-
-                self.assertEqual(interaction.get("step_id"), "step5")
-                self.assertEqual(interaction.get("status"), "awaiting_user_input")
-                self.assertEqual(interaction.get("reason_code"), "step5_dependency_source_mapping_missing")
-                self.assertIn("rerun_current_step", action_ids)
-                self.assertIn("restart_from_step", action_ids)
-                self.assertIn("dependency_source_dirs", properties)
-                self.assertIn("allow_degraded", properties)
+                self.assertFalse(
+                    any(line.startswith(step5.STEP_INTERACTION_PREFIX) for line in stdout_lines)
+                )
 
                 details_path = output_dir / "missing_dependency_source_mappings.json"
                 self.assertTrue(details_path.exists())
                 details = json.loads(details_path.read_text(encoding="utf-8"))
+                self.assertEqual(details.get("status"), "degraded")
+                self.assertEqual(
+                    details.get("resolution"),
+                    "continue_with_final_artifact_bytecode_and_restricted_conclusion",
+                )
                 self.assertEqual(details.get("missing_mapping_count"), 1)
                 self.assertEqual(details.get("missing_mapping_coords"), ["com.example:demo"])
+
+    def test_gate_allows_step4_timeout_in_standard_mode_and_blocks_strict_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            api_dir = self._api_changes_dir(report_dir)
+            api_dir.mkdir(parents=True)
+            (api_dir / "all_changed_apis.csv").write_text(
+                "coord,api_name\ncom.example:demo,com.example.Api.run\n",
+                encoding="utf-8",
+            )
+            (api_dir / "git_ref_matches.txt").write_text("complete\n", encoding="utf-8")
+            (api_dir / "git_ref_matches.json").write_text("{}\n", encoding="utf-8")
+            (api_dir / "git_ref_pending.json").write_text('{"items": []}\n', encoding="utf-8")
+            (api_dir / "timeouts.json").write_text(
+                json.dumps({"items": [{"coord": "com.example:demo", "stage": "japicmp"}]}),
+                encoding="utf-8",
+            )
+
+            gate.gate_jar_compare(str(report_dir), strict_risk_gate=False)
+            with self.assertRaises(SystemExit) as raised:
+                gate.gate_jar_compare(str(report_dir), strict_risk_gate=True)
+
+        self.assertEqual(raised.exception.code, 1)
 
     def test_step5_main_infers_report_dir_from_all_changed_apis(self):
         with tempfile.TemporaryDirectory() as tmp:

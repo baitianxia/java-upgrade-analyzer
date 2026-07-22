@@ -12,6 +12,7 @@ import safe_xml as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
+from compat import git_cmd
 from csv_io import open_csv_read
 from pipeline_constants import STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
 
@@ -499,7 +500,7 @@ def sha256_file(path):
 
 def git_revision(project_dir, ref="HEAD"):
     result = subprocess.run(
-        ["git", "rev-parse", str(ref)], cwd=str(project_dir), text=True, encoding="utf-8", errors="replace",
+        git_cmd() + ["rev-parse", str(ref)], cwd=str(project_dir), text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
@@ -689,6 +690,7 @@ def derive_coverage_report(report_dir, project_scope=None):
     })
 
     behavior_files = sorted(api_changes_dir.glob("*_gitdiff_api_changes.txt"))
+    behavior_bytecode_files = sorted(api_changes_dir.glob("*_bytecode_behavior.json"))
     behavior_component = dict(step4_coverage.get('behavior_diff') or {})
     if behavior_component:
         behavior_status = behavior_component.get('status') or 'insufficient'
@@ -703,7 +705,10 @@ def derive_coverage_report(report_dir, project_scope=None):
         behavior_status, behavior_reasons = "partial", ["dependency_source_diff_not_available"]
     components.append({
         "id": "behavior_diff", "status": behavior_status, "reason_codes": behavior_reasons,
-        "evidence": [str(path.relative_to(report)) for path in behavior_files],
+        "evidence": [
+            str(path.relative_to(report))
+            for path in [*behavior_files, *behavior_bytecode_files]
+        ],
         "metrics": behavior_component.get('metrics') or {},
     })
 
@@ -844,6 +849,7 @@ def derive_coverage_report(report_dir, project_scope=None):
     overall = aggregate_coverage_status(item["status"] for item in components)
     critical_ids = {
         'project_scope', 'dependency_diff', 'build_provenance', 'binary_api_diff',
+        'behavior_diff',
         'artifact_bytecode_dependencies', 'source_artifact_alignment',
         'indirect_usage_matrix',
     }

@@ -772,6 +772,12 @@ def main():
 
     # ── 3. Spring Boot 版本（从依赖树，最可靠）─────────────────
     sb_base, sb_cur, sb_source = detect_spring_boot_version(deps)
+    if orchestrated_input.get('springboot_base'):
+        sb_base = str(orchestrated_input.get('springboot_base')).strip()
+        sb_source = 'user_confirmed'
+    if orchestrated_input.get('springboot_current'):
+        sb_cur = str(orchestrated_input.get('springboot_current')).strip()
+        sb_source = 'user_confirmed'
     print(f"  Spring Boot：{sb_base or '?'} → {sb_cur or '?'} (来源: {sb_source})",
           file=sys.stderr)
 
@@ -785,6 +791,10 @@ def main():
         base_revision, current_revision,
         args.work_dir, build_tool
     )
+    if orchestrated_input.get('jdk_base'):
+        jdk_base = str(orchestrated_input.get('jdk_base')).strip()
+    if orchestrated_input.get('jdk_current'):
+        jdk_cur = str(orchestrated_input.get('jdk_current')).strip()
     print(f"  JDK：{jdk_base or '❓未知'} → {jdk_cur or '❓未知'}", file=sys.stderr)
 
     # ── 6. 升级标志位 ────────────────────────────────────────────
@@ -837,7 +847,11 @@ def main():
         'jdk_base':        jdk_base,
         'jdk_current':     jdk_cur,
         'jdk_upgraded':    jdk_upgraded,
-        'jdk_source':      'pom_xml' if (jdk_base or jdk_cur) else 'not_found',
+        'jdk_source':      (
+            'user_confirmed'
+            if orchestrated_input.get('jdk_base') or orchestrated_input.get('jdk_current')
+            else ('pom_xml' if (jdk_base or jdk_cur) else 'not_found')
+        ),
 
         # Spring Boot
         'springboot_base':            sb_base,

@@ -14,7 +14,7 @@
 - 已核实：quality gate 的所有 profile 默认只运行本地回归；真实项目矩阵必须通过 `--include-real` 显式加入。只有 release、本地回归、完整 guard 和质量审计全部通过时才允许发布；GitHub release workflow 会物化并运行完整 guard。
 - 已核实：移交早期曾记录两个未跟踪的历史 ZIP；它们从未进入 Git，仓库目录中已无这两个文件，对应源码状态仍可由 `1599903dd8838c7f66c1b2415550b0fa8f9a47fb` 和 `fdb3895920a7f6ee697dbc14ce0b4aec78f9c7f5` 恢复。2026-07-22 所有者确认不保留、不重新制作、不交付这两个过期快照；完整时间线与决定见 [历史 ZIP 归属审计](../archive/2026-07-22-historical-zip-audit.md)。
 - 已验证：2026-07-21 在 `d064f61` 上，quick 的语法检查、Oracle 独立性、核心确定性、核心准确性基准和 21 项核心语义测试通过。
-- 已核实：运行契约现已固定为 CPython 3.12.x 与精确解析器版本；本机 Python 3.14.6 会在分析前以 `unsupported_python` 明确失败，不再触发隐式联网安装。2026-07-21 已在隔离 CPython 3.12.12、JDK 21、macOS 环境通过离线 wheel bootstrap、44 项定向测试和 quick 全部 7 个任务；这属于当前工作区证据，完整 Step5/release/真实项目矩阵仍需在提交后建立新鲜证据。
+- 已核实：运行契约支持 CPython 3.12.x、3.13.x 与 3.14.x，解析器依赖仍精确固定；PR quick 门禁在三个 Python 小版本上分别执行。2026-07-22 已在隔离 CPython 3.12.13/3.13.14/3.14.6、JDK 21、macOS 环境完成固定依赖安装与本地兼容性验证；跨平台最终证据以提交后的 CI 矩阵为准。
 - 已验证：`main@5b41834` 在 CPython 3.12.13、JDK 21.0.8、Maven 3.9.16、macOS 下通过 `guard-capability` 与完整 `release --include-real --real-case guard`；完整单测 2000 项（跳过 1 项）、9 个真实项目、质量信号审计、复盘与 capability closure 全部通过，发布裁决为 `release_allowed`。
 - 已验证：Kotlin/KTS 已明确为 partial capability；`.kts`、标准源集分类、Java/Kotlin 双向 fixture、最终制品 class 闭集和 `not_impacted` 失败关闭均有定向回归，466 项 Step5/拓扑测试与 quick 通过。
 - 已验证：Step5 会按坐标与 owner 预热多目标反向传播并复用目标无关的前驱转换；开启/关闭复用后的五态、路径指纹与完整 `alerts.csv` 字节一致，1×/2×/4× 共享子图的转换物化次数为近线性增长。

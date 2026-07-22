@@ -299,6 +299,8 @@ class RefConfirmationFlowTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             interaction = step4.build_git_ref_confirmation_interaction(tmp, [pending_item])
+        self.assertEqual(interaction["title"], "确认依赖源码版本")
+        self.assertIn("选择不同方案会改变源码差异结果", interaction["question"])
         response = run_step.expand_dependency_git_ref_selections(interaction, {
             "action": "rerun_current_step",
             "dependency_git_ref_selections": [{"coord": "com.acme:demo", "option": 1}],

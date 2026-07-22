@@ -51,6 +51,9 @@ class UserScenarioRegressionTest(unittest.TestCase):
             "com.example:dep-b:com.depb.BridgeB.call(String)",
             by_name["query_after_step5"]["details"]["query_stdout"],
         )
+        delivery = by_name["delivery_output_journey"]
+        self.assertEqual(delivery["status"], "passed")
+        self.assertTrue(delivery["details"]["report"].endswith("deliverables/report.md"))
 
 
 if __name__ == "__main__":

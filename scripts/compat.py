@@ -19,6 +19,7 @@ import subprocess
 import locale
 import io
 import re
+import shutil
 import threading
 import safe_xml as ET
 from pathlib import Path
@@ -92,6 +93,7 @@ def _detect_subprocess_encoding():
 # 模块加载时检测一次，后续复用
 _SUBPROCESS_ENCODING = _detect_subprocess_encoding()
 _PROCESS_OBSERVER = None
+_GIT_EXECUTABLE_CACHE = {}
 
 
 def set_process_observer(observer):
@@ -198,6 +200,7 @@ def run_cmd(
       stream_output 将子进程 stdout/stderr 实时转发到当前 stderr，同时仍完整捕获返回
       stream_stdout 流式模式下是否转发 stdout；协议型子进程可仅转发 stderr
     """
+    cmd = resolve_command(cmd)
     observer = _PROCESS_OBSERVER
     try:
         observer_token = observer.command_started(cmd) if observer is not None else None
@@ -269,6 +272,16 @@ def run_cmd(
                 stdout_thread.join(timeout=5)
                 stderr_thread.join(timeout=5)
                 return _finish_observed_command(observer, observer_token, ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
+            except KeyboardInterrupt:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+                raise
             stdout_thread.join()
             stderr_thread.join()
             return _finish_observed_command(observer, observer_token, (
@@ -291,6 +304,9 @@ def run_cmd(
         stderr = _decode_subprocess_output(proc.stderr)
         return _finish_observed_command(observer, observer_token, (stdout, stderr, proc.returncode))
 
+    except KeyboardInterrupt:
+        _finish_observed_command(observer, observer_token, ('', '', 130))
+        raise
     except subprocess.TimeoutExpired:
         return _finish_observed_command(observer, observer_token, ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
     except FileNotFoundError:
@@ -369,12 +385,64 @@ def normalize_path(path):
     return str(Path(path))
 
 
+def _git_executable_works(path):
+    """Return whether a Git candidate is executable without leaking tool errors."""
+    candidate = str(path or '').strip()
+    if not candidate or not Path(candidate).is_file():
+        return False
+    try:
+        completed = subprocess.run(
+            [candidate, '--version'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _find_working_git():
+    """Choose a working Git instead of trusting the first PATH entry on macOS."""
+    cache_key = (
+        os.environ.get('JUA_GIT_EXECUTABLE', '').strip(),
+        os.environ.get('PATH', ''),
+        str(Path.home()),
+        sys.platform,
+    )
+    if cache_key in _GIT_EXECUTABLE_CACHE:
+        return _GIT_EXECUTABLE_CACHE[cache_key]
+
+    executable_name = 'git.exe' if IS_WINDOWS else 'git'
+    candidates = [
+        os.environ.get('JUA_GIT_EXECUTABLE', '').strip(),
+        str(Path.home() / '.local' / 'bin' / executable_name),
+    ]
+    if sys.platform == 'darwin':
+        candidates.extend(('/opt/homebrew/bin/git', '/usr/local/bin/git'))
+    candidates.append(shutil.which('git') or '')
+
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.normcase(os.path.abspath(candidate)) if candidate else ''
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if _git_executable_works(candidate):
+            _GIT_EXECUTABLE_CACHE[cache_key] = candidate
+            return candidate
+    _GIT_EXECUTABLE_CACHE[cache_key] = None
+    return None
+
+
 def find_executable(name):
     """
     跨平台查找可执行文件。
     Windows 上会自动尝试加 .cmd/.bat/.exe 后缀。
     """
-    import shutil
+    if str(name or '').strip().lower() in {'git', 'git.exe'}:
+        return _find_working_git()
     found = shutil.which(name)
     if found:
         return found
@@ -400,6 +468,17 @@ def git_cmd():
     if git:
         return [git]
     return ['git']
+
+
+def resolve_command(cmd):
+    """Resolve bare Git commands to the validated executable used by the product."""
+    if not isinstance(cmd, (list, tuple)) or not cmd:
+        return cmd
+    first = str(cmd[0] or '')
+    if Path(first).name.lower() not in {'git', 'git.exe'} or Path(first).parent != Path('.'):
+        return cmd
+    resolved = find_executable('git')
+    return [resolved, *cmd[1:]] if resolved else list(cmd)
 
 def _xml_first_text(elem, local_tag):
     for child in list(elem):

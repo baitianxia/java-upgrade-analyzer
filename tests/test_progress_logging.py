@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 from contextlib import redirect_stderr
@@ -54,9 +55,9 @@ class ProgressLoggingTest(unittest.TestCase):
                 step3.SCAN_FUNCS = original_scan_funcs
 
         output = stderr.getvalue()
-        self.assertIn("[progress][step3][plan]", output)
-        self.assertIn("[progress][step3][scan]", output)
-        self.assertIn("[progress][step3][done]", output)
+        self.assertIn("[进度][兼容性线索][准备]", output)
+        self.assertIn("[进度][兼容性线索][扫描]", output)
+        self.assertIn("[进度][兼容性线索][完成]", output)
 
     def test_step5_tracer_emits_structured_progress_logs(self):
         stderr = io.StringIO()
@@ -78,7 +79,7 @@ class ProgressLoggingTest(unittest.TestCase):
 
         output = stderr.getvalue()
         self.assertEqual(len(results), 3)
-        self.assertIn("[progress][step5][trace]", output)
+        self.assertIn("[进度][系统触达证据][追踪系统触达]", output)
         self.assertIn("反向追踪完成", output)
 
     def test_step5_emits_structured_progress_logs(self):
@@ -150,10 +151,36 @@ class ProgressLoggingTest(unittest.TestCase):
 
         output = stderr.getvalue()
         self.assertEqual(exit_code, 0)
-        self.assertIn("[progress][step5][plan]", output)
-        self.assertIn("[progress][step5][graph]", output)
-        self.assertIn("[progress][step5][trace]", output)
-        self.assertIn("[progress][step5][done]", output)
+        self.assertIn("[进度][系统触达证据][准备]", output)
+        self.assertIn("[进度][系统触达证据][构建调用图]", output)
+        self.assertIn("[进度][系统触达证据][追踪系统触达]", output)
+        self.assertIn("[进度][系统触达证据][完成]", output)
+
+    def test_progress_is_persisted_without_exposing_internal_ids_to_human_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with patch.dict(os.environ, {"UPGRADE_REPORT_DIR": tmp}), redirect_stderr(stderr):
+                progress_logging.emit_progress(
+                    "step4",
+                    "dependency",
+                    "完成一个依赖",
+                    current=1,
+                    total=2,
+                    elapsed=1.25,
+                    item="com.acme:demo",
+                )
+
+            progress_path = Path(tmp) / ".runtime" / "observability" / "progress.jsonl"
+            event = json.loads(progress_path.read_text(encoding="utf-8").splitlines()[0])
+
+        self.assertIn("[进度][依赖 API 变化][处理依赖]", stderr.getvalue())
+        self.assertIn("[1/2]", stderr.getvalue())
+        self.assertNotIn("[step4]", stderr.getvalue())
+        self.assertEqual(event["step_id"], "step4")
+        self.assertEqual(event["phase"], "dependency")
+        self.assertEqual(event["item"], "com.acme:demo")
+        self.assertEqual(event["estimated_remaining_sec"], 1.25)
+        self.assertIn("预计剩余约 1.2s", stderr.getvalue())
 
 
 if __name__ == "__main__":

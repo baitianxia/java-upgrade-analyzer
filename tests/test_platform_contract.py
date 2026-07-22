@@ -1,17 +1,58 @@
+import os
 import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import compat  # noqa: E402
 from compat import run_cmd  # noqa: E402
 
 
 class PlatformContractTest(unittest.TestCase):
+    def test_git_resolution_prefers_working_user_install_over_broken_system_git(self):
+        user_git = Path("/Users/example/.local/bin/git")
+
+        with patch.object(compat.Path, "home", return_value=Path("/Users/example")), \
+                patch.object(compat.shutil, "which", return_value="/usr/bin/git"), \
+                patch.object(
+                    compat,
+                    "_git_executable_works",
+                    side_effect=lambda path: Path(path) == user_git,
+                ), \
+                patch.dict(os.environ, {"JUA_GIT_EXECUTABLE": ""}, clear=False):
+            resolved = compat.find_executable("git")
+
+        self.assertEqual(resolved, str(user_git))
+
+    def test_bare_git_command_is_replaced_with_validated_absolute_path(self):
+        with patch.object(
+            compat, "find_executable", return_value="/Users/example/.local/bin/git"
+        ):
+            resolved = compat.resolve_command(["git", "status", "--short"])
+
+        self.assertEqual(
+            resolved,
+            ["/Users/example/.local/bin/git", "status", "--short"],
+        )
+
+    def test_validated_git_is_cached_for_repeated_commands(self):
+        compat._GIT_EXECUTABLE_CACHE.clear()
+        with patch.object(compat.Path, "home", return_value=Path("/Users/cache-test")), \
+                patch.object(compat.shutil, "which", return_value="/usr/bin/git"), \
+                patch.object(compat, "_git_executable_works", return_value=True) as probe, \
+                patch.dict(os.environ, {"JUA_GIT_EXECUTABLE": ""}, clear=False):
+            first = compat.find_executable("git")
+            second = compat.find_executable("git")
+
+        self.assertEqual(first, second)
+        probe.assert_called_once()
+
     def test_workflow_declares_mandatory_os_jdk_tool_and_evidence_matrix(self):
         workflow = ROOT / ".github" / "workflows" / "platform-contract.yml"
         text = workflow.read_text(encoding="utf-8")

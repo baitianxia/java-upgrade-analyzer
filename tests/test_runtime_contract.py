@@ -12,6 +12,12 @@ import runtime_contract  # noqa: E402
 
 
 class RuntimeContractTest(unittest.TestCase):
+    def test_supported_python_matrix_covers_current_maintained_contract(self):
+        self.assertEqual(
+            runtime_contract.SUPPORTED_PYTHON,
+            {(3, 12), (3, 13), (3, 14)},
+        )
+
     def test_runtime_requirements_are_exactly_pinned(self):
         declared = {
             line.strip() for line in
@@ -64,7 +70,7 @@ class RuntimeContractTest(unittest.TestCase):
 
     def test_formal_runner_checks_environment_before_project_state(self):
         source = (ROOT / "scripts" / "run_step.py").read_text(encoding="utf-8")
-        main_source = source[source.index("def main():"):]
+        main_source = source[source.index("def main("):]
         contract_call = main_source.index("contract_payload(require_maven=True)")
         state_load = main_source.index("load_main_state(report_dir")
         self.assertLess(contract_call, state_load)

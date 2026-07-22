@@ -895,7 +895,7 @@ def _iter_business_class_bytes(business_jar, fact_store=None):
 
 def collect_business_bytecode_edges(
     source_roots, max_classes=10000, artifact_catalog=None, cache_path=None,
-    fact_store=None,
+    fact_store=None, *, stream_cache=False,
 ):
     evidence = []
     failures = []
@@ -966,7 +966,9 @@ def collect_business_bytecode_edges(
     if cache_path and cache_key:
         try:
             cached_metrics = _validate_business_bytecode_cache(cache_path, cache_key)
-            cached_edges = list(_iter_business_bytecode_cache(cache_path, cache_key))
+            cached_edges = _iter_business_bytecode_cache(cache_path, cache_key)
+            if not stream_cache:
+                cached_edges = list(cached_edges)
         except (OSError, ValueError, TypeError):
             cached_metrics = None
             cached_edges = None
@@ -1359,6 +1361,7 @@ def collect_business_bytecode_batch(
         artifact_catalog=artifact_catalog,
         cache_path=cache_path,
         fact_store=fact_store,
+        stream_cache=True,
     )
     return _business_bytecode_batch(
         evidence,

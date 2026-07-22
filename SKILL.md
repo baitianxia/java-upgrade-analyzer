@@ -82,7 +82,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
 8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
-9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。tree-sitter 必须按固定清单显式 bootstrap，运行时不联网安装；安装、版本或加载检查失败后必须 checkpoint，修复环境后重跑。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
+9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。tree-sitter 必须按固定清单显式 bootstrap，运行时不联网安装；安装、版本或加载检查失败时记录 `blocked_by_system` 并停止，不生成用户确认项。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
 10. **CSV 编码统一**：所有 CSV 产物统一使用 UTF-8 BOM；程序读取时同时兼容带 BOM 与历史无 BOM 的 UTF-8 文件，保证 Excel 直接打开中文不乱码。
 11. **准确性双线验证**：真实项目验证必须并行生成分析器结果与独立 Oracle 结果，只共享同一最终制品、API 身份协议和运行输入，不得复用分析器的解析、筛选或结论实现。必须逐 API 闭集对账；缺失、重复、额外、冲突、错误结论或无法绑定本次最终制品的 Oracle 均不得标记为已验证。接入新项目只增加数据输入和独立证据，不得在生产代码中登记项目、坐标或类名特例。失效的辅助证据必须报告，但不能推翻同一 API 已存在的有效强证据。
 
@@ -160,15 +160,15 @@ if gate failed or step blocked:
 2. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本不等价于完整主状态流程。
 3. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
 
-Step5 必须使用 `tree-sitter` 做 Java AST 分析。正式运行契约为 CPython 3.12.x、Linux/macOS/Windows、JDK 11/17/21、Maven 3.8+，Python 依赖版本由 `requirements-runtime.txt` 固定。运行时不得联网安装；缺少或版本不符时必须在分析前失败，Step5 仍进入 checkpoint，正式流程不允许继续用增强正则生成分析结论。
+Step5 必须使用 `tree-sitter` 做 Java AST 分析。正式运行契约为 CPython 3.12.x/3.13.x/3.14.x、Linux/macOS/Windows、JDK 11/17/21、Maven 3.8+，Python 依赖版本由 `requirements-runtime.txt` 固定。运行时不得联网安装；缺少或版本不符时必须在分析前失败并记录系统环境阻塞，不得伪装成需要用户确认的业务 checkpoint，也不允许继续用增强正则生成分析结论。
 
-首次准备环境时，在 Skill 根目录使用 CPython 3.12 执行显式 bootstrap：
+首次准备环境时，在 Skill 根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
 
 ```bash
-python3.12 scripts/bootstrap_runtime.py
+python3 scripts/bootstrap_runtime.py
 ```
 
-离线环境使用 `python3.12 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels`，该模式带 `--no-index`，只读取受控缓存。用户安装完成后恢复 checkpoint 时，应将自然语言“已安装，重跑 Step5”归一化为 `action=rerun_current_step` 与 `tree_sitter_installed=true`。
+离线环境使用 `python3 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels`，该模式带 `--no-index`，只读取受控缓存。用户安装完成后恢复 checkpoint 时，应将自然语言“已安装，重跑 Step5”归一化为 `action=rerun_current_step` 与 `tree_sitter_installed=true`。
 
 首次进入任务时，先确认：
 
@@ -302,7 +302,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 2. 若 `status` 为 `awaiting_*`，读取 `.upgrade-report/.runtime/state/interaction.json`
 3. 把 `interaction.json` 整理成用户可读的决策卡片，而不是把协议字段逐项甩给用户
 4. 决策卡片必须说明：当前要确认什么、为什么停下、可选动作、需要补什么、候选对象、完整候选或证据文件、用户可以直接怎么回复
-5. 覆盖当前所有交互点：缺少 Step1 输入、Step1/Step2/Step4/Step5 checkpoint、补依赖源码目录、补 git ref/超时参数、选择 Step5 依赖包范围、从指定步骤重跑
+5. 覆盖当前所有交互点中确有必要的事项：缺少 Step1 输入、Step1/Step2 的业务选择、Step4 两个以上不同 commit pair 的真实歧义、Step4 成功且存在至少两个候选依赖时的 Step5 全量/部分范围选择、需要用户授权的环境阻塞，以及用户主动要求从指定步骤重跑；可内部恢复的证据故障不得列为必问项，0/1 个候选不得制造范围确认，Step5 成功后的例行复核不得保留
 6. `response_schema` / `input_normalization` / `action_requirements` / `selection_resolution` 只用于把用户原话整理成结构化答复，不作为用户主信息展示
 7. 等待用户答复
 8. 用用户真实答复构造 `--response-json` 或 `--response-file`
@@ -408,50 +408,43 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：Step4 必须且只能复用 Step1 `evidence/dependencies/build_provenance.json` 指向的 base/current 最终构建产物，并按 `evidence/dependencies/dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 JAR；最终制品中无法定位时必须输出明确的证据缺失原因，不得回退本地 Maven 仓库或下载同坐标 JAR 替代
 - 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应超时；Git fetch 与 JApiCmp 工具安装不得共用一个超时字段
-- 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；不同 commit pair 的真实歧义、未匹配或远程失败才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
-- 规则：Step1/Step4 的 ref checkpoint 必须按同一语义处理：唯一 commit 自动继续，歧义或 ref 移动才选择方案，未找到时补明确 remote/ref，fetch 失败时只询问重试。Step4 必须在一张决策卡中展示全部待确认依赖；每项给出按稳定顺序排列、按 commit pair 去重的方案编号、old/new ref 和 commit 摘要。卡片最多展示 6 个方案时必须标明总数和完整候选文件。用户可以一次回复各依赖的方案编号，也可以直接给 old_ref/new_ref；恢复前必须校验本轮所有待确认依赖均已覆盖，已确认覆盖项按坐标合并保留，不得逐项重复询问
+- 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；只有两个以上不同 commit pair、且选择会改变源码 diff 范围的真实歧义才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
+- 规则：Step4 的远端查询失败、fetch 失败、ref 移动、未匹配、远端不可用和未授权本地兜底均属于内部源码证据故障。按错误类型完成受控重试后，不得把修复工作抛给用户，也不得猜测或静默改用本地 ref；应记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并从升级前后最终制品 JAR 对共享变化类执行同签名方法字节码指纹对比，以 `jar_bytecode` 证据补齐 `BEHAVIOR_CHANGED` 候选。只有源码 diff 或最终 JAR 方法字节码兜底至少一项完整时，该依赖的行为变化覆盖才可计为 complete；两者都失败时 `behavior_diff` 必须进入关键覆盖缺口，禁止输出完整或无影响结论。若存在真实 commit pair 歧义，必须在一张决策卡中展示全部待确认依赖；每项给出按稳定顺序排列、按 commit pair 去重的方案编号、升级前/升级后源码分支和 commit 摘要。卡片最多展示 6 个方案时必须标明总数和完整候选文件；用户可以一次回复各依赖的方案编号，也可以直接给 old_ref/new_ref，恢复前必须校验本轮所有待确认依赖均已覆盖
 - 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
 - 门控：`step4` 完成后执行 `jar_compare`
 
-### Phase 7 [CHECKPOINT] Confirm Evidence Completeness
+### Phase 7 [CHECKPOINT] Select Step5 Scope
 
-- 对应步骤：`step4` 完成后进入
-- 必须展示：`changed_dependencies.md/csv`、`all_changed_apis.csv`、`git_ref_matches.txt/json`、`summary.txt`
-- 必须确认：Step5 是全量分析还是只分析部分依赖包；若只想分析部分变更 jar，应在这里指定 `changed_dependencies.md/csv` 中的 `selection_key`
-- 若证据不足，应先补 `dependency_source_dirs`，而不是直接进入 `step5`
-- 允许在 `continue` 时优先附带 `selected_targets`，让系统自动归一化为 `step5_selected_coords` / `step5_selected_names`
+- 对应步骤：`step4` 成功后
+- 当 `changed_dependencies.md/csv` 中存在至少两个候选依赖时必须停下，让用户选择全部分析或只分析所选依赖；0 个候选时 Step5 没有范围可选，1 个候选时“全量”和“选择该候选”等价，均直接继续
+- 全量分析不提供 `selected_targets`；部分分析必须提供 `selected_targets`，系统自动归一化为 `step5_selected_coords` / `step5_selected_names`
+- 决策卡必须展示全量依赖数、变化 API 数和高风险 API 数，并说明取舍：全量分析覆盖最完整但耗时可能更长；部分分析降低耗时，但 Step6 结论只能适用于所选依赖，不能表述为全局无影响
+- 真实 commit pair 歧义仍由 Step4 的专用 checkpoint 在耗时分析前处理；内部超时或证据故障记录覆盖缺口后继续，不得作为本范围 checkpoint 的用户修复问题
 - `selection_options` 只反映 Step4 依赖包维度候选；每个候选都应带稳定 `selection_key`
-- Step4 checkpoint 若只展示部分 `selection_options` 作为人工阅读摘要，这不应收窄正式选择范围；`selected_targets` 的解析仍必须基于完整候选集，允许用户直接提交未展示但合法的 `selection_key` / `coord` / `name`
+- `selected_targets` 的解析必须基于完整候选集，允许用户提交合法的 `selection_key` / `coord` / `name`
 - `selected_targets` 若填写 `selection_key` 或 `coord`，调度层必须严格按该唯一目标执行；若只填写 `name`，则按 `artifactId` 名称筛选命中的全部候选
-- 恢复前必须遵守 `action_requirements`；若当前动作缺少 required / at_least_one_of 字段，必须先追问，不能空恢复
-- 允许动作：`continue`、`cancel`
-- 禁止动作：证据明显不足时仍直接进入 `step5`
 - 恢复命令模板：
 
 ```bash
-# 用户接受当前证据池，继续调用链分析
+# 全量分析
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{}}}'
+  --response-json '{"action":"continue","notes":"全量分析全部变化依赖"}'
 
-# 用户接受当前证据池，但只分析指定依赖
+# 部分分析
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["coord:com.example:demo-lib"]}}}'
-
-# 用户补充依赖源码映射后再恢复
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"dependency_source_dirs":["/abs/path/to/dependency-repo"]},"notes":"补依赖源码目录后复跑 Step5"}}'
+  --response-json '{"action":"continue","selected_targets":["coord:com.example:demo-lib"],"notes":"只分析所选依赖"}'
 ```
+
+- 调度层必须将确认结果写入 `.runtime/cache/step5_selection.json`；Step6 必须据此展示全量/部分范围。范围快照缺失时不得默认宣称全量分析
 
 ### Phase 8 [AUTO] Call Chain Analysis
 
 - 对应步骤：`step5`
-- 输入：仅使用 `evidence/api_changes/all_changed_apis.csv`（由 Phase 4 产出）作为变更 API 目标集；若在 Phase 7 指定了 `selected_targets` 或正式 `step5_selected_coords` / `step5_selected_names`，则先过滤到命中的依赖子集再执行分析
+- 输入：仅使用 `evidence/api_changes/all_changed_apis.csv`（由 Phase 4 产出）作为变更 API 目标集；按 Phase 7 用户确认的全量范围执行，或按 `selected_targets` / 正式 `step5_selected_coords` / `step5_selected_names` 过滤到所选依赖子集
 - 输出：`.upgrade-report/evidence/call_chain/`
 - 附加证据：Step1 留存的 current 最终制品业务 class、嵌套运行时 JAR 字节码边与 `.upgrade-report/framework_adapters.json`
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
@@ -461,6 +454,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：筛选匹配范围只允许来自 Step4 API；Step3 平台/框架风险和类级 candidate 不得追加为 Step5 变更 API
 - 规则：显式重跑某一步前，调度层必须先清空该步骤全部正式输出，避免旧轮次的制品、目录或字节码证据混入本轮结果
 - 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
+- 规则：依赖源码映射缺失或无法对齐时，不得要求用户显式批准降级；系统应继续使用 current 最终制品中的业务 class 和运行时依赖 JAR 字节码。仍无法补齐的 API 进入 `not_analyzed` 并限制最终结论，用户可在报告完成后自愿补源码重跑
+- 规则：Step5 成功后直接进入 Step6 生成带覆盖边界的最终报告，不生成例行成功确认 checkpoint
 - 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
 - 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step3、Step4、Step5 必须按 `lib_entry` 使用制品中的真实嵌套 JAR，且不得用本地 Maven 仓库副本或重新下载的 JAR 替代最终制品证据
 - 规则：最终制品内缺失嵌套 JAR、坐标 unresolved、SHA 不一致或字节码解析失败时，必须记录覆盖缺口；未命中不得解释为无影响，也不得以本地 Maven JAR 填补缺口
@@ -538,10 +533,14 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 输入：前面所有产物
 - 输出：`.upgrade-report/.runtime/findings/s6_findings.json`、`.upgrade-report/deliverables/report.md`
 - 规则：主报告优先呈现已证明影响当前系统的项，并保持 Step5 用户侧结论分桶一致；`可能影响`、`需要补充输入` 与剩余 `未覆盖/未分析` 不能混并成同一详情列表
+- 规则：结论确定性与风险等级必须分开展示；`已确认影响` 是结论状态，P0/P1/P2 是严重级别，不得合并成“已确认/高风险”造成误读
+- 规则：主报告必须提供由当前证据和结论边界生成的下一步复核顺序与完成标准，但不得替使用者决定具体代码修改或发布
 
 ## 恢复与压缩
 
 默认由 `run_step.py` 自动保存主状态。若步骤执行后进入待交互状态，还会额外生成 `.upgrade-report/.runtime/state/interaction.json`，并以退出码 `4` 结束当前命令，供 Claude Code 读取并转成用户对话。若需要手动保存压缩摘要，执行：
+
+长任务必须通过用户语言的定期心跳表明进程仍在运行，只有存在可靠已完成/总量时才显示预计剩余时间。用户按 `Ctrl-C` 时必须终止当前子进程、清理当前步骤的半成品并保留之前的正式产物与当前输入；退出码为 `130`，再次运行 `--step auto` 从当前任务安全重试。
 
 ```bash
 export PYTHONUTF8=1

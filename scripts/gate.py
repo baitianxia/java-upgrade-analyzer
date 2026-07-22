@@ -200,7 +200,7 @@ def gate_scan(d):
               for pc in python_cmds()])
     ok("scan 门控通过")
 
-def gate_jar_compare(d):
+def gate_jar_compare(d, strict_risk_gate=False):
     jar_dir = evidence_api_changes_dir(d)
     csv_path = jar_dir / "all_changed_apis.csv"
     ref_txt_path = jar_dir / "git_ref_matches.txt"
@@ -229,12 +229,15 @@ def gate_jar_compare(d):
             timeout_payload = json.load(f)
         timeout_items = list(timeout_payload.get("items") or [])
         if timeout_items:
-            fail(
-                f"Step4 存在超时导致的证据缺失：{len(timeout_items)} 项",
-                [
-                    "查看 evidence/api_changes/timeouts.json，确认是 git diff 还是 JApiCmp 对比超时",
-                    "通过 --response-json 调整 step4_git_diff_timeout / step4_japicmp_timeout 后重跑 Step4",
-                ],
+            if strict_risk_gate:
+                fail(
+                    f"严格模式下 Step4 不允许存在超时证据缺失：{len(timeout_items)} 项",
+                    ["查看 evidence/api_changes/timeouts.json，修复后重跑 Step4"],
+                )
+            print(
+                f"\n⚠️ Step4 存在 {len(timeout_items)} 个超时项；标准模式继续生成受限结论，"
+                "不会把证据缺口解释为无影响。",
+                file=sys.stderr,
             )
     with open(csv_path, encoding="utf-8", errors="replace") as f:
         rows = sum(1 for l in f if l.strip() and not l.startswith('#')) - 1
@@ -275,16 +278,12 @@ def gate_call_chain(d, strict_risk_gate=False):
             fail('.runtime/coverage/coverage.json 无效，无法判断分析完整性')
     critical_incomplete = list(coverage.get('critical_incomplete') or [])
     components = {item.get('id'): item for item in coverage.get('components') or []}
-    critical_insufficient = [
-        component_id for component_id in critical_incomplete
-        if (components.get(component_id) or {}).get('status') == 'insufficient'
-    ]
-    if critical_insufficient and coverage.get('enforcement') == 'required':
+    if critical_incomplete and coverage.get('enforcement') == 'required':
         # Standard mode may continue to produce a diagnostic report, but the
         # report must not turn this into a safe/zero-impact conclusion. Strict
         # mode below remains a hard gate.
         print(
-            f"\n⚠️ 关键覆盖维度证据不足，标准模式仅允许生成受限结论：{critical_insufficient}",
+            f"\n⚠️ 关键覆盖维度未完整，标准模式仅允许生成受限结论：{critical_incomplete}",
             file=sys.stderr,
         )
         summary['safe_conclusion_allowed'] = False
@@ -326,8 +325,9 @@ def gate_call_chain(d, strict_risk_gate=False):
             print(f"  - {item.get('api','')[:60]}: {item.get('reason','')[:60]}", file=sys.stderr)
     if needs_input > 0:
         print(
-            f"\n⚠️  Step5 仍有 {needs_input} 个风险点需要补充输入，"
-            "应优先在 checkpoint 中补充依赖源码目录，或选择重跑当前步骤。",
+            f"\n⚠️  Step5 仍有 {needs_input} 个风险点缺少依赖源码证据；"
+            "系统已使用最终制品字节码继续并限制相关结论。"
+            "如需提高覆盖率，可在报告生成后补充源码并重跑 Step5。",
             file=sys.stderr,
         )
     if strict_risk_gate and (uncertain > 0 or not_analyzed > 0 or not_found > 0):
@@ -352,7 +352,8 @@ def main():
     ap.add_argument('--strict-risk-gate', action='store_true')
     args = ap.parse_args()
     gates = {'step1_scope': gate_step1_scope, 'context': gate_context, 'scan': gate_scan,
-             'jar_compare': gate_jar_compare, 'call_chain': lambda d: gate_call_chain(d, strict_risk_gate=args.strict_risk_gate)}
+             'jar_compare': lambda d: gate_jar_compare(d, strict_risk_gate=args.strict_risk_gate),
+             'call_chain': lambda d: gate_call_chain(d, strict_risk_gate=args.strict_risk_gate)}
     gates[args.step](args.report_dir)
     print(f"\n门控 [{args.step}] 通过，可以进入下一步。", file=sys.stderr)
 

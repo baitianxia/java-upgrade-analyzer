@@ -6,6 +6,8 @@ import hashlib
 from pathlib import Path
 import subprocess
 
+from compat import git_cmd
+
 
 @dataclass(frozen=True)
 class AlignmentRecord:
@@ -29,7 +31,7 @@ class AlignmentRecord:
 
 def _git(project, *args):
     completed = subprocess.run(
-        ["git", "-C", str(project), *args],
+        git_cmd() + ["-C", str(project), *args],
         capture_output=True,
         text=True,
         encoding="utf-8",

@@ -509,12 +509,20 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
                     (_ for _ in ()).throw(AssertionError("cache must be streamed"))
                     if path == cache_path else original_read_text(path, *args, **kwargs)
                 )
-                second = collect_business_bytecode_batch([], catalog, str(cache_path))
+                with patch.object(
+                    module,
+                    "_business_bytecode_batch",
+                    wraps=module._business_bytecode_batch,
+                ) as build_batch:
+                    second = collect_business_bytecode_batch(
+                        [], catalog, str(cache_path)
+                    )
             finally:
                 module.parse_classfile_calls, Path.read_text = original_parse, original_read_text
 
         self.assertEqual(first.edges, second.edges)
         self.assertTrue(dict(second.metrics)["cache_hit"])
+        self.assertNotIsInstance(build_batch.call_args.args[0], list)
 
     def test_collect_business_bytecode_batch_rejects_tampered_v3_cache_and_rescans(self):
         import business_bytecode_graph as module

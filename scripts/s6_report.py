@@ -2,8 +2,7 @@
 """
 s6_report.py — Step 6：汇总报告
 
-读取所有前序步骤的产出，生成结构化报告。
-只描述问题，不提供修复方案。
+读取所有前序步骤的产出，生成结构化报告和证据支持的复核路径。
 
 用法：
   python s6_report.py \
@@ -30,6 +29,7 @@ from pipeline_constants import (
     EVIDENCE_STATIC_SCAN_DIRNAME,
     PER_DEPENDENCY_DIRNAME,
     PER_DEPENDENCY_SUMMARY_FILE,
+    RUNTIME_CACHE_DIRNAME,
     RUNTIME_COVERAGE_DIRNAME,
     RUNTIME_DIRNAME,
 )
@@ -76,6 +76,10 @@ def _call_chain_dir(report_dir):
 
 def _coverage_path(report_dir):
     return _runtime_dir(report_dir, RUNTIME_COVERAGE_DIRNAME) / "coverage.json"
+
+
+def _step5_selection_path(report_dir):
+    return _runtime_dir(report_dir, RUNTIME_CACHE_DIRNAME) / "step5_selection.json"
 
 
 def _step5_summary_coverage_fallback(call_summary):
@@ -730,6 +734,95 @@ def write_s6_detail_artifacts(report_dir, findings):
     return artifacts
 
 
+def write_analysis_scope_artifact(report_dir, findings):
+    """Materialize the exact Step5 scope as a stable, human-readable boundary.
+
+    The runtime snapshot remains the machine source of truth. This page exposes
+    the same facts without inferring a full analysis when the snapshot is absent.
+    """
+    scope = dict((findings or {}).get("analysis_scope") or {})
+    mode = str(scope.get("mode") or "").strip()
+    included = sorted({str(item).strip() for item in scope.get("included_dependency_coords") or [] if str(item).strip()})
+    excluded = sorted({str(item).strip() for item in scope.get("excluded_dependency_coords") or [] if str(item).strip()})
+    selected_names = sorted({str(item).strip() for item in scope.get("selected_names") or [] if str(item).strip()})
+    available_count = int(scope.get("available_dependency_count") or 0)
+    included_count = int(scope.get("included_dependency_count") or len(included))
+    total_api_count = int(scope.get("total_api_count") or 0)
+    analyzed_api_count = int(scope.get("analyzed_api_count") or 0)
+
+    if mode == "full":
+        mode_label = "全量分析"
+        boundary = (
+            "本轮覆盖依赖 API 变化分析识别出的全部变化依赖及其变化 API；"
+            "这里的“全量”不等于覆盖所有未变化依赖，也不包含 JAR 中未被 API 比对识别的资源、SPI 配置或清单变化。"
+        )
+    elif mode == "partial":
+        mode_label = "部分分析"
+        boundary = (
+            "本轮只对用户选中的变化依赖执行系统触达分析。未选依赖不在本报告结论范围内，"
+            "不得据此得出整个系统不受影响的结论。"
+        )
+    else:
+        mode_label = "范围未记录"
+        boundary = (
+            "缺少可核验的分析范围快照，无法证明本轮覆盖了全部变化依赖；"
+            "最终报告不得按全量分析或全局无影响结论解释。"
+        )
+
+    lines = [
+        "# 本轮分析范围",
+        "",
+        "> 这份文件回答“最终结论具体覆盖了哪些变化依赖和 API”。",
+        "",
+        "## 范围结论",
+        "",
+        f"- **模式**：{mode_label}",
+        f"- **已纳入变化依赖**：{included_count}/{available_count}",
+        f"- **已纳入变化 API**：{analyzed_api_count}/{total_api_count}",
+        f"- **结论边界**：{boundary}",
+        "",
+    ]
+    if included:
+        lines.extend(["## 已纳入的依赖", ""])
+        lines.extend(f"- `{coord}`" for coord in included)
+        lines.append("")
+    if excluded:
+        lines.extend(["## 未纳入的依赖", ""])
+        lines.extend(f"- `{coord}`" for coord in excluded)
+        lines.append("")
+    if selected_names:
+        lines.extend([
+            "## 用户输入中使用的名称",
+            "",
+            *[f"- `{name}`" for name in selected_names],
+            "",
+        ])
+    evidence_links = [
+        (
+            "变化依赖摘要",
+            "changed_dependencies.md",
+            "evidence/api_changes/changed_dependencies.md",
+        ),
+        ("变化 API 全集", "all_changed_apis.csv", "evidence/api_changes/all_changed_apis.csv"),
+        ("逐 API 系统触达台账", "alerts.csv", "evidence/call_chain/alerts.csv"),
+    ]
+    lines.extend(["## 可核验证据", ""])
+    for label, file_name, relative_path in evidence_links:
+        if (Path(report_dir) / relative_path).is_file():
+            lines.append(f"- {label}：[{file_name}](../{relative_path})")
+        else:
+            lines.append(f"- {label}：本轮未生成，不作为结论依据。")
+    lines.extend([
+        "- 可复现范围快照由程序保存在 `.runtime/cache/step5_selection.json`，普通复核无需打开。",
+        "",
+    ])
+
+    output_path = _deliverables_dir(report_dir) / "analysis-scope.md"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_text(str(output_path), "\n".join(lines))
+    return relpath_for_report(output_path, report_dir)
+
+
 def available_s6_detail_artifacts(findings):
     """Return only bucket detail files produced by the current Step6 run."""
     artifacts = (findings or {}).get("artifacts") or {}
@@ -741,7 +834,8 @@ def available_s6_detail_artifacts(findings):
             continue
         rows.append({
             "bucket": bucket_name,
-            "path": f"deliverables/{config['csv'][:-4]}.csv/md",
+            "csv_path": str(artifacts.get(csv_key) or ""),
+            "md_path": str(artifacts.get(md_key) or ""),
             "title": config.get("title") or bucket_name,
         })
     return rows
@@ -818,15 +912,42 @@ def load_per_dependency_summaries(report_dir):
     return results
 
 
-def build_api_identity_key(payload):
+def _canonical_identity_coord(value):
+    """Remove report-only version decorations from a dependency coordinate."""
+    text = str(value or '').strip()
+    return re.sub(
+        r"\s*[（(][^（）()]*?(?:→|->)[^（）()]*?[）)]\s*$",
+        "",
+        text,
+    ).strip()
+
+
+def _canonical_identity_api(value, signature):
+    """Keep the signature in its own identity field when a display label repeats it."""
+    api = str(value or '').strip()
+    normalized_signature = str(signature or '').strip()
+    if normalized_signature and api.endswith(normalized_signature):
+        api = api[:-len(normalized_signature)].rstrip()
+    return api
+
+
+def _canonical_report_identity(payload):
     payload = payload or {}
+    signature = str(payload.get('api_signature', '') or '').strip()
     return (
-        str(payload.get('coord', '') or '').strip(),
-        str(payload.get('api_name') or payload.get('api') or '').strip(),
-        str(payload.get('api_signature', '') or '').strip(),
+        _canonical_identity_coord(payload.get('coord', '')),
+        _canonical_identity_api(
+            payload.get('api_name') or payload.get('api') or '',
+            signature,
+        ),
+        signature,
         str(payload.get('symbol_kind', '') or '').strip(),
         str(payload.get('change_type', '') or '').strip(),
     )
+
+
+def build_api_identity_key(payload):
+    return _canonical_report_identity(payload)
 
 
 def _short_path(value, parts=4):
@@ -1084,12 +1205,16 @@ def collect_findings(d):
             'business_entries': [],
         },
         'coverage': {},
+        'analysis_scope': {},
         'diagnostics': [],
     }
     diagnostics = findings['diagnostics']
 
     findings['coverage'] = load_json(
         _coverage_path(d), diagnostics=diagnostics, artifact='coverage'
+    )
+    findings['analysis_scope'] = load_json(
+        _step5_selection_path(d), diagnostics=diagnostics, artifact='step5_selection'
     )
 
     # Step 2 上下文
@@ -1537,6 +1662,28 @@ def _join_inline(values, limit=3, empty="-"):
     return text
 
 
+def _report_link(path, label=None):
+    """Build a link relative to deliverables/report.md."""
+    normalized = str(path or '').strip().replace('\\', '/')
+    if not normalized:
+        return '-'
+    if Path(normalized).is_absolute():
+        href = normalized
+    else:
+        href = normalized[len('deliverables/'):] if normalized.startswith('deliverables/') else f'../{normalized}'
+    return f"[{label or normalized}]({href})"
+
+
+def _join_report_links(values, limit=3, empty='-'):
+    cleaned = [str(value or '').strip() for value in values or [] if str(value or '').strip()]
+    if not cleaned:
+        return empty
+    text = '<br>'.join(_report_link(value) for value in cleaned[:limit])
+    if len(cleaned) > limit:
+        text += f'<br>…另 {len(cleaned) - limit} 项'
+    return text
+
+
 def render_report_toc():
     return [
         "## 报告目录",
@@ -1545,10 +1692,11 @@ def render_report_toc():
         "",
         "1. [核心结论](#一核心结论)",
         "2. [结论限制](#二结论限制)",
-        "3. [分析结果总表](#三分析结果总表)",
-        "4. [附录](#四附录)",
+        "3. [下一步复核顺序](#三下一步复核顺序)",
+        "4. [分析结果总表](#四分析结果总表)",
+        "5. [附录](#五附录)",
         "",
-        "> 关键证据在主表中展示；完整逐链路台账以 `evidence/call_chain/alerts.csv` 为准。",
+        "> 关键证据在主表中展示；完整结果见[逐链路证据台账](../evidence/call_chain/alerts.csv)。",
         "",
     ]
 
@@ -1625,6 +1773,7 @@ def _coverage_item_label(component_id):
         'dependency_diff': '依赖变更识别',
         'build_provenance': '构建产物来源',
         'binary_api_diff': '二进制 API 对比',
+        'behavior_diff': '依赖行为变化识别',
         'artifact_bytecode_dependencies': '制品内依赖字节码',
         'source_artifact_alignment': '源码与制品一致性',
         'indirect_usage_matrix': '动态调用可能漏报',
@@ -1647,6 +1796,11 @@ def _coverage_impact_text(component_id, reason_codes):
         'base_or_current_build_not_succeeded': '升级前或升级后构建产物不完整。',
         'step4_coverage_missing': '缺少 API 对比覆盖记录。',
         'dependency_source_diff_not_available': '缺少依赖源码 diff，行为变化可能不完整。',
+        'dependency_source_or_git_ref_coverage_incomplete': '依赖行为变化识别未覆盖全部升级依赖。',
+        'DEPENDENCY_SOURCE_REF_UNAVAILABLE': '依赖源码版本无法可靠固定。',
+        'DEPENDENCY_SOURCE_DIFF_UNAVAILABLE': '依赖源码差异分析未能完成。',
+        'FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE': '最终 JAR 方法字节码兜底未能完成。',
+        'JAPICMP_TIMEOUT': 'JApiCmp 二进制 API 对比超时。',
         'compiled_business_classes_not_available': '缺少业务编译产物，字节码调用补充分析不完整。',
         'step5_not_analyzed_targets': '部分变更 API 没有完成调用链分析。',
         'step5_target_count_mismatch': 'Step5 目标 API 数和结果数不一致。',
@@ -1663,6 +1817,7 @@ def _coverage_impact_text(component_id, reason_codes):
         'dependency_diff': '依赖变更识别不完整，报告可能漏掉部分依赖变化。',
         'build_provenance': '构建产物来源不完整，结果可复现性不足。',
         'binary_api_diff': 'API 对比不完整，报告可能漏掉部分破坏性 API 变化。',
+        'behavior_diff': '依赖行为变化识别不完整，可能漏掉签名不变的方法实现变化。',
         'artifact_bytecode_dependencies': '制品内依赖分析不完整，运行时依赖链路可能不完整。',
         'source_artifact_alignment': '源码与实际制品不一致，调用链需要复核。',
         'indirect_usage_matrix': '动态调用可能漏报。',
@@ -1715,17 +1870,27 @@ def render_core_conclusion(findings):
     ]
     not_found = findings.get('not_found') or []
     not_impacted = findings.get('not_impacted') or []
+    coverage_incomplete = str(coverage.get('overall_status') or '') not in {
+        'complete', 'not_applicable'
+    }
+    analysis_scope = findings.get('analysis_scope') or {}
+    scope_mode = str(analysis_scope.get('mode') or '')
+    partial_scope = scope_mode == 'partial'
     confirmed_count = len(p0) + len(p1) + len(p2)
     if confirmed_count:
-        verdict = f"发现 {confirmed_count} 个已确认/高风险影响项。"
+        verdict = f"发现 {confirmed_count} 个已确认影响项。"
     elif probable or uncertain or needs_input or not_analyzed:
         verdict = "本次报告未确认任何已影响当前系统的变更 API。仍有条目需要复核或补齐依赖源码/构建产物。"
+    elif coverage_incomplete:
+        verdict = "分析覆盖仍不完整，当前结果不得解释为系统不受影响。"
     elif not_impacted and not (probable or uncertain or needs_input or not_analyzed or not_found):
-        verdict = f"Step4 识别的 {len(not_impacted)} 个变更 API 均已确认仍由当前制品以相同字节码提供。"
+        verdict = f"依赖 API 变化分析识别的 {len(not_impacted)} 个变更 API 均已确认仍由当前制品以相同字节码提供。"
     elif not_found:
         verdict = "未发现业务调用路径。"
     else:
         verdict = "当前报告范围内未发现影响项。"
+    if partial_scope:
+        verdict = "本次仅分析用户选择的部分依赖。" + verdict
     lines = [
         "## 一、核心结论",
         "",
@@ -1734,27 +1899,38 @@ def render_core_conclusion(findings):
         "| 项目 | 结果 |",
         "|---|---|",
         f"| 调用链分析状态 | {_call_chain_status_label(stat.get('call_chain_status'))} |",
-        f"| 已确认/高风险影响项 | {confirmed_count} |",
+        (
+            f"| 分析范围 | 部分依赖（{int(analysis_scope.get('included_dependency_count') or 0)}/"
+            f"{int(analysis_scope.get('available_dependency_count') or 0)}） |"
+            if partial_scope
+            else (
+                "| 分析范围 | 全部变化依赖 |"
+                if scope_mode == 'full'
+                else "| 分析范围 | 未记录（不得按全量结论解释） |"
+            )
+        ),
+        f"| 已确认影响项 | {confirmed_count} |",
+        f"| 其中高风险（P0/P1） | {len(p0) + len(p1)} |",
         f"| 已确认不受影响 | {len(not_impacted)} |",
         f"| 可能影响 | {len(probable)} |",
         f"| 需人工复核 | {len(uncertain)} |",
         f"| 缺少依赖源码/构建产物 | {len(needs_input)} |",
         f"| 本次未完成分析 | {len(not_analyzed)} |",
         f"| 未发现调用路径 | {len(not_found)} |",
-        f"| 分析完整度 | {'API 范围内完整' if not_impacted and len(not_impacted) == int(stat.get('call_chain_total') or len(not_impacted)) else _coverage_status_label(coverage.get('overall_status'))} |",
+        f"| 分析完整度 | {'API 范围内完整' if (not coverage_incomplete and not_impacted and len(not_impacted) == int(stat.get('call_chain_total') or len(not_impacted))) else _coverage_status_label(coverage.get('overall_status'))} |",
         "",
     ]
+    scope_artifact = ((findings.get('artifacts') or {}).get('analysis_scope_md') or '').strip()
+    if scope_artifact:
+        lines.extend([
+            "> 完整范围清单：[查看本轮分析范围](analysis-scope.md)。",
+            "",
+        ])
     return lines
 
 
 def _identity_without_severity(item):
-    return (
-        str(item.get('coord', '') or '').strip(),
-        str(item.get('api', '') or item.get('api_name', '') or '').strip(),
-        str(item.get('api_signature', '') or '').strip(),
-        str(item.get('symbol_kind', '') or '').strip(),
-        str(item.get('change_type', '') or '').strip(),
-    )
+    return _canonical_report_identity(item)
 
 
 def _change_cell(item, severity=''):
@@ -1763,7 +1939,7 @@ def _change_cell(item, severity=''):
 
 def _conclusion_for_report(item, fallback):
     conclusion = str(item.get('user_conclusion') or '').strip()
-    if fallback == '已确认/高风险影响' and conclusion == '已确认影响':
+    if fallback == '已确认影响' and conclusion == '已确认影响':
         return conclusion
     if conclusion and fallback and fallback != conclusion:
         return _display_label(f"{fallback}；{conclusion}")
@@ -1943,7 +2119,7 @@ def _render_path_sample_cards(rows):
             cards += [
                 "",
                 (
-                    "完整证据：打开 `evidence/call_chain/alerts.csv`，"
+                    "完整证据：打开[逐链路证据台账](../evidence/call_chain/alerts.csv)，"
                     f"筛选 `api_id = {_md_cell(api_id, 160)}`。"
                 ),
             ]
@@ -1982,9 +2158,9 @@ def _render_path_sample_cards(rows):
         title = '调用链证据'
         intro = '下面按 API 展示主表中的调用链证据。'
     return [
-        f"### 3.1 {title}",
+        f"### 4.1 {title}",
         "",
-        f"{intro}完整证据台账以 `evidence/call_chain/alerts.csv` 为准。",
+        f"{intro}完整结果见[逐链路证据台账](../evidence/call_chain/alerts.csv)。",
         "",
     ] + cards
 
@@ -2022,9 +2198,9 @@ def build_api_result_rows(findings):
         for item in ((findings.get('impact_overview') or {}).get('apis') or [])
     }
     source_buckets = [
-        ('已确认/高风险影响', 'P0', findings.get('p0') or []),
-        ('已确认/高风险影响', 'P1', findings.get('p1') or []),
-        ('已确认/高风险影响', 'P2', findings.get('p2') or []),
+        ('已确认影响', 'P0', findings.get('p0') or []),
+        ('已确认影响', 'P1', findings.get('p1') or []),
+        ('已确认影响', 'P2', findings.get('p2') or []),
         ('可能影响', '', findings.get('probable_impact') or []),
         ('需人工复核', '', findings.get('uncertain') or []),
         ('已确认不受影响', '', findings.get('not_impacted') or []),
@@ -2043,7 +2219,7 @@ def build_api_result_rows(findings):
     seen = set()
     for fallback_conclusion, severity, items in source_buckets:
         desired_statuses = {
-            '已确认/高风险影响': ('reachable',),
+            '已确认影响': ('reachable',),
             '可能影响': ('not_analyzed',),
             '需人工复核': ('uncertain',),
             '已确认不受影响': ('not_impacted',),
@@ -2063,7 +2239,7 @@ def build_api_result_rows(findings):
             additional_review_path_count = sum(
                 int(counts_by_status.get(status) or 0)
                 for status in ('uncertain', 'not_analyzed')
-            ) if fallback_conclusion == '已确认/高风险影响' else 0
+            ) if fallback_conclusion == '已确认影响' else 0
             uncertain_path_count = int(counts_by_status.get('uncertain') or 0)
             not_analyzed_path_count = int(counts_by_status.get('not_analyzed') or 0)
             paths_by_status = overview.get('paths_by_status') or {}
@@ -2082,7 +2258,7 @@ def build_api_result_rows(findings):
                 'path_count': _path_count_for_report(
                     item, overview_lookup, sampled_paths, desired_statuses
                 ),
-                'confirmed_path_count': confirmed_path_count if fallback_conclusion == '已确认/高风险影响' else 0,
+                'confirmed_path_count': confirmed_path_count if fallback_conclusion == '已确认影响' else 0,
                 'additional_review_path_count': additional_review_path_count,
                 'uncertain_path_count': uncertain_path_count,
                 'not_analyzed_path_count': not_analyzed_path_count,
@@ -2094,7 +2270,7 @@ def build_api_result_rows(findings):
 def render_api_result_table(findings):
     rows = build_api_result_rows(findings)
     lines = [
-        "## 三、分析结果总表",
+        "## 四、分析结果总表",
         "",
     ]
     if not rows:
@@ -2115,14 +2291,16 @@ def render_api_result_table(findings):
     omitted_count = len(rows) - len(displayed)
     lines += [
         f"> 本表共有 {len(rows)} 条 API 分析结果，当前展示 {len(displayed)} 条，省略 {omitted_count} 条；"
-        "完整逐链路台账见 `evidence/call_chain/alerts.csv`。",
+        "完整结果见[逐链路证据台账](../evidence/call_chain/alerts.csv)。",
     ]
     detail_rows = available_s6_detail_artifacts(findings)
     if detail_rows:
-        detail_paths = "、".join(f"`{row['path']}`" for row in detail_rows)
-        lines.append(f"> 本轮已生成的分类明细：{detail_paths}。")
+        detail_links = "、".join(
+            _report_link(row['md_path'], row['title']) for row in detail_rows
+        )
+        lines.append(f"> 本轮已生成的分类明细：{detail_links}。")
     lines += [
-        "> 排序：已确认/高风险、可能影响、需人工复核、已确认不受影响、缺少依赖源码/构建产物、本次未完成分析、未发现调用路径。",
+        "> 排序：先按结论状态，再在已确认影响中按严重级别 P0、P1、P2 排序；严重级别不等于结论确定性。",
         "",
         "| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |",
         "|---|---|---|---|---|",
@@ -2148,13 +2326,42 @@ def render_api_result_table(findings):
 def render_limitations_section(findings):
     coverage = findings.get('coverage') or {}
     gap_rows = _coverage_gap_rows(coverage)
+    analysis_scope = findings.get('analysis_scope') or {}
+    scope_mode = str(analysis_scope.get('mode') or '')
+    if scope_mode == 'partial':
+        excluded = list(analysis_scope.get('excluded_dependency_coords') or [])
+        excluded_preview = '、'.join(excluded[:5])
+        if len(excluded) > 5:
+            excluded_preview += f" 等 {len(excluded)} 个依赖"
+        gap_rows.insert(0, {
+            'label': '用户选择了部分分析范围',
+            'status': 'scope_boundary',
+            'impact': (
+                '本报告结论只适用于所选依赖；未选择的变化依赖未执行系统触达分析，'
+                '不得据此得出全局无影响结论。'
+                + (f" 未分析：{excluded_preview}。" if excluded_preview else '')
+            ),
+            'evidence': [
+                '.runtime/cache/step5_selection.json',
+                'evidence/api_changes/changed_dependencies.md',
+            ],
+        })
+    elif scope_mode != 'full':
+        gap_rows.insert(0, {
+            'label': '分析范围快照缺失',
+            'status': 'scope_unknown',
+            'impact': (
+                '无法证明本轮覆盖了全部变化依赖；报告不得按全量分析或全局无影响结论解释。'
+            ),
+            'evidence': ['.runtime/cache/step5_selection.json'],
+        })
     not_impacted = findings.get('not_impacted') or []
     if not_impacted:
         gap_rows.append({
             'label': '已确认不受影响的范围',
             'status': 'scope_boundary',
             'impact': (
-                '该结论只表示 Step4 识别的 API 仍由当前制品以相同类字节码提供；'
+                '该结论只表示依赖 API 变化分析识别的 API 仍由当前制品以相同类字节码提供；'
                 '不包含被删除 JAR 中的 SPI 配置、资源文件、清单等非 API 内容。'
             ),
             'evidence': ['evidence/call_chain/alerts.csv'],
@@ -2168,7 +2375,7 @@ def render_limitations_section(findings):
             "|---|---|---|",
         ]
         for row in gap_rows:
-            evidence = _join_inline(row.get('evidence'), limit=3) or "-"
+            evidence = _join_report_links(row.get('evidence'), limit=3) or "-"
             lines.append(
                 f"| {_md_cell(row.get('label'), 120)} | {_md_cell(row.get('impact'), 260)} | {evidence} |"
             )
@@ -2178,9 +2385,69 @@ def render_limitations_section(findings):
     return lines
 
 
+def render_next_review_steps(findings):
+    coverage = findings.get('coverage') or {}
+    scope = findings.get('analysis_scope') or {}
+    confirmed_count = sum(len(findings.get(key) or []) for key in ('p0', 'p1', 'p2'))
+    probable_count = len(findings.get('probable_impact') or [])
+    uncertain_count = len(findings.get('uncertain') or [])
+    needs_input_count = len(findings.get('needs_input') or [])
+    not_analyzed_count = len(findings.get('not_analyzed') or [])
+    rows = []
+
+    if str(scope.get('mode') or '') != 'full' or (coverage.get('critical_incomplete') or []):
+        rows.append((
+            '1',
+            '先处理结论边界',
+            '打开[结论限制](#二结论限制)，确认部分范围或关键证据缺口是否允许本轮结果用于当前决策。',
+            '每个限制项均已补齐，或已明确记录可接受的适用边界。',
+        ))
+    if confirmed_count:
+        rows.append((
+            str(len(rows) + 1),
+            f'复核 {confirmed_count} 个已确认影响项',
+            '从[分析结果总表](#四分析结果总表)按 P0、P1、P2 读取业务入口、变更 API 和调用链证据，并执行对应编译与业务回归。',
+            '每项均有处理结论，相关构建和业务测试结果已记录。',
+        ))
+    if probable_count or uncertain_count:
+        rows.append((
+            str(len(rows) + 1),
+            '收敛可能影响和需人工复核项',
+            f'逐项核对 {probable_count} 个可能影响和 {uncertain_count} 个需人工复核项的运行时配置、动态调用或业务入口。',
+            '条目已转为已确认影响、已确认不受影响，或保留了明确的未确认原因。',
+        ))
+    if needs_input_count or not_analyzed_count:
+        rows.append((
+            str(len(rows) + 1),
+            '补齐未完成证据',
+            f'按原因补充 {needs_input_count} 个缺少输入项所需的源码、制品或映射，并重跑 {not_analyzed_count} 个本次未完成项。',
+            '对应条目不再处于“缺少输入”或“本次未完成分析”。',
+        ))
+    if not rows:
+        rows.append((
+            '1',
+            '保存本轮分析基线',
+            '保留最终报告、分析范围和构建来源，用于发布复核及后续升级结果对比。',
+            '报告范围、制品身份和关键结论均可追溯。',
+        ))
+
+    lines = [
+        '## 三、下一步复核顺序',
+        '',
+        '以下动作由本轮证据和结论边界生成；它们用于收敛风险，不替使用者决定具体代码修改或发布。',
+        '',
+        '| 顺序 | 任务 | 操作 | 完成标准 |',
+        '|---:|---|---|---|',
+    ]
+    for order, task, action, done in rows:
+        lines.append(f'| {order} | {task} | {action} | {done} |')
+    lines.append('')
+    return lines
+
+
 def render_report_appendix(findings):
     lines = [
-        "## 四、附录", "",
+        "## 五、附录", "",
     ]
     lines += [
         "### 运行产物阅读分层", "",
@@ -2188,16 +2455,17 @@ def render_report_appendix(findings):
         "| 文件 | 承载的信息 |",
         "|---|---|",
         "| `deliverables/report.md` | 最终报告；优先阅读这一份 |",
+        "| `deliverables/analysis-scope.md` | 本轮实际纳入和排除的变化依赖、API 数量及结论边界 |",
     ]
     for row in available_s6_detail_artifacts(findings):
-        lines.append(f"| `{row['path']}` | {row['title']} |")
+        lines.append(f"| {_report_link(row['md_path'], row['title'])} | {row['title']} |")
     lines += [
         "",
         "#### 用户深入排查时看的产物", "",
         "| 文件 | 承载的信息 |",
         "|---|---|",
         "| `evidence/dependencies/dep_changes.csv` | 依赖包变更列表 |",
-        "| `evidence/api_changes/changed_dependencies.md` | 依赖包维度的 Step4 变化摘要；用于选择 Step5 分析范围 |",
+        "| `evidence/api_changes/changed_dependencies.md` | 依赖包维度的变化摘要；用于选择系统触达分析范围 |",
         "| `evidence/api_changes/changed_dependencies.csv` | 依赖包维度的结构化清单；供筛选和自动化使用 |",
         "| `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化全集 |",
         f"| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 {S6_CHANGED_API_SPLIT_ROWS} 条一份） |",
@@ -2212,8 +2480,9 @@ def render_report_appendix(findings):
         "| `.runtime/state/main_state.json` | 流程状态；用于恢复、重跑和 checkpoint 判断 |",
         "| `.runtime/state/interaction.json` | 当前等待用户确认的问题和选项 |",
         "| `.runtime/coverage/coverage.json` / `.runtime/coverage/s*_coverage.json` | 各步骤覆盖情况；用于判断结论限制 |",
+        "| `.runtime/observability/progress.jsonl` | 全流程结构化进度事件；供中断排障和运行审计 |",
         "| `.runtime/observability/step*_timing.csv` / `step1_progress.jsonl` | 运行进度与分阶段耗时；供 Agent 监控和性能排查 |",
-        "| `.runtime/findings/s6_findings.json` | Step6 结构化结果；供程序读取，不作为人工优先阅读文件 |",
+        "| `.runtime/findings/s6_findings.json` | 最终结构化结果；供程序读取，不作为人工优先阅读文件 |",
         "| `.runtime/indexes/s5_query_index.json` | 调用链查询索引；供只读查询命令使用 |",
         "",
     ]
@@ -2224,9 +2493,11 @@ def build_report_sections_for_test_only():
     return [
         "核心结论",
         "结论限制",
+        "下一步复核顺序",
         "分析结果总表",
         "附录",
-        "本报告只呈现分析结果、证据和结论限制，不替使用者决定修改、验证或发布动作。",
+        "本报告呈现分析结果、证据、结论限制和复核顺序，不替使用者决定具体代码修改或发布动作。",
+        *render_next_review_steps({}),
         *render_report_appendix({}),
     ]
 
@@ -2238,7 +2509,7 @@ def generate_report(findings):
         "# Java 升级兼容性分析报告", "",
         f"> 生成时间：{findings['generated_at']}  ",
         f"> JDK：{ctx.get('jdk','')} | Spring Boot：{ctx.get('springboot','')}  ",
-        "> **本报告只描述问题，不提供修复方案**",
+        "> **本报告提供证据支持的复核顺序，但不替使用者决定具体代码修改或发布动作。**",
         "", "---", "",
     ]
 
@@ -2247,6 +2518,8 @@ def generate_report(findings):
     L += render_core_conclusion(findings)
     L += ["---", ""]
     L += render_limitations_section(findings)
+    L += ["---", ""]
+    L += render_next_review_steps(findings)
     L += ["---", ""]
     L += render_api_result_table(findings)
     L += ["---", ""]
@@ -2294,10 +2567,13 @@ def main():
     ap.add_argument('--output-report',   required=True)
     args = ap.parse_args()
 
-    print("\nStep 6：生成报告...", file=sys.stderr)
+    print("\n正在生成最终分析报告…", file=sys.stderr)
     findings = collect_findings(args.report_dir)
     findings.setdefault('artifacts', {})
     findings['artifacts'].update(write_s6_detail_artifacts(args.report_dir, findings))
+    findings['artifacts']['analysis_scope_md'] = write_analysis_scope_artifact(
+        args.report_dir, findings
+    )
 
     Path(args.output_findings).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output_findings, 'w', encoding='utf-8', newline='\n') as f:
@@ -2305,13 +2581,21 @@ def main():
 
     write_text(args.output_report, generate_report(findings))
 
-    p0, p1, p2, unk, na, nf = (len(findings[k]) for k in ('p0', 'p1', 'p2', 'uncertain', 'not_analyzed', 'not_found'))
-    print(f"  P0={p0} P1={p1} P2={p2} ❓={unk} ⊘={na} ✗={nf}", file=sys.stderr)
-    print(f"  findings → {args.output_findings}", file=sys.stderr)
-    print(f"  report   → {args.output_report}",   file=sys.stderr)
-    for key in sorted(findings.get('artifacts', {})):
-        if key.endswith('_csv'):
-            print(f"  {key} → {Path(args.report_dir) / findings['artifacts'][key]}", file=sys.stderr)
+    p0, p1, p2, unk, na, nf = (
+        len(findings[k])
+        for k in ('p0', 'p1', 'p2', 'uncertain', 'not_analyzed', 'not_found')
+    )
+    print("最终分析报告已生成。", file=sys.stderr)
+    print(
+        f"结果：已确认影响 {p0 + p1 + p2}（其中高风险 {p0 + p1}），"
+        f"需人工复核 {unk}，本次未完成 {na}，未发现静态路径 {nf}。",
+        file=sys.stderr,
+    )
+    print(f"最终报告：{args.output_report}", file=sys.stderr)
+    print(
+        f"本轮分析范围：{_deliverables_dir(args.report_dir) / 'analysis-scope.md'}",
+        file=sys.stderr,
+    )
 
 
 if __name__ == '__main__':

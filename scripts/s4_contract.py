@@ -87,7 +87,14 @@ DEFAULT_SEVERITY = {
 }
 
 # source 枚举
-SOURCES = ["japicmp", "gitdiff", "changelog", "old_jar", "classfile_contract"]
+SOURCES = [
+    "japicmp",
+    "gitdiff",
+    "jar_bytecode",
+    "changelog",
+    "old_jar",
+    "classfile_contract",
+]
 
 SYMBOL_KINDS = {"method", "field", "class", "constructor"}
 

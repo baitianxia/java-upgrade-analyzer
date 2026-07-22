@@ -20,6 +20,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import s4_jar_compare as step4  # noqa: E402
+import run_step as orchestrator  # noqa: E402
 from csv_io import open_csv_read, open_csv_write  # noqa: E402
 
 
@@ -496,7 +498,132 @@ def scenario_jar_primary_source_auxiliary(workspace: Path) -> ScenarioResult:
     )
 
 
+def _missing_local_markdown_links(markdown_path: Path) -> list[str]:
+    missing = []
+    text = markdown_path.read_text(encoding="utf-8", errors="replace")
+    for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
+        target = target.strip().split("#", 1)[0]
+        if not target or target.startswith(("http://", "https://", "mailto:")):
+            continue
+        if not (markdown_path.parent / target).resolve().exists():
+            missing.append(target)
+    return sorted(set(missing))
+
+
+def scenario_delivery_output_journey(workspace: Path) -> ScenarioResult:
+    """Exercise Step5 -> final delivery and verify every human reading entry."""
+    started = time.perf_counter()
+    failures: list[str] = []
+    paths = _prepare_transitive_deleted_dependency_workspace(workspace / "delivery")
+    report_dir = paths["report_dir"]
+    step5_proc = _run_step5(paths)
+    if step5_proc.returncode != 0:
+        failures.append(f"step5_returncode={step5_proc.returncode}")
+
+    selection_path = report_dir / ".runtime" / "cache" / "step5_selection.json"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text(
+        json.dumps(
+            {
+                "mode": "full",
+                "available_dependency_count": 1,
+                "included_dependency_count": 1,
+                "included_dependency_coords": ["com.vendor:legacy-lib"],
+                "excluded_dependency_coords": [],
+                "analyzed_api_count": 1,
+                "total_api_count": 1,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report_path = report_dir / "deliverables" / "report.md"
+    findings_path = report_dir / ".runtime" / "findings" / "s6_findings.json"
+    step6_proc = _run(
+        [
+            sys.executable,
+            str(ROOT_DIR / "scripts" / "s6_report.py"),
+            "--report-dir",
+            str(report_dir),
+            "--output-findings",
+            str(findings_path),
+            "--output-report",
+            str(report_path),
+        ]
+    )
+    if step6_proc.returncode != 0:
+        failures.append(f"step6_returncode={step6_proc.returncode}")
+
+    state = orchestrator.new_main_state(report_dir)
+    state["state"].update(
+        {
+            "current_step": "done",
+            "completed_step": "step6",
+            "status": "completed",
+            "completion_summary": orchestrator.build_final_completion_summary(report_dir),
+        }
+    )
+    orchestrator.save_main_state(report_dir, state)
+
+    landing_path = report_dir / "README.md"
+    scope_path = report_dir / "deliverables" / "analysis-scope.md"
+    required_files = [report_path, scope_path, landing_path, findings_path]
+    for path in required_files:
+        if not path.is_file() or path.stat().st_size == 0:
+            failures.append(f"missing_or_empty:{path.relative_to(report_dir)}")
+
+    report_text = report_path.read_text(encoding="utf-8", errors="replace") if report_path.exists() else ""
+    landing_text = landing_path.read_text(encoding="utf-8", errors="replace") if landing_path.exists() else ""
+    for expected in (
+        "## 一、核心结论",
+        "## 二、结论限制",
+        "## 三、下一步复核顺序",
+        "## 四、分析结果总表",
+        "严重级别不等于结论确定性",
+        "已确认链路 3 条",
+    ):
+        if expected not in report_text:
+            failures.append(f"report_missing:{expected}")
+    if "已确认影响" in report_text and "发现 3 条依赖引用，尚未回溯到业务入口" in report_text:
+        failures.append("confirmed_impact_uses_unresolved_evidence_summary")
+    for forbidden in (
+        "__business__",
+        "<clinit>",
+        "fallback simple key",
+        "response_schema",
+        "action_requirements",
+    ):
+        if forbidden in report_text or forbidden in landing_text:
+            failures.append(f"internal_marker_visible:{forbidden}")
+    if re.search(r"\b[Ss]tep\d+\b", landing_text):
+        failures.append("landing_exposes_internal_step_id")
+    for path in (report_path, scope_path, landing_path):
+        if path.exists():
+            for target in _missing_local_markdown_links(path):
+                failures.append(
+                    f"broken_link:{path.relative_to(report_dir)}->{target}"
+                )
+
+    return ScenarioResult(
+        name="delivery_output_journey",
+        status="passed" if not failures else "failed",
+        elapsed_seconds=round(time.perf_counter() - started, 3),
+        report_dir=str(report_dir),
+        failures=failures,
+        details={
+            "report": str(report_path),
+            "scope": str(scope_path),
+            "landing": str(landing_path),
+            "step5_stderr_tail": step5_proc.stderr[-1200:],
+            "step6_stderr_tail": step6_proc.stderr[-1200:],
+        },
+    )
+
+
 SCENARIOS = {
+    "delivery_output_journey": scenario_delivery_output_journey,
     "transitive_deleted_dependency": scenario_transitive_deleted_dependency,
     "query_after_step5": scenario_query_after_step5,
     "jar_primary_source_auxiliary": scenario_jar_primary_source_auxiliary,

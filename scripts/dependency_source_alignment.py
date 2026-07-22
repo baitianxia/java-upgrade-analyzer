@@ -12,10 +12,12 @@ import tempfile
 import zipfile
 from pathlib import Path, PureWindowsPath
 
+from compat import git_cmd
+
 
 def _run_git(repo_path, *args):
     completed = subprocess.run(
-        ["git", "-C", str(repo_path), *args],
+        git_cmd() + ["-C", str(repo_path), *args],
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -217,7 +219,7 @@ def materialize_detached_snapshot(report_dir, coord, repo_path, ref, module_rel_
         # record.  Archive the exact commit instead: the source bytes are the
         # same tracked revision and the user's repository is never mutated.
         completed = subprocess.run(
-            ["git", "-C", str(repo_path), "archive", "--format=zip", commit],
+            git_cmd() + ["-C", str(repo_path), "archive", "--format=zip", commit],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,

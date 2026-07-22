@@ -30,9 +30,12 @@ def main(argv=None):
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if platform.python_implementation() != "CPython" or sys.version_info[:2] != (3, 12):
+    if (
+        platform.python_implementation() != "CPython"
+        or sys.version_info[:2] not in {(3, 12), (3, 13), (3, 14)}
+    ):
         parser.error(
-            f"unsupported Python {sys.version.split()[0]}; use CPython 3.12.x"
+            f"unsupported Python {sys.version.split()[0]}; use CPython 3.12.x, 3.13.x, or 3.14.x"
         )
     command = build_command(args.wheel_dir)
     if args.dry_run:

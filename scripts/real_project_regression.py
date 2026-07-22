@@ -42,6 +42,7 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
+from compat import git_cmd
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import (
     build_project_scope,
@@ -1776,7 +1777,7 @@ def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
         errors.append("project_checkout_missing")
     else:
         completed = subprocess.run(
-            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            git_cmd() + ["-C", str(project_root), "rev-parse", "HEAD"],
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -7797,7 +7798,7 @@ def collect_project_asset_health(project_root: Path) -> dict:
         or "/generated-sources/" in path.as_posix()
     ]
     git_result = subprocess.run(
-        ["git", "-C", str(project_root), "rev-parse", "--is-inside-work-tree"],
+        git_cmd() + ["-C", str(project_root), "rev-parse", "--is-inside-work-tree"],
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -7811,7 +7812,7 @@ def collect_project_asset_health(project_root: Path) -> dict:
     extra_git_errors = []
     if valid_git_checkout:
         revision_result = subprocess.run(
-            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            git_cmd() + ["-C", str(project_root), "rev-parse", "HEAD"],
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -7826,7 +7827,7 @@ def collect_project_asset_health(project_root: Path) -> dict:
                 (revision_result.stderr or revision_result.stdout or "git revision unavailable").strip()
             )
         dirty_result = subprocess.run(
-            ["git", "-C", str(project_root), "status", "--porcelain"],
+            git_cmd() + ["-C", str(project_root), "status", "--porcelain"],
             text=True,
             encoding="utf-8",
             errors="replace",

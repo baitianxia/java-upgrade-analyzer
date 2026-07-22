@@ -5,10 +5,12 @@ import os
 import subprocess
 import sys
 
+from compat import git_cmd
+
 
 def _git(*args):
     return subprocess.run(
-        ["git", *args],
+        git_cmd() + list(args),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -37,7 +39,7 @@ def main():
         commands.append(("git", "diff", "--check", f"{base}...HEAD"))
     failed = False
     for command in commands:
-        completed = subprocess.run(command, check=False)
+        completed = subprocess.run(git_cmd() + list(command[1:]), check=False)
         failed = failed or completed.returncode != 0
     return 1 if failed else 0
 

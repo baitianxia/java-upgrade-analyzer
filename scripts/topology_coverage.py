@@ -24,6 +24,7 @@ from final_artifact_edge_oracle import (
 )
 from signature_utils import normalize_signature_for_lookup
 from third_party_jdk_oracle import _source_signature
+from compat import git_cmd
 
 
 STABLE_TOPOLOGY_IDS = frozenset({
@@ -1259,7 +1260,7 @@ def _source_attestation_evidence(
         evidence = json.loads(evidence_bytes.decode("utf-8"))
         revision = str(attestation.get("git_revision") or "")
         tree = subprocess.run(
-            ["git", "-C", str(source_root), "rev-parse", f"{revision}^{{tree}}"],
+            git_cmd() + ["-C", str(source_root), "rev-parse", f"{revision}^{{tree}}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
         )
         source_path = Path(source_root) / str(attestation.get("source_path") or ".")
@@ -1267,11 +1268,11 @@ def _source_attestation_evidence(
         source_path_resolved = source_path.resolve()
         source_path_text = str(attestation.get("source_path") or "")
         tracked = subprocess.run(
-            ["git", "-C", str(source_root), "ls-tree", "-d", revision, "--", source_path_text],
+            git_cmd() + ["-C", str(source_root), "ls-tree", "-d", revision, "--", source_path_text],
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
         )
         git_entries = subprocess.run(
-            ["git", "-C", str(source_root), "ls-tree", "-r", "-z", revision, "--", source_path_text],
+            git_cmd() + ["-C", str(source_root), "ls-tree", "-r", "-z", revision, "--", source_path_text],
             capture_output=True, check=False, timeout=30,
         )
         revision_digest = hashlib.sha256()
@@ -1286,22 +1287,22 @@ def _source_attestation_evidence(
             if not relative_path or relative_path == raw_path.decode("utf-8"):
                 raise ValueError("Git source tree entry escapes declared source path")
             blob = subprocess.run(
-                ["git", "-C", str(source_root), "cat-file", "blob", fields[2].decode("ascii")],
+                git_cmd() + ["-C", str(source_root), "cat-file", "blob", fields[2].decode("ascii")],
                 capture_output=True, check=False, timeout=30,
             )
             if blob.returncode != 0:
                 raise ValueError("Git source tree blob unreadable")
             revision_digest.update(relative_path.encode() + b"\0" + blob.stdout)
         worktree_diff = subprocess.run(
-            ["git", "-C", str(source_root), "diff", "--quiet", revision, "--", source_path_text],
+            git_cmd() + ["-C", str(source_root), "diff", "--quiet", revision, "--", source_path_text],
             capture_output=True, check=False, timeout=30,
         )
         index_diff = subprocess.run(
-            ["git", "-C", str(source_root), "diff", "--cached", "--quiet", revision, "--", source_path_text],
+            git_cmd() + ["-C", str(source_root), "diff", "--cached", "--quiet", revision, "--", source_path_text],
             capture_output=True, check=False, timeout=30,
         )
         status = subprocess.run(
-            ["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=all", "--", source_path_text],
+            git_cmd() + ["-C", str(source_root), "status", "--porcelain", "--untracked-files=all", "--", source_path_text],
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
         )
         live_digest = compute_source_tree_sha256(source_path_resolved)

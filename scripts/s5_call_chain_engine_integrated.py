@@ -104,7 +104,6 @@ from s5_query_call_chain import write_query_index
 from dependency_source_alignment import align_dependency_source_mappings
 from artifact_alignment import build_artifact_alignment
 
-EXIT_AWAITING_USER = 4
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
 EVIDENCE_FAILURE_OCCURRENCE_FIELDS = (
@@ -445,11 +444,6 @@ def _observe_step5_memory(graph_stats, phase, *, graph=None, extra=None):
 # Step 5集成版：完整流程
 # ══════════════════════════════════════════════════════════════════
 
-def emit_step_interaction(interaction):
-    sys.stdout.write(STEP_INTERACTION_PREFIX + json.dumps(interaction, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-
-
 def load_orchestrated_step5_input(report_dir):
     """正式流程下仅从 main_state 读取 Step5 已确认输入，调试 CLI 不参与正式求值。"""
     if os.environ.get("JUA_ORCHESTRATED") != "1":
@@ -474,8 +468,9 @@ def write_missing_dependency_mapping_details(
 ):
     details_path = os.path.join(output_dir, "missing_dependency_source_mappings.json")
     details = {
-        "status": "awaiting_user_input",
+        "status": "degraded",
         "reason_code": "step5_dependency_source_mapping_missing",
+        "resolution": "continue_with_final_artifact_bytecode_and_restricted_conclusion",
         "generated_at": datetime.now().isoformat(),
         "missing_mapping_count": len(missing_mapping_items or []),
         "missing_mapping_coords": list(missing_mapping_coords or []),
@@ -489,123 +484,6 @@ def write_missing_dependency_mapping_details(
     with open(details_path, "w", encoding="utf-8") as f:
         json.dump(details, f, ensure_ascii=False, indent=2)
     return details_path
-
-
-def build_missing_dependency_mapping_interaction(
-    output_dir,
-    details_path,
-    missing_mapping_count,
-    missing_mapping_coords,
-    has_provided_dependency_inputs,
-):
-    files_to_review = [os.path.abspath(details_path)]
-    report_dir = str(Path(output_dir).resolve().parent.parent)
-    for extra_name in (
-        str(_source_mapping_summary_path(report_dir)),
-        str(_all_changed_apis_path(report_dir)),
-    ):
-        if os.path.exists(extra_name):
-            files_to_review.append(os.path.abspath(extra_name))
-    if has_provided_dependency_inputs:
-        question = (
-            "Step5 检测到需要跨依赖边界分析的变更 API，但当前提供的依赖源码目录/仓库"
-            "仍不足以解析出完整源码映射。请先补齐或修正依赖源码目录，"
-            "或者明确允许降级执行后再重跑 Step5；在此之前不要继续 Step6。"
-        )
-        summary = (
-            f"共有 {missing_mapping_count} 个变更 API 需要跨依赖分析，"
-            f"其中 {len(missing_mapping_coords)} 个依赖坐标缺少可用源码映射。"
-        )
-    else:
-        question = (
-            "Step5 检测到需要跨依赖边界分析的变更 API，但当前没有可用的依赖源码映射。"
-            "请先补充依赖源码目录，或者明确允许降级执行后再重跑 Step5；"
-            "在此之前不要继续 Step6。"
-        )
-        summary = (
-            f"共有 {missing_mapping_count} 个变更 API 需要跨依赖分析，"
-            f"涉及 {len(missing_mapping_coords)} 个依赖坐标缺少源码映射。"
-        )
-    return {
-        "schema": "java-upgrade-analyzer.interaction.v2",
-        "checkpoint": True,
-        "hard_stop": True,
-        "status": "awaiting_user_input",
-        "kind": "review",
-        "step_id": "step5",
-        "title": "step5 缺少依赖源码映射",
-        "question": question,
-        "summary": summary,
-        "reason_code": "step5_dependency_source_mapping_missing",
-        "files_to_review": files_to_review,
-        "required_fields": ["action"],
-        "options": [
-            {
-                "id": "rerun_current_step",
-                "label": "补输入后重跑",
-                "description": "补充依赖源码目录或允许降级后，重跑 Step5。",
-            },
-            {
-                "id": "restart_from_step",
-                "label": "从指定步骤重跑",
-                "description": "若需要回到更早步骤修正输入，可指定重跑起始步骤后重跑。",
-            },
-            {
-                "id": "cancel",
-                "label": "取消",
-                "description": "先人工复核缺失映射明细，再决定下一步。",
-            },
-        ],
-        "response_schema": {
-            "type": "object",
-            "required": ["action"],
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["rerun_current_step", "restart_from_step", "cancel"],
-                },
-                "dependency_source_dirs": {
-                    "type": "array",
-                    "description": "可选。补充依赖源码目录或仓库根目录，系统会自动重新推断源码映射。",
-                },
-                "allow_degraded": {
-                    "type": "boolean",
-                    "description": "可选。设为 true 时允许在缺失依赖源码映射的前提下降级执行，相关 API 会进入“本次未完成分析”清单。",
-                },
-                "restart_step_id": {
-                    "type": "string",
-                    "enum": ["step1", "step2", "step3", "step4", "step5"],
-                },
-                "notes": {
-                    "type": "string",
-                },
-            },
-        },
-        "input_normalization": {
-            "enabled": True,
-            "allowed_actions": ["rerun_current_step", "restart_from_step", "cancel"],
-            "required_fields": ["action"],
-        },
-        "action_requirements": {
-            "rerun_current_step": {
-                "at_least_one_of": ["dependency_source_dirs", "allow_degraded"],
-                "description": "重跑 Step5 时，至少要补充依赖源码目录，或显式允许降级执行。",
-            },
-            "restart_from_step": {
-                "required_fields": ["restart_step_id"],
-                "description": "从更早步骤重跑时，必须明确重跑起始步骤。",
-            },
-        },
-        "missing_mapping_coords": list(missing_mapping_coords or []),
-        "resume_hint": (
-            "若用户补充依赖源码目录，请使用 --response-json 传回 "
-            "action=rerun_current_step 与 dependency_source_dirs 重跑 Step5；"
-            "若用户接受降级执行，可同时传回 allow_degraded=true。"
-        ),
-        "next_action_rule": "只能先补充依赖源码目录或明确允许降级后重跑 Step5，不得直接继续 Step6。",
-        "must_wait_for_user_reply": True,
-        "exit_code": EXIT_AWAITING_USER,
-    }
 
 
 def _iter_existing_source_dirs(source_dirs):
@@ -656,7 +534,7 @@ def has_java_source_file(source_dirs, max_dirs=200):
 def write_tree_sitter_preflight_details(output_dir, status, source_dirs):
     details_path = os.path.join(output_dir, "tree_sitter_preflight.json")
     details = {
-        "status": "awaiting_user_input",
+        "status": "blocked_by_system",
         "reason_code": "step5_tree_sitter_missing_need_resolution",
         "generated_at": datetime.now().isoformat(),
         "tree_sitter": dict(status or {}),
@@ -673,91 +551,6 @@ def write_tree_sitter_preflight_details(output_dir, status, source_dirs):
         json.dump(details, f, ensure_ascii=False, indent=2)
     return details_path
 
-
-def build_tree_sitter_missing_interaction(output_dir, details_path, status):
-    install_command = (status or {}).get("install_command") or "python scripts/bootstrap_runtime.py"
-    return {
-        "schema": "java-upgrade-analyzer.interaction.v2",
-        "checkpoint": True,
-        "hard_stop": True,
-        "status": "awaiting_user_input",
-        "kind": "review",
-        "step_id": "step5",
-        "title": "step5 缺少 tree-sitter，Java AST 主链路不可用",
-        "question": (
-            "Step5 需要 tree-sitter/tree-sitter-java 提升 Java 源码调用链分析准确性。"
-            "运行环境未通过依赖预检。请执行显式 bootstrap 后重跑 Step5。"
-        ),
-        "summary": "tree-sitter 不可用；Step5 已停止，未使用增强正则生成分析结论。",
-        "reason_code": "step5_tree_sitter_missing_need_resolution",
-        "files_to_review": [os.path.abspath(details_path)],
-        "required_fields": ["action"],
-        "options": [
-            {
-                "id": "rerun_current_step",
-                "label": "处理 tree-sitter 后重跑",
-                "description": "安装 tree-sitter/tree-sitter-java 后重跑。",
-            },
-            {
-                "id": "restart_from_step",
-                "label": "从指定步骤重跑",
-                "description": "如输入或环境需要调整，可从 step1..step5 重新处理。",
-            },
-            {
-                "id": "cancel",
-                "label": "取消",
-                "description": "先人工安装 tree-sitter 或确认风险后再继续。",
-            },
-        ],
-        "response_schema": {
-            "type": "object",
-            "required": ["action"],
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["rerun_current_step", "restart_from_step", "cancel"],
-                },
-                "tree_sitter_installed": {
-                    "type": "boolean",
-                    "description": "可选。用户已按提示安装 tree-sitter/tree-sitter-java 后设为 true，再重跑 Step5。",
-                },
-                "restart_step_id": {
-                    "type": "string",
-                    "enum": ["step1", "step2", "step3", "step4", "step5"],
-                },
-                "notes": {
-                    "type": "string",
-                },
-            },
-        },
-        "input_normalization": {
-            "enabled": True,
-            "allowed_actions": ["rerun_current_step", "restart_from_step", "cancel"],
-            "required_fields": ["action"],
-        },
-        "action_requirements": {
-            "rerun_current_step": {
-                "required_fields": ["tree_sitter_installed"],
-                "description": "重跑 Step5 时，必须先安装 tree-sitter 并声明 tree_sitter_installed=true。",
-            },
-            "restart_from_step": {
-                "required_fields": ["restart_step_id"],
-                "description": "从更早步骤重跑时，必须明确重跑起始步骤。",
-            },
-        },
-        "tree_sitter": {
-            "install_command": install_command,
-            "auto_install_error": (status or {}).get("auto_install_error") or "",
-            "python_executable": (status or {}).get("python_executable") or "",
-        },
-        "resume_hint": (
-            f"请优先执行或让环境具备：{install_command}；"
-            "安装完成后 action=rerun_current_step 且 tree_sitter_installed=true。"
-        ),
-        "next_action_rule": "只能先处理 tree-sitter 缺失并等待用户回复，不得直接继续生成 Step6。",
-        "must_wait_for_user_reply": True,
-        "exit_code": EXIT_AWAITING_USER,
-    }
 
 def step5_integrated_main(args):
     previous_debug = os.environ.get('JUA_STEP5_DEBUG')
@@ -1083,10 +876,13 @@ def _step5_integrated_main_impl(args):
                 status,
                 tree_sitter_source_dirs,
             )
-            emit_step_interaction(
-                build_tree_sitter_missing_interaction(output_dir, details_path, status)
+            print(f"诊断文件：{details_path}", file=sys.stderr)
+            print(
+                "已记录为系统环境阻塞；不会把内部解析器故障转成用户确认，"
+                "也不会用低准确率解析路径继续。",
+                file=sys.stderr,
             )
-            return EXIT_AWAITING_USER
+            return 1
     else:
         _step5_debug(
             'tree_sitter_preflight',
@@ -1307,41 +1103,17 @@ def _step5_integrated_main_impl(args):
 
     if missing_mapping_count and not allow_degraded:
         _step5_debug(
-            'bridge_check_blocked',
-            'step5 blocked because dependency source mappings are missing',
+            'bridge_check_auto_degraded',
+            'step5 automatically continues with restricted evidence because dependency source mappings are missing',
             missing_mapping_count=missing_mapping_count,
             missing_mapping_coords=missing_mapping_coords,
             has_provided_dependency_inputs=has_provided_dependency_inputs,
         )
-        if has_provided_dependency_inputs:
-            print("\n❌ 错误：检测到需要跨依赖边界分析的变更API。", file=sys.stderr)
-            print("当前状态：用户已提供依赖源码目录，但系统尚未为全部目标依赖解析出可用的依赖源码映射。", file=sys.stderr)
-            print("影响：这些 API 本轮不能形成确定结论。", file=sys.stderr)
-            unresolved_dirs = (bridge_discovery or {}).get('unresolved_dependency_source_dirs') or []
-            if unresolved_dirs:
-                print("\n未解析成功的依赖源码输入：", file=sys.stderr)
-                for item in unresolved_dirs[:5]:
-                    reason = item.get('reason') or 'unknown'
-                    root_path = item.get('root_path') or ''
-                    source_dirs = item.get('source_dirs') or []
-                    if source_dirs:
-                        print(
-                            f"  - {root_path} | reason={reason} | detected_source_dirs={len(source_dirs)}",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(f"  - {root_path} | reason={reason}", file=sys.stderr)
-            print("\n解决方案：", file=sys.stderr)
-            print("  1. 优先修正依赖源码目录，使其指向依赖工程根目录或多模块仓库根目录", file=sys.stderr)
-            print("  2. 确认目录下包含可识别的模块清单与源码目录（如 pom.xml/build.gradle、src/main/java）", file=sys.stderr)
-            print("  3. 或者使用 --allow-degraded 继续分析；相关 API 会进入“本次未完成分析”清单", file=sys.stderr)
-        else:
-            print("\n❌ 错误：检测到需要跨依赖边界分析的变更API，但未提供可用的依赖源码映射", file=sys.stderr)
-            print("影响：这些 API 本轮不能形成确定结论。", file=sys.stderr)
-            print("\n解决方案：", file=sys.stderr)
-            print("  1. 提供依赖源码目录或仓库根目录", file=sys.stderr)
-            print("  2. 确认目录下包含可识别的模块清单与源码目录", file=sys.stderr)
-            print("  3. 或者使用 --allow-degraded 继续分析；相关 API 会进入“本次未完成分析”清单", file=sys.stderr)
+        print(
+            "\n⚠️ 依赖源码映射不完整；系统将自动使用最终制品字节码继续，"
+            "无法补齐的 API 会进入“本次未完成分析”，不会要求用户批准降级。",
+            file=sys.stderr,
+        )
         if missing_mapping_coords:
             print(
                 f"  缺失映射的依赖坐标：{', '.join(missing_mapping_coords[:10])}",
@@ -1354,16 +1126,7 @@ def _step5_integrated_main_impl(args):
             has_provided_dependency_inputs,
             bridge_discovery=bridge_discovery,
         )
-        emit_step_interaction(
-            build_missing_dependency_mapping_interaction(
-                output_dir,
-                details_path,
-                missing_mapping_count,
-                missing_mapping_coords,
-                has_provided_dependency_inputs,
-            )
-        )
-        return EXIT_AWAITING_USER
+        allow_degraded = True
 
     if missing_mapping_count and allow_degraded:
         _step5_debug(
@@ -1562,18 +1325,25 @@ def _step5_integrated_main_impl(args):
             'ambiguous_framework_proxy_dispatches',
         )
     }
-    ingestion_failures = [
-        _serialize_ingestion_failure(collector, failure)
-        for collector, failure in ingestion_result.failures_by_collector
-    ]
+    # Keep the typed failure ledger for tracing, but defer its output-shaped
+    # duplicate until the collector batches have been released.  On shaded
+    # artifacts this ledger can contain more than 100k physical occurrences;
+    # eagerly holding both representations raises peak RSS without adding any
+    # analysis fact.
+    ingestion_failure_records = tuple(ingestion_result.failures_by_collector)
     graph_stats['evidence_ingestion'] = {
         'merged_edges': ingestion_result.merged_edges,
         'duplicate_edges': ingestion_result.duplicate_edges,
         'rejected_edges': ingestion_result.rejected_edges,
         'failure_count': len(ingestion_result.failures),
         'failure_occurrence_fields': list(EVIDENCE_FAILURE_OCCURRENCE_FIELDS),
-        'failures': ingestion_failures,
-        'reason_codes': sorted({item['reason_code'] for item in ingestion_failures}),
+        # Preserve insertion order in the final JSON while avoiding eager
+        # materialization.  This placeholder is replaced before reporting.
+        'failures': None,
+        'reason_codes': sorted({
+            failure.reason_code
+            for _collector, failure in ingestion_failure_records
+        }),
     }
     bytecode_merge = {
         'merged_edges': dict(ingestion_result.merged_by_collector).get('business_bytecode', 0),
@@ -1754,6 +1524,18 @@ def _step5_integrated_main_impl(args):
             for r in all_results[:5]
         ],
     )
+
+    graph_stats['evidence_ingestion']['failures'] = [
+        _serialize_ingestion_failure(collector, failure)
+        for collector, failure in ingestion_failure_records
+    ]
+    # Tracing and the persisted query index have consumed the typed ledger.
+    # TraceResult envelopes and graph_stats now own every externally visible
+    # fact, so retaining the internal dataclasses would only duplicate memory
+    # during JSON generation.
+    graph.step5_evidence_failures = ()
+    graph.step5_evidence_failures_by_collector = ()
+    del ingestion_failure_records
 
     # Phase 6: 增强型输出（核心改进）
     print("\n生成分析报告...", file=sys.stderr)

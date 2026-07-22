@@ -141,10 +141,13 @@ def japicmp_tool_sha256(jar_path):
 def effective_java_runtime_identity():
     java_command = shutil.which("java") or "java"
     java_path = Path(java_command).resolve() if Path(java_command).exists() else Path(java_command)
+    explicit_java_home = str(os.environ.get("JAVA_HOME") or "").strip()
     identity = {
         "java": str(java_path),
         "java_sha256": "",
-        "java_home": str(os.environ.get("JAVA_HOME") or "").strip(),
+        "java_home": explicit_java_home,
+        "runtime_java": "",
+        "runtime_java_sha256": "",
         "release_sha256": "",
         "complete": True,
         "failures": [],
@@ -159,6 +162,39 @@ def effective_java_runtime_identity():
     java_home = Path(identity["java_home"]).expanduser() if identity["java_home"] else None
     if java_home is None and java_path.is_absolute():
         java_home = java_path.parent.parent
+    # Package managers commonly expose Java through a small shell launcher whose
+    # parent is not the effective JDK home.  Resolve only a literal absolute
+    # ``exec .../bin/java`` target; never execute or interpolate wrapper text.
+    # Hashing both launcher and target keeps the cache identity fail-closed while
+    # allowing content-addressed reuse for these deterministic wrappers.
+    if not explicit_java_home and java_path.is_file():
+        inferred_release = java_home / "release" if java_home is not None else None
+        if inferred_release is None or not inferred_release.is_file():
+            try:
+                if java_path.stat().st_size <= 1024 * 1024:
+                    launcher_text = java_path.read_text(encoding="utf-8")
+                    match = re.search(
+                        r"(?m)^\s*exec\s+(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))",
+                        launcher_text,
+                    )
+                    target_text = next(
+                        (item for item in match.groups() if item), ""
+                    ) if match else ""
+                    target_path = Path(target_text)
+                    if (
+                        target_path.is_absolute()
+                        and target_path.name == "java"
+                        and target_path.parent.name == "bin"
+                        and target_path.is_file()
+                    ):
+                        target_path = target_path.resolve()
+                        identity["runtime_java"] = str(target_path)
+                        identity["runtime_java_sha256"] = sha256_file(target_path)
+                        java_home = target_path.parent.parent
+            except (OSError, UnicodeError):
+                # The normal incomplete-identity path below records the missing
+                # release evidence and disables comparison caching.
+                pass
     if java_home is not None:
         try:
             identity["java_home"] = str(java_home.resolve())
@@ -170,7 +206,15 @@ def effective_java_runtime_identity():
         except OSError as exc:
             identity["java_home"] = str(java_home)
             identity["failures"].append(f"java_release_hash_failed:{type(exc).__name__}")
-    identity["complete"] = bool(identity["java_sha256"] and not identity["failures"])
+    identity["complete"] = bool(
+        identity["java_sha256"]
+        and identity["release_sha256"]
+        and (
+            not identity["runtime_java"]
+            or identity["runtime_java_sha256"]
+        )
+        and not identity["failures"]
+    )
     return identity
 
 
@@ -1684,7 +1728,13 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
         for item in decision_items
         for side_info in (item.get("local_fallback_available") or {}).values()
     )
-    if pending_kinds and pending_kinds <= {"fetch_failed", "remote_query_failed"}:
+    if pending_kinds == {"ambiguous"}:
+        question = (
+            "以下依赖的升级前、升级后源码存在多组不同提交范围，选择不同方案会改变源码差异结果。"
+            "请按依赖一次性选择对应方案。"
+        )
+        recommended_action = "核对版本对应的源码分支和提交摘要，并一次性提交每个依赖的方案编号。"
+    elif pending_kinds and pending_kinds <= {"fetch_failed", "remote_query_failed"}:
         question = (
             "以下依赖的远端查询或 fetch 在受控重试后仍失败。"
             "请在网络或权限恢复后确认重试；无需猜测或重新选择已经唯一确定的分支。"
@@ -1712,10 +1762,18 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
         "status": "awaiting_user_input",
         "kind": "review",
         "step_id": "step4",
-        "title": "step4 git refs 待人工确认",
+        "title": "确认依赖源码版本",
         "question": question,
-        "summary": f"共有 {len(pending_items)} 个依赖需要人工确认 git refs。",
-        "user_reason": "候选 ref 指向不同 commit，或远端 ref 无法成功固定；继续猜测会改变源码差异范围。",
+        "summary": (
+            f"共有 {len(pending_items)} 个依赖存在会改变源码对比范围的版本歧义。"
+            if pending_kinds == {"ambiguous"}
+            else f"共有 {len(pending_items)} 个依赖源码版本待处理。"
+        ),
+        "user_reason": (
+            "候选源码分支指向不同提交，选择不同方案会改变源码差异范围。"
+            if pending_kinds == {"ambiguous"}
+            else "依赖源码版本当前无法可靠固定。"
+        ),
         "recommended_action": recommended_action,
         "reason_code": "step4_git_refs_need_confirmation",
         "files_to_review": files_to_review,
@@ -1723,7 +1781,7 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
         "options": [
             {
                 "id": "rerun_current_step",
-                "label": "确认 refs 后重跑",
+                "label": "确认源码版本后重跑",
                 "description": "提供 dependency_git_ref_overrides 并重跑 Step4。",
             },
             {
@@ -1981,9 +2039,11 @@ def dependency_needs_japicmp(row):
     return (not is_removed_dependency) and (not is_added_dependency) and old_ver not in ("", "-") and new_ver not in ("", "-")
 
 
-def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, planned_dependencies):
+def write_japicmp_preflight_details(output_dir, japicmp_jar, install_error, planned_dependencies):
     preflight_path = os.path.join(output_dir, "japicmp_preflight.json")
     payload = {
+        "status": "blocked_by_system",
+        "reason_code": "step4_japicmp_missing_need_resolution",
         "generated_at": datetime.now().isoformat(),
         "japicmp_jar": str(japicmp_jar or ""),
         "install_error": str(install_error or ""),
@@ -1999,84 +2059,7 @@ def build_japicmp_missing_interaction(output_dir, japicmp_jar, install_error, pl
         ],
     }
     Path(preflight_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return {
-        "schema": "java-upgrade-analyzer.interaction.v2",
-        "checkpoint": True,
-        "hard_stop": True,
-        "status": "awaiting_user_input",
-        "kind": "review",
-        "step_id": "step4",
-        "title": "step4 缺少 JApiCmp，二进制 API 对比不可用",
-        "question": (
-            "Step4 需要 JApiCmp 执行依赖 jar 的二进制 API 对比。系统已尝试自动安装但失败。"
-            "请安装 JApiCmp 或提供 japicmp_jar 后重跑 Step4。"
-        ),
-        "summary": f"共有 {len(planned_dependencies)} 个升级依赖需要 JApiCmp；当前工具不可用。",
-        "reason_code": "step4_japicmp_missing_need_resolution",
-        "files_to_review": [os.path.abspath(preflight_path)],
-        "required_fields": ["action"],
-        "options": [
-            {
-                "id": "rerun_current_step",
-                "label": "处理 JApiCmp 后重跑",
-                "description": "安装或提供 japicmp_jar 后重跑。",
-            },
-            {
-                "id": "restart_from_step",
-                "label": "从更早步骤重跑",
-                "description": "如输入或环境需要调整，可从 step1/step2/step4 重新处理。",
-            },
-            {
-                "id": "cancel",
-                "label": "取消",
-                "description": "先人工安装 JApiCmp 或确认风险后再继续。",
-            },
-        ],
-        "response_schema": {
-            "type": "object",
-            "required": ["action"],
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["rerun_current_step", "restart_from_step", "cancel"],
-                },
-                "japicmp_jar": {
-                    "type": "string",
-                    "description": "可选。JApiCmp jar-with-dependencies 的绝对路径。",
-                },
-                "restart_step_id": {
-                    "type": "string",
-                    "enum": ["step1", "step2", "step4"],
-                },
-                "notes": {"type": "string"},
-            },
-        },
-        "action_requirements": {
-            "rerun_current_step": {
-                "required_fields": ["japicmp_jar"],
-                "description": "重跑 Step4 时必须提供可用的 japicmp_jar。",
-            },
-            "restart_from_step": {
-                "required_fields": ["restart_step_id"],
-                "description": "从更早步骤重跑时，必须明确 restart_step_id。",
-            },
-        },
-        "input_normalization": {
-            "enabled": True,
-            "allowed_actions": ["rerun_current_step", "restart_from_step", "cancel"],
-            "required_fields": ["action"],
-        },
-        "japicmp": {
-            "expected_jar": str(japicmp_jar or ""),
-            "install_error": str(install_error or ""),
-            "manual_install": f"mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}",
-        },
-        "resume_hint": (
-            "安装 JApiCmp 或提供 japicmp_jar 后，使用 action=rerun_current_step 重跑。"
-        ),
-        "next_action_rule": "只能先处理 JApiCmp 缺失并等待用户回复，不得直接继续进入 Step5。",
-        "must_wait_for_user_reply": True,
-    }
+    return preflight_path
 
 def _jar_class_hash_map(jar_path: str) -> dict:
     m = {}
@@ -2119,6 +2102,321 @@ def compute_changed_classes(old_jar: str, new_jar: str) -> dict:
             "modified": len(modified),
         },
     }
+
+
+def _jar_class_variant_hash_map(jar_path):
+    """Return one aggregate hash per logical class, including MR-JAR variants."""
+    variants = defaultdict(list)
+    multi_release_enabled = False
+    require_safe_archive(jar_path)
+    with zipfile.ZipFile(jar_path) as archive:
+        try:
+            manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
+        except KeyError:
+            manifest = ""
+        multi_release_enabled = bool(
+            re.search(r"(?im)^Multi-Release\s*:\s*true\s*$", manifest)
+        )
+        for entry in sorted(archive.namelist()):
+            if not entry.endswith(".class"):
+                continue
+            versioned = re.match(r"^META-INF/versions/(\d+)/(.*\.class)$", entry)
+            if entry.startswith("META-INF/") and not versioned:
+                continue
+            logical_entry = versioned.group(2) if versioned else entry
+            if logical_entry.endswith(("module-info.class", "package-info.class")):
+                continue
+            class_name = logical_entry[:-6].replace("/", ".")
+            variants[class_name].append(
+                (entry, hashlib.sha256(archive.read(entry)).hexdigest())
+            )
+    result = {
+        class_name: hashlib.sha256(
+            json.dumps(entries, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        for class_name, entries in variants.items()
+    }
+    return result, multi_release_enabled
+
+
+def _run_javap_behavior_dumps(
+    jar_path,
+    class_binary_names,
+    batch_size=32,
+    multi_release_version=None,
+):
+    names = [str(item) for item in class_binary_names]
+    dumps = {}
+    errors = []
+    invocations = 0
+    size = max(1, int(batch_size))
+
+    def command_for(batch):
+        command = ["javap"]
+        if multi_release_version is not None:
+            command.extend(["--multi-release", str(multi_release_version)])
+        command.extend(["-classpath", str(jar_path), "-c", "-s", "-p", *batch])
+        return command
+
+    for offset in range(0, len(names), size):
+        batch = names[offset:offset + size]
+        if not batch:
+            continue
+        invocations += 1
+        stdout, stderr, rc = run_cmd(
+            command_for(batch),
+            timeout=max(60, min(300, len(batch) * 8)),
+        )
+        if rc != 0:
+            # A single unreadable class makes javap return a non-zero status for
+            # the whole batch. Retry only this failed batch one class at a time
+            # so healthy classes still produce evidence.
+            for class_binary_name in batch:
+                invocations += 1
+                item_stdout, item_stderr, item_rc = run_cmd(
+                    command_for([class_binary_name]),
+                    timeout=60,
+                )
+                if item_rc != 0:
+                    errors.append(
+                        f"{class_binary_name}:"
+                        f"{(item_stderr or item_stdout or 'javap failed').strip()[:300]}"
+                    )
+                    continue
+                sections = _split_javap_public_api_dump(
+                    item_stdout,
+                    [class_binary_name],
+                )
+                section = sections.get(class_binary_name)
+                if section is None:
+                    errors.append(f"{class_binary_name}:javap_class_section_missing")
+                else:
+                    dumps[class_binary_name] = section
+            continue
+        sections = _split_javap_public_api_dump(stdout, batch)
+        for class_binary_name in batch:
+            section = sections.get(class_binary_name)
+            if section is None:
+                errors.append(f"{class_binary_name}:javap_class_section_missing")
+            else:
+                dumps[class_binary_name] = section
+    return dumps, errors, invocations
+
+
+def _normalize_javap_behavior_line(line):
+    text = " ".join(str(line or "").strip().split())
+    if not text:
+        return ""
+    # Constant-pool positions are packaging details. javap's symbolic comment
+    # remains, so replacing the numeric slot removes harmless pool reordering
+    # without hiding the referenced owner/member/value.
+    return re.sub(r"#\d+", "#", text)
+
+
+def _parse_javap_method_bodies(text, class_binary_name):
+    """Parse executable method fingerprints from `javap -c -s -p` output."""
+    class_fqcn = str(class_binary_name or "").replace("$", ".")
+    class_simple = class_fqcn.rsplit(".", 1)[-1]
+    methods = {}
+    current = None
+    collecting_code = False
+
+    def finalize():
+        nonlocal current, collecting_code
+        if current and current.get("descriptor") and current.get("code_lines"):
+            body = "\n".join(current["code_lines"])
+            identity = (
+                current["api_name"],
+                current["symbol_kind"],
+                current["descriptor"],
+            )
+            methods[identity] = {
+                **current,
+                "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            }
+        current = None
+        collecting_code = False
+
+    for raw_line in str(text or "").splitlines():
+        stripped = raw_line.strip()
+        is_static_initializer = stripped == "static {};"
+        is_method_declaration = is_static_initializer or (
+            stripped.endswith(";")
+            and "(" in stripped
+            and ")" in stripped
+            and not stripped.startswith(("descriptor:", "Signature:"))
+        )
+        if is_method_declaration:
+            finalize()
+            declaration = stripped[:-1].split(" throws ", 1)[0].strip()
+            if is_static_initializer:
+                api_simple = class_simple
+                api_name = class_fqcn
+                symbol_kind = "class"
+                api_signature = ""
+            else:
+                name_token = declaration.split("(", 1)[0].strip().split()[-1]
+                displayed_simple = name_token.rsplit(".", 1)[-1].replace("$", ".").rsplit(".", 1)[-1]
+                is_constructor = displayed_simple == class_simple
+                api_simple = class_simple if is_constructor else displayed_simple
+                api_name = f"{class_fqcn}.{api_simple}"
+                symbol_kind = "constructor" if is_constructor else "method"
+                api_signature = extract_api_signature_from_declaration(declaration)
+            current = {
+                "api_name": api_name,
+                "api_simple": api_simple,
+                "symbol_kind": symbol_kind,
+                "api_signature": api_signature,
+                "descriptor": "",
+                "declaration": declaration,
+                "code_lines": [],
+            }
+            continue
+        if current is None:
+            continue
+        if stripped.startswith("descriptor:"):
+            current["descriptor"] = stripped.split(":", 1)[1].strip()
+            continue
+        if stripped == "Code:":
+            collecting_code = True
+            continue
+        if not collecting_code:
+            continue
+        if re.match(r"^\d+:\s", stripped):
+            normalized = _normalize_javap_behavior_line(stripped)
+            if normalized:
+                current["code_lines"].append(normalized)
+            continue
+        if stripped == "Exception table:":
+            current["code_lines"].append("Exception table:")
+            continue
+        if current["code_lines"] and current["code_lines"][-1] == "Exception table:":
+            # The header itself is followed by column labels; keep only rows.
+            if stripped.startswith("from"):
+                continue
+        if re.match(r"^(?:default|-?\d+):\s+-?\d+", stripped):
+            current["code_lines"].append(_normalize_javap_behavior_line(stripped))
+            continue
+        if re.match(r"^\d+\s+\d+\s+\d+\s+", stripped):
+            current["code_lines"].append(_normalize_javap_behavior_line(stripped))
+            continue
+    finalize()
+    return methods
+
+
+def compare_jar_method_bodies(
+    old_jar,
+    new_jar,
+    *,
+    coord,
+    old_version,
+    new_version,
+    output_dir,
+    target_jdk=None,
+):
+    """Find same-signature executable changes using immutable final JARs."""
+    safe_coord = str(coord or "").strip()
+    artifact = (safe_coord.split(":")[-1] or "dependency").replace(".", "-")
+    evidence_path = Path(output_dir) / (
+        f"{artifact}_{old_version}_vs_{new_version}_bytecode_behavior.json"
+    )
+    try:
+        old_hashes, old_multi_release = _jar_class_variant_hash_map(old_jar)
+        new_hashes, new_multi_release = _jar_class_variant_hash_map(new_jar)
+    except (OSError, zipfile.BadZipFile, ValueError) as exc:
+        result = {
+            "status": "insufficient",
+            "reason_code": "FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE",
+            "errors": [f"{type(exc).__name__}:{str(exc)[:200]}"],
+            "rows": [],
+        }
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return {**result, "evidence_path": str(evidence_path.resolve())}
+
+    modified_classes = sorted(
+        class_name
+        for class_name in (set(old_hashes) & set(new_hashes))
+        if old_hashes[class_name] != new_hashes[class_name]
+    )
+    target_jdk_major = _java_major_version(target_jdk)
+    old_dumps, old_errors, old_invocations = _run_javap_behavior_dumps(
+        old_jar,
+        modified_classes,
+        multi_release_version=target_jdk_major if old_multi_release else None,
+    )
+    new_dumps, new_errors, new_invocations = _run_javap_behavior_dumps(
+        new_jar,
+        modified_classes,
+        multi_release_version=target_jdk_major if new_multi_release else None,
+    )
+    errors = [f"old:{item}" for item in old_errors] + [f"new:{item}" for item in new_errors]
+    if (old_multi_release or new_multi_release) and target_jdk_major is None:
+        errors.append("target_jdk_required_for_multi_release_jar")
+    rows = []
+    changed_methods = []
+    scanned_classes = []
+    for class_name in modified_classes:
+        if class_name not in old_dumps or class_name not in new_dumps:
+            continue
+        scanned_classes.append(class_name)
+        old_methods = _parse_javap_method_bodies(old_dumps[class_name], class_name)
+        new_methods = _parse_javap_method_bodies(new_dumps[class_name], class_name)
+        for identity in sorted(set(old_methods) & set(new_methods)):
+            old_method = old_methods[identity]
+            new_method = new_methods[identity]
+            if old_method["body_sha256"] == new_method["body_sha256"]:
+                continue
+            api_name, symbol_kind, descriptor = identity
+            changed_methods.append({
+                "api_name": api_name,
+                "symbol_kind": symbol_kind,
+                "descriptor": descriptor,
+                "old_body_sha256": old_method["body_sha256"],
+                "new_body_sha256": new_method["body_sha256"],
+            })
+            row = {
+                "coord": safe_coord,
+                "old_version": str(old_version or ""),
+                "new_version": str(new_version or ""),
+                "change_type": "BEHAVIOR_CHANGED",
+                "api_name": api_name,
+                "api_simple": new_method["api_simple"],
+                "symbol_kind": symbol_kind,
+                "api_signature": new_method.get("api_signature") or "",
+                "confirmed": "true",
+                "severity": DEFAULT_SEVERITY["BEHAVIOR_CHANGED"],
+                "source": "jar_bytecode",
+                "binary_compatible": "true",
+                "source_compatible": "true",
+                "reason_code": "FINAL_JAR_METHOD_BODY_CHANGED",
+                "evidence_path": str(evidence_path.resolve()),
+            }
+            if not validate_row(row):
+                rows.append(row)
+
+    status = "complete" if not errors and len(scanned_classes) == len(modified_classes) else "insufficient"
+    payload = {
+        "schema": "java-upgrade-analyzer.jar-bytecode-behavior.v1",
+        "status": status,
+        "reason_code": "" if status == "complete" else "FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE",
+        "coord": safe_coord,
+        "old_version": str(old_version or ""),
+        "new_version": str(new_version or ""),
+        "old_jar_sha256": sha256_file(old_jar),
+        "new_jar_sha256": sha256_file(new_jar),
+        "target_jdk": target_jdk_major,
+        "multi_release": bool(old_multi_release or new_multi_release),
+        "modified_classes": len(modified_classes),
+        "scanned_classes": len(scanned_classes),
+        "changed_methods": changed_methods,
+        "javap_invocations": old_invocations + new_invocations,
+        "errors": errors,
+        "rows": rows,
+    }
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {**payload, "evidence_path": str(evidence_path.resolve())}
 
 
 def _java_major_version(value):
@@ -3048,6 +3346,7 @@ def run_japicmp(
             "new_jar_source": new_jar_source,
             "old_jar_evidence": old_jar_evidence or {},
             "new_jar_evidence": new_jar_evidence or {},
+            "reason_code": "JAPICMP_TIMEOUT",
             "external_process_count": 1,
         }, "超时"
     if rc != 0:
@@ -4311,6 +4610,57 @@ def preflight_gitdiff_refs(
     return matched, pending
 
 
+def partition_git_ref_pending_items(pending_items):
+    """Keep only result-changing source ambiguities as user checkpoints.
+
+    Source git diff is auxiliary to the final-artifact JAR comparison.  Remote
+    query/fetch failures, moved refs after controlled retries, missing matches,
+    and unusable local fallbacks are operational failures; asking the user to
+    repair them would leak internal implementation work into the interaction.
+    Those cases are therefore recorded as an explicit source-evidence gap while
+    binary analysis continues.  A user checkpoint is reserved for two or more
+    concrete commit pairs, where choosing a pair changes the source diff range.
+    """
+    user_confirmation = []
+    internally_skipped = []
+    for pending_item in pending_items or []:
+        item = dict(pending_item or {})
+        pending_kind = str(item.get("pending_kind") or "").strip() or classify_git_ref_pending_kind(
+            item.get("reason"), item.get("old_reason"), item.get("new_reason")
+        )
+        pair_options = build_git_ref_pair_options(item, limit=0)
+        is_result_changing_ambiguity = pending_kind == "ambiguous" and len(pair_options) > 1
+        if is_result_changing_ambiguity:
+            item["pending_kind"] = pending_kind
+            user_confirmation.append(item)
+            continue
+
+        internal_reason_by_kind = {
+            "fetch_failed": "远端源码拉取在受控重试后仍不可用",
+            "remote_query_failed": "远端源码版本查询在受控重试后仍不可用",
+            "remote_ref_moved": "远端源码分支在校验期间发生变化，无法固定为可复现提交",
+            "remote_unavailable": "远端源码仓库当前不可用",
+            "not_found": "未能稳定定位与依赖版本对应的远端源码提交",
+            "local_confirmation_required": "本地源码不能在未授权的情况下作为远端源码替代",
+            "ambiguous": "未形成两个以上可供可靠选择的完整源码提交范围",
+        }
+        internally_skipped.append({
+            **item,
+            "status": "skipped",
+            "pending_kind": pending_kind,
+            "reason_code": "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
+            "reason": (
+                f"{internal_reason_by_kind.get(pending_kind, '依赖源码版本无法可靠固定')}；"
+                "已跳过源码行为差异辅助分析，将使用最终制品 JAR 完成二进制与方法字节码分析"
+            ),
+            "resolution": "continue_with_final_artifact_analysis",
+            "user_attention_required": False,
+            "evidence_impact": "源码证据暂缺；等待最终 JAR 方法字节码兜底结果",
+            "ref_pair_options": pair_options,
+        })
+    return user_confirmation, internally_skipped
+
+
 def write_git_ref_pending_file(output_dir, pending_items):
     pending_refs_path = os.path.join(output_dir, "git_ref_pending.json")
     serialized_items = []
@@ -4706,7 +5056,7 @@ def write_git_ref_match_outputs(
     if needs_user_confirmation:
         lines.append("Step4 依赖源码 git ref 匹配结果（需要确认）")
     else:
-        lines.append("Step4 依赖源码 git ref 匹配结果（自动匹配完成）")
+        lines.append("Step4 依赖源码版本解析结果（无需用户确认）")
     lines.append("")
     lines.append("一、结论总览")
     lines.append(f"- 已匹配：{len(gitdiff_runs)}")
@@ -4723,6 +5073,11 @@ def write_git_ref_match_outputs(
     )
     if needs_user_confirmation:
         lines.append("- 当前存在待确认项；这些依赖的源码 diff 范围还不能视为可信。")
+    elif gitdiff_skipped:
+        lines.append(
+            "- 当前没有需要用户处理的歧义；内部源码解析故障已自动降级并记录，"
+            "最终制品 JAR 二进制分析继续执行。"
+        )
     else:
         lines.append("- 当前没有待确认项；可按需抽查依赖坐标、源码仓库和 git refs 是否符合预期。")
     lines.append("")
@@ -4775,6 +5130,11 @@ def write_git_ref_match_outputs(
         lines.append(
             f"- {item.get('coord')}：版本={item.get('old_version')} -> {item.get('new_version')}；原因={item.get('reason') or '-'}"
         )
+        if item.get("behavior_fallback_status") == "complete":
+            lines.append(
+                "  - 恢复结果：最终 JAR 方法字节码对比已完成，源码行为证据缺口已补齐；"
+                f"证据={item.get('behavior_fallback_evidence') or '-'}"
+            )
         old_candidates = item.get("old_candidates") or []
         new_candidates = item.get("new_candidates") or []
         if old_candidates:
@@ -5294,14 +5654,15 @@ def write_changed_dependencies(api_rows, output_dir):
         "## 如何选择定向分析范围",
         "",
         "1. 可以直接全量分析全部候选依赖包。",
-        "2. 也可以先从“推荐候选”为“是”的依赖包中选择。推荐依据是：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个。",
-        "3. 还可以从本文件列出的全部候选中选择；复制“依赖包”列中的完整坐标即可。",
-        "4. 定向分析可直接回复，例如：`只分析 com.example:demo-lib`。",
+        "2. 仅当明确需要控制耗时时，可以先从“部分分析优先项”为“是”的依赖包中选择。排序依据是：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个。",
+        "3. “部分分析优先项”只用于部分范围取舍，不表示系统建议缩小范围，也不代表已经确认影响。",
+        "4. 还可以从本文件列出的全部候选中选择；复制“依赖包”列中的完整坐标即可。",
+        "5. 定向分析可直接回复，例如：`只分析 com.example:demo-lib`。",
         "",
         "完整 API 明细：`all_changed_apis.csv`。",
         "依赖包明细目录：`s4_per_dependency/`。",
         "",
-        "| 推荐候选 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |",
+        "| 部分分析优先项 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |",
         "|---|---|---:|---:|---|---|---|",
     ]
     if dependency_rows:
@@ -5345,6 +5706,7 @@ def normalize_step5_input_rows(rows):
         'japicmp': 0,
         'old_jar': 0,
         'classfile_contract': 0,
+        'jar_bytecode': 0,
         'gitdiff': 1,
         'changelog': 2,
     }
@@ -5515,7 +5877,7 @@ def human_checkpoint_1(dep_rows, all_apis, output_dir):
     """
     Step 4 完成后的摘要输出。
     展示：每个依赖的变更 API 数量，重点标出数量为 0 的，
-    供 run_step.py 后续统一组织为用户交互材料。
+    供用户核对证据并选择 Step5 的全量或部分分析范围。
     """
     print("\n" + "="*60)
     print("【Step4 摘要】依赖 API 变化识别完成")
@@ -5543,10 +5905,12 @@ def human_checkpoint_1(dep_rows, all_apis, output_dir):
             p0 = sum(1 for a in apis_found if (a.get('severity') or '').strip() == 'P0')
 
     print("\n先看什么：")
-    print(f"  - 决定 Step5 范围：{os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)}")
+    print(f"  - 查看变化依赖概览：{os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)}")
     print(f"  - 核对完整 API 事实：{os.path.join(output_dir, 'all_changed_apis.csv')}")
     print("  - 是否影响当前系统：继续看 Step5 alerts.csv 和 Step6 report.md")
-    print("\n本次是否能进入 Step5：")
+    print("\n确认 Step5 分析范围：")
+    print("  - 全量分析：覆盖全部变化依赖，准确性覆盖最完整")
+    print(f"  - 部分分析：从 {os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)} 选择依赖，以控制耗时")
     print(f"  - 变更 API 总数：{len(all_apis)}")
     print(f"  - 版本变更但未发现 API 变化的依赖：{len(zero_change)}")
 
@@ -5562,7 +5926,7 @@ def human_checkpoint_1(dep_rows, all_apis, output_dir):
 
     print(f"\n复核文件：")
     print(f"  - 摘要：{os.path.join(output_dir, 'summary.txt')}")
-    print(f"  - 依赖包选择：{os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)}")
+    print(f"  - 依赖变化概览：{os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)}")
     print(f"  - 完整变更 API：{os.path.join(output_dir, 'all_changed_apis.csv')}")
     print(f"  - 高风险/需关注 API：{os.path.join(output_dir, 'all_changed_apis_alerts.csv')}")
     print("="*60)
@@ -5713,7 +6077,11 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
         if gitdiff_skipped:
             lines.append(f"- 跳过明细（前 {min(20, len(gitdiff_skipped))} 项）：")
             for it in gitdiff_skipped[:20]:
-                lines.append(f"  - {it.get('coord')}：{it.get('reason')}")
+                recovery = (
+                    "；最终 JAR 方法字节码已补齐行为变化证据"
+                    if it.get("behavior_fallback_status") == "complete" else ""
+                )
+                lines.append(f"  - {it.get('coord')}：{it.get('reason')}{recovery}")
             if len(gitdiff_skipped) > 20:
                 lines.append(f"  ...（仅展示前 20，共 {len(gitdiff_skipped)}）")
         lines.append(f"- 待人工确认 refs：{len(gitdiff_pending)}")
@@ -6057,11 +6425,22 @@ def main():
         dependency_git_ref_overrides,
         fetch_timeout=args.fetch_timeout,
     )
+    (
+        preflight_gitdiff_pending,
+        preflight_gitdiff_skipped,
+    ) = partition_git_ref_pending_items(preflight_gitdiff_pending)
     timing.record(
         "preflight.git_refs",
-        status="pending" if preflight_gitdiff_pending else "success",
+        status=(
+            "pending" if preflight_gitdiff_pending
+            else ("degraded" if preflight_gitdiff_skipped else "success")
+        ),
         elapsed=time.perf_counter() - preflight_timer,
-        details={"matched": len(preflight_gitdiff_runs), "pending": len(preflight_gitdiff_pending)},
+        details={
+            "matched": len(preflight_gitdiff_runs),
+            "pending": len(preflight_gitdiff_pending),
+            "internally_skipped": len(preflight_gitdiff_skipped),
+        },
     )
     if preflight_gitdiff_pending:
         source_repo_mappings = [
@@ -6076,7 +6455,7 @@ def main():
         ref_matches_json, ref_matches_txt = write_git_ref_match_outputs(
             output_dir=args.output_dir,
             gitdiff_runs=preflight_gitdiff_runs,
-            gitdiff_skipped=[],
+            gitdiff_skipped=preflight_gitdiff_skipped,
             gitdiff_pending=preflight_gitdiff_pending,
             source_repo_mappings=source_repo_mappings,
         )
@@ -6084,11 +6463,11 @@ def main():
         emit_progress(
             "step4",
             "preflight",
-            f"git refs 预检需要人工确认，pending={len(preflight_gitdiff_pending)}，已提前停止耗时分析",
+            f"依赖源码版本存在结果歧义，待确认={len(preflight_gitdiff_pending)}，已提前停止耗时分析",
             elapsed=step_timer.elapsed(),
         )
         print(
-            "\n⚠️  Step4 preflight 发现依赖源码 git refs 需要人工确认，"
+            "\n⚠️  Step4 预检发现依赖源码版本存在会改变分析范围的歧义，"
             "已提前停止，避免执行后续耗时分析。",
             file=sys.stderr,
         )
@@ -6102,6 +6481,22 @@ def main():
             emit_interaction(interaction)
             return 0
         return 2
+
+    if preflight_gitdiff_skipped:
+        emit_progress(
+            "step4",
+            "preflight",
+            (
+                f"{len(preflight_gitdiff_skipped)} 个依赖的源码辅助对比不可用，"
+                "已自动切换到最终制品 JAR 分析"
+            ),
+            elapsed=step_timer.elapsed(),
+        )
+        print(
+            f"  ℹ️  {len(preflight_gitdiff_skipped)} 个依赖的源码辅助对比不可用；"
+            "系统将自动执行 JAR 二进制与方法字节码分析，无需用户处理。",
+            file=sys.stderr,
+        )
 
     if japicmp_planned_rows and not os.path.exists(args.japicmp_jar):
         japicmp_preflight_timer = time.perf_counter()
@@ -6130,27 +6525,30 @@ def main():
                 }
                 for row in japicmp_planned_rows
             ]
-            interaction = build_japicmp_missing_interaction(
+            # Persist an exact diagnostic, but do not turn a missing internal
+            # analysis tool into a user decision.  JApiCmp is an accuracy
+            # prerequisite: after automatic installation has failed, the run
+            # is system-blocked and must not continue with weaker evidence.
+            write_japicmp_preflight_details(
                 args.output_dir,
                 args.japicmp_jar,
                 install_error,
                 planned_dependencies,
             )
-            if os.environ.get("JUA_ORCHESTRATED") == "1":
-                timing.record("step4.total", status="awaiting_japicmp_resolution", elapsed=step_timer.elapsed())
-                timing.flush()
-                emit_interaction(interaction)
-                return 0
             print("\n❌ JApiCmp 不可用，无法执行 Java 升级分析。", file=sys.stderr)
             print(f"   自动安装失败原因：{install_error}", file=sys.stderr)
-            print(f"   请执行：mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}", file=sys.stderr)
-            print("   或提供 --japicmp-jar 后重跑 Step4。", file=sys.stderr)
-            timing.record("step4.total", status="japicmp_missing", elapsed=step_timer.elapsed())
+            print("   已记录为系统环境阻塞；不会要求用户确认降级，也不会生成不完整 API 结论。", file=sys.stderr)
+            timing.record("step4.total", status="blocked_by_system_japicmp_missing", elapsed=step_timer.elapsed())
             timing.flush()
             return 2
     preflight_plan_by_coord = {
         str(item.get("coord") or ""): item
         for item in preflight_gitdiff_runs
+        if str(item.get("coord") or "")
+    }
+    preflight_skip_by_coord = {
+        str(item.get("coord") or ""): item
+        for item in preflight_gitdiff_skipped
         if str(item.get("coord") or "")
     }
     all_apis            = []
@@ -6163,6 +6561,7 @@ def main():
     gitdiff_runs = []
     gitdiff_skipped = []
     gitdiff_pending = []
+    bytecode_behavior_runs = []
     timeout_items = []
     binary_runs = []
 
@@ -6238,6 +6637,7 @@ def main():
             "gitdiff_runs": [],
             "gitdiff_skipped": [],
             "gitdiff_pending": [],
+            "bytecode_behavior_runs": [],
             "timeout_items": [],
             "binary_runs": [],
             "per_dependency_record": None,
@@ -6281,7 +6681,37 @@ def main():
                 "new_version": new_ver,
             })
 
-        if has_source_repo and not is_removed_dependency and not is_added_dependency:
+        preflight_source_skip = preflight_skip_by_coord.get(coord) or {}
+        source_skip_for_behavior = dict(preflight_source_skip)
+        if preflight_source_skip and not is_removed_dependency and not is_added_dependency:
+            source_skip_timer = time.perf_counter()
+            result["gitdiff_skipped"].append(dict(preflight_source_skip))
+            print(
+                f"    ℹ️  {coord} 的源码辅助对比不可用，切换到最终制品 JAR 分析。",
+                file=sys.stderr,
+            )
+            emit_progress(
+                "step4",
+                "gitdiff",
+                "源码辅助对比不可用，已切换到最终制品 JAR 分析",
+                current=i,
+                total=total_dependencies,
+                elapsed=time.perf_counter() - source_skip_timer,
+                item=coord,
+            )
+            timing.record(
+                "dependency.gitdiff",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="skipped",
+                elapsed=time.perf_counter() - source_skip_timer,
+                details={
+                    "reason_code": preflight_source_skip.get("reason_code"),
+                    "resolution": preflight_source_skip.get("resolution"),
+                },
+            )
+        elif has_source_repo and not is_removed_dependency and not is_added_dependency:
             # 4b: 有源码依赖做 git diff
             gitdiff_timer = time.perf_counter()
             emit_progress(
@@ -6326,32 +6756,57 @@ def main():
             if gitdiff_result.get("status") == "needs_user_confirmation":
                 gitdiff_status = "pending"
                 gitdiff_details = meta.get("reason") or err or ""
-                print("    ⚠️  git refs 无法自动确定，已加入待人工确认清单。", file=sys.stderr)
-                emit_progress(
-                    "step4",
-                    "gitdiff",
-                    "源码 diff 需要人工确认 git refs",
-                    current=i,
-                    total=total_dependencies,
-                    elapsed=time.perf_counter() - gitdiff_timer,
-                    item=coord,
-                )
-                result["gitdiff_pending"].append(
-                    {
-                        "coord": coord,
-                        "old_version": old_ver,
-                        "new_version": new_ver,
-                        "reason": meta.get("reason") or err,
-                        "repo_path": meta.get("repo_path") or source_mapping.get("repo_path", ""),
-                        "module_path": meta.get("module_path") or source_mapping.get("module_path", ""),
-                        "old_candidates": meta.get("old_candidates") or [],
-                        "new_candidates": meta.get("new_candidates") or [],
-                        "old_ref_override": meta.get("old_ref_override") or "",
-                        "new_ref_override": meta.get("new_ref_override") or "",
-                        "mapping_mode": (dependency_path_meta.get(coord) or {}).get("mapping_mode"),
-                        "out_file": os.path.abspath(_out_file) if _out_file else "",
-                    }
-                )
+                pending_item = {
+                    "coord": coord,
+                    "old_version": old_ver,
+                    "new_version": new_ver,
+                    "reason": meta.get("reason") or err,
+                    "pending_kind": classify_git_ref_pending_kind(
+                        meta.get("reason") or err,
+                        meta.get("old_reason"),
+                        meta.get("new_reason"),
+                    ),
+                    "repo_path": meta.get("repo_path") or source_mapping.get("repo_path", ""),
+                    "module_path": meta.get("module_path") or source_mapping.get("module_path", ""),
+                    "old_reason": meta.get("old_reason") or "",
+                    "new_reason": meta.get("new_reason") or "",
+                    "old_candidates": meta.get("old_candidates") or [],
+                    "new_candidates": meta.get("new_candidates") or [],
+                    "old_ref_override": meta.get("old_ref_override") or "",
+                    "new_ref_override": meta.get("new_ref_override") or "",
+                    "mapping_mode": (dependency_path_meta.get(coord) or {}).get("mapping_mode"),
+                    "out_file": os.path.abspath(_out_file) if _out_file else "",
+                }
+                user_pending, internal_skipped = partition_git_ref_pending_items([pending_item])
+                if internal_skipped:
+                    gitdiff_status = "skipped"
+                    source_skip_for_behavior = dict(internal_skipped[0])
+                    result["gitdiff_skipped"].extend(internal_skipped)
+                    print(
+                        "    ℹ️  源码版本在正式对比时失效，已自动切换到最终制品 JAR 分析。",
+                        file=sys.stderr,
+                    )
+                    emit_progress(
+                        "step4",
+                        "gitdiff",
+                        "源码版本解析故障，已切换到最终制品 JAR 分析",
+                        current=i,
+                        total=total_dependencies,
+                        elapsed=time.perf_counter() - gitdiff_timer,
+                        item=coord,
+                    )
+                else:
+                    result["gitdiff_pending"].extend(user_pending)
+                    print("    ⚠️  源码版本存在多组提交范围，已加入待用户确认清单。", file=sys.stderr)
+                    emit_progress(
+                        "step4",
+                        "gitdiff",
+                        "源码版本存在结果歧义，需要用户选择提交范围",
+                        current=i,
+                        total=total_dependencies,
+                        elapsed=time.perf_counter() - gitdiff_timer,
+                        item=coord,
+                    )
             elif gitdiff_result.get("status") == "error":
                 gitdiff_status = "error"
                 gitdiff_details = err or ""
@@ -6365,19 +6820,23 @@ def main():
                     elapsed=time.perf_counter() - gitdiff_timer,
                     item=coord,
                 )
-                result["gitdiff_skipped"].append(
-                    {
-                        "coord": coord,
-                        "old_version": old_ver,
-                        "new_version": new_ver,
-                        "reason": err,
-                        "repo_path": meta.get("repo_path") or source_mapping.get("repo_path", ""),
-                        "module_path": meta.get("module_path") or source_mapping.get("module_path", ""),
-                        "old_candidates": meta.get("old_candidates") or [],
-                        "new_candidates": meta.get("new_candidates") or [],
-                        "out_file": os.path.abspath(_out_file) if _out_file else "",
-                    }
-                )
+                generic_source_skip = {
+                    "coord": coord,
+                    "old_version": old_ver,
+                    "new_version": new_ver,
+                    "reason": err,
+                    "reason_code": "DEPENDENCY_SOURCE_DIFF_UNAVAILABLE",
+                    "resolution": "continue_with_final_artifact_analysis",
+                    "user_attention_required": False,
+                    "evidence_impact": "源码证据暂缺；等待最终 JAR 方法字节码兜底结果",
+                    "repo_path": meta.get("repo_path") or source_mapping.get("repo_path", ""),
+                    "module_path": meta.get("module_path") or source_mapping.get("module_path", ""),
+                    "old_candidates": meta.get("old_candidates") or [],
+                    "new_candidates": meta.get("new_candidates") or [],
+                    "out_file": os.path.abspath(_out_file) if _out_file else "",
+                }
+                source_skip_for_behavior = dict(generic_source_skip)
+                result["gitdiff_skipped"].append(generic_source_skip)
                 if meta.get("timed_out"):
                     result["timeout_items"].append(
                         {
@@ -6714,6 +7173,96 @@ def main():
                     api_count=len(contract_apis),
                 )
 
+        if source_skip_for_behavior:
+            behavior_timer = time.perf_counter()
+            if dependency_old_jar and dependency_new_jar:
+                try:
+                    behavior_fallback = compare_jar_method_bodies(
+                        dependency_old_jar,
+                        dependency_new_jar,
+                        coord=coord,
+                        old_version=old_ver,
+                        new_version=new_ver,
+                        output_dir=args.output_dir,
+                        target_jdk=jdk_current,
+                    )
+                except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                    behavior_fallback = {
+                        "status": "insufficient",
+                        "reason_code": "FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE",
+                        "errors": [f"{type(exc).__name__}:{str(exc)[:200]}"],
+                        "rows": [],
+                    }
+            else:
+                behavior_fallback = {
+                    "status": "insufficient",
+                    "reason_code": "FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE",
+                    "errors": ["final_artifact_dependency_jars_unavailable"],
+                    "rows": [],
+                }
+            behavior_rows = list(behavior_fallback.get("rows") or [])
+            behavior_run = {
+                "coord": coord,
+                "old_version": old_ver,
+                "new_version": new_ver,
+                "status": behavior_fallback.get("status") or "insufficient",
+                "reason_code": behavior_fallback.get("reason_code") or "",
+                "api_changes": len(behavior_rows),
+                "modified_classes": int(behavior_fallback.get("modified_classes") or 0),
+                "scanned_classes": int(behavior_fallback.get("scanned_classes") or 0),
+                "javap_invocations": int(behavior_fallback.get("javap_invocations") or 0),
+                "evidence_path": behavior_fallback.get("evidence_path") or "",
+                "errors": list(behavior_fallback.get("errors") or []),
+            }
+            result["bytecode_behavior_runs"].append(behavior_run)
+            if behavior_run["status"] == "complete":
+                dependency_raw_apis.extend(behavior_rows)
+                result["all_apis"].extend(behavior_rows)
+                for skipped_item in result["gitdiff_skipped"]:
+                    if skipped_item.get("coord") == coord:
+                        skipped_item["resolution"] = "recovered_with_final_jar_method_bytecode_diff"
+                        skipped_item["behavior_fallback_status"] = "complete"
+                        skipped_item["behavior_fallback_evidence"] = behavior_run["evidence_path"]
+                        skipped_item["evidence_impact"] = (
+                            "源码 git diff 未完成；最终 JAR 方法字节码对比已补齐行为变化识别"
+                        )
+                print(
+                    f"    → 最终 JAR 方法字节码兜底完成：行为变化候选={len(behavior_rows)}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "    ⚠️  最终 JAR 方法字节码兜底未完成；将禁止完整/无影响结论。",
+                    file=sys.stderr,
+                )
+            emit_progress(
+                "step4",
+                "behavior-bytecode",
+                (
+                    f"最终 JAR 方法字节码兜底{('完成' if behavior_run['status'] == 'complete' else '证据不足')}，"
+                    f"变化候选={len(behavior_rows)}"
+                ),
+                current=i,
+                total=total_dependencies,
+                elapsed=time.perf_counter() - behavior_timer,
+                item=coord,
+            )
+            timing.record(
+                "dependency.behavior_bytecode_fallback",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status=behavior_run["status"],
+                elapsed=time.perf_counter() - behavior_timer,
+                external_process_count=behavior_run["javap_invocations"],
+                api_count=len(behavior_rows),
+                details={
+                    "reason_code": behavior_run["reason_code"],
+                    "evidence_path": behavior_run["evidence_path"],
+                    "errors": behavior_run["errors"][:5],
+                },
+            )
+
         if dependency_gitdiff_apis:
             gitdiff_filter_timer = time.perf_counter()
             accepted_source_apis, rejected_source_apis = filter_gitdiff_rows_with_jar_truth(
@@ -6828,11 +7377,18 @@ def main():
         gitdiff_runs.extend(item.get("gitdiff_runs") or [])
         gitdiff_skipped.extend(item.get("gitdiff_skipped") or [])
         gitdiff_pending.extend(item.get("gitdiff_pending") or [])
+        bytecode_behavior_runs.extend(item.get("bytecode_behavior_runs") or [])
         timeout_items.extend(item.get("timeout_items") or [])
         binary_runs.extend(item.get("binary_runs") or [])
         per_record = item.get("per_dependency_record")
         if per_record and per_record.get("coord"):
             per_dependency_records[per_record.get("coord")] = per_record
+
+    # A late source-ref failure can still occur if repository state changes
+    # after preflight.  Apply the same interaction boundary here so operational
+    # failures never become user work merely because they happened later.
+    gitdiff_pending, late_gitdiff_skipped = partition_git_ref_pending_items(gitdiff_pending)
+    gitdiff_skipped.extend(late_gitdiff_skipped)
 
     # 写入汇总文件
     write_all_timer = time.perf_counter()
@@ -6898,7 +7454,7 @@ def main():
     print(f"  最终制品 JAR 证据缺失：{len(jar_missing_deps)} 个依赖", file=sys.stderr)
     print(f"  JApiCmp 未安装：{len(japicmp_missing_deps)} 个依赖", file=sys.stderr)
     print(f"  其他 JApiCmp 失败：{len(other_failed_deps)} 个依赖", file=sys.stderr)
-    print(f"  git ref 待人工确认：{len(gitdiff_pending)} 个依赖", file=sys.stderr)
+    print(f"  源码版本待用户确认：{len(gitdiff_pending)} 个依赖", file=sys.stderr)
     print(f"  超时项：{len(timeout_items)}", file=sys.stderr)
     print(f"  输出：{csv_file}", file=sys.stderr)
 
@@ -6950,10 +7506,26 @@ def main():
         and row.get('old_version') not in ('', '-')
         and row.get('new_version') not in ('', '-')
     ]
+    behavior_expected_coords = {
+        str(row.get('coord') or '').strip()
+        for row in behavior_expected
+        if str(row.get('coord') or '').strip()
+    }
+    behavior_successful_coords = {
+        str(item.get('coord') or '').strip()
+        for item in gitdiff_runs
+        if str(item.get('coord') or '').strip()
+    } | {
+        str(item.get('coord') or '').strip()
+        for item in bytecode_behavior_runs
+        if item.get('status') == 'complete' and str(item.get('coord') or '').strip()
+    }
+    behavior_successful_coords &= behavior_expected_coords
+    behavior_uncovered_coords = behavior_expected_coords - behavior_successful_coords
     behavior_status = (
-        'not_applicable' if not behavior_expected
-        else ('complete' if len(gitdiff_runs) == len(behavior_expected)
-              else ('partial' if gitdiff_runs else 'insufficient'))
+        'not_applicable' if not behavior_expected_coords
+        else ('complete' if not behavior_uncovered_coords
+              else ('partial' if behavior_successful_coords else 'insufficient'))
     )
     step4_coverage = {
         'schema': 'java-upgrade-analyzer.step4-coverage.v1',
@@ -6976,16 +7548,34 @@ def main():
         },
         'behavior_diff': {
             'status': behavior_status,
-            'reason_codes': [] if behavior_status in {'complete', 'not_applicable'} else [
-                'dependency_source_or_git_ref_coverage_incomplete'
-            ],
+            'reason_codes': (
+                [] if behavior_status in {'complete', 'not_applicable'}
+                else [
+                    'dependency_source_or_git_ref_coverage_incomplete',
+                    *sorted({
+                        str(item.get('reason_code') or '').strip()
+                        for item in [*gitdiff_skipped, *bytecode_behavior_runs]
+                        if str(item.get('coord') or '').strip() in behavior_uncovered_coords
+                        and str(item.get('reason_code') or '').strip()
+                    }),
+                ]
+            ),
             'metrics': {
-                'planned_dependencies': len(behavior_expected),
-                'successful_dependencies': len(gitdiff_runs),
+                'planned_dependencies': len(behavior_expected_coords),
+                'successful_dependencies': len(behavior_successful_coords),
                 'pending_dependencies': len(gitdiff_pending),
-                'failed_or_skipped_dependencies': len(gitdiff_skipped),
+                'failed_or_skipped_dependencies': len(behavior_uncovered_coords),
                 'missing_source_dependencies': len(changed_deps_missing_source),
+                'source_gitdiff_dependencies': len({
+                    str(item.get('coord') or '').strip() for item in gitdiff_runs
+                    if str(item.get('coord') or '').strip()
+                }),
+                'jar_bytecode_fallback_dependencies': len({
+                    str(item.get('coord') or '').strip() for item in bytecode_behavior_runs
+                    if item.get('status') == 'complete' and str(item.get('coord') or '').strip()
+                }),
             },
+            'runs': bytecode_behavior_runs,
         },
     }
     coverage_output = Path(args.coverage_output) if args.coverage_output else default_coverage_output_path(args.output_dir)
@@ -7063,29 +7653,33 @@ def main():
         print("影响：这部分依赖无法通过 git diff 识别“签名不变的行为变更”。", file=sys.stderr)
         for it in items[:10]:
             print(f"  - {it['coord']} ({it['old_version']}→{it['new_version']})", file=sys.stderr)
-        print("\n相关输入：dependency_repo_mappings / dependency_source_dirs", file=sys.stderr)
-        print("说明：给到依赖源码 repo 根目录后，调度层会扫描 pom.xml 并展开多模块坐标。", file=sys.stderr)
-        print("示例输入：", file=sys.stderr)
-        print('  {"dependency_repo_mappings":["/abs/path/internal-repo"]}', file=sys.stderr)
-        print('  {"dependency_repo_mappings":[{"coord":"com.myco:lib-a","path":"/abs/path/internal-repo"}]}', file=sys.stderr)
+        print(
+            "系统处理：记录源码证据缺口，并继续最终制品 JAR 分析；"
+            "证据不足时限制最终结论。",
+            file=sys.stderr,
+        )
+        print(
+            "可选增强（不阻塞）：如需提高源码行为覆盖率，可在报告生成后补充依赖源码并重跑 Step4。",
+            file=sys.stderr,
+        )
 
     # 输出摘要，真正的交互暂停由 run_step.py 统一处理
     human_checkpoint_1(dep_rows, all_apis, args.output_dir)
     print(
-        "\nStep4 复核文件：changed_dependencies.md、summary.txt、all_changed_apis.csv、git_ref_matches.*",
+        "\nStep4 证据文件：changed_dependencies.md、summary.txt、all_changed_apis.csv、git_ref_matches.*",
         file=sys.stderr,
     )
     emit_progress(
         "step4",
         "done",
-        f"Step4 完成，变更 API={valid_count}，待确认 git refs={len(gitdiff_pending)}，超时项={len(timeout_items)}",
+        f"Step4 完成，变更 API={valid_count}，待确认源码版本={len(gitdiff_pending)}，超时项={len(timeout_items)}",
         elapsed=step_timer.elapsed(),
     )
     timing.record(
         "step4.total",
         status=(
             "awaiting_git_ref_confirmation" if gitdiff_pending
-            else ("awaiting_timeout_resolution" if timeout_items else "done")
+            else ("completed_with_timeouts" if timeout_items else "done")
         ),
         elapsed=step_timer.elapsed(),
         api_count=valid_count,
@@ -7097,15 +7691,14 @@ def main():
         if os.environ.get("JUA_ORCHESTRATED") == "1":
             emit_interaction(interaction)
             return 0
-        print("\n⚠️  存在待人工确认的 git refs，请查看 git_ref_pending.json 后重跑 Step4。", file=sys.stderr)
+        print("\n⚠️  存在会改变分析范围的源码版本歧义，请确认候选方案后重跑 Step4。", file=sys.stderr)
         return 2
     if timeout_items:
-        interaction = build_timeout_resolution_interaction(args.output_dir, timeout_items)
-        if os.environ.get("JUA_ORCHESTRATED") == "1":
-            emit_interaction(interaction)
-            return 0
-        print("\n⚠️  Step4 存在超时导致的证据缺口，请查看 timeouts.json 后重跑 Step4。", file=sys.stderr)
-        return 2
+        print(
+            "\n⚠️  Step4 存在超时项；系统已记录证据缺口并继续。"
+            "若关键覆盖未补齐，最终报告将禁止完整或无影响结论。",
+            file=sys.stderr,
+        )
     return 0
 
 

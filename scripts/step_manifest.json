@@ -1,5 +1,6 @@
 {
   "version": "1.1",
+  "auto_run_until_checkpoint": true,
   "runtime_controls": {
     "strict_risk_gate": {
       "type": "boolean",
@@ -101,7 +102,7 @@
       ],
       "notes": [
         "Step1 默认通过真实构建获取依赖结果。",
-        "自动切换分支执行构建时，必须显式允许。"
+        "分支构建使用固定 commit 的隔离临时 worktree，不修改用户当前工作区。"
       ]
     },
     {
@@ -110,6 +111,8 @@
       "title": "升级上下文",
       "script": "s2_context_from_deps.py",
       "gate": "context",
+      "auto_continue_on_success": true,
+      "conditional_confirmation": true,
       "interaction": {
         "type": "decision",
         "status": "awaiting_user_input",
@@ -146,6 +149,22 @@
             },
             "current_branch": {
               "type": "string"
+            },
+            "jdk_base": {
+              "type": "string",
+              "description": "升级前实际使用的 JDK 主版本，例如 8、11、17。仅在自动识别缺失或错误时修正。"
+            },
+            "jdk_current": {
+              "type": "string",
+              "description": "升级后实际使用的 JDK 主版本，例如 17、21。仅在自动识别缺失或错误时修正。"
+            },
+            "springboot_base": {
+              "type": "string",
+              "description": "升级前 Spring Boot 版本。仅在自动识别错误时修正。"
+            },
+            "springboot_current": {
+              "type": "string",
+              "description": "升级后 Spring Boot 版本。仅在自动识别错误时修正。"
             },
             "source_dirs": {
               "type": "array",
@@ -236,6 +255,8 @@
       "id": "step4",
       "order": 4,
       "title": "依赖 API 变化",
+      "requires_scope_confirmation": true,
+      "scope_confirmation_min_candidates": 2,
       "script": "s4_jar_compare.py",
       "gate": "jar_compare",
       "interaction": {
@@ -249,11 +270,10 @@
           "required_fields": [],
           "allowed_actions": [
             "continue",
-            "rerun_current_step",
             "cancel"
           ]
         },
-        "question": "请确认依赖 API 变化是否完整：源码目录应覆盖相关仓库，自动识别的模块坐标和新旧版本引用应正确。若有缺失、匹配错误或对比超时，请补充信息后重新分析；若只关心部分依赖，也可以从依赖变化清单中选择。",
+        "question": "请选择系统触达分析范围：默认全量分析全部变化依赖，以保持结论覆盖完整；如果你明确需要控制耗时，也可以选择部分依赖，但最终结论只适用于所选范围。",
         "response_schema": {
           "type": "object",
           "required": [
@@ -264,74 +284,35 @@
               "type": "string",
               "enum": [
                 "continue",
-                "rerun_current_step",
                 "cancel"
               ]
-            },
-            "dependency_source_dirs": {
-              "type": "array",
-              "description": "当 action=rerun_current_step 时可提供依赖源码目录列表；支持单模块工程根目录或多模块仓库根目录，系统会自动推断模块坐标并派生 Step4 所需映射。"
-            },
-            "dependency_git_ref_overrides": {
-              "type": "array",
-              "description": "当源码仓库已识别但 old_version/new_version 无法自动唯一匹配 git refs 时，按依赖显式确认 old_ref/new_ref，例如 [{\"coord\":\"g:a\",\"old_ref\":\"v1\",\"new_ref\":\"v2\"}]。"
             },
             "selected_targets": {
               "type": "array",
               "description": "可选。定向分析时，从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。"
             },
-            "step4_git_diff_timeout": {
-              "type": "integer",
-              "description": "可选。放宽单个依赖执行 git diff 的超时时间（秒）。"
-            },
-            "step4_japicmp_timeout": {
-              "type": "integer",
-              "description": "可选。放宽单个依赖执行 JApiCmp 的超时时间（秒）。"
-            },
-            "step4_fetch_timeout": {
-              "type": "integer",
-              "description": "可选。放宽通过 Maven dependency:get 安装 JApiCmp 工具的超时时间（秒）；不会用于下载被分析依赖。"
-            },
             "notes": {
               "type": "string",
-              "description": "记录用户对源码映射、git refs、缺失 jar、缺失源码映射等复核意见。"
+              "description": "可选。记录本次选择全量或部分分析范围的原因。"
             }
           }
         },
-        "resume_hint": "若用户补充依赖源码目录、依赖 old_ref/new_ref 或 Step4 超时参数，请使用 --response-json 传回 action=rerun_current_step 与对应字段，并重跑 Step4；若用户只想分析部分依赖包，在 continue 时通过 selected_targets 传回从 changed_dependencies.md 复制的完整坐标；若用户要求从更早阶段重跑，请传回 action=restart_from_step 与 restart_step_id（如 step2 / step4）。",
+        "resume_hint": "全量分析时传回 action=continue；部分分析时同时通过 selected_targets 传回从 changed_dependencies.md 复制的完整坐标。Step4 内部证据故障不属于本确认项，由系统自动处理并记录结论边界。",
         "options": [
           {
             "id": "continue",
-            "label": "继续（选择分析范围）",
-            "description": "可全量分析、从推荐候选中选择，或打开 evidence/api_changes/changed_dependencies.md 从全部候选中选择。定向分析时提供“依赖包”列中的一个或多个完整坐标。"
-          },
-          {
-            "id": "rerun_current_step",
-            "label": "修正映射后重跑",
-            "description": "补充依赖源码目录、修正新旧版本引用或放宽超时后，重新生成 API 变化结果。"
+            "label": "确认范围（默认全量）",
+            "description": "不提供 selected_targets 表示全量分析；仅在明确接受覆盖缩小时，提供一个或多个依赖坐标进行部分分析。"
           },
           {
             "id": "cancel",
             "label": "稍后处理",
-            "description": "保留当前分析现场，补齐依赖包或源码信息后再继续。"
+            "description": "保留当前分析现场，暂不进入系统触达分析。"
           }
         ],
         "action_requirements": {
           "continue": {
-            "recommended_fields": [
-              "selected_targets"
-            ],
-            "description": "定向分析时，应从 changed_dependencies.md 的“依赖包”列提供一个或多个完整坐标。"
-          },
-          "rerun_current_step": {
-            "at_least_one_of": [
-              "dependency_source_dirs",
-              "dependency_git_ref_overrides",
-              "step4_git_diff_timeout",
-              "step4_japicmp_timeout",
-              "step4_fetch_timeout"
-            ],
-            "description": "重跑 Step4 时，至少要提供一个修正项，不能空重跑。"
+            "description": "全量分析时无需 selected_targets；部分分析时，应从 changed_dependencies.md 的“依赖包”列提供一个或多个完整坐标。"
           }
         }
       },
@@ -348,91 +329,17 @@
         "evidence/api_changes/git_ref_matches.json"
       ],
       "notes": [
-        "本步骤输出 all_changed_apis.csv，后续 Step5 默认基于该文件做反向调用链分析，也允许在 checkpoint 中指定只分析其中部分依赖。"
+        "本步骤输出 all_changed_apis.csv；存在至少两个候选依赖时由用户选择 Step5 全量或部分分析范围，0/1 个候选时直接继续。范围选择会影响覆盖率、耗时和最终结论边界。"
       ]
     },
     {
       "id": "step5",
       "order": 5,
       "title": "系统触达证据",
+      "auto_continue_on_success": true,
       "script": "s5_call_chain_engine_integrated.py",
       "gate": "call_chain",
-      "interaction": {
-        "type": "review",
-        "status": "awaiting_user_input",
-        "missing_inputs": [],
-        "fallback_inputs": [],
-        "input_modes": [],
-        "input_normalization": {
-          "enabled": true,
-          "required_fields": [],
-          "allowed_actions": [
-            "continue",
-            "rerun_current_step",
-            "cancel"
-          ]
-        },
-        "question": "请确认系统触达证据的分析结果。结论分为已确认影响、可能影响、已确认不受影响、需人工复核、缺少依赖源码或构建产物；本次未完成分析和未发现调用路径会另列为覆盖缺口。可以基于当前证据生成报告，也可以补充材料后重新分析。",
-        "response_schema": {
-          "type": "object",
-          "required": [
-            "action"
-          ],
-          "properties": {
-            "action": {
-              "type": "string",
-              "enum": [
-                "continue",
-                "rerun_current_step",
-                "cancel"
-              ]
-            },
-            "dependency_source_dirs": {
-              "type": "array",
-              "description": "可选。优先补充依赖源码目录；支持单模块工程或多模块仓库，系统会自动推断依赖源码映射后重跑 Step5。"
-            },
-            "strict_risk_gate": {
-              "type": "boolean",
-              "description": "可选。设为 true 时，Step5 门控会在 uncertain/not_analyzed 非零时直接阻断。"
-            },
-            "notes": {
-              "type": "string",
-              "description": "记录用户对 uncertain 项、依赖源码补充计划或重跑决定。"
-            }
-          }
-        },
-        "options": [
-          {
-            "id": "continue",
-            "label": "继续",
-            "description": "接受当前影响判定，继续生成最终报告。"
-          },
-          {
-            "id": "rerun_current_step",
-            "label": "补源码后重跑",
-            "description": "补充依赖源码目录后，重新判断变更是否触达当前系统以及哪些项目仍无法确认。"
-          },
-          {
-            "id": "cancel",
-            "label": "稍后处理",
-            "description": "保留当前分析现场，补齐系统调用关系证据后再继续。"
-          }
-        ],
-        "action_requirements": {
-          "continue": {
-            "recommended_fields": [
-              "strict_risk_gate"
-            ],
-            "description": "若用户要求无盲区结论，可在继续前显式打开 strict_risk_gate。"
-          },
-          "rerun_current_step": {
-            "at_least_one_of": [
-              "dependency_source_dirs"
-            ],
-            "description": "重跑 Step5 时，应至少补充依赖源码目录。"
-          }
-        }
-      },
+      "interaction": null,
       "depends_on": [
         "step4"
       ],
@@ -467,7 +374,8 @@
       ],
       "outputs": [
         ".runtime/findings/s6_findings.json",
-        "deliverables/report.md"
+        "deliverables/report.md",
+        "deliverables/analysis-scope.md"
       ]
     }
   ]

@@ -616,6 +616,44 @@ class AnalysisContractTest(unittest.TestCase):
         indirect = next(item for item in coverage["components"] if item["id"] == "indirect_usage_matrix")
         self.assertEqual(indirect["reason_codes"], ["reflection_source_partial"])
 
+    def test_behavior_diff_insufficient_is_a_critical_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp)
+            dependencies = report / "evidence" / "dependencies"
+            api_changes = report / "evidence" / "api_changes"
+            runtime_coverage = report / ".runtime" / "coverage"
+            dependencies.mkdir(parents=True)
+            api_changes.mkdir(parents=True)
+            runtime_coverage.mkdir(parents=True)
+            (dependencies / "dep_changes.csv").write_text(
+                "coord,old_version,new_version\ncom.acme:api,1,2\n",
+                encoding="utf-8",
+            )
+            (api_changes / "all_changed_apis.csv").write_text(
+                "coord,api_name\n",
+                encoding="utf-8",
+            )
+            (runtime_coverage / "s4_coverage.json").write_text(
+                json.dumps({
+                    "binary_api_diff": {"status": "complete", "reason_codes": []},
+                    "behavior_diff": {
+                        "status": "insufficient",
+                        "reason_codes": ["FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE"],
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            coverage = derive_coverage_report(
+                report,
+                project_scope={"status": "complete", "reason_codes": []},
+            )
+
+        self.assertIn("behavior_diff", coverage["critical_incomplete"])
+        behavior = next(item for item in coverage["components"] if item["id"] == "behavior_diff")
+        self.assertEqual(behavior["status"], "insufficient")
+        self.assertEqual(behavior["reason_codes"], ["FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE"])
+
 
 if __name__ == "__main__":
     unittest.main()

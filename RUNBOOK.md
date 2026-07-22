@@ -101,24 +101,24 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ### tree-sitter 安装
 
-- 正式支持 CPython 3.12.x、Linux/macOS/Windows、JDK 11/17/21 与 Maven 3.8+。
+- 正式支持 CPython 3.12.x/3.13.x/3.14.x、Linux/macOS/Windows、JDK 11/17/21 与 Maven 3.8+。
 - 安装版本以根目录 `requirements-runtime.txt` 为唯一清单；Step5 运行时不会联网安装或修改 Python 环境。
-- 在仓库根目录使用 CPython 3.12 执行显式 bootstrap：
+- 在仓库根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
 
 ```bash
-python3.12 scripts/bootstrap_runtime.py
+python3 scripts/bootstrap_runtime.py
 ```
 
 - 离线环境先准备受控 wheel 目录，再禁止索引访问安装：
 
 ```bash
-python3.12 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels
+python3 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels
 ```
 
 - 安装后运行门禁；它会实际执行外部命令、核对解析器 import/精确版本，并确认 Java 工具与 Maven 使用同一 JDK：
 
 ```bash
-python3.12 scripts/quality_gate.py --profile quick --skip-real
+python3 scripts/quality_gate.py --profile quick --skip-real
 ```
 
 - 环境不满足契约时，分析在开始前给出明确失败；Step5 缺少解析器时仍进入 checkpoint，且不会用正则静默生成结论。
@@ -228,7 +228,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 - `run_step.py` 退出码 `4` 表示当前命令已进入待用户交互状态，不是普通失败
 - 退出码 `4` 时不要直接重试上一条命令，应先读取 `interaction.json` 并等待用户答复
-- 推荐把用户答复整理成 `intent_patch`，再通过 `--response-json` / `--response-file` 恢复；不要继续沿用旧的顶层业务字段示例
+- 对当前 checkpoint 的答复直接使用其 `response_schema`；Step4 范围确认使用顶层 `action` / `selected_targets`。只有当前不存在 `pending_interaction`、用户提出新的正式业务意图时才使用 `intent_patch`
 - 若当前不存在 `pending_interaction`，但用户提出了新的正式业务意图，也可以继续使用 `intent_patch`
 - 这类输入不会伪装成 checkpoint 恢复；调度器会先把它桥接为主状态更新，再从推断出的目标步骤或 `restart_step_id` 重跑
 - 非 checkpoint 场景下，`intent_patch` 必须在 `set` / `clear` 中提供至少一个正式业务字段，或显式使用 `action=restart_from_step`
@@ -237,7 +237,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 当 Step4 已生成 `evidence/api_changes/changed_dependencies.md` / `changed_dependencies.csv` 后，可通过依赖包完整坐标只让某个或某几个依赖进入 Step5。
 
-对用户展示三层入口：全量分析、从推荐候选中选择、从完整候选清单中选择。推荐候选由 `recommended=true` 标识，规则为含高风险 API、删除或签名变化，或变化 API 数不少于 20；推荐只用于缩小范围，不代表已经确认影响。
+Step4 成功且存在至少两个候选依赖时生成范围选择 checkpoint，由用户决定 Step5 全量或部分分析。0 个候选时没有系统触达目标，1 个候选时全量和选择该候选等价，系统直接继续。全量覆盖全部变化依赖；部分分析通过 `selected_targets` 从推荐候选或完整候选清单中选择，能够降低耗时，但最终报告必须明确仅覆盖所选范围。范围卡同时展示依赖数、变化 API 数和高风险 API 数。推荐候选由 `recommended=true` 标识，规则为含高风险 API、删除或签名变化，或变化 API 数不少于 20。内部源码/ref/超时故障不得成为该 checkpoint 的用户修复项。
 
 让用户从 `changed_dependencies.md` 的“依赖包”列复制完整坐标，例如：
 
@@ -251,7 +251,7 @@ com.example:legacy-lib
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["com.example:legacy-lib"]}}}'
+  --response-json '{"action":"continue","selected_targets":["com.example:legacy-lib"],"notes":"只分析所选依赖"}'
 ```
 
 说明：
@@ -264,7 +264,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - Step5 的 `summary.json -> graph_stats.indirect_usage` 会输出按 API、symbol kind 和调用机制拆分的覆盖矩阵；目标相关能力为 `partial/insufficient` 时，该 API 不得输出 `not_found_in_static_analysis`，对应总视图会派生到 `.upgrade-report/.runtime/coverage/coverage.json` 的 `indirect_usage_matrix`
 - Step5 的 `.upgrade-report/framework_adapters.json` 当前基线包含 `java_spi`、`spring_basic`、`mybatis`、`dynamic_proxy_basic` 和 `declarative_http_client_basic`
 - `dynamic_proxy_basic` 只为能够从注册点绑定到具体 handler 的回调输出证据，但仅注册不会把 handler 提升为业务入口；`declarative_http_client_basic` 生成的是业务向远端发起调用的出站证据；两者都不直接进入 `framework_entry_symbols`
-- 若当前已经不在 Step4 checkpoint，也可以通过结构化新意图继续指定范围，例如：
+- 若当前不在 Step4 范围 checkpoint，用户之后主动改变范围，可通过结构化新意图指定，例如：
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
@@ -275,7 +275,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 - 调度器会先把 `selected_targets` 归一化为正式 `step5_selected_coords` / `step5_selected_names`，再自动桥接为从 `step5` 重跑，而不是直接卡死在“当前没有 pending interaction”
 - 只有已进入 Step4 API 目标集的依赖才能通过 `step5_selected_coords` / `step5_selected_names` 被选中
-- Step4 checkpoint 中展示给用户的候选列表可以按数量截断，但 `selected_targets` 的正式解析范围仍是完整候选集；因此即使目标未出现在终端展示片段中，也可以从 `changed_dependencies.md` 复制完整坐标提交
+- `selected_targets` 的正式解析范围始终是完整候选集，可以从 `changed_dependencies.md` 复制完整坐标提交
+- 调度器会把本次全量/部分选择写入 `.runtime/cache/step5_selection.json`；Step6 使用该快照声明分析范围，部分分析不得生成全局无影响结论
 
 若用户答复较长，优先使用：
 
@@ -335,6 +336,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
       by_api/
       by_module/
   .runtime/
+    observability/progress.jsonl
     state/
       main_state.json
       interaction.json
@@ -398,7 +400,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 - 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支执行 `mvn dependency:list` 补全坐标；但这不是 direct artifact 模式的执行前硬前置
 - `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
 - 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧源码并运行 Maven 补全；自动构建模式则在构建前解析两侧 ref。解析时先查询实时远程 refs，候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在 Maven 执行前暂停确认；选定后仅定向 fetch 所需 ref，不执行 `git pull`，也不修改用户当前分支。
-- 远端不存在、认证失败、网络失败、超时或定向 fetch 失败时会暂停。瞬时网络错误在暂停前最多尝试 3 次（间隔 1 秒、3 秒），认证失败、ref 不存在和 ref 移动不重试；fetch 已唯一定位但失败时，卡片提供“重试 fetch”，不再要求重新选分支。裸 SHA 必须先与实时远端记录的 `commit` 匹配并按 expected commit 固定；远端无法提供时以 `remote_source_unavailable` / fetch 失败为主状态，本地对象仅记录为 `local_fallback_available`。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地 commit；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。依赖源码 ref 使用 `dependency_git_ref_overrides` 中对应的 `allow_local_source` / `allow_dirty_local_source`，不得由 Agent 代替用户填写确认。
+- 对 Step1 构建来源，远端不存在、认证失败、网络失败、超时或定向 fetch 失败时会暂停。瞬时网络错误在暂停前最多尝试 3 次（间隔 1 秒、3 秒），认证失败、ref 不存在和 ref 移动不重试；裸 SHA 必须先与实时远端记录的 `commit` 匹配并按 expected commit 固定。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地 commit；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。Step4 的依赖源码属于辅助证据：远端查询、fetch、ref 移动、未匹配等内部故障在受控重试后记录为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并自动改用最终 JAR 方法字节码指纹识别同签名实现变化；不会要求用户修复，也不会静默使用本地 ref。若字节码兜底也失败，行为覆盖成为关键缺口并限制最终结论。只有两个以上不同 commit pair 会改变源码对比范围时才暂停确认。
 - 同时提供 branch/ref 与 source directory 时，以确认后的 branch/ref 为准；只有 source directory 时不得直接使用当前 checkout 执行坐标补全
 - 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源
 - 若这两个分支是在 Step1 review checkpoint 才补充，恢复 `continue` 后调度器会先把确认值写入 `step2.input`，再进入 Step2
@@ -466,7 +468,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step context --report-dir .upgra
 - JDK 升级时运行 JDK 相关扫描
 - Spring Boot 大版本升级时运行 Spring Boot 相关扫描
 - 无论何种升级，默认补跑依赖 jar 兼容性扫描
-- 正式流程会向 `stderr` 输出 `[progress][step3][plan|scan|done]` 日志，便于外部观察长耗时扫描的阶段推进
+- 正式流程会向 `stderr` 输出 `[进度][兼容性线索][准备/扫描/完成]` 等用户可读进度；长时间无新输出时每 30 秒发出一次运行心跳，有可靠分母时显示粗略预计剩余时间；原始任务、阶段、数量、已用时间和预计剩余时间同时写入 `.runtime/observability/progress.jsonl`
+- 用户按 `Ctrl-C` 时，编排器会终止当前子进程、清理当前步骤的候选输出，保留已完成步骤及当前输入，并以退出码 130 结束；再次运行 `run_step.py --step auto` 即可安全重试当前任务。
 
 ### 参考命令
 
@@ -520,7 +523,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s4_jar_compare.py" \
 ```
 
 更推荐写入 `main_state.json` 的 `dependency_source_dirs`，减少命令行复杂度。
-提供后，Step4 会从远端实时查询结果中尝试将 `old_version/new_version` 匹配为对应依赖源码分支，例如 `origin/release-1.2.3`、`origin/hotfix-1.2.3`、`origin/support/1.2.3-DEV`；其中会先去掉末尾 `-SNAPSHOT`，按“严格边界命中”筛选候选。比如版本 `3.0.2` 会命中 `origin/auth-sdk3.0.2`，不会命中 `origin/auth-sdk3.0.2.1`。若 old/new 两侧同时存在多个候选，还会优先选择 remote 一致、版本前缀家族一致的 ref pair；同分候选指向不同 commit 时进入人工确认，指向同一 commit 时固定该 commit。
+提供后，Step4 会从远端实时查询结果中尝试将 `old_version/new_version` 匹配为对应依赖源码分支，例如 `origin/release-1.2.3`、`origin/hotfix-1.2.3`、`origin/support/1.2.3-DEV`；其中会先去掉末尾 `-SNAPSHOT`，按“严格边界命中”筛选候选。比如版本 `3.0.2` 会命中 `origin/auth-sdk3.0.2`，不会命中 `origin/auth-sdk3.0.2.1`。若 old/new 两侧同时存在多个候选，还会优先选择 remote 一致、版本前缀家族一致的 ref pair；同分候选指向同一 commit pair 时固定该 pair，指向两个以上不同 commit pair 且会改变 diff 范围时才进入人工确认。远端查询、fetch、ref 移动或未匹配等内部故障不会中断 JAR 分析；系统会自动执行最终 JAR 方法字节码兜底，只有源码与字节码两条行为证据都失败时才把覆盖率标记为关键缺口。
 
 Step4 需要 JApiCmp 执行 jar 二进制 API 对比。正式流程会先自动尝试安装：
 
@@ -529,11 +532,9 @@ mvn dependency:get \
   -Dartifact=com.github.siom79.japicmp:japicmp:0.21.2:jar:jar-with-dependencies
 ```
 
-如果自动安装失败，Step4 会进入 checkpoint，要求用户选择：
-
-1. 手动安装 JApiCmp 后重跑；
-2. 提供 `japicmp_jar` 绝对路径后重跑；
-3. 取消本轮分析，待环境准备完成后再运行。
+如果自动安装失败，Step4 会记录 `japicmp_preflight.json` 并以
+`blocked_by_system` 停止，不生成用户确认项。环境恢复后可以重跑 Step4；
+也可以事先在主状态中提供 `japicmp_jar` 绝对路径。
 
 JApiCmp 是 Java 依赖升级分析的必需工具，不允许降级继续。缺少 JApiCmp 会漏掉删除方法、签名变化、字段变化、源码重编译不兼容等风险。
 
@@ -552,7 +553,7 @@ JApiCmp 是 Java 依赖升级分析的必需工具，不允许降级继续。缺
 - Step4 只复用 Step1 成功构建产物中的 `base_lib_entry/current_lib_entry` JAR，并将提取缓存写入 `.upgrade-report/evidence/api_changes/step4_artifact_jars/`；无法从最终制品定位时会明确报告证据缺失，不读取本地 Maven 仓库，也不下载同坐标 JAR 替代
 - Step4 默认 `step4_workers=4` 进行依赖级并行；如果本机 CPU/磁盘压力过高，可在主状态或命令行设为 1/2
 - 正式流程默认不设置 Step4 超时；仅在主状态中显式写入 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应限制。`step4_fetch_timeout` 只控制远端 Git 查询/抓取，JApiCmp 自动安装使用独立的 `step4_tool_install_timeout`
-- 正式流程会向 `stderr` 输出 `[progress][step4][dependency|gitdiff|japicmp|done]` 日志，展示当前处理到哪个依赖、子阶段和耗时
+- 正式流程会向 `stderr` 输出 `[进度][依赖 API 变化][处理依赖/源码辅助对比/制品 API 对比/完成]` 等用户可读进度，并展示当前对象、数量和耗时
 
 ## Step 5：调用链影响分析
 
@@ -567,7 +568,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
 ```
 
 若通过 `run_step.py` 执行，建议将 `source_dirs` / `dependency_source_dirs` / `max_depth` 写入 `main_state.json`，命令保持最小参数集。
-- 若 Step4 checkpoint 只想分析部分变更 jar，优先在恢复时传 `selected_targets`；调度器会先把它归一化为正式的 `step5_selected_coords` / `step5_selected_names`，再基于 Step4 API 生成过滤后的输入文件执行 Step5。
+- 若只想分析部分变更 jar，通过新的正式意图传入 `selected_targets`；调度器会先把它归一化为正式的 `step5_selected_coords` / `step5_selected_names`，再基于 Step4 API 生成过滤后的输入文件执行 Step5。
 - 人工输入的 `selected_targets` 使用依赖包完整坐标，调度器必须严格匹配唯一目标；`selection_key` 仅供结构化自动化输入兼容解析。只有用户仅给出依赖名称时，才允许按 `artifactId` 名称筛选命中的全部候选。
 正式流程默认不设置 Step5 外层超时；仅在主状态中显式写入 `step5_timeout` 时才启用限制。
 
@@ -579,13 +580,13 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / not_impacted / uncertain / not_found_in_static_analysis / not_analyzed 的成因；`by_api/*.json` 中的 `evidence_paths` 是逐边证据
 - 若 `all_changed_apis.csv` 为空，直接跳过并说明“Step4 未提取到可追踪的变更 API”
 - 若指定 `selected_targets`，优先按依赖包完整坐标精确匹配；结构化自动化输入仍可使用 `selection_key`。解析后归一化为程序内部的 `step5_selected_coords` / `step5_selected_names`
-- Step4 checkpoint 若只展示前若干个候选，这只影响展示，不影响正式匹配；未展示的合法目标仍会参与 `selected_targets` 解析
+- `selected_targets` 基于完整候选集匹配，不依赖终端是否展示该候选
 - 显式重跑 Step1 或 Step5 前，调度层会先清空该步骤全部正式输出，避免旧的制品、catalog、framework adapter 或对齐文件污染新一轮结果
 - 若直接指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
 - 若筛选条件未在 Step4 API 目标中命中，Step5 会直接报错，避免静默分析错范围
-- 正式流程会向 `stderr` 输出 `[progress][step5][discovery|graph|bridge-check|trace|report|done]` 日志，展示源码映射发现、图构建、调用链追踪与报告生成的推进情况
+- 正式流程会向 `stderr` 输出 `[进度][系统触达证据][发现源码/构建调用图/跨依赖检查/追踪系统触达/生成结果/完成]` 等用户可读进度
 - Step5 会生成内部查询索引 `.upgrade-report/.runtime/indexes/s5_query_index.json`。当用户询问某个方法的调用链时，Claude Code 可使用 `scripts/s5_query_call_chain.py` 即时查询；默认只把调用链返回给用户，不额外落查询结果文件。
-- 该查询是只读旁路能力：Step5 完成后任意时刻都可使用，包括当前处于 Step5/Step6 checkpoint 等待用户确认时；它不会恢复 checkpoint，也不会推进 pipeline。
+- 该查询是只读旁路能力：Step5 完成后任意时刻都可使用；它不会改写主流程状态。
 - 当 `reason_code` 为 `DIRECT_CLASS_USAGE`、`DIRECT_FIELD_USAGE`、`DIRECT_STATIC_IMPORT_USAGE` 时，表示 Step5 已直接在业务源码中找到类型/字段引用证据，而不是传统方法调用链
 - `DIRECT_CLASS_USAGE` 仅接受声明类型、import（含 wildcard import）精确命中或 FQCN 直写等正式类型证据；若 simple name 已被 import 解析到其他 FQCN，不会再升级为直接类型命中
 - 当 `reason_code` 为 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示 Step5 已在运行时依赖 jar 的字节码里稳定命中目标符号；若该依赖仍有可用源码映射，Step5 会先继续尝试回溯到业务代码，只有源码追踪未能确认业务入口时才保守收敛为 `uncertain`

@@ -9,12 +9,13 @@ from importlib import metadata
 from pathlib import Path
 import platform
 import re
-import shutil
 import subprocess
 import sys
 
+from compat import find_executable
 
-SUPPORTED_PYTHON = {(3, 12)}
+
+SUPPORTED_PYTHON = {(3, 12), (3, 13), (3, 14)}
 SUPPORTED_PLATFORMS = {"Linux", "Darwin", "Windows"}
 SUPPORTED_JDK_MAJORS = {11, 17, 21}
 MINIMUM_MAVEN = (3, 8)
@@ -57,7 +58,7 @@ def _check(component, ok, observed, expected, reason=""):
 
 
 def _run(command, timeout=15):
-    executable = shutil.which(command[0])
+    executable = find_executable(command[0])
     if executable is None:
         return None, ""
     try:
@@ -109,8 +110,8 @@ def validate_runtime_contract(*, require_maven=True):
         "python",
         python_implementation == "CPython" and python_version in SUPPORTED_PYTHON,
         f"{python_implementation} {platform.python_version()}",
-        "CPython 3.12.x",
-        "unsupported_python; run the bootstrap with CPython 3.12",
+        "CPython 3.12.x, 3.13.x, or 3.14.x",
+        "unsupported_python; run the bootstrap with CPython 3.12-3.14",
     ))
     system = platform.system()
     checks.append(_check(

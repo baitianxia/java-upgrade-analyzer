@@ -427,7 +427,9 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 - 依赖源码仓库的 git ref 只从远端分支 `remotes` 中匹配，不直接沿用主项目分支名
 - 版本匹配会先去掉末尾 `-SNAPSHOT`，再按“严格边界命中”筛选候选；像 `3.0.2` 不会命中 `3.0.2.1`
 - `DEV/dev` 分支在同等条件下低于非 `DEV/dev` 分支
-- old/new 两侧同时存在多个候选时，先要求候选各自命中规范化版本，再优先选择能够复现 `old_version -> new_version` 非核心 token 差分、且 remote 一致、版本前缀家族一致的 ref pair；若仍无法拉开差距，则进入人工确认
+- old/new 两侧同时存在多个候选时，先要求候选各自命中规范化版本，再优先选择能够复现 `old_version -> new_version` 非核心 token 差分、且 remote 一致、版本前缀家族一致的 ref pair；只有剩余两个以上不同 commit pair、且选择会改变 diff 范围时才进入人工确认
+- 远端查询失败、fetch 失败、ref 移动、未匹配、远端不可用或未授权本地兜底属于内部源码证据故障；受控重试后统一转为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不生成用户 checkpoint，不猜测 ref，也不静默使用本地对象。系统改用升级前后最终 JAR：先以 class SHA-256 缩小到共享变化类，再批量运行 `javap -c -s -p`，按方法 JVM descriptor 对齐并比较去除常量池槽位噪声后的指令指纹，生成 `jar_bytecode` / `FINAL_JAR_METHOD_BODY_CHANGED` 证据
+- 源码 git diff 或最终 JAR 方法字节码兜底只要有一项完整，该依赖的 `behavior_diff` 即可计为 complete；两者均不可用时，`behavior_diff` 必须成为 `critical_incomplete`，标准报告只能给受限结论，严格模式必须阻塞
 
 #### Step4 到 Step5 的正式契约
 
@@ -498,7 +500,9 @@ Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系�
 - `all_changed_apis.csv`
 - 业务源码目录 `source_dirs`
 - 自动推断或用户补齐的依赖源码映射
-- 必要时由 Step4 checkpoint 指定的目标 API 子集
+- 用户在 Step4 范围 checkpoint 中选择的目标 API 子集；选择全量时使用全部 Step4 API
+
+调度层在执行 Step5 前写入 `.runtime/cache/step5_selection.json`，记录全量/部分模式、纳入和排除的依赖以及 API 数量。Step6 必须读取该快照声明结论范围；快照缺失时不得默认解释为全量分析。
 
 当 `Step5` 作为独立 CLI 运行且未显式传 `--report-dir` 时，当前实现会优先从 `all_changed_apis.csv` 所在的 `evidence/api_changes/` 目录推导报告目录；若该输入也未提供，则再回退到 `output_dir` 的父目录。
 
@@ -526,7 +530,7 @@ Step5 在保留原有 `summary.json`、`by_api/*.json`、`by_module/*.json` 的�
 
 - Step4 负责提供“已确认 API 变化事实”
 - Step3 负责提供 `class_usage / resource / reflection / SPI` 等候选信号
-- 若在 Step4 checkpoint 指定了 `step5_selected_coords` / `step5_selected_names`，筛选会同时作用于这两类输入，而不是只过滤 Step4
+- 若通过定向分析意图指定了 `step5_selected_coords` / `step5_selected_names`，筛选会同时作用于这两类输入，而不是只过滤 Step4
 
 #### Step5 的直接证据增强
 
