@@ -165,7 +165,7 @@ class CollectedEdge:
         )))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CoverageRecord:
     collector: str
     api_identity: str

@@ -3015,6 +3015,7 @@ def export_removed_jar_apis(
         f"old_jar_source={old_jar_source or 'unknown'}",
         f"class_count={class_count}",
         f"exported_api_count={len(apis)}",
+        f"api_surface_empty={str(not apis and not errors).lower()}",
     ]
     if errors:
         lines.append("errors:")
@@ -3024,12 +3025,12 @@ def export_removed_jar_apis(
         "old_jar": old_jar,
         "old_jar_source": old_jar_source,
         "javap_invocations": javap_invocations,
+        "class_count": class_count,
+        "exported_api_count": len(apis),
+        "api_surface_empty": not apis and not errors,
         "old_jar_evidence": old_jar_evidence or {},
         "errors": errors,
-    }, (
-        "removed JAR javap 导出不完整"
-        if errors else None if apis else "未导出到任何 public/protected API"
-    )
+    }, ("removed JAR javap 导出不完整" if errors else None)
 
 
 # ══════════════════════════════════════════════════════════════════

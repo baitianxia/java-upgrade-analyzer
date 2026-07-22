@@ -21,8 +21,10 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import csv
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -61,6 +63,7 @@ ALERTS_SPLIT_MAX_ROWS = 50000
 ALERTS_SPLIT_MAX_BYTES = 8 * 1024 * 1024
 _SUMMARY_JSON_ELAPSED_PLACEHOLDER = 999999.999
 _REPORT_ELAPSED_PLACEHOLDER = 999998.999
+_SUMMARY_ARTIFACT_STREAM_PATCH_MIN_BYTES = 16 * 1024 * 1024
 
 ALERTS_REVIEW_BUCKETS = [
     ('reachable', {'reachable'}),
@@ -348,31 +351,51 @@ def write_per_dependency_summaries(all_results, report_dir):
     for result in all_results or []:
         coord = str(getattr(result, 'coord', '') or '').strip()
         if coord:
-            grouped[coord].append(trace_result_to_api_entry(result))
+            # Retain the already-existing TraceResult reference.  Converting
+            # every API here duplicated the complete Step5 report in memory,
+            # even though this summary only emits twenty samples per coord.
+            grouped[coord].append(result)
 
-    for coord, entries in grouped.items():
+    def representative_rank(result):
+        severity = {'P0': 0, 'P1': 1, 'P2': 2}.get(
+            str(getattr(result, 'severity', '') or '').strip(), 9
+        )
+        return (
+            _per_dependency_status_rank(
+                getattr(result, 'analysis_status', '')
+            ),
+            severity,
+            -int(getattr(result, 'business_reach_depth', 0) or 0),
+            str(getattr(result, 'api_name', '') or ''),
+        )
+
+    for coord, results in grouped.items():
         per_dependency_dir = get_per_dependency_dir(report_dir, coord)
         os.makedirs(per_dependency_dir, exist_ok=True)
         summary_path = per_dependency_dir / PER_DEPENDENCY_SUMMARY_FILE
         existing_summary = _load_json_if_exists(summary_path)
 
-        reachable_entries = [item for item in entries if item.get('analysis_status') == 'reachable']
-        uncertain_entries = [item for item in entries if item.get('analysis_status') == 'uncertain']
-        not_analyzed_entries = [item for item in entries if item.get('analysis_status') == 'not_analyzed']
-        not_found_entries = [
-            item for item in entries
-            if item.get('analysis_status') in ('not_found_in_static_analysis', 'not_reachable')
-        ]
-        representative = _pick_per_dependency_representative(entries)
-        reaches_system_source = bool(reachable_entries)
+        status_counts = defaultdict(int)
+        for result in results:
+            status_counts[str(getattr(result, 'analysis_status', '') or '')] += 1
+        representative_result = min(results, key=representative_rank) if results else None
+        representative = (
+            trace_result_to_api_entry(representative_result)
+            if representative_result is not None
+            else {}
+        )
+        reaches_system_source = bool(status_counts['reachable'])
 
         step5_summary = {
             'status': 'done',
-            'total_targets': len(entries),
-            'reachable': len(reachable_entries),
-            'uncertain': len(uncertain_entries),
-            'not_analyzed': len(not_analyzed_entries),
-            'not_found_in_static_analysis': len(not_found_entries),
+            'total_targets': len(results),
+            'reachable': status_counts['reachable'],
+            'uncertain': status_counts['uncertain'],
+            'not_analyzed': status_counts['not_analyzed'],
+            'not_found_in_static_analysis': (
+                status_counts['not_found_in_static_analysis']
+                + status_counts['not_reachable']
+            ),
             'reaches_system_source': reaches_system_source,
             'final_status': str(representative.get('analysis_status') or '').strip(),
             'blocked_at': '' if reaches_system_source else _infer_blocked_at(representative),
@@ -381,7 +404,9 @@ def write_per_dependency_summaries(all_results, report_dir):
             'selected_status': str(representative.get('analysis_status') or '').strip(),
             'selected_api': str(representative.get('api') or representative.get('api_name') or '').strip(),
             'selected_reason': str(representative.get('reason') or representative.get('reachable_note') or '').strip(),
-            'sample_results': entries[:20],
+            'sample_results': [
+                trace_result_to_api_entry(result) for result in results[:20]
+            ],
         }
 
         summary = dict(existing_summary) if isinstance(existing_summary, dict) else {}
@@ -1278,8 +1303,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     uncertain_reason_summary = reason_summary(uncertain)
     not_analyzed_reason_summary = reason_summary(not_analyzed)
 
-    summary = {
-        'meta': {
+    meta = {
             'generated_at': datetime.now().isoformat(),
             'total_apis':   len(all_results),
             'reachable':    len(reachable),
@@ -1289,24 +1313,8 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
             'not_found_in_static_analysis': len(not_found),
             'tool':         's5_call_chain_engine_integrated.py (enhanced)',
             'graph_stats':  thaw_evidence_value(graph_stats or {}),
-        },
-        'status':           'done',
-        'skip_reason':      '',
-        'total_apis':       len(all_results),
-        'reachable':        len(reachable),
-        'not_impacted':     len(not_impacted),
-        'not_found_in_static_analysis': len(not_found),
-        'uncertain':        len(uncertain),
-        'not_analyzed':     len(not_analyzed),
-        'reachable_apis':     [trace_result_to_api_entry(r) for r in reachable],
-        'not_impacted_apis':  [trace_result_to_api_entry(r) for r in not_impacted],
-        'uncertain_apis':     [trace_result_to_api_entry(r) for r in uncertain],
-        'not_analyzed_apis':  [trace_result_to_api_entry(r) for r in not_analyzed],
-        'not_found_apis':     [trace_result_to_api_entry(r) for r in not_found],
-        'uncertain_reason_summary': uncertain_reason_summary,
-        'not_analyzed_reason_summary': not_analyzed_reason_summary,
-        'user_conclusion_summary': dict(sorted(user_conclusion_summary.items(), key=lambda x: x[0])),
-        'quality_gate': {
+    }
+    quality_gate = {
             'confirmed_impact': decision_bucket_summary.get('confirmed_impact', 0),
             'confirmed_no_impact': decision_bucket_summary.get('confirmed_no_impact', 0),
             'probable_impact': decision_bucket_summary.get('probable_impact', 0),
@@ -1317,8 +1325,8 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
                 for r in all_results
                 if summarize_user_facing_outcome(r)['decision_bucket'] == 'inconclusive' and r.severity in ('P0', 'P1')
             ),
-        },
-        'deprecated_aliases': {
+    }
+    deprecated_aliases = {
             'not_reachable': {
                 'replacement': 'not_found_in_static_analysis',
                 'scope': 'count',
@@ -1327,12 +1335,83 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
                 'replacement': 'not_found_apis',
                 'scope': 'api_list',
             },
-        },
     }
+    artifacts = {'summary_json': 'summary.json'}
+    for key, path_name in (
+        ('alerts_csv', 'alerts.csv'),
+        ('api_detail_dir', 'by_api'),
+        ('module_summary_dir', 'by_module'),
+    ):
+        if os.path.exists(os.path.join(output_dir, path_name)):
+            artifacts[key] = path_name
 
     summary_json_path = os.path.join(output_dir, 'summary.json')
     with open(summary_json_path, 'w', encoding='utf-8', newline='\n') as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+        f.write('{\n')
+        first = True
+
+        def write_field(name, value):
+            nonlocal first
+            if not first:
+                f.write(',\n')
+            first = False
+            f.write('  ' + json.dumps(name, ensure_ascii=False) + ': ')
+            rendered = json.dumps(value, ensure_ascii=False, indent=2)
+            lines = rendered.splitlines()
+            f.write(lines[0])
+            for line in lines[1:]:
+                f.write('\n  ' + line)
+
+        def write_api_array(name, results):
+            nonlocal first
+            if not first:
+                f.write(',\n')
+            first = False
+            f.write('  ' + json.dumps(name, ensure_ascii=False) + ': [')
+            wrote_item = False
+            for result in results:
+                if wrote_item:
+                    f.write(',')
+                f.write('\n')
+                rendered = json.dumps(
+                    trace_result_to_api_entry(result),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                for line_index, line in enumerate(rendered.splitlines()):
+                    if line_index:
+                        f.write('\n')
+                    f.write('    ' + line)
+                wrote_item = True
+            if wrote_item:
+                f.write('\n  ]')
+            else:
+                f.write(']')
+
+        write_field('meta', meta)
+        write_field('status', 'done')
+        write_field('skip_reason', '')
+        write_field('total_apis', len(all_results))
+        write_field('reachable', len(reachable))
+        write_field('not_impacted', len(not_impacted))
+        write_field('not_found_in_static_analysis', len(not_found))
+        write_field('uncertain', len(uncertain))
+        write_field('not_analyzed', len(not_analyzed))
+        write_api_array('reachable_apis', reachable)
+        write_api_array('not_impacted_apis', not_impacted)
+        write_api_array('uncertain_apis', uncertain)
+        write_api_array('not_analyzed_apis', not_analyzed)
+        write_api_array('not_found_apis', not_found)
+        write_field('uncertain_reason_summary', uncertain_reason_summary)
+        write_field('not_analyzed_reason_summary', not_analyzed_reason_summary)
+        write_field(
+            'user_conclusion_summary',
+            dict(sorted(user_conclusion_summary.items(), key=lambda x: x[0])),
+        )
+        write_field('quality_gate', quality_gate)
+        write_field('deprecated_aliases', deprecated_aliases)
+        write_field('artifacts', artifacts)
+        f.write('\n}\n')
 
     write_per_dependency_summaries(all_results, str(api_changes_dir_for_step5_output(output_dir)))
 
@@ -1355,6 +1434,45 @@ def register_step5_summary_artifacts(output_dir, report_dir=None):
     else:
         report_path = output_path.resolve().parent
     summary_path = output_path / 'summary.json'
+    timing_path = (
+        report_path / RUNTIME_DIRNAME / RUNTIME_OBSERVABILITY_DIRNAME
+        / 'step5_timing.csv'
+    )
+    # The generated summary keeps ``artifacts`` as its final top-level field.
+    # Patch the late timing artifact into that small tail instead of loading a
+    # multi-gigabyte report solely to add one string.
+    try:
+        summary_size = summary_path.stat().st_size
+    except OSError:
+        return False
+    if summary_size >= _SUMMARY_ARTIFACT_STREAM_PATCH_MIN_BYTES:
+        if not timing_path.exists():
+            return True
+        with summary_path.open('r+b') as handle:
+            tail_size = min(summary_size, 16 * 1024)
+            handle.seek(summary_size - tail_size)
+            tail = handle.read(tail_size)
+            if b'"timing_csv"' in tail:
+                return True
+            artifacts_marker = b'\n  "artifacts": {'
+            closing_marker = b'\n  }\n}\n'
+            if artifacts_marker not in tail:
+                return False
+            closing_at = tail.rfind(closing_marker)
+            if closing_at < 0:
+                return False
+            absolute_closing = summary_size - tail_size + closing_at
+            handle.seek(absolute_closing)
+            handle.write(
+                b',\n    "timing_csv": "'
+                + (
+                    f'{RUNTIME_DIRNAME}/{RUNTIME_OBSERVABILITY_DIRNAME}/'
+                    'step5_timing.csv'
+                ).encode('utf-8')
+                + b'"\n  }\n}\n'
+            )
+            handle.truncate()
+        return True
     try:
         with summary_path.open('r', encoding='utf-8') as handle:
             summary = json.load(handle)
@@ -1369,7 +1487,7 @@ def register_step5_summary_artifacts(output_dir, report_dir=None):
         'api_detail_dir': (output_path / 'by_api', 'by_api'),
         'module_summary_dir': (output_path / 'by_module', 'by_module'),
         'timing_csv': (
-            report_path / RUNTIME_DIRNAME / RUNTIME_OBSERVABILITY_DIRNAME / 'step5_timing.csv',
+            timing_path,
             f'{RUNTIME_DIRNAME}/{RUNTIME_OBSERVABILITY_DIRNAME}/step5_timing.csv',
         ),
     }
@@ -1383,23 +1501,176 @@ def register_step5_summary_artifacts(output_dir, report_dir=None):
 
 
 def generate_alerts_csv(all_results, output_path):
-    """生成完整、无抽样的人工链路台账；每个 API 至少一行，每条链路独立一行。"""
-    rows = []
-    for result in all_results:
-        rows.extend(_alert_rows_for_result(result))
-    rows.sort(key=lambda row: (
-        {'confirmed': 0, 'candidate': 1, 'confirmed_no_impact': 2, 'no_static_path': 3, 'incomplete': 4}.get(
-            row['conclusion_level'], 9
-        ),
-        severity_rank(row['severity']), row['target_coord'], row['changed_symbol'], row['path_id'],
-    ))
-    _relativize_alert_evidence_paths(rows, os.path.dirname(os.path.abspath(output_path)))
+    """Generate the complete ledger with an exact disk-backed stable sort.
 
-    with open_csv_write(output_path) as f:
-        writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES, extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows(rows)
-    write_alerts_review_splits(rows, os.path.dirname(os.path.abspath(output_path)))
+    A large API diff can expand to millions of path rows.  Keeping every row
+    dictionary plus five review-bucket lists in RAM made report generation the
+    process-wide memory peak.  SQLite stores the same canonical sort columns
+    and insertion sequence, so the emitted row order is identical to Python's
+    stable sort while only one decoded row is resident during output.
+    """
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(output_dir, exist_ok=True)
+    cleanup_alerts_review_splits(output_dir)
+    status_to_bucket = {
+        status: name
+        for name, statuses in ALERTS_REVIEW_BUCKETS
+        for status in statuses
+    }
+    bucket_stats = defaultdict(lambda: {'count': 0, 'estimated_bytes': 0})
+    conclusion_ranks = {
+        'confirmed': 0,
+        'candidate': 1,
+        'confirmed_no_impact': 2,
+        'no_static_path': 3,
+        'incomplete': 4,
+    }
+
+    with tempfile.TemporaryDirectory(prefix='.alerts-sort-', dir=output_dir) as temp_dir:
+        database_path = os.path.join(temp_dir, 'alerts.sqlite3')
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute('PRAGMA journal_mode=OFF')
+            connection.execute('PRAGMA synchronous=OFF')
+            connection.execute('PRAGMA temp_store=FILE')
+            connection.execute('PRAGMA cache_size=-8192')
+            connection.execute(
+                'CREATE TABLE alert_rows ('
+                'sequence INTEGER PRIMARY KEY, conclusion_rank INTEGER, '
+                'severity_rank INTEGER, target_coord TEXT, changed_symbol TEXT, '
+                'path_id TEXT, bucket TEXT, payload TEXT)'
+            )
+            pending = []
+            sequence = 0
+            for result in all_results:
+                rows = _alert_rows_for_result(result)
+                _relativize_alert_evidence_paths(rows, output_dir)
+                for row in rows:
+                    bucket = status_to_bucket.get(
+                        str(row.get('path_status') or ''), 'other'
+                    )
+                    stats = bucket_stats[bucket]
+                    stats['count'] += 1
+                    stats['estimated_bytes'] += sum(
+                        len(str(row.get(field) or '').encode('utf-8')) + 1
+                        for field in ALERTS_CSV_FIELDNAMES
+                    )
+                    pending.append((
+                        sequence,
+                        conclusion_ranks.get(row['conclusion_level'], 9),
+                        severity_rank(row['severity']),
+                        row['target_coord'],
+                        row['changed_symbol'],
+                        row['path_id'],
+                        bucket,
+                        json.dumps(row, ensure_ascii=False, separators=(',', ':')),
+                    ))
+                    sequence += 1
+                    if len(pending) >= 1000:
+                        connection.executemany(
+                            'INSERT INTO alert_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                            pending,
+                        )
+                        pending.clear()
+            if pending:
+                connection.executemany(
+                    'INSERT INTO alert_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    pending,
+                )
+            connection.commit()
+            connection.execute(
+                'CREATE INDEX alert_sort_order ON alert_rows ('
+                'conclusion_rank, severity_rank, target_coord, changed_symbol, '
+                'path_id, sequence)'
+            )
+            connection.commit()
+
+            split_limits = {
+                bucket: _alerts_review_split_row_limit(
+                    stats['count'], stats['estimated_bytes'], None
+                )
+                for bucket, stats in bucket_stats.items()
+            }
+            with open_csv_write(output_path) as main_file:
+                main_writer = csv.DictWriter(
+                    main_file,
+                    fieldnames=ALERTS_CSV_FIELDNAMES,
+                    extrasaction='ignore',
+                )
+                main_writer.writeheader()
+                cursor = connection.execute(
+                    'SELECT bucket, payload FROM alert_rows ORDER BY '
+                    'conclusion_rank, severity_rank, target_coord, changed_symbol, '
+                    'path_id, sequence'
+                )
+                try:
+                    for _bucket, payload in cursor:
+                        row = json.loads(payload)
+                        main_writer.writerow(row)
+                finally:
+                    cursor.close()
+            _write_streamed_alert_review_splits(
+                connection, output_dir, bucket_stats, split_limits
+            )
+        finally:
+            connection.close()
+
+
+def _alerts_review_split_row_limit(row_count, estimated_bytes, max_rows=None):
+    if max_rows is None:
+        max_rows = _alerts_split_max_rows()
+    max_rows = max(1, int(max_rows or ALERTS_SPLIT_MAX_ROWS))
+    raw_max_bytes = str(os.environ.get('JUA_ALERTS_SPLIT_MAX_BYTES') or '').strip()
+    try:
+        max_bytes = max(1, int(raw_max_bytes)) if raw_max_bytes else ALERTS_SPLIT_MAX_BYTES
+    except ValueError:
+        max_bytes = ALERTS_SPLIT_MAX_BYTES
+    if estimated_bytes > max_bytes:
+        max_rows = min(
+            max_rows,
+            max(1, int(int(row_count or 0) * max_bytes / estimated_bytes)),
+        )
+    return max_rows
+
+
+def _write_streamed_alert_review_splits(
+    connection, output_dir, bucket_stats, split_limits,
+):
+    order_by = (
+        'conclusion_rank, severity_rank, target_coord, changed_symbol, '
+        'path_id, sequence'
+    )
+    for bucket, stats in bucket_stats.items():
+        row_count = int(stats.get('count') or 0)
+        if not row_count:
+            continue
+        max_rows = split_limits[bucket]
+        part_count = (row_count + max_rows - 1) // max_rows
+        cursor = connection.execute(
+            f'SELECT payload FROM alert_rows WHERE bucket = ? ORDER BY {order_by}',
+            (bucket,),
+        )
+        try:
+            for part in range(1, part_count + 1):
+                filename = (
+                    f'alerts_{bucket}.csv'
+                    if part_count == 1
+                    else f'alerts_{bucket}_{part:03d}.csv'
+                )
+                with open_csv_write(os.path.join(output_dir, filename)) as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=ALERTS_CSV_FIELDNAMES,
+                        extrasaction='ignore',
+                    )
+                    writer.writeheader()
+                    for _index in range(max_rows):
+                        found = cursor.fetchone()
+                        if found is None:
+                            break
+                        writer.writerow(json.loads(found[0]))
+        finally:
+            cursor.close()
 
 
 def _relativize_alert_evidence_paths(rows, report_dir):

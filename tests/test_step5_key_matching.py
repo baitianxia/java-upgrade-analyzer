@@ -378,6 +378,37 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
         self.assertIs(matched, api_row)
 
+    def test_graph_edge_owner_index_preserves_exact_first_match_semantics(self):
+        unrelated = {
+            "api_name": "other.Type.call",
+            "api_simple": "call",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+        }
+        first_match = {
+            "api_name": "example.Type.call",
+            "api_simple": "call",
+            "api_signature": "(java.lang.String)",
+            "symbol_kind": "method",
+        }
+        duplicate_match = dict(first_match)
+        rows = [unrelated, first_match, duplicate_match]
+        edge = SimpleNamespace(
+            callee_key="example.Type.call(String)",
+            evidence_type="bytecode_method_invocation",
+            owner_coord="__business__",
+        )
+
+        indexed = tracer._graph_edge_target_row(
+            edge,
+            rows,
+            api_rows_by_owner=tracer._build_graph_edge_api_owner_index(rows),
+        )
+        unindexed = tracer._graph_edge_target_row(edge, rows)
+
+        self.assertIs(indexed, first_match)
+        self.assertIs(indexed, unindexed)
+
     def test_classfile_fast_path_preserves_dollar_in_nested_jvm_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
             classes = self._compile_java_fixture(
@@ -1698,16 +1729,18 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 methods_by_id={}, reverse_edges={}, runtime_dependency_catalog=catalog,
             )
 
-            tracer._ensure_runtime_dependency_callers_for_key(
+            first_expansion = tracer._ensure_runtime_dependency_callers_for_key(
                 graph, "com.vendor.Target.removed(String)"
             )
-            tracer._ensure_runtime_dependency_callers_for_key(
+            second_expansion = tracer._ensure_runtime_dependency_callers_for_key(
                 graph,
                 "com.vendor.Target.removed(String)",
                 excluded_provider_coord=api_row["coord"],
                 excluded_self_owner="com.vendor.Target",
             )
 
+        self.assertTrue(first_expansion["expanded"])
+        self.assertFalse(second_expansion["expanded"])
         callers = [
             edge.caller_qualified_key
             for edges in graph.reverse_edges.values()
@@ -2155,6 +2188,37 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertFalse(verified["complete"])
         self.assertIn("BOOT-INF/lib/corrupt.jar", verified["failures"][0])
 
+    def test_analyzer_edge_reuses_transaction_verified_jar_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph, _artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            evidence_jar = graph.runtime_dependency_catalog["by_coord"][
+                "com.vendor:target"
+            ]["jar_path"]
+            provenance = tracer._verified_final_artifact_provenance(graph)
+            verified = {
+                os.path.realpath(evidence_jar): hashlib.sha256(
+                    Path(evidence_jar).read_bytes()
+                ).hexdigest(),
+            }
+            edge = {
+                "artifact_container_entry": "BOOT-INF/lib/target.jar",
+                "jar_path": evidence_jar,
+                "class_entry": "com/vendor/Bridge.class",
+            }
+
+            with patch.object(
+                Path, "read_bytes",
+                side_effect=AssertionError("verified JAR must not be read per API hit"),
+            ):
+                matched = tracer._evidence_bytes_match_final_artifact(
+                    edge,
+                    provenance,
+                    "BOOT-INF/lib/target.jar!/com/vendor/Bridge.class",
+                    verified,
+                )
+
+        self.assertTrue(matched)
+
     def test_writes_complete_analyzer_edge_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
             graph, artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
@@ -2225,15 +2289,22 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 "symbol_kind": "constructor",
             }
 
-            tracer.record_analyzer_edge(graph, base_api, edges[0])
-            tracer.record_analyzer_edge(graph, base_api, edges[0])
-            tracer.record_analyzer_edge(
-                graph,
-                base_api,
-                {**edges[0], "instruction_offset": 2},
-            )
-            tracer.record_analyzer_edge(graph, int_overload, edges[1])
-            tracer.record_analyzer_edge(graph, constructor, edges[2])
+            with patch.dict(
+                os.environ, {"JUA_ANALYZER_EDGE_MEMORY_LIMIT": "2"}
+            ):
+                tracer.record_analyzer_edge(graph, base_api, edges[0])
+                tracer.record_analyzer_edge(graph, base_api, edges[0])
+                tracer.record_analyzer_edge(
+                    graph,
+                    base_api,
+                    {**edges[0], "instruction_offset": 2},
+                )
+                tracer.record_analyzer_edge(graph, int_overload, edges[1])
+                tracer.record_analyzer_edge(graph, constructor, edges[2])
+                self.assertIsInstance(
+                    graph.analyzer_edges,
+                    tracer._DiskBackedAnalyzerEdgeStore,
+                )
             graph_stats = {}
             ledger_path = tracer.write_analyzer_edge_ledger(graph, graph_stats=graph_stats)
 
@@ -3371,12 +3442,50 @@ public class com.example.TargetBridge {
             with patch.object(
                 tracer, "_run_javap_bytecode_dump",
                 side_effect=AssertionError("cached classfile parse must be reused"),
+            ), patch.object(
+                tracer.zipfile, "ZipFile",
+                side_effect=AssertionError("cache hit must avoid reopening the JAR"),
             ):
                 _task, actual = tracer._load_runtime_dependency_class_references_for_task(task)
 
         self.assertEqual(actual, expected)
         perf = tracer._finalize_step5_perf_stats(graph)["bytecode_scan"]
         self.assertEqual(perf.get("duplicate_class_scans", 0), 0)
+
+    def test_member_index_task_reuses_batch_runtime_reference_cache_before_jar_io(self):
+        graph = SimpleNamespace()
+        catalog = {}
+        artifact_sha256 = "d" * 64
+        class_name = "fixture.Consumer"
+        class_entry = "fixture/Consumer.class"
+        expected = {"method_refs": [{"owner": "java.lang.System", "name": "nanoTime"}]}
+        immutable_key = tracer._immutable_artifact_parse_cache_key(
+            artifact_sha256, "17", class_name, "base", class_entry=class_entry
+        )
+        cache_key = ("fixture:consumer", "/missing/consumer.jar", *immutable_key)
+        catalog["_bytecode_reference_cache"] = {cache_key: expected}
+        catalog["_bytecode_reference_cache_generations"] = {
+            cache_key: tracer._IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
+        }
+        task = {
+            "catalog": catalog,
+            "coord": "fixture:consumer",
+            "jar_path": "/missing/consumer.jar",
+            "class_binary_name": class_name,
+            "class_entry": class_entry,
+            "artifact_sha256": artifact_sha256,
+            "target_jdk": "17",
+            "multi_release_version": "base",
+            "graph": graph,
+        }
+
+        with patch.object(
+            tracer.zipfile, "ZipFile",
+            side_effect=AssertionError("batch cache hit must avoid reopening the JAR"),
+        ):
+            _task, actual = tracer._load_runtime_dependency_class_references_for_task(task)
+
+        self.assertEqual(actual, expected)
 
     def test_artifact_hash_parse_cache_never_decodes_an_invalidated_none_value(self):
         graph = SimpleNamespace()
@@ -5897,6 +6006,29 @@ public class com.example.TargetBridge {
                     result.reason_code, "INCOMPLETE_EVIDENCE_COVERAGE"
                 )
 
+    def test_collector_coverage_index_preserves_order_and_refreshes(self):
+        first = CoverageRecord(
+            collector="global", api_identity="global", status="partial",
+        )
+        second = CoverageRecord(
+            collector="target", api_identity="api-1", status="complete",
+        )
+        graph = SimpleNamespace(step5_collector_coverage=(first, second))
+
+        indexed = tracer._collector_coverage_records_for_api(
+            graph, "api-1", include_self_scoped=True,
+        )
+        self.assertEqual(indexed, (first, second))
+
+        third = CoverageRecord(
+            collector="target", api_identity="api-2", status="insufficient",
+        )
+        graph.step5_collector_coverage = (third,)
+        self.assertEqual(
+            tracer._collector_coverage_records_for_api(graph, "api-2"),
+            (third,),
+        )
+
     def test_trace_api_ignores_path_scoped_framework_gap_unrelated_to_target(self):
         api_row = {
             "api_name": "org.springframework.data.domain.Page.getContent",
@@ -6170,6 +6302,93 @@ public class com.example.TargetBridge {
             graph.step5_evidence_failures[0].artifact,
             "broken.jar",
         )
+
+    def test_analyzer_failure_buffer_preserves_all_api_failures_and_order(self):
+        graph = SimpleNamespace()
+        expected = [f"vendor:demo|com.vendor.Api.call{i}|()|method|" for i in range(2000)]
+
+        for identity in expected:
+            tracer._record_analyzer_ledger_failure(
+                graph,
+                "MULTI_RELEASE_TARGET_JDK_UNKNOWN",
+                api_identity=identity,
+            )
+        tracer._record_analyzer_ledger_failure(
+            graph,
+            "MULTI_RELEASE_TARGET_JDK_UNKNOWN",
+            api_identity=expected[-1],
+        )
+
+        failures = tuple(graph.step5_evidence_failures)
+        self.assertEqual(len(failures), len(expected))
+        self.assertEqual([failure.api_identity for failure in failures], expected)
+        self.assertEqual(len(graph._step5_evidence_failure_index), len(expected))
+
+    def test_evidence_failure_index_preserves_order_and_indexes_appends(self):
+        failures = [
+            EvidenceFailure("stage", "GLOBAL", True, api_identity=""),
+            EvidenceFailure("stage", "API_A_1", True, api_identity="api-a"),
+            EvidenceFailure("stage", "API_B", True, api_identity="api-b"),
+        ]
+        graph = SimpleNamespace(step5_evidence_failures=failures)
+
+        first = tracer._evidence_failures_for_api(graph, "", "api-a")
+        failures.append(EvidenceFailure(
+            "stage", "API_A_2", True, api_identity="api-a"
+        ))
+        second = tracer._evidence_failures_for_api(graph, "", "api-a")
+
+        self.assertEqual([item.reason_code for item in first], ["GLOBAL", "API_A_1"])
+        self.assertEqual(
+            [item.reason_code for item in second],
+            ["GLOBAL", "API_A_1", "API_A_2"],
+        )
+        self.assertEqual(
+            graph._step5_evidence_failures_by_identity_index["indexed_count"], 4
+        )
+
+    def test_perf_top_filter_matches_full_canonical_sort(self):
+        graph = SimpleNamespace()
+        rows = [
+            {"elapsed_sec": float(index % 7), "name": f"row-{index:03d}"}
+            for index in range(100)
+        ]
+        expected = sorted(rows, key=lambda row: (
+            -row["elapsed_sec"],
+            json.dumps(row, sort_keys=True, default=str, ensure_ascii=True),
+        ))[:20]
+
+        for row in rows:
+            tracer._perf_record_top(graph, "trace", "top", row)
+
+        self.assertEqual(graph._step5_perf_stats["trace"]["top"], expected)
+
+    def test_capability_coverage_looks_up_one_api_without_copying_global_map(self):
+        api = {
+            "coord": "vendor:demo", "api_name": "com.vendor.Api.call",
+            "api_simple": "call", "api_signature": "()", "symbol_kind": "method",
+        }
+        identity = tracer.indirect_api_key(api)
+
+        class LookupOnlyDict(dict):
+            def keys(self):
+                raise AssertionError("global by_api coverage must not be copied")
+
+            def __iter__(self):
+                raise AssertionError("global by_api coverage must not be iterated")
+
+        graph = SimpleNamespace(indirect_analysis_coverage={
+            "status": "complete",
+            "by_api": LookupOnlyDict({identity: {
+                "status": "complete", "reason_codes": [],
+                "matrix": {"reflection_source": "complete"},
+            }}),
+        })
+
+        actual = tracer._capability_coverage_for_api(api, graph)
+
+        self.assertEqual(actual["status"], "complete")
+        self.assertEqual(actual["analyzers"], {"reflection_source": "complete"})
 
     def test_trace_api_consumes_ingestion_concerns_from_graph(self):
         api_row = {
@@ -11603,7 +11822,14 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
             timing = Path(tmp) / ".runtime/observability/step5_timing.csv"
             timing.parent.mkdir(parents=True)
             timing.write_text("section,metric,value\n", encoding="utf-8")
-            formatter.register_step5_summary_artifacts(str(output))
+            with patch.object(
+                formatter, "_SUMMARY_ARTIFACT_STREAM_PATCH_MIN_BYTES", 1
+            ), patch.object(
+                formatter.json,
+                "load",
+                side_effect=AssertionError("large summary must not be loaded"),
+            ):
+                formatter.register_step5_summary_artifacts(str(output))
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
 
         self.assertEqual("alerts.csv", summary["artifacts"]["alerts_csv"])
@@ -20692,6 +20918,54 @@ public class com.example.consumer.Adapter {
         self.assertGreater(hashes_after_build, 0)
         self.assertEqual(digest.call_count, hashes_after_build)
 
+    def test_runtime_member_index_trace_lease_avoids_per_lookup_stat_scans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("p/Caller.class", b"com/vendor/Target removed")
+            catalog = [{"coord": "sample:fixture", "jar_path": str(jar_path)}]
+            graph = SimpleNamespace(
+                report_dir=str(Path(tmp) / "report"),
+                _active_packaged_scan_trace_serial=7,
+            )
+            first = tracer._get_runtime_dependency_member_candidate_index(
+                graph, catalog, 17
+            )
+
+            with patch.object(
+                tracer, "_runtime_artifact_stat_snapshot",
+                side_effect=AssertionError("active trace lease must avoid repeated stat scans"),
+            ):
+                second = tracer._get_runtime_dependency_member_candidate_index(
+                    graph, catalog, 17
+                )
+
+        self.assertIs(first, second)
+        self.assertEqual(first["_validated_trace_serial"], 7)
+
+    def test_runtime_member_index_trace_lease_final_sha_detects_artifact_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "fixture.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("p/Caller.class", b"first")
+            catalog = [{"coord": "sample:fixture", "jar_path": str(jar_path)}]
+            graph = SimpleNamespace(
+                report_dir=str(Path(tmp) / "report"),
+                runtime_dependency_catalog={"entries": catalog, "target_jdk": 17},
+                _active_packaged_scan_trace_serial=11,
+            )
+            tracer._get_runtime_dependency_member_candidate_index(graph, catalog, 17)
+            with zipfile.ZipFile(jar_path, "a") as archive:
+                archive.writestr("mutation-marker", b"changed")
+
+            valid = tracer._validate_runtime_member_index_trace_lease(graph)
+
+        self.assertFalse(valid)
+        self.assertTrue(any(
+            failure.reason_code == "BYTECODE_MEMBER_INDEX_INPUT_CHANGED"
+            for failure in graph.step5_evidence_failures
+        ))
+
     def test_runtime_member_index_rejects_change_between_final_identity_and_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "fixture.jar"
@@ -21862,6 +22136,44 @@ public class com.example.consumer.Adapter {
             {
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
                 "(Ljava/lang/Object;)Ljava/lang/String;",
+            },
+        )
+
+    def test_runtime_reverse_edges_preserve_distinct_multi_release_variants(self):
+        graph = SimpleNamespace(methods_by_id={}, reverse_edges={})
+        matched = {
+            "consumer_method": "run", "consumer_signature": "()",
+            "consumer_descriptor": "()V", "callee_descriptor": "()V",
+            "evidence_type": "bytecode_method_invocation",
+        }
+        base_hit = {
+            "jar_path": "/tmp/consumer.jar",
+            "artifact_container_entry": "BOOT-INF/lib/consumer.jar",
+            "class_entry": "com/acme/Consumer.class",
+            "instruction_offset": 6,
+        }
+        versioned_hit = {
+            **base_hit,
+            "class_entry": "META-INF/versions/11/com/acme/Consumer.class",
+            "multi_release_version": 11,
+        }
+        for hit in (versioned_hit, base_hit, versioned_hit, base_hit):
+            tracer._add_runtime_dependency_caller_edge(
+                graph, "com.vendor.Target.call()", "com.acme:consumer",
+                "/tmp/consumer.jar", "com.acme.Consumer", matched,
+                analyzer_hit=hit,
+            )
+
+        edges = graph.reverse_edges["com.vendor.Target.call()"]
+        self.assertEqual(len(edges), 2)
+        self.assertEqual(
+            {
+                edge.runtime_analyzer_hit["class_entry"]
+                for edge in edges
+            },
+            {
+                "com/acme/Consumer.class",
+                "META-INF/versions/11/com/acme/Consumer.class",
             },
         )
 

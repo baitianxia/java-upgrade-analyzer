@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -71,6 +72,29 @@ public class com.example.LegacyApi {
                 self.assertTrue(Path(out_file).exists())
                 self.assertEqual(jar_info["old_jar"], str(old_jar))
                 self.assertEqual([row["symbol_kind"] for row in apis], ["class", "constructor", "method"])
+
+    def test_export_removed_jar_apis_accepts_complete_empty_api_surface(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            old_jar = output_dir / "empty-placeholder-1.0.0.jar"
+            with zipfile.ZipFile(old_jar, "w") as archive:
+                archive.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+
+            out_file, apis, jar_info, err = step4.export_removed_jar_apis(
+                coord="com.example:empty-placeholder",
+                old_ver="1.0.0",
+                output_dir=str(output_dir),
+                old_jar_path=str(old_jar),
+                old_jar_evidence={"source": "step1_final_artifact"},
+            )
+
+            self.assertIsNone(err)
+            self.assertEqual(apis, [])
+            self.assertEqual(jar_info["class_count"], 0)
+            self.assertEqual(jar_info["exported_api_count"], 0)
+            self.assertTrue(jar_info["api_surface_empty"])
+            self.assertEqual(jar_info["javap_invocations"], 0)
+            self.assertIn("api_surface_empty=true", Path(out_file).read_text())
 
     def test_export_removed_jar_batches_classes_without_cross_attributing_members(self):
         javap_output = """

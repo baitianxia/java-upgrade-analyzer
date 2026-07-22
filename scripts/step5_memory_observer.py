@@ -42,13 +42,19 @@ def _descendant_totals(processes, root_pid):
 def _directory_size_bytes(paths):
     total = 0
     for root in paths or ():
-        path = Path(root)
-        if not path.exists():
-            continue
-        for item in path.rglob("*"):
+        pending = [os.fspath(root)]
+        while pending:
+            current = pending.pop()
             try:
-                if item.is_file():
-                    total += item.stat().st_size
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                total += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            continue
             except OSError:
                 continue
     return total

@@ -22,6 +22,7 @@ import io
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -29,8 +30,9 @@ import time
 import zipfile
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict, deque
+from collections import ChainMap, defaultdict, deque
 from dataclasses import dataclass, field, replace
+from itertools import chain
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -424,24 +426,35 @@ def _normalized_instruction_offset(value):
     return text if text.isdigit() else None
 
 
-def _evidence_bytes_match_final_artifact(edge, provenance, artifact_entry):
+def _evidence_bytes_match_final_artifact(
+    edge, provenance, artifact_entry, verified_artifacts=None,
+):
     jar_path = str((edge or {}).get('jar_path') or '').strip()
     class_entry = str((edge or {}).get('class_entry') or '').replace('\\', '/').strip('/')
     if not jar_path or not class_entry or not os.path.isfile(jar_path):
         return False
     container_entry = _normalized_artifact_container_entry(edge)
+    verified_sha256 = str(
+        (verified_artifacts or {}).get(os.path.realpath(jar_path)) or ''
+    ).lower()
     try:
         if container_entry:
             expected_jar_sha = (provenance.get('entry_sha256') or {}).get(container_entry)
             if not expected_jar_sha:
                 return False
-            scanned_jar = Path(jar_path).read_bytes()
-            if hashlib.sha256(scanned_jar).hexdigest() != expected_jar_sha:
-                return False
             expected_class_sha = (
                 (provenance.get('nested_entry_sha256') or {}).get(container_entry) or {}
             ).get(class_entry)
             if not expected_class_sha:
+                return False
+            # The batch scanner hashes every physical runtime JAR immediately
+            # before edge commit and hashes it again after commit.  Equality to
+            # the immutable nested-JAR hash proves every class byte in that JAR,
+            # so repeating a full JAR read for each API hit adds no evidence.
+            if verified_sha256 and verified_sha256 == expected_jar_sha:
+                return True
+            scanned_jar = Path(jar_path).read_bytes()
+            if hashlib.sha256(scanned_jar).hexdigest() != expected_jar_sha:
                 return False
             with zipfile.ZipFile(io.BytesIO(scanned_jar)) as archive:
                 return hashlib.sha256(archive.read(class_entry)).hexdigest() == expected_class_sha
@@ -449,6 +462,11 @@ def _evidence_bytes_match_final_artifact(edge, provenance, artifact_entry):
         expected_class_sha = (provenance.get('entry_sha256') or {}).get(artifact_entry)
         if not expected_class_sha:
             return False
+        if (
+            verified_sha256
+            and verified_sha256 == str(provenance.get('artifact_sha256') or '').lower()
+        ):
+            return True
         with zipfile.ZipFile(jar_path) as archive:
             scanned_class = archive.read(class_entry)
         return hashlib.sha256(scanned_class).hexdigest() == expected_class_sha
@@ -465,7 +483,12 @@ def _normalize_analyzer_edge(graph, api_row, edge):
     evidence_bound = bool(
         provenance.get('complete')
         and artifact_entry
-        and _evidence_bytes_match_final_artifact(edge, provenance, artifact_entry)
+        and _evidence_bytes_match_final_artifact(
+            edge,
+            provenance,
+            artifact_entry,
+            getattr(graph, '_analyzer_edge_verified_artifacts', None),
+        )
     )
     row = {
         'artifact_sha256': provenance.get('artifact_sha256') or '',
@@ -506,6 +529,252 @@ def _normalize_analyzer_edge(graph, api_row, edge):
     return row, complete
 
 
+class _DiskBackedAnalyzerEdgeStore:
+    """Exact analyzer-edge mapping with a bounded in-memory working set."""
+
+    def __init__(self, path, initial_rows=None):
+        self.path = str(path)
+        self.connection = sqlite3.connect(self.path)
+        self.connection.execute('PRAGMA journal_mode=OFF')
+        self.connection.execute('PRAGMA synchronous=OFF')
+        self.connection.execute('PRAGMA temp_store=FILE')
+        self.connection.execute('PRAGMA cache_size=-16384')
+        self.sort_fields = (
+            *EDGE_IDENTITY_FIELDS,
+            'artifact_entry',
+            'api_identity',
+            'edge_role',
+            'instruction_offset',
+        )
+        sort_columns = ', '.join(
+            f'sort_{index} TEXT NOT NULL' for index in range(len(self.sort_fields))
+        )
+        self.connection.execute(
+            'CREATE TABLE edges ('
+            'identity TEXT PRIMARY KEY, sequence INTEGER NOT NULL, '
+            f'{sort_columns}, payload TEXT NOT NULL)'
+        )
+        self.columns = ', '.join(
+            ['identity', 'sequence']
+            + [f'sort_{index}' for index in range(len(self.sort_fields))]
+            + ['payload']
+        )
+        placeholders = ', '.join(
+            '?' for _ in range(3 + len(self.sort_fields))
+        )
+        assignments = ', '.join(
+            [f'sort_{index} = excluded.sort_{index}'
+             for index in range(len(self.sort_fields))]
+            + ['payload = excluded.payload']
+        )
+        self.upsert_sql = (
+            f'INSERT INTO edges ({self.columns}) VALUES ({placeholders}) '
+            f'ON CONFLICT(identity) DO UPDATE SET {assignments}'
+        )
+        self.count = 0
+        self.next_sequence = 0
+        self.pending = {}
+        self.pending_limit = 4096
+        # Hashes are only a negative lookup accelerator.  A possible collision
+        # always falls through to an exact SQLite identity comparison, so this
+        # set cannot merge distinct evidence rows.
+        self.identity_hashes = set()
+        self.last_absent_identity = None
+        for identity, row in (initial_rows or {}).items():
+            self[identity] = row
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        self._flush_pending()
+        cursor = self.connection.execute(
+            'SELECT identity FROM edges ORDER BY sequence'
+        )
+        try:
+            for (identity,) in cursor:
+                yield identity
+        finally:
+            cursor.close()
+
+    def get(self, identity, default=None):
+        pending = self.pending.get(identity)
+        if pending is not None:
+            self.last_absent_identity = None
+            return pending['row']
+        if hash(identity) not in self.identity_hashes:
+            self.last_absent_identity = identity
+            return default
+        found = self.connection.execute(
+            'SELECT payload FROM edges WHERE identity = ?', (identity,)
+        ).fetchone()
+        if found:
+            self.last_absent_identity = None
+            return json.loads(found[0])
+        self.last_absent_identity = identity
+        return default
+
+    def __setitem__(self, identity, row):
+        sort_values = canonical_analyzer_edge_sort_key(row)
+        payload = json.dumps(row, ensure_ascii=False, separators=(',', ':'))
+        pending = self.pending.get(identity)
+        if pending is not None:
+            sequence = pending['sequence']
+            persisted = pending['persisted']
+        elif self.last_absent_identity == identity:
+            sequence = self.next_sequence
+            persisted = False
+        elif hash(identity) not in self.identity_hashes:
+            sequence = self.next_sequence
+            persisted = False
+        else:
+            found = self.connection.execute(
+                'SELECT sequence FROM edges WHERE identity = ?', (identity,)
+            ).fetchone()
+            if found:
+                sequence = int(found[0])
+                persisted = True
+            else:
+                sequence = self.next_sequence
+                persisted = False
+        if not persisted and pending is None:
+            self.count += 1
+            self.next_sequence += 1
+        self.identity_hashes.add(hash(identity))
+        self.pending[identity] = {
+            'sequence': sequence,
+            'sort_values': sort_values,
+            'payload': payload,
+            'row': row,
+            'persisted': persisted,
+        }
+        self.last_absent_identity = None
+        if len(self.pending) >= self.pending_limit:
+            self._flush_pending()
+
+    def _flush_pending(self):
+        if not self.pending:
+            return
+        self.connection.executemany(
+            self.upsert_sql,
+            (
+                (
+                    identity, item['sequence'],
+                    *item['sort_values'], item['payload'],
+                )
+                for identity, item in self.pending.items()
+            ),
+        )
+        self.pending.clear()
+
+    def values(self):
+        self._flush_pending()
+        cursor = self.connection.execute(
+            'SELECT payload FROM edges ORDER BY sequence'
+        )
+        try:
+            for (payload,) in cursor:
+                yield json.loads(payload)
+        finally:
+            cursor.close()
+
+    def pop(self, identity, default=None):
+        pending = self.pending.pop(identity, None)
+        if pending is not None:
+            if pending['persisted']:
+                self.connection.execute(
+                    'DELETE FROM edges WHERE identity = ?', (identity,)
+                )
+            self.count -= 1
+            self.last_absent_identity = None
+            return pending['row']
+        current = self.get(identity, default)
+        if current is default:
+            return default
+        self.connection.execute('DELETE FROM edges WHERE identity = ?', (identity,))
+        self.count -= 1
+        return current
+
+    def clear(self):
+        self.pending.clear()
+        self.connection.execute('DELETE FROM edges')
+        self.count = 0
+        self.next_sequence = 0
+        self.identity_hashes.clear()
+        self.last_absent_identity = None
+
+    def update(self, rows):
+        for identity, row in dict(rows or {}).items():
+            self[identity] = row
+
+    def write_csv(self, output_path):
+        self._flush_pending()
+        self.connection.commit()
+        order_by = ', '.join(
+            f'sort_{index}' for index in range(len(self.sort_fields))
+        )
+        cursor = self.connection.execute(
+            f'SELECT payload FROM edges ORDER BY {order_by}, sequence'
+        )
+        try:
+            with open_csv_write(output_path) as handle:
+                writer = csv.DictWriter(handle, fieldnames=ANALYZER_EDGE_FIELDS)
+                writer.writeheader()
+                for (payload,) in cursor:
+                    writer.writerow(json.loads(payload))
+        finally:
+            cursor.close()
+
+    def close(self, *, remove=False):
+        self._flush_pending()
+        self.connection.close()
+        if remove:
+            try:
+                Path(self.path).unlink()
+            except OSError:
+                return
+
+
+def _analyzer_edge_spill_threshold():
+    raw = str(os.environ.get('JUA_ANALYZER_EDGE_MEMORY_LIMIT') or '').strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return 50000
+    return 50000
+
+
+def _spill_analyzer_edges_if_needed(graph, analyzer_edges):
+    if (
+        not isinstance(analyzer_edges, dict)
+        or len(analyzer_edges) < _analyzer_edge_spill_threshold()
+    ):
+        return analyzer_edges
+    report_dir = str(getattr(graph, 'report_dir', '') or '').strip()
+    if not report_dir:
+        return analyzer_edges
+    temp_dir = Path(report_dir) / '.runtime' / 'cache'
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        prefix='analyzer-edges-', suffix='.sqlite3', dir=temp_dir, delete=False
+    )
+    path = handle.name
+    handle.close()
+    try:
+        store = _DiskBackedAnalyzerEdgeStore(path, analyzer_edges)
+    except (OSError, sqlite3.Error):
+        try:
+            Path(path).unlink()
+        except OSError:
+            return analyzer_edges
+        return analyzer_edges
+    graph.analyzer_edges = store
+    _perf_add(graph, 'edge_ledger', 'disk_spill_count', 1)
+    _perf_add(graph, 'edge_ledger', 'disk_spill_initial_edges', len(analyzer_edges))
+    return store
+
+
 def record_analyzer_edge(graph, api_row, edge):
     if graph is None:
         return None
@@ -526,6 +795,7 @@ def record_analyzer_edge(graph, api_row, edge):
     current = analyzer_edges.get(identity)
     if current is None or canonical_analyzer_edge_sort_key(row) < canonical_analyzer_edge_sort_key(current):
         analyzer_edges[identity] = row
+        _spill_analyzer_edges_if_needed(graph, analyzer_edges)
     return row
 
 
@@ -559,10 +829,11 @@ def _record_analyzer_ledger_failure(graph, reason, **fields):
     if failures is None:
         failures = set()
         graph._analyzer_edge_failures = failures
-    failures.add((
+    failure_identity = (
         reason_code,
         tuple(sorted((str(key), str(value or '')) for key, value in fields.items())),
-    ))
+    )
+    failures.add(failure_identity)
     typed_failure = EvidenceFailure(
         stage=str(fields.get('stage') or 'analyzer-edge-collection'),
         reason_code=reason_code,
@@ -586,9 +857,26 @@ def _record_analyzer_ledger_failure(graph, reason, **fields):
             if value not in (None, '')
         ),
     )
-    typed_failures = tuple(getattr(graph, 'step5_evidence_failures', ()) or ())
-    if typed_failure not in typed_failures:
-        graph.step5_evidence_failures = typed_failures + (typed_failure,)
+    current_failures = getattr(graph, 'step5_evidence_failures', ()) or ()
+    typed_failures = (
+        current_failures
+        if isinstance(current_failures, list)
+        else list(current_failures)
+    )
+    failure_index = getattr(graph, '_step5_evidence_failure_index', None)
+    indexed_buffer = getattr(graph, '_step5_evidence_failure_index_source', None)
+    if (
+        not isinstance(failure_index, set)
+        or indexed_buffer is not typed_failures
+        or len(failure_index) != len(typed_failures)
+    ):
+        failure_index = set(typed_failures)
+        graph._step5_evidence_failure_index = failure_index
+        graph._step5_evidence_failure_index_source = typed_failures
+    if typed_failure not in failure_index:
+        typed_failures.append(typed_failure)
+        failure_index.add(typed_failure)
+    graph.step5_evidence_failures = typed_failures
 
 
 def _record_analyzer_scan_failures(graph, failures):
@@ -607,10 +895,8 @@ def _record_analyzer_scan_failures(graph, failures):
 def write_analyzer_edge_ledger(graph, graph_stats=None):
     graph_stats = graph_stats if graph_stats is not None else {}
     provenance = _verified_final_artifact_provenance(graph)
-    rows = sorted(
-        list((getattr(graph, 'analyzer_edges', {}) or {}).values()),
-        key=canonical_analyzer_edge_sort_key,
-    )
+    analyzer_edges = getattr(graph, 'analyzer_edges', {}) or {}
+    edge_count = len(analyzer_edges)
     discovery_count = int(getattr(graph, '_analyzer_edge_discovery_count', 0) or 0)
     incomplete_count = int(getattr(graph, '_analyzer_edge_incomplete_count', 0) or 0)
     failures = set(getattr(graph, '_analyzer_edge_failures', set()) or set())
@@ -618,8 +904,8 @@ def write_analyzer_edge_ledger(graph, graph_stats=None):
         failures.add(('final_artifact_provenance_invalid', ()))
     if incomplete_count:
         failures.add(('incomplete_edge_metadata', (('count', str(incomplete_count)),)))
-    graph_stats['analyzer_edge_count'] = len(rows)
-    graph_stats['duplicate_edge_count'] = max(0, discovery_count - incomplete_count - len(rows))
+    graph_stats['analyzer_edge_count'] = edge_count
+    graph_stats['duplicate_edge_count'] = max(0, discovery_count - incomplete_count - edge_count)
     graph_stats['edge_ledger_failure_count'] = len(failures)
     graph_stats['edge_ledger_complete'] = bool(
         provenance.get('complete') and not incomplete_count and not failures
@@ -629,10 +915,19 @@ def write_analyzer_edge_ledger(graph, graph_stats=None):
         return ''
     output_path = Path(report_dir) / 'evidence' / 'call_chain' / 'analyzer_edges.csv'
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open_csv_write(output_path) as handle:
-        writer = csv.DictWriter(handle, fieldnames=ANALYZER_EDGE_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    if isinstance(analyzer_edges, _DiskBackedAnalyzerEdgeStore):
+        analyzer_edges.write_csv(output_path)
+        analyzer_edges.close(remove=True)
+        graph.analyzer_edges = {}
+    else:
+        rows = sorted(
+            list(analyzer_edges.values()),
+            key=canonical_analyzer_edge_sort_key,
+        )
+        with open_csv_write(output_path) as handle:
+            writer = csv.DictWriter(handle, fieldnames=ANALYZER_EDGE_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
     return str(output_path)
 
 
@@ -781,7 +1076,23 @@ def _perf_record_top(graph, section, key, item, elapsed_key='elapsed_sec', limit
         if not isinstance(values, list):
             values = []
             bucket[key] = values
-        values.append(dict(item))
+        candidate = dict(item)
+        candidate_elapsed = float(candidate.get(elapsed_key) or 0)
+        if len(values) >= limit and values:
+            worst = values[-1]
+            worst_elapsed = float(worst.get(elapsed_key) or 0)
+            if candidate_elapsed < worst_elapsed:
+                return
+            if candidate_elapsed == worst_elapsed:
+                candidate_key = json.dumps(
+                    candidate, sort_keys=True, default=str, ensure_ascii=True,
+                )
+                worst_key = json.dumps(
+                    worst, sort_keys=True, default=str, ensure_ascii=True,
+                )
+                if candidate_key >= worst_key:
+                    return
+        values.append(candidate)
         values.sort(key=lambda row: (
             -float(row.get(elapsed_key) or 0),
             json.dumps(row, sort_keys=True, default=str, ensure_ascii=True),
@@ -1160,6 +1471,90 @@ def _path_subject_matches(subject, symbols):
     )
 
 
+def _collector_coverage_index(graph):
+    """Index immutable coverage records once instead of rescanning per API."""
+    records = tuple(getattr(graph, 'step5_collector_coverage', ()) or ())
+    cached = getattr(graph, '_step5_collector_coverage_index', None)
+    token = (id(records), len(records))
+    if cached and cached.get('token') == token:
+        return cached
+
+    positions_by_identity = defaultdict(list)
+    self_scoped_positions = []
+    path_scoped_collectors = set()
+    for position, record in enumerate(records):
+        positions_by_identity[record.api_identity].append(position)
+        if record.api_identity == record.collector:
+            self_scoped_positions.append(position)
+        if getattr(record, 'scope', 'api') == 'path':
+            path_scoped_collectors.add(record.collector)
+    index = {
+        'token': token,
+        'records': records,
+        'positions_by_identity': {
+            identity: tuple(positions)
+            for identity, positions in positions_by_identity.items()
+        },
+        'self_scoped_positions': tuple(self_scoped_positions),
+        'path_scoped_collectors': frozenset(path_scoped_collectors),
+    }
+    if graph is not None:
+        graph._step5_collector_coverage_index = index
+        _perf_add(graph, 'trace', 'collector_coverage_index_builds', 1)
+        _perf_max(graph, 'trace', 'collector_coverage_index_size', len(records))
+    return index
+
+
+def _collector_coverage_records_for_api(graph, *identities, include_self_scoped=False):
+    index = _collector_coverage_index(graph)
+    positions = set(index['self_scoped_positions'] if include_self_scoped else ())
+    by_identity = index['positions_by_identity']
+    for identity in identities:
+        positions.update(by_identity.get(identity, ()))
+    records = index['records']
+    return tuple(records[position] for position in sorted(positions))
+
+
+def _evidence_failure_index(graph):
+    """Incrementally index failure evidence without rescanning it per API."""
+    failures = getattr(graph, 'step5_evidence_failures', ()) or ()
+    cached = getattr(graph, '_step5_evidence_failures_by_identity_index', None)
+    if (
+        cached
+        and cached.get('source') is failures
+        and int(cached.get('indexed_count') or 0) <= len(failures)
+    ):
+        start = int(cached.get('indexed_count') or 0)
+        positions_by_identity = cached['positions_by_identity']
+    else:
+        start = 0
+        positions_by_identity = defaultdict(list)
+        cached = {
+            'source': failures,
+            'positions_by_identity': positions_by_identity,
+            'indexed_count': 0,
+        }
+    for position in range(start, len(failures)):
+        positions_by_identity[failures[position].api_identity].append(position)
+    cached['indexed_count'] = len(failures)
+    if graph is not None:
+        graph._step5_evidence_failures_by_identity_index = cached
+        if start == 0:
+            _perf_add(graph, 'trace', 'evidence_failure_index_builds', 1)
+        _perf_max(graph, 'trace', 'evidence_failure_index_size', len(failures))
+    return cached
+
+
+def _evidence_failures_for_api(graph, *identities):
+    index = _evidence_failure_index(graph)
+    positions = set()
+    by_identity = index['positions_by_identity']
+    for identity in identities:
+        positions.update(by_identity.get(identity, ()))
+    failures = index['source']
+    return tuple(failures[position] for position in sorted(positions))
+
+
 def _new_trace_draft(api_row, graph=None):
     draft = TraceDraft(
         api_name=str(api_row.get('api_name') or '').strip(),
@@ -1179,11 +1574,8 @@ def _new_trace_draft(api_row, graph=None):
     source_identity = indirect_api_key(api_row)
     target_identity = _trace_target_identity(draft)
     path_collectors, path_symbols = _target_reverse_path_context(api_row, graph)
-    path_scoped_collectors = {
-        record.collector
-        for record in tuple(getattr(graph, 'step5_collector_coverage', ()) or ())
-        if getattr(record, 'scope', 'api') == 'path'
-    }
+    coverage_index = _collector_coverage_index(graph)
+    path_scoped_collectors = coverage_index['path_scoped_collectors']
     relevant_path_concerns = tuple(
         concern
         for concern in tuple(getattr(graph, 'step5_evidence_concerns', ()) or ())
@@ -1197,11 +1589,9 @@ def _new_trace_draft(api_row, graph=None):
         )
     )
     coverage_by_collector = defaultdict(list)
-    for record in tuple(getattr(graph, 'step5_collector_coverage', ()) or ()):
-        if record.api_identity not in {
-            source_identity, target_identity, record.collector,
-        }:
-            continue
+    for record in _collector_coverage_records_for_api(
+        graph, source_identity, target_identity, include_self_scoped=True,
+    ):
         if (
             getattr(record, 'scope', 'api') == 'path'
             and record.collector not in path_collectors
@@ -1237,10 +1627,8 @@ def _new_trace_draft(api_row, graph=None):
         ))
     relevant_identities = {'', source_identity, target_identity}
     draft.envelope_coverage = tuple(merged_coverage)
-    draft.envelope_failures = tuple(
-        failure
-        for failure in tuple(getattr(graph, 'step5_evidence_failures', ()) or ())
-        if failure.api_identity in relevant_identities
+    draft.envelope_failures = _evidence_failures_for_api(
+        graph, *relevant_identities,
     )
     draft.envelope_concerns = tuple(
         replace(concern, api_identity=target_identity)
@@ -3228,9 +3616,9 @@ def _load_immutable_artifact_parse(
         return parsed
 
 
-def _load_runtime_dependency_class_references(
-    catalog, coord, jar_path, class_binary_name, multi_release_version=None,
-    artifact_sha256='', target_jdk=None, graph=None, class_entry='',
+def _load_cached_runtime_dependency_references(
+    catalog, coord, jar_path, artifact_sha256, target_jdk, class_binary_name,
+    multi_release_version=None, class_entry='', graph=None,
 ):
     immutable_key = _immutable_artifact_parse_cache_key(
         artifact_sha256, target_jdk, class_binary_name, multi_release_version,
@@ -3240,12 +3628,34 @@ def _load_runtime_dependency_class_references(
     with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
         generation = _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
         cache = catalog.setdefault('_bytecode_reference_cache', {})
-        cache_generations = catalog.setdefault('_bytecode_reference_cache_generations', {})
+        cache_generations = catalog.setdefault(
+            '_bytecode_reference_cache_generations', {}
+        )
         if cache_generations.get(cache_key) == generation and cache_key in cache:
             _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
-            return cache[cache_key]
+            return True, cache[cache_key]
         cache.pop(cache_key, None)
         cache_generations.pop(cache_key, None)
+    return False, None
+
+
+def _load_runtime_dependency_class_references(
+    catalog, coord, jar_path, class_binary_name, multi_release_version=None,
+    artifact_sha256='', target_jdk=None, graph=None, class_entry='',
+):
+    immutable_key = _immutable_artifact_parse_cache_key(
+        artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        class_entry=class_entry,
+    )
+    cache_key = (coord, jar_path, *immutable_key)
+    cache_hit, cached_references = _load_cached_runtime_dependency_references(
+        catalog, coord, jar_path, artifact_sha256, target_jdk,
+        class_binary_name, multi_release_version,
+        class_entry=class_entry, graph=graph,
+    )
+    if cache_hit:
+        return cached_references
+    generation = _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
 
     def parse():
         _perf_add(graph, 'bytecode_scan', 'javap_fallbacks', 1)
@@ -3285,6 +3695,26 @@ def _load_runtime_dependency_class_references(
     return parsed
 
 
+def _load_cached_direct_classfile_references(
+    artifact_sha256, target_jdk, class_binary_name,
+    multi_release_version=None, class_entry='', graph=None,
+):
+    """Return an already verified in-memory classfile parse without JAR I/O."""
+    if not _valid_sha256(artifact_sha256):
+        return False, None
+    base_key = _immutable_artifact_parse_cache_key(
+        artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        class_entry=class_entry,
+    )
+    cache_key = ('classfile-executable-v4', *base_key)
+    with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
+        cached = _IMMUTABLE_ARTIFACT_PARSE_CACHE.get(cache_key)
+    if not isinstance(cached, str):
+        return False, None
+    _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
+    return True, json.loads(cached)
+
+
 def _load_direct_classfile_references(
     data, artifact_sha256, target_jdk, class_binary_name,
     multi_release_version=None, class_entry='', graph=None,
@@ -3294,6 +3724,12 @@ def _load_direct_classfile_references(
     The namespace prevents a shallow direct result from colliding with the
     authoritative javap cache introduced by the immutable artifact cache.
     """
+    cache_hit, cached_references = _load_cached_direct_classfile_references(
+        artifact_sha256, target_jdk, class_binary_name, multi_release_version,
+        class_entry=class_entry, graph=graph,
+    )
+    if cache_hit:
+        return cached_references
     base_key = _immutable_artifact_parse_cache_key(
         artifact_sha256, target_jdk, class_binary_name, multi_release_version,
         class_entry=class_entry,
@@ -3301,11 +3737,6 @@ def _load_direct_classfile_references(
     cache_key = ('classfile-executable-v4', *base_key)
     generation = _IMMUTABLE_ARTIFACT_PARSE_CACHE_GENERATION
     if _valid_sha256(artifact_sha256):
-        with _IMMUTABLE_ARTIFACT_PARSE_CACHE_LOCK:
-            cached = _IMMUTABLE_ARTIFACT_PARSE_CACHE.get(cache_key)
-        if isinstance(cached, str):
-            _perf_add(graph, 'bytecode_scan', 'artifact_cache_hits', 1)
-            return json.loads(cached)
         tool_identity = (
             f'inprocess-classfile:{ARTIFACT_PARSE_CACHE_PROCEDURE_VERSION}:'
             f'python-{sys.version_info.major}.{sys.version_info.minor}'
@@ -3378,6 +3809,30 @@ def _load_runtime_dependency_class_references_for_task(task):
         return task, task.get('preparsed_references')
     jar_path = str(task.get('jar_path') or '')
     class_entry = str(task.get('class_entry') or '')
+    catalog = task.get('catalog') or {}
+    cache_hit, cached_references = _load_cached_runtime_dependency_references(
+        catalog,
+        task.get('coord') or '',
+        jar_path,
+        task.get('artifact_sha256') or '',
+        task.get('target_jdk'),
+        task.get('class_binary_name') or '',
+        task.get('multi_release_version'),
+        class_entry=class_entry,
+        graph=task.get('graph'),
+    )
+    if cache_hit:
+        return task, cached_references
+    cache_hit, cached_references = _load_cached_direct_classfile_references(
+        task.get('artifact_sha256') or '',
+        task.get('target_jdk'),
+        task.get('class_binary_name') or '',
+        multi_release_version=task.get('multi_release_version'),
+        class_entry=class_entry,
+        graph=task.get('graph'),
+    )
+    if cache_hit:
+        return task, cached_references
     if jar_path and class_entry:
         with zipfile.ZipFile(jar_path) as archive:
             class_bytes = archive.read(class_entry)
@@ -3393,7 +3848,7 @@ def _load_runtime_dependency_class_references_for_task(task):
         if references is not None:
             return task, references
     references = _load_runtime_dependency_class_references(
-        task['catalog'],
+        catalog,
         task['coord'],
         task['jar_path'],
         task['class_binary_name'],
@@ -3694,14 +4149,32 @@ def _dedupe_runtime_matches(matches):
     return unique
 
 
-def _api_row_for_graph_callee(callee_key, api_rows):
+def _build_graph_edge_api_owner_index(api_rows):
+    """Index changed APIs by normalized owner while preserving input order."""
+    by_owner = defaultdict(list)
+    for api_row in api_rows or []:
+        owner, _member, _symbol_kind = _extract_target_owner_and_member(api_row)
+        normalized_owner = str(owner or '').replace('$', '.')
+        if normalized_owner:
+            by_owner[normalized_owner].append(api_row)
+    return by_owner
+
+
+def _api_row_for_graph_callee(callee_key, api_rows, *, api_rows_by_owner=None):
     parsed = _parse_runtime_method_lookup_key(callee_key)
     if parsed:
         callee_owner, callee_member, callee_signature = parsed
         normalized_callee_signature = (
             normalize_signature_for_lookup(callee_signature) or callee_signature
         )
-        for api_row in api_rows or []:
+        candidates = (
+            (api_rows_by_owner or {}).get(
+                str(callee_owner or '').replace('$', '.'), ()
+            )
+            if api_rows_by_owner is not None
+            else (api_rows or [])
+        )
+        for api_row in candidates:
             owner, member, symbol_kind = _extract_target_owner_and_member(api_row)
             if symbol_kind not in {'method', 'constructor'}:
                 continue
@@ -3718,15 +4191,22 @@ def _api_row_for_graph_callee(callee_key, api_rows):
     return None
 
 
-def _graph_edge_target_row(edge, api_rows):
+def _graph_edge_target_row(edge, api_rows, *, api_rows_by_owner=None):
     callee_key = str(getattr(edge, 'callee_key', '') or '').strip()
-    matched_api = _api_row_for_graph_callee(callee_key, api_rows)
+    matched_api = _api_row_for_graph_callee(
+        callee_key, api_rows, api_rows_by_owner=api_rows_by_owner
+    )
     if matched_api is not None:
         return matched_api
     evidence_type = str(getattr(edge, 'evidence_type', '') or '')
     if 'field' in evidence_type:
         field_owner, separator, field_member = callee_key.rpartition('.')
-        for api_row in api_rows or []:
+        candidates = (
+            (api_rows_by_owner or {}).get(field_owner.replace('$', '.'), ())
+            if api_rows_by_owner is not None
+            else (api_rows or [])
+        )
+        for api_row in candidates:
             owner, member, symbol_kind = _extract_target_owner_and_member(api_row)
             if (
                 separator
@@ -3931,7 +4411,9 @@ def collect_graph_analyzer_edges(graph, api_rows):
     if not provenance.get('complete'):
         _record_analyzer_ledger_failure(graph, 'final_artifact_provenance_invalid')
         return 0
-    collected = _collect_target_runtime_reference_closure(graph, api_rows)
+    collected = _collect_target_runtime_reference_closure(
+        graph, api_rows, consume_scan_results=True
+    )
     candidate_edges = []
     seen_edges = set()
     for edges in (getattr(graph, 'reverse_edges', {}) or {}).values():
@@ -3987,6 +4469,7 @@ def collect_graph_analyzer_edges(graph, api_rows):
         return 0
 
     methods_by_id = getattr(graph, 'methods_by_id', {}) or {}
+    api_rows_by_owner = _build_graph_edge_api_owner_index(api_rows)
     for edge in candidate_edges:
         if str(getattr(edge, 'artifact_sha256', '') or '') != business_jar_sha256:
             _record_analyzer_ledger_failure(
@@ -4007,7 +4490,9 @@ def collect_graph_analyzer_edges(graph, api_rows):
         selected_version = int(versioned_entry.group(1)) if versioned_entry else 'base'
         logical_class_entry = versioned_entry.group(2) if versioned_entry else class_entry
         class_binary_name = logical_class_entry[:-6].replace('/', '.')
-        target_row = _graph_edge_target_row(edge, api_rows)
+        target_row = _graph_edge_target_row(
+            edge, api_rows, api_rows_by_owner=api_rows_by_owner
+        )
         if target_row is None:
             _record_analyzer_ledger_failure(
                 graph,
@@ -4369,6 +4854,8 @@ def _commit_packaged_analyzer_edges_transaction(graph, api_hit_pairs):
         graph._analyzer_edge_incomplete_count = incomplete_before
         graph._analyzer_edge_failures = failures_before
         graph.step5_evidence_failures = typed_failures_before
+        graph._step5_evidence_failure_index = set(typed_failures_before)
+        graph._step5_evidence_failure_index_source = typed_failures_before
         raise
     return committed
 
@@ -4468,7 +4955,11 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     scan_failures = []
     scan_input_changes = []
     candidate_failures_by_key = defaultdict(list)
-    hits_by_key = defaultdict(list)
+    # Key physical hits as they are discovered. This preserves the former
+    # stable "sort then keep first" contract while avoiding a second identity
+    # calculation and late duplicate retention for very large class APIs.
+    hits_by_key = defaultdict(dict)
+    duplicate_strong_hits_by_key = defaultdict(list)
     javap_tasks = []
     scanned_classes = 0
     actual_javap_classes = 0
@@ -4886,7 +5377,13 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                             'class_entry': task.get('class_entry') or '',
                             'multi_release_version': selected_version,
                         }
-                        hits_by_key[key].append(hit)
+                        hit_identity = _packaged_hit_sort_key(hit)
+                        hit_bucket = hits_by_key[key]
+                        if hit_identity in hit_bucket:
+                            if not hit.get('weak_reference'):
+                                duplicate_strong_hits_by_key[key].append(hit)
+                        else:
+                            hit_bucket[hit_identity] = hit
 
         if workers <= 1:
             progress_interval = suggest_log_interval(len(javap_tasks), target_updates=12, minimum=1)
@@ -4936,8 +5433,21 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                             elapsed=time.perf_counter() - javap_started_at,
                             item=(task.get('class_binary_name') or '')[:100],
                         )
+                # Futures retain every parsed class reference result.  All facts
+                # have already been reduced into hits/failures at this point, so
+                # release them before materializing the per-API result table.
+                future_map.clear()
+                future = None
+                references = None
+                _task = None
+                task = None
         _perf_add(graph, 'bytecode_scan', 'javap_elapsed_sec', time.perf_counter() - javap_started_at)
 
+    finalize_started_at = time.perf_counter()
+    emit_progress(
+        'step5', 'bytecode-scan',
+        '候选 class 解析完成，开始复核制品身份并提交命中证据',
+    )
     snapshot_before_final_hash = _runtime_artifact_stat_snapshot(
         catalog_entries, target_jdk
     )
@@ -4981,51 +5491,176 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
         return existing
 
+    verification_elapsed = time.perf_counter() - finalize_started_at
+    graph._analyzer_edge_verified_artifacts = dict(scanned_artifact_sha256)
+    commit_started_at = time.perf_counter()
     committed_analyzer_edges = _commit_packaged_analyzer_edges_transaction(
         graph,
-        [
+        (
             (row, hit)
             for row in missing_rows
-            for hit in (hits_by_key.get(build_api_identity_key(row)) or ())
-        ],
+            for hit in chain(
+                (hits_by_key.get(build_api_identity_key(row)) or {}).values(),
+                duplicate_strong_hits_by_key.get(build_api_identity_key(row), ()),
+            )
+        ),
+    )
+    emit_progress(
+        'step5', 'bytecode-scan',
+        (
+            '制品身份复核与命中证据提交完成，'
+            f'identity_check={verification_elapsed:.1f}s，'
+            f'committed_edges={len(committed_analyzer_edges)}'
+        ),
+        elapsed=time.perf_counter() - commit_started_at,
     )
 
     snapshot_after_commit = _runtime_artifact_stat_snapshot(
         catalog_entries, target_jdk
     )
-    if snapshot_after_commit != snapshot_after_final_hash:
+    post_commit_verify_started_at = time.perf_counter()
+    emit_progress(
+        'step5', 'bytecode-scan',
+        '开始提交后制品 SHA-256 复核',
+    )
+    post_commit_changes = []
+    for jar_path, expected_sha256 in sorted(scanned_artifact_sha256.items()):
+        try:
+            actual_sha256 = _artifact_sha256(jar_path)
+        except OSError as exc:
+            actual_sha256 = ''
+            error = f'{type(exc).__name__}:{exc}'
+        else:
+            error = ''
+        if actual_sha256 != expected_sha256:
+            post_commit_changes.append({
+                'reason': 'BYTECODE_SCAN_INPUT_CHANGED',
+                'jar_path': jar_path,
+                'expected_sha256': expected_sha256,
+                'actual_sha256': actual_sha256,
+                'error': error or 'runtime dependency bytes changed during edge commit',
+            })
+    emit_progress(
+        'step5', 'bytecode-scan',
+        '提交后制品 SHA-256 复核完成',
+        elapsed=time.perf_counter() - post_commit_verify_started_at,
+    )
+    if snapshot_after_commit != snapshot_after_final_hash or post_commit_changes:
         analyzer_edges = getattr(graph, 'analyzer_edges', {}) or {}
         for row in committed_analyzer_edges:
             identity = physical_analyzer_edge_identity(row)
-            if analyzer_edges.get(identity) is row:
+            current_row = analyzer_edges.get(identity)
+            if current_row is row or current_row == row:
                 analyzer_edges.pop(identity, None)
-        failure = {
+        failures = post_commit_changes or [{
             'reason': 'BYTECODE_SCAN_INPUT_CHANGED',
             'jar_path': '',
             'error': 'runtime dependency stat identity changed during edge commit',
-        }
-        _record_analyzer_scan_failures(graph, [failure])
+        }]
+        _record_analyzer_scan_failures(graph, failures)
         _mark_packaged_scan_input_changed(
-            existing, api_rows, [failure], scanned_classes, visited_classes,
+            existing, api_rows, failures, scanned_classes, visited_classes,
         )
+        graph._analyzer_edge_verified_artifacts = {}
         catalog['_packaged_api_scan_stat_snapshot'] = None
         _perf_add(graph, 'bytecode_scan', 'scan_failures', 1)
         _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
         return existing
 
     catalog['_packaged_api_scan_stat_snapshot'] = snapshot_after_commit
+    candidate_parse_task_count = len(javap_tasks)
+    javap_tasks.clear()
+    target_rows_by_owner.clear()
+    owner_internal_names.clear()
+    owner_packages.clear()
+    package_bytes.clear()
+    committed_analyzer_edges = ()
+    api_rows = None
     _record_analyzer_scan_failures(graph, scan_failures)
     for failures in candidate_failures_by_key.values():
         _record_analyzer_scan_failures(graph, failures)
     catalog_status = str(catalog.get('status') or '').strip()
-    for row in missing_rows:
+    shared_scan_failures = list(scan_failures)
+    shared_miss_result = {
+        'status': 'miss',
+        'scan_failures': shared_scan_failures,
+        'scanned_classes': scanned_classes,
+        'visited_classes': visited_classes,
+        'scan_mode': 'batch',
+    }
+    shared_multi_release_result = {
+        'status': 'unavailable',
+        'reason': 'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
+        'scan_failures': shared_scan_failures,
+        'scanned_classes': scanned_classes,
+        'visited_classes': visited_classes,
+        'scan_mode': 'batch',
+    }
+    shared_catalog_incomplete_result = {
+        'status': 'unavailable',
+        'reason': 'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
+        'catalog_status': catalog.get('status'),
+        'catalog_reason_codes': list(catalog.get('reason_codes') or []),
+        'scan_failures': shared_scan_failures,
+        'scanned_classes': scanned_classes,
+        'visited_classes': visited_classes,
+        'scan_mode': 'batch',
+    }
+    result_population_started_at = time.perf_counter()
+    population_interval = suggest_log_interval(
+        len(missing_rows), target_updates=8, minimum=1,
+    )
+    max_hit_key, max_hit_count = max(
+        ((key, len(value or ())) for key, value in hits_by_key.items()),
+        key=lambda item: item[1],
+        default=('', 0),
+    )
+    total_hit_count = sum(len(value or ()) for value in hits_by_key.values())
+    emit_progress(
+        'step5', 'bytecode-scan',
+        (
+            f'开始写入逐 API 批量扫描结果，API={len(missing_rows)}，'
+            f'hit_apis={len(hits_by_key)}，total_hits={total_hit_count}，'
+            f'max_hits_per_api={max_hit_count}，'
+            f'max_hit_api={max_hit_key[:100]}'
+        ),
+    )
+    population_key_elapsed = 0.0
+    population_hit_copy_elapsed = 0.0
+    for row_index, row in enumerate(missing_rows, 1):
+        row_started_at = time.perf_counter()
         key = build_api_identity_key(row)
+        population_key_elapsed += time.perf_counter() - row_started_at
+        if should_log_progress(row_index, len(missing_rows), population_interval):
+            emit_progress(
+                'step5', 'bytecode-scan',
+                (
+                    f'逐 API 批量扫描结果写入进度，hits={len(hits_by_key.get(key) or ())}，'
+                    f'key_time={population_key_elapsed:.1f}s，'
+                    f'hit_copy_time={population_hit_copy_elapsed:.1f}s'
+                ),
+                current=row_index,
+                total=len(missing_rows),
+                elapsed=time.perf_counter() - result_population_started_at,
+                item=str(row.get('api_name') or '')[:100],
+            )
         if key in existing and existing[key].get('status') == 'unavailable':
             continue
-        hits = hits_by_key.get(key) or []
-        api_scan_failures = scan_failures + list(candidate_failures_by_key.get(key) or [])
-        if hits:
-            unique_hits = _deduplicate_physical_packaged_hits(hits)
+        hit_bucket = hits_by_key.get(key) or {}
+        candidate_failures = list(candidate_failures_by_key.get(key) or [])
+        api_scan_failures = (
+            shared_scan_failures
+            if not candidate_failures
+            else [*shared_scan_failures, *candidate_failures]
+        )
+        if hit_bucket:
+            # Preserve the legacy scan-cache contract: physical hits are exposed
+            # in canonical order even though workers complete out of order.
+            # Downstream deduplication recognizes this ordering and avoids a
+            # second sort.
+            hit_copy_started_at = time.perf_counter()
+            unique_hits = sorted(hit_bucket.values(), key=_packaged_hit_sort_key)
+            population_hit_copy_elapsed += time.perf_counter() - hit_copy_started_at
             existing[key] = {
                 'status': 'hit',
                 'hits': unique_hits,
@@ -5041,26 +5676,21 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
                 api_identity=key,
             )
-            existing[key] = {
-                'status': 'unavailable',
-                'reason': 'MULTI_RELEASE_TARGET_JDK_UNKNOWN',
-                'scan_failures': api_scan_failures,
-                'scanned_classes': scanned_classes,
-                'visited_classes': visited_classes,
-                'scan_mode': 'batch',
-            }
+            existing[key] = (
+                shared_multi_release_result
+                if api_scan_failures is shared_scan_failures
+                else {**shared_multi_release_result, 'scan_failures': api_scan_failures}
+            )
             continue
         if catalog_status and catalog_status != 'complete':
-            existing[key] = {
-                'status': 'unavailable',
-                'reason': 'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
-                'catalog_status': catalog.get('status'),
-                'catalog_reason_codes': list(catalog.get('reason_codes') or []),
-                'scan_failures': api_scan_failures,
-                'scanned_classes': scanned_classes,
-                'visited_classes': visited_classes,
-                'scan_mode': 'batch',
-            }
+            existing[key] = (
+                shared_catalog_incomplete_result
+                if api_scan_failures is shared_scan_failures
+                else {
+                    **shared_catalog_incomplete_result,
+                    'scan_failures': api_scan_failures,
+                }
+            )
             continue
         if api_scan_failures:
             first = dict(api_scan_failures[0])
@@ -5073,13 +5703,16 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
                 'scan_mode': 'batch',
             }
             continue
-        existing[key] = {
-            'status': 'miss',
-            'scan_failures': api_scan_failures,
-            'scanned_classes': scanned_classes,
-            'visited_classes': visited_classes,
-            'scan_mode': 'batch',
-        }
+        existing[key] = (
+            shared_miss_result
+            if api_scan_failures is shared_scan_failures
+            else {**shared_miss_result, 'scan_failures': api_scan_failures}
+        )
+    emit_progress(
+        'step5', 'bytecode-scan',
+        '逐 API 批量扫描结果写入完成',
+        elapsed=time.perf_counter() - result_population_started_at,
+    )
 
     emit_progress(
         "step5",
@@ -5096,7 +5729,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
     )
     _perf_add(graph, 'bytecode_scan', 'elapsed_sec', time.perf_counter() - scan_started_at)
     _perf_add(graph, 'bytecode_scan', 'visited_classes', visited_classes)
-    _perf_add(graph, 'bytecode_scan', 'candidate_parse_tasks', len(javap_tasks))
+    _perf_add(graph, 'bytecode_scan', 'candidate_parse_tasks', candidate_parse_task_count)
     _perf_add(graph, 'bytecode_scan', 'javap_tasks', actual_javap_classes)
     _perf_add(graph, 'bytecode_scan', 'classfile_fast_path_classes', direct_classfile_classes)
     _perf_add(graph, 'bytecode_scan', 'javap_classes', actual_javap_classes)
@@ -5258,24 +5891,38 @@ def _add_runtime_dependency_caller_edge(
         edge.ownership_evidence = analyzer_hit.get('ownership_evidence')
     if str(coord or '') == '__business__':
         edge.evidence_source = 'current_final_artifact'
+    reverse_edge_identities = getattr(
+        graph, '_runtime_dependency_reverse_edge_identities_by_key', None
+    )
+    if reverse_edge_identities is None:
+        reverse_edge_identities = {}
+        graph._runtime_dependency_reverse_edge_identities_by_key = (
+            reverse_edge_identities
+        )
+
+    def runtime_edge_identity(item):
+        hit = getattr(item, 'runtime_analyzer_hit', {}) or {}
+        return (
+            item.caller_symbol_id, item.callee_key, item.evidence_type,
+            _normalized_instruction_offset(hit.get('instruction_offset')),
+            str(hit.get('consumer_descriptor') or ''),
+            str(hit.get('callee_descriptor') or ''),
+            str(hit.get('jar_path') or ''),
+            str(hit.get('artifact_container_entry') or ''),
+            str(hit.get('class_entry') or ''),
+        )
+
+    identity = runtime_edge_identity(edge)
     for key in (lookup_key, edge.callee_simple_key):
         bucket = reverse_edges.setdefault(key, [])
-        identity = (
-            edge.caller_symbol_id, edge.callee_key, edge.evidence_type,
-            _normalized_instruction_offset((analyzer_hit or {}).get('instruction_offset')),
-            str((analyzer_hit or {}).get('consumer_descriptor') or ''),
-            str((analyzer_hit or {}).get('callee_descriptor') or ''),
-        )
-        if any((
-            old.caller_symbol_id, old.callee_key, old.evidence_type,
-            _normalized_instruction_offset(
-                (getattr(old, 'runtime_analyzer_hit', {}) or {}).get('instruction_offset')
-            ),
-            str((getattr(old, 'runtime_analyzer_hit', {}) or {}).get('consumer_descriptor') or ''),
-            str((getattr(old, 'runtime_analyzer_hit', {}) or {}).get('callee_descriptor') or ''),
-        ) == identity for old in bucket):
+        identities = reverse_edge_identities.get(key)
+        if identities is None:
+            identities = {runtime_edge_identity(old) for old in bucket}
+            reverse_edge_identities[key] = identities
+        if identity in identities:
             continue
         bucket.append(edge)
+        identities.add(identity)
         reverse_edge_count += 1
     graph.methods_by_id = methods_by_id
     graph.reverse_edges = reverse_edges
@@ -5343,6 +5990,42 @@ def _runtime_member_index_cache_path(graph):
         Path(report_dir) / '.runtime' / 'cache'
         / 's5_runtime_member_candidate_index.json'
     )
+
+
+def _activate_runtime_member_index_trace_lease(graph, index):
+    """Trust one verified member index until the batch's final SHA-256 check."""
+    active_serial = int(
+        getattr(graph, '_active_packaged_scan_trace_serial', 0) or 0
+    )
+    identity = (index or {}).get('_identity')
+    if active_serial and identity is not None:
+        index['_validated_trace_serial'] = active_serial
+        graph._runtime_member_index_trace_identity = identity
+    return index
+
+
+def _validate_runtime_member_index_trace_lease(graph):
+    baseline = getattr(graph, '_runtime_member_index_trace_identity', None)
+    if baseline is None:
+        return True
+    catalog = _get_runtime_dependency_catalog(graph)
+    entries = list(catalog.get('entries') or [])
+    try:
+        current = _runtime_member_index_cache_identity(
+            entries, catalog.get('target_jdk')
+        )
+    except OSError:
+        current = None
+    if current == baseline:
+        return True
+    _record_analyzer_ledger_failure(
+        graph,
+        'BYTECODE_MEMBER_INDEX_INPUT_CHANGED',
+        stage='trace-final-artifact-validation',
+        error_type='ArtifactIdentityChanged',
+        error='runtime dependency SHA-256 identity changed during batch trace',
+    )
+    return False
 
 
 def _runtime_member_index_serializable(index):
@@ -5712,12 +6395,23 @@ def _get_runtime_dependency_member_candidate_index(graph, catalog_entries, targe
     if not graph:
         return None
     cached = getattr(graph, '_runtime_dependency_member_candidate_index', None)
+    active_serial = int(
+        getattr(graph, '_active_packaged_scan_trace_serial', 0) or 0
+    )
+    if (
+        cached is not None
+        and active_serial
+        and cached.get('_validated_trace_serial') == active_serial
+        and getattr(graph, '_runtime_member_index_trace_identity', None)
+        == cached.get('_identity')
+    ):
+        return cached
     if cached is not None:
         current_stat_snapshot = _runtime_artifact_stat_snapshot(
             catalog_entries, target_jdk
         )
         if cached.get('_stat_snapshot') == current_stat_snapshot:
-            return cached
+            return _activate_runtime_member_index_trace_lease(graph, cached)
         snapshot_before_identity = current_stat_snapshot
         try:
             current_identity = _runtime_member_index_cache_identity(
@@ -5734,7 +6428,7 @@ def _get_runtime_dependency_member_candidate_index(graph, catalog_entries, targe
             and snapshot_after_identity == snapshot_before_identity
         ):
             cached['_stat_snapshot'] = snapshot_after_identity
-            return cached
+            return _activate_runtime_member_index_trace_lease(graph, cached)
         setattr(graph, '_runtime_dependency_member_candidate_index', None)
     cache_path = _runtime_member_index_cache_path(graph)
     identity = None
@@ -5764,7 +6458,7 @@ def _get_runtime_dependency_member_candidate_index(graph, catalog_entries, targe
                     time.perf_counter() - cache_started_at,
                 )
                 setattr(graph, '_runtime_dependency_member_candidate_index', index)
-                return index
+                return _activate_runtime_member_index_trace_lease(graph, index)
             identity = identity_after_load
             _perf_add(
                 graph, 'bytecode_expand',
@@ -5860,7 +6554,7 @@ def _get_runtime_dependency_member_candidate_index(graph, catalog_entries, targe
             f"unparsed={len(index.get('unparsed_tasks') or [])}"
         ),
     )
-    return index
+    return _activate_runtime_member_index_trace_lease(graph, index)
 
 
 def _candidate_tasks_from_runtime_member_index(index, owner, member):
@@ -5998,11 +6692,12 @@ def _ensure_runtime_dependency_callers_for_key(
     if expanded is None:
         expanded = set()
         setattr(graph, '_runtime_dependency_caller_expanded', expanded)
-    expansion_key = (
-        lookup_key,
-        str(excluded_provider_coord or ''),
-        str(excluded_self_owner or '').replace('$', '.'),
-    )
+    # Expansion materializes the complete caller set and applies neither of
+    # the legacy exclusion hints while selecting candidates or committing
+    # edges.  Keying the cache by those hints therefore repeated the exact
+    # same bytecode work for every root API/coordinate.  Keep the parameters
+    # for call compatibility, but cache the context-independent result once.
+    expansion_key = lookup_key
     if expansion_key in expanded:
         _perf_add(graph, 'bytecode_expand', 'already_expanded_hits', 1)
         _perf_add(graph, 'bytecode_expand', 'elapsed_sec', time.perf_counter() - expand_started_at)
@@ -6176,14 +6871,20 @@ def _ensure_runtime_dependency_callers_for_key(
                     })
                     continue
             _perf_add(graph, 'bytecode_expand', 'light_scan_elapsed_sec', time.perf_counter() - scan_started_at)
-        javap_tasks = [
-            {**task, 'catalog': catalog, 'graph': graph}
-            for task in javap_tasks
-        ]
         candidate_cache[candidate_cache_key] = {
             'javap_tasks': list(javap_tasks),
             'visited_classes': visited_classes,
         }
+
+    def contextual_task(task):
+        if task.get('catalog') is catalog and task.get('graph') is graph:
+            return task
+        return ChainMap({'catalog': catalog, 'graph': graph}, task)
+
+    def load_candidate_task(task):
+        return _load_runtime_dependency_class_references_for_task(
+            contextual_task(task)
+        )
 
     def handle_javap_result(task, references):
         nonlocal javap_classes, edges_added
@@ -6210,6 +6911,7 @@ def _ensure_runtime_dependency_callers_for_key(
                     else task.get('artifact_container_entry') or ''
                 ),
                 'class_entry': task.get('class_entry') or '',
+                'multi_release_version': task.get('multi_release_version'),
                 'caller_owner': task.get('class_binary_name') or '',
                 'class_fqcn': task.get('class_fqcn') or '',
                 'consumer_method': matched.get('consumer_method') or '<unknown>',
@@ -6239,21 +6941,24 @@ def _ensure_runtime_dependency_callers_for_key(
         # log lines while hiding the actual hotspots. Large lookups remain
         # visible here; all lookups are still retained in aggregate timing and
         # slow-item statistics.
-        log_lookup_progress = len(javap_tasks) >= 50
+        # Cached scans commonly finish in a few milliseconds.  Logging ten
+        # progress lines for each small lookup costs more than the lookup and
+        # floods large-project reports without adding useful observability.
+        log_lookup_progress = len(javap_tasks) >= 500
         if log_lookup_progress:
             emit_progress(
                 "step5",
                 "bytecode-expand",
                 f"扩展运行时依赖调用者字节码，lookup={lookup_key[:120]}，候选class={len(javap_tasks)}，并行度={workers}",
-            )
+        )
         if workers <= 1:
             for task in javap_tasks:
-                _task, references = _load_runtime_dependency_class_references_for_task(task)
+                _task, references = load_candidate_task(task)
                 handle_javap_result(_task, references)
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_map = {
-                    executor.submit(_load_runtime_dependency_class_references_for_task, task): task
+                    executor.submit(load_candidate_task, task): task
                     for task in javap_tasks
                 }
                 progress_interval = suggest_log_interval(len(future_map), target_updates=8, minimum=1)
@@ -6317,12 +7022,28 @@ def _ensure_runtime_dependency_callers_for_key(
     }
 
 
-def _collect_target_runtime_reference_closure(graph, api_rows):
+def _collect_target_runtime_reference_closure(
+    graph, api_rows, *, consume_scan_results=False,
+):
     """Record the complete runtime caller closure for each original target API."""
     collected = 0
     catalog = _get_runtime_dependency_catalog(graph)
     scan_results = catalog.get('_packaged_api_scan_results') or {}
-    for api_row in api_rows or []:
+    api_rows = list(api_rows or [])
+    remaining_by_identity = defaultdict(int)
+    if consume_scan_results:
+        for api_row in api_rows:
+            remaining_by_identity[build_api_identity_key(api_row)] += 1
+    started_at = time.perf_counter()
+    progress_interval = suggest_log_interval(
+        len(api_rows), target_updates=12, minimum=1
+    )
+    emit_progress(
+        'step5', 'edge-ledger',
+        '开始生成目标 API 的完整运行时调用者闭包',
+        total=len(api_rows),
+    )
+    for row_index, api_row in enumerate(api_rows, 1):
         api_name = str(api_row.get('api_name') or '').strip()
         target_owner, _target_member, _target_kind = (
             _extract_target_owner_and_member(api_row)
@@ -6336,7 +7057,8 @@ def _collect_target_runtime_reference_closure(graph, api_rows):
         symbol_kind = str(api_row.get('symbol_kind') or 'method')
         if symbol_kind in {'method', 'constructor'} and api_signature:
             queue.extend(_method_lookup_key_variants(f'{api_name}{api_signature}'))
-        scan = scan_results.get(build_api_identity_key(api_row)) or {}
+        api_identity = build_api_identity_key(api_row)
+        scan = scan_results.get(api_identity) or {}
         for hit in scan.get('hits') or []:
             queue.extend(_packaged_hit_consumer_lookup_keys(hit))
         visited = set()
@@ -6388,6 +7110,27 @@ def _collect_target_runtime_reference_closure(graph, api_rows):
                 for variant in _method_lookup_key_variants(caller_key):
                     if variant not in visited:
                         queue.append(variant)
+        if consume_scan_results:
+            remaining_by_identity[api_identity] -= 1
+            if remaining_by_identity[api_identity] <= 0:
+                scan_results.pop(api_identity, None)
+                remaining_by_identity.pop(api_identity, None)
+        if should_log_progress(row_index, len(api_rows), progress_interval):
+            emit_progress(
+                'step5', 'edge-ledger',
+                f'运行时调用者闭包生成进度，已收集边={collected}',
+                current=row_index,
+                total=len(api_rows),
+                elapsed=time.perf_counter() - started_at,
+                item=api_name[:100],
+            )
+    emit_progress(
+        'step5', 'edge-ledger',
+        f'目标 API 运行时调用者闭包生成完成，已收集边={collected}',
+        current=len(api_rows),
+        total=len(api_rows),
+        elapsed=time.perf_counter() - started_at,
+    )
     return collected
 
 
@@ -6662,21 +7405,35 @@ def _packaged_hit_sort_key(hit):
 
 
 def _deduplicate_physical_packaged_hits(hits):
+    items = list(hits or ())
+    if not items:
+        return []
+    previous = _packaged_hit_sort_key(items[0])
+    already_sorted = True
+    for hit in items[1:]:
+        current = _packaged_hit_sort_key(hit)
+        if current < previous:
+            already_sorted = False
+            break
+        previous = current
+    if not already_sorted:
+        items.sort(key=_packaged_hit_sort_key)
     unique = []
-    seen = set()
-    for hit in sorted(hits or (), key=_packaged_hit_sort_key):
+    previous = None
+    for hit in items:
         identity = _packaged_hit_sort_key(hit)
-        if identity in seen:
+        if identity == previous:
             continue
-        seen.add(identity)
+        previous = identity
         unique.append(hit)
     return unique
 
 
-def _select_canonical_packaged_hits(hits):
+def _select_canonical_packaged_hits(hits, *, already_deduplicated=False):
     unique = []
     seen = set()
-    for hit in _deduplicate_physical_packaged_hits(hits):
+    source_hits = hits if already_deduplicated else _deduplicate_physical_packaged_hits(hits)
+    for hit in source_hits:
         identity = tuple(hit.get(field) for field in (
             'coord', 'class_fqcn', 'consumer_method', 'consumer_signature',
             'evidence_type', 'target_display', 'multi_release_version',
@@ -6718,7 +7475,9 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
     )
     if not physical_hits:
         return _apply_evidence_decision(result, complete_scan=True)
-    hits = _select_canonical_packaged_hits(physical_hits)
+    hits = _select_canonical_packaged_hits(
+        physical_hits, already_deduplicated=True,
+    )
     ambiguous_hits = [
         item for item in physical_hits if item.get('signature_ambiguous')
     ]
@@ -7226,17 +7985,17 @@ def _build_indirect_usage_result(result, api_row, graph):
 
 
 def _capability_coverage_for_api(api_row, graph):
-    coverage = dict(getattr(graph, 'indirect_analysis_coverage', {}) or {})
-    per_api = dict(coverage.get('by_api') or {})
+    coverage = getattr(graph, 'indirect_analysis_coverage', {}) or {}
+    per_api = coverage.get('by_api') or {}
     identity = indirect_api_key(api_row)
-    item = dict(per_api.get(identity) or {})
+    item = per_api.get(identity) or {}
     collector_records = [
         record
-        for record in (getattr(graph, 'step5_collector_coverage', ()) or ())
-        if record.api_identity == identity and record.applicable
+        for record in _collector_coverage_records_for_api(graph, identity)
+        if record.applicable
     ]
     if not item and not collector_records:
-        return coverage
+        return dict(coverage)
     statuses = [item.get('status') or 'not_applicable'] if item else []
     statuses.extend(record.status for record in collector_records)
     if 'insufficient' in statuses:
@@ -11494,6 +12253,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         graph._active_packaged_scan_trace_serial = int(
             getattr(graph, '_active_packaged_scan_trace_serial', 0) or 0
         ) + 1
+        graph._runtime_member_index_trace_identity = None
         catalog = _get_runtime_dependency_catalog(graph)
         catalog['_packaged_api_scan_validated_trace_serial'] = 0
         try:
@@ -11520,7 +12280,16 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                     _changed_api_owner_fqcn(row),
                 ) not in identical_providers
             ]
+            preparation_started_at = time.perf_counter()
+            emit_progress(
+                'step5', 'trace-prepare',
+                f'开始构建最终制品批量扫描结果，API={len(scan_apis)}',
+            )
             _build_packaged_runtime_dependency_scan_cache(scan_apis, graph)
+            emit_progress(
+                'step5', 'trace-prepare', '最终制品批量扫描结果构建完成',
+                elapsed=time.perf_counter() - preparation_started_at,
+            )
             # Building the shared source-fact index is a batch preparation cost,
             # not latency attributable to whichever class/field API happens to
             # be traced first.
@@ -11528,16 +12297,29 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                 str(row.get('symbol_kind') or '').strip().lower() in {'class', 'field'}
                 for row in all_apis
             ):
+                source_index_started_at = time.perf_counter()
+                emit_progress('step5', 'trace-prepare', '开始构建源码直接使用索引')
                 _get_direct_source_fact_index(graph, trace_cache)
+                emit_progress(
+                    'step5', 'trace-prepare', '源码直接使用索引构建完成',
+                    elapsed=time.perf_counter() - source_index_started_at,
+                )
             if enable_multi_target_reuse:
+                reverse_plan_started_at = time.perf_counter()
+                emit_progress('step5', 'trace-prepare', '开始构建多目标反向追踪计划')
                 prepare_multi_target_reverse_plan(
                     scan_apis,
                     graph,
                     type_metadata,
                     trace_cache=trace_cache,
                 )
+                emit_progress(
+                    'step5', 'trace-prepare', '多目标反向追踪计划构建完成',
+                    elapsed=time.perf_counter() - reverse_plan_started_at,
+                )
         except BaseException:
             graph._active_packaged_scan_trace_serial = 0
+            graph._runtime_member_index_trace_identity = None
             catalog['_packaged_api_scan_validated_trace_serial'] = 0
             raise
         catalog['_packaged_api_scan_validated_trace_serial'] = (
@@ -11607,6 +12389,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
         except BaseException:
             if graph is not None:
                 graph._active_packaged_scan_trace_serial = 0
+                graph._runtime_member_index_trace_identity = None
                 catalog = _get_runtime_dependency_catalog(graph)
                 catalog['_packaged_api_scan_validated_trace_serial'] = 0
             raise
@@ -11650,9 +12433,16 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
             )
 
     if graph is not None:
+        member_index_identity_valid = _validate_runtime_member_index_trace_lease(graph)
         graph._active_packaged_scan_trace_serial = 0
+        graph._runtime_member_index_trace_identity = None
         catalog = _get_runtime_dependency_catalog(graph)
         catalog['_packaged_api_scan_validated_trace_serial'] = 0
+        if not member_index_identity_valid:
+            raise RuntimeError(
+                'BYTECODE_MEMBER_INDEX_INPUT_CHANGED: runtime dependency '
+                'artifacts changed during batch trace'
+            )
 
     emit_progress(
         "step5",

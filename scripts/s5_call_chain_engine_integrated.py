@@ -1540,13 +1540,40 @@ def _step5_integrated_main_impl(args):
     # Phase 6: 增强型输出（核心改进）
     print("\n生成分析报告...", file=sys.stderr)
     graph_stats['step5_perf']['artifact_facts'] = artifact_fact_store.metrics()
+    # The query index, analyzer-edge ledger and TraceResult envelopes now own
+    # every externally visible fact.  The mutable graph and runtime scan
+    # indexes are analysis workspaces, not report inputs; retaining them while
+    # formatting 185k API entries made the two largest object graphs overlap.
+    graph_method_count = len(graph.methods_by_id)
+    graph_reverse_edge_count = int(getattr(graph, 'reverse_edge_count', 0) or 0)
+    graph = None
+    graph_result = None
+    business_graph_result = None
+    runtime_dependency_catalog = None
+    type_metadata = None
+    api_bridge_requirements = None
+    all_apis = None
+    business_coverage = None
+    artifact_fact_store = None
+    jar_metadata = None
+    gc.collect()
+    _observe_step5_memory(
+        graph_stats,
+        'report_input_released',
+        graph=None,
+        extra={
+            'result_count': len(all_results),
+            'released_graph_methods': graph_method_count,
+            'released_graph_reverse_edges': graph_reverse_edge_count,
+        },
+    )
     summary_timer = time.perf_counter()
     emit_progress("step5", "report", "开始生成汇总报告与证据视图")
     generate_enhanced_summary(all_results, output_dir, graph_stats=graph_stats)
     _observe_step5_memory(
         graph_stats,
         'report_ready',
-        graph=graph,
+        graph=None,
         extra={'result_count': len(all_results)},
     )
     emit_progress(

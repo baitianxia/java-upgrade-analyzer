@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1118,8 +1119,11 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
     owners_by_simple = {}
     for owner in owners:
         owners_by_simple.setdefault(owner.rsplit('.', 1)[-1], []).append(owner)
-    findings = {target['api_key']: [] for target in targets}
-    unresolved_by_api = {target['api_key']: [] for target in targets}
+    # Findings are sparse in real projects: most changed APIs have no reflective
+    # or resource reference.  Missing and empty entries have identical lookup
+    # semantics throughout Step5, so retain only APIs with actual evidence.
+    findings = defaultdict(list)
+    unresolved_by_api = defaultdict(list)
     coverage_by_api = {
         target['api_key']: {
             'reflection_source': 'not_applicable',
@@ -1467,8 +1471,8 @@ def collect_indirect_usage_batch(graph_snapshot, api_rows, source_roots):
         coverage=tuple(coverage),
         metrics=tuple(sorted({
             **compatibility,
-            'findings': findings,
-            'unresolved': unresolved_by_api,
+            'findings': dict(findings),
+            'unresolved': dict(unresolved_by_api),
         }.items())),
     )
 
