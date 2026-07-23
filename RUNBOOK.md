@@ -74,7 +74,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/runtime_coverage_oracle.py" \
   "base_branch": "main",
   "current_branch": "feature/upgrade-test",
   "source_dirs": ["src/main/java"],
-  "dependency_source_dirs": ["/abs/path/to/dependency-repo"],
+  "dependency_source_dirs": ["/abs/path/to/dependency-repo", "https://git.example.com/team/dependency-repo.git"],
   "max_depth": 5,
   "tool": "maven"
 }
@@ -101,7 +101,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ### tree-sitter 安装
 
-- 正式支持 CPython 3.12.x/3.13.x/3.14.x、Linux/macOS/Windows、JDK 11/17/21 与 Maven 3.8+。
+- 正式支持 CPython 3.12.x/3.13.x/3.14.x、Linux/macOS/Windows、JDK 11/17/21，以及 Maven 3.8+ 或 Gradle 7.6+。
 - 安装版本以根目录 `requirements-runtime.txt` 为唯一清单；Step5 运行时不会联网安装或修改 Python 环境。
 - 在仓库根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
 
@@ -115,7 +115,7 @@ python3 scripts/bootstrap_runtime.py
 python3 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels
 ```
 
-- 安装后运行门禁；它会实际执行外部命令、核对解析器 import/精确版本，并确认 Java 工具与 Maven 使用同一 JDK：
+- 安装后运行门禁；它会实际执行外部命令、核对解析器 import/精确版本，并确认 Java 工具与当前项目的 Maven 或 Gradle 使用同一 JDK：
 
 ```bash
 python3 scripts/quality_gate.py --profile quick --skip-real
@@ -151,7 +151,8 @@ python3 scripts/quality_gate.py --profile quick --skip-real
 
 说明：
 
-- `dependency_source_dirs` 是推荐主入口；只要提供源码工程目录或仓库根目录，调度层就会优先扫描仓库 `pom.xml` / `build.gradle` 并展开所有推断出的 `groupId:artifactId`。
+- `dependency_source_dirs` 是推荐主入口；可填写源码工程目录、仓库根目录或 HTTPS/SSH Git 地址。Git 地址会先克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/` 并在后续运行中复用，随后调度层扫描仓库 `pom.xml` / `build.gradle` 并展开所有推断出的 `groupId:artifactId`。
+- Git 地址克隆复用宿主环境已有的 SSH key 或 Git credential helper，并设置 `GIT_TERMINAL_PROMPT=0`；克隆失败会保留既有正式产物并要求修正地址或权限，不会降级成一个空源码目录。
 - 路径支持相对路径（相对 `project-dir`）和绝对路径。
 - `dependency_source_dirs` 一旦提供，Step4 会通过 `git ls-remote` 查询源码仓库的实时远程分支，再按依赖 `old_version/new_version` 做严格边界匹配；old/new 两侧优先选择 remote 和版本前缀家族一致的 ref pair，同名候选只有 commit 相同才会自动合并。选定 ref 后会定向 fetch 并固定 commit，再执行源码 diff；不会以本地远端跟踪分支冒充远端最新状态。
 - 唯一匹配会自动继续；确认卡中的方案会把 `old_ref/new_ref` 与 `expected_old_commit/expected_new_commit` 一起写回。执行前再次校验远端 ref：commit 不一致或 ref 消失时标记 `remote_ref_moved`，重新确认后才继续。`refs/heads/*` 在多个 remote 上指向不同 commit 时仍视为歧义，不能按排序取第一个。
@@ -170,7 +171,7 @@ python3 scripts/quality_gate.py --profile quick --skip-real
   "base_branch": "基准分支，如 main",
   "current_branch": "当前分支",
   "source_dirs": ["src/main/java"],
-  "dependency_source_dirs": ["依赖源码工程目录或仓库根目录（可选）"],
+  "dependency_source_dirs": ["依赖源码工程目录、仓库根目录或 Git 地址（可选）"],
   "max_depth": 5,
   "include_test_scope": false,
   "tool": "maven"
@@ -393,20 +394,22 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 ```
 
 说明：
-- Maven 场景下，Step1 会真实执行 `package`，或直接读取用户提供的编译产物
+- Maven 场景下，Step1 会真实执行目标模块的 `package`
+- Gradle 场景下，Step1 优先调用项目 Wrapper，执行目标 project 的 `build -x test`；Groovy DSL、Kotlin DSL、`projectDir` 与 `project(...)` 模块依赖均纳入模块/源码范围推导
+- 两种构建工具都可以跳过自动构建，直接读取用户提供的编译产物
 - `boot jar/war` 直接读取最终产物
 - `thin jar` / 无嵌套依赖场景当前不支持，会直接报错
 - 若 Step1 先进入待交互，Claude Code 必须把 `interaction.json` 整理成用户可读的决策卡片：缺什么输入、可用哪种输入方式、可以直接怎么回复；协议字段只用于内部恢复命令构造
-- 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支执行 `mvn dependency:list` 补全坐标；但这不是 direct artifact 模式的执行前硬前置
+- 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支生成 Maven `dependency:list` 或 Gradle `runtimeClasspath` 报告补全坐标；但这不是 direct artifact 模式的执行前硬前置
 - `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
-- 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧源码并运行 Maven 补全；自动构建模式则在构建前解析两侧 ref。解析时先查询实时远程 refs，候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在 Maven 执行前暂停确认；选定后仅定向 fetch 所需 ref，不执行 `git pull`，也不修改用户当前分支。
+- 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧源码并运行对应构建工具补全；自动构建模式则在构建前解析两侧 ref。解析时先查询实时远程 refs，候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在构建前暂停确认；选定后仅定向 fetch 所需 ref，不执行 `git pull`，也不修改用户当前分支。
 - 对 Step1 构建来源，远端不存在、认证失败、网络失败、超时或定向 fetch 失败时会暂停。瞬时网络错误在暂停前最多尝试 3 次（间隔 1 秒、3 秒），认证失败、ref 不存在和 ref 移动不重试；裸 SHA 必须先与实时远端记录的 `commit` 匹配并按 expected commit 固定。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地 commit；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。Step4 的依赖源码属于辅助证据：远端查询、fetch、ref 移动、未匹配等内部故障在受控重试后记录为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并自动改用最终 JAR 方法字节码指纹识别同签名实现变化；不会要求用户修复，也不会静默使用本地 ref。若字节码兜底也失败，行为覆盖成为关键缺口并限制最终结论。只有两个以上不同 commit pair 会改变源码对比范围时才暂停确认。
 - 同时提供 branch/ref 与 source directory 时，以确认后的 branch/ref 为准；只有 source directory 时不得直接使用当前 checkout 执行坐标补全
 - 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源
 - 若这两个分支是在 Step1 review checkpoint 才补充，恢复 `continue` 后调度器会先把确认值写入 `step2.input`，再进入 Step2
 - 任一步 checkpoint 恢复时，若主状态里该 step 已有更新后的 `input`，恢复逻辑会优先使用它，而不是继续沿用旧 `output`
 - 若用户选择 `restart_from_step` 回跳更早步骤，调度器会优先复用当前 checkpoint 已确认的新上下文，再补目标步骤原有缺失字段
-- 若直接产物中的嵌套 jar 缺少 `pom.properties`，可同时提供 `base_branch/current_branch`，让 Step1 额外执行 `mvn dependency:list` 安全补全坐标
+- 若直接产物中的嵌套 jar 缺少 `pom.properties`，可同时提供 `base_branch/current_branch`，让 Step1 额外生成 Maven `dependency:list` 或 Gradle `runtimeClasspath` 报告安全补全坐标
 - `base_jdk_home/current_jdk_home` 为可选项；未提供时各侧默认回落主机 `JAVA_HOME`
 - 若仍有依赖坐标无法安全补齐，Step1 会进入待交互；可补 `manual_coord_overrides`，或显式选择 `confirm_unresolved`。这条补丁路径同时适用于直接产物模式和自动切分支构建模式
 - 选择 `confirm_unresolved` 后，未补齐项会保留在 `evidence/dependencies/dep_changes.csv` 并标记 `resolution_status=unresolved`；后续步骤会跳过这些行
@@ -438,7 +441,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step step1_scope --report-dir .u
 
 ## Step 2：从依赖树推断上下文
 
-- 依赖是否存在及实际版本以 Step1 留存的最终制品为准；该结果已经包含 Maven BOM 仲裁和 `<exclusions>` 的最终效果。
+- 依赖是否存在及实际版本以 Step1 留存的最终制品为准；该结果已经包含 Maven BOM / `<exclusions>` 或 Gradle dependency constraints / resolution strategy 的最终效果。
 - `s2_dep_graph.json` 不再读取单个依赖的原始 POM 猜测传递父子边。没有构建工具最终解析树证据时，`edges` 保持为空并标记 `relationship_status=not_inferred_without_resolved_tree`，避免把已排除依赖画成幽灵关系。
 
 ```bash

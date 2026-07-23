@@ -160,7 +160,7 @@ if gate failed or step blocked:
 2. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本不等价于完整主状态流程。
 3. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
 
-Step5 必须使用 `tree-sitter` 做 Java AST 分析。正式运行契约为 CPython 3.12.x/3.13.x/3.14.x、Linux/macOS/Windows、JDK 11/17/21、Maven 3.8+，Python 依赖版本由 `requirements-runtime.txt` 固定。运行时不得联网安装；缺少或版本不符时必须在分析前失败并记录系统环境阻塞，不得伪装成需要用户确认的业务 checkpoint，也不允许继续用增强正则生成分析结论。
+Step5 必须使用 `tree-sitter` 做 Java AST 分析。正式运行契约为 CPython 3.12.x/3.13.x/3.14.x、Linux/macOS/Windows、JDK 11/17/21，以及 Maven 3.8+ 或 Gradle 7.6+。Gradle 优先使用工程 Wrapper；运行环境必须已具备对应 distribution，分析期间不得联网安装。Python 依赖版本由 `requirements-runtime.txt` 固定。运行时不得联网安装；缺少或版本不符时必须在分析前失败并记录系统环境阻塞，不得伪装成需要用户确认的业务 checkpoint，也不允许继续用增强正则生成分析结论。
 
 首次准备环境时，在 Skill 根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
 
@@ -172,7 +172,7 @@ python3 scripts/bootstrap_runtime.py
 
 首次进入任务时，先确认：
 
-1. 当前工作目录是否就是待分析系统的 Maven 工程根目录；通常直接采用，不重复询问路径
+1. 当前工作目录是否就是待分析系统的 Maven / Gradle 工程根目录；通常直接采用，不重复询问路径
 2. `Step1` 选择哪一种输入方式：`artifact_inputs` 或 `checkout_build`
 3. 若是 `artifact_inputs`：`base_artifact_path/current_artifact_path`
 4. 若是 `checkout_build`：`base_branch/current_branch`
@@ -182,7 +182,7 @@ python3 scripts/bootstrap_runtime.py
 
 1. 在第一次执行 `step1` 前，就要通过 `--seed-json` 初始化 `target_module`，或直接通过 `--target-module` 传给 `run_step.py`
 2. 禁止先按 root 范围执行 `step1`，再在 `Phase 2 [CHECKPOINT]` 里让用户二次确认模块
-3. 若用户尚未明确模块，先展示 Maven reactor 候选并等待用户确认，不得静默选择 root、第一个模块或最大产物
+3. 若用户尚未明确模块，先展示 Maven reactor 或 Gradle project 候选并等待用户确认，不得静默选择 root、第一个模块或最大产物
 
 优先一次性向用户收集执行所需信息，避免多轮追问。最小收集集建议包含：
 
@@ -191,9 +191,9 @@ python3 scripts/bootstrap_runtime.py
 3. 若是 `artifact_inputs`：`base_artifact_path/current_artifact_path`
 4. 若是 `checkout_build`：`base_branch/current_branch`
 5. 若 artifact 中某侧嵌套依赖缺少 `pom.properties`：优先补该侧 `branch`，特殊场景才补 `base_source_project_dir/current_source_project_dir`
-6. 若某一侧 Maven 需要特定 JDK：补该侧 `base_jdk_home/current_jdk_home`；未提供时各侧默认回落主机 `JAVA_HOME`
-7. 本次唯一的 `target_module`；确认后由 Maven reactor 自动推导系统源码范围
-8. 依赖源码目录或仓库根目录（可选但强烈推荐；仅表示依赖源码，字段为 `dependency_source_dirs`）
+6. 若某一侧 Maven / Gradle 需要特定 JDK：补该侧 `base_jdk_home/current_jdk_home`；未提供时各侧默认回落主机 `JAVA_HOME`
+7. 本次唯一的 `target_module`；确认后由 Maven reactor 或 Gradle project graph 自动推导系统源码范围
+8. 依赖源码目录、仓库根目录或 Git 地址（可选但强烈推荐；仅表示依赖源码，字段为 `dependency_source_dirs`）
 9. `max_depth`（默认 5，表示最大累计追踪代价；全高置信度边时最多约 5 跳；同一节点保留“更短”和“更可信”的 Pareto 最优路径）
 10. 是否包含 test 作用域（默认 false）
 11. 是否允许降级执行（默认 false；缺少关键源码映射时将阻塞以避免漏分析）
@@ -207,7 +207,7 @@ python3 scripts/bootstrap_runtime.py
   "base_branch": "main",
   "current_branch": "feature/upgrade-test",
   "target_module": "app-module",
-  "dependency_source_dirs": ["/abs/path/to/dependency-repo"],
+  "dependency_source_dirs": ["/abs/path/to/dependency-repo", "https://git.example.com/team/dependency-repo.git"],
   "max_depth": 5,
   "tool": "maven"
 }
@@ -254,7 +254,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --current-artifact-path /abs/path/to/current-app.jar
 ```
 
-若系统升级分析默认语义是“同一系统、同一仓库、不同分支”，则 direct artifact 模式还推荐同时显式给出 `base_branch/current_branch`；当某一侧嵌套依赖缺少 `pom.properties` 时，Step1 会优先使用这两个分支在同一源码仓库执行 `mvn dependency:list` 补全坐标。
+若系统升级分析默认语义是“同一系统、同一仓库、不同分支”，则 direct artifact 模式还推荐同时显式给出 `base_branch/current_branch`；当某一侧嵌套依赖缺少 `pom.properties` 时，Step1 会优先使用这两个分支在同一源码仓库生成 Maven `dependency:list` 或 Gradle `runtimeClasspath` 报告补全坐标。
 
 若 direct artifact 模式的两侧产物已经齐全，Step1 可以直接进入执行；`base_branch/current_branch` 属于强烈推荐的补全来源，不是 direct artifact 入口的执行前硬前置。
 
@@ -408,7 +408,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：Step4 必须且只能复用 Step1 `evidence/dependencies/build_provenance.json` 指向的 base/current 最终构建产物，并按 `evidence/dependencies/dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 JAR；最终制品中无法定位时必须输出明确的证据缺失原因，不得回退本地 Maven 仓库或下载同坐标 JAR 替代
 - 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应超时；Git fetch 与 JApiCmp 工具安装不得共用一个超时字段
-- 规则：若提供 `dependency_source_dirs`，系统必须先自动识别模块坐标，再用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref；只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；只有两个以上不同 commit pair、且选择会改变源码 diff 范围的真实歧义才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
+- 规则：若提供 `dependency_source_dirs`，其中的 Git 地址必须先克隆到报告内部缓存并保留 `origin`，本地目录则原样只读使用；系统随后自动识别模块坐标，再用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref。只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；只有两个以上不同 commit pair、且选择会改变源码 diff 范围的真实歧义才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
 - 规则：Step4 的远端查询失败、fetch 失败、ref 移动、未匹配、远端不可用和未授权本地兜底均属于内部源码证据故障。按错误类型完成受控重试后，不得把修复工作抛给用户，也不得猜测或静默改用本地 ref；应记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并从升级前后最终制品 JAR 对共享变化类执行同签名方法字节码指纹对比，以 `jar_bytecode` 证据补齐 `BEHAVIOR_CHANGED` 候选。只有源码 diff 或最终 JAR 方法字节码兜底至少一项完整时，该依赖的行为变化覆盖才可计为 complete；两者都失败时 `behavior_diff` 必须进入关键覆盖缺口，禁止输出完整或无影响结论。若存在真实 commit pair 歧义，必须在一张决策卡中展示全部待确认依赖；每项给出按稳定顺序排列、按 commit pair 去重的方案编号、升级前/升级后源码分支和 commit 摘要。卡片最多展示 6 个方案时必须标明总数和完整候选文件；用户可以一次回复各依赖的方案编号，也可以直接给 old_ref/new_ref，恢复前必须校验本轮所有待确认依赖均已覆盖
 - 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
 - 门控：`step4` 完成后执行 `jar_compare`

@@ -37,7 +37,7 @@
 - Spring Boot 2.x → 3.x；
 - Spring Framework 5 → 6；
 - `javax.*` → `jakarta.*`；
-- Maven 依赖批量升级；
+- Maven / Gradle 依赖批量升级；
 - 某个依赖 jar 被删除；
 - 想确认某个依赖 API 变化是否真正影响当前业务系统。
 
@@ -52,7 +52,7 @@
 - base 分支：main
 - current 分支：feature/upgrade
 - 目标模块：app-module
-- 依赖源码路径：/abs/path/to/dependency-source-repo
+- 依赖源码路径或 Git 地址：/abs/path/to/dependency-source-repo 或 https://git.example.com/team/dependency-source-repo.git
 ```
 
 如果你已经有升级前后的构建产物，可以这样说：
@@ -82,19 +82,22 @@ Claude Code 会负责：
 | 待分析工程 | 通常已知 | Claude Code 当前打开的工程；如果不是目标工程，请明确路径 |
 | 目标模块 | 必需 | 本次唯一分析的可部署模块；多模块项目必须明确 |
 | 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current jar/war |
-| 依赖源码路径 | 可选但推荐 | 依赖包源码仓库路径，用于提升 API 行为变更和跨依赖调用链分析能力 |
+| 依赖源码路径或 Git 地址 | 可选但推荐 | 依赖包源码仓库本地路径或 HTTPS/SSH Git 地址，用于提升 API 行为变更和跨依赖调用链分析能力 |
 | 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
 
 说明：
 
-- 标准 Maven 结构下，业务系统源码路径通常不需要你提供，Skill 会从目标模块推断。
-- 依赖源码路径指的是依赖包自己的源码仓库路径，不是当前业务系统源码路径。
+- 标准 Maven / Gradle 结构下，业务系统源码路径通常不需要你提供，Skill 会从 reactor 或 Gradle project graph 推断。
+- Gradle 项目同时支持 Groovy DSL 与 Kotlin DSL；优先使用仓库内 `gradlew` / `gradlew.bat`，没有 Wrapper 时才使用系统 `gradle`。多模块选择既可写 `app`，也可写 `:app`。
+- Gradle 自动构建执行目标模块的 `build -x test`，缺失嵌套 JAR 坐标时读取 `runtimeClasspath`；和 Maven 一样，最终依赖版本与内容仍以实际 fat JAR / boot JAR / WAR 为准。thin JAR 本身不包含运行时依赖，不能作为正式比较结果。
+- 依赖源码输入指的是依赖包自己的源码仓库，不是当前业务系统源码路径。既可以填写本地目录，也可以直接填写 HTTPS/SSH Git 地址；远端仓库会克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/`，不会切换或修改用户工作区。
+- Git 克隆复用当前环境已有的 SSH key 或 Git 凭据配置，并禁用交互式密码提示；地址不可达或无权限时会明确停止，不会把失败仓库当成有效源码继续分析。
 - base/current 可以使用同一个工程目录；两侧身份由各自确认后的远程分支、tag 或 commit 决定。Skill 会查询远端最新 ref、定向 fetch 并固定到具体 commit，在隔离快照中分析，不会切换或拉取你的当前分支。
 - 直接产物模式会先解析 JAR；只有依赖坐标仍缺失时才使用对应侧源码补全。Step4 的依赖源码默认只取远端：唯一 ref pair 或多个名称指向同一 commit pair 时自动采用；只有两个以上不同 commit pair、且选择会改变源码对比范围时，才把全部歧义依赖及方案编号汇总到一张决策卡中，用户可一次答全。
 - 分支名只用于定位和展示，确认卡选择会同时绑定当时的 commit SHA。Step1 构建来源发生 ref 移动时会基于新 commit 重新确认；Step4 的依赖源码 ref 移动或不可用时不要求用户修复，而是从升级前后最终 JAR 比较同签名方法的规范化字节码，继续识别实现变化。两种情况都不会按旧分支名静默继续。
 - 远端 `ls-remote`/`fetch` 对超时、连接重置、临时 DNS/HTTP 5xx 等瞬时错误最多尝试 3 次，重试间隔为 1 秒、3 秒；认证失败、ref 不存在和 ref 已移动不自动重试。Step4 自动重试耗尽后会记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不会生成要求用户处理网络、权限或 ref 的确认卡，也不会静默使用本地对象；只有运行前已经明确提供 `allow_local_source=true` 时才允许采用本地兜底。若最终 JAR 方法字节码兜底也无法完成，行为变化覆盖会成为关键缺口，报告不得输出“完整”或“不受影响”结论。
 - 无论是否提供源码，依赖范围、版本、JAR 内容和字节码调用边始终以 base/current 最终制品为准；源码只用于补坐标、行为差异和可读性解释，不能把最终制品中不存在的模块扩展进确定性结论。
-- 只提供源码目录不能证明它对应哪一侧制品；这种输入会先要求确认 revision，确认前不会执行 Maven。
+- 只提供源码目录不能证明它对应哪一侧制品；这种输入会先要求确认 revision，确认前不会执行 Maven 或 Gradle。
 - 如果存在多个可部署模块且无法唯一判断，Claude Code 必须让你选择目标模块。
 - 如果只表达“想分析什么”，但没有提供 base/current 来源或目标模块，Claude Code 会继续追问，不会猜测执行。
 - 如果只是查询某个方法调用链，则需要当前工程已经跑完 Step5 并生成查询索引。
@@ -312,7 +315,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 如果工具发现多个可部署模块且无法唯一判断，Claude Code 必须让你选择，不能静默选择 root、第一个模块或最大产物。
 
-### 依赖源码路径应该填什么？
+### 依赖源码路径或 Git 地址应该填什么？
 
 填依赖包自己的源码仓库根目录，例如：
 
@@ -320,7 +323,13 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 /Users/me/source/dependency-project
 ```
 
-不要填当前业务系统的源码目录。当前业务系统源码通常由 Maven 模块结构自动推断。
+也可以直接在 `dependency_source_dirs` 中填写 Git 地址，例如：
+
+```json
+{"dependency_source_dirs":["https://git.example.com/team/dependency-project.git"]}
+```
+
+不要填当前业务系统的源码目录。当前业务系统源码通常由 Maven reactor 或 Gradle project graph 自动推断。
 
 ### 没有依赖源码还能分析吗？
 
