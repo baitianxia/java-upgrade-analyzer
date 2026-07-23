@@ -1,3 +1,4 @@
+import ast
 import os
 import re
 import sys
@@ -11,10 +12,69 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import compat  # noqa: E402
+import error_handler  # noqa: E402
 from compat import run_cmd  # noqa: E402
 
 
 class PlatformContractTest(unittest.TestCase):
+    def test_platform_only_stdlib_imports_are_guarded(self):
+        platform_only_modules = {
+            "fcntl", "grp", "posix", "pty", "pwd", "resource",
+            "syslog", "termios", "tty",
+        }
+        for path in sorted((ROOT / "scripts").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            parents = {
+                child: parent
+                for parent in ast.walk(tree)
+                for child in ast.iter_child_nodes(parent)
+            }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported = {alias.name.split(".", 1)[0] for alias in node.names}
+                elif isinstance(node, ast.ImportFrom):
+                    imported = {(node.module or "").split(".", 1)[0]}
+                else:
+                    continue
+                guarded_modules = imported & platform_only_modules
+                if not guarded_modules:
+                    continue
+                ancestor = parents.get(node)
+                protected = False
+                while ancestor is not None:
+                    if isinstance(ancestor, ast.Try):
+                        caught = {
+                            name.id
+                            for handler in ancestor.handlers
+                            for name in ast.walk(handler.type)
+                            if isinstance(name, ast.Name)
+                        }
+                        if "ImportError" in caught:
+                            protected = True
+                            break
+                    ancestor = parents.get(ancestor)
+                self.assertTrue(
+                    protected,
+                    f"{path.relative_to(ROOT)}:{node.lineno} imports "
+                    f"{sorted(guarded_modules)} without an ImportError fallback",
+                )
+
+    def test_diagnostic_commands_match_the_host_shell(self):
+        expected_java_locator = (
+            "where java" if os.name == "nt" else "command -v java"
+        )
+        expected_settings_reader = (
+            'Get-Content "$HOME\\.m2\\settings.xml"'
+            if os.name == "nt"
+            else "cat ~/.m2/settings.xml"
+        )
+
+        self.assertEqual(error_handler.JAVA_LOCATION_COMMAND, expected_java_locator)
+        self.assertEqual(
+            error_handler.MAVEN_SETTINGS_COMMAND,
+            expected_settings_reader,
+        )
+
     def test_git_resolution_prefers_working_user_install_over_broken_system_git(self):
         user_git = Path("/Users/example/.local/bin/git")
 

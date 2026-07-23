@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -29,7 +30,7 @@ def _compile(output: Path, sources: list[Path], classpath: list[Path] | None = N
     output.mkdir(parents=True, exist_ok=True)
     command = ["javac", "-d", str(output)]
     if classpath:
-        command.extend(["-classpath", ":".join(str(item) for item in classpath)])
+        command.extend(["-classpath", os.pathsep.join(str(item) for item in classpath)])
     command.extend(str(item) for item in sources)
     subprocess.run(command, check=True, capture_output=True, text=True)
 

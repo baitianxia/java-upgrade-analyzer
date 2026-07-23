@@ -98,7 +98,9 @@
         "evidence/dependencies/dep_summary.txt",
         "evidence/dependencies/deps_current_resolved.csv",
         "evidence/dependencies/build_provenance.json",
-        "evidence/dependencies/s1_artifacts/"
+        "evidence/dependencies/s1_artifacts/",
+        "evidence/dependencies/dependency_jars.json",
+        "evidence/dependencies/s1_dependency_jars/"
       ],
       "notes": [
         "Step1 默认通过真实构建获取依赖结果。",
@@ -289,7 +291,7 @@
             },
             "selected_targets": {
               "type": "array",
-              "description": "可选。定向分析时，从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。"
+              "description": "内部恢复字段，不向用户展示或要求用户填写。系统根据用户回复的依赖名称或完整坐标自动生成。"
             },
             "notes": {
               "type": "string",
@@ -297,12 +299,12 @@
             }
           }
         },
-        "resume_hint": "全量分析时传回 action=continue；部分分析时同时通过 selected_targets 传回从 changed_dependencies.md 复制的完整坐标。Step4 内部证据故障不属于本确认项，由系统自动处理并记录结论边界。",
+        "resume_hint": "用户回复“全量分析”时继续全部候选；用户回复“只分析”并给出依赖名称或完整坐标时，系统在内部转换为范围参数。未在卡片中展示的依赖可从 changed_dependencies.md 的“依赖包”列选择。Step4 内部证据故障不属于本确认项，由系统自动处理并记录结论边界。",
         "options": [
           {
             "id": "continue",
-            "label": "确认范围（默认全量）",
-            "description": "不提供 selected_targets 表示全量分析；仅在明确接受覆盖缩小时，提供一个或多个依赖坐标进行部分分析。"
+            "label": "选择分析范围（默认全量）",
+            "description": "回复“全量分析”即可分析全部依赖；如需部分分析，直接回复要分析的依赖名称或完整坐标。未展示的依赖可从完整依赖选择清单的“依赖包”列获取。"
           },
           {
             "id": "cancel",
@@ -312,7 +314,7 @@
         ],
         "action_requirements": {
           "continue": {
-            "description": "全量分析时无需 selected_targets；部分分析时，应从 changed_dependencies.md 的“依赖包”列提供一个或多个完整坐标。"
+            "description": "全量分析时直接回复“全量分析”；部分分析时直接说明要分析的依赖名称或完整坐标，系统负责转换内部参数。"
           }
         }
       },

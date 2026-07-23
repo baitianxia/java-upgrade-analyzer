@@ -12820,6 +12820,65 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertIn("com.vendor:aggregate", final_report)
         self.assertIn("不包含被删除 JAR 中的 SPI 配置、资源文件、清单等非 API 内容", final_report)
 
+    def test_removed_api_preservation_reads_step1_dependency_jar_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            dep_dir = report / "evidence" / "dependencies"
+            retained_dir = dep_dir / "s1_dependency_jars" / "base"
+            retained_dir.mkdir(parents=True)
+            entry = "BOOT-INF/lib/legacy-1.0.jar"
+            (dep_dir / "dep_changes.csv").write_text(
+                "coord,old_version,new_version,change_type,scope,base_coord,current_coord,base_lib_entry,current_lib_entry\n"
+                f"com.vendor:legacy,1.0,-,移除,runtime,com.vendor:legacy,,{entry},\n",
+                encoding="utf-8",
+            )
+            class_entry = "com/vendor/LegacyApi.class"
+            class_bytes = b"identical-classfile-bytes"
+            retained_jar = retained_dir / "legacy-1.0.jar"
+            current_jar = Path(tmp) / "aggregate.jar"
+            for jar in (retained_jar, current_jar):
+                with zipfile.ZipFile(jar, "w") as zf:
+                    zf.writestr(class_entry, class_bytes)
+            retained_sha = hashlib.sha256(retained_jar.read_bytes()).hexdigest()
+            (dep_dir / "dependency_jars.json").write_text(
+                json.dumps(
+                    {
+                        "items": [{
+                            "side": "base",
+                            "coord": "com.vendor:legacy",
+                            "lib_entry": entry,
+                            "retained_path": str(retained_jar),
+                            "nested_jar_sha256": retained_sha,
+                        }],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            api = {
+                "coord": "com.vendor:legacy",
+                "old_version": "1.0",
+                "new_version": "-",
+                "change_type": "REMOVED",
+                "api_name": "com.vendor.LegacyApi.removed",
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report),
+                runtime_dependency_catalog={
+                    "entries": [{
+                        "coord": "com.vendor:aggregate",
+                        "jar_path": str(current_jar),
+                    }],
+                },
+            )
+
+            providers = tracer._build_identical_current_class_provider_index([api], graph)
+
+        self.assertIn(("com.vendor:legacy", "com.vendor.LegacyApi"), providers)
+        self.assertEqual(
+            providers[("com.vendor:legacy", "com.vendor.LegacyApi")][0]["old_jar"],
+            str(retained_jar),
+        )
+
     def test_same_class_name_with_different_bytecode_is_not_marked_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / ".upgrade-report"

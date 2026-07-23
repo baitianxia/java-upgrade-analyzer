@@ -1,5 +1,7 @@
 import io
 import csv
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -15,7 +17,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import s1_dep_diff  # noqa: E402
-from pipeline_constants import STEP1_ARTIFACTS_DIRNAME  # noqa: E402
+from pipeline_constants import (  # noqa: E402
+    STEP1_ARTIFACTS_DIRNAME,
+    STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
+)
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
@@ -40,9 +45,13 @@ class Step1PackagedDepsTest(unittest.TestCase):
             (work_dir / "build.gradle").write_text("group = 'com.acme'\n", encoding="utf-8")
             (work_dir / "app").mkdir()
             (work_dir / "app/build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
-            wrapper = work_dir / "gradlew"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(0o755)
+            wrapper = work_dir / ("gradlew.bat" if os.name == "nt" else "gradlew")
+            wrapper.write_text(
+                "@echo off\r\n" if os.name == "nt" else "#!/bin/sh\n",
+                encoding="utf-8",
+            )
+            if os.name != "nt":
+                wrapper.chmod(0o755)
             artifact_path = work_dir / "app/build/libs/app.jar"
             artifact_path.parent.mkdir(parents=True)
             artifact_path.write_text("placeholder", encoding="utf-8")
@@ -249,6 +258,65 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(rows[0]["coord"], "org.example:demo")
         self.assertEqual(rows[0]["version"], "1.0")
         self.assertEqual(rows[0]["metadata_anomalies"], [])
+
+    def test_step1_persists_changed_jars_for_step4(self):
+        nested_bytes = self._nested_jar_bytes([
+            (
+                "META-INF/maven/org.example/demo/pom.properties",
+                "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+            ),
+            ("org/example/Demo.class", b"class"),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_artifact = root / "base.jar"
+            current_artifact = root / "current.jar"
+            base_entry = "BOOT-INF/lib/demo-1.0.jar"
+            current_entry = "BOOT-INF/lib/demo-2.0.jar"
+            for artifact, entry in (
+                (base_artifact, base_entry),
+                (current_artifact, current_entry),
+            ):
+                with zipfile.ZipFile(artifact, "w") as outer:
+                    outer.writestr(entry, nested_bytes)
+            output_dir = root / "dependencies"
+            manifest_path, items = s1_dep_diff.materialize_changed_dependency_jars(
+                [{
+                    "coord": "org.example:demo",
+                    "base_coord": "org.example:demo",
+                    "current_coord": "org.example:demo",
+                    "old_version": "1.0",
+                    "new_version": "2.0",
+                    "change_type": "大版本升级",
+                    "resolution_status": "resolved",
+                    "base_lib_entry": base_entry,
+                    "current_lib_entry": current_entry,
+                    "base_packaged_match_source": "embedded-pom",
+                    "current_packaged_match_source": "embedded-pom",
+                }],
+                {
+                    "base": {
+                        "artifact_path": str(base_artifact),
+                        "artifact_sha256": hashlib.sha256(
+                            base_artifact.read_bytes()
+                        ).hexdigest(),
+                    },
+                    "current": {
+                        "artifact_path": str(current_artifact),
+                        "artifact_sha256": hashlib.sha256(
+                            current_artifact.read_bytes()
+                        ).hexdigest(),
+                    },
+                },
+                output_dir,
+            )
+
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest_path.name, STEP1_DEPENDENCY_JARS_MANIFEST_FILE)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(len(payload["items"]), 2)
+        self.assertTrue(all(item.get("nested_jar_sha256") for item in items))
 
     def test_conflicting_duplicate_maven_metadata_is_reconciled_by_filename(self):
         with warnings.catch_warnings():
@@ -1201,6 +1269,19 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(interaction["reason_code"], "ambiguous_step1_source_ref")
         self.assertEqual(interaction["required_fields"], ["current_branch"])
         self.assertEqual(len(interaction["ref_resolution_requests"][0]["candidates"]), 2)
+        self.assertEqual(
+            interaction["ref_resolution_scope"]["queried_sides"],
+            ["current"],
+        )
+        self.assertEqual(
+            interaction["ref_resolution_scope"]["other_side_status"],
+            "not_evaluated_by_this_interaction",
+        )
+        self.assertIn("不表示基准侧执行过远端查询", interaction["summary"])
+        self.assertEqual(
+            interaction["ref_resolution_requests"][0]["resolution_trigger"],
+            "artifact_coordinate_enrichment",
+        )
 
     def test_source_only_artifact_enrichment_requires_revision_confirmation(self):
         resolution = {
@@ -1354,9 +1435,20 @@ class Step1PackagedDepsTest(unittest.TestCase):
                     "version": "1.0.0",
                 }
             }
+            nested_jar = self._nested_jar_bytes([
+                ("org/example/Demo.class", b"class"),
+            ])
+            base_artifact = work_dir / "base.jar"
+            current_artifact = work_dir / "current.jar"
+            with zipfile.ZipFile(base_artifact, "w") as archive:
+                archive.writestr(base_entry["lib_entry"], nested_jar)
+            with zipfile.ZipFile(current_artifact, "w") as archive:
+                archive.writestr(current_entry["lib_entry"], nested_jar)
             base_meta = {
                 "mode": "final_artifact",
-                "archives": [str(work_dir / "base.jar")],
+                "archives": [str(base_artifact)],
+                "artifact_path": str(base_artifact),
+                "artifact_sha256": hashlib.sha256(base_artifact.read_bytes()).hexdigest(),
                 "deps": [base_entry],
                 "dep_entries": [base_entry],
                 "matched_count": 1,
@@ -1366,7 +1458,9 @@ class Step1PackagedDepsTest(unittest.TestCase):
             }
             curr_meta = {
                 "mode": "final_artifact",
-                "archives": [str(work_dir / "current.jar")],
+                "archives": [str(current_artifact)],
+                "artifact_path": str(current_artifact),
+                "artifact_sha256": hashlib.sha256(current_artifact.read_bytes()).hexdigest(),
                 "deps": [current_entry],
                 "dep_entries": [current_entry],
                 "matched_count": 1,

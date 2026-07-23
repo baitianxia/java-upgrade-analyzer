@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -1262,6 +1263,13 @@ class RunStepMainStateTest(unittest.TestCase):
                 interaction["files_to_review"],
                 [str((api_dir / "changed_dependencies.md").resolve())],
             )
+            card_text = "\n".join(interaction["user_decision_card"])
+            self.assertIn("`com.acme:alpha`", card_text)
+            self.assertIn("`com.acme:beta`", card_text)
+            self.assertIn("完整依赖选择清单", card_text)
+            self.assertIn("直接回复依赖名称或完整坐标", card_text)
+            self.assertNotIn("selected_targets", card_text)
+            self.assertNotIn("selection_key", card_text)
 
     def test_step4_scope_checkpoint_is_skipped_when_no_real_scope_choice_exists(self):
         _, manifest_steps = run_step.load_manifest(ROOT_DIR / "scripts" / "step_manifest.json")
@@ -1638,8 +1646,11 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("当前需要确认：系统触达证据是覆盖全部依赖，还是只分析部分依赖包？", text)
         self.assertIn("推荐动作：依赖包数量不多时，选择全量继续。", text)
         self.assertIn("`com.acme:alpha`", text)
+        self.assertIn("直接回复依赖名称或完整坐标", text)
+        self.assertIn("完整依赖选择清单", text)
         self.assertIn("你可以直接回复：", text)
         self.assertNotIn("Step5", text)
+        self.assertNotIn("selected_targets", text)
         self.assertNotIn("`continue`", text)
         self.assertNotIn("`rerun_current_step`", text)
         self.assertNotIn("coord:com.acme:alpha", text)
@@ -1688,6 +1699,13 @@ class RunStepMainStateTest(unittest.TestCase):
             "其余 2 个高优先级项见 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md` 的“部分分析优先项”列",
             text,
         )
+        self.assertIn("展示 20 / 37 个", text)
+        self.assertIn("还有 17 个候选未在卡片中展示", text)
+        self.assertIn(
+            "该文件不是普通复核材料；需要选择未展示的依赖时",
+            text,
+        )
+        self.assertNotIn("selected_targets", text)
         self.assertNotIn("完整候选请看下面的文件", text)
         self.assertNotIn("interaction.json", text)
         self.assertIn("all_changed_apis_part_002.csv", text)
@@ -1743,14 +1761,15 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("推荐 1 个，展示 1 / 1 个", text)
         self.assertIn("高优先级项依据：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", text)
         self.assertIn("不表示系统建议缩小范围，也不代表已经确认影响", text)
-        self.assertIn("3. 从全部变化依赖中选择部分范围", text)
+        self.assertIn("可直接选择的依赖（展示 1 / 2 个", text)
+        self.assertIn("| `com.acme:alpha` | 42 | 5 |", text)
         self.assertIn(
-            "打开 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md`；这里列出了全部 2 个候选依赖包",
+            "完整依赖选择清单：`/project/.upgrade-report/evidence/api_changes/changed_dependencies.md`",
             text,
         )
-        self.assertIn("查看“部分分析优先项”“依赖包”“高风险 API 数”和“为什么先看”", text)
-        self.assertIn("复制“依赖包”列中的完整坐标", text)
+        self.assertIn("从“依赖包”列复制名称或完整坐标", text)
         self.assertIn("只分析 com.acme:alpha", text)
+        self.assertNotIn("selected_targets", text)
 
     def test_terminal_pause_message_only_shows_user_facing_decision_information(self):
         interaction = {
@@ -1797,6 +1816,14 @@ class RunStepMainStateTest(unittest.TestCase):
         machine_event = json.loads(machine_line.split(":", 1)[1])
         self.assertEqual(machine_event["schema"], "java-upgrade-analyzer.confirmation.v1")
         self.assertEqual(machine_event["event"], "interaction_required")
+        self.assertEqual(
+            machine_event["user_decision_card"],
+            run_step.build_user_decision_card(interaction),
+        )
+        self.assertNotIn(
+            "selected_targets",
+            "\n".join(machine_event["user_decision_card"]),
+        )
 
     def test_human_interaction_output_mode_hides_machine_protocol(self):
         interaction = {
@@ -2519,6 +2546,21 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn('"intent_patch"', restart_example["command"])
         self.assertIn('"action": "restart_from_step"', restart_example["command"])
         self.assertIn('"restart_step_id": "<step1|step2|step3|step4|step5>"', restart_example["command"])
+
+    def test_resume_command_uses_powershell_safe_argument_quoting(self):
+        command = run_step._format_resume_shell_command(
+            [
+                r"C:\Program Files\Python\python.exe",
+                r"C:\work dir\run_step.py",
+                "--response-json",
+                """{"notes":"O'Brien"}""",
+            ],
+            platform_name="win32",
+        )
+
+        self.assertTrue(command.startswith("& 'C:\\Program Files\\Python\\python.exe'"))
+        self.assertIn("'C:\\work dir\\run_step.py'", command)
+        self.assertIn("""'{"notes":"O''Brien"}'""", command)
 
     def test_continue_resume_example_does_not_fill_optional_scope_fields(self):
         examples = run_step.build_resume_command_examples(
@@ -5054,6 +5096,61 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(updated["current_ref_resolution_mode"], "unique_remote")
         self.assertEqual(updated["current_ref_candidate_count"], 1)
 
+    def test_step1_ref_preflight_resolves_both_branches_from_project_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "origin.git"
+            project_dir = root / "project"
+
+            def git(cwd, *args):
+                completed = subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+                return completed.stdout.strip()
+
+            git(root, "init", "--bare", str(remote))
+            git(root, "clone", str(remote), str(project_dir))
+            git(project_dir, "config", "user.email", "step1@example.invalid")
+            git(project_dir, "config", "user.name", "Step1 Test")
+            git(project_dir, "commit", "--allow-empty", "-m", "base")
+            base_commit = git(project_dir, "rev-parse", "HEAD")
+            git(project_dir, "branch", "nbs-base", base_commit)
+            git(project_dir, "commit", "--allow-empty", "-m", "current")
+            current_commit = git(project_dir, "rev-parse", "HEAD")
+            git(
+                project_dir,
+                "branch",
+                "nbs-mid26.07.22.DEV",
+                current_commit,
+            )
+            git(
+                project_dir,
+                "push",
+                "origin",
+                "nbs-base",
+                "nbs-mid26.07.22.DEV",
+            )
+
+            updated, interaction = run_step.resolve_step1_refs_for_execution(
+                {
+                    "analysis_mode": "checkout_build",
+                    "base_branch": "nbs-base",
+                    "current_branch": "nbs-mid26.07.22.DEV",
+                },
+                project_dir,
+            )
+
+        self.assertIsNone(interaction)
+        self.assertEqual(updated["base_resolved_commit"], base_commit)
+        self.assertEqual(updated["current_resolved_commit"], current_commit)
+        self.assertEqual(updated["base_ref_remote"], "origin")
+        self.assertEqual(updated["current_ref_remote"], "origin")
+
     def test_step1_direct_artifacts_do_not_resolve_refs_before_coordinate_fallback(self):
         context = {
             "analysis_mode": "artifact_inputs",
@@ -5201,6 +5298,168 @@ class RunStepMainStateTest(unittest.TestCase):
                 interaction,
                 {"action": "continue", "current_branch": "release-2.0.0"},
             )
+
+    def test_step1_ref_confirmation_accepts_same_ref_when_repository_changes(self):
+        interaction = {
+            "step_id": "step1",
+            "reason_code": "step1_remote_source_unavailable",
+            "options": [{"id": "continue"}],
+            "required_fields": ["current_branch"],
+            "action_requirements": {
+                "continue": {"required_fields": ["current_branch"]},
+            },
+            "response_schema": {
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "current_branch": {"type": "string"},
+                    "current_source_project_dir": {"type": "string"},
+                },
+            },
+            "ref_resolution_requests": [
+                {
+                    "side": "current",
+                    "field": "current_branch",
+                    "requested_ref": "nbs-mid26.07.22.DEV",
+                    "source_project_dir": "/stale/repository",
+                }
+            ],
+        }
+
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {
+                "action": "continue",
+                "current_branch": "nbs-mid26.07.22.DEV",
+                "current_source_project_dir": "/actual/repository",
+            },
+        )
+
+    def test_step1_ref_confirmation_accepts_explicit_remote_requery(self):
+        interaction = {
+            "step_id": "step1",
+            "reason_code": "step1_remote_source_unavailable",
+            "options": [{"id": "continue"}],
+            "required_fields": ["current_branch"],
+            "action_requirements": {
+                "continue": {"required_fields": ["current_branch"]},
+            },
+            "response_schema": {
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "current_branch": {"type": "string"},
+                    "retry_remote_fetch": {"type": "boolean"},
+                },
+            },
+            "ref_resolution_requests": [
+                {
+                    "side": "current",
+                    "field": "current_branch",
+                    "status": "not_found",
+                    "requested_ref": "nbs-mid26.07.22.DEV",
+                    "source_project_dir": "/actual/repository",
+                    "remote_failures": [
+                        {
+                            "stage": "resolve",
+                            "reason": "repository has no configured remote",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {
+                "action": "continue",
+                "retry_remote_fetch": True,
+            },
+        )
+
+    def test_step1_ref_protocol_exposes_actual_repository_correction_field(self):
+        interaction = {
+            "step_id": "step1",
+            "reason_code": "step1_remote_source_unavailable",
+            "options": [{"id": "continue"}],
+            "required_fields": ["current_branch"],
+            "response_schema": {
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "current_branch": {"type": "string"},
+                },
+            },
+            "ref_resolution_requests": [
+                {
+                    "side": "current",
+                    "field": "current_branch",
+                    "requested_ref": "nbs-mid26.07.22.DEV",
+                    "source_project_dir": "/actual/repository",
+                }
+            ],
+        }
+
+        enhanced = run_step.apply_interaction_protocol_enhancements(
+            interaction,
+            "step1",
+        )
+
+        self.assertIn(
+            "current_source_project_dir",
+            enhanced["response_schema"]["properties"],
+        )
+
+    def test_step1_old_artifact_ref_card_clarifies_other_side_was_not_queried(self):
+        interaction = {
+            "step_id": "step1",
+            "reason_code": "step1_remote_source_unavailable",
+            "question": "请确认当前侧 ref。",
+            "options": [{"id": "continue"}],
+            "required_fields": ["current_branch"],
+            "response_schema": {
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "current_branch": {"type": "string"},
+                },
+            },
+            "ref_resolution_requests": [
+                {
+                    "side": "current",
+                    "field": "current_branch",
+                    "requested_ref": "nbs-mid26.07.22.DEV",
+                    "source_project_dir": "/actual/repository",
+                    "artifact_path": "/tmp/current.jar",
+                }
+            ],
+            "source_ref_decision_items": [
+                {
+                    "side": "current",
+                    "field": "current_branch",
+                    "requested_ref": "nbs-mid26.07.22.DEV",
+                }
+            ],
+        }
+
+        enhanced = run_step.apply_interaction_protocol_enhancements(
+            interaction,
+            "step1",
+        )
+
+        self.assertEqual(
+            enhanced["ref_resolution_scope"]["queried_sides"],
+            ["current"],
+        )
+        self.assertEqual(
+            enhanced["ref_resolution_scope"]["not_evaluated_sides"],
+            ["base"],
+        )
+        self.assertIn("不表示基准侧执行过远端查询", enhanced["question"])
+        self.assertEqual(
+            enhanced["source_ref_decision_items"][0]["source_project_dir"],
+            "/actual/repository",
+        )
 
 
 if __name__ == "__main__":

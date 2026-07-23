@@ -2649,7 +2649,11 @@ public class com.acme.Api {
                 second = step4._cached_maven_coord_locations(str(repo / "."), cache)
 
         self.assertIs(first, second)
-        infer_mock.assert_called_once_with(os.path.abspath(str(repo)))
+        infer_mock.assert_called_once_with(
+            os.path.abspath(str(repo)),
+            max_poms=120,
+            max_depth=4,
+        )
 
     def test_infer_maven_coord_locations_infers_gradle_submodule_group_from_repo_root(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3534,6 +3538,40 @@ public class com.acme.Api {
                 ),
                 encoding="utf-8",
             )
+            retained_base = dependencies_dir / "s1_dependency_jars/base/demo.jar"
+            retained_current = dependencies_dir / "s1_dependency_jars/current/demo.jar"
+            retained_base.parent.mkdir(parents=True)
+            retained_current.parent.mkdir(parents=True)
+            retained_base.write_bytes(nested_jar_bytes)
+            retained_current.write_bytes(nested_jar_bytes)
+            (dependencies_dir / "dependency_jars.json").write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.step1-dependency-jars.v1",
+                    "items": [
+                        {
+                            "side": "base",
+                            "coord": "com.example:demo",
+                            "version": "1.0.0",
+                            "lib_entry": base_entry,
+                            "retained_path": str(retained_base),
+                            "nested_jar_sha256": hashlib.sha256(nested_jar_bytes).hexdigest(),
+                            "outer_artifact_path": str(base_artifact),
+                            "outer_artifact_sha256": "base-sha",
+                        },
+                        {
+                            "side": "current",
+                            "coord": "com.example:demo",
+                            "version": "2.0.0",
+                            "lib_entry": current_entry,
+                            "retained_path": str(retained_current),
+                            "nested_jar_sha256": hashlib.sha256(nested_jar_bytes).hexdigest(),
+                            "outer_artifact_path": str(current_artifact),
+                            "outer_artifact_sha256": "current-sha",
+                        },
+                    ],
+                }),
+                encoding="utf-8",
+            )
             dep_changes = report_dir / "s1_dep_changes.csv"
             context_json = report_dir / "s2_context.json"
             dep_changes.write_text(
@@ -3580,14 +3618,14 @@ public class com.acme.Api {
                 "fetch_jar_from_repo",
                 side_effect=AssertionError("Step1 packaged jars should avoid Maven fetch"),
                 create=True,
-            ):
+            ), patch.dict(os.environ, {"JUA_ORCHESTRATED": "1"}):
                 exit_code = step4.main()
 
             self.assertEqual(exit_code, 0)
             japicmp_mock.assert_called_once()
             kwargs = japicmp_mock.call_args.kwargs
-            self.assertEqual(kwargs["old_jar_evidence"]["source"], "step1_final_artifact")
-            self.assertEqual(kwargs["new_jar_evidence"]["source"], "step1_final_artifact")
+            self.assertEqual(kwargs["old_jar_evidence"]["source"], "step1_retained_dependency_jar")
+            self.assertEqual(kwargs["new_jar_evidence"]["source"], "step1_retained_dependency_jar")
             self.assertEqual(kwargs["jdk_current"], "21")
             self.assertTrue(Path(kwargs["old_jar_path"]).exists())
             self.assertTrue(Path(kwargs["new_jar_path"]).exists())

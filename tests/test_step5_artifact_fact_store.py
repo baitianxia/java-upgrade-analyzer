@@ -499,7 +499,10 @@ class ArtifactInventoryTest(unittest.TestCase):
                 archive.writestr("com/example/Original.class", b"original")
             with zipfile.ZipFile(replacement, "w") as archive:
                 archive.writestr("com/example/Replacement.class", b"replacement")
-            link.symlink_to(original)
+            try:
+                link.symlink_to(original)
+            except OSError as exc:
+                self.skipTest(f"file symlinks are unavailable: {exc}")
             store = Step5ArtifactFactStore.from_catalog(
                 self._catalog(
                     link, sha256=hashlib.sha256(original.read_bytes()).hexdigest(),
@@ -623,7 +626,10 @@ class ResourceFactTest(unittest.TestCase):
                 archive.writestr("example/Impl.class", b"original-class")
             with zipfile.ZipFile(replacement, "w") as archive:
                 archive.writestr("example/Impl.class", b"replacement-class")
-            link.symlink_to(original)
+            try:
+                link.symlink_to(original)
+            except OSError as exc:
+                self.skipTest(f"file symlinks are unavailable: {exc}")
             digest = hashlib.sha256(original.read_bytes()).hexdigest()
             store = Step5ArtifactFactStore.from_catalog({
                 "entries": [{"coord": "g:a", "jar_path": str(link), "sha256": digest}],

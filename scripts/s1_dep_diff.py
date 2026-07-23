@@ -33,8 +33,12 @@ from analysis_contract import (
     project_scope_provenance_fields,
     sha256_file,
 )
-from artifact_safety import _unsafe_entry_name
-from pipeline_constants import STEP1_ARTIFACTS_DIRNAME
+from artifact_safety import _unsafe_entry_name, require_safe_archive
+from pipeline_constants import (
+    STEP1_ARTIFACTS_DIRNAME,
+    STEP1_DEPENDENCY_JARS_DIRNAME,
+    STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
+)
 from step1_observability import Step1Observer
 from step1_ref_resolution import resolve_step1_ref
 
@@ -82,6 +86,106 @@ def retain_artifact_for_analysis(meta, artifact_cache_dir, side):
     return meta
 
 
+def materialize_changed_dependency_jars(rows, side_meta, output_dir):
+    """Persist only changed dependency JARs for direct Step4 consumption."""
+    output_dir = Path(output_dir).resolve()
+    jar_dir = output_dir / STEP1_DEPENDENCY_JARS_DIRNAME
+    if jar_dir.exists():
+        shutil.rmtree(jar_dir)
+    jar_dir.mkdir(parents=True, exist_ok=True)
+
+    items = []
+    materialized = {}
+    for row in rows or []:
+        if str(row.get('resolution_status') or '').strip() != 'resolved':
+            continue
+        if str(row.get('change_type') or '').strip() == '未变':
+            continue
+        for side, version_field, coord_field, entry_field in (
+            ('base', 'old_version', 'base_coord', 'base_lib_entry'),
+            ('current', 'new_version', 'current_coord', 'current_lib_entry'),
+        ):
+            version = str(row.get(version_field) or '').strip()
+            if version in ('', '-'):
+                continue
+            lib_entry = str(row.get(entry_field) or '').replace('\\', '/').strip()
+            if not lib_entry:
+                raise ValueError(
+                    f"Step1 变化依赖缺少 {entry_field}: "
+                    f"{row.get('coord') or '<unknown>'}"
+                )
+            key = (side, lib_entry)
+            if key in materialized:
+                continue
+            meta = dict((side_meta or {}).get(side) or {})
+            artifact_path = Path(str(meta.get('artifact_path') or ''))
+            if not artifact_path.is_file():
+                raise ValueError(f"Step1 {side} 最终制品不可用: {artifact_path}")
+            target_name = (
+                hashlib.sha256(lib_entry.encode('utf-8')).hexdigest()[:16]
+                + '-'
+                + Path(lib_entry).name
+            )
+            target = jar_dir / side / target_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(artifact_path) as outer:
+                matches = [
+                    info for info in outer.infolist()
+                    if info.filename == lib_entry
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"Step1 {side} 最终制品条目数量异常: "
+                        f"{lib_entry}（{len(matches)}）"
+                    )
+                with outer.open(matches[0]) as source, open(target, 'wb') as sink:
+                    shutil.copyfileobj(source, sink, NESTED_JAR_COPY_CHUNK_BYTES)
+            try:
+                require_safe_archive(
+                    target,
+                    inspect_nested_archives=False,
+                    allow_duplicate_maven_metadata=True,
+                )
+            except Exception:
+                if target.exists():
+                    target.unlink()
+                raise
+            nested_sha256 = sha256_file(target)
+            item = {
+                'side': side,
+                'coord': str(row.get(coord_field) or row.get('coord') or '').strip(),
+                'version': version,
+                'lib_entry': lib_entry,
+                'retained_path': str(target),
+                'nested_jar_sha256': nested_sha256,
+                'outer_artifact_path': str(artifact_path),
+                'outer_artifact_sha256': str(meta.get('artifact_sha256') or ''),
+                'identity_source': str(
+                    row.get(
+                        'base_packaged_match_source'
+                        if side == 'base'
+                        else 'current_packaged_match_source'
+                    ) or ''
+                ).strip(),
+            }
+            materialized[key] = item
+            items.append(item)
+
+    manifest_path = output_dir / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
+    manifest_path.write_text(
+        json.dumps(
+            {
+                'schema': 'java-upgrade-analyzer.step1-dependency-jars.v1',
+                'items': items,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + '\n',
+        encoding='utf-8',
+    )
+    return manifest_path, items
+
+
 class ArtifactCoordinateInputRequiredError(RuntimeError):
     def __init__(self, artifact_path, unresolved_items=None):
         self.artifact_path = str(artifact_path)
@@ -118,10 +222,16 @@ def build_step1_ref_resolution_interaction(error):
     side = str(error.side or "").strip() or "current"
     field = f"{side}_branch"
     side_cn = "基准侧" if side == "base" else "当前侧"
+    other_side_cn = "当前侧" if side == "base" else "基准侧"
     resolution = dict(getattr(error, "resolution", {}) or {})
     candidates = [dict(item) for item in (resolution.get("candidates") or [])]
     status = str(resolution.get("status") or "not_found")
     source_status = str(resolution.get("source_status") or "")
+    query_scope_note = (
+        f"本卡片只记录{side_cn}因产物坐标补全而触发的 Git ref 查询；"
+        f"它不表示{other_side_cn}执行过远端查询。"
+        f"只有{other_side_cn}状态明确为 remote_source_resolved，才能认定其远端解析成功。"
+    )
     for candidate in candidates:
         payload = {
             "side": side,
@@ -146,7 +256,8 @@ def build_step1_ref_resolution_interaction(error):
         summary = f"{side_cn}分支匹配到多个不同 commit，不能自动选择。"
     else:
         reason_code = "step1_source_ref_not_found"
-        summary = f"{side_cn}分支无法在本地或现有远端跟踪 ref 中定位。"
+        summary = f"{side_cn}分支无法从实际源码仓库的实时远端清单中解析并固定为 commit。"
+    summary = f"{summary}{query_scope_note}"
     request = {
         "side": side,
         "field": field,
@@ -161,6 +272,9 @@ def build_step1_ref_resolution_interaction(error):
         "remote_failures": [dict(item) for item in (resolution.get("failures") or [])],
         "local_candidate_commit": str(resolution.get("local_candidate_commit") or ""),
         "dirty": bool(resolution.get("dirty")),
+        "resolution_trigger": "artifact_coordinate_enrichment",
+        "remote_query_scope": side,
+        "other_side_remote_status": "not_evaluated_by_this_interaction",
     }
     detected_commit = str(
         resolution.get("resolved_commit") or resolution.get("local_candidate_commit") or ""
@@ -193,6 +307,7 @@ def build_step1_ref_resolution_interaction(error):
         if status == "fetch_failed"
         else f"请为{side_cn}选择或填写明确的 branch、tag 或 commit；确认后才会执行构建工具坐标补全。"
     )
+    question = f"{question}{query_scope_note}"
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
         "checkpoint": True,
@@ -215,6 +330,13 @@ def build_step1_ref_resolution_interaction(error):
             "value_type": "branch",
         }],
         "fallback_inputs": [],
+        "ref_resolution_scope": {
+            "trigger": "artifact_coordinate_enrichment",
+            "queried_sides": [side],
+            "other_side": "current" if side == "base" else "base",
+            "other_side_status": "not_evaluated_by_this_interaction",
+            "note": query_scope_note,
+        },
         "files_to_review": [str(error.source_project_dir)] if error.source_project_dir else [],
         "ref_resolution_requests": [request],
         "source_ref_decision_items": [{
@@ -223,10 +345,18 @@ def build_step1_ref_resolution_interaction(error):
             "status": request.get("status"),
             "source_status": source_status,
             "requested_ref": request.get("requested_ref"),
+            "source_project_dir": request.get("source_project_dir"),
+            "resolution_trigger": request.get("resolution_trigger"),
+            "remote_query_scope": request.get("remote_query_scope"),
             "candidates": list(request.get("candidates") or []),
         }],
         "checklist_lines": [
+            query_scope_note,
             f"{side_cn}待补全产物: {error.artifact_path}",
+            *(
+                [f"{side_cn}实际解析目录: {error.source_project_dir}"]
+                if error.source_project_dir else []
+            ),
             *(
                 [f"{side_cn}源码目录当前 revision: {request.get('detected_ref')} ({request.get('detected_commit')})"]
                 if request.get("detected_commit") else []
@@ -247,9 +377,19 @@ def build_step1_ref_resolution_interaction(error):
             "properties": {
                 "action": {"type": "string", "enum": ["continue", "confirm_local_source", "cancel"]},
                 field: {"type": "string", "description": f"{side_cn}明确的 branch、tag 或 commit。"},
+                f"{side}_source_project_dir": {
+                    "type": "string",
+                    "description": (
+                        f"可选。修正{side_cn}实际执行 Git ref 解析的源码仓库目录；"
+                        "当 ref 已确认存在但解析目录不正确时，与原 ref 一起提交。"
+                    ),
+                },
                 f"{side}_expected_commit": {"type": "string", "description": "内部固定值：所选 ref 对应的 commit。"},
                 "source_ref_selections": {"type": "array", "description": "选择当前卡片中的 ref 方案。"},
-                "retry_remote_fetch": {"type": "boolean", "description": "重试远端查询或 fetch。"},
+                "retry_remote_fetch": {
+                    "type": "boolean",
+                    "description": "用户已确认远端状态正常后，显式重新查询远端并重试定向 fetch。",
+                },
                 f"{side}_allow_local_source": {"type": "boolean", "description": "明确允许使用本地 commit 兜底。"},
                 f"{side}_allow_dirty_local_source": {"type": "boolean", "description": "明确允许使用含未提交修改的本地源码。"},
                 "notes": {"type": "string", "description": "可选。记录 revision 的确认依据。"},
@@ -268,10 +408,14 @@ def build_step1_ref_resolution_interaction(error):
             "enabled": True,
             "mode": "llm_assisted_structuring",
             "required_fields": required_fields,
-            "rules": ["必须提供能够唯一解析到 commit 的明确 ref。"],
+            "rules": [
+                "必须提供能够唯一解析到 commit 的明确 ref。",
+                "若 ref 已确认存在但实际解析目录不正确，可保留原 ref，并修正对应侧 source_project_dir。",
+                "若目录和 ref 都正确，但远端状态已由用户确认恢复，可设置 retry_remote_fetch=true 显式重查。",
+            ],
         },
         "runtime_rules": ["确认前不得执行 Maven/Gradle 坐标补全。"],
-        "next_action_rule": "只能等待用户补充明确 ref 或取消。",
+        "next_action_rule": "只能等待用户补充明确 ref、修正实际解析目录或取消。",
         "must_wait_for_user_reply": True,
     }
 
@@ -2523,9 +2667,8 @@ def _collect_maven_runtime_deps_for_workspace(
         ['-Dmaven.test.skip=true', 'package']
         if _maven_reactor_has_modules(work_dir) else []
     )
-    list_cmd = mvn_cmd() + [
+    list_cmd = mvn_cmd(work_dir) + [
         '--batch-mode',
-        '--no-transfer-progress',
         *profile_args,
         *(["-pl", pl, "-am"] if pl else []),
         '-DskipTests',
@@ -2668,9 +2811,8 @@ def collect_maven_deps_for_workspace(
     profile_args = _maven_profile_args_for_module(
         work_dir, target_selector, active_maven_profiles
     )
-    package_cmd = mvn_cmd() + [
+    package_cmd = mvn_cmd(work_dir) + [
         '--batch-mode',
-        '--no-transfer-progress',
         *profile_args,
         *(["-pl", pl, "-am"] if pl else []),
         '-DskipTests',
@@ -3274,7 +3416,7 @@ def get_packaged_deps_by_switching_branch(
                 command=(
                     "gradlew --no-daemon --console=plain build -x test"
                     if str(build_tool).lower() == 'gradle'
-                    else "mvn --batch-mode --no-transfer-progress -DskipTests package"
+                    else "mvn --batch-mode -DskipTests package"
                 ),
                 exc=exc,
                 side=side,
@@ -3388,7 +3530,7 @@ def get_runtime_deps_by_switching_branch(
                 command=(
                     "gradlew --no-daemon --console=plain dependencies --configuration runtimeClasspath"
                     if str(build_tool).lower() == 'gradle'
-                    else "mvn --batch-mode --no-transfer-progress -DskipTests dependency:list -DincludeScope=runtime -DoutputAbsoluteArtifactFilename=true"
+                    else "mvn --batch-mode -DskipTests dependency:list -DincludeScope=runtime -DoutputAbsoluteArtifactFilename=true"
                 ),
                 exc=exc,
                 side=side,
@@ -4192,6 +4334,11 @@ def main():
     if args.base_artifact_path and args.current_artifact_path:
         retain_artifact_for_analysis(base_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'base')
         retain_artifact_for_analysis(curr_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'current')
+    materialize_changed_dependency_jars(
+        rows,
+        {'base': base_meta, 'current': curr_meta},
+        out_dir,
+    )
     # CSV 统一使用 UTF-8 BOM，可直接用 Excel 打开。
     with open_csv_write(args.output) as f:
         fields = ['coord', 'base_coord', 'current_coord', 'old_version', 'new_version', 'change_type',

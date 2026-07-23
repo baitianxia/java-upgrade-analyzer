@@ -14,13 +14,18 @@ from pipeline_constants import (
     GATE_SEQUENCE,
     RUNTIME_COVERAGE_DIRNAME,
     RUNTIME_DIRNAME,
+    STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
 )
 from analysis_contract import sha256_file
 from csv_io import open_csv_read
 GATES = list(GATE_SEQUENCE)
 
 def python_cmds():
-    return ['python3', 'python', 'py -3']
+    return (
+        ['python', 'py -3']
+        if sys.platform == 'win32'
+        else ['python3', 'python']
+    )
 
 def fail(msg, instructions=None):
     print(f"\n{'='*60}\n❌ 门控未通过：{msg}", file=sys.stderr)
@@ -69,6 +74,10 @@ def provenance_path(report_dir):
     return evidence_dependencies_dir(report_dir) / "build_provenance.json"
 
 
+def dependency_jars_manifest_path(report_dir):
+    return evidence_dependencies_dir(report_dir) / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
+
+
 def context_path(report_dir):
     return evidence_context_dir(report_dir) / "context.json"
 
@@ -105,7 +114,10 @@ def gate_step1_scope(d):
               for pc in python_cmds()])
     dep_rows = read_csv_dicts(
         csv_path,
-        ["coord", "old_version", "new_version", "change_type", "risk", "scope"],
+        [
+            "coord", "old_version", "new_version", "change_type", "risk", "scope",
+            "resolution_status", "base_lib_entry", "current_lib_entry",
+        ],
     )
     valid_dep_rows = [row for row in dep_rows if (row.get("coord") or "").strip() and has_dep_versions(row)]
     if not valid_dep_rows:
@@ -139,6 +151,45 @@ def gate_step1_scope(d):
             fail(f"{item.get('side')} 最终制品未留存或已丢失，无法继续执行制品字节码分析")
         if sha256_file(artifact_path) != item.get("artifact_sha256"):
             fail(f"{item.get('side')} 最终制品 SHA-256 与 build_provenance.json 不一致")
+    manifest_file = dependency_jars_manifest_path(d)
+    if not manifest_file.is_file():
+        fail("Step1 变化依赖 JAR 清单不存在，请重新执行 Step1")
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"Step1 变化依赖 JAR 清单无法读取：{type(exc).__name__}")
+    manifest_items = list(manifest.get("items") or [])
+    item_by_side_entry = {
+        (
+            str(item.get("side") or "").strip(),
+            str(item.get("lib_entry") or "").replace("\\", "/").strip(),
+        ): item
+        for item in manifest_items
+        if isinstance(item, dict)
+    }
+    for row in dep_rows:
+        if str(row.get("resolution_status") or "").strip() != "resolved":
+            continue
+        if str(row.get("change_type") or "").strip() == "未变":
+            continue
+        for side, version_field, entry_field in (
+            ("base", "old_version", "base_lib_entry"),
+            ("current", "new_version", "current_lib_entry"),
+        ):
+            if str(row.get(version_field) or "").strip() in ("", "-"):
+                continue
+            lib_entry = str(row.get(entry_field) or "").replace("\\", "/").strip()
+            if not lib_entry:
+                fail(f"Step1 变化依赖缺少 {entry_field}：{row.get('coord')}")
+            item = item_by_side_entry.get((side, lib_entry))
+            if not item:
+                fail(f"Step1 未留存变化依赖 JAR：{row.get('coord')}（{side}）")
+            retained_path = Path(str(item.get("retained_path") or ""))
+            expected_sha = str(item.get("nested_jar_sha256") or "").strip()
+            if not retained_path.is_file() or not expected_sha:
+                fail(f"Step1 变化依赖 JAR 不可用：{row.get('coord')}（{side}）")
+            if sha256_file(retained_path) != expected_sha:
+                fail(f"Step1 变化依赖 JAR SHA-256 不一致：{row.get('coord')}（{side}）")
     ok(f"step1_scope 门控通过：变更清单={len(valid_dep_rows)} 当前依赖={len(valid_current_rows)}")
 
 def gate_context(d):

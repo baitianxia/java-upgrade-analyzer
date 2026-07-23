@@ -101,7 +101,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ### tree-sitter 安装
 
-- 正式支持 CPython 3.12.x/3.13.x/3.14.x、Linux/macOS/Windows、JDK 11/17/21，以及 Maven 3.8+ 或 Gradle 7.6+。
+- 分析器正式支持 CPython 3.12.x/3.13.x/3.14.x 与 Linux/macOS/Windows。JDK、Maven、Gradle 版本以 base/current 工程为准，不设全局最低版本；优先使用各 revision 的 `mvnw` / `gradlew` 和对应侧 JDK。
 - 安装版本以根目录 `requirements-runtime.txt` 为唯一清单；Step5 运行时不会联网安装或修改 Python 环境。
 - 在仓库根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
 
@@ -151,7 +151,7 @@ python3 scripts/quality_gate.py --profile quick --skip-real
 
 说明：
 
-- `dependency_source_dirs` 是推荐主入口；可填写源码工程目录、仓库根目录或 HTTPS/SSH Git 地址。Git 地址会先克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/` 并在后续运行中复用，随后调度层扫描仓库 `pom.xml` / `build.gradle` 并展开所有推断出的 `groupId:artifactId`。
+- `dependency_source_dirs` 是推荐主入口；可填写源码工程目录、仓库根目录或 HTTPS/SSH Git 地址。Git 地址会先克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/` 并在后续运行中复用。调度层只针对 Step1 已确认的变化 GAV，对构建清单执行一次有界模块定位；源码只补充版本差异证据，不会再次发现依赖或新增同 GAV 条目。
 - Git 地址克隆复用宿主环境已有的 SSH key 或 Git credential helper，并设置 `GIT_TERMINAL_PROMPT=0`；克隆失败会保留既有正式产物并要求修正地址或权限，不会降级成一个空源码目录。
 - 路径支持相对路径（相对 `project-dir`）和绝对路径。
 - `dependency_source_dirs` 一旦提供，Step4 会通过 `git ls-remote` 查询源码仓库的实时远程分支，再按依赖 `old_version/new_version` 做严格边界匹配；old/new 两侧优先选择 remote 和版本前缀家族一致的 ref pair，同名候选只有 commit 相同才会自动合并。选定 ref 后会定向 fetch 并固定 commit，再执行源码 diff；不会以本地远端跟踪分支冒充远端最新状态。
@@ -238,7 +238,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 当 Step4 已生成 `evidence/api_changes/changed_dependencies.md` / `changed_dependencies.csv` 后，可通过依赖包完整坐标只让某个或某几个依赖进入 Step5。
 
-Step4 成功且存在至少两个候选依赖时生成范围选择 checkpoint，由用户决定 Step5 全量或部分分析。0 个候选时没有系统触达目标，1 个候选时全量和选择该候选等价，系统直接继续。全量覆盖全部变化依赖；部分分析通过 `selected_targets` 从推荐候选或完整候选清单中选择，能够降低耗时，但最终报告必须明确仅覆盖所选范围。范围卡同时展示依赖数、变化 API 数和高风险 API 数。推荐候选由 `recommended=true` 标识，规则为含高风险 API、删除或签名变化，或变化 API 数不少于 20。内部源码/ref/超时故障不得成为该 checkpoint 的用户修复项。
+Step4 成功且存在至少两个候选依赖时生成范围选择 checkpoint，由用户决定 Step5 全量或部分分析。0 个候选时没有系统触达目标，1 个候选时全量和选择该候选等价，系统直接继续。用户只需回复“全量分析”或“只分析 <依赖名称/完整坐标>”；调度器在内部转换范围字段，不向用户暴露 `selected_targets` / `selection_key`。范围卡同时展示依赖数、变化 API 数和高风险 API 数。推荐候选由 `recommended=true` 标识，规则为含高风险 API、删除或签名变化，或变化 API 数不少于 20。候选未全部展示时，卡片必须明确指出 `changed_dependencies.md` 是完整依赖选择清单，并指导用户从“依赖包”列取得未展示候选。内部源码/ref/超时故障不得成为该 checkpoint 的用户修复项。
 
 让用户从 `changed_dependencies.md` 的“依赖包”列复制完整坐标，例如：
 
@@ -257,7 +257,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 说明：
 
-- `selected_targets` 填写 `changed_dependencies.md` 中“依赖包”列的完整坐标
+- 用户无需填写或理解 `selected_targets`；只需自然语言回复要分析的依赖名称或完整坐标，调度器负责生成内部字段
 - `changed_dependencies.csv` 中的 `selection_key` 仅供程序兼容解析和自动化使用，不作为人工选择入口
 - 这些选择字段必须先归一化写入 `main_state.json`
 - 正式流程中不要把选中依赖直接透传给 `s5_call_chain*.py`
@@ -304,7 +304,9 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
       dep_summary.txt
       deps_current_resolved.csv
       build_provenance.json
+      dependency_jars.json
       s1_artifacts/
+      s1_dependency_jars/
     context/
       review.md
       context.json
@@ -553,7 +555,7 @@ JApiCmp 是 Java 依赖升级分析的必需工具，不允许降级继续。缺
 - `最终制品 JAR 证据缺失`
 - `JApiCmp 未安装`
 - 其他执行失败项
-- Step4 只复用 Step1 成功构建产物中的 `base_lib_entry/current_lib_entry` JAR，并将提取缓存写入 `.upgrade-report/evidence/api_changes/step4_artifact_jars/`；无法从最终制品定位时会明确报告证据缺失，不读取本地 Maven 仓库，也不下载同坐标 JAR 替代
+- Step1 按 `base_lib_entry/current_lib_entry` 一次性提取变化依赖 JAR，写入 `evidence/dependencies/s1_dependency_jars/` 和 `dependency_jars.json`，并在 Step1 门控校验条目与 SHA-256。正式 Step4 只直读这份清单，不重新打开 fat JAR、不递归检查内嵌归档，也不读取本地 Maven 仓库或下载同坐标 JAR
 - Step4 默认 `step4_workers=4` 进行依赖级并行；如果本机 CPU/磁盘压力过高，可在主状态或命令行设为 1/2
 - 正式流程默认不设置 Step4 超时；仅在主状态中显式写入 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应限制。`step4_fetch_timeout` 只控制远端 Git 查询/抓取，JApiCmp 自动安装使用独立的 `step4_tool_install_timeout`
 - 正式流程会向 `stderr` 输出 `[进度][依赖 API 变化][处理依赖/源码辅助对比/制品 API 对比/完成]` 等用户可读进度，并展示当前对象、数量和耗时

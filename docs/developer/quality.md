@@ -56,11 +56,13 @@ python3 scripts/real_project_regression.py --case guard-exploratory
 
 `guard` 是 `core + capability` 的发布集合；`exploratory` 用于候选项目观察，不计入发布充分条件。物化脚本接受相同 selector，并在输出中记录本次实际 artifact SHA-256。
 
-运行环境契约支持 CPython 3.12.x、3.13.x 和 3.14.x，并固定 `tree-sitter==0.25.2`、
-`tree-sitter-java==0.23.5`、Linux/macOS/Windows、JDK 11/17/21 和 Maven 3.8+。
+分析器运行环境契约支持 CPython 3.12.x、3.13.x 和 3.14.x，并固定 `tree-sitter==0.25.2`、
+`tree-sitter-java==0.23.5` 与 Linux/macOS/Windows。JDK、Maven、Gradle 属于被分析工程的
+构建工具链，不设全局版本下限；base/current 构建分别优先采用其 revision 中的 Wrapper 和
+对应侧 JDK，Wrapper 缺失时才回落 PATH。
 `scripts/bootstrap_runtime.py` 是唯一依赖安装入口，支持联网安装或通过 `--wheel-dir`
-使用带 `--no-index` 的受控离线缓存。quality gate 的首项会实际执行 Git/JDK/Maven
-命令、核对 Python 包精确版本与 import，并验证 Java 工具和 Maven 使用同一 JDK；
+使用带 `--no-index` 的受控离线缓存。quality gate 的首项会核对 Python 包精确版本与
+import；需要 Java/Maven 的测试 profile 只检查命令可执行，不把 CI 工具版本强加给用户工程。
 运行分析时不得隐式联网修复环境。
 
 快速检查：

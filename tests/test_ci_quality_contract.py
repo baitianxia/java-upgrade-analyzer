@@ -96,6 +96,18 @@ class CiQualityContractTest(unittest.TestCase):
                 plan = quality_gate.build_plan(profile, skip_real=True)
                 self.assertEqual(plan[0].name, "environment_contract")
 
+    def test_every_gate_profile_runs_platform_compatibility_after_compile(self):
+        for profile in ("quick", "step5", "release"):
+            with self.subTest(profile=profile):
+                plan = quality_gate.build_plan(profile, skip_real=True)
+                names = [task.name for task in plan]
+
+                self.assertIn("platform_compatibility", names)
+                self.assertGreater(
+                    names.index("platform_compatibility"),
+                    names.index("py_compile_scripts"),
+                )
+
     def test_tool_preflight_matches_profile_dependencies(self):
         quick = quality_gate.build_plan("quick", skip_real=True)[0]
         step5 = quality_gate.build_plan("step5", skip_real=True)[0]

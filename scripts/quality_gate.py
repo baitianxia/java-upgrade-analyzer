@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 from compat import setup_utf8_io
@@ -20,6 +21,7 @@ from runtime_contract import contract_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_AUDIT_ROOT = Path(tempfile.gettempdir()) / "jua-quality-gate"
 
 setup_utf8_io()
 
@@ -65,6 +67,39 @@ CORE_SEMANTIC_TESTS = [
     "tests.test_s5_query_call_chain.S5QueryCallChainTest.test_query_avoids_cycles_while_finding_business_chain",
 ]
 
+PLATFORM_CONTRACT_TESTS = [
+    "tests.test_platform_contract",
+    (
+        "tests.test_step5_memory_equivalence.Step5MemoryObserverTest."
+        "test_imports_and_runs_when_resource_module_is_unavailable"
+    ),
+    (
+        "tests.test_user_scenario_regression.UserScenarioRegressionTest."
+        "test_java_classpath_uses_platform_separator"
+    ),
+    (
+        "tests.test_user_scenario_regression.UserScenarioRegressionTest."
+        "test_default_workspace_uses_platform_temp_directory"
+    ),
+    "tests.test_build_tool_selection",
+    (
+        "tests.test_execution_faults.ExecutionFaultTest."
+        "test_permission_fault_uses_portable_owner_write_boundary"
+    ),
+    (
+        "tests.test_run_step_main_state.RunStepMainStateTest."
+        "test_resume_command_uses_powershell_safe_argument_quoting"
+    ),
+    (
+        "tests.test_quality_gate.QualityGateTest."
+        "test_user_scenario_workspace_follows_portable_report_root"
+    ),
+    (
+        "tests.test_real_project_regression.RealProjectRegressionTest."
+        "test_default_report_root_uses_platform_temp_directory"
+    ),
+]
+
 RELEASE_REAL_PROJECT_SCOPES = frozenset({"guard", "all"})
 
 
@@ -72,13 +107,16 @@ def _environment_contract_task(require_maven=True):
     return GateTask(
         name="environment_contract",
         command=["with_maven" if require_maven else "without_maven"],
-        purpose="运行契约预检：Python、固定依赖、平台及 Java/Maven 工具链",
+        purpose="运行契约预检：分析器固定依赖及当前测试 profile 所需命令",
     )
 
 
 def _run_environment_contract_task(task):
     started = time.perf_counter()
-    payload = contract_payload(require_maven=task.command == ["with_maven"])
+    payload = contract_payload(
+        require_java_tools=True,
+        require_maven=task.command == ["with_maven"],
+    )
     failures = [item for item in payload["checks"] if item["status"] != "passed"]
     status = payload["status"]
     purpose = task.purpose + (
@@ -135,6 +173,15 @@ def _unittest_discover_task(python_exe):
         command=[python_exe, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],
         purpose="完整单元测试，防止跨步骤回归",
         heavy=True,
+    )
+
+
+def _platform_contract_task(python_exe):
+    return _unittest_task(
+        python_exe,
+        "platform_compatibility",
+        PLATFORM_CONTRACT_TESTS,
+        "Linux、macOS、Windows 的导入、路径、命令、权限及临时目录契约",
     )
 
 
@@ -236,7 +283,7 @@ def _capability_family_closure_task(python_exe, real_json, audit_root):
     )
 
 
-def _user_scenario_task(python_exe):
+def _user_scenario_task(python_exe, audit_root):
     return GateTask(
         name="user_scenario_regression",
         command=[
@@ -245,7 +292,7 @@ def _user_scenario_task(python_exe):
             "--scenario",
             "all",
             "--workspace",
-            "/private/tmp/java-upgrade-quality-user-scenarios",
+            str(Path(audit_root) / "user_scenarios"),
         ],
         purpose="固定模拟用户场景：删除依赖跨 jar 链路、jar-primary 过滤、Step5 即时查询",
         heavy=True,
@@ -398,9 +445,10 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
     tasks = [
         _environment_contract_task(require_maven=profile in {"step5", "release"}),
         _py_compile_task(python_exe),
+        _platform_contract_task(python_exe),
         _oracle_independence_task(python_exe),
     ]
-    audit_root = Path(report_root or "/private/tmp/jua-quality-gate")
+    audit_root = Path(report_root) if report_root else DEFAULT_AUDIT_ROOT
     real_json = str(audit_root / f"real_project_{real_case}.json")
     audit_json = str(audit_root / f"quality_signal_audit_{real_case}.json")
 
@@ -426,7 +474,7 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
         ))
         tasks.append(_smoke_task(python_exe, "core", str(audit_root / "smoke_core.json")))
         tasks.append(_smoke_task(python_exe, "step5", str(audit_root / "smoke_step5.json")))
-        tasks.append(_user_scenario_task(python_exe))
+        tasks.append(_user_scenario_task(python_exe, audit_root))
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root, real_json))
             tasks.append(_quality_signal_audit_task(python_exe, real_json, audit_json))
@@ -460,7 +508,7 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
         ))
         tasks.append(_unittest_discover_task(python_exe))
         tasks.append(_smoke_task(python_exe, "all", str(audit_root / "smoke_all.json")))
-        tasks.append(_user_scenario_task(python_exe))
+        tasks.append(_user_scenario_task(python_exe, audit_root))
         if not skip_real:
             tasks.append(_real_project_task(python_exe, real_case, report_root, real_json))
             tasks.append(_quality_signal_audit_task(python_exe, real_json, audit_json))

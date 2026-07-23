@@ -73,6 +73,18 @@ class QualityGateTest(unittest.TestCase):
                 self.assertIn("scripts/oracle_independence.py", task.command)
                 self.assertIn("tests/fixtures/oracle_boundary.json", task.command)
 
+    def test_every_profile_runs_the_platform_compatibility_contract(self):
+        for profile in ("quick", "step5", "release"):
+            with self.subTest(profile=profile):
+                tasks = quality_gate.build_plan(profile, skip_real=True)
+                task = next(
+                    item for item in tasks
+                    if item.name == "platform_compatibility"
+                )
+
+                self.assertIn("tests.test_platform_contract", task.command)
+                self.assertIn("tests.test_build_tool_selection", task.command)
+
     def test_release_profile_has_explicit_production_mutation_gate(self):
         tasks = quality_gate.build_plan("release", skip_real=True)
         task = next(item for item in tasks if item.name == "production_mutations")
@@ -137,6 +149,19 @@ class QualityGateTest(unittest.TestCase):
             self.assertIn("--json-out", task.command)
             self.assertEqual(task.command[-1], str(Path(tmp) / "smoke_core.json"))
             self.assertEqual(task.output_paths, (task.command[-1],))
+
+    def test_user_scenario_workspace_follows_portable_report_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = quality_gate.build_plan(
+                "step5", report_root=tmp, skip_real=True,
+            )
+            task = next(
+                item for item in tasks
+                if item.name == "user_scenario_regression"
+            )
+
+        workspace = task.command[task.command.index("--workspace") + 1]
+        self.assertEqual(Path(workspace), Path(tmp) / "user_scenarios")
 
     def test_release_profile_has_explicit_execution_fault_gate(self):
         tasks = quality_gate.build_plan("release", skip_real=True)

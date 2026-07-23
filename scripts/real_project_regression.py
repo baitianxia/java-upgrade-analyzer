@@ -3,7 +3,7 @@
 Real-project regression runner for java-upgrade-analyzer.
 
 This script is intentionally not part of the default CI smoke suite: it expects
-real project checkouts under /private/tmp (or explicit paths passed by CLI) and
+materialized real-project checkouts (or explicit paths passed by CLI) and
 therefore validates ecosystem-shaped source code rather than synthetic fixtures.
 
 The checks are deliberately conservative:
@@ -92,6 +92,9 @@ from topology_coverage import (
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_REPORT_ROOT = (
+    Path(tempfile.gettempdir()) / "java-upgrade-real-project-regression"
+)
 
 ORACLE_EDGE_FIELDS = (
     "artifact_sha256", "artifact_entry", *EDGE_IDENTITY_FIELDS[1:],
@@ -9082,7 +9085,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--report-root",
-        default="/private/tmp/java-upgrade-real-project-regression",
+        default=str(DEFAULT_REPORT_ROOT),
         help="Directory where per-case reports are written.",
     )
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON only.")

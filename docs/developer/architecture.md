@@ -419,11 +419,14 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 
 当前关键语义如下：
 
-- `dependency_source_dirs` 是推荐入口，同时接受本地目录和 Git 地址；Git 地址先物化到 `.runtime/cache/dependency_source_git/`，再进入同一套坐标推断与源码分析链路
+- Step1 从最终制品提取变化依赖 JAR，并用 `dependency_jars.json` 固化 `side + coord + lib_entry + SHA-256 + retained_path`；Step1 门控逐项验证，正式 Step4 只直读该清单
+- JAR 坐标优先来自内嵌 Maven 元数据，无法确定时只用工程依赖树补齐对应制品条目；源码不是坐标事实源
+- `dependency_source_dirs` 是推荐入口，同时接受本地目录和 Git 地址；Git 地址先物化到 `.runtime/cache/dependency_source_git/`。模块定位仅针对 Step1 已有变化 GAV，对构建清单做一次有深度和数量上限的扫描；源码不得新增依赖行
 - `dependency_repo_mappings` 是内部派生结果
 - `s4_contract.py` 固定 `all_changed_apis.csv` 字段契约
 - `removed jar` 不走旁路逻辑；正式语义是把旧版 jar 的 `class / method / constructor` 符号集导出为 Step5 目标池
 - Step4 在报告根目录下为每个依赖写出 `s4_per_dependency/<coord>/removed_jar_symbols.csv`、`resolved_targets.csv`、`summary.json`
+- 同一 JAR 条目内重复但内容一致的 `pom.properties` / `pom.xml` 只归一化为一个 GAV，不生成重复依赖；只有元数据声明彼此冲突时才记录异常。源码不能覆盖这项制品判断
 - 依赖源码仓库的 git ref 只从远端分支 `remotes` 中匹配，不直接沿用主项目分支名
 - 版本匹配会先去掉末尾 `-SNAPSHOT`，再按“严格边界命中”筛选候选；像 `3.0.2` 不会命中 `3.0.2.1`
 - `DEV/dev` 分支在同等条件下低于非 `DEV/dev` 分支

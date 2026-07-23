@@ -23,6 +23,8 @@ GATE_SEQUENCE = [
 ]
 
 STEP1_ARTIFACTS_DIRNAME = "s1_artifacts"
+STEP1_DEPENDENCY_JARS_DIRNAME = "s1_dependency_jars"
+STEP1_DEPENDENCY_JARS_MANIFEST_FILE = "dependency_jars.json"
 PER_DEPENDENCY_DIRNAME = "s4_per_dependency"
 PER_DEPENDENCY_SUMMARY_FILE = "summary.json"
 PER_DEPENDENCY_RESOLVED_TARGETS_FILE = "resolved_targets.csv"

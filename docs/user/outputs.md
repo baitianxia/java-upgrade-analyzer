@@ -75,12 +75,14 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 | `evidence/dependencies/dep_alerts.csv` | 需要优先复核的依赖变化 | 降级、删除、无法解析或高风险依赖 |
 | `evidence/dependencies/build_provenance.json` | base/current 构建产物来源和摘要 | 后续字节码分析是否基于正确制品 |
 | `evidence/dependencies/s1_artifacts/` | 留存的 base/current 产物 | Step5 业务字节码和运行时依赖 JAR 的来源 |
+| `evidence/dependencies/dependency_jars.json` | Step1 固化的变化依赖 JAR 清单与 SHA-256 | Step4 是否直接消费正确的 base/current JAR |
+| `evidence/dependencies/s1_dependency_jars/` | 从最终制品一次性提取的变化依赖 JAR | Step4 的唯一依赖 JAR 输入 |
 
 注意：Step1 当前以真实构建结果或用户提供的构建产物为准，不把手工 dependency tree 当作正式事实源。
 base/current 即使使用同一个源码目录，也会按各自确认后的 commit 分别建立临时 worktree；源码目录本身不代表制品版本。
 `dep_changes.csv` 仍只在完整比较成功后写入；过程日志和耗时文件仅用于监控与诊断，不是未完成分析的部分结果。
 
-从 Step1 开始，最终制品是依赖事实的唯一来源：Step3、Step4 和 Step5 只分析 Step1 留存的 base/current 最终制品及其内嵌 JAR，不使用本地 Maven 仓库中的同坐标文件，也不下载其他版本代替。JApiCmp 自身是分析工具，首次缺失时可以自动安装；这不等于允许下载被分析依赖。最终制品内缺少目标 JAR 时，结果会明确标记为“最终制品 JAR 证据缺失”，不会用本机缓存生成看似完整但制品不一致的结论。
+从 Step1 开始，最终制品是依赖事实的唯一来源。Step1 先从 fat JAR 读取条目和坐标；内嵌 Maven 元数据无法确定坐标时，工程依赖树只补齐该条目，不替换制品事实。变化依赖 JAR 会在 Step1 固化，正式 Step4 直接读取，不会重新展开 fat JAR。源码只用于解释 Step1 已有 GAV 的源码变化，不会再次发现依赖或制造同 GAV 重复。所有步骤都不使用本地 Maven 仓库中的同坐标文件，也不下载其他版本代替。JApiCmp 自身是分析工具，首次缺失时可以自动安装；这不等于允许下载被分析依赖。最终制品内缺少目标 JAR 时，Step1 门控会明确报错，不会把异常拖到 Step4。
 
 ## 运行监控与性能诊断
 

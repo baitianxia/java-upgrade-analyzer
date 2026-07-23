@@ -1644,6 +1644,10 @@ def run_core_pipeline_smoke(workspace, dep_env):
         report_dir / "evidence" / "dependencies" / "build_provenance.json",
         runtime_full_expand_report / "evidence" / "dependencies" / "build_provenance.json",
     )
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "dependency_jars.json",
+        runtime_full_expand_report / "evidence" / "dependencies" / "dependency_jars.json",
+    )
     write_text(
         runtime_full_expand_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
@@ -2743,6 +2747,10 @@ return ExtraApi.callLegacy();
         report_dir / "evidence" / "dependencies" / "build_provenance.json",
         interactive_step4_report / "evidence" / "dependencies" / "build_provenance.json",
     )
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "dependency_jars.json",
+        interactive_step4_report / "evidence" / "dependencies" / "dependency_jars.json",
+    )
     write_text(
         interactive_step4_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
@@ -2820,6 +2828,10 @@ return ExtraApi.callLegacy();
     copy_file(
         report_dir / "evidence" / "dependencies" / "build_provenance.json",
         interactive_step4_restart_report / "evidence" / "dependencies" / "build_provenance.json",
+    )
+    copy_file(
+        report_dir / "evidence" / "dependencies" / "dependency_jars.json",
+        interactive_step4_restart_report / "evidence" / "dependencies" / "dependency_jars.json",
     )
     write_text(
         interactive_step4_restart_report / "evidence" / "context" / "context.json",

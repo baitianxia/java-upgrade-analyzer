@@ -20,10 +20,12 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from dataclasses import asdict, dataclass, field
@@ -53,6 +55,8 @@ CHANGED_API_FIELDS = [
     "severity",
     "source",
 ]
+
+DEFAULT_WORKSPACE = Path(tempfile.gettempdir()) / "java-upgrade-user-scenario-regression"
 
 
 @dataclass
@@ -95,7 +99,7 @@ def _compile_java(source_root: Path, classes_dir: Path, classpath: list[Path] | 
     classes_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["javac", "-d", str(classes_dir)]
     if classpath:
-        cmd.extend(["-cp", ":".join(str(item) for item in classpath)])
+        cmd.extend(["-cp", os.pathsep.join(str(item) for item in classpath)])
     cmd.extend(java_files)
     result = _run(cmd)
     if result.returncode != 0:
@@ -647,7 +651,7 @@ def parse_args(argv=None):
     parser.add_argument("--scenario", choices=sorted(SCENARIOS) + ["all"], default="all")
     parser.add_argument(
         "--workspace",
-        default="/private/tmp/java-upgrade-user-scenario-regression",
+        default=str(DEFAULT_WORKSPACE),
         help="Workspace for generated projects and reports.",
     )
     parser.add_argument("--json", action="store_true", help="Print JSON only.")

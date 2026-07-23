@@ -51,6 +51,8 @@ from signature_utils import (
 from enhanced_source_analyzer import CallEdge, MethodDef, _strip_strings_and_comments
 from business_bytecode_graph import parse_classfile_calls
 from artifact_safety import inspect_archive
+from analysis_contract import sha256_file
+from pipeline_constants import STEP1_DEPENDENCY_JARS_MANIFEST_FILE
 from constant_impact import classify_constant_impact
 from indirect_usage_analyzer import (
     api_key as indirect_api_key,
@@ -2402,31 +2404,60 @@ def _build_identical_current_class_provider_index(all_apis, graph):
         setattr(graph, 'identical_current_class_providers', {})
         return {}
 
-    dep_changes_path = os.path.join(report_dir, 'evidence', 'dependencies', 'dep_changes.csv')
+    dependencies_dir = Path(report_dir) / 'evidence' / 'dependencies'
+    dep_changes_path = dependencies_dir / 'dep_changes.csv'
+    manifest_path = dependencies_dir / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
+    manifest_index = {}
+    manifest_available = manifest_path.is_file()
+    if manifest_available:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            manifest_index = {
+                (
+                    str(item.get('side') or '').strip(),
+                    str(item.get('lib_entry') or '').replace('\\', '/').strip(),
+                ): item
+                for item in (manifest.get('items') or [])
+                if isinstance(item, dict)
+            }
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            _record_analyzer_ledger_failure(
+                graph,
+                'PRESERVATION_MANIFEST_UNREADABLE',
+                artifact=str(manifest_path),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            manifest_index = {}
     old_jars = {}
     try:
-        import csv
         with open_csv_read(dep_changes_path) as handle:
             for row in csv.DictReader(handle):
                 coord = str(row.get('coord') or '').strip()
-                entry = str(row.get('base_lib_entry') or '').strip()
+                entry = str(row.get('base_lib_entry') or '').replace('\\', '/').strip()
                 if coord not in targets or not entry:
                     continue
-                candidate = os.path.join(
-                    report_dir,
-                    'evidence',
-                    'api_changes',
-                    'step4_artifact_jars',
-                    'base',
-                    _step4_artifact_cache_filename(entry),
+                if manifest_available:
+                    item = manifest_index.get(('base', entry)) or {}
+                    candidate = Path(str(item.get('retained_path') or ''))
+                    expected_sha = str(item.get('nested_jar_sha256') or '').strip()
+                    if candidate.is_file():
+                        actual_sha = sha256_file(candidate)
+                        if expected_sha and actual_sha == expected_sha:
+                            old_jars[coord] = str(candidate)
+                    continue
+                legacy_candidate = (
+                    Path(report_dir) / 'evidence' / 'api_changes'
+                    / 'step4_artifact_jars' / 'base'
+                    / _step4_artifact_cache_filename(entry)
                 )
-                if os.path.isfile(candidate):
-                    old_jars[coord] = candidate
+                if legacy_candidate.is_file():
+                    old_jars[coord] = str(legacy_candidate)
     except (OSError, ValueError) as exc:
         _record_analyzer_ledger_failure(
             graph,
             'PRESERVATION_MANIFEST_UNREADABLE',
-            artifact=dep_changes_path,
+            artifact=str(dep_changes_path),
             error_type=type(exc).__name__,
             error=str(exc),
         )

@@ -617,6 +617,14 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(args.final_artifact, "/tmp/commons-text.jar")
 
+    def test_default_report_root_uses_platform_temp_directory(self):
+        args = realreg.parse_args(["--case", "commons-text"])
+
+        self.assertEqual(
+            Path(args.report_root),
+            Path(tempfile.gettempdir()) / "java-upgrade-real-project-regression",
+        )
+
     def test_project_asset_health_records_revision_without_fake_git_error(self):
         completed = [
             subprocess.CompletedProcess([], 0, stdout="true\n", stderr=""),

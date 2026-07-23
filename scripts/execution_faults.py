@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -109,7 +110,10 @@ def run_execution_fault(spec: ExecutionFaultSpec, workspace: Path) -> ExecutionF
                 reason = "EXECUTION_ARTIFACT_REPLACED"
         elif spec.id == "permission_denied":
             artifact.chmod(0)
-            if artifact.stat().st_mode & 0o777 == 0:
+            # Windows chmod exposes only the read-only flag, while POSIX
+            # exposes the full permission mask.  Lack of owner-write is the
+            # portable boundary this fault is intended to exercise.
+            if not artifact.stat().st_mode & stat.S_IWUSR:
                 reason = "EXECUTION_PERMISSION_DENIED"
         elif spec.id == "invalid_encoding":
             artifact.write_bytes(b"\xff\xfe\xfa")

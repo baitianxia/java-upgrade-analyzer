@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import threading
@@ -16,10 +17,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from compat import infer_maven_coords, open_text, resolve_repo_input_path, run_cmd
+from compat import (
+    infer_maven_coord_locations,
+    infer_maven_coords,
+    open_text,
+    resolve_repo_input_path,
+    run_cmd,
+)
 from compat import git_cmd
 from csv_io import open_csv_read, open_csv_write
-from auto_discover_bridge_sources import discover_bridge_source_mappings
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
@@ -38,6 +44,8 @@ from pipeline_constants import (
     RUNTIME_OBSERVABILITY_DIRNAME,
     RUNTIME_STATE_DIRNAME,
     STEP1_ARTIFACTS_DIRNAME,
+    STEP1_DEPENDENCY_JARS_DIRNAME,
+    STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
     STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
     STEP5_ARTIFACT_BYTECODE_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
@@ -232,6 +240,17 @@ def build_provenance_path(report_dir):
 
 def step1_artifacts_dir(report_dir):
     return evidence_dependencies_dir(report_dir) / STEP1_ARTIFACTS_DIRNAME
+
+
+def step1_dependency_jars_dir(report_dir):
+    return evidence_dependencies_dir(report_dir) / STEP1_DEPENDENCY_JARS_DIRNAME
+
+
+def step1_dependency_jars_manifest_path(report_dir):
+    return (
+        evidence_dependencies_dir(report_dir)
+        / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
+    )
 
 
 def step2_context_path(report_dir):
@@ -591,9 +610,6 @@ def build_environment_block_message(environment):
     labels = {
         "python": "Python 运行时",
         "platform": "操作系统",
-        "jdk_toolchain": "JDK 工具链",
-        "maven_runtime": "Maven 运行时",
-        "gradle_runtime": "Gradle 运行时",
     }
     failed = [
         item for item in (environment or {}).get("checks") or []
@@ -601,7 +617,7 @@ def build_environment_block_message(environment):
     ]
     lines = [
         "分析尚未开始：运行环境预检未通过。",
-        "系统没有修改宿主机的 Python、JDK、Maven 或 Gradle 安装；这些操作需要外部安装条件或授权。",
+        "系统没有修改宿主机的 Python 环境；安装或修复运行依赖需要外部条件或授权。",
         "未满足的条件：",
     ]
     if not failed:
@@ -1710,22 +1726,42 @@ def _resolve_source_dirs_plan(project_dir, source_dirs=None, modules=None, proje
     }
 
 
-def _discover_dependency_source_candidates(dependency_source_dirs):
+def _discover_dependency_source_candidates(
+    dependency_source_dirs,
+    relevant_coords=None,
+):
     candidates = []
     seen = set()
+    relevant_coords = {
+        str(item or "").strip()
+        for item in (relevant_coords or [])
+        if str(item or "").strip()
+    }
     for raw_path in (dependency_source_dirs or []):
         input_path = str(raw_path or "").strip()
         if not input_path:
             continue
         repo_path = resolve_repo_input_path(os.path.expanduser(input_path))
-        discovered_pairs = discover_bridge_source_mappings("", repo_path)
-        if discovered_pairs:
-            for coord, source_dir in discovered_pairs:
-                coord = str(coord or "").strip()
-                source_dir = str(source_dir or "").strip()
-                if not coord:
-                    continue
-                module_root = _guess_module_root_from_source_dir(source_dir) if source_dir else repo_path
+        locations = infer_maven_coord_locations(
+            repo_path,
+            max_poms=120,
+            max_depth=4,
+            target_coords=relevant_coords,
+        )
+        for location in locations:
+            coord = str(location.get("coord") or "").strip()
+            if not coord:
+                continue
+            module_root = str(location.get("module_dir") or repo_path)
+            source_dirs = [
+                str(Path(module_root) / relative)
+                for relative in (
+                    "src/main/java",
+                    "src/main/kotlin",
+                )
+                if (Path(module_root) / relative).is_dir()
+            ] or [""]
+            for source_dir in source_dirs:
                 key = (coord, repo_path, module_root, source_dir)
                 if key in seen:
                     continue
@@ -1733,32 +1769,13 @@ def _discover_dependency_source_candidates(dependency_source_dirs):
                 candidates.append(
                     {
                         "input_path": input_path,
-                        "repo_path": repo_path,
+                        "repo_path": str(location.get("repo_root") or repo_path),
                         "module_root": module_root,
                         "coord": coord,
                         "source_dir": source_dir,
-                        "discovery_mode": "bridge_source_scan",
+                        "discovery_mode": "bounded_manifest_scan",
                     }
                 )
-        inferred_coords = [item for item in infer_maven_coords(repo_path) if item]
-        for coord in inferred_coords:
-            coord = str(coord or "").strip()
-            if not coord:
-                continue
-            key = (coord, repo_path, repo_path, "")
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append(
-                {
-                    "input_path": input_path,
-                    "repo_path": repo_path,
-                    "module_root": repo_path,
-                    "coord": coord,
-                    "source_dir": "",
-                    "discovery_mode": "coord_inference_only",
-                }
-            )
     return candidates
 
 
@@ -1772,7 +1789,10 @@ def _build_dependency_source_plan(dependency_source_dirs, relevant_coords=None):
             relevant_order.append(value)
     relevant_set = set(relevant_order)
 
-    raw_candidates = _discover_dependency_source_candidates(dependency_source_dirs)
+    raw_candidates = _discover_dependency_source_candidates(
+        dependency_source_dirs,
+        relevant_coords=relevant_set,
+    )
     filtered_candidates = []
     for item in raw_candidates:
         coord = str(item.get("coord") or "").strip()
@@ -1800,7 +1820,11 @@ def _build_dependency_source_plan(dependency_source_dirs, relevant_coords=None):
     for coord in coord_order:
         coord_candidates = candidates_by_coord.get(coord) or []
         repo_paths = _dedupe_strings(
-            [str(item.get("repo_path") or "").strip() for item in coord_candidates if item.get("repo_path")]
+            [
+                str(item.get("repo_path") or "").strip()
+                for item in coord_candidates
+                if item.get("repo_path")
+            ]
         )
         if len(repo_paths) > 1:
             ambiguous_coords.append(
@@ -4238,6 +4262,19 @@ def _wrap_response_payload_as_intent_patch(payload):
     return {"intent_patch": intent_patch}
 
 
+def _format_resume_shell_command(arguments, *, platform_name=None):
+    """Render argv for POSIX shells or PowerShell without losing arguments."""
+    values = [str(item) for item in arguments]
+    system = str(platform_name or sys.platform).lower()
+    if system.startswith("win"):
+        quoted = [
+            "'" + value.replace("'", "''") + "'"
+            for value in values
+        ]
+        return "& " + " ".join(quoted)
+    return shlex.join(values)
+
+
 def build_resume_command_examples(options, required_fields, properties, project_dir, report_dir):
     examples = []
     for option in options or []:
@@ -4261,22 +4298,36 @@ def build_resume_command_examples(options, required_fields, properties, project_
                 {
                     "action": action_id,
                     "label": label,
-                    "command": (
-                        f'python3 "{SCRIPT_DIR / "run_step.py"}" --step auto '
-                        f'--project-dir "{project_dir}" --report-dir "{report_dir}" '
-                        f"--response-json '{json.dumps(payload, ensure_ascii=False)}'"
-                    ),
+                    "command": _format_resume_shell_command([
+                        sys.executable,
+                        SCRIPT_DIR / "run_step.py",
+                        "--step",
+                        "auto",
+                        "--project-dir",
+                        project_dir,
+                        "--report-dir",
+                        report_dir,
+                        "--response-json",
+                        json.dumps(payload, ensure_ascii=False),
+                    ]),
                 }
             )
     examples.append(
         {
             "action": "response_file",
             "label": "从文件恢复",
-            "command": (
-                f'python3 "{SCRIPT_DIR / "run_step.py"}" --step auto '
-                f'--project-dir "{project_dir}" --report-dir "{report_dir}" '
-                f'--response-file "{report_dir / "user_response.json"}"'
-            ),
+            "command": _format_resume_shell_command([
+                sys.executable,
+                SCRIPT_DIR / "run_step.py",
+                "--step",
+                "auto",
+                "--project-dir",
+                project_dir,
+                "--report-dir",
+                report_dir,
+                "--response-file",
+                report_dir / "user_response.json",
+            ]),
         }
     )
     return examples
@@ -4954,7 +5005,9 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         },
         "retry_remote_fetch": {
             "type": "boolean",
-            "description": "仅重试已经唯一定位 ref、但 3 次受控 fetch 均失败的侧。",
+            "description": (
+                "用户已确认远端配置、权限或 ref 状态正常后，显式重新查询远端并重试定向 fetch。"
+            ),
         },
         "notes": {"type": "string", "description": "可选。记录分支或 revision 的确认依据。"},
     }
@@ -4962,17 +5015,26 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
     checklist_lines = []
     for request in requests:
         field = request["field"]
-        side_cn = "基准侧" if request.get("side") == "base" else "当前侧"
+        side = str(request.get("side") or "").strip()
+        side_cn = "基准侧" if side == "base" else "当前侧"
+        source_field = f"{side}_source_project_dir"
         properties[field] = {
             "type": "string",
             "description": f"{side_cn}明确的远程分支或 tag；指定 remote 时使用 origin/release 形式。",
         }
-        properties[f"{request.get('side')}_expected_commit"] = {
+        properties[source_field] = {
+            "type": "string",
+            "description": (
+                f"可选。修正{side_cn}实际执行 Git ref 解析的源码仓库目录；"
+                "当 ref 已确认存在但卡片中的解析目录不正确时，与原 ref 一起提交。"
+            ),
+        }
+        properties[f"{side}_expected_commit"] = {
             "type": "string",
             "description": f"内部固定值：{side_cn}确认卡中所选 ref 对应的 commit。",
         }
-        allow_local_field = f"{request.get('side')}_allow_local_source"
-        allow_dirty_field = f"{request.get('side')}_allow_dirty_local_source"
+        allow_local_field = f"{side}_allow_local_source"
+        allow_dirty_field = f"{side}_allow_dirty_local_source"
         properties[allow_local_field] = {
             "type": "boolean",
             "description": f"仅当远程不可用时，明确允许{side_cn}使用本地 commit 作为辅助源码。",
@@ -4993,6 +5055,10 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         })
         if request.get("requested_ref"):
             checklist_lines.append(f"{side_cn}原始输入: {request.get('requested_ref')}")
+        if request.get("source_project_dir"):
+            checklist_lines.append(
+                f"{side_cn}实际解析目录: {request.get('source_project_dir')}"
+            )
         if request.get("detected_commit"):
             checklist_lines.append(
                 f"{side_cn}源码目录当前 revision: {request.get('detected_ref')} "
@@ -5092,15 +5158,16 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             "required_fields": required_fields,
             "rules": [
                 "更正远程 ref 时必须使用完整 remote/ref，或用户明确提供的其他远程 ref。",
+                "若 ref 已确认存在但实际解析目录不正确，可保留原 ref，并同时修正对应侧 source_project_dir。",
                 "只有用户明确同意本地兜底时才能设置 allow_local_source=true。",
-                "不得原样重复已解析失败或存在歧义的输入。",
+                "ref 与实际解析目录都未变化时，只有用户明确要求 retry_remote_fetch=true 才能重新查询。",
             ],
         },
         "runtime_rules": [
             "确认前不得执行 Maven/Gradle、创建分析 worktree 或继续后续步骤。",
             "用户确认后必须固定到 resolved commit，不能依赖工作区当前 checkout。",
         ],
-        "next_action_rule": "只能等待用户补充远程 ref、明确确认本地兜底或取消。",
+        "next_action_rule": "只能等待用户补充远程 ref、修正实际解析目录、明确确认本地兜底或取消。",
         "must_wait_for_user_reply": True,
     }
 
@@ -5260,6 +5327,89 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
     options = [dict(item) for item in (payload.get("options") or [])]
     response_schema = dict(payload.get("response_schema") or {})
     properties = dict(response_schema.get("properties") or {})
+    if step_id == "step1" and payload.get("ref_resolution_requests"):
+        requests = [
+            dict(item) for item in (payload.get("ref_resolution_requests") or [])
+            if isinstance(item, dict)
+        ]
+        for request in payload.get("ref_resolution_requests") or []:
+            side = str(request.get("side") or "").strip()
+            if side not in {"base", "current"}:
+                continue
+            side_cn = "基准侧" if side == "base" else "当前侧"
+            properties.setdefault(
+                f"{side}_source_project_dir",
+                {
+                    "type": "string",
+                    "description": (
+                        f"可选。修正{side_cn}实际执行 Git ref 解析的源码仓库目录；"
+                        "可与原 ref 一起提交。"
+                    ),
+                },
+            )
+        artifact_triggered_sides = [
+            str(item.get("side") or "").strip()
+            for item in requests
+            if str(item.get("side") or "").strip() in {"base", "current"}
+            and (
+                str(item.get("artifact_path") or "").strip()
+                or str(item.get("resolution_trigger") or "").strip()
+                == "artifact_coordinate_enrichment"
+            )
+        ]
+        if artifact_triggered_sides:
+            queried_sides = list(dict.fromkeys(artifact_triggered_sides))
+            queried_labels = "、".join(
+                "基准侧" if side == "base" else "当前侧"
+                for side in queried_sides
+            )
+            absent_sides = [
+                side for side in ("base", "current") if side not in queried_sides
+            ]
+            absent_labels = "、".join(
+                "基准侧" if side == "base" else "当前侧"
+                for side in absent_sides
+            )
+            scope_note = (
+                f"本卡片只记录{queried_labels}因产物坐标补全而触发的 Git ref 查询。"
+            )
+            if absent_sides:
+                scope_note += (
+                    f"它不表示{absent_labels}执行过远端查询；"
+                    f"只有{absent_labels}状态明确为 remote_source_resolved，"
+                    "才能认定其远端解析成功。"
+                )
+            payload["ref_resolution_scope"] = {
+                "trigger": "artifact_coordinate_enrichment",
+                "queried_sides": queried_sides,
+                "not_evaluated_sides": absent_sides,
+                "note": scope_note,
+            }
+            checklist_lines = list(payload.get("checklist_lines") or [])
+            if scope_note not in checklist_lines:
+                checklist_lines.insert(0, scope_note)
+            payload["checklist_lines"] = checklist_lines
+            question = str(payload.get("question") or "").strip()
+            if scope_note not in question:
+                payload["question"] = f"{question}{scope_note}"
+            decision_items = []
+            request_by_side = {
+                str(item.get("side") or "").strip(): item
+                for item in requests
+                if str(item.get("side") or "").strip()
+            }
+            for raw_item in payload.get("source_ref_decision_items") or []:
+                item = dict(raw_item or {})
+                request = request_by_side.get(str(item.get("side") or "").strip(), {})
+                item.setdefault("source_project_dir", request.get("source_project_dir"))
+                item.setdefault(
+                    "resolution_trigger",
+                    request.get("resolution_trigger") or "artifact_coordinate_enrichment",
+                )
+                item.setdefault("remote_query_scope", request.get("side"))
+                decision_items.append(item)
+            if decision_items:
+                payload["source_ref_decision_items"] = decision_items
     selection_options = build_interaction_selection_options(payload.get("selection_options") or [])
     selection_resolution = dict(payload.get("selection_resolution") or {})
     if not selection_resolution.get("enabled"):
@@ -5289,7 +5439,10 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
             "selected_targets",
             {
                 "type": "array",
-                "description": "可选。从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。",
+                "description": (
+                    "内部恢复字段，不向用户展示或要求用户填写。"
+                    "系统根据用户回复的依赖名称或完整坐标自动生成。"
+                ),
             },
         )
         payload["selection_resolution"] = selection_resolution
@@ -5366,6 +5519,8 @@ def _user_field_label(field):
         "modules": "模块列表",
         "base_branch": "基准分支",
         "current_branch": "当前分支",
+        "base_source_project_dir": "基准侧源码仓库目录",
+        "current_source_project_dir": "当前侧源码仓库目录",
         "base_artifact_path": "升级前构建产物",
         "current_artifact_path": "升级后构建产物",
         "jdk_base": "升级前 JDK 版本",
@@ -5416,7 +5571,7 @@ def _user_field_description(field, meta=None):
         "dependency_git_ref_overrides": "当依赖版本无法自动匹配 git ref 时，显式给出 old_ref/new_ref。",
         "dependency_git_ref_selections": "从当前决策卡中按依赖选择方案编号。",
         "source_ref_selections": "从当前决策卡中按 base/current 侧选择源码 ref 方案。",
-        "retry_remote_fetch": "仅重试已经按错误类型完成自动尝试的远端查询或 fetch。",
+        "retry_remote_fetch": "确认远端状态已正常后，显式重新查询 ref 并重试定向 fetch。",
         "selected_targets": "从 changed_dependencies.md 的“依赖包”列复制完整坐标。",
         "step5_selected_coords": "只分析这些依赖坐标的系统触达证据。",
         "step5_selected_names": "只分析这些依赖名称的系统触达证据。",
@@ -5447,6 +5602,8 @@ def _humanize_interaction_text(text):
         "step5_selected_coords": "系统触达证据要分析的依赖坐标",
         "step5_selected_names": "系统触达证据要分析的依赖名称",
         "selected_targets": "选择的依赖包",
+        "selection_key": "依赖坐标",
+        "action=continue": "全量分析",
         "restart_step_id": "重跑起始步骤",
         "not_analyzed": "本次未完成分析",
         "allow_degraded=true": "允许降级执行",
@@ -5513,9 +5670,14 @@ def _decision_card_reply_examples(interaction, selection_options, options):
         if any(item.get("pending_kind") not in {"fetch_failed", "remote_query_failed"} for item in git_ref_items):
             examples.append("我直接提供每个依赖的 old_ref/new_ref，并一次性确认后重跑")
     elif selection_options:
-        first_key = selection_options[0].get("coord") or selection_options[0].get("name") or "指定依赖包"
+        visible_targets = [
+            str(item.get("coord") or item.get("name") or "").strip()
+            for item in selection_options[:2]
+            if str(item.get("coord") or item.get("name") or "").strip()
+        ]
         examples.append("全量继续")
-        examples.append(f"只分析 {first_key}")
+        if visible_targets:
+            examples.append("只分析 " + " 和 ".join(visible_targets))
     elif "continue" in option_ids and not required_fields:
         examples.append("继续")
 
@@ -5795,25 +5957,47 @@ def build_user_decision_card(interaction):
                     )
         else:
             lines.append("- 当前没有符合高优先级规则的候选依赖包。")
-        lines.append("3. 从全部变化依赖中选择部分范围")
+        displayed_candidates = selection_options[:20]
+        lines.append(
+            f"- 可直接选择的依赖（展示 {len(displayed_candidates)} / {total_candidates} 个；"
+            "直接回复依赖名称或完整坐标）："
+        )
+        lines.append("| 依赖包 | 变化 API 数 | 高风险 API 数 |")
+        lines.append("|---|---:|---:|")
+        for item in displayed_candidates:
+            lines.append(
+                f"| `{item.get('coord') or item.get('name') or ''}` | "
+                f"{item.get('api_count') or 0} | {item.get('high_risk_api_count') or 0} |"
+            )
+        visible_targets = [
+            str(item.get("coord") or item.get("name") or "").strip()
+            for item in displayed_candidates[:2]
+            if str(item.get("coord") or item.get("name") or "").strip()
+        ]
+        if visible_targets:
+            lines.append("- 直接回复，例如：只分析 " + " 和 ".join(visible_targets))
+        if total_candidates > len(displayed_candidates):
+            remaining = total_candidates - len(displayed_candidates)
+            lines.append(f"- 还有 {remaining} 个候选未在卡片中展示。")
         if full_candidate_file:
             lines.append(
-                f"- 打开 `{full_candidate_file}`；这里列出了全部 {total_candidates} 个候选依赖包。"
+                f"- 完整依赖选择清单：`{full_candidate_file}`。"
             )
-        else:
-            lines.append(f"- 打开完整依赖包清单；这里列出了全部 {total_candidates} 个候选依赖包。")
-        lines.append("- 查看“部分分析优先项”“依赖包”“高风险 API 数”和“为什么先看”。")
-        lines.append("- 复制“依赖包”列中的完整坐标，可同时复制多个依赖包。")
-        first_coord = str(
-            selection_options[0].get("coord") or selection_options[0].get("name") or ""
-        ).strip()
-        if first_coord:
-            lines.append(f"- 直接回复，例如：只分析 {first_coord}")
+            lines.append(
+                "- 该文件不是普通复核材料；需要选择未展示的依赖时，"
+                "从“依赖包”列复制名称或完整坐标，然后直接回复“只分析 …”。"
+            )
 
     if options:
         primary_options = [
             option for option in options
-            if str(option.get("id") or "").strip() != "restart_from_step"
+            if (
+                str(option.get("id") or "").strip() != "restart_from_step"
+                and not (
+                    selection_options
+                    and str(option.get("id") or "").strip() == "continue"
+                )
+            )
         ]
         advanced_options = [
             option for option in options
@@ -5838,7 +6022,13 @@ def build_user_decision_card(interaction):
     if files_to_review:
         lines.append("完整候选或证据文件：")
         for path in files_to_review:
-            lines.append(f"- `{path}`")
+            if selection_options and str(path).endswith("changed_dependencies.md"):
+                lines.append(
+                    f"- 完整依赖选择清单：`{path}`"
+                    "（包含未展示候选；部分分析时从“依赖包”列选择）"
+                )
+            else:
+                lines.append(f"- `{path}`")
 
     checklist_lines = [
         _humanize_interaction_text(item).strip()
@@ -5914,11 +6104,14 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
     next_action_rule = interaction.get("next_action_rule")
     resume_examples = interaction.get("resume_command_examples", []) or []
     task_name = USER_TASK_NAMES.get(str(interaction.get("step_id") or "").lower(), interaction.get("title") or "当前分析")
+    user_decision_card = list(
+        interaction.get("user_decision_card") or build_user_decision_card(interaction)
+    )
     if human_enabled:
         sys.stderr.write("\n")
         sys.stderr.write("【分析已暂停，等待你的确认】\n")
         sys.stderr.write(f"当前任务：{task_name}\n")
-        for line in build_user_decision_card(interaction):
+        for line in user_decision_card:
             sys.stderr.write(f"{line}\n")
     missing_inputs = interaction.get("missing_inputs", []) or []
     fallback_inputs = interaction.get("fallback_inputs", []) or []
@@ -5942,6 +6135,7 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
                 "step_id": interaction.get("step_id"),
                 "title": interaction.get("title"),
                 "question": interaction.get("question"),
+                "user_decision_card": user_decision_card,
                 "reason_code": interaction.get("reason_code"),
                 "summary": interaction.get("summary"),
                 "options": interaction.get("options", []),
@@ -6440,11 +6634,16 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         )
         for item in selection_options[:10]:
             checklist_lines.append(
-                f"  - {item.get('selection_key')} | {item.get('coord')} | "
-                f"changed_api_count={item.get('api_count')} | high_risk_api_count={item.get('high_risk_api_count') or 0}"
+                f"  - 可选择 `{item.get('coord') or item.get('name')}`："
+                f"变化 API {item.get('api_count') or 0}，"
+                f"高风险 API {item.get('high_risk_api_count') or 0}"
             )
         if target_summary.get("available_target_count", 0) > 10:
-            checklist_lines.append("  - 其余候选请查看 evidence/api_changes/changed_dependencies.md；复制“依赖包”列中的完整坐标即可选择")
+            checklist_lines.append(
+                "  - 未展示候选位于完整依赖选择清单 "
+                "evidence/api_changes/changed_dependencies.md；"
+                "从“依赖包”列取得名称或完整坐标后，直接回复“只分析 …”"
+            )
         existing_selection = build_step5_selection_summary(
             available_rows,
             selected_coords=(run_context or {}).get("step5_selected_coords"),
@@ -6633,7 +6832,10 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             "selected_targets",
             {
                 "type": "array",
-                "description": "可选。定向分析时，从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。",
+                "description": (
+                    "内部恢复字段，不向用户展示或要求用户填写。"
+                    "系统根据用户回复的依赖名称或完整坐标自动生成。"
+                ),
             },
         )
     if step_id == "step2":
@@ -6686,7 +6888,10 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             "selected_targets",
             {
                 "type": "array",
-                "description": "可选。定向分析时，从 changed_dependencies.md 的“依赖包”列复制一个或多个完整坐标。",
+                "description": (
+                    "内部恢复字段，不向用户展示或要求用户填写。"
+                    "系统根据用户回复的依赖名称或完整坐标自动生成。"
+                ),
             },
         )
     for field in interaction_meta.get("required_fields", []) or []:
@@ -6761,7 +6966,9 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
     runtime_view.update(run_context or {})
     payload = apply_interaction_protocol_enhancements(payload, step_id, project_dir=project_dir, report_dir=report_dir)
-    return annotate_dependency_source_dirs_interaction(payload, runtime_view, report_dir)
+    payload = annotate_dependency_source_dirs_interaction(payload, runtime_view, report_dir)
+    payload["user_decision_card"] = build_user_decision_card(payload)
+    return payload
 
 
 def option_ids(interaction):
@@ -7030,7 +7237,20 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             raise StepError(f"当前检查点要求字段 {field} 必填，不能为空。")
     action_requirements = dict(pending_interaction.get("action_requirements") or {})
     requirement = dict(action_requirements.get(action) or {})
+    retry_remote_fetch = user_response.get("retry_remote_fetch") is True
+    step1_remote_retry_fields = {
+        str(item.get("field") or "").strip()
+        for item in (pending_interaction.get("ref_resolution_requests") or [])
+        if item.get("status") in {"fetch_failed", "not_found", "ref_moved"}
+        if str(item.get("field") or "").strip()
+    }
     for field in requirement.get("required_fields") or []:
+        if (
+            step_id == "step1"
+            and retry_remote_fetch
+            and field in step1_remote_retry_fields
+        ):
+            continue
         if not _response_value_present(user_response.get(field)):
             raise StepError(f"当前动作 {action} 要求字段 {field} 必填，不能为空。")
     if step_id == "step1" and action == "confirm_local_source":
@@ -7045,21 +7265,20 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             if user_response.get(field) is not True:
                 raise StepError(f"当前动作 confirm_local_source 要求 {field}=true，不能隐式确认本地源码。")
     if step_id == "step1" and action == "continue" and pending_interaction.get("ref_resolution_requests"):
-        retry_remote_fetch = user_response.get("retry_remote_fetch") is True
-        fetch_failed_sides = {
+        remote_retry_sides = {
             str(item.get("side") or "")
             for item in (pending_interaction.get("ref_resolution_requests") or [])
-            if item.get("status") == "fetch_failed"
+            if item.get("status") in {"fetch_failed", "not_found", "ref_moved"}
         }
         for request in pending_interaction.get("ref_resolution_requests") or []:
             side = str(request.get("side") or "")
             field = str(request.get("field") or "").strip()
-            if request.get("status") == "fetch_failed" and retry_remote_fetch:
+            if retry_remote_fetch and side in remote_retry_sides:
                 continue
             if field and not str(user_response.get(field) or "").strip():
                 raise StepError(f"Step1 请一次性处理全部待确认侧；本次仍缺少：{field}")
-        if retry_remote_fetch and not fetch_failed_sides:
-            raise StepError("当前 Step1 确认项中没有可直接重试的 fetch 失败侧。")
+        if retry_remote_fetch and not remote_retry_sides:
+            raise StepError("当前 Step1 确认项中没有可显式重查的远端 ref 失败侧。")
     step5_missing_source_rerun = (
         step_id == "step5"
         and reason_code == "step5_dependency_source_mapping_missing"
@@ -7093,13 +7312,27 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         "step1_dirty_local_source_confirmation_required",
     } and action == "continue":
         for request in pending_interaction.get("ref_resolution_requests") or []:
+            side = str(request.get("side") or "").strip()
             field = str(request.get("field") or "").strip()
             previous = str(request.get("requested_ref") or "").strip()
             current = str(user_response.get(field) or "").strip()
-            if field and previous and current == previous:
+            source_field = f"{side}_source_project_dir"
+            previous_source = str(request.get("source_project_dir") or "").strip()
+            current_source = str(user_response.get(source_field) or "").strip()
+            source_changed = bool(
+                current_source and current_source != previous_source
+            )
+            if (
+                field
+                and previous
+                and current == previous
+                and not source_changed
+                and user_response.get("retry_remote_fetch") is not True
+            ):
                 raise StepError(
                     f"{field}={current} 已经解析失败或存在歧义；"
-                    "必须补充不同的明确 ref/commit，不能用相同输入重复执行 Step1。"
+                    f"必须补充不同的明确 ref/commit，或修正 {source_field}，"
+                    "不能用完全相同的输入重复执行 Step1。"
                 )
 
     if step5_missing_source_rerun:
@@ -7991,6 +8224,8 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             runtime_observability_dir(report_dir) / "step1_timing.csv",
             build_provenance_path(report_dir),
             step1_artifacts_dir(report_dir),
+            step1_dependency_jars_manifest_path(report_dir),
+            step1_dependency_jars_dir(report_dir),
         ],
         "step2": [
             step2_context_path(report_dir),
@@ -8275,19 +8510,10 @@ def main(argv=None, _skip_environment_contract=False):
         ap.error("--step 是必填参数；若只想读取前置协议，请改用 --describe-step1-contract")
 
     project_dir = Path(args.project_dir).resolve()
-    selected_build_tool = args.tool or detect_build_tool(project_dir)
     environment = (
         {"status": "passed", "checks": []}
         if _skip_environment_contract
-        else (
-            contract_payload(require_maven=True)
-            if selected_build_tool == "maven"
-            else contract_payload(
-                require_maven=False,
-                require_gradle=True,
-                project_dir=project_dir,
-            )
-        )
+        else contract_payload()
     )
     if environment["status"] != "passed":
         for line in build_environment_block_message(environment):
@@ -8303,6 +8529,18 @@ def main(argv=None, _skip_environment_contract=False):
     main_state = load_main_state(report_dir, manifest_path=args.manifest)
     manifest_data, manifest_steps = load_manifest(args.manifest)
     pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
+    if pending_interaction:
+        enhanced_pending_interaction = apply_interaction_protocol_enhancements(
+            pending_interaction,
+            str(pending_interaction.get("step_id") or ""),
+            project_dir=project_dir,
+            report_dir=report_dir,
+        )
+        if enhanced_pending_interaction != pending_interaction:
+            pending_interaction = enhanced_pending_interaction
+            main_state["state"]["pending_interaction"] = dict(pending_interaction)
+            save_main_state(report_dir, main_state)
+            save_interaction_file(report_dir, pending_interaction)
     structured_user_response = None
     has_structured_response = bool(args.response_json or args.response_file)
     if has_structured_response:

@@ -62,6 +62,7 @@ from pipeline_constants import (
     RUNTIME_DIRNAME,
     RUNTIME_OBSERVABILITY_DIRNAME,
     RUNTIME_STATE_DIRNAME,
+    STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
 )
 from signature_utils import normalize_signature_for_lookup
 from data_contract_analysis import compare_jar_data_contracts
@@ -102,6 +103,14 @@ _CHANGE_TYPE_LABELS = {
     "DATA_FIELD_REMOVED": "DTO 字段删除",
     "DATA_FIELD_TYPE_CHANGED": "DTO 字段类型变化",
 }
+
+
+def require_safe_dependency_jar(path):
+    return require_safe_archive(
+        path,
+        inspect_nested_archives=False,
+        allow_duplicate_maven_metadata=True,
+    )
 
 _SYMBOL_KIND_LABELS = {
     "method": "方法",
@@ -604,66 +613,50 @@ def _resolve_step4_side_coord(row, side, fallback_coord=""):
     return side_coord or str(fallback_coord or row.get("coord") or "").strip()
 
 
-def _safe_artifact_entry_filename(entry_name):
-    raw = str(entry_name or "").replace("\\", "/").strip("/")
-    safe = re.sub(r"[^A-Za-z0-9._/-]+", "_", raw).replace("/", "__")
-    return safe or "unknown.jar"
-
-
 class Step1ArtifactJarResolver:
-    """Resolve dependency jars exclusively from the Step1 final build artifacts.
-
-    Step1 records the final deployable artifact and each packaged lib entry.  Reusing those
-    nested jars keeps Step4 aligned with the exact artifacts that successfully built, and avoids
-    substituting a different jar from a developer's local Maven repository.
-    """
+    """Resolve dependency jars exclusively from the JARs materialized by Step1."""
 
     def __init__(self, report_dir, output_dir):
         self.report_dir = Path(report_dir or ".").resolve()
         self.output_dir = Path(output_dir or ".").resolve()
-        self.cache_dir = self.output_dir / "step4_artifact_jars"
         self._load_failure = None
         self._entry_failures = {}
-        self.sides = self._load_sides()
+        self._manifest_loaded = False
+        self._manifest_index = {}
+        self._load_manifest()
         self._entry_cache = {}
 
-    def _load_sides(self):
-        provenance_path = self.report_dir / "dependencies" / "build_provenance.json"
-        if not provenance_path.is_file():
+    def _load_manifest(self):
+        manifest_path = (
+            self.report_dir / "dependencies"
+            / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
+        )
+        if not manifest_path.is_file():
             self._load_failure = {
-                "reason_code": "STEP1_BUILD_PROVENANCE_MISSING",
-                "message": "Step1 构建产物来源记录不存在",
-                "provenance_path": str(provenance_path),
+                "reason_code": "STEP1_DEPENDENCY_JARS_MANIFEST_MISSING",
+                "message": "Step1 变化依赖 JAR 清单不存在",
+                "manifest_path": str(manifest_path),
             }
-            return {}
+            return
         try:
-            data = json.loads(provenance_path.read_text(encoding="utf-8"))
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             self._load_failure = {
-                "reason_code": "STEP1_BUILD_PROVENANCE_UNREADABLE",
-                "message": "Step1 构建产物来源记录无法读取",
-                "provenance_path": str(provenance_path),
+                "reason_code": "STEP1_DEPENDENCY_JARS_MANIFEST_UNREADABLE",
+                "message": "Step1 变化依赖 JAR 清单无法读取",
+                "manifest_path": str(manifest_path),
                 "error_type": type(exc).__name__,
                 "error": str(exc)[:300],
             }
-            return {}
-        sides = {}
-        for item in data.get("sides") or []:
-            side = str(item.get("side") or "").strip()
-            artifact_path = str(item.get("artifact_path") or "").strip()
-            if not side or not artifact_path:
+            return
+        self._manifest_loaded = True
+        for item in data.get("items") or []:
+            if not isinstance(item, dict):
                 continue
-            artifact = Path(artifact_path)
-            if not artifact.is_file():
-                retained_name = Path(artifact_path).name
-                retained = self.report_dir / "s1_artifacts" / retained_name
-                if retained.is_file():
-                    artifact = retained
-            if artifact.is_file():
-                record = dict(item)
-                record["artifact_path"] = str(artifact)
-                sides[side] = record
-        return sides
+            side = str(item.get("side") or "").strip()
+            lib_entry = str(item.get("lib_entry") or "").replace("\\", "/").strip()
+            if side and lib_entry:
+                self._manifest_index[(side, lib_entry)] = dict(item)
 
     def resolve_for_row(self, row, side):
         row = row or {}
@@ -692,80 +685,82 @@ class Step1ArtifactJarResolver:
                 "lib_entry": lib_entry,
                 **self._load_failure,
             }
-        side_meta = self.sides.get(side) or {}
-        artifact_path = str(side_meta.get("artifact_path") or "")
-        if not artifact_path:
-            return {
-                "source": "step1_final_artifact",
+        if self._manifest_loaded:
+            return dict(self._entry_failures.get((side, lib_entry)) or {
+                "source": "step1_retained_dependency_jar",
                 "side": side,
                 "lib_entry": lib_entry,
-                "reason_code": "FINAL_ARTIFACT_SIDE_UNAVAILABLE",
-                "message": f"Step1 留存的 {side} 最终制品不可用",
-            }
-        key = (side, artifact_path, lib_entry)
-        return dict(self._entry_failures.get(key) or {
-            "source": "step1_final_artifact",
+                "reason_code": "STEP1_DEPENDENCY_JAR_NOT_RETAINED",
+                "message": "Step1 未留存该变化依赖 JAR",
+            })
+        return {
+            "source": "step1_retained_dependency_jar",
             "side": side,
-            "artifact_path": artifact_path,
             "lib_entry": lib_entry,
-            "reason_code": "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
-            "message": "最终制品内依赖 JAR 证据缺失",
-        })
+            "reason_code": "STEP1_DEPENDENCY_JARS_MANIFEST_MISSING",
+            "message": "Step1 变化依赖 JAR 清单不存在",
+        }
 
     def resolve_entry(self, side, lib_entry):
-        side_meta = self.sides.get(side) or {}
-        artifact_path = side_meta.get("artifact_path")
-        if not artifact_path or not lib_entry:
-            return None
-        key = (side, artifact_path, lib_entry)
-        if key in self._entry_cache:
-            cached = self._entry_cache[key]
-            return dict(cached) if cached else None
-        artifact = Path(artifact_path)
-        target = self.cache_dir / side / _safe_artifact_entry_filename(lib_entry)
-        try:
-            require_safe_archive(artifact)
-            with zipfile.ZipFile(artifact) as zf:
-                names = set(zf.namelist())
-                if lib_entry not in names:
-                    self._entry_failures[key] = {
-                        "source": "step1_final_artifact",
-                        "side": side,
-                        "artifact_path": str(artifact),
-                        "lib_entry": lib_entry,
-                        "reason_code": "FINAL_ARTIFACT_LIB_ENTRY_NOT_FOUND",
-                        "message": "Step1 记录的依赖 JAR 条目不在最终制品中",
-                    }
-                    self._entry_cache[key] = None
-                    return None
-                target.parent.mkdir(parents=True, exist_ok=True)
-                info = zf.getinfo(lib_entry)
-                if not target.exists() or target.stat().st_size != info.file_size:
-                    with zf.open(info) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-        except (OSError, ValueError, zipfile.BadZipFile, KeyError) as exc:
-            self._entry_failures[key] = {
-                "source": "step1_final_artifact",
-                "side": side,
-                "artifact_path": str(artifact),
-                "lib_entry": lib_entry,
-                "reason_code": "FINAL_ARTIFACT_JAR_EXTRACTION_FAILED",
-                "message": "无法从最终制品提取依赖 JAR",
-                "error_type": type(exc).__name__,
-                "error": str(exc)[:300],
+        if self._manifest_loaded:
+            key = (side, lib_entry)
+            if key in self._entry_cache:
+                cached = self._entry_cache[key]
+                return dict(cached) if cached else None
+            item = dict(self._manifest_index.get(key) or {})
+            if not item:
+                self._entry_failures[key] = {
+                    "source": "step1_retained_dependency_jar",
+                    "side": side,
+                    "lib_entry": lib_entry,
+                    "reason_code": "STEP1_DEPENDENCY_JAR_NOT_RETAINED",
+                    "message": "Step1 未留存该变化依赖 JAR",
+                }
+                self._entry_cache[key] = None
+                return None
+            retained_path = Path(str(item.get("retained_path") or ""))
+            expected_sha = str(item.get("nested_jar_sha256") or "").strip()
+            if not retained_path.is_file():
+                self._entry_failures[key] = {
+                    **item,
+                    "source": "step1_retained_dependency_jar",
+                    "reason_code": "STEP1_DEPENDENCY_JAR_MISSING",
+                    "message": "Step1 留存的变化依赖 JAR 不存在",
+                }
+                self._entry_cache[key] = None
+                return None
+            if not expected_sha or sha256_file(retained_path) != expected_sha:
+                self._entry_failures[key] = {
+                    **item,
+                    "source": "step1_retained_dependency_jar",
+                    "reason_code": "STEP1_DEPENDENCY_JAR_SHA_MISMATCH",
+                    "message": "Step1 留存的变化依赖 JAR SHA-256 不一致",
+                }
+                self._entry_cache[key] = None
+                return None
+            try:
+                require_safe_dependency_jar(retained_path)
+            except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                self._entry_failures[key] = {
+                    **item,
+                    "source": "step1_retained_dependency_jar",
+                    "reason_code": "STEP1_DEPENDENCY_JAR_UNSAFE",
+                    "message": "Step1 留存的变化依赖 JAR 无法安全读取",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:300],
+                }
+                self._entry_cache[key] = None
+                return None
+            evidence = {
+                **item,
+                "path": str(retained_path),
+                "source": "step1_retained_dependency_jar",
+                "artifact_path": str(item.get("outer_artifact_path") or ""),
+                "artifact_sha256": str(item.get("outer_artifact_sha256") or ""),
             }
-            self._entry_cache[key] = None
-            return None
-        evidence = {
-            "path": str(target),
-            "source": "step1_final_artifact",
-            "side": side,
-            "artifact_path": str(artifact),
-            "artifact_sha256": str(side_meta.get("artifact_sha256") or ""),
-            "lib_entry": lib_entry,
-        }
-        self._entry_cache[key] = dict(evidence)
-        return evidence
+            self._entry_cache[key] = dict(evidence)
+            return evidence
+        return None
 
 
 _REPO_REFS_CACHE = {}
@@ -986,7 +981,11 @@ def _cached_maven_coord_locations(repo_path, cache):
     """Infer repository coordinates once per lexical absolute repository path."""
     cache_key = os.path.normcase(os.path.abspath(str(repo_path or "")))
     if cache_key not in cache:
-        cache[cache_key] = infer_maven_coord_locations(cache_key)
+        cache[cache_key] = infer_maven_coord_locations(
+            cache_key,
+            max_poms=120,
+            max_depth=4,
+        )
     return cache[cache_key]
 
 
@@ -2007,7 +2006,6 @@ def auto_install_japicmp(japicmp_jar, timeout=DEFAULT_FETCH_TIMEOUT):
     cmd = mvn_cmd() + [
         "dependency:get",
         f"-Dartifact={DEFAULT_JAPICMP_COORD}",
-        "--no-transfer-progress",
         "-q",
     ]
     print(
@@ -2063,7 +2061,7 @@ def write_japicmp_preflight_details(output_dir, japicmp_jar, install_error, plan
 
 def _jar_class_hash_map(jar_path: str) -> dict:
     m = {}
-    require_safe_archive(jar_path)
+    require_safe_dependency_jar(jar_path)
     with zipfile.ZipFile(jar_path) as zf:
         for entry in zf.namelist():
             if not entry.endswith(".class"):
@@ -2108,7 +2106,7 @@ def _jar_class_variant_hash_map(jar_path):
     """Return one aggregate hash per logical class, including MR-JAR variants."""
     variants = defaultdict(list)
     multi_release_enabled = False
-    require_safe_archive(jar_path)
+    require_safe_dependency_jar(jar_path)
     with zipfile.ZipFile(jar_path) as archive:
         try:
             manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
@@ -2451,7 +2449,7 @@ def collect_data_contract_changes(
 
 
 def _iter_jar_class_entries(jar_path):
-    require_safe_archive(jar_path)
+    require_safe_dependency_jar(jar_path)
     with zipfile.ZipFile(jar_path) as zf:
         for entry in sorted(zf.namelist()):
             if not entry.endswith('.class') or entry.startswith('META-INF/'):
@@ -2481,7 +2479,7 @@ def _write_runtime_provider_set_jar(paths):
     seen = set()
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as target:
         for path in normalized:
-            require_safe_archive(path)
+            require_safe_dependency_jar(path)
             with zipfile.ZipFile(path) as source:
                 for name in sorted(source.namelist()):
                     if not name.endswith('.class') or name.startswith('META-INF/') or name in seen:
@@ -6399,20 +6397,9 @@ def main():
         dep['coord'] for dep in ctx.get('changed_dependencies', []) if dep.get('coord')
     }
 
-    # “版本未变”只表示 Maven 坐标没有变化，不能证明依赖源码/制品内容未变。
-    # 当 base/current 是不同源码 ref 且存在依赖源码映射时，仍需执行 git diff，
-    # 以免漏掉未改版本号的方法体行为变化。相同 ref 则没有必要重复扫描。
-    source_refs_differ = source_refs_have_different_commits(
-        args.source_revisions or args.source_branches,
-        os.getcwd(),
-    )
     analysis_dep_rows = [
         row for row in dep_rows
         if str(row.get('change_type') or '').strip() != '未变'
-        or (
-            source_refs_differ
-            and str(row.get('coord') or '').strip() in dependency_paths
-        )
     ]
     compute_changed_classes_enabled = (not args.skip_changed_classes) and len(analysis_dep_rows) <= 200
     if not compute_changed_classes_enabled:

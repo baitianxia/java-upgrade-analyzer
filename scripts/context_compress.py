@@ -23,7 +23,7 @@ context_compress.py — 主动上下文压缩
     --input .upgrade-report/context_summary.json
 """
 
-import argparse, csv, json, os, sys
+import argparse, csv, json, os, shlex, sys
 from pathlib import Path
 from datetime import datetime
 
@@ -575,8 +575,21 @@ def main():
         next_label = ckpt.get('current_step', 'done')
         print(f"   已完成 {completed_label}，下一步是 {next_label}",
               file=sys.stderr)
-        print(f"   在新对话中运行：python3 context_compress.py load --input {args.output}",
-              file=sys.stderr)
+        resume_args = [
+            "python" if sys.platform == "win32" else "python3",
+            "context_compress.py",
+            "load",
+            "--input",
+            args.output,
+        ]
+        if sys.platform == "win32":
+            resume_command = "& " + " ".join(
+                "'" + str(value).replace("'", "''") + "'"
+                for value in resume_args
+            )
+        else:
+            resume_command = shlex.join(resume_args)
+        print(f"   在新对话中运行：{resume_command}", file=sys.stderr)
 
     elif args.cmd == 'load':
         display_checkpoint(args.input)

@@ -88,7 +88,9 @@ Claude Code 会负责：
 说明：
 
 - 标准 Maven / Gradle 结构下，业务系统源码路径通常不需要你提供，Skill 会从 reactor 或 Gradle project graph 推断。
+- Maven 项目优先使用对应 base/current revision 内的 `mvnw` / `mvnw.cmd`，没有 Wrapper 时才使用系统 `mvn`；分析器不规定 Maven 最低版本。
 - Gradle 项目同时支持 Groovy DSL 与 Kotlin DSL；优先使用仓库内 `gradlew` / `gradlew.bat`，没有 Wrapper 时才使用系统 `gradle`。多模块选择既可写 `app`，也可写 `:app`。
+- JDK、Maven、Gradle 均以用户工程为准。base/current 可分别使用不同 JDK；实际工具链不兼容时按真实构建命令失败原因阻塞，不会因分析器预设版本白名单提前拒绝。
 - Gradle 自动构建执行目标模块的 `build -x test`，缺失嵌套 JAR 坐标时读取 `runtimeClasspath`；和 Maven 一样，最终依赖版本与内容仍以实际 fat JAR / boot JAR / WAR 为准。thin JAR 本身不包含运行时依赖，不能作为正式比较结果。
 - 依赖源码输入指的是依赖包自己的源码仓库，不是当前业务系统源码路径。既可以填写本地目录，也可以直接填写 HTTPS/SSH Git 地址；远端仓库会克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/`，不会切换或修改用户工作区。
 - Git 克隆复用当前环境已有的 SSH key 或 Git 凭据配置，并禁用交互式密码提示；地址不可达或无权限时会明确停止，不会把失败仓库当成有效源码继续分析。

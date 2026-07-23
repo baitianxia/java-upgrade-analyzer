@@ -580,8 +580,7 @@ def resolve_maven_jdk_from_effective_model(branch, work_dir, pom_relpath='pom.xm
             root_dir = Path(tmp)
             pom_path = root_dir / pom_relpath
             eval_cwd = str(pom_path.parent if pom_path.exists() else root_dir)
-            wrapper = root_dir / 'mvnw'
-            mvn = [str(wrapper)] if wrapper.exists() else mvn_cmd()
+            mvn = mvn_cmd(root_dir)
             for expr in ('maven.compiler.release', 'maven.compiler.target', 'maven.compiler.source'):
                 stdout, stderr, rc = run_cmd(
                     mvn + ['-q', 'help:evaluate', f'-Dexpression={expr}', '-DforceStdout'],

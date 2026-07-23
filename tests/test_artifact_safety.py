@@ -92,6 +92,47 @@ class ArtifactSafetyTest(unittest.TestCase):
         self.assertIn("ARCHIVE_NESTED_DEPTH_EXCEEDED", depth_result.reason_codes)
         self.assertIn("ARCHIVE_ENTRY_COUNT_EXCEEDED", count_result.reason_codes)
 
+    def test_dependency_jar_shallow_scan_allows_duplicate_maven_metadata(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            dependency = _archive_bytes([
+                (
+                    "META-INF/maven/com.example/demo/pom.properties",
+                    b"groupId=com.example\nartifactId=demo\nversion=1.0\n",
+                ),
+                (
+                    "META-INF/maven/com.example/demo/pom.properties",
+                    b"groupId=com.example\nartifactId=demo\nversion=1.0\n",
+                ),
+                ("com/example/Demo.class", b"class"),
+            ])
+        outer = _archive_bytes([("BOOT-INF/lib/demo-1.0.jar", dependency)])
+
+        result = artifact_safety.inspect_archive_bytes(
+            outer,
+            inspect_nested_archives=False,
+            allow_duplicate_maven_metadata=True,
+        )
+
+        self.assertTrue(result.safe)
+        self.assertEqual(result.max_observed_depth, 0)
+
+    def test_duplicate_classes_remain_blocking_when_maven_metadata_is_allowed(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            dependency = _archive_bytes([
+                ("com/example/Demo.class", b"one"),
+                ("com/example/Demo.class", b"two"),
+            ])
+
+        result = artifact_safety.inspect_archive_bytes(
+            dependency,
+            inspect_nested_archives=False,
+            allow_duplicate_maven_metadata=True,
+        )
+
+        self.assertIn("ARCHIVE_DUPLICATE_ENTRY", result.reason_codes)
+
     def test_runtime_catalog_fails_closed_before_reading_unsafe_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp)

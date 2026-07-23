@@ -62,6 +62,27 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["resolved_commit"], self.current_commit)
         self.assertEqual(result["resolution_mode"], "live_remote")
 
+    def test_base_and_current_refs_resolve_sequentially_from_same_repo(self):
+        self.add_remote(
+            "origin",
+            {
+                "nbs-base": self.base_commit,
+                "nbs-mid26.07.22.DEV": self.current_commit,
+            },
+        )
+
+        base = resolve_remote_source_ref(self.repo, "nbs-base")
+        current = resolve_remote_source_ref(
+            self.repo,
+            "nbs-mid26.07.22.DEV",
+        )
+
+        self.assertEqual(base["status"], "remote_source_resolved")
+        self.assertEqual(base["resolved_commit"], self.base_commit)
+        self.assertEqual(current["status"], "remote_source_resolved")
+        self.assertEqual(current["resolved_commit"], self.current_commit)
+        self.assertEqual(current["remote"], "origin")
+
     def test_explicit_remote_ref_only_matches_requested_remote(self):
         self.add_remote("origin", {"release": self.base_commit})
         self.add_remote("upstream", {"release": self.current_commit})

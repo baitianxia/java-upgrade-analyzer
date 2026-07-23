@@ -6,12 +6,16 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
-import resource
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping, Optional
+
+try:
+    import resource as _resource
+except ImportError:  # The stdlib resource module is unavailable on Windows.
+    _resource = None
 
 
 _MIB = 1024.0 * 1024.0
@@ -19,6 +23,21 @@ _MIB = 1024.0 * 1024.0
 
 class Step5ResourceBudgetExceeded(RuntimeError):
     """Raised after an observed hard limit is crossed, before more work starts."""
+
+
+def _process_cpu_seconds():
+    """Return cumulative self/child CPU seconds with a portable self fallback."""
+    if _resource is not None:
+        try:
+            self_usage = _resource.getrusage(_resource.RUSAGE_SELF)
+            child_usage = _resource.getrusage(_resource.RUSAGE_CHILDREN)
+            return (
+                float(self_usage.ru_utime + self_usage.ru_stime),
+                float(child_usage.ru_utime + child_usage.ru_stime),
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+    return time.process_time(), 0.0
 
 
 def _descendant_totals(processes, root_pid):
@@ -227,10 +246,7 @@ class ProcessTreeObserver:
         if self._thread is not None:
             return self
         self._started_at = time.perf_counter()
-        self_usage = resource.getrusage(resource.RUSAGE_SELF)
-        child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-        self._self_cpu_start = self_usage.ru_utime + self_usage.ru_stime
-        self._child_cpu_start = child_usage.ru_utime + child_usage.ru_stime
+        self._self_cpu_start, self._child_cpu_start = _process_cpu_seconds()
         self._sample_once()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -310,14 +326,9 @@ class ProcessTreeObserver:
 
     def snapshot(self):
         self._sample_once(force_temporary=True)
-        self_usage = resource.getrusage(resource.RUSAGE_SELF)
-        child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-        self_cpu = max(
-            0.0, self_usage.ru_utime + self_usage.ru_stime - self._self_cpu_start
-        )
-        completed_child_cpu = max(
-            0.0, child_usage.ru_utime + child_usage.ru_stime - self._child_cpu_start
-        )
+        self_cpu_total, child_cpu_total = _process_cpu_seconds()
+        self_cpu = max(0.0, self_cpu_total - self._self_cpu_start)
+        completed_child_cpu = max(0.0, child_cpu_total - self._child_cpu_start)
         with self._lock:
             active_wall = sum(
                 max(0.0, time.perf_counter() - started)
@@ -454,11 +465,13 @@ def current_rss_mb(
 
 
 def peak_rss_mb(*, platform_name: Optional[str] = None) -> float:
+    if _resource is None:
+        return 0.0
     try:
-        peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        peak = float(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss)
         divisor = _MIB if (platform_name or platform.system()).lower() == "darwin" else 1024.0
         return round(peak / divisor, 3)
-    except (OSError, TypeError, ValueError):
+    except (AttributeError, OSError, TypeError, ValueError):
         return 0.0
 
 

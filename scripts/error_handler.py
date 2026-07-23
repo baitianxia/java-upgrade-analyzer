@@ -22,18 +22,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+JAVA_LOCATION_COMMAND = 'where java' if os.name == 'nt' else 'command -v java'
+MAVEN_SETTINGS_COMMAND = (
+    'Get-Content "$HOME\\.m2\\settings.xml"'
+    if os.name == 'nt'
+    else 'cat ~/.m2/settings.xml'
+)
+
 # 用户可操作指导
 GUIDANCE = {
     'ENV_MISSING': {
         'maven': {
             'diagnosis': ['mvn --version'],
-            'actions':   ['安装 Maven 3.6+：https://maven.apache.org/download.cgi',
-                          '确认 JAVA_HOME 和 M2_HOME 已设置',
-                          'Windows: 确认 mvn.cmd 在 PATH 中'],
+            'actions':   ['优先确认工程 mvnw / mvnw.cmd 及其 distribution 可用',
+                          '没有 Wrapper 时，确认用户工程所需 Maven 在 PATH 中',
+                          '确认该侧 JAVA_HOME 与工程构建要求一致'],
             'workaround': '修复 Maven 环境后重新执行 Step1，使用 base/current 分支走真实构建',
         },
         'java': {
-            'diagnosis': ['java -version', 'where java'],
+            'diagnosis': ['java -version', JAVA_LOCATION_COMMAND],
             'actions':   ['安装 JDK（非 JRE），确认 java.exe 在 PATH 中'],
         },
         'jdeprscan': {
@@ -51,7 +58,7 @@ GUIDANCE = {
     },
     'ENV_AUTH': {
         'maven_repo': {
-            'diagnosis': ['cat ~/.m2/settings.xml'],
+            'diagnosis': [MAVEN_SETTINGS_COMMAND],
             'actions':   ['检查 settings.xml 中 <server> 的 username/password',
                           '确认已连接 VPN（内网私服）'],
         }

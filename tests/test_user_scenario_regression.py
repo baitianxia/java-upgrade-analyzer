@@ -4,13 +4,52 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "user_scenario_regression.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import user_scenario_regression as scenarios  # noqa: E402
 
 
 class UserScenarioRegressionTest(unittest.TestCase):
+    def test_java_classpath_uses_platform_separator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src"
+            source.mkdir()
+            (source / "Example.java").write_text(
+                "class Example {}\n", encoding="utf-8",
+            )
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr="",
+            )
+            with patch.object(
+                scenarios, "_run", return_value=completed,
+            ) as runner, patch.object(scenarios.os, "pathsep", ";"):
+                scenarios._compile_java(
+                    source,
+                    root / "classes",
+                    [root / "first.jar", root / "second.jar"],
+                )
+
+        command = runner.call_args.args[0]
+        classpath = command[command.index("-cp") + 1]
+        self.assertEqual(
+            classpath,
+            f"{root / 'first.jar'};{root / 'second.jar'}",
+        )
+
+    def test_default_workspace_uses_platform_temp_directory(self):
+        args = scenarios.parse_args([])
+
+        self.assertEqual(
+            Path(args.workspace),
+            Path(tempfile.gettempdir()) / "java-upgrade-user-scenario-regression",
+        )
+
     def test_generated_user_scenarios_pass_and_cover_key_contracts(self):
         with tempfile.TemporaryDirectory() as tmp:
             json_out = Path(tmp) / "result.json"

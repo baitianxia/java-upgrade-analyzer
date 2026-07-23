@@ -1,4 +1,5 @@
 import csv
+import importlib.util
 import json
 import os
 import platform
@@ -204,6 +205,32 @@ class FrameworkSnapshotTest(unittest.TestCase):
 
 
 class Step5MemoryObserverTest(unittest.TestCase):
+    def test_imports_and_runs_when_resource_module_is_unavailable(self):
+        module_path = ROOT_DIR / "scripts" / "step5_memory_observer.py"
+        spec = importlib.util.spec_from_file_location(
+            "step5_memory_observer_without_resource", module_path,
+        )
+        module = importlib.util.module_from_spec(spec)
+        real_import = __import__
+
+        def import_without_resource(name, *args, **kwargs):
+            if name == "resource":
+                raise ImportError("resource is unavailable on Windows")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_without_resource):
+            spec.loader.exec_module(module)
+
+        observer = module.ProcessTreeObserver(
+            platform_name="windows", interval_sec=1,
+        ).start()
+        metrics = observer.stop()
+
+        self.assertFalse(metrics["process_tree_observer_supported"])
+        self.assertGreaterEqual(metrics["self_cpu_sec"], 0.0)
+        self.assertEqual(metrics["child_cpu_sec"], 0.0)
+        self.assertEqual(module.peak_rss_mb(platform_name="windows"), 0.0)
+
     def test_reads_linux_current_rss_without_subprocess(self):
         with tempfile.TemporaryDirectory() as tmp:
             status = Path(tmp) / "status"

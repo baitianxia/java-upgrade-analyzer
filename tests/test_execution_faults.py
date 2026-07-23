@@ -47,6 +47,15 @@ class ExecutionFaultTest(unittest.TestCase):
         self.assertTrue(all(result.after_sha256 for result in results))
         self.assertTrue(all(result.cleanup_complete for result in results))
 
+    def test_permission_fault_uses_portable_owner_write_boundary(self):
+        spec = next(item for item in EXECUTION_FAULTS if item.id == "permission_denied")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_execution_fault(spec, Path(tmp) / spec.id)
+
+        self.assertEqual(result.status, "failed_closed")
+        self.assertEqual(result.reason_code, "EXECUTION_PERMISSION_DENIED")
+        self.assertTrue(result.cleanup_complete)
+
     def test_malformed_or_partial_output_never_becomes_empty_success(self):
         selected = [
             spec for spec in EXECUTION_FAULTS

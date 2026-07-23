@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import json
 import os
@@ -62,7 +63,7 @@ class FinalArtifactOnlyPolicyTest(unittest.TestCase):
             self.assertEqual(details["reason_code"], "BASE_FINAL_ARTIFACT_JAR_EVIDENCE_MISSING")
             self.assertIn("最终制品", error)
 
-    def test_step4_resolver_explains_missing_final_artifact_entry(self):
+    def test_step4_resolver_requires_step1_dependency_jar_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / "evidence"
             dependencies = report / "dependencies"
@@ -82,8 +83,54 @@ class FinalArtifactOnlyPolicyTest(unittest.TestCase):
 
             self.assertIsNone(resolver.resolve_for_row(row, "current"))
             failure = resolver.failure_for_row(row, "current")
-            self.assertEqual(failure["reason_code"], "FINAL_ARTIFACT_LIB_ENTRY_NOT_FOUND")
+            self.assertEqual(
+                failure["reason_code"],
+                "STEP1_DEPENDENCY_JARS_MANIFEST_MISSING",
+            )
             self.assertEqual(failure["lib_entry"], "BOOT-INF/lib/demo-1.0.jar")
+
+    def test_step4_formal_resolver_consumes_step1_retained_dependency_jar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "evidence"
+            dependencies = report / "dependencies"
+            retained_dir = dependencies / "s1_dependency_jars/current"
+            retained_dir.mkdir(parents=True)
+            retained = retained_dir / "demo-1.0.jar"
+            retained.write_bytes(self._nested_jar_bytes([
+                ("com/example/Demo.class", b"class"),
+            ]))
+            lib_entry = "BOOT-INF/lib/demo-1.0.jar"
+            (dependencies / "dependency_jars.json").write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.step1-dependency-jars.v1",
+                    "items": [{
+                        "side": "current",
+                        "coord": "com.example:demo",
+                        "version": "1.0",
+                        "lib_entry": lib_entry,
+                        "retained_path": str(retained),
+                        "nested_jar_sha256": hashlib.sha256(
+                            retained.read_bytes()
+                        ).hexdigest(),
+                        "outer_artifact_path": "/must/not/be/opened.jar",
+                        "outer_artifact_sha256": "outer-sha",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"JUA_ORCHESTRATED": "1"}):
+                resolver = step4.Step1ArtifactJarResolver(
+                    report,
+                    Path(tmp) / "api_changes",
+                )
+                evidence = resolver.resolve_for_row(
+                    {"current_lib_entry": lib_entry},
+                    "current",
+                )
+
+            self.assertEqual(evidence["path"], str(retained))
+            self.assertEqual(evidence["source"], "step1_retained_dependency_jar")
 
     def test_step5_runtime_catalog_does_not_fallback_to_local_maven(self):
         with tempfile.TemporaryDirectory() as tmp:

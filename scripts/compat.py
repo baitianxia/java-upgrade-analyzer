@@ -454,8 +454,16 @@ def find_executable(name):
     return None
 
 
-def mvn_cmd():
-    """返回可用的 Maven 命令（Windows 上是 mvn.cmd）"""
+def mvn_cmd(work_dir=None):
+    """Prefer the project's Maven Wrapper, then fall back to system Maven."""
+    if work_dir is not None:
+        root = Path(work_dir).resolve()
+        wrapper = root / ('mvnw.cmd' if IS_WINDOWS else 'mvnw')
+        if wrapper.is_file():
+            if IS_WINDOWS or os.access(wrapper, os.X_OK):
+                return [str(wrapper)]
+            shell = find_executable('sh') or 'sh'
+            return [shell, str(wrapper)]
     mvn = find_executable('mvn')
     if mvn:
         return [mvn]
@@ -796,7 +804,13 @@ def _looks_like_source_module(module_dir):
     return any((base / marker).is_dir() for marker in source_markers)
 
 
-def infer_maven_coord_locations(project_dir, max_poms=None):
+def infer_maven_coord_locations(
+    project_dir,
+    max_poms=None,
+    *,
+    max_depth=None,
+    target_coords=None,
+):
     normalized_root = resolve_repo_input_path(project_dir)
     if not normalized_root:
         return []
@@ -805,9 +819,18 @@ def infer_maven_coord_locations(project_dir, max_poms=None):
     locations = []
     skip_dirs = {'.git', 'target', 'build', '.gradle', 'out', 'bin', '.idea', '.upgrade-report'}
     count = 0
+    target_coords = {
+        str(item or "").strip()
+        for item in (target_coords or [])
+        if str(item or "").strip()
+    }
 
     def add_location(coord, module_dir, repo_root):
-        if not coord or coord in seen:
+        if (
+            not coord
+            or coord in seen
+            or (target_coords and coord not in target_coords)
+        ):
             return
         seen.add(coord)
         locations.append(
@@ -840,10 +863,16 @@ def infer_maven_coord_locations(project_dir, max_poms=None):
             # probe_root is resolved once above and os.walk() preserves that
             # absolute prefix.  Avoid resolving every directory in the tree.
             current_root = Path(root)
+            try:
+                relative_depth = len(current_root.relative_to(probe_root).parts)
+            except ValueError:
+                relative_depth = 0
             if _is_embedded_resource_fixture_dir(current_root, probe_root):
                 dirs[:] = []
                 continue
-            dirs[:] = [
+            dirs[:] = [] if (
+                max_depth is not None and relative_depth >= max_depth
+            ) else [
                 d for d in dirs
                 if d not in skip_dirs
                 and not _is_embedded_resource_fixture_dir(current_root / d, probe_root)
@@ -866,6 +895,8 @@ def infer_maven_coord_locations(project_dir, max_poms=None):
                 add_location(c, root, repo_root)
                 count += 1
             if max_poms and count >= max_poms:
+                break
+            if target_coords and target_coords.issubset(seen):
                 break
         if max_poms and count >= max_poms:
             break

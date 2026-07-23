@@ -95,6 +95,7 @@ main_state = read(.upgrade-report/.runtime/state/main_state.json if exists)
 
 if main_state.state.status startswith "awaiting_":
     interaction = read(.upgrade-report/.runtime/state/interaction.json)
+    若交互事件提供 user_decision_card，直接以它作为用户卡片，不得根据 response_schema / action_requirements 重新拼接用户说明
     向用户展示决策卡片:
       - 当前需要确认什么
       - 为什么停下
@@ -134,6 +135,9 @@ if gate failed or step blocked:
 4. checkpoint 转述必须先形成用户可读的“决策卡片”：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可以直接怎么回复。
 5. Claude Code 不要把 action_requirements、selection_resolution、response_schema、runtime_rules 作为普通用户的主信息；这些字段只用于构造恢复命令。
 6. Step4 后进入 Step5 的候选对象必须按依赖包维度展示，优先引用 `evidence/api_changes/changed_dependencies.md`，不要要求用户从 `all_changed_apis.csv` 中逐行挑 API。
+7. `selected_targets`、`selection_key`、`action=continue` 等是机器协议，禁止出现在面向用户的决策卡、动作说明和回复示例中。用户只需回复“全量分析”或“只分析 <依赖名称/完整坐标>”，系统负责转换内部字段。
+8. 候选未全部展示时，不能只把 `changed_dependencies.md` 列为“待复核产物”；必须明确说明它是完整依赖选择清单，并指引用户从“依赖包”列取得未展示候选后直接回复。
+9. 若 `JUA_CONFIRMATION_JSON` 提供 `user_decision_card`，必须优先展示该字段；`response_schema`、`selection_resolution`、`selected_targets` 只用于把用户自然语言答复转换成恢复输入。
 
 优先使用统一调度入口 `scripts/run_step.py`。不要要求自己一次记住所有命令；具体命令、参数、产物清单统一按需查看 `RUNBOOK.md`。
 
@@ -160,7 +164,7 @@ if gate failed or step blocked:
 2. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本不等价于完整主状态流程。
 3. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
 
-Step5 必须使用 `tree-sitter` 做 Java AST 分析。正式运行契约为 CPython 3.12.x/3.13.x/3.14.x、Linux/macOS/Windows、JDK 11/17/21，以及 Maven 3.8+ 或 Gradle 7.6+。Gradle 优先使用工程 Wrapper；运行环境必须已具备对应 distribution，分析期间不得联网安装。Python 依赖版本由 `requirements-runtime.txt` 固定。运行时不得联网安装；缺少或版本不符时必须在分析前失败并记录系统环境阻塞，不得伪装成需要用户确认的业务 checkpoint，也不允许继续用增强正则生成分析结论。
+Step5 必须使用 `tree-sitter` 做 Java AST 分析。分析器自身的正式运行契约为 CPython 3.12.x/3.13.x/3.14.x 和 Linux/macOS/Windows，Python 依赖版本由 `requirements-runtime.txt` 固定。JDK、Maven、Gradle 属于用户工程构建环境，不设分析器级版本下限：base/current 各自在隔离 worktree 中优先使用该 revision 的 `mvnw` / `gradlew`，没有 Wrapper 时才回落 PATH；JDK 使用该侧 `base_jdk_home/current_jdk_home`，未提供时回落宿主机 `JAVA_HOME`。Wrapper 对应 distribution 必须已可用，分析期间不得联网替换成其他版本。Python 运行依赖缺少、版本不符或加载失败时必须在分析前失败并记录系统环境阻塞，不得伪装成需要用户确认的业务 checkpoint，也不允许继续用增强正则生成分析结论。
 
 首次准备环境时，在 Skill 根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
 
@@ -405,10 +409,10 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 输入：依赖变更清单、上下文、分支信息、依赖源码目录（推荐字段：`dependency_source_dirs`）
 - 输出：`.upgrade-report/evidence/api_changes/` 与 `all_changed_apis.csv`
 - 重点：JApiCmp XML 是机器解析主证据，stdout 仅用于人读和 XML 失败回退；分别保留 binary/source compatibility，不能把“二进制兼容但源码重编译不兼容”合并掉
-- 规则：Step4 必须且只能复用 Step1 `evidence/dependencies/build_provenance.json` 指向的 base/current 最终构建产物，并按 `evidence/dependencies/dep_changes.csv` 中的 `base_lib_entry/current_lib_entry` 提取真实打包 JAR；最终制品中无法定位时必须输出明确的证据缺失原因，不得回退本地 Maven 仓库或下载同坐标 JAR 替代
+- 规则：Step1 必须把变化依赖的 base/current 内嵌 JAR 一次性提取到 `evidence/dependencies/s1_dependency_jars/`，并在 `dependency_jars.json` 记录 `coord + side + lib_entry + SHA-256 + retained_path`。正式 Step4 只能按该清单直读已固化 JAR，不得重新打开 fat JAR、递归查询嵌套归档、回退本地 Maven 仓库或下载同坐标 JAR；条目缺失或摘要不一致必须由 Step1 门控报错
 - 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应超时；Git fetch 与 JApiCmp 工具安装不得共用一个超时字段
-- 规则：若提供 `dependency_source_dirs`，其中的 Git 地址必须先克隆到报告内部缓存并保留 `origin`，本地目录则原样只读使用；系统随后自动识别模块坐标，再用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref。只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；只有两个以上不同 commit pair、且选择会改变源码 diff 范围的真实歧义才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
+- 规则：依赖坐标只由 Step1 的最终制品条目确定；内嵌 Maven 元数据无法确定坐标时，工程依赖树只用于补齐该条目。源码只能 enrich Step1 已有变化 GAV，不能再次发现依赖或新增同 GAV 行。若提供 `dependency_source_dirs`，模块定位只扫描构建清单一次，必须先按 Step1 变化坐标过滤，并设置深度和文件数上限；禁止递归扫描源码树或多轮嵌套查询。Git 地址先克隆到报告内部缓存并保留 `origin`，本地目录原样只读使用；随后用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref。只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；只有两个以上不同 commit pair、且选择会改变源码 diff 范围的真实歧义才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
 - 规则：Step4 的远端查询失败、fetch 失败、ref 移动、未匹配、远端不可用和未授权本地兜底均属于内部源码证据故障。按错误类型完成受控重试后，不得把修复工作抛给用户，也不得猜测或静默改用本地 ref；应记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并从升级前后最终制品 JAR 对共享变化类执行同签名方法字节码指纹对比，以 `jar_bytecode` 证据补齐 `BEHAVIOR_CHANGED` 候选。只有源码 diff 或最终 JAR 方法字节码兜底至少一项完整时，该依赖的行为变化覆盖才可计为 complete；两者都失败时 `behavior_diff` 必须进入关键覆盖缺口，禁止输出完整或无影响结论。若存在真实 commit pair 歧义，必须在一张决策卡中展示全部待确认依赖；每项给出按稳定顺序排列、按 commit pair 去重的方案编号、升级前/升级后源码分支和 commit 摘要。卡片最多展示 6 个方案时必须标明总数和完整候选文件；用户可以一次回复各依赖的方案编号，也可以直接给 old_ref/new_ref，恢复前必须校验本轮所有待确认依赖均已覆盖
 - 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
 - 门控：`step4` 完成后执行 `jar_compare`
@@ -417,12 +421,12 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 - 对应步骤：`step4` 成功后
 - 当 `changed_dependencies.md/csv` 中存在至少两个候选依赖时必须停下，让用户选择全部分析或只分析所选依赖；0 个候选时 Step5 没有范围可选，1 个候选时“全量”和“选择该候选”等价，均直接继续
-- 全量分析不提供 `selected_targets`；部分分析必须提供 `selected_targets`，系统自动归一化为 `step5_selected_coords` / `step5_selected_names`
+- 面向用户只能表述为“全量分析”或“只分析指定依赖名称/完整坐标”；`selected_targets` 仅由系统在恢复时生成，禁止要求用户理解或填写该内部字段
 - 决策卡必须展示全量依赖数、变化 API 数和高风险 API 数，并说明取舍：全量分析覆盖最完整但耗时可能更长；部分分析降低耗时，但 Step6 结论只能适用于所选依赖，不能表述为全局无影响
 - 真实 commit pair 歧义仍由 Step4 的专用 checkpoint 在耗时分析前处理；内部超时或证据故障记录覆盖缺口后继续，不得作为本范围 checkpoint 的用户修复问题
-- `selection_options` 只反映 Step4 依赖包维度候选；每个候选都应带稳定 `selection_key`
-- `selected_targets` 的解析必须基于完整候选集，允许用户提交合法的 `selection_key` / `coord` / `name`
-- `selected_targets` 若填写 `selection_key` 或 `coord`，调度层必须严格按该唯一目标执行；若只填写 `name`，则按 `artifactId` 名称筛选命中的全部候选
+- `selection_options` 只反映 Step4 依赖包维度候选；内部每个候选都应带稳定 `selection_key`，但用户卡片只展示名称或完整坐标
+- 用户选择的解析必须基于完整候选集；完整坐标严格匹配唯一目标，仅提供依赖名称时按 `artifactId` 名称匹配
+- 候选未全部展示时，卡片必须把 `changed_dependencies.md` 标注为“完整依赖选择清单”，说明从“依赖包”列取得名称或坐标，不能只放在待复核文件列表中
 - 恢复命令模板：
 
 ```bash
@@ -432,11 +436,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --report-dir .upgrade-report \
   --response-json '{"action":"continue","notes":"全量分析全部变化依赖"}'
 
-# 部分分析
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"action":"continue","selected_targets":["coord:com.example:demo-lib"],"notes":"只分析所选依赖"}'
+# 部分分析由系统把用户回复的依赖名称/完整坐标转换成内部恢复字段。
+# 禁止把内部字段名或恢复命令展示给用户。
 ```
 
 - 调度层必须将确认结果写入 `.runtime/cache/step5_selection.json`；Step6 必须据此展示全量/部分范围。范围快照缺失时不得默认宣称全量分析
@@ -457,7 +458,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：依赖源码映射缺失或无法对齐时，不得要求用户显式批准降级；系统应继续使用 current 最终制品中的业务 class 和运行时依赖 JAR 字节码。仍无法补齐的 API 进入 `not_analyzed` 并限制最终结论，用户可在报告完成后自愿补源码重跑
 - 规则：Step5 成功后直接进入 Step6 生成带覆盖边界的最终报告，不生成例行成功确认 checkpoint
 - 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
-- 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256；Step3、Step4、Step5 必须按 `lib_entry` 使用制品中的真实嵌套 JAR，且不得用本地 Maven 仓库副本或重新下载的 JAR 替代最终制品证据
+- 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256，同时固化变化依赖 JAR 清单；Step4 直接消费该清单，Step3/Step5 按各自契约使用最终制品证据。任何步骤都不得用本地 Maven 仓库副本或重新下载的 JAR 替代最终制品证据
 - 规则：最终制品内缺失嵌套 JAR、坐标 unresolved、SHA 不一致或字节码解析失败时，必须记录覆盖缺口；未命中不得解释为无影响，也不得以本地 Maven JAR 填补缺口
 - 规则：依赖源码只有在 Step4 记录包含固定 commit 且来源为 `remote_source_resolved` 或 `user_confirmed_local_source` 时，才允许进入 Step5 增强图；来源未确认、仓库不一致、源码类不在当前最终制品 JAR 中时必须拒绝该源码边并记录覆盖缺口，不能降级成确定无影响
 - 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4

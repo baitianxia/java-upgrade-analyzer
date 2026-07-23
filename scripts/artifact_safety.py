@@ -2,7 +2,7 @@
 """Bounded, fail-closed validation for JAR/WAR/ZIP analysis inputs."""
 
 from dataclasses import dataclass
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 import io
 from pathlib import Path, PurePosixPath
 import re
@@ -43,6 +43,8 @@ def _inspect_archive_source(
     max_expansion_ratio=200,
     max_nested_depth=3,
     max_nested_archive_bytes=64 * 1024 * 1024,
+    inspect_nested_archives=True,
+    allow_duplicate_maven_metadata=False,
 ):
     reasons = set()
     details = set()
@@ -64,9 +66,23 @@ def _inspect_archive_source(
                 entry_count += len(infos)
                 if entry_count > max_entries:
                     reasons.add("ARCHIVE_ENTRY_COUNT_EXCEEDED")
-                if len(names) != len(set(names)):
+                duplicate_names = {
+                    name for name, count in Counter(names).items() if count > 1
+                }
+                blocking_duplicate_names = {
+                    name for name in duplicate_names
+                    if not (
+                        allow_duplicate_maven_metadata
+                        and re.match(
+                            r"^META-INF/maven/[^/]+/[^/]+/(?:pom\.properties|pom\.xml)$",
+                            name,
+                        )
+                    )
+                }
+                if blocking_duplicate_names:
                     reasons.add("ARCHIVE_DUPLICATE_ENTRY")
-                    details.add(f"ARCHIVE_DUPLICATE_ENTRY:{location}")
+                    for name in blocking_duplicate_names:
+                        details.add(f"ARCHIVE_DUPLICATE_ENTRY:{location}!/{name}")
                 for info in infos:
                     entry_rejected = False
                     if _unsafe_entry_name(info.filename):
@@ -91,7 +107,7 @@ def _inspect_archive_source(
                         nested_archives += 1
                     if entry_rejected:
                         continue
-                    if is_nested:
+                    if is_nested and inspect_nested_archives:
                         if depth >= max_nested_depth:
                             reasons.add("ARCHIVE_NESTED_DEPTH_EXCEEDED")
                             continue
@@ -99,7 +115,7 @@ def _inspect_archive_source(
                             reasons.add("ARCHIVE_NESTED_SIZE_EXCEEDED")
                             continue
                     try:
-                        if is_nested:
+                        if is_nested and inspect_nested_archives:
                             nested_payload = archive.read(info)
                         else:
                             with archive.open(info) as entry_stream:
@@ -114,7 +130,7 @@ def _inspect_archive_source(
                         reasons.add(reason)
                         details.add(f"{reason}:{info.filename}")
                         continue
-                    if is_nested:
+                    if is_nested and inspect_nested_archives:
                         inspect(nested_payload, depth + 1, info.filename)
         except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
             reasons.add("ARCHIVE_FORMAT_INVALID")
