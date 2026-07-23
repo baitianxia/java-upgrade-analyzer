@@ -25,10 +25,11 @@ from pathlib import Path
 
 # compat 必须第一个 import，它会在 Windows 上修复 stdout/stderr 编码
 sys.path.insert(0, str(Path(__file__).parent))
-from compat import run_cmd, open_text, mvn_cmd, git_cmd, IS_WINDOWS, require_human_confirm
+from compat import run_cmd, open_text, mvn_cmd, gradle_cmd, git_cmd, IS_WINDOWS, require_human_confirm
 from csv_io import open_csv_write
 from analysis_contract import (
     build_project_scope,
+    discover_project_modules,
     project_scope_provenance_fields,
     sha256_file,
 )
@@ -190,7 +191,7 @@ def build_step1_ref_resolution_interaction(error):
     question = (
         f"{side_cn}远端操作失败；请在网络或权限恢复后确认重试。"
         if status == "fetch_failed"
-        else f"请为{side_cn}选择或填写明确的 branch、tag 或 commit；确认后才会执行 Maven 坐标补全。"
+        else f"请为{side_cn}选择或填写明确的 branch、tag 或 commit；确认后才会执行构建工具坐标补全。"
     )
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
@@ -269,7 +270,7 @@ def build_step1_ref_resolution_interaction(error):
             "required_fields": required_fields,
             "rules": ["必须提供能够唯一解析到 commit 的明确 ref。"],
         },
-        "runtime_rules": ["确认前不得执行 Maven 坐标补全。"],
+        "runtime_rules": ["确认前不得执行 Maven/Gradle 坐标补全。"],
         "next_action_rule": "只能等待用户补充明确 ref 或取消。",
         "must_wait_for_user_reply": True,
     }
@@ -349,7 +350,7 @@ class UnresolvedPackagedCoordinatesError(RuntimeError):
         )
         super().__init__(
             "最终制品中存在无法确认坐标的依赖，已停止输出以避免错误对比："
-            f"{unresolved_text}。请检查嵌套 jar 的 pom.properties，或确认 `mvn dependency:list` 可正常执行。"
+            f"{unresolved_text}。请检查嵌套 jar 的 pom.properties，或确认构建工具的 runtime 依赖报告可正常生成。"
         )
 
 
@@ -381,7 +382,7 @@ class Step1CommandExecutionBlockedError(RuntimeError):
         self.artifact_path = str(artifact_path or "").strip()
         self.suspected_causes = list(suspected_causes or [])
         message = (
-            f"Step1 在 {self.stage or 'maven_command'} 阶段执行失败"
+            f"Step1 在 {self.stage or 'build_command'} 阶段执行失败"
             + (f"（branch={self.branch}）" if self.branch else "")
             + (f": {self.stderr_excerpt}" if self.stderr_excerpt else "")
         )
@@ -784,9 +785,27 @@ def _infer_maven_failure_causes(stderr_excerpt):
     return causes
 
 
+def _infer_gradle_failure_causes(stderr_excerpt):
+    text = str(stderr_excerpt or "").lower()
+    causes = []
+    if any(token in text for token in ("invalid source release", "unsupported class file major version", "could not target platform")):
+        causes.append("JDK 版本与目标分支的 Gradle/Java 配置不兼容。")
+    if "java_home" in text or "java installation" in text:
+        causes.append("JAVA_HOME 或 Gradle toolchain 配置无效。")
+    if any(token in text for token in ("could not resolve all files", "could not resolve all dependencies", "could not find")):
+        causes.append("依赖仓库、插件仓库或凭据不可用，导致 Gradle 无法解析依赖。")
+    if any(token in text for token in ("task ':", "task with path", "configuration with name 'runtimeclasspath' not found")):
+        causes.append("目标模块、构建任务或 runtimeClasspath 配置不存在。")
+    if not causes:
+        causes.append("Gradle 命令执行失败，请检查 Wrapper、JDK、仓库凭据、根目录和模块参数。")
+    return causes
+
+
 def _infer_step1_blocked_causes(stage, stderr_excerpt):
     if stage in {"mvn_dependency_list", "mvn_package"}:
         return _infer_maven_failure_causes(stderr_excerpt)
+    if stage in {"gradle_dependencies", "gradle_build"}:
+        return _infer_gradle_failure_causes(stderr_excerpt)
     text = str(stderr_excerpt or "").lower()
     causes = []
     if stage == "prepare_java_env":
@@ -870,7 +889,7 @@ def add_branch_hint_to_env(env, branch):
 
 def build_step1_command_blocked_interaction(error):
     blocked = error if isinstance(error, Step1CommandExecutionBlockedError) else Step1CommandExecutionBlockedError(
-        stage="maven_command",
+        stage="build_command",
         command="",
         stderr_excerpt=str(error or ""),
     )
@@ -886,8 +905,10 @@ def build_step1_command_blocked_interaction(error):
     }
     missing_inputs = []
     required_fields = []
+    is_gradle = blocked.stage.startswith("gradle_") or "gradle" in blocked.command.lower()
+    build_tool_name = "Gradle" if is_gradle else "Maven"
     checklist_lines = [
-        "这不是缺少业务参数，而是 Step1 已拿到必要输入后执行 Maven 命令时被环境阻塞。",
+        f"这不是缺少业务参数，而是 Step1 已拿到必要输入后执行 {build_tool_name} 命令时被环境阻塞。",
     ]
     files_to_review = []
     if blocked.artifact_path:
@@ -906,7 +927,7 @@ def build_step1_command_blocked_interaction(error):
     if blocked.jdk_field:
         properties[blocked.jdk_field] = {
             "type": "string",
-            "description": "目标分支对应的 JDK Home 目录；若提供后将按该 JDK 重新执行 Maven 命令。",
+            "description": f"目标分支对应的 JDK Home 目录；若提供后将按该 JDK 重新执行 {build_tool_name} 命令。",
         }
         missing_inputs.append(
             {
@@ -915,13 +936,13 @@ def build_step1_command_blocked_interaction(error):
                 "side": blocked.side,
                 "required": False,
                 "recommended": True,
-                "reason": "当前更像是 Maven/JDK 环境阻塞；若该侧需要不同 JDK，请补充对应 JDK Home。",
+                "reason": f"当前更像是 {build_tool_name}/JDK 环境阻塞；若该侧需要不同 JDK，请补充对应 JDK Home。",
                 "value_type": "path",
             }
         )
         if blocked.jdk_home:
             checklist_lines.append(f"当前该侧 JDK Home: {blocked.jdk_home}")
-    question = "Step1 已显式暴露本次 Maven 命令失败原因，请先处理环境阻塞后再决定是否继续。"
+    question = f"Step1 已显式暴露本次 {build_tool_name} 命令失败原因，请先处理环境阻塞后再决定是否继续。"
     if blocked.jdk_field:
         question += f" 若需要由 skill 继续重跑，可补充 `{blocked.jdk_field}`。"
     return {
@@ -931,8 +952,8 @@ def build_step1_command_blocked_interaction(error):
         "status": "awaiting_user_input",
         "kind": "execution_blocked",
         "step_id": "step1",
-        "reason_code": "step1_maven_command_blocked",
-        "summary": "Step1 已进入执行阶段，但 Maven 命令被环境问题阻塞；必须先显式暴露原因并等待用户决策。",
+        "reason_code": "step1_gradle_command_blocked" if is_gradle else "step1_maven_command_blocked",
+        "summary": f"Step1 已进入执行阶段，但 {build_tool_name} 命令被环境问题阻塞；必须先显式暴露原因并等待用户决策。",
         "title": "step1 执行被环境阻塞",
         "question": question,
         "files_to_review": files_to_review,
@@ -980,9 +1001,9 @@ def build_step1_command_blocked_interaction(error):
         "resume_hint": "修复环境问题或补充 JDK Home 后，再继续执行 Step1。",
         "runtime_rules": [
             "看到 execution_blocked 后，必须先向用户暴露失败原因，再等待用户决定是否继续。",
-            "禁止把 Maven 执行失败伪装成“缺少信息”或继续盲重试。",
+            f"禁止把 {build_tool_name} 执行失败伪装成“缺少信息”或继续盲重试。",
         ],
-        "next_action_rule": "只能向用户说明 Maven 命令失败原因并等待回复，不得继续执行后续步骤。",
+        "next_action_rule": f"只能向用户说明 {build_tool_name} 命令失败原因并等待回复，不得继续执行后续步骤。",
         "must_wait_for_user_reply": True,
     }
 
@@ -1321,6 +1342,20 @@ def _resolve_module_dir_for_packaging(selector, work_dir):
         elif target_artifact:
             if artifact_id == target_artifact or pom_path.parent.name == target_artifact:
                 matches.append(pom_path.parent.resolve())
+
+    if not matches:
+        discovery = discover_project_modules(root_dir)
+        selector_normalized = raw.replace('\\', '/').rstrip('/')
+        for item in discovery.get('modules') or []:
+            aliases = {
+                str(item.get('module') or ''),
+                str(item.get('gradle_path') or ''),
+                str(item.get('artifact_id') or ''),
+                str(item.get('coord') or ''),
+                Path(str(item.get('module_dir') or '')).name,
+            }
+            if selector_normalized in aliases:
+                matches.append(Path(item['module_dir']).resolve())
 
     if not matches:
         return None
@@ -2130,6 +2165,49 @@ def parse_maven_dependency_list(text):
     return deps
 
 
+GRADLE_DEPENDENCY_RE = re.compile(
+    r"(?<![\w.-])([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([^\s()]+)"
+    r"(?:\s+->\s+([^\s()]+))?"
+)
+
+
+def parse_gradle_dependency_report(text):
+    """Parse resolved external modules from Gradle's runtimeClasspath report."""
+    deps = {}
+    for raw_line in str(text or '').splitlines():
+        line = raw_line.strip()
+        if not line or ' FAILED' in line or line.startswith(('No dependencies', 'A web-based')):
+            continue
+        match = GRADLE_DEPENDENCY_RE.search(line)
+        if not match:
+            continue
+        group_id, artifact_id, requested_version, selected_version = match.groups()
+        selected = (selected_version or '').rstrip(',')
+        if selected.count(':') >= 2:
+            selected_group, selected_artifact, selected = selected.split(':', 2)
+            group_id, artifact_id = selected_group, selected_artifact
+        version = (selected or requested_version).rstrip(',')
+        if (
+            not version
+            or version in {'FAILED', '(n)', '(c)'}
+            or any(token in version for token in '{}[]')
+        ):
+            continue
+        key = f"{group_id}:{artifact_id}"
+        deps[key] = {
+            'key': key,
+            'group_id': group_id,
+            'artifact_id': artifact_id,
+            'version': version,
+            'scope': 'runtime',
+            'remark': 'source:gradle_dependencies(runtimeClasspath)',
+            'classifier': '',
+            'packaged_present': '',
+            'packaged_match_source': '',
+        }
+    return deps
+
+
 def _packaged_metadata_anomaly_suffix(item):
     anomalies = sorted({
         str(value).strip()
@@ -2431,7 +2509,7 @@ def _maven_reactor_has_modules(work_dir):
     )
 
 
-def collect_runtime_deps_for_workspace(
+def _collect_maven_runtime_deps_for_workspace(
     work_dir, primary_module=None, modules=None, env=None, observer=None, side="",
     active_maven_profiles=None,
 ):
@@ -2477,6 +2555,90 @@ def collect_runtime_deps_for_workspace(
             )
     runtime_deps = parse_maven_dependency_list(list_stdout)
     return runtime_deps, list_command
+
+
+def _gradle_target_model(work_dir, target_selector):
+    discovery = discover_project_modules(work_dir, build_tool='gradle')
+    selector = str(target_selector or '.').strip().replace('\\', '/').rstrip('/')
+    if selector in ('', './', 'root', '__root__'):
+        selector = '.'
+    matches = []
+    for item in discovery.get('modules') or []:
+        aliases = {
+            str(item.get('module') or ''),
+            str(item.get('gradle_path') or ''),
+            str(item.get('artifact_id') or ''),
+            str(item.get('coord') or ''),
+            Path(str(item.get('module_dir') or '')).name,
+        }
+        if selector in aliases:
+            matches.append(item)
+    if len(matches) != 1:
+        raise RuntimeError(f"无法唯一解析 Gradle 目标模块：{target_selector}")
+    return matches[0]
+
+
+def _gradle_task(target_model, task):
+    gradle_path = str((target_model or {}).get('gradle_path') or ':').rstrip(':')
+    return f"{gradle_path}:{task}" if gradle_path else task
+
+
+def _collect_gradle_runtime_deps_for_workspace(
+    work_dir, primary_module=None, modules=None, env=None, observer=None, side="",
+):
+    work_dir = str(Path(work_dir).resolve())
+    target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
+    target_model = _gradle_target_model(work_dir, target_selector)
+    list_cmd = gradle_cmd(work_dir) + [
+        '--no-daemon', '--console=plain',
+        _gradle_task(target_model, 'dependencies'),
+        '--configuration', 'runtimeClasspath',
+    ]
+    list_command = ' '.join(list_cmd)
+    side_display = _side_display(side)
+    with _observed_phase(
+        observer,
+        "gradle_dependencies",
+        side=side,
+        item=target_selector or ".",
+        command=list_command,
+        start_message=f"开始补全{side_display}最终制品依赖坐标",
+        complete_message=f"{side_display}依赖坐标补全完成",
+    ):
+        list_stdout, list_stderr, list_rc = run_cmd(
+            list_cmd, cwd=work_dir, timeout=1800, env=env, stream_output=True,
+        )
+        if list_rc != 0:
+            raise RuntimeError(
+                "最终制品中存在无法直接识别坐标的嵌套依赖，且 Gradle "
+                "runtimeClasspath 解析失败，无法安全补全坐标："
+                f"{(list_stderr[:300] or list_stdout[:300])}"
+            )
+    return parse_gradle_dependency_report(list_stdout), list_command
+
+
+def collect_runtime_deps_for_workspace(
+    work_dir, primary_module=None, modules=None, env=None, observer=None, side="",
+    active_maven_profiles=None, build_tool='maven',
+):
+    if str(build_tool or 'maven').lower() == 'gradle':
+        return _collect_gradle_runtime_deps_for_workspace(
+            work_dir,
+            primary_module=primary_module,
+            modules=modules,
+            env=env,
+            observer=observer,
+            side=side,
+        )
+    return _collect_maven_runtime_deps_for_workspace(
+        work_dir,
+        primary_module=primary_module,
+        modules=modules,
+        env=env,
+        observer=observer,
+        side=side,
+        active_maven_profiles=active_maven_profiles,
+    )
 
 
 def collect_maven_deps_for_workspace(
@@ -2599,6 +2761,7 @@ def collect_maven_deps_for_workspace(
                 observer=observer,
                 side=side,
                 active_maven_profiles=active_maven_profiles,
+                build_tool='maven',
             )
             list_cmd_text = list_command_text or ''
         with _observed_phase(
@@ -2638,6 +2801,153 @@ def collect_maven_deps_for_workspace(
     raise RuntimeError(
         f"目标模块的最终制品中未发现可比较的打包依赖：{module_dir}。"
         "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不再作为正式结果输出。"
+    )
+
+
+def collect_gradle_deps_for_workspace(
+    work_dir,
+    primary_module=None,
+    modules=None,
+    env=None,
+    manual_coord_overrides=None,
+    allow_unresolved=False,
+    confirmed_unresolved_items=None,
+    observer=None,
+    side="",
+):
+    work_dir = str(Path(work_dir).resolve())
+    target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
+    target_model = _gradle_target_model(work_dir, target_selector)
+    module_dir = Path(target_model['module_dir'])
+    build_scope = build_project_scope(
+        work_dir, target_selector or '.', build_tool='gradle'
+    )
+    package_cmd = gradle_cmd(work_dir) + [
+        '--no-daemon', '--console=plain',
+        _gradle_task(target_model, 'build'),
+        '-x', 'test',
+    ]
+    package_command = ' '.join(package_cmd)
+    side_display = _side_display(side)
+    with _observed_phase(
+        observer,
+        "gradle_build",
+        side=side,
+        item=target_selector or ".",
+        command=package_command,
+        start_message=f"开始构建{side_display}目标模块",
+        complete_message=f"{side_display}目标模块构建完成",
+    ):
+        stdout, stderr, rc = run_cmd(
+            package_cmd, cwd=work_dir, timeout=1800, env=env, stream_output=True,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"Gradle build 失败（退出码 {rc}）：\n{stderr[:1000] or stdout[:1000]}"
+            )
+    post_build_scope = build_project_scope(
+        work_dir, target_selector or '.', build_tool='gradle'
+    )
+    if build_scope.get('source_state_hash') != post_build_scope.get('source_state_hash'):
+        raise RuntimeError(
+            "GRADLE_SOURCE_STATE_CHANGED_DURING_BUILD: "
+            "settings/build scripts/source-set state changed while packaging"
+        )
+
+    with _observed_phase(
+        observer,
+        "artifact_discovery",
+        side=side,
+        item=str(module_dir),
+        start_message=f"开始定位{side_display}最终制品",
+        complete_message=f"{side_display}最终制品定位完成",
+    ):
+        archives = _discover_packaged_archives(module_dir)
+    if not archives:
+        raise RuntimeError(
+            f"目标模块未产出可解析的最终制品：{module_dir}。"
+            "请确认目标模块存在 jar、bootJar、shadowJar 或 war 构建任务。"
+        )
+
+    runtime_deps = {}
+    list_cmd_text = ''
+    for artifact_path in archives:
+        with _observed_phase(
+            observer,
+            "artifact_parse",
+            side=side,
+            item=str(artifact_path),
+            start_message=f"开始解析{side_display}最终制品：{Path(artifact_path).name}",
+            complete_message=f"{side_display}最终制品解析完成：{Path(artifact_path).name}",
+        ):
+            packaging_type = _detect_archive_packaging_type(artifact_path)
+            if packaging_type not in ('boot_jar', 'war', 'packaged_jar'):
+                continue
+            cache_stats = {}
+            packaged_raw = _inspect_packaged_archive(
+                artifact_path,
+                cache_dir=_observer_packaged_inventory_cache_dir(observer),
+                cache_stats=cache_stats,
+            )
+            if observer is not None:
+                observer.increment_counter('cache_hits', cache_stats.get('hits', 0))
+                observer.increment_counter('cache_misses', cache_stats.get('misses', 0))
+                observer.increment_counter('archive_bytes', cache_stats.get('archive_bytes', 0))
+                observer.increment_counter('nested_entries', cache_stats.get('nested_entries', 0))
+            _require_complete_packaged_archive_scan(cache_stats, artifact_path)
+            if not packaged_raw:
+                continue
+        if any(not (item.get('coord') or '').strip() for item in packaged_raw) and not runtime_deps:
+            runtime_deps, list_cmd_text = collect_runtime_deps_for_workspace(
+                work_dir,
+                primary_module=primary_module,
+                modules=modules,
+                env=env,
+                observer=observer,
+                side=side,
+                build_tool='gradle',
+            )
+        with _observed_phase(
+            observer,
+            "artifact_coordinate_resolution",
+            side=side,
+            item=str(artifact_path),
+            start_message=f"开始解析{side_display}最终制品中的依赖坐标",
+            complete_message=f"{side_display}最终制品依赖坐标解析完成",
+        ):
+            dep_entries, packaged_deps, unresolved_items = _enrich_packaged_deps_with_runtime(
+                packaged_raw,
+                runtime_deps,
+                manual_coord_overrides=manual_coord_overrides,
+                confirmed_unresolved_items=confirmed_unresolved_items,
+            )
+            if unresolved_items and not allow_unresolved:
+                raise UnresolvedPackagedCoordinatesError(
+                    unresolved_items, resolved_deps=packaged_deps
+                )
+            if dep_entries:
+                return packaged_deps, {
+                    'mode': 'final_artifact',
+                    'packaging_type': packaging_type,
+                    'artifact_path': str(artifact_path),
+                    'module_dir': str(module_dir),
+                    'build_command': package_command,
+                    'list_command': list_cmd_text,
+                    'archives': [str(artifact_path)],
+                    'deps': list(dep_entries),
+                    'dep_entries': list(dep_entries),
+                    'matched_count': sum(
+                        1 for item in dep_entries
+                        if str(item.get('resolution_status') or '').strip() == 'resolved'
+                    ),
+                    'unresolved_items': unresolved_items,
+                    'runtime_only_count': 0,
+                    'runtime_only_coords': [],
+                    **project_scope_provenance_fields(build_scope),
+                }
+    raise RuntimeError(
+        f"目标模块的最终制品中未发现可比较的打包依赖：{module_dir}。"
+        "当前 Step1 只比较最终打包依赖；thin jar / 无嵌套依赖场景不作为正式结果输出。"
     )
 
 
@@ -2752,6 +3062,7 @@ def _collect_runtime_deps_for_artifact_input(
     allow_local_source=False,
     allow_dirty_local_source=False,
     active_maven_profiles=None,
+    build_tool='maven',
 ):
     source_dir = str(source_project_dir or '').strip()
     if branch:
@@ -2805,6 +3116,7 @@ def _collect_runtime_deps_for_artifact_input(
             artifact_path=artifact_path,
             observer=observer,
             active_maven_profiles=active_maven_profiles,
+            build_tool=build_tool,
         )
         return runtime_deps, {
             **meta,
@@ -2868,6 +3180,7 @@ def get_packaged_deps_by_switching_branch(
     artifact_cache_dir=None,
     observer=None,
     active_maven_profiles=None,
+    build_tool='maven',
 ):
     blocked_error = None
     env = None
@@ -2911,17 +3224,26 @@ def get_packaged_deps_by_switching_branch(
             )
     if blocked_error is None:
         try:
-            deps, meta = collect_maven_deps_for_workspace(
+            collector = (
+                collect_gradle_deps_for_workspace
+                if str(build_tool or 'maven').lower() == 'gradle'
+                else collect_maven_deps_for_workspace
+            )
+            collector_kwargs = {
+                'primary_module': primary_module,
+                'modules': modules,
+                'env': add_branch_hint_to_env(env, branch),
+                'manual_coord_overrides': manual_coord_overrides,
+                'allow_unresolved': allow_unresolved,
+                'confirmed_unresolved_items': confirmed_unresolved_items,
+                'observer': observer,
+                'side': side,
+            }
+            if str(build_tool or 'maven').lower() == 'maven':
+                collector_kwargs['active_maven_profiles'] = active_maven_profiles
+            deps, meta = collector(
                 str(temp_dir),
-                primary_module=primary_module,
-                modules=modules,
-                env=add_branch_hint_to_env(env, branch),
-                manual_coord_overrides=manual_coord_overrides,
-                allow_unresolved=allow_unresolved,
-                confirmed_unresolved_items=confirmed_unresolved_items,
-                observer=observer,
-                side=side,
-                active_maven_profiles=active_maven_profiles,
+                **collector_kwargs,
             )
             meta['branch'] = branch
             meta['jdk_home'] = resolve_effective_jdk_home(jdk_home)
@@ -2948,8 +3270,12 @@ def get_packaged_deps_by_switching_branch(
             result = (deps, meta)
         except Exception as exc:
             blocked_error = exc if isinstance(exc, Step1CommandExecutionBlockedError) else build_step1_command_blocked_error(
-                stage="mvn_package",
-                command="mvn --batch-mode --no-transfer-progress -DskipTests package",
+                stage=("gradle_build" if str(build_tool).lower() == 'gradle' else "mvn_package"),
+                command=(
+                    "gradlew --no-daemon --console=plain build -x test"
+                    if str(build_tool).lower() == 'gradle'
+                    else "mvn --batch-mode --no-transfer-progress -DskipTests package"
+                ),
                 exc=exc,
                 side=side,
                 branch=branch,
@@ -2991,6 +3317,7 @@ def get_packaged_deps_by_switching_branch(
 def get_runtime_deps_by_switching_branch(
     branch, work_dir, primary_module=None, modules=None, jdk_field="", jdk_home="",
     side="", artifact_path="", observer=None, active_maven_profiles=None,
+    build_tool='maven',
 ):
     blocked_error = None
     env = None
@@ -3044,6 +3371,7 @@ def get_runtime_deps_by_switching_branch(
                 observer=observer,
                 side=side,
                 active_maven_profiles=active_maven_profiles,
+                build_tool=build_tool,
             )
             result = (
                 runtime_deps,
@@ -3056,8 +3384,12 @@ def get_runtime_deps_by_switching_branch(
             )
         except Exception as exc:
             blocked_error = exc if isinstance(exc, Step1CommandExecutionBlockedError) else build_step1_command_blocked_error(
-                stage="mvn_dependency_list",
-                command="mvn --batch-mode --no-transfer-progress -DskipTests dependency:list -DincludeScope=runtime -DoutputAbsoluteArtifactFilename=true",
+                stage=("gradle_dependencies" if str(build_tool).lower() == 'gradle' else "mvn_dependency_list"),
+                command=(
+                    "gradlew --no-daemon --console=plain dependencies --configuration runtimeClasspath"
+                    if str(build_tool).lower() == 'gradle'
+                    else "mvn --batch-mode --no-transfer-progress -DskipTests dependency:list -DincludeScope=runtime -DoutputAbsoluteArtifactFilename=true"
+                ),
                 exc=exc,
                 side=side,
                 branch=branch,
@@ -3318,7 +3650,7 @@ def main():
     )
     ap.add_argument('--base',           dest='base_branch',    help='基准分支名（自动模式）')
     ap.add_argument('--current',        dest='current_branch', help='当前分支名（自动模式）')
-    ap.add_argument('--tool',           choices=['maven'], default='maven')
+    ap.add_argument('--tool',           choices=['maven', 'gradle'], default=None)
     ap.add_argument('--work-dir',       default='.')
     ap.add_argument('--base-artifact-path',
                     help='基准侧已编译产物路径（直接产物模式）')
@@ -3385,6 +3717,7 @@ def main():
             ]
         if not args.allow_unresolved and orchestrated_input.get("allow_unresolved"):
             args.allow_unresolved = True
+    args.tool = args.tool or 'maven'
 
     manual_coord_overrides, invalid_manual_overrides = parse_manual_coord_overrides(args.manual_coord_override)
     if invalid_manual_overrides:
@@ -3495,6 +3828,7 @@ def main():
                         artifact_path=args.base_artifact_path,
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
+                        build_tool=args.tool,
                         source_resolution=confirmed_source_resolution("base"),
                         expected_commit=str(orchestrated_input.get("base_expected_commit") or ""),
                         allow_local_source=bool(orchestrated_input.get("base_allow_local_source")),
@@ -3517,6 +3851,7 @@ def main():
                         artifact_path=args.current_artifact_path,
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
+                        build_tool=args.tool,
                         source_resolution=confirmed_source_resolution("current"),
                         expected_commit=str(orchestrated_input.get("current_expected_commit") or ""),
                         allow_local_source=bool(orchestrated_input.get("current_allow_local_source")),
@@ -3599,7 +3934,7 @@ def main():
                 )
             if missing_items:
                 interaction = build_step1_missing_input_interaction(missing_items, unresolved_items=unresolved_items)
-                print("当前输入无法补全最终产物中的全部 Maven 坐标。", file=sys.stderr)
+                print("当前输入无法补全最终产物中的全部依赖坐标。", file=sys.stderr)
                 for item in interaction.get("missing_inputs", []) or []:
                     print(
                         f"  - 缺失字段: {item.get('field')}（{item.get('label')}）",
@@ -3658,7 +3993,7 @@ def main():
                 sys.exit(EXIT_AWAITING_USER)
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
-            print("当前输入已进入执行阶段，但 Maven 命令被环境问题阻塞。", file=sys.stderr)
+            print(f"当前输入已进入执行阶段，但 {args.tool} 命令被环境问题阻塞。", file=sys.stderr)
             print(f"  - 阻塞阶段: {e.stage}", file=sys.stderr)
             if e.branch:
                 print(f"  - 失败分支: {e.branch}", file=sys.stderr)
@@ -3680,8 +4015,11 @@ def main():
             attach_unresolved_side(base_meta.get('unresolved_items') or [], 'base')
             + attach_unresolved_side(curr_meta.get('unresolved_items') or [], 'current')
         )
-    elif args.base_branch and args.current_branch and args.tool == 'maven':
-        print("模式：自动切换分支并对目标模块执行真实 package", file=sys.stderr)
+    elif args.base_branch and args.current_branch and args.tool in {'maven', 'gradle'}:
+        print(
+            f"模式：自动切换分支并使用 {args.tool} 对目标模块执行真实构建",
+            file=sys.stderr,
+        )
         try:
             base_deps, base_meta = get_packaged_deps_by_switching_branch(
                     args.base_branch, args.work_dir, args.primary_module, args.modules,
@@ -3693,6 +4031,7 @@ def main():
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
                 observer=observer,
                 active_maven_profiles=args.active_maven_profile,
+                build_tool=args.tool,
             )
             curr_deps, curr_meta = get_packaged_deps_by_switching_branch(
                     args.current_branch, args.work_dir, args.primary_module, args.modules,
@@ -3703,10 +4042,11 @@ def main():
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
                 observer=observer,
                 active_maven_profiles=args.active_maven_profile,
+                build_tool=args.tool,
             )
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
-            print("当前输入已进入执行阶段，但 Maven 命令被环境问题阻塞。", file=sys.stderr)
+            print(f"当前输入已进入执行阶段，但 {args.tool} 命令被环境问题阻塞。", file=sys.stderr)
             print(f"  - 阻塞阶段: {e.stage}", file=sys.stderr)
             if e.branch:
                 print(f"  - 失败分支: {e.branch}", file=sys.stderr)
@@ -3722,11 +4062,16 @@ def main():
             print(f"❌ 自动执行失败：{e}", file=sys.stderr)
             print("建议人工执行：", file=sys.stderr)
             target_selector = _resolve_single_module_selector(args.primary_module, args.modules, args.work_dir)
-            pl = _normalize_maven_pl_with_workdir(target_selector, args.work_dir)
             print(f"  git checkout {args.base_branch}", file=sys.stderr)
-            print(f"  mvn {'-pl ' + pl + ' -am ' if pl else ''}-DskipTests package", file=sys.stderr)
+            if args.tool == 'gradle':
+                target_model = _gradle_target_model(args.work_dir, target_selector)
+                command = ' '.join(gradle_cmd(args.work_dir) + [_gradle_task(target_model, 'build'), '-x', 'test'])
+            else:
+                pl = _normalize_maven_pl_with_workdir(target_selector, args.work_dir)
+                command = f"mvn {'-pl ' + pl + ' -am ' if pl else ''}-DskipTests package"
+            print(f"  {command}", file=sys.stderr)
             print(f"  git checkout {args.current_branch}", file=sys.stderr)
-            print(f"  mvn {'-pl ' + pl + ' -am ' if pl else ''}-DskipTests package", file=sys.stderr)
+            print(f"  {command}", file=sys.stderr)
             sys.exit(1)
 
         base_fmt = base_meta.get('mode', 'final_artifact')
@@ -3909,6 +4254,7 @@ def main():
             'target_module': str(args.primary_module or ''),
             'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),
             'build_command': str((meta or {}).get('build_command') or ''),
+            'build_tool': str((meta or {}).get('build_tool') or args.tool or 'maven'),
             'artifact_path': artifact_path,
             'original_artifact_path': str((meta or {}).get('original_artifact_path') or artifact_path),
             'artifact_sha256': artifact_hash,
@@ -3916,6 +4262,13 @@ def main():
             'project_scope_hash': str((meta or {}).get('project_scope_hash') or ''),
             'source_state_hash': str((meta or {}).get('source_state_hash') or ''),
             'maven_model_hash': str((meta or {}).get('maven_model_hash') or ''),
+            'gradle_model_hash': str((meta or {}).get('gradle_model_hash') or ''),
+            'build_model_hash': str(
+                (meta or {}).get('build_model_hash')
+                or (meta or {}).get('maven_model_hash')
+                or (meta or {}).get('gradle_model_hash')
+                or ''
+            ),
             'active_maven_profiles': sorted({
                 str(profile).strip()
                 for profile in ((meta or {}).get('active_maven_profiles') or [])

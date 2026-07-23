@@ -462,6 +462,21 @@ def mvn_cmd():
     return ['mvn']  # 让调用方收到 FileNotFoundError 并给出提示
 
 
+def gradle_cmd(work_dir=None):
+    """Prefer the project's Gradle Wrapper, then fall back to system Gradle."""
+    root = Path(work_dir or '.').resolve()
+    wrapper = root / ('gradlew.bat' if IS_WINDOWS else 'gradlew')
+    if wrapper.is_file():
+        if IS_WINDOWS or os.access(wrapper, os.X_OK):
+            return [str(wrapper)]
+        shell = find_executable('sh') or 'sh'
+        return [shell, str(wrapper)]
+    gradle = find_executable('gradle')
+    if gradle:
+        return [gradle]
+    return ['gradle']
+
+
 def git_cmd():
     """返回可用的 Git 命令"""
     git = find_executable('git')

@@ -82,7 +82,7 @@ from step5_memory_observer import (
 )
 from step5_artifact_fact_store import Step5ArtifactFactStore
 from signature_utils import normalize_signature_for_identity, signatures_match_identity
-from analysis_contract import build_project_scope, discover_maven_modules, sha256_file
+from analysis_contract import build_project_scope, discover_project_modules, sha256_file
 from artifact_safety import inspect_archive
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -1793,12 +1793,15 @@ def _recover_reactor_module_coords(
         start = source_path if source_path.is_dir() else source_path.parent
         candidate_roots.update(
             parent for parent in (start, *start.parents)
-            if (parent / 'pom.xml').is_file()
+            if any((parent / name).is_file() for name in (
+                'pom.xml', 'build.gradle', 'build.gradle.kts',
+                'settings.gradle', 'settings.gradle.kts',
+            ))
         )
 
     recovered_scopes = []
     for candidate in sorted(candidate_roots, key=lambda path: len(path.parts), reverse=True):
-        discovery = discover_maven_modules(
+        discovery = discover_project_modules(
             candidate, active_profiles=active_profiles
         )
         reactor_coords = {

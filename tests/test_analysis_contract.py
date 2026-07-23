@@ -16,6 +16,7 @@ from analysis_contract import (
     build_provenance,
     derive_coverage_report,
     discover_maven_modules,
+    discover_gradle_modules,
 )
 
 
@@ -36,6 +37,109 @@ def write_pom(path, artifact, packaging="jar", modules=None, dependencies=None, 
 
 
 class AnalysisContractTest(unittest.TestCase):
+    def test_gradle_multimodule_scope_includes_project_dependencies_and_custom_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "settings.gradle").write_text(
+                "rootProject.name = 'demo'\ninclude ':common', ':app'\n",
+                encoding="utf-8",
+            )
+            (root / "build.gradle").write_text(
+                "allprojects {\n  group = 'com.acme'\n  version = '1.0.0'\n}\n",
+                encoding="utf-8",
+            )
+            (root / "common/build.gradle").parent.mkdir(parents=True)
+            (root / "common/build.gradle").write_text(
+                "plugins { id 'java-library' }\n", encoding="utf-8"
+            )
+            (root / "app/build.gradle").parent.mkdir(parents=True)
+            (root / "app/build.gradle").write_text(
+                """plugins { id 'org.springframework.boot' }
+                dependencies {
+                  implementation project(':common')
+                }
+                sourceSets { main {
+                  java.srcDir 'generated/main/java'
+                  resources.srcDirs = ['config']
+                } }
+                """,
+                encoding="utf-8",
+            )
+            for relative in (
+                "common/src/main/java",
+                "app/src/main/java",
+                "app/generated/main/java",
+                "app/config",
+            ):
+                (root / relative).mkdir(parents=True)
+
+            discovery = discover_gradle_modules(root)
+            scope = build_project_scope(root, ":app", build_tool="gradle")
+
+        modules = {item["module"]: item for item in discovery["modules"]}
+        self.assertEqual(modules["app"]["coord"], "com.acme:app")
+        self.assertIn("org.springframework.boot", modules["app"]["deploy_hints"])
+        self.assertEqual(scope["status"], "complete")
+        self.assertEqual(scope["build_tool"], "gradle")
+        self.assertEqual(scope["included_modules"], ["app", "common"])
+        self.assertEqual(
+            set(scope["source_roots"]),
+            {
+                str((root / "app/src/main/java").resolve()),
+                str((root / "app/generated/main/java").resolve()),
+                str((root / "common/src/main/java").resolve()),
+            },
+        )
+        self.assertEqual(scope["resource_roots"], [str((root / "app/config").resolve())])
+        self.assertTrue(scope["gradle_model_hash"])
+        self.assertFalse(scope["maven_model_hash"])
+
+    def test_gradle_kotlin_settings_support_custom_project_dir_and_archive_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "settings.gradle.kts").write_text(
+                'rootProject.name = "demo"\ninclude(":service")\n'
+                'project(":service").projectDir = file("modules/backend")\n',
+                encoding="utf-8",
+            )
+            (root / "build.gradle.kts").write_text(
+                'group = "com.acme"\nversion = "2.0"\n', encoding="utf-8"
+            )
+            module = root / "modules/backend"
+            module.mkdir(parents=True)
+            (module / "build.gradle.kts").write_text(
+                'plugins { id("java") }\nbase.archivesName.set("backend-service")\n',
+                encoding="utf-8",
+            )
+            (module / "src/main/kotlin").mkdir(parents=True)
+
+            discovery = discover_gradle_modules(root)
+            scope = build_project_scope(root, "com.acme:backend-service")
+
+        service = next(item for item in discovery["modules"] if item["module"] == "service")
+        self.assertEqual(Path(service["module_dir"]), module.resolve())
+        self.assertEqual(service["coord"], "com.acme:backend-service")
+        self.assertEqual(scope["included_modules"], ["service"])
+        self.assertEqual(scope["source_roots"], [str((module / "src/main/kotlin").resolve())])
+
+    def test_gradle_scope_hash_changes_when_relevant_build_script_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "settings.gradle").write_text("include ':app', ':other'\n", encoding="utf-8")
+            (root / "build.gradle").write_text("group = 'com.acme'\n", encoding="utf-8")
+            for name in ("app", "other"):
+                (root / name).mkdir()
+                (root / name / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+                (root / name / "src/main/java").mkdir(parents=True)
+            initial = build_project_scope(root, "app")
+            (root / "other/build.gradle").write_text("plugins { id 'java-library' }\n", encoding="utf-8")
+            unrelated = build_project_scope(root, "app")
+            (root / "app/build.gradle").write_text("plugins { id 'java-library' }\n", encoding="utf-8")
+            changed = build_project_scope(root, "app")
+
+        self.assertEqual(initial["source_state_hash"], unrelated["source_state_hash"])
+        self.assertNotEqual(initial["source_state_hash"], changed["source_state_hash"])
+
     def test_inactive_profile_modules_are_not_reactor_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

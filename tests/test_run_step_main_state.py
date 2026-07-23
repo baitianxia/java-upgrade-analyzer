@@ -3271,6 +3271,37 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("--modules", captured["script_args"])
         self.assertNotIn("--manual-coord-override", captured["script_args"])
 
+    def test_execute_step1_accepts_gradle_run_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            (project_dir / "settings.gradle").write_text("include ':app'\n", encoding="utf-8")
+            (project_dir / "build.gradle").write_text("group = 'com.acme'\n", encoding="utf-8")
+            (project_dir / "app").mkdir()
+            (project_dir / "app/build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+            (project_dir / "app/src/main/java").mkdir(parents=True)
+            args = self._make_default_args(project_dir, report_dir)
+            run_context = {
+                "tool": "gradle",
+                "base_branch": "main",
+                "current_branch": "feature/demo",
+                "target_module": ":app",
+            }
+            captured = []
+            with patch.object(run_step, "run_python", side_effect=lambda name, *_args, **_kwargs: captured.append(name)), \
+                    patch.object(run_step, "ensure_exists"), \
+                    patch.object(run_step, "run_gate"), \
+                    patch.object(run_step, "build_interaction_payload", return_value={}):
+                run_step.execute_step(
+                    "step1",
+                    args,
+                    {"step1": {"gate": "step1_scope"}},
+                    run_context,
+                )
+
+        self.assertEqual(captured, ["s1_dep_diff.py"])
+
     def test_execute_step2_does_not_pass_business_inputs_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)

@@ -68,6 +68,34 @@ class RuntimeContractTest(unittest.TestCase):
         self.assertEqual(toolchain.status, "failed")
         self.assertEqual(toolchain.reason, "unsupported_or_mixed_jdk_toolchain")
 
+    def test_gradle_contract_accepts_wrapper_using_active_jdk(self):
+        outputs = {
+            "git": "git version 2.45.0",
+            "java": 'openjdk version "17.0.12"',
+            "javac": "javac 17.0.12",
+            "javap": "17.0.12",
+            "jdeps": "17.0.12",
+            "/project/gradlew": "Gradle 8.10.2\nLauncher JVM: 17.0.12 (Eclipse Adoptium)",
+        }
+
+        def fake_run(command, timeout=15):
+            return True, outputs[command[0]]
+
+        with patch.object(runtime_contract, "_run", side_effect=fake_run), \
+                patch.object(runtime_contract, "gradle_cmd", return_value=["/project/gradlew"]), \
+                patch.object(runtime_contract.metadata, "version", side_effect=lambda name: runtime_contract.REQUIRED_PACKAGES[name]), \
+                patch.object(runtime_contract.importlib, "import_module", return_value=object()), \
+                patch.object(runtime_contract.platform, "system", return_value="Linux"), \
+                patch.object(runtime_contract.sys, "version_info", (3, 12, 1)):
+            checks = runtime_contract.validate_runtime_contract(
+                require_maven=False,
+                require_gradle=True,
+                project_dir="/project",
+            )
+
+        gradle = next(item for item in checks if item.component == "gradle_runtime")
+        self.assertEqual(gradle.status, "passed")
+
     def test_formal_runner_checks_environment_before_project_state(self):
         source = (ROOT / "scripts" / "run_step.py").read_text(encoding="utf-8")
         main_source = source[source.index("def main("):]

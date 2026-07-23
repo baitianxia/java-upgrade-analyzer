@@ -20,7 +20,7 @@ from compat import infer_maven_coords, open_text, resolve_repo_input_path, run_c
 from compat import git_cmd
 from csv_io import open_csv_read, open_csv_write
 from auto_discover_bridge_sources import discover_bridge_source_mappings
-from analysis_contract import build_project_scope, discover_maven_modules, write_coverage_report
+from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -593,6 +593,7 @@ def build_environment_block_message(environment):
         "platform": "操作系统",
         "jdk_toolchain": "JDK 工具链",
         "maven_runtime": "Maven 运行时",
+        "gradle_runtime": "Gradle 运行时",
     }
     failed = [
         item for item in (environment or {}).get("checks") or []
@@ -600,7 +601,7 @@ def build_environment_block_message(environment):
     ]
     lines = [
         "分析尚未开始：运行环境预检未通过。",
-        "系统没有修改宿主机的 Python、JDK 或 Maven 安装；这些操作需要外部安装条件或授权。",
+        "系统没有修改宿主机的 Python、JDK、Maven 或 Gradle 安装；这些操作需要外部安装条件或授权。",
         "未满足的条件：",
     ]
     if not failed:
@@ -1502,12 +1503,29 @@ def detect_source_dirs_by_modules(project_dir, modules):
     if not modules:
         return []
     candidates = []
+    discovery = discover_project_modules(project_dir)
+    discovered_modules = list(discovery.get("modules") or [])
     for mod in modules:
         mod_value = (mod or "").strip()
         if mod_value in (".", "./", "__root__", "root"):
             module_dir = project_dir
         else:
-            module_dir = (project_dir / mod_value).resolve()
+            matches = []
+            for item in discovered_modules:
+                aliases = {
+                    str(item.get("module") or ""),
+                    str(item.get("gradle_path") or ""),
+                    str(item.get("artifact_id") or ""),
+                    str(item.get("coord") or ""),
+                    Path(str(item.get("module_dir") or "")).name,
+                }
+                if mod_value in aliases:
+                    matches.append(Path(item["module_dir"]).resolve())
+            module_dir = (
+                matches[0]
+                if len(matches) == 1
+                else (project_dir / mod_value).resolve()
+            )
         if not module_dir.exists() or not module_dir.is_dir():
             raise StepError(f"modules 指定的模块目录不存在：{module_dir}")
         for rel in (("src", "main", "java"), ("src", "main", "kotlin")):
@@ -3711,9 +3729,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             project_dir,
             result["target_module"],
             active_profiles=set(result["active_maven_profiles"]),
+            build_tool=result.get("tool", ""),
         )
     else:
-        discovery = discover_maven_modules(project_dir)
+        discovery = discover_project_modules(
+            project_dir, build_tool=result.get("tool", "")
+        )
         result["project_scope"] = {
             "schema": "java-upgrade-analyzer.project-scope.v1",
             "status": "insufficient",
@@ -4144,11 +4165,11 @@ def build_step1_response_properties():
         },
         "base_branch": {
             "type": "string",
-            "description": "可选。基准侧分支名；artifact 模式下若嵌套依赖缺少 pom.properties，会优先用该分支执行 mvn dependency:list 补全坐标。",
+            "description": "可选。基准侧分支名；artifact 模式下若嵌套依赖缺少 pom.properties，会优先用该分支生成 Maven/Gradle runtime 依赖报告补全坐标。",
         },
         "current_branch": {
             "type": "string",
-            "description": "可选。当前侧分支名；artifact 模式下若嵌套依赖缺少 pom.properties，会优先用该分支执行 mvn dependency:list 补全坐标。",
+            "description": "可选。当前侧分支名；artifact 模式下若嵌套依赖缺少 pom.properties，会优先用该分支生成 Maven/Gradle runtime 依赖报告补全坐标。",
         },
         "base_source_project_dir": {
             "type": "string",
@@ -4193,8 +4214,8 @@ def build_step1_response_properties():
         },
         "tool": {
             "type": "string",
-            "enum": ["maven"],
-            "description": "当前 Step1 只支持 maven。",
+            "enum": ["maven", "gradle"],
+            "description": "构建工具；通常从项目根目录自动识别 Maven 或 Gradle。",
         },
     }
 
@@ -4271,7 +4292,7 @@ def build_step1_static_contract():
                 "artifact_inputs 模式下，若用户已给两侧产物，仍应优先继续抽取 base_branch/current_branch，避免运行时反复补参。",
                 "只有在不是同仓库双分支场景时，才把 base_source_project_dir/current_source_project_dir 作为兜底字段。",
                 "checkout_build 模式一旦成立，就天然表示由系统在隔离 worktree 中 package，不需要任何额外布尔许可字段。",
-                "若已知某一侧 Maven 需要特定 JDK，可分别显式提供 base_jdk_home/current_jdk_home；未提供时各侧默认回落主机 JAVA_HOME。",
+                "若已知某一侧 Maven/Gradle 需要特定 JDK，可分别显式提供 base_jdk_home/current_jdk_home；未提供时各侧默认回落主机 JAVA_HOME。",
             ],
         },
         "agent_workflow": [
@@ -4372,7 +4393,7 @@ def write_step1_module_candidates(report_dir, module_candidates):
         "",
         "请选择本次实际部署和升级的一个业务模块。部署线索只用于排序，系统不会据此替你决定分析范围。",
         "",
-        "| 模块路径 | Maven 坐标 | packaging | 部署线索 |",
+        "| 模块路径 | 依赖坐标 | packaging | 部署线索 |",
         "|---|---|---|---|",
     ]
     for item in module_candidates or []:
@@ -4478,7 +4499,7 @@ def build_step1_preflight_interaction(run_context):
         )
 
     checklist_lines = [
-        "当前只支持 Maven，且一次分析只对应一个部署模块。",
+        "支持 Maven 与 Gradle，且一次分析只对应一个部署模块。",
         "执行前请先明确一种输入方式；模式一旦进入执行，不允许因为失败自动切到另一种模式。",
         "主推荐场景：同一系统、同一仓库、不同分支；若已拿到编译产物，优先走直接产物模式。",
         "直接产物模式先使用两侧最终制品；分支和源码目录只用于后续上下文或坐标补全，不替代制品事实。",
@@ -4864,7 +4885,7 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             ],
         },
         "runtime_rules": [
-            "确认前不得执行 Maven、创建分析 worktree 或继续后续步骤。",
+            "确认前不得执行 Maven/Gradle、创建分析 worktree 或继续后续步骤。",
             "用户确认后必须固定到 resolved commit，不能依赖工作区当前 checkout。",
         ],
         "next_action_rule": "只能等待用户补充远程 ref、明确确认本地兜底或取消。",
@@ -4873,11 +4894,11 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
 
 
 def resolve_step1_refs_for_execution(run_context, project_dir):
-    """Resolve explicit Step1 refs and stop mutable source-only inputs before Maven."""
+    """Resolve explicit Step1 refs before Maven/Gradle execution."""
     updated = dict(run_context or {})
     if updated.get("base_artifact_path") and updated.get("current_artifact_path"):
         # Direct artifacts are parsed first. Ref resolution is deferred until a
-        # concrete unresolved nested JAR actually needs Maven coordinate fallback.
+        # concrete unresolved nested JAR actually needs build-tool coordinate fallback.
         return updated, None
     requests = []
     for side in ("base", "current"):
@@ -7822,8 +7843,6 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
 
     if step_id == "step1":
         output = step1_dep_changes_path(report_dir)
-        if run_context.get("tool", "maven") != "maven":
-            raise StepError("Step1 当前只支持 Maven，并且只比较单模块的最终打包依赖。")
         base_artifact_path = run_context.get("base_artifact_path", "")
         current_artifact_path = run_context.get("current_artifact_path", "")
         base_branch = run_context.get("base_branch")
@@ -8017,7 +8036,7 @@ def main(argv=None, _skip_environment_contract=False):
     ap.add_argument("--strict-risk-gate", action="store_true")
     ap.add_argument("--primary-module", default="")
     ap.add_argument("--target-module", default="", help="本次分析唯一的目标部署模块；新流程优先使用")
-    ap.add_argument("--tool", choices=["maven", "gradle"], default="maven")
+    ap.add_argument("--tool", choices=["maven", "gradle"], default="")
     ap.add_argument("--response-json", default="", help="结构化用户答复 JSON，例如 '{\"action\":\"continue\"}'")
     ap.add_argument("--response-file", default="", help="结构化用户答复 JSON 文件路径")
     ap.add_argument(
@@ -8042,17 +8061,26 @@ def main(argv=None, _skip_environment_contract=False):
     if not args.step:
         ap.error("--step 是必填参数；若只想读取前置协议，请改用 --describe-step1-contract")
 
+    project_dir = Path(args.project_dir).resolve()
+    selected_build_tool = args.tool or detect_build_tool(project_dir)
     environment = (
         {"status": "passed", "checks": []}
         if _skip_environment_contract
-        else contract_payload(require_maven=True)
+        else (
+            contract_payload(require_maven=True)
+            if selected_build_tool == "maven"
+            else contract_payload(
+                require_maven=False,
+                require_gradle=True,
+                project_dir=project_dir,
+            )
+        )
     )
     if environment["status"] != "passed":
         for line in build_environment_block_message(environment):
             print(line, file=sys.stderr)
         return 1
 
-    project_dir = Path(args.project_dir).resolve()
     if not project_dir.is_dir():
         print(f"❌ 项目目录不存在：{project_dir}", file=sys.stderr)
         return 1

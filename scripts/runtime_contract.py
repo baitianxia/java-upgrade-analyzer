@@ -12,13 +12,14 @@ import re
 import subprocess
 import sys
 
-from compat import find_executable
+from compat import find_executable, gradle_cmd
 
 
 SUPPORTED_PYTHON = {(3, 12), (3, 13), (3, 14)}
 SUPPORTED_PLATFORMS = {"Linux", "Darwin", "Windows"}
 SUPPORTED_JDK_MAJORS = {11, 17, 21}
 MINIMUM_MAVEN = (3, 8)
+MINIMUM_GRADLE = (7, 6)
 REQUIREMENTS_FILE = Path(__file__).resolve().parents[1] / "requirements-runtime.txt"
 
 
@@ -102,7 +103,7 @@ def _jdk_major(text):
     return version[1] if version[0] == 1 and len(version) > 1 else version[0]
 
 
-def validate_runtime_contract(*, require_maven=True):
+def validate_runtime_contract(*, require_maven=True, require_gradle=False, project_dir=None):
     checks = []
     python_version = sys.version_info[:2]
     python_implementation = platform.python_implementation()
@@ -149,6 +150,8 @@ def validate_runtime_contract(*, require_maven=True):
     }
     if require_maven:
         commands["mvn"] = ["mvn", "-version"]
+    if require_gradle:
+        commands["gradle"] = gradle_cmd(project_dir) + ["--version", "--no-daemon"]
 
     outputs = {}
     for name, command in commands.items():
@@ -187,11 +190,33 @@ def validate_runtime_contract(*, require_maven=True):
             "Maven >= 3.8 using the active JDK",
             "unsupported_maven_or_mismatched_java_runtime",
         ))
+    if require_gradle and outputs.get("gradle"):
+        gradle_output = outputs["gradle"]
+        gradle_match = re.search(r"(?m)^Gradle\s+([^\s]+)", gradle_output)
+        gradle_version = _version_tuple(gradle_match.group(1)) if gradle_match else ()
+        java_match = re.search(
+            r"(?m)^(?:Launcher JVM|JVM):\s*([^\r\n]+)",
+            gradle_output,
+            re.IGNORECASE,
+        )
+        gradle_java = _jdk_major(java_match.group(1)) if java_match else None
+        active_java = next(iter(observed_majors), None) if len(observed_majors) == 1 else None
+        checks.append(_check(
+            "gradle_runtime",
+            gradle_version[:2] >= MINIMUM_GRADLE and gradle_java == active_java,
+            f"gradle={'.'.join(map(str, gradle_version)) or 'unknown'}, java={gradle_java or 'unknown'}",
+            "Gradle >= 7.6 using the active JDK",
+            "unsupported_gradle_or_mismatched_java_runtime",
+        ))
     return checks
 
 
-def contract_payload(*, require_maven=True):
-    checks = validate_runtime_contract(require_maven=require_maven)
+def contract_payload(*, require_maven=True, require_gradle=False, project_dir=None):
+    checks = validate_runtime_contract(
+        require_maven=require_maven,
+        require_gradle=require_gradle,
+        project_dir=project_dir,
+    )
     return {
         "status": "passed" if all(item.status == "passed" for item in checks) else "failed",
         "checks": [asdict(item) for item in checks],

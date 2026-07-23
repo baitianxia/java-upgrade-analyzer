@@ -19,6 +19,65 @@ from pipeline_constants import STEP1_ARTIFACTS_DIRNAME  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
+    def test_parse_gradle_dependency_report_uses_selected_runtime_version(self):
+        deps = s1_dep_diff.parse_gradle_dependency_report(
+            """runtimeClasspath - Runtime classpath of source set 'main'.
+            +--- org.example:direct:1.0 -> 1.2
+            |    \\--- org.example:transitive:3.4 (*)
+            +--- project :internal
+            \\--- org.example:broken:9 FAILED
+            """
+        )
+
+        self.assertEqual(deps["org.example:direct"]["version"], "1.2")
+        self.assertEqual(deps["org.example:transitive"]["version"], "3.4")
+        self.assertNotIn("org.example:broken", deps)
+
+    def test_collect_gradle_deps_uses_wrapper_and_target_module_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+            (work_dir / "settings.gradle").write_text("include ':app'\n", encoding="utf-8")
+            (work_dir / "build.gradle").write_text("group = 'com.acme'\n", encoding="utf-8")
+            (work_dir / "app").mkdir()
+            (work_dir / "app/build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+            wrapper = work_dir / "gradlew"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+            artifact_path = work_dir / "app/build/libs/app.jar"
+            artifact_path.parent.mkdir(parents=True)
+            artifact_path.write_text("placeholder", encoding="utf-8")
+            commands = []
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                return "", "", 0
+
+            packaged_raw = [{
+                "entry_id": "1",
+                "lib_entry": "BOOT-INF/lib/demo-1.0.jar",
+                "lib_name": "demo-1.0.jar",
+                "coord": "org.example:demo",
+                "group_id": "org.example",
+                "artifact_id": "demo",
+                "version": "1.0",
+                "classifier": "",
+                "match_source": "pom.properties",
+                "read_error": "",
+            }]
+            with patch.object(s1_dep_diff, "run_cmd", side_effect=fake_run), \
+                    patch.object(s1_dep_diff, "_discover_packaged_archives", return_value=[artifact_path]), \
+                    patch.object(s1_dep_diff, "_detect_archive_packaging_type", return_value="boot_jar"), \
+                    patch.object(s1_dep_diff, "_inspect_packaged_archive", return_value=packaged_raw):
+                deps, meta = s1_dep_diff.collect_gradle_deps_for_workspace(
+                    work_dir, primary_module=":app"
+                )
+
+        self.assertIn("org.example:demo", deps)
+        self.assertEqual(Path(commands[0][0]), wrapper.resolve())
+        self.assertIn(":app:build", commands[0])
+        self.assertEqual(meta["build_tool"], "gradle")
+        self.assertTrue(meta["gradle_model_hash"])
+
     def test_explicit_profile_is_used_even_when_target_module_is_unprofiled(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1022,6 +1081,39 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertIn("org.example:demo-lib", deps)
         self.assertEqual(meta["branch"], "feature/upgrade")
         self.assertEqual(meta["worktree_dir"], str(temp_dir))
+
+    def test_get_packaged_deps_by_switching_branch_dispatches_to_gradle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+            temp_dir = work_dir / "worktree"
+            temp_dir.mkdir(parents=True)
+            artifact = temp_dir / "app/build/libs/app.jar"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"artifact")
+            gradle_meta = {
+                "mode": "final_artifact",
+                "artifact_path": str(artifact),
+            }
+            with patch.object(s1_dep_diff, "build_java_env", return_value={}), \
+                    patch.object(s1_dep_diff, "create_branch_worktree", return_value=temp_dir), \
+                    patch.object(
+                        s1_dep_diff,
+                        "collect_gradle_deps_for_workspace",
+                        return_value=({"org.example:demo": {"version": "1"}}, gradle_meta),
+                    ) as gradle_collect, \
+                    patch.object(s1_dep_diff, "collect_maven_deps_for_workspace") as maven_collect, \
+                    patch.object(s1_dep_diff, "remove_branch_worktree"):
+                deps, meta = s1_dep_diff.get_packaged_deps_by_switching_branch(
+                    "feature/upgrade",
+                    work_dir,
+                    primary_module=":app",
+                    build_tool="gradle",
+                )
+
+        gradle_collect.assert_called_once()
+        maven_collect.assert_not_called()
+        self.assertIn("org.example:demo", deps)
+        self.assertEqual(meta["branch"], "feature/upgrade")
 
     def test_artifact_coordinate_enrichment_prefers_branch_over_source_directory(self):
         branch_deps = {"org.example:branch": {"version": "2.0.0"}}
