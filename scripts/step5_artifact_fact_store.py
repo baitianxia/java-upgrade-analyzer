@@ -199,23 +199,6 @@ class Step5ArtifactFactStore:
                 identities[coord] = identity
             elif previous != identity:
                 identity_failures[coord] = f"artifact_coord_identity_conflict:{coord}"
-        final_path = str(catalog.get("final_artifact_path") or "")
-        final_sha = str(catalog.get("final_artifact_sha256") or "").lower()
-        if final_path:
-            final_identity = ArtifactIdentity(
-                coord="__final_artifact__",
-                path=final_path,
-                sha256=final_sha,
-                artifact_entry="<final-artifact>",
-                target_jdk=target_jdk,
-            )
-            previous = identities.get("__final_artifact__")
-            if previous is None:
-                identities["__final_artifact__"] = final_identity
-            elif previous != final_identity:
-                identity_failures["__final_artifact__"] = (
-                    "artifact_coord_identity_conflict:__final_artifact__"
-                )
         return cls(identities, identity_failures)
 
     def inventory(self, coord: str) -> ArtifactInventory:

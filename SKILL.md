@@ -447,19 +447,21 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 对应步骤：`step5`
 - 输入：仅使用 `evidence/api_changes/all_changed_apis.csv`（由 Phase 4 产出）作为变更 API 目标集；按 Phase 7 用户确认的全量范围执行，或按 `selected_targets` / 正式 `step5_selected_coords` / `step5_selected_names` 过滤到所选依赖子集
 - 输出：`.upgrade-report/evidence/call_chain/`
-- 附加证据：Step1 留存的 current 最终制品业务 class、嵌套运行时 JAR 字节码边与 `.upgrade-report/framework_adapters.json`
+- 附加证据：Step1 从 current 最终制品一次性留存的业务内容、独立运行时 JAR 字节码边与 `.upgrade-report/framework_adapters.json`
+- 规则：Step1 的 `dependency_jars.json` 必须同时覆盖 Step4 变化 JAR、Step5 全部 current 运行时 JAR 和 current 业务内容。Step5 只能校验并读取这些独立留存文件，不得重新打开 fat JAR/WAR、再次提取 `BOOT-INF/lib`/`WEB-INF/lib`、递归打开嵌套 JAR，或从源码重新识别已有 GAV。源码只增强已经由 Step1 确定的坐标
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
 - 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
 - 规则：名称筛选按 `coord` 的 `artifactId` 精确匹配；坐标筛选按 `coord` 精确匹配
-- 规则：若用户通过 `selected_targets` 明确提交 `selection_key` 或 `coord`，Step5 只能分析对应唯一依赖；只有当用户只给出 `name` 时，才允许按名称批量筛选
+- 规则：用户只需用自然语言选择“全部分析”或说出依赖名称/完整坐标；`selected_targets`、`selection_key` 等仅是程序内部字段，禁止出现在用户卡片、回复示例和操作指引中。内部归一化后，Step5 只能分析对应唯一依赖；只有用户只给出依赖简称时，才允许按名称批量筛选
 - 规则：筛选匹配范围只允许来自 Step4 API；Step3 平台/框架风险和类级 candidate 不得追加为 Step5 变更 API
 - 规则：显式重跑某一步前，调度层必须先清空该步骤全部正式输出，避免旧轮次的制品、目录或字节码证据混入本轮结果
 - 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
 - 规则：依赖源码映射缺失或无法对齐时，不得要求用户显式批准降级；系统应继续使用 current 最终制品中的业务 class 和运行时依赖 JAR 字节码。仍无法补齐的 API 进入 `not_analyzed` 并限制最终结论，用户可在报告完成后自愿补源码重跑
 - 规则：Step5 成功后直接进入 Step6 生成带覆盖边界的最终报告，不生成例行成功确认 checkpoint
 - 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
-- 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256，同时固化变化依赖 JAR 清单；Step4 直接消费该清单，Step3/Step5 按各自契约使用最终制品证据。任何步骤都不得用本地 Maven 仓库副本或重新下载的 JAR 替代最终制品证据
+- 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256，同时一次性固化变化依赖 JAR、全部 current 运行时 JAR 和 current 业务内容；Step4/Step5 直接消费该清单。任何步骤都不得用本地 Maven 仓库副本、重新下载的 JAR 或再次解包 fat JAR 替代这些证据
 - 规则：最终制品内缺失嵌套 JAR、坐标 unresolved、SHA 不一致或字节码解析失败时，必须记录覆盖缺口；未命中不得解释为无影响，也不得以本地 Maven JAR 填补缺口
+- 规则：Step1 留存 JAR 缺失、SHA 不一致或归档安全校验失败属于核心制品证据失效，不是普通覆盖缺口。必须在 Step1 门控或 Step5 构图前硬失败；禁止继续生成调用链的 `not_analyzed` 结果或进入 Step6
 - 规则：依赖源码只有在 Step4 记录包含固定 commit 且来源为 `remote_source_resolved` 或 `user_confirmed_local_source` 时，才允许进入 Step5 增强图；来源未确认、仓库不一致、源码类不在当前最终制品 JAR 中时必须拒绝该源码边并记录覆盖缺口，不能降级成确定无影响
 - 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / not_impacted / uncertain / not_found_in_static_analysis / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据

@@ -836,6 +836,38 @@ class RunStepMainStateTest(unittest.TestCase):
                 ["FINAL_ARTIFACT_JAR_EVIDENCE_MISSING"],
             )
 
+    def test_step5_artifact_preflight_failure_carries_system_block_reason_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            diagnostic_path = (
+                report_dir
+                / "evidence"
+                / "call_chain"
+                / "artifact_preflight_failure.json"
+            )
+            self._write_text(
+                diagnostic_path,
+                json.dumps(
+                    {
+                        "status": "blocked_by_system",
+                        "reason_code": (
+                            "STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            reason_codes = run_step.read_step_system_block_reason_codes(
+                "s5_call_chain_engine_integrated.py",
+                report_dir,
+            )
+
+        self.assertEqual(
+            reason_codes,
+            ["STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID"],
+        )
+
     def test_auto_step_reads_from_main_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
@@ -1353,7 +1385,9 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertIn("请确认系统触达证据的分析范围", root_readme)
             self.assertIn("## 当前需要你决定", root_readme)
             self.assertIn("请选择全量分析或部分分析", root_readme)
-            self.assertIn("`全量继续`", root_readme)
+            self.assertIn("`全量分析`", root_readme)
+            self.assertIn("完整依赖选择清单（包含未展示候选）", root_readme)
+            self.assertIn("从“依赖包”列复制名称或完整坐标", root_readme)
             self.assertIn(
                 "[evidence/api_changes/changed_dependencies.md](evidence/api_changes/changed_dependencies.md)",
                 root_readme,

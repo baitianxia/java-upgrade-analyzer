@@ -17,6 +17,7 @@ from pipeline_constants import (
     STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
 )
 from analysis_contract import sha256_file
+from artifact_safety import require_safe_archive
 from csv_io import open_csv_read
 GATES = list(GATE_SEQUENCE)
 
@@ -104,6 +105,21 @@ def has_dep_versions(row):
     new_ver = (row.get("new_version") or "").strip()
     return old_ver not in ("", "-") or new_ver not in ("", "-")
 
+
+def require_safe_step1_retained_archive(path, label):
+    try:
+        require_safe_archive(
+            path,
+            inspect_nested_archives=False,
+            allow_duplicate_maven_metadata=True,
+        )
+    except (OSError, ValueError) as exc:
+        fail(
+            f"Step1 留存制品安全校验失败：{label}（{exc}）",
+            ["修复 Step1 最终制品条目后重新执行 Step1；禁止继续 Step4/Step5"],
+        )
+
+
 def gate_step1_scope(d):
     csv_path = dep_changes_path(d)
     current_csv_path = current_resolved_path(d)
@@ -128,7 +144,10 @@ def gate_step1_scope(d):
               for pc in python_cmds()])
     current_rows = read_csv_dicts(
         current_csv_path,
-        ["coord", "version", "scope", "remark"],
+        [
+            "coord", "version", "scope", "remark", "lib_entry",
+            "resolution_status",
+        ],
     )
     valid_current_rows = [
         row for row in current_rows
@@ -145,20 +164,30 @@ def gate_step1_scope(d):
         fail("仅允许分析 base/current 均成功构建的升级结果")
     if any(not item.get("artifact_sha256") for item in sides):
         fail("evidence/dependencies/build_provenance.json 缺少 base/current 产物哈希，无法校验源码与制品对齐")
-    for item in sides:
-        artifact_path = str(item.get("artifact_path") or "").strip()
-        if not artifact_path or not Path(artifact_path).is_file():
-            fail(f"{item.get('side')} 最终制品未留存或已丢失，无法继续执行制品字节码分析")
-        if sha256_file(artifact_path) != item.get("artifact_sha256"):
-            fail(f"{item.get('side')} 最终制品 SHA-256 与 build_provenance.json 不一致")
     manifest_file = dependency_jars_manifest_path(d)
     if not manifest_file.is_file():
-        fail("Step1 变化依赖 JAR 清单不存在，请重新执行 Step1")
+        fail("Step1 依赖制品清单不存在，请重新执行 Step1")
     try:
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        fail(f"Step1 变化依赖 JAR 清单无法读取：{type(exc).__name__}")
+        fail(f"Step1 依赖制品清单无法读取：{type(exc).__name__}")
     manifest_items = list(manifest.get("items") or [])
+    gav_hashes = {}
+    for item in manifest_items:
+        key = (
+            str(item.get("side") or "").strip(),
+            str(item.get("coord") or "").strip(),
+            str(item.get("version") or "").strip(),
+        )
+        gav_hashes.setdefault(key, set()).add(
+            str(item.get("nested_jar_sha256") or "").lower()
+        )
+    for (side, coord, version), hashes in gav_hashes.items():
+        if len(hashes) > 1:
+            fail(
+                f"Step1 同一 GAV 对应多个不同字节的最终制品条目："
+                f"{side} {coord}:{version}"
+            )
     item_by_side_entry = {
         (
             str(item.get("side") or "").strip(),
@@ -190,6 +219,42 @@ def gate_step1_scope(d):
                 fail(f"Step1 变化依赖 JAR 不可用：{row.get('coord')}（{side}）")
             if sha256_file(retained_path) != expected_sha:
                 fail(f"Step1 变化依赖 JAR SHA-256 不一致：{row.get('coord')}（{side}）")
+            require_safe_step1_retained_archive(
+                retained_path,
+                f"{row.get('coord')}（{side}）",
+            )
+    for row in current_rows:
+        if str(row.get("resolution_status") or "").strip() != "resolved":
+            continue
+        if str(row.get("scope") or "").strip() in {"test", "provided", "optional"}:
+            continue
+        coord = str(row.get("coord") or "").strip()
+        version = str(row.get("version") or "").strip()
+        if not coord or version in ("", "-"):
+            continue
+        lib_entry = str(row.get("lib_entry") or "").replace("\\", "/").strip()
+        if not lib_entry:
+            fail(f"Step1 当前运行依赖缺少 lib_entry：{coord}")
+        item = item_by_side_entry.get(("current", lib_entry))
+        if not item or "step5_runtime" not in set(item.get("purposes") or ()):
+            fail(f"Step1 未留存当前运行依赖 JAR：{coord}")
+        retained_path = Path(str(item.get("retained_path") or ""))
+        expected_sha = str(item.get("nested_jar_sha256") or "").strip()
+        if not retained_path.is_file() or not expected_sha:
+            fail(f"Step1 当前运行依赖 JAR 不可用：{coord}")
+        if sha256_file(retained_path) != expected_sha:
+            fail(f"Step1 当前运行依赖 JAR SHA-256 不一致：{coord}")
+        require_safe_step1_retained_archive(retained_path, coord)
+    for item in manifest.get("business_artifacts") or ():
+        if not isinstance(item, dict) or str(item.get("side") or "") != "current":
+            continue
+        retained_path = Path(str(item.get("retained_path") or ""))
+        expected_sha = str(item.get("sha256") or "").strip()
+        if not retained_path.is_file() or not expected_sha:
+            fail("Step1 当前业务类制品不可用")
+        if sha256_file(retained_path) != expected_sha:
+            fail("Step1 当前业务类制品 SHA-256 不一致")
+        require_safe_step1_retained_archive(retained_path, "current 业务内容")
     ok(f"step1_scope 门控通过：变更清单={len(valid_dep_rows)} 当前依赖={len(valid_current_rows)}")
 
 def gate_context(d):

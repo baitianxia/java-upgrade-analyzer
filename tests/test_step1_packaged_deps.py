@@ -349,6 +349,48 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(unresolved, [])
         self.assertIn("metadata_anomalies=", entries[0]["remark"])
 
+    def test_identical_duplicate_maven_metadata_resolves_one_gav(self):
+        properties = (
+            "groupId=com.webank.ims.jmx\n"
+            "artifactId=jmxmon\n"
+            "version=0.0.1-SNAPSHOT\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            nested_bytes = self._nested_jar_bytes([
+                (
+                    "META-INF/maven/com.webank.ims.jmx/jmxmon/pom.properties",
+                    properties,
+                ),
+                (
+                    "META-INF/maven/com.webank.ims.jmx/jmxmon/pom.properties",
+                    properties,
+                ),
+                (
+                    "META-INF/maven/com.webank.ims.jmx/jmxmon/pom.xml",
+                    "<project/>",
+                ),
+                (
+                    "META-INF/maven/com.webank.ims.jmx/jmxmon/pom.xml",
+                    "<project/>",
+                ),
+            ])
+
+        row = s1_dep_diff._extract_packaged_dep_from_nested_jar(
+            nested_bytes,
+            "BOOT-INF/lib/jmxmon-0.0.1-SNAPSHOT.jar",
+        )
+        entries, resolved, unresolved = s1_dep_diff._enrich_packaged_deps_with_runtime(
+            [row], {},
+        )
+
+        self.assertEqual(row["coord"], "com.webank.ims.jmx:jmxmon")
+        self.assertEqual(row["version"], "0.0.1-SNAPSHOT")
+        self.assertEqual(row["metadata_anomalies"], [])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(list(resolved), ["com.webank.ims.jmx:jmxmon"])
+        self.assertEqual(unresolved, [])
+
     def test_step1_does_not_read_unrelated_nested_class_payloads(self):
         class_payload = b"step1-must-not-read-this-class"
         nested = bytearray(self._nested_jar_bytes([

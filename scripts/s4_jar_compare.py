@@ -763,6 +763,56 @@ class Step1ArtifactJarResolver:
         return None
 
 
+def collapse_same_gav_artifact_rows(rows):
+    """Analyze one logical GAV change once when its retained bytes are identical."""
+    collapsed = []
+    seen = {}
+    conflicts = []
+    for row in rows or ():
+        key = (
+            str(row.get('base_coord') or row.get('coord') or '').strip(),
+            str(row.get('current_coord') or row.get('coord') or '').strip(),
+            str(row.get('old_version') or '').strip(),
+            str(row.get('new_version') or '').strip(),
+            str(row.get('change_type') or '').strip(),
+        )
+        identity = (
+            str(
+                (row.get('_step4_base_jar_evidence') or {}).get(
+                    'nested_jar_sha256'
+                ) or ''
+            ).lower(),
+            str(
+                (row.get('_step4_current_jar_evidence') or {}).get(
+                    'nested_jar_sha256'
+                ) or ''
+            ).lower(),
+        )
+        previous = seen.get(key)
+        if previous is None:
+            seen[key] = (identity, row)
+            collapsed.append(row)
+            continue
+        previous_identity, previous_row = previous
+        if identity == previous_identity:
+            continue
+        conflicts.append({
+            'coord': str(row.get('coord') or '').strip(),
+            'old_version': key[2],
+            'new_version': key[3],
+            'base_entries': sorted({
+                str(previous_row.get('base_lib_entry') or '').strip(),
+                str(row.get('base_lib_entry') or '').strip(),
+            } - {''}),
+            'current_entries': sorted({
+                str(previous_row.get('current_lib_entry') or '').strip(),
+                str(row.get('current_lib_entry') or '').strip(),
+            } - {''}),
+            'reason_code': 'SAME_GAV_DIFFERENT_RETAINED_BYTES',
+        })
+    return collapsed, conflicts
+
+
 _REPO_REFS_CACHE = {}
 _CORE_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 _NON_CORE_TOKEN_RE = re.compile(r"[A-Za-z]+[A-Za-z0-9]*|\d+")
@@ -6576,6 +6626,40 @@ def main():
             prepared["_step4_current_jar_path"] = current_evidence.get("path") or ""
         prepared_dep_rows.append(prepared)
     prepared_dep_rows, artifact_replacements = pair_artifact_replacement_rows(prepared_dep_rows)
+    prepared_dep_rows, same_gav_conflicts = collapse_same_gav_artifact_rows(
+        prepared_dep_rows
+    )
+    if same_gav_conflicts:
+        conflict_path = Path(args.output_dir) / "same_gav_identity_conflicts.json"
+        conflict_path.write_text(
+            json.dumps(
+                {
+                    "schema": "java-upgrade-analyzer.same-gav-conflicts.v1",
+                    "items": same_gav_conflicts,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            "❌ Step1 对同一 GAV 留存了不同字节的 JAR，无法按逻辑依赖合并；"
+            f"请复核 {conflict_path}",
+            file=sys.stderr,
+        )
+        timing.record(
+            "artifact_resolve",
+            status="error",
+            elapsed=time.perf_counter() - artifact_resolve_timer,
+            details={"same_gav_identity_conflicts": len(same_gav_conflicts)},
+        )
+        timing.record(
+            "step4.total",
+            status="same_gav_identity_conflict",
+            elapsed=step_timer.elapsed(),
+        )
+        timing.flush()
+        return 2
     artifact_replacements_path = Path(args.output_dir) / "artifact_replacements.json"
     artifact_replacements_path.write_text(
         json.dumps(

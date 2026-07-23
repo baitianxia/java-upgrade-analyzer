@@ -83,7 +83,7 @@ from step5_memory_observer import (
 from step5_artifact_fact_store import Step5ArtifactFactStore
 from signature_utils import normalize_signature_for_identity, signatures_match_identity
 from analysis_contract import build_project_scope, discover_project_modules, sha256_file
-from artifact_safety import inspect_archive
+from artifact_safety import require_safe_archive
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
     EVIDENCE_CALL_CHAIN_DIRNAME,
@@ -99,6 +99,7 @@ from pipeline_constants import (
     STEP5_ARTIFACT_BYTECODE_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
     STEP5_QUERY_INDEX_FILE,
+    STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
 )
 from s5_query_call_chain import write_query_index
 from dependency_source_alignment import align_dependency_source_mappings
@@ -147,6 +148,13 @@ def _dep_changes_path(report_dir):
 
 def _current_resolved_path(report_dir):
     return _evidence_dir(report_dir, EVIDENCE_DEPENDENCIES_DIRNAME) / "deps_current_resolved.csv"
+
+
+def _step1_dependency_jars_manifest_path(report_dir):
+    return (
+        _evidence_dir(report_dir, EVIDENCE_DEPENDENCIES_DIRNAME)
+        / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
+    )
 
 
 def _build_provenance_path(report_dir):
@@ -937,6 +945,36 @@ def _step5_integrated_main_impl(args):
         report_dir,
         business_source_dirs=business_source_dirs,
     )
+    catalog_blockers = runtime_dependency_catalog_blockers(
+        runtime_dependency_catalog
+    )
+    if catalog_blockers:
+        details_path = write_runtime_catalog_preflight_failure(
+            output_dir,
+            runtime_dependency_catalog,
+            catalog_blockers,
+        )
+        print(
+            "\n❌ Step5 前置检查失败：Step1 留存的核心制品证据不完整或不可安全读取。",
+            file=sys.stderr,
+        )
+        for item in catalog_blockers[:5]:
+            target = (
+                item.get('coord')
+                or item.get('artifact_entry')
+                or '<runtime-catalog>'
+            )
+            print(
+                f"  - {target}: {item.get('reason') or 'invalid'}",
+                file=sys.stderr,
+            )
+        print(f"诊断文件：{details_path}", file=sys.stderr)
+        print(
+            "必须从 Step1 修复制品证据后重跑；本次不会构建调用图、"
+            "生成“未完成分析”结论或进入 Step6。",
+            file=sys.stderr,
+        )
+        return 2
     artifact_fact_store = Step5ArtifactFactStore.from_catalog(
         runtime_dependency_catalog
     )
@@ -1742,50 +1780,19 @@ def _split_coord(coord):
     return parts[0].strip(), parts[1].strip()
 
 
-def _maven_coordinates_from_archive(archive):
-    coordinates = []
-    for name in archive.namelist():
-        if not re.fullmatch(r'META-INF/maven/[^/]+/[^/]+/pom\.properties', name):
-            continue
-        try:
-            text = archive.read(name).decode('utf-8', errors='strict')
-        except (KeyError, UnicodeDecodeError):
-            continue
-        properties = {}
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith(('#', '!')):
-                continue
-            key, separator, value = stripped.partition('=')
-            if separator:
-                properties[key.strip()] = value.strip()
-        group_id = properties.get('groupId', '')
-        artifact_id = properties.get('artifactId', '')
-        version = properties.get('version', '')
-        if group_id and artifact_id and version:
-            coordinates.append((group_id, artifact_id, version))
-    return sorted(set(coordinates))
-
-
 def _recover_reactor_module_coords(
-    business_source_dirs, artifact_path, *, active_profiles=None,
+    business_source_dirs, packaged_coords, *, active_profiles=None,
 ):
     source_paths = [
         Path(value).resolve() for value in (business_source_dirs or [])
         if str(value or '').strip()
     ]
-    if not source_paths or not artifact_path or not Path(artifact_path).is_file():
-        return set()
-    try:
-        with zipfile.ZipFile(artifact_path) as archive:
-            artifact_coords = {
-                f'{group_id}:{artifact_id}'
-                for group_id, artifact_id, _version
-                in _maven_coordinates_from_archive(archive)
-            }
-    except (OSError, zipfile.BadZipFile):
-        return set()
-    if not artifact_coords:
+    artifact_coords = {
+        str(value or '').strip()
+        for value in (packaged_coords or ())
+        if str(value or '').strip()
+    }
+    if not source_paths or not artifact_coords:
         return set()
 
     candidate_roots = set()
@@ -1878,216 +1885,226 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
     with open_csv_read(current_resolved_path) as f:
         rows = list(csv.DictReader(f))
 
-    artifact_path = ''
-    artifact_expected_hash = ''
-    provenance_path = str(_build_provenance_path(report_dir))
-    if os.path.exists(provenance_path):
+    manifest_path = _step1_dependency_jars_manifest_path(report_dir)
+    manifest = {}
+    if manifest_path.is_file():
         try:
-            provenance = json.loads(Path(provenance_path).read_text(encoding='utf-8'))
-            current_side = next(
-                (item for item in provenance.get('sides') or [] if item.get('side') == 'current'),
-                {},
-            )
-            artifact_path = str(current_side.get('artifact_path') or '').strip()
-            artifact_expected_hash = str(current_side.get('artifact_sha256') or '').strip()
-        except (OSError, json.JSONDecodeError):
-            catalog['reason_codes'].append('build_provenance_unreadable')
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            catalog['reason_codes'].append('step1_dependency_jars_manifest_unreadable')
+    else:
+        catalog['reason_codes'].append('step1_dependency_jars_manifest_missing')
 
-    artifact_ok = bool(artifact_path and os.path.isfile(artifact_path))
-    if artifact_ok and artifact_expected_hash:
-        artifact_ok = sha256_file(artifact_path) == artifact_expected_hash
-        if not artifact_ok:
-            catalog['reason_codes'].append('current_artifact_hash_mismatch')
-    elif not artifact_ok:
-        catalog['reason_codes'].append('current_artifact_unavailable')
-    if artifact_ok:
-        catalog['final_artifact_path'] = artifact_path
-        catalog['final_artifact_sha256'] = sha256_file(artifact_path)
-        safety = inspect_archive(artifact_path)
-        catalog['artifact_safety'] = {
-            'safe': safety.safe,
-            'reason_codes': list(safety.reason_codes),
-            'entry_count': safety.entry_count,
-            'total_uncompressed_bytes': safety.total_uncompressed_bytes,
-            'nested_archives': safety.nested_archives,
-            'max_observed_depth': safety.max_observed_depth,
-        }
-        if not safety.safe:
-            artifact_ok = False
-            catalog['reason_codes'].append('artifact_safety_violation')
-        if artifact_ok and not application_module_coords:
-            application_module_coords.update(
-                _recover_reactor_module_coords(
-                    business_source_dirs,
-                    artifact_path,
-                    active_profiles=active_maven_profiles,
-                )
+    runtime_manifest_items = [
+        item for item in (manifest.get('items') or ())
+        if isinstance(item, dict)
+        and str(item.get('side') or '').strip() == 'current'
+        and 'step5_runtime' in set(item.get('purposes') or ())
+    ]
+    packaged_coords = {
+        str(item.get('coord') or '').strip()
+        for item in runtime_manifest_items
+        if str(item.get('coord') or '').strip()
+    }
+    if not application_module_coords:
+        application_module_coords.update(
+            _recover_reactor_module_coords(
+                business_source_dirs,
+                packaged_coords,
+                active_profiles=active_maven_profiles,
             )
+        )
 
     exact_count = 0
     extraction_failures = []
+    conflicted_coords = set()
     business_class_count = 0
-    cache_dir = _runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME / 'current'
-    if artifact_ok:
-        cache_dir.mkdir(parents=True, exist_ok=True)
+    final_artifact_sha256 = ''
+    row_by_entry = {
+        str(row.get('lib_entry') or '').replace('\\', '/').strip(): row
+        for row in rows
+        if str(row.get('lib_entry') or '').strip()
+    }
+    for manifest_item in sorted(
+        runtime_manifest_items,
+        key=lambda item: str(item.get('lib_entry') or ''),
+    ):
+        lib_entry = str(manifest_item.get('lib_entry') or '').replace('\\', '/').strip()
+        row = row_by_entry.get(lib_entry) or {}
+        coord = str(row.get('coord') or manifest_item.get('coord') or '').strip()
+        version = str(row.get('version') or manifest_item.get('version') or '').strip()
+        scope = str(row.get('scope') or manifest_item.get('scope') or '').strip()
+        jar_path = Path(str(manifest_item.get('retained_path') or ''))
+        expected_sha = str(manifest_item.get('nested_jar_sha256') or '').lower()
+        outer_sha = str(manifest_item.get('outer_artifact_sha256') or '').lower()
+        if outer_sha:
+            if final_artifact_sha256 and final_artifact_sha256 != outer_sha:
+                extraction_failures.append({
+                    'coord': coord, 'lib_entry': lib_entry,
+                    'reason': 'step1_outer_artifact_identity_conflict',
+                })
+                continue
+            final_artifact_sha256 = outer_sha
+        if not coord or not version:
+            extraction_failures.append({
+                'coord': coord, 'lib_entry': lib_entry,
+                'reason': 'step1_runtime_identity_missing',
+            })
+            continue
+        if coord in conflicted_coords:
+            continue
+        if not jar_path.is_file() or not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+            extraction_failures.append({
+                'coord': coord, 'lib_entry': lib_entry,
+                'reason': 'step1_retained_dependency_jar_missing',
+            })
+            continue
         try:
-            with zipfile.ZipFile(artifact_path) as outer:
-                names = set(outer.namelist())
-                for row in rows:
-                    coord = str((row or {}).get('coord') or '').strip()
-                    version = str((row or {}).get('version') or '').strip()
-                    scope = str((row or {}).get('scope') or '').strip()
-                    lib_entry = str((row or {}).get('lib_entry') or '').strip()
-                    if scope in {'test', 'provided', 'optional'}:
-                        continue
-                    if not coord or str((row or {}).get('resolution_status') or '').strip() == 'unresolved':
-                        extraction_failures.append({
-                            'coord': coord, 'lib_entry': lib_entry,
-                            'reason': 'dependency_coordinate_unresolved',
-                        })
-                        continue
-                    if not version:
-                        extraction_failures.append({'coord': coord, 'lib_entry': lib_entry, 'reason': 'dependency_version_missing'})
-                        continue
-                    if not lib_entry or lib_entry not in names:
-                        extraction_failures.append({'coord': coord, 'lib_entry': lib_entry, 'reason': 'lib_entry_missing'})
-                        continue
-                    try:
-                        blob = outer.read(lib_entry)
-                        digest = hashlib.sha256(blob).hexdigest()
-                        jar_path = cache_dir / f'{digest[:16]}-{Path(lib_entry).name}'
-                        if not jar_path.exists() or sha256_file(jar_path) != digest:
-                            jar_path.write_bytes(blob)
-                        application_owned = coord in application_module_coords
-                        item = {
-                            'coord': coord, 'version': version, 'scope': scope,
-                            'jar_path': str(jar_path), 'artifact_entry': lib_entry,
-                            'sha256': digest, 'evidence_source': 'current_final_artifact',
-                            'application_owned': application_owned,
-                        }
-                        if application_owned:
-                            item['ownership_evidence'] = {
-                                'authority': 'reactor_coordinate_and_final_artifact_entry',
-                                'reactor_coord': coord,
-                                'artifact_entry': lib_entry,
-                                'final_artifact_sha256': catalog['final_artifact_sha256'],
-                            }
-                        catalog['by_coord'][coord] = item
-                        catalog['entries'].append(item)
-                        catalog['jar_paths'][coord] = str(jar_path)
-                        exact_count += 1
-                    except (OSError, KeyError, zipfile.BadZipFile) as exc:
-                        extraction_failures.append({'coord': coord, 'lib_entry': lib_entry, 'reason': f'extract_failed:{exc}'})
+            if sha256_file(jar_path) != expected_sha:
+                raise ValueError('sha256_mismatch')
+            require_safe_archive(
+                jar_path,
+                inspect_nested_archives=False,
+                allow_duplicate_maven_metadata=True,
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            extraction_failures.append({
+                'coord': coord, 'lib_entry': lib_entry,
+                'reason': f'step1_retained_dependency_jar_invalid:{exc}',
+            })
+            continue
+        application_owned = coord in application_module_coords
+        item = {
+            'coord': coord,
+            'version': version,
+            'scope': scope,
+            'jar_path': str(jar_path),
+            'artifact_entry': lib_entry,
+            'artifact_entries': [lib_entry],
+            'sha256': expected_sha,
+            'evidence_source': 'current_final_artifact',
+            'evidence_origin': 'step1_retained_dependency_jar',
+            'application_owned': application_owned,
+        }
+        if application_owned:
+            item['ownership_evidence'] = {
+                'authority': 'reactor_coordinate_and_final_artifact_entry',
+                'reactor_coord': coord,
+                'artifact_entry': lib_entry,
+                'final_artifact_sha256': final_artifact_sha256,
+            }
+        previous = catalog['by_coord'].get(coord)
+        if previous:
+            if str(previous.get('sha256') or '') == expected_sha:
+                previous['artifact_entries'] = sorted(set(
+                    previous.get('artifact_entries') or ()
+                ) | {lib_entry})
+                continue
+            extraction_failures.append({
+                'coord': coord, 'lib_entry': lib_entry,
+                'reason': 'runtime_coordinate_identity_conflict',
+            })
+            catalog['by_coord'].pop(coord, None)
+            catalog['jar_paths'].pop(coord, None)
+            catalog['entries'] = [
+                value for value in catalog['entries']
+                if str(value.get('coord') or '') != coord
+            ]
+            conflicted_coords.add(coord)
+            continue
+        catalog['by_coord'][coord] = item
+        catalog['entries'].append(item)
+        catalog['jar_paths'][coord] = str(jar_path)
+        exact_count += 1
 
-                cataloged_entries = {
-                    str(item.get('artifact_entry') or '') for item in catalog['entries']
-                }
-                for lib_entry in sorted(
-                    name for name in names
-                    if name.startswith(('BOOT-INF/lib/', 'WEB-INF/lib/'))
-                    and name.endswith('.jar')
-                    and name not in cataloged_entries
-                ):
-                    try:
-                        blob = outer.read(lib_entry)
-                        with zipfile.ZipFile(io.BytesIO(blob)) as nested:
-                            internal_coordinates = [
-                                coordinate
-                                for coordinate in _maven_coordinates_from_archive(nested)
-                                if f'{coordinate[0]}:{coordinate[1]}'
-                                in application_module_coords
-                            ]
-                        if len(internal_coordinates) != 1:
-                            continue
-                        group_id, artifact_id, version = internal_coordinates[0]
-                        coord = f'{group_id}:{artifact_id}'
-                        if coord in catalog['by_coord']:
-                            continue
-                        digest = hashlib.sha256(blob).hexdigest()
-                        jar_path = cache_dir / f'{digest[:16]}-{Path(lib_entry).name}'
-                        if not jar_path.exists() or sha256_file(jar_path) != digest:
-                            jar_path.write_bytes(blob)
-                        item = {
-                            'coord': coord, 'version': version, 'scope': 'runtime',
-                            'jar_path': str(jar_path), 'artifact_entry': lib_entry,
-                            'sha256': digest, 'evidence_source': 'current_final_artifact',
-                            'application_owned': True,
-                            'ownership_evidence': {
-                                'authority': 'reactor_coordinate_and_final_artifact_entry',
-                                'reactor_coord': coord,
-                                'artifact_entry': lib_entry,
-                                'final_artifact_sha256': catalog['final_artifact_sha256'],
-                            },
-                        }
-                        catalog['by_coord'][coord] = item
-                        catalog['entries'].append(item)
-                        catalog['jar_paths'][coord] = str(jar_path)
-                        exact_count += 1
-                    except (OSError, KeyError, zipfile.BadZipFile):
-                        continue
+    for business_item in manifest.get('business_artifacts') or ():
+        if (
+            not isinstance(business_item, dict)
+            or str(business_item.get('side') or '').strip() != 'current'
+        ):
+            continue
+        business_jar = Path(str(business_item.get('retained_path') or ''))
+        business_sha = str(business_item.get('sha256') or '').lower()
+        outer_sha = str(business_item.get('outer_artifact_sha256') or '').lower()
+        try:
+            if not business_jar.is_file() or not re.fullmatch(
+                r'[0-9a-f]{64}', business_sha
+            ):
+                raise ValueError('business_artifact_missing')
+            if sha256_file(business_jar) != business_sha:
+                raise ValueError('business_artifact_sha256_mismatch')
+            require_safe_archive(
+                business_jar,
+                inspect_nested_archives=False,
+                allow_duplicate_maven_metadata=True,
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            extraction_failures.append({
+                'coord': '__business__', 'lib_entry': '<business-classes>',
+                'reason': f'step1_business_artifact_invalid:{exc}',
+            })
+            break
+        if outer_sha:
+            if final_artifact_sha256 and final_artifact_sha256 != outer_sha:
+                extraction_failures.append({
+                    'coord': '__business__', 'lib_entry': '<business-classes>',
+                    'reason': 'step1_outer_artifact_identity_conflict',
+                })
+                break
+            final_artifact_sha256 = outer_sha
+        business_class_count = int(business_item.get('class_count') or 0)
+        catalog['by_coord']['__business__'] = {
+            'coord': '__business__',
+            'version': '',
+            'scope': 'business',
+            'jar_path': str(business_jar),
+            'artifact_entry': '<business-classes>',
+            'sha256': business_sha,
+            'evidence_source': 'current_final_artifact',
+            'evidence_origin': 'step1_retained_business_content',
+            'application_owned': True,
+        }
+        catalog['entries'].append(catalog['by_coord']['__business__'])
+        catalog['jar_paths']['__business__'] = str(business_jar)
+        break
 
-                business_entries = []
-                application_class_prefixes = ('BOOT-INF/classes/', 'WEB-INF/classes/')
-                has_packaged_application_classes = any(
-                    name.startswith(application_class_prefixes) for name in names
-                )
-                for name in sorted(names):
-                    if not name.endswith('.class') or name.startswith('META-INF/'):
-                        continue
-                    if has_packaged_application_classes and not name.startswith(application_class_prefixes):
-                        continue
-                    stripped = name
-                    for prefix in application_class_prefixes:
-                        if name.startswith(prefix):
-                            stripped = name[len(prefix):]
-                            break
-                    if stripped == name and name.startswith(('BOOT-INF/', 'WEB-INF/', 'lib/')):
-                        continue
-                    if stripped:
-                        business_entries.append((name, stripped))
-                if business_entries:
-                    business_jar = cache_dir / 'business-classes.jar'
-                    with zipfile.ZipFile(business_jar, 'w', compression=zipfile.ZIP_DEFLATED) as target:
-                        for source_name, target_name in business_entries:
-                            entry = zipfile.ZipInfo(
-                                target_name, date_time=(1980, 1, 1, 0, 0, 0)
-                            )
-                            entry.compress_type = zipfile.ZIP_DEFLATED
-                            entry.create_system = 3
-                            entry.external_attr = 0o100644 << 16
-                            target.writestr(entry, outer.read(source_name))
-                    business_class_count = len(business_entries)
-                    catalog['by_coord']['__business__'] = {
-                        'coord': '__business__', 'version': '', 'scope': 'business',
-                        'jar_path': str(business_jar), 'artifact_entry': '<business-classes>',
-                        'sha256': sha256_file(business_jar),
-                        'evidence_source': 'current_final_artifact',
-                    }
-                    catalog['entries'].append(catalog['by_coord']['__business__'])
-                    catalog['jar_paths']['__business__'] = str(business_jar)
-        except (OSError, zipfile.BadZipFile) as exc:
-            extraction_failures.append({'coord': '', 'lib_entry': '', 'reason': f'artifact_open_failed:{exc}'})
+    if final_artifact_sha256:
+        catalog['final_artifact_sha256'] = final_artifact_sha256
+    catalog['artifact_safety'] = {
+        'safe': not extraction_failures,
+        'source': 'step1_retained_artifacts',
+        'inspected_archives': exact_count + int('__business__' in catalog['by_coord']),
+        'nested_archives_inspected': 0,
+    }
 
     expected_coords = {
         str(row.get('coord') or '').strip() for row in rows
         if str(row.get('coord') or '').strip()
+        and str(row.get('resolution_status') or 'resolved').strip() == 'resolved'
         and str(row.get('scope') or '').strip() not in {'test', 'provided', 'optional'}
     }
     missing_coords = sorted(expected_coords - set(catalog['by_coord']))
     if missing_coords:
         catalog['reason_codes'].append('runtime_dependency_jars_missing')
+    if extraction_failures:
+        catalog['reason_codes'].append('step1_retained_artifact_invalid')
     catalog['status'] = (
-        'complete' if artifact_ok and not extraction_failures and not missing_coords
+        'complete' if manifest and not extraction_failures and not missing_coords
         else ('partial' if catalog['by_coord'] else 'insufficient')
     )
     catalog['metrics'] = {
         'expected_runtime_dependencies': len(expected_coords),
-        'exact_artifact_dependencies': exact_count,
+        'exact_artifact_dependencies': sum(
+            1 for item in catalog['entries']
+            if str(item.get('coord') or '') != '__business__'
+        ),
         'missing_dependencies': len(missing_coords),
         'business_classes': business_class_count,
         'extraction_failures': len(extraction_failures),
         'application_owned_nested_dependencies': sum(
-            1 for item in catalog['entries'] if item.get('application_owned')
+            1 for item in catalog['entries']
+            if item.get('application_owned')
+            and str(item.get('coord') or '') != '__business__'
         ),
     }
     catalog['extraction_failures'] = extraction_failures
@@ -2098,6 +2115,63 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
         json.dumps(serializable, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
     return catalog
+
+
+def runtime_dependency_catalog_blockers(runtime_dependency_catalog):
+    """Return core artifact failures that must stop Step5 before graph analysis."""
+    catalog = runtime_dependency_catalog or {}
+    status = str(catalog.get('status') or 'insufficient').strip()
+    if status == 'complete':
+        return []
+    blockers = []
+    reason_codes = [
+        str(value or '').strip()
+        for value in catalog.get('reason_codes') or ()
+        if str(value or '').strip()
+    ]
+    for item in catalog.get('extraction_failures') or ():
+        if not isinstance(item, dict):
+            continue
+        blockers.append({
+            'coord': str(item.get('coord') or '').strip(),
+            'artifact_entry': str(item.get('lib_entry') or '').strip(),
+            'reason': str(item.get('reason') or 'retained_artifact_invalid').strip(),
+        })
+    if not blockers:
+        blockers.append({
+            'coord': '',
+            'artifact_entry': '',
+            'reason': ','.join(reason_codes) or f'runtime_catalog_{status}',
+        })
+    return blockers
+
+
+def write_runtime_catalog_preflight_failure(
+    output_dir, runtime_dependency_catalog, blockers,
+):
+    path = Path(output_dir) / 'artifact_preflight_failure.json'
+    path.write_text(
+        json.dumps(
+            {
+                'schema': 'java-upgrade-analyzer.step5-artifact-preflight.v1',
+                'status': 'blocked_by_system',
+                'reason_code': 'STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID',
+                'catalog_status': str(
+                    (runtime_dependency_catalog or {}).get('status')
+                    or 'insufficient'
+                ),
+                'catalog_reason_codes': list(
+                    (runtime_dependency_catalog or {}).get('reason_codes') or ()
+                ),
+                'blockers': list(blockers or ()),
+                'next_action': 'restart_from_step1',
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + '\n',
+        encoding='utf-8',
+    )
+    return path
 
 
 def runtime_business_class_index(runtime_dependency_catalog):
@@ -4065,7 +4139,12 @@ def check_apis_that_need_bridge(
         # Step5 always evaluates the final-artifact bytecode contract. An empty or
         # incomplete catalog is itself evidence of insufficient coverage, not a
         # reason to silently fall back to source-only negative conclusions.
-        has_packaged_bytecode_fallback = runtime_dependency_catalog is not None
+        has_packaged_bytecode_fallback = (
+            str(
+                (runtime_dependency_catalog or {}).get('status') or ''
+            ).strip()
+            == 'complete'
+        )
 
         if not coord or not api_name:
             continue

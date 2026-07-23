@@ -39,6 +39,9 @@ from step5_evidence_model import (  # noqa: E402
 )
 from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 from step5_artifact_fact_store import Step5ArtifactFactStore  # noqa: E402
+from tests.retained_artifact_test_support import (  # noqa: E402
+    retain_current_artifact_contract,
+)
 
 
 class Step5KeyMatchingTest(unittest.TestCase):
@@ -1234,6 +1237,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 }]}),
                 encoding="utf-8",
             )
+            retain_current_artifact_contract(report_dir, artifact)
 
             catalog = step5.build_runtime_dependency_catalog(report_dir)
             with zipfile.ZipFile(catalog["by_coord"]["__business__"]["jar_path"]) as business_jar:
@@ -1265,11 +1269,18 @@ class Step5KeyMatchingTest(unittest.TestCase):
             )
 
             with patch("zipfile.time.localtime", return_value=(2020, 1, 2, 3, 4, 6, 0, 0, -1)):
+                retain_current_artifact_contract(report_dir, artifact)
                 first = step5.build_runtime_dependency_catalog(report_dir)
             first_sha = first["by_coord"]["__business__"]["sha256"]
-            Path(first["by_coord"]["__business__"]["jar_path"]).unlink()
+            second_report_dir = root / "report-second"
+            self._write_text(
+                self._dependencies_dir(second_report_dir) / "deps_current_resolved.csv",
+                "coord,version,scope,lib_entry,resolution_status\n",
+                encoding="utf-8",
+            )
             with patch("zipfile.time.localtime", return_value=(2025, 6, 7, 8, 9, 10, 0, 0, -1)):
-                second = step5.build_runtime_dependency_catalog(report_dir)
+                retain_current_artifact_contract(second_report_dir, artifact)
+                second = step5.build_runtime_dependency_catalog(second_report_dir)
             second_sha = second["by_coord"]["__business__"]["sha256"]
 
         self.assertEqual(first_sha, second_sha)
@@ -1321,6 +1332,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 }]}),
                 encoding="utf-8",
             )
+            retain_current_artifact_contract(report_dir, artifact)
 
             catalog = step5.build_runtime_dependency_catalog(report_dir)
 
@@ -1832,6 +1844,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
             with zipfile.ZipFile(artifact, "w") as zf:
                 zf.writestr("BOOT-INF/lib/target.jar", jar_path.read_bytes())
             artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            retained_sha256 = hashlib.sha256(jar_path.read_bytes()).hexdigest()
             self._write_text(
                 report_dir / "evidence" / "dependencies" / "build_provenance.json",
                 json.dumps({
@@ -1849,11 +1862,19 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 reverse_edges={},
                 runtime_dependency_catalog={
                     "status": "complete",
+                    "entries": [{
+                        "coord": api_row["coord"],
+                        "jar_path": str(jar_path),
+                        "artifact_entry": "BOOT-INF/lib/target.jar",
+                        "sha256": retained_sha256,
+                        "evidence_source": "current_final_artifact",
+                    }],
                     "by_coord": {
                         api_row["coord"]: {
                             "coord": api_row["coord"],
                             "jar_path": str(jar_path),
                             "artifact_entry": "BOOT-INF/lib/target.jar",
+                            "sha256": retained_sha256,
                             "evidence_source": "current_final_artifact",
                         }
                     },
@@ -1867,7 +1888,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
 
         bridge = next(row for row in rows if row["caller_owner"] == "com.vendor.InternalBridge")
-        self.assertEqual(bridge["artifact_sha256"], artifact_sha256)
+        self.assertEqual(bridge["artifact_sha256"], retained_sha256)
         self.assertEqual(
             bridge["artifact_entry"],
             "BOOT-INF/lib/target.jar!/com/vendor/InternalBridge.class",
@@ -1966,6 +1987,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 "coord": api_row["coord"],
                 "jar_path": str(runtime_jar),
                 "artifact_entry": "BOOT-INF/lib/target.jar",
+                "sha256": hashlib.sha256(runtime_jar.read_bytes()).hexdigest(),
                 "evidence_source": "current_final_artifact",
             }
             business_item = {
@@ -2148,45 +2170,47 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
+        runtime_item = {
+            "coord": "com.vendor:target",
+            "jar_path": str(nested_path),
+            "artifact_entry": "BOOT-INF/lib/target.jar",
+            "sha256": hashlib.sha256(nested_path.read_bytes()).hexdigest(),
+            "evidence_source": "current_final_artifact",
+        }
         return SimpleNamespace(
             report_dir=str(report_dir),
             runtime_dependency_catalog={
-                "status": "complete",
-                "by_coord": {
-                    "com.vendor:target": {
-                        "coord": "com.vendor:target",
-                        "jar_path": str(nested_path),
-                        "artifact_entry": "BOOT-INF/lib/target.jar",
-                        "evidence_source": "current_final_artifact",
-                    }
-                },
+                "status": "complete" if include_provenance else "insufficient",
+                "final_artifact_sha256": artifact_sha256,
+                "by_coord": {"com.vendor:target": runtime_item},
+                "entries": [runtime_item],
             },
         ), artifact_sha256
 
     def test_corrupt_nested_final_artifact_is_incomplete_not_verified(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / "report"
-            artifact = Path(tmp) / "application.jar"
-            with zipfile.ZipFile(artifact, "w") as archive:
-                archive.writestr("BOOT-INF/classes/app/App.class", b"class")
-                archive.writestr("BOOT-INF/lib/corrupt.jar", b"not-a-jar")
-            artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
-            provenance = report_dir / "evidence" / "dependencies" / "build_provenance.json"
-            self._write_text(
-                provenance,
-                json.dumps({"sides": [{
-                    "side": "current",
-                    "artifact_path": str(artifact),
-                    "artifact_sha256": artifact_sha256,
-                }]}),
-                encoding="utf-8",
+            corrupt = Path(tmp) / "corrupt.jar"
+            corrupt.write_bytes(b"not-a-jar")
+            item = {
+                "coord": "com.vendor:corrupt",
+                "jar_path": str(corrupt),
+                "artifact_entry": "BOOT-INF/lib/corrupt.jar",
+                "sha256": hashlib.sha256(corrupt.read_bytes()).hexdigest(),
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report_dir),
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "entries": [item],
+                    "by_coord": {"com.vendor:corrupt": item},
+                },
             )
-            graph = SimpleNamespace(report_dir=str(report_dir))
 
             verified = tracer._verified_final_artifact_provenance(graph)
 
         self.assertFalse(verified["complete"])
-        self.assertIn("BOOT-INF/lib/corrupt.jar", verified["failures"][0])
+        self.assertIn("com.vendor:corrupt", verified["failures"][0])
 
     def test_analyzer_edge_reuses_transaction_verified_jar_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2221,7 +2245,7 @@ class Step5KeyMatchingTest(unittest.TestCase):
 
     def test_writes_complete_analyzer_edge_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
-            graph, artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
+            graph, _outer_artifact_sha256 = self._analyzer_edge_ledger_graph(tmp)
             base_api = {
                 "coord": "com.vendor:target",
                 "api_name": "com.vendor.Target.call",
@@ -2233,6 +2257,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
             evidence_jar = graph.runtime_dependency_catalog["by_coord"][
                 "com.vendor:target"
             ]["jar_path"]
+            evidence_jar_sha256 = graph.runtime_dependency_catalog["by_coord"][
+                "com.vendor:target"
+            ]["sha256"]
             edges = [
                 {
                     "coord": "com.vendor:target",
@@ -2312,7 +2339,10 @@ class Step5KeyMatchingTest(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
 
         self.assertEqual(len(rows), 4)
-        self.assertEqual({row["artifact_sha256"] for row in rows}, {artifact_sha256})
+        self.assertEqual(
+            {row["artifact_sha256"] for row in rows},
+            {evidence_jar_sha256},
+        )
         self.assertEqual(
             {row["artifact_entry"] for row in rows},
             {"BOOT-INF/lib/target.jar!/com/vendor/Bridge.class"},
@@ -2538,7 +2568,26 @@ BootstrapMethods:
             stale_business_jar = Path(tmp) / "business-classes.jar"
             with zipfile.ZipFile(stale_business_jar, "w") as zf:
                 zf.writestr("app/Service.class", b"stale")
-            graph = SimpleNamespace(report_dir=str(report_dir), runtime_dependency_catalog={})
+            expected_business_jar = Path(tmp) / "expected-business-classes.jar"
+            with zipfile.ZipFile(expected_business_jar, "w") as zf:
+                zf.writestr("app/Service.class", b"expected")
+            business_item = {
+                "coord": "__business__",
+                "jar_path": str(expected_business_jar),
+                "artifact_entry": "<business-classes>",
+                "sha256": hashlib.sha256(
+                    expected_business_jar.read_bytes()
+                ).hexdigest(),
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report_dir),
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "final_artifact_sha256": artifact_sha256,
+                    "by_coord": {"__business__": business_item},
+                    "entries": [business_item],
+                },
+            )
 
             accepted = tracer.record_analyzer_edge(
                 graph,
@@ -2585,7 +2634,21 @@ BootstrapMethods:
             business_jar = Path(tmp) / "business-classes.jar"
             with zipfile.ZipFile(business_jar, "w") as zf:
                 zf.writestr("app/Service.class", b"matching-class-bytes")
-            graph = SimpleNamespace(report_dir=str(report_dir), runtime_dependency_catalog={})
+            business_item = {
+                "coord": "__business__",
+                "jar_path": str(business_jar),
+                "artifact_entry": "<business-classes>",
+                "sha256": hashlib.sha256(business_jar.read_bytes()).hexdigest(),
+            }
+            graph = SimpleNamespace(
+                report_dir=str(report_dir),
+                runtime_dependency_catalog={
+                    "status": "complete",
+                    "final_artifact_sha256": artifact_sha256,
+                    "by_coord": {"__business__": business_item},
+                    "entries": [business_item],
+                },
+            )
 
             accepted = tracer.record_analyzer_edge(
                 graph,
@@ -2767,7 +2830,7 @@ BootstrapMethods:
         self.assertGreater(graph_stats["edge_ledger_failure_count"], 0)
         self.assertFalse(graph_stats["edge_ledger_complete"])
 
-    def test_analyzer_edge_ledger_keeps_duplicate_coordinate_containers_distinct(self):
+    def test_analyzer_edge_ledger_analyzes_same_coordinate_bytes_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             api_row, jar_path = self._same_coordinate_bytecode_fixture(tmp)
             report_dir = Path(tmp) / "report"
@@ -2791,23 +2854,23 @@ BootstrapMethods:
                 }),
                 encoding="utf-8",
             )
-            entries = [
-                {
-                    "coord": api_row["coord"],
-                    "jar_path": str(jar_path),
-                    "artifact_entry": container,
-                    "evidence_source": "current_final_artifact",
-                }
-                for container in container_entries
-            ]
+            retained_sha256 = hashlib.sha256(jar_path.read_bytes()).hexdigest()
+            entry = {
+                "coord": api_row["coord"],
+                "jar_path": str(jar_path),
+                "artifact_entry": container_entries[0],
+                "artifact_entries": list(container_entries),
+                "sha256": retained_sha256,
+                "evidence_source": "current_final_artifact",
+            }
             graph = SimpleNamespace(
                 report_dir=str(report_dir),
                 methods_by_id={},
                 reverse_edges={},
                 runtime_dependency_catalog={
                     "status": "complete",
-                    "entries": entries,
-                    "by_coord": {api_row["coord"]: entries[0]},
+                    "entries": [entry],
+                    "by_coord": {api_row["coord"]: entry},
                 },
             )
 
@@ -2824,8 +2887,7 @@ BootstrapMethods:
         self.assertEqual(
             bridge_entries,
             {
-                f"{container}!/com/vendor/InternalBridge.class"
-                for container in container_entries
+                f"{container_entries[0]}!/com/vendor/InternalBridge.class"
             },
         )
 
@@ -2935,8 +2997,8 @@ BootstrapMethods:
                 rows = list(csv.DictReader(handle))
 
         row = next(item for item in rows if item["caller_owner"] == "app.Service")
-        self.assertEqual(row["artifact_sha256"], artifact_sha256)
-        self.assertEqual(row["artifact_entry"], "BOOT-INF/classes/app/Service.class")
+        self.assertEqual(row["artifact_sha256"], business_sha256)
+        self.assertEqual(row["artifact_entry"], "app/Service.class")
         self.assertEqual(row["caller_descriptor"], "()V")
         self.assertEqual(row["callee_descriptor"], "()V")
         self.assertEqual(row["opcode_family"], "invokestatic")
@@ -14554,6 +14616,11 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
 
             with patch.object(step5, "auto_discover_bridge_sources", return_value={"dependency_source_mappings": []}), \
                  patch.object(step5, "load_changed_apis", return_value=[{"coord": "com.example:demo", "api_name": "com.example.Target.call"}]), \
+                 patch.object(step5, "build_runtime_dependency_catalog", return_value={
+                     "by_coord": {},
+                     "entries": [],
+                     "status": "complete",
+                 }), \
                  patch.object(step5, "build_enhanced_source_graph", return_value=graph_result), \
                  patch.object(
                      step5,
@@ -14791,6 +14858,11 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
 
             with patch.object(step5, "auto_discover_bridge_sources"), \
                  patch.object(step5, "load_changed_apis", return_value=[{"coord": "com.example:demo", "api_name": "com.example.Target.call"}]), \
+                 patch.object(step5, "build_runtime_dependency_catalog", return_value={
+                     "by_coord": {},
+                     "entries": [],
+                     "status": "complete",
+                 }), \
                  patch.object(step5, "align_dependency_source_mappings", return_value={
                      "mappings": [f"com.example:demo={dep_source_dir}"],
                      "allowed_classes_by_coord": {"com.example:demo": {"com.example.Target"}},
@@ -14881,7 +14953,13 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
 
             with patch.object(step5, "auto_discover_bridge_sources"), \
                  patch.object(step5, "load_changed_apis", return_value=[{"coord": "com.vendor:target", "api_name": "com.vendor.Target.call"}]), \
-                 patch.object(step5, "build_runtime_dependency_catalog", return_value={"by_coord": {"com.example:used": {"coord": "com.example:used"}}}), \
+                 patch.object(step5, "build_runtime_dependency_catalog", return_value={
+                     "by_coord": {
+                         "com.example:used": {"coord": "com.example:used"}
+                     },
+                     "entries": [],
+                     "status": "complete",
+                 }), \
                  patch.object(step5, "align_dependency_source_mappings", return_value={
                      "mappings": [f"com.example:used={used_dep_dir}"],
                      "allowed_classes_by_coord": {"com.example:used": {"com.example.Used"}},
@@ -18455,7 +18533,15 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "api_name": "com.example.Api.call",
                 "api_signature": "()",
                 "symbol_kind": "method",
-            }]), patch.object(step5, "build_enhanced_source_graph", return_value=fake_graph_result), patch.object(
+            }]), patch.object(
+                step5,
+                "build_runtime_dependency_catalog",
+                return_value={
+                    "by_coord": {},
+                    "entries": [],
+                    "status": "complete",
+                },
+            ), patch.object(step5, "build_enhanced_source_graph", return_value=fake_graph_result), patch.object(
                 step5,
                 "check_apis_that_need_bridge",
                 return_value={"sample:dep:com.example.Api.call": {"needs_bridge": False, "has_dependency_source_mapping": True, "reason": ""}},
@@ -18693,16 +18779,20 @@ public class com.example.consumer.Adapter {
                 reverse_edges={},
                 runtime_dependency_catalog={
                     "status": "complete",
-                    "by_coord": {
-                        "sample:consumer": {
-                            "coord": "sample:consumer",
-                            "version": "1",
-                            "scope": "compile",
-                            "jar_path": str(jar_path),
-                        }
-                    },
+                    "entries": [{
+                        "coord": "sample:consumer",
+                        "version": "1",
+                        "scope": "compile",
+                        "jar_path": str(jar_path),
+                        "artifact_entry": "BOOT-INF/lib/consumer.jar",
+                        "sha256": hashlib.sha256(jar_path.read_bytes()).hexdigest(),
+                        "evidence_source": "current_final_artifact",
+                    }],
                 },
             )
+            graph.runtime_dependency_catalog["by_coord"] = {
+                "sample:consumer": graph.runtime_dependency_catalog["entries"][0]
+            }
             apis = [
                 {
                     "coord": "commons-lang:commons-lang",
@@ -18750,11 +18840,7 @@ public class com.example.consumer.Adapter {
             self.assertEqual(mocked_run.call_count, 1)
             self.assertEqual(
                 [item.analysis_status for item in results],
-                ["not_analyzed", "not_analyzed"],
-            )
-            self.assertEqual(
-                results[0].reason_code,
-                "FINAL_ARTIFACT_PROVENANCE_UNREADABLE",
+                ["uncertain", "not_found_in_static_analysis"],
             )
 
     def test_batch_packaged_bytecode_scan_rejects_artifact_changed_during_parse(self):
@@ -20329,7 +20415,8 @@ public class com.example.consumer.Adapter {
                         "coord": "sample:consumer",
                         "jar_path": "/tmp/consumer.jar",
                     }
-                }
+                },
+                "status": "complete",
             },
         )
 

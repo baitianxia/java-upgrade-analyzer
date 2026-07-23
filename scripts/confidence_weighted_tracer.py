@@ -50,7 +50,7 @@ from signature_utils import (
 )
 from enhanced_source_analyzer import CallEdge, MethodDef, _strip_strings_and_comments
 from business_bytecode_graph import parse_classfile_calls
-from artifact_safety import inspect_archive
+from artifact_safety import require_safe_archive
 from analysis_contract import sha256_file
 from pipeline_constants import STEP1_DEPENDENCY_JARS_MANIFEST_FILE
 from constant_impact import classify_constant_impact
@@ -315,6 +315,7 @@ def _verified_final_artifact_provenance(graph):
     result = {
         'complete': False,
         'artifact_sha256': '',
+        'business_artifact_sha256': '',
         'entries': set(),
         'entry_sha256': {},
         'nested_entries': {},
@@ -322,59 +323,67 @@ def _verified_final_artifact_provenance(graph):
         'failures': [],
     }
     report_dir = str(getattr(graph, 'report_dir', '') or '').strip()
-    provenance_path = Path(report_dir) / 'evidence' / 'dependencies' / 'build_provenance.json'
+    catalog_path = (
+        Path(report_dir) / '.runtime' / 'cache'
+        / 's5_artifact_bytecode_catalog.json'
+    )
+    catalog = getattr(graph, 'runtime_dependency_catalog', None) or {}
     try:
-        payload = json.loads(provenance_path.read_text(encoding='utf-8'))
-        current = next(
-            (item for item in payload.get('sides') or [] if item.get('side') == 'current'),
-            {},
-        )
-        artifact_path = Path(str(current.get('artifact_path') or '').strip())
-        expected_sha256 = str(current.get('artifact_sha256') or '').strip()
-        safety = inspect_archive(artifact_path)
-        if not safety.safe:
-            raise ValueError(
-                'artifact safety violation:'
-                + ','.join(safety.details or safety.reason_codes)
-            )
-        snapshot = artifact_path.read_bytes()
-        actual_sha256 = hashlib.sha256(snapshot).hexdigest()
-        if not _valid_sha256(expected_sha256) or actual_sha256 != expected_sha256:
-            raise ValueError('current final artifact SHA-256 is missing or mismatched')
-        with zipfile.ZipFile(io.BytesIO(snapshot)) as outer:
-            entries = {item.filename for item in outer.infolist() if not item.is_dir()}
-            entry_sha256 = {}
-            nested_entries = {}
-            nested_entry_sha256 = {}
-            nested_failures = []
-            for entry in sorted(entries):
-                entry_bytes = outer.read(entry)
-                entry_sha256[entry] = hashlib.sha256(entry_bytes).hexdigest()
-                if not entry.endswith('.jar'):
-                    continue
-                try:
-                    with zipfile.ZipFile(io.BytesIO(entry_bytes)) as nested:
-                        nested_entries[entry] = {
-                            item.filename for item in nested.infolist() if not item.is_dir()
-                        }
-                        nested_entry_sha256[entry] = {
-                            item.filename: hashlib.sha256(nested.read(item)).hexdigest()
-                            for item in nested.infolist()
-                            if not item.is_dir()
-                        }
-                except (OSError, zipfile.BadZipFile) as exc:
-                    nested_failures.append(
-                        f'{entry}:{type(exc).__name__}:{exc}'
-                    )
-                    continue
+        if str(catalog.get('status') or '') != 'complete':
+            raise ValueError('Step1 retained runtime catalog is incomplete')
+        artifact_sha256 = str(catalog.get('final_artifact_sha256') or '').lower()
+        if artifact_sha256 and not _valid_sha256(artifact_sha256):
+            raise ValueError('Step1 outer artifact SHA-256 is invalid')
+        entries = set()
+        entry_sha256 = {}
+        nested_entries = {}
+        business_artifact_sha256 = ''
+        failures = []
+        for item in catalog.get('entries') or ():
+            coord = str(item.get('coord') or '').strip()
+            artifact_entry = str(item.get('artifact_entry') or '').strip()
+            artifact_path = Path(str(item.get('jar_path') or '').strip())
+            expected_sha256 = str(item.get('sha256') or '').lower()
+            if not artifact_path.is_file() or not _valid_sha256(expected_sha256):
+                failures.append(f'{coord or artifact_entry}:retained_artifact_missing')
+                continue
+            if sha256_file(artifact_path) != expected_sha256:
+                failures.append(f'{coord or artifact_entry}:retained_artifact_sha256_mismatch')
+                continue
+            try:
+                require_safe_archive(
+                    artifact_path,
+                    inspect_nested_archives=False,
+                    allow_duplicate_maven_metadata=True,
+                )
+                with zipfile.ZipFile(artifact_path) as archive:
+                    archive_entries = {
+                        value.filename for value in archive.infolist()
+                        if not value.is_dir()
+                    }
+            except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                failures.append(
+                    f'{coord or artifact_entry}:{type(exc).__name__}:{exc}'
+                )
+                continue
+            if coord == '__business__':
+                entries.update(archive_entries)
+                business_artifact_sha256 = expected_sha256
+                continue
+            if not artifact_entry:
+                failures.append(f'{coord}:artifact_entry_missing')
+                continue
+            entry_sha256[artifact_entry] = expected_sha256
+            nested_entries[artifact_entry] = archive_entries
         result = {
-            'complete': not nested_failures,
-            'artifact_sha256': expected_sha256,
+            'complete': not failures,
+            'artifact_sha256': artifact_sha256,
+            'business_artifact_sha256': business_artifact_sha256,
             'entries': entries,
             'entry_sha256': entry_sha256,
             'nested_entries': nested_entries,
-            'nested_entry_sha256': nested_entry_sha256,
-            'failures': nested_failures,
+            'nested_entry_sha256': {},
+            'failures': failures,
         }
     except (OSError, ValueError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
         result['failures'] = [f'{type(exc).__name__}:{exc}']
@@ -382,7 +391,7 @@ def _verified_final_artifact_provenance(graph):
         _record_analyzer_ledger_failure(
             graph,
             'FINAL_ARTIFACT_PROVENANCE_UNREADABLE',
-            artifact=str(provenance_path),
+            artifact=str(catalog_path),
             error=failure,
         )
     setattr(graph, '_verified_final_artifact_provenance', result)
@@ -444,10 +453,9 @@ def _evidence_bytes_match_final_artifact(
             expected_jar_sha = (provenance.get('entry_sha256') or {}).get(container_entry)
             if not expected_jar_sha:
                 return False
-            expected_class_sha = (
-                (provenance.get('nested_entry_sha256') or {}).get(container_entry) or {}
-            ).get(class_entry)
-            if not expected_class_sha:
+            if class_entry not in (
+                (provenance.get('nested_entries') or {}).get(container_entry) or set()
+            ):
                 return False
             # The batch scanner hashes every physical runtime JAR immediately
             # before edge commit and hashes it again after commit.  Equality to
@@ -458,20 +466,21 @@ def _evidence_bytes_match_final_artifact(
             scanned_jar = Path(jar_path).read_bytes()
             if hashlib.sha256(scanned_jar).hexdigest() != expected_jar_sha:
                 return False
-            with zipfile.ZipFile(io.BytesIO(scanned_jar)) as archive:
-                return hashlib.sha256(archive.read(class_entry)).hexdigest() == expected_class_sha
+            return True
 
-        expected_class_sha = (provenance.get('entry_sha256') or {}).get(artifact_entry)
-        if not expected_class_sha:
+        if artifact_entry not in (provenance.get('entries') or set()):
+            return False
+        expected_business_sha = str(
+            provenance.get('business_artifact_sha256') or ''
+        ).lower()
+        if not expected_business_sha:
             return False
         if (
             verified_sha256
-            and verified_sha256 == str(provenance.get('artifact_sha256') or '').lower()
+            and verified_sha256 == expected_business_sha
         ):
             return True
-        with zipfile.ZipFile(jar_path) as archive:
-            scanned_class = archive.read(class_entry)
-        return hashlib.sha256(scanned_class).hexdigest() == expected_class_sha
+        return sha256_file(jar_path) == expected_business_sha
     except (OSError, KeyError, zipfile.BadZipFile):
         return False
 
@@ -479,6 +488,12 @@ def _evidence_bytes_match_final_artifact(
 def _normalize_analyzer_edge(graph, api_row, edge):
     provenance = _verified_final_artifact_provenance(graph)
     artifact_entry = _analyzer_edge_artifact_entry(graph, edge, provenance)
+    container_entry = _normalized_artifact_container_entry(edge)
+    evidence_artifact_sha256 = (
+        (provenance.get('entry_sha256') or {}).get(container_entry, '')
+        if container_entry
+        else provenance.get('business_artifact_sha256', '')
+    )
     instruction_offset = _normalized_instruction_offset(
         (edge or {}).get('instruction_offset')
     )
@@ -493,7 +508,7 @@ def _normalize_analyzer_edge(graph, api_row, edge):
         )
     )
     row = {
-        'artifact_sha256': provenance.get('artifact_sha256') or '',
+        'artifact_sha256': evidence_artifact_sha256,
         'artifact_entry': artifact_entry,
         'caller_owner': str(
             (edge or {}).get('caller_owner') or (edge or {}).get('class_fqcn') or ''

@@ -501,23 +501,35 @@ def _landing_pending_interaction_lines(report_dir, state):
                 description = _humanize_interaction_text((item or {}).get("description") or "").strip()
                 lines.append(f"- {label}" + (f"：{description}" if description else ""))
             lines.append("")
+    selection_options = list(interaction.get("selection_options") or [])
     examples = _decision_card_reply_examples(
         interaction,
-        list(interaction.get("selection_options") or []),
+        selection_options,
         options,
     )
     if examples:
         lines.extend(["可以直接这样回复：", ""])
         lines.extend(f"- `{example}`" for example in examples)
         lines.append("")
-    review_links = [
-        _landing_review_file_link(report_dir, path)
+    review_items = [
+        (str(path or ""), _landing_review_file_link(report_dir, path))
         for path in (interaction.get("files_to_review") or [])
     ]
-    review_links = [item for item in review_links if item]
-    if review_links:
-        lines.extend(["确认前可核对：", ""])
-        lines.extend(f"- {item}" for item in review_links)
+    review_items = [(path, link) for path, link in review_items if link]
+    if review_items:
+        lines.extend([
+            "完整候选或证据入口：" if selection_options else "确认前可核对：",
+            "",
+        ])
+        for path, link in review_items:
+            if selection_options and path.endswith("changed_dependencies.md"):
+                lines.append(f"- 完整依赖选择清单（包含未展示候选）：{link}")
+                lines.append(
+                    "  需要选择未展示依赖时，从“依赖包”列复制名称或完整坐标，"
+                    "然后直接回复“只分析 …”。"
+                )
+            else:
+                lines.append(f"- {link}")
         lines.append("")
     return lines
 
@@ -1347,6 +1359,7 @@ def read_step_system_block_reason_codes(script_name, report_dir):
         ],
         "s5_call_chain_engine_integrated.py": [
             step5_call_chain_dir(report_dir) / "tree_sitter_preflight.json",
+            step5_call_chain_dir(report_dir) / "artifact_preflight_failure.json",
         ],
     }
     reason_codes = []
@@ -5675,7 +5688,7 @@ def _decision_card_reply_examples(interaction, selection_options, options):
             for item in selection_options[:2]
             if str(item.get("coord") or item.get("name") or "").strip()
         ]
-        examples.append("全量继续")
+        examples.append("全量分析")
         if visible_targets:
             examples.append("只分析 " + " 和 ".join(visible_targets))
     elif "continue" in option_ids and not required_fields:
@@ -5926,7 +5939,7 @@ def build_user_decision_card(interaction):
             f"其中高风险 API {total_high_risk_count} 个。"
         )
         lines.append("- 没有明确耗时约束时选择这一项。")
-        lines.append("- 直接回复：全量继续")
+        lines.append("- 直接回复：全量分析")
         lines.append("2. 部分分析（仅在明确控制耗时时）")
         lines.append("- 未选择的依赖及其变化 API 不会进入系统触达分析，最终报告只适用于所选范围。")
         lines.append("- 高优先级项依据：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个。")

@@ -19,6 +19,9 @@ import enhanced_source_analyzer as source_analyzer  # noqa: E402
 import enhanced_output_formatter as formatter  # noqa: E402
 import final_artifact_edge_oracle as artifact_oracle  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
+from tests.retained_artifact_test_support import (  # noqa: E402
+    retain_current_artifact_contract,
+)
 
 
 class RuntimeTopologyMatrixTest(unittest.TestCase):
@@ -90,6 +93,7 @@ class RuntimeTopologyMatrixTest(unittest.TestCase):
                     "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
                 }]
             }), encoding="utf-8")
+            retain_current_artifact_contract(report, artifact)
 
             catalog = step5.build_runtime_dependency_catalog(str(report))
 

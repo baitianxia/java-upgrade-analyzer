@@ -19,6 +19,9 @@ if str(SCRIPTS) not in sys.path:
 import s5_call_chain_engine_integrated as step5  # noqa: E402
 import confidence_weighted_tracer as tracer  # noqa: E402
 from step5_evidence_model import ModuleScope, classify_module_scope  # noqa: E402
+from tests.retained_artifact_test_support import (  # noqa: E402
+    retain_current_artifact_contract,
+)
 
 
 def nested_maven_jar(group_id, artifact_id, version="1.0"):
@@ -76,6 +79,7 @@ class ArtifactIdentityOwnershipInvariantTest(unittest.TestCase):
                 "artifact_sha256": artifact_sha,
             }]
         }), encoding="utf-8")
+        retain_current_artifact_contract(report, application)
         state = report / ".runtime/state/main_state.json"
         state.parent.mkdir(parents=True)
         state.write_text(json.dumps({
@@ -180,6 +184,7 @@ class ArtifactIdentityOwnershipInvariantTest(unittest.TestCase):
                 "artifact_sha256": artifact_sha,
             }]
         }), encoding="utf-8")
+        retain_current_artifact_contract(report, application)
 
         catalog = step5.build_runtime_dependency_catalog(
             report,
@@ -214,7 +219,9 @@ class ArtifactIdentityOwnershipInvariantTest(unittest.TestCase):
                 nested_maven_jar("com.acme", "library"),
             )
 
-        recovered = step5._recover_reactor_module_coords([root], artifact)
+        recovered = step5._recover_reactor_module_coords(
+            [root], {"com.acme:application", "com.acme:library"}
+        )
 
         self.assertEqual(recovered, {"com.acme:application"})
         self.assertNotIn("com.acme:library", recovered)

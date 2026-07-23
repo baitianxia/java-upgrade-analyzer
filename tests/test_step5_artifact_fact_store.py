@@ -54,7 +54,7 @@ class Step5ColdRunContractTest(unittest.TestCase):
                     ):
                         store.verified_inventory("g:a")
 
-    def test_catalog_rejects_entry_that_shadows_final_artifact_identity(self):
+    def test_catalog_does_not_create_synthetic_final_artifact_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifacts = []
@@ -77,10 +77,13 @@ class Step5ColdRunContractTest(unittest.TestCase):
                 ).hexdigest(),
             })
 
-            with self.assertRaisesRegex(
-                ValueError, "artifact_coord_identity_conflict:__final_artifact__",
-            ):
-                store.verified_inventory("__final_artifact__")
+            inventory = store.verified_inventory("__final_artifact__")
+
+            self.assertEqual(inventory.identity.path, str(catalog_entry))
+            self.assertEqual(
+                inventory.identity.sha256,
+                hashlib.sha256(catalog_entry.read_bytes()).hexdigest(),
+            )
 
     def test_stream_reader_does_not_spool_archive_to_disk(self):
         with tempfile.TemporaryDirectory() as tmp:

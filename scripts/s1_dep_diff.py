@@ -86,16 +86,103 @@ def retain_artifact_for_analysis(meta, artifact_cache_dir, side):
     return meta
 
 
-def materialize_changed_dependency_jars(rows, side_meta, output_dir):
-    """Persist only changed dependency JARs for direct Step4 consumption."""
+def _write_deterministic_archive(target, source_archive, entries):
+    """Write ``(source_name, target_name)`` entries without build-time metadata."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED) as output:
+        for source_name, target_name in entries:
+            info = zipfile.ZipInfo(target_name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3
+            info.external_attr = 0o100644 << 16
+            output.writestr(info, source_archive.read(source_name))
+
+
+def _business_content_entries(archive):
+    names = sorted(
+        info.filename
+        for info in archive.infolist()
+        if not info.is_dir()
+    )
+    application_prefixes = ('BOOT-INF/classes/', 'WEB-INF/classes/')
+    has_application_layout = any(
+        name.startswith(application_prefixes) for name in names
+    )
+    entries = []
+    seen_targets = set()
+    for name in names:
+        if has_application_layout:
+            prefix = next(
+                (value for value in application_prefixes if name.startswith(value)),
+                '',
+            )
+            if not prefix:
+                continue
+            target_name = name[len(prefix):]
+        else:
+            if name.startswith(('META-INF/', 'BOOT-INF/', 'WEB-INF/', 'lib/')):
+                continue
+            target_name = name
+        if not target_name:
+            continue
+        if target_name in seen_targets:
+            raise ValueError(f'Step1 业务制品条目重复: {target_name}')
+        seen_targets.add(target_name)
+        entries.append((name, target_name))
+    return entries
+
+
+def materialize_changed_dependency_jars(
+    rows, side_meta, output_dir, current_entries=None,
+):
+    """Persist Step4 change JARs and the complete Step5 current runtime view once."""
     output_dir = Path(output_dir).resolve()
     jar_dir = output_dir / STEP1_DEPENDENCY_JARS_DIRNAME
     if jar_dir.exists():
         shutil.rmtree(jar_dir)
     jar_dir.mkdir(parents=True, exist_ok=True)
 
-    items = []
-    materialized = {}
+    requests = {}
+
+    def add_request(
+        side, lib_entry, coord, version, scope, identity_source, purpose,
+    ):
+        normalized_entry = str(lib_entry or '').replace('\\', '/').strip()
+        if not normalized_entry:
+            raise ValueError(
+                f'Step1 {purpose} 依赖缺少最终制品条目: {coord or "<unknown>"}'
+            )
+        key = (side, normalized_entry)
+        request = requests.setdefault(key, {
+            'side': side,
+            'coord': str(coord or '').strip(),
+            'version': str(version or '').strip(),
+            'scope': str(scope or '').strip(),
+            'lib_entry': normalized_entry,
+            'identity_source': str(identity_source or '').strip(),
+            'purposes': set(),
+        })
+        request['purposes'].add(purpose)
+        for field, value in (
+            ('coord', coord),
+            ('version', version),
+            ('scope', scope),
+            ('identity_source', identity_source),
+        ):
+            normalized_value = str(value or '').strip()
+            if (
+                field in {'coord', 'version'}
+                and request[field]
+                and normalized_value
+                and request[field] != normalized_value
+            ):
+                raise ValueError(
+                    f'Step1 同一制品条目身份冲突: {normalized_entry} '
+                    f'({request[field]} != {normalized_value})'
+                )
+            if not request[field] and normalized_value:
+                request[field] = normalized_value
+
     for row in rows or []:
         if str(row.get('resolution_status') or '').strip() != 'resolved':
             continue
@@ -109,74 +196,168 @@ def materialize_changed_dependency_jars(rows, side_meta, output_dir):
             if version in ('', '-'):
                 continue
             lib_entry = str(row.get(entry_field) or '').replace('\\', '/').strip()
-            if not lib_entry:
-                raise ValueError(
-                    f"Step1 变化依赖缺少 {entry_field}: "
-                    f"{row.get('coord') or '<unknown>'}"
-                )
-            key = (side, lib_entry)
-            if key in materialized:
-                continue
-            meta = dict((side_meta or {}).get(side) or {})
-            artifact_path = Path(str(meta.get('artifact_path') or ''))
-            if not artifact_path.is_file():
-                raise ValueError(f"Step1 {side} 最终制品不可用: {artifact_path}")
-            target_name = (
-                hashlib.sha256(lib_entry.encode('utf-8')).hexdigest()[:16]
-                + '-'
-                + Path(lib_entry).name
+            add_request(
+                side,
+                lib_entry,
+                row.get(coord_field) or row.get('coord'),
+                version,
+                row.get('scope'),
+                row.get(
+                    'base_packaged_match_source'
+                    if side == 'base'
+                    else 'current_packaged_match_source'
+                ),
+                'step4_change',
             )
-            target = jar_dir / side / target_name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(artifact_path) as outer:
+
+    for entry in current_entries or []:
+        if str(entry.get('resolution_status') or 'resolved').strip() != 'resolved':
+            continue
+        scope = str(entry.get('scope') or '').strip()
+        if scope in {'test', 'provided', 'optional'}:
+            continue
+        coord = str(entry.get('coord') or '').strip()
+        version = str(entry.get('version') or '').strip()
+        if not coord or version in ('', '-'):
+            continue
+        add_request(
+            'current',
+            entry.get('lib_entry'),
+            coord,
+            version,
+            scope,
+            entry.get('packaged_match_source'),
+            'step5_runtime',
+        )
+
+    items = []
+    business_artifacts = []
+    for side in ('base', 'current'):
+        side_requests = [
+            request for (request_side, _entry), request in requests.items()
+            if request_side == side
+        ]
+        if not side_requests and side != 'current':
+            continue
+        meta = dict((side_meta or {}).get(side) or {})
+        artifact_path = Path(str(meta.get('artifact_path') or ''))
+        if not artifact_path.is_file():
+            if side_requests:
+                raise ValueError(f"Step1 {side} 最终制品不可用: {artifact_path}")
+            continue
+        outer_sha256 = str(meta.get('artifact_sha256') or '').strip()
+        if not outer_sha256:
+            outer_sha256 = sha256_file(artifact_path)
+        with zipfile.ZipFile(artifact_path) as outer:
+            info_by_name = defaultdict(list)
+            for info in outer.infolist():
+                info_by_name[info.filename].append(info)
+            for request in sorted(side_requests, key=lambda item: item['lib_entry']):
+                lib_entry = request['lib_entry']
                 matches = [
-                    info for info in outer.infolist()
-                    if info.filename == lib_entry
+                    info for info in info_by_name.get(lib_entry, ())
+                    if not info.is_dir()
                 ]
                 if len(matches) != 1:
                     raise ValueError(
                         f"Step1 {side} 最终制品条目数量异常: "
                         f"{lib_entry}（{len(matches)}）"
                     )
+                target_name = (
+                    hashlib.sha256(lib_entry.encode('utf-8')).hexdigest()[:16]
+                    + '-'
+                    + Path(lib_entry).name
+                )
+                target = jar_dir / side / target_name
+                target.parent.mkdir(parents=True, exist_ok=True)
                 with outer.open(matches[0]) as source, open(target, 'wb') as sink:
                     shutil.copyfileobj(source, sink, NESTED_JAR_COPY_CHUNK_BYTES)
-            try:
-                require_safe_archive(
-                    target,
-                    inspect_nested_archives=False,
-                    allow_duplicate_maven_metadata=True,
-                )
-            except Exception:
-                if target.exists():
-                    target.unlink()
-                raise
-            nested_sha256 = sha256_file(target)
-            item = {
-                'side': side,
-                'coord': str(row.get(coord_field) or row.get('coord') or '').strip(),
-                'version': version,
-                'lib_entry': lib_entry,
-                'retained_path': str(target),
-                'nested_jar_sha256': nested_sha256,
-                'outer_artifact_path': str(artifact_path),
-                'outer_artifact_sha256': str(meta.get('artifact_sha256') or ''),
-                'identity_source': str(
-                    row.get(
-                        'base_packaged_match_source'
-                        if side == 'base'
-                        else 'current_packaged_match_source'
-                    ) or ''
-                ).strip(),
-            }
-            materialized[key] = item
-            items.append(item)
+                try:
+                    require_safe_archive(
+                        target,
+                        inspect_nested_archives=False,
+                        allow_duplicate_maven_metadata=True,
+                    )
+                except Exception:
+                    if target.exists():
+                        target.unlink()
+                    raise
+                items.append({
+                    'side': side,
+                    'coord': request['coord'],
+                    'version': request['version'],
+                    'scope': request['scope'],
+                    'lib_entry': lib_entry,
+                    'retained_path': str(target),
+                    'nested_jar_sha256': sha256_file(target),
+                    'outer_artifact_path': str(artifact_path),
+                    'outer_artifact_sha256': outer_sha256,
+                    'identity_source': request['identity_source'],
+                    'purposes': sorted(request['purposes']),
+                })
+
+            if side == 'current':
+                business_entries = _business_content_entries(outer)
+                if business_entries:
+                    business_target = jar_dir / side / 'business-classes.jar'
+                    _write_deterministic_archive(
+                        business_target, outer, business_entries
+                    )
+                    try:
+                        require_safe_archive(
+                            business_target,
+                            inspect_nested_archives=False,
+                            allow_duplicate_maven_metadata=True,
+                        )
+                    except Exception:
+                        if business_target.exists():
+                            business_target.unlink()
+                        raise
+                    business_artifacts.append({
+                        'side': 'current',
+                        'kind': 'business_content',
+                        'retained_path': str(business_target),
+                        'sha256': sha256_file(business_target),
+                        'entry_count': len(business_entries),
+                        'class_count': sum(
+                            1 for _source, target in business_entries
+                            if target.endswith('.class')
+                        ),
+                        'outer_artifact_path': str(artifact_path),
+                        'outer_artifact_sha256': outer_sha256,
+                    })
+
+    gav_artifacts = defaultdict(lambda: {'hashes': set(), 'entries': []})
+    for item in items:
+        key = (
+            str(item.get('side') or ''),
+            str(item.get('coord') or ''),
+            str(item.get('version') or ''),
+        )
+        gav_artifacts[key]['hashes'].add(
+            str(item.get('nested_jar_sha256') or '').lower()
+        )
+        gav_artifacts[key]['entries'].append(str(item.get('lib_entry') or ''))
+    identity_conflicts = [
+        (key, value)
+        for key, value in gav_artifacts.items()
+        if len(value['hashes']) > 1
+    ]
+    if identity_conflicts:
+        key, value = identity_conflicts[0]
+        raise ValueError(
+            'Step1 同一 GAV 对应多个不同字节的最终制品条目: '
+            f'{key[0]} {key[1]}:{key[2]} '
+            f'({", ".join(sorted(value["entries"]))})'
+        )
 
     manifest_path = output_dir / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
     manifest_path.write_text(
         json.dumps(
             {
-                'schema': 'java-upgrade-analyzer.step1-dependency-jars.v1',
+                'schema': 'java-upgrade-analyzer.step1-dependency-jars.v2',
                 'items': items,
+                'business_artifacts': business_artifacts,
             },
             ensure_ascii=False,
             indent=2,
@@ -4338,6 +4519,7 @@ def main():
         rows,
         {'base': base_meta, 'current': curr_meta},
         out_dir,
+        current_entries=curr_entries,
     )
     # CSV 统一使用 UTF-8 BOM，可直接用 Excel 打开。
     with open_csv_write(args.output) as f:

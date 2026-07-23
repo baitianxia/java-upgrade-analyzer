@@ -19,6 +19,7 @@ if str(SCRIPTS) not in sys.path:
 import s5_call_chain_engine_integrated as step5
 import confidence_weighted_tracer as tracer
 from step5_artifact_fact_store import Step5ArtifactFactStore
+from tests.retained_artifact_test_support import retain_current_artifact_contract
 
 
 class ArtifactBytecodeCatalogTest(unittest.TestCase):
@@ -54,10 +55,10 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
                 )
 
             inactive = step5._recover_reactor_module_coords(
-                [root], artifact
+                [root], {"com.acme:application"}
             )
             active = step5._recover_reactor_module_coords(
-                [root], artifact,
+                [root], {"com.acme:application"},
                 active_profiles={"boot"},
             )
 
@@ -526,6 +527,7 @@ class ArtifactBytecodeCatalogTest(unittest.TestCase):
                     "artifact_sha256": hashlib.sha256(application.read_bytes()).hexdigest(),
                 }]
             }), encoding="utf-8")
+            retain_current_artifact_contract(report, application)
             state = report / ".runtime/state/main_state.json"
             state.parent.mkdir(parents=True)
             state.write_text(json.dumps({
@@ -853,6 +855,7 @@ BootstrapMethods:
                     "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
                 }]
             }), encoding="utf-8")
+            retain_current_artifact_contract(report, artifact)
 
             with patch.object(
                 step5,

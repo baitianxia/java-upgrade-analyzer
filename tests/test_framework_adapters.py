@@ -922,6 +922,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             for class_file in classes.rglob("*.class"):
                 jar.write(class_file, class_file.relative_to(classes).as_posix())
         artifact = module / "application.jar"
+        business_jar = module / "business-classes.jar"
         mapper_source = (module / "src/main/java/com/acme/CityMapper.java").read_text(
             encoding="utf-8", errors="replace"
         ) if (module / "src/main/java/com/acme/CityMapper.java").is_file() else ""
@@ -947,17 +948,37 @@ class FrameworkAdaptersTest(unittest.TestCase):
             if resources.is_dir():
                 for resource in resources.rglob("*.xml"):
                     outer.write(resource, "BOOT-INF/classes/" + resource.relative_to(resources).as_posix())
+        with zipfile.ZipFile(business_jar, "w") as retained:
+            retained.writestr("com/acme/CityMapper.class", mapper_bytes)
+            retained.writestr("com/acme/Application.class", application_bytes)
+            resources = module / "src/main/resources"
+            if resources.is_dir():
+                for resource in resources.rglob("*.xml"):
+                    retained.write(resource, resource.relative_to(resources).as_posix())
         return {
             "final_artifact_path": str(artifact),
             "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-            "entries": [{
-                "coord": "runtime:mybatis-test",
-                "version": "test",
-                "jar_path": str(jar_path),
-                "artifact_entry": "BOOT-INF/lib/mybatis-test.jar",
-                "sha256": hashlib.sha256(jar_path.read_bytes()).hexdigest(),
-                "evidence_source": "current_final_artifact",
-            }]
+            "entries": [
+                {
+                    "coord": "__business__",
+                    "version": "",
+                    "jar_path": str(business_jar),
+                    "artifact_entry": "<business-classes>",
+                    "sha256": hashlib.sha256(business_jar.read_bytes()).hexdigest(),
+                    "evidence_source": "current_final_artifact",
+                    "evidence_origin": "step1_retained_business_content",
+                    "application_owned": True,
+                },
+                {
+                    "coord": "runtime:mybatis-test",
+                    "version": "test",
+                    "jar_path": str(jar_path),
+                    "artifact_entry": "BOOT-INF/lib/mybatis-test.jar",
+                    "sha256": hashlib.sha256(jar_path.read_bytes()).hexdigest(),
+                    "evidence_source": "current_final_artifact",
+                    "evidence_origin": "step1_retained_dependency_jar",
+                },
+            ],
         }
 
     def test_mybatis_proxy_adapter_requires_registration_and_packaged_dispatch_chain(self):
@@ -987,7 +1008,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 artifact_catalog=catalog,
                 fact_store=Step5ArtifactFactStore.from_catalog(catalog),
             )
-            verified_final_sha256 = catalog["final_artifact_sha256"]
+            verified_business_sha256 = catalog["entries"][0]["sha256"]
             corrupt_sha_catalog = {
                 **catalog,
                 "entries": [{**catalog["entries"][0], "sha256": "c" * 64}],
@@ -1010,10 +1031,13 @@ class FrameworkAdaptersTest(unittest.TestCase):
             mapper.write_text(mapper_source, encoding="utf-8")
             catalog = self._mybatis_runtime_catalog(module)
             fallback_catalog = {
-                "entries": [{
-                    **catalog["entries"][0],
-                    "evidence_source": "local_maven_fallback",
-                }]
+                "entries": [
+                    catalog["entries"][0],
+                    {
+                        **catalog["entries"][1],
+                        "evidence_source": "local_maven_fallback",
+                    },
+                ]
             }
             fallback = run_mybatis_proxy_adapter(
                 [{"root": str(module / "src/main/java"), "owner_type": "business"}],
@@ -1035,9 +1059,9 @@ class FrameworkAdaptersTest(unittest.TestCase):
             and edge["parameter_count"] == 1
             and edge["provenance"]["authority"] == "final_artifact_javap"
             and edge["provenance"]["mapper_registration"]["artifact_sha256"]
-            == verified_final_sha256
+            == verified_business_sha256
             and edge["provenance"]["binding_evidence"]["artifact_sha256"]
-            == verified_final_sha256
+            == verified_business_sha256
             and edge["provenance"]["physical_target_evidence"]["target"]
             == edge["target"]
             for edge in adapter["edges"]
@@ -1060,19 +1084,24 @@ class FrameworkAdaptersTest(unittest.TestCase):
 
     def test_mybatis_final_artifact_replacement_is_blocking(self):
         with tempfile.TemporaryDirectory() as tmp:
-            artifact = Path(tmp) / "application.jar"
+            artifact = Path(tmp) / "business-classes.jar"
             replacement = Path(tmp) / "replacement.jar"
             with zipfile.ZipFile(artifact, "w") as archive:
-                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"original")
+                archive.writestr("com/acme/App.class", b"original")
             catalog = {
-                "final_artifact_path": str(artifact),
-                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                "entries": [],
+                "entries": [{
+                    "coord": "__business__",
+                    "jar_path": str(artifact),
+                    "artifact_entry": "<business-classes>",
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    "application_owned": True,
+                    "evidence_source": "current_final_artifact",
+                }],
             }
             store = Step5ArtifactFactStore.from_catalog(catalog)
-            store.inventory("__final_artifact__")
+            store.inventory("__business__")
             with zipfile.ZipFile(replacement, "w") as archive:
-                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"replacement")
+                archive.writestr("com/acme/App.class", b"replacement")
             replacement.replace(artifact)
 
             packaged, unregistered, activation, errors = (
@@ -1087,22 +1116,39 @@ class FrameworkAdaptersTest(unittest.TestCase):
 
     def test_mybatis_packaged_contract_rejects_duplicate_mapper_class(self):
         with tempfile.TemporaryDirectory() as tmp:
-            artifact = Path(tmp) / "application.jar"
+            artifact = Path(tmp) / "business-classes.jar"
+            internal = Path(tmp) / "internal-module.jar"
             mapper_bytes = (
                 b"Lorg/apache/ibatis/annotations/Mapper;"
                 b"Lorg/apache/ibatis/annotations/Select;find"
             )
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr(
-                    "BOOT-INF/classes/com/acme/CityMapper.class", mapper_bytes,
+                    "com/acme/CityMapper.class", mapper_bytes,
                 )
+            with zipfile.ZipFile(internal, "w") as archive:
                 archive.writestr(
-                    "WEB-INF/classes/com/acme/CityMapper.class", mapper_bytes,
+                    "com/acme/CityMapper.class", mapper_bytes,
                 )
             catalog = {
-                "final_artifact_path": str(artifact),
-                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                "entries": [],
+                "entries": [
+                    {
+                        "coord": "__business__",
+                        "jar_path": str(artifact),
+                        "artifact_entry": "<business-classes>",
+                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                        "application_owned": True,
+                        "evidence_source": "current_final_artifact",
+                    },
+                    {
+                        "coord": "com.acme:internal",
+                        "jar_path": str(internal),
+                        "artifact_entry": "BOOT-INF/lib/internal-module.jar",
+                        "sha256": hashlib.sha256(internal.read_bytes()).hexdigest(),
+                        "application_owned": True,
+                        "evidence_source": "current_final_artifact",
+                    },
+                ],
             }
             candidate = {
                 "owner": "com.acme.CityMapper", "member": "find",
@@ -1124,7 +1170,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
 
     def test_mybatis_packaged_contract_rejects_duplicate_xml_binding(self):
         with tempfile.TemporaryDirectory() as tmp:
-            artifact = Path(tmp) / "application.jar"
+            artifact = Path(tmp) / "business-classes.jar"
             mapper_bytes = b"Lorg/apache/ibatis/annotations/Mapper;find"
             mapping = (
                 b'<mapper namespace="com.acme.CityMapper">'
@@ -1132,14 +1178,19 @@ class FrameworkAdaptersTest(unittest.TestCase):
             )
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr(
-                    "BOOT-INF/classes/com/acme/CityMapper.class", mapper_bytes,
+                    "com/acme/CityMapper.class", mapper_bytes,
                 )
-                archive.writestr("BOOT-INF/classes/mapper/one.xml", mapping)
-                archive.writestr("WEB-INF/classes/mapper/two.xml", mapping)
+                archive.writestr("mapper/one.xml", mapping)
+                archive.writestr("mapper/two.xml", mapping)
             catalog = {
-                "final_artifact_path": str(artifact),
-                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                "entries": [],
+                "entries": [{
+                    "coord": "__business__",
+                    "jar_path": str(artifact),
+                    "artifact_entry": "<business-classes>",
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    "application_owned": True,
+                    "evidence_source": "current_final_artifact",
+                }],
             }
             candidate = {
                 "owner": "com.acme.CityMapper", "member": "find",
@@ -1161,22 +1212,23 @@ class FrameworkAdaptersTest(unittest.TestCase):
 
     def test_mybatis_packaged_contract_creates_fact_store_when_omitted(self):
         with tempfile.TemporaryDirectory() as tmp:
-            artifact = Path(tmp) / "application.jar"
+            artifact = Path(tmp) / "business-classes.jar"
             with zipfile.ZipFile(artifact, "w") as archive:
-                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"fixture")
+                archive.writestr("com/acme/App.class", b"fixture")
             catalog = {
-                "final_artifact_path": str(artifact),
-                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                "entries": [],
+                "entries": [{
+                    "coord": "__business__",
+                    "jar_path": str(artifact),
+                    "artifact_entry": "<business-classes>",
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    "application_owned": True,
+                    "evidence_source": "current_final_artifact",
+                }],
             }
 
-            with patch.object(
-                framework_adapter_module, "_verified_final_artifact",
-                side_effect=AssertionError("legacy path used"),
-            ):
-                result = framework_adapter_module._packaged_mybatis_contracts(
-                    [], catalog,
-                )
+            result = framework_adapter_module._packaged_mybatis_contracts(
+                [], catalog,
+            )
 
         self.assertEqual(([], [], [], []), result)
 
@@ -1237,12 +1289,17 @@ class FrameworkAdaptersTest(unittest.TestCase):
 
     def test_mybatis_bad_zip_is_blocking_parser_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            artifact = Path(tmp) / "application.jar"
+            artifact = Path(tmp) / "business-classes.jar"
             artifact.write_bytes(b"not-a-zip")
             catalog = {
-                "final_artifact_path": str(artifact),
-                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                "entries": [],
+                "entries": [{
+                    "coord": "__business__",
+                    "jar_path": str(artifact),
+                    "artifact_entry": "<business-classes>",
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    "application_owned": True,
+                    "evidence_source": "current_final_artifact",
+                }],
             }
 
             _packaged, _unregistered, _activation, errors = (
@@ -1250,7 +1307,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
             )
 
         failure = framework_adapter_module._framework_failure("mybatis", errors[0])
-        self.assertEqual("MYBATIS_FINAL_ARTIFACT_PARSE_FAILED", failure.reason_code)
+        self.assertEqual("MYBATIS_APPLICATION_ARTIFACT_PARSE_FAILED", failure.reason_code)
         self.assertTrue(failure.blocking)
 
     def test_mybatis_internal_module_failures_are_blocking(self):
@@ -1271,18 +1328,12 @@ class FrameworkAdaptersTest(unittest.TestCase):
     def test_mybatis_declared_internal_module_missing_is_blocking(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            artifact = root / "application.jar"
-            with zipfile.ZipFile(artifact, "w") as archive:
-                archive.writestr("BOOT-INF/classes/com/acme/App.class", b"fixture")
             missing = root / "library.jar"
-            missing.write_bytes(b"declared-library")
             catalog = {
-                "final_artifact_path": str(artifact),
-                "final_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
                 "entries": [{
                     "coord": "com.acme:library", "jar_path": str(missing),
                     "artifact_entry": "BOOT-INF/lib/library.jar",
-                    "sha256": hashlib.sha256(missing.read_bytes()).hexdigest(),
+                    "sha256": "a" * 64,
                     "application_owned": True,
                     "evidence_source": "current_final_artifact",
                 }],
@@ -1292,9 +1343,9 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 framework_adapter_module._packaged_mybatis_contracts([], catalog)
             )
 
-        self.assertTrue(any("mybatis_internal_module_missing" in item for item in errors))
+        self.assertTrue(any("artifact_fact_store_identity_failed" in item for item in errors))
         failure = framework_adapter_module._framework_failure("mybatis", errors[0])
-        self.assertEqual("MYBATIS_INTERNAL_MODULE_MISSING", failure.reason_code)
+        self.assertEqual("ARTIFACT_FACT_STORE_IDENTITY_FAILED", failure.reason_code)
         self.assertTrue(failure.blocking)
 
     def test_public_framework_scanners_keep_docstrings(self):
@@ -1415,7 +1466,11 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             catalog = self._mybatis_runtime_catalog(module)
-            artifact = Path(catalog["final_artifact_path"])
+            business_entry = next(
+                item for item in catalog["entries"]
+                if item["coord"] == "__business__"
+            )
+            artifact = Path(business_entry["jar_path"])
             with zipfile.ZipFile(artifact) as archive:
                 original = {
                     item.filename: archive.read(item)
@@ -1424,11 +1479,11 @@ class FrameworkAdaptersTest(unittest.TestCase):
 
             mutations = {
                 "mapper_absent": (
-                    "BOOT-INF/classes/com/acme/CityMapper.class",
+                    "com/acme/CityMapper.class",
                     "mybatis_mapper_registration_unproven",
                 ),
                 "xml_absent": (
-                    "BOOT-INF/classes/mappers/CityMapper.xml",
+                    "mappers/CityMapper.xml",
                     "mybatis_mapper_binding_unproven",
                 ),
             }
@@ -1438,7 +1493,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
                         for entry, content in original.items():
                             if entry != removed_entry:
                                 archive.writestr(entry, content)
-                    catalog["final_artifact_sha256"] = hashlib.sha256(
+                    business_entry["sha256"] = hashlib.sha256(
                         artifact.read_bytes()
                     ).hexdigest()
 
@@ -1470,13 +1525,16 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             catalog = self._mybatis_runtime_catalog(module)
-            artifact = module / "application.jar"
+            business_entry = next(
+                item for item in catalog["entries"]
+                if item["coord"] == "__business__"
+            )
+            artifact = Path(business_entry["jar_path"])
             with zipfile.ZipFile(artifact, "w") as archive:
-                archive.writestr("BOOT-INF/classes/com/acme/Application.class", b"no activation")
-            catalog.update({
-                "final_artifact_path": str(artifact),
-                "final_artifact_sha256": "b" * 64,
-            })
+                archive.writestr("com/acme/Application.class", b"no activation")
+            business_entry["sha256"] = hashlib.sha256(
+                artifact.read_bytes()
+            ).hexdigest()
 
             adapter = run_mybatis_proxy_adapter(
                 [{"root": str(module / "src/main/java"), "owner_type": "business"}],
@@ -1506,22 +1564,27 @@ class FrameworkAdaptersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             catalog = self._mybatis_runtime_catalog(module)
-            artifact = Path(catalog["final_artifact_path"])
-            with zipfile.ZipFile(artifact) as outer:
+            business_entry = next(
+                item for item in catalog["entries"]
+                if item["coord"] == "__business__"
+            )
+            business_jar = Path(business_entry["jar_path"])
+            with zipfile.ZipFile(business_jar) as retained:
                 entries = {
-                    item.filename: outer.read(item)
-                    for item in outer.infolist()
+                    item.filename: retained.read(item)
+                    for item in retained.infolist()
                     if not item.is_dir()
                 }
-            mapper_entry = "BOOT-INF/classes/com/acme/CityMapper.class"
+            mapper_entry = "com/acme/CityMapper.class"
             internal_jar = module / "library.jar"
             with zipfile.ZipFile(internal_jar, "w") as nested:
                 nested.writestr("com/acme/CityMapper.class", entries.pop(mapper_entry))
-            with zipfile.ZipFile(artifact, "w") as outer:
+            with zipfile.ZipFile(business_jar, "w") as retained:
                 for name, content in entries.items():
-                    outer.writestr(name, content)
-                outer.writestr("BOOT-INF/lib/library.jar", internal_jar.read_bytes())
-            catalog["final_artifact_sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                    retained.writestr(name, content)
+            business_entry["sha256"] = hashlib.sha256(
+                business_jar.read_bytes()
+            ).hexdigest()
             catalog["entries"].append({
                 "coord": "com.acme:library",
                 "version": "1.0.0",
@@ -1540,7 +1603,7 @@ class FrameworkAdaptersTest(unittest.TestCase):
         self.assertEqual(len(adapter["edges"]), 3)
         self.assertTrue(all(
             "BOOT-INF/lib/library.jar!/com/acme/CityMapper.class"
-            in edge["provenance"]["file"]
+            == edge["provenance"]["mapper_registration"]["final_artifact_entry"]
             for edge in adapter["edges"]
         ))
 

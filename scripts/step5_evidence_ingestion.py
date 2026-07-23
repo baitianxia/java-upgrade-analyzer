@@ -694,6 +694,12 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
     if not final_artifact_path:
         final_artifact_path = str(provenance.get("file") or "").split("!/", 1)[0]
     caller_artifact_path, separator, caller_file_entry = caller_file.partition("!/")
+    registration_sha = str(
+        (registration or {}).get("artifact_sha256") or ""
+    ).lower()
+    binding_sha = str(
+        (binding or {}).get("artifact_sha256") or ""
+    ).lower()
     caller_descriptor = _mybatis_caller_descriptor(
         caller_artifact_path,
         caller_sha,
@@ -706,18 +712,16 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
         isinstance(item, Mapping)
         and str(item.get("artifact_entry") or "").strip()
         and _valid_sha256(item.get("artifact_sha256"))
-        and str(item.get("artifact_sha256") or "").lower()
-        == final_artifact_sha
         and str(item.get("authority") or "") == "current_final_artifact_classfile"
         and bool(_business_class_entry(item.get("artifact_entry")))
         and _artifact_evidence_matches_bytes(
             item.get("artifact_path") or final_artifact_path,
-            final_artifact_sha,
+            item.get("artifact_sha256"),
             (item.get("artifact_entry"),),
         )
         and _mybatis_activation_semantics_match(
             item.get("artifact_path") or final_artifact_path,
-            final_artifact_sha,
+            item.get("artifact_sha256"),
             item.get("artifact_entry"),
         )
         for item in (activations if isinstance(activations, (list, tuple)) else ())
@@ -726,12 +730,12 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
         isinstance(registration, Mapping)
         and _artifact_evidence_matches_bytes(
             registration.get("artifact_path") or final_artifact_path,
-            final_artifact_sha,
+            registration_sha,
             (registration.get("artifact_entry"),),
         )
         and _mybatis_registration_semantics_match(
             registration.get("artifact_path") or final_artifact_path,
-            final_artifact_sha,
+            registration_sha,
             registration.get("artifact_entry"),
             edge_mapping.get("source_owner"),
             edge_mapping.get("source_member"),
@@ -742,12 +746,12 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
         isinstance(binding, Mapping)
         and _artifact_evidence_matches_bytes(
             binding.get("artifact_path") or final_artifact_path,
-            final_artifact_sha,
+            binding_sha,
             (binding.get("artifact_entry"),),
         )
         and _mybatis_binding_semantics_match(
             binding.get("artifact_path") or final_artifact_path,
-            final_artifact_sha,
+            binding_sha,
             binding.get("artifact_entry"),
             edge_mapping.get("source_owner"),
             edge_mapping.get("source_member"),
@@ -805,8 +809,7 @@ def _mybatis_chain_is_complete(edge, edge_mapping, caller):
             "current_final_artifact_classfile",
             "current_final_artifact_resource",
         }
-        and str(binding.get("artifact_sha256") or "").lower()
-        == final_artifact_sha
+        and _valid_sha256(binding_sha)
         and binding_is_verified
         and runtime_entry
         and _valid_sha256(runtime_sha)
@@ -941,17 +944,6 @@ def _read_artifact_entry_bytes(artifact_path, artifact_sha256, entries):
             for entry in evidence_entries:
                 if entry in names:
                     return archive.read(entry)
-                container_entry, separator, nested_entry = entry.partition("!/")
-                if not separator or container_entry not in names or not nested_entry:
-                    continue
-                try:
-                    with zipfile.ZipFile(
-                        io.BytesIO(archive.read(container_entry))
-                    ) as nested:
-                        if nested_entry in set(nested.namelist()):
-                            return nested.read(nested_entry)
-                except zipfile.BadZipFile:
-                    continue
     except (OSError, zipfile.BadZipFile):
         return None
     return None

@@ -136,32 +136,52 @@ class ArtifactSafetyTest(unittest.TestCase):
     def test_runtime_catalog_fails_closed_before_reading_unsafe_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp)
-            artifact = report / "application.jar"
-            artifact.write_bytes(_archive_bytes([
-                ("../escape.class", b"x"),
-                ("BOOT-INF/classes/com/acme/Application.class", b"app"),
-            ]))
             dependencies = report / "evidence/dependencies"
-            dependencies.mkdir(parents=True)
+            retained = dependencies / "s1_dependency_jars/current/unsafe.jar"
+            retained.parent.mkdir(parents=True)
+            retained.write_bytes(_archive_bytes([
+                ("../escape.class", b"x"),
+            ]))
             with (dependencies / "deps_current_resolved.csv").open(
                 "w", newline="", encoding="utf-8"
             ) as handle:
                 writer = csv.DictWriter(
-                    handle, fieldnames=["coord", "version", "scope", "lib_entry"]
+                    handle,
+                    fieldnames=[
+                        "coord", "version", "scope", "lib_entry",
+                        "resolution_status",
+                    ],
                 )
                 writer.writeheader()
-            (dependencies / "build_provenance.json").write_text(json.dumps({
-                "sides": [{
+                writer.writerow({
+                    "coord": "com.acme:unsafe",
+                    "version": "1.0",
+                    "scope": "runtime",
+                    "lib_entry": "BOOT-INF/lib/unsafe.jar",
+                    "resolution_status": "resolved",
+                })
+            (dependencies / "dependency_jars.json").write_text(json.dumps({
+                "schema": "java-upgrade-analyzer.step1-dependency-jars.v2",
+                "items": [{
                     "side": "current",
-                    "artifact_path": str(artifact),
-                    "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                }]
+                    "coord": "com.acme:unsafe",
+                    "version": "1.0",
+                    "scope": "runtime",
+                    "lib_entry": "BOOT-INF/lib/unsafe.jar",
+                    "retained_path": str(retained),
+                    "nested_jar_sha256": hashlib.sha256(
+                        retained.read_bytes()
+                    ).hexdigest(),
+                    "purposes": ["step5_runtime"],
+                }],
             }), encoding="utf-8")
 
             catalog = step5.build_runtime_dependency_catalog(str(report))
 
         self.assertEqual(catalog["status"], "insufficient")
-        self.assertIn("artifact_safety_violation", catalog["reason_codes"])
+        self.assertIn(
+            "step1_retained_artifact_invalid", catalog["reason_codes"]
+        )
         self.assertNotIn("__business__", catalog["by_coord"])
 
     def test_large_archive_metadata_scan_stays_within_time_and_memory_budget(self):
@@ -188,16 +208,20 @@ class ArtifactSafetyTest(unittest.TestCase):
             artifact = report / "unsafe.jar"
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("../escaped.class", b"class")
-            dependencies = report / "evidence/dependencies"
-            dependencies.mkdir(parents=True)
-            (dependencies / "build_provenance.json").write_text(json.dumps({
-                "sides": [{
-                    "side": "current",
-                    "artifact_path": str(artifact),
-                    "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                }]
-            }), encoding="utf-8")
-            graph = type("Graph", (), {"report_dir": str(report)})()
+            item = {
+                "coord": "com.acme:unsafe",
+                "jar_path": str(artifact),
+                "artifact_entry": "BOOT-INF/lib/unsafe.jar",
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            graph = type("Graph", (), {
+                "report_dir": str(report),
+                "runtime_dependency_catalog": {
+                    "status": "complete",
+                    "entries": [item],
+                    "by_coord": {"com.acme:unsafe": item},
+                },
+            })()
 
             result = tracer._verified_final_artifact_provenance(graph)
 
