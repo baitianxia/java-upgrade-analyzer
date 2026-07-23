@@ -1886,13 +1886,7 @@ def _alert_rows_for_result(result):
         changed_symbol = _api_display_name(result)
         chain_view = _alert_chain_view(path_text, business_entry, changed_symbol, evidence)
         if not has_chain:
-            chain_view = {
-                'summary': f"未形成完整链路；目标 API：{changed_symbol}" if changed_symbol else '未形成完整链路',
-                'entry': '',
-                'target': changed_symbol,
-                'hop_count': '',
-                'detail': '无已发现调用链',
-            }
+            chain_view = _alert_no_chain_view(path_status, changed_symbol)
         review_reason = _alert_review_reason(result, detail, evidence, explanation, stop_reason)
         rows.append({
             'conclusion': _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_reason),
@@ -1951,6 +1945,37 @@ def _alert_rows_for_result(result):
             'detail_file': detail_file,
         })
     return rows
+
+
+def _alert_no_chain_view(path_status, changed_symbol):
+    """Explain an absent chain without conflating incomplete and negative analysis."""
+    status = str(path_status or '').strip()
+    target_suffix = f"；目标 API：{changed_symbol}" if changed_symbol else ''
+    if status == 'not_analyzed':
+        summary = f'本次分析未完成，尚无法判断是否存在调用链{target_suffix}'
+        detail = '分析未完成，尚无法判断是否存在调用链'
+    elif status in {'not_found_in_static_analysis', 'not_reachable'}:
+        summary = f'静态分析未发现调用链{target_suffix}'
+        detail = '完整静态分析未发现调用链'
+    elif status == 'uncertain':
+        summary = f'存在待复核线索，但尚未形成可确认调用链{target_suffix}'
+        detail = '存在待复核线索，尚未形成可确认调用链'
+    elif status == 'not_impacted':
+        summary = f'目标 API 已确认保留，无需调用链判定{target_suffix}'
+        detail = '目标 API 在当前版本中仍然存在'
+    elif status == 'reachable':
+        summary = f'已确认影响，但调用链明细缺失{target_suffix}'
+        detail = '已确认影响，但本行未包含可展示的调用链明细'
+    else:
+        summary = f'未形成完整链路{target_suffix}'
+        detail = '当前没有可展示的完整调用链'
+    return {
+        'summary': summary,
+        'entry': '',
+        'target': changed_symbol,
+        'hop_count': '',
+        'detail': detail,
+    }
 
 
 def _alert_entry_kind(detail):

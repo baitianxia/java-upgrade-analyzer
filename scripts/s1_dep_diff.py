@@ -4512,6 +4512,14 @@ def main():
         )
         if observer is not None else None
     )
+    artifact_materialization_token = (
+        observer.start_phase(
+            "dependency_jar_materialization",
+            item=str(out_dir),
+            message="开始留存最终制品并提取 Step4/Step5 所需依赖 JAR",
+        )
+        if observer is not None else None
+    )
     if args.base_artifact_path and args.current_artifact_path:
         retain_artifact_for_analysis(base_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'base')
         retain_artifact_for_analysis(curr_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'current')
@@ -4521,7 +4529,21 @@ def main():
         out_dir,
         current_entries=curr_entries,
     )
+    if observer is not None and artifact_materialization_token is not None:
+        observer.finish_phase(
+            artifact_materialization_token,
+            status="completed",
+            message="最终制品留存和依赖 JAR 提取完成",
+        )
     # CSV 统一使用 UTF-8 BOM，可直接用 Excel 打开。
+    dependency_csv_token = (
+        observer.start_phase(
+            "write.dependency_changes",
+            item=str(args.output),
+            message=f"开始写入 {len(rows)} 条依赖变更记录",
+        )
+        if observer is not None else None
+    )
     with open_csv_write(args.output) as f:
         fields = ['coord', 'base_coord', 'current_coord', 'old_version', 'new_version', 'change_type',
                   'risk', 'scope', 'remark', 'current_packaged', 'downgrade_confirmed', 'resolution_status',
@@ -4532,8 +4554,22 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+    if observer is not None and dependency_csv_token is not None:
+        observer.finish_phase(
+            dependency_csv_token,
+            status="completed",
+            message=f"依赖变更记录写入完成，共 {len(rows)} 条",
+        )
 
     current_out = str((out_dir / "deps_current_resolved.csv").resolve())
+    current_inventory_token = (
+        observer.start_phase(
+            "write.current_dependency_inventory",
+            item=current_out,
+            message=f"开始写入当前制品依赖清单，共 {len(curr_entries)} 项",
+        )
+        if observer is not None else None
+    )
     current_rows = []
     for item in sorted(curr_entries, key=_entry_sort_key):
         current_rows.append({
@@ -4560,7 +4596,21 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(current_rows)
+    if observer is not None and current_inventory_token is not None:
+        observer.finish_phase(
+            current_inventory_token,
+            status="completed",
+            message=f"当前制品依赖清单写入完成，共 {len(current_rows)} 项",
+        )
 
+    provenance_token = (
+        observer.start_phase(
+            "write.build_provenance",
+            item=str(out_dir / 'build_provenance.json'),
+            message="开始整理 base/current 构建与制品来源",
+        )
+        if observer is not None else None
+    )
     provenance_sides = []
     for side, meta, branch, configured_jdk in (
         ('base', base_meta, args.base_branch, args.base_jdk_home),
@@ -4613,6 +4663,12 @@ def main():
         }, ensure_ascii=False, indent=2) + '\n',
         encoding='utf-8',
     )
+    if observer is not None and provenance_token is not None:
+        observer.finish_phase(
+            provenance_token,
+            status="completed",
+            message="base/current 构建与制品来源写入完成",
+        )
 
     # 统计
     counts = defaultdict(int)
@@ -4624,6 +4680,14 @@ def main():
     alerts = [r for r in rows
               if '降级' in r['change_type'] or '❓' in r['risk']]
     alerts_out = str((out_dir / "dep_alerts.csv").resolve())
+    alerts_token = (
+        observer.start_phase(
+            "write.dependency_alerts",
+            item=alerts_out,
+            message=f"开始生成依赖告警清单，候选 {len(alerts)} 项",
+        )
+        if observer is not None else None
+    )
     with open_csv_write(alerts_out) as f:
         fields = ['conclusion', 'change_summary', 'review_reason',
                   'coord', 'old_version', 'new_version', 'change_type',
@@ -4649,8 +4713,22 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(alert_rows)
+    if observer is not None and alerts_token is not None:
+        observer.finish_phase(
+            alerts_token,
+            status="completed",
+            message=f"依赖告警清单写入完成，共 {len(alerts)} 项",
+        )
 
     summary_out = str((out_dir / "dep_summary.txt").resolve())
+    summary_token = (
+        observer.start_phase(
+            "write.dependency_summary",
+            item=summary_out,
+            message="开始生成 Step1 可读摘要",
+        )
+        if observer is not None else None
+    )
     summary_lines = []
     summary_lines.append("Step1 依赖变更摘要")
     summary_lines.append("")
@@ -4727,6 +4805,12 @@ def main():
     summary_lines.append("- 是否触达业务代码，以 Step5 的 alerts.csv 和 Step6 的 report.md 为准。")
     with open(summary_out, 'w', encoding='utf-8', newline='\n') as f:
         f.write("\n".join(summary_lines) + "\n")
+    if observer is not None and summary_token is not None:
+        observer.finish_phase(
+            summary_token,
+            status="completed",
+            message="Step1 可读摘要写入完成",
+        )
     if alerts:
         print(f"\n⚠️  需人工确认（{len(alerts)} 项）：", file=sys.stderr)
         for r in alerts:

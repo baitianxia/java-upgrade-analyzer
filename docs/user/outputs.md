@@ -92,9 +92,9 @@ base/current 即使使用同一个源码目录，也会按各自确认后的 com
 |---|---|
 | `.runtime/observability/progress.jsonl` | 全流程统一进度事件；保留任务、阶段、当前/总量、已用时间、粗略预计剩余时间和当前对象，长任务还会记录定期心跳，供中断排障与运行审计使用 |
 | `.runtime/observability/step1_progress.jsonl` | Agent 在 Step1 运行中查看当前侧、当前阶段、命令和状态；`ref_resolution.details` 可核对实际采用的 ref 与 commit |
-| `.runtime/observability/step1_timing.csv` | Step1 分支工作区、Maven 构建、坐标补全、制品解析、差异计算和结果写入耗时 |
-| `.runtime/observability/step4_timing.csv` | Step4 jar 解析、git diff、JApiCmp、removed jar 导出、changed classes 和汇总写入耗时 |
-| `.runtime/observability/step5_timing.csv` | Step5 建图、字节码扫描、框架适配、间接引用和调用链追踪耗时；`memory` 段同时记录主进程与完整子进程树的当前/峰值内存、CPU、外部命令次数/并发/墙钟时间、临时文件高水位及图规模 |
+| `.runtime/observability/step1_timing.csv` | Step1 当前执行阶段及耗时；阶段开始即出现 `status=running`，可看到当前侧、模块/文件、命令和任务说明，完成后同一行更新为最终状态 |
+| `.runtime/observability/step4_timing.csv` | Step4 当前执行阶段及耗时；按依赖并行记录源码 diff、JApiCmp、数据契约、行为字节码兜底和结果写入等 start/end 事件。以相同 `phase + coord + old_version + new_version` 的最后一条状态判断任务是否仍在运行 |
+| `.runtime/observability/step5_timing.csv` | Step5 当前执行阶段及耗时；`activity` 段实时显示输入解析、建图、字节码扫描、框架适配、间接引用、证据合并、调用链追踪和报告写入，最终追加性能指标；`memory` 段同时记录主进程与完整子进程树的当前/峰值内存、CPU、外部命令次数/并发/墙钟时间、临时文件高水位及图规模 |
 
 终端中的进度使用“任务名称 + 当前阶段 + 当前/总量 + 已用时间 + 可用时的预计剩余时间”的用户语言，不要求使用者理解 `step4` 等内部编号；完整内部标识仍保存在 `progress.jsonl`。这些文件用于运行监控和性能排查，不用于证明依赖、API 或调用链结论。
 

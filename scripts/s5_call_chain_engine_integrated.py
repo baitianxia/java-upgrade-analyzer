@@ -234,10 +234,79 @@ def _step5_debug(topic, message, **fields):
     )
 
 
-def _write_step5_timing_csv(report_dir, graph_stats):
-    """Persist Step5 timing metrics in a small human-readable CSV."""
+STEP5_TIMING_FIELDS = [
+    'section',
+    'metric',
+    'value',
+    'status',
+    'started_at',
+    'ended_at',
+    'elapsed_sec',
+    'item',
+    'message',
+]
+
+
+class Step5TimingRecorder:
+    """Keep the Step5 timing CSV useful before the final metrics exist."""
+
+    def __init__(self, report_dir):
+        self.report_dir = report_dir
+        self.path = _runtime_observability_dir(report_dir) / 'step5_timing.csv'
+        self._activity_rows = []
+        self._metrics = {}
+        self.write_metrics({})
+
+    @property
+    def activity_rows(self):
+        return [dict(row) for row in self._activity_rows]
+
+    def start_phase(self, phase, *, item='', message=''):
+        token = {
+            'row_index': len(self._activity_rows),
+            'started_perf': time.perf_counter(),
+        }
+        self._activity_rows.append({
+            'section': 'activity',
+            'metric': str(phase or ''),
+            'value': '',
+            'status': 'running',
+            'started_at': datetime.now().astimezone().isoformat(timespec='milliseconds'),
+            'ended_at': '',
+            'elapsed_sec': '',
+            'item': str(item or ''),
+            'message': str(message or f'正在执行 {phase}'),
+        })
+        self.write_metrics(self._metrics)
+        return token
+
+    def finish_phase(self, token, *, status='completed', message=''):
+        elapsed = time.perf_counter() - float(token.get('started_perf') or 0.0)
+        index = int(token.get('row_index'))
+        row = dict(self._activity_rows[index])
+        row.update({
+            'status': str(status or ''),
+            'ended_at': datetime.now().astimezone().isoformat(timespec='milliseconds'),
+            'elapsed_sec': f'{max(0.0, elapsed):.3f}',
+            'message': str(message or row.get('message') or ''),
+        })
+        self._activity_rows[index] = row
+        self.write_metrics(self._metrics)
+        return elapsed
+
+    def write_metrics(self, graph_stats):
+        self._metrics = dict(graph_stats or {})
+        return _write_step5_timing_csv(
+            self.report_dir,
+            self._metrics,
+            activity_rows=self._activity_rows,
+        )
+
+
+def _write_step5_timing_csv(report_dir, graph_stats, *, activity_rows=None):
+    """Persist live Step5 activities plus final performance metrics."""
     perf = ((graph_stats or {}).get('step5_perf') or {})
-    rows = []
+    rows = [dict(row) for row in (activity_rows or [])]
     preferred_keys = {
         'main': [
             'business_graph_elapsed_sec',
@@ -362,18 +431,31 @@ def _write_step5_timing_csv(report_dir, graph_stats):
             continue
         for key in keys:
             if key in bucket:
-                rows.append({'section': section, 'metric': key, 'value': bucket.get(key)})
+                rows.append({
+                    'section': section,
+                    'metric': key,
+                    'value': bucket.get(key),
+                })
         for key in sorted(bucket):
             if key in keys or isinstance(bucket.get(key), (dict, list)):
                 continue
-            rows.append({'section': section, 'metric': key, 'value': bucket.get(key)})
+            rows.append({
+                'section': section,
+                'metric': key,
+                'value': bucket.get(key),
+            })
     if not rows:
-        return ''
+        observability_dir = _runtime_observability_dir(report_dir)
+        observability_dir.mkdir(parents=True, exist_ok=True)
+        path = observability_dir / 'step5_timing.csv'
+        with open_csv_write(path) as f:
+            csv.DictWriter(f, fieldnames=STEP5_TIMING_FIELDS).writeheader()
+        return str(path)
     observability_dir = _runtime_observability_dir(report_dir)
     observability_dir.mkdir(parents=True, exist_ok=True)
     path = observability_dir / 'step5_timing.csv'
     with open_csv_write(path) as f:
-        writer = csv.DictWriter(f, fieldnames=['section', 'metric', 'value'])
+        writer = csv.DictWriter(f, fieldnames=STEP5_TIMING_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
     return str(path)
@@ -764,9 +846,16 @@ def _step5_integrated_main_impl(args):
     legacy_timing_path = Path(output_dir) / 'step5_timing.csv'
     if legacy_timing_path.exists():
         legacy_timing_path.unlink()
-    timing_path = _runtime_observability_dir(report_dir) / 'step5_timing.csv'
-    if timing_path.exists():
-        timing_path.unlink()
+    timing = Step5TimingRecorder(report_dir)
+    total_timing_token = timing.start_phase(
+        'step5.total',
+        message='正在执行 Step5 调用链影响分析',
+    )
+    input_timing_token = timing.start_phase(
+        'input.resolve',
+        item=str(report_dir),
+        message='正在解析 Step5 输入、源码目录和运行参数',
+    )
     orchestrated_input = load_orchestrated_step5_input(report_dir)
 
     # Phase 1: 先确定 all_changed_apis_path（避免未定义变量错误）
@@ -791,6 +880,16 @@ def _step5_integrated_main_impl(args):
     )
 
     if not business_source_dirs:
+        timing.finish_phase(
+            input_timing_token,
+            status='failed',
+            message='Step5 输入解析失败：缺少业务源码目录',
+        )
+        timing.finish_phase(
+            total_timing_token,
+            status='failed',
+            message='Step5 因缺少业务源码目录停止',
+        )
         print("❌ 至少需要提供一个业务源码目录", file=sys.stderr)
         print("  请通过以下方式指定：", file=sys.stderr)
         print("  1. 命令行 --source-dirs", file=sys.stderr)
@@ -804,6 +903,10 @@ def _step5_integrated_main_impl(args):
         print(f"  使用命令行指定源码目录：{args.source_dirs}", file=sys.stderr)
     elif context_source_dirs:
         print(f"  从 evidence/context/context.json 读取源码目录：{context_source_dirs}", file=sys.stderr)
+    timing.finish_phase(
+        input_timing_token,
+        message=f'输入解析完成，业务源码目录 {len(business_source_dirs)} 个',
+    )
     _step5_debug(
         'step5_inputs',
         'resolved step5 input sources',
@@ -832,6 +935,11 @@ def _step5_integrated_main_impl(args):
     if not dependency_source_mappings:
         print("\n自动发现依赖源码映射...", file=sys.stderr)
         discovery_timer = time.perf_counter()
+        discovery_timing_token = timing.start_phase(
+            'input.dependency_source_discovery',
+            item=str(report_dir),
+            message='正在自动发现依赖源码与依赖坐标的映射',
+        )
         emit_progress("step5", "discovery", "开始自动发现依赖源码映射")
         bridge_discovery = auto_discover_bridge_sources(report_dir)
 
@@ -854,6 +962,10 @@ def _step5_integrated_main_impl(args):
             f"依赖源码映射发现完成，可用映射 {len(dependency_source_mappings)} 个",
             elapsed=time.perf_counter() - discovery_timer,
         )
+        timing.finish_phase(
+            discovery_timing_token,
+            message=f'依赖源码映射发现完成，可用映射 {len(dependency_source_mappings)} 个',
+        )
     _step5_debug(
         'dependency_mapping_resolution',
         'resolved dependency source mappings for step5',
@@ -872,9 +984,24 @@ def _step5_integrated_main_impl(args):
     # tree-sitter 不是“可有可无”的小优化：它直接影响 Step5 源码图的准确性。
     # 因此正式流程中，若存在 Java 源码但依赖预检失败，必须停止；不允许 regex 降级。
     tree_sitter_source_dirs = list(business_source_dirs or []) + _dependency_mapping_source_dirs(dependency_source_mappings)
+    parser_timing_token = timing.start_phase(
+        'preflight.java_parser',
+        item=f'{len(tree_sitter_source_dirs)} source roots',
+        message='正在检查 Java 源码与 tree-sitter 解析器',
+    )
     if has_java_source_file(tree_sitter_source_dirs):
         if not ensure_tree_sitter_available():
             status = tree_sitter_status()
+            timing.finish_phase(
+                parser_timing_token,
+                status='failed',
+                message='Java 解析器预检失败：tree-sitter 不可用',
+            )
+            timing.finish_phase(
+                total_timing_token,
+                status='failed',
+                message='Step5 因 Java 解析器不可用停止',
+            )
             print("\n❌ tree-sitter 不可用，无法执行 Java 源码调用链分析。", file=sys.stderr)
             if status.get("auto_install_error"):
                 print(f"依赖预检失败原因：{status.get('auto_install_error')}", file=sys.stderr)
@@ -897,24 +1024,57 @@ def _step5_integrated_main_impl(args):
             'skip tree-sitter preflight because no Java source files were detected',
             checked_source_dirs=list(tree_sitter_source_dirs or []),
         )
+    timing.finish_phase(
+        parser_timing_token,
+        message='Java 源码解析器预检完成',
+    )
 
     # Phase 3: 先只用业务源码构建基础图，判断哪些API真的必须跨依赖边界
     business_roots = build_source_roots(business_source_dirs, [])
     if not business_roots:
+        timing.finish_phase(
+            total_timing_token,
+            status='failed',
+            message='Step5 因业务源码根为空停止',
+        )
         print("❌ 至少需要提供一个业务源码目录", file=sys.stderr)
         return 1
 
     # Phase 4: 检查API文件是否存在
     if not os.path.exists(all_changed_apis_path):
+        timing.finish_phase(
+            total_timing_token,
+            status='failed',
+            message=f'Step5 变更 API 文件不存在：{all_changed_apis_path}',
+        )
         print(f"❌ 变更API文件不存在：{all_changed_apis_path}", file=sys.stderr)
         return 1
 
+    api_input_timing_token = timing.start_phase(
+        'input.changed_apis',
+        item=str(all_changed_apis_path),
+        message='正在读取并规范化变更 API 清单',
+    )
     all_apis = load_changed_apis(all_changed_apis_path, args.jdk_scan_dir)
 
     if not all_apis:
+        timing.finish_phase(
+            api_input_timing_token,
+            status='skipped',
+            message='变更 API 清单为空',
+        )
+        timing.finish_phase(
+            total_timing_token,
+            status='skipped',
+            message='Step5 因变更 API 清单为空跳过',
+        )
         print("⚠️ Step 5跳过：all_changed_apis.csv为空", file=sys.stderr)
         write_skip_summary(output_dir, all_changed_apis_path)
         return 0
+    timing.finish_phase(
+        api_input_timing_token,
+        message=f'变更 API 加载完成，共 {len(all_apis)} 个',
+    )
 
     print(f"\n加载变更API：{len(all_apis)} 个", file=sys.stderr)
     emit_progress("step5", "input", f"已加载 {len(all_apis)} 个变更 API")
@@ -941,6 +1101,11 @@ def _step5_integrated_main_impl(args):
             'all_api_count': len(all_apis),
         },
     )
+    catalog_timing_token = timing.start_phase(
+        'input.runtime_artifact_catalog',
+        item=str(report_dir),
+        message='正在读取 Step1 留存制品并构建当前运行时依赖目录',
+    )
     runtime_dependency_catalog = build_runtime_dependency_catalog(
         report_dir,
         business_source_dirs=business_source_dirs,
@@ -949,6 +1114,16 @@ def _step5_integrated_main_impl(args):
         runtime_dependency_catalog
     )
     if catalog_blockers:
+        timing.finish_phase(
+            catalog_timing_token,
+            status='failed',
+            message=f'运行时依赖目录构建失败，阻塞项 {len(catalog_blockers)} 个',
+        )
+        timing.finish_phase(
+            total_timing_token,
+            status='failed',
+            message='Step5 因运行时制品证据不完整停止',
+        )
         details_path = write_runtime_catalog_preflight_failure(
             output_dir,
             runtime_dependency_catalog,
@@ -1026,6 +1201,13 @@ def _step5_integrated_main_impl(args):
             f"  已将 {len(dependency_source_mappings)} 个依赖源码根固定到 Step4 确认的当前版本 commit",
             file=sys.stderr,
         )
+    timing.finish_phase(
+        catalog_timing_token,
+        message=(
+            '运行时依赖目录与源码映射对齐完成，'
+            f'依赖 {len((runtime_dependency_catalog or {}).get("by_coord") or {})} 个'
+        ),
+    )
     _report_step5_debug_event(
         'CATALOG',
         's5_call_chain_engine_integrated.py:runtime-catalog',
@@ -1043,6 +1225,11 @@ def _step5_integrated_main_impl(args):
 
     print("\n构建业务源码基础图（跨依赖判定预分析）...", file=sys.stderr)
     business_graph_timer = time.perf_counter()
+    business_graph_timing_token = timing.start_phase(
+        'graph.business_source',
+        item=f'{len(business_roots)} source roots',
+        message='正在解析业务源码并构建基础调用图',
+    )
     emit_progress("step5", "graph", "开始构建业务源码基础图")
     business_jar_metadata = build_jar_metadata_for_source_roots(
         business_roots,
@@ -1062,6 +1249,13 @@ def _step5_integrated_main_impl(args):
         'business_graph_ready',
         graph=business_graph_result['graph'],
     )
+    timing.finish_phase(
+        business_graph_timing_token,
+        message=(
+            '业务源码基础图构建完成，'
+            f'方法 {len(business_graph_result["graph"].methods_by_id)} 个'
+        ),
+    )
     emit_progress(
         "step5",
         "graph",
@@ -1070,6 +1264,11 @@ def _step5_integrated_main_impl(args):
     )
 
     bridge_check_timer = time.perf_counter()
+    bridge_timing_token = timing.start_phase(
+        'graph.bridge_requirements',
+        item=f'{len(all_apis)} APIs',
+        message='正在判断每个变更 API 是否需要跨依赖继续追踪',
+    )
     emit_progress("step5", "bridge-check", "开始判断哪些 API 需要跨依赖继续分析")
     api_bridge_requirements = check_apis_that_need_bridge(
         all_apis,
@@ -1085,6 +1284,10 @@ def _step5_integrated_main_impl(args):
         "bridge-check",
         "跨依赖分析判定完成",
         elapsed=time.perf_counter() - bridge_check_timer,
+    )
+    timing.finish_phase(
+        bridge_timing_token,
+        message='变更 API 跨依赖追踪需求判定完成',
     )
     needs_count = sum(1 for v in api_bridge_requirements.values() if v.get('needs_bridge'))
     missing_mapping_items = [
@@ -1179,6 +1382,15 @@ def _step5_integrated_main_impl(args):
             print("  ⚠️ 允许降级执行：需要依赖源码映射的 API 会进入“本次未完成分析”清单", file=sys.stderr)
 
     # Phase 5: 构建增强型源码图
+    full_graph_timing_token = timing.start_phase(
+        'graph.full_source',
+        item=f'{len(dependency_source_mappings)} dependency mappings',
+        message=(
+            '正在构建业务与依赖源码完整调用图'
+            if dependency_source_mappings
+            else '正在准备复用业务源码调用图'
+        ),
+    )
     source_roots = build_source_roots(business_source_dirs, dependency_source_mappings)
     jar_metadata = build_jar_metadata_for_source_roots(
         source_roots,
@@ -1234,6 +1446,15 @@ def _step5_integrated_main_impl(args):
         print("\n复用业务源码图进行调用链分析...", file=sys.stderr)
         emit_progress("step5", "graph", "未提供依赖源码映射，复用业务源码图")
         graph_result = business_graph_result
+    timing.finish_phase(
+        full_graph_timing_token,
+        status='completed' if dependency_source_mappings else 'reused',
+        message=(
+            f'完整源码图准备完成，源码根 {len(source_roots)} 个'
+            if dependency_source_mappings
+            else '无依赖源码映射，已复用业务源码基础图'
+        ),
+    )
 
     graph = graph_result['graph']
     graph.runtime_dependency_catalog = runtime_dependency_catalog
@@ -1261,6 +1482,11 @@ def _step5_integrated_main_impl(args):
         graph=graph,
     )
     bytecode_timer = time.perf_counter()
+    bytecode_timing_token = timing.start_phase(
+        'graph.business_bytecode',
+        item=f'{len(business_roots)} business roots',
+        message='正在扫描当前业务制品字节码并补充真实调用边',
+    )
     bytecode_batch = collect_business_bytecode_batch(
         business_roots,
         runtime_dependency_catalog,
@@ -1284,6 +1510,14 @@ def _step5_integrated_main_impl(args):
     graph_stats['step5_perf']['main']['business_bytecode_javap_fallback_classes'] = int(
         bytecode_stats.get('javap_fallback_classes') or 0
     )
+    timing.finish_phase(
+        bytecode_timing_token,
+        message=(
+            '业务字节码扫描完成，'
+            f'类 {int(bytecode_stats.get("classes_scanned") or 0)} 个，'
+            f'调用边 {int(bytecode_stats.get("edges_found") or 0)} 条'
+        ),
+    )
     _observe_step5_memory(
         graph_stats,
         'business_bytecode_collected',
@@ -1296,14 +1530,28 @@ def _step5_integrated_main_impl(args):
         **(runtime_dependency_catalog.get('metrics') or {}),
     }
     source_alignment_timer = time.perf_counter()
+    alignment_timing_token = timing.start_phase(
+        'evidence.source_artifact_alignment',
+        item=f'{len(business_source_dirs)} business roots',
+        message='正在核对业务源码与当前最终制品的一致性',
+    )
     source_alignment = assess_source_artifact_alignment(report_dir, business_source_dirs)
     graph.source_artifact_alignment = source_alignment
     graph_stats['source_artifact_alignment'] = source_alignment
     graph_stats['step5_perf']['main']['source_artifact_alignment_elapsed_sec'] = round(
         time.perf_counter() - source_alignment_timer, 3
     )
+    timing.finish_phase(
+        alignment_timing_token,
+        message='业务源码与最终制品一致性核对完成',
+    )
     framework_output = str(_call_chain_dir(report_dir) / 'framework_adapters.json')
     framework_timer = time.perf_counter()
+    framework_timing_token = timing.start_phase(
+        'evidence.framework_adapters',
+        item=f'{len(source_roots)} source roots',
+        message='正在分析 Spring、MyBatis 等框架隐式调用关系',
+    )
     framework_batches = run_framework_adapters(
         source_roots,
         artifact_catalog=runtime_dependency_catalog,
@@ -1312,6 +1560,10 @@ def _step5_integrated_main_impl(args):
     serialize_framework_batches(framework_batches, framework_output)
     graph_stats['step5_perf']['main']['framework_adapters_elapsed_sec'] = round(
         time.perf_counter() - framework_timer, 3
+    )
+    timing.finish_phase(
+        framework_timing_token,
+        message=f'框架适配分析完成，证据批次 {len(framework_batches)} 个',
     )
     graph_stats['framework_adapters'] = {
         batch.collector: {
@@ -1329,6 +1581,11 @@ def _step5_integrated_main_impl(args):
         for batch in framework_batches
     }
     indirect_timer = time.perf_counter()
+    indirect_timing_token = timing.start_phase(
+        'evidence.indirect_usage',
+        item=f'{len(all_apis)} APIs',
+        message='正在分析反射、配置和间接引用等非直接调用',
+    )
     indirect_batch = collect_indirect_usage_batch(
         _graph_snapshot_with_bytecode_batch(graph, bytecode_batch),
         all_apis,
@@ -1340,12 +1597,28 @@ def _step5_integrated_main_impl(args):
         graph=graph,
         extra={'batch_edge_count': len(indirect_batch.edges)},
     )
+    timing.finish_phase(
+        indirect_timing_token,
+        message=f'间接引用分析完成，候选边 {len(indirect_batch.edges)} 条',
+    )
     framework_merge_timer = time.perf_counter()
+    merge_timing_token = timing.start_phase(
+        'evidence.merge',
+        message='正在把字节码、框架和间接引用证据合并到调用图',
+    )
     ingestion_result = ingest_collector_batches(
         graph, (bytecode_batch, *framework_batches, indirect_batch)
     )
     graph_stats['step5_perf']['main']['framework_adapter_merge_elapsed_sec'] = round(
         time.perf_counter() - framework_merge_timer, 3
+    )
+    timing.finish_phase(
+        merge_timing_token,
+        message=(
+            '调用证据合并完成，'
+            f'新增边 {ingestion_result.merged_edges} 条，'
+            f'拒绝边 {ingestion_result.rejected_edges} 条'
+        ),
     )
     graph_stats['framework_adapter_merge'] = {
         key: getattr(ingestion_result, key)
@@ -1508,6 +1781,11 @@ def _step5_integrated_main_impl(args):
         max_depth = 5
     # 关键修复：直接使用max_depth，让语义清晰
     # 用户传3就是最多3条边，不再转换
+    trace_timing_token = timing.start_phase(
+        'trace.changed_apis',
+        item=f'{len(all_apis)} APIs',
+        message=f'正在反向追踪 {len(all_apis)} 个变更 API 的业务调用链',
+    )
     all_results = trace_all_apis_with_confidence_weighting(
         all_apis,
         graph,
@@ -1523,9 +1801,18 @@ def _step5_integrated_main_impl(args):
         graph=graph,
         extra={'result_count': len(all_results)},
     )
+    timing.finish_phase(
+        trace_timing_token,
+        message=f'变更 API 调用链追踪完成，结果 {len(all_results)} 条',
+    )
     # Runtime bytecode closure can add methods and reverse edges while tracing.
     # Refresh the persisted query index so it describes the same graph as the report.
     query_index_refresh_timer = time.perf_counter()
+    query_index_timing_token = timing.start_phase(
+        'write.query_index',
+        item=str(getattr(args, 'query_index', '') or _default_query_index_path(report_dir)),
+        message='正在写入可查询的调用图索引',
+    )
     query_index_path = write_query_index(
         graph,
         str(Path(getattr(args, 'query_index', '') or _default_query_index_path(report_dir))),
@@ -1537,6 +1824,10 @@ def _step5_integrated_main_impl(args):
     graph_stats['step5_perf']['main']['query_index_elapsed_sec'] = round(
         time.perf_counter() - query_index_refresh_timer,
         3,
+    )
+    timing.finish_phase(
+        query_index_timing_token,
+        message=f'调用图查询索引写入完成：{query_index_path}',
     )
     print(f"  调用链查询索引 → {query_index_path}", file=sys.stderr)
     _step5_debug(
@@ -1606,6 +1897,11 @@ def _step5_integrated_main_impl(args):
         },
     )
     summary_timer = time.perf_counter()
+    report_timing_token = timing.start_phase(
+        'write.reports',
+        item=str(output_dir),
+        message='正在生成汇总报告、告警和逐 API 证据视图',
+    )
     emit_progress("step5", "report", "开始生成汇总报告与证据视图")
     generate_enhanced_summary(all_results, output_dir, graph_stats=graph_stats)
     _observe_step5_memory(
@@ -1620,7 +1916,11 @@ def _step5_integrated_main_impl(args):
         "汇总报告生成完成",
         elapsed=time.perf_counter() - summary_timer,
     )
-    timing_csv = _write_step5_timing_csv(report_dir, graph_stats)
+    timing.finish_phase(
+        report_timing_token,
+        message='Step5 汇总报告与证据视图生成完成',
+    )
+    timing_csv = timing.write_metrics(graph_stats)
     if timing_csv:
         print(f"  耗时明细 → {timing_csv}", file=sys.stderr)
     register_step5_summary_artifacts(output_dir, report_dir=report_dir)
@@ -1663,6 +1963,11 @@ def _step5_integrated_main_impl(args):
         not_found=not_found_count,
         elapsed_seconds=step_timer.elapsed(),
     )
+    timing.finish_phase(
+        total_timing_token,
+        message='Step5 调用链影响分析完成',
+    )
+    timing.write_metrics(graph_stats)
 
     return 0
 

@@ -129,7 +129,12 @@ class Step1ObservabilityTest(unittest.TestCase):
             self.assertEqual(progress_rows[-1]["status"], "running")
             self.assertEqual(progress_rows[-1]["side"], "base")
             self.assertIn("mvn -pl app-module", progress_rows[-1]["command"])
-            self.assertEqual(timing_rows_before_finish, [])
+            self.assertEqual(len(timing_rows_before_finish), 1)
+            self.assertEqual(timing_rows_before_finish[0]["phase"], "maven_package")
+            self.assertEqual(timing_rows_before_finish[0]["status"], "running")
+            self.assertEqual(timing_rows_before_finish[0]["ended_at"], "")
+            self.assertEqual(timing_rows_before_finish[0]["elapsed_sec"], "")
+            self.assertEqual(timing_rows_before_finish[0]["message"], "开始构建基准侧")
 
             observer.finish_phase(token, status="completed", message="基准侧构建完成")
 
@@ -281,6 +286,47 @@ class Step1ObservabilityTest(unittest.TestCase):
 
         self.assertEqual(rows[0]["external_process_count"], "1")
         self.assertGreater(float(rows[0]["peak_rss_mb"]), 0.0)
+
+    def test_step4_timing_exposes_and_updates_running_operation_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            timing = s4_jar_compare.Step4TimingRecorder(tmp)
+            timing.record(
+                "dependency.japicmp",
+                coord="com.example:demo",
+                old_version="1.0",
+                new_version="2.0",
+                status="running",
+                message="正在执行 JApiCmp 二进制 API 对比",
+                details={"dependency_index": 2, "dependency_total": 7},
+            )
+
+            with Path(timing.path).open(encoding="utf-8-sig", newline="") as handle:
+                running_rows = list(csv.DictReader(handle))
+
+            self.assertEqual(len(running_rows), 1)
+            self.assertEqual(running_rows[0]["status"], "running")
+            self.assertEqual(running_rows[0]["coord"], "com.example:demo")
+            self.assertIn("JApiCmp", running_rows[0]["message"])
+            self.assertEqual(running_rows[0]["ended_at"], "")
+
+            timing.record(
+                "dependency.japicmp",
+                coord="com.example:demo",
+                old_version="1.0",
+                new_version="2.0",
+                status="success",
+                elapsed=0.25,
+                external_process_count=1,
+            )
+            with Path(timing.path).open(encoding="utf-8-sig", newline="") as handle:
+                completed_rows = list(csv.DictReader(handle))
+
+        self.assertEqual(len(completed_rows), 2)
+        self.assertEqual(completed_rows[0]["status"], "running")
+        self.assertIn("JApiCmp", completed_rows[0]["message"])
+        self.assertTrue(completed_rows[0]["started_at"])
+        self.assertEqual(completed_rows[1]["status"], "success")
+        self.assertTrue(completed_rows[1]["ended_at"])
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ from compat import (
     run_cmd, write_text, open_text, mvn_cmd, git_cmd, maven_repo_dir,
     infer_maven_coord_locations,
 )
-from csv_io import open_csv_read, open_csv_write
+from csv_io import open_csv_append, open_csv_read, open_csv_write
 
 sys.path.insert(0, os.path.dirname(__file__))
 from s4_contract import (
@@ -473,7 +473,7 @@ def write_result(path, content):
 
 
 class Step4TimingRecorder:
-    """Collect Step4 timing as side-channel evidence without affecting analysis results."""
+    """Append Step4 work-in-progress and completed timing events immediately."""
 
     FIELDS = [
         "phase",
@@ -481,10 +481,13 @@ class Step4TimingRecorder:
         "old_version",
         "new_version",
         "status",
+        "started_at",
+        "ended_at",
         "elapsed_sec",
         "peak_rss_mb",
         "external_process_count",
         "api_count",
+        "message",
         "details",
     ]
 
@@ -508,6 +511,7 @@ class Step4TimingRecorder:
         elapsed=None,
         external_process_count=0,
         api_count="",
+        message="",
         details=None,
     ):
         try:
@@ -518,30 +522,39 @@ class Step4TimingRecorder:
             details_value = json.dumps(details, ensure_ascii=False, sort_keys=True)
         else:
             details_value = "" if details is None else str(details)
+        now = datetime.now().astimezone().isoformat(timespec="milliseconds")
         row = {
             "phase": str(phase or ""),
             "coord": str(coord or ""),
             "old_version": str(old_version or ""),
             "new_version": str(new_version or ""),
             "status": str(status or ""),
+            "started_at": now if status == "running" else "",
+            "ended_at": "" if status == "running" else now,
             "elapsed_sec": elapsed_value,
             "peak_rss_mb": f"{peak_rss_mb():.3f}",
             "external_process_count": str(max(0, int(external_process_count or 0))),
             "api_count": "" if api_count is None else str(api_count),
+            "message": str(message or ""),
             "details": details_value,
         }
         with self._lock:
             self._rows.append(row)
+            with open_csv_append(self.path) as f:
+                csv.DictWriter(f, fieldnames=self.FIELDS).writerow(row)
 
     def flush(self):
         with self._lock:
-            rows = list(self._rows)
+            self._flush_locked()
+        return str(self.path)
+
+    def _flush_locked(self):
+        rows = list(self._rows)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         with open_csv_write(self.path) as f:
             writer = csv.DictWriter(f, fieldnames=self.FIELDS)
             writer.writeheader()
             writer.writerows(rows)
-        return str(self.path)
 
 
 def cleanup_step4_generated_outputs(output_dir):
@@ -6294,6 +6307,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     cleanup_step4_generated_outputs(args.output_dir)
     timing = Step4TimingRecorder(infer_report_dir_from_output_dir(args.output_dir))
+    timing.record(
+        "step4.total",
+        status="running",
+        message="正在执行 Step4 依赖 API 变更分析",
+    )
     try:
         dependency_git_ref_overrides = parse_dependency_git_ref_overrides(args.dependency_git_ref_overrides_json)
     except ValueError as exc:
@@ -6304,6 +6322,11 @@ def main():
 
     step_timer = PhaseTimer("step4", "total")
     load_inputs_timer = time.perf_counter()
+    timing.record(
+        "input.load",
+        status="running",
+        message="正在读取依赖变更清单和项目上下文",
+    )
     dep_rows = load_csv(args.dep_changes)
     analysis_dep_rows = [
         row for row in dep_rows
@@ -6335,6 +6358,11 @@ def main():
     dependency_path_meta = {}
     maven_coord_locations_cache = {}
     source_mapping_timer = time.perf_counter()
+    timing.record(
+        "source_mapping.resolve",
+        status="running",
+        message="正在解析依赖源码仓库与模块映射",
+    )
 
     def register_dependency_path(mapped_coord, repo_path, module_path, input_spec, input_coord, mapping_mode, repo_inferred_coords):
         if mapped_coord and mapped_coord not in dependency_paths:
@@ -6456,6 +6484,12 @@ def main():
         print("  ℹ️  changed_classes.json 已降级为轻量模式，跳过 class hash 计算以提升大批量依赖稳定性。", file=sys.stderr)
 
     preflight_timer = time.perf_counter()
+    timing.record(
+        "preflight.git_refs",
+        status="running",
+        message="正在预检依赖源码的 base/current Git 版本",
+        details={"changed_dependencies": len(analysis_dep_rows)},
+    )
     preflight_gitdiff_runs, preflight_gitdiff_pending = preflight_gitdiff_refs(
         analysis_dep_rows,
         dependency_paths,
@@ -6538,6 +6572,11 @@ def main():
 
     if japicmp_planned_rows and not os.path.exists(args.japicmp_jar):
         japicmp_preflight_timer = time.perf_counter()
+        timing.record(
+            "preflight.japicmp",
+            status="running",
+            message="正在检查并安装 JApiCmp 工具",
+        )
         installed, resolved_japicmp_jar, install_error = auto_install_japicmp(
             args.japicmp_jar,
             timeout=args.tool_install_timeout,
@@ -6605,6 +6644,12 @@ def main():
 
     report_dir = str(Path(args.output_dir).resolve().parent)
     artifact_resolve_timer = time.perf_counter()
+    timing.record(
+        "artifact_resolve",
+        status="running",
+        message="正在解析 Step1 留存的 base/current 依赖 JAR",
+        details={"changed_dependencies": len(analysis_dep_rows)},
+    )
     artifact_resolver = Step1ArtifactJarResolver(report_dir, args.output_dir)
     prepared_dep_rows = []
     artifact_jar_hits = 0
@@ -6720,6 +6765,20 @@ def main():
         new_ver    = row.get('new_version', '-')
         change     = row.get('change_type', '')
         scope      = row.get('scope', 'compile')
+        timing.record(
+            "dependency.total",
+            coord=coord,
+            old_version=old_ver,
+            new_version=new_ver,
+            status="running",
+            message=f"正在处理依赖 {coord or '<empty>'}（{i}/{total_dependencies}）",
+            details={
+                "dependency_index": i,
+                "dependency_total": total_dependencies,
+                "change_type": change,
+                "scope": scope,
+            },
+        )
 
         if not coord:
             timing.record("dependency.total", status="skipped", elapsed=time.perf_counter() - dependency_timer, details="empty_coord")
@@ -6786,6 +6845,15 @@ def main():
         elif has_source_repo and not is_removed_dependency and not is_added_dependency:
             # 4b: 有源码依赖做 git diff
             gitdiff_timer = time.perf_counter()
+            timing.record(
+                "dependency.gitdiff",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="running",
+                message=f"正在对比依赖源码 Git diff：{coord}",
+                details={"dependency_index": i, "dependency_total": total_dependencies},
+            )
             emit_progress(
                 "step4",
                 "gitdiff",
@@ -6979,6 +7047,15 @@ def main():
         # 4a: 升级依赖做 JApiCmp；removed 依赖导出旧 jar 符号集作为 Step5 输入
         if is_removed_dependency:
             removed_timer = time.perf_counter()
+            timing.record(
+                "dependency.removed_jar_export",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="running",
+                message=f"正在导出已移除依赖的旧版 JAR 符号：{coord}",
+                details={"dependency_index": i, "dependency_total": total_dependencies},
+            )
             emit_progress(
                 "step4",
                 "japicmp",
@@ -7057,6 +7134,15 @@ def main():
             )
         elif change != '未变' and old_ver != '-' and new_ver != '-':
             japicmp_timer = time.perf_counter()
+            timing.record(
+                "dependency.japicmp",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="running",
+                message=f"正在执行 JApiCmp 二进制 API 对比：{coord}",
+                details={"dependency_index": i, "dependency_total": total_dependencies},
+            )
             emit_progress(
                 "step4",
                 "japicmp",
@@ -7104,6 +7190,14 @@ def main():
             })
             if compute_changed_classes_enabled and jar_info and jar_info.get("old_jar") and jar_info.get("new_jar"):
                 changed_classes_timer = time.perf_counter()
+                timing.record(
+                    "dependency.changed_classes",
+                    coord=coord,
+                    old_version=old_ver,
+                    new_version=new_ver,
+                    status="running",
+                    message=f"正在计算 class 字节码变化：{coord}",
+                )
                 try:
                     result["changed_classes_by_coord"][coord] = {
                         "coord": coord,
@@ -7199,6 +7293,14 @@ def main():
 
         if dependency_old_jar and dependency_new_jar:
             contract_timer = time.perf_counter()
+            timing.record(
+                "dependency.data_contract",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="running",
+                message=f"正在对比 DTO/数据契约变化：{coord}",
+            )
             try:
                 contract_apis = collect_data_contract_changes(
                     dependency_old_jar,
@@ -7247,6 +7349,14 @@ def main():
 
         if source_skip_for_behavior:
             behavior_timer = time.perf_counter()
+            timing.record(
+                "dependency.behavior_bytecode_fallback",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="running",
+                message=f"正在执行最终 JAR 方法字节码行为对比：{coord}",
+            )
             if dependency_old_jar and dependency_new_jar:
                 try:
                     behavior_fallback = compare_jar_method_bodies(
@@ -7337,6 +7447,14 @@ def main():
 
         if dependency_gitdiff_apis:
             gitdiff_filter_timer = time.perf_counter()
+            timing.record(
+                "dependency.gitdiff_jar_truth_filter",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="running",
+                message=f"正在用最终 JAR 事实过滤源码 diff：{coord}",
+            )
             accepted_source_apis, rejected_source_apis = filter_gitdiff_rows_with_jar_truth(
                 dependency_gitdiff_apis,
                 old_jar=dependency_old_jar,
@@ -7381,6 +7499,14 @@ def main():
         # 4c: changelog 分析任务文件（由 AI agent 后续填写）
         if change in ('大版本升级', '小版本升级') and (not has_source_repo):
             changelog_timer = time.perf_counter()
+            timing.record(
+                "dependency.changelog_task",
+                coord=coord,
+                old_version=old_ver,
+                new_version=new_ver,
+                status="running",
+                message=f"正在生成 changelog 后续分析任务：{coord}",
+            )
             analyze_changelog(coord, old_ver, new_ver, args.output_dir)
             timing.record(
                 "dependency.changelog_task",
@@ -7420,6 +7546,15 @@ def main():
     per_dependency_records = {}
     task_results = []
     dependencies_timer = time.perf_counter()
+    timing.record(
+        "dependencies.process_all",
+        status="running",
+        message=(
+            f"正在并行处理 {len(prepared_dep_rows)} 个变更依赖"
+            f"（workers={workers}）"
+        ),
+        details={"dependencies": len(prepared_dep_rows), "workers": workers},
+    )
     if workers == 1:
         for i, row in enumerate(prepared_dep_rows, 1):
             task_results.append(process_dependency(i, row))
@@ -7464,6 +7599,12 @@ def main():
 
     # 写入汇总文件
     write_all_timer = time.perf_counter()
+    timing.record(
+        "write.all_changed_apis",
+        status="running",
+        message="正在汇总并写入全量变更 API",
+        details={"raw_api_rows": len(all_apis)},
+    )
     csv_file, valid_count, invalid_count = write_all_changed_apis(
         all_apis, args.output_dir)
     write_changed_dependencies(load_csv(csv_file), args.output_dir)
@@ -7475,6 +7616,12 @@ def main():
         details={"invalid_count": invalid_count, "output": csv_file},
     )
     write_per_dep_timer = time.perf_counter()
+    timing.record(
+        "write.per_dependency_outputs",
+        status="running",
+        message="正在写入逐依赖 API 变更证据",
+        details={"dependencies": len(per_dependency_records)},
+    )
     for coord in sorted(per_dependency_records.keys()):
         item = per_dependency_records.get(coord) or {}
         write_per_dependency_outputs(
@@ -7492,6 +7639,11 @@ def main():
     )
 
     changed_classes_write_timer = time.perf_counter()
+    timing.record(
+        "write.changed_classes",
+        status="running",
+        message="正在写入类级变更索引",
+    )
     changed_classes_path = os.path.join(args.output_dir, "changed_classes.json")
     with open(changed_classes_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -7532,6 +7684,11 @@ def main():
 
     timeouts_path = os.path.join(args.output_dir, "timeouts.json")
     write_aux_timer = time.perf_counter()
+    timing.record(
+        "write.auxiliary_json",
+        status="running",
+        message="正在写入超时和 Git 版本待确认诊断文件",
+    )
     with open(timeouts_path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -7652,6 +7809,11 @@ def main():
     }
     coverage_output = Path(args.coverage_output) if args.coverage_output else default_coverage_output_path(args.output_dir)
     coverage_write_timer = time.perf_counter()
+    timing.record(
+        "write.coverage",
+        status="running",
+        message="正在写入 Step4 证据覆盖率结果",
+    )
     coverage_output.parent.mkdir(parents=True, exist_ok=True)
     coverage_output.write_text(
         json.dumps(step4_coverage, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
@@ -7664,6 +7826,11 @@ def main():
     )
 
     readable_write_timer = time.perf_counter()
+    timing.record(
+        "write.readable_outputs",
+        status="running",
+        message="正在生成 Step4 告警和可读摘要",
+    )
     alerts_path, summary_path = write_readable_outputs(
         dep_rows=dep_rows,
         output_dir=args.output_dir,
@@ -7687,6 +7854,11 @@ def main():
         details={"alerts": alerts_path, "summary": summary_path},
     )
     ref_matches_timer = time.perf_counter()
+    timing.record(
+        "write.git_ref_matches",
+        status="running",
+        message="正在写入依赖源码 Git 版本匹配结果",
+    )
     ref_matches_json, ref_matches_txt = write_git_ref_match_outputs(
         output_dir=args.output_dir,
         gitdiff_runs=gitdiff_runs,

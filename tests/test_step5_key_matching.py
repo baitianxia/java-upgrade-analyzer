@@ -10680,6 +10680,49 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
             values[("trace", "reverse_transition_edges_materialized")], "19"
         )
 
+    def test_step5_timing_exposes_live_activity_and_keeps_it_with_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            timing = step5.Step5TimingRecorder(tmp)
+            token = timing.start_phase(
+                "graph.business_source",
+                item="src/main/java",
+                message="正在构建业务源码调用图",
+            )
+
+            with Path(timing.path).open(encoding="utf-8-sig", newline="") as handle:
+                running_rows = list(csv.DictReader(handle))
+
+            self.assertEqual(len(running_rows), 1)
+            self.assertEqual(running_rows[0]["section"], "activity")
+            self.assertEqual(running_rows[0]["metric"], "graph.business_source")
+            self.assertEqual(running_rows[0]["status"], "running")
+            self.assertEqual(running_rows[0]["item"], "src/main/java")
+            self.assertIn("构建业务源码调用图", running_rows[0]["message"])
+
+            timing.finish_phase(
+                token,
+                status="completed",
+                message="业务源码调用图构建完成",
+            )
+            timing.write_metrics({
+                "step5_perf": {
+                    "main": {"business_graph_elapsed_sec": 1.25},
+                },
+            })
+            with Path(timing.path).open(encoding="utf-8-sig", newline="") as handle:
+                completed_rows = list(csv.DictReader(handle))
+
+        activity = next(row for row in completed_rows if row["section"] == "activity")
+        metric = next(
+            row for row in completed_rows
+            if row["section"] == "main"
+            and row["metric"] == "business_graph_elapsed_sec"
+        )
+        self.assertEqual(activity["status"], "completed")
+        self.assertTrue(activity["ended_at"])
+        self.assertGreaterEqual(float(activity["elapsed_sec"]), 0.0)
+        self.assertEqual(metric["value"], "1.25")
+
     def test_trace_cache_reuses_sorted_incoming_edges_and_critical_node_checks(self):
         trace_cache = tracer.ensure_trace_cache()
         edge_a = source_analyzer.CallEdge(
@@ -11696,7 +11739,8 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         self.assertEqual(len(rows), 1)
         self.assertEqual("未发现静态调用路径", rows[0]["conclusion"])
         self.assertEqual("依赖 a:b 删除了方法 com.acme.Api.gone()（严重级别 P0）", rows[0]["change_summary"])
-        self.assertIn("未形成完整链路", rows[0]["chain_summary"])
+        self.assertIn("静态分析未发现调用链", rows[0]["chain_summary"])
+        self.assertEqual("完整静态分析未发现调用链", rows[0]["chain_detail"])
         self.assertEqual("com.acme.Api.gone()", rows[0]["chain_target"])
         self.assertEqual(rows[0]["path_status"], "not_found_in_static_analysis")
         self.assertEqual(rows[0]["path_text"], "")
@@ -11715,8 +11759,11 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
 
         row = formatter._alert_rows_for_result(result)[0]
 
+        self.assertEqual("未完成分析", row["conclusion"])
         self.assertEqual("", row["chain_entry"])
-        self.assertEqual("无已发现调用链", row["chain_detail"])
+        self.assertIn("本次分析未完成", row["chain_summary"])
+        self.assertEqual("分析未完成，尚无法判断是否存在调用链", row["chain_detail"])
+        self.assertNotIn("无已发现调用链", json.dumps(row, ensure_ascii=False))
         self.assertEqual("0.00", row["confidence"])
         self.assertEqual(-1, row["depth"])
         self.assertEqual(0, row["path_occurrence_count"])

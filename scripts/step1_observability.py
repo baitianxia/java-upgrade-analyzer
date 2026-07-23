@@ -6,13 +6,14 @@ from __future__ import annotations
 import csv
 import json
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from csv_io import open_csv_append, open_csv_write
+from csv_io import open_csv_write
 from pipeline_constants import (
     EVIDENCE_DEPENDENCIES_DIRNAME,
     EVIDENCE_DIRNAME,
@@ -48,6 +49,7 @@ def peak_rss_mb():
 
 @dataclass(frozen=True)
 class PhaseToken:
+    row_index: int
     side: str
     phase: str
     item: str
@@ -84,6 +86,8 @@ class Step1Observer:
             "cache_hits": 0,
             "cache_misses": 0,
         }
+        self._timing_rows = []
+        self._timing_lock = threading.RLock()
         observability_dir.mkdir(parents=True, exist_ok=True)
         self.progress_path = observability_dir / "step1_progress.jsonl"
         self.timing_path = observability_dir / "step1_timing.csv"
@@ -94,8 +98,41 @@ class Step1Observer:
             if legacy_path.exists():
                 legacy_path.unlink()
         self.progress_path.write_text("", encoding="utf-8")
-        with open_csv_write(self.timing_path) as handle:
-            csv.DictWriter(handle, fieldnames=TIMING_FIELDS).writeheader()
+        self._flush_timing()
+
+    def _flush_timing(self):
+        with self._timing_lock:
+            rows = list(self._timing_rows)
+            with open_csv_write(self.timing_path) as handle:
+                writer = csv.DictWriter(handle, fieldnames=TIMING_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+
+    def _timing_row(
+        self,
+        token,
+        *,
+        status,
+        message,
+        ended_at="",
+        elapsed_sec="",
+    ):
+        return {
+            "side": token.side,
+            "phase": token.phase,
+            "item": token.item,
+            "started_at": token.started_at,
+            "ended_at": ended_at,
+            "elapsed_sec": elapsed_sec,
+            "peak_rss_mb": f"{peak_rss_mb():.3f}",
+            "archive_bytes": str(self._counters["archive_bytes"]),
+            "nested_entries": str(self._counters["nested_entries"]),
+            "cache_hits": str(self._counters["cache_hits"]),
+            "cache_misses": str(self._counters["cache_misses"]),
+            "status": str(status or ""),
+            "command": token.command,
+            "message": str(message or ""),
+        }
 
     def increment_counter(self, name, amount=1):
         if name not in self._counters:
@@ -135,12 +172,24 @@ class Step1Observer:
         return payload
 
     def start_phase(self, phase, *, side="", item="", command="", message=""):
-        token = PhaseToken(
-            side=str(side or ""), phase=str(phase or ""), item=str(item or ""),
-            command=str(command or ""), started_at=_utc_now(), started_perf=time.perf_counter(),
-        )
+        with self._timing_lock:
+            token = PhaseToken(
+                row_index=len(self._timing_rows),
+                side=str(side or ""), phase=str(phase or ""), item=str(item or ""),
+                command=str(command or ""), started_at=_utc_now(),
+                started_perf=time.perf_counter(),
+            )
+            start_message = message or f"开始 {token.phase}"
+            self._timing_rows.append(
+                self._timing_row(
+                    token,
+                    status="running",
+                    message=start_message,
+                )
+            )
+            self._flush_timing()
         self.event(
-            token.phase, "running", message or f"开始 {token.phase}",
+            token.phase, "running", start_message,
             side=token.side, item=token.item, command=token.command, elapsed_sec=0,
         )
         return token
@@ -153,24 +202,19 @@ class Step1Observer:
             token.phase, status, final_message, side=token.side, item=token.item,
             command=token.command, elapsed_sec=elapsed,
         )
-        with open_csv_append(self.timing_path) as handle:
-            writer = csv.DictWriter(handle, fieldnames=TIMING_FIELDS)
-            writer.writerow({
-                "side": token.side,
-                "phase": token.phase,
-                "item": token.item,
-                "started_at": token.started_at,
-                "ended_at": ended_at,
-                "elapsed_sec": f"{elapsed:.3f}",
-                "peak_rss_mb": f"{peak_rss_mb():.3f}",
-                "archive_bytes": str(self._counters["archive_bytes"]),
-                "nested_entries": str(self._counters["nested_entries"]),
-                "cache_hits": str(self._counters["cache_hits"]),
-                "cache_misses": str(self._counters["cache_misses"]),
-                "status": str(status or ""),
-                "command": token.command,
-                "message": final_message,
-            })
+        with self._timing_lock:
+            completed_row = self._timing_row(
+                token,
+                status=status,
+                message=final_message,
+                ended_at=ended_at,
+                elapsed_sec=f"{elapsed:.3f}",
+            )
+            if 0 <= token.row_index < len(self._timing_rows):
+                self._timing_rows[token.row_index] = completed_row
+            else:
+                self._timing_rows.append(completed_row)
+            self._flush_timing()
         return elapsed
 
     @contextmanager
