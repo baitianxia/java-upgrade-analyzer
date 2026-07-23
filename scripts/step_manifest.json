@@ -172,7 +172,7 @@
             },
             "dependency_source_dirs": {
               "type": "array",
-              "description": "可选。直接提供依赖源码工程目录或多模块仓库根目录，系统会自动推断模块坐标并派生后续所需映射。"
+              "description": "可选。提供依赖源码工程目录、多模块仓库根目录或 Git 地址；Git 地址会克隆到报告内部缓存，系统随后自动推断模块坐标并派生后续所需映射。"
             },
             "source_repo_hints": {
               "type": "array",

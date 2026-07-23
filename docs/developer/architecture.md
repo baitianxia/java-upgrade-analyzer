@@ -419,7 +419,7 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 
 当前关键语义如下：
 
-- `dependency_source_dirs` 是推荐入口
+- `dependency_source_dirs` 是推荐入口，同时接受本地目录和 Git 地址；Git 地址先物化到 `.runtime/cache/dependency_source_git/`，再进入同一套坐标推断与源码分析链路
 - `dependency_repo_mappings` 是内部派生结果
 - `s4_contract.py` 固定 `all_changed_apis.csv` 字段契约
 - `removed jar` 不走旁路逻辑；正式语义是把旧版 jar 的 `class / method / constructor` 符号集导出为 Step5 目标池

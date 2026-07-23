@@ -1089,6 +1089,8 @@ def apply_user_response_clears(updated, clear_fields):
             continue
         if field == "dependency_source_dirs":
             result.pop("dependency_source_dirs", None)
+            result.pop("dependency_source_git_urls", None)
+            result.pop("dependency_source_git_materializations", None)
             result.pop("dependency_repo_mappings", None)
             result.pop("dependency_source_mappings", None)
             result.pop("dependency_source_mapping_conflicts", None)
@@ -1193,6 +1195,12 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
     )
     if dependency_source_dirs is not None:
         updated["dependency_source_dirs"] = dependency_source_dirs
+        updated["dependency_source_git_urls"] = [
+            item
+            for item in dependency_source_dirs
+            if is_dependency_source_git_url(item, project_dir)
+        ]
+        updated.pop("dependency_source_git_materializations", None)
         updated.pop("dependency_repo_mappings", None)
         updated.pop("dependency_source_mappings", None)
 
@@ -1825,7 +1833,178 @@ def looks_like_remote_repo(path_value):
     value = (path_value or "").strip()
     if not value:
         return False
-    return value.startswith(("http://", "https://", "ssh://", "git@")) or value.endswith(".git")
+    return (
+        value.startswith(("http://", "https://", "ssh://", "git://", "file://", "git@"))
+        or bool(re.match(r"^[^/@\s]+@[^:\s]+:.+", value))
+        or value.endswith(".git")
+    )
+
+
+def is_dependency_source_git_url(path_value, project_dir=None):
+    """Distinguish cloneable Git addresses from existing local source paths."""
+    value = str(path_value or "").strip()
+    if not looks_like_remote_repo(value):
+        return False
+    if value.startswith(("http://", "https://", "ssh://", "git://", "file://", "git@")):
+        return True
+    if re.match(r"^[^/@\s]+@[^:\s]+:.+", value):
+        return True
+    local_path = Path(value).expanduser()
+    if not local_path.is_absolute() and project_dir is not None:
+        local_path = Path(project_dir) / local_path
+    return not local_path.exists()
+
+
+def _redact_git_url(value):
+    text = str(value or "")
+    return re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1***@", text)
+
+
+def _dependency_source_git_origin(repo_path):
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + ["-C", str(repo_path), "remote", "get-url", "origin"],
+        timeout=10,
+        env={"GIT_TERMINAL_PROMPT": "0"},
+    )
+    return str(stdout or "").strip() if rc == 0 else ""
+
+
+def _is_materialized_dependency_source_repo(repo_path, git_url):
+    repo_path = Path(repo_path)
+    if not repo_path.is_dir() or repo_path.is_symlink():
+        return False
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + ["-C", str(repo_path), "rev-parse", "--is-inside-work-tree"],
+        timeout=10,
+        env={"GIT_TERMINAL_PROMPT": "0"},
+    )
+    return (
+        rc == 0
+        and str(stdout or "").strip().lower() == "true"
+        and _dependency_source_git_origin(repo_path) == str(git_url or "").strip()
+    )
+
+
+def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300):
+    """Clone a user-provided dependency source URL into a report-owned cache."""
+    git_url = str(git_url or "").strip()
+    if not is_dependency_source_git_url(git_url):
+        raise StepError(f"依赖源码 Git 地址格式无法识别：{git_url or '(空)'}")
+    clone_timeout = parse_positive_int_like(
+        clone_timeout,
+        "dependency_source_clone_timeout",
+    )
+
+    cache_key = hashlib.sha256(git_url.encode("utf-8")).hexdigest()[:24]
+    cache_entry = runtime_cache_dir(report_dir) / "dependency_source_git" / cache_key
+    repo_path = cache_entry / "repository"
+    metadata_path = cache_entry / "metadata.json"
+    cache_entry.mkdir(parents=True, exist_ok=True)
+
+    if _is_materialized_dependency_source_repo(repo_path, git_url):
+        write_json(
+            metadata_path,
+            {
+                "schema": "java-upgrade-analyzer.dependency-source-git.v1",
+                "git_url": git_url,
+                "repo_path": str(repo_path.resolve()),
+                "status": "ready",
+            },
+        )
+        return {
+            "git_url": git_url,
+            "repo_path": str(repo_path.resolve()),
+            "metadata_path": str(metadata_path.resolve()),
+            "reused": True,
+        }
+
+    if repo_path.exists() or repo_path.is_symlink():
+        if repo_path.is_symlink():
+            raise StepError(
+                "依赖源码 Git 缓存路径异常（检测到符号链接），为避免覆盖未知内容已停止："
+                f"{repo_path}"
+            )
+        shutil.rmtree(repo_path)
+
+    temp_repo = cache_entry / f"repository.clone-{os.getpid()}-{threading.get_ident()}"
+    if temp_repo.exists() or temp_repo.is_symlink():
+        if temp_repo.is_symlink():
+            temp_repo.unlink()
+        else:
+            shutil.rmtree(temp_repo)
+    stdout, stderr, rc = run_cmd(
+        git_cmd() + [
+            "clone",
+            "--no-tags",
+            "--origin",
+            "origin",
+            git_url,
+            str(temp_repo),
+        ],
+        cwd=str(cache_entry),
+        timeout=clone_timeout,
+        env={"GIT_TERMINAL_PROMPT": "0"},
+    )
+    if rc != 0 or not _is_materialized_dependency_source_repo(temp_repo, git_url):
+        if temp_repo.exists() and not temp_repo.is_symlink():
+            shutil.rmtree(temp_repo)
+        reason = str(stderr or stdout or f"git clone exited with {rc}").strip()
+        reason = _redact_git_url(reason.replace(git_url, _redact_git_url(git_url)))
+        raise StepError(
+            f"无法克隆依赖源码 Git 地址 {_redact_git_url(git_url)}：{reason[:1000]}。"
+            "请确认地址和访问权限后重试；已有分析产物不会被修改。"
+        )
+
+    if repo_path.exists():
+        if _is_materialized_dependency_source_repo(repo_path, git_url):
+            shutil.rmtree(temp_repo)
+        else:
+            shutil.rmtree(temp_repo)
+            raise StepError(f"依赖源码 Git 缓存被并发写入且结果无效：{repo_path}")
+    else:
+        temp_repo.replace(repo_path)
+
+    write_json(
+        metadata_path,
+        {
+            "schema": "java-upgrade-analyzer.dependency-source-git.v1",
+            "git_url": git_url,
+            "repo_path": str(repo_path.resolve()),
+            "status": "ready",
+        },
+    )
+    return {
+        "git_url": git_url,
+        "repo_path": str(repo_path.resolve()),
+        "metadata_path": str(metadata_path.resolve()),
+        "reused": False,
+    }
+
+
+def materialize_dependency_source_inputs(source_inputs, project_dir, report_dir, clone_timeout=300):
+    local_dirs = []
+    git_urls = []
+    materializations = []
+    for item in source_inputs or []:
+        value = str(item or "").strip()
+        if not value:
+            continue
+        if is_dependency_source_git_url(value, project_dir):
+            materialized = materialize_dependency_source_git_url(
+                value,
+                report_dir,
+                clone_timeout=clone_timeout,
+            )
+            git_urls.append(value)
+            local_dirs.append(materialized["repo_path"])
+            materializations.append(materialized)
+        else:
+            local_dirs.append(resolve_repo_input_path(absolutize_path(value, project_dir)))
+    return {
+        "dependency_source_dirs": _dedupe_strings(local_dirs),
+        "dependency_source_git_urls": _dedupe_strings(git_urls),
+        "dependency_source_git_materializations": materializations,
+    }
 
 
 def normalize_source_dirs(raw_value, project_dir):
@@ -1866,7 +2045,10 @@ def normalize_dependency_source_dirs(raw_value, project_dir, config_key="depende
                 continue
         elif isinstance(item, dict):
             path_value = str(
-                item.get("path")
+                item.get("url")
+                or item.get("git_url")
+                or item.get("clone_url")
+                or item.get("path")
                 or item.get("root")
                 or item.get("repo_path")
                 or item.get("git_path")
@@ -1875,15 +2057,16 @@ def normalize_dependency_source_dirs(raw_value, project_dir, config_key="depende
                 or ""
             ).strip()
             if not path_value:
-                raise StepError(f"当前步骤输入中的 {config_key} 的对象项需包含 path/repo_path/git_path")
+                raise StepError(
+                    f"当前步骤输入中的 {config_key} 的对象项需包含 url/git_url/path/repo_path/git_path"
+                )
         else:
             raise StepError(f"当前步骤输入中的 {config_key} 存在不支持的项类型")
 
-        if looks_like_remote_repo(path_value) and not Path(path_value).expanduser().exists():
-            raise StepError(
-                f"当前步骤输入中的 {config_key} 当前仅支持本地已检出的源码目录，暂不支持直接传远程地址：{path_value}"
-            )
-        normalized_path = resolve_repo_input_path(absolutize_path(path_value, project_dir))
+        if is_dependency_source_git_url(path_value, project_dir):
+            normalized_path = path_value
+        else:
+            normalized_path = resolve_repo_input_path(absolutize_path(path_value, project_dir))
         if normalized_path in seen:
             continue
         seen.add(normalized_path)
@@ -3544,6 +3727,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         ),
         "source_dirs": resolve_value(cli_list(args.source_dirs), merged, "source_dirs"),
         "dependency_source_dirs": resolve_value(cli_list(args.dependency_source_dirs), merged, "dependency_source_dirs", []),
+        "dependency_source_git_urls": resolve_value(
+            None,
+            merged,
+            "dependency_source_git_urls",
+            [],
+        ),
         "dependency_source_mappings": resolve_value(
             cli_list(args.dependency_source_mappings),
             merged,
@@ -3661,12 +3850,35 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         path_value = result.get(path_key)
         if isinstance(path_value, str) and path_value.strip():
             result[path_key] = absolutize_path(path_value.strip(), project_dir)
-    dependency_source_dirs = normalize_dependency_source_dirs(
+    dependency_source_inputs = normalize_dependency_source_dirs(
         result.get("dependency_source_dirs"),
         project_dir,
         "dependency_source_dirs",
     ) or []
-    result["dependency_source_dirs"] = dependency_source_dirs
+    remembered_git_urls = normalize_dependency_source_dirs(
+        result.get("dependency_source_git_urls"),
+        project_dir,
+        "dependency_source_git_urls",
+    ) or []
+    dependency_source_inputs = _dedupe_strings(
+        dependency_source_inputs + remembered_git_urls
+    )
+    clone_timeout_value = result.get("step4_fetch_timeout")
+    clone_timeout = (
+        parse_positive_int_like(clone_timeout_value, "step4_fetch_timeout")
+        if clone_timeout_value not in (None, "")
+        else 300
+    )
+    dependency_source_materialization = materialize_dependency_source_inputs(
+        dependency_source_inputs,
+        project_dir,
+        result["report_dir"],
+        clone_timeout=clone_timeout,
+    )
+    dependency_source_dirs = list(
+        dependency_source_materialization.get("dependency_source_dirs") or []
+    )
+    result.update(dependency_source_materialization)
     result["dependency_repo_mappings"] = normalize_dependency_repo_mappings(
         result.get("dependency_repo_mappings"),
         project_dir,
@@ -5161,7 +5373,7 @@ def _user_field_label(field):
         "springboot_base": "升级前 Spring Boot 版本",
         "springboot_current": "升级后 Spring Boot 版本",
         "source_dirs": "业务源码目录",
-        "dependency_source_dirs": "依赖源码目录",
+        "dependency_source_dirs": "依赖源码目录或 Git 地址",
         "source_repo_hints": "源码仓库线索",
         "dependency_repo_mappings": "依赖源码映射",
         "accept_suggested_mappings": "是否采用建议的依赖源码映射",
@@ -5198,7 +5410,7 @@ def _user_field_description(field, meta=None):
         "jdk_current": "升级后实际使用的 JDK 主版本。",
         "springboot_base": "升级前实际使用的 Spring Boot 版本。",
         "springboot_current": "升级后实际使用的 Spring Boot 版本。",
-        "dependency_source_dirs": "相关依赖源码仓库或多模块仓库根目录。",
+        "dependency_source_dirs": "相关依赖源码仓库目录、多模块仓库根目录或 HTTPS/SSH Git 地址。",
         "dependency_repo_mappings": "存在多个源码候选时，明确依赖坐标对应的源码仓库。",
         "accept_suggested_mappings": "采用会增加源码行为覆盖；不采用则保留最终制品证据边界。",
         "dependency_git_ref_overrides": "当依赖版本无法自动匹配 git ref 时，显式给出 old_ref/new_ref。",
@@ -5225,7 +5437,7 @@ def _humanize_interaction_text(text):
     value = str(text or "")
     replacements = {
         "Step5 是全量分析": "系统触达证据是覆盖全部依赖",
-        "dependency_source_dirs": "依赖源码目录",
+        "dependency_source_dirs": "依赖源码目录或 Git 地址",
         "dependency_repo_mappings": "依赖源码映射",
         "accept_suggested_mappings": "是否采用建议的依赖源码映射",
         "dependency_git_ref_overrides": "依赖 old_ref/new_ref",
@@ -5341,6 +5553,7 @@ def _decision_card_reply_examples(interaction, selection_options, options):
         examples.append("基准分支 main，当前分支 feature/upgrade")
     if "dependency_source_dirs" in fields:
         examples.append("依赖源码目录是 /path/to/dependency-repo，补充后重跑")
+        examples.append("依赖源码 Git 地址是 https://git.example.com/team/dependency-repo.git，补充后重跑")
     if "dependency_git_ref_overrides" in fields:
         examples.append('依赖 com.acme:lib 的 old_ref 是 v1.0.0，new_ref 是 v2.0.0，补充后重跑')
     if {
@@ -5878,7 +6091,7 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
     if has_dependency_source_dirs_field:
         dep_dirs_prop = dict(properties.get("dependency_source_dirs") or {})
         dep_dirs_prop["description"] = (
-            "可选。填写依赖源码目录或仓库根目录；仅当现有目录不正确、无法识别，"
+            "可选。填写依赖源码目录、仓库根目录或 Git 地址；仅当现有输入不正确、无法识别，"
             "或仍未覆盖目标依赖时再修正。字段名为 dependency_source_dirs。"
         )
         properties["dependency_source_dirs"] = dep_dirs_prop
@@ -6404,7 +6617,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             "dependency_source_dirs",
             {
                 "type": "array",
-                "description": "可选。直接提供依赖源码目录，支持单模块或多模块仓库；系统会自动推断模块坐标、Step4 仓库映射与 Step5 源码映射。",
+                "description": "可选。提供依赖源码目录或 Git 地址，支持单模块或多模块仓库；Git 地址会克隆到报告内部缓存，系统会自动推断模块坐标、Step4 仓库映射与 Step5 源码映射。",
             },
         )
     if step_id == "step4":
@@ -6466,7 +6679,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             "dependency_source_dirs",
             {
                 "type": "array",
-                "description": "可选。直接补充依赖源码目录；系统会自动推断依赖源码映射并重跑分析。",
+                "description": "可选。补充依赖源码目录或 Git 地址；Git 地址会克隆到报告内部缓存，系统会自动推断依赖源码映射并重跑分析。",
             },
         )
         properties.setdefault(

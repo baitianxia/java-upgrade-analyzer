@@ -9,7 +9,8 @@
   ],
   "dependency_source_dirs": [
     "/abs/path/to/dependency-a",
-    "/abs/path/to/dependency-b-multi-module"
+    "/abs/path/to/dependency-b-multi-module",
+    "https://git.example.com/team/dependency-c.git"
   ],
   "japicmp_jar": "/abs/path/to/japicmp-0.21.2-jar-with-dependencies.jar",
   "max_depth": 5,
