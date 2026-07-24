@@ -34,6 +34,10 @@ from analysis_contract import (
     sha256_file,
 )
 from artifact_safety import _unsafe_entry_name, require_safe_archive
+from diagnostic_contract import (
+    DEPENDENCY_COORDINATES_UNRESOLVED,
+    normalize_diagnostic_payload,
+)
 from pipeline_constants import (
     STEP1_ARTIFACTS_DIRNAME,
     STEP1_DEPENDENCY_JARS_DIRNAME,
@@ -41,6 +45,7 @@ from pipeline_constants import (
 )
 from step1_observability import Step1Observer
 from step1_ref_resolution import resolve_step1_ref
+from reason_guidance import REASON_GUIDANCE_SCHEMA, guidance_for_reason_code
 
 
 EXIT_AWAITING_USER = 4
@@ -752,7 +757,16 @@ class Step1CommandExecutionBlockedError(RuntimeError):
 
 
 def emit_step_interaction(interaction):
-    sys.stdout.write(STEP_INTERACTION_PREFIX + json.dumps(interaction, ensure_ascii=False) + "\n")
+    payload = normalize_diagnostic_payload(interaction, origin_step="step1")
+    if payload.get("reason_code"):
+        payload.setdefault("diagnostic_guidance_schema", REASON_GUIDANCE_SCHEMA)
+        payload.setdefault(
+            "diagnostic_guidance",
+            guidance_for_reason_code(
+                payload["reason_code"], origin_step="step1"
+            ),
+        )
+    sys.stdout.write(STEP_INTERACTION_PREFIX + json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
@@ -1013,7 +1027,15 @@ def build_step1_coordinate_followup_interaction(
         "status": "awaiting_user_input",
         "kind": kind,
         "step_id": "step1",
-        "reason_code": "unresolved_dependency_coordinates_after_enrichment",
+        "reason_code": DEPENDENCY_COORDINATES_UNRESOLVED,
+        "reason_code_aliases": [
+            "unresolved_dependency_coordinates_after_enrichment",
+        ],
+        "origin_step": "step1",
+        "diagnostic_guidance_schema": REASON_GUIDANCE_SCHEMA,
+        "diagnostic_guidance": guidance_for_reason_code(
+            DEPENDENCY_COORDINATES_UNRESOLVED
+        ),
         "summary": "Step1 已尝试根据已有 branch/source 信息补全嵌套依赖坐标，但仍无法安全确认全部 Maven 坐标。",
         "title": "step1 仍需进一步确认坐标补全信息",
         "question": question,
@@ -1064,7 +1086,7 @@ def build_step1_coordinate_followup_interaction(
         },
         "resume_hint": "可补充模块范围、源码目录、人工补充坐标，或显式确认 unresolved 后继续执行 Step1。",
         "runtime_rules": [
-            "看到 unresolved_dependency_coordinates_after_enrichment 后，必须先向用户暴露未识别的嵌套依赖和已尝试的补全来源。",
+            f"看到 {DEPENDENCY_COORDINATES_UNRESOLVED} 后，必须先向用户暴露未识别的嵌套依赖和已尝试的补全来源。",
             "禁止把这类失败压成通用 rc=1 或继续盲重试。",
             "只有用户明确选择 confirm_unresolved，才允许保留 unresolved 行并继续。",
         ],

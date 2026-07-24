@@ -18,11 +18,13 @@ s4_jar_compare.py — Step 4：jar 包变更全量对比
   [artifact]_[旧版]_vs_[新版]_behavior.txt — changelog 行为变更记录
   [lib]_gitdiff_api_changes.txt            — 依赖源码 git diff 结果
   all_changed_apis.csv                     — 汇总（Step 5 的核心输入）
+  dependency_analysis_status.{csv,json}    — 逐依赖执行状态（区分零变化与无数据）
 
 交互约束：
   脚本只负责产出证据与摘要，不负责等待用户确认
   进入下一步前是否停下、向用户展示哪些文件，由 run_step.py 统一调度
-  "变更 API 数量 = 0 的依赖"仍需特别标出，便于后续交互时人工复核
+  只有对比成功且 API 数量为 0 的依赖才可标记为“无可见 API 变化”；
+  执行失败必须单独标记为“数据不可用”
 """
 
 import argparse, csv, json, os, re, shutil, struct, sys, time, threading
@@ -70,6 +72,21 @@ from step1_observability import peak_rss_mb
 from analysis_contract import sha256_file
 from artifact_safety import require_safe_archive
 from constant_impact import extract_constant_field_evidence
+from diagnostic_contract import (
+    DEPENDENCY_SOURCE_REF_UNAVAILABLE,
+    JAPICMP_EXECUTION_FAILED,
+    JAPICMP_TIMEOUT,
+    canonical_reason_code,
+    diagnostic_contract_metadata,
+    normalize_component_reason_codes,
+    normalize_diagnostic_payload,
+    reason_code_aliases,
+)
+from reason_guidance import (
+    REASON_GUIDANCE_SCHEMA,
+    build_catalog_guidance,
+    guidance_for_reason_code,
+)
 from remote_source_refs import (
     materialize_remote_source_candidate,
     query_live_remote_refs,
@@ -88,6 +105,9 @@ _JAPICMP_TOOL_DIGEST_CACHE = {}
 _REMOTE_SOURCE_MATERIALIZATION_LOCK = threading.RLock()
 _REMOTE_SOURCE_MATERIALIZATION_CACHE = {}
 STEP4_TIMING_FILE = "step4_timing.csv"
+DEPENDENCY_ANALYSIS_STATUS_CSV = "dependency_analysis_status.csv"
+DEPENDENCY_ANALYSIS_STATUS_JSON = "dependency_analysis_status.json"
+DEPENDENCY_ANALYSIS_STATUS_MD = "dependency_analysis_status.md"
 JAPICMP_COMPARISON_CACHE_SCHEMA_VERSION = 2
 JAPICMP_COMPARISON_CACHE_DIRNAME = "step4_japicmp"
 
@@ -574,6 +594,9 @@ def cleanup_step4_generated_outputs(output_dir):
         "git_ref_pending.json",
         "git_ref_matches.txt",
         "git_ref_matches.json",
+        DEPENDENCY_ANALYSIS_STATUS_CSV,
+        DEPENDENCY_ANALYSIS_STATUS_JSON,
+        DEPENDENCY_ANALYSIS_STATUS_MD,
         STEP4_TIMING_FILE,
         "summary.txt",
     )
@@ -1911,7 +1934,7 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
                     "retry_remote_fetch",
                     "step4_fetch_timeout",
                 ],
-                "description": "重跑 Step4 时，至少要确认 git refs、重试远端操作，或修正依赖源码目录。",
+                "description": "重跑 Step4 时，至少要确认新旧源码版本、重试远端操作，或修正依赖源码目录。",
             },
             "restart_from_step": {
                 "required_fields": ["restart_step_id"],
@@ -1921,11 +1944,11 @@ def build_git_ref_confirmation_interaction(output_dir, pending_items):
         "pending_git_ref_items": pending_items,
         "git_ref_decision_items": decision_items,
         "resume_hint": (
-            "用户确认 old_ref/new_ref 后，可使用 --response-json 传回 "
+            "用户确认新旧源码版本（old_ref/new_ref）后，可使用 --response-json 传回 "
             "action=rerun_current_step 与 dependency_git_ref_overrides 重跑 Step4；"
             "若问题源于依赖源码目录指向错误，也可同时修正依赖源码目录后重跑。"
         ),
-        "next_action_rule": "只能向用户确认 git refs 并等待回复，不得直接继续执行后续步骤。",
+        "next_action_rule": "只能向用户确认新旧源码版本并等待回复，不得直接继续执行后续步骤。",
         "must_wait_for_user_reply": True,
     }
 
@@ -2040,7 +2063,16 @@ def build_timeout_resolution_interaction(output_dir, timeout_items):
 
 
 def emit_interaction(interaction):
-    print(f"{INTERACTION_PREFIX}{json.dumps(interaction, ensure_ascii=False)}")
+    payload = normalize_diagnostic_payload(interaction, origin_step="step4")
+    if payload.get("reason_code"):
+        payload.setdefault("diagnostic_guidance_schema", REASON_GUIDANCE_SCHEMA)
+        payload.setdefault(
+            "diagnostic_guidance",
+            guidance_for_reason_code(
+                payload["reason_code"], origin_step="step4"
+            ),
+        )
+    print(f"{INTERACTION_PREFIX}{json.dumps(payload, ensure_ascii=False)}")
 
 
 def _env_flag_disabled(name):
@@ -2102,7 +2134,7 @@ def dependency_needs_japicmp(row):
 
 def write_japicmp_preflight_details(output_dir, japicmp_jar, install_error, planned_dependencies):
     preflight_path = os.path.join(output_dir, "japicmp_preflight.json")
-    payload = {
+    payload = normalize_diagnostic_payload({
         "status": "blocked_by_system",
         "reason_code": "step4_japicmp_missing_need_resolution",
         "generated_at": datetime.now().isoformat(),
@@ -2110,15 +2142,15 @@ def write_japicmp_preflight_details(output_dir, japicmp_jar, install_error, plan
         "install_error": str(install_error or ""),
         "planned_dependencies": planned_dependencies,
         "impact": [
-            "Step4 无法执行 JApiCmp 二进制 API 对比。",
-            "这会漏掉仅通过 jar 二进制对比才能发现的删除、签名变化、字段变化、源码重编译不兼容等 API 变化。",
-            "JApiCmp 是 Java 升级分析的必需工具；未安装时不会生成后续分析结论。",
+            "依赖 API 对比工具（JApiCmp）不可用，Step4 无法形成 API 变化数据。",
+            "当前无法判断删除、签名变化、字段变化和重新编译不兼容等 API 变化。",
+            "修复或提供 API 对比工具后重跑；在此之前不能按“没有 API 变化”处理。",
         ],
         "manual_install": [
             f"mvn dependency:get -Dartifact={DEFAULT_JAPICMP_COORD}",
             "或提供 japicmp_jar 的绝对路径。",
         ],
-    }
+    }, origin_step="step4")
     Path(preflight_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return preflight_path
 
@@ -3180,7 +3212,8 @@ def run_japicmp(
     jdk_current=None,
 ):
     """
-    对单个依赖运行 JApiCmp，返回 (output_file, changed_apis, error_msg)
+    对单个依赖运行 JApiCmp，返回
+    (output_file, changed_apis, artifact_metadata, error_msg)。
     保留完整原始输出，不裁剪任何内容。
     """
     display_coord = str(coord or "").strip()
@@ -3203,6 +3236,7 @@ def run_japicmp(
         write_result(out_file, msg)
         return out_file, [], {
             "old_jar": None, "new_jar": None, "external_process_count": 0,
+            "reason_code": "DEPENDENCY_COORDINATES_INVALID",
         }, "非法坐标"
     safe_name = safe_artifact_id.replace('.', '-') + (f"_{safe_classifier}" if safe_classifier else "")
     out_file = os.path.join(output_dir,
@@ -3264,6 +3298,7 @@ def run_japicmp(
             "new_jar_source": new_jar_source,
             "old_jar_evidence": old_jar_evidence or {},
             "new_jar_evidence": new_jar_evidence or {},
+            "reason_code": "JAPICMP_TOOL_UNAVAILABLE",
             "external_process_count": 0,
         }, "JApiCmp 未安装"
 
@@ -3408,7 +3443,7 @@ def run_japicmp(
             "new_jar_source": new_jar_source,
             "old_jar_evidence": old_jar_evidence or {},
             "new_jar_evidence": new_jar_evidence or {},
-            "reason_code": "JAPICMP_TIMEOUT",
+            "reason_code": JAPICMP_TIMEOUT,
             "external_process_count": 1,
         }, "超时"
     if rc != 0:
@@ -3426,6 +3461,7 @@ def run_japicmp(
             "new_jar_source": new_jar_source,
             "old_jar_evidence": old_jar_evidence or {},
             "new_jar_evidence": new_jar_evidence or {},
+            "reason_code": JAPICMP_EXECUTION_FAILED,
             "external_process_count": 1,
         }, failure_msg[:100]
     raw_output = stdout or stderr or "(无输出)"
@@ -4710,7 +4746,13 @@ def partition_git_ref_pending_items(pending_items):
             **item,
             "status": "skipped",
             "pending_kind": pending_kind,
-            "reason_code": "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
+            "origin_step": "step4",
+            "reason_code": DEPENDENCY_SOURCE_REF_UNAVAILABLE,
+            "reason_code_aliases": [],
+            "diagnostic_guidance_schema": REASON_GUIDANCE_SCHEMA,
+            "diagnostic_guidance": guidance_for_reason_code(
+                DEPENDENCY_SOURCE_REF_UNAVAILABLE
+            ),
             "reason": (
                 f"{internal_reason_by_kind.get(pending_kind, '依赖源码版本无法可靠固定')}；"
                 "已跳过源码行为差异辅助分析，将使用最终制品 JAR 完成二进制与方法字节码分析"
@@ -4748,18 +4790,18 @@ def write_git_ref_pending_file(output_dir, pending_items):
 def write_git_ref_preflight_summary(output_dir, pending_items, matched_items):
     summary_path = os.path.join(output_dir, "summary.txt")
     lines = [
-        "Step4 依赖源码 git refs 预检摘要",
+        "Step4 依赖的新旧源码版本检查摘要",
         "",
         "一、结论总览",
-        f"- 待确认 refs：{len(pending_items or [])}",
-        f"- 已自动匹配 refs：{len(matched_items or [])}",
+        f"- 待确认的新旧源码版本：{len(pending_items or [])}",
+        f"- 已自动匹配的新旧源码版本：{len(matched_items or [])}",
         "",
         "二、判断口径",
-        "- 为避免先执行耗时分析后才发现 ref 歧义，Step4 会在正式分析前先检查依赖源码 git refs。",
-        "- 待确认项表示 old_version/new_version 无法唯一映射到依赖源码仓库中的 refs。",
+        "- Step4 会在正式分析前检查依赖的新旧版本能否唯一匹配到对应源码版本。",
+        "- 待确认表示系统找到了多个或没有找到对应源码版本，不能自行决定对比范围。",
     ]
     if pending_items:
-        lines += ["", f"三、待确认 ref 明细（前 {min(20, len(pending_items or []))} 项）"]
+        lines += ["", f"三、待确认的新旧源码版本（前 {min(20, len(pending_items or []))} 项）"]
     for item in (pending_items or [])[:20]:
         lines.append("")
         lines.append(f"- {item.get('coord')}：{item.get('old_version')} -> {item.get('new_version')}")
@@ -4767,8 +4809,8 @@ def write_git_ref_preflight_summary(output_dir, pending_items, matched_items):
         lines.append(f"  - 仓库路径：{item.get('repo_path') or '-'}")
         old_candidates = item.get("old_candidates") or []
         new_candidates = item.get("new_candidates") or []
-        lines.append(f"  - old 候选 refs：{', '.join(c.get('ref', '') for c in old_candidates[:10]) or '无'}")
-        lines.append(f"  - new 候选 refs：{', '.join(c.get('ref', '') for c in new_candidates[:10]) or '无'}")
+        lines.append(f"  - 旧版源码候选：{', '.join(c.get('ref', '') for c in old_candidates[:10]) or '无'}")
+        lines.append(f"  - 新版源码候选：{', '.join(c.get('ref', '') for c in new_candidates[:10]) or '无'}")
         for option in build_git_ref_pair_options(item, limit=3):
             lines.append(
                 f"  - 方案 {option.get('rank')}：{option.get('old_ref') or '-'} -> "
@@ -5116,7 +5158,7 @@ def write_git_ref_match_outputs(
 
     lines = []
     if needs_user_confirmation:
-        lines.append("Step4 依赖源码 git ref 匹配结果（需要确认）")
+        lines.append("Step4 依赖的新旧源码版本匹配结果（需要确认）")
     else:
         lines.append("Step4 依赖源码版本解析结果（无需用户确认）")
     lines.append("")
@@ -5128,20 +5170,20 @@ def write_git_ref_match_outputs(
     lines.append(f"- 生成时间：{payload['generated_at']}")
     lines.append("")
     lines.append("二、判断口径")
-    lines.append("- old_version/new_version 到 git ref 的映射会直接决定源码 diff 对比范围。")
+    lines.append("- 依赖的新旧版本与源码版本的匹配结果会直接决定源码实现对比范围。")
     lines.append(
         "- 当前自动匹配策略：仅扫描远端分支 remotes；"
         "只去掉版本号末尾的 -SNAPSHOT 后，按分支名包含版本号命中；非 DEV 分支优先于 DEV 分支。"
     )
     if needs_user_confirmation:
-        lines.append("- 当前存在待确认项；这些依赖的源码 diff 范围还不能视为可信。")
+        lines.append("- 当前存在待确认项；这些依赖的源码实现对比范围尚未确定。")
     elif gitdiff_skipped:
         lines.append(
             "- 当前没有需要用户处理的歧义；内部源码解析故障已自动降级并记录，"
             "最终制品 JAR 二进制分析继续执行。"
         )
     else:
-        lines.append("- 当前没有待确认项；可按需抽查依赖坐标、源码仓库和 git refs 是否符合预期。")
+        lines.append("- 当前没有待确认项；可按需抽查依赖、源码仓库和新旧源码版本是否符合预期。")
     lines.append("")
     lines.append("三、源码仓库映射")
     for item in source_repo_mappings:
@@ -5647,6 +5689,484 @@ def build_changed_dependency_rows(api_rows):
     return sorted(result, key=lambda row: (-int(row["high_risk_api_count"]), row["coord"]))
 
 
+DEPENDENCY_ANALYSIS_STATUS_FIELDS = [
+    "coord",
+    "old_version",
+    "new_version",
+    "change_type",
+    "binary_api_result_text",
+    "implementation_check_result_text",
+    "final_result_text",
+    "analysis_complete",
+    "can_treat_as_no_change",
+    "requires_action_before_conclusion",
+    "next_action",
+    "comparison_mode",
+    "comparison_status",
+    "api_data_available",
+    "changed_api_count",
+    "reason_code",
+    "reason_code_aliases",
+    "failure_message",
+    "result_interpretation",
+    "recommended_action",
+    "evidence_path",
+    "implementation_check_status",
+    "implementation_data_available",
+    "implementation_change_count",
+    "implementation_reason_code",
+    "implementation_failure_reason",
+    "implementation_evidence_path",
+    "origin_step",
+]
+
+
+def build_dependency_analysis_status_rows(
+    dep_rows,
+    binary_runs,
+    *,
+    gitdiff_runs=None,
+    gitdiff_skipped=None,
+    gitdiff_pending=None,
+    bytecode_behavior_runs=None,
+    changed_deps_missing_source=None,
+):
+    """Build one unambiguous binary-comparison outcome for every dependency."""
+    primary_modes = {"japicmp", "old_jar_export", "dependency_worker"}
+    runs_by_coord = {}
+    for run in binary_runs or []:
+        coord = str((run or {}).get("coord") or "").strip()
+        mode = str((run or {}).get("mode") or "").strip()
+        if coord and mode in primary_modes:
+            runs_by_coord[coord] = dict(run)
+
+    rows = []
+    for dep in dep_rows or []:
+        coord = str((dep or {}).get("coord") or "").strip()
+        if not coord:
+            continue
+        old_version = str((dep or {}).get("old_version") or "").strip()
+        new_version = str((dep or {}).get("new_version") or "").strip()
+        change_type = str((dep or {}).get("change_type") or "").strip()
+        run = runs_by_coord.get(coord)
+
+        if run:
+            mode = str(run.get("mode") or "japicmp").strip()
+            run_status = str(run.get("status") or "").strip()
+            api_count = int(run.get("api_count") or 0)
+            if run_status == "success":
+                comparison_status = (
+                    "changes_detected" if api_count else "no_api_change"
+                )
+                api_data_available = True
+                reason_code = ""
+                failure_message = ""
+                interpretation = (
+                    f"对比成功，发现 {api_count} 个 API 变化。"
+                    if api_count
+                    else "对比成功，未发现可见 API 变化。"
+                )
+                recommended_action = (
+                    "将变化 API 送入 Step5 做系统触达分析。"
+                    if api_count
+                    else "API 对比成功且未发现可见变化，可按本轮无变化处理。"
+                )
+            else:
+                comparison_status = "failed"
+                api_data_available = False
+                api_count = None
+                reason_code = canonical_reason_code(
+                    run.get("reason_code")
+                    or (
+                        JAPICMP_EXECUTION_FAILED
+                        if mode == "japicmp"
+                        else "BINARY_API_COMPARISON_FAILED"
+                    )
+                )
+                failure_message = str(run.get("error") or "").strip()
+                interpretation = (
+                    "对比失败，API 数据不可用；不能解释为“没有 API 变化”。"
+                )
+                recommended_action = (
+                    "查看失败原因和原始证据，修复后重跑该依赖的 Step4 对比。"
+                )
+        elif (
+            change_type in {"新增", "未变"}
+            or old_version in {"", "-"}
+            or new_version in {"", "-"} and change_type != "移除"
+        ):
+            mode = "not_applicable"
+            comparison_status = "not_applicable"
+            api_data_available = False
+            api_count = None
+            reason_code = ""
+            failure_message = ""
+            interpretation = "该依赖没有可执行的新旧版本 API 对比范围。"
+            recommended_action = "本项不适用，不要把它解释为“对比成功且无变化”。"
+        else:
+            mode = "japicmp" if change_type != "移除" else "old_jar_export"
+            comparison_status = "failed"
+            api_data_available = False
+            api_count = None
+            reason_code = "BINARY_API_COMPARISON_NOT_EXECUTED"
+            failure_message = "没有找到该依赖的二进制 API 对比执行记录"
+            interpretation = (
+                "对比未执行或执行记录丢失，API 数据不可用；不能解释为“没有 API 变化”。"
+            )
+            recommended_action = "检查 Step4 运行日志和输入制品后重跑。"
+
+        raw_reason = str(reason_code or "").strip()
+        aliases = reason_code_aliases(raw_reason) if raw_reason else []
+        run_reason = str((run or {}).get("reason_code") or "").strip()
+        if raw_reason and run_reason and run_reason != raw_reason and run_reason not in aliases:
+            aliases.append(run_reason)
+        rows.append({
+            "coord": coord,
+            "old_version": old_version,
+            "new_version": new_version,
+            "change_type": change_type,
+            "comparison_mode": mode,
+            "comparison_status": comparison_status,
+            "api_data_available": api_data_available,
+            "changed_api_count": api_count,
+            "reason_code": raw_reason,
+            "reason_code_aliases": aliases,
+            "failure_message": failure_message,
+            "result_interpretation": interpretation,
+            "recommended_action": recommended_action,
+            "evidence_path": str((run or {}).get("evidence_path") or "").strip(),
+            "origin_step": "step4",
+            "old_jar_source": str((run or {}).get("old_jar_source") or "").strip(),
+            "new_jar_source": str((run or {}).get("new_jar_source") or "").strip(),
+        })
+    gitdiff_run_by_coord = {
+        str(item.get("coord") or "").strip(): dict(item)
+        for item in (gitdiff_runs or [])
+        if str(item.get("coord") or "").strip()
+    }
+    gitdiff_skip_by_coord = {
+        str(item.get("coord") or "").strip(): dict(item)
+        for item in (gitdiff_skipped or [])
+        if str(item.get("coord") or "").strip()
+    }
+    gitdiff_pending_by_coord = {
+        str(item.get("coord") or "").strip(): dict(item)
+        for item in (gitdiff_pending or [])
+        if str(item.get("coord") or "").strip()
+    }
+    behavior_run_by_coord = {
+        str(item.get("coord") or "").strip(): dict(item)
+        for item in (bytecode_behavior_runs or [])
+        if str(item.get("coord") or "").strip()
+    }
+    missing_source_coords = {
+        str(item.get("coord") or "").strip()
+        for item in (changed_deps_missing_source or [])
+        if str(item.get("coord") or "").strip()
+    }
+
+    for row in rows:
+        coord = row["coord"]
+        source_run = gitdiff_run_by_coord.get(coord)
+        source_skip = gitdiff_skip_by_coord.get(coord)
+        source_pending = gitdiff_pending_by_coord.get(coord)
+        behavior_run = behavior_run_by_coord.get(coord)
+        source_change_count = None
+        source_reason_code = ""
+        source_failure_reason = ""
+        source_evidence_path = ""
+
+        if source_run:
+            source_change_count = int(source_run.get("api_changes") or 0)
+            promoted_count = int(source_run.get("promoted_to_step5") or 0)
+            source_diff_status = (
+                "changes_detected" if source_change_count else "no_source_change"
+            )
+            source_diff_available = True
+            source_analysis_complete = True
+            source_evidence_path = str(source_run.get("out_file") or "")
+            source_result_text = (
+                f"源码对比成功，发现 {source_change_count} 条实现差异"
+                f"（{promoted_count} 条进入 Step5）。"
+                if source_change_count
+                else "源码对比成功，未发现实现差异。"
+            )
+            source_has_actionable_changes = promoted_count > 0
+            source_next_action = ""
+        elif source_pending:
+            source_diff_status = "pending"
+            source_diff_available = False
+            source_analysis_complete = False
+            source_reason_code = canonical_reason_code(
+                source_pending.get("reason_code")
+                or "DEPENDENCY_SOURCE_REF_CONFIRMATION_REQUIRED"
+            )
+            source_failure_reason = str(
+                source_pending.get("reason") or "源码版本范围尚未确认"
+            )
+            source_evidence_path = str(source_pending.get("out_file") or "")
+            source_result_text = "等待确认新旧源码版本，尚未执行实现变化检查。"
+            source_has_actionable_changes = False
+            source_next_action = "确认 old/new 源码版本后重跑 Step4。"
+        elif source_skip:
+            fallback_complete = bool(
+                source_skip.get("behavior_fallback_status") == "complete"
+                or (behavior_run or {}).get("status") == "complete"
+            )
+            fallback_changes = int((behavior_run or {}).get("api_changes") or 0)
+            source_reason_code = canonical_reason_code(
+                source_skip.get("reason_code")
+                or "DEPENDENCY_SOURCE_DIFF_UNAVAILABLE"
+            )
+            source_failure_reason = str(
+                source_skip.get("reason") or "源码对比未完成"
+            )
+            source_evidence_path = str(
+                source_skip.get("behavior_fallback_evidence")
+                or (behavior_run or {}).get("evidence_path")
+                or source_skip.get("out_file")
+                or ""
+            )
+            source_diff_available = False
+            if fallback_complete:
+                source_change_count = fallback_changes
+                source_diff_status = (
+                    "jar_fallback_changes_detected"
+                    if fallback_changes
+                    else "jar_fallback_no_behavior_change"
+                )
+                source_analysis_complete = True
+                source_result_text = (
+                    "源码对比未完成；已通过发布 JAR 的方法实现检查补齐，"
+                    f"发现 {fallback_changes} 条行为变化。"
+                    if fallback_changes
+                    else "源码对比未完成；已通过发布 JAR 的方法实现检查补齐，未发现行为变化。"
+                )
+                source_has_actionable_changes = fallback_changes > 0
+                source_next_action = ""
+            else:
+                source_diff_status = "failed"
+                source_analysis_complete = False
+                source_result_text = (
+                    "源码对比失败，发布 JAR 的方法实现检查也未完成；实现变化数据不可用。"
+                )
+                source_has_actionable_changes = False
+                source_next_action = "修复源码版本或最终 JAR 行为对比后重跑 Step4。"
+        elif coord in missing_source_coords:
+            source_diff_status = "not_configured"
+            source_diff_available = False
+            source_analysis_complete = False
+            source_reason_code = "DEPENDENCY_SOURCE_NOT_CONFIGURED"
+            source_failure_reason = "未提供该依赖的源码仓库或源码目录"
+            source_result_text = "未提供依赖源码，无法检查实现变化；当前证据不完整。"
+            source_has_actionable_changes = False
+            source_next_action = "补充依赖源码映射后重跑 Step4。"
+        else:
+            source_diff_status = "not_applicable"
+            source_diff_available = False
+            source_analysis_complete = True
+            source_result_text = "本依赖不需要检查源码实现变化。"
+            source_has_actionable_changes = False
+            source_next_action = ""
+
+        binary_status = row["comparison_status"]
+        binary_complete = binary_status != "failed"
+        binary_has_changes = binary_status == "changes_detected"
+        analysis_complete = binary_complete and source_analysis_complete
+        requires_action_before_conclusion = not analysis_complete
+        can_treat_as_no_change = bool(
+            binary_status == "no_api_change"
+            and source_diff_status in {
+                "no_source_change",
+                "jar_fallback_no_behavior_change",
+                "not_applicable",
+            }
+        )
+        if binary_status == "failed":
+            final_result_text = (
+                "分析不完整：API 对比失败，没有 API 数据，不能按无变化处理。"
+            )
+            next_action = row["recommended_action"]
+        elif not source_analysis_complete:
+            final_result_text = (
+                "分析不完整：二进制 API 结果可用，但源码行为变化证据不完整。"
+            )
+            next_action = source_next_action
+        elif binary_has_changes or source_has_actionable_changes:
+            final_result_text = "分析完整：已发现需要进入后续触达分析的变化。"
+            next_action = "继续 Step5，判断这些变化是否触达当前系统。"
+        elif can_treat_as_no_change:
+            final_result_text = "分析完整：未发现可见 API 或行为变化，可以按无变化处理。"
+            next_action = "无需修复；保留证据后继续。"
+        else:
+            final_result_text = "当前检查不适用，或没有可执行的对比范围。"
+            next_action = source_next_action or row["recommended_action"]
+
+        row.update({
+            "binary_api_result_text": row["result_interpretation"],
+            "implementation_check_status": source_diff_status,
+            "implementation_data_available": source_diff_available,
+            "implementation_change_count": source_change_count,
+            "implementation_reason_code": source_reason_code,
+            "implementation_failure_reason": source_failure_reason,
+            "implementation_evidence_path": source_evidence_path,
+            "implementation_check_result_text": source_result_text,
+            "final_result_text": final_result_text,
+            "analysis_complete": analysis_complete,
+            "can_treat_as_no_change": can_treat_as_no_change,
+            "requires_action_before_conclusion": requires_action_before_conclusion,
+            "next_action": next_action,
+        })
+
+    return sorted(rows, key=lambda item: item["coord"])
+
+
+def write_dependency_analysis_status(
+    dep_rows,
+    binary_runs,
+    output_dir,
+    *,
+    gitdiff_runs=None,
+    gitdiff_skipped=None,
+    gitdiff_pending=None,
+    bytecode_behavior_runs=None,
+    changed_deps_missing_source=None,
+):
+    """Write the companion ledger that distinguishes zero changes from no data."""
+    rows = build_dependency_analysis_status_rows(
+        dep_rows,
+        binary_runs,
+        gitdiff_runs=gitdiff_runs,
+        gitdiff_skipped=gitdiff_skipped,
+        gitdiff_pending=gitdiff_pending,
+        bytecode_behavior_runs=bytecode_behavior_runs,
+        changed_deps_missing_source=changed_deps_missing_source,
+    )
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    csv_path = output_path / DEPENDENCY_ANALYSIS_STATUS_CSV
+    json_path = output_path / DEPENDENCY_ANALYSIS_STATUS_JSON
+    md_path = output_path / DEPENDENCY_ANALYSIS_STATUS_MD
+
+    with open_csv_write(csv_path) as fh:
+        writer = csv.DictWriter(fh, fieldnames=DEPENDENCY_ANALYSIS_STATUS_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            csv_row = {field: row.get(field, "") for field in DEPENDENCY_ANALYSIS_STATUS_FIELDS}
+            csv_row["api_data_available"] = str(
+                bool(row.get("api_data_available"))
+            ).lower()
+            for boolean_field in (
+                "analysis_complete",
+                "can_treat_as_no_change",
+                "requires_action_before_conclusion",
+                "implementation_data_available",
+            ):
+                csv_row[boolean_field] = str(
+                    bool(row.get(boolean_field))
+                ).lower()
+            csv_row["changed_api_count"] = (
+                "" if row.get("changed_api_count") is None
+                else row.get("changed_api_count")
+            )
+            csv_row["implementation_change_count"] = (
+                "" if row.get("implementation_change_count") is None
+                else row.get("implementation_change_count")
+            )
+            csv_row["reason_code_aliases"] = "|".join(
+                row.get("reason_code_aliases") or []
+            )
+            writer.writerow(csv_row)
+
+    status_counts = Counter(row["comparison_status"] for row in rows)
+    source_status_counts = Counter(
+        row["implementation_check_status"] for row in rows
+    )
+    failed_codes = sorted({
+        reason_code
+        for row in rows
+        for reason_code in (
+            row.get("reason_code"),
+            row.get("implementation_reason_code"),
+        )
+        if reason_code and row.get("requires_action_before_conclusion")
+    })
+    payload = {
+        "schema": "java-upgrade-analyzer.dependency-analysis-status.v1",
+        "origin_step": "step4",
+        "diagnostic_contract": diagnostic_contract_metadata(),
+        "diagnostic_guidance_schema": REASON_GUIDANCE_SCHEMA,
+        "diagnostic_guidance": build_catalog_guidance(
+            failed_codes,
+            origin_step="step4",
+            observed_scope="dependency",
+            source_components=("binary_api_diff",),
+        ),
+        "summary": {
+            "total_dependencies": len(rows),
+            "changes_detected": status_counts.get("changes_detected", 0),
+            "no_api_change": status_counts.get("no_api_change", 0),
+            "failed": status_counts.get("failed", 0),
+            "not_applicable": status_counts.get("not_applicable", 0),
+            "analysis_complete": sum(
+                1 for row in rows if row.get("analysis_complete")
+            ),
+            "requires_action_before_conclusion": sum(
+                1 for row in rows
+                if row.get("requires_action_before_conclusion")
+            ),
+            "can_treat_as_no_change": sum(
+                1 for row in rows if row.get("can_treat_as_no_change")
+            ),
+            "implementation_check_status_counts": dict(
+                sorted(source_status_counts.items())
+            ),
+        },
+        "interpretation": {
+            "analysis_complete": "true 表示该依赖本轮需要的二进制和源码行为证据均已形成。",
+            "can_treat_as_no_change": "只有 true 才能把该依赖解释为本轮未发现变化。",
+            "requires_action_before_conclusion": (
+                "true 表示当前不能直接采用结论，必须按 next_action 处理并重新分析。"
+            ),
+        },
+        "items": rows,
+    }
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    def md_cell(value):
+        return str(value if value not in (None, "") else "-").replace("|", "\\|").replace("\n", " ")
+
+    md_lines = [
+        "# 每个依赖的分析结果（先看这里）",
+        "",
+        "本表直接给出结果和下一步，不需要根据 API 行是否存在来猜测执行状态。",
+        "",
+        "- “可以按无变化处理”为“是”时，才表示相关对比成功且未发现变化。",
+        "- “分析完整”为“否”时，即使 `all_changed_apis.csv` 没有该依赖，也不能解释为没有变化。",
+        "",
+        "| 依赖 | API 对比 | 实现变化检查 | 最终结论 | 分析完整 | 可按无变化处理 | 形成结论前需处理 | 下一步 |",
+        "|---|---|---|---|:---:|:---:|:---:|---|",
+    ]
+    for row in rows:
+        md_lines.append(
+            f"| `{md_cell(row.get('coord'))}` | "
+            f"{md_cell(row.get('binary_api_result_text'))} | "
+            f"{md_cell(row.get('implementation_check_result_text'))} | "
+            f"{md_cell(row.get('final_result_text'))} | "
+            f"{'是' if row.get('analysis_complete') else '否'} | "
+            f"{'是' if row.get('can_treat_as_no_change') else '否'} | "
+            f"{'是' if row.get('requires_action_before_conclusion') else '否'} | "
+            f"{md_cell(row.get('next_action'))} |"
+        )
+    if not rows:
+        md_lines.append("| - | - | - | 本轮没有需要分析的依赖。 | 是 | 否 | 否 | - |")
+    md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    return rows, csv_path, json_path
+
+
 def _dependency_review_focus(row):
     high_risk = int((row or {}).get("high_risk_api_count") or 0)
     changed = int((row or {}).get("changed_api_count") or 0)
@@ -5672,7 +6192,7 @@ def _is_recommended_dependency(row):
     )
 
 
-def write_changed_dependencies(api_rows, output_dir):
+def write_changed_dependencies(api_rows, output_dir, dependency_status_rows=None):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     dependency_rows = build_changed_dependency_rows(api_rows)
@@ -5722,6 +6242,7 @@ def write_changed_dependencies(api_rows, output_dir):
         "5. 定向分析可直接回复，例如：`只分析 com.example:demo-lib`。",
         "",
         "完整 API 明细：`all_changed_apis.csv`。",
+        f"全部依赖的直接结论：`{DEPENDENCY_ANALYSIS_STATUS_MD}`。",
         "依赖包明细目录：`s4_per_dependency/`。",
         "",
         "| 部分分析优先项 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |",
@@ -5737,6 +6258,29 @@ def write_changed_dependencies(api_rows, output_dir):
             )
     else:
         lines.append("| - | - | 0 | 0 | - | - | - |")
+    failed_rows = [
+        row for row in (dependency_status_rows or [])
+        if row.get("comparison_status") == "failed"
+    ]
+    if failed_rows:
+        lines.extend([
+            "",
+            "## API 对比失败、不能进入 Step5 的依赖",
+            "",
+            "以下依赖没有形成 API 数据，不能因为 `all_changed_apis.csv` 中没有记录而解释为“没有变化”。",
+            "",
+            "| 依赖包 | 原因码 | 失败原因 | 原始证据 |",
+            "|---|---|---|---|",
+        ])
+        for row in failed_rows:
+            failure_message = str(
+                row.get("failure_message") or "-"
+            ).replace("|", "\\|")
+            lines.append(
+                f"| `{row.get('coord')}` | `{row.get('reason_code') or '-'}` | "
+                f"{failure_message} | "
+                f"`{row.get('evidence_path') or '-'}` |"
+            )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return csv_path, md_path
 
@@ -5836,7 +6380,14 @@ def _load_json_file(path):
         return {}
 
 
-def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_export=None, gitdiff_auxiliary_rows=None):
+def write_per_dependency_outputs(
+    report_dir,
+    dep_row,
+    raw_rows,
+    removed_jar_export=None,
+    gitdiff_auxiliary_rows=None,
+    dependency_analysis=None,
+):
     """
     为单个依赖写出 Step4 的 per-dependency 产物。
 
@@ -5855,6 +6406,7 @@ def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_expo
 
     raw_rows = list(raw_rows or [])
     gitdiff_auxiliary_rows = list(gitdiff_auxiliary_rows or [])
+    dependency_analysis = dict(dependency_analysis or {})
     normalized_rows = normalize_step5_input_rows(raw_rows)
     removed_rows = [row for row in raw_rows if str(row.get('source') or '').strip() == 'old_jar']
 
@@ -5872,7 +6424,11 @@ def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_expo
         source_counts[source] = source_counts.get(source, 0) + 1
 
     step4_summary = {
-        "status": "done",
+        "status": (
+            "incomplete"
+            if dependency_analysis.get("comparison_status") == "failed"
+            else "done"
+        ),
         "raw_target_count": len(raw_rows),
         "resolved_target_count": len(normalized_rows),
         "removed_jar_symbol_count": len(removed_rows),
@@ -5889,8 +6445,8 @@ def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_expo
         "gitdiff_auxiliary": {
             "count": len(gitdiff_auxiliary_rows),
             "reason": (
-                "依赖源码 diff 仅作为辅助证据；结构性 API 变化以 jar/JApiCmp 为主，"
-                "行为变化只有在 old/new jar 都能确认成员存在时才进入 Step5。"
+                "源码实现对比仅作为辅助证据；结构性 API 变化以发布 JAR 的 API 对比为准，"
+                "只有新旧发布 JAR 都存在同一成员时，行为变化才进入 Step5。"
             ),
             "filter_reasons": sorted({
                 str(row.get("filter_reason") or "").strip()
@@ -5898,6 +6454,7 @@ def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_expo
                 if str(row.get("filter_reason") or "").strip()
             }),
         },
+        "binary_api_comparison": dependency_analysis,
         "artifacts": {
             "removed_jar_symbols_csv": str(removed_symbols_path),
             "resolved_targets_csv": str(resolved_targets_path),
@@ -5935,7 +6492,12 @@ def write_per_dependency_outputs(report_dir, dep_row, raw_rows, removed_jar_expo
 # 摘要输出：展示关键复核点，但不在脚本内等待确认
 # ══════════════════════════════════════════════════════════════════
 
-def human_checkpoint_1(dep_rows, all_apis, output_dir):
+def human_checkpoint_1(
+    dep_rows,
+    all_apis,
+    output_dir,
+    dependency_status_rows=None,
+):
     """
     Step 4 完成后的摘要输出。
     展示：每个依赖的变更 API 数量，重点标出数量为 0 的，
@@ -5952,42 +6514,72 @@ def human_checkpoint_1(dep_rows, all_apis, output_dir):
         by_coord.setdefault(c, []).append(api)
 
     zero_change = []
-    rows = dep_rows or []
-    for row in rows:
-        coord = (row.get('coord', '') or '').strip()
-        change_type = (row.get('change_type', '') or '').strip()
-        if not coord:
-            continue
-        if change_type in ('未变', '新增', '移除'):
-            continue
-        apis_found = by_coord.get(coord, [])
-        if not apis_found:
-            zero_change.append(coord)
-        else:
-            p0 = sum(1 for a in apis_found if (a.get('severity') or '').strip() == 'P0')
+    failed_comparisons = []
+    if dependency_status_rows is not None:
+        zero_change = [
+            row.get("coord")
+            for row in dependency_status_rows
+            if row.get("comparison_status") == "no_api_change"
+            and row.get("coord")
+        ]
+        failed_comparisons = [
+            row for row in dependency_status_rows
+            if row.get("comparison_status") == "failed"
+        ]
+    else:
+        for row in dep_rows or []:
+            coord = (row.get('coord', '') or '').strip()
+            change_type = (row.get('change_type', '') or '').strip()
+            if not coord or change_type in ('未变', '新增', '移除'):
+                continue
+            if not by_coord.get(coord, []):
+                zero_change.append(coord)
 
     print("\n先看什么：")
     print(f"  - 查看变化依赖概览：{os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)}")
+    print(f"  - 每个依赖的直接结论：{os.path.join(output_dir, DEPENDENCY_ANALYSIS_STATUS_MD)}")
     print(f"  - 核对完整 API 事实：{os.path.join(output_dir, 'all_changed_apis.csv')}")
     print("  - 是否影响当前系统：继续看 Step5 alerts.csv 和 Step6 report.md")
     print("\n确认 Step5 分析范围：")
     print("  - 全量分析：覆盖全部变化依赖，准确性覆盖最完整")
     print(f"  - 部分分析：从 {os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)} 选择依赖，以控制耗时")
     print(f"  - 变更 API 总数：{len(all_apis)}")
-    print(f"  - 版本变更但未发现 API 变化的依赖：{len(zero_change)}")
+    print(f"  - API 对比成功且未发现变化的依赖：{len(zero_change)}")
+    print(f"  - API 对比失败、没有数据的依赖：{len(failed_comparisons)}")
+    if failed_comparisons:
+        print("  - 当前结论不完整：失败依赖修复前，不能完成全量 Step5 风险判断。")
+
+    if failed_comparisons:
+        print(
+            f"\nAPI 对比失败、不能按无变化处理的依赖"
+            f"（前 {min(50, len(failed_comparisons))} 个）："
+        )
+        for item in failed_comparisons[:50]:
+            print(
+                f"  - {item.get('coord')}："
+                f"{item.get('reason_code') or 'BINARY_API_COMPARISON_FAILED'}；"
+                f"{item.get('failure_message') or '未形成可验证结果'}"
+            )
+        if len(failed_comparisons) > 50:
+            print(f"  ...（仅展示前 50，共 {len(failed_comparisons)}）")
 
     if zero_change:
-        print(f"\n版本变更但未发现 API 变化的依赖（前 {min(50, len(zero_change))} 个）：")
+        print(
+            f"\nAPI 对比成功且未发现变化的依赖"
+            f"（前 {min(50, len(zero_change))} 个）："
+        )
         for c in zero_change[:50]:
             print(f"  - {c}")
         if len(zero_change) > 50:
             print(f"  ...（仅展示前 50，共 {len(zero_change)}）")
         print("\n说明：")
-        print("  - 可能是该版本确实没有可见 API 变化。")
-        print("  - 也可能是 jar/JApiCmp/依赖源码证据不完整，或变化只体现在签名不变的行为逻辑。")
+        print("  - 这些依赖的 API 对比已成功完成，未发现可见 API 变化。")
+        print("  - 是否存在签名不变的实现变化，以逐依赖结果中的“实现变化检查”为准。")
 
     print(f"\n复核文件：")
     print(f"  - 摘要：{os.path.join(output_dir, 'summary.txt')}")
+    print(f"  - 每个依赖的直接结论：{os.path.join(output_dir, DEPENDENCY_ANALYSIS_STATUS_MD)}")
+    print(f"  - 机器可读明细：{os.path.join(output_dir, DEPENDENCY_ANALYSIS_STATUS_JSON)}")
     print(f"  - 依赖变化概览：{os.path.join(output_dir, CHANGED_DEPENDENCIES_MD)}")
     print(f"  - 完整变更 API：{os.path.join(output_dir, 'all_changed_apis.csv')}")
     print(f"  - 高风险/需关注 API：{os.path.join(output_dir, 'all_changed_apis_alerts.csv')}")
@@ -6009,7 +6601,8 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
                            japicmp_missing_deps, other_failed_deps,
                            changed_deps_missing_source, valid_count, invalid_count,
                            gitdiff_runs=None, gitdiff_skipped=None, gitdiff_pending=None,
-                           timeout_items=None, source_branches=None):
+                           timeout_items=None, source_branches=None,
+                           dependency_status_rows=None):
     all_rows = load_csv(os.path.join(output_dir, "all_changed_apis.csv"))
     alerts = []
     for r in all_rows:
@@ -6034,16 +6627,27 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
             continue
         by_coord.setdefault(c, []).append(api)
 
-    zero_change = []
-    for row in dep_rows:
-        coord = row.get('coord', '')
-        change_type = row.get('change_type', '')
-        if not coord:
-            continue
-        if change_type in ('未变', '新增', '移除'):
-            continue
-        if not by_coord.get(coord):
-            zero_change.append(coord)
+    failed_comparisons = []
+    if dependency_status_rows is not None:
+        zero_change = [
+            row.get("coord")
+            for row in dependency_status_rows
+            if row.get("comparison_status") == "no_api_change"
+            and row.get("coord")
+        ]
+        failed_comparisons = [
+            row for row in dependency_status_rows
+            if row.get("comparison_status") == "failed"
+        ]
+    else:
+        zero_change = []
+        for row in dep_rows:
+            coord = row.get('coord', '')
+            change_type = row.get('change_type', '')
+            if not coord or change_type in ('未变', '新增', '移除'):
+                continue
+            if not by_coord.get(coord):
+                zero_change.append(coord)
 
     by_sev = {'P0': 0, 'P1': 0, 'P2': 0}
     by_source = {}
@@ -6061,40 +6665,56 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
     lines.append("")
     lines.append("一、先看什么")
     lines.append("- 如果只决定系统触达分析范围，先打开 changed_dependencies.md，复制“依赖包”列中的完整坐标。")
+    lines.append(f"- 先看 {DEPENDENCY_ANALYSIS_STATUS_MD}；它直接写明每个依赖的结论和下一步。")
     lines.append("- 如果要核对完整 API 事实，再打开 all_changed_apis.csv。")
-    lines.append("- 如果报告提示最终制品 JAR 证据缺失、JApiCmp 不可用或依赖源码 ref 待确认，再看本文件后面的缺口清单。")
+    lines.append("- 如果报告提示发布 JAR 缺失、API 对比工具不可用或新旧源码版本待确认，再看本文件后面的缺口清单。")
     lines.append("")
     lines.append("二、本次是否能进入 Step5")
     lines.append(f"- 变更 API 有效行：{valid_count}")
     lines.append(f"- 契约校验失败：{invalid_count}")
     lines.append(f"- 高风险/需关注条目：{len(alerts)}")
-    lines.append(f"- 最终制品 JAR 证据缺失：{len(jar_missing_deps)}")
-    lines.append(f"- JApiCmp 未安装导致未分析：{len(japicmp_missing_deps)}")
-    lines.append(f"- 其他 JApiCmp 失败：{len(other_failed_deps)}")
-    if valid_count:
-        lines.append("- 结论：已生成变更 API 清单，可作为 Step5 调用链分析输入。")
-    elif invalid_count or jar_missing_deps or japicmp_missing_deps or other_failed_deps:
-        lines.append("- 结论：变更 API 清单不完整，需先复核缺失或失败项。")
+    lines.append(f"- 发布 JAR 缺失：{len(jar_missing_deps)}")
+    lines.append(f"- API 对比工具未安装：{len(japicmp_missing_deps)}")
+    lines.append(f"- API 对比工具执行失败：{len(other_failed_deps)}")
+    lines.append(f"- API 对比失败、没有数据：{len(failed_comparisons)}")
+    lines.append(f"- 对比成功且无可见 API 变化：{len(zero_change)}")
+    if (
+        failed_comparisons
+        or invalid_count
+        or jar_missing_deps
+        or japicmp_missing_deps
+        or other_failed_deps
+    ):
+        lines.append(
+            "- 结论：变更 API 清单不完整；成功依赖的 API 行仍有效，"
+            "但失败依赖修复前不能完成全量 Step5 风险判断。"
+        )
+    elif valid_count:
+        lines.append("- 结论：已生成完整变更 API 清单，可作为 Step5 调用链分析输入。")
     else:
         lines.append("- 结论：未发现可进入 Step5 的变更 API。")
     lines.append("")
     lines.append("三、复核入口")
     lines.append(f"- 依赖包选择清单：{os.path.abspath(os.path.join(output_dir, CHANGED_DEPENDENCIES_MD))}")
+    lines.append(f"- 每个依赖的直接结论：{os.path.abspath(os.path.join(output_dir, DEPENDENCY_ANALYSIS_STATUS_MD))}")
+    lines.append(f"- 机器可读状态：{os.path.abspath(os.path.join(output_dir, DEPENDENCY_ANALYSIS_STATUS_JSON))}")
     lines.append(f"- 完整变更 API 清单：{os.path.abspath(os.path.join(output_dir, 'all_changed_apis.csv'))}")
     lines.append(f"- 高风险/需关注 API：{os.path.abspath(alerts_path)}")
-    lines.append(f"- 依赖源码 ref 匹配说明：{os.path.abspath(os.path.join(output_dir, 'git_ref_matches.txt'))}")
-    lines.append(f"- 依赖源码 ref 匹配明细：{os.path.abspath(os.path.join(output_dir, 'git_ref_matches.json'))}")
+    lines.append(f"- 新旧源码版本匹配说明：{os.path.abspath(os.path.join(output_dir, 'git_ref_matches.txt'))}")
+    lines.append(f"- 新旧源码版本匹配明细：{os.path.abspath(os.path.join(output_dir, 'git_ref_matches.json'))}")
     lines.append("")
     lines.append("四、判断口径")
     lines.append("- Step4 只说明依赖 API 发生了什么变化。")
+    lines.append(f"- 是否可以按无变化处理，直接查看 {DEPENDENCY_ANALYSIS_STATUS_MD} 的“可按无变化处理”列。")
+    lines.append("- API 变化清单中没有记录，不代表对比成功；必须同时确认逐依赖结果为“分析完整”。")
     lines.append("- Step4 不证明这些变化是否影响当前系统；是否触达业务代码以 Step5/Step6 为准。")
-    lines.append("- 如提供了依赖源码，需确认 old_version/new_version 命中的 git refs 是否正确。")
+    lines.append("- 如提供了依赖源码，需确认依赖的新旧版本是否匹配到正确的源码版本。")
     lines.append("")
     lines.append("五、运行信息")
     lines.append(f"- 生成时间：{datetime.now().isoformat()}")
     if source_branches:
         lines.append(f"- 主工程分支范围：{source_branches[0]}..{source_branches[1]}")
-        lines.append("- 依赖源码仓库 git diff 默认按依赖自身版本匹配 refs，不直接沿用主工程分支名。")
+        lines.append("- 依赖源码默认按依赖自身的新旧版本确定对比范围，不直接沿用主工程分支名。")
     lines.append("")
     lines.append("附录：统计分布")
     lines.append("")
@@ -6116,7 +6736,7 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
         timeout_items = []
     if gitdiff_runs or gitdiff_skipped or gitdiff_pending:
         lines.append("依赖源码对比")
-        lines.append(f"- 已执行 git diff：{len(gitdiff_runs)}")
+        lines.append(f"- 已完成源码实现对比：{len(gitdiff_runs)}")
         if gitdiff_runs:
             top = sorted(gitdiff_runs, key=lambda x: (-int(x.get("api_changes", 0)), x.get("coord", "")))
             lines.append(f"- 已执行明细（前 {min(20, len(top))} 项）：")
@@ -6135,12 +6755,12 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
                 )
             if len(top) > 20:
                 lines.append(f"  ...（仅展示前 20，共 {len(top)}）")
-        lines.append(f"- 跳过 git diff：{len(gitdiff_skipped)}")
+        lines.append(f"- 未完成源码实现对比：{len(gitdiff_skipped)}")
         if gitdiff_skipped:
             lines.append(f"- 跳过明细（前 {min(20, len(gitdiff_skipped))} 项）：")
             for it in gitdiff_skipped[:20]:
                 recovery = (
-                    "；最终 JAR 方法字节码已补齐行为变化证据"
+                    "；发布 JAR 的方法实现检查已补齐证据"
                     if it.get("behavior_fallback_status") == "complete" else ""
                 )
                 lines.append(f"  - {it.get('coord')}：{it.get('reason')}{recovery}")
@@ -6168,25 +6788,45 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
         lines.append(f"- {k or '未标明类型'}: {v}")
     lines.append("")
     if jar_missing_deps:
-        lines.append(f"最终制品 JAR 证据缺失（前 {min(20, len(jar_missing_deps))} 项）")
+        lines.append(f"发布 JAR 缺失（前 {min(20, len(jar_missing_deps))} 项）")
         for c in jar_missing_deps[:20]:
             lines.append(f"- {c}")
         if len(jar_missing_deps) > 20:
             lines.append(f"...（仅展示前 20，共 {len(jar_missing_deps)}）")
         lines.append("")
     if japicmp_missing_deps:
-        lines.append(f"JApiCmp 未安装导致未分析（前 {min(20, len(japicmp_missing_deps))} 项）")
+        lines.append(f"API 对比工具未安装（前 {min(20, len(japicmp_missing_deps))} 项）")
         for c in japicmp_missing_deps[:20]:
             lines.append(f"- {c}")
         if len(japicmp_missing_deps) > 20:
             lines.append(f"...（仅展示前 20，共 {len(japicmp_missing_deps)}）")
         lines.append("")
     if other_failed_deps:
-        lines.append(f"其他 JApiCmp 失败（前 {min(20, len(other_failed_deps))} 项）")
+        lines.append(f"API 对比工具执行失败（前 {min(20, len(other_failed_deps))} 项）")
         for c in other_failed_deps[:20]:
             lines.append(f"- {c}")
         if len(other_failed_deps) > 20:
             lines.append(f"...（仅展示前 20，共 {len(other_failed_deps)}）")
+        lines.append("")
+    if failed_comparisons:
+        lines.append(
+            f"API 对比失败、没有数据"
+            f"（前 {min(50, len(failed_comparisons))} 项）"
+        )
+        lines.append(
+            "以下依赖不能解释为零变化；完整字段见 "
+            f"{DEPENDENCY_ANALYSIS_STATUS_JSON}。"
+        )
+        for item in failed_comparisons[:50]:
+            lines.append(
+                f"- {item.get('coord')}："
+                "结果=API 对比失败，不能按无变化处理；"
+                f"诊断标识={item.get('reason_code') or 'BINARY_API_COMPARISON_FAILED'}；"
+                f"技术原因={item.get('failure_message') or '-'}；"
+                f"证据={item.get('evidence_path') or '-'}"
+            )
+        if len(failed_comparisons) > 50:
+            lines.append(f"...（仅展示前 50，共 {len(failed_comparisons)}）")
         lines.append("")
     if changed_deps_missing_source:
         uniq = {}
@@ -6201,7 +6841,10 @@ def write_readable_outputs(dep_rows, output_dir, all_apis, jar_missing_deps,
             lines.append(f"...（仅展示前 20，共 {len(items)}）")
         lines.append("")
     if zero_change:
-        lines.append(f"版本已变更但未发现 API 变化（前 {min(50, len(zero_change))} 项）")
+        lines.append(
+            f"API 对比成功且未发现可见变化"
+            f"（前 {min(50, len(zero_change))} 项）"
+        )
         for c in zero_change[:50]:
             lines.append(f"- {c}")
         if len(zero_change) > 50:
@@ -6559,14 +7202,14 @@ def main():
             "step4",
             "preflight",
             (
-                f"{len(preflight_gitdiff_skipped)} 个依赖的源码辅助对比不可用，"
-                "已自动切换到最终制品 JAR 分析"
+                f"{len(preflight_gitdiff_skipped)} 个依赖的源码实现对比不可用，"
+                "已自动切换到发布 JAR 分析"
             ),
             elapsed=step_timer.elapsed(),
         )
         print(
-            f"  ℹ️  {len(preflight_gitdiff_skipped)} 个依赖的源码辅助对比不可用；"
-            "系统将自动执行 JAR 二进制与方法字节码分析，无需用户处理。",
+            f"  ℹ️  {len(preflight_gitdiff_skipped)} 个依赖的源码实现对比不可用；"
+            "系统将自动检查发布 JAR 的 API 和方法实现，无需用户处理。",
             file=sys.stderr,
         )
 
@@ -6612,7 +7255,7 @@ def main():
                 install_error,
                 planned_dependencies,
             )
-            print("\n❌ JApiCmp 不可用，无法执行 Java 升级分析。", file=sys.stderr)
+            print("\n❌ API 对比工具（JApiCmp）不可用，无法执行 Java 升级分析。", file=sys.stderr)
             print(f"   自动安装失败原因：{install_error}", file=sys.stderr)
             print("   已记录为系统环境阻塞；不会要求用户确认降级，也不会生成不完整 API 结论。", file=sys.stderr)
             timing.record("step4.total", status="blocked_by_system_japicmp_missing", elapsed=step_timer.elapsed())
@@ -6818,13 +7461,13 @@ def main():
             source_skip_timer = time.perf_counter()
             result["gitdiff_skipped"].append(dict(preflight_source_skip))
             print(
-                f"    ℹ️  {coord} 的源码辅助对比不可用，切换到最终制品 JAR 分析。",
+                f"    ℹ️  {coord} 的源码实现对比不可用，切换到发布 JAR 分析。",
                 file=sys.stderr,
             )
             emit_progress(
                 "step4",
                 "gitdiff",
-                "源码辅助对比不可用，已切换到最终制品 JAR 分析",
+                "源码实现对比不可用，已切换到发布 JAR 分析",
                 current=i,
                 total=total_dependencies,
                 elapsed=time.perf_counter() - source_skip_timer,
@@ -6857,7 +7500,7 @@ def main():
             emit_progress(
                 "step4",
                 "gitdiff",
-                f"开始源码 diff：{coord}",
+                f"开始源码实现对比：{coord}",
                 current=i,
                 total=total_dependencies,
                 item=coord,
@@ -6923,13 +7566,13 @@ def main():
                     source_skip_for_behavior = dict(internal_skipped[0])
                     result["gitdiff_skipped"].extend(internal_skipped)
                     print(
-                        "    ℹ️  源码版本在正式对比时失效，已自动切换到最终制品 JAR 分析。",
+                        "    ℹ️  源码版本在正式对比时失效，已自动切换到发布 JAR 分析。",
                         file=sys.stderr,
                     )
                     emit_progress(
                         "step4",
                         "gitdiff",
-                        "源码版本解析故障，已切换到最终制品 JAR 分析",
+                        "源码版本解析故障，已切换到发布 JAR 分析",
                         current=i,
                         total=total_dependencies,
                         elapsed=time.perf_counter() - gitdiff_timer,
@@ -6950,11 +7593,11 @@ def main():
             elif gitdiff_result.get("status") == "error":
                 gitdiff_status = "error"
                 gitdiff_details = err or ""
-                print(f"    ⚠️  git diff 失败：{err}", file=sys.stderr)
+                print(f"    ⚠️  源码实现对比失败：{err}", file=sys.stderr)
                 emit_progress(
                     "step4",
                     "gitdiff",
-                    f"源码 diff 失败：{err}",
+                    f"源码实现对比失败：{err}",
                     current=i,
                     total=total_dependencies,
                     elapsed=time.perf_counter() - gitdiff_timer,
@@ -6968,7 +7611,7 @@ def main():
                     "reason_code": "DEPENDENCY_SOURCE_DIFF_UNAVAILABLE",
                     "resolution": "continue_with_final_artifact_analysis",
                     "user_attention_required": False,
-                    "evidence_impact": "源码证据暂缺；等待最终 JAR 方法字节码兜底结果",
+                    "evidence_impact": "源码证据暂缺；等待发布 JAR 的方法实现检查结果",
                     "repo_path": meta.get("repo_path") or source_mapping.get("repo_path", ""),
                     "module_path": meta.get("module_path") or source_mapping.get("module_path", ""),
                     "old_candidates": meta.get("old_candidates") or [],
@@ -6993,14 +7636,14 @@ def main():
                 behavior_changed = sum(1 for a in apis if a.get("change_type") == "BEHAVIOR_CHANGED")
                 structural_changed = len(apis) - behavior_changed
                 print(
-                    f"    → {len(apis)} 个源码差异（含 behavior_changed={behavior_changed}, "
-                    f"structural={structural_changed}；待 jar truth 过滤）",
+                    f"    → {len(apis)} 个源码差异（实现变化={behavior_changed}，"
+                    f"结构变化={structural_changed}；等待发布 JAR 结果核验）",
                     file=sys.stderr,
                 )
                 emit_progress(
                     "step4",
                     "gitdiff",
-                    f"源码 diff 完成，提取 {len(apis)} 个变化，待 jar truth 过滤，behavior_changed={behavior_changed}",
+                    f"源码实现对比完成，发现 {len(apis)} 个变化，等待发布 JAR 结果核验，涉及实现变化的文件={behavior_changed}",
                     current=i,
                     total=total_dependencies,
                     elapsed=time.perf_counter() - gitdiff_timer,
@@ -7088,8 +7731,16 @@ def main():
                     'coord': coord,
                     'status': 'failed',
                     'mode': 'old_jar_export',
+                    'old_version': old_ver,
+                    'new_version': new_ver,
+                    'change_type': change,
+                    'api_count': 0,
+                    'evidence_path': os.path.abspath(removed_out_file),
                     'error': err,
-                    'reason_code': str((jar_info or {}).get('reason_code') or ''),
+                    'reason_code': str(
+                        (jar_info or {}).get('reason_code')
+                        or 'OLD_JAR_SYMBOL_EXPORT_FAILED'
+                    ),
                     'old_jar_evidence': (jar_info or {}).get('old_jar_evidence') or {},
                 })
                 print(f"    ⚠️  removed jar 旧版符号导出失败：{err}", file=sys.stderr)
@@ -7108,6 +7759,11 @@ def main():
                     'coord': coord,
                     'status': 'success',
                     'mode': 'old_jar_export',
+                    'old_version': old_ver,
+                    'new_version': new_ver,
+                    'change_type': change,
+                    'api_count': len(apis),
+                    'evidence_path': os.path.abspath(removed_out_file),
                     'old_jar_source': str((jar_info or {}).get('old_jar_source') or ''),
                 })
                 dependency_raw_apis.extend(apis)
@@ -7140,13 +7796,13 @@ def main():
                 old_version=old_ver,
                 new_version=new_ver,
                 status="running",
-                message=f"正在执行 JApiCmp 二进制 API 对比：{coord}",
+                message=f"正在执行发布 JAR API 对比：{coord}",
                 details={"dependency_index": i, "dependency_total": total_dependencies},
             )
             emit_progress(
                 "step4",
                 "japicmp",
-                f"开始二进制对比：{coord}",
+                f"开始 API 对比：{coord}",
                 current=i,
                 total=total_dependencies,
                 item=coord,
@@ -7176,6 +7832,11 @@ def main():
                 'coord': coord,
                 'status': 'failed' if err else 'success',
                 'mode': 'japicmp',
+                'old_version': old_ver,
+                'new_version': new_ver,
+                'change_type': change,
+                'api_count': len(apis),
+                'evidence_path': os.path.abspath(_out_file),
                 'old_jar_source': str((jar_info or {}).get('old_jar_source') or ''),
                 'new_jar_source': str((jar_info or {}).get('new_jar_source') or ''),
                 'parser_mode': str((jar_info or {}).get('parser_mode') or ''),
@@ -7184,7 +7845,10 @@ def main():
                 'japicmp_version': str((jar_info or {}).get('japicmp_version') or ''),
                 'japicmp_sha256': str((jar_info or {}).get('japicmp_sha256') or ''),
                 'error': str(err or ''),
-                'reason_code': str((jar_info or {}).get('reason_code') or ''),
+                'reason_code': str(
+                    (jar_info or {}).get('reason_code')
+                    or (JAPICMP_EXECUTION_FAILED if err else '')
+                ),
                 'old_jar_evidence': (jar_info or {}).get('old_jar_evidence') or {},
                 'new_jar_evidence': (jar_info or {}).get('new_jar_evidence') or {},
             })
@@ -7228,11 +7892,11 @@ def main():
                         details=str(e)[:200],
                     )
             if err:
-                print(f"    ⚠️  JApiCmp 失败：{err}", file=sys.stderr)
+                print(f"    ⚠️  API 对比工具执行失败：{err}", file=sys.stderr)
                 emit_progress(
                     "step4",
                     "japicmp",
-                    f"二进制对比失败：{err}",
+                    f"API 对比失败：{err}",
                     current=i,
                     total=total_dependencies,
                     elapsed=time.perf_counter() - japicmp_timer,
@@ -7256,11 +7920,11 @@ def main():
                             }
                         )
             else:
-                print(f"    → {len(apis)} 个 binary incompatible 变更", file=sys.stderr)
+                print(f"    → 发现 {len(apis)} 个二进制不兼容 API 变化", file=sys.stderr)
                 emit_progress(
                     "step4",
                     "japicmp",
-                    f"二进制对比完成，提取 {len(apis)} 个变化",
+                    f"API 对比完成，发现 {len(apis)} 个变化",
                     current=i,
                     total=total_dependencies,
                     elapsed=time.perf_counter() - japicmp_timer,
@@ -7355,7 +8019,7 @@ def main():
                 old_version=old_ver,
                 new_version=new_ver,
                 status="running",
-                message=f"正在执行最终 JAR 方法字节码行为对比：{coord}",
+                message=f"正在检查发布 JAR 的方法实现变化：{coord}",
             )
             if dependency_old_jar and dependency_new_jar:
                 try:
@@ -7406,23 +8070,23 @@ def main():
                         skipped_item["behavior_fallback_status"] = "complete"
                         skipped_item["behavior_fallback_evidence"] = behavior_run["evidence_path"]
                         skipped_item["evidence_impact"] = (
-                            "源码 git diff 未完成；最终 JAR 方法字节码对比已补齐行为变化识别"
+                            "源码实现对比未完成；发布 JAR 的方法实现检查已补齐变化识别"
                         )
                 print(
-                    f"    → 最终 JAR 方法字节码兜底完成：行为变化候选={len(behavior_rows)}",
+                    f"    → 发布 JAR 的方法实现检查完成：发现 {len(behavior_rows)} 个变化候选",
                     file=sys.stderr,
                 )
             else:
                 print(
-                    "    ⚠️  最终 JAR 方法字节码兜底未完成；将禁止完整/无影响结论。",
+                    "    ⚠️  发布 JAR 的方法实现检查未完成；当前不能形成完整或无影响结论。",
                     file=sys.stderr,
                 )
             emit_progress(
                 "step4",
                 "behavior-bytecode",
                 (
-                    f"最终 JAR 方法字节码兜底{('完成' if behavior_run['status'] == 'complete' else '证据不足')}，"
-                    f"变化候选={len(behavior_rows)}"
+                    f"发布 JAR 的方法实现检查{('完成' if behavior_run['status'] == 'complete' else '证据不足')}，"
+                    f"发现变化候选={len(behavior_rows)}"
                 ),
                 current=i,
                 total=total_dependencies,
@@ -7453,7 +8117,7 @@ def main():
                 old_version=old_ver,
                 new_version=new_ver,
                 status="running",
-                message=f"正在用最终 JAR 事实过滤源码 diff：{coord}",
+                message=f"正在用发布 JAR 结果核验源码实现变化：{coord}",
             )
             accepted_source_apis, rejected_source_apis = filter_gitdiff_rows_with_jar_truth(
                 dependency_gitdiff_apis,
@@ -7473,14 +8137,14 @@ def main():
                     run_item["auxiliary_only"] = len(rejected_source_apis)
                     run_item["auxiliary_only_file"] = os.path.abspath(aux_path) if aux_path else ""
             print(
-                f"    → 源码 diff 经 jar truth 过滤：进入 Step5={len(accepted_source_apis)}，"
+                f"    → 源码实现变化经发布 JAR 核验：进入后续分析={len(accepted_source_apis)}，"
                 f"辅助证据={len(rejected_source_apis)}",
                 file=sys.stderr,
             )
             emit_progress(
                 "step4",
                 "gitdiff",
-                f"源码 diff jar truth 过滤完成，promoted={len(accepted_source_apis)}，auxiliary={len(rejected_source_apis)}",
+                f"源码实现变化核验完成，进入后续分析={len(accepted_source_apis)}，仅作辅助证据={len(rejected_source_apis)}",
                 current=i,
                 total=total_dependencies,
                 item=coord,
@@ -7543,6 +8207,64 @@ def main():
         )
         return result
 
+    def dependency_worker_failure(index, row, exc):
+        coord = str((row or {}).get("coord") or "").strip()
+        old_version = str((row or {}).get("old_version") or "").strip()
+        new_version = str((row or {}).get("new_version") or "").strip()
+        message = f"{type(exc).__name__}: {exc}"[:500]
+        print(
+            f"    ⚠️  依赖 worker 异常，已记录为数据不可用：{coord}：{message}",
+            file=sys.stderr,
+        )
+        timing.record(
+            "dependency.total",
+            coord=coord,
+            old_version=old_version,
+            new_version=new_version,
+            status="error",
+            details={
+                "reason_code": "STEP4_DEPENDENCY_WORKER_FAILED",
+                "error": message,
+            },
+        )
+        return {
+            "index": index,
+            "all_apis": [],
+            "jar_missing_deps": [],
+            "japicmp_missing_deps": [],
+            "other_failed_deps": [coord] if coord else [],
+            "changed_classes_by_coord": {},
+            "changed_classes_errors": [],
+            "changed_deps_missing_source": [],
+            "gitdiff_runs": [],
+            "gitdiff_skipped": [],
+            "gitdiff_pending": [],
+            "bytecode_behavior_runs": [],
+            "timeout_items": [],
+            "binary_runs": [{
+                "coord": coord,
+                "status": "failed",
+                "mode": "dependency_worker",
+                "old_version": old_version,
+                "new_version": new_version,
+                "change_type": str((row or {}).get("change_type") or ""),
+                "api_count": 0,
+                "reason_code": "STEP4_DEPENDENCY_WORKER_FAILED",
+                "error": message,
+                "evidence_path": "",
+            }],
+            "per_dependency_record": {
+                "coord": coord,
+                "dep_row": {
+                    key: value for key, value in dict(row or {}).items()
+                    if not str(key).startswith("_step4_")
+                },
+                "raw_rows": [],
+                "removed_jar_export": {},
+                "gitdiff_auxiliary_rows": [],
+            } if coord else None,
+        }
+
     per_dependency_records = {}
     task_results = []
     dependencies_timer = time.perf_counter()
@@ -7557,20 +8279,40 @@ def main():
     )
     if workers == 1:
         for i, row in enumerate(prepared_dep_rows, 1):
-            task_results.append(process_dependency(i, row))
+            try:
+                task_results.append(process_dependency(i, row))
+            except Exception as exc:
+                task_results.append(dependency_worker_failure(i, row, exc))
     else:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="step4-dep") as executor:
-            futures = [
-                executor.submit(process_dependency, i, row)
+            futures = {
+                executor.submit(process_dependency, i, row): (i, row)
                 for i, row in enumerate(prepared_dep_rows, 1)
-            ]
+            }
             for future in as_completed(futures):
-                task_results.append(future.result())
+                index, row = futures[future]
+                try:
+                    task_results.append(future.result())
+                except Exception as exc:
+                    task_results.append(
+                        dependency_worker_failure(index, row, exc)
+                    )
+    worker_failure_count = sum(
+        1
+        for result in task_results
+        for run in (result.get("binary_runs") or [])
+        if run.get("mode") == "dependency_worker"
+        and run.get("status") == "failed"
+    )
     timing.record(
         "dependencies.process_all",
-        status="success",
+        status="partial" if worker_failure_count else "success",
         elapsed=time.perf_counter() - dependencies_timer,
-        details={"dependencies": len(prepared_dep_rows), "workers": workers},
+        details={
+            "dependencies": len(prepared_dep_rows),
+            "workers": workers,
+            "worker_failures": worker_failure_count,
+        },
     )
 
     for item in sorted(task_results, key=lambda value: value.get("index") or 0):
@@ -7597,6 +8339,22 @@ def main():
     gitdiff_pending, late_gitdiff_skipped = partition_git_ref_pending_items(gitdiff_pending)
     gitdiff_skipped.extend(late_gitdiff_skipped)
 
+    dependency_status_rows, dependency_status_csv, dependency_status_json = (
+        write_dependency_analysis_status(
+            prepared_dep_rows,
+            binary_runs,
+            args.output_dir,
+            gitdiff_runs=gitdiff_runs,
+            gitdiff_skipped=gitdiff_skipped,
+            gitdiff_pending=gitdiff_pending,
+            bytecode_behavior_runs=bytecode_behavior_runs,
+            changed_deps_missing_source=changed_deps_missing_source,
+        )
+    )
+    dependency_status_by_coord = {
+        item["coord"]: item for item in dependency_status_rows
+    }
+
     # 写入汇总文件
     write_all_timer = time.perf_counter()
     timing.record(
@@ -7607,7 +8365,11 @@ def main():
     )
     csv_file, valid_count, invalid_count = write_all_changed_apis(
         all_apis, args.output_dir)
-    write_changed_dependencies(load_csv(csv_file), args.output_dir)
+    write_changed_dependencies(
+        load_csv(csv_file),
+        args.output_dir,
+        dependency_status_rows=dependency_status_rows,
+    )
     timing.record(
         "write.all_changed_apis",
         status="success",
@@ -7630,6 +8392,7 @@ def main():
             raw_rows=item.get("raw_rows") or [],
             removed_jar_export=item.get("removed_jar_export") or None,
             gitdiff_auxiliary_rows=item.get("gitdiff_auxiliary_rows") or [],
+            dependency_analysis=dependency_status_by_coord.get(coord) or {},
         )
     timing.record(
         "write.per_dependency_outputs",
@@ -7675,9 +8438,14 @@ def main():
     print(f"\nStep 4 完成：", file=sys.stderr)
     print(f"  变更 API 总数：{valid_count}", file=sys.stderr)
     print(f"  数据验证失败：{invalid_count} 行", file=sys.stderr)
-    print(f"  最终制品 JAR 证据缺失：{len(jar_missing_deps)} 个依赖", file=sys.stderr)
-    print(f"  JApiCmp 未安装：{len(japicmp_missing_deps)} 个依赖", file=sys.stderr)
-    print(f"  其他 JApiCmp 失败：{len(other_failed_deps)} 个依赖", file=sys.stderr)
+    print(f"  发布 JAR 缺失：{len(jar_missing_deps)} 个依赖", file=sys.stderr)
+    print(f"  API 对比工具未安装：{len(japicmp_missing_deps)} 个依赖", file=sys.stderr)
+    print(f"  API 对比工具执行失败：{len(other_failed_deps)} 个依赖", file=sys.stderr)
+    print(f"  逐依赖对比状态：{dependency_status_csv}", file=sys.stderr)
+    print(
+        f"  用户直接结论：{Path(args.output_dir) / DEPENDENCY_ANALYSIS_STATUS_MD}",
+        file=sys.stderr,
+    )
     print(f"  源码版本待用户确认：{len(gitdiff_pending)} 个依赖", file=sys.stderr)
     print(f"  超时项：{len(timeout_items)}", file=sys.stderr)
     print(f"  输出：{csv_file}", file=sys.stderr)
@@ -7717,18 +8485,46 @@ def main():
             indent=2,
         )
 
-    binary_failures = [item for item in binary_runs if item.get('status') != 'success']
+    primary_binary_status_rows = [
+        item for item in dependency_status_rows
+        if item.get('comparison_status') != 'not_applicable'
+    ]
+    binary_failures = [
+        item for item in primary_binary_status_rows
+        if item.get('comparison_status') == 'failed'
+    ]
+    auxiliary_binary_failures = [
+        item for item in binary_runs
+        if item.get('mode') not in {'japicmp', 'old_jar_export', 'dependency_worker'}
+        and item.get('status') != 'success'
+    ]
+    coverage_binary_failures = [
+        *binary_failures,
+        *auxiliary_binary_failures,
+    ]
     binary_failure_reason_codes = sorted({
         str(item.get('reason_code') or '').strip()
-        for item in binary_failures
+        for item in coverage_binary_failures
         if str(item.get('reason_code') or '').strip()
     })
     text_fallbacks = [item for item in binary_runs if item.get('parser_mode') == 'text_fallback']
     missing_classes_ignored = [item for item in binary_runs if item.get('missing_class_policy') == 'ignored']
+    successful_binary_status_rows = [
+        item for item in primary_binary_status_rows
+        if item.get('comparison_status') in {'changes_detected', 'no_api_change'}
+    ]
+    zero_change_status_rows = [
+        item for item in primary_binary_status_rows
+        if item.get('comparison_status') == 'no_api_change'
+    ]
     binary_status = (
-        'insufficient' if binary_runs and len(binary_failures) == len(binary_runs)
-        else ('partial' if binary_failures or text_fallbacks or missing_classes_ignored else 'complete')
-    ) if binary_runs else 'not_applicable'
+        'insufficient' if primary_binary_status_rows and len(binary_failures) == len(primary_binary_status_rows)
+        else (
+            'partial'
+            if coverage_binary_failures or text_fallbacks or missing_classes_ignored
+            else 'complete'
+        )
+    ) if primary_binary_status_rows else 'not_applicable'
     behavior_expected = [
         row for row in prepared_dep_rows
         if row.get('coord') in dependency_paths
@@ -7761,19 +8557,26 @@ def main():
         'binary_api_diff': {
             'status': binary_status,
             'reason_codes': (
-                (['japicmp_or_old_jar_failed'] if binary_failures else [])
+                (['japicmp_or_old_jar_failed'] if coverage_binary_failures else [])
                 + binary_failure_reason_codes
                 + (['JAPICMP_TEXT_FALLBACK_USED'] if text_fallbacks else [])
                 + (['JAPICMP_MISSING_CLASSES_IGNORED'] if missing_classes_ignored else [])
             ),
             'metrics': {
-                'planned_dependencies': len(binary_runs),
-                'successful_dependencies': len(binary_runs) - len(binary_failures),
+                'planned_dependencies': len(primary_binary_status_rows),
+                'successful_dependencies': len(successful_binary_status_rows),
                 'failed_dependencies': len(binary_failures),
+                'zero_change_dependencies': len(zero_change_status_rows),
+                'auxiliary_failed_checks': len(auxiliary_binary_failures),
                 'text_fallbacks': len(text_fallbacks),
                 'missing_classes_ignored': len(missing_classes_ignored),
             },
             'runs': binary_runs,
+            'dependency_status_artifacts': [
+                str(dependency_status_csv),
+                str(dependency_status_json),
+                str(Path(args.output_dir) / DEPENDENCY_ANALYSIS_STATUS_MD),
+            ],
         },
         'behavior_diff': {
             'status': behavior_status,
@@ -7807,6 +8610,27 @@ def main():
             'runs': bytecode_behavior_runs,
         },
     }
+    for component_name in ('binary_api_diff', 'behavior_diff'):
+        step4_coverage[component_name] = normalize_component_reason_codes(
+            step4_coverage.get(component_name)
+        )
+    step4_reason_codes = sorted({
+        reason_code
+        for component_name in ('binary_api_diff', 'behavior_diff')
+        for reason_code in (
+            step4_coverage.get(component_name, {}).get('reason_codes') or ()
+        )
+    })
+    step4_coverage.update({
+        'origin_step': 'step4',
+        'diagnostic_contract': diagnostic_contract_metadata(),
+        'diagnostic_guidance_schema': REASON_GUIDANCE_SCHEMA,
+        'diagnostic_guidance': build_catalog_guidance(
+            step4_reason_codes,
+            origin_step='step4',
+            source_components=('binary_api_diff', 'behavior_diff'),
+        ),
+    })
     coverage_output = Path(args.coverage_output) if args.coverage_output else default_coverage_output_path(args.output_dir)
     coverage_write_timer = time.perf_counter()
     timing.record(
@@ -7846,6 +8670,7 @@ def main():
         gitdiff_pending=gitdiff_pending,
         timeout_items=timeout_items,
         source_branches=args.source_branches,
+        dependency_status_rows=dependency_status_rows,
     )
     timing.record(
         "write.readable_outputs",
@@ -7893,24 +8718,30 @@ def main():
         for item in changed_deps_missing_source:
             uniq[item["coord"]] = item
         items = list(uniq.values())
-        print(f"\n⚠️  升级依赖缺少源码路径映射：{len(items)} 个", file=sys.stderr)
-        print("影响：这部分依赖无法通过 git diff 识别“签名不变的行为变更”。", file=sys.stderr)
+        print(f"\n⚠️  升级依赖未提供源码：{len(items)} 个", file=sys.stderr)
+        print("影响：这部分依赖无法通过源码识别“签名不变的实现变化”。", file=sys.stderr)
         for it in items[:10]:
             print(f"  - {it['coord']} ({it['old_version']}→{it['new_version']})", file=sys.stderr)
         print(
-            "系统处理：记录源码证据缺口，并继续最终制品 JAR 分析；"
+            "系统处理：记录源码证据缺口，并继续发布 JAR 分析；"
             "证据不足时限制最终结论。",
             file=sys.stderr,
         )
         print(
-            "可选增强（不阻塞）：如需提高源码行为覆盖率，可在报告生成后补充依赖源码并重跑 Step4。",
+            "可选增强（不阻塞）：如需提高实现变化覆盖率，可补充依赖源码并重跑 Step4。",
             file=sys.stderr,
         )
 
     # 输出摘要，真正的交互暂停由 run_step.py 统一处理
-    human_checkpoint_1(dep_rows, all_apis, args.output_dir)
+    human_checkpoint_1(
+        dep_rows,
+        all_apis,
+        args.output_dir,
+        dependency_status_rows=dependency_status_rows,
+    )
     print(
-        "\nStep4 证据文件：changed_dependencies.md、summary.txt、all_changed_apis.csv、git_ref_matches.*",
+        "\nStep4 证据文件：dependency_analysis_status.*、changed_dependencies.md、"
+        "summary.txt、all_changed_apis.csv、git_ref_matches.*",
         file=sys.stderr,
     )
     emit_progress(

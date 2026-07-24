@@ -1152,7 +1152,18 @@ class Step5KeyMatchingTest(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertNotIn(step5.STEP_INTERACTION_PREFIX, stdout.getvalue())
             self.assertIn("系统环境阻塞", stderr.getvalue())
-            self.assertTrue((output_dir / "tree_sitter_preflight.json").exists())
+            preflight_path = output_dir / "tree_sitter_preflight.json"
+            self.assertTrue(preflight_path.exists())
+            preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                preflight["reason_code"],
+                "STEP5_TREE_SITTER_MISSING_NEED_RESOLUTION",
+            )
+            self.assertEqual(
+                preflight["reason_code_aliases"],
+                ["step5_tree_sitter_missing_need_resolution"],
+            )
+            self.assertEqual(preflight["origin_step"], "step5")
 
     def _compile_java_fixture(self, tmp, relative_path, source):
         if not shutil.which("javac"):
@@ -6423,7 +6434,7 @@ public class com.example.TargetBridge {
         }
         failure = EvidenceFailure(
             stage="spring_aop_activation",
-            reason_code="SPRING_PACKAGED_CLASS_AMBIGUOUS",
+            reason_code="SPRING_RUNTIME_CLASS_AMBIGUOUS",
             blocking=True,
             class_name="demo.Affected",
             scope="path",
@@ -6468,7 +6479,7 @@ public class com.example.TargetBridge {
         self.assertEqual((failure,), affected.envelope_failures)
         self.assertFalse(unrelated.envelope_failures)
         self.assertEqual(
-            "SPRING_PACKAGED_CLASS_AMBIGUOUS",
+            "SPRING_RUNTIME_CLASS_AMBIGUOUS",
             affected_result.reason_code,
         )
         self.assertEqual("not_analyzed", affected_result.analysis_status)
@@ -11950,6 +11961,11 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
             {"RUNTIME_DEPENDENCY_JARS_UNAVAILABLE": 1},
             summary["not_analyzed_reason_summary"],
         )
+        self.assertEqual("step5", summary["origin_step"])
+        self.assertEqual(
+            "UPPER_SNAKE_CASE",
+            summary["diagnostic_contract"]["reason_code_style"],
+        )
 
     def test_summary_api_entry_hides_unmatched_internal_tier(self):
         entry = formatter.trace_result_to_api_entry(
@@ -12410,6 +12426,11 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
 
         self.assertEqual(entry["match_provenance"], "polymorphic")
         self.assertEqual(entry["match_tier"], 2)
+        self.assertEqual(entry["origin_step"], "step5")
+        self.assertEqual(
+            entry["diagnostic_schema"],
+            "java-upgrade-analyzer.diagnostic.v1",
+        )
 
     def test_is_system_code_touched_recognizes_formatter_callback_entry(self):
         method_def = SimpleNamespace(
@@ -14813,6 +14834,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                      "entries": [],
                      "status": "complete",
                  }), \
+                 patch.object(step5, "fatal_business_bytecode_failures", return_value=[]), \
                  patch.object(step5, "build_enhanced_source_graph", return_value=graph_result), \
                  patch.object(
                      step5,
@@ -14840,6 +14862,15 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 self.assertTrue(details_path.exists())
                 details = json.loads(details_path.read_text(encoding="utf-8"))
                 self.assertEqual(details.get("status"), "degraded")
+                self.assertEqual(
+                    details.get("reason_code"),
+                    "STEP5_DEPENDENCY_SOURCE_MAPPING_MISSING",
+                )
+                self.assertEqual(
+                    details.get("reason_code_aliases"),
+                    ["step5_dependency_source_mapping_missing"],
+                )
+                self.assertEqual(details.get("origin_step"), "step5")
                 self.assertEqual(
                     details.get("resolution"),
                     "continue_with_final_artifact_bytecode_and_restricted_conclusion",
@@ -14973,6 +15004,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                      "entries": [],
                      "status": "complete",
                  }), \
+                 patch.object(step5, "fatal_business_bytecode_failures", return_value=[]), \
                  patch.object(step5, "trace_all_apis_with_confidence_weighting", return_value=[fake_result]), \
                  patch.object(step5, "generate_enhanced_summary", return_value=None):
                 exit_code = step5.step5_integrated_main(args)
@@ -15055,6 +15087,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                      "entries": [],
                      "status": "complete",
                  }), \
+                 patch.object(step5, "fatal_business_bytecode_failures", return_value=[]), \
                  patch.object(step5, "align_dependency_source_mappings", return_value={
                      "mappings": [f"com.example:demo={dep_source_dir}"],
                      "allowed_classes_by_coord": {"com.example:demo": {"com.example.Target"}},
@@ -15152,6 +15185,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                      "entries": [],
                      "status": "complete",
                  }), \
+                 patch.object(step5, "fatal_business_bytecode_failures", return_value=[]), \
                  patch.object(step5, "align_dependency_source_mappings", return_value={
                      "mappings": [f"com.example:used={used_dep_dir}"],
                      "allowed_classes_by_coord": {"com.example:used": {"com.example.Used"}},
@@ -18734,6 +18768,8 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                     "status": "complete",
                 },
             ), patch.object(step5, "build_enhanced_source_graph", return_value=fake_graph_result), patch.object(
+                step5, "fatal_business_bytecode_failures", return_value=[]
+            ), patch.object(
                 step5,
                 "check_apis_that_need_bridge",
                 return_value={"sample:dep:com.example.Api.call": {"needs_bridge": False, "has_dependency_source_mapping": True, "reason": ""}},

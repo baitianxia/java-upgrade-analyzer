@@ -133,6 +133,18 @@ class ProgressLoggingTest(unittest.TestCase):
                 return_value=graph_result,
             ), patch.object(
                 step5,
+                "build_runtime_dependency_catalog",
+                return_value={
+                    "status": "complete",
+                    "entries": [],
+                    "by_coord": {},
+                },
+            ), patch.object(
+                step5,
+                "fatal_business_bytecode_failures",
+                return_value=[],
+            ), patch.object(
+                step5,
                 "check_apis_that_need_bridge",
                 return_value={},
             ), patch.object(

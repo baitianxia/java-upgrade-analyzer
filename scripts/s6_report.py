@@ -19,6 +19,7 @@ from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
 from csv_io import open_csv_read, open_csv_write
+from diagnostic_contract import canonical_reason_code
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -35,7 +36,9 @@ from pipeline_constants import (
 )
 from reason_guidance import (
     REASON_GUIDANCE_SCHEMA,
+    build_catalog_guidance,
     build_diagnostic_guidance_from_summary,
+    guidance_for_reason_code,
 )
 
 S6_INLINE_LIMIT = 20
@@ -325,7 +328,9 @@ def _csv_cell(value):
 def summarize_item_reason_codes(items):
     counts = defaultdict(int)
     for item in items or []:
-        counts[item.get("reason_code") or "UNKNOWN"] += 1
+        counts[
+            canonical_reason_code(item.get("reason_code") or "UNKNOWN")
+        ] += 1
     return dict(sorted(counts.items(), key=lambda x: (-x[1], x[0])))
 
 
@@ -1313,14 +1318,24 @@ def collect_findings(d):
             diagnostic_guidance = build_diagnostic_guidance_from_summary(
                 call_summary
             )
-        findings['diagnostic_guidance_schema'] = str(
-            call_summary.get('diagnostic_guidance_schema')
-            or REASON_GUIDANCE_SCHEMA
-        )
-        findings['diagnostic_guidance'] = [
-            dict(item) for item in diagnostic_guidance
-            if isinstance(item, dict)
-        ]
+        findings['diagnostic_guidance_schema'] = REASON_GUIDANCE_SCHEMA
+        normalized_guidance = []
+        for item in diagnostic_guidance:
+            if not isinstance(item, dict):
+                continue
+            definition = guidance_for_reason_code(
+                item.get('reason_code') or 'UNKNOWN',
+                origin_step=item.get('origin_step') or '',
+            )
+            normalized_guidance.append({
+                **definition,
+                **dict(item),
+                'reason_code': definition['reason_code'],
+                'reason_code_aliases': definition['reason_code_aliases'],
+                'diagnostic_schema': definition['diagnostic_schema'],
+                'diagnostic_contract': definition['diagnostic_contract'],
+            })
+        findings['diagnostic_guidance'] = normalized_guidance
         if not findings.get('coverage'):
             findings['coverage'] = _step5_summary_coverage_fallback(call_summary)
         findings['user_conclusion_summary'] = dict(call_summary.get('user_conclusion_summary') or {})
@@ -1346,7 +1361,9 @@ def collect_findings(d):
                 'change_type': api_info.get('change_type', ''),
                 'severity': api_info.get('severity', ''),
                 'call_paths': api_info.get('call_paths', []),
-                'reason_code': api_info.get('reason_code', ''),
+                'reason_code': canonical_reason_code(
+                    api_info.get('reason_code') or 'UNKNOWN'
+                ),
                 'reason': api_info.get('reason', ''),
                 'user_conclusion': api_info.get('user_conclusion', ''),
                 'user_reason': api_info.get('user_reason', ''),
@@ -1365,7 +1382,9 @@ def collect_findings(d):
                 'symbol_kind':   api_info.get('symbol_kind', ''),
                 'change_type':   api_info.get('change_type', ''),
                 'call_paths':    api_info.get('call_paths', []),
-                'reason_code':   api_info.get('reason_code', ''),
+                'reason_code': canonical_reason_code(
+                    api_info.get('reason_code') or 'UNKNOWN'
+                ),
                 'user_conclusion': api_info.get('user_conclusion', ''),
                 'user_reason':   api_info.get('user_reason', ''),
                 'recommended_action': api_info.get('recommended_action', ''),
@@ -1389,7 +1408,9 @@ def collect_findings(d):
             coord = item.get('coord', '')
             if coord:
                 impacted_coords.add(coord)
-            reason_code = item.get('reason_code', '')
+            reason_code = canonical_reason_code(
+                item.get('reason_code') or 'UNKNOWN'
+            )
             uncertain_reason_counts[reason_code or 'UNKNOWN'] += 1
             findings['uncertain'].append({
                 'coord':         coord,
@@ -1416,7 +1437,9 @@ def collect_findings(d):
             coord = item.get('coord', '')
             if coord:
                 impacted_coords.add(coord)
-            reason_code = item.get('reason_code', '')
+            reason_code = canonical_reason_code(
+                item.get('reason_code') or 'UNKNOWN'
+            )
             not_analyzed_reason_counts[reason_code or 'UNKNOWN'] += 1
             entry = {
                 'coord':         coord,
@@ -1449,7 +1472,9 @@ def collect_findings(d):
             coord = item.get('coord', '')
             if coord:
                 impacted_coords.add(coord)
-            reason_code = item.get('reason_code', '')
+            reason_code = canonical_reason_code(
+                item.get('reason_code') or 'UNKNOWN'
+            )
             not_found_reason_counts[reason_code or 'UNKNOWN'] += 1
             findings['not_found'].append({
                 'coord':         coord,
@@ -1668,6 +1693,34 @@ def collect_findings(d):
         ),
     )
 
+    component_by_reason = defaultdict(list)
+    for component in (findings.get('coverage') or {}).get('components') or []:
+        component_id = str(component.get('id') or '').strip()
+        for reason_code in component.get('reason_codes') or []:
+            code = str(reason_code or '').strip()
+            if code and component_id not in component_by_reason[code]:
+                component_by_reason[code].append(component_id)
+    existing_guidance = {
+        str(item.get('reason_code') or ''): item
+        for item in findings.get('diagnostic_guidance') or []
+        if isinstance(item, dict)
+    }
+    for reason_code, component_ids in component_by_reason.items():
+        for item in build_catalog_guidance(
+            [reason_code],
+            observed_scope='step',
+            source_components=component_ids,
+        ):
+            existing_guidance.setdefault(item['reason_code'], item)
+    findings['diagnostic_guidance'] = sorted(
+        existing_guidance.values(),
+        key=lambda item: (
+            str(item.get('origin_step') or 'unknown'),
+            not bool(item.get('blocking')),
+            str(item.get('reason_code') or ''),
+        ),
+    )
+
     return findings
 
 
@@ -1807,8 +1860,11 @@ def _coverage_item_label(component_id):
 
 def _coverage_impact_text(component_id, reason_codes):
     component_id = str(component_id or '').strip()
-    reasons = set(reason_codes or [])
-    reason_texts = {
+    reasons = {
+        canonical_reason_code(reason_code)
+        for reason_code in (reason_codes or ())
+    }
+    raw_reason_texts = {
         'dependency_pairing_ambiguous': '依赖升级前后坐标匹配存在歧义。',
         'dependency_coordinates_unresolved': '部分依赖坐标未解析。',
         'artifact_hash_missing': '构建产物缺少哈希，无法确认输入制品是否稳定。',
@@ -1819,6 +1875,7 @@ def _coverage_impact_text(component_id, reason_codes):
         'DEPENDENCY_SOURCE_REF_UNAVAILABLE': '依赖源码版本无法可靠固定。',
         'DEPENDENCY_SOURCE_DIFF_UNAVAILABLE': '依赖源码差异分析未能完成。',
         'FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE': '最终 JAR 方法字节码兜底未能完成。',
+        'JAPICMP_EXECUTION_FAILED': '部分依赖的 JApiCmp 执行失败，没有形成 API 变化数据。',
         'JAPICMP_TIMEOUT': 'JApiCmp 二进制 API 对比超时。',
         'compiled_business_classes_not_available': '缺少业务编译产物，字节码调用补充分析不完整。',
         'step5_not_analyzed_targets': '部分变更 API 没有完成调用链分析。',
@@ -1827,6 +1884,10 @@ def _coverage_impact_text(component_id, reason_codes):
         's5_artifact_bytecode_catalog_missing': '缺少制品内依赖字节码清单。',
         'indirect_usage_coverage_missing': '反射、配置或间接调用可能漏报。',
         'reflection_source_partial': '反射调用可能漏报。',
+    }
+    reason_texts = {
+        canonical_reason_code(reason_code): text
+        for reason_code, text in raw_reason_texts.items()
     }
     known = [reason_texts[item] for item in sorted(reasons) if item in reason_texts]
     if known:
@@ -2347,6 +2408,7 @@ def _diagnostic_scope_label(scope):
         'global': '全局',
         'path': '相关调用路径',
         'api': '单个 API',
+        'step': '对应步骤/覆盖组件',
         'mixed': '混合作用域',
         'unknown': '旧结果未记录',
     }.get(str(scope or ''), str(scope or '') or '未记录')
@@ -2360,6 +2422,7 @@ def _diagnostic_evidence_text(item):
     collectors = list(item.get('collectors') or [])
     candidates = list(item.get('candidate_evidence') or [])
     failure_details = list(item.get('failure_detail_summaries') or [])
+    source_components = list(item.get('source_components') or [])
     if classes:
         pieces.append('类：' + '、'.join(classes[:5]))
     if artifacts:
@@ -2385,6 +2448,11 @@ def _diagnostic_evidence_text(item):
             pieces.append('候选：' + '、'.join(candidate_text))
     if failure_details:
         pieces.append('错误摘要：' + '；'.join(failure_details[:2]))
+    if source_components:
+        pieces.append(
+            '覆盖组件：'
+            + '、'.join(_coverage_item_label(value) for value in source_components[:5])
+        )
     return '；'.join(pieces) or '当前只记录了 API 级原因，未附加制品或类证据。'
 
 
@@ -2398,12 +2466,13 @@ def render_diagnostic_guidance(findings):
         "以下诊断会限制结论。表中的数量和作用域来自本轮实际证据；"
         "“可忽略条件”必须有部署或业务证据支持，不能仅凭原因码名称判断。",
         "",
-        "| 原因码 | 说明 | 是否阻断 | 本轮作用域 | 主原因 API | 建议决策 |",
-        "|---|---|---|---|---:|---|",
+        "| 来源步骤 | 原因码 | 说明 | 是否阻断 | 本轮作用域 | 主原因 API | 建议决策 |",
+        "|---|---|---|---|---|---:|---|",
     ]
     for item in guidance:
         lines.append(
-            f"| `{_md_cell(item.get('reason_code'), 100)}` | "
+            f"| `{_md_cell(item.get('origin_step'), 40)}` | "
+            f"`{_md_cell(item.get('reason_code'), 100)}` | "
             f"{_md_cell(item.get('title'), 120)} | "
             f"{'是' if item.get('blocking') else '否'} | "
             f"{_diagnostic_scope_label(item.get('observed_scope'))} | "

@@ -733,7 +733,7 @@ class SpringActivationClosureTest(unittest.TestCase):
         failure = framework_adapters._framework_failure(
             "spring_aop_activation", diagnostics[0],
         )
-        self.assertEqual("SPRING_PACKAGED_CLASS_AMBIGUOUS", failure.reason_code)
+        self.assertEqual("SPRING_RUNTIME_CLASS_AMBIGUOUS", failure.reason_code)
         self.assertEqual("demo.Config", failure.class_name)
         self.assertEqual("path", failure.scope)
         self.assertEqual(2, len(failure.occurrences))

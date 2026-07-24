@@ -111,7 +111,7 @@
       "mutation_tests": [
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_analyzer_collector_failure_blocks_a_negative_conclusion",
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_unreadable_preservation_artifact_cannot_be_treated_as_no_provider",
-        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_packaged_class_locator_reports_malformed_nested_jar",
+        "tests.test_spring_activation_closure.SpringActivationClosureTest.test_shared_class_locator_scopes_unordered_cross_jar_conflict",
         "tests.test_execution_faults.ExecutionFaultTest.test_registry_covers_every_declared_execution_boundary",
         "tests.test_step5_key_matching.Step5KeyMatchingTest.test_mixed_language_source_scope_is_closed_by_final_business_classes"
       ],

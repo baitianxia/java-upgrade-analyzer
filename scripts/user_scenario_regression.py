@@ -38,6 +38,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import s4_jar_compare as step4  # noqa: E402
+import s1_dep_diff as step1  # noqa: E402
 import run_step as orchestrator  # noqa: E402
 from csv_io import open_csv_read, open_csv_write  # noqa: E402
 
@@ -232,23 +233,47 @@ def _prepare_transitive_deleted_dependency_workspace(workspace: Path) -> dict[st
     report_dir = project / ".upgrade-report"
     deps_dir = report_dir / "evidence" / "dependencies"
     deps_dir.mkdir(parents=True, exist_ok=True)
-    with open_csv_write(deps_dir / "deps_current_resolved.csv") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["coord", "version", "scope", "lib_entry", "resolution_status"])
-        writer.writeheader()
-        writer.writerow({
+    current_entries = [
+        {
             "coord": "com.example:dep-a",
             "version": "1.0.0",
             "scope": "compile",
             "lib_entry": "BOOT-INF/lib/dep-a-1.0.0.jar",
             "resolution_status": "resolved",
-        })
-        writer.writerow({
+            "packaged_match_source": "user_scenario_final_artifact",
+        },
+        {
             "coord": "com.example:dep-b",
             "version": "1.0.0",
             "scope": "compile",
             "lib_entry": "BOOT-INF/lib/dep-b-1.0.0.jar",
             "resolution_status": "resolved",
-        })
+            "packaged_match_source": "user_scenario_final_artifact",
+        },
+    ]
+    with open_csv_write(deps_dir / "deps_current_resolved.csv") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "coord", "version", "scope", "lib_entry",
+                "resolution_status",
+            ],
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(current_entries)
+    final_artifact_sha256 = _sha256(final_artifact)
+    step1.materialize_changed_dependency_jars(
+        [],
+        {
+            "current": {
+                "artifact_path": str(final_artifact),
+                "artifact_sha256": final_artifact_sha256,
+            }
+        },
+        deps_dir,
+        current_entries=current_entries,
+    )
     (deps_dir / "build_provenance.json").write_text(
         json.dumps(
             {
@@ -256,7 +281,7 @@ def _prepare_transitive_deleted_dependency_workspace(workspace: Path) -> dict[st
                     {
                         "side": "current",
                         "artifact_path": str(final_artifact),
-                        "artifact_sha256": _sha256(final_artifact),
+                        "artifact_sha256": final_artifact_sha256,
                     }
                 ]
             },

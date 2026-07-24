@@ -27,6 +27,7 @@ from compat import (
 from compat import git_cmd
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
+from diagnostic_contract import canonical_reason_code, normalize_diagnostic_payload
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -49,6 +50,7 @@ from pipeline_constants import (
     STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
     STEP5_ARTIFACT_BYTECODE_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
+    STEP5_DIAGNOSTICS_FILE,
     STEP5_QUERY_INDEX_FILE,
     STEP_SEQUENCE,
 )
@@ -62,6 +64,7 @@ from s4_contract import (
 from step1_ref_resolution import resolve_step1_ref
 from runtime_contract import contract_payload
 from progress_logging import emit_progress
+from reason_guidance import REASON_GUIDANCE_SCHEMA, guidance_for_reason_code
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -950,7 +953,10 @@ def normalize_interaction_status(status):
 def save_interaction_file(report_dir, interaction):
     if not interaction:
         return
-    payload = dict(interaction)
+    payload = normalize_diagnostic_payload(
+        interaction,
+        origin_step=(interaction or {}).get("step_id"),
+    )
     payload["status"] = normalize_interaction_status(payload.get("status"))
     payload.setdefault("exit_code", EXIT_AWAITING_USER)
     write_json(runtime_state_dir(report_dir) / "interaction.json", payload)
@@ -1372,7 +1378,9 @@ def read_step_system_block_reason_codes(script_name, report_dir):
             continue
         if str(payload.get("status") or "").strip() != "blocked_by_system":
             continue
-        reason_code = str(payload.get("reason_code") or "").strip()
+        reason_code = canonical_reason_code(
+            payload.get("reason_code") or "UNKNOWN"
+        )
         if reason_code:
             reason_codes.append(reason_code)
     return _dedupe_strings(reason_codes)
@@ -1386,7 +1394,10 @@ def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
     }
     if report_dir is not None:
         env["UPGRADE_REPORT_DIR"] = str(Path(report_dir).resolve())
-    stream_output = script_name == "s1_dep_diff.py"
+    stream_output = script_name in {
+        "s1_dep_diff.py",
+        "s5_call_chain_engine_integrated.py",
+    }
     run_kwargs = {
         "cwd": str(cwd),
         "env": env,
@@ -5521,6 +5532,16 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
             project_dir,
             report_dir,
         )
+    payload = normalize_diagnostic_payload(payload, origin_step=step_id)
+    if payload.get("reason_code"):
+        payload.setdefault("diagnostic_guidance_schema", REASON_GUIDANCE_SCHEMA)
+        payload.setdefault(
+            "diagnostic_guidance",
+            guidance_for_reason_code(
+                payload["reason_code"],
+                origin_step=payload.get("origin_step") or step_id,
+            ),
+        )
     return payload
 
 
@@ -6150,6 +6171,20 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
                 "question": interaction.get("question"),
                 "user_decision_card": user_decision_card,
                 "reason_code": interaction.get("reason_code"),
+                "reason_code_aliases": interaction.get(
+                    "reason_code_aliases", []
+                ),
+                "origin_step": interaction.get("origin_step"),
+                "diagnostic_schema": interaction.get("diagnostic_schema"),
+                "diagnostic_contract": interaction.get(
+                    "diagnostic_contract", {}
+                ),
+                "diagnostic_guidance_schema": interaction.get(
+                    "diagnostic_guidance_schema"
+                ),
+                "diagnostic_guidance": interaction.get(
+                    "diagnostic_guidance", {}
+                ),
                 "summary": interaction.get("summary"),
                 "options": interaction.get("options", []),
                 "files_to_review": files_to_review,
@@ -6230,14 +6265,16 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
     response_schema = dict(payload.get("response_schema") or {})
     properties = dict(response_schema.get("properties") or {})
     has_dependency_source_dirs_field = "dependency_source_dirs" in properties
-    reason_code = str(payload.get("reason_code") or "").strip()
-    if not has_dependency_source_dirs_field and reason_code != "step5_dependency_source_mapping_missing":
+    reason_code = canonical_reason_code(
+        payload.get("reason_code") or "UNKNOWN"
+    )
+    if not has_dependency_source_dirs_field and reason_code != "STEP5_DEPENDENCY_SOURCE_MAPPING_MISSING":
         return payload
 
     source_state = build_dependency_source_dirs_state(run_context, report_dir)
     payload["dependency_source_dirs_state"] = source_state
 
-    if reason_code != "step5_dependency_source_mapping_missing":
+    if reason_code != "STEP5_DEPENDENCY_SOURCE_MAPPING_MISSING":
         if has_dependency_source_dirs_field:
             dep_dirs_prop = dict(properties.get("dependency_source_dirs") or {})
             dep_dirs_prop["description"] = (
@@ -6256,7 +6293,7 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
         question_prefix = "已收到依赖源码目录，但当前目录未识别出有效依赖源码仓库。"
     elif (
         str(payload.get("step_id") or "").strip() == "step5"
-        and reason_code != "step5_dependency_source_mapping_missing"
+        and reason_code != "STEP5_DEPENDENCY_SOURCE_MAPPING_MISSING"
         and not source_state.get("analysis_requires_more_source")
     ):
         question_prefix = (
@@ -6284,7 +6321,7 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
     payload["checklist_lines"] = checklist_lines
 
     question = str(payload.get("question") or "").strip()
-    if reason_code == "step5_dependency_source_mapping_missing":
+    if reason_code == "STEP5_DEPENDENCY_SOURCE_MAPPING_MISSING":
         if source_state.get("provided"):
             payload["question"] = (
                 question_prefix
@@ -7234,7 +7271,9 @@ def validate_pending_interaction_response(pending_interaction, user_response):
     user_response = expand_step1_ref_selections(pending_interaction, user_response)
     user_response = expand_dependency_git_ref_selections(pending_interaction, user_response)
     step_id = str(pending_interaction.get("step_id") or "").strip()
-    reason_code = str(pending_interaction.get("reason_code") or "").strip()
+    reason_code = canonical_reason_code(
+        pending_interaction.get("reason_code") or "UNKNOWN"
+    )
     action = str(user_response.get("action") or "").strip()
     response_schema = dict(pending_interaction.get("response_schema") or {})
     properties = dict(response_schema.get("properties") or {})
@@ -7294,7 +7333,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             raise StepError("当前 Step1 确认项中没有可显式重查的远端 ref 失败侧。")
     step5_missing_source_rerun = (
         step_id == "step5"
-        and reason_code == "step5_dependency_source_mapping_missing"
+        and reason_code == "STEP5_DEPENDENCY_SOURCE_MAPPING_MISSING"
         and action == "rerun_current_step"
     )
     step5_has_selection_override = False
@@ -7319,10 +7358,10 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         )
 
     if step_id == "step1" and reason_code in {
-        "ambiguous_step1_source_ref",
-        "step1_source_ref_not_found",
-        "step1_remote_source_unavailable",
-        "step1_dirty_local_source_confirmation_required",
+        "AMBIGUOUS_STEP1_SOURCE_REF",
+        "STEP1_SOURCE_REF_NOT_FOUND",
+        "STEP1_REMOTE_SOURCE_UNAVAILABLE",
+        "STEP1_DIRTY_LOCAL_SOURCE_CONFIRMATION_REQUIRED",
     } and action == "continue":
         for request in pending_interaction.get("ref_resolution_requests") or []:
             side = str(request.get("side") or "").strip()
@@ -7363,7 +7402,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
 
     if (
         step_id == "step4"
-        and reason_code == "step4_git_refs_need_confirmation"
+        and reason_code == "STEP4_GIT_REFS_NEED_CONFIRMATION"
         and action == "rerun_current_step"
     ):
         dependency_source_dirs = [
@@ -7413,7 +7452,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
                 raise StepError("当前 Step4 确认项中没有可直接重试的 fetch 失败条目。")
     if (
         step_id == "step4"
-        and reason_code == "step4_timeouts_need_resolution"
+        and reason_code == "STEP4_TIMEOUTS_NEED_RESOLUTION"
         and action == "rerun_current_step"
     ):
         dependency_source_dirs = [
@@ -7435,7 +7474,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             )
     if (
         step_id == "step4"
-        and reason_code == "step4_japicmp_missing_need_resolution"
+        and reason_code == "STEP4_JAPICMP_MISSING_NEED_RESOLUTION"
         and action == "rerun_current_step"
     ):
         japicmp_jar = str(user_response.get("japicmp_jar") or "").strip()
@@ -7446,7 +7485,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             )
     if (
         step_id == "step5"
-        and reason_code == "step5_tree_sitter_missing_need_resolution"
+        and reason_code == "STEP5_TREE_SITTER_MISSING_NEED_RESOLUTION"
         and action == "rerun_current_step"
     ):
         tree_sitter_installed = bool(user_response.get("tree_sitter_installed"))
@@ -8265,6 +8304,7 @@ def step_output_paths_for_cleanup(step_id, report_dir):
         "step5": [
             step5_call_chain_dir(report_dir),
             runtime_observability_dir(report_dir) / "step5_timing.csv",
+            runtime_observability_dir(report_dir) / STEP5_DIAGNOSTICS_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME,

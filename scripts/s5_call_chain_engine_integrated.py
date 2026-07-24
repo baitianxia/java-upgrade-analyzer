@@ -81,9 +81,11 @@ from step5_memory_observer import (
     set_active_process_tree_observer,
 )
 from step5_artifact_fact_store import Step5ArtifactFactStore
+from step5_diagnostics import Step5DiagnosticRecorder
 from signature_utils import normalize_signature_for_identity, signatures_match_identity
 from analysis_contract import build_project_scope, discover_project_modules, sha256_file
 from artifact_safety import require_safe_archive
+from diagnostic_contract import normalize_diagnostic_payload
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
     EVIDENCE_CALL_CHAIN_DIRNAME,
@@ -111,6 +113,37 @@ EVIDENCE_FAILURE_OCCURRENCE_FIELDS = (
     'caller_symbol', 'caller_qualified_key', 'artifact', 'artifact_entry',
     'class_name', 'line', 'instruction_offset', 'detail',
 )
+
+FATAL_BUSINESS_BYTECODE_REASON_CODES = frozenset({
+    'CURRENT_FINAL_ARTIFACT_REQUIRED',
+    'CURRENT_FINAL_ARTIFACT_SHA_INVALID',
+    'CURRENT_FINAL_ARTIFACT_SHA_MISMATCH',
+    'CURRENT_FINAL_ARTIFACT_CHANGED_DURING_SCAN',
+})
+GLOBAL_TRACE_BLOCKER_REASON_CODES = frozenset({
+    'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE',
+    'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE',
+})
+
+
+class Step5GlobalCoverageBlocked(RuntimeError):
+    def __init__(self, reason_code, result):
+        self.reason_code = str(reason_code or 'STEP5_GLOBAL_COVERAGE_INVALID')
+        self.result = result
+        super().__init__(self.reason_code)
+
+
+def record_trace_diagnostic_or_raise(
+    diagnostics, result, current, total,
+):
+    """Expose each first reason and stop when one result proves a global gap."""
+    diagnostics.record_trace_result(result, current, total)
+    reason_code = str(getattr(result, 'reason_code', '') or '').strip()
+    if (
+        str(getattr(result, 'analysis_status', '') or '') == 'not_analyzed'
+        and reason_code in GLOBAL_TRACE_BLOCKER_REASON_CODES
+    ):
+        raise Step5GlobalCoverageBlocked(reason_code, result)
 
 
 def _serialize_ingestion_failure(collector, failure):
@@ -558,7 +591,7 @@ def write_missing_dependency_mapping_details(
     bridge_discovery=None,
 ):
     details_path = os.path.join(output_dir, "missing_dependency_source_mappings.json")
-    details = {
+    details = normalize_diagnostic_payload({
         "status": "degraded",
         "reason_code": "step5_dependency_source_mapping_missing",
         "resolution": "continue_with_final_artifact_bytecode_and_restricted_conclusion",
@@ -571,7 +604,7 @@ def write_missing_dependency_mapping_details(
         "source_dirs_detected_without_coord": list((bridge_discovery or {}).get("source_dirs_detected_without_coord") or []),
         "unresolved_dependency_source_dirs": list((bridge_discovery or {}).get("unresolved_dependency_source_dirs") or []),
         "discovery_log": list((bridge_discovery or {}).get("discovery_log") or []),
-    }
+    }, origin_step="step5")
     with open(details_path, "w", encoding="utf-8") as f:
         json.dump(details, f, ensure_ascii=False, indent=2)
     return details_path
@@ -624,7 +657,7 @@ def has_java_source_file(source_dirs, max_dirs=200):
 
 def write_tree_sitter_preflight_details(output_dir, status, source_dirs):
     details_path = os.path.join(output_dir, "tree_sitter_preflight.json")
-    details = {
+    details = normalize_diagnostic_payload({
         "status": "blocked_by_system",
         "reason_code": "step5_tree_sitter_missing_need_resolution",
         "generated_at": datetime.now().isoformat(),
@@ -637,7 +670,7 @@ def write_tree_sitter_preflight_details(output_dir, status, source_dirs):
         "manual_install": [
             (status or {}).get("install_command") or "python scripts/bootstrap_runtime.py",
         ],
-    }
+    }, origin_step="step5")
     with open(details_path, "w", encoding="utf-8") as f:
         json.dump(details, f, ensure_ascii=False, indent=2)
     return details_path
@@ -824,6 +857,56 @@ def _build_business_bytecode_coverage(batch, ingestion_result, api_identities):
     return coverage, status, reason_codes
 
 
+def runtime_artifact_inventory_blockers(
+    artifact_fact_store, runtime_dependency_catalog,
+):
+    """Eagerly verify immutable archive identities before expensive graph work."""
+    blockers = []
+    seen = set()
+    for item in (runtime_dependency_catalog or {}).get('entries') or ():
+        coord = str((item or {}).get('coord') or '').strip()
+        jar_path = str((item or {}).get('jar_path') or '').strip()
+        sha256 = str((item or {}).get('sha256') or '').strip().lower()
+        if (
+            not coord
+            or coord in seen
+            or not jar_path
+            or not re.fullmatch(r'[0-9a-f]{64}', sha256)
+        ):
+            continue
+        seen.add(coord)
+        inventory = artifact_fact_store.inventory(coord)
+        if inventory.failure:
+            blockers.append({
+                'coord': coord,
+                'artifact_entry': str(
+                    (item or {}).get('artifact_entry') or ''
+                ),
+                'reason': f'artifact_inventory_invalid:{inventory.failure}',
+            })
+    return blockers
+
+
+def fatal_business_bytecode_failures(batch):
+    """Return artifact-wide bytecode failures that invalidate all later tracing."""
+    fatal = []
+    for failure in getattr(batch, 'failures', ()) or ():
+        reason_code = str(getattr(failure, 'reason_code', '') or '').strip()
+        detail = str(getattr(failure, 'detail', '') or '')
+        if (
+            reason_code in FATAL_BUSINESS_BYTECODE_REASON_CODES
+            or (
+                reason_code == 'BYTECODE_COLLECTION_FAILED'
+                and (
+                    detail.startswith('business_artifact_identity_failed:')
+                    or detail.startswith('business_artifact_scan_failed:')
+                )
+            )
+        ):
+            fatal.append(failure)
+    return fatal
+
+
 def _step5_integrated_main_impl(args):
     """
     Step 5集成版主流程
@@ -848,6 +931,7 @@ def _step5_integrated_main_impl(args):
     if legacy_timing_path.exists():
         legacy_timing_path.unlink()
     timing = Step5TimingRecorder(report_dir)
+    diagnostics = Step5DiagnosticRecorder(report_dir)
     total_timing_token = timing.start_phase(
         'step5.total',
         message='正在执行 Step5 调用链影响分析',
@@ -1012,6 +1096,14 @@ def _step5_integrated_main_impl(args):
                 status,
                 tree_sitter_source_dirs,
             )
+            diagnostics.record(
+                phase='preflight.java_parser',
+                reason_code='STEP5_TREE_SITTER_MISSING_NEED_RESOLUTION',
+                blocking=True,
+                scope='global',
+                status='blocked',
+                message='Java 解析器不可用，Step5 已立即停止。',
+            )
             print(f"诊断文件：{details_path}", file=sys.stderr)
             print(
                 "已记录为系统环境阻塞；不会把内部解析器故障转成用户确认，"
@@ -1130,6 +1222,16 @@ def _step5_integrated_main_impl(args):
             runtime_dependency_catalog,
             catalog_blockers,
         )
+        diagnostics.record(
+            phase='preflight.runtime_artifacts',
+            reason_code='STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID',
+            blocking=True,
+            scope='global',
+            status='blocked',
+            message='核心制品证据不完整或安全校验失败，Step5 已立即停止。',
+            failure_count=len(catalog_blockers),
+            samples=list(catalog_blockers)[:5],
+        )
         print(
             "\n❌ Step5 前置检查失败：Step1 留存的核心制品证据不完整或不可安全读取。",
             file=sys.stderr,
@@ -1154,6 +1256,52 @@ def _step5_integrated_main_impl(args):
     artifact_fact_store = Step5ArtifactFactStore.from_catalog(
         runtime_dependency_catalog
     )
+    inventory_blockers = runtime_artifact_inventory_blockers(
+        artifact_fact_store,
+        runtime_dependency_catalog,
+    )
+    if inventory_blockers:
+        timing.finish_phase(
+            catalog_timing_token,
+            status='failed',
+            message=(
+                '运行时制品事实库存预检失败，'
+                f'阻塞项 {len(inventory_blockers)} 个'
+            ),
+        )
+        timing.finish_phase(
+            total_timing_token,
+            status='failed',
+            message='Step5 因运行时制品事实库存失效停止',
+        )
+        details_path = write_runtime_catalog_preflight_failure(
+            output_dir,
+            runtime_dependency_catalog,
+            inventory_blockers,
+            failure_phase='runtime_artifact_inventory',
+        )
+        diagnostics.record(
+            phase='preflight.runtime_artifact_inventory',
+            reason_code='STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID',
+            blocking=True,
+            scope='global',
+            status='blocked',
+            message='制品身份或归档结构校验失败，Step5 已在构图前停止。',
+            failure_count=len(inventory_blockers),
+            samples=list(inventory_blockers)[:5],
+        )
+        print(
+            "\n❌ Step5 前置检查失败：留存制品无法建立可信事实库存。",
+            file=sys.stderr,
+        )
+        for item in inventory_blockers[:5]:
+            print(
+                f"  - {item.get('coord') or '<runtime-artifact>'}: "
+                f"{item.get('reason') or 'invalid'}",
+                file=sys.stderr,
+            )
+        print(f"诊断文件：{details_path}", file=sys.stderr)
+        return 2
     allowed_business_classes = runtime_business_class_index(runtime_dependency_catalog)
     dependency_source_mappings, skipped_dependency_source_mappings = (
         filter_dependency_source_mappings_for_runtime(
@@ -1519,6 +1667,54 @@ def _step5_integrated_main_impl(args):
             f'调用边 {int(bytecode_stats.get("edges_found") or 0)} 条'
         ),
     )
+    diagnostics.record_collector_failures(
+        'evidence.business_bytecode',
+        (bytecode_batch,),
+    )
+    fatal_bytecode_failures = fatal_business_bytecode_failures(bytecode_batch)
+    if fatal_bytecode_failures:
+        blockers = [{
+            'coord': '__business__',
+            'artifact_entry': str(
+                getattr(failure, 'artifact', '') or '<business-classes>'
+            ),
+            'reason': (
+                f"{getattr(failure, 'reason_code', '')}:"
+                f"{getattr(failure, 'detail', '')}"
+            ),
+        } for failure in fatal_bytecode_failures]
+        details_path = write_runtime_catalog_preflight_failure(
+            output_dir,
+            runtime_dependency_catalog,
+            blockers,
+            reason_code='STEP5_BUSINESS_BYTECODE_EVIDENCE_INVALID',
+            failure_phase='business_bytecode_collection',
+            next_action='repair_artifact_and_rerun_step5',
+        )
+        diagnostics.record(
+            phase='evidence.business_bytecode',
+            reason_code='STEP5_BUSINESS_BYTECODE_EVIDENCE_INVALID',
+            blocking=True,
+            scope='global',
+            status='blocked',
+            message=(
+                '当前业务最终制品字节码无法可信读取；'
+                '已在进入框架分析和逐 API 追踪前停止。'
+            ),
+            failure_count=len(fatal_bytecode_failures),
+            samples=blockers[:5],
+        )
+        timing.finish_phase(
+            total_timing_token,
+            status='failed',
+            message='Step5 因业务最终制品字节码证据失效停止',
+        )
+        print(
+            "\n❌ Step5 已提前停止：当前业务最终制品字节码证据失效。",
+            file=sys.stderr,
+        )
+        print(f"诊断文件：{details_path}", file=sys.stderr)
+        return 2
     _observe_step5_memory(
         graph_stats,
         'business_bytecode_collected',
@@ -1559,6 +1755,10 @@ def _step5_integrated_main_impl(args):
         fact_store=artifact_fact_store,
     )
     serialize_framework_batches(framework_batches, framework_output)
+    diagnostics.record_collector_failures(
+        'evidence.framework_adapters',
+        framework_batches,
+    )
     graph_stats['step5_perf']['main']['framework_adapters_elapsed_sec'] = round(
         time.perf_counter() - framework_timer, 3
     )
@@ -1591,6 +1791,10 @@ def _step5_integrated_main_impl(args):
         _graph_snapshot_with_bytecode_batch(graph, bytecode_batch),
         all_apis,
         source_roots,
+    )
+    diagnostics.record_collector_failures(
+        'evidence.indirect_usage',
+        (indirect_batch,),
     )
     _observe_step5_memory(
         graph_stats,
@@ -1787,15 +1991,71 @@ def _step5_integrated_main_impl(args):
         item=f'{len(all_apis)} APIs',
         message=f'正在反向追踪 {len(all_apis)} 个变更 API 的业务调用链',
     )
-    all_results = trace_all_apis_with_confidence_weighting(
-        all_apis,
-        graph,
-        type_metadata,
-        max_total_cost=max_depth,
-        api_bridge_requirements=api_bridge_requirements,
-        allow_degraded=allow_degraded,
-        graph_stats=graph_stats,
-    )
+
+    try:
+        all_results = trace_all_apis_with_confidence_weighting(
+            all_apis,
+            graph,
+            type_metadata,
+            max_total_cost=max_depth,
+            api_bridge_requirements=api_bridge_requirements,
+            allow_degraded=allow_degraded,
+            graph_stats=graph_stats,
+            diagnostic_callback=lambda result, current, total: (
+                record_trace_diagnostic_or_raise(
+                    diagnostics, result, current, total
+                )
+            ),
+        )
+    except Step5GlobalCoverageBlocked as exc:
+        timing.finish_phase(
+            trace_timing_token,
+            status='failed',
+            message=(
+                '逐 API 追踪检测到全局覆盖失效，'
+                '已在首个受影响 API 后停止'
+            ),
+        )
+        timing.finish_phase(
+            total_timing_token,
+            status='failed',
+            message=f'Step5 因全局覆盖失败 {exc.reason_code} 停止',
+        )
+        blocker = {
+            'coord': str(getattr(exc.result, 'coord', '') or ''),
+            'artifact_entry': '',
+            'reason': exc.reason_code,
+            'api_name': str(getattr(exc.result, 'api_name', '') or ''),
+            'api_signature': str(
+                getattr(exc.result, 'api_signature', '') or ''
+            ),
+        }
+        details_path = write_runtime_catalog_preflight_failure(
+            output_dir,
+            runtime_dependency_catalog,
+            [blocker],
+            reason_code=exc.reason_code,
+            failure_phase='trace_global_coverage',
+            next_action='repair_coverage_and_rerun_step5',
+        )
+        diagnostics.record(
+            phase='trace',
+            reason_code=exc.reason_code,
+            blocking=True,
+            scope='global',
+            status='blocked',
+            message=(
+                '该原因会使后续 API 产生同类未分析结果；'
+                'Step5 已在首个命中后短路。'
+            ),
+            samples=[blocker],
+        )
+        print(
+            f"\n❌ Step5 已提前停止：{exc.reason_code}。",
+            file=sys.stderr,
+        )
+        print(f"诊断文件：{details_path}", file=sys.stderr)
+        return 2
     _observe_step5_memory(
         graph_stats,
         'trace_complete',
@@ -2466,28 +2726,36 @@ def runtime_dependency_catalog_blockers(runtime_dependency_catalog):
 
 
 def write_runtime_catalog_preflight_failure(
-    output_dir, runtime_dependency_catalog, blockers,
+    output_dir,
+    runtime_dependency_catalog,
+    blockers,
+    *,
+    reason_code='STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID',
+    failure_phase='runtime_artifact_preflight',
+    next_action='restart_from_step1',
 ):
     path = Path(output_dir) / 'artifact_preflight_failure.json'
+    payload = normalize_diagnostic_payload(
+        {
+            'schema': 'java-upgrade-analyzer.step5-artifact-preflight.v1',
+            'status': 'blocked_by_system',
+            'reason_code': reason_code,
+            'failure_phase': failure_phase,
+            'catalog_status': str(
+                (runtime_dependency_catalog or {}).get('status')
+                or 'insufficient'
+            ),
+            'catalog_reason_codes': list(
+                (runtime_dependency_catalog or {}).get('reason_codes') or ()
+            ),
+            'blockers': list(blockers or ()),
+            'next_action': next_action,
+            'generated_at': datetime.now().astimezone().isoformat(),
+        },
+        origin_step='step5',
+    )
     path.write_text(
-        json.dumps(
-            {
-                'schema': 'java-upgrade-analyzer.step5-artifact-preflight.v1',
-                'status': 'blocked_by_system',
-                'reason_code': 'STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID',
-                'catalog_status': str(
-                    (runtime_dependency_catalog or {}).get('status')
-                    or 'insufficient'
-                ),
-                'catalog_reason_codes': list(
-                    (runtime_dependency_catalog or {}).get('reason_codes') or ()
-                ),
-                'blockers': list(blockers or ()),
-                'next_action': 'restart_from_step1',
-            },
-            ensure_ascii=False,
-            indent=2,
-        ) + '\n',
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
         encoding='utf-8',
     )
     return path

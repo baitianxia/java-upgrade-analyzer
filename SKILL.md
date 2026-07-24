@@ -462,6 +462,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256，同时一次性固化变化依赖 JAR、全部 current 运行时 JAR 和 current 业务内容；Step4/Step5 直接消费该清单。任何步骤都不得用本地 Maven 仓库副本、重新下载的 JAR 或再次解包 fat JAR 替代这些证据
 - 规则：最终制品内缺失嵌套 JAR、坐标 unresolved、SHA 不一致或字节码解析失败时，必须记录覆盖缺口；未命中不得解释为无影响，也不得以本地 Maven JAR 填补缺口
 - 规则：Step1 留存 JAR 缺失、SHA 不一致或归档安全校验失败属于核心制品证据失效，不是普通覆盖缺口。必须在 Step1 门控或 Step5 构图前硬失败；禁止继续生成调用链的 `not_analyzed` 结果或进入 Step6
+- 规则：Step5 运行期间发现的制品、字节码、框架和逐 API 失败必须立即追加到 `.runtime/observability/step5_diagnostics.jsonl` 并实时输出原因码；核心制品或全局业务字节码证据失效必须短路，路径级/API 级失败只约束对应范围，禁止等最终 `summary.json` 才首次暴露
 - 规则：依赖源码只有在 Step4 记录包含固定 commit 且来源为 `remote_source_resolved` 或 `user_confirmed_local_source` 时，才允许进入 Step5 增强图；来源未确认、仓库不一致、源码类不在当前最终制品 JAR 中时必须拒绝该源码边并记录覆盖缺口，不能降级成确定无影响
 - 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4
 - `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / not_impacted / uncertain / not_found_in_static_analysis / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据

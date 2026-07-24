@@ -24,6 +24,28 @@ from pipeline_constants import (  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
+    def test_coordinate_followup_uses_cross_step_diagnostic_contract(self):
+        interaction = s1_dep_diff.build_step1_coordinate_followup_interaction(
+            side="current",
+            side_cn="当前侧",
+            artifact_path="/tmp/app.jar",
+            unresolved_items=[{"label": "unknown-lib.jar"}],
+        )
+
+        self.assertEqual(
+            "DEPENDENCY_COORDINATES_UNRESOLVED",
+            interaction["reason_code"],
+        )
+        self.assertEqual("step1", interaction["origin_step"])
+        self.assertIn(
+            "unresolved_dependency_coordinates_after_enrichment",
+            interaction["reason_code_aliases"],
+        )
+        self.assertEqual(
+            "DEPENDENCY_COORDINATES_UNRESOLVED",
+            interaction["diagnostic_guidance"]["reason_code"],
+        )
+
     def test_spring_boot_classpath_index_is_parsed_as_runtime_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "app.jar"

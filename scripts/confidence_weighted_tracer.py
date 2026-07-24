@@ -12280,7 +12280,8 @@ def format_call_chain(path_edges, final_target):
 def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max_total_cost=5,
                                             api_bridge_requirements=None, allow_degraded=False,
                                             graph_stats=None,
-                                            enable_multi_target_reuse=True):
+                                            enable_multi_target_reuse=True,
+                                            diagnostic_callback=None):
     """
     批量追踪所有变更API
 
@@ -12416,6 +12417,8 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
             result = _finalize_trace_draft(draft)
             results.append(result)
             status_counts['not_analyzed'] += 1
+            if diagnostic_callback is not None:
+                diagnostic_callback(result, idx, total)
             continue
 
         # 检查该 API 是否需要依赖源码映射
@@ -12467,6 +12470,8 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
             raise
 
         results.append(result)
+        if diagnostic_callback is not None:
+            diagnostic_callback(result, idx, total)
         api_elapsed_sec = time.perf_counter() - api_started_at
         _perf_add(graph, 'trace', 'api_elapsed_sec', api_elapsed_sec)
         _perf_add(graph, 'trace', 'apis_traced', 1)

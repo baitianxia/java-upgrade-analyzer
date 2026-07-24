@@ -541,7 +541,7 @@ class AnalysisContractTest(unittest.TestCase):
             )
             dependency = next(item for item in coverage["components"] if item["id"] == "dependency_diff")
             self.assertEqual(dependency["status"], "partial")
-            self.assertIn("dependency_pairing_ambiguous", dependency["reason_codes"])
+            self.assertIn("DEPENDENCY_PAIRING_AMBIGUOUS", dependency["reason_codes"])
 
     def test_build_provenance_rejects_dirty_pom_at_same_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -577,7 +577,7 @@ class AnalysisContractTest(unittest.TestCase):
             if item["id"] == "build_provenance"
         )
         self.assertEqual(provenance["status"], "insufficient")
-        self.assertIn("build_source_state_mismatch", provenance["reason_codes"])
+        self.assertIn("BUILD_SOURCE_STATE_MISMATCH", provenance["reason_codes"])
 
     def test_build_provenance_rejects_different_active_profile_at_same_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -605,7 +605,7 @@ class AnalysisContractTest(unittest.TestCase):
             if item["id"] == "build_provenance"
         )
         self.assertEqual(provenance["status"], "insufficient")
-        self.assertIn("build_active_profiles_mismatch", provenance["reason_codes"])
+        self.assertIn("BUILD_ACTIVE_PROFILES_MISMATCH", provenance["reason_codes"])
 
     def test_build_provenance_accepts_and_records_exact_source_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -672,7 +672,7 @@ class AnalysisContractTest(unittest.TestCase):
             if item["id"] == "build_provenance"
         )
         self.assertEqual(provenance["status"], "insufficient")
-        self.assertIn("build_active_profiles_missing", provenance["reason_codes"])
+        self.assertIn("BUILD_ACTIVE_PROFILES_MISSING", provenance["reason_codes"])
 
     @staticmethod
     def _write_bound_provenance(report, scope):
@@ -718,7 +718,7 @@ class AnalysisContractTest(unittest.TestCase):
 
         self.assertIn("indirect_usage_matrix", coverage["critical_incomplete"])
         indirect = next(item for item in coverage["components"] if item["id"] == "indirect_usage_matrix")
-        self.assertEqual(indirect["reason_codes"], ["reflection_source_partial"])
+        self.assertEqual(indirect["reason_codes"], ["REFLECTION_SOURCE_PARTIAL"])
 
     def test_behavior_diff_insufficient_is_a_critical_coverage_gap(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -31,6 +31,11 @@ from datetime import datetime
 from pathlib import Path
 
 from csv_io import open_csv_write
+from diagnostic_contract import (
+    canonical_reason_code,
+    diagnostic_contract_metadata,
+    reason_code_aliases,
+)
 from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_OBSERVABILITY_DIRNAME
 from reason_guidance import (
     REASON_GUIDANCE_SCHEMA,
@@ -188,7 +193,10 @@ def trace_result_to_api_entry(r):
     except (TypeError, ValueError):
         public_match_tier = None
 
+    canonical_code = canonical_reason_code(r.reason_code)
     return {
+        'diagnostic_schema':   diagnostic_contract_metadata()['schema'],
+        'origin_step':         'step5',
         'api_identity': canonical_api_identity({
             'coord': r.coord,
             'api_name': r.api_name,
@@ -209,7 +217,8 @@ def trace_result_to_api_entry(r):
         'confirmed':           str(r.confirmed).lower() if r.confirmed is not None else '',
         'source':              r.source,
         'analysis_status':     r.analysis_status,
-        'reason_code':         r.reason_code,
+        'reason_code':         canonical_code,
+        'reason_code_aliases': reason_code_aliases(canonical_code),
         'reason':              r.reachable_note,
         'reachable_note':      r.reachable_note,
         'direct_callers':      r.direct_callers,
@@ -763,7 +772,9 @@ def build_key_evidence(
 
 def summarize_user_facing_outcome(trace_like):
     analysis_status = str(_get_trace_attr(trace_like, 'analysis_status', '') or '').strip()
-    reason_code = str(_get_trace_attr(trace_like, 'reason_code', '') or '').strip()
+    reason_code = canonical_reason_code(
+        _get_trace_attr(trace_like, 'reason_code', '') or 'UNKNOWN'
+    )
     severity = str(_get_trace_attr(trace_like, 'severity', '') or '').strip()
     call_paths = _get_trace_attr(trace_like, 'call_paths', []) or []
     evidence_paths = _get_trace_attr(trace_like, 'evidence_paths', []) or []
@@ -836,6 +847,7 @@ def explain_reason_code(reason_code, trace_result):
     Returns:
         {'reason': str, 'action': str}
     """
+    reason_code = canonical_reason_code(reason_code)
     explanation = REASON_CODE_EXPLANATIONS.get(reason_code)
     if explanation is None:
         guidance = guidance_for_reason_code(reason_code)
@@ -1041,7 +1053,7 @@ def aggregate_by_module(all_results, output_dir):
                 "severity": result.severity,
                 "analysis_status": result.analysis_status,
                 "is_reachable": result.is_reachable,
-                "reason_code": result.reason_code,
+                "reason_code": canonical_reason_code(result.reason_code),
                 "user_conclusion": user_view["user_conclusion"],
                 "decision_bucket": user_view["decision_bucket"],
                 "call_paths": result.call_paths[:3] if result.call_paths else [],
@@ -1302,7 +1314,11 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     def reason_summary(results):
         grouped = defaultdict(int)
         for item in results:
-            grouped[str(getattr(item, 'reason_code', '') or 'UNKNOWN')] += 1
+            grouped[
+                canonical_reason_code(
+                    getattr(item, 'reason_code', '') or 'UNKNOWN'
+                )
+            ] += 1
         return dict(sorted(grouped.items(), key=lambda x: (-x[1], x[0])))
 
     # Keep the two states separate: an uncertain candidate has different
@@ -1344,6 +1360,14 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
             'not_reachable_apis': {
                 'replacement': 'not_found_apis',
                 'scope': 'api_list',
+            },
+            'unresolved_dependency_coordinates_after_enrichment': {
+                'replacement': 'DEPENDENCY_COORDINATES_UNRESOLVED',
+                'scope': 'reason_code',
+            },
+            'SPRING_PACKAGED_CLASS_AMBIGUOUS': {
+                'replacement': 'SPRING_RUNTIME_CLASS_AMBIGUOUS',
+                'scope': 'reason_code',
             },
     }
     artifacts = {'summary_json': 'summary.json'}
@@ -1401,6 +1425,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         write_field('meta', meta)
         write_field('status', 'done')
         write_field('skip_reason', '')
+        write_field('origin_step', 'step5')
         write_field('total_apis', len(all_results))
         write_field('reachable', len(reachable))
         write_field('not_impacted', len(not_impacted))
@@ -1415,6 +1440,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         write_field('uncertain_reason_summary', uncertain_reason_summary)
         write_field('not_analyzed_reason_summary', not_analyzed_reason_summary)
         write_field('diagnostic_guidance_schema', REASON_GUIDANCE_SCHEMA)
+        write_field('diagnostic_contract', diagnostic_contract_metadata())
         write_field('diagnostic_guidance', diagnostic_guidance)
         write_field(
             'user_conclusion_summary',

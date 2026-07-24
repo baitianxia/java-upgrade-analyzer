@@ -38,6 +38,7 @@ PHASE_LABELS = {
     "edge-ledger": "构建运行时边台账",
     "bytecode-scan": "扫描依赖字节码",
     "bytecode-expand": "扩展依赖调用者",
+    "diagnostic": "实时诊断",
     "perf": "性能状态",
     "report": "生成结果",
     "heartbeat": "运行中",

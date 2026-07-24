@@ -12,15 +12,176 @@ import json
 from collections import defaultdict
 from collections.abc import Mapping
 
+from diagnostic_contract import (
+    DEPENDENCY_COORDINATES_UNRESOLVED,
+    DEPENDENCY_SOURCE_REF_UNAVAILABLE,
+    DIAGNOSTIC_CONTRACT_SCHEMA,
+    JAPICMP_EXECUTION_FAILED,
+    JAPICMP_TIMEOUT,
+    MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED,
+    SPRING_RUNTIME_CLASS_AMBIGUOUS,
+    canonical_reason_code,
+    diagnostic_contract_metadata,
+    reason_code_aliases,
+)
 
-REASON_GUIDANCE_SCHEMA = "java-upgrade-analyzer.reason-guidance.v1"
+REASON_GUIDANCE_SCHEMA = "java-upgrade-analyzer.reason-guidance.v2"
 _SAMPLE_LIMIT = 5
 _EVIDENCE_LIMIT = 10
 
 
 _REASON_GUIDANCE = {
-    "SPRING_PACKAGED_CLASS_AMBIGUOUS": {
+    DEPENDENCY_COORDINATES_UNRESOLVED: {
+        "title": "依赖坐标仍未解析",
+        "origin_step": "step1",
+        "domain": "dependency",
+        "subject": "coordinates",
+        "condition": "unresolved",
+        "category": "analysis_input",
+        "summary": (
+            "Step1 已使用构建产物、分支、源码目录和已有人工补充信息尝试识别依赖，"
+            "但仍有嵌套 JAR 无法安全映射到唯一 Maven 坐标。"
+        ),
+        "trigger_condition": (
+            "最终制品中的嵌套 JAR 缺少可信 Maven 坐标，且 enrichment 后仍无法根据 "
+            "pom.properties、构建工具输出、分支或源码信息唯一补全。"
+        ),
+        "semantic_impact": (
+            "未解析依赖无法进入可靠的升级前后配对；后续 API 对比和调用链分析会跳过这些依赖，"
+            "因此可能漏掉真实兼容性风险。"
+        ),
+        "default_blocking": True,
+        "recommended_decision": "provide_input_or_explicitly_accept_gap",
+        "decision_text": (
+            "优先补充模块、源码或人工坐标映射后重跑 Step1；"
+            "只有明确接受覆盖缺口时才确认保留 unresolved。"
+        ),
+        "ignore_when": (
+            "只有能够证明该嵌套 JAR 不属于本次部署运行时，或明确接受后续步骤跳过它造成的漏报风险时，"
+            "才可确认继续。"
+        ),
+        "repair_actions": [
+            "补充正确的 primary_module、升级前后源码目录或 branch/tag/commit。",
+            "对仍无法识别的条目提供 artifact:version -> group:artifact 人工坐标映射。",
+            "重新运行 Step1，并检查依赖变更清单中不再存在对应 unresolved 行。",
+        ],
+        "verification_steps": [
+            "Step1 不再输出该原因码，或用户已明确确认接受列出的 unresolved 覆盖缺口。",
+            "相关依赖具有稳定坐标并进入升级前后配对与后续分析范围。",
+        ],
+    },
+    DEPENDENCY_SOURCE_REF_UNAVAILABLE: {
+        "title": "依赖源码版本不可用",
+        "origin_step": "step4",
+        "domain": "dependency",
+        "subject": "source_ref",
+        "condition": "unavailable",
+        "category": "source_evidence",
+        "summary": (
+            "Step4 无法把依赖版本可靠固定到源码仓库中的 old/new commit，"
+            "因此跳过源码行为差异辅助分析。"
+        ),
+        "trigger_condition": (
+            "依赖源码 ref 未找到、远端不可用、拉取失败、分支漂移，"
+            "或没有形成可安全采用的唯一提交范围。"
+        ),
+        "semantic_impact": (
+            "源码行为差异证据缺失；最终制品 JAR 的二进制和方法字节码分析仍可继续，"
+            "但若 JAR 兜底也失败，签名不变的实现变化可能漏报。"
+        ),
+        "default_blocking": False,
+        "recommended_decision": "verify_binary_fallback_or_restore_source_ref",
+        "decision_text": (
+            "先确认对应依赖的最终 JAR 方法字节码兜底已完成；"
+            "若未完成，应修复源码 ref 或制品输入后重跑 Step4。"
+        ),
+        "ignore_when": (
+            "仅当同一依赖的最终 JAR 行为差异分析状态为 complete，"
+            "且本次决策不依赖源码级结构信息时，才可接受该源码证据缺口。"
+        ),
+        "repair_actions": [
+            "核对依赖源码仓库地址、版本标签和 old/new commit，并修复网络或权限问题。",
+            "需要使用本地源码兜底时显式授权并记录固定 commit，避免直接采用漂移中的工作区。",
+            "重跑 Step4，或确认最终 JAR 方法字节码兜底已覆盖该依赖。",
+        ],
+        "verification_steps": [
+            "源码 old/new ref 被固定到可复现 commit，或对应 JAR 行为差异兜底状态为 complete。",
+            "Step4 覆盖文件中该依赖不再属于 behavior_diff 未覆盖集合。",
+        ],
+    },
+    JAPICMP_EXECUTION_FAILED: {
+        "title": "JApiCmp 依赖对比执行失败",
+        "origin_step": "step4",
+        "domain": "japicmp",
+        "subject": "execution",
+        "condition": "failed",
+        "category": "binary_api_diff",
+        "summary": (
+            "JApiCmp 已针对某个依赖启动，但进程非正常退出或没有形成可验证的对比结果。"
+        ),
+        "trigger_condition": (
+            "单个依赖的 JApiCmp 进程返回非零退出码，或执行结果无法作为二进制 API 差异证据采用。"
+        ),
+        "semantic_impact": (
+            "该依赖的 API 变化数据不可用；all_changed_apis.csv 中没有该依赖的记录，"
+            "不能解释为该依赖确实没有 API 变化。其他成功依赖的结果仍然有效。"
+        ),
+        "default_blocking": True,
+        "recommended_decision": "repair_and_rerun_failed_dependency",
+        "decision_text": (
+            "查看逐依赖状态台账和原始 JApiCmp 输出，修复该依赖的工具、JDK、JAR 或资源问题后重跑 Step4。"
+        ),
+        "ignore_when": (
+            "仅当能够证明该依赖不属于本次最终运行时，或已明确接受该依赖全部 API 风险未知时，"
+            "才可排除；不能因 all_changed_apis.csv 中没有记录而忽略。"
+        ),
+        "repair_actions": [
+            "打开 dependency_analysis_status.json 中该依赖的 failure_message 和 evidence_path。",
+            "检查 old/new 最终制品 JAR、Java/JDK 兼容性、JApiCmp stderr 与进程资源。",
+            "修复后重跑 Step4；无需把失败伪造成一条 API 变化记录。",
+        ],
+        "verification_steps": [
+            "逐依赖状态从 failed 变为 changes_detected 或 no_api_change。",
+            "Step4 binary_api_diff 覆盖状态不再因该依赖处于 partial/insufficient。",
+        ],
+    },
+    JAPICMP_TIMEOUT: {
+        "title": "JApiCmp 依赖对比超时",
+        "origin_step": "step4",
+        "domain": "japicmp",
+        "subject": "execution",
+        "condition": "timeout",
+        "category": "binary_api_diff",
+        "summary": "单个依赖的 JApiCmp 对比超过配置时限，未形成可判定结果。",
+        "trigger_condition": "JApiCmp 子进程在 step4_japicmp_timeout 到期前没有完成。",
+        "semantic_impact": (
+            "该依赖的 API 变化数据不可用，不能归入“成功对比且无 API 变化”。"
+        ),
+        "default_blocking": True,
+        "recommended_decision": "increase_timeout_or_reduce_contention_and_rerun",
+        "decision_text": (
+            "结合原始输出评估耗时，适当增加 step4_japicmp_timeout，"
+            "或降低 step4_workers 后重跑失败依赖。"
+        ),
+        "ignore_when": (
+            "仅当该依赖已被证明确认不在最终运行时范围内时可以排除；否则应恢复完整对比。"
+        ),
+        "repair_actions": [
+            "增加 step4_japicmp_timeout，或降低 step4_workers 以减少 CPU/内存争用。",
+            "确认 old/new JAR 可读且没有异常膨胀、损坏或重复嵌套。",
+            "重跑 Step4 并检查逐依赖状态台账。",
+        ],
+        "verification_steps": [
+            "该依赖状态变为 changes_detected 或 no_api_change。",
+            "timeouts.json 与 Step4 覆盖结果不再记录该依赖超时。",
+        ],
+    },
+    SPRING_RUNTIME_CLASS_AMBIGUOUS: {
         "title": "Spring 运行时类选择歧义",
+        "origin_step": "step5",
+        "domain": "spring",
+        "subject": "runtime_class",
+        "condition": "ambiguous",
         "category": "runtime_classpath",
         "summary": (
             "最终制品中同一逻辑类存在多个字节码不同的运行时可见定义，"
@@ -35,6 +196,7 @@ _REASON_GUIDANCE = {
             "只应阻断调用链经过歧义类的 Spring 隐式调用证据；"
             "无关 API 和不经过该类的路径不应被降级。"
         ),
+        "default_blocking": True,
         "recommended_decision": "fix_before_relying_on_affected_results",
         "decision_text": (
             "受影响 API 的结论不可直接用于发布决策。应消除重复类，"
@@ -56,8 +218,12 @@ _REASON_GUIDANCE = {
             "重跑后该原因码消失，受影响 API 获得新的可判定结论；无关 API 不再被该原因降级。",
         ],
     },
-    "MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED": {
+    MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED: {
         "title": "MyBatis 运行时制品解析失败",
+        "origin_step": "step5",
+        "domain": "mybatis",
+        "subject": "runtime_artifact",
+        "condition": "parse_failed",
         "category": "artifact_integrity",
         "summary": (
             "MyBatis 适配器无法读取当前最终制品保留的一个运行时制品，"
@@ -72,6 +238,7 @@ _REASON_GUIDANCE = {
             "若旧结果把失败记录为 global，报告会如实显示它曾保守阻断所有 API，"
             "以便识别过度传播。"
         ),
+        "default_blocking": True,
         "recommended_decision": "fix_if_mybatis_is_in_scope",
         "decision_text": (
             "部署中使用 MyBatis 时必须修复制品并重跑；否则 Mapper 相关 API 不能判定。"
@@ -153,13 +320,27 @@ def _generic_guidance(reason_code):
     }
 
 
-def guidance_for_reason_code(reason_code):
+def guidance_for_reason_code(reason_code, *, origin_step=""):
     """Return a detached guidance definition for one stable reason code."""
-    code = str(reason_code or "UNKNOWN").strip() or "UNKNOWN"
+    input_code = str(reason_code or "UNKNOWN").strip() or "UNKNOWN"
+    code = canonical_reason_code(input_code)
     definition = _REASON_GUIDANCE.get(code)
     return {
         "reason_code": code,
+        "reason_code_aliases": reason_code_aliases(code),
+        "input_reason_code": input_code,
+        "matched_via": "canonical" if input_code == code else "legacy_alias",
+        "diagnostic_schema": DIAGNOSTIC_CONTRACT_SCHEMA,
+        "diagnostic_contract": diagnostic_contract_metadata(),
         "catalog_match": "exact" if definition is not None else "family_fallback",
+        "origin_step": str(
+            (definition or {}).get("origin_step")
+            or origin_step
+            or "unknown"
+        ),
+        "domain": str((definition or {}).get("domain") or "analysis"),
+        "subject": str((definition or {}).get("subject") or "diagnostic"),
+        "condition": str((definition or {}).get("condition") or "requires_review"),
         **dict(definition or _generic_guidance(code)),
     }
 
@@ -275,7 +456,9 @@ def build_diagnostic_guidance(results, graph_stats=None):
     status_counts = defaultdict(lambda: defaultdict(int))
     for item in results or ():
         status = str(_get(item, "analysis_status", "") or "").strip()
-        reason_code = str(_get(item, "reason_code", "") or "UNKNOWN").strip()
+        reason_code = canonical_reason_code(
+            _get(item, "reason_code", "") or "UNKNOWN"
+        )
         if status not in {"uncertain", "not_analyzed"}:
             continue
         grouped_results[reason_code].append(item)
@@ -283,7 +466,9 @@ def build_diagnostic_guidance(results, graph_stats=None):
 
     grouped_failures = defaultdict(list)
     for failure in _failure_rows(graph_stats or {}):
-        reason_code = str(failure.get("reason_code") or "UNKNOWN").strip()
+        reason_code = canonical_reason_code(
+            failure.get("reason_code") or "UNKNOWN"
+        )
         if failure.get("blocking") or reason_code in grouped_results:
             grouped_failures[reason_code].append(failure)
 
@@ -373,6 +558,51 @@ def build_diagnostic_guidance(results, graph_stats=None):
             item.get("reason_code") or "",
         ),
     )
+
+
+def build_catalog_guidance(
+    reason_codes,
+    *,
+    origin_step="",
+    observed_scope="step",
+    source_components=None,
+):
+    """Build self-service guidance for step/coverage codes without API results."""
+    guidance = []
+    for reason_code in sorted({
+        canonical_reason_code(value)
+        for value in (reason_codes or ())
+        if str(value or "").strip()
+    }):
+        definition = guidance_for_reason_code(reason_code)
+        if definition.get("catalog_match") != "exact":
+            continue
+        if (
+            origin_step
+            and str(definition.get("origin_step") or "") != str(origin_step)
+        ):
+            continue
+        guidance.append({
+            **definition,
+            "blocking": bool(definition.get("default_blocking")),
+            "observed_scope": observed_scope,
+            "scope_explanation": (
+                "该诊断限制对应步骤或覆盖组件，不代表所有 API 都受到影响。"
+            ),
+            "affected_api_count": 0,
+            "affected_api_count_semantics": "not_available_at_step_scope",
+            "affected_status_counts": {},
+            "observed_failure_count": 1,
+            "collectors": [],
+            "affected_classes": [],
+            "affected_artifacts": [],
+            "affected_artifact_entries": [],
+            "candidate_evidence": [],
+            "sample_apis": [],
+            "failure_detail_summaries": [],
+            "source_components": list(source_components or ()),
+        })
+    return guidance
 
 
 def build_diagnostic_guidance_from_summary(summary):

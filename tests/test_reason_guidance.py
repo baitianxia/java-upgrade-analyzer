@@ -14,6 +14,7 @@ import enhanced_output_formatter as formatter  # noqa: E402
 import s6_report  # noqa: E402
 from reason_guidance import (  # noqa: E402
     REASON_GUIDANCE_SCHEMA,
+    build_catalog_guidance,
     build_diagnostic_guidance,
     build_diagnostic_guidance_from_summary,
     guidance_for_reason_code,
@@ -62,7 +63,7 @@ class ReasonGuidanceTest(unittest.TestCase):
             "detail",
         ]
         spring_detail = {
-            "reason_code": "SPRING_PACKAGED_CLASS_AMBIGUOUS",
+            "reason_code": "SPRING_RUNTIME_CLASS_AMBIGUOUS",
             "class_name": "demo.Config",
             "candidates": [
                 {
@@ -85,7 +86,7 @@ class ReasonGuidanceTest(unittest.TestCase):
                 "failures": [
                     {
                         "collector": "spring_aop_activation",
-                        "reason_code": "SPRING_PACKAGED_CLASS_AMBIGUOUS",
+                        "reason_code": "SPRING_RUNTIME_CLASS_AMBIGUOUS",
                         "blocking": True,
                         "artifact": "/runtime/a.jar",
                         "class_name": "demo.Config",
@@ -139,6 +140,10 @@ class ReasonGuidanceTest(unittest.TestCase):
         )
 
         self.assertEqual("exact", spring["catalog_match"])
+        self.assertEqual("legacy_alias", spring["matched_via"])
+        self.assertEqual(
+            "SPRING_RUNTIME_CLASS_AMBIGUOUS", spring["reason_code"]
+        )
         self.assertIn("BOOT-INF/classpath.idx", spring["trigger_condition"])
         self.assertIn("无关 API", spring["semantic_impact"])
         self.assertIn("受影响 API", spring["decision_text"])
@@ -155,6 +160,64 @@ class ReasonGuidanceTest(unittest.TestCase):
         self.assertEqual("artifact_parse", guidance["category"])
         self.assertIn("解析", guidance["trigger_condition"])
         self.assertTrue(guidance["repair_actions"])
+
+    def test_cross_step_catalog_uses_one_vocabulary_and_origin_field(self):
+        step1 = guidance_for_reason_code(
+            "unresolved_dependency_coordinates_after_enrichment"
+        )
+        step4 = guidance_for_reason_code("DEPENDENCY_SOURCE_REF_UNAVAILABLE")
+        japicmp = guidance_for_reason_code("JAPICMP_EXECUTION_FAILED")
+        timeout = guidance_for_reason_code("JAPICMP_TIMEOUT")
+        coverage_guidance = build_catalog_guidance(
+            ["DEPENDENCY_SOURCE_REF_UNAVAILABLE"],
+            origin_step="step4",
+            source_components=["behavior_diff"],
+        )
+
+        self.assertEqual(
+            "DEPENDENCY_COORDINATES_UNRESOLVED", step1["reason_code"]
+        )
+        self.assertEqual("step1", step1["origin_step"])
+        self.assertEqual("step4", step4["origin_step"])
+        self.assertEqual("source_ref", step4["subject"])
+        self.assertEqual("step4", japicmp["origin_step"])
+        self.assertTrue(japicmp["default_blocking"])
+        self.assertIn("all_changed_apis.csv", japicmp["semantic_impact"])
+        self.assertIn("step4_workers", timeout["repair_actions"][0])
+        self.assertEqual(1, len(coverage_guidance))
+        self.assertEqual(
+            ["behavior_diff"], coverage_guidance[0]["source_components"]
+        )
+
+    def test_final_report_merges_step4_coverage_guidance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            coverage_path = report_dir / ".runtime" / "coverage" / "coverage.json"
+            coverage_path.parent.mkdir(parents=True)
+            coverage_path.write_text(json.dumps({
+                "schema": "java-upgrade-analyzer.coverage.v1",
+                "overall_status": "partial",
+                "critical_incomplete": ["behavior_diff"],
+                "components": [{
+                    "id": "behavior_diff",
+                    "status": "partial",
+                    "reason_codes": ["DEPENDENCY_SOURCE_REF_UNAVAILABLE"],
+                }],
+            }), encoding="utf-8")
+
+            findings = s6_report.collect_findings(str(report_dir))
+            report = s6_report.generate_report(findings)
+
+        by_code = {
+            item["reason_code"]: item
+            for item in findings["diagnostic_guidance"]
+        }
+        self.assertEqual(
+            "step4",
+            by_code["DEPENDENCY_SOURCE_REF_UNAVAILABLE"]["origin_step"],
+        )
+        self.assertIn("DEPENDENCY_SOURCE_REF_UNAVAILABLE", report)
+        self.assertIn("来源步骤", report)
 
     def test_old_summary_can_be_upgraded_without_reading_collector_source(self):
         guidance = build_diagnostic_guidance_from_summary({
@@ -176,7 +239,7 @@ class ReasonGuidanceTest(unittest.TestCase):
     def test_aggregation_reports_actual_failure_scope_and_evidence(self):
         results = [
             self._result(
-                "SPRING_PACKAGED_CLASS_AMBIGUOUS", "demo.Api.spring"
+                "SPRING_RUNTIME_CLASS_AMBIGUOUS", "demo.Api.spring"
             ),
             self._result(
                 "MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED", "demo.Api.mybatis"
@@ -186,7 +249,7 @@ class ReasonGuidanceTest(unittest.TestCase):
         guidance = build_diagnostic_guidance(results, self._graph_stats())
         by_code = {item["reason_code"]: item for item in guidance}
 
-        spring = by_code["SPRING_PACKAGED_CLASS_AMBIGUOUS"]
+        spring = by_code["SPRING_RUNTIME_CLASS_AMBIGUOUS"]
         self.assertTrue(spring["blocking"])
         self.assertEqual("path", spring["observed_scope"])
         self.assertEqual(1, spring["affected_api_count"])
@@ -215,7 +278,7 @@ class ReasonGuidanceTest(unittest.TestCase):
     def test_summary_and_final_report_share_structured_guidance(self):
         results = [
             self._result(
-                "SPRING_PACKAGED_CLASS_AMBIGUOUS", "demo.Api.spring"
+                "SPRING_RUNTIME_CLASS_AMBIGUOUS", "demo.Api.spring"
             ),
             self._result(
                 "MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED", "demo.Api.mybatis"
@@ -245,7 +308,7 @@ class ReasonGuidanceTest(unittest.TestCase):
         self.assertIn(
             "同一逻辑类",
             api_entries[
-                "SPRING_PACKAGED_CLASS_AMBIGUOUS"
+                "SPRING_RUNTIME_CLASS_AMBIGUOUS"
             ]["user_reason"],
         )
         self.assertIn(
@@ -261,7 +324,7 @@ class ReasonGuidanceTest(unittest.TestCase):
         self.assertEqual(
             "path",
             summary_by_code[
-                "SPRING_PACKAGED_CLASS_AMBIGUOUS"
+                "SPRING_RUNTIME_CLASS_AMBIGUOUS"
             ]["observed_scope"],
         )
         self.assertEqual(
@@ -271,7 +334,7 @@ class ReasonGuidanceTest(unittest.TestCase):
             ]["observed_scope"],
         )
         self.assertIn("### 需要决策的分析诊断", report)
-        self.assertIn("SPRING_PACKAGED_CLASS_AMBIGUOUS", report)
+        self.assertIn("SPRING_RUNTIME_CLASS_AMBIGUOUS", report)
         self.assertIn("MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED", report)
         self.assertIn("**触发条件**", report)
         self.assertIn("**可忽略条件**", report)

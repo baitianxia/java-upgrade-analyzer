@@ -5085,7 +5085,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true(rc == EXIT_AWAITING_USER, "branch 已提供但坐标仍无法补全时，Step1 也应进入 awaiting user")
     artifact_followup_interaction = read_json(interaction_path(artifact_followup_report))
     assert_true(
-        artifact_followup_interaction.get("reason_code") == "unresolved_dependency_coordinates_after_enrichment",
+        artifact_followup_interaction.get("reason_code") == "DEPENDENCY_COORDINATES_UNRESOLVED",
         "branch 已提供但坐标仍无法补全时，Step1 应显式暴露 follow-up 交互原因",
     )
     assert_true(

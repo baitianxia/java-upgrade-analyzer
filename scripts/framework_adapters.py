@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Mapping, Protocol
 
 from enhanced_source_analyzer import analyze_file
+from diagnostic_contract import SPRING_RUNTIME_CLASS_AMBIGUOUS
 from signature_utils import normalize_signature_for_lookup
 from step5_evidence_model import (
     ActivationEvidence,
@@ -409,7 +410,7 @@ def _framework_failure(adapter, error):
         reason = 'SPRING_NESTED_ARTIFACT_INVALID'
         blocking = True
     elif 'spring_packaged_class_ambiguous' in text:
-        reason = 'SPRING_PACKAGED_CLASS_AMBIGUOUS'
+        reason = SPRING_RUNTIME_CLASS_AMBIGUOUS
         blocking = True
     elif 'spring_transaction_business_class_ambiguous' in text:
         reason = 'SPRING_TRANSACTION_BUSINESS_CLASS_AMBIGUOUS'
@@ -3672,7 +3673,7 @@ def collect_spring_aop_activation(
                         if (
                             isinstance(item, Mapping)
                             and item.get('reason_code')
-                            == 'SPRING_PACKAGED_CLASS_AMBIGUOUS'
+                            == SPRING_RUNTIME_CLASS_AMBIGUOUS
                         )
                         else item
                         for item in diagnostics
@@ -4186,7 +4187,7 @@ def _resolve_runtime_class_candidates(logical, values, fact_store):
             else ''
         )
         return None, {
-            'reason_code': 'SPRING_PACKAGED_CLASS_AMBIGUOUS',
+            'reason_code': SPRING_RUNTIME_CLASS_AMBIGUOUS,
             'blocking': True,
             'scope': 'path',
             'class_name': owner,

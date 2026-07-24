@@ -79,6 +79,18 @@ class ContextCompressTest(unittest.TestCase):
                         "not_found_apis": [{"api": "d", "severity": "P1"}],
                         "quality_gate": {"needs_input": 1},
                         "user_conclusion_summary": {"已确认影响": 1},
+                        "origin_step": "step5",
+                        "diagnostic_contract": {
+                            "schema": "java-upgrade-analyzer.diagnostic.v1",
+                            "reason_code_style": "UPPER_SNAKE_CASE",
+                        },
+                        "diagnostic_guidance_schema": "java-upgrade-analyzer.reason-guidance.v2",
+                        "diagnostic_guidance": [
+                            {
+                                "reason_code": "SPRING_RUNTIME_CLASS_AMBIGUOUS",
+                                "origin_step": "step5",
+                            }
+                        ],
                     },
                     ensure_ascii=False,
                 ),
@@ -100,6 +112,15 @@ class ContextCompressTest(unittest.TestCase):
             self.assertEqual(summary["severity_breakdown"], {"P0": 1, "P1": 2, "P2": 1})
             self.assertEqual(summary["quality_gate"], {"needs_input": 1})
             self.assertEqual(summary["user_conclusion_summary"], {"已确认影响": 1})
+            self.assertEqual(summary["origin_step"], "step5")
+            self.assertEqual(
+                summary["diagnostic_contract"]["reason_code_style"],
+                "UPPER_SNAKE_CASE",
+            )
+            self.assertEqual(
+                summary["diagnostic_guidance"][0]["reason_code"],
+                "SPRING_RUNTIME_CLASS_AMBIGUOUS",
+            )
 
 
 if __name__ == "__main__":

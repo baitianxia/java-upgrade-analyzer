@@ -39,7 +39,9 @@ class RunStepMainStateTest(unittest.TestCase):
                 "s4_jar_compare.py", report_dir
             )
 
-        self.assertEqual(reason_codes, ["step4_japicmp_missing_need_resolution"])
+        self.assertEqual(
+            reason_codes, ["STEP4_JAPICMP_MISSING_NEED_RESOLUTION"]
+        )
 
     def test_step1_artifact_preflight_asks_only_for_missing_module_and_shows_candidates(self):
         interaction = run_step.build_step1_preflight_interaction(
@@ -92,7 +94,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 main_state=run_step.new_main_state(report_dir),
             )
 
-        self.assertEqual(payload["reason_code"], "step1_context_refs_required")
+        self.assertEqual(payload["reason_code"], "STEP1_CONTEXT_REFS_REQUIRED")
         self.assertEqual(payload["required_fields"], ["base_branch", "current_branch"])
         self.assertEqual(
             payload["action_requirements"]["continue"]["required_fields"],
@@ -200,7 +202,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 main_state=run_step.new_main_state(report_dir),
             )
 
-        self.assertEqual(payload["reason_code"], "step2_context_facts_unresolved")
+        self.assertEqual(payload["reason_code"], "STEP2_CONTEXT_FACTS_UNRESOLVED")
         self.assertEqual(payload["required_fields"], ["jdk_base", "jdk_current"])
         self.assertIn("升级前 JDK", payload["question"])
         self.assertIn("升级后 JDK", payload["question"])
@@ -4628,6 +4630,10 @@ class RunStepMainStateTest(unittest.TestCase):
             artifact_bytecode_dir = self._runtime_cache_dir(report_dir) / run_step.STEP5_ARTIFACT_BYTECODE_DIRNAME
             framework_adapters = self._call_chain_dir(report_dir) / "framework_adapters.json"
             source_alignment = self._call_chain_dir(report_dir) / "source_artifact_alignment.json"
+            diagnostics = (
+                run_step.runtime_observability_dir(report_dir)
+                / run_step.STEP5_DIAGNOSTICS_FILE
+            )
             main_state = self._runtime_state_dir(report_dir) / "main_state.json"
             interaction = self._runtime_state_dir(report_dir) / "interaction.json"
             step5_dir.mkdir(parents=True)
@@ -4639,6 +4645,8 @@ class RunStepMainStateTest(unittest.TestCase):
             artifact_index.write_text("{}", encoding="utf-8")
             framework_adapters.write_text("{}", encoding="utf-8")
             source_alignment.write_text("{}", encoding="utf-8")
+            diagnostics.parent.mkdir(parents=True, exist_ok=True)
+            diagnostics.write_text("{}\n", encoding="utf-8")
             main_state.parent.mkdir(parents=True, exist_ok=True)
             main_state.write_text("{}", encoding="utf-8")
             interaction.write_text("{}", encoding="utf-8")
@@ -4651,6 +4659,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertFalse(artifact_index.exists())
             self.assertFalse(framework_adapters.exists())
             self.assertFalse(source_alignment.exists())
+            self.assertFalse(diagnostics.exists())
             self.assertTrue(main_state.exists())
             self.assertTrue(interaction.exists())
 
@@ -4855,7 +4864,10 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(saved["state"]["status"], "awaiting_user_input")
             self.assertEqual(saved["state"]["current_step"], "step5")
             self.assertEqual(saved["state"]["completed_step"], "step4")
-            self.assertEqual(saved["state"]["pending_interaction"]["reason_code"], "step5_dependency_source_mapping_missing")
+            self.assertEqual(
+                saved["state"]["pending_interaction"]["reason_code"],
+                "STEP5_DEPENDENCY_SOURCE_MAPPING_MISSING",
+            )
             pending_properties = saved["state"]["pending_interaction"]["response_schema"]["properties"]
             self.assertNotIn("step5_selected_coords", pending_properties)
             self.assertNotIn("step5_selected_names", pending_properties)

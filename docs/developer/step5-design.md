@@ -202,7 +202,7 @@ Class.forName("org.apache.commons.lang.StringUtils")
 `summary.json` 不能只输出 `not_analyzed_reason_summary` 的原因码计数。每个进入
 `uncertain` / `not_analyzed` 的主原因，以及 failure ledger 中未成为主原因的阻塞失败，
 都必须进入 `diagnostic_guidance[]`。该数组使用
-`java-upgrade-analyzer.reason-guidance.v1`，至少包含：
+`java-upgrade-analyzer.reason-guidance.v2`，至少包含：
 
 - 稳定 `reason_code`、可读标题和触发条件；
 - 该原因的语义影响，以及本轮实际观察到的 `api` / `path` / `global` 传播范围；旧结果缺少
@@ -215,7 +215,11 @@ Step6 主报告必须直接消费 `diagnostic_guidance[]`，不得维护另一�
 `summary.json` 没有该字段时，Step6 可以用同一原因目录基于 API 列表和
 `meta.graph_stats.evidence_ingestion.failures` 补建。
 
-`SPRING_PACKAGED_CLASS_AMBIGUOUS` 是路径级失败，只能影响经过歧义类的 Spring 路径。
+跨步骤原因码、字段命名和旧码兼容规则统一遵循
+[`diagnostic-contract.md`](diagnostic-contract.md)，Step5 不再定义自己的命名风格。
+
+`SPRING_RUNTIME_CLASS_AMBIGUOUS` 是路径级失败，只能影响经过歧义类的 Spring 路径。
+旧原因码 `SPRING_PACKAGED_CLASS_AMBIGUOUS` 仅作为兼容别名读取，新结果不再输出该名称。
 `MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED` 同样是路径级失败，作用对象为
 `org.apache.ibatis.binding.MapperProxy` 代理路径；它不得再作为全局失败传播给所有变化
 API。报告仍需如实展示历史输入中已经记录的 `global` 作用域，便于识别旧结果的过度传播。
@@ -259,7 +263,19 @@ Step5 会输出：
 
 ```text
 .runtime/observability/step5_timing.csv
+.runtime/observability/step5_diagnostics.jsonl
 ```
+
+`step5_diagnostics.jsonl` 是追加式过程台账。collector 完成后立即按
+`reason_code + blocking + scope` 聚合写入；逐 API 追踪第一次出现某个
+`uncertain` / `not_analyzed` 原因时也立即写入，随后只在计数达到受控检查点时更新，
+避免为数千个同原因 API 写数千条重复事件。正式调度器实时转发 Step5 stderr，不能等子进程
+结束后再一次性打印。
+
+核心制品身份、安全性和全局业务字节码证据失败必须写
+`artifact_preflight_failure.json` 并在构图或逐 API 追踪前尽早停止。路径级和 API 级失败
+不得扩大成全局短路；例如 `SPRING_RUNTIME_CLASS_AMBIGUOUS` 立即出现在实时台账中，但只
+限制经过歧义类的路径。
 
 重点看：
 

@@ -298,6 +298,10 @@ def summarize_step5(report_dir):
         'severity_breakdown': _build_step5_severity_breakdown(summary),
         'quality_gate':       summary.get('quality_gate', {}),
         'user_conclusion_summary': summary.get('user_conclusion_summary', {}),
+        'origin_step':        summary.get('origin_step', 'step5'),
+        'diagnostic_contract': summary.get('diagnostic_contract', {}),
+        'diagnostic_guidance_schema': summary.get('diagnostic_guidance_schema', ''),
+        'diagnostic_guidance': summary.get('diagnostic_guidance', []),
         'deprecated_aliases': summary.get('deprecated_aliases', {}),
         # 只保留 Top 10 可达风险
         'top_reachable': summary.get('reachable_apis', [])[:10],

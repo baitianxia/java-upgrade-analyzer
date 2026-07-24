@@ -35,6 +35,7 @@ STEP5_ARTIFACT_BYTECODE_DIRNAME = "s5_artifact_bytecode"
 STEP5_ARTIFACT_BYTECODE_CATALOG_FILE = "s5_artifact_bytecode_catalog.json"
 STEP5_ARTIFACT_BYTECODE_INDEX_FILE = "s5_artifact_bytecode_index.json"
 STEP5_QUERY_INDEX_FILE = "s5_query_index.json"
+STEP5_DIAGNOSTICS_FILE = "step5_diagnostics.jsonl"
 
 DELIVERABLES_DIRNAME = "deliverables"
 EVIDENCE_DIRNAME = "evidence"

@@ -463,6 +463,201 @@ public class com.acme.Api {
             self.assertIn("`com.acme:alpha`", md_text)
             self.assertIn("完整 API 明细", md_text)
 
+    def test_dependency_analysis_status_distinguishes_zero_change_from_failure(self):
+        dep_rows = [
+            {
+                "coord": "com.acme:no-change",
+                "old_version": "1.0",
+                "new_version": "2.0",
+                "change_type": "小版本升级",
+            },
+            {
+                "coord": "com.acme:failed",
+                "old_version": "1.0",
+                "new_version": "2.0",
+                "change_type": "小版本升级",
+            },
+        ]
+        binary_runs = [
+            {
+                "coord": "com.acme:failed",
+                "mode": "japicmp",
+                "status": "failed",
+                "reason_code": "JAPICMP_EXECUTION_FAILED",
+                "error": "Unsupported class file major version",
+                "evidence_path": "/tmp/failed_binary.txt",
+            },
+            {
+                "coord": "com.acme:no-change",
+                "mode": "japicmp",
+                "status": "success",
+                "api_count": 0,
+                "evidence_path": "/tmp/no_change_binary.txt",
+            },
+        ]
+
+        rows = step4.build_dependency_analysis_status_rows(dep_rows, binary_runs)
+        by_coord = {row["coord"]: row for row in rows}
+
+        self.assertEqual(
+            by_coord["com.acme:no-change"]["comparison_status"],
+            "no_api_change",
+        )
+        self.assertTrue(
+            by_coord["com.acme:no-change"]["api_data_available"]
+        )
+        self.assertEqual(
+            by_coord["com.acme:failed"]["comparison_status"],
+            "failed",
+        )
+        self.assertFalse(by_coord["com.acme:failed"]["api_data_available"])
+        self.assertIsNone(
+            by_coord["com.acme:failed"]["changed_api_count"]
+        )
+        self.assertIn(
+            "不能解释为“没有 API 变化”",
+            by_coord["com.acme:failed"]["result_interpretation"],
+        )
+
+    def test_write_dependency_analysis_status_includes_failure_guidance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows, csv_path, json_path = step4.write_dependency_analysis_status(
+                [
+                    {
+                        "coord": "com.acme:failed",
+                        "old_version": "1.0",
+                        "new_version": "2.0",
+                        "change_type": "小版本升级",
+                    }
+                ],
+                [
+                    {
+                        "coord": "com.acme:failed",
+                        "mode": "japicmp",
+                        "status": "failed",
+                        "reason_code": "JAPICMP_EXECUTION_FAILED",
+                        "error": "process exited with 1",
+                        "evidence_path": "/tmp/failed_binary.txt",
+                    }
+                ],
+                tmp,
+            )
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            md_text = (
+                Path(tmp) / step4.DEPENDENCY_ANALYSIS_STATUS_MD
+            ).read_text(encoding="utf-8")
+            with csv_path.open(encoding="utf-8-sig") as fh:
+                csv_rows = list(csv.DictReader(fh))
+
+        self.assertEqual(rows[0]["comparison_status"], "failed")
+        self.assertEqual(csv_rows[0]["comparison_status"], "failed")
+        self.assertEqual(csv_rows[0]["changed_api_count"], "")
+        self.assertEqual(payload["summary"]["failed"], 1)
+        self.assertEqual(
+            payload["diagnostic_guidance"][0]["reason_code"],
+            "JAPICMP_EXECUTION_FAILED",
+        )
+        self.assertIn(
+            "不能解释为该依赖确实没有 API 变化",
+            payload["diagnostic_guidance"][0]["semantic_impact"],
+        )
+        self.assertIn("每个依赖的分析结果（先看这里）", md_text)
+        self.assertIn("可按无变化处理", md_text)
+        self.assertIn("分析不完整：API 对比失败", md_text)
+        self.assertIn("修复后重跑", md_text)
+
+    def test_dependency_status_uses_direct_source_diff_conclusions(self):
+        dep_rows = [
+            {
+                "coord": coord,
+                "old_version": "1.0",
+                "new_version": "2.0",
+                "change_type": "小版本升级",
+            }
+            for coord in (
+                "com.acme:source-ok",
+                "com.acme:jar-recovered",
+                "com.acme:source-pending",
+            )
+        ]
+        binary_runs = [
+            {
+                "coord": row["coord"],
+                "mode": "japicmp",
+                "status": "success",
+                "api_count": 0,
+            }
+            for row in dep_rows
+        ]
+
+        rows = step4.build_dependency_analysis_status_rows(
+            dep_rows,
+            binary_runs,
+            gitdiff_runs=[
+                {
+                    "coord": "com.acme:source-ok",
+                    "api_changes": 0,
+                    "promoted_to_step5": 0,
+                    "out_file": "/tmp/source-ok.txt",
+                }
+            ],
+            gitdiff_skipped=[
+                {
+                    "coord": "com.acme:jar-recovered",
+                    "reason_code": "DEPENDENCY_SOURCE_DIFF_UNAVAILABLE",
+                    "reason": "git diff failed",
+                    "behavior_fallback_status": "complete",
+                }
+            ],
+            gitdiff_pending=[
+                {
+                    "coord": "com.acme:source-pending",
+                    "reason": "存在多个候选 ref",
+                }
+            ],
+            bytecode_behavior_runs=[
+                {
+                    "coord": "com.acme:jar-recovered",
+                    "status": "complete",
+                    "api_changes": 0,
+                    "evidence_path": "/tmp/behavior.json",
+                }
+            ],
+        )
+        by_coord = {row["coord"]: row for row in rows}
+
+        self.assertEqual(
+            by_coord["com.acme:source-ok"]["implementation_check_result_text"],
+            "源码对比成功，未发现实现差异。",
+        )
+        self.assertTrue(
+            by_coord["com.acme:source-ok"]["can_treat_as_no_change"]
+        )
+        self.assertIn(
+            "已通过发布 JAR 的方法实现检查补齐",
+            by_coord["com.acme:jar-recovered"][
+                "implementation_check_result_text"
+            ],
+        )
+        self.assertTrue(
+            by_coord["com.acme:jar-recovered"]["analysis_complete"]
+        )
+        self.assertEqual(
+            by_coord["com.acme:source-pending"][
+                "implementation_check_result_text"
+            ],
+            "等待确认新旧源码版本，尚未执行实现变化检查。",
+        )
+        self.assertTrue(
+            by_coord["com.acme:source-pending"][
+                "requires_action_before_conclusion"
+            ]
+        )
+        self.assertIn(
+            "确认 old/new 源码版本",
+            by_coord["com.acme:source-pending"]["next_action"],
+        )
+
     def test_source_refs_compare_resolved_commits_not_only_branch_names(self):
         with patch.object(
             step4,
@@ -1417,6 +1612,10 @@ public class com.acme.Api {
         self.assertEqual(apis, [])
         self.assertEqual(jar_info["old_jar"], str(old_jar))
         self.assertEqual(jar_info["new_jar"], str(new_jar))
+        self.assertEqual(
+            jar_info["reason_code"],
+            "JAPICMP_EXECUTION_FAILED",
+        )
         self.assertIn("Required option -o, --old is missing.", err)
         self.assertIn("JApiCmp 执行失败（退出码 1）", content)
         self.assertIn("stderr:", content)
@@ -1753,6 +1952,11 @@ public class com.acme.Api {
             internally_skipped[0]["reason_code"],
             "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
         )
+        self.assertEqual("step4", internally_skipped[0]["origin_step"])
+        self.assertEqual(
+            "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
+            internally_skipped[0]["diagnostic_guidance"]["reason_code"],
+        )
         self.assertEqual(
             internally_skipped[0]["resolution"],
             "continue_with_final_artifact_analysis",
@@ -1970,7 +2174,7 @@ public class com.acme.Api {
         self.assertEqual(len(pending["items"]), 1)
         self.assertEqual(pending["items"][0]["coord"], "com.acme:acct-sdk")
         self.assertTrue(matches["need_user_confirmation"])
-        self.assertIn("Step4 依赖源码 git refs 预检摘要", summary_text)
+        self.assertIn("Step4 依赖的新旧源码版本检查摘要", summary_text)
         self.assertIn("一、结论总览", summary_text)
         self.assertIn("preflight.git_refs", {row["phase"] for row in timing_rows})
         self.assertIn("step4.total", {row["phase"] for row in timing_rows})
@@ -2057,6 +2261,17 @@ public class com.acme.Api {
         self.assertIn(
             "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
             coverage["behavior_diff"]["reason_codes"],
+        )
+        self.assertEqual(
+            "UPPER_SNAKE_CASE",
+            coverage["diagnostic_contract"]["reason_code_style"],
+        )
+        self.assertEqual(
+            ["DEPENDENCY_SOURCE_REF_UNAVAILABLE"],
+            [
+                item["reason_code"]
+                for item in coverage["diagnostic_guidance"]
+            ],
         )
 
     def test_main_recovers_source_ref_failure_with_final_jar_bytecode_diff(self):
@@ -3692,6 +3907,153 @@ public class com.acme.Api {
             self.assertEqual(exit_code, 0)
             self.assertEqual(japicmp_mock.call_count, 2)
             self.assertGreaterEqual(len(seen_threads), 2)
+
+    def test_parallel_japicmp_failure_is_not_reported_as_zero_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "s4_jar_compare"
+            dep_changes = report_dir / "s1_dep_changes.csv"
+            context_json = report_dir / "s2_context.json"
+            dep_changes.write_text(
+                "\n".join(
+                    [
+                        "coord,old_version,new_version,change_type,scope",
+                        "com.example:no-change,1.0.0,2.0.0,小版本升级,compile",
+                        "com.example:failed,1.0.0,2.0.0,小版本升级,compile",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps(
+                    {
+                        "changed_dependencies": [
+                            {"coord": "com.example:no-change"},
+                            {"coord": "com.example:failed"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            barrier = threading.Barrier(2)
+
+            def fake_run_japicmp(coord, *_args, **_kwargs):
+                barrier.wait(timeout=2)
+                out_file = output_dir / f"{coord.rsplit(':', 1)[-1]}_binary.txt"
+                if coord == "com.example:failed":
+                    return (
+                        str(out_file),
+                        [],
+                        {
+                            "old_jar": "",
+                            "new_jar": "",
+                            "reason_code": "JAPICMP_EXECUTION_FAILED",
+                        },
+                        "Unsupported class file major version",
+                    )
+                return (
+                    str(out_file),
+                    [],
+                    {"old_jar": "", "new_jar": ""},
+                    None,
+                )
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes",
+                    str(dep_changes),
+                    "--context",
+                    str(context_json),
+                    "--output-dir",
+                    str(output_dir),
+                    "--workers",
+                    "2",
+                ],
+            ), patch.object(
+                step4,
+                "run_japicmp",
+                side_effect=fake_run_japicmp,
+            ):
+                exit_code = step4.main()
+
+            status_payload = json.loads(
+                (output_dir / step4.DEPENDENCY_ANALYSIS_STATUS_JSON).read_text(
+                    encoding="utf-8"
+                )
+            )
+            by_coord = {
+                row["coord"]: row for row in status_payload["items"]
+            }
+            summary_text = (output_dir / "summary.txt").read_text(
+                encoding="utf-8"
+            )
+            changed_dependencies = (
+                output_dir / step4.CHANGED_DEPENDENCIES_MD
+            ).read_text(encoding="utf-8")
+            direct_status = (
+                output_dir / step4.DEPENDENCY_ANALYSIS_STATUS_MD
+            ).read_text(encoding="utf-8")
+            coverage = json.loads(
+                (
+                    report_dir / ".runtime/coverage/s4_coverage.json"
+                ).read_text(encoding="utf-8")
+            )
+            failed_summary = json.loads(
+                (
+                    step4.get_per_dependency_dir(
+                        str(report_dir),
+                        "com.example:failed",
+                    )
+                    / step4.PER_DEPENDENCY_SUMMARY_FILE
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            by_coord["com.example:no-change"]["comparison_status"],
+            "no_api_change",
+        )
+        self.assertEqual(
+            by_coord["com.example:failed"]["comparison_status"],
+            "failed",
+        )
+        self.assertIsNone(
+            by_coord["com.example:failed"]["changed_api_count"]
+        )
+        self.assertIn(
+            "com.example:failed",
+            summary_text.split(
+                "API 对比失败、没有数据", 1
+            )[1],
+        )
+        self.assertNotIn(
+            "com.example:failed",
+            summary_text.split(
+                "API 对比成功且未发现可见变化", 1
+            )[1].split("高风险/需关注 API", 1)[0],
+        )
+        self.assertIn("API 对比失败、不能进入 Step5", changed_dependencies)
+        self.assertIn(
+            "未提供依赖源码，无法检查实现变化；当前证据不完整",
+            direct_status,
+        )
+        self.assertIn("可以按无变化处理”为“是”时", direct_status)
+        self.assertEqual(coverage["binary_api_diff"]["status"], "partial")
+        self.assertIn(
+            "JAPICMP_EXECUTION_FAILED",
+            coverage["binary_api_diff"]["reason_codes"],
+        )
+        self.assertEqual(failed_summary["step4"]["status"], "incomplete")
+        self.assertEqual(
+            failed_summary["step4"]["binary_api_comparison"][
+                "comparison_status"
+            ],
+            "failed",
+        )
 
     def test_main_removed_dependency_exports_old_jar_symbols_and_writes_per_dependency_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:

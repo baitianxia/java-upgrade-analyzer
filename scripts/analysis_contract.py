@@ -14,6 +14,10 @@ from pathlib import Path
 
 from compat import git_cmd
 from csv_io import open_csv_read
+from diagnostic_contract import (
+    diagnostic_contract_metadata,
+    normalize_component_reason_codes,
+)
 from pipeline_constants import STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
 
 
@@ -1065,6 +1069,9 @@ def derive_coverage_report(report_dir, project_scope=None):
 
     api_changes_dir = report / "evidence" / "api_changes"
     api_path = api_changes_dir / "all_changed_apis.csv"
+    dependency_status_csv = api_changes_dir / "dependency_analysis_status.csv"
+    dependency_status_json = api_changes_dir / "dependency_analysis_status.json"
+    dependency_status_md = api_changes_dir / "dependency_analysis_status.md"
     api_rows = _csv_rows(api_path)
     step4_coverage_path = report / ".runtime" / "coverage" / "s4_coverage.json"
     step4_coverage = {}
@@ -1083,7 +1090,25 @@ def derive_coverage_report(report_dir, project_scope=None):
         binary_status, binary_reasons = "not_applicable", ["step4_not_executed"]
     components.append({
         "id": "binary_api_diff", "status": binary_status, "reason_codes": binary_reasons,
-        "evidence": ["evidence/api_changes/all_changed_apis.csv"] if api_path.is_file() else [],
+        "evidence": [
+            value
+            for path, value in (
+                (api_path, "evidence/api_changes/all_changed_apis.csv"),
+                (
+                    dependency_status_csv,
+                    "evidence/api_changes/dependency_analysis_status.csv",
+                ),
+                (
+                    dependency_status_json,
+                    "evidence/api_changes/dependency_analysis_status.json",
+                ),
+                (
+                    dependency_status_md,
+                    "evidence/api_changes/dependency_analysis_status.md",
+                ),
+            )
+            if path.is_file()
+        ],
         "metrics": {"changed_apis": len(api_rows), **(binary_component.get('metrics') or {})},
     })
 
@@ -1244,6 +1269,10 @@ def derive_coverage_report(report_dir, project_scope=None):
                 "metrics": adapter.get("metrics") or {},
             })
 
+    components = [
+        normalize_component_reason_codes(component)
+        for component in components
+    ]
     overall = aggregate_coverage_status(item["status"] for item in components)
     critical_ids = {
         'project_scope', 'dependency_diff', 'build_provenance', 'binary_api_diff',
@@ -1257,6 +1286,7 @@ def derive_coverage_report(report_dir, project_scope=None):
     ]
     return {
         "schema": "java-upgrade-analyzer.coverage.v1",
+        "diagnostic_contract": diagnostic_contract_metadata(),
         "derived": True,
         "overall_status": overall,
         "critical_incomplete": critical_incomplete,
