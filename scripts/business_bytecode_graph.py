@@ -8,13 +8,13 @@ import json
 import os
 import re
 import struct
-import tempfile
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from compat import run_cmd
 from indirect_usage_analyzer import parse_javap_indirect_references
+from path_runtime import named_temporary_file, short_temp_root
 from step5_evidence_ingestion import ingest_collector_batches
 from step5_artifact_fact_store import Step5ArtifactFactStore
 from step5_evidence_model import (
@@ -92,8 +92,8 @@ def _write_business_bytecode_cache(cache_path, artifact_sha256, evidence, metric
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode='wb', dir=cache_file.parent, prefix=cache_file.name + '.',
+        with named_temporary_file(
+            mode='wb', dir=cache_file.parent, prefix='.jua-cache-',
             suffix='.tmp', delete=False,
         ) as handle:
             temporary_path = Path(handle.name)
@@ -1023,8 +1023,10 @@ def collect_business_bytecode_edges(
                         )
                     with zipfile.ZipFile(artifact_path) as archive:
                         nested_data = archive.read(entry)
-                    temporary_class = tempfile.NamedTemporaryFile(
-                        suffix='.class', delete=False
+                    temporary_class = named_temporary_file(
+                        suffix='.class',
+                        dir=short_temp_root(),
+                        delete=False,
                     )
                     try:
                         temporary_class.write(nested_data)

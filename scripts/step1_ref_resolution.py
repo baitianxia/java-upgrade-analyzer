@@ -189,7 +189,11 @@ def resolve_step1_ref(
         return {**remote, "status": "ambiguous", "source_status": "remote_source_ambiguous"}
     if remote.get("status") == "remote_ref_moved":
         return {**remote, "status": "ref_moved", "source_status": "remote_ref_moved"}
-    if remote.get("status") in {"remote_fetch_failed", "remote_query_failed"}:
+    remote_operational_failure = remote.get("status") in {
+        "remote_fetch_failed",
+        "remote_query_failed",
+    }
+    if remote_operational_failure and not allow_local_source:
         return {
             **remote,
             "status": "fetch_failed",
@@ -209,11 +213,19 @@ def resolve_step1_ref(
             "source_status": "user_confirmed_local_source",
             "remote_failures": list(remote.get("failures") or []),
         }
-    status = "dirty_confirmation_required" if local.get("status") == "awaiting_dirty_local_source_confirmation" else "not_found"
+    status = (
+        "dirty_confirmation_required"
+        if local.get("status") == "awaiting_dirty_local_source_confirmation"
+        else ("fetch_failed" if remote_operational_failure else "not_found")
+    )
     return {
         **remote,
         "status": status,
-        "source_status": str(local.get("status") or "awaiting_local_source_confirmation"),
+        "source_status": (
+            str(remote.get("status") or "remote_fetch_failed")
+            if remote_operational_failure
+            else str(local.get("status") or "awaiting_local_source_confirmation")
+        ),
         "local_candidate_commit": str(local.get("local_candidate_commit") or ""),
         "dirty": bool(local.get("dirty")),
     }

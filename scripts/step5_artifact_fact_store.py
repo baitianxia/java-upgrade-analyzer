@@ -16,6 +16,8 @@ from pathlib import Path
 import tempfile
 from typing import Any, Mapping
 
+from path_runtime import short_temporary_directory
+
 
 @dataclass(frozen=True)
 class ArtifactIdentity:
@@ -536,7 +538,7 @@ class Step5ArtifactFactStore:
             binary_name = str(location.binary_name or "")
             if not re.fullmatch(r"[A-Za-z0-9_$]+(?:\.[A-Za-z0-9_$]+)*", binary_name):
                 raise ValueError(f"invalid_class_binary_name:{binary_name}")
-            with tempfile.TemporaryDirectory(prefix="jua-step5-javap-") as tmp:
+            with short_temporary_directory(prefix="s5-javap") as tmp:
                 class_path = Path(tmp).joinpath(*binary_name.split(".")).with_suffix(".class")
                 class_path.parent.mkdir(parents=True, exist_ok=True)
                 class_path.write_bytes(content.value)

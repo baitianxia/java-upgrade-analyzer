@@ -87,6 +87,7 @@ from reason_guidance import (
     build_catalog_guidance,
     guidance_for_reason_code,
 )
+from path_runtime import bounded_path_component
 from remote_source_refs import (
     materialize_remote_source_candidate,
     query_live_remote_refs,
@@ -2410,9 +2411,12 @@ def compare_jar_method_bodies(
     """Find same-signature executable changes using immutable final JARs."""
     safe_coord = str(coord or "").strip()
     artifact = (safe_coord.split(":")[-1] or "dependency").replace(".", "-")
-    evidence_path = Path(output_dir) / (
-        f"{artifact}_{old_version}_vs_{new_version}_bytecode_behavior.json"
+    evidence_stem = bounded_path_component(
+        f"{artifact}_{old_version}_vs_{new_version}",
+        max_length=72,
+        default="dependency-comparison",
     )
+    evidence_path = Path(output_dir) / f"{evidence_stem}_bytecode_behavior.json"
     try:
         old_hashes, old_multi_release = _jar_class_variant_hash_map(old_jar)
         new_hashes, new_multi_release = _jar_class_variant_hash_map(new_jar)
@@ -3226,7 +3230,12 @@ def run_japicmp(
     if not display_coord:
         display_coord = resolved_new_coord or resolved_old_coord
     if not old_group_id or not old_artifact_id or not new_group_id or not new_artifact_id:
-        out_file = os.path.join(output_dir, f"invalid_coord_{old_ver}_vs_{new_ver}_binary.txt")
+        invalid_stem = bounded_path_component(
+            f"invalid_coord_{old_ver}_vs_{new_ver}",
+            max_length=72,
+            default="invalid_coord",
+        )
+        out_file = os.path.join(output_dir, f"{invalid_stem}_binary.txt")
         msg = (
             f"=== 非法 Maven 坐标：{display_coord or coord} ===\n"
             f"old_coord={resolved_old_coord or '(空)'}\n"
@@ -3239,10 +3248,13 @@ def run_japicmp(
             "reason_code": "DEPENDENCY_COORDINATES_INVALID",
         }, "非法坐标"
     safe_name = safe_artifact_id.replace('.', '-') + (f"_{safe_classifier}" if safe_classifier else "")
-    out_file = os.path.join(output_dir,
-        f"{safe_name}_{old_ver}_vs_{new_ver}_binary.txt")
-    xml_file = os.path.join(output_dir,
-        f"{safe_name}_{old_ver}_vs_{new_ver}_binary.xml")
+    comparison_stem = bounded_path_component(
+        f"{safe_name}_{old_ver}_vs_{new_ver}",
+        max_length=72,
+        default="dependency-comparison",
+    )
+    out_file = os.path.join(output_dir, f"{comparison_stem}_binary.txt")
+    xml_file = os.path.join(output_dir, f"{comparison_stem}_binary.xml")
 
     old_jar = str(old_jar_path or "").strip() or None
     new_jar = str(new_jar_path or "").strip() or None
@@ -4838,8 +4850,13 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
     old_ver    = lib_info.get('old_version', '')
     new_ver    = lib_info.get('new_version', '')
     artifact   = coord.split(':')[-1]
+    artifact_stem = bounded_path_component(
+        artifact,
+        max_length=64,
+        default="dependency",
+    )
 
-    out_file = os.path.join(output_dir, f"{artifact}_gitdiff_api_changes.txt")
+    out_file = os.path.join(output_dir, f"{artifact_stem}_gitdiff_api_changes.txt")
 
     if not repo_path or not os.path.isdir(repo_path):
         msg = (
@@ -5558,8 +5575,12 @@ def analyze_changelog(coord, old_ver, new_ver, output_dir):
     """
     artifact = coord.split(':')[-1]
     safe = artifact.replace('.', '-')
-    out_file = os.path.join(output_dir,
-        f"{safe}_{old_ver}_vs_{new_ver}_behavior.txt")
+    behavior_stem = bounded_path_component(
+        f"{safe}_{old_ver}_vs_{new_ver}",
+        max_length=72,
+        default="dependency-behavior",
+    )
+    out_file = os.path.join(output_dir, f"{behavior_stem}_behavior.txt")
 
     content = (
         f"=== changelog 行为变更分析任务：{coord} ===\n"

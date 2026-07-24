@@ -38,6 +38,67 @@ class Step1RefResolutionTest(unittest.TestCase):
         self.assertEqual(result["source_status"], "remote_query_failed")
         local_resolver.assert_not_called()
 
+    def test_remote_query_failure_uses_explicitly_authorized_local_fallback(self):
+        remote = {
+            "status": "remote_query_failed",
+            "requested_ref": "release",
+            "failures": [{
+                "stage": "ls_remote_before_fetch",
+                "reason": "kex_exchange_identification: Connection closed",
+            }],
+        }
+        local = {
+            "status": "user_confirmed_local_source",
+            "requested_ref": "release",
+            "resolved_ref": "release",
+            "resolved_commit": "c" * 40,
+            "resolution_mode": "user_confirmed_local_source",
+            "dirty": False,
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ) as local_resolver:
+            result = resolve_step1_ref(
+                "/repo",
+                "release",
+                allow_local_source=True,
+            )
+
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(
+            result["source_status"],
+            "user_confirmed_local_source",
+        )
+        self.assertEqual(result["resolved_commit"], "c" * 40)
+        self.assertTrue(local_resolver.call_args.kwargs["allow_local_source"])
+
+    def test_remote_ref_movement_never_uses_local_fallback(self):
+        remote = {
+            "status": "remote_ref_moved",
+            "requested_ref": "release",
+            "expected_commit": "a" * 40,
+            "observed_commit": "b" * 40,
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+        ) as local_resolver:
+            result = resolve_step1_ref(
+                "/repo",
+                "release",
+                allow_local_source=True,
+            )
+
+        self.assertEqual(result["status"], "ref_moved")
+        self.assertEqual(result["source_status"], "remote_ref_moved")
+        local_resolver.assert_not_called()
+
     def test_remote_resolution_is_exposed_as_resolved(self):
         remote = {
             "status": "remote_source_resolved",

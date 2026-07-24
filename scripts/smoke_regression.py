@@ -20,7 +20,6 @@ import os
 import re
 import shutil
 import sys
-import tempfile
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +37,7 @@ from confidence_weighted_tracer import (
 )
 import enhanced_source_analyzer as source_analyzer_module
 from enhanced_output_formatter import explain_reason_code
+from path_runtime import make_short_temp_dir, short_temporary_directory
 import s1_dep_diff as s1_dep_diff_module
 from enhanced_source_analyzer import (
     analyze_file,
@@ -437,7 +437,7 @@ def commit_business_fixture_and_update_provenance(project_dir, report_dir, messa
 def refresh_fixture_business_bytecode(report_dir, source_files):
     report_dir = Path(report_dir)
     artifact_path = report_dir / "evidence" / "dependencies" / "s1_artifacts" / "current.jar"
-    with tempfile.TemporaryDirectory(prefix="jua-smoke-javac-") as tmp:
+    with short_temporary_directory(prefix="smoke-javac") as tmp:
         classes_dir = Path(tmp) / "classes"
         classes_dir.mkdir()
         stdout, stderr, rc = compat_run_cmd(
@@ -1796,7 +1796,7 @@ def run_core_pipeline_smoke(workspace, dep_env):
 
 def run_smoke(cli_args):
     mark_smoke_checkpoint("startup")
-    base_tmp = Path(tempfile.mkdtemp(prefix="java-upgrade-smoke-"))
+    base_tmp = make_short_temp_dir(prefix="smoke")
     try:
         workspace = create_smoke_workspace(base_tmp)
         project_dir = workspace.project_dir
@@ -4442,11 +4442,13 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     def fake_worktree_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None, **_kwargs):
         joined = " ".join(str(part) for part in cmd)
         worktree_calls.append({"cmd": list(cmd), "cwd": cwd, "env": dict(env or {})})
-        if cmd[:3] == ["git", "worktree", "add"] or (len(cmd) >= 3 and cmd[1:3] == ["worktree", "add"]):
+        if "ls-tree" in cmd:
+            return "pom.xml\0", "", 0
+        if "worktree" in cmd and "add" in cmd:
             temp_dir = Path(cmd[-2])
             temp_dir.mkdir(parents=True, exist_ok=True)
             return "", "", 0
-        if cmd[:3] == ["git", "worktree", "remove"] or (len(cmd) >= 3 and cmd[1:3] == ["worktree", "remove"]):
+        if "worktree" in cmd and "remove" in cmd:
             return "", "", 0
         if "dependency:list" in joined:
             return (
@@ -4531,11 +4533,13 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     def fake_host_jdk_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None, **_kwargs):
         joined = " ".join(str(part) for part in cmd)
         host_jdk_calls.append({"cmd": list(cmd), "cwd": cwd, "env": dict(env or {})})
-        if cmd[:3] == ["git", "worktree", "add"] or (len(cmd) >= 3 and cmd[1:3] == ["worktree", "add"]):
+        if "ls-tree" in cmd:
+            return "pom.xml\0", "", 0
+        if "worktree" in cmd and "add" in cmd:
             temp_dir = Path(cmd[-2])
             temp_dir.mkdir(parents=True, exist_ok=True)
             return "", "", 0
-        if cmd[:3] == ["git", "worktree", "remove"] or (len(cmd) >= 3 and cmd[1:3] == ["worktree", "remove"]):
+        if "worktree" in cmd and "remove" in cmd:
             return "", "", 0
         if "dependency:list" in joined:
             return (

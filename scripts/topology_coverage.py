@@ -13,7 +13,6 @@ from pathlib import Path
 import re
 import subprocess
 import struct
-import tempfile
 import time
 import zipfile
 
@@ -25,6 +24,7 @@ from final_artifact_edge_oracle import (
 from signature_utils import normalize_signature_for_lookup
 from third_party_jdk_oracle import _source_signature
 from compat import git_cmd
+from path_runtime import short_temporary_directory
 
 
 STABLE_TOPOLOGY_IDS = frozenset({
@@ -161,7 +161,7 @@ def compute_source_tree_sha256(source_root: Path) -> str:
 
 
 def _javap_text(content: bytes, *options: str) -> str:
-    with tempfile.TemporaryDirectory(prefix="topology-javap-") as temporary:
+    with short_temporary_directory(prefix="s5-topology-javap") as temporary:
         class_path = Path(temporary) / "target.class"
         class_path.write_bytes(content)
         completed = subprocess.run(
@@ -239,7 +239,7 @@ def _class_header_parents(content: bytes, timeout_sec: float) -> tuple[tuple[str
     if timeout_sec <= 0:
         return (), f"hierarchy scan deadline exceeded before javap started; {direct_error}"
     try:
-        with tempfile.TemporaryDirectory(prefix="topology-javap-") as temporary:
+        with short_temporary_directory(prefix="s5-topology-javap") as temporary:
             class_path = Path(temporary) / "target.class"
             class_path.write_bytes(content)
             completed = subprocess.run(
@@ -1156,7 +1156,7 @@ def _bootstrap_links(inventory: dict, targets: set[tuple[str, str, str]], edges:
         owner = _class_binary_name(entry)
         if not any(caller[0] == owner for caller, _offset in dynamic_edges):
             continue
-        with tempfile.TemporaryDirectory(prefix="topology-bootstrap-") as temporary:
+        with short_temporary_directory(prefix="s5-topology-bootstrap") as temporary:
             class_path = Path(temporary) / "target.class"
             class_path.write_bytes(content)
             completed = subprocess.run(

@@ -1,6 +1,7 @@
 import ast
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,10 +14,126 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import compat  # noqa: E402
 import error_handler  # noqa: E402
+import s1_dep_diff  # noqa: E402
+import s4_contract  # noqa: E402
+import path_runtime  # noqa: E402
 from compat import run_cmd  # noqa: E402
 
 
 class PlatformContractTest(unittest.TestCase):
+    def test_shared_path_policy_bounds_dynamic_components_without_collisions(self):
+        first = "com.example:" + ("very-long-artifact-" * 20) + "one"
+        second = "com.example:" + ("very-long-artifact-" * 20) + "two"
+
+        first_component = path_runtime.bounded_path_component(first, max_length=48)
+        second_component = path_runtime.bounded_path_component(second, max_length=48)
+        first_filename = path_runtime.bounded_filename(first + ".jar", max_length=64)
+
+        self.assertLessEqual(len(first_component), 48)
+        self.assertLessEqual(len(second_component), 48)
+        self.assertNotEqual(first_component, second_component)
+        self.assertLessEqual(len(first_filename), 64)
+        self.assertTrue(first_filename.endswith(".jar"))
+        self.assertLessEqual(len(s4_contract.make_per_dependency_dirname(first)), 48)
+
+    def test_windows_runtime_storage_uses_shared_short_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            configured_root = Path(tmp) / "w"
+            long_report = Path(tmp) / (("deep-" * 20) + "report")
+            with patch.object(path_runtime, "IS_WINDOWS", True), patch.dict(
+                os.environ,
+                {path_runtime.SHORT_TEMP_ROOT_ENV: str(configured_root)},
+                clear=False,
+            ):
+                storage = path_runtime.runtime_storage_root(
+                    long_report, "source_snapshots",
+                )
+
+        self.assertEqual(configured_root, storage.parents[2])
+        self.assertNotIn(str(long_report), str(storage))
+
+    def test_windows_git_policy_is_applied_at_the_shared_command_boundary(self):
+        with patch.object(compat, "IS_WINDOWS", True), patch.object(
+            compat, "find_executable", return_value=r"C:\Git\git.exe",
+        ):
+            command = compat.git_cmd()
+
+        self.assertEqual(
+            [r"C:\Git\git.exe", "-c", "core.longpaths=true"],
+            command,
+        )
+
+    def test_path_expanding_temporary_directories_cannot_bypass_shared_runtime(self):
+        for path in sorted((ROOT / "scripts").glob("*.py")):
+            if path.name == "path_runtime.py":
+                continue
+            source = path.read_text(encoding="utf-8")
+            self.assertNotRegex(
+                source,
+                r"tempfile\.(?:TemporaryDirectory|mkdtemp)\s*\(",
+                f"{path.name} bypasses the shared short-path runtime",
+            )
+
+    def test_step1_real_worktree_round_trip_uses_short_generated_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+
+            def git(*arguments):
+                completed = subprocess.run(
+                    ["git", *arguments],
+                    cwd=repository,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True,
+                )
+                return completed.stdout.strip()
+
+            git("init")
+            git("config", "user.email", "platform@example.invalid")
+            git("config", "user.name", "Platform Contract")
+            (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+            git("add", "tracked.txt")
+            git("commit", "-m", "initial")
+            commit = git("rev-parse", "HEAD")
+            worktree_root = root / "w"
+
+            with patch.dict(
+                os.environ,
+                {path_runtime.SHORT_TEMP_ROOT_ENV: str(worktree_root)},
+                clear=False,
+            ):
+                worktree = s1_dep_diff.create_branch_worktree(
+                    commit,
+                    repository,
+                    side="base",
+                )
+                try:
+                    self.assertEqual(worktree_root, worktree.parent)
+                    self.assertTrue(worktree.name.startswith("s1-b-"))
+                    self.assertNotIn(commit, worktree.name)
+                    self.assertEqual(
+                        commit,
+                        subprocess.run(
+                            ["git", "rev-parse", "HEAD"],
+                            cwd=worktree,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            check=True,
+                        ).stdout.strip(),
+                    )
+                finally:
+                    s1_dep_diff.remove_branch_worktree(worktree, repository)
+
+            self.assertFalse(worktree.exists())
+            self.assertNotIn(
+                str(worktree),
+                git("worktree", "list", "--porcelain"),
+            )
+
     def test_platform_only_stdlib_imports_are_guarded(self):
         platform_only_modules = {
             "fcntl", "grp", "posix", "pty", "pwd", "resource",

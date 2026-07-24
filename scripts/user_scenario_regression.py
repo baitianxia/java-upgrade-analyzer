@@ -25,7 +25,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import zipfile
 from dataclasses import asdict, dataclass, field
@@ -41,6 +40,7 @@ import s4_jar_compare as step4  # noqa: E402
 import s1_dep_diff as step1  # noqa: E402
 import run_step as orchestrator  # noqa: E402
 from csv_io import open_csv_read, open_csv_write  # noqa: E402
+from path_runtime import short_temp_root  # noqa: E402
 
 
 CHANGED_API_FIELDS = [
@@ -57,7 +57,7 @@ CHANGED_API_FIELDS = [
     "source",
 ]
 
-DEFAULT_WORKSPACE = Path(tempfile.gettempdir()) / "java-upgrade-user-scenario-regression"
+DEFAULT_WORKSPACE = short_temp_root() / "jua-user-scenarios"
 
 
 @dataclass

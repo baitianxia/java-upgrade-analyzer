@@ -215,6 +215,79 @@ class RefConfirmationFlowTest(unittest.TestCase):
         )
         self.assertIn("allow_local_source=true", interaction["question"])
 
+    def test_step4_targeted_query_failure_uses_authorized_local_fallback(self):
+        old_commit = "a" * 40
+        new_commit = "b" * 40
+        old_candidate = {
+            "ref": "origin/v1", "commit": old_commit,
+            "canonical_ref": "refs/heads/v1", "remote": "origin",
+        }
+        new_candidate = {
+            "ref": "origin/v2", "commit": new_commit,
+            "canonical_ref": "refs/heads/v2", "remote": "origin",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".git").mkdir()
+            with patch.object(
+                step4,
+                "resolve_repo_ref_pair_for_versions",
+                return_value=(
+                    "origin/v1", "origin/v2", "matched-old", "matched-new",
+                    [old_candidate], [new_candidate],
+                ),
+            ), patch.object(
+                step4,
+                "_materialize_resolved_remote_ref",
+                side_effect=[
+                    (
+                        {
+                            "status": "remote_fetch_failed",
+                            "failure": {
+                                "reason_code": "transient_network_failure",
+                            },
+                        },
+                        "kex_exchange_identification: Connection closed",
+                    ),
+                    (
+                        {
+                            "status": "remote_source_resolved",
+                            "resolved_commit": new_commit,
+                        },
+                        "",
+                    ),
+                ],
+            ), patch.object(
+                step4,
+                "resolve_local_source_ref",
+                return_value={
+                    "status": "user_confirmed_local_source",
+                    "resolved_commit": old_commit,
+                    "dirty": False,
+                },
+            ) as local_resolver:
+                plan = step4.resolve_gitdiff_ref_plan_for_row(
+                    {
+                        "coord": "com.acme:demo",
+                        "old_version": "1",
+                        "new_version": "2",
+                    },
+                    {"repo_path": tmp, "module_path": tmp},
+                    {},
+                    {
+                        "com.acme:demo": {
+                            "allow_local_source": True,
+                        },
+                    },
+                )
+
+        self.assertEqual(plan["status"], "matched")
+        self.assertEqual(
+            plan["old_source"]["status"],
+            "user_confirmed_local_source",
+        )
+        self.assertEqual(plan["base_ref"], old_commit)
+        self.assertTrue(local_resolver.call_args.kwargs["allow_local_source"])
+
     def test_canonical_remote_ref_with_different_remote_commits_is_ambiguous(self):
         records = [
             {

@@ -46,6 +46,13 @@ from pipeline_constants import (
 from step1_observability import Step1Observer
 from step1_ref_resolution import resolve_step1_ref
 from reason_guidance import REASON_GUIDANCE_SCHEMA, guidance_for_reason_code
+from path_runtime import (
+    bounded_filename,
+    create_detached_worktree,
+    named_temporary_file,
+    remove_detached_worktree,
+    short_temp_root,
+)
 
 
 EXIT_AWAITING_USER = 4
@@ -58,6 +65,11 @@ PACKAGED_INVENTORY_CACHE_DIRNAME = 'step1_packaged_inventory'
 STEP1_MAX_DEPENDENCY_JAR_BYTES = 1024 * 1024 * 1024
 STEP1_MAX_TOTAL_DEPENDENCY_BYTES = 2 * 1024 * 1024 * 1024
 STEP1_MAX_DEPENDENCY_EXPANSION_RATIO = 200
+# A cold Maven/Gradle cache can legitimately spend more than 30 minutes
+# downloading dependencies and wrapper distributions. Build tools already own
+# repository connection/read timeouts, so Step1 must not impose a total
+# wall-clock deadline unless an explicit timeout option is added in the future.
+STEP1_BUILD_TOOL_TIMEOUT = None
 
 
 def _observed_phase(observer, phase, **kwargs):
@@ -177,16 +189,38 @@ def materialize_changed_dependency_jars(
 
     def add_request(
         side, lib_entry, coord, version, scope, identity_source, purpose,
+        classifier='',
     ):
         normalized_entry = str(lib_entry or '').replace('\\', '/').strip()
         if not normalized_entry:
             raise ValueError(
                 f'Step1 {purpose} 依赖缺少最终制品条目: {coord or "<unknown>"}'
             )
+        normalized_coord = str(coord or '').strip()
+        coord_parts = normalized_coord.split(':', 2)
+        coord_classifier = (
+            coord_parts[2].strip()
+            if len(coord_parts) == 3
+            else ''
+        )
+        normalized_classifier = str(classifier or '').strip()
+        if (
+            normalized_classifier
+            and coord_classifier
+            and normalized_classifier != coord_classifier
+        ):
+            raise ValueError(
+                f'Step1 依赖 classifier 冲突: {normalized_entry} '
+                f'({coord_classifier} != {normalized_classifier})'
+            )
+        normalized_classifier = normalized_classifier or coord_classifier
+        if normalized_classifier and not coord_classifier and normalized_coord:
+            normalized_coord = f'{normalized_coord}:{normalized_classifier}'
         key = (side, normalized_entry)
         request = requests.setdefault(key, {
             'side': side,
-            'coord': str(coord or '').strip(),
+            'coord': normalized_coord,
+            'classifier': normalized_classifier,
             'version': str(version or '').strip(),
             'scope': str(scope or '').strip(),
             'lib_entry': normalized_entry,
@@ -195,14 +229,49 @@ def materialize_changed_dependency_jars(
         })
         request['purposes'].add(purpose)
         for field, value in (
-            ('coord', coord),
+            ('coord', normalized_coord),
+            ('classifier', normalized_classifier),
             ('version', version),
             ('scope', scope),
             ('identity_source', identity_source),
         ):
             normalized_value = str(value or '').strip()
             if (
-                field in {'coord', 'version'}
+                field == 'coord'
+                and request[field]
+                and normalized_value
+                and request[field] != normalized_value
+            ):
+                request_parts = request[field].split(':', 2)
+                value_parts = normalized_value.split(':', 2)
+                request_gav = ':'.join(request_parts[:2])
+                value_gav = ':'.join(value_parts[:2])
+                request_classifier = (
+                    request_parts[2].strip()
+                    if len(request_parts) == 3
+                    else ''
+                )
+                value_classifier = (
+                    value_parts[2].strip()
+                    if len(value_parts) == 3
+                    else ''
+                )
+                if (
+                    request_gav == value_gav
+                    and not request_classifier
+                    and value_classifier
+                ):
+                    request['coord'] = normalized_value
+                    request['classifier'] = value_classifier
+                    continue
+                if (
+                    request_gav == value_gav
+                    and request_classifier
+                    and not value_classifier
+                ):
+                    continue
+            if (
+                field in {'coord', 'classifier', 'version'}
                 and request[field]
                 and normalized_value
                 and request[field] != normalized_value
@@ -239,6 +308,11 @@ def materialize_changed_dependency_jars(
                     else 'current_packaged_match_source'
                 ),
                 'step4_change',
+                row.get(
+                    'base_classifier'
+                    if side == 'base'
+                    else 'current_classifier'
+                ) or row.get('classifier'),
             )
 
     for entry in current_entries or []:
@@ -259,6 +333,7 @@ def materialize_changed_dependency_jars(
             scope,
             entry.get('packaged_match_source'),
             'step5_runtime',
+            entry.get('classifier'),
         )
 
     items = []
@@ -298,7 +373,7 @@ def materialize_changed_dependency_jars(
                 target_name = (
                     hashlib.sha256(lib_entry.encode('utf-8')).hexdigest()[:16]
                     + '-'
-                    + Path(lib_entry).name
+                    + bounded_filename(Path(lib_entry).name, max_length=40)
                 )
                 target = jar_dir / side / target_name
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +392,7 @@ def materialize_changed_dependency_jars(
                 retained_item = {
                     'side': side,
                     'coord': request['coord'],
+                    'classifier': request['classifier'],
                     'version': request['version'],
                     'scope': request['scope'],
                     'lib_entry': lib_entry,
@@ -371,10 +447,21 @@ def materialize_changed_dependency_jars(
 
     gav_artifacts = defaultdict(lambda: {'hashes': set(), 'entries': []})
     for item in items:
+        coord = str(item.get('coord') or '').strip()
+        coord_parts = coord.split(':', 2)
+        classifier = str(item.get('classifier') or '').strip()
+        if not classifier and len(coord_parts) == 3:
+            classifier = coord_parts[2].strip()
+        gav_coord = (
+            ':'.join(coord_parts[:2])
+            if len(coord_parts) >= 2
+            else coord
+        )
         key = (
-            str(item.get('side') or ''),
-            str(item.get('coord') or ''),
-            str(item.get('version') or ''),
+            str(item.get('side') or '').strip(),
+            gav_coord,
+            str(item.get('version') or '').strip(),
+            classifier,
         )
         gav_artifacts[key]['hashes'].add(
             str(item.get('nested_jar_sha256') or '').lower()
@@ -387,9 +474,10 @@ def materialize_changed_dependency_jars(
     ]
     if identity_conflicts:
         key, value = identity_conflicts[0]
+        classifier_suffix = f':{key[3]}' if key[3] else ''
         raise ValueError(
             'Step1 同一 GAV 对应多个不同字节的最终制品条目: '
-            f'{key[0]} {key[1]}:{key[2]} '
+            f'{key[0]} {key[1]}:{key[2]}{classifier_suffix} '
             f'({", ".join(sorted(value["entries"]))})'
         )
 
@@ -1201,6 +1289,13 @@ def _infer_step1_blocked_causes(stage, stderr_excerpt):
             causes.append("当前目录不是有效的 Git 仓库，无法创建临时 worktree。")
         if "permission" in text:
             causes.append("当前用户对仓库目录或临时目录权限不足，无法管理 worktree。")
+        if any(token in text for token in (
+            "filename too long",
+            "file name too long",
+            "path too long",
+            "filename or extension is too long",
+        )):
+            causes.append("Windows worktree 路径超过工具可处理的长度；Step1 已尝试短路径和 Git 长路径模式。")
         if not causes:
             causes.append("Git worktree 初始化或清理失败，请检查仓库状态与 `.git/worktrees`。")
     if not causes:
@@ -1290,9 +1385,10 @@ def build_step1_command_blocked_interaction(error):
     missing_inputs = []
     required_fields = []
     is_gradle = blocked.stage.startswith("gradle_") or "gradle" in blocked.command.lower()
-    build_tool_name = "Gradle" if is_gradle else "Maven"
+    is_git_worktree = blocked.stage in {"prepare_branch_worktree", "cleanup_branch_worktree"}
+    execution_tool_name = "Git worktree" if is_git_worktree else ("Gradle" if is_gradle else "Maven")
     checklist_lines = [
-        f"这不是缺少业务参数，而是 Step1 已拿到必要输入后执行 {build_tool_name} 命令时被环境阻塞。",
+        f"这不是缺少业务参数，而是 Step1 已拿到必要输入后执行 {execution_tool_name} 命令时被环境阻塞。",
     ]
     files_to_review = []
     if blocked.artifact_path:
@@ -1308,10 +1404,10 @@ def build_step1_command_blocked_interaction(error):
         checklist_lines.append(f"错误摘要: {blocked.stderr_excerpt}")
     for cause in blocked.suspected_causes:
         checklist_lines.append(f"可能原因: {cause}")
-    if blocked.jdk_field:
+    if blocked.jdk_field and not is_git_worktree:
         properties[blocked.jdk_field] = {
             "type": "string",
-            "description": f"目标分支对应的 JDK Home 目录；若提供后将按该 JDK 重新执行 {build_tool_name} 命令。",
+            "description": f"目标分支对应的 JDK Home 目录；若提供后将按该 JDK 重新执行 {execution_tool_name} 命令。",
         }
         missing_inputs.append(
             {
@@ -1320,15 +1416,27 @@ def build_step1_command_blocked_interaction(error):
                 "side": blocked.side,
                 "required": False,
                 "recommended": True,
-                "reason": f"当前更像是 {build_tool_name}/JDK 环境阻塞；若该侧需要不同 JDK，请补充对应 JDK Home。",
+                "reason": f"当前更像是 {execution_tool_name}/JDK 环境阻塞；若该侧需要不同 JDK，请补充对应 JDK Home。",
                 "value_type": "path",
             }
         )
         if blocked.jdk_home:
             checklist_lines.append(f"当前该侧 JDK Home: {blocked.jdk_home}")
-    question = f"Step1 已显式暴露本次 {build_tool_name} 命令失败原因，请先处理环境阻塞后再决定是否继续。"
-    if blocked.jdk_field:
+    question = f"Step1 已显式暴露本次 {execution_tool_name} 命令失败原因，请先处理环境阻塞后再决定是否继续。"
+    if blocked.jdk_field and not is_git_worktree:
         question += f" 若需要由 skill 继续重跑，可补充 `{blocked.jdk_field}`。"
+    if is_git_worktree:
+        reason_code = "step1_git_worktree_command_blocked"
+        continue_description = "Step1 已自动尝试短路径和 Git 长路径模式；环境问题修复后继续重跑。"
+        resume_hint = "确认错误摘要中的 worktree 路径与环境限制后，再继续执行 Step1。"
+    elif is_gradle:
+        reason_code = "step1_gradle_command_blocked"
+        continue_description = "用户已修复环境问题，或补充了该侧 JDK Home，继续重跑 Step1。"
+        resume_hint = "修复环境问题或补充 JDK Home 后，再继续执行 Step1。"
+    else:
+        reason_code = "step1_maven_command_blocked"
+        continue_description = "用户已修复环境问题，或补充了该侧 JDK Home，继续重跑 Step1。"
+        resume_hint = "修复环境问题或补充 JDK Home 后，再继续执行 Step1。"
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
         "checkpoint": True,
@@ -1336,8 +1444,8 @@ def build_step1_command_blocked_interaction(error):
         "status": "awaiting_user_input",
         "kind": "execution_blocked",
         "step_id": "step1",
-        "reason_code": "step1_gradle_command_blocked" if is_gradle else "step1_maven_command_blocked",
-        "summary": f"Step1 已进入执行阶段，但 {build_tool_name} 命令被环境问题阻塞；必须先显式暴露原因并等待用户决策。",
+        "reason_code": reason_code,
+        "summary": f"Step1 已进入执行阶段，但 {execution_tool_name} 命令被环境问题阻塞；必须先显式暴露原因并等待用户决策。",
         "title": "step1 执行被环境阻塞",
         "question": question,
         "files_to_review": files_to_review,
@@ -1354,7 +1462,7 @@ def build_step1_command_blocked_interaction(error):
             {
                 "id": "continue",
                 "label": "修复后继续",
-                "description": "用户已修复环境问题，或补充了该侧 JDK Home，继续重跑 Step1。",
+                "description": continue_description,
             },
             {
                 "id": "cancel",
@@ -1378,16 +1486,20 @@ def build_step1_command_blocked_interaction(error):
             "rules": [
                 "可以将用户自然语言答复整理为符合 response_schema 的 JSON 对象。",
                 "必须忠实保留用户意图，不得把环境阻塞误判为缺少业务参数。",
-                "若用户补充了对应侧 JDK Home，请写入该字段后再继续。",
+                (
+                    "Git worktree 阻塞不需要补充 JDK Home，应按错误摘要处理路径或权限环境。"
+                    if is_git_worktree
+                    else "若用户补充了对应侧 JDK Home，请写入该字段后再继续。"
+                ),
                 "若用户只是确认稍后处理，应选择 cancel，不要无条件重试。",
             ],
         },
-        "resume_hint": "修复环境问题或补充 JDK Home 后，再继续执行 Step1。",
+        "resume_hint": resume_hint,
         "runtime_rules": [
             "看到 execution_blocked 后，必须先向用户暴露失败原因，再等待用户决定是否继续。",
-            f"禁止把 {build_tool_name} 执行失败伪装成“缺少信息”或继续盲重试。",
+            f"禁止把 {execution_tool_name} 执行失败伪装成“缺少信息”或继续盲重试。",
         ],
-        "next_action_rule": f"只能向用户说明 {build_tool_name} 命令失败原因并等待回复，不得继续执行后续步骤。",
+        "next_action_rule": f"只能向用户说明 {execution_tool_name} 命令失败原因并等待回复，不得继续执行后续步骤。",
         "must_wait_for_user_reply": True,
     }
 
@@ -1982,6 +2094,7 @@ def _stream_nested_jar_to_spool(outer_zip, entry):
     spool = tempfile.SpooledTemporaryFile(
         max_size=NESTED_JAR_SPOOL_MAX_MEMORY_BYTES,
         mode='w+b',
+        dir=short_temp_root(),
     )
     try:
         with outer_zip.open(entry, 'r') as source:
@@ -2075,9 +2188,9 @@ def _write_packaged_inventory_cache(cache_path, artifact_sha256, scan_result):
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(
+        with named_temporary_file(
             mode='w', encoding='utf-8', dir=cache_path.parent,
-            prefix=f'.{cache_path.name}.', suffix='.tmp', delete=False,
+            prefix='.jua-cache-', suffix='.tmp', delete=False,
         ) as handle:
             temp_path = Path(handle.name)
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
@@ -2929,7 +3042,8 @@ def _collect_maven_runtime_deps_for_workspace(
         complete_message=f"{side_display}依赖坐标补全完成",
     ):
         list_stdout, list_stderr, list_rc = run_cmd(
-            list_cmd, cwd=work_dir, timeout=1800, env=env, stream_output=True,
+            list_cmd, cwd=work_dir, timeout=STEP1_BUILD_TOOL_TIMEOUT,
+            env=env, stream_output=True,
         )
         if list_rc != 0:
             raise RuntimeError(
@@ -2989,7 +3103,8 @@ def _collect_gradle_runtime_deps_for_workspace(
         complete_message=f"{side_display}依赖坐标补全完成",
     ):
         list_stdout, list_stderr, list_rc = run_cmd(
-            list_cmd, cwd=work_dir, timeout=1800, env=env, stream_output=True,
+            list_cmd, cwd=work_dir, timeout=STEP1_BUILD_TOOL_TIMEOUT,
+            env=env, stream_output=True,
         )
         if list_rc != 0:
             raise RuntimeError(
@@ -3070,7 +3185,8 @@ def collect_maven_deps_for_workspace(
         complete_message=f"{side_display}目标模块构建完成",
     ):
         stdout, stderr, rc = run_cmd(
-            package_cmd, cwd=work_dir, timeout=1800, env=env, stream_output=True,
+            package_cmd, cwd=work_dir, timeout=STEP1_BUILD_TOOL_TIMEOUT,
+            env=env, stream_output=True,
         )
         if rc != 0:
             raise RuntimeError(f"mvn package 失败（退出码 {rc}）：\n{stderr[:1000] or stdout[:1000]}")
@@ -3221,7 +3337,8 @@ def collect_gradle_deps_for_workspace(
         complete_message=f"{side_display}目标模块构建完成",
     ):
         stdout, stderr, rc = run_cmd(
-            package_cmd, cwd=work_dir, timeout=1800, env=env, stream_output=True,
+            package_cmd, cwd=work_dir, timeout=STEP1_BUILD_TOOL_TIMEOUT,
+            env=env, stream_output=True,
         )
         if rc != 0:
             raise RuntimeError(
@@ -3524,28 +3641,24 @@ def _collect_runtime_deps_for_artifact_input(
     }
 
 
-def create_branch_worktree(branch, work_dir):
-    git = git_cmd()
-    repo_dir = str(Path(work_dir).resolve())
-    temp_dir = Path(tempfile.mkdtemp(prefix=f"jua-step1-{re.sub(r'[^A-Za-z0-9_.-]+', '-', branch)}-"))
-    _, stderr, rc = run_cmd(git + ['worktree', 'add', '--detach', str(temp_dir), branch], cwd=repo_dir, timeout=1800)
-    if rc != 0:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise RuntimeError(f"git worktree add {branch} 失败：{stderr[:500]}")
-    return temp_dir
+def create_branch_worktree(branch, work_dir, side=""):
+    side_token = {"base": "b", "current": "c"}.get(str(side or "").strip(), "x")
+    return create_detached_worktree(
+        branch,
+        work_dir,
+        label=f"s1-{side_token}",
+        runner=run_cmd,
+        git_command=git_cmd(),
+    )
 
 
 def remove_branch_worktree(temp_dir, work_dir):
-    git = git_cmd()
-    repo_dir = str(Path(work_dir).resolve())
-    errors = []
-    _, stderr, rc = run_cmd(git + ['worktree', 'remove', '--force', str(temp_dir)], cwd=repo_dir, timeout=1800)
-    if rc != 0:
-        errors.append(f"git worktree remove 失败：{stderr[:300]}")
-    else:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-    if errors:
-        raise RuntimeError("；".join(errors))
+    remove_detached_worktree(
+        temp_dir,
+        work_dir,
+        runner=run_cmd,
+        git_command=git_cmd(),
+    )
 
 
 def get_packaged_deps_by_switching_branch(
@@ -3592,7 +3705,7 @@ def get_packaged_deps_by_switching_branch(
                 start_message=f"开始准备{_side_display(side)}分支工作区",
                 complete_message=f"{_side_display(side)}分支工作区准备完成",
             ):
-                temp_dir = create_branch_worktree(branch, work_dir)
+                temp_dir = create_branch_worktree(branch, work_dir, side=side)
         except Exception as exc:
             blocked_error = build_step1_command_blocked_error(
                 stage="prepare_branch_worktree",
@@ -3730,7 +3843,7 @@ def get_runtime_deps_by_switching_branch(
                 start_message=f"开始准备{_side_display(side)}分支工作区",
                 complete_message=f"{_side_display(side)}分支工作区准备完成",
             ):
-                temp_dir = create_branch_worktree(branch, work_dir)
+                temp_dir = create_branch_worktree(branch, work_dir, side=side)
         except Exception as exc:
             blocked_error = build_step1_command_blocked_error(
                 stage="prepare_branch_worktree",

@@ -68,6 +68,96 @@ class RemoteSourceRefRetryTest(unittest.TestCase):
         self.assertEqual(git_mock.call_count, 4)
         self.assertEqual(sleep_mock.call_count, 2)
 
+    def test_transient_targeted_ls_remote_ssh_failure_retries_then_succeeds(self):
+        query_responses = [
+            (
+                "",
+                "kex_exchange_identification: Connection closed by remote host",
+                128,
+            ),
+            (self.commit, "", 0),
+            (self.commit, "", 0),
+        ]
+        git_responses = [
+            ("", "", 0),
+            (self.commit, "", 0),
+        ]
+        with patch.object(
+            refs,
+            "_query_remote_candidate_commit",
+            side_effect=query_responses,
+        ) as query_mock, patch.object(
+            refs,
+            "_git",
+            side_effect=git_responses,
+        ), patch.object(refs.time, "sleep") as sleep_mock:
+            result = refs.materialize_remote_source_candidate(
+                "/repo",
+                self.candidate,
+                retry_delays=(1, 3),
+            )
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_commit"], self.commit)
+        self.assertEqual(query_mock.call_count, 3)
+        self.assertEqual(
+            [item["status"] for item in result["attempts"]],
+            ["transient_network_failure", "success"],
+        )
+        sleep_mock.assert_called_once_with(1)
+
+    def test_transient_targeted_ls_remote_exhaustion_is_not_ref_movement(self):
+        ssh_failure = (
+            "",
+            "ssh_exchange_identification: Connection closed by remote host",
+            128,
+        )
+        with patch.object(
+            refs,
+            "_query_remote_candidate_commit",
+            side_effect=[ssh_failure, ssh_failure, ssh_failure],
+        ) as query_mock, patch.object(
+            refs,
+            "_git",
+        ) as git_mock, patch.object(refs.time, "sleep") as sleep_mock:
+            result = refs.materialize_remote_source_candidate(
+                "/repo",
+                self.candidate,
+                retry_delays=(1, 3),
+            )
+
+        self.assertEqual(result["status"], "remote_fetch_failed")
+        self.assertEqual(
+            result["failure"]["reason_code"],
+            "transient_network_failure",
+        )
+        self.assertEqual(
+            result["failure"]["stage"],
+            "ls_remote_before_fetch",
+        )
+        self.assertTrue(result["failure"]["retryable"])
+        self.assertEqual(query_mock.call_count, 3)
+        git_mock.assert_not_called()
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_successful_targeted_ls_remote_without_ref_is_ref_movement(self):
+        with patch.object(
+            refs,
+            "_git",
+            return_value=("", "", 0),
+        ) as git_mock, patch.object(refs.time, "sleep") as sleep_mock:
+            result = refs.materialize_remote_source_candidate(
+                "/repo",
+                self.candidate,
+                expected_commit=self.commit,
+            )
+
+        self.assertEqual(result["status"], "remote_ref_moved")
+        self.assertEqual(result["expected_commit"], self.commit)
+        self.assertEqual(result["observed_commit"], "")
+        self.assertEqual(git_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
     def test_authentication_failure_is_not_retried(self):
         with patch.object(
             refs,

@@ -32,7 +32,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 import zipfile
@@ -44,6 +43,7 @@ from typing import Iterable
 
 from compat import git_cmd
 from csv_io import open_csv_read, open_csv_write
+from path_runtime import short_temp_root, short_temporary_directory
 from analysis_contract import (
     build_project_scope,
     project_scope_provenance_errors,
@@ -92,9 +92,7 @@ from topology_coverage import (
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_REPORT_ROOT = (
-    Path(tempfile.gettempdir()) / "java-upgrade-real-project-regression"
-)
+DEFAULT_REPORT_ROOT = short_temp_root() / "jua-regression"
 
 ORACLE_EDGE_FIELDS = (
     "artifact_sha256", "artifact_entry", *EDGE_IDENTITY_FIELDS[1:],
@@ -4431,7 +4429,7 @@ def scan_final_artifact_javap_class_references(
                 errors.append(f"{name}:{type(error).__name__}:{error}")
 
     references = []
-    with tempfile.TemporaryDirectory(prefix="jua-javap-class-oracle-") as tmp:
+    with short_temporary_directory(prefix="reg-javap") as tmp:
         root = Path(tmp)
         jobs = []
         for index, (content, entry, business_owned, identities) in enumerate(candidates):
@@ -6340,7 +6338,7 @@ def build_runtime_bound_oracle_records(
         descriptor = str(expected.get("descriptor") or "")
         try:
             content = _artifact_entry_bytes(artifact, entries[0])
-            with tempfile.TemporaryDirectory(prefix="runtime-oracle-javap-") as temporary:
+            with short_temporary_directory(prefix="reg-oracle") as temporary:
                 class_file = Path(temporary) / "target.class"
                 class_file.write_bytes(content)
                 javap = subprocess.run(

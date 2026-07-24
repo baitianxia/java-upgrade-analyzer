@@ -6,9 +6,9 @@ from __future__ import annotations
 import codecs
 import os
 import shutil
-import tempfile
 from pathlib import Path
 
+from path_runtime import named_temporary_file
 
 CSV_ENCODING = "utf-8-sig"
 UTF8_BOM = codecs.BOM_UTF8
@@ -35,9 +35,9 @@ def _ensure_leading_bom(path):
 
     temporary_path = None
     try:
-        with tempfile.NamedTemporaryFile(
+        with named_temporary_file(
             mode="wb",
-            prefix=f".{target.name}.bom-",
+            prefix=".jua-bom-",
             suffix=".tmp",
             dir=target.parent,
             delete=False,

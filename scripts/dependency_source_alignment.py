@@ -8,16 +8,20 @@ import re
 import shutil
 import stat
 import subprocess
-import tempfile
 import zipfile
 from pathlib import Path, PureWindowsPath
 
-from compat import git_cmd
+from path_runtime import (
+    bounded_path_component,
+    git_with_long_paths,
+    make_short_temp_dir,
+    runtime_storage_root,
+)
 
 
 def _run_git(repo_path, *args):
     completed = subprocess.run(
-        git_cmd() + ["-C", str(repo_path), *args],
+        git_with_long_paths() + ["-C", str(repo_path), *args],
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -70,9 +74,12 @@ def _coord_ga(coord):
 
 
 def _safe_coord(coord):
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(coord or "").strip()).strip("_")
-    digest = hashlib.sha256(str(coord or "").encode("utf-8")).hexdigest()[:10]
-    return f"{slug or 'dependency'}-{digest}"
+    return bounded_path_component(
+        coord,
+        max_length=40,
+        default="dependency",
+        always_hash=True,
+    )
 
 
 def normalize_mapping(mapping):
@@ -195,9 +202,7 @@ def materialize_detached_snapshot(report_dir, coord, repo_path, ref, module_rel_
     if rc or not commit:
         raise RuntimeError(f"dependency_source_ref_not_found:{stderr or ref}")
     snapshot = (
-        Path(report_dir)
-        / ".runtime"
-        / "source_snapshots"
+        runtime_storage_root(report_dir, "source_snapshots")
         / _safe_coord(coord)
         / commit[:12]
     )
@@ -219,7 +224,9 @@ def materialize_detached_snapshot(report_dir, coord, repo_path, ref, module_rel_
         # record.  Archive the exact commit instead: the source bytes are the
         # same tracked revision and the user's repository is never mutated.
         completed = subprocess.run(
-            git_cmd() + ["-C", str(repo_path), "archive", "--format=zip", commit],
+            git_with_long_paths() + [
+                "-C", str(repo_path), "archive", "--format=zip", commit,
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -229,7 +236,11 @@ def materialize_detached_snapshot(report_dir, coord, repo_path, ref, module_rel_
                 "dependency_source_snapshot_create_failed:"
                 + completed.stderr.decode("utf-8", errors="replace").strip()
             )
-        temporary = Path(tempfile.mkdtemp(prefix=".jua-source-", dir=str(snapshot.parent)))
+        temporary = make_short_temp_dir(
+            prefix=f"source-{commit[:8]}",
+            preferred_root=snapshot.parent,
+            strict_preferred=True,
+        )
         try:
             with zipfile.ZipFile(io.BytesIO(completed.stdout)) as archive:
                 extract_zip_safely(archive, temporary)

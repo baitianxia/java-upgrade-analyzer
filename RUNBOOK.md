@@ -102,6 +102,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 ### tree-sitter 安装
 
 - 分析器正式支持 CPython 3.12.x/3.13.x/3.14.x 与 Linux/macOS/Windows。JDK、Maven、Gradle 版本以 base/current 工程为准，不设全局最低版本；优先使用各 revision 的 `mvnw` / `gradlew` 和对应侧 JDK。
+- Windows 下所有步骤共用统一的短路径运行时：Git 命令自动带 `core.longpaths=true`；Step1/Step2 的 detached worktree 使用短名称，失败后定向清理本次注册并切换备用根目录；Step3–Step5 的源码快照、JAR/class 解压、`javap`/`jdeps`/JaCoCo 和排序缓存使用短临时根；Step4/Step5 的坐标、版本和 API 派生文件名会做定长截断并附稳定哈希。系统不会修改用户全局 Git 配置，一般无需人工干预。`JUA_SHORT_TEMP_ROOT` 可选指定一个可写的短目录（例如 `C:\jua-tmp`）；旧的 `JUA_STEP1_WORKTREE_ROOT` 仍兼容，但不再建议使用。只有所有候选目录都不可写，或下游旧版构建插件本身不支持长路径时才会阻塞。
 - 安装版本以根目录 `requirements-runtime.txt` 为唯一清单；Step5 运行时不会联网安装或修改 Python 环境。
 - 在仓库根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
 
@@ -398,6 +399,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 说明：
 - Maven 场景下，Step1 会真实执行目标模块的 `package`
 - Gradle 场景下，Step1 优先调用项目 Wrapper，执行目标 project 的 `build -x test`；Groovy DSL、Kotlin DSL、`projectDir` 与 `project(...)` 模块依赖均纳入模块/源码范围推导
+- Maven/Gradle 构建、Wrapper 下载和运行时依赖坐标补全默认不设置总执行时限；首次填充本地依赖缓存时不会再因超过固定 30 分钟而被 Step1 中止。仓库连接或读取失败仍由 Maven/Gradle 自身的网络超时与退出码显式报告
 - 两种构建工具都可以跳过自动构建，直接读取用户提供的编译产物
 - `boot jar/war` 直接读取最终产物
 - `thin jar` / 无嵌套依赖场景当前不支持，会直接报错
@@ -406,6 +408,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 - `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
 - 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧源码并运行对应构建工具补全；自动构建模式则在构建前解析两侧 ref。解析时先查询实时远程 refs，候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在构建前暂停确认；选定后仅定向 fetch 所需 ref，不执行 `git pull`，也不修改用户当前分支。
 - 对 Step1 构建来源，远端不存在、认证失败、网络失败、超时或定向 fetch 失败时会暂停。瞬时网络错误在暂停前最多尝试 3 次（间隔 1 秒、3 秒），认证失败、ref 不存在和 ref 移动不重试；裸 SHA 必须先与实时远端记录的 `commit` 匹配并按 expected commit 固定。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地 commit；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。Step4 的依赖源码属于辅助证据：远端查询、fetch、ref 移动、未匹配等内部故障在受控重试后记录为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并自动改用最终 JAR 方法字节码指纹识别同签名实现变化；不会要求用户修复，也不会静默使用本地 ref。若字节码兜底也失败，行为覆盖成为关键缺口并限制最终结论。只有两个以上不同 commit pair 会改变源码对比范围时才暂停确认。
+- 全量 `ls-remote` 选出 ref 后，定向 `ls-remote` 只有在命令成功且结果为空，或成功返回了不同 commit 时才判为 ref 删除/移动；SSH 握手、断连、超时、DNS 和临时服务故障按瞬时网络错误重试，重试耗尽后进入远端不可用及已授权的 local fallback 路径，不得误报 `remote_ref_moved`
 - 同时提供 branch/ref 与 source directory 时，以确认后的 branch/ref 为准；只有 source directory 时不得直接使用当前 checkout 执行坐标补全
 - 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源
 - 若这两个分支是在 Step1 review checkpoint 才补充，恢复 `continue` 后调度器会先把确认值写入 `step2.input`，再进入 Step2

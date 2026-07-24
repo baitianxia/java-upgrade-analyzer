@@ -32,7 +32,7 @@ class ConstantImpactOracleTest(unittest.TestCase):
                 imported_roots.add(node.module.split(".", 1)[0])
         allowed = {
             "dataclasses", "hashlib", "io", "pathlib", "re", "subprocess",
-            "tempfile", "zipfile", "signature_utils",
+            "tempfile", "zipfile", "path_runtime", "signature_utils",
         }
 
         self.assertEqual(imported_roots - allowed, set())

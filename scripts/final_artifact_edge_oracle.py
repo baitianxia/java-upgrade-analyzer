@@ -12,13 +12,13 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 from threading import Event, Lock
 import time
 import zipfile
 
 from artifact_safety import inspect_archive
 from edge_truth import EdgeIdentity, canonical_edge_identity
+from path_runtime import short_temporary_directory
 
 
 INVOKE_OPCODES = {"invokevirtual", "invokeinterface", "invokestatic", "invokespecial", "invokedynamic"}
@@ -1080,7 +1080,7 @@ def scan_final_artifact(
     worker_count = 0
     inventory_class_count = 0
     try:
-        with tempfile.TemporaryDirectory(prefix="final-artifact-edge-oracle-") as temporary_directory:
+        with short_temporary_directory(prefix="s5-edge-oracle") as temporary_directory:
             entries, failures = _extract_packaged_classes(
                 snapshot,
                 Path(temporary_directory),

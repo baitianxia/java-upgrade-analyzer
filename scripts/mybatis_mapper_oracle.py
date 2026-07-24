@@ -8,12 +8,12 @@ import io
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
 
 from final_artifact_edge_oracle import scan_final_artifact
+from path_runtime import short_temporary_directory
 
 
 MAPPER_ANNOTATION = b"Lorg/apache/ibatis/annotations/Mapper;"
@@ -165,7 +165,7 @@ def parse_mapper_javap(output: str, artifact_entry: str) -> dict:
 
 
 def _run_javap(content: bytes, artifact_entry: str, timeout_seconds: float) -> str:
-    with tempfile.TemporaryDirectory(prefix="mybatis-oracle-javap-") as temporary:
+    with short_temporary_directory(prefix="s5-mybatis") as temporary:
         class_path = Path(temporary) / "target.class"
         class_path.write_bytes(content)
         completed = subprocess.run(

@@ -9,7 +9,6 @@ import io
 import re
 import safe_xml as ET
 import subprocess
-import tempfile
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +32,7 @@ from step5_evidence_model import (
     thaw_evidence_value,
 )
 from step5_artifact_fact_store import ClassLocation, Step5ArtifactFactStore
+from path_runtime import short_temporary_directory
 
 
 def _shared_artifact_inventory(entry, fact_store, *, strict=False):
@@ -3371,8 +3371,8 @@ def _message_listener_adapter_callbacks(
         entry = entry or {'coord': coord, 'jar_path': jar_path}
         try:
             _shared_artifact_inventory(entry, fact_store, strict=True)
-            with tempfile.TemporaryDirectory(
-                prefix='spring-message-listener-snapshot-'
+            with short_temporary_directory(
+                prefix='s5-msg-snapshot'
             ) as temporary:
                 snapshot = Path(temporary) / 'verified-classes.jar'
                 with zipfile.ZipFile(snapshot, 'w') as archive:
@@ -3390,8 +3390,8 @@ def _message_listener_adapter_callbacks(
     parsed = []
     errors = []
     try:
-        with zipfile.ZipFile(jar_path) as jar, tempfile.TemporaryDirectory(
-            prefix='spring-message-listener-adapter-'
+        with zipfile.ZipFile(jar_path) as jar, short_temporary_directory(
+            prefix='s5-msg-adapter'
         ) as temporary:
             class_names = sorted(
                 name for name in jar.namelist()
@@ -3634,7 +3634,7 @@ def collect_spring_aop_activation(
     errors = class_errors
     aspect_count = 0
     registered_count = 0
-    with tempfile.TemporaryDirectory(prefix='spring-aop-activation-') as temporary:
+    with short_temporary_directory(prefix='s5-aop') as temporary:
         verified_join_points = {}
         verified_join_point_classes = {}
         current_stream_record = {}
@@ -4559,7 +4559,7 @@ def collect_spring_security_filter_activation(
     )
     errors.extend(business_errors)
     errors.extend(runtime_errors)
-    with tempfile.TemporaryDirectory(prefix='spring-security-activation-') as temporary:
+    with short_temporary_directory(prefix='s5-security') as temporary:
         for index, chain in enumerate(chains):
             filter_owner = str(chain.get('filter_owner') or '')
             if str(chain.get('condition_status') or '') != 'resolved':

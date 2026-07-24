@@ -17,6 +17,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import s1_dep_diff  # noqa: E402
+import path_runtime  # noqa: E402
 from pipeline_constants import (  # noqa: E402
     STEP1_ARTIFACTS_DIRNAME,
     STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
@@ -24,6 +25,88 @@ from pipeline_constants import (  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
+    def test_windows_step1_git_command_enables_long_paths_without_global_config(self):
+        with patch.object(path_runtime, "IS_WINDOWS", True), \
+                patch.object(path_runtime, "git_cmd", return_value=[r"C:\Git\git.exe"]):
+            command = path_runtime.git_with_long_paths()
+
+        self.assertEqual(
+            [r"C:\Git\git.exe", "-c", "core.longpaths=true"],
+            command,
+        )
+
+    def test_create_branch_worktree_uses_short_name_and_retries_another_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_root = root / "first"
+            second_root = root / "second"
+            branch = "a" * 40
+            calls = []
+
+            def fake_run_cmd(command, cwd=None, timeout=None, **_kwargs):
+                calls.append((list(command), cwd, timeout))
+                if "ls-tree" in command:
+                    return "src/" + ("nested/" * 20) + "Demo.java\0", "", 0
+                if "add" in command and "worktree" in command:
+                    target = Path(command[-2])
+                    if target.parent == first_root:
+                        return "", "error: unable to create file: Filename too long", 1
+                    return "", "", 0
+                if "remove" in command and "worktree" in command:
+                    return "", "", 0
+                raise AssertionError(f"unexpected command: {command}")
+
+            with patch.object(path_runtime, "IS_WINDOWS", True), \
+                    patch.object(path_runtime, "git_cmd", return_value=["git"]), \
+                    patch.object(
+                        path_runtime,
+                        "short_temp_root_candidates",
+                        return_value=[first_root, second_root],
+                    ), \
+                    patch.object(path_runtime, "run_cmd", side_effect=fake_run_cmd):
+                worktree = path_runtime.create_detached_worktree(
+                    branch,
+                    root,
+                    label="s1-b",
+                )
+
+            self.assertEqual(second_root, worktree.parent)
+            self.assertTrue(worktree.name.startswith("s1-b-"))
+            self.assertNotIn(branch, worktree.name)
+            self.assertLess(len(worktree.name), 32)
+            self.assertTrue(any(
+                "remove" in command and str(first_root) in command[-1]
+                for command, _cwd, _timeout in calls
+            ))
+            self.assertTrue(all(
+                command[1:3] == ["-c", "core.longpaths=true"]
+                for command, _cwd, _timeout in calls
+            ))
+
+    def test_worktree_blocked_interaction_is_not_mislabeled_as_maven(self):
+        error = s1_dep_diff.build_step1_command_blocked_error(
+            stage="prepare_branch_worktree",
+            command="git worktree add --detach <temp> abc123",
+            exc=RuntimeError("Filename too long"),
+            side="current",
+            branch="abc123",
+        )
+
+        interaction = s1_dep_diff.build_step1_command_blocked_interaction(error)
+
+        self.assertEqual(
+            "step1_git_worktree_command_blocked",
+            interaction["reason_code"],
+        )
+        self.assertIn("Git worktree", interaction["summary"])
+        self.assertNotIn(
+            "current_jdk_home",
+            interaction["response_schema"]["properties"],
+        )
+        self.assertTrue(any(
+            "路径超过" in cause for cause in interaction["suspected_causes"]
+        ))
+
     def test_coordinate_followup_uses_cross_step_diagnostic_contract(self):
         interaction = s1_dep_diff.build_step1_coordinate_followup_interaction(
             side="current",
@@ -150,9 +233,11 @@ class Step1PackagedDepsTest(unittest.TestCase):
             artifact_path.parent.mkdir(parents=True)
             artifact_path.write_text("placeholder", encoding="utf-8")
             commands = []
+            call_options = []
 
-            def fake_run(command, **_kwargs):
+            def fake_run(command, **kwargs):
                 commands.append(command)
+                call_options.append(kwargs)
                 return "", "", 0
 
             packaged_raw = [{
@@ -178,6 +263,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertIn("org.example:demo", deps)
         self.assertEqual(Path(commands[0][0]), wrapper.resolve())
         self.assertIn(":app:build", commands[0])
+        self.assertIsNone(call_options[0]["timeout"])
         self.assertEqual(meta["build_tool"], "gradle")
         self.assertTrue(meta["gradle_model_hash"])
 
@@ -254,9 +340,11 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 encoding="utf-8",
             )
             commands = []
+            call_options = []
 
-            def fake_run(cmd, **_kwargs):
+            def fake_run(cmd, **kwargs):
                 commands.append(cmd)
+                call_options.append(kwargs)
                 return (
                     "[INFO] com.acme:common:jar:1:compile\n",
                     "",
@@ -268,6 +356,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
 
         self.assertIn("package", commands[0])
         self.assertLess(commands[0].index("package"), commands[0].index("dependency:list"))
+        self.assertIsNone(call_options[0]["timeout"])
         self.assertIn("com.acme:common", deps)
 
     def test_packaged_archive_rejects_unsafe_entry_before_scanning(self):

@@ -17,6 +17,7 @@ _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 _CORE_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 DEFAULT_FETCH_ATTEMPTS = 3
 DEFAULT_FETCH_RETRY_DELAYS = (1, 3)
+_REMOTE_REF_ABSENT_RC = 4
 
 _FETCH_AUTH_PATTERNS = (
     "authentication failed", "permission denied", "access denied",
@@ -29,11 +30,15 @@ _FETCH_NOT_FOUND_PATTERNS = (
 )
 _FETCH_TRANSIENT_PATTERNS = (
     "timed out", "timeout", "connection reset", "connection was reset",
-    "connection refused", "remote end hung up", "unexpected disconnect",
+    "connection refused", "connection closed", "connection aborted",
+    "remote end hung up", "unexpected disconnect", "broken pipe",
+    "kex_exchange_identification", "ssh_exchange_identification",
+    "banner exchange", "no route to host", "network is unreachable",
     "temporary failure", "temporarily unavailable", "could not resolve host",
     "name or service not known", "http 500", "http 502", "http 503", "http 504",
     "the requested url returned error: 500", "the requested url returned error: 502",
     "the requested url returned error: 503", "the requested url returned error: 504",
+    "命令超时", "连接超时", "连接被重置", "连接已关闭", "网络不可达",
 )
 
 
@@ -250,7 +255,11 @@ def _query_remote_candidate_commit(repo_dir, candidate, timeout=30):
             rows[parts[1]] = parts[0]
     commit = rows.get(f"{canonical_ref}^{{}}") or rows.get(canonical_ref) or ""
     if not commit:
-        return "", "remote ref no longer exists", 2
+        # A successful targeted query with no matching row is the only
+        # authoritative "ref disappeared" signal. Keep it distinct from
+        # transport/process failures so an intermittent SSH connection can
+        # never be promoted to remote_ref_moved by error-text heuristics.
+        return "", "remote ref no longer exists", _REMOTE_REF_ABSENT_RC
     return commit, "", 0
 
 
@@ -280,7 +289,7 @@ def _materialize_remote_candidate_details(
                 "reason": query_error,
                 "retryable": retryable,
             })
-            if expected_commit and failure_type == "remote_ref_not_found":
+            if expected_commit and query_rc == _REMOTE_REF_ABSENT_RC:
                 return {
                     "status": "remote_ref_moved",
                     "resolved_commit": "",
@@ -332,7 +341,7 @@ def _materialize_remote_candidate_details(
                         "reason": after_error,
                         "retryable": retryable,
                     })
-                    if expected_commit and failure_type == "remote_ref_not_found":
+                    if expected_commit and after_rc == _REMOTE_REF_ABSENT_RC:
                         return {
                             "status": "remote_ref_moved",
                             "resolved_commit": "",
@@ -448,15 +457,17 @@ def materialize_remote_source_candidate(
     )
     fixed_commit = str(materialized.get("resolved_commit") or "")
     if not fixed_commit:
+        attempts = list(materialized.get("attempts") or [])
+        last_attempt = attempts[-1] if attempts else {}
         return {
             "status": str(materialized.get("status") or "remote_fetch_failed"),
             "resolved_commit": "",
             "expected_commit": str(materialized.get("expected_commit") or ""),
             "observed_commit": str(materialized.get("observed_commit") or ""),
-            "attempts": list(materialized.get("attempts") or []),
+            "attempts": attempts,
             "failure": {
                 "remote": str((candidate or {}).get("remote") or ""),
-                "stage": "fetch",
+                "stage": str(last_attempt.get("stage") or "fetch"),
                 "reason": str(materialized.get("reason") or "remote fetch failed"),
                 "reason_code": str(materialized.get("failure_type") or materialized.get("status") or "fetch_failed"),
                 "retryable": bool(materialized.get("retryable")),

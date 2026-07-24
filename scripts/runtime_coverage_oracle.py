@@ -13,12 +13,12 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
 
 from csv_io import open_csv_read, open_csv_write
+from path_runtime import short_temporary_directory
 from signature_utils import canonical_api_identity_tuple, signatures_match_identity
 
 
@@ -274,7 +274,7 @@ def read_jacoco_coverage(
         if not path.is_file():
             raise ValueError(f"runtime_oracle_input_missing:{path}")
     joined_classpath = os.pathsep.join(str(Path(item).resolve()) for item in classpath)
-    with tempfile.TemporaryDirectory(prefix="jua-jacoco-oracle-") as tmp:
+    with short_temporary_directory(prefix="s5-jacoco") as tmp:
         build_dir = Path(tmp)
         compile_result = subprocess.run(
             [javac, "-cp", joined_classpath, "-d", str(build_dir), str(JAVA_HELPER)],

@@ -193,6 +193,31 @@ class Step2SourceDirsTest(unittest.TestCase):
             None,
         )
 
+    def test_effective_model_probe_uses_shared_worktree_runtime_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "short-worktree"
+            worktree.mkdir()
+            (worktree / "pom.xml").write_text("<project/>", encoding="utf-8")
+            with patch.object(step2, "get_git_root", return_value=tmp), \
+                    patch.object(
+                        step2, "create_detached_worktree", return_value=worktree,
+                    ) as create_worktree, \
+                    patch.object(
+                        step2, "remove_detached_worktree",
+                    ) as remove_worktree, \
+                    patch.object(step2, "mvn_cmd", return_value=["mvn"]), \
+                    patch.object(step2, "run_cmd", return_value=("17", "", 0)):
+                detected = step2.resolve_maven_jdk_from_effective_model(
+                    "feature/upgrade", tmp,
+                )
+
+        self.assertEqual("17", detected)
+        create_worktree.assert_called_once()
+        self.assertEqual(
+            "s2-jdk", create_worktree.call_args.kwargs["label"],
+        )
+        remove_worktree.assert_called_once()
+
     def test_detect_jdk_versions_falls_back_to_effective_maven_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

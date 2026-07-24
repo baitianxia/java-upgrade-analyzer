@@ -174,19 +174,31 @@ def gate_step1_scope(d):
     manifest_items = list(manifest.get("items") or [])
     gav_hashes = {}
     for item in manifest_items:
+        coord = str(item.get("coord") or "").strip()
+        coord_parts = coord.split(":", 2)
+        classifier = str(item.get("classifier") or "").strip()
+        if not classifier and len(coord_parts) == 3:
+            classifier = coord_parts[2].strip()
+        gav_coord = (
+            ":".join(coord_parts[:2])
+            if len(coord_parts) >= 2
+            else coord
+        )
         key = (
             str(item.get("side") or "").strip(),
-            str(item.get("coord") or "").strip(),
+            gav_coord,
             str(item.get("version") or "").strip(),
+            classifier,
         )
         gav_hashes.setdefault(key, set()).add(
             str(item.get("nested_jar_sha256") or "").lower()
         )
-    for (side, coord, version), hashes in gav_hashes.items():
+    for (side, coord, version, classifier), hashes in gav_hashes.items():
         if len(hashes) > 1:
+            classifier_suffix = f":{classifier}" if classifier else ""
             fail(
                 f"Step1 同一 GAV 对应多个不同字节的最终制品条目："
-                f"{side} {coord}:{version}"
+                f"{side} {coord}:{version}{classifier_suffix}"
             )
     item_by_side_entry = {
         (

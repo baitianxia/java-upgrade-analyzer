@@ -13,15 +13,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import time
 
 from compat import setup_utf8_io
+from path_runtime import short_temp_root
 from runtime_contract import contract_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_AUDIT_ROOT = Path(tempfile.gettempdir()) / "jua-quality-gate"
+DEFAULT_AUDIT_ROOT = short_temp_root() / "jua-quality-gate"
 
 setup_utf8_io()
 

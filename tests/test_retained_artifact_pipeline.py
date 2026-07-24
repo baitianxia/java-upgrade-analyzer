@@ -208,6 +208,110 @@ class RetainedArtifactPipelineTest(unittest.TestCase):
                     ],
                 )
 
+    def test_step1_keeps_different_classifiers_as_distinct_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            dependencies = report / "evidence" / "dependencies"
+            artifact = root / "current.jar"
+            aarch64 = self._jar_bytes([
+                ("io/netty/resolver/dns/macos/MacOSDnsServerAddressStreamProvider.class", b"aarch64"),
+            ])
+            x86_64 = self._jar_bytes([
+                ("io/netty/resolver/dns/macos/MacOSDnsServerAddressStreamProvider.class", b"x86_64"),
+            ])
+            entries = [
+                {
+                    "coord": "io.netty:netty-resolver-dns-native-macos",
+                    "classifier": classifier,
+                    "version": "4.1.130.Final",
+                    "scope": "runtime",
+                    "lib_entry": f"BOOT-INF/lib/netty-resolver-dns-native-macos-4.1.130.Final-{classifier}.jar",
+                    "resolution_status": "resolved",
+                    "packaged_match_source": "dependency-list",
+                }
+                for classifier in ("osx-aarch_64", "osx-x86_64")
+            ]
+            with zipfile.ZipFile(artifact, "w") as outer:
+                outer.writestr(entries[0]["lib_entry"], aarch64)
+                outer.writestr(entries[1]["lib_entry"], x86_64)
+
+            manifest_path, items = s1_dep_diff.materialize_changed_dependency_jars(
+                [],
+                {"current": {
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                }},
+                dependencies,
+                current_entries=entries,
+            )
+
+            self.assertEqual(
+                {item["classifier"] for item in items},
+                {"osx-aarch_64", "osx-x86_64"},
+            )
+            self.assertEqual(
+                {item["coord"] for item in items},
+                {
+                    "io.netty:netty-resolver-dns-native-macos:osx-aarch_64",
+                    "io.netty:netty-resolver-dns-native-macos:osx-x86_64",
+                },
+            )
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for item in manifest["items"]:
+                item["coord"] = "io.netty:netty-resolver-dns-native-macos"
+            manifest_path.write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            with (dependencies / "dep_changes.csv").open(
+                "w", encoding="utf-8", newline="",
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "coord", "old_version", "new_version", "change_type",
+                        "risk", "scope", "resolution_status",
+                        "base_lib_entry", "current_lib_entry",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "coord": "io.netty:netty-resolver-dns-native-macos",
+                    "old_version": "4.1.130.Final",
+                    "new_version": "4.1.130.Final",
+                    "change_type": "未变",
+                    "risk": "低",
+                    "scope": "runtime",
+                    "resolution_status": "resolved",
+                })
+            with (dependencies / "deps_current_resolved.csv").open(
+                "w", encoding="utf-8", newline="",
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "coord", "classifier", "version", "scope", "remark",
+                        "lib_entry", "resolution_status",
+                        "packaged_match_source",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(entries)
+            (dependencies / "build_provenance.json").write_text(
+                json.dumps({
+                    "both_builds_succeeded": True,
+                    "sides": [
+                        {"side": "base", "artifact_sha256": "a" * 64},
+                        {"side": "current", "artifact_sha256": "b" * 64},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+
+            gate.gate_step1_scope(report)
+
     def test_step1_rejects_unsafe_retained_business_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

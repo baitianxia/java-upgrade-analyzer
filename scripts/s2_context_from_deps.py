@@ -17,7 +17,7 @@ s2_context_from_deps.py — Step 2：从依赖树推断项目上下文
 Windows 兼容：通过 compat.py 处理编码和 subprocess 调用。
 """
 
-import argparse, csv, json, os, re, sys, tempfile
+import argparse, csv, json, os, re, sys
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
@@ -25,6 +25,7 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, git_cmd, mvn_cmd
 from csv_io import open_csv_read
+from path_runtime import create_detached_worktree, remove_detached_worktree
 
 
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -565,39 +566,41 @@ def resolve_maven_jdk_from_effective_model(branch, work_dir, pom_relpath='pom.xm
     """
     git_root = get_git_root(work_dir) or work_dir
     pom_relpath = (pom_relpath or 'pom.xml').strip() or 'pom.xml'
-    safe_prefix = re.sub(r'[^A-Za-z0-9._-]+', '-', str(branch or 'branch')).strip('-') or 'branch'
-
-    with tempfile.TemporaryDirectory(prefix=f'jua-step2-jdk-{safe_prefix}-') as tmp:
-        stdout, stderr, rc = run_cmd(
-            git_cmd() + ['worktree', 'add', '--detach', tmp, branch],
-            cwd=git_root,
-            timeout=180,
+    try:
+        tmp = create_detached_worktree(
+            branch,
+            git_root,
+            label="s2-jdk",
+            runner=run_cmd,
+            git_command=git_cmd(),
         )
-        if rc != 0:
-            return None
+    except RuntimeError as exc:
+        print(f"  ⚠️ Step2 无法准备 JDK 探测工作区：{exc}", file=sys.stderr)
+        return None
 
-        try:
-            root_dir = Path(tmp)
-            pom_path = root_dir / pom_relpath
-            eval_cwd = str(pom_path.parent if pom_path.exists() else root_dir)
-            mvn = mvn_cmd(root_dir)
-            for expr in ('maven.compiler.release', 'maven.compiler.target', 'maven.compiler.source'):
-                stdout, stderr, rc = run_cmd(
-                    mvn + ['-q', 'help:evaluate', f'-Dexpression={expr}', '-DforceStdout'],
-                    cwd=eval_cwd,
-                    timeout=180,
-                )
-                if rc != 0:
-                    continue
-                detected = parse_maven_help_evaluate_jdk(stdout)
-                if detected:
-                    return detected
-        finally:
-            run_cmd(
-                git_cmd() + ['worktree', 'remove', '--force', tmp],
-                cwd=git_root,
-                timeout=60,
+    try:
+        root_dir = Path(tmp)
+        pom_path = root_dir / pom_relpath
+        eval_cwd = str(pom_path.parent if pom_path.exists() else root_dir)
+        mvn = mvn_cmd(root_dir)
+        for expr in ('maven.compiler.release', 'maven.compiler.target', 'maven.compiler.source'):
+            stdout, stderr, rc = run_cmd(
+                mvn + ['-q', 'help:evaluate', f'-Dexpression={expr}', '-DforceStdout'],
+                cwd=eval_cwd,
+                timeout=180,
             )
+            if rc != 0:
+                continue
+            detected = parse_maven_help_evaluate_jdk(stdout)
+            if detected:
+                return detected
+    finally:
+        remove_detached_worktree(
+            tmp,
+            git_root,
+            runner=run_cmd,
+            git_command=git_cmd(),
+        )
     return None
 
 

@@ -486,11 +486,12 @@ def gradle_cmd(work_dir=None):
 
 
 def git_cmd():
-    """返回可用的 Git 命令"""
+    """返回可用的 Git 命令；Windows 全局启用 Git 长路径实现。"""
     git = find_executable('git')
-    if git:
-        return [git]
-    return ['git']
+    command = [git] if git else ['git']
+    if IS_WINDOWS:
+        command.extend(['-c', 'core.longpaths=true'])
+    return command
 
 
 def resolve_command(cmd):

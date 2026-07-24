@@ -12,6 +12,7 @@ SCRIPT = ROOT / "scripts" / "user_scenario_regression.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import user_scenario_regression as scenarios  # noqa: E402
+from path_runtime import short_temp_root  # noqa: E402
 
 
 class UserScenarioRegressionTest(unittest.TestCase):
@@ -47,7 +48,7 @@ class UserScenarioRegressionTest(unittest.TestCase):
 
         self.assertEqual(
             Path(args.workspace),
-            Path(tempfile.gettempdir()) / "java-upgrade-user-scenario-regression",
+            short_temp_root() / "jua-user-scenarios",
         )
 
     def test_generated_user_scenarios_pass_and_cover_key_contracts(self):

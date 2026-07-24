@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import real_project_regression as realreg  # noqa: E402
 import confidence_weighted_tracer as tracer  # noqa: E402
 import enhanced_output_formatter as formatter  # noqa: E402
+from path_runtime import short_temp_root  # noqa: E402
 
 
 def minimal_classfile_with_utf8(*values):
@@ -622,7 +623,7 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertEqual(
             Path(args.report_root),
-            Path(tempfile.gettempdir()) / "java-upgrade-real-project-regression",
+            short_temp_root() / "jua-regression",
         )
 
     def test_project_asset_health_records_revision_without_fake_git_error(self):

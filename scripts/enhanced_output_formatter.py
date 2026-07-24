@@ -24,7 +24,6 @@ import re
 import sqlite3
 import sys
 import csv
-import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -37,6 +36,7 @@ from diagnostic_contract import (
     reason_code_aliases,
 )
 from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_OBSERVABILITY_DIRNAME
+from path_runtime import short_temporary_directory
 from reason_guidance import (
     REASON_GUIDANCE_SCHEMA,
     build_diagnostic_guidance,
@@ -1564,7 +1564,7 @@ def generate_alerts_csv(all_results, output_path):
         'incomplete': 4,
     }
 
-    with tempfile.TemporaryDirectory(prefix='.alerts-sort-', dir=output_dir) as temp_dir:
+    with short_temporary_directory(prefix='s5-alerts-sort') as temp_dir:
         database_path = os.path.join(temp_dir, 'alerts.sqlite3')
         connection = sqlite3.connect(database_path)
         try:

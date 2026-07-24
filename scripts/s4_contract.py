@@ -8,6 +8,7 @@ all_changed_apis.csv 是 Step 4 的核心输出，Step 5 的核心输入。
 import re
 from pathlib import Path
 
+from path_runtime import bounded_path_component
 from pipeline_constants import (
     PER_DEPENDENCY_CANDIDATE_HITS_FILE as _PER_DEPENDENCY_CANDIDATE_HITS_FILE,
     PER_DEPENDENCY_DIRNAME as _PER_DEPENDENCY_DIRNAME,
@@ -147,20 +148,16 @@ _WINDOWS_RESERVED_NAMES = {
 
 
 def _sanitize_filename(name: str, fallback: str = "file", max_len: int = 180) -> str:
-    s = (name or "").strip()
-    s = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", s)
-    s = re.sub(r"\s+", " ", s)
-    s = s.rstrip(" .")
-    s = re.sub(r"_+", "_", s).strip("_")
-    if not s:
-        s = fallback
-    if s.upper() in _WINDOWS_RESERVED_NAMES:
-        s = "_" + s
-    if len(s) > max_len:
-        s = s[:max_len].rstrip(" ._")
-        if not s:
-            s = fallback
-    return s
+    safe = str(name or "").strip()
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", safe)
+    safe = re.sub(r"\s+", " ", safe)
+    safe = safe.rstrip(" .")
+    safe = re.sub(r"_+", "_", safe).strip("_") or fallback
+    if safe.upper() in _WINDOWS_RESERVED_NAMES:
+        safe = f"_{safe}"
+    return bounded_path_component(
+        safe, max_length=min(int(max_len), 80), default=fallback,
+    )
 
 
 def make_api_filename(api_name: str, change_type: str) -> str:
@@ -187,7 +184,11 @@ def make_module_filename(module_name: str) -> str:
 
 def make_per_dependency_dirname(coord: str) -> str:
     """将 Maven 坐标转成稳定目录名。"""
-    safe = _sanitize_filename(str(coord or "").replace(":", "__"), fallback="unknown_coord", max_len=160)
+    safe = bounded_path_component(
+        str(coord or "").replace(":", "__"),
+        default="unknown_coord",
+        max_length=48,
+    )
     return safe
 
 

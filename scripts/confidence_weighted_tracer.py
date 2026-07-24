@@ -25,7 +25,6 @@ import shutil
 import sqlite3
 import struct
 import sys
-import tempfile
 import time
 import zipfile
 from collections.abc import Mapping
@@ -40,6 +39,11 @@ from types import SimpleNamespace
 from compat import run_cmd
 from csv_io import open_csv_read, open_csv_write
 from edge_truth import EDGE_IDENTITY_FIELDS, canonical_edge_identity
+from path_runtime import (
+    make_temporary_file,
+    named_temporary_file,
+    runtime_storage_root,
+)
 from progress_logging import emit_progress, should_log_progress, suggest_log_interval
 from signature_utils import (
     canonical_api_identity,
@@ -258,8 +262,8 @@ def _store_persistent_artifact_fact(
             'result': result,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent),
+        descriptor, temporary_name = make_temporary_file(
+            prefix='.jua-cache-', suffix='.tmp', dir=str(path.parent),
         )
         temporary_path = Path(temporary_name)
         with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as handle:
@@ -771,9 +775,8 @@ def _spill_analyzer_edges_if_needed(graph, analyzer_edges):
     report_dir = str(getattr(graph, 'report_dir', '') or '').strip()
     if not report_dir:
         return analyzer_edges
-    temp_dir = Path(report_dir) / '.runtime' / 'cache'
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
+    temp_dir = runtime_storage_root(report_dir, 'cache')
+    handle = named_temporary_file(
         prefix='analyzer-edges-', suffix='.sqlite3', dir=temp_dir, delete=False
     )
     path = handle.name
@@ -6217,9 +6220,9 @@ def _write_runtime_member_index_cache(path, identity, index):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
-        with tempfile.NamedTemporaryFile(
+        with named_temporary_file(
             mode='w', encoding='utf-8', dir=path.parent,
-            prefix=path.name + '.', suffix='.tmp', delete=False,
+            prefix='.jua-cache-', suffix='.tmp', delete=False,
         ) as handle:
             temporary_path = Path(handle.name)
             json.dump(wrapper, handle, ensure_ascii=False, sort_keys=True)

@@ -221,6 +221,7 @@ class Step1ObservabilityTest(unittest.TestCase):
                 )
 
             self.assertTrue(calls[0][1]["stream_output"])
+            self.assertIsNone(calls[0][1]["timeout"])
             with observer.timing_path.open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertTrue(any(

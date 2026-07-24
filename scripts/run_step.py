@@ -25,6 +25,7 @@ from compat import (
     run_cmd,
 )
 from compat import git_cmd
+from path_runtime import git_with_long_paths
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
 from diagnostic_contract import canonical_reason_code, normalize_diagnostic_payload
@@ -1981,7 +1982,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
         else:
             shutil.rmtree(temp_repo)
     stdout, stderr, rc = run_cmd(
-        git_cmd() + [
+        git_with_long_paths() + [
             "clone",
             "--no-tags",
             "--origin",

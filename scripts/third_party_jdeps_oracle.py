@@ -10,10 +10,10 @@ import io
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 import time
 import zipfile
 
+from path_runtime import short_temporary_directory
 from signature_utils import canonical_api_identity
 
 
@@ -147,7 +147,7 @@ def scan_artifact_class_references(
     references: list[dict] = []
     errors: list[str] = []
 
-    with tempfile.TemporaryDirectory(prefix="jua-jdeps-") as temp_dir:
+    with short_temporary_directory(prefix="s5-jdeps") as temp_dir:
         root = Path(temp_dir)
         jobs: list[tuple[str, Path, bool, int]] = []
         with zipfile.ZipFile(io.BytesIO(snapshot)) as outer:

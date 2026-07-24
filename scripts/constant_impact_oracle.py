@@ -7,9 +7,9 @@ import io
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 import zipfile
 
+from path_runtime import short_temporary_directory
 from signature_utils import canonical_api_identity
 
 
@@ -108,7 +108,7 @@ def _javap_version(javap):
 
 
 def _javap_class(content, javap, *args):
-    with tempfile.TemporaryDirectory() as tmp:
+    with short_temporary_directory(prefix="s4-constant-javap") as tmp:
         class_file = Path(tmp) / "Evidence.class"
         class_file.write_bytes(content)
         completed = subprocess.run(
