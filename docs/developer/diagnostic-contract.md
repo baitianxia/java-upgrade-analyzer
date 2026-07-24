@@ -41,7 +41,10 @@ Step4 的 `all_changed_apis.csv` 只保存真实 API 变化事实，不使用伪
 错误。用户首先阅读 `dependency_analysis_status.md`，其中使用中文直接说明每个依赖
 的 API 对比结果、实现变化检查结果、最终结论、是否完整、能否按无变化处理、形成结论
 前是否还需处理，以及下一步动作。
-`dependency_analysis_status.csv` 与 `dependency_analysis_status.json` 供机器读取：
+`dependency_analysis_status.csv` 与 `dependency_analysis_status.json` 供机器读取。字段名
+必须带明确对象，例如 `api_comparison_status`、`api_comparison_failure_reason`、
+`implementation_check_status`，不得使用无法看出所指对象的 `status`、`failure_message`
+或 `result_interpretation`。`api_comparison_status` 的值为：
 
 - `changes_detected`：对比成功且发现 API 变化；
 - `no_api_change`：对比成功且没有可见 API 变化；

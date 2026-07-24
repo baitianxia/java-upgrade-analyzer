@@ -136,7 +136,7 @@ _REASON_GUIDANCE = {
             "才可排除；不能因 all_changed_apis.csv 中没有记录而忽略。"
         ),
         "repair_actions": [
-            "打开 dependency_analysis_status.json 中该依赖的 failure_message 和 evidence_path。",
+            "打开 dependency_analysis_status.json 中该依赖的 api_comparison_failure_reason 和 api_comparison_evidence_path。",
             "检查 old/new 最终制品 JAR、Java/JDK 兼容性、JApiCmp stderr 与进程资源。",
             "修复后重跑 Step4；无需把失败伪造成一条 API 变化记录。",
         ],

@@ -5693,24 +5693,22 @@ DEPENDENCY_ANALYSIS_STATUS_FIELDS = [
     "coord",
     "old_version",
     "new_version",
-    "change_type",
-    "binary_api_result_text",
+    "dependency_change_type",
+    "api_comparison_result_text",
     "implementation_check_result_text",
     "final_result_text",
     "analysis_complete",
     "can_treat_as_no_change",
     "requires_action_before_conclusion",
     "next_action",
-    "comparison_mode",
-    "comparison_status",
-    "api_data_available",
-    "changed_api_count",
-    "reason_code",
-    "reason_code_aliases",
-    "failure_message",
-    "result_interpretation",
-    "recommended_action",
-    "evidence_path",
+    "api_comparison_method",
+    "api_comparison_status",
+    "api_comparison_data_available",
+    "api_change_count",
+    "api_comparison_reason_code",
+    "api_comparison_reason_code_aliases",
+    "api_comparison_failure_reason",
+    "api_comparison_evidence_path",
     "implementation_check_status",
     "implementation_data_available",
     "implementation_change_count",
@@ -5719,6 +5717,53 @@ DEPENDENCY_ANALYSIS_STATUS_FIELDS = [
     "implementation_evidence_path",
     "origin_step",
 ]
+
+
+def dependency_analysis_status_public_row(row):
+    """Expose field names that identify both the subject and the meaning."""
+    row = row or {}
+    return {
+        "coord": row.get("coord", ""),
+        "old_version": row.get("old_version", ""),
+        "new_version": row.get("new_version", ""),
+        "dependency_change_type": row.get("change_type", ""),
+        "api_comparison_result_text": row.get("binary_api_result_text", ""),
+        "implementation_check_result_text": row.get(
+            "implementation_check_result_text", ""
+        ),
+        "final_result_text": row.get("final_result_text", ""),
+        "analysis_complete": row.get("analysis_complete", False),
+        "can_treat_as_no_change": row.get("can_treat_as_no_change", False),
+        "requires_action_before_conclusion": row.get(
+            "requires_action_before_conclusion", False
+        ),
+        "next_action": row.get("next_action", ""),
+        "api_comparison_method": row.get("comparison_mode", ""),
+        "api_comparison_status": row.get("comparison_status", ""),
+        "api_comparison_data_available": row.get("api_data_available", False),
+        "api_change_count": row.get("changed_api_count"),
+        "api_comparison_reason_code": row.get("reason_code", ""),
+        "api_comparison_reason_code_aliases": row.get(
+            "reason_code_aliases", []
+        ),
+        "api_comparison_failure_reason": row.get("failure_message", ""),
+        "api_comparison_evidence_path": row.get("evidence_path", ""),
+        "implementation_check_status": row.get(
+            "implementation_check_status", ""
+        ),
+        "implementation_data_available": row.get(
+            "implementation_data_available", False
+        ),
+        "implementation_change_count": row.get("implementation_change_count"),
+        "implementation_reason_code": row.get("implementation_reason_code", ""),
+        "implementation_failure_reason": row.get(
+            "implementation_failure_reason", ""
+        ),
+        "implementation_evidence_path": row.get(
+            "implementation_evidence_path", ""
+        ),
+        "origin_step": row.get("origin_step", "step4"),
+    }
 
 
 def build_dependency_analysis_status_rows(
@@ -5785,7 +5830,8 @@ def build_dependency_analysis_status_rows(
                 )
                 failure_message = str(run.get("error") or "").strip()
                 interpretation = (
-                    "对比失败，API 数据不可用；不能解释为“没有 API 变化”。"
+                    "API 对比失败，没有 API 数据，不能按无变化处理。"
+                    f"技术原因：{failure_message or '未记录'}"
                 )
                 recommended_action = (
                     "查看失败原因和原始证据，修复后重跑该依赖的 Step4 对比。"
@@ -5811,7 +5857,7 @@ def build_dependency_analysis_status_rows(
             reason_code = "BINARY_API_COMPARISON_NOT_EXECUTED"
             failure_message = "没有找到该依赖的二进制 API 对比执行记录"
             interpretation = (
-                "对比未执行或执行记录丢失，API 数据不可用；不能解释为“没有 API 变化”。"
+                "API 对比未执行或执行记录丢失，没有 API 数据，不能按无变化处理。"
             )
             recommended_action = "检查 Step4 运行日志和输入制品后重跑。"
 
@@ -6047,14 +6093,21 @@ def write_dependency_analysis_status(
     csv_path = output_path / DEPENDENCY_ANALYSIS_STATUS_CSV
     json_path = output_path / DEPENDENCY_ANALYSIS_STATUS_JSON
     md_path = output_path / DEPENDENCY_ANALYSIS_STATUS_MD
+    public_rows = [
+        dependency_analysis_status_public_row(row)
+        for row in rows
+    ]
 
     with open_csv_write(csv_path) as fh:
         writer = csv.DictWriter(fh, fieldnames=DEPENDENCY_ANALYSIS_STATUS_FIELDS)
         writer.writeheader()
-        for row in rows:
-            csv_row = {field: row.get(field, "") for field in DEPENDENCY_ANALYSIS_STATUS_FIELDS}
-            csv_row["api_data_available"] = str(
-                bool(row.get("api_data_available"))
+        for row in public_rows:
+            csv_row = {
+                field: row.get(field, "")
+                for field in DEPENDENCY_ANALYSIS_STATUS_FIELDS
+            }
+            csv_row["api_comparison_data_available"] = str(
+                bool(row.get("api_comparison_data_available"))
             ).lower()
             for boolean_field in (
                 "analysis_complete",
@@ -6065,16 +6118,16 @@ def write_dependency_analysis_status(
                 csv_row[boolean_field] = str(
                     bool(row.get(boolean_field))
                 ).lower()
-            csv_row["changed_api_count"] = (
-                "" if row.get("changed_api_count") is None
-                else row.get("changed_api_count")
+            csv_row["api_change_count"] = (
+                "" if row.get("api_change_count") is None
+                else row.get("api_change_count")
             )
             csv_row["implementation_change_count"] = (
                 "" if row.get("implementation_change_count") is None
                 else row.get("implementation_change_count")
             )
-            csv_row["reason_code_aliases"] = "|".join(
-                row.get("reason_code_aliases") or []
+            csv_row["api_comparison_reason_code_aliases"] = "|".join(
+                row.get("api_comparison_reason_code_aliases") or []
             )
             writer.writerow(csv_row)
 
@@ -6104,18 +6157,26 @@ def write_dependency_analysis_status(
         ),
         "summary": {
             "total_dependencies": len(rows),
-            "changes_detected": status_counts.get("changes_detected", 0),
-            "no_api_change": status_counts.get("no_api_change", 0),
-            "failed": status_counts.get("failed", 0),
-            "not_applicable": status_counts.get("not_applicable", 0),
-            "analysis_complete": sum(
+            "dependencies_with_api_changes": status_counts.get(
+                "changes_detected", 0
+            ),
+            "dependencies_with_no_api_changes": status_counts.get(
+                "no_api_change", 0
+            ),
+            "dependencies_with_failed_api_comparison": status_counts.get(
+                "failed", 0
+            ),
+            "dependencies_without_applicable_api_comparison": (
+                status_counts.get("not_applicable", 0)
+            ),
+            "dependencies_with_complete_analysis": sum(
                 1 for row in rows if row.get("analysis_complete")
             ),
-            "requires_action_before_conclusion": sum(
+            "dependencies_requiring_action_before_conclusion": sum(
                 1 for row in rows
                 if row.get("requires_action_before_conclusion")
             ),
-            "can_treat_as_no_change": sum(
+            "dependencies_that_can_be_treated_as_no_change": sum(
                 1 for row in rows if row.get("can_treat_as_no_change")
             ),
             "implementation_check_status_counts": dict(
@@ -6129,7 +6190,7 @@ def write_dependency_analysis_status(
                 "true 表示当前不能直接采用结论，必须按 next_action 处理并重新分析。"
             ),
         },
-        "items": rows,
+        "items": public_rows,
     }
     json_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",

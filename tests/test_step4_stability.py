@@ -515,7 +515,7 @@ public class com.acme.Api {
             by_coord["com.acme:failed"]["changed_api_count"]
         )
         self.assertIn(
-            "不能解释为“没有 API 变化”",
+            "不能按无变化处理",
             by_coord["com.acme:failed"]["result_interpretation"],
         )
 
@@ -550,9 +550,18 @@ public class com.acme.Api {
                 csv_rows = list(csv.DictReader(fh))
 
         self.assertEqual(rows[0]["comparison_status"], "failed")
-        self.assertEqual(csv_rows[0]["comparison_status"], "failed")
-        self.assertEqual(csv_rows[0]["changed_api_count"], "")
-        self.assertEqual(payload["summary"]["failed"], 1)
+        self.assertEqual(csv_rows[0]["api_comparison_status"], "failed")
+        self.assertEqual(csv_rows[0]["api_change_count"], "")
+        self.assertEqual(
+            payload["summary"]["dependencies_with_failed_api_comparison"],
+            1,
+        )
+        self.assertEqual(
+            payload["items"][0]["api_comparison_failure_reason"],
+            "process exited with 1",
+        )
+        self.assertNotIn("comparison_status", payload["items"][0])
+        self.assertNotIn("needs_fix", payload["items"][0])
         self.assertEqual(
             payload["diagnostic_guidance"][0]["reason_code"],
             "JAPICMP_EXECUTION_FAILED",
@@ -4014,15 +4023,15 @@ public class com.acme.Api {
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(
-            by_coord["com.example:no-change"]["comparison_status"],
+            by_coord["com.example:no-change"]["api_comparison_status"],
             "no_api_change",
         )
         self.assertEqual(
-            by_coord["com.example:failed"]["comparison_status"],
+            by_coord["com.example:failed"]["api_comparison_status"],
             "failed",
         )
         self.assertIsNone(
-            by_coord["com.example:failed"]["changed_api_count"]
+            by_coord["com.example:failed"]["api_change_count"]
         )
         self.assertIn(
             "com.example:failed",
