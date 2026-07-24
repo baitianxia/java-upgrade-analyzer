@@ -33,6 +33,10 @@ from pipeline_constants import (
     RUNTIME_COVERAGE_DIRNAME,
     RUNTIME_DIRNAME,
 )
+from reason_guidance import (
+    REASON_GUIDANCE_SCHEMA,
+    build_diagnostic_guidance_from_summary,
+)
 
 S6_INLINE_LIMIT = 20
 S6_NOT_FOUND_INLINE_LIMIT = S6_INLINE_LIMIT
@@ -1193,6 +1197,8 @@ def collect_findings(d):
         'uncertain_reason_summary': {},
         'not_analyzed_reason_summary': {},
         'not_found_reason_summary': {},
+        'diagnostic_guidance_schema': REASON_GUIDANCE_SCHEMA,
+        'diagnostic_guidance': [],
         'user_conclusion_summary': {},
         'module_impacts':      {},
         'dep_changes_summary': {},
@@ -1302,6 +1308,19 @@ def collect_findings(d):
     )
     impacted_coords = set()
     if call_summary:
+        diagnostic_guidance = call_summary.get('diagnostic_guidance')
+        if not isinstance(diagnostic_guidance, list):
+            diagnostic_guidance = build_diagnostic_guidance_from_summary(
+                call_summary
+            )
+        findings['diagnostic_guidance_schema'] = str(
+            call_summary.get('diagnostic_guidance_schema')
+            or REASON_GUIDANCE_SCHEMA
+        )
+        findings['diagnostic_guidance'] = [
+            dict(item) for item in diagnostic_guidance
+            if isinstance(item, dict)
+        ]
         if not findings.get('coverage'):
             findings['coverage'] = _step5_summary_coverage_fallback(call_summary)
         findings['user_conclusion_summary'] = dict(call_summary.get('user_conclusion_summary') or {})
@@ -2323,6 +2342,112 @@ def render_api_result_table(findings):
     return lines
 
 
+def _diagnostic_scope_label(scope):
+    return {
+        'global': '全局',
+        'path': '相关调用路径',
+        'api': '单个 API',
+        'mixed': '混合作用域',
+        'unknown': '旧结果未记录',
+    }.get(str(scope or ''), str(scope or '') or '未记录')
+
+
+def _diagnostic_evidence_text(item):
+    pieces = []
+    classes = list(item.get('affected_classes') or [])
+    artifacts = list(item.get('affected_artifacts') or [])
+    entries = list(item.get('affected_artifact_entries') or [])
+    collectors = list(item.get('collectors') or [])
+    candidates = list(item.get('candidate_evidence') or [])
+    failure_details = list(item.get('failure_detail_summaries') or [])
+    if classes:
+        pieces.append('类：' + '、'.join(classes[:5]))
+    if artifacts:
+        pieces.append('制品：' + '、'.join(_short_path(value) for value in artifacts[:3]))
+    if entries:
+        pieces.append('物理条目：' + '、'.join(entries[:3]))
+    if collectors:
+        pieces.append('采集器：' + '、'.join(collectors[:3]))
+    if candidates:
+        candidate_text = []
+        for candidate in candidates[:3]:
+            coord = str(candidate.get('coord') or '').strip()
+            entry = str(candidate.get('artifact_entry') or '').strip()
+            digest = str(candidate.get('bytecode_sha256') or '').strip()
+            label = coord or _short_path(candidate.get('artifact') or '')
+            if entry:
+                label = f"{label}@{entry}" if label else entry
+            if digest:
+                label += f" (class sha256={digest[:12]}…)"
+            if label:
+                candidate_text.append(label)
+        if candidate_text:
+            pieces.append('候选：' + '、'.join(candidate_text))
+    if failure_details:
+        pieces.append('错误摘要：' + '；'.join(failure_details[:2]))
+    return '；'.join(pieces) or '当前只记录了 API 级原因，未附加制品或类证据。'
+
+
+def render_diagnostic_guidance(findings):
+    guidance = list(findings.get('diagnostic_guidance') or [])
+    if not guidance:
+        return []
+    lines = [
+        "### 需要决策的分析诊断",
+        "",
+        "以下诊断会限制结论。表中的数量和作用域来自本轮实际证据；"
+        "“可忽略条件”必须有部署或业务证据支持，不能仅凭原因码名称判断。",
+        "",
+        "| 原因码 | 说明 | 是否阻断 | 本轮作用域 | 主原因 API | 建议决策 |",
+        "|---|---|---|---|---:|---|",
+    ]
+    for item in guidance:
+        lines.append(
+            f"| `{_md_cell(item.get('reason_code'), 100)}` | "
+            f"{_md_cell(item.get('title'), 120)} | "
+            f"{'是' if item.get('blocking') else '否'} | "
+            f"{_diagnostic_scope_label(item.get('observed_scope'))} | "
+            f"{int(item.get('affected_api_count') or 0)} | "
+            f"{_md_cell(item.get('decision_text'), 260)} |"
+        )
+    lines.append("")
+
+    for item in guidance:
+        code = str(item.get('reason_code') or 'UNKNOWN')
+        lines += [
+            f"#### `{code}` — {item.get('title') or '分析诊断'}",
+            "",
+            f"- **触发条件**：{item.get('trigger_condition') or '-'}",
+            (
+                "- **本轮实际影响**："
+                f"{item.get('scope_explanation') or ''}"
+                f"{item.get('semantic_impact') or ''}"
+            ),
+            f"- **当前证据**：{_diagnostic_evidence_text(item)}",
+            f"- **建议决策**：{item.get('decision_text') or '-'}",
+            f"- **可忽略条件**：{item.get('ignore_when') or '无。'}",
+            "",
+            "**修复动作**：",
+            "",
+        ]
+        for index, action in enumerate(item.get('repair_actions') or [], 1):
+            lines.append(f"{index}. {action}")
+        lines += ["", "**完成标准**：", ""]
+        for step in item.get('verification_steps') or []:
+            lines.append(f"- {step}")
+        sample_apis = list(item.get('sample_apis') or [])
+        if sample_apis:
+            lines += [
+                "",
+                "**受影响 API 样例**：",
+                "",
+            ]
+            for api_identity in sample_apis:
+                lines.append(f"- `{_md_cell(api_identity, 300)}`")
+        lines.append("")
+    return lines
+
+
 def render_limitations_section(findings):
     coverage = findings.get('coverage') or {}
     gap_rows = _coverage_gap_rows(coverage)
@@ -2382,6 +2507,7 @@ def render_limitations_section(findings):
         lines.append("")
     else:
         lines += ["- 未发现影响结论的关键限制。", ""]
+    lines += render_diagnostic_guidance(findings)
     return lines
 
 

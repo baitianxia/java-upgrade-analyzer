@@ -267,6 +267,7 @@ class CollectorBatch:
                 "artifact": failure.artifact,
                 "class_name": failure.class_name,
                 "detail": failure.detail,
+                "scope": failure.scope,
                 "occurrences": [{
                     "caller_symbol": occurrence.caller_symbol,
                     "caller_qualified_key": occurrence.caller_qualified_key,
@@ -313,11 +314,14 @@ class EvidenceFailure:
     class_name: str = ""
     detail: str = ""
     occurrences: Tuple[EvidenceFailureOccurrence, ...] = field(default_factory=tuple)
+    scope: str = "global"
 
     def __post_init__(self):
         occurrences = tuple(self.occurrences or ())
         if any(not isinstance(item, EvidenceFailureOccurrence) for item in occurrences):
             raise ValueError("failure occurrences must be EvidenceFailureOccurrence values")
+        if self.scope not in {"api", "global", "path"}:
+            raise ValueError(f"unsupported evidence failure scope: {self.scope}")
         object.__setattr__(self, "occurrences", tuple(sorted(set(occurrences))))
 
 

@@ -1488,6 +1488,20 @@ def _path_subject_matches(subject, symbols):
     )
 
 
+def _path_failure_matches(failure, symbols):
+    subjects = {
+        str(getattr(failure, 'class_name', '') or '').strip()
+    }
+    subjects.update(
+        str(getattr(occurrence, 'class_name', '') or '').strip()
+        for occurrence in tuple(getattr(failure, 'occurrences', ()) or ())
+    )
+    return any(
+        subject and _path_subject_matches(subject, symbols)
+        for subject in subjects
+    )
+
+
 def _collector_coverage_index(graph):
     """Index immutable coverage records once instead of rescanning per API."""
     records = tuple(getattr(graph, 'step5_collector_coverage', ()) or ())
@@ -1644,8 +1658,20 @@ def _new_trace_draft(api_row, graph=None):
         ))
     relevant_identities = {'', source_identity, target_identity}
     draft.envelope_coverage = tuple(merged_coverage)
-    draft.envelope_failures = _evidence_failures_for_api(
+    candidate_failures = _evidence_failures_for_api(
         graph, *relevant_identities,
+    )
+    draft.envelope_failures = tuple(
+        failure for failure in candidate_failures
+        if (
+            failure.api_identity in {source_identity, target_identity}
+            or getattr(failure, 'scope', 'global') == 'global'
+            or (
+                getattr(failure, 'scope', 'global') == 'path'
+                and failure.stage in path_scoped_collectors
+                and _path_failure_matches(failure, path_symbols)
+            )
+        )
     )
     draft.envelope_concerns = tuple(
         replace(concern, api_identity=target_identity)

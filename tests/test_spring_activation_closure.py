@@ -449,10 +449,15 @@ class SpringActivationClosureTest(unittest.TestCase):
             root = Path(tmp)
             artifact = self._compile_security_fixture(root, nested_support=True)
             digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-
+            support = root / "security-support.jar"
             catalog = {"entries": [{
                 "coord": "__business__", "jar_path": str(artifact),
                 "sha256": digest,
+            }, {
+                "coord": "com.acme:security-support",
+                "jar_path": str(support),
+                "artifact_entry": "BOOT-INF/lib/security-support.jar",
+                "sha256": hashlib.sha256(support.read_bytes()).hexdigest(),
             }]}
             batch = framework_adapters.collect_spring_security_filter_activation(
                 catalog,
@@ -625,21 +630,24 @@ class SpringActivationClosureTest(unittest.TestCase):
         )
         self.assertTrue(any(failure.blocking for failure in batch.failures))
 
-    def test_packaged_class_locator_reports_malformed_nested_jar(self):
+    def test_catalog_locator_does_not_open_unretained_nested_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "broken-app.jar"
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("BOOT-INF/lib/broken.jar", b"not-a-zip")
-            with zipfile.ZipFile(artifact) as archive:
-                locations, diagnostics = framework_adapters._locate_packaged_classes(
-                    archive, {"demo.Missing"}
-                )
+            entry = {
+                "coord": "__business__", "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            locations, diagnostics = framework_adapters._locate_catalog_classes(
+                [entry], {"demo.Missing"}, fact_store=store,
+            )
 
         self.assertIsNone(locations["demo.Missing"])
-        self.assertEqual(len(diagnostics), 1)
-        self.assertIn("spring_nested_artifact_invalid", diagnostics[0])
+        self.assertFalse(diagnostics)
 
-    def test_shared_class_locator_rejects_duplicate_logical_class(self):
+    def test_shared_class_locator_uses_business_boot_classpath_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "duplicate.jar"
             with zipfile.ZipFile(artifact, "w") as archive:
@@ -655,10 +663,106 @@ class SpringActivationClosureTest(unittest.TestCase):
                 [entry], {"demo.Config"}, fact_store=store,
             )
 
+        self.assertFalse(diagnostics)
+        self.assertEqual(b"boot", locations["demo.Config"]["bytes"])
+
+    def test_shared_class_locator_ignores_nested_boot_layout_in_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "dependency.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("demo/Config.class", b"root")
+                archive.writestr("BOOT-INF/classes/demo/Config.class", b"boot")
+            entry = {
+                "coord": "com.acme:dependency",
+                "artifact_entry": "BOOT-INF/lib/dependency.jar",
+                "jar_path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            locations, diagnostics = framework_adapters._locate_catalog_classes(
+                [entry], {"demo.Config"}, fact_store=store,
+            )
+
+        self.assertFalse(diagnostics)
+        self.assertEqual(b"root", locations["demo.Config"]["bytes"])
+
+    def test_shared_class_locator_collapses_identical_cross_jar_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entries = []
+            for index in range(2):
+                artifact = Path(tmp) / f"dependency-{index}.jar"
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr("demo/Config.class", b"identical")
+                entries.append({
+                    "coord": f"com.acme:dependency-{index}",
+                    "artifact_entry": f"BOOT-INF/lib/dependency-{index}.jar",
+                    "jar_path": str(artifact),
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                })
+            store = Step5ArtifactFactStore.from_catalog({"entries": entries})
+
+            locations, diagnostics = framework_adapters._locate_catalog_classes(
+                entries, {"demo.Config"}, fact_store=store,
+            )
+
+        self.assertFalse(diagnostics)
+        self.assertEqual(b"identical", locations["demo.Config"]["bytes"])
+
+    def test_shared_class_locator_scopes_unordered_cross_jar_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entries = []
+            for index, content in enumerate((b"first", b"second")):
+                artifact = Path(tmp) / f"dependency-{index}.jar"
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr("demo/Config.class", content)
+                entries.append({
+                    "coord": f"com.acme:dependency-{index}",
+                    "artifact_entry": f"BOOT-INF/lib/dependency-{index}.jar",
+                    "jar_path": str(artifact),
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                })
+            store = Step5ArtifactFactStore.from_catalog({"entries": entries})
+
+            locations, diagnostics = framework_adapters._locate_catalog_classes(
+                entries, {"demo.Config"}, fact_store=store,
+            )
+
         self.assertIsNone(locations["demo.Config"])
-        self.assertTrue(any(
-            "spring_packaged_class_ambiguous" in item for item in diagnostics
-        ))
+        self.assertEqual(1, len(diagnostics))
+        failure = framework_adapters._framework_failure(
+            "spring_aop_activation", diagnostics[0],
+        )
+        self.assertEqual("SPRING_PACKAGED_CLASS_AMBIGUOUS", failure.reason_code)
+        self.assertEqual("demo.Config", failure.class_name)
+        self.assertEqual("path", failure.scope)
+        self.assertEqual(2, len(failure.occurrences))
+
+    def test_shared_class_locator_uses_explicit_boot_classpath_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entries = []
+            for index, content in enumerate((b"selected", b"shadowed")):
+                artifact = Path(tmp) / f"dependency-{index}.jar"
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr("demo/Config.class", content)
+                entries.append({
+                    "coord": f"com.acme:dependency-{index}",
+                    "artifact_entry": f"BOOT-INF/lib/dependency-{index}.jar",
+                    "jar_path": str(artifact),
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    "runtime_classpath_index": index,
+                    "runtime_classpath_authority": (
+                        "spring_boot_classpath_index"
+                    ),
+                })
+            store = Step5ArtifactFactStore.from_catalog({"entries": entries})
+
+            locations, diagnostics = framework_adapters._locate_catalog_classes(
+                entries, {"demo.Config"}, fact_store=store,
+            )
+
+        self.assertFalse(diagnostics)
+        self.assertEqual(b"selected", locations["demo.Config"]["bytes"])
 
     def test_shared_class_locator_reads_only_requested_class(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -680,26 +784,25 @@ class SpringActivationClosureTest(unittest.TestCase):
         self.assertEqual(b"42", locations["demo.Class42"]["bytes"])
         self.assertEqual(1, store.metrics()["class_bytes_reads"])
 
-    def test_shared_class_locator_classifies_malformed_nested_jar_as_parser_failure(self):
+    def test_shared_class_locator_classifies_retained_bad_zip_as_parser_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            artifact = Path(tmp) / "broken-app.jar"
-            with zipfile.ZipFile(artifact, "w") as archive:
-                archive.writestr("BOOT-INF/lib/broken.jar", b"not-a-zip")
+            artifact = Path(tmp) / "broken.jar"
+            artifact.write_bytes(b"not-a-zip")
             entry = {
-                "coord": "__business__", "jar_path": str(artifact),
+                "coord": "com.acme:broken", "jar_path": str(artifact),
                 "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
             }
             store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
 
             locations, diagnostics = framework_adapters._locate_catalog_classes(
-                [entry], {"demo.Missing"}, include_nested=True, fact_store=store,
+                [entry], {"demo.Missing"}, fact_store=store,
             )
 
         self.assertIsNone(locations["demo.Missing"])
-        self.assertTrue(any("spring_nested_artifact_invalid" in item for item in diagnostics))
-        self.assertFalse(any("artifact_fact_store_identity_failed" in item for item in diagnostics))
+        self.assertEqual(1, len(diagnostics))
+        self.assertIn("spring_class_location_failed", diagnostics[0])
         failure = framework_adapters._framework_failure("spring", diagnostics[0])
-        self.assertEqual("SPRING_NESTED_ARTIFACT_INVALID", failure.reason_code)
+        self.assertEqual("SPRING_CLASS_LOCATION_FAILED", failure.reason_code)
         self.assertTrue(failure.blocking)
 
     def test_aop_collector_streams_large_non_aspect_class_set(self):

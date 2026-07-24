@@ -32,6 +32,11 @@ from pathlib import Path
 
 from csv_io import open_csv_write
 from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_OBSERVABILITY_DIRNAME
+from reason_guidance import (
+    REASON_GUIDANCE_SCHEMA,
+    build_diagnostic_guidance,
+    guidance_for_reason_code,
+)
 from step5_evidence_model import thaw_evidence_value
 
 from signature_utils import canonical_api_identity, split_signature_params
@@ -831,13 +836,14 @@ def explain_reason_code(reason_code, trace_result):
     Returns:
         {'reason': str, 'action': str}
     """
-    explanation = dict(REASON_CODE_EXPLANATIONS.get(reason_code, {
-        # Reason codes are diagnostic state, not a user explanation.  Keep an
-        # unknown future code in structured diagnostics, but never surface it
-        # as if it were readable guidance in reports or CSVs.
-        'reason': '当前静态分析未记录可用于确认结论的具体原因。',
-        'action': '查看本条的证据与停止原因；如关键输入不完整，补齐后重跑分析。'
-    }))
+    explanation = REASON_CODE_EXPLANATIONS.get(reason_code)
+    if explanation is None:
+        guidance = guidance_for_reason_code(reason_code)
+        explanation = {
+            'reason': guidance['summary'],
+            'action': (guidance.get('repair_actions') or [''])[0],
+        }
+    explanation = dict(explanation)
 
     # 补充上下文信息
     if reason_code == 'DEPENDENCY_SOURCE_MAPPING_MISSING':
@@ -1277,7 +1283,8 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     契约字段（当前主语义）：
       status, skip_reason, reachable/not_found_in_static_analysis/uncertain/not_analyzed,
       reachable_apis[], uncertain_apis[], not_analyzed_apis[], not_found_apis[],
-      uncertain_reason_summary{}, deprecated_aliases{}, meta{}
+      uncertain_reason_summary{}, diagnostic_guidance[], deprecated_aliases{},
+      meta{}
     """
     reachable       = [r for r in all_results if r.analysis_status == 'reachable']
     not_impacted    = [r for r in all_results if r.analysis_status == 'not_impacted']
@@ -1302,6 +1309,9 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     # remediation from an API that could not be analysed at all.
     uncertain_reason_summary = reason_summary(uncertain)
     not_analyzed_reason_summary = reason_summary(not_analyzed)
+    diagnostic_guidance = build_diagnostic_guidance(
+        all_results, graph_stats=graph_stats or {},
+    )
 
     meta = {
             'generated_at': datetime.now().isoformat(),
@@ -1404,6 +1414,8 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         write_api_array('not_found_apis', not_found)
         write_field('uncertain_reason_summary', uncertain_reason_summary)
         write_field('not_analyzed_reason_summary', not_analyzed_reason_summary)
+        write_field('diagnostic_guidance_schema', REASON_GUIDANCE_SCHEMA)
+        write_field('diagnostic_guidance', diagnostic_guidance)
         write_field(
             'user_conclusion_summary',
             dict(sorted(user_conclusion_summary.items(), key=lambda x: x[0])),

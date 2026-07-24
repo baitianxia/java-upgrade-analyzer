@@ -122,6 +122,7 @@ def _serialize_ingestion_failure(collector, failure):
         'artifact': failure.artifact,
         'class_name': failure.class_name,
         'detail': failure.detail,
+        'scope': failure.scope,
         'occurrences': [
             tuple(getattr(occurrence, field_name)
                   for field_name in EVIDENCE_FAILURE_OCCURRENCE_FIELDS)
@@ -2291,6 +2292,19 @@ def build_runtime_dependency_catalog(report_dir, business_source_dirs=None):
             'evidence_origin': 'step1_retained_dependency_jar',
             'application_owned': application_owned,
         }
+        runtime_classpath_index = manifest_item.get('runtime_classpath_index')
+        runtime_classpath_authority = str(
+            manifest_item.get('runtime_classpath_authority') or ''
+        ).strip()
+        if (
+            isinstance(runtime_classpath_index, int)
+            and runtime_classpath_index >= 0
+            and runtime_classpath_authority
+        ):
+            item.update({
+                'runtime_classpath_index': runtime_classpath_index,
+                'runtime_classpath_authority': runtime_classpath_authority,
+            })
         if application_owned:
             item['ownership_evidence'] = {
                 'authority': 'reactor_coordinate_and_final_artifact_entry',

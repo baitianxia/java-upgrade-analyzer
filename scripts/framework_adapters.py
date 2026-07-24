@@ -13,7 +13,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from enhanced_source_analyzer import analyze_file
 from signature_utils import normalize_signature_for_lookup
@@ -25,6 +25,7 @@ from step5_evidence_model import (
     EvidenceAuthority,
     EvidenceConcern,
     EvidenceFailure,
+    EvidenceFailureOccurrence,
     EvidenceProvenance,
     ModuleScope,
     classify_module_scope,
@@ -320,12 +321,66 @@ def _framework_edge_scope(edge):
 
 
 def _framework_failure(adapter, error):
+    if isinstance(error, Mapping):
+        reason = str(
+            error.get('reason_code') or 'FRAMEWORK_ADAPTER_COLLECTION_FAILED'
+        )
+        candidates = tuple(error.get('candidates') or ())
+        class_name = str(error.get('class_name') or '')
+        related_class_names = tuple(
+            str(value or '').strip()
+            for value in (error.get('related_class_names') or ())
+            if str(value or '').strip()
+        )
+        occurrences = [
+            EvidenceFailureOccurrence(
+                artifact=str(item.get('artifact_path') or ''),
+                artifact_entry=str(item.get('artifact_entry') or ''),
+                class_name=class_name,
+                detail=(
+                    f"coord={item.get('coord') or ''};"
+                    f"bytecode_sha256={item.get('bytecode_sha256') or ''}"
+                ),
+            )
+            for item in candidates
+            if isinstance(item, Mapping)
+        ]
+        occurrences.extend(
+            EvidenceFailureOccurrence(
+                class_name=related,
+                detail='related_class',
+            )
+            for related in related_class_names
+            if related != class_name
+        )
+        artifact = next(
+            (
+                str(item.get('artifact_path') or '')
+                for item in candidates
+                if isinstance(item, Mapping)
+                and str(item.get('artifact_path') or '')
+            ),
+            str(error.get('artifact') or ''),
+        )
+        return EvidenceFailure(
+            stage=adapter,
+            reason_code=reason,
+            blocking=bool(error.get('blocking', False)),
+            api_identity=str(error.get('api_identity') or ''),
+            artifact=artifact,
+            class_name=class_name,
+            detail=json.dumps(error, ensure_ascii=False, sort_keys=True),
+            occurrences=tuple(occurrences),
+            scope=str(error.get('scope') or 'global'),
+        )
     text = str(error or '')
     artifact, separator, detail = text.partition(':')
     if artifact.startswith('/private/var/'):
         artifact = '/var/' + artifact[len('/private/var/'):]
     reason = 'FRAMEWORK_ADAPTER_COLLECTION_FAILED'
     blocking = False
+    scope = 'global'
+    class_name = ''
     if 'spring_xml:ParseError' in text:
         reason = 'SPRING_XML_PARSE_FAILED'
     elif 'mybatis_xml:ParseError' in text:
@@ -395,6 +450,8 @@ def _framework_failure(adapter, error):
     elif 'mybatis_runtime_artifact_parse_failed' in text:
         reason = 'MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED'
         blocking = True
+        scope = 'path'
+        class_name = 'org.apache.ibatis.binding.MapperProxy'
     elif 'spring_message_listener_artifact_parse_failed' in text:
         reason = 'SPRING_MESSAGE_LISTENER_ARTIFACT_PARSE_FAILED'
         blocking = True
@@ -415,7 +472,9 @@ def _framework_failure(adapter, error):
         reason_code=reason,
         blocking=blocking,
         artifact=artifact if separator else '',
+        class_name=class_name,
         detail=detail if separator else text,
+        scope=scope,
     )
 
 
@@ -505,7 +564,12 @@ def _framework_batch(adapter, version, status, nodes, edges, findings, errors, m
         'nodes': len(nodes),
         '_legacy_nodes': tuple(nodes),
         '_legacy_findings': tuple(findings),
-        '_legacy_errors': tuple(errors),
+        '_legacy_errors': tuple(
+            json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if isinstance(item, Mapping)
+            else item
+            for item in errors
+        ),
     }
     return CollectorBatch(
         collector=adapter,
@@ -3562,7 +3626,7 @@ def collect_spring_aop_activation(
         return _insufficient_activation_batch(
             'spring_aop_activation', 'SPRING_AOP_BUSINESS_ARTIFACT_UNAVAILABLE'
         )
-    class_records, class_errors = _catalog_class_records(
+    class_records, class_errors, class_resolutions = _catalog_class_records(
         business_entries, fact_store=fact_store,
     )
     raw_edges = []
@@ -3595,6 +3659,24 @@ def collect_spring_aop_activation(
                     locations, diagnostics = _locate_catalog_classes(
                         business_entries, {owner}, fact_store=fact_store,
                     )
+                    diagnostics = [
+                        {
+                            **item,
+                            'related_class_names': sorted(set(
+                                tuple(item.get('related_class_names') or ())
+                                + (
+                                    str(current_stream_record.get('owner') or ''),
+                                )
+                            )),
+                        }
+                        if (
+                            isinstance(item, Mapping)
+                            and item.get('reason_code')
+                            == 'SPRING_PACKAGED_CLASS_AMBIGUOUS'
+                        )
+                        else item
+                        for item in diagnostics
+                    ]
                     location = locations.get(owner)
                 errors.extend(diagnostics)
                 if location is None:
@@ -3748,6 +3830,8 @@ def collect_spring_aop_activation(
             'aspects': aspect_count,
             'registered_aspects': registered_count,
             'active_advice': len(raw_edges),
+            'resolved_duplicate_classes': len(class_resolutions),
+            'class_resolutions': class_resolutions,
         },
     )
 
@@ -3922,6 +4006,249 @@ def _fact_store_class_records(item, fact_store):
     return tuple(records)
 
 
+_APPLICATION_CLASS_PREFIXES = ('BOOT-INF/classes/', 'WEB-INF/classes/')
+
+
+def _catalog_entry_is_business_classes(item):
+    return (
+        str((item or {}).get('coord') or '') == '__business__'
+        or str((item or {}).get('artifact_entry') or '') == '<business-classes>'
+    )
+
+
+def _runtime_visible_inventory_classes(item, inventory):
+    """Project physical entries into the classloader-visible namespace."""
+    locations = tuple(inventory.classes)
+    business_classes = _catalog_entry_is_business_classes(item)
+    active_prefix = ''
+    if business_classes:
+        active_prefix = next(
+            (
+                prefix
+                for prefix in _APPLICATION_CLASS_PREFIXES
+                if any(
+                    location.logical_name.startswith(prefix)
+                    for location in locations
+                )
+            ),
+            '',
+        )
+    visible = []
+    for location in locations:
+        logical = location.logical_name
+        nested_prefix = next(
+            (
+                prefix for prefix in _APPLICATION_CLASS_PREFIXES
+                if logical.startswith(prefix)
+            ),
+            '',
+        )
+        if active_prefix:
+            if nested_prefix != active_prefix:
+                continue
+            logical = logical[len(active_prefix):]
+        elif nested_prefix:
+            # A retained dependency is mounted at its archive root. A second
+            # executable-jar layout inside it is not another classpath root.
+            continue
+        visible.append((location, logical))
+    return tuple(visible)
+
+
+def _runtime_visible_archive_classes(item, names):
+    business_classes = _catalog_entry_is_business_classes(item)
+    active_prefix = ''
+    if business_classes:
+        active_prefix = next(
+            (
+                prefix for prefix in _APPLICATION_CLASS_PREFIXES
+                if any(name.startswith(prefix) for name in names)
+            ),
+            '',
+        )
+    visible = []
+    for name in names:
+        if not name.endswith('.class') or name.startswith('META-INF/'):
+            continue
+        nested_prefix = next(
+            (
+                prefix for prefix in _APPLICATION_CLASS_PREFIXES
+                if name.startswith(prefix)
+            ),
+            '',
+        )
+        if active_prefix:
+            if nested_prefix != active_prefix:
+                continue
+            logical = name[len(active_prefix):]
+        elif nested_prefix:
+            continue
+        else:
+            logical = name
+        visible.append((name, logical))
+    return tuple(visible)
+
+
+def _class_candidate_payload(record, bytecode_sha256=''):
+    return {
+        'coord': str(record.get('coord') or ''),
+        'artifact_path': str(record.get('artifact_path') or ''),
+        'artifact_entry': str(record.get('entry') or ''),
+        'artifact_sha256': str(record.get('artifact_sha256') or ''),
+        'bytecode_sha256': str(bytecode_sha256 or ''),
+    }
+
+
+def _class_candidate_bytes(record, fact_store):
+    if 'bytes' in record:
+        return record['bytes']
+    if fact_store is None or 'location' not in record:
+        raise ValueError('spring_packaged_class_bytes_unavailable')
+    outcome = fact_store.class_bytes(record['coord'], record['location'])
+    if outcome.status != 'complete':
+        raise ValueError(outcome.reason)
+    return outcome.value
+
+
+def _class_candidate_sort_key(record):
+    business_rank = 0 if record.get('runtime_role') == 'business' else 1
+    classpath_index = record.get('runtime_classpath_index')
+    return (
+        business_rank,
+        (
+            int(classpath_index)
+            if isinstance(classpath_index, int) and classpath_index >= 0
+            else 2 ** 31
+        ),
+        str(record.get('entry') or ''),
+        str(record.get('coord') or ''),
+    )
+
+
+def _resolve_runtime_class_candidates(logical, values, fact_store):
+    """Resolve equivalent or provably ordered runtime-visible class copies."""
+    materialized = []
+    for record in values:
+        content = _class_candidate_bytes(record, fact_store)
+        digest = hashlib.sha256(content).hexdigest()
+        materialized.append((record, content, digest))
+    bytecode_hashes = {digest for _record, _content, digest in materialized}
+    ordered = sorted(
+        materialized,
+        key=lambda item: _class_candidate_sort_key(item[0]),
+    )
+    selection_authority = ''
+    if len(bytecode_hashes) == 1:
+        selected = ordered[0]
+        selection_authority = 'identical_class_bytecode'
+    else:
+        business = [
+            item for item in ordered
+            if item[0].get('runtime_role') == 'business'
+        ]
+        if len(business) == 1:
+            selected = business[0]
+            selection_authority = 'spring_boot_business_classes_precedence'
+        else:
+            ranked = [
+                item for item in ordered
+                if (
+                    item[0].get('runtime_role') == 'dependency'
+                    and isinstance(item[0].get('runtime_classpath_index'), int)
+                    and item[0].get('runtime_classpath_index') >= 0
+                    and item[0].get('runtime_classpath_authority')
+                )
+            ]
+            authorities = {
+                item[0].get('runtime_classpath_authority') for item in ranked
+            }
+            indices = [item[0].get('runtime_classpath_index') for item in ranked]
+            if (
+                len(ranked) == len(ordered)
+                and len(authorities) == 1
+                and len(indices) == len(set(indices))
+            ):
+                selected = min(
+                    ranked,
+                    key=lambda item: item[0]['runtime_classpath_index'],
+                )
+                selection_authority = next(iter(authorities))
+            else:
+                selected = None
+    candidates = [
+        _class_candidate_payload(record, digest)
+        for record, _content, digest in ordered
+    ]
+    if selected is None:
+        owner = (
+            logical[:-6].replace('/', '.')
+            if logical.endswith('.class')
+            else ''
+        )
+        return None, {
+            'reason_code': 'SPRING_PACKAGED_CLASS_AMBIGUOUS',
+            'blocking': True,
+            'scope': 'path',
+            'class_name': owner,
+            'logical_entry': logical,
+            'candidates': candidates,
+        }
+    selected_record, selected_bytes, selected_digest = selected
+    resolved = {
+        **selected_record,
+        '_resolved_bytes': selected_bytes,
+        'bytecode_sha256': selected_digest,
+    }
+    selected_payload = _class_candidate_payload(
+        selected_record, selected_digest,
+    )
+    return resolved, {
+        'class_name': (
+            logical[:-6].replace('/', '.') if logical.endswith('.class') else ''
+        ),
+        'logical_entry': logical,
+        'resolution': 'equivalent' if len(bytecode_hashes) == 1 else 'selected',
+        'selection_authority': selection_authority,
+        'selected': selected_payload,
+        'shadowed': [
+            item for item in candidates if item != selected_payload
+        ],
+    }
+
+
+def _catalog_class_record(item, location, logical):
+    catalog_entry = str(item.get('artifact_entry') or '')
+    full_entry = location.physical_entry
+    if catalog_entry and catalog_entry != '<business-classes>':
+        full_entry = f'{catalog_entry}!/{full_entry}'
+    classpath_index = item.get('runtime_classpath_index')
+    return {
+        'entry': full_entry,
+        'logical_entry': logical,
+        'owner': (
+            logical[:-6].replace('/', '.')
+            if logical.endswith('.class')
+            else ''
+        ),
+        'location': location,
+        'artifact_path': str(item.get('jar_path') or ''),
+        'artifact_sha256': str(item.get('sha256') or '').lower(),
+        'coord': str(item.get('coord') or ''),
+        'runtime_role': (
+            'business' if _catalog_entry_is_business_classes(item)
+            else 'dependency'
+        ),
+        'runtime_classpath_index': (
+            classpath_index
+            if isinstance(classpath_index, int) and classpath_index >= 0
+            else None
+        ),
+        'runtime_classpath_authority': str(
+            item.get('runtime_classpath_authority') or ''
+        ),
+    }
+
+
 def _locate_catalog_classes(entries, owners, *, fact_store=None):
     requested = {str(owner) for owner in owners if str(owner or '').strip()}
     candidates = {owner: [] for owner in requested}
@@ -3932,30 +4259,18 @@ def _locate_catalog_classes(entries, owners, *, fact_store=None):
                 inventory = _shared_artifact_inventory(
                     item, fact_store, strict=True,
                 )
-                coord = str(item.get('coord') or '')
-                catalog_entry = str(item.get('artifact_entry') or '')
+                visible = _runtime_visible_inventory_classes(item, inventory)
                 for owner in requested:
                     expected = owner.replace('.', '/') + '.class'
                     matches = [
-                        location for location in inventory.classes
-                        if location.physical_entry == expected
-                        or location.physical_entry.endswith('/' + expected)
+                        (location, logical)
+                        for location, logical in visible
+                        if logical == expected
                     ]
-                    for location in matches:
-                        outcome = fact_store.class_bytes(coord, location)
-                        if outcome.status != 'complete':
-                            raise ValueError(outcome.reason)
-                        class_entry = location.physical_entry
-                        if catalog_entry and catalog_entry != '<business-classes>':
-                            class_entry = f'{catalog_entry}!/{class_entry}'
-                        candidates[owner].append({
-                            'entry': class_entry,
-                            'logical_entry': expected,
-                            'bytes': outcome.value,
-                            'artifact_path': str(item.get('jar_path') or ''),
-                            'artifact_sha256': str(item.get('sha256') or '').lower(),
-                            'coord': coord,
-                        })
+                    for location, logical in matches:
+                        candidates[owner].append(
+                            _catalog_class_record(item, location, logical)
+                        )
             except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
                 diagnostics.append(_fact_store_or_parser_error(
                     item, 'spring_class_location', exc,
@@ -3963,11 +4278,28 @@ def _locate_catalog_classes(entries, owners, *, fact_store=None):
                 ))
                 continue
         for owner, values in candidates.items():
-            if len(values) > 1:
-                diagnostics.append(
-                    f'{owner}:spring_packaged_class_ambiguous:'
-                    + ','.join(item['entry'] for item in values)
+            if not values:
+                continue
+            try:
+                selected, resolution = _resolve_runtime_class_candidates(
+                    owner.replace('.', '/') + '.class', values, fact_store,
                 )
+            except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                diagnostics.append(_fact_store_or_parser_error(
+                    values[0], f'spring_class_location:{owner}', exc,
+                    'spring_class_location_failed',
+                ))
+                candidates[owner] = []
+                continue
+            if selected is None:
+                diagnostics.append(resolution)
+                candidates[owner] = []
+                continue
+            resolved_bytes = selected.pop('_resolved_bytes')
+            candidates[owner] = [{
+                **selected,
+                'bytes': resolved_bytes,
+            }]
         return {
             owner: values[0] if len(values) == 1 else None
             for owner, values in candidates.items()
@@ -3985,17 +4317,14 @@ def _locate_catalog_classes(entries, owners, *, fact_store=None):
             if hashlib.sha256(content).hexdigest() != expected_sha:
                 raise ValueError('sha256_mismatch')
             with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                names = set(archive.namelist())
+                names = tuple(archive.namelist())
                 located = {}
                 for owner in requested:
                     logical = owner.replace('.', '/') + '.class'
                     matches = [
-                        entry for entry in (
-                            logical,
-                            f'BOOT-INF/classes/{logical}',
-                            f'WEB-INF/classes/{logical}',
-                        )
-                        if entry in names
+                        entry for entry, visible_logical
+                        in _runtime_visible_archive_classes(item, names)
+                        if visible_logical == logical
                     ]
                     located[owner] = (
                         {'entry': matches[0], 'bytes': archive.read(matches[0])}
@@ -4019,13 +4348,30 @@ def _locate_catalog_classes(entries, owners, *, fact_store=None):
                 'artifact_path': str(artifact_path),
                 'artifact_sha256': expected_sha,
                 'coord': str(item.get('coord') or ''),
+                'runtime_role': (
+                    'business' if _catalog_entry_is_business_classes(item)
+                    else 'dependency'
+                ),
+                'runtime_classpath_index': item.get('runtime_classpath_index'),
+                'runtime_classpath_authority': str(
+                    item.get('runtime_classpath_authority') or ''
+                ),
             })
     for owner, values in candidates.items():
-        if len(values) > 1:
-            diagnostics.append(
-                f'{owner}:spring_packaged_class_ambiguous:'
-                + ','.join(item['entry'] for item in values)
-            )
+        if not values:
+            continue
+        selected, resolution = _resolve_runtime_class_candidates(
+            owner.replace('.', '/') + '.class', values, None,
+        )
+        if selected is None:
+            diagnostics.append(resolution)
+            candidates[owner] = []
+            continue
+        resolved_bytes = selected.pop('_resolved_bytes')
+        candidates[owner] = [{
+            **selected,
+            'bytes': resolved_bytes,
+        }]
     return {
         owner: values[0] if len(values) == 1 else None
         for owner, values in candidates.items()
@@ -4035,6 +4381,7 @@ def _locate_catalog_classes(entries, owners, *, fact_store=None):
 def _catalog_class_records(entries, fact_store=None):
     records = []
     diagnostics = []
+    resolutions = []
     identities = {}
     for item in entries:
         if fact_store is not None:
@@ -4048,25 +4395,10 @@ def _catalog_class_records(entries, fact_store=None):
                     'spring_aop_class_parse_failed',
                 ))
                 continue
-            catalog_entry = str(item.get('artifact_entry') or '')
-            for location in inventory.classes:
-                logical = location.physical_entry
-                for prefix in ('BOOT-INF/classes/', 'WEB-INF/classes/'):
-                    if logical.startswith(prefix):
-                        logical = logical[len(prefix):]
-                        break
-                full_entry = location.physical_entry
-                if catalog_entry and catalog_entry != '<business-classes>':
-                    full_entry = f'{catalog_entry}!/{full_entry}'
-                record = {
-                    'entry': full_entry,
-                    'logical_entry': logical,
-                    'owner': logical[:-6].replace('/', '.') if logical.endswith('.class') else '',
-                    'location': location,
-                    'artifact_path': str(item.get('jar_path') or ''),
-                    'artifact_sha256': str(item.get('sha256') or '').lower(),
-                    'coord': str(item.get('coord') or ''),
-                }
+            for location, logical in _runtime_visible_inventory_classes(
+                item, inventory,
+            ):
+                record = _catalog_class_record(item, location, logical)
                 identities.setdefault(record['logical_entry'], []).append(record)
                 records.append(record)
             continue
@@ -4095,18 +4427,24 @@ def _catalog_class_records(entries, fact_store=None):
                         'artifact_path': str(artifact_path),
                         'artifact_sha256': expected_sha,
                         'coord': str(item.get('coord') or ''),
+                        'runtime_role': (
+                            'business'
+                            if _catalog_entry_is_business_classes(item)
+                            else 'dependency'
+                        ),
+                        'runtime_classpath_index': item.get(
+                            'runtime_classpath_index'
+                        ),
+                        'runtime_classpath_authority': str(
+                            item.get('runtime_classpath_authority') or ''
+                        ),
                     }
                     identities.setdefault(logical_entry, []).append(record)
                     records.append(record)
 
-                for name in sorted(archive.namelist()):
-                    if not name.endswith('.class') or name.startswith('META-INF/'):
-                        continue
-                    logical = name
-                    for prefix in ('BOOT-INF/classes/', 'WEB-INF/classes/'):
-                        if logical.startswith(prefix):
-                            logical = logical[len(prefix):]
-                            break
+                for name, logical in _runtime_visible_archive_classes(
+                    item, tuple(archive.namelist()),
+                ):
                     append_record(name, archive.read(name), logical)
         except (OSError, ValueError, zipfile.BadZipFile) as error:
             diagnostics.append(
@@ -4115,18 +4453,45 @@ def _catalog_class_records(entries, fact_store=None):
     duplicate_entries = {
         logical: values for logical, values in identities.items() if len(values) > 1
     }
-    for logical, values in sorted(duplicate_entries.items()):
-        diagnostics.append(
-            f'{logical}:spring_packaged_class_ambiguous:'
-            + ','.join(item['entry'] for item in values)
-        )
     if duplicate_entries:
+        selected_by_logical = {}
+        for logical, values in sorted(duplicate_entries.items()):
+            try:
+                selected, resolution = _resolve_runtime_class_candidates(
+                    logical, values, fact_store,
+                )
+            except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                diagnostics.append(_fact_store_or_parser_error(
+                    {
+                        'jar_path': values[0].get('artifact_path') or '',
+                        'coord': values[0].get('coord') or '',
+                    },
+                    f'spring_duplicate_class:{logical}', exc,
+                    'spring_aop_class_parse_failed',
+                ))
+                continue
+            if selected is None:
+                diagnostics.append(resolution)
+                continue
+            selected.pop('_resolved_bytes', None)
+            selected_by_logical[logical] = (
+                str(selected.get('coord') or ''),
+                str(selected.get('entry') or ''),
+            )
+            resolutions.append(resolution)
         records = [
-            record for record in records
-            if record['logical_entry'] not in duplicate_entries
+            record
+            for record in records
+            if (
+                record['logical_entry'] not in duplicate_entries
+                or (
+                    str(record.get('coord') or ''),
+                    str(record.get('entry') or ''),
+                ) == selected_by_logical.get(record['logical_entry'])
+            )
         ]
     if fact_store is None:
-        return tuple(records), diagnostics
+        return tuple(records), diagnostics, resolutions
 
     grouped = {}
     for record in records:
@@ -4156,7 +4521,7 @@ def _catalog_class_records(entries, fact_store=None):
                     'spring_aop_class_parse_failed',
                 ))
 
-    return stream_records(), diagnostics
+    return stream_records(), diagnostics, resolutions
 
 
 def collect_spring_security_filter_activation(

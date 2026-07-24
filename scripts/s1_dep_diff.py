@@ -132,6 +132,32 @@ def _business_content_entries(archive):
     return entries
 
 
+def _spring_boot_classpath_order(archive):
+    """Return only an explicit, packaged Spring Boot classpath order."""
+    try:
+        raw = archive.read("BOOT-INF/classpath.idx").decode(
+            "utf-8", errors="strict"
+        )
+    except (KeyError, UnicodeError):
+        return {}
+    order = {}
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r'-\s+"(BOOT-INF/lib/[^"]+\.jar)"', line)
+        if not match:
+            return {}
+        entry = match.group(1)
+        if entry in order:
+            return {}
+        order[entry] = len(order)
+    archive_names = set(archive.namelist())
+    if not order or any(entry not in archive_names for entry in order):
+        return {}
+    return order
+
+
 def materialize_changed_dependency_jars(
     rows, side_meta, output_dir, current_entries=None,
 ):
@@ -249,6 +275,7 @@ def materialize_changed_dependency_jars(
         if not outer_sha256:
             outer_sha256 = sha256_file(artifact_path)
         with zipfile.ZipFile(artifact_path) as outer:
+            spring_boot_classpath_order = _spring_boot_classpath_order(outer)
             info_by_name = defaultdict(list)
             for info in outer.infolist():
                 info_by_name[info.filename].append(info)
@@ -282,7 +309,7 @@ def materialize_changed_dependency_jars(
                     if target.exists():
                         target.unlink()
                     raise
-                items.append({
+                retained_item = {
                     'side': side,
                     'coord': request['coord'],
                     'version': request['version'],
@@ -294,7 +321,17 @@ def materialize_changed_dependency_jars(
                     'outer_artifact_sha256': outer_sha256,
                     'identity_source': request['identity_source'],
                     'purposes': sorted(request['purposes']),
-                })
+                }
+                if lib_entry in spring_boot_classpath_order:
+                    retained_item.update({
+                        'runtime_classpath_index': (
+                            spring_boot_classpath_order[lib_entry]
+                        ),
+                        'runtime_classpath_authority': (
+                            'spring_boot_classpath_index'
+                        ),
+                    })
+                items.append(retained_item)
 
             if side == 'current':
                 business_entries = _business_content_entries(outer)

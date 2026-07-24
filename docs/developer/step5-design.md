@@ -187,6 +187,39 @@ Class.forName("org.apache.commons.lang.StringUtils")
 
 并非所有影响链路都必须从业务源码显式调用开始。若依赖源码中存在容器或框架会主动触发的入口，例如 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle 或 Quartz `Job.execute`，Step5 会把该方法作为框架主动入口。只要该入口链路触达变更 API，就可以形成影响链路。
 
+## 最终制品中的同名 class
+
+框架适配器必须按最终制品的实际 classloader 可见性处理同名类，不能仅因多个物理条目归一到同一 FQCN 就全局阻断：
+
+- 业务制品使用 `BOOT-INF/classes` / `WEB-INF/classes` 对应的应用 classpath 根；作为依赖挂载的 JAR 只使用自身归档根，不能把其内部的第二层可执行 JAR 布局当成新的 classpath 根。
+- 多个运行时可见候选的 class 字节码完全一致时，合并为一个等价候选并保留副本来源。
+- 字节码不同时，只有最终制品提供了可验证的加载顺序（例如 `BOOT-INF/classpath.idx`），或业务 classes 对依赖 JAR 的优先级可确定时，才能选择 effective class；其他候选作为 shadowed 证据保留。
+- 字节码不同且加载顺序无法证明时，输出带候选 JAR、物理 entry、class 名称和字节码摘要的路径级歧义。该失败只约束涉及相应 class 的框架候选路径，不得传播成所有变化 API 的 `not_analyzed`。
+- ZIP 中完全相同的物理 entry 名仍属于制品身份异常，应在事实库存阶段失败关闭，而不是按普通 classpath shadowing 处理。
+
+## 原因码自助决策契约
+
+`summary.json` 不能只输出 `not_analyzed_reason_summary` 的原因码计数。每个进入
+`uncertain` / `not_analyzed` 的主原因，以及 failure ledger 中未成为主原因的阻塞失败，
+都必须进入 `diagnostic_guidance[]`。该数组使用
+`java-upgrade-analyzer.reason-guidance.v1`，至少包含：
+
+- 稳定 `reason_code`、可读标题和触发条件；
+- 该原因的语义影响，以及本轮实际观察到的 `api` / `path` / `global` 传播范围；旧结果缺少
+  typed failure 时必须标为 `unknown`，不能猜测；
+- 受影响 API 数、状态分布和少量 API 样例；
+- 采集器、类、JAR、物理 entry、候选 class 哈希和错误摘要；
+- 是否阻断、建议决策、可忽略条件、修复动作和完成标准。
+
+Step6 主报告必须直接消费 `diagnostic_guidance[]`，不得维护另一套解释文案。旧版或合成
+`summary.json` 没有该字段时，Step6 可以用同一原因目录基于 API 列表和
+`meta.graph_stats.evidence_ingestion.failures` 补建。
+
+`SPRING_PACKAGED_CLASS_AMBIGUOUS` 是路径级失败，只能影响经过歧义类的 Spring 路径。
+`MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED` 同样是路径级失败，作用对象为
+`org.apache.ibatis.binding.MapperProxy` 代理路径；它不得再作为全局失败传播给所有变化
+API。报告仍需如实展示历史输入中已经记录的 `global` 作用域，便于识别旧结果的过度传播。
+
 ## alerts.csv 设计原则
 
 `alerts.csv` 是完整链路台账，不是抽样。

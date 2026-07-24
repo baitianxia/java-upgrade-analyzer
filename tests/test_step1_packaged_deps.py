@@ -24,6 +24,78 @@ from pipeline_constants import (  # noqa: E402
 
 
 class Step1PackagedDepsTest(unittest.TestCase):
+    def test_spring_boot_classpath_index_is_parsed_as_runtime_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/second.jar", b"second")
+                archive.writestr("BOOT-INF/lib/first.jar", b"first")
+                archive.writestr(
+                    "BOOT-INF/classpath.idx",
+                    '- "BOOT-INF/lib/first.jar"\n'
+                    '- "BOOT-INF/lib/second.jar"\n',
+                )
+            with zipfile.ZipFile(artifact) as archive:
+                order = s1_dep_diff._spring_boot_classpath_order(archive)
+
+        self.assertEqual({
+            "BOOT-INF/lib/first.jar": 0,
+            "BOOT-INF/lib/second.jar": 1,
+        }, order)
+
+    def test_malformed_spring_boot_classpath_index_is_not_authoritative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("BOOT-INF/lib/demo.jar", b"demo")
+                archive.writestr(
+                    "BOOT-INF/classpath.idx",
+                    "BOOT-INF/lib/demo.jar\n",
+                )
+            with zipfile.ZipFile(artifact) as archive:
+                order = s1_dep_diff._spring_boot_classpath_order(archive)
+
+        self.assertFalse(order)
+
+    def test_retained_runtime_jar_carries_explicit_classpath_order(self):
+        nested_bytes = self._nested_jar_bytes([
+            ("demo/Support.class", b"class"),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "app.jar"
+            lib_entry = "BOOT-INF/lib/support.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(lib_entry, nested_bytes)
+                archive.writestr(
+                    "BOOT-INF/classpath.idx",
+                    f'- "{lib_entry}"\n',
+                )
+            _manifest, items = s1_dep_diff.materialize_changed_dependency_jars(
+                [],
+                {"current": {
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": hashlib.sha256(
+                        artifact.read_bytes()
+                    ).hexdigest(),
+                }},
+                root / "dependencies",
+                current_entries=[{
+                    "coord": "com.acme:support",
+                    "version": "1",
+                    "scope": "runtime",
+                    "lib_entry": lib_entry,
+                    "resolution_status": "resolved",
+                }],
+            )
+
+        self.assertEqual(1, len(items))
+        self.assertEqual(0, items[0]["runtime_classpath_index"])
+        self.assertEqual(
+            "spring_boot_classpath_index",
+            items[0]["runtime_classpath_authority"],
+        )
+
     def test_parse_gradle_dependency_report_uses_selected_runtime_version(self):
         deps = s1_dep_diff.parse_gradle_dependency_report(
             """runtimeClasspath - Runtime classpath of source set 'main'.

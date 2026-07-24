@@ -609,6 +609,10 @@ class FrameworkAdaptersTest(unittest.TestCase):
         failure = framework_adapter_module._framework_failure("mybatis", errors[0])
         self.assertEqual("MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED", failure.reason_code)
         self.assertTrue(failure.blocking)
+        self.assertEqual("path", failure.scope)
+        self.assertEqual(
+            "org.apache.ibatis.binding.MapperProxy", failure.class_name,
+        )
 
     def test_framework_orchestrator_returns_tuple_and_serializer_alone_projects_v1(self):
         batches = _run_framework_adapters([], artifact_catalog={"entries": []})

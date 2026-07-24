@@ -6409,6 +6409,151 @@ public class com.example.TargetBridge {
             graph._step5_evidence_failures_by_identity_index["indexed_count"], 4
         )
 
+    def test_path_scoped_framework_failure_only_reaches_related_api(self):
+        affected_api = {
+            "api_name": "com.vendor.Target.call",
+            "api_signature": "(java.lang.String)",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "coord": "com.vendor:target",
+        }
+        unrelated_api = {
+            **affected_api,
+            "api_name": "com.vendor.Unrelated.call",
+        }
+        failure = EvidenceFailure(
+            stage="spring_aop_activation",
+            reason_code="SPRING_PACKAGED_CLASS_AMBIGUOUS",
+            blocking=True,
+            class_name="demo.Affected",
+            scope="path",
+        )
+        graph = SimpleNamespace(
+            reverse_edges={
+                "com.vendor.Target.call(java.lang.String)": [
+                    SimpleNamespace(
+                        collector="source_ast",
+                        caller_symbol_id="demo.Affected.run()",
+                        caller_qualified_key="demo.Affected.run()",
+                    ),
+                ],
+            },
+            step5_evidence_failures=(failure,),
+            step5_evidence_concerns=(),
+            step5_collector_coverage=(
+                CoverageRecord(
+                    collector="spring_aop_activation",
+                    api_identity="spring_aop_activation",
+                    status="partial",
+                    scope="path",
+                ),
+                CoverageRecord(
+                    collector="business_bytecode",
+                    api_identity=tracer.indirect_api_key(affected_api),
+                    status="complete",
+                ),
+                CoverageRecord(
+                    collector="business_bytecode",
+                    api_identity=tracer.indirect_api_key(unrelated_api),
+                    status="complete",
+                ),
+            ),
+        )
+
+        affected = tracer._new_trace_draft(affected_api, graph)
+        unrelated = tracer._new_trace_draft(unrelated_api, graph)
+        affected_result = tracer._finalize_trace_draft(affected)
+        unrelated_result = tracer._finalize_trace_draft(unrelated)
+
+        self.assertEqual((failure,), affected.envelope_failures)
+        self.assertFalse(unrelated.envelope_failures)
+        self.assertEqual(
+            "SPRING_PACKAGED_CLASS_AMBIGUOUS",
+            affected_result.reason_code,
+        )
+        self.assertEqual("not_analyzed", affected_result.analysis_status)
+        self.assertEqual(
+            "not_found_in_static_analysis",
+            unrelated_result.analysis_status,
+        )
+        self.assertEqual("NO_STATIC_PATH", unrelated_result.reason_code)
+
+    def test_mybatis_runtime_parse_failure_only_reaches_proxy_path(self):
+        affected_api = {
+            "api_name": "org.apache.ibatis.session.SqlSession.selectOne",
+            "api_signature": "(java.lang.String,java.lang.Object)",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "coord": "org.mybatis:mybatis",
+        }
+        unrelated_api = {
+            **affected_api,
+            "api_name": "com.vendor.Unrelated.call",
+        }
+        failure = framework_adapters._framework_failure(
+            "mybatis_mapper_proxy",
+            (
+                "/runtime/mybatis.jar:"
+                "mybatis_runtime_artifact_parse_failed:"
+                "mybatis_runtime:BadZipFile"
+            ),
+        )
+        graph = SimpleNamespace(
+            reverse_edges={
+                (
+                    "org.apache.ibatis.session.SqlSession.selectOne"
+                    "(java.lang.String,java.lang.Object)"
+                ): [
+                    SimpleNamespace(
+                        collector="source_ast",
+                        caller_symbol_id=(
+                            "org.apache.ibatis.binding.MapperProxy.invoke()"
+                        ),
+                        caller_qualified_key=(
+                            "org.apache.ibatis.binding.MapperProxy.invoke()"
+                        ),
+                    ),
+                ],
+            },
+            step5_evidence_failures=(failure,),
+            step5_evidence_concerns=(),
+            step5_collector_coverage=(
+                CoverageRecord(
+                    collector="mybatis_mapper_proxy",
+                    api_identity="mybatis_mapper_proxy",
+                    status="partial",
+                    scope="path",
+                ),
+                CoverageRecord(
+                    collector="business_bytecode",
+                    api_identity=tracer.indirect_api_key(affected_api),
+                    status="complete",
+                ),
+                CoverageRecord(
+                    collector="business_bytecode",
+                    api_identity=tracer.indirect_api_key(unrelated_api),
+                    status="complete",
+                ),
+            ),
+        )
+
+        affected = tracer._new_trace_draft(affected_api, graph)
+        unrelated = tracer._new_trace_draft(unrelated_api, graph)
+        affected_result = tracer._finalize_trace_draft(affected)
+        unrelated_result = tracer._finalize_trace_draft(unrelated)
+
+        self.assertEqual((failure,), affected.envelope_failures)
+        self.assertFalse(unrelated.envelope_failures)
+        self.assertEqual(
+            "MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED",
+            affected_result.reason_code,
+        )
+        self.assertEqual("not_analyzed", affected_result.analysis_status)
+        self.assertEqual(
+            "not_found_in_static_analysis",
+            unrelated_result.analysis_status,
+        )
+
     def test_perf_top_filter_matches_full_canonical_sort(self):
         graph = SimpleNamespace()
         rows = [
