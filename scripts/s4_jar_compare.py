@@ -6556,9 +6556,10 @@ def human_checkpoint_1(
         )
         for item in failed_comparisons[:50]:
             print(
-                f"  - {item.get('coord')}："
-                f"{item.get('reason_code') or 'BINARY_API_COMPARISON_FAILED'}；"
-                f"{item.get('failure_message') or '未形成可验证结果'}"
+                f"  - {item.get('coord')}：API 对比失败，不能按无变化处理；"
+                f"诊断标识={item.get('reason_code') or 'BINARY_API_COMPARISON_FAILED'}；"
+                f"技术原因={item.get('failure_message') or '未形成可验证结果'}；"
+                f"下一步={item.get('recommended_action') or '修复后重跑 Step4'}"
             )
         if len(failed_comparisons) > 50:
             print(f"  ...（仅展示前 50，共 {len(failed_comparisons)}）")
