@@ -104,7 +104,10 @@ def _iter_artifact_classes(path):
             relative = class_file.relative_to(artifact).as_posix()
             yield _class_owner(relative), relative, class_file.read_bytes()
         return
-    require_safe_archive(artifact)
+    require_safe_archive(
+        artifact,
+        allow_duplicate_maven_metadata=True,
+    )
     yield from _iter_zip_classes(artifact.read_bytes())
 
 

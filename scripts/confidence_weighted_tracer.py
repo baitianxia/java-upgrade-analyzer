@@ -5552,7 +5552,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
             'jar_path': '',
             'expected_sha256': '',
             'actual_sha256': '',
-            'error': 'runtime dependency stat identity changed during final verification',
+            'error': 'runtime dependency SHA-256 changed during final verification',
         })
     if changed_artifacts:
         scan_failures.extend(changed_artifacts)
@@ -5630,7 +5630,7 @@ def _build_packaged_runtime_dependency_scan_cache(api_rows, graph):
         failures = post_commit_changes or [{
             'reason': 'BYTECODE_SCAN_INPUT_CHANGED',
             'jar_path': '',
-            'error': 'runtime dependency stat identity changed during edge commit',
+            'error': 'runtime dependency SHA-256 changed during edge commit',
         }]
         _record_analyzer_scan_failures(graph, failures)
         _mark_packaged_scan_input_changed(
@@ -6039,19 +6039,15 @@ def _runtime_artifact_stat_snapshot(catalog_entries, target_jdk):
     for item in catalog_entries or ():
         jar_path = str(item.get('jar_path') or '').strip()
         resolved = str(Path(jar_path).resolve()) if jar_path else ''
-        stat_identity = None
+        artifact_sha256 = None
         if jar_path:
             try:
-                stat = os.stat(jar_path)
-                stat_identity = (
-                    int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
-                    int(stat.st_mtime_ns), int(stat.st_ctime_ns),
-                )
+                artifact_sha256 = _artifact_sha256(jar_path)
             except OSError:
-                stat_identity = None
+                artifact_sha256 = None
         artifacts.append((
             str(item.get('coord') or '').strip(), resolved,
-            str(item.get('artifact_entry') or ''), stat_identity,
+            str(item.get('artifact_entry') or ''), artifact_sha256,
             item.get('application_owned'), item.get('ownership_evidence'),
         ))
     return (str(target_jdk or ''), tuple(sorted(artifacts, key=repr)))

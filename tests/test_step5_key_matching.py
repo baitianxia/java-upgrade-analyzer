@@ -21289,7 +21289,7 @@ public class com.example.consumer.Adapter {
         self.assertEqual(rebuilt.call_count, 1)
         self.assertTrue(second["complete"])
 
-    def test_runtime_member_index_graph_cache_hit_does_not_rehash_unchanged_jars(self):
+    def test_runtime_member_index_graph_cache_hit_rechecks_sha_without_rebuilding(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "fixture.jar"
             with zipfile.ZipFile(jar_path, "w") as archive:
@@ -21304,13 +21304,20 @@ public class com.example.consumer.Adapter {
                     graph, catalog, 17
                 )
                 hashes_after_build = digest.call_count
-                second = tracer._get_runtime_dependency_member_candidate_index(
-                    graph, catalog, 17
-                )
+                with patch.object(
+                    tracer,
+                    "_build_runtime_dependency_member_candidate_index",
+                    side_effect=AssertionError(
+                        "unchanged SHA-bound index must not be rebuilt"
+                    ),
+                ):
+                    second = tracer._get_runtime_dependency_member_candidate_index(
+                        graph, catalog, 17
+                    )
 
         self.assertIs(first, second)
         self.assertGreater(hashes_after_build, 0)
-        self.assertEqual(digest.call_count, hashes_after_build)
+        self.assertEqual(digest.call_count, hashes_after_build + 1)
 
     def test_runtime_member_index_trace_lease_avoids_per_lookup_stat_scans(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -21328,7 +21335,7 @@ public class com.example.consumer.Adapter {
 
             with patch.object(
                 tracer, "_runtime_artifact_stat_snapshot",
-                side_effect=AssertionError("active trace lease must avoid repeated stat scans"),
+                side_effect=AssertionError("active trace lease must avoid repeated SHA scans"),
             ):
                 second = tracer._get_runtime_dependency_member_candidate_index(
                     graph, catalog, 17

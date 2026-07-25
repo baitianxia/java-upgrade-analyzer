@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import threading
 import time
@@ -16,6 +15,7 @@ from pathlib import Path
 import tempfile
 from typing import Any, Mapping
 
+from artifact_safety import is_allowed_duplicate_archive_entry
 from path_runtime import short_temporary_directory
 
 
@@ -45,7 +45,6 @@ class ArtifactInventory:
     failure: str = ""
     multi_release: bool = False
     target_jdk_resolved: bool = False
-    file_identity: tuple[int, int, int, int, int] = ()
 
 
 @dataclass(frozen=True)
@@ -71,16 +70,6 @@ def _sha256_handle(handle) -> str:
         digest.update(block)
     handle.seek(0)
     return digest.hexdigest()
-
-
-def _file_identity(stat_result) -> tuple[int, int, int, int, int]:
-    return (
-        int(stat_result.st_dev),
-        int(stat_result.st_ino),
-        int(stat_result.st_size),
-        int(stat_result.st_mtime_ns),
-        int(stat_result.st_ctime_ns),
-    )
 
 
 def _target_jdk_major(value: str) -> int | None:
@@ -252,7 +241,7 @@ class Step5ArtifactFactStore:
         inventory = self.inventory(coord)
         if inventory.failure:
             raise ValueError(inventory.failure)
-        self._assert_path_identity(inventory)
+        self._assert_path_sha256(inventory)
         return inventory
 
     def verified_inventory(self, coord: str) -> ArtifactInventory:
@@ -267,23 +256,27 @@ class Step5ArtifactFactStore:
             try:
                 yield handle
             finally:
-                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
-                    raise ValueError("artifact_changed_after_inventory")
-                self._assert_path_identity(inventory)
+                self._assert_handle_sha256(handle, inventory)
+                self._assert_path_sha256(inventory)
 
     @staticmethod
-    def _assert_path_identity(inventory: ArtifactInventory) -> None:
+    def _assert_path_sha256(inventory: ArtifactInventory) -> None:
         try:
-            current = _file_identity(Path(inventory.identity.path).stat())
+            current = _sha256_file(Path(inventory.identity.path))
         except OSError as exc:
             raise ValueError(f"artifact_changed_after_inventory:{exc}") from exc
-        if current != inventory.file_identity:
+        if current != inventory.identity.sha256:
+            raise ValueError("artifact_changed_after_inventory")
+
+    @staticmethod
+    def _assert_handle_sha256(handle, inventory: ArtifactInventory) -> None:
+        if _sha256_handle(handle) != inventory.identity.sha256:
             raise ValueError("artifact_changed_after_inventory")
 
     @staticmethod
     def _open_verified_artifact(inventory: ArtifactInventory):
         handle = Path(inventory.identity.path).open("rb")
-        if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
+        if _sha256_handle(handle) != inventory.identity.sha256:
             handle.close()
             raise ValueError("artifact_changed_after_inventory")
         return handle
@@ -296,9 +289,8 @@ class Step5ArtifactFactStore:
             with self._open_verified_artifact(inventory) as handle:
                 with zipfile.ZipFile(handle) as archive:
                     content = archive.read(location.physical_entry)
-                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
-                    raise ValueError("artifact_changed_after_inventory")
-            self._assert_path_identity(inventory)
+                self._assert_handle_sha256(handle, inventory)
+            self._assert_path_sha256(inventory)
             with self._lock:
                 self._metrics["class_bytes_reads"] += 1
                 self._metrics["class_bytes_read"] += len(content)
@@ -361,9 +353,8 @@ class Step5ArtifactFactStore:
                             content = read_archive(location)
                         yield location, content, read_location
             finally:
-                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
-                    raise ValueError("artifact_changed_after_inventory")
-                self._assert_path_identity(inventory)
+                self._assert_handle_sha256(handle, inventory)
+                self._assert_path_sha256(inventory)
 
     def iter_physical_class_bytes(self, coord: str):
         """Yield all physical class entries in stable name order from one ZIP open."""
@@ -378,9 +369,8 @@ class Step5ArtifactFactStore:
                             self._metrics["class_bytes_read"] += len(content)
                         yield entry, content
             finally:
-                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
-                    raise ValueError("artifact_changed_after_inventory")
-                self._assert_path_identity(inventory)
+                self._assert_handle_sha256(handle, inventory)
+                self._assert_path_sha256(inventory)
 
     def resource_bytes(
         self, coord: str, resource_name: str, *, retain: bool = True,
@@ -405,9 +395,8 @@ class Step5ArtifactFactStore:
             with self._open_verified_artifact(inventory) as handle:
                 with zipfile.ZipFile(handle) as archive:
                     content = archive.read(resource_name)
-                if _file_identity(os.fstat(handle.fileno())) != inventory.file_identity:
-                    raise ValueError("artifact_changed_after_inventory")
-            self._assert_path_identity(inventory)
+                self._assert_handle_sha256(handle, inventory)
+            self._assert_path_sha256(inventory)
             with self._lock:
                 self._metrics["resource_bytes_reads"] += 1
                 self._metrics["resource_bytes_read"] += len(content)
@@ -543,7 +532,7 @@ class Step5ArtifactFactStore:
                 class_path.parent.mkdir(parents=True, exist_ok=True)
                 class_path.write_bytes(content.value)
                 result = producer(replace(identity, path=tmp), location, profile)
-            self._assert_path_identity(inventory)
+            self._assert_path_sha256(inventory)
             return result
 
         if retain:
@@ -584,7 +573,6 @@ class Step5ArtifactFactStore:
         if not path.is_file():
             raise FileNotFoundError(f"artifact_missing:{path}")
         with path.open("rb") as handle:
-            before_identity = _file_identity(os.fstat(handle.fileno()))
             digest = _sha256_handle(handle)
             if not re.fullmatch(r"[0-9a-f]{64}", identity.sha256):
                 raise ValueError("artifact_sha256_invalid")
@@ -595,7 +583,14 @@ class Step5ArtifactFactStore:
             with zipfile.ZipFile(handle) as archive:
                 names = tuple(archive.namelist())
                 duplicates = sorted(
-                    name for name, count in Counter(names).items() if count > 1
+                    name for name, count in Counter(names).items()
+                    if (
+                        count > 1
+                        and not is_allowed_duplicate_archive_entry(
+                            name,
+                            allow_duplicate_maven_metadata=True,
+                        )
+                    )
                 )
                 if duplicates:
                     raise ValueError(
@@ -614,15 +609,17 @@ class Step5ArtifactFactStore:
                     names, identity.target_jdk, multi_release_enabled=multi_release,
                 )
                 resources = tuple(sorted(
-                    name for name in names if not name.endswith(".class")
+                    {
+                        name for name in names
+                        if not name.endswith(".class")
+                    }
                 ))
                 physical_classes = tuple(sorted(
                     name for name in names if name.endswith(".class")
                 ))
-            after_identity = _file_identity(os.fstat(handle.fileno()))
-            if after_identity != before_identity:
+            if _sha256_handle(handle) != identity.sha256:
                 raise ValueError("artifact_changed_during_inventory")
-        if _file_identity(path.stat()) != before_identity:
+        if _sha256_file(path) != identity.sha256:
             raise ValueError("artifact_changed_during_inventory")
         return ArtifactInventory(
             identity=identity,
@@ -631,7 +628,6 @@ class Step5ArtifactFactStore:
             physical_classes=physical_classes,
             multi_release=multi_release,
             target_jdk_resolved=_target_jdk_major(identity.target_jdk) is not None,
-            file_identity=before_identity,
         )
 
 

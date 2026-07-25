@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+import os
 import sys
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -116,6 +118,89 @@ class Step5ColdRunContractTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "artifact_duplicate_entries"):
                 store.verified_inventory("g:a")
+
+    def test_inventory_allows_duplicate_maven_metadata_and_deduplicates_resources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "artifact.jar"
+            metadata_entry = (
+                "META-INF/maven/com.example/demo/pom.properties"
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(jar, "w") as archive:
+                    archive.writestr(
+                        metadata_entry,
+                        b"groupId=com.example\nartifactId=demo\nversion=1\n",
+                    )
+                    archive.writestr(
+                        metadata_entry,
+                        b"groupId=com.example\nartifactId=demo\nversion=1\n",
+                    )
+                    archive.writestr("demo/Original.class", b"original")
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            inventory = store.verified_inventory("g:a")
+
+        self.assertEqual("", inventory.failure)
+        self.assertEqual((metadata_entry,), inventory.resources)
+        self.assertEqual(
+            ["demo/Original.class"],
+            [item.physical_entry for item in inventory.classes],
+        )
+
+    def test_inventory_still_rejects_duplicate_semantic_meta_inf_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "artifact.jar"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(jar, "w") as archive:
+                    archive.writestr(
+                        "META-INF/services/com.example.Service", b"first",
+                    )
+                    archive.writestr(
+                        "META-INF/services/com.example.Service", b"second",
+                    )
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+
+            with self.assertRaisesRegex(
+                ValueError, "artifact_duplicate_entries"
+            ):
+                store.verified_inventory("g:a")
+
+    def test_timestamp_only_change_after_inventory_keeps_sha_bound_artifact_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "artifact.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("demo/Original.class", b"original")
+            entry = {
+                "coord": "g:a", "jar_path": str(jar),
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            }
+            store = Step5ArtifactFactStore.from_catalog({"entries": [entry]})
+            inventory = store.verified_inventory("g:a")
+            original_stat = jar.stat()
+            os.utime(
+                jar,
+                ns=(
+                    original_stat.st_atime_ns,
+                    original_stat.st_mtime_ns + 1_000_000_000,
+                ),
+            )
+
+            refreshed = store.verified_inventory("g:a")
+            outcome = store.class_bytes("g:a", inventory.classes[0])
+
+        self.assertIs(refreshed, inventory)
+        self.assertEqual("complete", outcome.status)
+        self.assertEqual(b"original", outcome.value)
 
     def test_physical_class_stream_checks_identity_when_closed_early(self):
         with tempfile.TemporaryDirectory() as tmp:

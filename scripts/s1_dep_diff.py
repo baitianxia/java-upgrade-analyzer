@@ -33,7 +33,11 @@ from analysis_contract import (
     project_scope_provenance_fields,
     sha256_file,
 )
-from artifact_safety import _unsafe_entry_name, require_safe_archive
+from artifact_safety import (
+    _unsafe_entry_name,
+    is_allowed_duplicate_archive_entry,
+    require_safe_archive,
+)
 from artifact_coordinates import normalize_artifact_coord
 from diagnostic_contract import (
     DEPENDENCY_COORDINATES_UNRESOLVED,
@@ -2296,7 +2300,14 @@ def _scan_packaged_archive(artifact_path):
             for info in outer_infos:
                 infos_by_name[info.filename].append(info)
             duplicate_names = sorted(
-                name for name, infos in infos_by_name.items() if len(infos) > 1
+                name for name, infos in infos_by_name.items()
+                if (
+                    len(infos) > 1
+                    and not is_allowed_duplicate_archive_entry(
+                        name,
+                        allow_duplicate_maven_metadata=True,
+                    )
+                )
             )
             if duplicate_names:
                 dependency_duplicates = {

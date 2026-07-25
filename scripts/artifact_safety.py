@@ -3,11 +3,17 @@
 
 from dataclasses import dataclass
 from collections import Counter, OrderedDict
+import hashlib
 import io
 from pathlib import Path, PurePosixPath
 import re
 import threading
 import zipfile
+
+
+_DUPLICATE_MAVEN_METADATA_PATTERN = re.compile(
+    r"^META-INF/maven/[^/]+/[^/]+/(?:pom\.properties|pom\.xml)$"
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,15 @@ def _unsafe_entry_name(name):
         or re.match(r"^[A-Za-z]:", value)
         or "\\" in value
         or ".." in path.parts
+    )
+
+
+def is_allowed_duplicate_archive_entry(
+    name, *, allow_duplicate_maven_metadata=False,
+):
+    return bool(
+        allow_duplicate_maven_metadata
+        and _DUPLICATE_MAVEN_METADATA_PATTERN.fullmatch(str(name or ""))
     )
 
 
@@ -71,12 +86,11 @@ def _inspect_archive_source(
                 }
                 blocking_duplicate_names = {
                     name for name in duplicate_names
-                    if not (
-                        allow_duplicate_maven_metadata
-                        and re.match(
-                            r"^META-INF/maven/[^/]+/[^/]+/(?:pom\.properties|pom\.xml)$",
-                            name,
-                        )
+                    if not is_allowed_duplicate_archive_entry(
+                        name,
+                        allow_duplicate_maven_metadata=(
+                            allow_duplicate_maven_metadata
+                        ),
                     )
                 }
                 if blocking_duplicate_names:
@@ -178,8 +192,16 @@ def _changed_during_scan_result():
     )
 
 
-def _cached_archive_inspection(path, device, inode, size, mtime_ns, ctime_ns, limits):
-    key = (path, device, inode, size, mtime_ns, ctime_ns, limits)
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _cached_archive_inspection(path, expected_sha256, limits):
+    key = (path, expected_sha256, limits)
     with _ARCHIVE_CACHE_CONDITION:
         while key in _ARCHIVE_CACHE_IN_FLIGHT:
             _ARCHIVE_CACHE_CONDITION.wait()
@@ -190,22 +212,14 @@ def _cached_archive_inspection(path, device, inode, size, mtime_ns, ctime_ns, li
         scan_generation = _ARCHIVE_CACHE_GENERATION
         _ARCHIVE_CACHE_IN_FLIGHT.add(key)
     try:
-        expected_identity = (device, inode, size, mtime_ns, ctime_ns)
         archive_path = Path(path)
         result = _inspect_archive_source(archive_path, **dict(limits))
         try:
-            stat = archive_path.stat()
+            actual_sha256 = _sha256_file(archive_path)
         except OSError:
             result = _changed_during_scan_result()
         else:
-            actual_identity = (
-                stat.st_dev,
-                stat.st_ino,
-                stat.st_size,
-                stat.st_mtime_ns,
-                stat.st_ctime_ns,
-            )
-            if actual_identity != expected_identity:
+            if actual_sha256 != expected_sha256:
                 result = _changed_during_scan_result()
     except BaseException:
         with _ARCHIVE_CACHE_CONDITION:
@@ -240,17 +254,13 @@ _ARCHIVE_CACHE_CONDITION = threading.Condition()
 def require_safe_archive(path, **limits):
     archive_path = Path(path)
     try:
-        stat = archive_path.stat()
+        artifact_sha256 = _sha256_file(archive_path)
     except OSError:
         result = inspect_archive(archive_path, **limits)
     else:
         result = _cached_archive_inspection(
             str(archive_path.resolve()),
-            stat.st_dev,
-            stat.st_ino,
-            stat.st_size,
-            stat.st_mtime_ns,
-            stat.st_ctime_ns,
+            artifact_sha256,
             tuple(sorted(limits.items())),
         )
     if not result.safe:

@@ -176,8 +176,8 @@ def compare_jar_data_contracts(
     conditional system runtime entry.
     """
     rows: list[dict] = []
-    require_safe_archive(old_jar)
-    require_safe_archive(new_jar)
+    require_safe_archive(old_jar, allow_duplicate_maven_metadata=True)
+    require_safe_archive(new_jar, allow_duplicate_maven_metadata=True)
     with zipfile.ZipFile(old_jar) as old_archive, zipfile.ZipFile(new_jar) as new_archive:
         old_entries = _effective_class_entries(old_archive, target_java_version)
         new_entries = _effective_class_entries(new_archive, target_java_version)

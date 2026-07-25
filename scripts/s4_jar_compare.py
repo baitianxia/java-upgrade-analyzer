@@ -153,24 +153,7 @@ def clear_japicmp_tool_digest_cache():
 
 def japicmp_tool_sha256(jar_path):
     path = Path(jar_path).resolve()
-    for _attempt in range(2):
-        before = path.stat()
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        after = path.stat()
-        before_identity = (
-            int(getattr(before, 'st_dev', 0) or 0),
-            int(getattr(before, 'st_ino', 0) or 0), int(before.st_size),
-            int(before.st_mtime_ns), int(before.st_ctime_ns),
-        )
-        after_identity = (
-            int(getattr(after, 'st_dev', 0) or 0),
-            int(getattr(after, 'st_ino', 0) or 0), int(after.st_size),
-            int(after.st_mtime_ns), int(after.st_ctime_ns),
-        )
-        if after_identity != before_identity:
-            continue
-        return digest
-    raise OSError(f"JApiCmp tool changed while hashing: {path}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def effective_java_runtime_identity():

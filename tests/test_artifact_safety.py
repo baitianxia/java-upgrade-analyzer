@@ -22,6 +22,7 @@ if str(SCRIPTS) not in sys.path:
 
 import artifact_safety  # noqa: E402
 import confidence_weighted_tracer as tracer  # noqa: E402
+import constant_impact  # noqa: E402
 import data_contract_analysis  # noqa: E402
 import s4_jar_compare  # noqa: E402
 import s5_call_chain_engine_integrated as step5  # noqa: E402
@@ -258,6 +259,40 @@ class ArtifactSafetyTest(unittest.TestCase):
                     new_version="2",
                 )
 
+    def test_full_archive_consumers_allow_duplicate_maven_metadata(self):
+        metadata_entry = (
+            "META-INF/maven/com.example/demo/pom.properties"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            old_jar = Path(tmp) / "old.jar"
+            new_jar = Path(tmp) / "new.jar"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                for artifact in (old_jar, new_jar):
+                    with zipfile.ZipFile(artifact, "w") as archive:
+                        archive.writestr(
+                            metadata_entry,
+                            b"groupId=com.example\nartifactId=demo\nversion=1\n",
+                        )
+                        archive.writestr(
+                            metadata_entry,
+                            b"groupId=com.example\nartifactId=demo\nversion=1\n",
+                        )
+
+            contract_rows = data_contract_analysis.compare_jar_data_contracts(
+                old_jar,
+                new_jar,
+                coord="com.example:demo",
+                old_version="1",
+                new_version="1",
+            )
+            constant_classes = list(
+                constant_impact._iter_artifact_classes(old_jar)
+            )
+
+        self.assertEqual(contract_rows, [])
+        self.assertEqual(constant_classes, [])
+
     def test_step4_class_hash_scan_rejects_crc_corruption(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "corrupt.jar"
@@ -287,6 +322,60 @@ class ArtifactSafetyTest(unittest.TestCase):
                 artifact_safety.require_safe_archive(artifact)
 
             self.assertEqual(inspect_mock.call_count, 1)
+
+    def test_archive_safety_ignores_timestamp_only_changes_when_sha256_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "safe.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("sample/Ok.class", b"class")
+            original_stat = artifact.stat()
+
+            with patch.object(
+                artifact_safety,
+                "_inspect_archive_source",
+                wraps=artifact_safety._inspect_archive_source,
+            ) as inspect_mock:
+                artifact_safety.require_safe_archive(artifact)
+                os.utime(
+                    artifact,
+                    ns=(
+                        original_stat.st_atime_ns,
+                        original_stat.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+                artifact_safety.require_safe_archive(artifact)
+
+            self.assertEqual(inspect_mock.call_count, 1)
+
+    def test_step5_runtime_artifact_snapshot_uses_sha256_not_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "runtime.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("sample/Ok.class", b"class")
+            entries = [{
+                "coord": "g:a",
+                "jar_path": str(artifact),
+                "artifact_entry": "BOOT-INF/lib/runtime.jar",
+            }]
+            before = tracer._runtime_artifact_stat_snapshot(entries, "17")
+            original_stat = artifact.stat()
+            os.utime(
+                artifact,
+                ns=(
+                    original_stat.st_atime_ns,
+                    original_stat.st_mtime_ns + 1_000_000_000,
+                ),
+            )
+            after_timestamp_change = tracer._runtime_artifact_stat_snapshot(
+                entries, "17"
+            )
+            artifact.write_bytes(artifact.read_bytes() + b"changed")
+            after_content_change = tracer._runtime_artifact_stat_snapshot(
+                entries, "17"
+            )
+
+        self.assertEqual(before, after_timestamp_change)
+        self.assertNotEqual(before, after_content_change)
 
     def test_archive_safety_coalesces_concurrent_first_scan(self):
         with tempfile.TemporaryDirectory() as tmp:

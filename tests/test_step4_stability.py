@@ -1193,6 +1193,36 @@ public class com.acme.Api {
         self.assertEqual(first, second)
         self.assertEqual(read_bytes.call_count, 2)
 
+    def test_japicmp_tool_digest_ignores_timestamp_change_during_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = Path(tmp) / "japicmp.jar"
+            payload = b"stable-tool"
+            tool.write_bytes(payload)
+            original_stat = tool.stat()
+            original_read_bytes = Path.read_bytes
+
+            def read_and_touch(path):
+                content = original_read_bytes(path)
+                os.utime(
+                    path,
+                    ns=(
+                        original_stat.st_atime_ns,
+                        original_stat.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+                return content
+
+            with patch.object(
+                step4.Path,
+                "read_bytes",
+                autospec=True,
+                side_effect=read_and_touch,
+            ) as read_bytes:
+                digest = step4.japicmp_tool_sha256(tool)
+
+        self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+        self.assertEqual(read_bytes.call_count, 1)
+
     def test_japicmp_comparison_identity_includes_target_jdk_and_java_runtime(self):
         base = {
             "coord": "com.acme:api",

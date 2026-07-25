@@ -631,6 +631,35 @@ class Step1PackagedDepsTest(unittest.TestCase):
             for item in result.failures
         ), result.failures)
 
+    def test_step1_allows_duplicate_outer_maven_metadata(self):
+        nested = self._nested_jar_bytes([(
+            "META-INF/maven/org.example/demo/pom.properties",
+            "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+        )])
+        metadata_entry = (
+            "META-INF/maven/org.example/app/pom.properties"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(artifact, "w") as outer:
+                    outer.writestr(
+                        metadata_entry,
+                        "groupId=org.example\nartifactId=app\nversion=1.0\n",
+                    )
+                    outer.writestr(
+                        metadata_entry,
+                        "groupId=org.example\nartifactId=app\nversion=1.0\n",
+                    )
+                    outer.writestr("BOOT-INF/lib/demo-1.0.jar", nested)
+
+            result = s1_dep_diff._scan_packaged_archive(artifact)
+
+        self.assertTrue(result.complete, result.failures)
+        self.assertEqual(len(result.rows), 1)
+        self.assertEqual(result.rows[0]["coord"], "org.example:demo")
+
     def test_retain_artifact_for_analysis_preserves_exact_bytes_and_updates_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
