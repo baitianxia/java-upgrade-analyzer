@@ -70,6 +70,11 @@ from signature_utils import normalize_signature_for_lookup
 from data_contract_analysis import compare_jar_data_contracts
 from step1_observability import peak_rss_mb
 from analysis_contract import sha256_file
+from artifact_coordinates import (
+    artifact_classifier,
+    artifact_ga,
+    split_artifact_coord,
+)
 from artifact_safety import require_safe_archive
 from constant_impact import extract_constant_field_evidence
 from diagnostic_contract import (
@@ -630,13 +635,20 @@ def infer_package_from_source_path(source_path):
 
 
 def _split_coord(coord: str):
-    parts = (coord or "").strip().split(":")
-    if len(parts) < 2:
+    group_id, artifact_id, classifier = split_artifact_coord(coord)
+    if not group_id or not artifact_id:
         return None, None, None
-    group_id = parts[0].strip()
-    artifact_id = parts[1].strip()
-    classifier = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else None
-    return group_id, artifact_id, classifier
+    return group_id, artifact_id, classifier or None
+
+
+def _artifact_output_stem(coord):
+    _group_id, artifact_id, classifier = _split_coord(coord)
+    artifact_id = artifact_id or "dependency"
+    return (
+        f"{artifact_id}_{classifier}"
+        if classifier
+        else artifact_id
+    )
 
 
 def _resolve_step4_side_coord(row, side, fallback_coord=""):
@@ -1060,7 +1072,11 @@ def _filter_inferred_coords_by_prefix(inferred_coords, coord_prefix):
     if not coord_prefix:
         return list(inferred_coords or [])
     if ":" in coord_prefix:
-        return [item for item in (inferred_coords or []) if item == coord_prefix]
+        coord_ga = artifact_ga(coord_prefix)
+        return [
+            item for item in (inferred_coords or [])
+            if artifact_ga(item) == coord_ga
+        ]
     return [item for item in (inferred_coords or []) if item.startswith(coord_prefix + ":")]
 
 
@@ -2410,7 +2426,7 @@ def compare_jar_method_bodies(
 ):
     """Find same-signature executable changes using immutable final JARs."""
     safe_coord = str(coord or "").strip()
-    artifact = (safe_coord.split(":")[-1] or "dependency").replace(".", "-")
+    artifact = _artifact_output_stem(safe_coord).replace(".", "-")
     evidence_stem = bounded_path_component(
         f"{artifact}_{old_version}_vs_{new_version}",
         max_length=72,
@@ -3038,7 +3054,7 @@ def write_gitdiff_auxiliary_rows(output_dir, coord, rows):
     rows = _enrich_changed_api_rows(rows or [])
     if not rows:
         return ''
-    artifact = (str(coord or '').split(':')[-1] or 'dependency').replace('.', '-')
+    artifact = _artifact_output_stem(coord).replace('.', '-')
     path = os.path.join(output_dir, f"{artifact}_gitdiff_auxiliary_only.csv")
     fields = list(ALL_CHANGED_APIS_FIELDS)
     for extra in ('filter_reason', 'jar_truth'):
@@ -4849,7 +4865,7 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
     module_path = lib_info.get('module_path') or repo_path
     old_ver    = lib_info.get('old_version', '')
     new_ver    = lib_info.get('new_version', '')
-    artifact   = coord.split(':')[-1]
+    artifact = _artifact_output_stem(coord)
     artifact_stem = bounded_path_component(
         artifact,
         max_length=64,
@@ -5573,7 +5589,7 @@ def analyze_changelog(coord, old_ver, new_ver, output_dir):
     实际的联网查询由 AI（thirdparty agent）完成，这里只生成任务文件。
     AI 完成后将结果追加写入 behavior.txt 并更新 all_changed_apis.csv。
     """
-    artifact = coord.split(':')[-1]
+    artifact = _artifact_output_stem(coord)
     safe = artifact.replace('.', '-')
     behavior_stem = bounded_path_component(
         f"{safe}_{old_ver}_vs_{new_ver}",
@@ -7146,8 +7162,11 @@ def main():
                     return 2
                 for matched_coord in matched_coords:
                     location = location_by_coord.get(matched_coord) or {}
+                    artifact_coord = (
+                        coord if artifact_classifier(coord) else matched_coord
+                    )
                     register_dependency_path(
-                        matched_coord,
+                        artifact_coord,
                         location.get("repo_root") or abs_path,
                         location.get("module_dir") or abs_path,
                         mapping,
@@ -7187,6 +7206,29 @@ def main():
                     "repo_inference_all",
                     coords,
                 )
+
+    # POM/Gradle metadata identifies a source module by GA, while Step1 rows
+    # identify physical runtime artifacts by GA plus an optional classifier.
+    # Expand an unqualified module mapping onto each full artifact identity once,
+    # then keep all downstream ref/JAR lookups exact.
+    for row in dep_rows:
+        artifact_coord = str((row or {}).get("coord") or "").strip()
+        module_coord = artifact_ga(artifact_coord)
+        if (
+            not artifact_coord
+            or not module_coord
+            or artifact_coord in dependency_paths
+            or module_coord not in dependency_paths
+        ):
+            continue
+        dependency_paths[artifact_coord] = dict(dependency_paths[module_coord])
+        module_meta = dict(dependency_path_meta.get(module_coord) or {})
+        dependency_path_meta[artifact_coord] = {
+            **module_meta,
+            "coord": artifact_coord,
+            "module_coord": module_coord,
+            "mapping_mode": "ga_module_expansion",
+        }
     timing.record(
         "source_mapping.resolve",
         status="success",

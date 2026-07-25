@@ -11,6 +11,7 @@ import subprocess
 import zipfile
 from pathlib import Path, PureWindowsPath
 
+from artifact_coordinates import artifact_classifier, artifact_ga
 from path_runtime import (
     bounded_path_component,
     git_with_long_paths,
@@ -69,8 +70,7 @@ def extract_zip_safely(archive, destination_root):
 
 
 def _coord_ga(coord):
-    parts = str(coord or "").strip().split(":")
-    return ":".join(parts[:2]) if len(parts) >= 2 else ""
+    return artifact_ga(coord)
 
 
 def _safe_coord(coord):
@@ -136,11 +136,21 @@ def load_step4_current_ref_records(report_dir):
 
 
 def resolve_unique_ref_record(coord, records):
-    coord_ga = _coord_ga(coord)
-    candidates = [
+    exact_candidates = [
         item for item in records or []
-        if item.get("coord") == coord or (_coord_ga(item.get("coord")) and _coord_ga(item.get("coord")) == coord_ga)
+        if str(item.get("coord") or "").strip() == str(coord or "").strip()
     ]
+    if exact_candidates:
+        candidates = exact_candidates
+    elif artifact_classifier(coord):
+        candidates = []
+    else:
+        coord_ga = _coord_ga(coord)
+        candidates = [
+            item for item in records or []
+            if _coord_ga(item.get("coord"))
+            and _coord_ga(item.get("coord")) == coord_ga
+        ]
     if not candidates:
         return None, "step4_current_ref_missing"
     invalid_statuses = sorted({
@@ -338,6 +348,8 @@ def _runtime_item_for_coord(coord, runtime_catalog):
     exact = by_coord.get(coord)
     if exact:
         return dict(exact)
+    if artifact_classifier(coord):
+        return None
     coord_ga = _coord_ga(coord)
     matches = [
         dict(item or {})

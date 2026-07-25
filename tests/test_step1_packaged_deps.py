@@ -634,16 +634,22 @@ class Step1PackagedDepsTest(unittest.TestCase):
     def test_retain_artifact_for_analysis_preserves_exact_bytes_and_updates_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            artifact = root / "build/app.jar"
-            artifact.parent.mkdir()
+            worktree = root / "worktree"
+            artifact = worktree / "app/build/app.jar"
+            artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"exact-artifact")
-            meta = {"artifact_path": str(artifact), "archives": [str(artifact)]}
+            meta = {
+                "artifact_path": str(artifact),
+                "archives": [str(artifact)],
+                "worktree_dir": str(worktree),
+            }
 
             s1_dep_diff.retain_artifact_for_analysis(meta, root / "report" / STEP1_ARTIFACTS_DIRNAME, "current")
 
             retained = Path(meta["artifact_path"])
             self.assertEqual(retained.read_bytes(), b"exact-artifact")
             self.assertEqual(meta["original_artifact_path"], str(artifact))
+            self.assertEqual(meta["artifact_relative_path"], "app/build/app.jar")
             self.assertTrue(meta["artifact_retained"])
             self.assertEqual(meta["archives"], [str(retained)])
 
@@ -1273,6 +1279,34 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(migrated["current_coord"], "new.group:shared")
         self.assertEqual(migrated["pairing_status"], "unique_artifact_migration")
 
+    def test_classifier_compare_key_is_canonical_across_enrichment_shapes(self):
+        embedded = {
+            "coord": "com.example:native:osx-aarch_64",
+            "artifact_id": "native",
+            "classifier": "osx-aarch_64",
+            "version": "1",
+            "resolution_status": "resolved",
+        }
+        manually_enriched = {
+            **embedded,
+            "coord": "com.example:native",
+            "version": "2",
+        }
+
+        self.assertEqual(
+            s1_dep_diff._entry_full_compare_key(embedded),
+            "com.example:native:osx-aarch_64",
+        )
+        rows = s1_dep_diff._build_step1_change_rows(
+            [embedded], [manually_enriched]
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pairing_status"], "exact_coord")
+        self.assertEqual(
+            rows[0]["comparison_key"],
+            "com.example:native:osx-aarch_64",
+        )
+
     def test_build_step1_change_rows_refuses_ambiguous_cross_group_pairing(self):
         rows = s1_dep_diff._build_step1_change_rows(
             [
@@ -1341,6 +1375,153 @@ class Step1PackagedDepsTest(unittest.TestCase):
             packaged_deps["org.example:demo-lib"]["remark"],
             "source:final_artifact(manual_override)",
         )
+
+    def test_manual_coord_override_preserves_distinct_classifiers(self):
+        packaged = [
+            {
+                "entry_id": classifier,
+                "lib_entry": f"BOOT-INF/lib/native-1-{classifier}.jar",
+                "lib_name": f"native-1-{classifier}.jar",
+                "coord": "",
+                "group_id": "",
+                "artifact_id": "native",
+                "version": "1",
+                "classifier": classifier,
+                "match_source": "filename",
+                "filename_stem": f"native-1-{classifier}",
+            }
+            for classifier in ("osx-aarch_64", "osx-x86_64")
+        ]
+        overrides = {
+            ("native", "1"): {
+                "group_id": "com.example",
+                "artifact_id": "native",
+                "coord": "com.example:native",
+            }
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged, {}, overrides
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(
+            set(resolved),
+            {
+                "com.example:native:osx-aarch_64",
+                "com.example:native:osx-x86_64",
+            },
+        )
+        self.assertEqual(
+            {item["coord"] for item in entries},
+            set(resolved),
+        )
+
+    def test_manual_coord_override_parser_accepts_classifier_specific_key(self):
+        overrides, invalid = s1_dep_diff.parse_manual_coord_overrides([
+            "native:1:osx-aarch_64 -> com.example:native",
+            "native:1 -> com.example:native",
+        ])
+
+        self.assertEqual(invalid, [])
+        self.assertEqual(
+            overrides[("native", "1", "osx-aarch_64")]["classifier"],
+            "osx-aarch_64",
+        )
+        self.assertIn(("native", "1"), overrides)
+
+    def test_runtime_enrichment_rejects_different_classifier_candidate(self):
+        packaged = [{
+            "entry_id": "x86",
+            "lib_entry": "BOOT-INF/lib/native-1-osx-x86_64.jar",
+            "lib_name": "native-1-osx-x86_64.jar",
+            "coord": "",
+            "group_id": "",
+            "artifact_id": "native",
+            "version": "1",
+            "classifier": "osx-x86_64",
+            "match_source": "filename",
+            "filename_stem": "native-1-osx-x86_64",
+        }]
+        runtime = {
+            "com.example:native:osx-aarch_64": {
+                "group_id": "com.example",
+                "artifact_id": "native",
+                "version": "1",
+                "classifier": "osx-aarch_64",
+            }
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged, runtime
+            )
+        )
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(
+            [item["classifier"] for item in unresolved],
+            ["osx-x86_64"],
+        )
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
+
+    def test_confirmed_unresolved_item_is_scoped_to_classifier(self):
+        packaged = [
+            {
+                "entry_id": classifier,
+                "lib_entry": f"BOOT-INF/lib/native-1-{classifier}.jar",
+                "lib_name": f"native-1-{classifier}.jar",
+                "coord": f"com.example:native:{classifier}",
+                "group_id": "com.example",
+                "artifact_id": "native",
+                "version": "1",
+                "classifier": classifier,
+                "match_source": "embedded-pom",
+            }
+            for classifier in ("osx-aarch_64", "osx-x86_64")
+        ]
+        runtime = {
+            item["coord"]: {
+                "coord": item["coord"],
+                "group_id": item["group_id"],
+                "artifact_id": item["artifact_id"],
+                "version": item["version"],
+                "classifier": item["classifier"],
+            }
+            for item in packaged
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+                confirmed_unresolved_items=[{
+                    "artifact_id": "native",
+                    "version": "1",
+                    "classifier": "osx-aarch_64",
+                    "entry_id": "osx-aarch_64",
+                    "side": "current",
+                }],
+                side="current",
+            )
+        )
+
+        self.assertEqual(
+            [item["classifier"] for item in unresolved],
+            ["osx-aarch_64"],
+        )
+        self.assertEqual(
+            set(resolved),
+            {"com.example:native:osx-x86_64"},
+        )
+        statuses = {
+            item["classifier"]: item["resolution_status"]
+            for item in entries
+        }
+        self.assertEqual(statuses["osx-aarch_64"], "unresolved")
+        self.assertEqual(statuses["osx-x86_64"], "resolved")
 
     def test_get_packaged_deps_by_switching_branch_forwards_manual_coord_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:

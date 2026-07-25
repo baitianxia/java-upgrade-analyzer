@@ -25,6 +25,7 @@ from compat import (
     run_cmd,
 )
 from compat import git_cmd
+from artifact_coordinates import artifact_ga
 from path_runtime import git_with_long_paths
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
@@ -1762,6 +1763,12 @@ def _discover_dependency_source_candidates(
         for item in (relevant_coords or [])
         if str(item or "").strip()
     }
+    relevant_coords_by_ga = {}
+    for coord in sorted(relevant_coords):
+        coord_ga = artifact_ga(coord)
+        if coord_ga:
+            relevant_coords_by_ga.setdefault(coord_ga, []).append(coord)
+    module_target_coords = set(relevant_coords_by_ga)
     for raw_path in (dependency_source_dirs or []):
         input_path = str(raw_path or "").strip()
         if not input_path:
@@ -1771,11 +1778,11 @@ def _discover_dependency_source_candidates(
             repo_path,
             max_poms=120,
             max_depth=4,
-            target_coords=relevant_coords,
+            target_coords=module_target_coords,
         )
         for location in locations:
-            coord = str(location.get("coord") or "").strip()
-            if not coord:
+            module_coord = str(location.get("coord") or "").strip()
+            if not module_coord:
                 continue
             module_root = str(location.get("module_dir") or repo_path)
             source_dirs = [
@@ -1786,21 +1793,27 @@ def _discover_dependency_source_candidates(
                 )
                 if (Path(module_root) / relative).is_dir()
             ] or [""]
-            for source_dir in source_dirs:
-                key = (coord, repo_path, module_root, source_dir)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(
-                    {
-                        "input_path": input_path,
-                        "repo_path": str(location.get("repo_root") or repo_path),
-                        "module_root": module_root,
-                        "coord": coord,
-                        "source_dir": source_dir,
-                        "discovery_mode": "bounded_manifest_scan",
-                    }
-                )
+            artifact_coords = (
+                relevant_coords_by_ga.get(module_coord)
+                or [module_coord]
+            )
+            for coord in artifact_coords:
+                for source_dir in source_dirs:
+                    key = (coord, repo_path, module_root, source_dir)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(
+                        {
+                            "input_path": input_path,
+                            "repo_path": str(location.get("repo_root") or repo_path),
+                            "module_root": module_root,
+                            "module_coord": module_coord,
+                            "coord": coord,
+                            "source_dir": source_dir,
+                            "discovery_mode": "bounded_manifest_scan",
+                        }
+                    )
     return candidates
 
 

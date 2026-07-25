@@ -24,7 +24,7 @@ ALL_CHANGED_APIS_FIELDS = [
     "conclusion",    # 人工可读结论，如 高风险变更 / 需要复核 / 变更事实
     "change_summary",# 人工可读变化摘要，如 删除方法，foo，参数：String，严重级别：P1
     "review_reason", # 为什么需要看这一行，如 严重级别 P1；来源为 changelog
-    "coord",         # groupId:artifactId — 来自哪个依赖包
+    "coord",         # groupId:artifactId[:classifier] — 来自哪个物理依赖制品
     "old_version",   # 旧版本号
     "new_version",   # 新版本号
     "change_type",   # REMOVED / SIGNATURE_CHANGED / BEHAVIOR_CHANGED / ACCESS_REDUCED

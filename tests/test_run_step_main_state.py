@@ -4398,6 +4398,47 @@ class RunStepMainStateTest(unittest.TestCase):
             [f"com.example:demo-lib={dep_repo.resolve()}"],
         )
 
+    def test_dependency_source_plan_expands_module_ga_to_classifier_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dep_repo = Path(tmp) / "native-repo"
+            source_dir = dep_repo / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            (dep_repo / "pom.xml").write_text(
+                (
+                    "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">"
+                    "<modelVersion>4.0.0</modelVersion>"
+                    "<groupId>com.example</groupId>"
+                    "<artifactId>native</artifactId>"
+                    "<version>1.0.0</version>"
+                    "</project>"
+                ),
+                encoding="utf-8",
+            )
+
+            plan = run_step._build_dependency_source_plan(
+                [str(dep_repo)],
+                relevant_coords=[
+                    "com.example:native:osx-aarch_64",
+                    "com.example:native:osx-x86_64",
+                ],
+            )
+
+        self.assertEqual(
+            plan["dependency_repo_mappings"],
+            [
+                f"com.example:native:osx-aarch_64={dep_repo.resolve()}",
+                f"com.example:native:osx-x86_64={dep_repo.resolve()}",
+            ],
+        )
+        self.assertEqual(
+            plan["dependency_source_mappings"],
+            [
+                f"com.example:native:osx-aarch_64={source_dir.resolve()}",
+                f"com.example:native:osx-x86_64={source_dir.resolve()}",
+            ],
+        )
+        self.assertEqual(plan["unmatched_relevant_coords"], [])
+
     def test_build_run_context_expands_group_prefix_dependency_repo_mappings(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)

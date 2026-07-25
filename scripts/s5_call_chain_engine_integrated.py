@@ -35,6 +35,7 @@ import traceback
 import zipfile
 from collections import defaultdict, deque
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,7 +60,7 @@ from confidence_weighted_tracer import (
 )
 from enhanced_output_formatter import generate_enhanced_summary, register_step5_summary_artifacts
 import compat as compat_module
-from compat import run_cmd
+from compat import git_cmd, run_cmd
 from csv_io import open_csv_read, open_csv_write
 from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_batch
@@ -84,6 +85,7 @@ from step5_artifact_fact_store import Step5ArtifactFactStore
 from step5_diagnostics import Step5DiagnosticRecorder
 from signature_utils import normalize_signature_for_identity, signatures_match_identity
 from analysis_contract import build_project_scope, discover_project_modules, sha256_file
+from artifact_coordinates import artifact_classifier, artifact_ga
 from artifact_safety import require_safe_archive
 from diagnostic_contract import normalize_diagnostic_payload
 from pipeline_constants import (
@@ -103,6 +105,7 @@ from pipeline_constants import (
     STEP5_QUERY_INDEX_FILE,
     STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
 )
+from path_runtime import create_detached_worktree, remove_detached_worktree
 from s5_query_call_chain import write_query_index
 from dependency_source_alignment import align_dependency_source_mappings
 from artifact_alignment import build_artifact_alignment
@@ -217,6 +220,176 @@ def load_context_source_dirs(context_path):
             f"STEP5_CONTEXT_PARSE_FAILED:{path}:source_dirs must be a string list"
         )
     return source_dirs
+
+
+def load_current_build_provenance(report_dir):
+    provenance_path = _build_provenance_path(report_dir)
+    if not provenance_path.is_file():
+        return {}
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return next(
+        (
+            dict(item)
+            for item in provenance.get("sides") or []
+            if isinstance(item, dict) and item.get("side") == "current"
+        ),
+        {},
+    )
+
+
+def resolve_configured_step5_business_source_dirs(args, report_dir):
+    orchestrated_input = load_orchestrated_step5_input(report_dir)
+    context_source_dirs = load_context_source_dirs(_context_path(report_dir))
+    source_dirs = (
+        orchestrated_input.get("source_dirs")
+        if orchestrated_input.get("source_dirs")
+        else (
+            getattr(args, "source_dirs", None)
+            if getattr(args, "source_dirs", None)
+            else context_source_dirs
+        )
+    )
+    if isinstance(source_dirs, str):
+        source_dirs = [source_dirs]
+    return [
+        str(item).strip()
+        for item in source_dirs or []
+        if str(item or "").strip()
+    ]
+
+
+def _step5_git_output(cwd, *args):
+    stdout, stderr, rc = run_cmd(
+        git_cmd() + ["-C", str(cwd), *args],
+        timeout=300,
+    )
+    return str(stdout or "").strip(), str(stderr or "").strip(), rc
+
+
+def _step5_source_git_root(source_dir):
+    stdout, _stderr, rc = _step5_git_output(
+        source_dir, "rev-parse", "--show-toplevel",
+    )
+    return Path(stdout).resolve() if rc == 0 and stdout else None
+
+
+@contextmanager
+def materialize_step5_business_source_workspace(report_dir, source_dirs):
+    """Pin checkout-built business sources to the Step1 current commit for Step5."""
+    original_dirs = [
+        str(Path(item).expanduser().resolve())
+        for item in source_dirs or []
+        if str(item or "").strip()
+    ]
+    current = load_current_build_provenance(report_dir)
+    source_mode = str(current.get("source_mode") or "").strip()
+    expected_commit = str(current.get("revision") or "").strip().lower()
+    metadata = {
+        "mode": "configured_sources",
+        "source_mode": source_mode,
+        "expected_commit": expected_commit,
+        "source_dirs": list(original_dirs),
+        "git_root": "",
+        "temporary_worktree": "",
+    }
+
+    # Direct-artifact inputs can be bound to source in several user-defined ways.
+    # Only checkout_build has a Step1-created commit that we can enforce here.
+    if (
+        source_mode != "checkout_build"
+        or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_commit)
+        or not original_dirs
+    ):
+        yield metadata
+        return
+
+    source_paths = [Path(item) for item in original_dirs]
+    missing = [str(path) for path in source_paths if not path.is_dir()]
+    if missing:
+        raise RuntimeError(
+            "STEP5_BUSINESS_SOURCE_DIR_MISSING:"
+            + ",".join(missing[:10])
+        )
+
+    roots = [_step5_source_git_root(path) for path in source_paths]
+    if any(root is None for root in roots):
+        raise RuntimeError(
+            "STEP5_BUSINESS_SOURCE_NOT_GIT:"
+            + ",".join(
+                str(path)
+                for path, root in zip(source_paths, roots)
+                if root is None
+            )[:1200]
+        )
+    unique_roots = {str(root) for root in roots}
+    if len(unique_roots) != 1:
+        raise RuntimeError(
+            "STEP5_BUSINESS_SOURCE_MULTIPLE_GIT_ROOTS:"
+            + ",".join(sorted(unique_roots))[:1200]
+        )
+    git_root = roots[0]
+    metadata["git_root"] = str(git_root)
+
+    resolved_commit, commit_stderr, commit_rc = _step5_git_output(
+        git_root,
+        "rev-parse",
+        "--verify",
+        f"{expected_commit}^{{commit}}",
+    )
+    if commit_rc != 0 or resolved_commit.lower() != expected_commit:
+        raise RuntimeError(
+            "STEP5_CURRENT_COMMIT_UNAVAILABLE:"
+            f"{expected_commit}:{commit_stderr or resolved_commit or 'not found'}"
+        )
+
+    head, _head_stderr, head_rc = _step5_git_output(
+        git_root, "rev-parse", "HEAD",
+    )
+    status, status_stderr, status_rc = _step5_git_output(
+        git_root, "status", "--porcelain=v1", "--untracked-files=all",
+    )
+    if status_rc != 0:
+        raise RuntimeError(
+            "STEP5_BUSINESS_SOURCE_STATUS_FAILED:"
+            + (status_stderr or "git status failed")
+        )
+    if head_rc == 0 and head.lower() == expected_commit and not status:
+        metadata["mode"] = "existing_clean_checkout"
+        yield metadata
+        return
+
+    worktree = create_detached_worktree(
+        expected_commit,
+        git_root,
+        label="s5-src",
+        runner=run_cmd,
+        git_command=git_cmd(),
+    )
+    metadata["mode"] = "detached_commit_workspace"
+    metadata["temporary_worktree"] = str(worktree)
+    mapped_dirs = []
+    try:
+        for path in source_paths:
+            relative = path.relative_to(git_root)
+            mapped = worktree / relative
+            if not mapped.is_dir():
+                raise RuntimeError(
+                    "STEP5_BUSINESS_SOURCE_MISSING_AT_COMMIT:"
+                    f"{relative.as_posix()}:{expected_commit}"
+                )
+            mapped_dirs.append(str(mapped))
+        metadata["source_dirs"] = mapped_dirs
+        yield metadata
+    finally:
+        remove_detached_worktree(
+            worktree,
+            git_root,
+            runner=run_cmd,
+            git_command=git_cmd(),
+        )
 
 
 def _source_mapping_summary_path(report_dir):
@@ -689,9 +862,51 @@ def step5_integrated_main(args):
     ).start()
     previous_memory_observer = set_active_process_tree_observer(process_observer)
     previous_command_observer = compat_module.set_process_observer(process_observer)
+    had_materialized_dirs = hasattr(args, "_materialized_business_source_dirs")
+    previous_materialized_dirs = getattr(args, "_materialized_business_source_dirs", None)
+    had_workspace_metadata = hasattr(args, "_business_source_workspace")
+    previous_workspace_metadata = getattr(args, "_business_source_workspace", None)
     try:
-        return _step5_integrated_main_impl(args)
+        report_dir = infer_step5_report_dir(args)
+        configured_source_dirs = resolve_configured_step5_business_source_dirs(
+            args, report_dir,
+        )
+        prepare_started = time.perf_counter()
+        with materialize_step5_business_source_workspace(
+            report_dir, configured_source_dirs,
+        ) as workspace:
+            args._materialized_business_source_dirs = list(
+                workspace.get("source_dirs") or []
+            )
+            args._business_source_workspace = dict(workspace)
+            mode = str(workspace.get("mode") or "configured_sources")
+            if mode == "detached_commit_workspace":
+                print(
+                    "  Step5 已按 current commit 创建临时源码 worktree："
+                    f"{workspace.get('expected_commit')}",
+                    file=sys.stderr,
+                )
+            elif mode == "existing_clean_checkout":
+                print(
+                    "  Step5 复用与 current commit 一致的干净业务源码工作区",
+                    file=sys.stderr,
+                )
+            emit_progress(
+                "step5",
+                "source-workspace",
+                f"业务源码工作区准备完成（{mode}）",
+                elapsed=time.perf_counter() - prepare_started,
+            )
+            return _step5_integrated_main_impl(args)
     finally:
+        if had_materialized_dirs:
+            args._materialized_business_source_dirs = previous_materialized_dirs
+        else:
+            args.__dict__.pop("_materialized_business_source_dirs", None)
+        if had_workspace_metadata:
+            args._business_source_workspace = previous_workspace_metadata
+        else:
+            args.__dict__.pop("_business_source_workspace", None)
         compat_module.set_process_observer(previous_command_observer)
         process_observer.stop()
         set_active_process_tree_observer(previous_memory_observer)
@@ -950,18 +1165,23 @@ def _step5_integrated_main_impl(args):
 
     # Phase 2: 正式流程优先使用 main_state 中已确认的 Step5 输入；调试模式才使用 CLI
     context_path = str(_context_path(report_dir))
-    context_source_dirs = []
-
     context_source_dirs = load_context_source_dirs(context_path)
 
     # 业务源码目录来源优先级：
     # 1. 正式流程：main_state.step5.input.source_dirs
     # 2. 调试模式：命令行 args.source_dirs
     # 3. 当前报告 evidence/context/context.json
+    materialized_source_dirs = getattr(
+        args, "_materialized_business_source_dirs", None,
+    )
     business_source_dirs = (
-        orchestrated_input.get("source_dirs")
-        if orchestrated_input.get("source_dirs")
-        else (args.source_dirs if args.source_dirs else context_source_dirs)
+        materialized_source_dirs
+        if materialized_source_dirs is not None
+        else (
+            orchestrated_input.get("source_dirs")
+            if orchestrated_input.get("source_dirs")
+            else (args.source_dirs if args.source_dirs else context_source_dirs)
+        )
     )
 
     if not business_source_dirs:
@@ -999,7 +1219,18 @@ def _step5_integrated_main_impl(args):
         output_dir=os.path.abspath(output_dir),
         all_changed_apis_path=os.path.abspath(all_changed_apis_path),
         business_source_dirs=list(business_source_dirs or []),
-        input_source='main_state' if orchestrated_input.get("source_dirs") else ('cli' if args.source_dirs else 'context'),
+        input_source=(
+            "commit_workspace"
+            if materialized_source_dirs is not None
+            else (
+                'main_state'
+                if orchestrated_input.get("source_dirs")
+                else ('cli' if args.source_dirs else 'context')
+            )
+        ),
+        source_workspace=dict(
+            getattr(args, "_business_source_workspace", {}) or {}
+        ),
         orchestrated=bool(orchestrated_input),
     )
 
@@ -2274,10 +2505,7 @@ def build_source_roots(source_dirs, dependency_source_mappings):
 
 
 def _coord_ga(coord):
-    parts = str(coord or '').strip().split(':')
-    if len(parts) < 2:
-        return ''
-    return ':'.join(parts[:2])
+    return artifact_ga(coord)
 
 
 def filter_dependency_source_mappings_for_runtime(dependency_source_mappings, runtime_dependency_catalog):
@@ -2300,7 +2528,11 @@ def filter_dependency_source_mappings_for_runtime(dependency_source_mappings, ru
     if not mappings or not runtime_coords:
         return mappings, []
 
-    runtime_ga = {_coord_ga(coord) for coord in runtime_coords if _coord_ga(coord)}
+    runtime_by_ga = defaultdict(list)
+    for runtime_coord in sorted(runtime_coords):
+        coord_ga = _coord_ga(runtime_coord)
+        if coord_ga:
+            runtime_by_ga[coord_ga].append(runtime_coord)
     kept = []
     skipped = []
     seen_kept = set()
@@ -2315,16 +2547,27 @@ def filter_dependency_source_mappings_for_runtime(dependency_source_mappings, ru
             continue
         coord, path = raw.split('=', 1)
         coord = coord.strip()
+        path = path.strip()
         coord_key = _coord_ga(coord)
-        if coord in runtime_coords or (coord_key and coord_key in runtime_ga):
-            if raw not in seen_kept:
-                kept.append(raw)
-                seen_kept.add(raw)
+        if artifact_classifier(coord):
+            matched_runtime_coords = [coord] if coord in runtime_coords else []
+        else:
+            matched_runtime_coords = list(runtime_by_ga.get(coord_key) or [])
+        if matched_runtime_coords:
+            for runtime_coord in matched_runtime_coords:
+                normalized = f"{runtime_coord}={path}"
+                if normalized not in seen_kept:
+                    kept.append(normalized)
+                    seen_kept.add(normalized)
             continue
         skipped.append({
             'mapping': raw,
             'coord': coord,
-            'reason': 'dependency_source_not_in_current_runtime_catalog',
+            'reason': (
+                'dependency_source_classifier_not_in_current_runtime_catalog'
+                if artifact_classifier(coord)
+                else 'dependency_source_not_in_current_runtime_catalog'
+            ),
         })
     return kept, skipped
 
@@ -2783,17 +3026,7 @@ def runtime_business_class_index(runtime_dependency_catalog):
 
 
 def assess_source_artifact_alignment(report_dir, business_source_dirs):
-    provenance_path = _build_provenance_path(report_dir)
-    current = {}
-    if provenance_path.is_file():
-        try:
-            provenance = json.loads(provenance_path.read_text(encoding='utf-8'))
-            current = next(
-                (item for item in provenance.get('sides') or [] if item.get('side') == 'current'),
-                {},
-            )
-        except (OSError, json.JSONDecodeError):
-            current = {}
+    current = load_current_build_provenance(report_dir)
     source_root = str((business_source_dirs or [''])[0] or '')
     git_root = revision = ''
     dirty = None
@@ -2817,13 +3050,14 @@ def assess_source_artifact_alignment(report_dir, business_source_dirs):
     else:
         alignment = build_artifact_alignment(
             git_root,
-            current.get('original_artifact_path') or current.get('artifact_path') or '',
+            current.get('artifact_path') or '',
             target_module=current.get('target_module') or '',
             build_command=(str(current.get('build_command') or ''),),
             build_profile=current.get('build_profile') or '',
             expected_revision=expected_revision,
             expected_sha256=current.get('artifact_sha256') or '',
             internally_built=source_mode == 'checkout_build',
+            artifact_relative_path=current.get('artifact_relative_path') or '',
         )
         reason_map = {
             'source_revision_mismatch': 'source_revision_differs_from_build_revision',

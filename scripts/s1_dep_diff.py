@@ -34,6 +34,7 @@ from analysis_contract import (
     sha256_file,
 )
 from artifact_safety import _unsafe_entry_name, require_safe_archive
+from artifact_coordinates import normalize_artifact_coord
 from diagnostic_contract import (
     DEPENDENCY_COORDINATES_UNRESOLVED,
     normalize_diagnostic_payload,
@@ -89,6 +90,14 @@ def retain_artifact_for_analysis(meta, artifact_cache_dir, side):
     if not artifact_path or not artifact_cache_dir or not Path(artifact_path).is_file():
         return meta
     source_artifact = Path(artifact_path).resolve()
+    worktree_dir = str((meta or {}).get('worktree_dir') or '').strip()
+    if worktree_dir and not str((meta or {}).get('artifact_relative_path') or '').strip():
+        try:
+            meta['artifact_relative_path'] = source_artifact.relative_to(
+                Path(worktree_dir).resolve()
+            ).as_posix()
+        except ValueError:
+            meta['artifact_relative_path'] = ''
     cache_dir = Path(artifact_cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     suffix = ''.join(source_artifact.suffixes) or '.jar'
@@ -753,8 +762,11 @@ def _normalize_unresolved_label(item):
     if isinstance(item, dict):
         artifact_id = str(item.get("artifact_id") or "").strip()
         version = str(item.get("version") or "").strip()
+        classifier = str(item.get("classifier") or "").strip()
         source = str(item.get("source") or "").strip()
         label = f"{artifact_id or '<unknown-artifact>'}:{version or '<unknown-version>'}"
+        if classifier:
+            label = f"{label}:{classifier}"
         if source:
             label = f"{label} [{source}]"
         return label
@@ -769,6 +781,11 @@ def normalize_unresolved_items(unresolved_items):
             normalized_item = {
                 "artifact_id": str(item.get("artifact_id") or "").strip(),
                 "version": str(item.get("version") or "").strip(),
+                "classifier": str(item.get("classifier") or "").strip(),
+                "entry_id": str(item.get("entry_id") or "").strip(),
+                "lib_entry": str(item.get("lib_entry") or "").strip(),
+                "lib_name": str(item.get("lib_name") or "").strip(),
+                "side": str(item.get("side") or "").strip(),
                 "source": str(item.get("source") or "").strip(),
             }
             normalized_item["label"] = _normalize_unresolved_label(normalized_item)
@@ -780,12 +797,21 @@ def normalize_unresolved_items(unresolved_items):
             normalized_item = {
                 "artifact_id": artifact_id.strip(),
                 "version": version.strip(),
+                "classifier": "",
+                "entry_id": "",
+                "lib_entry": "",
+                "lib_name": "",
+                "side": "",
                 "source": "",
                 "label": label,
             }
         dedupe_key = (
             normalized_item.get("artifact_id", ""),
             normalized_item.get("version", ""),
+            normalized_item.get("classifier", ""),
+            normalized_item.get("entry_id", ""),
+            normalized_item.get("lib_entry", ""),
+            normalized_item.get("side", ""),
             normalized_item.get("source", ""),
             normalized_item.get("label", ""),
         )
@@ -1026,7 +1052,7 @@ def build_step1_coordinate_followup_interaction(
         "manual_coord_overrides": {
             "type": "array",
             "description": (
-                "可选。补充本轮新增坐标，格式为 artifact:version -> group:artifact；"
+                "可选。补充本轮新增坐标，格式为 artifact:version[:classifier] -> group:artifact；"
                 "系统会与前几轮已提交的坐标合并。"
             ),
         },
@@ -1040,7 +1066,7 @@ def build_step1_coordinate_followup_interaction(
     ]
     if unresolved_labels:
         checklist_lines.append("未识别的嵌套依赖: " + ", ".join(unresolved_labels[:10]))
-        checklist_lines.append("允许人工补充坐标，格式：artifact:version -> group:artifact")
+        checklist_lines.append("允许人工补充坐标，格式：artifact:version[:classifier] -> group:artifact")
         checklist_lines.append("未补齐的 unresolved 会保留在 s1_dep_changes.csv，并标记为 unresolved；后续步骤会跳过这些行。")
     if branch_value:
         checklist_lines.append(f"已尝试的 {side_cn}分支: {branch_value}")
@@ -1168,7 +1194,7 @@ def build_step1_coordinate_followup_interaction(
                 "必须忠实保留用户提供的模块名、源码目录，不得脑补。",
                 "如果用户补充了 primary_module，应确保它与编译产物所属模块一致。",
                 "若用户未提供能改变补全结果的新信息，不要直接继续重试。",
-                "如果用户人工补充坐标，统一整理成 artifact:version -> group:artifact。",
+                "如果用户人工补充坐标，统一整理成 artifact:version[:classifier] -> group:artifact。",
                 "如果用户明确接受 unresolved 保留并继续，应使用 action=confirm_unresolved。",
             ],
         },
@@ -1197,15 +1223,24 @@ def parse_manual_coord_overrides(raw_values):
         if ":" not in left or ":" not in right:
             invalid_entries.append(text)
             continue
-        artifact_id, version = [part.strip() for part in left.split(":", 1)]
+        left_parts = [part.strip() for part in left.split(":", 2)]
+        artifact_id = left_parts[0]
+        version = left_parts[1] if len(left_parts) >= 2 else ""
+        classifier = left_parts[2] if len(left_parts) >= 3 else ""
         group_id, target_artifact_id = [part.strip() for part in right.split(":", 1)]
         if not artifact_id or not version or not group_id or not target_artifact_id:
             invalid_entries.append(text)
             continue
-        overrides[(artifact_id, version)] = {
+        key = (
+            (artifact_id, version, classifier)
+            if classifier
+            else (artifact_id, version)
+        )
+        overrides[key] = {
             "group_id": group_id,
             "artifact_id": target_artifact_id,
             "coord": f"{group_id}:{target_artifact_id}",
+            "classifier": classifier,
             "raw": text,
         }
     return overrides, invalid_entries
@@ -2719,6 +2754,7 @@ def _enrich_packaged_deps_with_runtime(
     runtime_deps,
     manual_coord_overrides=None,
     confirmed_unresolved_items=None,
+    side="",
 ):
     """Use runtime metadata to补齐坐标, while keeping packaged-artifact version facts authoritative."""
     normalized_runtime_deps = {}
@@ -2731,10 +2767,13 @@ def _enrich_packaged_deps_with_runtime(
         if len(coord_parts) >= 2:
             item.setdefault('group_id', coord_parts[0])
             item.setdefault('artifact_id', coord_parts[1])
-            item.setdefault('coord', ':'.join(coord_parts[:2]))
             if len(coord_parts) > 2:
                 item.setdefault('classifier', ':'.join(coord_parts[2:]))
-        normalized_runtime_deps[str(runtime_coord)] = item
+            item['coord'] = normalize_artifact_coord(
+                item.get('coord') or runtime_coord,
+                item.get('classifier'),
+            )
+        normalized_runtime_deps[item.get('coord') or str(runtime_coord)] = item
         artifact_id = item.get('artifact_id')
         version = item.get('version')
         if artifact_id and version:
@@ -2749,12 +2788,40 @@ def _enrich_packaged_deps_with_runtime(
     runtime_deps = normalized_runtime_deps
 
     manual_coord_overrides = manual_coord_overrides or {}
-    confirmed_unresolved_map = {}
-    for item in normalize_unresolved_items(confirmed_unresolved_items):
-        key = ((item.get('artifact_id') or '').strip(), (item.get('version') or '').strip())
-        if key == ('', ''):
-            continue
-        confirmed_unresolved_map[key] = item
+    confirmed_unresolved_items = normalize_unresolved_items(
+        confirmed_unresolved_items
+    )
+
+    def confirmed_unresolved_for(packaged_item):
+        artifact_id = str(packaged_item.get('artifact_id') or '').strip()
+        version = str(packaged_item.get('version') or '').strip()
+        classifier = str(packaged_item.get('classifier') or '').strip()
+        entry_id = str(packaged_item.get('entry_id') or '').strip()
+        lib_entry = str(packaged_item.get('lib_entry') or '').strip()
+        packaged_side = str(
+            packaged_item.get('side') or side or ''
+        ).strip()
+        for confirmed in confirmed_unresolved_items:
+            if (
+                str(confirmed.get('artifact_id') or '').strip() != artifact_id
+                or str(confirmed.get('version') or '').strip() != version
+            ):
+                continue
+            selectors = (
+                ('classifier', classifier),
+                ('entry_id', entry_id),
+                ('lib_entry', lib_entry),
+                ('side', packaged_side),
+            )
+            if any(
+                str(confirmed.get(field) or '').strip()
+                and str(confirmed.get(field) or '').strip() != value
+                for field, value in selectors
+            ):
+                continue
+            return confirmed
+        return None
+
     entries = []
     resolved = {}
     unresolved = []
@@ -2767,9 +2834,33 @@ def _enrich_packaged_deps_with_runtime(
         if coord and coord in runtime_deps:
             runtime_match = runtime_deps.get(coord)
         elif item.get('artifact_id') and item.get('version'):
-            manual_override = manual_coord_overrides.get((item.get('artifact_id'), item.get('version')))
-            candidates = runtime_by_filename_artifact_version.get((item.get('artifact_id'), item.get('version')), [])
-            if not candidates:
+            item_classifier = str(item.get('classifier') or '').strip()
+            manual_override = (
+                manual_coord_overrides.get((
+                    item.get('artifact_id'),
+                    item.get('version'),
+                    item_classifier,
+                ))
+                or manual_coord_overrides.get((
+                    item.get('artifact_id'),
+                    item.get('version'),
+                ))
+            )
+            candidates = (
+                runtime_by_filename_artifact_version.get(
+                    (
+                        f"{item.get('artifact_id')}-{item_classifier}",
+                        item.get('version'),
+                    ),
+                    [],
+                )
+                if item_classifier
+                else runtime_by_filename_artifact_version.get(
+                    (item.get('artifact_id'), item.get('version')),
+                    [],
+                )
+            )
+            if not candidates and not item_classifier:
                 candidates = runtime_by_artifact_version.get((item.get('artifact_id'), item.get('version')), [])
             if len(candidates) == 1:
                 runtime_match = candidates[0]
@@ -2780,22 +2871,32 @@ def _enrich_packaged_deps_with_runtime(
         if manual_override:
             enriched['group_id'] = manual_override.get('group_id') or enriched.get('group_id', '')
             enriched['artifact_id'] = manual_override.get('artifact_id') or enriched.get('artifact_id', '')
-            enriched['coord'] = manual_override.get('coord') or enriched.get('coord', '')
+            enriched['coord'] = normalize_artifact_coord(
+                manual_override.get('coord') or enriched.get('coord', ''),
+                enriched.get('classifier'),
+            )
             enriched['match_source'] = 'manual_override'
-        confirmed_unresolved = confirmed_unresolved_map.get(
-            ((item.get('artifact_id') or '').strip(), (item.get('version') or '').strip())
-        )
+        confirmed_unresolved = confirmed_unresolved_for(item)
         if confirmed_unresolved and not manual_override:
             unresolved_item = {
                 'artifact_id': (item.get('artifact_id') or '').strip() or '<unknown-artifact>',
                 'version': (item.get('version') or '').strip() or '<unknown-version>',
+                'classifier': (item.get('classifier') or '').strip(),
                 'source': confirmed_unresolved.get('source') or enriched.get('match_source', 'archive'),
                 'entry_id': enriched.get('entry_id', ''),
                 'lib_entry': enriched.get('lib_entry', ''),
                 'lib_name': enriched.get('lib_name', ''),
             }
             unresolved.append(unresolved_item)
-            display_coord = f"{unresolved_item['artifact_id']}:{unresolved_item['version']}".strip(':')
+            display_coord = normalize_artifact_coord(
+                enriched.get('coord'),
+                unresolved_item.get('classifier'),
+            )
+            if not display_coord:
+                display_coord = (
+                    f"{unresolved_item['artifact_id']}:{unresolved_item['version']}"
+                    f"{':' + unresolved_item['classifier'] if unresolved_item.get('classifier') else ''}"
+                ).strip(':')
             entries.append({
                 'entry_id': enriched.get('entry_id', ''),
                 'lib_entry': enriched.get('lib_entry', ''),
@@ -2836,10 +2937,10 @@ def _enrich_packaged_deps_with_runtime(
             # Step1 keeps the packaged-artifact version whenever it is already trustworthy.
             enriched['version'] = normalized_packaged_version or runtime_version or enriched.get('version', '')
             classifier = runtime_match.get('classifier') or ''
-            coord = f"{enriched.get('group_id')}:{enriched.get('artifact_id')}".strip(':')
-            if classifier:
-                coord = f"{coord}:{classifier}"
-            enriched['coord'] = coord
+            enriched['coord'] = normalize_artifact_coord(
+                f"{enriched.get('group_id')}:{enriched.get('artifact_id')}",
+                classifier,
+            )
             enriched['classifier'] = classifier
 
         coord = (enriched.get('coord') or '').strip()
@@ -2850,13 +2951,17 @@ def _enrich_packaged_deps_with_runtime(
             unresolved_item = {
                 'artifact_id': artifact_id or '<unknown-artifact>',
                 'version': version or '<unknown-version>',
+                'classifier': (enriched.get('classifier') or '').strip(),
                 'source': enriched.get('match_source', 'archive'),
                 'entry_id': enriched.get('entry_id', ''),
                 'lib_entry': enriched.get('lib_entry', ''),
                 'lib_name': enriched.get('lib_name', ''),
             }
             unresolved.append(unresolved_item)
-            display_coord = f"{unresolved_item['artifact_id']}:{unresolved_item['version']}".strip(':')
+            display_coord = (
+                f"{unresolved_item['artifact_id']}:{unresolved_item['version']}"
+                f"{':' + unresolved_item['classifier'] if unresolved_item.get('classifier') else ''}"
+            ).strip(':')
             entries.append({
                 'entry_id': enriched.get('entry_id', ''),
                 'lib_entry': enriched.get('lib_entry', ''),
@@ -3275,6 +3380,7 @@ def collect_maven_deps_for_workspace(
                 runtime_deps,
                 manual_coord_overrides=manual_coord_overrides,
                 confirmed_unresolved_items=confirmed_unresolved_items,
+                side=side,
             )
             if unresolved_items and not allow_unresolved:
                 raise UnresolvedPackagedCoordinatesError(unresolved_items, resolved_deps=packaged_deps)
@@ -3419,6 +3525,7 @@ def collect_gradle_deps_for_workspace(
                 runtime_deps,
                 manual_coord_overrides=manual_coord_overrides,
                 confirmed_unresolved_items=confirmed_unresolved_items,
+                side=side,
             )
             if unresolved_items and not allow_unresolved:
                 raise UnresolvedPackagedCoordinatesError(
@@ -3520,6 +3627,7 @@ def collect_packaged_deps_from_artifact_path(
             resolved_runtime_deps,
             manual_coord_overrides=manual_coord_overrides,
             confirmed_unresolved_items=confirmed_unresolved_items,
+            side=side,
         )
     if unresolved_items and not allow_unresolved:
         raise ArtifactCoordinateInputRequiredError(
@@ -4006,7 +4114,10 @@ def _entry_sort_key(entry):
 def _display_coord(entry):
     if not entry:
         return ''
-    coord = str(entry.get('coord') or '').strip()
+    coord = normalize_artifact_coord(
+        entry.get('coord'),
+        entry.get('classifier'),
+    )
     if coord:
         return coord
     artifact_id = str(entry.get('artifact_id') or '').strip()
@@ -4019,15 +4130,14 @@ def _display_coord(entry):
 def _resolved_coord(entry):
     if not entry:
         return ''
-    return str(entry.get('coord') or '').strip()
+    return normalize_artifact_coord(
+        entry.get('coord'),
+        entry.get('classifier'),
+    )
 
 
 def _entry_full_compare_key(entry):
-    coord = _resolved_coord(entry)
-    if not coord:
-        return ''
-    classifier = str((entry or {}).get('classifier') or '').strip()
-    return f"{coord}:{classifier}" if classifier else coord
+    return _resolved_coord(entry)
 
 
 def _make_step1_change_row(base_entry, current_entry, comparison_key, pairing_status, pairing_reason_code=''):
@@ -4166,7 +4276,7 @@ def main():
     ap.add_argument('--active-maven-profile', action='append', default=[],
                     help='显式激活 Maven profile，可重复传入。正式流程从主状态读取。')
     ap.add_argument('--manual-coord-override', action='append', default=[],
-                    help='人工补充坐标，格式 artifact:version -> group:artifact，可重复传入。')
+                    help='人工补充坐标，格式 artifact:version[:classifier] -> group:artifact，可重复传入。')
     ap.add_argument('--confirmed-unresolved-item', action='append', default=[],
                     help='已由人工确认保留的 unresolved 项，内部使用，值为 JSON 对象。')
     ap.add_argument('--allow-unresolved', action='store_true',
@@ -4216,7 +4326,7 @@ def main():
 
     manual_coord_overrides, invalid_manual_overrides = parse_manual_coord_overrides(args.manual_coord_override)
     if invalid_manual_overrides:
-        print("❌ 以下人工坐标格式不合法（应为 artifact:version -> group:artifact）：", file=sys.stderr)
+        print("❌ 以下人工坐标格式不合法（应为 artifact:version[:classifier] -> group:artifact）：", file=sys.stderr)
         for item in invalid_manual_overrides:
             print(f"  - {item}", file=sys.stderr)
         sys.exit(1)
@@ -4808,6 +4918,7 @@ def main():
             'build_tool': str((meta or {}).get('build_tool') or args.tool or 'maven'),
             'artifact_path': artifact_path,
             'original_artifact_path': str((meta or {}).get('original_artifact_path') or artifact_path),
+            'artifact_relative_path': str((meta or {}).get('artifact_relative_path') or ''),
             'artifact_sha256': artifact_hash,
             'build_succeeded': bool(artifact_path),
             'project_scope_hash': str((meta or {}).get('project_scope_hash') or ''),

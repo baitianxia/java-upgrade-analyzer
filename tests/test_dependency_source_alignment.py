@@ -17,6 +17,61 @@ import s5_call_chain_engine_integrated as step5  # noqa: E402
 
 
 class DependencySourceAlignmentTest(unittest.TestCase):
+    def test_classifier_specific_lookup_never_falls_back_to_another_artifact(self):
+        records = [{
+            "coord": "com.example:native:osx-aarch_64",
+            "repo_path": "/repo",
+            "module_rel_path": ".",
+            "current_ref": "abc123",
+            "source_status": "remote_source_resolved",
+        }]
+        catalog = {
+            "by_coord": {
+                "com.example:native:osx-aarch_64": {
+                    "coord": "com.example:native:osx-aarch_64",
+                }
+            }
+        }
+
+        record, reason = alignment.resolve_unique_ref_record(
+            "com.example:native:osx-x86_64", records
+        )
+
+        self.assertIsNone(record)
+        self.assertEqual(reason, "step4_current_ref_missing")
+        self.assertIsNone(alignment._runtime_item_for_coord(
+            "com.example:native:osx-x86_64", catalog
+        ))
+        self.assertEqual(
+            alignment._runtime_item_for_coord("com.example:native", catalog),
+            {"coord": "com.example:native:osx-aarch_64"},
+        )
+
+    def test_exact_classifier_ref_takes_precedence_over_other_ga_records(self):
+        records = [
+            {
+                "coord": "com.example:native:osx-aarch_64",
+                "repo_path": "/wrong",
+                "module_rel_path": ".",
+                "current_ref": "wrong",
+                "source_status": "missing",
+            },
+            {
+                "coord": "com.example:native:osx-x86_64",
+                "repo_path": "/right",
+                "module_rel_path": ".",
+                "current_ref": "right",
+                "source_status": "remote_source_resolved",
+            },
+        ]
+
+        record, reason = alignment.resolve_unique_ref_record(
+            "com.example:native:osx-x86_64", records
+        )
+
+        self.assertEqual(reason, "")
+        self.assertEqual(record["repo_path"], "/right")
+
     def test_safe_zip_extraction_rejects_traversal_and_symlink_members(self):
         payload = io.BytesIO()
         with zipfile.ZipFile(payload, "w") as archive:

@@ -23,6 +23,21 @@ import s4_jar_compare as step4  # noqa: E402
 
 
 class Step4StabilityTest(unittest.TestCase):
+    def test_classifier_artifact_maps_to_ga_source_module_and_unique_stem(self):
+        self.assertEqual(
+            step4._filter_inferred_coords_by_prefix(
+                ["com.example:native"],
+                "com.example:native:osx-aarch_64",
+            ),
+            ["com.example:native"],
+        )
+        self.assertEqual(
+            step4._artifact_output_stem(
+                "com.example:native:osx-aarch_64"
+            ),
+            "native_osx-aarch_64",
+        )
+
     def test_javap_method_body_parser_ignores_constant_pool_slot_numbers(self):
         old_dump = """
 public class com.acme.Api {

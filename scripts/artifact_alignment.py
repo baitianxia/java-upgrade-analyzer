@@ -14,6 +14,7 @@ class AlignmentRecord:
     status: str
     project_root: str
     artifact_path: str
+    artifact_relative_path: str
     artifact_sha256: str
     git_revision: str
     dirty_paths: tuple[str, ...]
@@ -61,9 +62,11 @@ def build_artifact_alignment(
     expected_revision="",
     expected_sha256="",
     internally_built=False,
+    artifact_relative_path="",
 ):
     project = Path(project_root).resolve()
     artifact = Path(artifact_path).resolve()
+    relative_artifact = str(artifact_relative_path or "").strip()
     revision = _git(project, "rev-parse", "HEAD")
     status_text = _git(project, "status", "--porcelain=v1", "--untracked-files=all")
     dirty_paths = tuple(
@@ -88,11 +91,16 @@ def build_artifact_alignment(
     if not expected_sha256:
         reasons.append("artifact_sha256_unpinned")
 
-    module = str(target_module or "").strip().strip("/")
+    module = str(target_module or "").strip().strip("/:")
     if module and module != ".":
-        module_root = (project / module).resolve()
+        module_root = (project / module.replace(":", "/")).resolve()
+        logical_artifact = (
+            (project / relative_artifact).resolve()
+            if relative_artifact
+            else artifact
+        )
         try:
-            artifact.relative_to(module_root)
+            logical_artifact.relative_to(module_root)
         except ValueError:
             reasons.append("target_module_mismatch")
 
@@ -111,6 +119,7 @@ def build_artifact_alignment(
         status=status,
         project_root=str(project),
         artifact_path=str(artifact),
+        artifact_relative_path=relative_artifact,
         artifact_sha256=artifact_sha,
         git_revision=revision,
         dirty_paths=dirty_paths,

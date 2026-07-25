@@ -38,6 +38,7 @@ from step5_evidence_model import (  # noqa: E402
     EvidenceFailure,
 )
 from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
+from s4_contract import make_per_dependency_dirname  # noqa: E402
 from step5_artifact_fact_store import Step5ArtifactFactStore  # noqa: E402
 from tests.retained_artifact_test_support import (  # noqa: E402
     retain_current_artifact_contract,
@@ -12383,7 +12384,12 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
             ]
 
             formatter.generate_enhanced_summary(results, output_dir)
-            per_dependency_summary = self._api_changes_dir(report_dir) / PER_DEPENDENCY_DIRNAME / "a_b" / "summary.json"
+            per_dependency_summary = (
+                self._api_changes_dir(report_dir)
+                / PER_DEPENDENCY_DIRNAME
+                / make_per_dependency_dirname("a:b")
+                / "summary.json"
+            )
             self.assertTrue(per_dependency_summary.exists())
             summary = json.loads(per_dependency_summary.read_text(encoding="utf-8"))
 
@@ -15608,13 +15614,19 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             "/broken/mapping",
             "com.example:used=/tmp/used-src",
             "com.example:unused=/tmp/unused-src",
-            "com.example:versioned:jar:tests=/tmp/versioned-src",
+            "com.example:native=/tmp/native-src",
+            "com.example:native:osx-ppc64=/tmp/wrong-native-src",
         ]
         catalog = {
             "by_coord": {
                 "__business__": {"coord": "__business__"},
                 "com.example:used": {"coord": "com.example:used"},
-                "com.example:versioned": {"coord": "com.example:versioned"},
+                "com.example:native:osx-aarch_64": {
+                    "coord": "com.example:native:osx-aarch_64",
+                },
+                "com.example:native:osx-x86_64": {
+                    "coord": "com.example:native:osx-x86_64",
+                },
             }
         }
 
@@ -15624,14 +15636,22 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             filtered,
             [
                 "com.example:used=/tmp/used-src",
-                "com.example:versioned:jar:tests=/tmp/versioned-src",
+                "com.example:native:osx-aarch_64=/tmp/native-src",
+                "com.example:native:osx-x86_64=/tmp/native-src",
             ],
         )
         self.assertEqual(
             [item["reason"] for item in skipped],
-            ["invalid_mapping_format", "dependency_source_not_in_current_runtime_catalog"],
+            [
+                "invalid_mapping_format",
+                "dependency_source_not_in_current_runtime_catalog",
+                "dependency_source_classifier_not_in_current_runtime_catalog",
+            ],
         )
         self.assertEqual(skipped[1]["coord"], "com.example:unused")
+        self.assertEqual(
+            skipped[2]["coord"], "com.example:native:osx-ppc64"
+        )
 
     def test_dependency_source_graph_does_not_index_simple_method_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
