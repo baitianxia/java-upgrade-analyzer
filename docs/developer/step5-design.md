@@ -211,8 +211,10 @@ Class.forName("org.apache.commons.lang.StringUtils")
 - 采集器、类、JAR、物理 entry、候选 class 哈希和错误摘要；
 - 是否阻断、建议决策、可忽略条件、修复动作和完成标准。
 
-Step6 主报告必须直接消费 `diagnostic_guidance[]`，不得维护另一套解释文案。旧版或合成
-`summary.json` 没有该字段时，Step6 可以用同一原因目录基于 API 列表和
+Step6 必须直接消费 `diagnostic_guidance[]` 的诊断事实，不得维护另一套相互冲突的解释。
+主报告只呈现可读标题、观察范围和对结论的客观限制；原因码与物理证据进入诊断明细，
+`recommended_decision`、`repair_actions` 和 `verification_steps` 不进入 Step6 用户报告。
+旧版或合成 `summary.json` 没有该字段时，Step6 可以用同一原因目录基于 API 列表和
 `meta.graph_stats.evidence_ingestion.failures` 补建。
 
 跨步骤原因码、字段命名和旧码兼容规则统一遵循

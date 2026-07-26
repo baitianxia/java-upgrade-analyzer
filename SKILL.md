@@ -535,10 +535,11 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 - 对应步骤：`step6`
 - 输入：前面所有产物
-- 输出：`.upgrade-report/.runtime/findings/s6_findings.json`、`.upgrade-report/deliverables/report.md`
-- 规则：主报告优先呈现已证明影响当前系统的项，并保持 Step5 用户侧结论分桶一致；`可能影响`、`需要补充输入` 与剩余 `未覆盖/未分析` 不能混并成同一详情列表
-- 规则：结论确定性与风险等级必须分开展示；`已确认影响` 是结论状态，P0/P1/P2 是严重级别，不得合并成“已确认/高风险”造成误读
-- 规则：主报告必须提供由当前证据和结论边界生成的下一步复核顺序与完成标准，但不得替使用者决定具体代码修改或发布
+- 输出：`.upgrade-report/.runtime/findings/s6_findings.json`、`.upgrade-report/deliverables/report.md`、`.upgrade-report/deliverables/all-affected-dependencies.md`、`.upgrade-report/deliverables/all-impact-details.md`
+- 规则：主报告固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织；依赖结论必须先于 API 结论
+- 规则：依赖和 API 都分别展示变化总数、已完成分析和未完成分析；确认影响是已完成结果的子集。已完成但未发现当前系统调用关系不得归入未完成分析
+- 规则：已完成分析结果合并展示；只有真正未完成的项单列并直接说明原因。主报告节选之外的依赖和 API 必须分别链接到两份不同的全量 Markdown
+- 规则：主报告只陈述客观事实，不得生成建议、待办清单、完成标准、发布判断、修改判断或具体实现与验证指令
 
 ## 恢复与压缩
 

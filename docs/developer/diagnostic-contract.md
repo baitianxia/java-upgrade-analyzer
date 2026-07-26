@@ -23,6 +23,12 @@
 | Step4 | `JAPICMP_TIMEOUT` | 无 |
 | Step5 | `SPRING_RUNTIME_CLASS_AMBIGUOUS` | `SPRING_PACKAGED_CLASS_AMBIGUOUS` |
 | Step5 | `MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED` | 无 |
+| Step5 | `BYTECODE_CALLER_UNRESOLVED` | 无 |
+| Step6 | `S6_EVIDENCE_IDENTITY_MISMATCH` | 无 |
+
+Step5 汇总中由采集器、调用图或证据接入产生的目录外原因码，`origin_step` 仍写为
+`step5`；传播作用域缺失时只有 `observed_scope` 使用 `unknown`。来源阶段与传播作用域
+是两个独立事实。
 
 ## 输出约定
 
@@ -34,8 +40,10 @@ Step1 交互卡、Step4 覆盖文件和 Step5 `summary.json` 都应提供：
 - 旧码别名；
 - 触发条件、影响范围、建议决策、修复动作和完成标准。
 
-Step6 使用同一原因目录生成主报告，不单独维护另一套解释词汇。旧版结果在读取时先
-归一化原因码，再进行聚合，避免同一问题因新旧拼写被拆成两条诊断。
+Step6 使用同一原因目录中的事实字段生成主报告，不单独维护另一套诊断事实。主报告只展示
+可读标题、观察范围和对结论的限制；原因码、来源阶段和物理证据进入诊断明细，建议决策、
+修复动作和完成标准不进入 Step6 的用户报告。旧版结果在读取时先归一化原因码，再进行聚合，
+避免同一问题因新旧拼写被拆成两条诊断。
 
 Step4 的 `all_changed_apis.csv` 只保存真实 API 变化事实，不使用伪造 API 行承载执行
 错误。用户首先阅读 `dependency_analysis_status.md`，其中使用中文直接说明每个依赖

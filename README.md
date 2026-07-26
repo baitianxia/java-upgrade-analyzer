@@ -154,14 +154,14 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 运行后 `.upgrade-report/README.md` 是产物目录的落地阅读入口；它会把 `deliverables/`、`evidence/`、`.runtime/` 的用途分开说明。
 
 1. 先打开 `.upgrade-report/README.md`；这里只链接本轮已经生成的文件，并在等待确认时保留问题、选项和可直接使用的回复示例。
-2. 看 `.upgrade-report/deliverables/report.md`，了解客观分析结果和结论限制。
-3. 看 `.upgrade-report/deliverables/analysis-scope.md`，核对本轮实际纳入和排除的变化依赖、API 数量及结论边界。
-4. 如果需要核对依赖 API 变化，先看 `.upgrade-report/evidence/api_changes/changed_dependencies.md`。
-5. 如果需要核对完整 API 明细，再看 `.upgrade-report/evidence/api_changes/all_changed_apis.csv`。
-6. 如果需要核对调用链证据，看 `.upgrade-report/evidence/call_chain/alerts.csv`。
+2. 看 `.upgrade-report/deliverables/report.md`：先读依赖层面的结论，再读 API 和调用关系。
+3. 主报告没有展开的依赖，全部位于 `.upgrade-report/deliverables/all-affected-dependencies.md`。
+4. 主报告没有展开的 API 和完整调用关系，全部位于 `.upgrade-report/deliverables/all-impact-details.md`。
+5. `.upgrade-report/evidence/call_chain/alerts.csv` 是一行一条的原始分析记录，用于核对明细中的调用关系和证据文件。
+6. `.upgrade-report/deliverables/analysis-scope.md` 记录本轮纳入和未纳入调用关系分析的依赖及 API 数量。
 7. `.upgrade-report/.runtime/` 是程序状态目录，普通阅读不需要进入。
 
-流程完成状态会区分“分析已完成”和“分析已完成，但存在结论限制”。部分范围、关键证据覆盖不完整、可能影响、需人工复核、本次未完成或证据读取异常都不会被包装成无限制的完整结论。
+流程完成状态会区分“分析已完成”和“分析已完成，但存在结论限制”。部分范围、关键证据覆盖不完整、可能影响、存在候选证据但结论未确定、本次未完成或证据读取异常都不会被包装成无限制的完整结论。
 
 依赖 API 变化分析完成后，系统会在执行 Step5 前确认分析范围：
 
@@ -249,8 +249,10 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 | 文件 | 用途 |
 |---|---|
-| `.upgrade-report/README.md` | 唯一产物入口；显示当前任务、暂停原因、下一步和按问题找文件 |
-| `.upgrade-report/deliverables/report.md` | 最终客观分析结果、证据、结论限制和下一步复核顺序 |
+| `.upgrade-report/README.md` | 产物入口；显示当前任务、暂停原因、结果状态和本轮产物 |
+| `.upgrade-report/deliverables/report.md` | 依赖层面结论、API 及调用关系、用户可见文件说明 |
+| `.upgrade-report/deliverables/all-affected-dependencies.md` | 全部变化依赖的分析结果和对应 API 明细链接 |
+| `.upgrade-report/deliverables/all-impact-details.md` | 全部变化 API 的分析结果和完整调用关系 |
 | `.upgrade-report/evidence/context/review.md` | 给人看的升级上下文确认页 |
 | `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 依赖包维度的 API 变化和范围选择入口 |
 | `.upgrade-report/evidence/call_chain/alerts.csv` | 完整系统触达证据台账 |
@@ -259,10 +261,10 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 | 顺序 | 文件 | 用途 |
 |---:|---|---|
-| 1 | `.upgrade-report/deliverables/report.md` | 查看最终客观分析结果、结论限制和下一步复核顺序 |
-| 2 | `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 查看依赖包维度的 API 变化摘要和定向分析范围 |
-| 3 | `.upgrade-report/evidence/api_changes/all_changed_apis.csv` | 查看完整 API 变化事实 |
-| 4 | `.upgrade-report/evidence/call_chain/alerts.csv` | 查看每个变化 API 的完整调用链台账 |
+| 1 | `.upgrade-report/deliverables/report.md` | 先看依赖结论，再看 API 和调用关系 |
+| 2 | `.upgrade-report/deliverables/all-affected-dependencies.md` | 查看全部变化依赖及完成、未完成状态 |
+| 3 | `.upgrade-report/deliverables/all-impact-details.md` | 查看全部变化 API 和完整调用关系 |
+| 4 | `.upgrade-report/evidence/call_chain/alerts.csv` | 核对一行一条的原始分析记录 |
 
 如果 `alerts.csv` 很大，Skill 会额外生成按状态拆分的阅读视图：
 
@@ -306,7 +308,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 | Step3 | 分析 JDK/Spring/Jakarta 等框架级风险 | `evidence/static_scan/*.csv` |
 | Step4 | 比较变更依赖 jar 的 API 变化 | `evidence/api_changes/changed_dependencies.md`、`evidence/api_changes/all_changed_apis.csv` |
 | Step5 | 追踪变化 API 是否触达业务代码 | `evidence/call_chain/alerts.csv` |
-| Step6 | 汇总成人可读报告 | `deliverables/report.md` |
+| Step6 | 生成依赖结论、API 调用关系和两份全量明细 | `deliverables/report.md`、`deliverables/all-affected-dependencies.md`、`deliverables/all-impact-details.md` |
 
 ---
 

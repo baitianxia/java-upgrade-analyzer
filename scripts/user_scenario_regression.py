@@ -598,7 +598,20 @@ def scenario_delivery_output_journey(workspace: Path) -> ScenarioResult:
 
     landing_path = report_dir / "README.md"
     scope_path = report_dir / "deliverables" / "analysis-scope.md"
-    required_files = [report_path, scope_path, landing_path, findings_path]
+    dependency_detail_path = (
+        report_dir / "deliverables" / "all-affected-dependencies.md"
+    )
+    api_detail_path = (
+        report_dir / "deliverables" / "all-impact-details.md"
+    )
+    required_files = [
+        report_path,
+        dependency_detail_path,
+        api_detail_path,
+        scope_path,
+        landing_path,
+        findings_path,
+    ]
     for path in required_files:
         if not path.is_file() or path.stat().st_size == 0:
             failures.append(f"missing_or_empty:{path.relative_to(report_dir)}")
@@ -606,16 +619,61 @@ def scenario_delivery_output_journey(workspace: Path) -> ScenarioResult:
     report_text = report_path.read_text(encoding="utf-8", errors="replace") if report_path.exists() else ""
     landing_text = landing_path.read_text(encoding="utf-8", errors="replace") if landing_path.exists() else ""
     for expected in (
-        "## 一、核心结论",
-        "## 二、结论限制",
-        "## 三、下一步复核顺序",
-        "## 四、分析结果总表",
-        "严重级别不等于结论确定性",
-        "已确认链路 3 条",
+        "# Java 依赖升级影响报告",
+        "## 一、依赖层面结论",
+        "## 二、API 及调用关系",
+        "## 三、用户可见文件说明",
+        "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+        "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+        "| 依赖 | 版本变化 | API 分析（已完成/总数） | 当前系统调用关系 | 分析结果 | 结果说明 |",
+        "| 依赖 | API | 新版本中的变化 | 当前系统调用关系 | 分析结果 | 结果说明 |",
+        "完整依赖分析明细",
+        "完整 API 分析与调用关系明细",
+        "原始分析记录",
+        "构建来源与制品身份",
+        "com.vendor:legacy-lib",
+        "1.0.0 → 已移除",
+        "com.vendor.LegacyApi.removed(String)",
+        "com.app.App.run(String)",
+        "确认影响",
     ):
         if expected not in report_text:
             failures.append(f"report_missing:{expected}")
-    if "已确认影响" in report_text and "发现 3 条依赖引用，尚未回溯到业务入口" in report_text:
+    api_detail_text = (
+        api_detail_path.read_text(encoding="utf-8", errors="replace")
+        if api_detail_path.exists()
+        else ""
+    )
+    dependency_detail_text = (
+        dependency_detail_path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        if dependency_detail_path.exists()
+        else ""
+    )
+    dependency_detail_header = (
+        "| 依赖 | 版本变化 | API 分析（已完成/总数） | "
+        "当前系统调用关系 | 分析结果 | 结果说明 |"
+    )
+    api_detail_header = (
+        "| 依赖 | API | 新版本中的变化 | 当前系统调用关系 | "
+        "分析结果 | 结果说明 |"
+    )
+    if dependency_detail_header not in dependency_detail_text:
+        failures.append("dependency_detail_missing:unified_header")
+    if api_detail_header not in api_detail_text:
+        failures.append("api_detail_missing:unified_header")
+    for expected in (
+        "com.app.App.run(String)",
+        "com.depa.FacadeA.entry(String)",
+        "com.depb.BridgeB.call(String)",
+        "com.vendor.LegacyApi.removed(String)",
+        "记录 3 次",
+    ):
+        if expected not in api_detail_text:
+            failures.append(f"api_detail_missing:{expected}")
+    if "确认影响" in report_text and "发现 3 条依赖引用，尚未回溯到业务入口" in report_text:
         failures.append("confirmed_impact_uses_unresolved_evidence_summary")
     for forbidden in (
         "__business__",
@@ -626,9 +684,30 @@ def scenario_delivery_output_journey(workspace: Path) -> ScenarioResult:
     ):
         if forbidden in report_text or forbidden in landing_text:
             failures.append(f"internal_marker_visible:{forbidden}")
+    for forbidden in (
+        "下一步",
+        "建议",
+        "待办",
+        "完成标准",
+        "修复动作",
+        "需人工复核",
+        "请先",
+        "api_id",
+        "path_status",
+        ".runtime/",
+        "BYTECODE_CALLER_UNRESOLVED",
+    ):
+        if forbidden in report_text:
+            failures.append(f"non_objective_report_text:{forbidden}")
     if re.search(r"\b[Ss]tep\d+\b", landing_text):
         failures.append("landing_exposes_internal_step_id")
-    for path in (report_path, scope_path, landing_path):
+    for path in (
+        report_path,
+        dependency_detail_path,
+        api_detail_path,
+        scope_path,
+        landing_path,
+    ):
         if path.exists():
             for target in _missing_local_markdown_links(path):
                 failures.append(

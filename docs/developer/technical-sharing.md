@@ -122,9 +122,11 @@ Step1 构建事实
 | Step3 | 背景风险有哪些 | 规则包扫描、源码/资源文本扫描、JDK/Jakarta/Spring 规则 | `s3_*.csv`、`s3_*.txt` |
 | Step4 | API 真实变了什么 | JApiCmp、git diff、removed jar 符号导出、CSV 契约 | `all_changed_apis.csv` |
 | Step5 | 变化是否触达业务 | AST、字节码、反向图、置信度追踪、动态调用补偿 | `alerts.csv`、`summary.json`、`by_api/*.json` |
-| Step6 | 如何交付复核 | 多源证据聚合、五态分桶、Markdown 报告生成 | `.runtime/findings/s6_findings.json`、`deliverables/report.md` |
+| Step6 | 如何交付复核 | 多源证据聚合、分析完成状态归并、Markdown 报告生成 | `.runtime/findings/s6_findings.json`、`deliverables/report.md`、`deliverables/all-affected-dependencies.md`、`deliverables/all-impact-details.md` |
 
 正式流程由 `scripts/run_step.py` 编排，并通过 `.upgrade-report/` 持久化所有关键证据。最终报告不是黑盒结论，而是可以沿文件回溯到每一步的输入、输出和证据来源。
+
+Step6 的主报告固定先给依赖层面结论，再给 API 及调用关系，最后说明全部用户可见文件。`all-affected-dependencies.md` 保存全量依赖结果；`all-impact-details.md` 保存全量 API 结果及完整调用关系；`alerts.csv` 保留一行一条的原始分析记录，不承担面向用户的汇总阅读职责。
 
 ## 五、关键技术一：从最终制品提取构建事实
 
@@ -374,9 +376,9 @@ Step5 对目标执行多证据追踪：
 - Step1 保留依赖变化和构建来源；
 - Step4 保留 JApiCmp、git diff、removed jar 符号和 `all_changed_apis.csv`；
 - Step5 保留 `alerts.csv`、`summary.json`、`by_api/*.json`；
-- Step6 输出 `.runtime/findings/s6_findings.json` 和 `deliverables/report.md`。
+- Step6 输出 `.runtime/findings/s6_findings.json`、`deliverables/report.md`、`deliverables/all-affected-dependencies.md` 和 `deliverables/all-impact-details.md`。
 
-其中 `alerts.csv` 是完整链路台账，不是样例抽样。
+其中 `alerts.csv` 是原始分析记录，不是样例抽样；`all-impact-details.md` 基于这些记录按 API 归并完整调用关系，供用户顺序阅读。`report.md` 中未展开的依赖和 API 分别由两份独立全量明细承接。
 
 ### 可恢复
 

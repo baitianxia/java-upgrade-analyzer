@@ -348,7 +348,7 @@ def _landing_status_lines(state):
             lines = [
                 "当前状态：分析已完成，但存在结论限制",
                 "",
-                "请先阅读最终报告的“结论限制”，并以本轮分析范围为解释边界。",
+                "最终报告记录了结论限制；结论适用范围以本轮分析范围为边界。",
             ]
         else:
             lines = ["当前状态：分析已完成"]
@@ -362,19 +362,27 @@ def _landing_status_lines(state):
             elif scope_mode == "full":
                 scope_text = "全部变化依赖"
             else:
-                scope_text = "未记录（不得按全量结论解释）"
+                scope_text = "未记录（不支持全量结论）"
             lines.extend([
                 "",
                 f"分析范围：{scope_text}",
                 (
-                    "结果计数：已确认影响 {confirmed}（其中高风险 {high_risk}），可能影响 {probable}，"
-                    "需人工复核 {uncertain}，本次未完成 {not_analyzed}。"
+                    "依赖：变化 {dependency_total}，已完成分析 {dependency_completed}，"
+                    "未完成分析 {dependency_incomplete}，含确认影响 {dependency_confirmed}。"
                 ).format(
-                    confirmed=int(completion_summary.get("confirmed_count") or 0),
-                    high_risk=int(completion_summary.get("high_risk_count") or 0),
-                    probable=int(completion_summary.get("probable_count") or 0),
-                    uncertain=int(completion_summary.get("uncertain_count") or 0),
-                    not_analyzed=int(completion_summary.get("not_analyzed_count") or 0),
+                    dependency_total=int(completion_summary.get("dependency_total_count") or 0),
+                    dependency_completed=int(completion_summary.get("dependency_completed_count") or 0),
+                    dependency_incomplete=int(completion_summary.get("dependency_incomplete_count") or 0),
+                    dependency_confirmed=int(completion_summary.get("dependency_confirmed_count") or 0),
+                ),
+                (
+                    "API：变化 {api_total}，已完成分析 {api_completed}，"
+                    "未完成分析 {api_incomplete}，确认影响 {api_confirmed}。"
+                ).format(
+                    api_total=int(completion_summary.get("api_total_count") or 0),
+                    api_completed=int(completion_summary.get("api_completed_count") or 0),
+                    api_incomplete=int(completion_summary.get("api_incomplete_count") or 0),
+                    api_confirmed=int(completion_summary.get("api_confirmed_count") or 0),
                 ),
             ])
             limitations = list(completion_summary.get("limitations") or [])
@@ -427,20 +435,51 @@ def _landing_status_lines(state):
 
 def _landing_existing_artifact_rows(report_dir):
     candidates = [
-        ("最终分析结论", "deliverables/report.md"),
-        ("本轮实际分析范围与结论边界", "deliverables/analysis-scope.md"),
+        ("依赖与 API 升级影响报告", "deliverables/report.md"),
+        ("完整依赖分析明细", "deliverables/all-affected-dependencies.md"),
+        ("完整 API 分析与调用关系明细", "deliverables/all-impact-details.md"),
+        ("原始分析记录", "evidence/call_chain/alerts.csv"),
+        ("本轮调用关系分析范围", "deliverables/analysis-scope.md"),
+        ("分析输入异常记录", "deliverables/analysis-diagnostics.md"),
         ("发生 API 变化的依赖及范围候选", "evidence/api_changes/changed_dependencies.md"),
-        ("完整变化 API 结构化清单", "evidence/api_changes/all_changed_apis.csv"),
-        ("变化 API 的系统触达台账", "evidence/call_chain/alerts.csv"),
+        ("变化 API 原始清单", "evidence/api_changes/all_changed_apis.csv"),
         ("升级上下文人工阅读页", "evidence/context/review.md"),
-        ("依赖变化清单", "evidence/dependencies/dep_changes.csv"),
+        ("依赖变化原始清单", "evidence/dependencies/dep_changes.csv"),
         ("构建来源与制品身份", "evidence/dependencies/build_provenance.json"),
     ]
     root = Path(report_dir)
+    findings_artifacts = None
+    findings_path = s6_findings_path(report_dir)
+    if findings_path.is_file():
+        try:
+            findings_artifacts = dict(
+                (read_json(findings_path).get("artifacts") or {})
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            findings_artifacts = {}
+    gated_artifacts = {
+        "evidence/call_chain/alerts.csv": "alerts_csv",
+        "evidence/api_changes/all_changed_apis.csv": "changed_apis_csv",
+    }
+    interaction_only_artifacts = {
+        "evidence/api_changes/changed_dependencies.md",
+        "evidence/context/review.md",
+    }
     return [
         (question, relative_path)
         for question, relative_path in candidates
         if (root / relative_path).is_file()
+        and not (
+            findings_artifacts is not None
+            and relative_path in interaction_only_artifacts
+        )
+        and (
+            findings_artifacts is None
+            or not gated_artifacts.get(relative_path)
+            or findings_artifacts.get(
+                gated_artifacts[relative_path]
+            )
+        )
     ]
 
 
@@ -554,13 +593,13 @@ def write_report_landing_docs(report_dir, state=None):
     ]
     if artifact_rows:
         lines.extend([
-            "## 按问题找文件",
+            "## 本轮产物",
             "",
-            "| 想确认的问题 | 打开文件 |",
+            "| 记录内容 | 文件 |",
             "|---|---|",
         ])
-        for question, relative_path in artifact_rows:
-            lines.append(f"| {question} | [{relative_path}]({relative_path}) |")
+        for content, relative_path in artifact_rows:
+            lines.append(f"| {content} | [{relative_path}]({relative_path}) |")
         lines.append("")
     else:
         lines.extend(["## 当前产物", "", "分析产物尚未生成；文件会随流程进度出现在这里。", ""])
@@ -596,16 +635,24 @@ def build_user_runtime_message(event, step_id, reason="", completion_summary=Non
         elif scope_mode == "full":
             lines.append("分析范围：依赖 API 变化分析识别出的全部变化依赖。")
         else:
-            lines.append("分析范围：未记录，结果不得按全量结论解释。")
+            lines.append("分析范围：未记录，当前结果不支持全量结论。")
         if summary:
             lines.append(
-                "结果：已确认影响 {confirmed}（其中高风险 {high_risk}），可能影响 {probable}，需人工复核 {uncertain}，"
-                "本次未完成 {not_analyzed}。".format(
-                    confirmed=int(summary.get("confirmed_count") or 0),
-                    high_risk=int(summary.get("high_risk_count") or 0),
-                    probable=int(summary.get("probable_count") or 0),
-                    uncertain=int(summary.get("uncertain_count") or 0),
-                    not_analyzed=int(summary.get("not_analyzed_count") or 0),
+                "依赖：变化 {total}，已完成分析 {completed}，"
+                "未完成分析 {incomplete}，含确认影响 {confirmed}。".format(
+                    total=int(summary.get("dependency_total_count") or 0),
+                    completed=int(summary.get("dependency_completed_count") or 0),
+                    incomplete=int(summary.get("dependency_incomplete_count") or 0),
+                    confirmed=int(summary.get("dependency_confirmed_count") or 0),
+                )
+            )
+            lines.append(
+                "API：变化 {total}，已完成分析 {completed}，"
+                "未完成分析 {incomplete}，确认影响 {confirmed}。".format(
+                    total=int(summary.get("api_total_count") or 0),
+                    completed=int(summary.get("api_completed_count") or 0),
+                    incomplete=int(summary.get("api_incomplete_count") or 0),
+                    confirmed=int(summary.get("api_confirmed_count") or 0),
                 )
             )
         limitations = list(summary.get("limitations") or [])
@@ -613,7 +660,8 @@ def build_user_runtime_message(event, step_id, reason="", completion_summary=Non
             lines.append("主要限制：" + "；".join(limitations[:3]) + "。")
         lines.extend([
             "最终报告：deliverables/report.md",
-            "分析范围：deliverables/analysis-scope.md",
+            "完整依赖分析：deliverables/all-affected-dependencies.md",
+            "完整 API 与调用关系：deliverables/all-impact-details.md",
         ])
         return lines
     next_step = next_step_id_for(step_id)
@@ -8020,33 +8068,99 @@ def build_final_completion_summary(report_dir):
     scope = dict(findings.get("analysis_scope") or {})
     coverage_status = str(coverage.get("overall_status") or "unknown").strip()
     scope_mode = str(scope.get("mode") or "unknown").strip()
+    scope_validation_status = str(
+        scope.get("validation_status") or ""
+    ).strip()
     confirmed_count = sum(len(findings.get(key) or []) for key in ("p0", "p1", "p2"))
     high_risk_count = sum(len(findings.get(key) or []) for key in ("p0", "p1"))
     probable_count = len(findings.get("probable_impact") or [])
     uncertain_count = len(findings.get("uncertain") or [])
     needs_input_count = len(findings.get("needs_input") or [])
-    not_analyzed_count = len(findings.get("not_analyzed") or [])
+    not_analyzed_count = sum(
+        1
+        for item in (findings.get("not_analyzed") or [])
+        if not isinstance(item, dict)
+        or str(item.get("user_conclusion") or "").strip()
+        not in {"可能影响", "需要补充输入"}
+    )
     diagnostic_count = len(findings.get("diagnostics") or [])
+    try:
+        from s6_report import (
+            build_human_api_analysis,
+            build_human_dependency_analysis,
+        )
+        api_model = build_human_api_analysis(findings)
+        dependency_model = build_human_dependency_analysis(
+            findings,
+            api_model,
+        )
+    except (ImportError, TypeError, ValueError):
+        api_model = {
+            "total_count": int(scope.get("total_api_count") or 0),
+            "completed_count": int(scope.get("analyzed_api_count") or 0),
+            "incomplete_count": max(
+                int(scope.get("total_api_count") or 0)
+                - int(scope.get("analyzed_api_count") or 0),
+                0,
+            ),
+            "confirmed_count": confirmed_count,
+            "unconfirmed_count": 0,
+        }
+        dependency_model = {
+            "total_count": int(scope.get("available_dependency_count") or 0),
+            "completed_count": int(scope.get("included_dependency_count") or 0),
+            "incomplete_count": max(
+                int(scope.get("available_dependency_count") or 0)
+                - int(scope.get("included_dependency_count") or 0),
+                0,
+            ),
+            "confirmed_any_count": 0,
+            "unconfirmed_completed_count": 0,
+        }
 
     limitations = []
     if not findings:
         limitations.append("最终结构化结果缺失或无法读取")
     if scope_mode == "partial":
         limitations.append("用户选择了部分变化依赖")
+    elif scope_validation_status == "invalid":
+        limitations.append("分析范围记录未通过一致性校验")
     elif scope_mode != "full":
-        limitations.append("分析范围快照缺失")
-    if coverage_status not in {"complete", "not_applicable"}:
+        limitations.append("分析范围状态无法确认")
+    if coverage_status == "partial":
         limitations.append("关键证据覆盖不完整")
+    elif coverage_status not in {"complete", "not_applicable"}:
+        limitations.append("关键证据覆盖状态无法确认")
     if probable_count:
         limitations.append(f"{probable_count} 项只能判定为可能影响")
     if uncertain_count:
-        limitations.append(f"{uncertain_count} 项需要人工复核")
-    if needs_input_count:
-        limitations.append(f"{needs_input_count} 项缺少依赖源码或构建产物")
-    if not_analyzed_count:
+        limitations.append(f"{uncertain_count} 项存在候选证据但结论未确定")
+    dependency_incomplete_count = int(
+        dependency_model.get("incomplete_count") or 0
+    )
+    api_incomplete_count = int(api_model.get("incomplete_count") or 0)
+    if dependency_model.get("population_unconfirmed"):
+        limitations.append("变化依赖总数在不同产物中的记录不一致")
+    if api_model.get("population_unconfirmed"):
+        limitations.append("变化 API 总数在不同产物中的记录不一致")
+    if dependency_incomplete_count:
+        limitations.append(
+            f"{dependency_incomplete_count} 个变化依赖未完成分析"
+        )
+    if api_incomplete_count:
+        limitations.append(
+            f"{api_incomplete_count} 个变化 API 未完成分析"
+        )
+    elif needs_input_count:
+        limitations.append(
+            f"{needs_input_count} 项调用关系分析输入不足，结论未确定"
+        )
+    elif not_analyzed_count:
         limitations.append(f"{not_analyzed_count} 项未完成分析")
     if diagnostic_count:
-        limitations.append(f"{diagnostic_count} 个证据文件读取异常")
+        limitations.append(
+            f"记录了 {diagnostic_count} 项输入读取或结构异常"
+        )
 
     return {
         "status": "completed_with_limits" if limitations else "completed",
@@ -8063,6 +8177,24 @@ def build_final_completion_summary(report_dir):
         "needs_input_count": needs_input_count,
         "not_analyzed_count": not_analyzed_count,
         "diagnostic_count": diagnostic_count,
+        "dependency_total_count": int(dependency_model.get("total_count") or 0),
+        "dependency_completed_count": int(dependency_model.get("completed_count") or 0),
+        "dependency_incomplete_count": int(dependency_model.get("incomplete_count") or 0),
+        "dependency_confirmed_count": int(dependency_model.get("confirmed_any_count") or 0),
+        "dependency_unconfirmed_count": int(
+            dependency_model.get("unconfirmed_completed_count") or 0
+        ),
+        "dependency_total_unconfirmed": bool(
+            dependency_model.get("population_unconfirmed")
+        ),
+        "api_total_count": int(api_model.get("total_count") or 0),
+        "api_completed_count": int(api_model.get("completed_count") or 0),
+        "api_incomplete_count": int(api_model.get("incomplete_count") or 0),
+        "api_confirmed_count": int(api_model.get("confirmed_count") or 0),
+        "api_unconfirmed_count": int(api_model.get("unconfirmed_count") or 0),
+        "api_total_unconfirmed": bool(
+            api_model.get("population_unconfirmed")
+        ),
         "limitations": limitations,
     }
 
@@ -8622,11 +8754,18 @@ def main(argv=None, _skip_environment_contract=False):
     ):
         repair_step_id = detect_integrity_repair_step("step6", report_dir)
         if not repair_step_id:
+            completion_summary = build_final_completion_summary(report_dir)
+            main_state.setdefault("state", {})
+            main_state["state"]["status"] = completion_summary["status"]
+            main_state["state"]["completion_summary"] = completion_summary
+            save_main_state(report_dir, main_state)
             write_report_landing_docs(report_dir, main_state)
-            print(
-                "分析已经完成，正式证据链完整；可直接查看 deliverables/report.md。",
-                file=sys.stderr,
-            )
+            for line in build_user_runtime_message(
+                "complete",
+                "step6",
+                completion_summary=completion_summary,
+            ):
+                print(line, file=sys.stderr)
             return 0
         reset_step_state_for_restart(main_state, repair_step_id, report_dir)
         save_main_state(report_dir, main_state)

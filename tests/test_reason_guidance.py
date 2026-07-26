@@ -23,6 +23,13 @@ from reason_guidance import (  # noqa: E402
 
 class ReasonGuidanceTest(unittest.TestCase):
     @staticmethod
+    def _render_diagnostic_detail(findings):
+        rendered = s6_report.render_diagnostic_detail_artifact(findings)
+        if isinstance(rendered, str):
+            return rendered
+        return "\n".join(rendered)
+
+    @staticmethod
     def _result(reason_code, api_name):
         return tracer.TraceResult(
             coord="com.acme:demo",
@@ -189,7 +196,7 @@ class ReasonGuidanceTest(unittest.TestCase):
             ["behavior_diff"], coverage_guidance[0]["source_components"]
         )
 
-    def test_final_report_merges_step4_coverage_guidance(self):
+    def test_final_report_summarizes_step4_guidance_and_detail_keeps_protocol(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
             coverage_path = report_dir / ".runtime" / "coverage" / "coverage.json"
@@ -206,7 +213,22 @@ class ReasonGuidanceTest(unittest.TestCase):
             }), encoding="utf-8")
 
             findings = s6_report.collect_findings(str(report_dir))
+            diagnostic_path = (
+                s6_report.write_diagnostic_detail_artifact(
+                    report_dir, findings
+                )
+            )
+            self.assertEqual(
+                "deliverables/analysis-diagnostics.md",
+                diagnostic_path,
+            )
+            findings.setdefault("artifacts", {})["diagnostic_detail_md"] = (
+                diagnostic_path
+            )
             report = s6_report.generate_report(findings)
+            diagnostic_detail = (
+                report_dir / diagnostic_path
+            ).read_text(encoding="utf-8")
 
         by_code = {
             item["reason_code"]: item
@@ -216,8 +238,33 @@ class ReasonGuidanceTest(unittest.TestCase):
             "step4",
             by_code["DEPENDENCY_SOURCE_REF_UNAVAILABLE"]["origin_step"],
         )
-        self.assertIn("DEPENDENCY_SOURCE_REF_UNAVAILABLE", report)
-        self.assertIn("来源步骤", report)
+        self.assertIn(
+            "[分析异常记录](analysis-diagnostics.md)",
+            report,
+        )
+        self.assertNotIn("依赖源码版本不可用", report)
+        self.assertNotIn("DEPENDENCY_SOURCE_REF_UNAVAILABLE", report)
+        self.assertNotIn("来源步骤", report)
+        self.assertNotIn("origin_step", report)
+        self.assertNotIn(".runtime/", report)
+        for non_objective_instruction in (
+            "下一步复核顺序",
+            "完成标准",
+            "待办",
+            "建议",
+            "修复动作",
+            "触发条件",
+            "可忽略条件",
+            "不替使用者决定",
+        ):
+            self.assertNotIn(non_objective_instruction, report)
+        self.assertIn(
+            "DEPENDENCY_SOURCE_REF_UNAVAILABLE", diagnostic_detail
+        )
+        self.assertIn("Step 4", diagnostic_detail)
+        self.assertNotIn("可忽略条件", diagnostic_detail)
+        self.assertNotIn("修复动作", diagnostic_detail)
+        self.assertNotIn("完成标准", diagnostic_detail)
 
     def test_old_summary_can_be_upgraded_without_reading_collector_source(self):
         guidance = build_diagnostic_guidance_from_summary({
@@ -235,6 +282,38 @@ class ReasonGuidanceTest(unittest.TestCase):
         self.assertEqual("exact", guidance[0]["catalog_match"])
         self.assertIn("MyBatis", guidance[0]["trigger_condition"])
         self.assertEqual(1, guidance[0]["affected_api_count"])
+
+    def test_generic_step5_diagnostic_has_a_concrete_origin(self):
+        guidance = build_diagnostic_guidance([
+            self._result(
+                "BYTECODE_CALLER_UNRESOLVED",
+                "demo.Api.bytecode",
+            )
+        ])
+
+        self.assertEqual(1, len(guidance))
+        self.assertEqual(
+            "BYTECODE_CALLER_UNRESOLVED",
+            guidance[0]["reason_code"],
+        )
+        self.assertEqual("step5", guidance[0]["origin_step"])
+
+    def test_old_unknown_item_origin_inherits_summary_origin(self):
+        guidance = build_diagnostic_guidance_from_summary({
+            "origin_step": "step5",
+            "not_analyzed_apis": [{
+                "analysis_status": "not_analyzed",
+                "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+                "origin_step": "unknown",
+                "coord": "com.acme:demo",
+                "api": "demo.Api.bytecode",
+                "api_signature": "()",
+                "symbol_kind": "method",
+            }],
+        })
+
+        self.assertEqual(1, len(guidance))
+        self.assertEqual("step5", guidance[0]["origin_step"])
 
     def test_aggregation_reports_actual_failure_scope_and_evidence(self):
         results = [
@@ -275,7 +354,7 @@ class ReasonGuidanceTest(unittest.TestCase):
             "BadZipFile", mybatis["failure_detail_summaries"][0]
         )
 
-    def test_summary_and_final_report_share_structured_guidance(self):
+    def test_summary_keeps_structured_guidance_while_report_stays_human_first(self):
         results = [
             self._result(
                 "SPRING_RUNTIME_CLASS_AMBIGUOUS", "demo.Api.spring"
@@ -295,7 +374,11 @@ class ReasonGuidanceTest(unittest.TestCase):
                 (output / "summary.json").read_text(encoding="utf-8")
             )
             findings = s6_report.collect_findings(str(report_dir))
+            findings.setdefault("artifacts", {})["diagnostic_detail_md"] = (
+                "deliverables/analysis-diagnostics.md"
+            )
             report = s6_report.generate_report(findings)
+            diagnostic_detail = self._render_diagnostic_detail(findings)
 
         self.assertEqual(
             REASON_GUIDANCE_SCHEMA, summary["diagnostic_guidance_schema"]
@@ -333,14 +416,48 @@ class ReasonGuidanceTest(unittest.TestCase):
                 "MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED"
             ]["observed_scope"],
         )
-        self.assertIn("### 需要决策的分析诊断", report)
-        self.assertIn("SPRING_RUNTIME_CLASS_AMBIGUOUS", report)
-        self.assertIn("MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED", report)
-        self.assertIn("**触发条件**", report)
-        self.assertIn("**可忽略条件**", report)
-        self.assertIn("**修复动作**", report)
-        self.assertIn("demo.Config", report)
-        self.assertIn("mybatis-runtime.jar", report)
+        self.assertIn(
+            "[分析异常记录](analysis-diagnostics.md)",
+            report,
+        )
+        self.assertNotIn("Spring 运行时类选择歧义", report)
+        self.assertNotIn("MyBatis 运行时制品解析失败", report)
+        for internal_protocol in (
+            "SPRING_RUNTIME_CLASS_AMBIGUOUS",
+            "MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED",
+            "reason_code",
+            "origin_step",
+            "来源步骤",
+            "api_id",
+            "path_status",
+            ".runtime/",
+            "触发条件",
+            "可忽略条件",
+        ):
+            self.assertNotIn(internal_protocol, report)
+        for non_objective_instruction in (
+            "下一步复核顺序",
+            "完成标准",
+            "待办",
+            "建议",
+            "修复动作",
+            "不替使用者决定",
+        ):
+            self.assertNotIn(non_objective_instruction, report)
+
+        self.assertIn(
+            "SPRING_RUNTIME_CLASS_AMBIGUOUS", diagnostic_detail
+        )
+        self.assertIn(
+            "MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED", diagnostic_detail
+        )
+        self.assertIn("**记录条件**", diagnostic_detail)
+        self.assertNotIn("**可忽略条件**", diagnostic_detail)
+        self.assertNotIn("建议", diagnostic_detail)
+        self.assertNotIn("修复动作", diagnostic_detail)
+        self.assertNotIn("完成标准", diagnostic_detail)
+        self.assertIn("demo.Config", diagnostic_detail)
+        self.assertIn("mybatis-runtime.jar", diagnostic_detail)
 
 
 if __name__ == "__main__":

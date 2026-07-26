@@ -11787,14 +11787,17 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
 
         row = formatter._alert_rows_for_result(result)[0]
 
-        self.assertEqual("需要人工复核", row["conclusion"])
+        self.assertEqual("结论未确定（存在候选证据）", row["conclusion"])
         self.assertEqual("依赖 a:b 变更了方法 com.acme.Api.changed()（严重级别 P1）", row["change_summary"])
         self.assertEqual("入口：A.call；终点：B.call；1 次调用（2 个节点）", row["chain_summary"])
         self.assertEqual("A.call", row["chain_entry"])
         self.assertEqual("B.call", row["chain_target"])
         self.assertEqual("1", row["chain_hop_count"])
         self.assertEqual("1. A.call -> 2. B.call", row["chain_detail"])
-        self.assertEqual("核对这条候选链路是否真实会在运行时触发。", row["review_focus"])
+        self.assertEqual(
+            "该候选链路的运行时触发事实未确认。",
+            row["review_focus"],
+        )
         self.assertIn("低置信度边", row["reason"])
         self.assertIn("低置信度边", row["review_reason"])
         self.assertNotIn("已证明变更 API 触达系统代码", row["reason"])
@@ -12226,13 +12229,14 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         self.assertEqual(2, summary["meta"]["graph_stats"]["parser_usage"]["regex"])
 
     def test_alerts_csv_is_a_focused_human_review_table(self):
-        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 31)
+        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 32)
         self.assertIn("chain_detail", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("path_text", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("api_signature", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("symbol_kind", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("compile_impact", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("runtime_link_impact", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertIn("business_entry", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("conclusion_level", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("action_type", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("coverage_details", formatter.ALERTS_CSV_FIELDNAMES)
@@ -13082,6 +13086,41 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             summary_payload = json.loads(Path(summary_json_path).read_text(encoding="utf-8"))
             with (call_chain_dir / "alerts.csv").open(encoding="utf-8") as alert_file:
                 alert_rows = list(csv.DictReader(alert_file))
+            coverage_path = Path(s6_report._coverage_path(report))
+            coverage_path.parent.mkdir(parents=True, exist_ok=True)
+            coverage_path.write_text(
+                json.dumps({
+                    "overall_status": "complete",
+                    "critical_incomplete": [],
+                    "components": [],
+                }),
+                encoding="utf-8",
+            )
+            selection_path = Path(s6_report._step5_selection_path(report))
+            selection_path.parent.mkdir(parents=True, exist_ok=True)
+            selection_path.write_text(
+                json.dumps({
+                    "mode": "full",
+                    "available_dependency_count": 1,
+                    "included_dependency_count": 1,
+                    "total_api_count": 1,
+                    "analyzed_api_count": 1,
+                }),
+                encoding="utf-8",
+            )
+            changed_path = (
+                report
+                / "evidence"
+                / "api_changes"
+                / "all_changed_apis.csv"
+            )
+            changed_path.write_text(
+                "coord,old_version,new_version,api_name,api_signature,"
+                "symbol_kind,change_type,severity\n"
+                "com.vendor:legacy,1.0,-,com.vendor.LegacyApi.removed,(),"
+                "method,REMOVED,P0\n",
+                encoding="utf-8",
+            )
             findings = s6_report.collect_findings(str(report))
             final_report = s6_report.generate_report(findings)
 
@@ -13096,10 +13135,16 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         )
         self.assertEqual(summary_payload["not_impacted"], 1)
         self.assertEqual(alert_rows[0]["path_status"], "not_impacted")
-        self.assertIn("已确认不受影响", final_report)
-        self.assertIn("### 4.1 符号保留证据", final_report)
-        self.assertIn("com.vendor:aggregate", final_report)
-        self.assertIn("不包含被删除 JAR 中的 SPI 配置、资源文件、清单等非 API 内容", final_report)
+        self.assertIn("| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |", final_report)
+        self.assertIn("| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |", final_report)
+        self.assertIn("确认不受 API 调用影响", final_report)
+        self.assertIn(
+            "| `com.vendor:legacy` | `com.vendor.LegacyApi.removed()` | "
+            "删除方法，参数：无参数 | 无已确认受影响调用关系 | "
+            "确认不受影响 | 当前制品中的相同类字节码保留该 API。 |",
+            final_report,
+        )
+        self.assertIn("相同类字节码保留记录", final_report)
 
     def test_removed_api_preservation_reads_step1_dependency_jar_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13399,6 +13444,50 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 ],
             }
             (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+            with (s5_dir / "alerts.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as output:
+                fieldnames = [
+                    "target_coord",
+                    "changed_symbol",
+                    "api_signature",
+                    "symbol_kind",
+                    "change_type",
+                    "path_status",
+                    "business_entry",
+                    "path_text",
+                ]
+                writer = csv.DictWriter(output, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow({
+                    "target_coord": "a:b",
+                    "changed_symbol": "com.example.Demo.call",
+                    "api_signature": "(String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "path_status": "reachable",
+                    "business_entry": "Service.run",
+                    "path_text": "Service.run -> com.example.Demo.call(String)",
+                })
+                writer.writerow({
+                    "target_coord": "a:b",
+                    "changed_symbol": "com.example.Demo.call",
+                    "api_signature": "(Long)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "path_status": "not_found_in_static_analysis",
+                    "path_text": "",
+                })
+            changed_path = (
+                report_dir / "evidence" / "api_changes" / "all_changed_apis.csv"
+            )
+            changed_path.parent.mkdir(parents=True)
+            changed_path.write_text(
+                "coord,api_name,api_signature,symbol_kind,change_type\n"
+                "a:b,com.example.Demo.call,(String),method,REMOVED\n"
+                "a:b,com.example.Demo.call,(Long),method,REMOVED\n",
+                encoding="utf-8",
+            )
 
             reachable_payload = {
                 "coord": "a:b",
@@ -13440,10 +13529,23 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             )
 
             findings = s6_report.collect_findings(str(report_dir))
+            artifacts, api_model, dependency_model = (
+                s6_report.write_primary_report_artifacts(
+                    str(report_dir),
+                    findings,
+                )
+            )
+            findings.setdefault("artifacts", {}).update(artifacts)
             report_text = s6_report.generate_report(findings)
-            s6_report.write_s6_detail_artifacts(str(report_dir), findings)
-            not_found_md = (report_dir / "deliverables" / "s6_not_found_apis.md").read_text(encoding="utf-8")
-            not_found_csv = (report_dir / "deliverables" / "s6_not_found_apis.csv").read_text(encoding="utf-8")
+            full_dependency_md = (
+                report_dir / artifacts["full_dependency_analysis_md"]
+            ).read_text(encoding="utf-8")
+            full_api_md = (
+                report_dir / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
+            legacy_detail_files = list(
+                (report_dir / "deliverables").glob("s6_*_apis.*")
+            )
 
         self.assertEqual(findings["p1"][0]["reason"], "命中了 String 重载")
         self.assertEqual(
@@ -13458,23 +13560,49 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         )
         self.assertEqual(findings["not_found_reason_summary"]["NO_STATIC_PATH"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["not_found"], 1)
-        self.assertIn("未发现调用路径", report_text)
-        self.assertIn("删除方法，call，参数：String，严重级别：P1", report_text)
-        self.assertIn("删除方法，call，参数：Long，严重级别：P1", report_text)
+        self.assertEqual(api_model["total_count"], 2)
+        self.assertEqual(api_model["completed_count"], 2)
+        self.assertEqual(api_model["incomplete_count"], 0)
+        self.assertEqual(api_model["confirmed_count"], 1)
+        self.assertEqual(dependency_model["total_count"], 1)
+        self.assertEqual(dependency_model["completed_count"], 1)
+        self.assertEqual(dependency_model["incomplete_count"], 0)
+        self.assertIn("## 一、依赖层面结论", report_text)
+        self.assertIn("## 二、API 及调用关系", report_text)
+        self.assertLess(
+            report_text.index("## 一、依赖层面结论"),
+            report_text.index("## 二、API 及调用关系"),
+        )
+        self.assertIn("未发现当前系统调用关系", report_text)
+        self.assertIn("删除方法，参数：String", report_text)
+        self.assertIn("删除方法，参数：Long", report_text)
         self.assertNotIn("REMOVED / method", report_text)
         self.assertNotIn("`REMOVED` / `method`", report_text)
-        self.assertIn("| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 |", not_found_md)
-        self.assertNotIn("原因码", not_found_md)
-        self.assertNotIn("NO_STATIC_PATH", not_found_md)
-        self.assertIn("删除方法，call，参数：Long，严重级别：P1", not_found_md)
-        self.assertIn("change_summary", not_found_csv)
-        self.assertIn("conclusion", not_found_csv)
-        self.assertIn("review_reason", not_found_csv)
-        self.assertIn("chain_summary", not_found_csv)
-        self.assertIn("chain_detail", not_found_csv)
-        self.assertIn("未发现静态调用路径", not_found_csv)
-        self.assertIn("入口：Other.run；终点：com.example.Demo.call(Long)；1 次调用（2 个节点）", not_found_csv)
-        self.assertIn("删除方法，call，参数：Long，严重级别：P1", not_found_csv)
+        self.assertIn(
+            "[完整依赖分析明细](all-affected-dependencies.md)",
+            report_text,
+        )
+        self.assertIn(
+            "[完整 API 分析与调用关系明细](all-impact-details.md)",
+            report_text,
+        )
+        self.assertIn("`com.example.Demo.call(Long)`", full_api_md)
+        self.assertIn(
+            "`Other.run → com.example.Demo.call(Long)`",
+            full_api_md,
+        )
+        self.assertIn("未确认影响", full_api_md)
+        self.assertIn(
+            "`Service.run → com.example.Demo.call(String)`",
+            full_api_md,
+        )
+        self.assertIn(
+            "[该依赖的 2 个 API 及调用关系](all-impact-details.md#",
+            full_dependency_md,
+        )
+        self.assertEqual(legacy_detail_files, [])
+        self.assertNotIn("s6_not_found_apis", report_text)
+        self.assertNotIn("NO_STATIC_PATH", report_text)
 
     def test_s6_report_starts_with_concrete_impact_overview_from_alerts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13533,36 +13661,90 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                     "path_occurrence_count": "2",
                     "evidence_files": "/repo/order/src/main/java/com/acme/OrderService.java",
                 })
+            changed_path = (
+                report_dir / "evidence" / "api_changes" / "all_changed_apis.csv"
+            )
+            changed_path.parent.mkdir(parents=True)
+            changed_path.write_text(
+                "coord,api_name,api_signature,symbol_kind,change_type,severity\n"
+                "a:b,com.vendor.LegacyApi.removed,(String),method,REMOVED,P1\n",
+                encoding="utf-8",
+            )
 
             findings = s6_report.collect_findings(str(report_dir))
+            artifacts, api_model, dependency_model = (
+                s6_report.write_primary_report_artifacts(
+                    str(report_dir),
+                    findings,
+                )
+            )
+            findings.setdefault("artifacts", {}).update(artifacts)
             report_text = s6_report.generate_report(findings)
+            full_dependency_md = (
+                report_dir / artifacts["full_dependency_analysis_md"]
+            ).read_text(encoding="utf-8")
+            full_api_md = (
+                report_dir / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
 
         self.assertEqual(len(findings["impact_overview"]["confirmed_apis"]), 1)
-        self.assertIn("## 报告目录", report_text)
-        self.assertIn("## 一、核心结论", report_text)
-        self.assertIn("## 二、结论限制", report_text)
-        self.assertIn("## 三、下一步复核顺序", report_text)
-        self.assertIn("## 四、分析结果总表", report_text)
-        self.assertIn("## 五、附录", report_text)
-        self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |", report_text)
-        self.assertNotIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 关键证据 | 未确认原因 |", report_text)
-        self.assertLess(
-            report_text.index("## 一、核心结论"),
-            report_text.index("## 二、结论限制"),
+        self.assertEqual(api_model["total_count"], 1)
+        self.assertEqual(api_model["completed_count"], 1)
+        self.assertEqual(api_model["incomplete_count"], 0)
+        self.assertEqual(api_model["confirmed_count"], 1)
+        self.assertEqual(dependency_model["total_count"], 1)
+        self.assertEqual(dependency_model["completed_count"], 1)
+        self.assertEqual(dependency_model["incomplete_count"], 0)
+        self.assertNotIn("## 报告目录", report_text)
+        self.assertIn("## 一、依赖层面结论", report_text)
+        self.assertIn("## 二、API 及调用关系", report_text)
+        self.assertIn("## 三、用户可见文件说明", report_text)
+        self.assertIn(
+            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+            report_text,
+        )
+        self.assertIn(
+            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+            report_text,
         )
         self.assertLess(
-            report_text.index("## 二、结论限制"),
-            report_text.index("## 四、分析结果总表"),
+            report_text.index("## 一、依赖层面结论"),
+            report_text.index("## 二、API 及调用关系"),
         )
         self.assertLess(
-            report_text.index("## 四、分析结果总表"),
-            report_text.index("## 五、附录"),
+            report_text.index("## 二、API 及调用关系"),
+            report_text.index("## 三、用户可见文件说明"),
         )
         self.assertIn("com.vendor.LegacyApi.removed", report_text)
         self.assertIn("com.acme.OrderService.submit", report_text)
-        self.assertIn("### 4.1 调用链证据", report_text)
-        self.assertIn("已确认链路 2 条", report_text)
-        self.assertIn("com.acme.OrderService.submit -> com.vendor.LegacyApi.removed(String)", report_text)
+        self.assertIn("com.acme.OrderService.submit → com.vendor.LegacyApi.removed(String)", report_text)
+        self.assertIn(
+            "[完整依赖分析明细](all-affected-dependencies.md)",
+            report_text,
+        )
+        self.assertIn(
+            "[完整 API 分析与调用关系明细](all-impact-details.md)",
+            report_text,
+        )
+        self.assertIn(
+            "[该依赖的 1 个 API 及调用关系](all-impact-details.md#",
+            full_dependency_md,
+        )
+        self.assertIn(
+            "com.acme.OrderService.submit → "
+            "com.vendor.LegacyApi.removed(String)（记录 2 次）",
+            full_api_md,
+        )
+        for forbidden in (
+            "下一步",
+            "待办",
+            "完成标准",
+            "建议",
+            "api_id",
+            "path_status",
+            ".runtime/",
+        ):
+            self.assertNotIn(forbidden, report_text)
 
     def test_s6_report_does_not_mix_uncertain_paths_into_confirmed_api_evidence(self):
         confirmed_path = "com.acme.App.main -> com.vendor.LegacyApi.removed(String)"
@@ -13616,33 +13798,25 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             "not_impacted": [], "needs_input": [], "not_analyzed": [], "not_found": [],
         }
 
+        rows = s6_report.build_api_result_rows(findings)
         report_text = "\n".join(s6_report.render_api_result_table(findings))
 
-        self.assertIn(confirmed_path, report_text)
-        self.assertIn(uncertain_path, report_text)
-        self.assertLess(
-            report_text.index("**已确认链路（当前展示 1 条，共 1 条）**"),
-            report_text.index(confirmed_path),
-        )
-        self.assertLess(
-            report_text.index("**尚未回溯到业务入口的依赖引用（当前展示 1 条，共 1 条）**"),
-            report_text.index(uncertain_path),
-        )
-        self.assertIn(
-            "[已确认链路 1 条；另有 1 条依赖引用尚未回溯到业务入口。查看具体链路]"
-            "(#api-api-exact-target)",
-            report_text,
-        )
-        self.assertIn('<a id="api-api-exact-target"></a>', report_text)
-        self.assertIn("筛选 `api_id = API-exact-target`", report_text)
-        self.assertIn("`path_status = reachable` 是已确认链路", report_text)
-        self.assertIn(
-            "`path_status = uncertain` 是尚未回溯到业务入口的依赖引用",
-            report_text,
-        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["paths"], [confirmed_path])
+        self.assertEqual(rows[0]["confirmed_path_count"], 1)
+        self.assertEqual(rows[0]["uncertain_paths"], [uncertain_path])
+        self.assertEqual(rows[0]["additional_review_path_count"], 1)
+        self.assertIn(confirmed_path.replace(" -> ", " → "), report_text)
+        self.assertNotIn(uncertain_path, report_text)
+        self.assertIn("已确认调用链 1 条", report_text)
+        self.assertNotIn("尚未回溯到业务入口", report_text)
+        self.assertNotIn("api_id", report_text)
+        self.assertNotIn("path_status", report_text)
+        self.assertNotIn("(#api-", report_text)
+        self.assertNotIn('<a id="api-', report_text)
         self.assertNotIn("已确认/高风险影响；已确认影响", report_text)
 
-    def test_s6_report_links_uncertain_evidence_by_exact_api_id(self):
+    def test_s6_report_matches_uncertain_evidence_without_exposing_internal_protocol(self):
         target = {
             "target_coord": "a:b",
             "changed_symbol": "com.vendor.LegacyApi.removed",
@@ -13672,21 +13846,32 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             "not_impacted": [], "needs_input": [], "not_analyzed": [], "not_found": [],
         }
 
+        rows = s6_report.build_api_result_rows(findings)
         report_text = "\n".join(s6_report.render_api_result_table(findings))
 
-        self.assertIn(
-            "| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |",
-            report_text,
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path_count"], 2)
+        self.assertEqual(
+            rows[0]["paths"],
+            [
+                "com.vendor.Helper.one -> com.vendor.LegacyApi.removed(String)",
+                "com.vendor.Helper.two -> com.vendor.LegacyApi.removed(String)",
+            ],
         )
         self.assertIn(
-            "[发现 2 条依赖引用，尚未回溯到业务入口。查看引用详情]"
-            "(#api-api-uncertain-target)",
+            "| 结论状态 | 涉及范围 | 依赖变化 | API 变化 | 已有事实与结论边界 |",
             report_text,
         )
-        self.assertIn('<a id="api-api-uncertain-target"></a>', report_text)
-        self.assertIn("筛选 `api_id = API-uncertain-target`", report_text)
+        self.assertIn("结论未确定（存在候选证据）", report_text)
+        self.assertIn("存在候选调用关系，但尚未形成完整的系统触达证据", report_text)
+        self.assertIn("com.vendor.Helper.one", report_text)
+        self.assertIn("com.vendor.Helper.two", report_text)
+        self.assertNotIn("API-uncertain-target", report_text)
+        self.assertNotIn("api_id", report_text)
+        self.assertNotIn("path_status", report_text)
+        self.assertNotIn("(#api-", report_text)
 
-    def test_s6_report_does_not_link_ambiguous_or_missing_api_id(self):
+    def test_s6_report_does_not_depend_on_ambiguous_or_missing_api_id(self):
         base = {
             "target_coord": "a:b",
             "changed_symbol": "com.vendor.LegacyApi.removed",
@@ -13719,7 +13904,10 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             empty_findings,
             impact_overview=s6_report.build_impact_overview(conflicting_rows),
         )
-        conflicting_report = "\n".join(s6_report.render_api_result_table(conflicting_findings))
+        conflicting_rows = s6_report.build_api_result_rows(conflicting_findings)
+        conflicting_report = "\n".join(
+            s6_report.render_api_result_table(conflicting_findings)
+        )
 
         missing_findings = dict(
             empty_findings,
@@ -13727,17 +13915,24 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 dict(base, path_text="Helper.missing -> LegacyApi.removed")
             ]),
         )
+        missing_rows = s6_report.build_api_result_rows(missing_findings)
         missing_report = "\n".join(s6_report.render_api_result_table(missing_findings))
 
-        for report_text, expected_count in (
-            (conflicting_report, 2),
-            (missing_report, 1),
+        for rows, report_text, expected_count in (
+            (conflicting_rows, conflicting_report, 2),
+            (missing_rows, missing_report, 1),
         ):
-            self.assertIn(f"发现 {expected_count} 条依赖引用", report_text)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["api_id"], "")
+            self.assertEqual(rows[0]["path_count"], expected_count)
+            self.assertEqual(len(rows[0]["paths"]), expected_count)
+            self.assertIn("结论未确定（存在候选证据）", report_text)
+            self.assertNotIn("api_id", report_text)
+            self.assertNotIn("path_status", report_text)
             self.assertNotIn("(#api-", report_text)
             self.assertNotIn('<a id="api-', report_text)
 
-    def test_s6_report_keeps_same_simple_names_in_separate_evidence_anchors(self):
+    def test_s6_report_keeps_same_simple_names_and_coordinates_separate(self):
         def alert(coord, owner, api_id, caller):
             return {
                 "api_id": api_id,
@@ -13772,14 +13967,38 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             "not_impacted": [], "needs_input": [], "not_analyzed": [], "not_found": [],
         }
 
+        rows = s6_report.build_api_result_rows(findings)
         report_text = "\n".join(s6_report.render_api_result_table(findings))
 
-        self.assertEqual(report_text.count("(#api-api-alpha)"), 1)
-        self.assertEqual(report_text.count("(#api-api-beta)"), 1)
-        self.assertEqual(report_text.count('<a id="api-api-alpha"></a>'), 1)
-        self.assertEqual(report_text.count('<a id="api-api-beta"></a>'), 1)
-        self.assertIn("com.app.AlphaCaller.run -> com.alpha.StringUtils.isEmpty(String)", report_text)
-        self.assertIn("com.app.BetaCaller.run -> com.beta.StringUtils.isEmpty(String)", report_text)
+        self.assertEqual(len(rows), 2)
+        rows_by_coord = {row["coord"]: row for row in rows}
+        self.assertEqual(
+            rows_by_coord["a:b"]["paths"],
+            ["com.app.AlphaCaller.run -> com.alpha.StringUtils.isEmpty(String)"],
+        )
+        self.assertEqual(
+            rows_by_coord["c:d"]["paths"],
+            ["com.app.BetaCaller.run -> com.beta.StringUtils.isEmpty(String)"],
+        )
+        self.assertNotIn(
+            "com.app.BetaCaller.run -> com.beta.StringUtils.isEmpty(String)",
+            rows_by_coord["a:b"]["paths"],
+        )
+        self.assertNotIn(
+            "com.app.AlphaCaller.run -> com.alpha.StringUtils.isEmpty(String)",
+            rows_by_coord["c:d"]["paths"],
+        )
+        self.assertIn(
+            "com.app.AlphaCaller.run → com.alpha.StringUtils.isEmpty(String)",
+            report_text,
+        )
+        self.assertIn(
+            "com.app.BetaCaller.run → com.beta.StringUtils.isEmpty(String)",
+            report_text,
+        )
+        self.assertNotIn("API-alpha", report_text)
+        self.assertNotIn("API-beta", report_text)
+        self.assertNotIn("(#api-", report_text)
 
     def test_s6_report_uses_not_analyzed_filter_for_incomplete_evidence(self):
         alert_rows = [{
@@ -13809,15 +14028,22 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             "not_found": [],
         }
 
+        rows = s6_report.build_api_result_rows(findings)
         report_text = "\n".join(s6_report.render_api_result_table(findings))
 
-        self.assertIn(
-            "[发现 1 条分析证据，但本项未完成有效分析。查看证据详情]"
-            "(#api-api-incomplete)",
-            report_text,
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path_count"], 1)
+        self.assertEqual(
+            rows[0]["paths"],
+            ["com.vendor.DynamicProxy.invoke -> com.vendor.DynamicApi.call(String)"],
         )
-        self.assertIn("`path_status = not_analyzed` 是本次未完成有效分析的证据", report_text)
-        self.assertNotIn("`path_status = uncertain`", report_text)
+        self.assertEqual(rows[0]["evidence_statuses"], ["not_analyzed"])
+        self.assertIn("本次未完成分析", report_text)
+        self.assertIn("该项未完成有效分析，不能按未影响解释", report_text)
+        self.assertIn("com.vendor.DynamicProxy.invoke", report_text)
+        self.assertNotIn("API-incomplete", report_text)
+        self.assertNotIn("path_status", report_text)
+        self.assertNotIn("(#api-", report_text)
 
     def test_s6_report_does_not_use_mixed_summary_paths_when_exact_alert_exists(self):
         alert_rows = [{
@@ -13849,11 +14075,25 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             "not_impacted": [], "needs_input": [], "not_analyzed": [], "not_found": [],
         }
 
+        rows = s6_report.build_api_result_rows(findings)
         report_text = "\n".join(s6_report.render_api_result_table(findings))
 
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["paths"], [])
+        self.assertEqual(rows[0]["path_count"], 0)
         self.assertNotIn(mixed_summary_path, report_text)
-        self.assertNotIn("(#api-api-exact-without-path)", report_text)
-        self.assertIn("依赖引用存在，但当前记录没有可展示的完整路径。", report_text)
+        self.assertIn(
+            "存在候选调用关系，但尚未形成完整的系统触达证据。",
+            report_text,
+        )
+        self.assertNotIn(
+            "依赖引用存在，但当前记录没有可展示的完整路径。",
+            report_text,
+        )
+        self.assertNotIn("API-exact-without-path", report_text)
+        self.assertNotIn("api_id", report_text)
+        self.assertNotIn("path_status", report_text)
+        self.assertNotIn("(#api-", report_text)
 
     def test_s6_report_uses_step5_graph_stats_as_coverage_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13896,15 +14136,75 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 ],
             }
             (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+            changed_path = (
+                report_dir / "evidence" / "api_changes" / "all_changed_apis.csv"
+            )
+            changed_path.parent.mkdir(parents=True)
+            changed_path.write_text(
+                "coord,api_name,api_signature,symbol_kind,change_type,severity\n"
+                "a:b,com.vendor.LegacyApi.removed,(String),method,REMOVED,P1\n",
+                encoding="utf-8",
+            )
+            with (s5_dir / "alerts.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as output:
+                writer = csv.DictWriter(
+                    output,
+                    fieldnames=[
+                        "target_coord",
+                        "changed_symbol",
+                        "api_signature",
+                        "symbol_kind",
+                        "change_type",
+                        "path_status",
+                        "business_entry",
+                        "path_text",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "target_coord": "a:b",
+                    "changed_symbol": "com.vendor.LegacyApi.removed",
+                    "api_signature": "(String)",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "path_status": "reachable",
+                    "business_entry": "com.acme.App.run",
+                    "path_text": (
+                        "com.acme.App.run -> "
+                        "com.vendor.LegacyApi.removed(String)"
+                    ),
+                })
 
             findings = s6_report.collect_findings(str(report_dir))
             report_text = s6_report.generate_report(findings)
 
         self.assertEqual(findings["coverage"]["source"], "step5_summary_fallback")
         self.assertEqual(findings["coverage"]["overall_status"], "partial")
-        self.assertIn("分析完整度 | 部分完整", report_text)
-        self.assertIn("源码与制品一致性", report_text)
-        self.assertIn("动态调用可能漏报", report_text)
+        coverage_components = {
+            item["id"]: item for item in findings["coverage"]["components"]
+        }
+        self.assertEqual(
+            coverage_components["business_reachability"]["status"],
+            "partial",
+        )
+        self.assertEqual(
+            coverage_components["source_artifact_alignment"]["status"],
+            "unverified",
+        )
+        self.assertEqual(
+            coverage_components["indirect_usage_matrix"]["status"],
+            "partial",
+        )
+        self.assertIn("## 一、依赖层面结论", report_text)
+        self.assertIn("## 二、API 及调用关系", report_text)
+        self.assertIn("## 三、用户可见文件说明", report_text)
+        self.assertNotIn("## 四、分析范围和证据边界", report_text)
+        self.assertIn("com.acme.App.run", report_text)
+        self.assertNotIn("step5_summary_fallback", report_text)
+        self.assertNotIn("unsupported_language_kotlin", report_text)
+        self.assertNotIn("reflection_source_partial", report_text)
+        self.assertNotIn(".runtime/", report_text)
 
     def test_s6_report_prefers_formal_coverage_over_step5_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13934,13 +14234,28 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             }
             (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
             (runtime_coverage_dir / "coverage.json").write_text(json.dumps(coverage, ensure_ascii=False), encoding="utf-8")
+            selection_path = s6_report._step5_selection_path(report_dir)
+            selection_path.parent.mkdir(parents=True)
+            selection_path.write_text(
+                json.dumps({"mode": "full"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            changed_path = report_dir / "evidence" / "api_changes" / "all_changed_apis.csv"
+            changed_path.parent.mkdir(parents=True)
+            changed_path.write_text("coord,api_name\n", encoding="utf-8")
 
             findings = s6_report.collect_findings(str(report_dir))
             report_text = s6_report.generate_report(findings)
 
         self.assertEqual(findings["coverage"]["overall_status"], "complete")
         self.assertNotEqual(findings["coverage"].get("source"), "step5_summary_fallback")
-        self.assertIn("分析完整度 | 完整", report_text)
+        self.assertIn("## 一、依赖层面结论", report_text)
+        self.assertIn("## 二、API 及调用关系", report_text)
+        self.assertIn("## 三、用户可见文件说明", report_text)
+        self.assertNotIn("## 四、分析范围和证据边界", report_text)
+        self.assertIn("| 0 | 0 | 0 | 0 |", report_text)
+        self.assertNotIn("max_methods", report_text)
+        self.assertNotIn(".runtime/", report_text)
 
     def test_s6_report_summarizes_large_not_found_list_outside_main_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13997,69 +14312,101 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             }, ensure_ascii=False), encoding="utf-8")
 
             findings = s6_report.collect_findings(str(report_dir))
-            findings.setdefault("artifacts", {}).update(
-                s6_report.write_s6_detail_artifacts(str(report_dir), findings)
+            artifacts, api_model, dependency_model = (
+                s6_report.write_primary_report_artifacts(
+                    str(report_dir),
+                    findings,
+                )
             )
+            findings.setdefault("artifacts", {}).update(artifacts)
+            split_artifacts = s6_report.write_changed_api_split_artifacts(
+                str(report_dir)
+            )
+            findings["artifacts"].update(split_artifacts)
             report_text = s6_report.generate_report(findings)
 
-            not_found_csv = report_dir / findings["artifacts"]["not_found_csv"]
-            not_found_md = report_dir / findings["artifacts"]["not_found_md"]
-            self.assertTrue(not_found_csv.exists())
-            self.assertTrue(not_found_md.exists())
-            with not_found_csv.open(encoding="utf-8") as f:
-                self.assertEqual(len(list(csv.DictReader(f))), 100)
-            self.assertIn("## 四、分析结果总表", report_text)
-            self.assertIn("本表共有 100 条 API 分析结果，当前展示 20 条，省略 80 条", report_text)
-            self.assertIn("完整结果见[逐链路证据台账](../evidence/call_chain/alerts.csv)", report_text)
-            self.assertIn("[未发现调用路径清单](s6_not_found_apis.md)", report_text)
-            self.assertNotIn("s6_probable_impact_apis.md", report_text)
-            self.assertIn("### 运行产物阅读分层", report_text)
-            self.assertIn("#### 给用户看的产物", report_text)
-            self.assertIn("#### 用户深入排查时看的产物", report_text)
-            self.assertIn("#### 程序使用的产物", report_text)
-            self.assertIn("| `deliverables/report.md` | 最终报告；优先阅读这一份 |", report_text)
-            self.assertIn("| `evidence/static_scan/s3_*.csv/.txt` | JDK、Spring Boot、反射等静态扫描命中 |", report_text)
-            self.assertIn("| `evidence/api_changes/changed_dependencies.md` | 依赖包维度的变化摘要；用于选择系统触达分析范围 |", report_text)
-            self.assertIn("| `evidence/api_changes/changed_dependencies.csv` | 依赖包维度的结构化清单；供筛选和自动化使用 |", report_text)
-            self.assertIn("| `evidence/api_changes/all_changed_apis.csv` | 依赖 API 变化全集 |", report_text)
-            self.assertIn("| `evidence/api_changes/all_changed_apis_part_*.csv` | 依赖 API 变化拆分文件（每 500 条一份） |", report_text)
-            self.assertNotIn("all_changed_apis_alerts.csv", report_text)
-            self.assertIn("| `evidence/call_chain/alerts_<status>.csv` / `alerts_<status>_NNN.csv` | 按链路状态拆分的台账 |", report_text)
-            self.assertNotIn("s6_probable_impact_apis.md", report_text)
-            self.assertNotIn("s6_uncertain_apis.md", report_text)
-            self.assertNotIn("s6_needs_input_apis.md", report_text)
-            self.assertNotIn("s6_not_analyzed_apis.md", report_text)
-            self.assertIn("| [未发现调用路径清单](s6_not_found_apis.md) | 未发现调用路径清单 |", report_text)
-            self.assertNotIn("### 产物索引", report_text)
-            self.assertIn("## 二、结论限制", report_text)
-            self.assertIn("| 分析完整度 | 部分完整 |", report_text)
-            self.assertIn("动态调用可能漏报", report_text)
-            self.assertIn("反射调用可能漏报。", report_text)
-            self.assertIn("排序：先按结论状态，再在已确认影响中按严重级别 P0、P1、P2 排序；严重级别不等于结论确定性。", report_text)
-            self.assertIn("静态分析未找到调用路径", report_text)
+            full_dependency_md = (
+                report_dir / artifacts["full_dependency_analysis_md"]
+            )
+            full_api_md = report_dir / artifacts["full_api_analysis_md"]
+            self.assertTrue(full_dependency_md.exists())
+            self.assertTrue(full_api_md.exists())
+            self.assertEqual(api_model["total_count"], 501)
+            self.assertEqual(api_model["completed_count"], 100)
+            self.assertEqual(api_model["incomplete_count"], 401)
+            self.assertEqual(api_model["confirmed_count"], 0)
+            self.assertEqual(dependency_model["total_count"], 1)
+            self.assertEqual(dependency_model["completed_count"], 0)
+            self.assertEqual(dependency_model["incomplete_count"], 1)
+            self.assertIn("## 一、依赖层面结论", report_text)
+            self.assertIn("## 二、API 及调用关系", report_text)
+            self.assertIn("## 三、用户可见文件说明", report_text)
+            self.assertIn(
+                "### 未完成分析的 API（展示 10/401）",
+                report_text,
+            )
+            self.assertIn("未展开 391 个", report_text)
+            self.assertIn(
+                "### 已完成分析的 API（展示 12/100）",
+                report_text,
+            )
+            self.assertIn(
+                "未展开 88 个",
+                report_text,
+            )
+            self.assertIn(
+                "[完整依赖分析明细](all-affected-dependencies.md)",
+                report_text,
+            )
+            self.assertIn(
+                "[完整 API 分析与调用关系明细]"
+                "(all-impact-details.md#unanalyzed-apis)",
+                report_text,
+            )
+            self.assertNotIn(
+                "[`evidence/call_chain/alerts.csv`](../evidence/call_chain/alerts.csv)",
+                report_text,
+            )
+            self.assertIn(
+                "[变化 API 原始清单]"
+                "(../evidence/api_changes/all_changed_apis.csv)",
+                report_text,
+            )
+            self.assertNotIn("s6_", report_text)
             self.assertNotIn("NO_STATIC_PATH", report_text)
-            self.assertNotIn("当前无法确认清单", report_text)
-            self.assertNotIn("需要补充输入清单", report_text)
-            self.assertNotIn("未覆盖/未分析清单", report_text)
-            self.assertNotIn("静态未找到清单", report_text)
-            self.assertNotIn("- 状态：部分完整", report_text)
             self.assertNotIn("整体状态：partial", report_text)
             self.assertNotIn("关键未完成维度", report_text)
             self.assertNotIn("dependency_source_mapping", report_text)
-            self.assertNotIn("背景证据入口", report_text)
-            self.assertNotIn("背景信号（未证明影响当前系统）", report_text)
-            self.assertNotIn("背景文件数量倒推风险", report_text)
-            self.assertNotIn("### 扫描统计", report_text)
-            self.assertNotIn("### 依赖变更概览", report_text)
-            self.assertNotIn("机器可消费", report_text)
             self.assertNotIn("scan_stats", report_text)
-            self.assertIn("| `.runtime/findings/s6_findings.json` | 最终结构化结果；供程序读取，不作为人工优先阅读文件 |", report_text)
-            self.assertIn("| `.runtime/observability/step*_timing.csv` / `step1_progress.jsonl` | 运行进度与分阶段耗时；供 Agent 监控和性能排查 |", report_text)
-            self.assertIn("主报告按结论类型各展示前 20 条", report_text)
+            self.assertNotIn("api_id", report_text)
+            self.assertNotIn("path_status", report_text)
+            self.assertNotIn(".runtime/", report_text)
+            self.assertNotIn("下一步", report_text)
+            self.assertNotIn("待办", report_text)
+            self.assertNotIn("完成标准", report_text)
+            self.assertNotIn("建议", report_text)
             self.assertIn("com.example.Api0.removed", report_text)
+            self.assertIn("com.example.Api11.removed", report_text)
+            self.assertIn("com.example.Api19.removed", report_text)
+            self.assertNotIn("com.example.Api2.removed", report_text)
             self.assertNotIn("com.example.Api99.removed", report_text)
             self.assertEqual(report_text.count("### `com.example.Api"), 0)
-            self.assertIn("com.example.Api99.removed", not_found_md.read_text(encoding="utf-8"))
+            full_api_text = full_api_md.read_text(encoding="utf-8")
+            full_dependency_text = full_dependency_md.read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("com.example.Api99.removed", full_api_text)
+            self.assertIn("com.example.Api500.removed", full_api_text)
+            self.assertIn("## 未完成分析的 API（401）", full_api_text)
+            self.assertIn(
+                "[未完成 API 及原因]"
+                "(all-impact-details.md#unanalyzed-apis)",
+                full_dependency_text,
+            )
+            self.assertEqual(
+                list((report_dir / "deliverables").glob("s6_*_apis.*")),
+                [],
+            )
             part_001 = s4_dir / "all_changed_apis_part_001.csv"
             part_002 = s4_dir / "all_changed_apis_part_002.csv"
             self.assertTrue(part_001.exists())
@@ -14129,32 +14476,86 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
 
             findings = s6_report.collect_findings(str(report_dir))
-            findings.setdefault("artifacts", {}).update(
-                s6_report.write_s6_detail_artifacts(str(report_dir), findings)
+            artifacts, api_model, dependency_model = (
+                s6_report.write_primary_report_artifacts(
+                    str(report_dir),
+                    findings,
+                )
             )
+            findings.setdefault("artifacts", {}).update(artifacts)
             report_text = s6_report.generate_report(findings)
 
-            for key in [
-                "uncertain_csv",
-                "probable_impact_csv",
-                "needs_input_csv",
-                "not_analyzed_csv",
-            ]:
-                self.assertTrue((report_dir / findings["artifacts"][key]).exists())
-
-            with (report_dir / findings["artifacts"]["not_analyzed_csv"]).open(encoding="utf-8") as f:
-                self.assertEqual(len(list(csv.DictReader(f))), 30)
-            self.assertIn("## 四、分析结果总表", report_text)
-            self.assertIn("| 依赖坐标 | 变更 API | 变化 | 结论 | 证据摘要 / 未确认原因 |", report_text)
-            self.assertIn("| 可能影响 | Probable reason |", report_text)
-            self.assertIn("| 需人工复核 | 字节码命中但未确认回业务入口 |", report_text)
-            self.assertIn("主报告按结论类型各展示前 20 条", report_text)
-            self.assertIn("com.example.Uncertain0.changed", report_text)
+            full_dependency_md = (
+                report_dir / artifacts["full_dependency_analysis_md"]
+            )
+            full_api_md = report_dir / artifacts["full_api_analysis_md"]
+            self.assertTrue(full_dependency_md.exists())
+            self.assertTrue(full_api_md.exists())
+            rows = s6_report.build_api_result_rows(findings)
+            self.assertEqual(len(rows), 120)
+            self.assertEqual(len({(row["coord"], row["api"], row["conclusion"]) for row in rows}), 120)
+            self.assertEqual(api_model["total_count"], 120)
+            self.assertEqual(api_model["completed_count"], 60)
+            self.assertEqual(api_model["incomplete_count"], 60)
+            self.assertEqual(api_model["confirmed_count"], 0)
+            self.assertEqual(dependency_model["total_count"], 1)
+            self.assertEqual(dependency_model["completed_count"], 0)
+            self.assertEqual(dependency_model["incomplete_count"], 1)
+            self.assertIn("## 一、依赖层面结论", report_text)
+            self.assertIn("## 二、API 及调用关系", report_text)
+            self.assertIn("## 三、用户可见文件说明", report_text)
+            self.assertIn(
+                "### 未完成分析的 API（展示 10/60）",
+                report_text,
+            )
+            self.assertIn(
+                "### 已完成分析的 API（展示 12/60）",
+                report_text,
+            )
+            self.assertIn("未展开 50 个", report_text)
+            self.assertIn(
+                "未展开 48 个",
+                report_text,
+            )
+            self.assertIn("com.example.Probable0.changed", report_text)
+            self.assertIn("com.example.Probable11.changed", report_text)
+            self.assertIn("com.example.Probable19.changed", report_text)
+            self.assertNotIn("com.example.Probable2.changed", report_text)
+            self.assertNotIn("com.example.Uncertain0.changed", report_text)
             self.assertNotIn("com.example.Uncertain29.changed", report_text)
             self.assertEqual(report_text.count("### `com.example.Uncertain"), 0)
+            self.assertNotIn("主报告按结论类型各展示前 20 条", report_text)
+            self.assertNotIn("Probable action", report_text)
+            self.assertNotIn("NeedsInput action", report_text)
+            self.assertNotIn("NotAnalyzed action", report_text)
+            self.assertNotIn("建议", report_text)
+            self.assertNotIn("待办", report_text)
+            self.assertNotIn("完成标准", report_text)
+            self.assertNotIn("api_id", report_text)
+            self.assertNotIn("path_status", report_text)
+            self.assertNotIn(".runtime/", report_text)
+            self.assertNotIn("s6_", report_text)
+            self.assertIn(
+                "[完整依赖分析明细](all-affected-dependencies.md)",
+                report_text,
+            )
+            self.assertIn(
+                "[完整 API 分析与调用关系明细]"
+                "(all-impact-details.md#unanalyzed-apis)",
+                report_text,
+            )
+            full_api_text = full_api_md.read_text(encoding="utf-8")
             self.assertIn(
                 "com.example.Uncertain29.changed",
-                (report_dir / findings["artifacts"]["uncertain_md"]).read_text(encoding="utf-8"),
+                full_api_text,
+            )
+            self.assertIn("com.example.Probable29.changed", full_api_text)
+            self.assertIn("com.example.NeedsInput29.changed", full_api_text)
+            self.assertIn("com.example.NotAnalyzed29.changed", full_api_text)
+            self.assertIn("## 未完成分析的 API（60）", full_api_text)
+            self.assertEqual(
+                list((report_dir / "deliverables").glob("s6_*_apis.*")),
+                [],
             )
 
     def test_s6_detail_markdown_stays_readable_for_very_large_bucket(self):
@@ -14198,12 +14599,27 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             with not_found_csv.open(encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 260)
             md_text = not_found_md.read_text(encoding="utf-8")
-            self.assertIn("## 明细样例（前 50 条）", md_text)
-            self.assertIn("## 附录：聚合统计", md_text)
+            self.assertIn("## 事实分布", md_text)
+            self.assertIn("## 明细样例（排序前 50 条）", md_text)
             self.assertIn("### 原因分类", md_text)
             self.assertIn("### 依赖坐标分布", md_text)
-            self.assertLess(md_text.index("## 明细样例（前 50 条）"), md_text.index("## 附录：聚合统计"))
-            self.assertIn("完整全集请看 `deliverables/s6_not_found_apis.csv`", md_text)
+            self.assertIn("### 严重级别分布", md_text)
+            self.assertIn("### 变化类型分布", md_text)
+            self.assertLess(
+                md_text.index("## 事实分布"),
+                md_text.index("## 明细样例（排序前 50 条）"),
+            )
+            self.assertIn(
+                "本文件展示 50/260 条；同名 CSV 保存全部 260 条。",
+                md_text,
+            )
+            self.assertIn("## 内容说明", md_text)
+            self.assertIn("结论边界", md_text)
+            self.assertNotIn("## 先看什么", md_text)
+            self.assertNotIn("复核重点", md_text)
+            self.assertNotIn("建议", md_text)
+            self.assertNotIn("待办", md_text)
+            self.assertNotIn("完成标准", md_text)
             self.assertIn("com.example.Huge0.removed", md_text)
             self.assertNotIn("com.example.Huge259.removed", md_text)
 
@@ -14318,7 +14734,21 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             )
 
             findings = s6_report.collect_findings(str(report_dir))
+            result_rows = s6_report.build_api_result_rows(findings)
+            artifacts, api_model, dependency_model = (
+                s6_report.write_primary_report_artifacts(
+                    str(report_dir),
+                    findings,
+                )
+            )
+            findings.setdefault("artifacts", {}).update(artifacts)
             report_text = s6_report.generate_report(findings)
+            full_dependency_md = (
+                report_dir / artifacts["full_dependency_analysis_md"]
+            ).read_text(encoding="utf-8")
+            full_api_md = (
+                report_dir / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
 
         self.assertEqual(len(findings["probable_impact"]), 1)
         self.assertEqual(findings["probable_impact"][0]["reason_code"], "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION")
@@ -14331,17 +14761,84 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertEqual(findings["module_impacts"]["app"]["probable_impact"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["needs_input"], 1)
         self.assertEqual(findings["module_impacts"]["app"]["not_analyzed"], 1)
-        self.assertIn("## 四、分析结果总表", report_text)
+        self.assertEqual(len(result_rows), 3)
+        self.assertEqual(
+            {row["api"] for row in result_rows},
+            {
+                "com.example.Demo.behavior",
+                "com.example.Demo.bridge",
+                "com.example.Demo.unknown",
+            },
+        )
+        self.assertEqual(
+            len({(row["coord"], row["api"], row["conclusion"]) for row in result_rows}),
+            3,
+        )
+        self.assertEqual(api_model["total_count"], 3)
+        self.assertEqual(api_model["completed_count"], 1)
+        self.assertEqual(api_model["incomplete_count"], 2)
+        self.assertEqual(api_model["confirmed_count"], 0)
+        self.assertEqual(
+            [row["api"] for row in api_model["completed"]],
+            ["com.example.Demo.behavior"],
+        )
+        self.assertEqual(
+            {row["api"] for row in api_model["incomplete"]},
+            {
+                "com.example.Demo.bridge",
+                "com.example.Demo.unknown",
+            },
+        )
+        self.assertEqual(dependency_model["total_count"], 1)
+        self.assertEqual(dependency_model["completed_count"], 0)
+        self.assertEqual(dependency_model["incomplete_count"], 1)
+        self.assertIn("## 一、依赖层面结论", report_text)
+        self.assertIn("## 二、API 及调用关系", report_text)
+        self.assertIn("### 未完成分析的 API（展示 2/2）", report_text)
+        self.assertIn(
+            "### 已完成分析的 API（展示 1/1）",
+            report_text,
+        )
         self.assertIn("com.example.Demo.behavior", report_text)
         self.assertIn("com.example.Demo.bridge", report_text)
         self.assertIn("com.example.Demo.unknown", report_text)
-        self.assertIn("| 可能影响 | 1 |", report_text)
-        self.assertIn("| 缺少依赖源码/构建产物 | 1 |", report_text)
-        self.assertIn("| 本次未完成分析 | 1 |", report_text)
-        self.assertIn("可能影响", report_text)
-        self.assertIn("缺少依赖源码/构建产物", report_text)
-        self.assertIn("需人工复核", report_text)
-        self.assertNotIn("### 5.4 未覆盖/未分析（3 项）", report_text)
+        self.assertIn("未确认影响（存在候选关系）", report_text)
+        self.assertIn("未完成调用关系分析", report_text)
+        self.assertIn(
+            "缺少依赖源码，跨依赖调用链未完整回溯",
+            report_text,
+        )
+        self.assertIn(
+            "涉及资源配置或反射调用，静态分析无法确认实际调用目标",
+            report_text,
+        )
+        self.assertIn(
+            "[完整依赖分析明细](all-affected-dependencies.md)",
+            report_text,
+        )
+        self.assertIn(
+            "[完整 API 分析与调用关系明细]"
+            "(all-impact-details.md#unanalyzed-apis)",
+            report_text,
+        )
+        self.assertIn("com.example.Demo.behavior", full_api_md)
+        self.assertIn("com.example.Demo.bridge", full_api_md)
+        self.assertIn("com.example.Demo.unknown", full_api_md)
+        self.assertIn(
+            "[未完成 API 及原因]"
+            "(all-impact-details.md#unanalyzed-apis)",
+            full_dependency_md,
+        )
+        self.assertNotIn("缺少依赖源码/构建产物", report_text)
+        self.assertNotIn("需人工复核", report_text)
+        self.assertNotIn("运行相关业务测试", report_text)
+        self.assertNotIn("补 dependency_source_dirs", report_text)
+        self.assertNotIn("建议", report_text)
+        self.assertNotIn("待办", report_text)
+        self.assertNotIn("完成标准", report_text)
+        self.assertNotIn("reason_code", report_text)
+        self.assertNotIn("path_status", report_text)
+        self.assertNotIn(".runtime/", report_text)
 
     def test_s6_report_reads_per_dependency_summary_and_renders_dependency_conclusion_table(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -14386,6 +14883,45 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 ),
                 encoding="utf-8",
             )
+            changed_path = (
+                self._api_changes_dir(report_dir) / "all_changed_apis.csv"
+            )
+            changed_path.write_text(
+                "coord,old_version,new_version,api_name,api_signature,"
+                "symbol_kind,change_type,severity\n"
+                "a:b,1.0.0,-,com.example.Demo.call,(),method,REMOVED,P0\n",
+                encoding="utf-8",
+            )
+            with (s5_dir / "alerts.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as output:
+                writer = csv.DictWriter(
+                    output,
+                    fieldnames=[
+                        "target_coord",
+                        "changed_symbol",
+                        "api_signature",
+                        "symbol_kind",
+                        "change_type",
+                        "path_status",
+                        "business_entry",
+                        "path_text",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "target_coord": "a:b",
+                    "changed_symbol": "com.example.Demo.call",
+                    "api_signature": "()",
+                    "symbol_kind": "method",
+                    "change_type": "REMOVED",
+                    "path_status": "reachable",
+                    "business_entry": "com.acme.OrderService.submit",
+                    "path_text": (
+                        "com.acme.OrderService.submit -> "
+                        "com.example.Demo.call()"
+                    ),
+                })
             (per_dep_dir / "summary.json").write_text(
                 json.dumps(
                     {
@@ -14406,15 +14942,65 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             )
 
             findings = s6_report.collect_findings(str(report_dir))
+            artifacts, api_model, dependency_model = (
+                s6_report.write_primary_report_artifacts(
+                    str(report_dir),
+                    findings,
+                )
+            )
+            findings.setdefault("artifacts", {}).update(artifacts)
             report_text = s6_report.generate_report(findings)
+            full_dependency_md = (
+                report_dir / artifacts["full_dependency_analysis_md"]
+            ).read_text(encoding="utf-8")
+            full_api_md = (
+                report_dir / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
 
         self.assertEqual(findings["per_dependency_results"][0]["coord"], "a:b")
         self.assertTrue(findings["per_dependency_results"][0]["reaches_system_source"])
         self.assertEqual(findings["impacted_dependencies"][0]["change_type"], "移除")
+        self.assertEqual(api_model["total_count"], 1)
+        self.assertEqual(api_model["completed_count"], 1)
+        self.assertEqual(api_model["incomplete_count"], 0)
+        self.assertEqual(api_model["confirmed_count"], 1)
+        self.assertEqual(dependency_model["total_count"], 1)
+        self.assertEqual(dependency_model["completed_count"], 1)
+        self.assertEqual(dependency_model["incomplete_count"], 0)
+        self.assertEqual(dependency_model["confirmed_completed_count"], 1)
         self.assertNotIn("单依赖包最终结论", report_text)
-        self.assertIn("## 四、分析结果总表", report_text)
+        self.assertIn("## 一、依赖层面结论", report_text)
+        self.assertIn("## 二、API 及调用关系", report_text)
+        self.assertLess(
+            report_text.index("## 一、依赖层面结论"),
+            report_text.index("## 二、API 及调用关系"),
+        )
+        self.assertIn(
+            "| 依赖 | 版本变化 | API 分析（已完成/总数） | "
+            "当前系统调用关系 | 分析结果 | 结果说明 |",
+            report_text,
+        )
         self.assertIn("com.example.Demo.call", report_text)
+        self.assertIn("1.0.0 → 已移除", report_text)
+        self.assertIn("删除方法，参数：无参数", report_text)
+        self.assertIn("1/1", report_text)
+        self.assertIn("确认影响", report_text)
+        self.assertIn(
+            "com.acme.OrderService.submit → com.example.Demo.call()",
+            report_text,
+        )
+        self.assertIn(
+            "[该依赖的 1 个 API 及调用关系](all-impact-details.md#",
+            full_dependency_md,
+        )
+        self.assertIn(
+            "com.acme.OrderService.submit → com.example.Demo.call()",
+            full_api_md,
+        )
         self.assertNotIn("| a:b | 移除 | 是 | reachable |  |  | strong | com.example.Demo.call |", report_text)
+        self.assertNotIn("final_status", report_text)
+        self.assertNotIn("evidence_level", report_text)
+        self.assertNotIn("selected_api", report_text)
 
     def test_gate_allows_checkpoint_when_inputs_are_missing_without_strict_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

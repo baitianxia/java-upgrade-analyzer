@@ -298,6 +298,9 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   README.md
   deliverables/
     report.md
+    all-affected-dependencies.md
+    all-impact-details.md
+    analysis-scope.md
   evidence/
     dependencies/
       dep_changes.csv
@@ -359,7 +362,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 当某个依赖在 Step1 中被识别为 `移除` 时，Step4 会额外尝试从旧版 jar 导出 `public/protected class/method/constructor` 符号集
 - 这些符号会写入 `evidence/api_changes/s4_per_dependency/<coord>/removed_jar_symbols.csv`
 - Step5 会把单条 API 结果再汇总回 `evidence/api_changes/s4_per_dependency/<coord>/summary.json`
-- Step6 会在最终报告中展示“单依赖包最终结论”表，汇总 `change_type`、`reaches_system_source`、`blocked_at`、`blocked_reason`
+- Step6 先汇总全部变化依赖的完成状态和影响结论，再展示变化 API 与对应调用关系；主报告未展开的内容分别进入完整依赖明细和完整 API 调用关系明细
 
 ## Step 1：获取真实依赖结果
 
@@ -639,7 +642,16 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s6_report.py" \
 
 说明：
 
-- `deliverables/report.md` 会保留 Step5 的用户侧结论分桶：`可能影响`、`需要补充输入` 与剩余的 `未覆盖/未分析` 会分别成段展示，不应再混写成单一“未覆盖”列表
+- `deliverables/report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织，不在依赖结论前重复报告范围或工程背景
+- 依赖和 API 都先展示“变化总数、已完成分析、未完成分析”；确认影响数量是已完成分析结果的子集，不与完成状态并列成互斥分类
+- 已完成分析的结果合并在同一张表中，通过“分析结论”区分确认影响、确认不受影响和未确认影响
+- 只有真正没有完成分析的依赖或 API 才进入“未完成分析”，并在主报告中直接记录具体原因；已完成分析但未发现当前系统调用关系的结果仍属于已完成分析
+- 主报告只展示部分 API 时，必须同时标明展示数、总数、未展示数，并链接 `deliverables/all-impact-details.md`
+- `deliverables/all-affected-dependencies.md` 保存全部变化依赖；`deliverables/all-impact-details.md` 保存全部变化 API 和完整调用关系；两者不得使用同一个链接替代
+- 主报告只反馈客观事实和证据边界，不得生成建议、待办清单、完成标准、发布判断、修改判断或具体实现与验证指令
+- `alerts.csv` 是原始分析记录，不替代完整 API 与调用关系明细，也不作为普通读者理解主报告的前置条件
+- 内部步骤编号、原因码、状态枚举、`api_id`/`path_status` 筛选说明和 `.runtime/` 文件目录不得进入主阅读路径；它们保留在结构化 findings、证据台账或深度排障文档中
+- “用户可见文件说明”必须解释每个主阅读文件包含什么、覆盖全量还是节选，以及对应主报告的哪一部分
 
 ## 每步完成后的固定动作
 

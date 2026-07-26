@@ -28,6 +28,17 @@ from diagnostic_contract import (
 REASON_GUIDANCE_SCHEMA = "java-upgrade-analyzer.reason-guidance.v2"
 _SAMPLE_LIMIT = 5
 _EVIDENCE_LIMIT = 10
+_VALID_ORIGIN_STEPS = {
+    "step1", "step2", "step3", "step4", "step5", "step6",
+}
+
+
+def _normalized_origin_step(value, default=""):
+    normalized = str(value or "").strip().lower()
+    if normalized in _VALID_ORIGIN_STEPS:
+        return normalized
+    fallback = str(default or "").strip().lower()
+    return fallback if fallback in _VALID_ORIGIN_STEPS else ""
 
 
 _REASON_GUIDANCE = {
@@ -450,7 +461,12 @@ def _scope_explanation(scope, affected_api_count):
     return f"{count_text}失败按目标 API 隔离。"
 
 
-def build_diagnostic_guidance(results, graph_stats=None):
+def build_diagnostic_guidance(
+    results,
+    graph_stats=None,
+    *,
+    origin_step="step5",
+):
     """Aggregate result reasons and typed failure evidence into user guidance."""
     grouped_results = defaultdict(list)
     status_counts = defaultdict(lambda: defaultdict(int))
@@ -475,9 +491,31 @@ def build_diagnostic_guidance(results, graph_stats=None):
     guidance = []
     reason_codes = set(grouped_results) | set(grouped_failures)
     for reason_code in reason_codes:
-        definition = guidance_for_reason_code(reason_code)
         result_items = grouped_results.get(reason_code, ())
         failures = grouped_failures.get(reason_code, ())
+        explicit_origins = {
+            normalized
+            for normalized in [
+                *[
+                    _normalized_origin_step(_get(item, "origin_step", ""))
+                    for item in result_items
+                ],
+                *[
+                    _normalized_origin_step(failure.get("origin_step"))
+                    for failure in failures
+                ],
+            ]
+            if normalized
+        }
+        observed_origin = (
+            next(iter(explicit_origins))
+            if len(explicit_origins) == 1
+            else _normalized_origin_step(origin_step, "step5")
+        )
+        definition = guidance_for_reason_code(
+            reason_code,
+            origin_step=observed_origin or "step5",
+        )
         scopes = [
             failure.get("scope") or "global" for failure in failures
         ] or ["unknown"]
@@ -613,4 +651,11 @@ def build_diagnostic_guidance_from_summary(summary):
         *list(payload.get("not_analyzed_apis") or ()),
     ]
     graph_stats = dict((payload.get("meta") or {}).get("graph_stats") or {})
-    return build_diagnostic_guidance(results, graph_stats)
+    return build_diagnostic_guidance(
+        results,
+        graph_stats,
+        origin_step=_normalized_origin_step(
+            payload.get("origin_step"),
+            "step5",
+        ),
+    )

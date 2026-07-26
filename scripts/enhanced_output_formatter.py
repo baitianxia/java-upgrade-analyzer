@@ -64,7 +64,8 @@ ALERTS_CSV_FIELDNAMES = [
     'review_focus', 'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
     'api_identity', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
     'symbol_kind', 'compile_impact', 'runtime_link_impact', 'change_type', 'severity', 'path_status',
-    'business_reachable', 'entry_kind', 'reach_kind', 'consumer_coord', 'consumer_class',
+    'business_reachable', 'entry_kind', 'reach_kind', 'business_entry',
+    'consumer_coord', 'consumer_class',
     'consumer_method', 'consumer_signature', 'path_text',
     'path_occurrence_count', 'evidence_files', 'detail_file',
 ]
@@ -142,7 +143,7 @@ def _human_evidence_type(value):
 def _human_analysis_status(value):
     return {
         'reachable': '已确认影响',
-        'uncertain': '需要人工复核',
+        'uncertain': '结论未确定（存在候选证据）',
         'not_impacted': '已确认不受影响',
         'not_found_in_static_analysis': '静态分析未找到路径',
         'not_reachable': '静态分析未找到路径',
@@ -872,9 +873,9 @@ def format_call_chain_readable(trace_result):
     将 TraceResult 格式化为人类可读的调用链报告
 
     用于生成 by_api/*.txt 文件，让开发者能快速理解：
-      1. API是��么
+      1. API 是什么
       2. 为什么被标记为这个状态
-      3. 需要做什么
+      3. 当前结论的证据边界
       4. 完整的证据链路
 
     Args:
@@ -897,9 +898,10 @@ def format_call_chain_readable(trace_result):
     lines.append("")
 
     lines.append("【结论】")
-    lines.append(f"  结论: {user_view['user_conclusion']}")
+    lines.append(
+        f"  结论: {_human_analysis_status(trace_result.analysis_status)}"
+    )
     lines.append(f"  原因: {user_view['user_reason']}")
-    lines.append(f"  建议: {user_view['recommended_action']}")
     if user_view.get('key_evidence'):
         lines.append(f"  关键证据: {user_view['key_evidence']}")
     lines.append("")
@@ -925,8 +927,6 @@ def format_call_chain_readable(trace_result):
 
     lines.append("【状态说明】")
     lines.append(f"  原因: {explanation['reason']}")
-    if explanation.get('action'):
-        lines.append(f"  建议: {explanation['action']}")
     lines.append("")
 
     # 证据详情（原始边）
@@ -949,13 +949,6 @@ def format_call_chain_readable(trace_result):
                 lines.append(f"        位置: {file_name}:{line}")
             if len(path) > 10:
                 lines.append(f"    ... (还有 {len(path) - 10} 条边)")
-        lines.append("")
-
-    # 后续复核建议
-    if trace_result.verification_commands:
-        lines.append("【后续复核建议】")
-        for cmd in trace_result.verification_commands:
-            lines.append(f"  - {cmd}")
         lines.append("")
 
     # 关键节点
@@ -1326,7 +1319,9 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     uncertain_reason_summary = reason_summary(uncertain)
     not_analyzed_reason_summary = reason_summary(not_analyzed)
     diagnostic_guidance = build_diagnostic_guidance(
-        all_results, graph_stats=graph_stats or {},
+        all_results,
+        graph_stats=graph_stats or {},
+        origin_step="step5",
     )
 
     meta = {
@@ -1996,8 +1991,8 @@ def _alert_no_chain_view(path_status, changed_symbol):
         summary = f'静态分析未发现调用链{target_suffix}'
         detail = '完整静态分析未发现调用链'
     elif status == 'uncertain':
-        summary = f'存在待复核线索，但尚未形成可确认调用链{target_suffix}'
-        detail = '存在待复核线索，尚未形成可确认调用链'
+        summary = f'存在候选证据，但尚未形成可确认调用链{target_suffix}'
+        detail = '存在候选证据，尚未形成可确认调用链'
     elif status == 'not_impacted':
         summary = f'目标 API 已确认保留，无需调用链判定{target_suffix}'
         detail = '目标 API 在当前版本中仍然存在'
@@ -2045,7 +2040,7 @@ def _alert_conclusion_label(path_status, conclusion_level):
     if status == 'reachable':
         return '已确认影响'
     if status == 'uncertain':
-        return '需要人工复核'
+        return '结论未确定（存在候选证据）'
     if status == 'not_impacted':
         return '已确认不受影响'
     if status in {'not_found_in_static_analysis', 'not_reachable'}:
@@ -2055,11 +2050,11 @@ def _alert_conclusion_label(path_status, conclusion_level):
     level = str(conclusion_level or '')
     return {
         'confirmed': '已确认影响',
-        'candidate': '需要人工复核',
+        'candidate': '结论未确定（存在候选证据）',
         'confirmed_no_impact': '已确认不受影响',
         'no_static_path': '未发现静态调用路径',
         'incomplete': '未完成分析',
-    }.get(level, '需要人工复核')
+    }.get(level, '结论未确定')
 
 
 def _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_reason):
@@ -2074,7 +2069,7 @@ def _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_r
             return '已确认影响：业务制品直接引用了被删除的类'
         return '已确认影响：已找到业务或已激活入口到变更 API 的路径'
     if path_status == 'uncertain' and detail.get('consumer_coord'):
-        return '需要复核：当前制品中的依赖已引用该 API，但尚未证明会由业务入口触发'
+        return '结论未确定：当前制品中的依赖已引用该 API，但尚未证明会由业务入口触发'
     return _alert_conclusion_label(path_status, conclusion_level)
 
 
@@ -2125,31 +2120,31 @@ def _alert_review_focus(path_status, conclusion_level, stop_reason):
     status = str(path_status or '').strip()
     reason = str(stop_reason or '').strip()
     if status == 'reachable':
-        return "核对业务入口和终点是否符合预期。"
+        return "当前记录包含业务入口和变更 API 终点。"
     if status == 'uncertain':
-        return "核对这条候选链路是否真实会在运行时触发。"
+        return "该候选链路的运行时触发事实未确认。"
     if status == 'not_impacted':
-        return "核对当前制品中保留该 API 的依赖是否符合预期。"
+        return "当前制品中记录了保留该 API 的依赖字节码。"
     if status in {'not_found_in_static_analysis', 'not_reachable'}:
-        return "核对本轮分析范围是否覆盖目标模块和依赖源码。"
+        return "本轮静态分析范围内未找到目标调用路径。"
     if status == 'not_analyzed':
         if reason == 'DEPENDENCY_SOURCE_MAPPING_MISSING':
-            return "补充缺失依赖源码目录后重跑 Step5。"
+            return "缺少依赖源码目录，Step5 未形成完整调用链。"
         if reason == 'RUNTIME_DEPENDENCY_JARS_UNAVAILABLE':
-            return "补齐本次部署制品的运行时依赖 JAR 后重跑 Step5。"
+            return "本轮未提供部署制品的运行时依赖 JAR，Step5 未完成该项分析。"
         if reason == 'MISSING_API_SIGNATURE':
-            return "从 Step4 重新生成带完整参数签名的变更 API 清单后重跑 Step5。"
+            return "Step4 变化 API 记录缺少完整参数签名，Step5 未完成该项分析。"
         if reason == 'MISSING_SYMBOL_KIND':
-            return "从 Step4 重新生成带符号类型的变更 API 清单后重跑 Step5。"
+            return "Step4 变化 API 记录缺少符号类型，Step5 未完成该项分析。"
         if reason == 'ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE':
-            return "补齐业务制品或运行时依赖字节码后重跑 Step5；当前未命中不能视为无影响。"
-        return "查看原因并补齐本轮未完成分析所需输入。"
+            return "业务制品或运行时依赖字节码覆盖不完整；当前未命中不能视为无影响。"
+        return "本轮输入不完整，Step5 未完成该项分析。"
     level = str(conclusion_level or '').strip()
     if level == 'candidate':
-        return "核对候选证据是否足以证明运行时触发。"
+        return "候选证据尚未证明运行时触发。"
     if level == 'incomplete':
-        return "补齐输入或工具能力后重跑。"
-    return "结合结论、原因和链路字段复核这一行。"
+        return "输入或分析能力不完整，本轮未形成确定结论。"
+    return "该行记录当前结论、原因和调用链事实。"
 
 
 def _alert_review_reason(result, detail, evidence, explanation, stop_reason):

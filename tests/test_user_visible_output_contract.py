@@ -20,10 +20,15 @@ class UserVisibleOutputContractTest(unittest.TestCase):
 
     def test_outputs_doc_uses_reader_facing_conclusion_terms(self):
         text = self.read("docs/user/outputs.md")
-        reading_section = text[text.index("建议按这个顺序阅读：") : text.index("每个用户可见文件")]
+        reading_section = text[text.index("主报告的内容顺序：") : text.index("每个用户可见文件")]
 
-        self.assertIn("需人工复核", reading_section)
-        self.assertIn("缺少依赖源码/构建产物", reading_section)
+        self.assertIn("依赖层面结论", reading_section)
+        self.assertIn("API 及调用关系", reading_section)
+        self.assertIn("用户可见文件说明", reading_section)
+        self.assertIn("已完成分析", reading_section)
+        self.assertIn("未完成分析", reading_section)
+        self.assertIn("确认影响", reading_section)
+        self.assertNotIn("建议按", reading_section)
         self.assertNotIn("当前无法确认", reading_section)
         self.assertIn("本次未完成分析", text)
         self.assertNotIn("当前未完成有效分析", text)
@@ -43,7 +48,8 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         step5_text = text[text.index("## 系统触达证据") : text.index("## 系统触达证据结论")]
         self.assertLess(step5_text.index("`alerts.csv` | 人工优先入口"), step5_text.index("`summary.json`"))
         self.assertIn("`.runtime/indexes/s5_query_index.json` | 程序使用", text)
-        self.assertIn("`.runtime/findings/s6_findings.json` | 程序使用", text)
+        self.assertIn("`.runtime/findings/s6_findings.json` 是程序使用的结构化结果", text)
+        self.assertIn("不属于主报告阅读路径", text)
         self.assertIn(".runtime/observability/step1_progress.jsonl", text)
         self.assertIn(".runtime/observability/step4_timing.csv", text)
         self.assertIn(".runtime/observability/step5_timing.csv", text)

@@ -377,6 +377,8 @@
       "outputs": [
         ".runtime/findings/s6_findings.json",
         "deliverables/report.md",
+        "deliverables/all-affected-dependencies.md",
+        "deliverables/all-impact-details.md",
         "deliverables/analysis-scope.md"
       ]
     }

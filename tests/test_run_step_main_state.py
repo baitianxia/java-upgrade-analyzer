@@ -1466,11 +1466,23 @@ class RunStepMainStateTest(unittest.TestCase):
                             "analyzed_api_count": 7,
                             "total_api_count": 19,
                         },
-                        "p0": [{"api": "a"}],
+                        "p0": [{
+                            "coord": "com.example:demo",
+                            "api": "com.example.Api.confirmed",
+                            "api_signature": "()",
+                            "symbol_kind": "method",
+                            "change_type": "REMOVED",
+                        }],
                         "p1": [],
                         "p2": [],
                         "probable_impact": [],
-                        "uncertain": [{"api": "b"}],
+                        "uncertain": [{
+                            "coord": "com.example:demo",
+                            "api": "com.example.Api.uncertain",
+                            "api_signature": "()",
+                            "symbol_kind": "method",
+                            "change_type": "REMOVED",
+                        }],
                         "needs_input": [],
                         "not_analyzed": [],
                         "diagnostics": [],
@@ -1490,10 +1502,31 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(summary["status"], "completed_with_limits")
         self.assertEqual(summary["confirmed_count"], 1)
         self.assertIn("用户选择了部分变化依赖", summary["limitations"])
-        self.assertIn("1 项需要人工复核", summary["limitations"])
+        self.assertIn("1 项存在候选证据但结论未确定", summary["limitations"])
         self.assertIn("分析已完成，但存在结论限制", message)
         self.assertIn("部分依赖（1/3）", message)
-        self.assertIn("deliverables/analysis-scope.md", message)
+        self.assertEqual(summary["dependency_total_count"], 3)
+        self.assertEqual(summary["dependency_completed_count"], 0)
+        self.assertEqual(summary["dependency_incomplete_count"], 3)
+        self.assertEqual(summary["dependency_confirmed_count"], 1)
+        self.assertEqual(summary["api_total_count"], 19)
+        self.assertEqual(summary["api_completed_count"], 2)
+        self.assertEqual(summary["api_incomplete_count"], 17)
+        self.assertEqual(summary["api_confirmed_count"], 1)
+        self.assertIn(
+            "依赖：变化 3，已完成分析 0，未完成分析 3，含确认影响 1。",
+            message,
+        )
+        self.assertIn(
+            "API：变化 19，已完成分析 2，未完成分析 17，确认影响 1。",
+            message,
+        )
+        self.assertIn(
+            "deliverables/all-affected-dependencies.md",
+            message,
+        )
+        self.assertIn("deliverables/all-impact-details.md", message)
+        self.assertNotIn("deliverables/analysis-scope.md", message)
 
     def test_landing_status_does_not_hide_completion_limits(self):
         state = {
@@ -1506,7 +1539,8 @@ class RunStepMainStateTest(unittest.TestCase):
         text = "\n".join(run_step._landing_status_lines(state))
 
         self.assertIn("分析已完成，但存在结论限制", text)
-        self.assertIn("以本轮分析范围为解释边界", text)
+        self.assertIn("结论适用范围以本轮分析范围为边界", text)
+        self.assertNotIn("请先", text)
 
     def test_completed_landing_page_links_only_existing_outputs_and_shows_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1514,6 +1548,14 @@ class RunStepMainStateTest(unittest.TestCase):
             deliverables = report_dir / "deliverables"
             deliverables.mkdir(parents=True)
             (deliverables / "report.md").write_text("# 报告\n", encoding="utf-8")
+            (deliverables / "all-affected-dependencies.md").write_text(
+                "# 完整依赖分析\n",
+                encoding="utf-8",
+            )
+            (deliverables / "all-impact-details.md").write_text(
+                "# 完整 API 与调用关系\n",
+                encoding="utf-8",
+            )
             (deliverables / "analysis-scope.md").write_text("# 范围\n", encoding="utf-8")
             state = run_step.new_main_state(report_dir)
             state["state"].update(
@@ -1528,7 +1570,16 @@ class RunStepMainStateTest(unittest.TestCase):
                         "confirmed_count": 2,
                         "probable_count": 1,
                         "uncertain_count": 4,
+                        "needs_input_count": 3,
                         "not_analyzed_count": 0,
+                        "dependency_total_count": 3,
+                        "dependency_completed_count": 2,
+                        "dependency_incomplete_count": 1,
+                        "dependency_confirmed_count": 1,
+                        "api_total_count": 10,
+                        "api_completed_count": 7,
+                        "api_incomplete_count": 3,
+                        "api_confirmed_count": 2,
                         "limitations": ["用户选择了部分变化依赖"],
                     },
                 }
@@ -1538,13 +1589,119 @@ class RunStepMainStateTest(unittest.TestCase):
             text = (report_dir / "README.md").read_text(encoding="utf-8")
 
         self.assertIn("分析范围：部分依赖（1/3）", text)
-        self.assertIn("已确认影响 2（其中高风险 0），可能影响 1，需人工复核 4", text)
+        self.assertIn(
+            "依赖：变化 3，已完成分析 2，未完成分析 1，含确认影响 1。",
+            text,
+        )
+        self.assertIn(
+            "API：变化 10，已完成分析 7，未完成分析 3，确认影响 2。",
+            text,
+        )
         self.assertIn("主要限制：用户选择了部分变化依赖", text)
         self.assertIn("[deliverables/report.md](deliverables/report.md)", text)
+        self.assertIn(
+            "[deliverables/all-affected-dependencies.md]"
+            "(deliverables/all-affected-dependencies.md)",
+            text,
+        )
+        self.assertIn(
+            "[deliverables/all-impact-details.md]"
+            "(deliverables/all-impact-details.md)",
+            text,
+        )
         self.assertIn(
             "[deliverables/analysis-scope.md](deliverables/analysis-scope.md)", text
         )
         self.assertNotIn("evidence/dependencies/dep_changes.csv", text)
+
+    def test_final_completion_counts_named_not_analyzed_subcategories_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            findings_path = report_dir / ".runtime" / "findings" / "s6_findings.json"
+            findings_path.parent.mkdir(parents=True)
+            probable = {
+                "coord": "com.example:demo",
+                "api": "com.example.Api.probable",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "user_conclusion": "可能影响",
+            }
+            needs_input = {
+                "coord": "com.example:demo",
+                "api": "com.example.Api.needsInput",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "user_conclusion": "需要补充输入",
+            }
+            residual = {
+                "coord": "com.example:demo",
+                "api": "com.example.Api.notAnalyzed",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "user_conclusion": "当前无法确认",
+            }
+            findings_path.write_text(
+                json.dumps(
+                    {
+                        "coverage": {"overall_status": "complete"},
+                        "analysis_scope": {"mode": "full"},
+                        "p0": [],
+                        "p1": [],
+                        "p2": [],
+                        "probable_impact": [probable],
+                        "uncertain": [],
+                        "needs_input": [needs_input],
+                        "not_analyzed": [probable, needs_input, residual],
+                        "diagnostics": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = run_step.build_final_completion_summary(report_dir)
+            terminal = "\n".join(
+                run_step.build_user_runtime_message(
+                    "complete", "step6", completion_summary=summary
+                )
+            )
+            landing = "\n".join(
+                run_step._landing_status_lines(
+                    {
+                        "state": {
+                            "current_step": "done",
+                            "status": summary["status"],
+                            "completion_summary": summary,
+                        }
+                    }
+                )
+            )
+
+        self.assertEqual(summary["probable_count"], 1)
+        self.assertEqual(summary["needs_input_count"], 1)
+        self.assertEqual(summary["not_analyzed_count"], 1)
+        self.assertEqual(summary["dependency_total_count"], 1)
+        self.assertEqual(summary["dependency_completed_count"], 0)
+        self.assertEqual(summary["dependency_incomplete_count"], 1)
+        self.assertEqual(summary["dependency_confirmed_count"], 0)
+        self.assertEqual(summary["api_total_count"], 3)
+        self.assertEqual(summary["api_completed_count"], 1)
+        self.assertEqual(summary["api_incomplete_count"], 2)
+        self.assertEqual(summary["api_confirmed_count"], 0)
+        for text in (terminal, landing):
+            self.assertIn(
+                "依赖：变化 1，已完成分析 0，未完成分析 1，含确认影响 0。",
+                text,
+            )
+            self.assertIn(
+                "API：变化 3，已完成分析 1，未完成分析 2，确认影响 0。",
+                text,
+            )
+            self.assertNotIn("建议", text)
+            self.assertNotIn("下一步", text)
 
     def test_upgrade_context_checkpoint_generates_one_human_review_page(self):
         with tempfile.TemporaryDirectory() as tmp:

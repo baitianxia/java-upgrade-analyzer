@@ -943,8 +943,14 @@ Step6 负责把 Step1 到 Step5 的结构化产物收敛成最终交付结果。
 
 - `.runtime/findings/s6_findings.json`
 - `deliverables/report.md`
+- `deliverables/all-affected-dependencies.md`
+- `deliverables/all-impact-details.md`
 
-Step6 的职责是读取和重组前序结构化产物，回填 `reason_code` 与 `evidence_paths`，并按用户可理解的视角组织 findings。
+`report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织。依赖层和 API 层统一使用“变化总数、已完成分析、未完成分析、确认影响、确认不受影响、尚未确认影响”六列统计，再给逐项结论和正文中选取的调用关系。变化总数等于已完成与未完成之和。API 层后三类结果划分已完成分析；依赖层只要已有 API 确认影响就保留确认影响计数，因此仍有其他 API 未完成的依赖会同时计入“确认影响”和“未完成分析”。依赖明细固定使用“依赖、版本变化、API 分析（已完成/总数）、当前系统调用关系、分析结果、结果说明”，API 明细固定使用“依赖、API、新版本中的变化、当前系统调用关系、分析结果、结果说明”；已完成与未完成只改变单元格内容，不改变表头和列顺序。正文没有展开的依赖进入 `all-affected-dependencies.md`，正文没有展开的 API 及完整调用关系进入 `all-impact-details.md`。两类全量明细相互独立，不能使用同一个文件替代。
+
+`alerts.csv` 是 Step5 的原始分析记录，一条原始记录一行；它保留分析状态、调用起点、完整调用关系和证据文件。`all-impact-details.md` 将这些原始记录按变化 API 归并成用户可读的全量明细，因此两者用途不同，都需要在 `report.md` 的“用户可见文件说明”中解释。
+
+Step6 的职责是读取和重组前序结构化产物，回填 `reason_code` 与 `evidence_paths`，并按用户可理解的视角组织 findings。已经执行分析但未找到当前系统调用关系的 API 属于“已完成分析”；只有缺少关键输入或分析过程未完成的 API 才进入“未完成分析”，并随项记录原因。
 
 #### Step5 到 Step6 的结果消费链
 
@@ -954,6 +960,8 @@ Step6 的职责是读取和重组前序结构化产物，回填 `reason_code` �
   - 五态统计、`user_conclusion_summary`、`quality_gate`
 - `evidence/call_chain/by_api/*.json`
   - 单条 API 的 `reason_code`、`call_paths`、`evidence_paths`
+- `evidence/call_chain/alerts.csv`
+  - 原始分析记录和完整调用关系，用于生成用户可读的全量 API 明细
 - `evidence/api_changes/all_changed_apis.csv`
   - Step4 输入变更集，用于反向核对 Step6 汇总项
 

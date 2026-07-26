@@ -4125,7 +4125,31 @@ BridgeFacade.callAdapter();
     findings = read_json(report_dir / "s6_findings.json")
     report_text = (report_dir / "s6_report.md").read_text(encoding="utf-8")
     assert_true(findings.get("scan_stats", {}).get("dep_compat", 0) > 0, "Step 6 未汇总依赖 jar 扫描结果")
-    assert_true("分析结果总表" in report_text, "Step 6 报告未展示新主表")
+    assert_true("# Java 依赖升级影响报告" in report_text, "Step 6 报告标题不符合用户交付契约")
+    step6_section_positions = [
+        report_text.find("## 一、依赖层面结论"),
+        report_text.find("## 二、API 及调用关系"),
+        report_text.find("## 三、用户可见文件说明"),
+    ]
+    assert_true(
+        all(position >= 0 for position in step6_section_positions)
+        and step6_section_positions == sorted(step6_section_positions),
+        "Step 6 报告未按依赖结论、API 及调用关系、用户可见文件说明的顺序展示",
+    )
+    assert_true(
+        (report_dir / "deliverables" / "all-affected-dependencies.md").is_file(),
+        "Step 6 未生成完整依赖分析明细",
+    )
+    assert_true(
+        (report_dir / "deliverables" / "all-impact-details.md").is_file(),
+        "Step 6 未生成完整 API 分析与调用关系明细",
+    )
+    assert_true(
+        "all-affected-dependencies.md" in report_text
+        and "all-impact-details.md" in report_text
+        and "alerts.csv" in report_text,
+        "Step 6 用户可见文件说明未区分依赖明细、API 调用明细和原始分析记录",
+    )
     assert_true(findings.get("p0", [])[0].get("reason_code") == "SYSTEM_CODE_REACHED", "Step 6 未透传 reachable 风险的 reason_code")
     assert_true(findings.get("p0", [])[0].get("evidence_paths"), "Step 6 未透传 reachable 风险的 evidence_paths")
     assert_true(
@@ -4210,8 +4234,10 @@ BridgeFacade.callAdapter();
     synthetic_findings = read_json(user_conclusion_findings)
     synthetic_report_text = user_conclusion_report.read_text(encoding="utf-8")
     assert_true(
-        "分析结果总表" in synthetic_report_text,
-        "Step 6 报告未呈现分析结果总表",
+        "## 一、依赖层面结论" in synthetic_report_text
+        and "## 二、API 及调用关系" in synthetic_report_text
+        and "## 三、用户可见文件说明" in synthetic_report_text,
+        "Step 6 报告未呈现依赖、API 调用关系和文件说明三段正文",
     )
     assert_true(
         "com.example.lib.LegacyApi.behaviorChanged" in synthetic_report_text,
@@ -6017,8 +6043,25 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "run_step 主状态未保留 step5 的输出结果"
     )
     orchestrated_report_text = (orchestrated_report / "deliverables" / "report.md").read_text(encoding="utf-8")
-    assert_true("# Java 升级兼容性分析报告" in orchestrated_report_text, "run_step 链路未生成最终报告")
-    assert_true("分析结果总表" in orchestrated_report_text, "run_step 链路未在 Step6 报告中呈现分析结果总表")
+    assert_true("# Java 依赖升级影响报告" in orchestrated_report_text, "run_step 链路未生成最终报告")
+    orchestrated_step6_sections = [
+        orchestrated_report_text.find("## 一、依赖层面结论"),
+        orchestrated_report_text.find("## 二、API 及调用关系"),
+        orchestrated_report_text.find("## 三、用户可见文件说明"),
+    ]
+    assert_true(
+        all(position >= 0 for position in orchestrated_step6_sections)
+        and orchestrated_step6_sections == sorted(orchestrated_step6_sections),
+        "run_step 链路未按依赖结论、API 及调用关系、用户可见文件说明的顺序生成报告",
+    )
+    assert_true(
+        (orchestrated_report / "deliverables" / "all-affected-dependencies.md").is_file(),
+        "run_step 链路未生成完整依赖分析明细",
+    )
+    assert_true(
+        (orchestrated_report / "deliverables" / "all-impact-details.md").is_file(),
+        "run_step 链路未生成完整 API 分析与调用关系明细",
+    )
 
 
 
