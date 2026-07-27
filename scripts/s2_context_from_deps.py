@@ -17,10 +17,11 @@ s2_context_from_deps.py — Step 2：从依赖树推断项目上下文
 Windows 兼容：通过 compat.py 处理编码和 subprocess 调用。
 """
 
-import argparse, csv, json, os, re, sys
+import argparse, csv, json, os, re, sys, zipfile
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).parent))
 from compat import run_cmd, open_text, git_cmd, mvn_cmd
@@ -499,12 +500,47 @@ def read_local_file(work_dir, *candidates):
 def normalize_jdk_version(ver):
     if ver is None:
         return None
-    ver = str(ver).strip()
+    ver = str(ver).strip().strip('"\'').replace('_', '.')
     if not ver or ver.lower() in ('null', 'none', 'unknown'):
         return None
     if ver.startswith('1.'):
         ver = ver[2:]
-    return ver
+    match = re.fullmatch(r'(\d+)(?:\.0+)?', ver)
+    if not match:
+        return None
+    major = int(match.group(1))
+    if major <= 0 or major > 99:
+        return None
+    return str(major)
+
+
+def _xml_local_name(tag):
+    return str(tag or '').rsplit('}', 1)[-1]
+
+
+def _resolve_maven_property(value, properties):
+    """解析 Maven 属性链；无法收敛为明确 JDK 主版本时返回 None。"""
+    current = str(value or '').strip()
+    visited = set()
+    for _ in range(12):
+        prop_match = re.fullmatch(r'\$\{([^}]+)\}', current)
+        if not prop_match:
+            return normalize_jdk_version(current)
+        key = prop_match.group(1).strip()
+        if not key or key in visited or key not in properties:
+            return None
+        visited.add(key)
+        current = str(properties.get(key) or '').strip()
+    return None
+
+
+def _direct_xml_child(parent, name):
+    if parent is None:
+        return None
+    for child in list(parent):
+        if _xml_local_name(child.tag) == name:
+            return child
+    return None
 
 
 def detect_jdk_from_pom(pom_content):
@@ -512,21 +548,99 @@ def detect_jdk_from_pom(pom_content):
     if not pom_content:
         return None
 
-    # 按优先级尝试多种配置方式
+    try:
+        root = ET.fromstring(pom_content)
+    except ET.ParseError:
+        root = None
+
+    if root is not None:
+        properties = {}
+        properties_node = _direct_xml_child(root, 'properties')
+        if properties_node is not None:
+            for child in list(properties_node):
+                key = _xml_local_name(child.tag)
+                value = ''.join(child.itertext()).strip()
+                if key and value:
+                    properties[key] = value
+
+        plugin_values = {
+            'maven-compiler-plugin': {},
+            'kotlin-maven-plugin': {},
+        }
+        build = _direct_xml_child(root, 'build')
+        if build is not None:
+            for plugin in build.iter():
+                if _xml_local_name(plugin.tag) != 'plugin':
+                    continue
+                artifact_node = _direct_xml_child(plugin, 'artifactId')
+                artifact_id = (
+                    ''.join(artifact_node.itertext()).strip()
+                    if artifact_node is not None else ''
+                )
+                if artifact_id not in ('maven-compiler-plugin', 'kotlin-maven-plugin'):
+                    continue
+                field_order = (
+                    ('release', 'target', 'source')
+                    if artifact_id == 'maven-compiler-plugin'
+                    else ('jvmTarget',)
+                )
+                for configuration in plugin.iter():
+                    if _xml_local_name(configuration.tag) != 'configuration':
+                        continue
+                    for node in configuration.iter():
+                        name = _xml_local_name(node.tag)
+                        if name in field_order and name not in plugin_values[artifact_id]:
+                            plugin_values[artifact_id][name] = ''.join(
+                                node.itertext()
+                            ).strip()
+
+        # Explicit compiler configuration is the effective task input and wins
+        # over shorthand properties. release/target describe produced bytecode
+        # more directly than source; java.version is only a final convention.
+        java_candidate_values = (
+            plugin_values['maven-compiler-plugin'].get('release'),
+            properties.get('maven.compiler.release'),
+            plugin_values['maven-compiler-plugin'].get('target'),
+            properties.get('maven.compiler.target'),
+            plugin_values['maven-compiler-plugin'].get('source'),
+            properties.get('maven.compiler.source'),
+        )
+        kotlin_candidate_values = (
+            plugin_values['kotlin-maven-plugin'].get('jvmTarget'),
+            properties.get('kotlin.compiler.jvmTarget'),
+        )
+        detected_languages = []
+        for candidate_group in (java_candidate_values, kotlin_candidate_values):
+            for value in candidate_group:
+                detected = _resolve_maven_property(value, properties)
+                if detected:
+                    detected_languages.append(detected)
+                    break
+        if detected_languages:
+            return str(max(int(item) for item in detected_languages))
+
+        for value in (
+            properties.get('java.version'),
+            properties.get('jdk.version'),
+            properties.get('javaVersion'),
+        ):
+            detected = _resolve_maven_property(value, properties)
+            if detected:
+                return detected
+
+    # Keep a narrow fallback for XML fragments used by diagnostics/tests.
     patterns = [
-        r'<maven\.compiler\.release>(\d+)</maven\.compiler\.release>',
-        r'<maven\.compiler\.source>(\d+[\.\d]*)</maven\.compiler\.source>',
-        r'<java\.version>(\d+[\.\d]*)</java\.version>',
-        r'<jdk\.version>(\d+[\.\d]*)</jdk\.version>',
-        # maven-compiler-plugin 的 <release> 配置
-        r'maven-compiler-plugin.*?<release>(\d+)</release>',
-        # Kotlin/其他插件的 jvmTarget
-        r'<jvmTarget>(\d+[\.\d]*)</jvmTarget>',
+        r'<maven\.compiler\.release>\s*(1[._]\d+|\d+)\s*</maven\.compiler\.release>',
+        r'<maven\.compiler\.target>\s*(1[._]\d+|\d+)\s*</maven\.compiler\.target>',
+        r'<maven\.compiler\.source>\s*(1[._]\d+|\d+)\s*</maven\.compiler\.source>',
+        r'<java\.version>\s*(1[._]\d+|\d+)\s*</java\.version>',
+        r'<jdk\.version>\s*(1[._]\d+|\d+)\s*</jdk\.version>',
+        r'<jvmTarget>\s*(1[._]\d+|\d+)\s*</jvmTarget>',
     ]
     for pattern in patterns:
-        m = re.search(pattern, pom_content, re.DOTALL)
-        if m:
-            return normalize_jdk_version(m.group(1))
+        match = re.search(pattern, pom_content, re.DOTALL)
+        if match:
+            return normalize_jdk_version(match.group(1))
     return None
 
 
@@ -535,18 +649,274 @@ def detect_jdk_from_gradle(gradle_content):
     if not gradle_content:
         return None
 
-    patterns = [
-        r'sourceCompatibility\s*=\s*JavaVersion\.VERSION_(\d+)',
-        r'sourceCompatibility\s*=\s*[\'"](\d+[\.\d]*)[\'"]',
-        r'javaVersion\s*=\s*[\'"](\d+[\.\d]*)[\'"]',
-        r'targetCompatibility\s*=\s*JavaVersion\.VERSION_(\d+)',
-        r'java\s*\{[^}]*release\s*=\s*(\d+)',  # java { release = 17 }
+    content = re.sub(r'/\*.*?\*/', ' ', gradle_content, flags=re.DOTALL)
+    content = re.sub(r'(?m)//.*$', ' ', content)
+
+    def expression_version(expression):
+        expression = str(expression or '').strip()
+        direct = normalize_jdk_version(expression)
+        if direct:
+            return direct
+        for pattern in (
+            r'JavaVersion\.VERSION_(1_\d+|\d+)',
+            r'JavaLanguageVersion\.of\(\s*[\'"]?(1[._]\d+|\d+)[\'"]?\s*\)',
+            r'JvmTarget\.JVM_(1_\d+|\d+)',
+            r'JavaVersion\.toVersion\(\s*[\'"]?(1[._]\d+|\d+)[\'"]?\s*\)',
+        ):
+            match = re.fullmatch(pattern, expression)
+            if match:
+                return normalize_jdk_version(match.group(1))
+        return None
+
+    variables = {}
+    assignment_pattern = re.compile(
+        r'(?m)^\s*(?:def|val|var)?\s*([A-Za-z_]\w*)\s*=\s*([^\n;]+)'
+    )
+    pending = [(match.group(1), match.group(2).strip()) for match in assignment_pattern.finditer(content)]
+    for _ in range(4):
+        changed = False
+        for name, expression in pending:
+            detected = expression_version(expression)
+            if not detected and re.fullmatch(r'[A-Za-z_]\w*', expression):
+                detected = variables.get(expression)
+            if detected and variables.get(name) != detected:
+                variables[name] = detected
+                changed = True
+        if not changed:
+            break
+
+    def detect_first(patterns):
+        for pattern in patterns:
+            match = re.search(pattern, content, re.DOTALL)
+            if not match:
+                continue
+            expression = match.group(1).strip()
+            detected = expression_version(expression)
+            if not detected and re.fullmatch(r'[A-Za-z_]\w*', expression):
+                detected = variables.get(expression)
+            if detected:
+                return detected
+        return None
+
+    # Java and Kotlin can have separate bytecode targets. The application needs
+    # the higher one; a toolchain is only a fallback when neither target exists.
+    java_target = detect_first([
+        r'options\.release\.set\(\s*([^)]+)\s*\)',
+        r'options\.release\s*=\s*([^\s;\n}]+)',
+        r'targetCompatibility\s*=\s*([^\s;\n}]+)',
+        r'targetCompatibility\s+([^\s;\n}]+)',
+        r'sourceCompatibility\s*=\s*([^\s;\n}]+)',
+        r'sourceCompatibility\s+([^\s;\n}]+)',
+    ])
+    kotlin_target = detect_first([
+        r'jvmTarget\s*=\s*([^\s;\n}]+)',
+        r'jvmTarget\.set\(\s*([^)]+)\s*\)',
+    ])
+    language_targets = [
+        item for item in (java_target, kotlin_target) if item
     ]
-    for pattern in patterns:
-        m = re.search(pattern, gradle_content, re.DOTALL)
-        if m:
-            return normalize_jdk_version(m.group(1).replace('_', '.'))
+    if language_targets:
+        return str(max(int(item) for item in language_targets))
+
+    toolchain_target = detect_first([
+        r'languageVersion\.set\(\s*(JavaLanguageVersion\.of\([^)]+\)|[A-Za-z_]\w*)\s*\)',
+        r'languageVersion\s*=\s*(JavaLanguageVersion\.of\([^)]+\)|[A-Za-z_]\w*)',
+        r'jvmToolchain\(\s*([^)]+)\s*\)',
+    ])
+    if toolchain_target:
+        return toolchain_target
+
+    # Common Kotlin compiler form nests JvmTarget inside .set(...), which the
+    # generic capture above intentionally keeps conservative.
+    match = re.search(r'JvmTarget\.JVM_(1_\d+|\d+)', content)
+    if match:
+        return normalize_jdk_version(match.group(1))
     return None
+
+
+def jdk_version_from_class_major(class_major):
+    """JVMS class major 52 -> Java 8, 61 -> Java 17。"""
+    try:
+        major = int(class_major)
+    except (TypeError, ValueError):
+        return None
+    if major < 45 or major > 143:
+        return None
+    return str(major - 44)
+
+
+def detect_jdk_from_artifact(artifact_path):
+    """
+    从最终 JAR/WAR 的业务 class 文件推断实际最低运行 JDK。
+
+    Spring Boot/WAR 只读取 BOOT-INF/classes 或 WEB-INF/classes，明确排除
+    嵌套依赖；普通 JAR 读取自身 class，并排除 multi-release 覆盖层。
+    """
+    path = Path(str(artifact_path or '')).expanduser()
+    result = {
+        'version': None,
+        'source': 'final_artifact_bytecode',
+        'artifact_path': str(path),
+        'class_count': 0,
+        'class_major_min': None,
+        'class_major_max': None,
+        'class_versions': [],
+        'status': 'not_found',
+    }
+    if not path.is_file():
+        result['status'] = 'artifact_missing'
+        return result
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            names = [info.filename.replace('\\', '/') for info in infos]
+            if any(name.startswith('BOOT-INF/classes/') for name in names):
+                class_prefix = 'BOOT-INF/classes/'
+            elif any(name.startswith('WEB-INF/classes/') for name in names):
+                class_prefix = 'WEB-INF/classes/'
+            else:
+                class_prefix = ''
+
+            majors = []
+            for info in infos:
+                name = info.filename.replace('\\', '/')
+                if info.is_dir() or not name.endswith('.class'):
+                    continue
+                if class_prefix:
+                    if not name.startswith(class_prefix):
+                        continue
+                elif (
+                    name.startswith('META-INF/')
+                    or name.startswith('BOOT-INF/lib/')
+                    or name.startswith('WEB-INF/lib/')
+                ):
+                    continue
+                try:
+                    with archive.open(info) as class_file:
+                        header = class_file.read(8)
+                except (OSError, RuntimeError, zipfile.BadZipFile):
+                    continue
+                if len(header) != 8 or header[:4] != b'\xca\xfe\xba\xbe':
+                    continue
+                major = int.from_bytes(header[6:8], byteorder='big')
+                if jdk_version_from_class_major(major):
+                    majors.append(major)
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        result['status'] = 'invalid_archive'
+        return result
+
+    if not majors:
+        result['status'] = 'no_application_classes'
+        return result
+    distinct_majors = sorted(set(majors))
+    result.update({
+        'version': jdk_version_from_class_major(max(distinct_majors)),
+        'class_count': len(majors),
+        'class_major_min': min(distinct_majors),
+        'class_major_max': max(distinct_majors),
+        'class_versions': [
+            jdk_version_from_class_major(item) for item in distinct_majors
+        ],
+        'status': 'detected',
+    })
+    return result
+
+
+def _build_provenance_candidates(output_path=''):
+    candidates = []
+    report_dir = str(os.environ.get('UPGRADE_REPORT_DIR') or '').strip()
+    if report_dir:
+        candidates.append(
+            Path(report_dir) / 'evidence' / 'dependencies' / 'build_provenance.json'
+        )
+    if output_path:
+        output = Path(output_path).expanduser().resolve()
+        if output.parent.name == 'context' and output.parent.parent.name == 'evidence':
+            candidates.append(
+                output.parent.parent / 'dependencies' / 'build_provenance.json'
+            )
+        candidates.append(output.parent / 'build_provenance.json')
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            yield candidate
+
+
+def detect_artifact_jdk_evidence(output_path=''):
+    """读取 Step1 产物账本，返回 base/current 的实际字节码证据。"""
+    provenance_path = next(
+        (item for item in _build_provenance_candidates(output_path) if item.is_file()),
+        None,
+    )
+    if provenance_path is None:
+        return {}
+    try:
+        payload = json.loads(provenance_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError):
+        return {}
+
+    evidence = {}
+    for item in payload.get('sides') or []:
+        side = str((item or {}).get('side') or '').strip()
+        if side not in ('base', 'current'):
+            continue
+        raw_path = str((item or {}).get('artifact_path') or '').strip()
+        if not raw_path:
+            continue
+        artifact_path = Path(raw_path).expanduser()
+        if not artifact_path.is_absolute():
+            artifact_path = provenance_path.parent / artifact_path
+        detected = detect_jdk_from_artifact(artifact_path)
+        detected['build_runtime_jdk_home'] = str((item or {}).get('jdk_home') or '')
+        detected['build_tool'] = str((item or {}).get('build_tool') or '')
+        detected['revision'] = str((item or {}).get('revision') or '')
+        evidence[side] = detected
+    return evidence
+
+
+def select_jdk_evidence(build_versions, artifact_evidence, confirmed_versions=None):
+    """
+    汇总 JDK 证据。最终制品代表实际结果，优先于构建声明；冲突只记录诊断，
+    不把已可由 class 文件回答的问题转成用户 checkpoint。
+    """
+    confirmed_versions = confirmed_versions or {}
+    selected = {}
+    for side in ('base', 'current'):
+        build_version = normalize_jdk_version((build_versions or {}).get(side))
+        artifact = dict((artifact_evidence or {}).get(side) or {})
+        artifact_version = normalize_jdk_version(artifact.get('version'))
+        confirmed = normalize_jdk_version(confirmed_versions.get(side))
+        if confirmed:
+            version = confirmed
+            source = 'user_confirmed'
+            confidence = 'confirmed'
+        elif artifact_version:
+            version = artifact_version
+            source = 'final_artifact_bytecode'
+            confidence = 'high'
+        elif build_version:
+            version = build_version
+            source = 'build_model'
+            confidence = 'medium'
+        else:
+            version = None
+            source = 'not_found'
+            confidence = 'none'
+        selected[side] = {
+            'version': version,
+            'source': source,
+            'confidence': confidence,
+            'build_model_version': build_version,
+            'artifact_bytecode_version': artifact_version,
+            'evidence_conflict': bool(
+                build_version and artifact_version and build_version != artifact_version
+            ),
+            'artifact': artifact,
+        }
+    return selected
 
 
 def parse_maven_help_evaluate_jdk(output):
@@ -583,7 +953,14 @@ def resolve_maven_jdk_from_effective_model(branch, work_dir, pom_relpath='pom.xm
         pom_path = root_dir / pom_relpath
         eval_cwd = str(pom_path.parent if pom_path.exists() else root_dir)
         mvn = mvn_cmd(root_dir)
-        for expr in ('maven.compiler.release', 'maven.compiler.target', 'maven.compiler.source'):
+        for expr in (
+            'maven.compiler.release',
+            'maven.compiler.target',
+            'maven.compiler.source',
+            'java.version',
+            'jdk.version',
+            'kotlin.compiler.jvmTarget',
+        ):
             stdout, stderr, rc = run_cmd(
                 mvn + ['-q', 'help:evaluate', f'-Dexpression={expr}', '-DforceStdout'],
                 cwd=eval_cwd,
@@ -604,21 +981,17 @@ def resolve_maven_jdk_from_effective_model(branch, work_dir, pom_relpath='pom.xm
     return None
 
 
-def detect_jdk_versions(base_branch, cur_branch, work_dir, build_tool):
-    """从两个分支读取 JDK 版本（只读 git，不切换分支）"""
+def detect_jdk_versions_from_manifests(base_branch, cur_branch, work_dir, build_tool):
+    """只读取两个 revision 的构建清单，不启动 Maven/Gradle。"""
     jdk_base, jdk_cur = None, None
-    has_git = is_git_repo(work_dir)
-
-    # Without git-backed base/current revisions, using the same local manifest
-    # for both sides would create a false "base=current" context.
-    if not has_git:
-        return None, None
+    matched_candidate = 'pom.xml'
+    if not is_git_repo(work_dir):
+        return jdk_base, jdk_cur, matched_candidate
 
     if build_tool == 'maven':
         pom_candidates = build_manifest_candidates(work_dir, 'pom.xml')
         base_pom = ''
         cur_pom = ''
-        matched_candidate = 'pom.xml'
         for candidate in pom_candidates:
             if not base_pom:
                 base_pom = git_show_file(base_branch, candidate, work_dir)
@@ -629,14 +1002,6 @@ def detect_jdk_versions(base_branch, cur_branch, work_dir, build_tool):
                 break
         jdk_base = detect_jdk_from_pom(base_pom)
         jdk_cur  = detect_jdk_from_pom(cur_pom)
-        if not jdk_base:
-            jdk_base = resolve_maven_jdk_from_effective_model(
-                base_branch, work_dir, matched_candidate
-            )
-        if not jdk_cur:
-            jdk_cur = resolve_maven_jdk_from_effective_model(
-                cur_branch, work_dir, matched_candidate
-            )
     else:
         # Gradle
         gradle_candidates = build_manifest_candidates(work_dir, 'build.gradle', 'build.gradle.kts')
@@ -648,6 +1013,25 @@ def detect_jdk_versions(base_branch, cur_branch, work_dir, build_tool):
                 content = git_show_file(cur_branch, gradle_file, work_dir)
                 jdk_cur = detect_jdk_from_gradle(content)
 
+    return jdk_base, jdk_cur, matched_candidate
+
+
+def detect_jdk_versions(base_branch, cur_branch, work_dir, build_tool):
+    """从两个 revision 推断 JDK；Maven 静态声明不足时再读取有效模型。"""
+    # Without git-backed base/current revisions, using the same local manifest
+    # for both sides would create a false "base=current" context.
+    jdk_base, jdk_cur, matched_candidate = detect_jdk_versions_from_manifests(
+        base_branch, cur_branch, work_dir, build_tool
+    )
+    if build_tool == 'maven' and is_git_repo(work_dir):
+        if not jdk_base:
+            jdk_base = resolve_maven_jdk_from_effective_model(
+                base_branch, work_dir, matched_candidate
+            )
+        if not jdk_cur:
+            jdk_cur = resolve_maven_jdk_from_effective_model(
+                cur_branch, work_dir, matched_candidate
+            )
     return jdk_base, jdk_cur
 
 
@@ -788,16 +1172,56 @@ def main():
     if has_sc:
         print(f"  Spring Cloud：{sc_ver or '已检测'}", file=sys.stderr)
 
-    # ── 5. JDK 版本（从 git 只读 pom.xml）──────────────────────
-    jdk_base, jdk_cur = detect_jdk_versions(
-        base_revision, current_revision,
-        args.work_dir, build_tool
+    # ── 5. JDK 版本（最终产物字节码优先，构建模型补充）──────────
+    artifact_jdk_evidence = detect_artifact_jdk_evidence(args.output)
+    artifact_pair_complete = all(
+        normalize_jdk_version(
+            (artifact_jdk_evidence.get(side) or {}).get('version')
+        )
+        for side in ('base', 'current')
     )
-    if orchestrated_input.get('jdk_base'):
-        jdk_base = str(orchestrated_input.get('jdk_base')).strip()
-    if orchestrated_input.get('jdk_current'):
-        jdk_cur = str(orchestrated_input.get('jdk_current')).strip()
+    if artifact_pair_complete:
+        # Step1 已给出 base/current 的实际业务字节码，不再为补一个声明值而
+        # 启动 Maven/Gradle；只读构建清单用于一致性诊断，避免网络、daemon
+        # 或文件锁反过来阻断流程。
+        build_jdk_base, build_jdk_cur, _ = detect_jdk_versions_from_manifests(
+            base_revision, current_revision,
+            args.work_dir, build_tool
+        )
+    else:
+        build_jdk_base, build_jdk_cur = detect_jdk_versions(
+            base_revision, current_revision,
+            args.work_dir, build_tool
+        )
+    selected_jdk = select_jdk_evidence(
+        {'base': build_jdk_base, 'current': build_jdk_cur},
+        artifact_jdk_evidence,
+        {
+            'base': orchestrated_input.get('jdk_base'),
+            'current': orchestrated_input.get('jdk_current'),
+        },
+    )
+    jdk_base = selected_jdk['base']['version']
+    jdk_cur = selected_jdk['current']['version']
+    jdk_sources = {
+        selected_jdk['base']['source'],
+        selected_jdk['current']['source'],
+    }
+    jdk_source = (
+        next(iter(jdk_sources))
+        if len(jdk_sources) == 1
+        else 'mixed'
+    )
     print(f"  JDK：{jdk_base or '❓未知'} → {jdk_cur or '❓未知'}", file=sys.stderr)
+    for side, label in (('base', '基准'), ('current', '当前')):
+        item = selected_jdk[side]
+        if item.get('evidence_conflict'):
+            print(
+                f"  ⚠️ {label}侧 JDK 声明为 {item.get('build_model_version')}，"
+                f"最终产物字节码为 {item.get('artifact_bytecode_version')}；"
+                "采用最终产物实际值",
+                file=sys.stderr,
+            )
 
     # ── 6. 升级标志位 ────────────────────────────────────────────
     sb_upgraded, sb_major_upgrade, jdk_upgraded = compute_version_flags(
@@ -829,7 +1253,7 @@ def main():
     # ── 构建 context.json ────────────────────────────────────────
     ctx = {
         'meta': {
-            'what': '项目升级上下文（由真实依赖树 + 少量 git/pom 只读信息推断）',
+            'what': '项目升级上下文（由真实依赖树、构建模型与最终产物字节码推断）',
             'why': '决定 Step3 扫描项与 Step4/5 的分析策略，解释“为什么会生成/跳过某些产物”',
             'how_to_read': [
                 '优先确认 jdk_base/jdk_current 与 springboot_base/springboot_current 是否符合预期',
@@ -849,11 +1273,8 @@ def main():
         'jdk_base':        jdk_base,
         'jdk_current':     jdk_cur,
         'jdk_upgraded':    jdk_upgraded,
-        'jdk_source':      (
-            'user_confirmed'
-            if orchestrated_input.get('jdk_base') or orchestrated_input.get('jdk_current')
-            else ('pom_xml' if (jdk_base or jdk_cur) else 'not_found')
-        ),
+        'jdk_source':      jdk_source,
+        'jdk_evidence':    selected_jdk,
 
         # Spring Boot
         'springboot_base':            sb_base,

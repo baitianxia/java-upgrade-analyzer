@@ -2,6 +2,7 @@ import csv
 import json
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,10 @@ import gate  # noqa: E402
 
 
 class Step2SourceDirsTest(unittest.TestCase):
+    @staticmethod
+    def _class_bytes(major):
+        return b"\xca\xfe\xba\xbe\x00\x00" + int(major).to_bytes(2, "big")
+
     def test_orchestrated_confirmed_versions_override_auto_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -192,6 +197,246 @@ class Step2SourceDirsTest(unittest.TestCase):
             step2.parse_maven_help_evaluate_jdk("null object or invalid expression"),
             None,
         )
+
+    def test_detect_jdk_from_pom_resolves_property_chain_and_prefers_release(self):
+        pom = """
+        <project>
+          <properties>
+            <java.baseline>17</java.baseline>
+            <java.version>${java.baseline}</java.version>
+            <maven.compiler.source>11</maven.compiler.source>
+            <maven.compiler.release>${java.version}</maven.compiler.release>
+          </properties>
+        </project>
+        """
+
+        self.assertEqual(step2.detect_jdk_from_pom(pom), "17")
+
+    def test_detect_jdk_from_pom_resolves_compiler_plugin_property(self):
+        pom = """
+        <project>
+          <properties>
+            <bytecode.level>21</bytecode.level>
+            <maven.compiler.source>11</maven.compiler.source>
+            <java.version>8</java.version>
+          </properties>
+          <build><plugins><plugin>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <configuration>
+              <source>17</source>
+              <target>${bytecode.level}</target>
+            </configuration>
+          </plugin></plugins></build>
+        </project>
+        """
+
+        self.assertEqual(step2.detect_jdk_from_pom(pom), "21")
+
+    def test_detect_jdk_from_pom_uses_highest_java_kotlin_bytecode_target(self):
+        pom = """
+        <project>
+          <build><plugins>
+            <plugin>
+              <artifactId>maven-compiler-plugin</artifactId>
+              <configuration><release>11</release></configuration>
+            </plugin>
+            <plugin>
+              <artifactId>kotlin-maven-plugin</artifactId>
+              <configuration><jvmTarget>17</jvmTarget></configuration>
+            </plugin>
+          </plugins></build>
+        </project>
+        """
+
+        self.assertEqual(step2.detect_jdk_from_pom(pom), "17")
+
+    def test_detect_jdk_from_gradle_supports_toolchains_release_and_kotlin_dsl(self):
+        self.assertEqual(
+            step2.detect_jdk_from_gradle(
+                """
+                val targetJdk = JavaLanguageVersion.of(21)
+                java {
+                    toolchain.languageVersion.set(targetJdk)
+                }
+                """
+            ),
+            "21",
+        )
+        self.assertEqual(
+            step2.detect_jdk_from_gradle(
+                """
+                java {
+                    sourceCompatibility = JavaVersion.VERSION_1_8
+                }
+                tasks.withType<JavaCompile> {
+                    options.release.set(17)
+                }
+                """
+            ),
+            "17",
+        )
+        self.assertEqual(
+            step2.detect_jdk_from_gradle(
+                "kotlin { jvmToolchain(21) }\n"
+                "compilerOptions.jvmTarget.set(JvmTarget.JVM_17)\n"
+            ),
+            "17",
+        )
+        self.assertEqual(
+            step2.detect_jdk_from_gradle(
+                "targetCompatibility = JavaVersion.VERSION_11\n"
+                "compilerOptions.jvmTarget.set(JvmTarget.JVM_17)\n"
+            ),
+            "17",
+        )
+
+    def test_detect_jdk_from_boot_artifact_reads_only_application_bytecode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "BOOT-INF/classes/com/example/Legacy.class",
+                    self._class_bytes(55),
+                )
+                archive.writestr(
+                    "BOOT-INF/classes/com/example/App.class",
+                    self._class_bytes(61),
+                )
+                archive.writestr(
+                    "META-INF/versions/21/com/example/App.class",
+                    self._class_bytes(65),
+                )
+                archive.writestr(
+                    "com/foreign/Higher.class",
+                    self._class_bytes(65),
+                )
+
+            detected = step2.detect_jdk_from_artifact(artifact)
+
+        self.assertEqual(detected["status"], "detected")
+        self.assertEqual(detected["version"], "17")
+        self.assertEqual(detected["class_count"], 2)
+        self.assertEqual(detected["class_versions"], ["11", "17"])
+
+    def test_artifact_jdk_evidence_comes_from_step1_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            dependencies = report_dir / "evidence" / "dependencies"
+            context = report_dir / "evidence" / "context"
+            dependencies.mkdir(parents=True)
+            context.mkdir(parents=True)
+            base_artifact = Path(tmp) / "base.jar"
+            current_artifact = Path(tmp) / "current.jar"
+            for artifact, major in ((base_artifact, 55), (current_artifact, 61)):
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr(
+                        "BOOT-INF/classes/com/example/App.class",
+                        self._class_bytes(major),
+                    )
+            (dependencies / "build_provenance.json").write_text(
+                json.dumps({
+                    "sides": [
+                        {
+                            "side": "base",
+                            "artifact_path": str(base_artifact),
+                            "jdk_home": "/jdks/21",
+                        },
+                        {
+                            "side": "current",
+                            "artifact_path": str(current_artifact),
+                            "jdk_home": "/jdks/21",
+                        },
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            evidence = step2.detect_artifact_jdk_evidence(
+                context / "context.json"
+            )
+
+        self.assertEqual(evidence["base"]["version"], "11")
+        self.assertEqual(evidence["current"]["version"], "17")
+        self.assertEqual(evidence["base"]["build_runtime_jdk_home"], "/jdks/21")
+
+    def test_main_uses_complete_artifact_pair_without_build_tool_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            report_dir = project_dir / ".upgrade-report"
+            dependencies = report_dir / "evidence" / "dependencies"
+            context = report_dir / "evidence" / "context"
+            dependencies.mkdir(parents=True)
+            context.mkdir(parents=True)
+            dep_changes = dependencies / "dep_changes.csv"
+            output_json = context / "context.json"
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,scope\n"
+                "org.example:demo,1.0,2.0,升级,packaged\n",
+                encoding="utf-8",
+            )
+            sides = []
+            for side, major in (("base", 55), ("current", 61)):
+                artifact = project_dir / f"{side}.jar"
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr(
+                        "BOOT-INF/classes/com/example/App.class",
+                        self._class_bytes(major),
+                    )
+                sides.append({"side": side, "artifact_path": str(artifact)})
+            (dependencies / "build_provenance.json").write_text(
+                json.dumps({"sides": sides}),
+                encoding="utf-8",
+            )
+            argv = [
+                "s2_context_from_deps.py",
+                "--dep-changes", str(dep_changes),
+                "--base", "origin/main",
+                "--current", "feature/upgrade",
+                "--work-dir", str(project_dir),
+                "--output", str(output_json),
+            ]
+
+            with patch.object(sys, "argv", argv), patch.object(
+                step2, "detect_build_tool", return_value="maven"
+            ), patch.object(
+                step2,
+                "detect_jdk_versions",
+                side_effect=AssertionError("完整最终产物不应再启动构建工具探测"),
+            ), patch.object(
+                step2, "detect_spring_boot_version", return_value=(None, None, "not_found")
+            ), patch.object(
+                step2, "detect_spring_cloud", return_value=(False, None)
+            ), patch.object(
+                step2, "detect_tech_flags", return_value={}
+            ), patch.object(
+                step2, "detect_jvm_param_changes", return_value=[]
+            ):
+                step2.main()
+
+            payload = json.loads(output_json.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["jdk_base"], "11")
+        self.assertEqual(payload["jdk_current"], "17")
+        self.assertEqual(payload["jdk_source"], "final_artifact_bytecode")
+        self.assertEqual(
+            payload["jdk_evidence"]["current"]["artifact"]["class_major_max"],
+            61,
+        )
+
+    def test_final_artifact_wins_over_conflicting_build_declaration(self):
+        selected = step2.select_jdk_evidence(
+            {"base": "8", "current": "11"},
+            {
+                "base": {"version": "11", "status": "detected"},
+                "current": {"version": "17", "status": "detected"},
+            },
+        )
+
+        self.assertEqual(selected["base"]["version"], "11")
+        self.assertEqual(selected["current"]["version"], "17")
+        self.assertTrue(selected["base"]["evidence_conflict"])
+        self.assertEqual(selected["base"]["source"], "final_artifact_bytecode")
 
     def test_effective_model_probe_uses_shared_worktree_runtime_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as tmp:
