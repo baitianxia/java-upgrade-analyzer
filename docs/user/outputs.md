@@ -35,7 +35,7 @@
 2. API 及调用关系：变化 API 总数、已完成分析、未完成分析、确认影响、确认不受影响、尚未确认影响，以及 API 对应的当前系统调用关系。
 3. 用户可见文件说明：每个主阅读文件包含什么、覆盖全量还是节选、对应主报告哪一部分。
 
-已完成分析与未完成分析之和等于变化总数。API 层的“确认影响”“确认不受影响”“尚未确认影响”是已完成分析结果的三种分类。依赖层只要已有 API 确认影响，就计入“确认影响”；如果同一依赖仍有其他 API 未完成分析，该依赖也同时计入“未完成分析”，并在明细中直接写明原因。已执行分析但未发现当前系统调用关系的 API 仍属于已完成分析。只有因为输入缺失、文件无法读取或分析结果没有产生而无法完成的项，才进入“未完成分析”。
+表中的“变化总数”以本轮分析范围为边界。全量分析时等于选择前识别出的全部变化对象；部分分析时只等于用户选中的依赖及其变化 API。未选择对象属于范围外对象，不计入“未完成分析”。已完成分析与未完成分析之和等于本轮范围内的变化总数。API 层的“确认影响”“确认不受影响”“尚未确认影响”是已完成分析结果的三种分类。依赖层只要已有 API 确认影响，就计入“确认影响”；如果同一依赖仍有其他 API 未完成分析，该依赖也同时计入“未完成分析”，并在明细中直接写明原因。已执行分析但未发现当前系统调用关系的 API 仍属于已完成分析。只有本轮范围内因为输入缺失、文件无法读取或分析结果没有产生而无法完成的项，才进入“未完成分析”。
 
 每个用户可见文件都应直接记录：
 
@@ -54,9 +54,11 @@
 | 顺序 | 文件 | 作用 |
 |---:|---|---|
 | 1 | `deliverables/report.md` | 先读依赖结论，再读 API 和调用关系 |
-| 2 | `deliverables/all-affected-dependencies.md` | 全部变化依赖的分析状态、结论依据和对应 API 链接 |
-| 3 | `deliverables/all-impact-details.md` | 全部变化 API、分析状态和完整调用关系 |
-| 4 | `evidence/call_chain/alerts.csv` | 一行一条的原始分析记录，用于核对调用关系和证据文件 |
+| 2 | `deliverables/all-affected-dependencies.md` | 本轮分析范围内全部变化依赖的分析状态、结论依据和对应 API 链接 |
+| 3 | `deliverables/all-affected-dependencies.csv` | 与完整依赖 Markdown 相同的数据和排序，便于表格筛选 |
+| 4 | `deliverables/all-impact-details.md` | 本轮分析范围内全部变化 API、分析状态和完整调用关系 |
+| 5 | `deliverables/all-impact-details.csv` | 与完整 API Markdown 相同的数据和排序，包含完整调用关系 |
+| 6 | `evidence/call_chain/alerts.csv` | 一行一条的原始分析记录，用于核对调用关系和证据文件 |
 
 如果结果存在疑问，再回到对应步骤的原始证据文件继续追溯。
 
@@ -66,7 +68,9 @@
 - `all_changed_apis.csv` 回答“完整 API 变化事实是什么”；
 - `deliverables/report.md` 回答“依赖层面和 API 层面的结论是什么”；
 - `all-affected-dependencies.md` 回答“主报告未展开的依赖结果在哪里”；
+- `all-affected-dependencies.csv` 是相同依赖结果的表格版本；
 - `all-impact-details.md` 回答“主报告未展开的 API 和完整调用关系在哪里”；
+- `all-impact-details.csv` 是相同 API 及调用关系的表格版本；
 - `alerts.csv` 保留形成上述调用关系的原始分析记录。
 
 ## 分析对象与依赖范围
@@ -173,7 +177,7 @@ Step4 还会从 old/current 最终 JAR 识别 DTO/数据对象的实例字段新
 
 `all_changed_apis.csv` 用于核对 API 级明细，不作为依赖包选择入口。“部分分析优先项”只用于用户已经决定缩小范围后的排序，不表示系统建议缩小范围，也不表示已经确认影响当前系统。
 
-确认结果会写入 `.runtime/cache/step5_selection.json`。最终报告会据此标明全量或部分范围；如果是部分分析，未选择依赖不会被纳入系统触达结论，也不能据此得出全局无影响结论。
+确认结果会写入 `.runtime/cache/step5_selection.json`。最终报告会据此标明全量或部分范围；如果是部分分析，主报告与依赖/API 两类完整分析明细（Markdown 和 CSV）只统计选中的依赖及其变化 API，未选择对象不会被归类为“未完成分析”。未选择依赖及原因记录在 `deliverables/analysis-scope.md`，选择前的依赖/API 全集仍保留在原始变化清单中。部分范围不能支持全局无影响结论。
 
 最终会同时生成 `deliverables/analysis-scope.md`，把运行时范围快照转换为可直接核对的纳入/排除依赖清单和 API 数量。根目录 `README.md` 只展示本轮实际存在的文件，并使用可点击的相对链接；若流程正在等待确认，确认问题、选项和回复示例也会保留在该入口中。
 
@@ -315,14 +319,16 @@ alerts_reachable_002.csv
 | 文件 | 说明 |
 |---|---|
 | `deliverables/report.md` | 主报告；依次展示依赖结论、API 及调用关系、用户可见文件说明 |
-| `deliverables/all-affected-dependencies.md` | 全部变化依赖的已完成/未完成状态、分析结论、结论依据和对应 API 链接 |
-| `deliverables/all-impact-details.md` | 全部变化 API 的分析结果；确认影响项包含完整调用关系，未完成项包含具体原因 |
-| `deliverables/analysis-scope.md` | 本轮纳入和未纳入调用关系分析的依赖及 API 数量 |
+| `deliverables/all-affected-dependencies.md` | 本轮分析范围内全部变化依赖的已完成/未完成状态、分析结论、结论依据和对应 API 链接 |
+| `deliverables/all-affected-dependencies.csv` | 与完整依赖 Markdown 相同的数据和排序 |
+| `deliverables/all-impact-details.md` | 本轮分析范围内全部变化 API 的分析结果；确认影响项包含完整调用关系，未完成项包含具体原因 |
+| `deliverables/all-impact-details.csv` | 与完整 API Markdown 相同的数据和排序，包含完整调用关系 |
+| `deliverables/analysis-scope.md` | 选择前总数、本轮纳入数量、未纳入数量、未纳入依赖及具体原因 |
 | `deliverables/analysis-diagnostics.md` | 仅在存在输入读取或结构异常时生成，记录异常及其影响范围 |
 
 `.runtime/findings/s6_findings.json` 是程序使用的结构化结果，不属于主报告阅读路径。内部原因码、步骤编号、状态枚举、查询索引和 `.runtime/` 文件目录保留在机器证据或深度排障材料中，不应出现在主报告正文或主报告的文件索引中。
 
-Step6 不把全部 API 逐项塞进主报告。主报告必须标明展示数、总数和未展示数；全部依赖和 API 分别进入两份全量 Markdown。
+Step6 不把本轮范围内全部 API 逐项塞进主报告。主报告必须标明展示数、总数和未展示数；本轮范围内全部依赖和 API 分别进入完整 Markdown，并各自生成一份同数据、同排序的 CSV。部分分析时，选择前全集只保留在原始变化清单和范围记录中。
 
 ### 主报告固定内容顺序
 
@@ -333,6 +339,8 @@ Step6 不把全部 API 逐项塞进主报告。主报告必须标明展示数、
 3. **用户可见文件说明**：区分主报告、完整依赖明细、完整 API 与调用关系明细、原始分析记录及范围/异常记录，逐项说明内容和数据范围。
 
 主报告只回答“发生了什么、证据证明到哪里、哪些事实仍未确认”。不得生成建议、待办清单、完成标准、发布判断、修改判断或具体实现与验证指令。
+
+依赖明细按“确认影响 → 未确认影响 → 确认不受影响”排列，同类结果按调用链数量从多到少排列。API 明细先按依赖分组，同一依赖内按相同的结果顺序和调用链数量排列。主报告展示列表、完整 Markdown 和对应 CSV 使用同一排序口径；未完成分析仍在独立列表中展示。
 
 依赖结果表至少包含：
 
@@ -348,7 +356,7 @@ API 结果表至少包含：
 
 已完成分析和未完成分析使用相同表头及列顺序。未完成项在“当前系统调用关系”中显示“调用关系分析未完成”，具体原因写入“结果说明”；已完成项在相同位置展示调用关系、分析结果及其客观依据。
 
-主报告不要求普通读者理解或筛选 `api_id`、`path_status`、内部原因码等字段。完整 API 和调用关系直接进入 `deliverables/all-impact-details.md`；`alerts.csv` 仅保留原始记录。静态分析已经完成但没有找到路径时，结果显示为“已完成分析、未确认影响”，不能写成“未完成分析”。
+主报告不要求普通读者理解或筛选 `api_id`、`path_status`、内部原因码等字段。完整 API 和调用关系直接进入 `deliverables/all-impact-details.md` 和对应的 `all-impact-details.csv`；`alerts.csv` 仅保留原始记录。静态分析已经完成但没有找到路径时，结果显示为“已完成分析、未确认影响”，不能写成“未完成分析”。
 
 ## 性能排查入口
 

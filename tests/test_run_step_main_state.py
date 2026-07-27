@@ -1465,7 +1465,52 @@ class RunStepMainStateTest(unittest.TestCase):
                             "available_dependency_count": 3,
                             "analyzed_api_count": 7,
                             "total_api_count": 19,
+                            "included_dependency_coords": [
+                                "com.example:demo"
+                            ],
+                            "excluded_dependency_coords": [
+                                "com.example:other",
+                                "com.example:third",
+                            ],
                         },
+                        "dependency_changes": [
+                            {
+                                "coord": "com.example:demo",
+                                "old_version": "1.0.0",
+                                "new_version": "2.0.0",
+                                "change_type": "major",
+                            },
+                            {
+                                "coord": "com.example:other",
+                                "old_version": "1.0.0",
+                                "new_version": "2.0.0",
+                                "change_type": "major",
+                            },
+                            {
+                                "coord": "com.example:third",
+                                "old_version": "1.0.0",
+                                "new_version": "2.0.0",
+                                "change_type": "major",
+                            },
+                        ],
+                        "changed_api_inventory": [
+                            {
+                                "coord": "com.example:demo",
+                                "api": (
+                                    "com.example.Api.confirmed"
+                                    if index == 0
+                                    else (
+                                        "com.example.Api.uncertain"
+                                        if index == 1
+                                        else f"com.example.Api.pending{index}"
+                                    )
+                                ),
+                                "api_signature": "()",
+                                "symbol_kind": "method",
+                                "change_type": "REMOVED",
+                            }
+                            for index in range(7)
+                        ],
                         "p0": [{
                             "coord": "com.example:demo",
                             "api": "com.example.Api.confirmed",
@@ -1505,27 +1550,32 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("1 项存在候选证据但结论未确定", summary["limitations"])
         self.assertIn("分析已完成，但存在结论限制", message)
         self.assertIn("部分依赖（1/3）", message)
-        self.assertEqual(summary["dependency_total_count"], 3)
+        self.assertEqual(summary["dependency_total_count"], 1)
         self.assertEqual(summary["dependency_completed_count"], 0)
-        self.assertEqual(summary["dependency_incomplete_count"], 3)
+        self.assertEqual(summary["dependency_incomplete_count"], 1)
         self.assertEqual(summary["dependency_confirmed_count"], 1)
-        self.assertEqual(summary["api_total_count"], 19)
+        self.assertEqual(summary["api_total_count"], 7)
         self.assertEqual(summary["api_completed_count"], 2)
-        self.assertEqual(summary["api_incomplete_count"], 17)
+        self.assertEqual(summary["api_incomplete_count"], 5)
         self.assertEqual(summary["api_confirmed_count"], 1)
         self.assertIn(
-            "依赖：变化 3，已完成分析 0，未完成分析 3，含确认影响 1。",
+            "依赖：变化 1，已完成分析 0，未完成分析 1，含确认影响 1。",
             message,
         )
         self.assertIn(
-            "API：变化 19，已完成分析 2，未完成分析 17，确认影响 1。",
+            "API：变化 7，已完成分析 2，未完成分析 5，确认影响 1。",
             message,
         )
         self.assertIn(
             "deliverables/all-affected-dependencies.md",
             message,
         )
+        self.assertIn(
+            "deliverables/all-affected-dependencies.csv",
+            message,
+        )
         self.assertIn("deliverables/all-impact-details.md", message)
+        self.assertIn("deliverables/all-impact-details.csv", message)
         self.assertNotIn("deliverables/analysis-scope.md", message)
 
     def test_landing_status_does_not_hide_completion_limits(self):
@@ -1552,8 +1602,16 @@ class RunStepMainStateTest(unittest.TestCase):
                 "# 完整依赖分析\n",
                 encoding="utf-8",
             )
+            (deliverables / "all-affected-dependencies.csv").write_text(
+                "依赖,分析结果\n",
+                encoding="utf-8",
+            )
             (deliverables / "all-impact-details.md").write_text(
                 "# 完整 API 与调用关系\n",
+                encoding="utf-8",
+            )
+            (deliverables / "all-impact-details.csv").write_text(
+                "依赖,API,分析结果\n",
                 encoding="utf-8",
             )
             (deliverables / "analysis-scope.md").write_text("# 范围\n", encoding="utf-8")
@@ -1607,6 +1665,16 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn(
             "[deliverables/all-impact-details.md]"
             "(deliverables/all-impact-details.md)",
+            text,
+        )
+        self.assertIn(
+            "[deliverables/all-affected-dependencies.csv]"
+            "(deliverables/all-affected-dependencies.csv)",
+            text,
+        )
+        self.assertIn(
+            "[deliverables/all-impact-details.csv]"
+            "(deliverables/all-impact-details.csv)",
             text,
         )
         self.assertIn(

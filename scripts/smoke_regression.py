@@ -4141,14 +4141,24 @@ BridgeFacade.callAdapter();
         "Step 6 未生成完整依赖分析明细",
     )
     assert_true(
+        (report_dir / "deliverables" / "all-affected-dependencies.csv").is_file(),
+        "Step 6 未生成完整依赖分析 CSV",
+    )
+    assert_true(
         (report_dir / "deliverables" / "all-impact-details.md").is_file(),
         "Step 6 未生成完整 API 分析与调用关系明细",
     )
     assert_true(
+        (report_dir / "deliverables" / "all-impact-details.csv").is_file(),
+        "Step 6 未生成完整 API 分析与调用关系 CSV",
+    )
+    assert_true(
         "all-affected-dependencies.md" in report_text
+        and "all-affected-dependencies.csv" in report_text
         and "all-impact-details.md" in report_text
+        and "all-impact-details.csv" in report_text
         and "alerts.csv" in report_text,
-        "Step 6 用户可见文件说明未区分依赖明细、API 调用明细和原始分析记录",
+        "Step 6 用户可见文件说明未区分 Markdown、CSV 和原始分析记录",
     )
     assert_true(findings.get("p0", [])[0].get("reason_code") == "SYSTEM_CODE_REACHED", "Step 6 未透传 reachable 风险的 reason_code")
     assert_true(findings.get("p0", [])[0].get("evidence_paths"), "Step 6 未透传 reachable 风险的 evidence_paths")
@@ -6059,8 +6069,16 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "run_step 链路未生成完整依赖分析明细",
     )
     assert_true(
+        (orchestrated_report / "deliverables" / "all-affected-dependencies.csv").is_file(),
+        "run_step 链路未生成完整依赖分析 CSV",
+    )
+    assert_true(
         (orchestrated_report / "deliverables" / "all-impact-details.md").is_file(),
         "run_step 链路未生成完整 API 分析与调用关系明细",
+    )
+    assert_true(
+        (orchestrated_report / "deliverables" / "all-impact-details.csv").is_file(),
+        "run_step 链路未生成完整 API 分析与调用关系 CSV",
     )
 
 

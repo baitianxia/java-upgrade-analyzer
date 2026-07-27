@@ -126,7 +126,7 @@ Step1 构建事实
 
 正式流程由 `scripts/run_step.py` 编排，并通过 `.upgrade-report/` 持久化所有关键证据。最终报告不是黑盒结论，而是可以沿文件回溯到每一步的输入、输出和证据来源。
 
-Step6 的主报告固定先给依赖层面结论，再给 API 及调用关系，最后说明全部用户可见文件。`all-affected-dependencies.md` 保存全量依赖结果；`all-impact-details.md` 保存全量 API 结果及完整调用关系；`alerts.csv` 保留一行一条的原始分析记录，不承担面向用户的汇总阅读职责。
+Step6 的主报告固定先给依赖层面结论，再给 API 及调用关系，最后说明全部用户可见文件。`all-affected-dependencies.md/.csv` 保存本轮范围内全部依赖结果；`all-impact-details.md/.csv` 保存本轮范围内全部 API 结果及完整调用关系；同类 Markdown 与 CSV 使用相同数据和排序。`alerts.csv` 保留一行一条的原始分析记录，不承担面向用户的汇总阅读职责。
 
 ## 五、关键技术一：从最终制品提取构建事实
 

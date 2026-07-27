@@ -437,7 +437,9 @@ def _landing_existing_artifact_rows(report_dir):
     candidates = [
         ("依赖与 API 升级影响报告", "deliverables/report.md"),
         ("完整依赖分析明细", "deliverables/all-affected-dependencies.md"),
+        ("完整依赖分析 CSV", "deliverables/all-affected-dependencies.csv"),
         ("完整 API 分析与调用关系明细", "deliverables/all-impact-details.md"),
+        ("完整 API 与调用关系 CSV", "deliverables/all-impact-details.csv"),
         ("原始分析记录", "evidence/call_chain/alerts.csv"),
         ("本轮调用关系分析范围", "deliverables/analysis-scope.md"),
         ("分析输入异常记录", "deliverables/analysis-diagnostics.md"),
@@ -660,8 +662,14 @@ def build_user_runtime_message(event, step_id, reason="", completion_summary=Non
             lines.append("主要限制：" + "；".join(limitations[:3]) + "。")
         lines.extend([
             "最终报告：deliverables/report.md",
-            "完整依赖分析：deliverables/all-affected-dependencies.md",
-            "完整 API 与调用关系：deliverables/all-impact-details.md",
+            (
+                "完整依赖分析：deliverables/all-affected-dependencies.md、"
+                "deliverables/all-affected-dependencies.csv"
+            ),
+            (
+                "完整 API 与调用关系：deliverables/all-impact-details.md、"
+                "deliverables/all-impact-details.csv"
+            ),
         ])
         return lines
     next_step = next_step_id_for(step_id)
@@ -8301,11 +8309,28 @@ def build_final_completion_summary(report_dir):
             api_model,
         )
     except (ImportError, TypeError, ValueError):
+        partial_scope = scope_mode == "partial"
+        fallback_api_total = int(
+            scope.get(
+                "analyzed_api_count"
+                if partial_scope
+                else "total_api_count"
+            )
+            or 0
+        )
+        fallback_dependency_total = int(
+            scope.get(
+                "included_dependency_count"
+                if partial_scope
+                else "available_dependency_count"
+            )
+            or 0
+        )
         api_model = {
-            "total_count": int(scope.get("total_api_count") or 0),
+            "total_count": fallback_api_total,
             "completed_count": int(scope.get("analyzed_api_count") or 0),
             "incomplete_count": max(
-                int(scope.get("total_api_count") or 0)
+                fallback_api_total
                 - int(scope.get("analyzed_api_count") or 0),
                 0,
             ),
@@ -8313,10 +8338,10 @@ def build_final_completion_summary(report_dir):
             "unconfirmed_count": 0,
         }
         dependency_model = {
-            "total_count": int(scope.get("available_dependency_count") or 0),
+            "total_count": fallback_dependency_total,
             "completed_count": int(scope.get("included_dependency_count") or 0),
             "incomplete_count": max(
-                int(scope.get("available_dependency_count") or 0)
+                fallback_dependency_total
                 - int(scope.get("included_dependency_count") or 0),
                 0,
             ),

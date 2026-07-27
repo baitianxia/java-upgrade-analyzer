@@ -601,13 +601,21 @@ def scenario_delivery_output_journey(workspace: Path) -> ScenarioResult:
     dependency_detail_path = (
         report_dir / "deliverables" / "all-affected-dependencies.md"
     )
+    dependency_detail_csv_path = (
+        report_dir / "deliverables" / "all-affected-dependencies.csv"
+    )
     api_detail_path = (
         report_dir / "deliverables" / "all-impact-details.md"
+    )
+    api_detail_csv_path = (
+        report_dir / "deliverables" / "all-impact-details.csv"
     )
     required_files = [
         report_path,
         dependency_detail_path,
+        dependency_detail_csv_path,
         api_detail_path,
+        api_detail_csv_path,
         scope_path,
         landing_path,
         findings_path,

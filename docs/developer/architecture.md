@@ -944,11 +944,13 @@ Step6 负责把 Step1 到 Step5 的结构化产物收敛成最终交付结果。
 - `.runtime/findings/s6_findings.json`
 - `deliverables/report.md`
 - `deliverables/all-affected-dependencies.md`
+- `deliverables/all-affected-dependencies.csv`
 - `deliverables/all-impact-details.md`
+- `deliverables/all-impact-details.csv`
 
-`report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织。依赖层和 API 层统一使用“变化总数、已完成分析、未完成分析、确认影响、确认不受影响、尚未确认影响”六列统计，再给逐项结论和正文中选取的调用关系。变化总数等于已完成与未完成之和。API 层后三类结果划分已完成分析；依赖层只要已有 API 确认影响就保留确认影响计数，因此仍有其他 API 未完成的依赖会同时计入“确认影响”和“未完成分析”。依赖明细固定使用“依赖、版本变化、API 分析（已完成/总数）、当前系统调用关系、分析结果、结果说明”，API 明细固定使用“依赖、API、新版本中的变化、当前系统调用关系、分析结果、结果说明”；已完成与未完成只改变单元格内容，不改变表头和列顺序。正文没有展开的依赖进入 `all-affected-dependencies.md`，正文没有展开的 API 及完整调用关系进入 `all-impact-details.md`。两类全量明细相互独立，不能使用同一个文件替代。
+`report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织。依赖层和 API 层统一使用“变化总数、已完成分析、未完成分析、确认影响、确认不受影响、尚未确认影响”六列统计，再给逐项结论和正文中选取的调用关系。统计母集是 Step5 本轮分析范围：全量模式使用全部变化对象，部分模式只使用 `included_dependency_coords` 及其变化 API；未选择对象不得进入“未完成分析”。部分模式下 `available_dependency_count` / `total_api_count` 只用于范围说明，结果统计分别使用 `included_dependency_count` / `analyzed_api_count`。变化总数等于已完成与未完成之和。API 层后三类结果划分已完成分析；依赖层只要已有 API 确认影响就保留确认影响计数，因此仍有其他已选 API 未完成的依赖会同时计入“确认影响”和“未完成分析”。依赖明细固定使用“依赖、版本变化、API 分析（已完成/总数）、当前系统调用关系、分析结果、结果说明”，API 明细固定使用“依赖、API、新版本中的变化、当前系统调用关系、分析结果、结果说明”；已完成与未完成只改变单元格内容，不改变表头和列顺序。依赖明细按“确认影响 → 未确认影响 → 确认不受影响”排序，同类结论按调用链数量降序；API 明细先按依赖分组，组内使用相同的结论顺序和调用链数量降序。主报告列表、完整 Markdown 和 CSV 共用排序模型。正文没有展开的依赖进入 `all-affected-dependencies.md`，正文没有展开的 API 及完整调用关系进入 `all-impact-details.md`；两份 Markdown 分别生成同数据、同顺序的 CSV。两类完整明细相互独立，且都只覆盖本轮分析范围。选择前的全量依赖/API 仍保留在 Step1/Step4 原始清单，未纳入对象和原因记录在 `analysis-scope.md`。
 
-`alerts.csv` 是 Step5 的原始分析记录，一条原始记录一行；它保留分析状态、调用起点、完整调用关系和证据文件。`all-impact-details.md` 将这些原始记录按变化 API 归并成用户可读的全量明细，因此两者用途不同，都需要在 `report.md` 的“用户可见文件说明”中解释。
+`alerts.csv` 是 Step5 的原始分析记录，一条原始记录一行；它保留分析状态、调用起点、完整调用关系和证据文件。`all-impact-details.md` 与 `all-impact-details.csv` 将这些原始记录按变化 API 归并成用户可读的全量明细，因此它们与原始记录的用途不同，都需要在 `report.md` 的“用户可见文件说明”中解释。
 
 Step6 的职责是读取和重组前序结构化产物，回填 `reason_code` 与 `evidence_paths`，并按用户可理解的视角组织 findings。已经执行分析但未找到当前系统调用关系的 API 属于“已完成分析”；只有缺少关键输入或分析过程未完成的 API 才进入“未完成分析”，并随项记录原因。
 

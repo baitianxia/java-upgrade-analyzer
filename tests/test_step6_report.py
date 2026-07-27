@@ -263,11 +263,256 @@ class Step6ReportObjectivityTest(unittest.TestCase):
 
         self.assertEqual(relative_path, "deliverables/analysis-scope.md")
         self.assertIn("**模式**：部分分析", text)
-        self.assertIn("**已纳入变化依赖**：1/3", text)
-        self.assertIn("**已纳入变化 API**：7/19", text)
+        self.assertIn(
+            "**变化依赖**：总数 3；纳入本轮分析 1；未纳入 2",
+            text,
+        )
+        self.assertIn(
+            "**变化 API**：总数 19；纳入本轮分析 7；未纳入 12",
+            text,
+        )
         self.assertIn("`com.acme:alpha`", text)
         self.assertIn("`com.acme:beta`", text)
+        self.assertIn(
+            "用户指定的分析范围未包含该依赖",
+            text,
+        )
         self.assertIn("该范围不支持整个系统不受影响的结论", text)
+
+    def test_partial_scope_requires_exact_included_dependency_coordinates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "step5_selection.json"
+            path.write_text("{}", encoding="utf-8")
+            scope = {
+                "mode": "partial",
+                "available_dependency_count": 2,
+                "included_dependency_count": 1,
+                "total_api_count": 2,
+                "analyzed_api_count": 1,
+                "included_dependency_coords": [],
+                "excluded_dependency_coords": ["com.acme:beta"],
+            }
+            diagnostics = []
+
+            s6_report._validate_analysis_scope_contract(
+                path,
+                scope,
+                diagnostics,
+            )
+
+        self.assertEqual(scope["validation_status"], "invalid")
+        self.assertEqual(scope["mode"], "")
+        self.assertTrue(any(
+            item.get("artifact") == "step5_selection"
+            for item in diagnostics
+        ))
+
+    def test_partial_scope_requires_exact_excluded_dependency_coordinates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "step5_selection.json"
+            path.write_text("{}", encoding="utf-8")
+            scope = {
+                "mode": "partial",
+                "available_dependency_count": 3,
+                "included_dependency_count": 1,
+                "total_api_count": 3,
+                "analyzed_api_count": 1,
+                "included_dependency_coords": ["com.acme:alpha"],
+                "excluded_dependency_coords": [],
+            }
+            diagnostics = []
+
+            s6_report._validate_analysis_scope_contract(
+                path,
+                scope,
+                diagnostics,
+            )
+
+        self.assertEqual(scope["validation_status"], "invalid")
+        self.assertEqual(scope["mode"], "")
+        self.assertTrue(any(
+            item.get("artifact") == "step5_selection"
+            for item in diagnostics
+        ))
+
+    def test_partial_scope_limits_all_step6_results_to_selected_dependencies(self):
+        selected = {
+            "coord": "com.acme:alpha",
+            "api": "com.acme.AlphaApi.run",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+        }
+        excluded = {
+            "coord": "com.acme:beta",
+            "api": "com.acme.BetaApi.run",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_collection_fixture(
+                tmp,
+                summary={
+                    "status": "done",
+                    "total_apis": 1,
+                    "reachable": 1,
+                    "reachable_apis": [{
+                        **selected,
+                        "reason_code": "SYSTEM_CODE_REACHED",
+                    }],
+                },
+                changed_rows=[
+                    {**selected, "api_name": selected["api"]},
+                    {**excluded, "api_name": excluded["api"]},
+                ],
+                alert_rows=[{
+                    "target_coord": selected["coord"],
+                    "changed_symbol": selected["api"],
+                    "api_signature": selected["api_signature"],
+                    "symbol_kind": selected["symbol_kind"],
+                    "change_type": selected["change_type"],
+                    "severity": selected["severity"],
+                    "old_version": selected["old_version"],
+                    "new_version": selected["new_version"],
+                    "path_status": "reachable",
+                    "conclusion_level": "confirmed",
+                    "business_reachable": "true",
+                    "business_entry": "com.app.Entry.run()",
+                    "path_text": (
+                        "com.app.Entry.run() -> "
+                        "com.acme.AlphaApi.run()"
+                    ),
+                }],
+                scope={
+                    "mode": "partial",
+                    "selection_basis": "explicit_targets",
+                    "available_dependency_count": 2,
+                    "included_dependency_count": 1,
+                    "total_api_count": 2,
+                    "analyzed_api_count": 1,
+                    "included_dependency_coords": [
+                        selected["coord"],
+                    ],
+                    "excluded_dependency_coords": [
+                        excluded["coord"],
+                    ],
+                },
+            )
+            dependency_path = Path(s6_report._dep_changes_path(tmp))
+            dependency_path.parent.mkdir(parents=True, exist_ok=True)
+            with dependency_path.open(
+                "w", encoding="utf-8", newline=""
+            ) as output:
+                writer = csv.DictWriter(
+                    output,
+                    fieldnames=[
+                        "coord",
+                        "old_version",
+                        "new_version",
+                        "change_type",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows([
+                    {
+                        "coord": item["coord"],
+                        "old_version": item["old_version"],
+                        "new_version": item["new_version"],
+                        "change_type": "major",
+                    }
+                    for item in (selected, excluded)
+                ])
+
+            findings = s6_report.collect_findings(tmp)
+            findings["artifacts"]["analysis_scope_md"] = (
+                s6_report.write_analysis_scope_artifact(tmp, findings)
+            )
+            artifacts, api_model, dependency_model = (
+                s6_report.write_primary_report_artifacts(tmp, findings)
+            )
+            findings["artifacts"].update(artifacts)
+            report = s6_report.generate_report(findings)
+            dependency_detail = (
+                Path(tmp) / artifacts["full_dependency_analysis_md"]
+            ).read_text(encoding="utf-8")
+            api_detail = (
+                Path(tmp) / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
+            dependency_detail_csv = (
+                Path(tmp) / artifacts["full_dependency_analysis_csv"]
+            ).read_text(encoding="utf-8-sig")
+            api_detail_csv = (
+                Path(tmp) / artifacts["full_api_analysis_csv"]
+            ).read_text(encoding="utf-8-sig")
+            scope_detail = (
+                Path(tmp) / findings["artifacts"]["analysis_scope_md"]
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            (
+                dependency_model["total_count"],
+                dependency_model["completed_count"],
+                dependency_model["incomplete_count"],
+                dependency_model["confirmed_any_count"],
+            ),
+            (1, 1, 0, 1),
+        )
+        self.assertEqual(
+            (
+                api_model["total_count"],
+                api_model["completed_count"],
+                api_model["incomplete_count"],
+                api_model["confirmed_count"],
+            ),
+            (1, 1, 0, 1),
+        )
+        self.assertEqual(
+            report.count("| 1 | 1 | 0 | 1 | 0 | 0 |"),
+            2,
+        )
+        self.assertIn(
+            "用户指定纳入 1/2 个变化依赖、1/2 个变化 API",
+            report,
+        )
+        self.assertIn(
+            "未纳入的 1 个依赖和 1 个 API 不计入“未完成分析”",
+            report,
+        )
+        for result_text in (
+            report,
+            dependency_detail,
+            dependency_detail_csv,
+            api_detail,
+            api_detail_csv,
+        ):
+            self.assertIn(selected["coord"], result_text)
+            self.assertNotIn(excluded["coord"], result_text)
+        self.assertIn(excluded["coord"], scope_detail)
+        self.assertIn(
+            "用户指定的分析范围未包含该依赖",
+            scope_detail,
+        )
+        self.assertIn(
+            "本轮分析范围内全部变化依赖",
+            report,
+        )
+        self.assertIn(
+            "本轮分析范围内全部变化 API",
+            report,
+        )
+        self.assertEqual(
+            report.count(
+                "选择前原始记录全量 2 条；包含未纳入本轮分析的对象"
+            ),
+            2,
+        )
 
     def test_analysis_scope_artifact_defines_what_full_means(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,6 +564,35 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertIn("范围快照缺失，不能按全量分析解释", conclusion)
         self.assertIn("分析范围快照缺失", limitations)
         self.assertIn("报告不支持全量分析或全局无影响结论", limitations)
+
+    def test_missing_scope_snapshot_does_not_label_report_details_as_complete_range(self):
+        findings = self._human_first_findings()
+        findings.pop("analysis_scope")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts, _api_model, _dependency_model = (
+                s6_report.write_primary_report_artifacts(tmp, findings)
+            )
+            findings["artifacts"].update(artifacts)
+            report = s6_report.generate_report(findings)
+            dependency_detail = (
+                Path(tmp) / artifacts["full_dependency_analysis_md"]
+            ).read_text(encoding="utf-8")
+            api_detail = (
+                Path(tmp) / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
+
+        self.assertIn("**分析范围无法核验**", report)
+        self.assertIn("现有记录中可识别", report)
+        self.assertNotIn("本轮分析范围内全部", report)
+        self.assertIn(
+            "不能把本文件解释为本轮分析的完整依赖结果",
+            dependency_detail,
+        )
+        self.assertIn(
+            "不能把本文件解释为本轮分析的完整 API 结果",
+            api_detail,
+        )
 
     def test_core_conclusion_links_to_human_scope_artifact(self):
         text = "\n".join(
@@ -1340,6 +1614,186 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         )
         self.assertEqual(3, rows[0]["business_entry_count"])
         self.assertEqual(3, rows[0]["confirmed_path_count"])
+
+    def test_human_lists_and_csv_share_dependency_result_and_path_order(self):
+        def changed_api(coord, name):
+            return {
+                "coord": coord,
+                "api": f"com.acme.Api.{name}",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+                "old_version": "1.0.0",
+                "new_version": "2.0.0",
+            }
+
+        def overview(item, status, path_count):
+            paths = [
+                (
+                    f"com.app.Entry{index}.run() → "
+                    f"{item['api']}()"
+                )
+                for index in range(path_count)
+            ]
+            return {
+                **item,
+                "paths": paths,
+                "paths_by_status": {status: paths},
+                "path_counts_by_status": {status: path_count},
+                "logical_path_counts_by_status": {
+                    status: path_count,
+                },
+                "occurrence_counts_by_status": {
+                    status: path_count,
+                },
+            }
+
+        uncertain_many = changed_api("a:uncertain", "uncertainMany")
+        uncertain_few = changed_api("a:uncertain", "uncertainFew")
+        no_impact = changed_api("b:no-impact", "noImpact")
+        confirmed_few = changed_api("y:confirmed-few", "confirmedFew")
+        confirmed_many = changed_api(
+            "z:confirmed-many",
+            "confirmedMany",
+        )
+        changed_apis = [
+            uncertain_few,
+            no_impact,
+            confirmed_few,
+            confirmed_many,
+            uncertain_many,
+        ]
+        findings = {
+            "analysis_scope": {
+                "mode": "full",
+                "available_dependency_count": 4,
+                "included_dependency_count": 4,
+                "total_api_count": 5,
+                "analyzed_api_count": 5,
+            },
+            "dependency_changes": [
+                {
+                    "coord": coord,
+                    "old_version": "1.0.0",
+                    "new_version": "2.0.0",
+                    "change_type": "major",
+                }
+                for coord in (
+                    "a:uncertain",
+                    "b:no-impact",
+                    "y:confirmed-few",
+                    "z:confirmed-many",
+                )
+            ],
+            "changed_api_inventory": changed_apis,
+            "call_chain_target_count": 5,
+            "impact_overview": {
+                "apis": [
+                    overview(uncertain_few, "uncertain", 2),
+                    overview(no_impact, "not_impacted", 0),
+                    overview(confirmed_few, "reachable", 1),
+                    overview(confirmed_many, "reachable", 3),
+                    overview(uncertain_many, "uncertain", 5),
+                ]
+            },
+            "p0": [],
+            "p1": [confirmed_few, confirmed_many],
+            "p2": [],
+            "probable_impact": [],
+            "uncertain": [uncertain_few, uncertain_many],
+            "not_impacted": [no_impact],
+            "needs_input": [],
+            "not_analyzed": [],
+            "not_found": [],
+            "artifacts": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts, api_model, dependency_model = (
+                s6_report.write_primary_report_artifacts(tmp, findings)
+            )
+            dependency_markdown = (
+                Path(tmp) / artifacts["full_dependency_analysis_md"]
+            ).read_text(encoding="utf-8")
+            api_markdown = (
+                Path(tmp) / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
+            with (
+                Path(tmp) / artifacts["full_dependency_analysis_csv"]
+            ).open(encoding="utf-8-sig", newline="") as source:
+                dependency_csv_rows = list(csv.DictReader(source))
+            with (
+                Path(tmp) / artifacts["full_api_analysis_csv"]
+            ).open(encoding="utf-8-sig", newline="") as source:
+                api_csv_rows = list(csv.DictReader(source))
+
+        expected_dependencies = [
+            "z:confirmed-many",
+            "y:confirmed-few",
+            "a:uncertain",
+            "b:no-impact",
+        ]
+        self.assertEqual(
+            expected_dependencies,
+            [row["coord"] for row in dependency_model["completed"]],
+        )
+        self.assertEqual(
+            expected_dependencies,
+            [row["依赖"] for row in dependency_csv_rows],
+        )
+        self.assertEqual(
+            sorted(
+                (
+                    dependency_markdown.index(coord),
+                    coord,
+                )
+                for coord in expected_dependencies
+            ),
+            [
+                (
+                    dependency_markdown.index(coord),
+                    coord,
+                )
+                for coord in expected_dependencies
+            ],
+        )
+
+        expected_apis = [
+            "com.acme.Api.uncertainMany()",
+            "com.acme.Api.uncertainFew()",
+            "com.acme.Api.noImpact()",
+            "com.acme.Api.confirmedFew()",
+            "com.acme.Api.confirmedMany()",
+        ]
+        self.assertEqual(
+            expected_apis,
+            [
+                s6_report._item_api_label(row)
+                for row in api_model["completed"]
+            ],
+        )
+        self.assertEqual(
+            expected_apis,
+            [row["API"] for row in api_csv_rows],
+        )
+        self.assertEqual(
+            sorted(
+                (api_markdown.index(api), api)
+                for api in expected_apis
+            ),
+            [
+                (api_markdown.index(api), api)
+                for api in expected_apis
+            ],
+        )
+        self.assertEqual(
+            s6_report._FULL_DEPENDENCY_CSV_FIELDS,
+            list(dependency_csv_rows[0]),
+        )
+        self.assertEqual(
+            s6_report._FULL_API_CSV_FIELDS,
+            list(api_csv_rows[0]),
+        )
 
     def test_business_entry_aggregation_keeps_full_api_identity(self):
         entry = "com.app.Entry.run()"

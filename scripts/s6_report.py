@@ -1341,6 +1341,20 @@ def _validate_analysis_scope_contract(path, scope, diagnostics):
             )
     if scope.get("mode") == "full" and excluded_coords:
         issues.append("full scope contains excluded dependencies")
+    if (
+        scope.get("mode") == "partial"
+        and len(included_coords) != included
+    ):
+        issues.append(
+            "partial scope does not record every included dependency coordinate"
+        )
+    if (
+        scope.get("mode") == "partial"
+        and len(excluded_coords) != max(available - included, 0)
+    ):
+        issues.append(
+            "partial scope does not record every excluded dependency coordinate"
+        )
 
     if issues:
         _invalidate_analysis_scope(
@@ -2322,7 +2336,7 @@ def write_analysis_scope_artifact(report_dir, findings):
     elif mode == "partial":
         mode_label = "部分分析"
         boundary = (
-            "本轮只对用户选中的变化依赖执行系统触达分析。未选依赖不在本报告结论范围内，"
+            "本轮只分析用户选中的变化依赖。未选依赖不在本报告结论范围内，"
             "该范围不支持整个系统不受影响的结论。"
         )
     else:
@@ -2347,8 +2361,16 @@ def write_analysis_scope_artifact(report_dir, findings):
         "## 范围结论",
         "",
         f"- **模式**：{mode_label}",
-        f"- **已纳入变化依赖**：{included_count}/{available_count}",
-        f"- **已纳入变化 API**：{analyzed_api_count}/{total_api_count}",
+        (
+            f"- **变化依赖**：总数 {available_count}；"
+            f"纳入本轮分析 {included_count}；"
+            f"未纳入 {max(available_count - included_count, 0)}"
+        ),
+        (
+            f"- **变化 API**：总数 {total_api_count}；"
+            f"纳入本轮分析 {analyzed_api_count}；"
+            f"未纳入 {max(total_api_count - analyzed_api_count, 0)}"
+        ),
         f"- **结论边界**：{boundary}",
         "",
     ]
@@ -2357,8 +2379,16 @@ def write_analysis_scope_artifact(report_dir, findings):
         lines.extend(f"- `{coord}`" for coord in included)
         lines.append("")
     if excluded:
-        lines.extend(["## 未纳入的依赖", ""])
-        lines.extend(f"- `{coord}`" for coord in excluded)
+        lines.extend([
+            "## 未纳入的依赖",
+            "",
+            "| 依赖 | 未纳入原因 |",
+            "|---|---|",
+        ])
+        lines.extend(
+            f"| `{coord}` | 用户指定的分析范围未包含该依赖 |"
+            for coord in excluded
+        )
         lines.append("")
     if selected_names:
         lines.extend([
@@ -3224,7 +3254,9 @@ def collect_findings(d):
             'read_order': [
                 'deliverables/report.md（主报告）',
                 'deliverables/all-affected-dependencies.md（完整依赖分析明细）',
+                'deliverables/all-affected-dependencies.csv（完整依赖分析表格）',
                 'deliverables/all-impact-details.md（完整 API 分析与调用关系明细）',
+                'deliverables/all-impact-details.csv（完整 API 与调用关系表格）',
                 'evidence/call_chain/alerts.csv（原始分析记录）',
                 'evidence/api_changes/all_changed_apis.csv（变化 API 原始清单）',
             ],
@@ -4931,29 +4963,44 @@ def _normalized_report_severity(value):
     return str(value or "").strip().upper() or "未分级"
 
 
-def _report_result_sort_key(row):
-    conclusion_rank = {
-        "已确认影响": 0,
-        "可能影响": 1,
-        "结论未确定（存在候选证据）": 2,
-        "输入不足，结论未确定": 3,
-        "本次未完成分析": 4,
-        "未发现调用路径": 5,
-        "已确认不受影响": 6,
-    }
-    return (
-        conclusion_rank.get(str(row.get("conclusion") or ""), 9),
-        _severity_rank(row.get("severity")),
-        -int(row.get("business_entry_count") or 0),
-        -int(row.get("confirmed_path_count") or row.get("path_count") or 0),
-        -int(
-            row.get("confirmed_occurrence_count")
-            or row.get("occurrence_count")
-            or 0
+def _api_result_rank(row):
+    conclusion = str((row or {}).get("conclusion") or "").strip()
+    if conclusion == "已确认影响":
+        return 0
+    if conclusion == "已确认不受影响":
+        return 2
+    if _api_result_is_incomplete(row or {}):
+        return 3
+    return 1
+
+
+def _api_call_relationship_count(row):
+    row = row or {}
+    review_total = max(
+        int(row.get("additional_review_path_count") or 0),
+        (
+            int(row.get("uncertain_path_count") or 0)
+            + int(row.get("not_analyzed_path_count") or 0)
         ),
+    )
+    explicit_total = (
+        int(row.get("confirmed_path_count") or 0)
+        + review_total
+    )
+    return max(
+        explicit_total,
+        int(row.get("path_count") or 0),
+    )
+
+
+def _report_result_sort_key(row):
+    return (
         str(row.get("coord") or ""),
+        _api_result_rank(row),
+        -_api_call_relationship_count(row),
         str(row.get("api") or ""),
         str(row.get("api_signature") or ""),
+        str(row.get("change_type") or ""),
     )
 
 
@@ -6360,6 +6407,38 @@ def _scope_excluded_coords(findings):
     }
 
 
+def _report_scope_is_verified(findings):
+    scope = (findings or {}).get("analysis_scope") or {}
+    return (
+        str(scope.get("mode") or "").strip() in {"full", "partial"}
+        and scope.get("validation_status") != "invalid"
+    )
+
+
+def _report_scope_included_coords(findings):
+    """Return the exact dependency population for a valid partial report.
+
+    A partial Step5 run is a deliberate report boundary. The Step1/Step4
+    inventories remain complete evidence, but only the explicitly included
+    dependencies belong to the Step6 result population.
+    """
+    scope = (findings or {}).get("analysis_scope") or {}
+    if (
+        str(scope.get("mode") or "").strip() != "partial"
+        or scope.get("validation_status") == "invalid"
+    ):
+        return None
+    included = {
+        _canonical_identity_coord(value)
+        for value in scope.get("included_dependency_coords") or []
+        if _canonical_identity_coord(value)
+    }
+    declared_count = int(scope.get("included_dependency_count") or 0)
+    if len(included) != declared_count:
+        return None
+    return included
+
+
 def _incomplete_api_reason(row, findings):
     explicit = str((row or {}).get("incomplete_reason") or "").strip()
     if explicit:
@@ -6413,10 +6492,17 @@ def _inventory_api_row(item):
 
 def build_human_api_analysis(findings):
     """Build the exact changed/completed/incomplete API population for reports."""
+    report_scope_coords = _report_scope_included_coords(findings)
     result_groups = defaultdict(list)
     for row in build_api_result_rows(findings):
         identity = build_api_identity_key(row)
-        if _identity_is_complete(identity):
+        if (
+            _identity_is_complete(identity)
+            and (
+                report_scope_coords is None
+                or identity[0] in report_scope_coords
+            )
+        ):
             result_groups[identity].append(dict(row))
 
     selected_results = {
@@ -6424,6 +6510,13 @@ def build_human_api_analysis(findings):
         for identity, rows in result_groups.items()
     }
     raw_inventory = list(findings.get("changed_api_inventory") or [])
+    if report_scope_coords is not None:
+        raw_inventory = [
+            item
+            for item in raw_inventory
+            if _canonical_identity_coord(item.get("coord"))
+            in report_scope_coords
+        ]
     inventory = {}
     inventory_variant_counts = defaultdict(lambda: defaultdict(int))
     complete_inventory_row_count = 0
@@ -6518,25 +6611,37 @@ def build_human_api_analysis(findings):
 
     known_count = sum(int(row.get("aggregate_count") or 1) for row in rows)
     scope = findings.get("analysis_scope") or {}
-    source_counts = [
-        (
-            "分析范围",
-            int(scope.get("total_api_count") or 0),
-        ),
-        (
-            "调用关系目标",
-            int(findings.get("call_chain_target_count") or 0),
-        ),
-        (
-            "变化 API 清单行数",
-            int(
-                (findings.get("scan_stats") or {}).get(
-                    "changed_apis_total"
-                )
-                or 0
+    if report_scope_coords is not None:
+        source_counts = [
+            (
+                "本轮分析范围",
+                int(scope.get("analyzed_api_count") or 0),
             ),
-        ),
-    ]
+            (
+                "调用关系目标",
+                int(findings.get("call_chain_target_count") or 0),
+            ),
+        ]
+    else:
+        source_counts = [
+            (
+                "分析范围",
+                int(scope.get("total_api_count") or 0),
+            ),
+            (
+                "调用关系目标",
+                int(findings.get("call_chain_target_count") or 0),
+            ),
+            (
+                "变化 API 清单行数",
+                int(
+                    (findings.get("scan_stats") or {}).get(
+                        "changed_apis_total"
+                    )
+                    or 0
+                ),
+            ),
+        ]
     positive_source_counts = [
         (label, count) for label, count in source_counts if count > 0
     ]
@@ -6655,10 +6760,7 @@ def build_human_api_analysis(findings):
     rows.sort(
         key=lambda row: (
             1 if _api_result_is_incomplete(row) else 0,
-            0 if row.get("conclusion") == "已确认影响" else 1,
-            str(row.get("coord") or ""),
-            str(row.get("api") or ""),
-            str(row.get("api_signature") or ""),
+            *_report_result_sort_key(row),
         )
     )
     completed = [row for row in rows if not _api_result_is_incomplete(row)]
@@ -6703,6 +6805,7 @@ def build_human_api_analysis(findings):
         "population_unconfirmed": population_unconfirmed,
         "count_note": count_note,
         "identified_count": known_count,
+        "scope_verified": _report_scope_is_verified(findings),
     }
 
 
@@ -6852,8 +6955,33 @@ def _dependency_basis(api_rows):
     return "；".join(parts) + ("。" if parts else "")
 
 
+def _dependency_result_rank(row):
+    conclusion = str(
+        (row or {}).get("analysis_conclusion") or ""
+    ).strip()
+    if (
+        conclusion == "确认影响"
+        or int((row or {}).get("confirmed_api_count") or 0) > 0
+    ):
+        return 0
+    if conclusion == "确认不受 API 调用影响":
+        return 2
+    if not (row or {}).get("analysis_complete"):
+        return 3
+    return 1
+
+
+def _dependency_display_sort_key(row):
+    return (
+        _dependency_result_rank(row),
+        -int((row or {}).get("call_relationship_count") or 0),
+        str((row or {}).get("coord") or ""),
+    )
+
+
 def build_human_dependency_analysis(findings, api_model=None):
     api_model = api_model or build_human_api_analysis(findings)
+    report_scope_coords = _report_scope_included_coords(findings)
     api_by_coord = defaultdict(list)
     unassigned_api_rows = []
     for row in api_model["rows"]:
@@ -6866,6 +6994,13 @@ def build_human_dependency_analysis(findings, api_model=None):
     raw_dependency_inventory = list(
         findings.get("dependency_changes") or []
     )
+    if report_scope_coords is not None:
+        raw_dependency_inventory = [
+            item
+            for item in raw_dependency_inventory
+            if _canonical_identity_coord(item.get("coord"))
+            in report_scope_coords
+        ]
     dependencies = {}
     dependency_variant_counts = defaultdict(lambda: defaultdict(int))
     complete_dependency_row_count = 0
@@ -6897,6 +7032,11 @@ def build_human_dependency_analysis(findings, api_model=None):
     for item in findings.get("per_dependency_results") or []:
         coord = _canonical_identity_coord(item.get("coord"))
         if not coord:
+            continue
+        if (
+            report_scope_coords is not None
+            and coord not in report_scope_coords
+        ):
             continue
         if raw_dependency_inventory and coord not in dependencies:
             continue
@@ -6931,7 +7071,11 @@ def build_human_dependency_analysis(findings, api_model=None):
         for row in unassigned_api_rows
     )
 
-    excluded_coords = _scope_excluded_coords(findings)
+    excluded_coords = (
+        set()
+        if report_scope_coords is not None
+        else _scope_excluded_coords(findings)
+    )
     result_rows = []
     for coord, dependency in dependencies.items():
         api_rows = api_by_coord.get(coord, [])
@@ -6967,6 +7111,11 @@ def build_human_dependency_analysis(findings, api_model=None):
             for row in api_rows
             if not _api_result_is_incomplete(row)
             and row.get("conclusion") == "已确认影响"
+        )
+        call_relationships = sum(
+            _api_call_relationship_count(row)
+            for row in api_rows
+            if not _api_result_is_incomplete(row)
         )
         if incomplete:
             conclusion = (
@@ -7052,6 +7201,7 @@ def build_human_dependency_analysis(findings, api_model=None):
             "analysis_complete": not incomplete,
             "confirmed_api_count": confirmed_api_count,
             "confirmed_relationship_count": confirmed_relationships,
+            "call_relationship_count": call_relationships,
             "unassigned_api_count": unassigned_api_count,
             "analysis_conclusion": conclusion,
             "conclusion_basis": _dependency_basis(api_rows),
@@ -7062,26 +7212,39 @@ def build_human_dependency_analysis(findings, api_model=None):
         })
 
     known_count = len(result_rows)
-    dependency_source_counts = [
-        (
-            "分析范围",
-            int(
-                (findings.get("analysis_scope") or {}).get(
-                    "available_dependency_count"
-                )
-                or 0
+    if report_scope_coords is not None:
+        dependency_source_counts = [
+            (
+                "本轮分析范围",
+                int(
+                    (findings.get("analysis_scope") or {}).get(
+                        "included_dependency_count"
+                    )
+                    or 0
+                ),
             ),
-        ),
-        (
-            "依赖变化汇总",
-            sum(
-                int(value or 0)
-                for value in (
-                    findings.get("dep_changes_summary") or {}
-                ).values()
+        ]
+    else:
+        dependency_source_counts = [
+            (
+                "分析范围",
+                int(
+                    (findings.get("analysis_scope") or {}).get(
+                        "available_dependency_count"
+                    )
+                    or 0
+                ),
             ),
-        ),
-    ]
+            (
+                "依赖变化汇总",
+                sum(
+                    int(value or 0)
+                    for value in (
+                        findings.get("dep_changes_summary") or {}
+                    ).values()
+                ),
+            ),
+        ]
     positive_dependency_source_counts = [
         (label, count)
         for label, count in dependency_source_counts
@@ -7183,6 +7346,7 @@ def build_human_dependency_analysis(findings, api_model=None):
             "analysis_complete": False,
             "confirmed_api_count": 0,
             "confirmed_relationship_count": 0,
+            "call_relationship_count": 0,
             "unassigned_api_count": 0,
             "analysis_conclusion": "未完成分析",
             "conclusion_basis": "",
@@ -7193,13 +7357,13 @@ def build_human_dependency_analysis(findings, api_model=None):
 
     completed = [row for row in result_rows if row["analysis_complete"]]
     incomplete = [row for row in result_rows if not row["analysis_complete"]]
-    completed.sort(
+    completed.sort(key=_dependency_display_sort_key)
+    incomplete.sort(
         key=lambda row: (
-            0 if row["analysis_conclusion"] == "确认影响" else 1,
+            -int(row.get("call_relationship_count") or 0),
             str(row.get("coord") or ""),
         )
     )
-    incomplete.sort(key=lambda row: str(row.get("coord") or ""))
     completed_count = sum(
         int(row.get("aggregate_count") or 1) for row in completed
     )
@@ -7248,6 +7412,7 @@ def build_human_dependency_analysis(findings, api_model=None):
         "population_unconfirmed": population_unconfirmed,
         "count_note": count_note,
         "identified_count": known_count,
+        "scope_verified": _report_scope_is_verified(findings),
     }
 
 
@@ -7372,22 +7537,94 @@ def _count_label(noun, suffix):
 
 def _population_full_range(model, noun):
     total = int(model.get("total_count") or 0)
+    if not model.get("scope_verified"):
+        return (
+            f"分析范围无法核验；现有记录中可识别 {noun} {total} 个"
+        )
     if model.get("population_unconfirmed"):
-        return f"{_count_label(noun, '总数')}无法确认；逐项识别 {total} 个"
-    return f"{_count_label(noun, '全量')} {total}/{total}"
+        return (
+            f"本轮分析范围内：{_count_label(noun, '总数')}无法确认；"
+            f"逐项识别 {total} 个"
+        )
+    return f"本轮分析范围内：{noun} {total}/{total}"
 
 
 def _main_report_range(model, noun, displayed_count):
     total = int(model.get("total_count") or 0)
+    if not model.get("scope_verified"):
+        return (
+            f"分析范围无法核验、现有记录中可识别 {noun} {total} 个、"
+            f"正文展示 {displayed_count} 个"
+        )
     if model.get("population_unconfirmed"):
         return (
-            f"{_count_label(noun, '总数')}无法确认、逐项识别 {total} 个、"
+            f"本轮分析范围内：{_count_label(noun, '总数')}无法确认、"
+            f"逐项识别 {total} 个、"
             f"正文展示 {displayed_count} 个"
         )
     return (
-        f"{_count_label(noun, '汇总')}覆盖 {total}/{total}、"
+        f"本轮分析范围内：{_count_label(noun, '汇总')}覆盖 {total}/{total}、"
         f"逐项展示 {displayed_count}/{total}"
     )
+
+
+def render_report_scope_notice(findings):
+    scope = (findings or {}).get("analysis_scope") or {}
+    scope_mode = str(scope.get("mode") or "").strip()
+    scope_verified = _report_scope_is_verified(findings)
+    if scope_mode == "full" and scope_verified:
+        return []
+    if scope_mode != "partial" or not scope_verified:
+        reason = (
+            "分析范围记录未通过一致性校验"
+            if scope.get("validation_status") == "invalid"
+            else "分析范围记录缺失"
+        )
+        return [
+            (
+                f"> **分析范围无法核验**：{reason}。"
+                "以下统计只汇总现有记录中可识别的对象，"
+                "不能解释为本轮分析的完整范围。"
+            ),
+            "",
+        ]
+    included_dependencies = int(
+        scope.get("included_dependency_count") or 0
+    )
+    available_dependencies = int(
+        scope.get("available_dependency_count") or 0
+    )
+    analyzed_apis = int(scope.get("analyzed_api_count") or 0)
+    total_apis = int(scope.get("total_api_count") or 0)
+    excluded_dependencies = max(
+        available_dependencies - included_dependencies,
+        0,
+    )
+    excluded_apis = max(total_apis - analyzed_apis, 0)
+    scope_path = str(
+        ((findings.get("artifacts") or {}).get("analysis_scope_md") or "")
+    ).strip()
+    scope_link = (
+        _report_link(scope_path, "分析范围记录")
+        if scope_path
+        else "分析范围记录"
+    )
+    return [
+        (
+            "> **本轮分析范围**：用户指定纳入 "
+            f"{included_dependencies}/{available_dependencies} 个变化依赖、"
+            f"{analyzed_apis}/{total_apis} 个变化 API。"
+        ),
+        (
+            "> 以下统计和两份完整分析明细只包含已纳入对象。"
+        ),
+        (
+            f"> 未纳入的 {excluded_dependencies} 个依赖和 {excluded_apis} 个 "
+            "API 不计入“未完成分析”。"
+            f"未纳入对象及原因记录在{scope_link}中。"
+        ),
+        "",
+    ]
 
 
 def render_dependency_conclusions(findings, dependency_model=None):
@@ -7521,7 +7758,7 @@ def _main_completed_api_rows(rows):
                 break
             selected.append(row)
             remaining -= 1
-    return selected
+    return sorted(selected, key=_report_result_sort_key)
 
 
 def _main_relationship_cell(row):
@@ -7912,6 +8149,101 @@ def _logical_full_path_labels(path_occurrences):
     return labels
 
 
+_FULL_DEPENDENCY_CSV_FIELDS = [
+    "依赖",
+    "版本变化",
+    "API 分析（已完成/总数）",
+    "当前系统调用关系",
+    "分析结果",
+    "结果说明",
+]
+
+_FULL_API_CSV_FIELDS = [
+    "依赖",
+    "API",
+    "新版本中的变化",
+    "当前系统调用关系",
+    "分析结果",
+    "结果说明",
+]
+
+
+def _csv_text(value):
+    return (
+        str(value or "")
+        .replace("<br>", "\n")
+        .replace("\\|", "|")
+        .replace("`", "")
+        .strip()
+    )
+
+
+def _write_human_csv(path, fieldnames, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open_csv_write(path) as output:
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _dependency_csv_row(row):
+    api_analysis = (
+        f"{int(row.get('api_completed') or 0)}/"
+        f"{int(row.get('api_total') or 0)}"
+    )
+    api_change_text = str(row.get("api_change_text") or "").strip()
+    if api_change_text:
+        api_analysis += f"\n{api_change_text}"
+    return {
+        "依赖": str(row.get("coord") or "依赖身份未记录"),
+        "版本变化": _csv_text(_dependency_version_change_cell(row)),
+        "API 分析（已完成/总数）": api_analysis,
+        "当前系统调用关系": _csv_text(
+            _dependency_current_calls_cell(row)
+        ),
+        "分析结果": str(row.get("analysis_conclusion") or ""),
+        "结果说明": _dependency_result_explanation(row),
+    }
+
+
+def _api_csv_row(row, findings, alert_details):
+    count = int(row.get("aggregate_count") or 1)
+    api = _item_api_label(row) or str(
+        row.get("api") or "API 身份未记录"
+    )
+    if count > 1:
+        api = f"{api}（{count} 个）"
+    relationship = (
+        "调用关系分析未完成"
+        if _api_result_is_incomplete(row)
+        else _full_relationship_cell(row, alert_details)
+    )
+    return {
+        "依赖": str(row.get("coord") or "依赖身份未记录"),
+        "API": api,
+        "新版本中的变化": _csv_text(
+            row.get("change_without_severity")
+        ),
+        "当前系统调用关系": _csv_text(relationship),
+        "分析结果": _analysis_conclusion_label(row),
+        "结果说明": _api_result_explanation(row, findings),
+    }
+
+
+def _completed_api_rows_by_dependency(api_model):
+    grouped = defaultdict(list)
+    for row in api_model.get("completed") or []:
+        grouped[_canonical_identity_coord(row.get("coord"))].append(row)
+    return [
+        (
+            coord,
+            sorted(grouped[coord], key=_report_result_sort_key),
+        )
+        for coord in sorted(grouped)
+    ]
+
+
 def write_full_dependency_analysis_artifact(
     report_dir,
     findings,
@@ -7922,8 +8254,22 @@ def write_full_dependency_analysis_artifact(
     )
     output = _deliverables_dir(report_dir) / "all-affected-dependencies.md"
     output.parent.mkdir(parents=True, exist_ok=True)
+    if _report_scope_is_verified(findings):
+        range_note = (
+            "> 本文件完整展示本轮分析范围内的依赖结果；"
+            "未纳入本轮分析的依赖不属于“未完成分析”，"
+            "统一记录在[分析范围记录](analysis-scope.md)中。"
+        )
+    else:
+        range_note = (
+            "> 本文件汇总现有记录中可识别的依赖结果；"
+            "当前分析范围无法核验，不能把本文件解释为"
+            "本轮分析的完整依赖结果。"
+        )
     lines = [
         "# 完整依赖分析明细",
+        "",
+        range_note,
         "",
         (
             "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | "
@@ -7966,9 +8312,10 @@ def write_full_dependency_analysis_artifact(
             ),
             "",
             (
-                "确认影响、确认不受 API 调用影响和未确认影响的依赖"
-                "合并在同一张表中；“API 分析”中的链接指向"
-                "该依赖的完整 API 结果。"
+                "确认影响、未确认影响和确认不受 API 调用影响的依赖"
+                "按该顺序合并在同一张表中；同类结果按调用关系数量"
+                "从多到少排列。“API 分析”中的链接指向该依赖的"
+                "完整 API 结果。"
             ),
             "",
             *_dependency_completed_table(
@@ -7978,6 +8325,25 @@ def write_full_dependency_analysis_artifact(
             "",
         ])
     write_text(str(output), "\n".join(lines))
+    return relpath_for_report(output, report_dir)
+
+
+def write_full_dependency_analysis_csv(
+    report_dir,
+    dependency_model,
+):
+    output = _deliverables_dir(
+        report_dir
+    ) / "all-affected-dependencies.csv"
+    ordered_rows = [
+        *list(dependency_model.get("incomplete") or []),
+        *list(dependency_model.get("completed") or []),
+    ]
+    _write_human_csv(
+        output,
+        _FULL_DEPENDENCY_CSV_FIELDS,
+        (_dependency_csv_row(row) for row in ordered_rows),
+    )
     return relpath_for_report(output, report_dir)
 
 
@@ -7995,8 +8361,22 @@ def write_full_api_analysis_artifact(
     alert_details = _load_full_alert_details(report_dir)
     output = _deliverables_dir(report_dir) / "all-impact-details.md"
     output.parent.mkdir(parents=True, exist_ok=True)
+    if _report_scope_is_verified(findings):
+        range_note = (
+            "> 本文件完整展示本轮分析范围内的 API 结果和调用关系；"
+            "未纳入本轮分析的 API 不属于“未完成分析”，"
+            "其所属依赖统一记录在[分析范围记录](analysis-scope.md)中。"
+        )
+    else:
+        range_note = (
+            "> 本文件汇总现有记录中可识别的 API 结果和调用关系；"
+            "当前分析范围无法核验，不能把本文件解释为"
+            "本轮分析的完整 API 结果。"
+        )
     lines = [
         "# 完整 API 分析与调用关系明细",
+        "",
+        range_note,
         "",
         (
             "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | "
@@ -8033,16 +8413,14 @@ def write_full_api_analysis_artifact(
             "",
         ])
 
-    completed_by_coord = defaultdict(list)
-    for row in api_model["completed"]:
-        completed_by_coord[_canonical_identity_coord(row.get("coord"))].append(
-            row
-        )
+    completed_by_coord = _completed_api_rows_by_dependency(api_model)
     if api_model["completed"]:
         lines.extend([
             (
                 f"以下 {api_model['completed_count']} 个已完成分析的 API "
-                "按依赖展示；不同分析结论合并在同一张表中。"
+                "按依赖展示；每个依赖内按确认影响、未确认影响、"
+                "确认不受影响排列，同类结果按调用关系数量从多到少"
+                "排列。"
             ),
             "",
         ])
@@ -8050,15 +8428,7 @@ def write_full_api_analysis_artifact(
         _canonical_identity_coord(row.get("coord")): row
         for row in dependency_model["rows"]
     }
-    for coord in sorted(completed_by_coord):
-        rows = sorted(
-            completed_by_coord[coord],
-            key=lambda row: (
-                0 if row.get("conclusion") == "已确认影响" else 1,
-                str(row.get("api") or ""),
-                str(row.get("api_signature") or ""),
-            ),
-        )
+    for coord, rows in completed_by_coord:
         dependency = dependency_lookup.get(coord) or {"coord": coord}
         lines.extend([
             f'<a id="{_dependency_anchor(coord)}"></a>',
@@ -8089,6 +8459,33 @@ def write_full_api_analysis_artifact(
     return relpath_for_report(output, report_dir)
 
 
+def write_full_api_analysis_csv(
+    report_dir,
+    findings,
+    api_model,
+):
+    output = _deliverables_dir(report_dir) / "all-impact-details.csv"
+    alert_details = _load_full_alert_details(report_dir)
+    completed_rows = [
+        row
+        for _coord, rows in _completed_api_rows_by_dependency(api_model)
+        for row in rows
+    ]
+    ordered_rows = [
+        *list(api_model.get("incomplete") or []),
+        *completed_rows,
+    ]
+    _write_human_csv(
+        output,
+        _FULL_API_CSV_FIELDS,
+        (
+            _api_csv_row(row, findings, alert_details)
+            for row in ordered_rows
+        ),
+    )
+    return relpath_for_report(output, report_dir)
+
+
 def cleanup_legacy_s6_detail_artifacts(report_dir):
     """Remove obsolete split files so users see one complete API detail file."""
     deliverables = _deliverables_dir(report_dir)
@@ -8114,11 +8511,22 @@ def write_primary_report_artifacts(report_dir, findings):
                 dependency_model,
             )
         ),
+        "full_dependency_analysis_csv": (
+            write_full_dependency_analysis_csv(
+                report_dir,
+                dependency_model,
+            )
+        ),
         "full_api_analysis_md": write_full_api_analysis_artifact(
             report_dir,
             findings,
             api_model,
             dependency_model,
+        ),
+        "full_api_analysis_csv": write_full_api_analysis_csv(
+            report_dir,
+            findings,
+            api_model,
         ),
     }
     return artifacts, api_model, dependency_model
@@ -8133,6 +8541,18 @@ def render_user_visible_files(
     dependency_model = dependency_model or build_human_dependency_analysis(
         findings,
         api_model,
+    )
+    scope = findings.get("analysis_scope") or {}
+    scope_verified = _report_scope_is_verified(findings)
+    partial_scope = (
+        str(scope.get("mode") or "").strip() == "partial"
+        and scope_verified
+    )
+    raw_dependency_record_count = len(
+        findings.get("dependency_changes") or []
+    )
+    raw_api_record_count = len(
+        findings.get("changed_api_inventory") or []
     )
     displayed_dependencies = sum(
         int(row.get("aggregate_count") or 1)
@@ -8164,20 +8584,35 @@ def render_user_visible_files(
         ),
         (
             "[完整依赖分析明细](all-affected-dependencies.md)"
-            "（`all-affected-dependencies.md`）",
+            "（`all-affected-dependencies.md`）<br>"
+            "[完整依赖分析 CSV](all-affected-dependencies.csv)"
+            "（`all-affected-dependencies.csv`）",
             (
-                "全部变化依赖的分析状态、确认影响数量、未完成原因，"
-                "以及对应 API 明细链接"
+                (
+                    "本轮分析范围内全部变化依赖"
+                    if scope_verified
+                    else "现有记录中可识别的变化依赖"
+                )
+                + "的分析状态、确认影响数量、未完成原因，"
+                "以及对应 API 明细链接；CSV 使用相同数据和排序"
             ),
             _population_full_range(dependency_model, "变化依赖"),
             "“一、依赖层面结论”",
         ),
         (
             "[完整 API 分析与调用关系明细](all-impact-details.md)"
-            "（`all-impact-details.md`）",
+            "（`all-impact-details.md`）<br>"
+            "[完整 API 与调用关系 CSV](all-impact-details.csv)"
+            "（`all-impact-details.csv`）",
             (
-                "全部变化 API 的分析状态；确认影响项展示完整调用关系，"
-                "未完成项记录具体原因"
+                (
+                    "本轮分析范围内全部变化 API"
+                    if scope_verified
+                    else "现有记录中可识别的变化 API"
+                )
+                + "的分析状态；"
+                "确认影响项展示完整调用关系，未完成项记录具体原因；"
+                "CSV 使用相同数据和排序"
             ),
             (
                 f"{_population_full_range(api_model, '变化 API')}；"
@@ -8224,18 +8659,34 @@ def render_user_visible_files(
     if dep_changes_path:
         rows.append((
             _report_link(dep_changes_path, "依赖变化原始清单"),
-            "升级前后的依赖版本和依赖变更类型",
-            _population_full_range(dependency_model, "变化依赖"),
+            (
+                "选择分析范围前识别出的依赖版本变化和依赖变更类型"
+            ),
+            (
+                f"选择前原始记录全量 {raw_dependency_record_count} 条"
+                + (
+                    "；包含未纳入本轮分析的对象"
+                    if partial_scope
+                    else ""
+                )
+            ),
             "“一、依赖层面结论”",
         ))
     changed_path = str(artifacts.get("changed_apis_csv") or "").strip()
     if changed_path:
         rows.append((
             _report_link(changed_path, "变化 API 原始清单"),
-            "新旧依赖对比得到的变化 API 及变化类型",
             (
-                f"可识别变化 API "
-                f"{len(findings.get('changed_api_inventory') or []) or api_model['total_count']} 条"
+                "选择分析范围前通过新旧依赖对比识别出的变化 API "
+                "及变化类型"
+            ),
+            (
+                f"选择前原始记录全量 {raw_api_record_count} 条"
+                + (
+                    "；包含未纳入本轮分析的对象"
+                    if partial_scope
+                    else ""
+                )
             ),
             "“二、API 及调用关系”",
         ))
@@ -8256,9 +8707,17 @@ def render_user_visible_files(
     if scope_path:
         rows.append((
             _report_link(scope_path, "分析范围记录"),
-            "本轮纳入和未纳入调用关系分析的依赖及 API 数量",
-            "本轮范围全量记录",
-            "未完成分析原因的范围依据",
+            (
+                "选择前总数、本轮纳入数量、未纳入数量、"
+                "未纳入依赖及具体原因"
+            ),
+            (
+                f"变化依赖 {int(scope.get('included_dependency_count') or 0)}/"
+                f"{int(scope.get('available_dependency_count') or 0)}；"
+                f"变化 API {int(scope.get('analyzed_api_count') or 0)}/"
+                f"{int(scope.get('total_api_count') or 0)}"
+            ),
+            "主报告顶部的分析范围说明",
         ))
     diagnostic_path = str(
         artifacts.get("diagnostic_detail_md") or ""
@@ -8312,6 +8771,7 @@ def generate_report(findings):
         f"> 生成时间：{findings.get('generated_at') or '未记录'}",
         "",
     ]
+    L += render_report_scope_notice(findings)
     L += render_dependency_conclusions(findings, dependency_model)
     L += render_api_and_calls(findings, api_model)
     L += render_user_visible_files(
@@ -8409,14 +8869,16 @@ def main():
     print(
         (
             "完整依赖分析明细："
-            f"{_deliverables_dir(args.report_dir) / 'all-affected-dependencies.md'}"
+            f"{_deliverables_dir(args.report_dir) / 'all-affected-dependencies.md'}；"
+            f"{_deliverables_dir(args.report_dir) / 'all-affected-dependencies.csv'}"
         ),
         file=sys.stderr,
     )
     print(
         (
             "完整 API 分析与调用关系明细："
-            f"{_deliverables_dir(args.report_dir) / 'all-impact-details.md'}"
+            f"{_deliverables_dir(args.report_dir) / 'all-impact-details.md'}；"
+            f"{_deliverables_dir(args.report_dir) / 'all-impact-details.csv'}"
         ),
         file=sys.stderr,
     )
