@@ -48,6 +48,8 @@ class ToolExecutionTest(unittest.TestCase):
                 self.assertEqual(result.failure.timeout_seconds, 30)
                 self.assertEqual(result.failure.stderr, stderr)
                 self.assertTrue(result.failure.blocking)
+                self.assertEqual(result.failure.attempts, 1)
+                self.assertEqual(result.failure.to_mapping()["attempts"], 1)
                 with self.assertRaises(ExternalToolError):
                     result.require_success()
 

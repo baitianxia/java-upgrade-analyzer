@@ -1420,9 +1420,15 @@ def _target_reverse_path_context(api_row, graph):
     """Return collectors and caller symbols that can participate in this target's paths."""
     reverse_edges = getattr(graph, 'reverse_edges', {}) or {}
     api_name = str((api_row or {}).get('api_name') or '').strip()
-    if not api_name or not reverse_edges:
+    if not api_name:
         return set(), set()
     normalized_api_name = api_name.replace('$', '.')
+    symbols = {
+        normalized_api_name,
+        normalized_api_name.rsplit('.', 1)[0],
+    }
+    if not reverse_edges:
+        return set(), symbols
     api_signature = normalize_signature_for_identity(
         str((api_row or {}).get('api_signature') or '').replace('$', '.')
     )
@@ -1460,12 +1466,12 @@ def _target_reverse_path_context(api_row, graph):
     pending = deque(matching_keys(normalized_api_name, api_signature))
     visited = set()
     collectors = set()
-    symbols = set()
     while pending:
         current = pending.popleft()
         if current in visited:
             continue
         visited.add(current)
+        symbols.add(str(current).split('(', 1)[0].replace('$', '.'))
         for edge in reverse_edges.get(current, ()) or ():
             collector = str(getattr(edge, 'collector', '') or '').strip()
             if collector:
@@ -1671,7 +1677,10 @@ def _new_trace_draft(api_row, graph=None):
             or getattr(failure, 'scope', 'global') == 'global'
             or (
                 getattr(failure, 'scope', 'global') == 'path'
-                and failure.stage in path_scoped_collectors
+                and (
+                    failure.stage == 'step5.jar-metadata.javap'
+                    or failure.stage in path_scoped_collectors
+                )
                 and _path_failure_matches(failure, path_symbols)
             )
         )

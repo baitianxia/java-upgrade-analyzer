@@ -40,6 +40,7 @@ from step5_evidence_model import (  # noqa: E402
 from pipeline_constants import PER_DEPENDENCY_DIRNAME  # noqa: E402
 from s4_contract import make_per_dependency_dirname  # noqa: E402
 from step5_artifact_fact_store import Step5ArtifactFactStore  # noqa: E402
+from tool_execution import ExternalToolError, ExternalToolFailure  # noqa: E402
 from tests.retained_artifact_test_support import (  # noqa: E402
     retain_current_artifact_contract,
 )
@@ -15945,6 +15946,186 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             self.assertNotIn("com.example.Unused", metadata["by_class"])
             mocked_javap.assert_called_once_with(str(jar_path), "com.example.Target")
 
+    def test_jar_metadata_javap_retries_only_timeouts_with_backoff(self):
+        javap_output = "\n".join([
+            "public interface com.example.Target {",
+            "  public abstract void call();",
+            "    descriptor: ()V",
+            "}",
+        ])
+        outcomes = [
+            ("", "命令超时（30秒）", -1),
+            ("", "command timeout after 30 seconds", -1),
+            (javap_output, "", 0),
+        ]
+
+        with (
+            patch.object(step5, "run_cmd", side_effect=outcomes) as mocked_runner,
+            patch.object(step5.time, "sleep") as mocked_sleep,
+        ):
+            actual = step5._run_javap_for_class(
+                "/runtime/demo.jar", "com.example.Target"
+            )
+
+        self.assertEqual(actual, javap_output)
+        self.assertEqual(mocked_runner.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in mocked_runner.call_args_list],
+            [30, 30, 30],
+        )
+        self.assertEqual(
+            [call.args[0] for call in mocked_sleep.call_args_list],
+            [1, 3],
+        )
+
+    def test_jar_metadata_javap_does_not_retry_non_timeout_failure(self):
+        with (
+            patch.object(
+                step5, "run_cmd", return_value=("", "class parse failed", 7)
+            ) as mocked_runner,
+            patch.object(step5.time, "sleep") as mocked_sleep,
+        ):
+            with self.assertRaises(ExternalToolError) as raised:
+                step5._run_javap_for_class(
+                    "/runtime/demo.jar", "com.example.Target"
+                )
+
+        self.assertEqual(mocked_runner.call_count, 1)
+        mocked_sleep.assert_not_called()
+        self.assertEqual(
+            raised.exception.failure.reason_code,
+            "STEP5_JAR_METADATA_JAVAP_NONZERO_EXIT",
+        )
+        self.assertEqual(raised.exception.failure.attempts, 1)
+
+    def test_hydrate_jar_metadata_exhausted_timeout_is_path_scoped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "demo.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr("com/example/Target.class", b"")
+            metadata = {
+                "complete": True,
+                "failures": [],
+                "by_coord": {"com.example:demo": {
+                    "coord": "com.example:demo",
+                    "version": "1.0.0",
+                    "jar_path": str(jar_path),
+                    "classes": {},
+                }},
+                "by_class": {},
+                "jar_paths": {"com.example:demo": str(jar_path)},
+            }
+
+            with (
+                patch.object(
+                    step5,
+                    "run_cmd",
+                    return_value=("", "命令超时（30秒）", -1),
+                ) as mocked_runner,
+                patch.object(step5.time, "sleep") as mocked_sleep,
+            ):
+                step5.hydrate_jar_metadata_for_classes(
+                    metadata,
+                    {"com.example.Target"},
+                    class_consumers={
+                        "com.example.Target": {"app.TargetConsumer"},
+                    },
+                )
+            graph_result = step5.build_enhanced_source_graph(
+                [], jar_metadata=metadata
+            )
+
+        self.assertEqual(mocked_runner.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in mocked_sleep.call_args_list],
+            [1, 3],
+        )
+        self.assertFalse(metadata["complete"])
+        self.assertEqual(len(metadata["failures"]), 1)
+        failure = metadata["failures"][0]
+        self.assertEqual(
+            failure["reason_code"], "STEP5_JAR_METADATA_JAVAP_TIMEOUT"
+        )
+        self.assertEqual(failure["attempts"], 3)
+        self.assertEqual(failure["consumer_classes"], ["app.TargetConsumer"])
+        projected = graph_result["graph"].step5_evidence_failures[0]
+        self.assertEqual(projected.scope, "path")
+        self.assertEqual(projected.class_name, "com.example.Target")
+        self.assertEqual(
+            [item.class_name for item in projected.occurrences],
+            ["app.TargetConsumer"],
+        )
+
+    def test_jar_metadata_path_failure_does_not_block_unrelated_api(self):
+        affected_api = {
+            "api_name": "com.vendor.Target.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "METHOD_REMOVED",
+            "coord": "com.vendor:target",
+        }
+        unrelated_api = {
+            **affected_api,
+            "api_name": "com.vendor.Unrelated.call",
+        }
+        failure = EvidenceFailure(
+            stage="step5.jar-metadata.javap",
+            reason_code="STEP5_JAR_METADATA_JAVAP_TIMEOUT",
+            blocking=True,
+            class_name="com.vendor.Target",
+            scope="path",
+        )
+        graph = SimpleNamespace(
+            reverse_edges={
+                "com.vendor.Target.call()": (
+                    SimpleNamespace(
+                        collector="source_ast",
+                        caller_symbol_id="app.TargetConsumer.run()",
+                        caller_qualified_key="app.TargetConsumer.run()",
+                    ),
+                ),
+                "com.vendor.Unrelated.call()": (
+                    SimpleNamespace(
+                        collector="source_ast",
+                        caller_symbol_id="app.OtherConsumer.run()",
+                        caller_qualified_key="app.OtherConsumer.run()",
+                    ),
+                ),
+            },
+            step5_evidence_failures=(failure,),
+            step5_evidence_concerns=(),
+            step5_collector_coverage=(
+                CoverageRecord(
+                    collector="business_bytecode",
+                    api_identity=tracer.indirect_api_key(affected_api),
+                    status="complete",
+                ),
+                CoverageRecord(
+                    collector="business_bytecode",
+                    api_identity=tracer.indirect_api_key(unrelated_api),
+                    status="complete",
+                ),
+            ),
+        )
+
+        affected = tracer._new_trace_draft(affected_api, graph)
+        unrelated = tracer._new_trace_draft(unrelated_api, graph)
+        affected_result = tracer._finalize_trace_draft(affected)
+        unrelated_result = tracer._finalize_trace_draft(unrelated)
+
+        self.assertEqual((failure,), affected.envelope_failures)
+        self.assertFalse(unrelated.envelope_failures)
+        self.assertEqual(affected_result.analysis_status, "not_analyzed")
+        self.assertEqual(
+            affected_result.reason_code,
+            "STEP5_JAR_METADATA_JAVAP_TIMEOUT",
+        )
+        self.assertEqual(
+            unrelated_result.analysis_status,
+            "not_found_in_static_analysis",
+        )
+        self.assertEqual(unrelated_result.reason_code, "NO_STATIC_PATH")
+
     def test_hydrate_jar_metadata_maps_javap_failure_to_blocking_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar_path = Path(tmp) / "demo.jar"
@@ -16054,6 +16235,49 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             self.assertIn("com.vendor.ExternalService", jar_metadata["by_class"])
             self.assertNotIn("com.vendor.Unused", jar_metadata["by_class"])
             mocked_javap.assert_called_once_with(str(jar_path), "com.vendor.ExternalService")
+
+            failed_metadata = {
+                "by_coord": {
+                    "com.vendor:demo": {
+                        "coord": "com.vendor:demo",
+                        "version": "1.0.0",
+                        "jar_path": str(jar_path),
+                        "classes": {},
+                    }
+                },
+                "by_class": {},
+                "jar_paths": {"com.vendor:demo": str(jar_path)},
+            }
+            tool_failure = ExternalToolFailure(
+                stage="step5.jar-metadata.javap",
+                reason_code="STEP5_JAR_METADATA_JAVAP_TIMEOUT",
+                command=(
+                    "javap", "-classpath", str(jar_path), "-s", "-p",
+                    "com.vendor.ExternalService",
+                ),
+                timeout_seconds=30,
+                stderr="命令超时（30秒）",
+                returncode=-1,
+                attempts=3,
+            )
+            with patch.object(
+                step5,
+                "_run_javap_for_class",
+                side_effect=ExternalToolError(tool_failure),
+            ):
+                failed_graph_result = step5.build_enhanced_source_graph(
+                    source_roots, jar_metadata=failed_metadata
+                )
+
+            projected = (
+                failed_graph_result["graph"].step5_evidence_failures[0]
+            )
+            self.assertEqual(projected.scope, "path")
+            self.assertEqual(projected.class_name, "com.vendor.ExternalService")
+            self.assertEqual(
+                [item.class_name for item in projected.occurrences],
+                ["com.example.App"],
+            )
 
     def test_build_enhanced_source_graph_preserves_local_return_type_maps_per_class(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -19,6 +19,7 @@ class ExternalToolFailure:
     returncode: int
     blocking: bool = True
     error_type: str = ""
+    attempts: int = 1
 
     def to_mapping(self) -> dict:
         return {
@@ -30,6 +31,7 @@ class ExternalToolFailure:
             "returncode": self.returncode,
             "blocking": self.blocking,
             "error_type": self.error_type,
+            "attempts": self.attempts,
         }
 
 

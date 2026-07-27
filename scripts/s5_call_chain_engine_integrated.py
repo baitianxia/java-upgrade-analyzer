@@ -36,6 +36,7 @@ import zipfile
 from collections import defaultdict, deque
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,7 +72,12 @@ from indirect_usage_analyzer import (
 )
 from framework_adapters import run_framework_adapters, serialize_framework_batches
 from step5_evidence_ingestion import ingest_collector_batches
-from step5_evidence_model import CoverageRecord, EvidenceFailure, thaw_evidence_value
+from step5_evidence_model import (
+    CoverageRecord,
+    EvidenceFailure,
+    EvidenceFailureOccurrence,
+    thaw_evidence_value,
+)
 from step5_graph import SourceGraph
 from tool_execution import ExternalToolError, execute_external_tool
 from step5_memory_observer import (
@@ -116,6 +122,8 @@ EVIDENCE_FAILURE_OCCURRENCE_FIELDS = (
     'caller_symbol', 'caller_qualified_key', 'artifact', 'artifact_entry',
     'class_name', 'line', 'instruction_offset', 'detail',
 )
+JAR_METADATA_JAVAP_TIMEOUT_SECONDS = 30
+JAR_METADATA_JAVAP_TIMEOUT_RETRY_DELAYS_SECONDS = (1, 3)
 
 FATAL_BUSINESS_BYTECODE_REASON_CODES = frozenset({
     'CURRENT_FINAL_ARTIFACT_REQUIRED',
@@ -3172,15 +3180,34 @@ def _build_signature_from_params(param_types):
 
 
 def _run_javap_for_class(jar_path, class_fqcn):
-    return execute_external_tool(
-        ['javap', '-classpath', jar_path, '-s', '-p', class_fqcn],
-        stage='step5.jar-metadata.javap',
-        reason_prefix='STEP5_JAR_METADATA_JAVAP',
-        timeout_seconds=30,
-        blocking=True,
-        require_stdout=True,
-        runner=run_cmd,
-    ).require_success().stdout
+    retry_delays = JAR_METADATA_JAVAP_TIMEOUT_RETRY_DELAYS_SECONDS
+    for attempt_number in range(1, len(retry_delays) + 2):
+        execution = execute_external_tool(
+            ['javap', '-classpath', jar_path, '-s', '-p', class_fqcn],
+            stage='step5.jar-metadata.javap',
+            reason_prefix='STEP5_JAR_METADATA_JAVAP',
+            timeout_seconds=JAR_METADATA_JAVAP_TIMEOUT_SECONDS,
+            blocking=True,
+            require_stdout=True,
+            runner=run_cmd,
+        )
+        if execution.succeeded:
+            return execution.stdout
+        failure = replace(execution.failure, attempts=attempt_number)
+        retryable = failure.reason_code == 'STEP5_JAR_METADATA_JAVAP_TIMEOUT'
+        if not retryable or attempt_number > len(retry_delays):
+            raise ExternalToolError(failure)
+        delay = retry_delays[attempt_number - 1]
+        _step5_debug(
+            'jar_metadata_javap_retry',
+            'retrying timed out jar metadata javap command',
+            attempt=attempt_number,
+            next_attempt=attempt_number + 1,
+            retry_delay_seconds=delay,
+            jar_path=jar_path,
+            class_fqcn=class_fqcn,
+        )
+        time.sleep(delay)
 
 
 def _parse_javap_signature_block(text, class_fqcn):
@@ -3301,13 +3328,27 @@ def _locate_jar_class(metadata, class_fqcn):
     return None
 
 
-def hydrate_jar_metadata_for_classes(metadata, target_classes, source_known_classes=None):
+def hydrate_jar_metadata_for_classes(
+    metadata,
+    target_classes,
+    source_known_classes=None,
+    class_consumers=None,
+):
     metadata = metadata or {}
     by_class = metadata.setdefault('by_class', {})
     by_coord = metadata.setdefault('by_coord', {})
     pending = deque()
     queued = set()
     source_known_classes = set(source_known_classes or [])
+    consumers_by_class = defaultdict(set)
+    for class_name, consumers in (class_consumers or {}).items():
+        normalized = _normalize_class_reference(class_name)
+        if normalized:
+            consumers_by_class[normalized].update(
+                str(consumer or '').strip()
+                for consumer in consumers or ()
+                if str(consumer or '').strip()
+            )
 
     for class_name in target_classes or []:
         normalized = _normalize_class_reference(class_name)
@@ -3333,6 +3374,7 @@ def hydrate_jar_metadata_for_classes(metadata, target_classes, source_known_clas
                 'jar_path': jar_path,
                 'class_fqcn': class_fqcn,
                 'class_binary_name': binary_name,
+                'consumer_classes': sorted(consumers_by_class.get(class_fqcn) or ()),
             })
             metadata.setdefault('failures', []).append(failure)
             metadata['complete'] = False
@@ -3359,6 +3401,10 @@ def hydrate_jar_metadata_for_classes(metadata, target_classes, source_known_clas
             ):
                 pending.append(normalized_parent)
                 queued.add(normalized_parent)
+            if normalized_parent:
+                consumers_by_class[normalized_parent].update(
+                    consumers_by_class.get(class_fqcn) or ()
+                )
 
 
 def _index_jar_classes_for_source_resolution(metadata):
@@ -3424,8 +3470,9 @@ def build_jar_metadata_for_source_roots(source_roots, report_dir, runtime_depend
 
 def _collect_external_class_candidates(class_info, all_methods, resolve_type_name, known_classes):
     candidates = set()
+    consumers_by_class = defaultdict(set)
     known_classes = set(known_classes or [])
-    for info in (class_info or {}).values():
+    for consumer_class, info in (class_info or {}).items():
         if info.get('owner_type') != 'business':
             continue
         owner_info = {
@@ -3436,6 +3483,7 @@ def _collect_external_class_candidates(class_info, all_methods, resolve_type_nam
             normalized = _normalize_class_reference(resolve_type_name(raw_name, owner_info))
             if normalized and normalized not in known_classes:
                 candidates.add(normalized)
+                consumers_by_class[normalized].add(consumer_class)
     for method_def in all_methods or []:
         if getattr(method_def, 'owner_type', '') != 'business':
             continue
@@ -3448,7 +3496,12 @@ def _collect_external_class_candidates(class_info, all_methods, resolve_type_nam
             normalized = _normalize_class_reference(raw_name)
             if normalized and normalized not in known_classes:
                 candidates.add(normalized)
-    return candidates
+                consumer_class = str(
+                    getattr(method_def, 'class_fqcn', '') or ''
+                ).strip()
+                if consumer_class:
+                    consumers_by_class[normalized].add(consumer_class)
+    return candidates, consumers_by_class
 
 
 def load_changed_apis(csv_path, jdk_scan_dir=""):
@@ -4316,7 +4369,7 @@ def build_enhanced_source_graph(
                     ))
         return synthetic_methods, synthetic_edges
 
-    jar_class_candidates = _collect_external_class_candidates(
+    jar_class_candidates, jar_class_consumers = _collect_external_class_candidates(
         class_info,
         all_methods,
         resolve_type_name,
@@ -4327,6 +4380,7 @@ def build_enhanced_source_graph(
             jar_metadata,
             jar_class_candidates,
             source_known_classes=known_classes,
+            class_consumers=jar_class_consumers,
         )
     jar_classes = set((jar_metadata.get('by_class') or {}).keys())
     for class_fqcn in jar_classes:
@@ -4683,11 +4737,17 @@ def build_enhanced_source_graph(
                 blocking=bool(failure.get('blocking', True)),
                 artifact=str(failure.get('jar_path') or ''),
                 class_name=str(failure.get('class_fqcn') or ''),
+                occurrences=tuple(
+                    EvidenceFailureOccurrence(class_name=str(class_name))
+                    for class_name in failure.get('consumer_classes') or ()
+                    if str(class_name or '').strip()
+                ),
                 detail='; '.join(
                     f'{key}={value}'
                     for key, value in sorted(failure.items())
                     if value not in (None, '', [], ())
                 ),
+                scope='path',
             )
             for failure in jar_metadata_failures
         )
