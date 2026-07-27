@@ -2880,6 +2880,14 @@ gradle.projectsEvaluated {
                             row.version = component.version
                         } else if (component instanceof ProjectComponentIdentifier) {
                             row.project_path = component.projectPath
+                            def dependencyProject = ownerProject.rootProject.findProject(
+                                component.projectPath
+                            )
+                            if (dependencyProject != null) {
+                                row.group_id = dependencyProject.group?.toString()
+                                row.artifact_id = dependencyProject.name
+                                row.version = dependencyProject.version?.toString()
+                            }
                         } else {
                             row.component_display_name = component.displayName
                         }
@@ -3343,10 +3351,13 @@ def _enrich_packaged_deps_with_runtime(
             and runtime_match
             and str(confirmed_unresolved.get('source') or '').strip() == 'filename'
             and not str(confirmed_unresolved.get('classifier') or '').strip()
-            and runtime_match.get('packaged_match_source') in {
-                'runtime-artifact-inventory',
-                'runtime-filename-classifier',
-            }
+            and (
+                runtime_match.get('packaged_match_source') in {
+                    'runtime-artifact-inventory',
+                    'runtime-filename-classifier',
+                }
+                or str(runtime_match.get('project_module') or '').strip()
+            )
         )
         if (
             confirmed_unresolved
@@ -3588,6 +3599,140 @@ def _maven_reactor_has_modules(work_dir):
     )
 
 
+def build_project_module_runtime_catalog(
+    work_dir,
+    target_selector,
+    *,
+    build_tool='maven',
+    active_maven_profiles=None,
+):
+    """Return source-backed coordinates for internal modules in the target closure.
+
+    Build-tool runtime output remains authoritative for external dependencies.
+    This catalog closes the reactor/project-dependency gap when Maven
+    ``dependency:list`` omits a reactor artifact or Gradle exposes only a
+    ``ProjectComponentIdentifier``.
+    """
+    tool = str(build_tool or 'maven').strip().lower()
+    active_profiles = (
+        set(active_maven_profiles or [])
+        if tool == 'maven'
+        else None
+    )
+    scope = build_project_scope(
+        work_dir,
+        target_selector or '.',
+        active_profiles=active_profiles,
+        build_tool=tool,
+    )
+    included_modules = {
+        str(item or '').strip()
+        for item in scope.get('included_modules') or []
+        if str(item or '').strip()
+    }
+    target_module = str(scope.get('target_module') or '').strip()
+    if not included_modules or not target_module:
+        return {}
+
+    discovery = discover_project_modules(
+        work_dir,
+        build_tool=tool,
+        active_profiles=active_profiles,
+    )
+    catalog = {}
+    for module in discovery.get('modules') or []:
+        module_name = str(module.get('module') or '').strip()
+        if module_name not in included_modules or module_name == target_module:
+            continue
+        group_id = str(module.get('group_id') or '').strip()
+        artifact_id = str(module.get('artifact_id') or '').strip()
+        version = str(module.get('version') or '').strip()
+        if (
+            not group_id
+            or not artifact_id
+            or not version
+            or version == 'unspecified'
+            or any(token in value for value in (group_id, artifact_id, version)
+                   for token in ('${', '}'))
+        ):
+            continue
+        coord = f'{group_id}:{artifact_id}'
+        record = {
+            'key': coord,
+            'coord': coord,
+            'group_id': group_id,
+            'artifact_id': artifact_id,
+            'version': version,
+            'scope': 'runtime',
+            'remark': 'source:project_module_catalog(target_closure)',
+            'classifier': '',
+            'packaged_present': '',
+            'packaged_match_source': '',
+            'project_module': module_name,
+        }
+
+        # A unique physical main artifact is stronger than conventional
+        # filename matching and also supports a module-specific finalName.
+        archives = _discover_packaged_archives(Path(module.get('module_dir') or ''))
+        main_archives = []
+        for archive in archives:
+            matched, classifier, _layout = _match_runtime_artifact_filename(
+                archive.name,
+                artifact_id,
+                version,
+            )
+            if matched and not classifier:
+                main_archives.append(archive)
+        physical = (
+            main_archives[0]
+            if len(main_archives) == 1
+            else (archives[0] if len(archives) == 1 else None)
+        )
+        if physical is not None:
+            record['artifact_file_name'] = physical.name
+            record['artifact_file_path'] = str(physical)
+        catalog[coord] = record
+    return catalog
+
+
+def augment_runtime_deps_with_project_modules(
+    runtime_deps,
+    work_dir,
+    target_selector,
+    *,
+    build_tool='maven',
+    active_maven_profiles=None,
+):
+    """Merge missing internal-module identities without overriding resolved output."""
+    augmented = {
+        str(key): dict(value or {})
+        for key, value in (runtime_deps or {}).items()
+    }
+    project_modules = build_project_module_runtime_catalog(
+        work_dir,
+        target_selector,
+        build_tool=build_tool,
+        active_maven_profiles=active_maven_profiles,
+    )
+    for coord, module_record in project_modules.items():
+        existing = augmented.get(coord)
+        if existing is None:
+            _merge_runtime_artifact_record(augmented, dict(module_record))
+            continue
+        if str(existing.get('version') or '') != str(module_record.get('version') or ''):
+            # The executed build model wins over the static source model.
+            continue
+        existing['project_module'] = module_record.get('project_module', '')
+        if not existing.get('artifact_file_name') and module_record.get('artifact_file_name'):
+            existing['artifact_file_name'] = module_record['artifact_file_name']
+            existing['artifact_file_path'] = module_record.get('artifact_file_path', '')
+            existing['artifact_file_names'] = [module_record['artifact_file_name']]
+            existing['artifact_file_paths'] = [
+                module_record.get('artifact_file_path', '')
+            ]
+    return augmented
+
+
 def _collect_maven_runtime_deps_for_workspace(
     work_dir, primary_module=None, modules=None, env=None, observer=None, side="",
     active_maven_profiles=None,
@@ -3632,7 +3777,13 @@ def _collect_maven_runtime_deps_for_workspace(
                 "最终制品中存在无法直接识别坐标的嵌套依赖，且 `mvn dependency:list` 执行失败，"
                 f"无法安全补全坐标：{(list_stderr[:300] or list_stdout[:300])}"
             )
-    runtime_deps = parse_maven_dependency_list(list_stdout)
+    runtime_deps = augment_runtime_deps_with_project_modules(
+        parse_maven_dependency_list(list_stdout),
+        work_dir,
+        target_selector,
+        build_tool='maven',
+        active_maven_profiles=active_maven_profiles,
+    )
     return runtime_deps, list_command
 
 
@@ -3830,7 +3981,12 @@ def _collect_gradle_runtime_deps_for_workspace(
         else {}
     )
     if runtime_deps:
-        return runtime_deps, inventory_command
+        return augment_runtime_deps_with_project_modules(
+            runtime_deps,
+            work_dir,
+            target_selector,
+            build_tool='gradle',
+        ), inventory_command
 
     # Compatibility fallback for Gradle versions/plugins that do not expose
     # ArtifactView.  This preserves existing support, but only the inventory
@@ -3873,9 +4029,14 @@ def _collect_gradle_runtime_deps_for_workspace(
             return_code=list_rc,
             attempts=fallback_attempts,
         )
-    return parse_gradle_dependency_report(
-        list_stdout,
-        project_modules=discovery.get('modules') or [],
+    return augment_runtime_deps_with_project_modules(
+        parse_gradle_dependency_report(
+            list_stdout,
+            project_modules=discovery.get('modules') or [],
+        ),
+        work_dir,
+        target_selector,
+        build_tool='gradle',
     ), f'{inventory_command}; fallback={fallback_command}'
 
 

@@ -281,6 +281,39 @@ class Step1PackagedDepsTest(unittest.TestCase):
             ":internal",
         )
 
+    def test_gradle_inventory_uses_effective_project_component_coordinates(self):
+        report = (
+            s1_dep_diff.GRADLE_ARTIFACT_INVENTORY_PREFIX
+            + json.dumps({
+                "project_path": ":internal",
+                "group_id": "com.effective",
+                "artifact_id": "internal-runtime",
+                "version": "3.4.5",
+                "file_name": "custom-internal.jar",
+                "file_path": "/workspace/custom-internal.jar",
+            })
+        )
+
+        deps = s1_dep_diff.parse_gradle_artifact_inventory(
+            report,
+            project_modules=[{
+                "gradle_path": ":internal",
+                "group_id": "",
+                "artifact_id": "static-name",
+                "version": "unspecified",
+            }],
+        )
+
+        self.assertEqual(set(deps), {"com.effective:internal-runtime"})
+        self.assertEqual(
+            deps["com.effective:internal-runtime"]["artifact_file_name"],
+            "custom-internal.jar",
+        )
+        self.assertEqual(
+            deps["com.effective:internal-runtime"]["gradle_project_path"],
+            ":internal",
+        )
+
     def test_collect_gradle_runtime_deps_prefers_artifact_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -593,6 +626,47 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(entries[0]["coord"], "com.acme:internal-core")
         self.assertEqual(entries[0]["resolution_status"], "resolved")
 
+    def test_gradle_project_module_catalog_is_limited_to_target_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "settings.gradle").write_text(
+                "include ':app', ':internal', ':unused'\n",
+                encoding="utf-8",
+            )
+            (root / "build.gradle").write_text(
+                "allprojects {\n"
+                "  group = 'com.acme'\n"
+                "  version = '2.1.0'\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            for module in ("app", "internal", "unused"):
+                (root / module).mkdir()
+                dependency = (
+                    "dependencies {\n"
+                    "  implementation project(':internal')\n"
+                    "}\n"
+                    if module == "app"
+                    else ""
+                )
+                (root / module / "build.gradle").write_text(
+                    "plugins { id 'java' }\n" + dependency,
+                    encoding="utf-8",
+                )
+
+            catalog = s1_dep_diff.build_project_module_runtime_catalog(
+                root,
+                ":app",
+                build_tool="gradle",
+            )
+
+        self.assertEqual(set(catalog), {"com.acme:internal"})
+        self.assertEqual(catalog["com.acme:internal"]["version"], "2.1.0")
+        self.assertEqual(
+            catalog["com.acme:internal"]["project_module"],
+            "internal",
+        )
+
     def test_collect_gradle_deps_uses_wrapper_and_target_module_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
             work_dir = Path(tmp)
@@ -736,6 +810,132 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertLess(commands[0].index("package"), commands[0].index("dependency:list"))
         self.assertIsNone(call_options[0]["timeout"])
         self.assertIn("com.acme:common", deps)
+
+    def test_reactor_module_catalog_closes_dependency_list_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pom.xml").write_text(
+                "<project><modelVersion>4.0.0</modelVersion>"
+                "<groupId>com.acme</groupId><artifactId>parent</artifactId>"
+                "<version>${revision}</version><packaging>pom</packaging>"
+                "<properties><revision>1.2.3</revision></properties>"
+                "<modules><module>common</module><module>app</module>"
+                "<module>unused</module></modules>"
+                "</project>",
+                encoding="utf-8",
+            )
+            for module in ("common", "app", "unused"):
+                module_dir = root / module
+                module_dir.mkdir()
+                dependencies = (
+                    "<dependencies><dependency>"
+                    "<groupId>com.acme</groupId><artifactId>common</artifactId>"
+                    "<version>${project.version}</version>"
+                    "</dependency></dependencies>"
+                    if module == "app"
+                    else ""
+                )
+                (module_dir / "pom.xml").write_text(
+                    "<project><modelVersion>4.0.0</modelVersion>"
+                    "<parent><groupId>com.acme</groupId>"
+                    "<artifactId>parent</artifactId>"
+                    "<version>${revision}</version></parent>"
+                    f"<artifactId>{module}</artifactId>{dependencies}"
+                    "</project>",
+                    encoding="utf-8",
+                )
+            internal_artifact = root / "common" / "target" / "custom-internal.jar"
+            internal_artifact.parent.mkdir()
+            internal_artifact.write_bytes(b"internal")
+
+            with patch.object(
+                s1_dep_diff,
+                "run_cmd",
+                return_value=(
+                    "[INFO] org.example:external:jar:9.0:runtime:"
+                    "/repo/external-9.0.jar\n",
+                    "",
+                    0,
+                ),
+            ):
+                runtime_deps, _command = (
+                    s1_dep_diff.collect_runtime_deps_for_workspace(
+                        root,
+                        primary_module="app",
+                    )
+                )
+
+            entries, resolved, unresolved = (
+                s1_dep_diff._enrich_packaged_deps_with_runtime(
+                    [{
+                        "entry_id": "BOOT-INF/lib/custom-internal.jar",
+                        "lib_entry": "BOOT-INF/lib/custom-internal.jar",
+                        "lib_name": "custom-internal.jar",
+                        "artifact_id": "",
+                        "version": "",
+                        "classifier": "",
+                        "coord": "",
+                        "match_source": "filename",
+                        "filename_stem": "custom-internal",
+                    }],
+                    runtime_deps,
+                )
+            )
+
+        self.assertEqual(
+            runtime_deps["com.acme:common"]["version"],
+            "1.2.3",
+        )
+        self.assertNotIn("com.acme:unused", runtime_deps)
+        self.assertEqual(
+            runtime_deps["com.acme:common"]["artifact_file_name"],
+            "custom-internal.jar",
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"com.acme:common"})
+        self.assertEqual(entries[0]["coord"], "com.acme:common")
+        self.assertEqual(
+            entries[0]["packaged_match_source"],
+            "runtime-artifact-inventory",
+        )
+
+    def test_new_project_module_evidence_reopens_confirmed_filename_unresolved(self):
+        runtime_deps = {
+            "com.acme:common": {
+                "key": "com.acme:common",
+                "coord": "com.acme:common",
+                "group_id": "com.acme",
+                "artifact_id": "common",
+                "version": "1.2.3",
+                "classifier": "",
+                "project_module": "common",
+            }
+        }
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                [{
+                    "entry_id": "BOOT-INF/lib/common-1.2.3.jar",
+                    "lib_entry": "BOOT-INF/lib/common-1.2.3.jar",
+                    "lib_name": "common-1.2.3.jar",
+                    "artifact_id": "common",
+                    "version": "1.2.3",
+                    "classifier": "",
+                    "coord": "",
+                    "match_source": "filename",
+                    "filename_stem": "common-1.2.3",
+                }],
+                runtime_deps,
+                confirmed_unresolved_items=[{
+                    "artifact_id": "common",
+                    "version": "1.2.3",
+                    "source": "filename",
+                }],
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"com.acme:common"})
+        self.assertEqual(entries[0]["resolution_status"], "resolved")
 
     def test_packaged_archive_rejects_unsafe_entry_before_scanning(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -41,12 +41,42 @@ def _pom_model(
 ):
     root = ET.parse(str(pom_path)).getroot()
     parent = root.find("{*}parent")
+
+    def resolve_inherited(value):
+        result = str(value or "").strip()
+        replacements = {
+            **{
+                str(key): str(val)
+                for key, val in (inherited_properties or {}).items()
+            },
+            "project.groupId": inherited_group,
+            "pom.groupId": inherited_group,
+            "project.version": inherited_version,
+            "pom.version": inherited_version,
+        }
+        for _ in range(8):
+            updated = re.sub(
+                r'\$\{([^}]+)\}',
+                lambda match: replacements.get(match.group(1), match.group(0)),
+                result,
+            )
+            if updated == result:
+                break
+            result = updated
+        return result
+
     inherits_reactor_parent = bool(
         parent is not None
         and inherited_artifact
         and _text(parent, "artifactId") == inherited_artifact
-        and (not _text(parent, "groupId") or _text(parent, "groupId") == inherited_group)
-        and (not _text(parent, "version") or _text(parent, "version") == inherited_version)
+        and (
+            not _text(parent, "groupId")
+            or resolve_inherited(_text(parent, "groupId")) == inherited_group
+        )
+        and (
+            not _text(parent, "version")
+            or resolve_inherited(_text(parent, "version")) == inherited_version
+        )
     )
     group_id = _text(root, "groupId") or _text(parent, "groupId") or inherited_group
     artifact_id = _text(root, "artifactId")
@@ -101,6 +131,18 @@ def _pom_model(
                 break
             result = updated
         return result
+
+    group_id = resolve_value(group_id)
+    artifact_id = resolve_value(artifact_id)
+    version = resolve_value(version)
+    builtin_properties.update({
+        "project.groupId": group_id,
+        "pom.groupId": group_id,
+        "project.artifactId": artifact_id,
+        "pom.artifactId": artifact_id,
+        "project.version": version,
+        "pom.version": version,
+    })
 
     module_nodes = list(root.findall("{*}modules/{*}module"))
     for profile in active_profile_nodes:
