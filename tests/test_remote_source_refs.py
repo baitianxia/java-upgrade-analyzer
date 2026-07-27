@@ -83,6 +83,42 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(current["resolved_commit"], self.current_commit)
         self.assertEqual(current["remote"], "origin")
 
+    def test_bound_snapshot_survives_remote_ref_movement_and_deletion(self):
+        self.add_remote("origin", {"release": self.current_commit})
+        selected = resolve_remote_source_ref(self.repo, "release")
+
+        self.git(
+            self.repo,
+            "push",
+            "--force",
+            "origin",
+            f"{self.base_commit}:refs/heads/release",
+        )
+        after_move = resolve_remote_source_ref(
+            self.repo,
+            "release",
+            expected_commit=selected["resolved_commit"],
+            expected_remote=selected["remote"],
+            expected_remote_ref=selected["remote_ref"],
+        )
+        self.git(self.repo, "push", "origin", ":refs/heads/release")
+        after_delete = resolve_remote_source_ref(
+            self.repo,
+            "release",
+            expected_commit=selected["resolved_commit"],
+            expected_remote=selected["remote"],
+            expected_remote_ref=selected["remote_ref"],
+        )
+
+        self.assertEqual(after_move["status"], "remote_source_resolved")
+        self.assertEqual(after_move["resolved_commit"], self.current_commit)
+        self.assertEqual(after_delete["status"], "remote_source_resolved")
+        self.assertEqual(after_delete["resolved_commit"], self.current_commit)
+        self.assertEqual(
+            after_delete["resolution_mode"],
+            "live_remote_expected_commit",
+        )
+
     def test_explicit_remote_ref_only_matches_requested_remote(self):
         self.add_remote("origin", {"release": self.base_commit})
         self.add_remote("upstream", {"release": self.current_commit})

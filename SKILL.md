@@ -262,7 +262,11 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 
 若 direct artifact 模式的两侧产物已经齐全，Step1 可以直接进入执行；`base_branch/current_branch` 属于强烈推荐的补全来源，不是 direct artifact 入口的执行前硬前置。
 
-需要源码时必须遵循统一来源顺序：先用 `git ls-remote` 查询所有配置 remote 的实时分支/tag，选定后定向 fetch 并固定 commit；不得用本地 `refs/remotes/*` 冒充远端最新状态，不得执行 `git pull`、checkout、merge 或 rebase。未指定 remote 的同名候选只有在 commit 唯一时才能自动采用；多个不同 commit 必须 checkpoint。裸 SHA 也必须先与实时远端记录的 `commit` 匹配。确认卡必须同时绑定 ref 和当时的 expected commit，执行前 ref 移动或消失必须重新确认。远端瞬时错误最多尝试 3 次，间隔 1 秒、3 秒；认证失败、ref 不存在和 ref 移动不自动重试。远端失败时必须保留远端失败为主状态，本地对象只能作为 `local_fallback_available` 附加信息，不得自动使用；只有结构化答复明确设置对应侧 `allow_local_source=true` 后才允许本地兜底，dirty 工作区还必须明确 `allow_dirty_local_source=true`。成功来源状态必须记录为 `remote_source_resolved` 或 `user_confirmed_local_source`。
+源码运行时清单与 fat JAR 同时可用时，必须先自动闭合依赖身份：Maven/Gradle resolved artifact inventory 提供 group、artifact、完整 version 与构建侧物理文件，fat JAR 提供实际打包条目；两侧物理文件精确匹配优先于文件名推断。构建工具没有报告 classifier 时，物理文件名相对精确 version 多出的唯一非空部分按 classifier 固化。不得把 `artifact-version-classifier.jar` 整体误解析成带 classifier 后缀的 version，也不得在唯一匹配时要求用户补人工坐标。版本本身包含连字符时以运行时清单为准；多个不同最终坐标仍能解释同一条目时才允许进入歧义处理。
+
+Gradle 文件锁冲突属于原命令的瞬时执行故障，不是 artifact inventory 能力缺失。必须仅对原命令按 1 秒、3 秒退避重试；重试耗尽后保留真实阶段、真实命令与锁错误，不得启动组件树回退、删除锁文件、执行全局 `gradle --stop` 或切换到会改变用户缓存/凭据语义的新 `GRADLE_USER_HOME`。只有明确的 task/API 不兼容或 inventory 成功但没有可用记录时才允许组件树回退。
+
+需要源码时必须遵循统一来源顺序：先用 `git ls-remote` 查询所有配置 remote 的实时分支/tag，选定后固定首次快照中的 commit；不得用本地 `refs/remotes/*` 冒充远端最新状态，不得执行 `git pull`、checkout、merge 或 rebase。未指定 remote 的同名候选只有在 commit 唯一时才能自动采用；多个不同 commit 必须 checkpoint。确认卡必须把 repo、remote、canonical ref、artifact 与当时的 expected commit 绑定为同一快照；只有绑定仍匹配当前输入时才能复用 `expected_commit`。后续定向查询为空或指向新 commit 时必须按 1 秒、3 秒间隔重试，且这些观测只能用于诊断，不能推翻首次已选 commit：本地已有该 commit 对象时直接验证复用，否则按固定 SHA 精确 fetch。只有固定 SHA 确实无法物化时才作为系统/远端对象可达性错误失败，不得要求用户重新选择 ref。远端失败时必须保留远端失败为主状态，本地分支只能作为 `local_fallback_available` 附加信息，不得自动使用；只有结构化答复明确设置对应侧 `allow_local_source=true` 后才允许本地分支兜底，dirty 工作区还必须明确 `allow_dirty_local_source=true`。成功来源状态必须记录为 `remote_source_resolved` 或 `user_confirmed_local_source`。
 
 若用户已明确只分析某个模块，第一次执行 `step1` 时必须直接带模块参数，不得先跑 root 范围：
 

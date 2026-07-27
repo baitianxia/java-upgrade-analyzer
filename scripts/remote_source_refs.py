@@ -263,6 +263,62 @@ def _query_remote_candidate_commit(repo_dir, candidate, timeout=30):
     return commit, "", 0
 
 
+def _verify_commit_object(repo_dir, commit):
+    """Return the immutable commit only when the object is present locally."""
+    expected = str(commit or "").strip()
+    if not expected:
+        return ""
+    stdout, _stderr, rc = _git(
+        repo_dir,
+        "rev-parse",
+        "--verify",
+        f"{expected}^{{commit}}",
+        timeout=10,
+    )
+    fixed_commit = str(stdout or "").splitlines()[-1].strip() if rc == 0 and stdout else ""
+    return fixed_commit if fixed_commit.lower() == expected.lower() else ""
+
+
+def _fetch_expected_commit(repo_dir, candidate, expected_commit, timeout=60):
+    """Try to materialize the already-pinned SHA without following a moving ref."""
+    expected = str(expected_commit or "").strip()
+    remote = str((candidate or {}).get("remote") or "").strip()
+    if not remote or not expected:
+        return {
+            "status": "remote_expected_commit_unmaterializable",
+            "target": expected,
+            "failure_type": "fetch_failed",
+            "reason": "remote or expected commit is missing",
+            "retryable": False,
+        }
+    stdout, stderr, rc = _git(
+        repo_dir,
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        remote,
+        expected,
+        timeout=timeout,
+    )
+    if rc == 0:
+        return {
+            "status": "success",
+            "target": expected,
+            "failure_type": "",
+            "reason": "",
+            "retryable": False,
+        }
+    reason = stderr or stdout or f"git fetch exited with {rc}"
+    failure_type, retryable = classify_fetch_failure(reason, rc)
+    return {
+        "status": "remote_expected_commit_unmaterializable",
+        "target": expected,
+        "failure_type": failure_type,
+        "reason": reason,
+        "retryable": retryable,
+    }
+
+
 def _materialize_remote_candidate_details(
     repo_dir,
     candidate,
@@ -272,16 +328,47 @@ def _materialize_remote_candidate_details(
     retry_attempts=DEFAULT_FETCH_ATTEMPTS,
     retry_delays=DEFAULT_FETCH_RETRY_DELAYS,
 ):
+    has_pinned_expectation = bool(str(expected_commit or "").strip())
     expected_commit = str(expected_commit or (candidate or {}).get("commit") or "").strip()
     attempts = []
     max_attempts = max(1, int(retry_attempts or 1))
     delays = tuple(retry_delays or ())
+    fixed_commit = (
+        _verify_commit_object(repo_dir, expected_commit)
+        if has_pinned_expectation
+        else ""
+    )
+    if fixed_commit:
+        attempts.append({
+            "attempt": 0,
+            "stage": "verify_local_commit",
+            "status": "success",
+            "reason": "",
+            "retryable": False,
+        })
+        return {
+            "status": "remote_source_resolved",
+            "resolved_commit": fixed_commit,
+            "expected_commit": expected_commit,
+            "observed_commit": "",
+            "resolution_mode": "live_remote_expected_commit",
+            "attempts": attempts,
+            "reason": "",
+        }
+
+    last_observed_commit = ""
+    should_fetch_pinned_commit = False
     for attempt_number in range(1, max_attempts + 1):
         observed_commit, query_error, query_rc = _query_remote_candidate_commit(
             repo_dir, candidate, timeout=min(int(timeout or 60), 30),
         )
         if query_error:
-            failure_type, retryable = classify_fetch_failure(query_error, query_rc)
+            is_empty_observation = query_rc == _REMOTE_REF_ABSENT_RC
+            failure_type, retryable = (
+                ("remote_ref_observation_empty", True)
+                if is_empty_observation
+                else classify_fetch_failure(query_error, query_rc)
+            )
             attempts.append({
                 "attempt": attempt_number,
                 "stage": "ls_remote_before_fetch",
@@ -289,33 +376,19 @@ def _materialize_remote_candidate_details(
                 "reason": query_error,
                 "retryable": retryable,
             })
-            if expected_commit and query_rc == _REMOTE_REF_ABSENT_RC:
-                return {
-                    "status": "remote_ref_moved",
-                    "resolved_commit": "",
-                    "expected_commit": expected_commit,
-                    "observed_commit": "",
-                    "attempts": attempts,
-                    "reason": "remote ref disappeared after candidate selection",
-                }
+            should_fetch_pinned_commit = should_fetch_pinned_commit or is_empty_observation
         elif expected_commit and observed_commit.lower() != expected_commit.lower():
+            last_observed_commit = observed_commit
+            should_fetch_pinned_commit = True
             attempts.append({
                 "attempt": attempt_number,
                 "stage": "verify_remote_before_fetch",
-                "status": "remote_ref_moved",
-                "reason": "remote ref changed after candidate selection",
-                "retryable": False,
+                "status": "remote_ref_observed_at_new_commit",
+                "reason": "remote ref no longer points to the pinned commit",
+                "retryable": True,
                 "expected_commit": expected_commit,
                 "observed_commit": observed_commit,
             })
-            return {
-                "status": "remote_ref_moved",
-                "resolved_commit": "",
-                "expected_commit": expected_commit,
-                "observed_commit": observed_commit,
-                "attempts": attempts,
-                "reason": "remote ref changed after candidate selection",
-            }
         else:
             if not expected_commit:
                 expected_commit = observed_commit
@@ -337,74 +410,58 @@ def _materialize_remote_candidate_details(
                     attempts.append({
                         "attempt": attempt_number,
                         "stage": "ls_remote_after_fetch",
-                        "status": failure_type,
+                        "status": (
+                            "remote_ref_observation_empty"
+                            if after_rc == _REMOTE_REF_ABSENT_RC
+                            else failure_type
+                        ),
                         "reason": after_error,
-                        "retryable": retryable,
+                        "retryable": False,
                     })
-                    if expected_commit and after_rc == _REMOTE_REF_ABSENT_RC:
-                        return {
-                            "status": "remote_ref_moved",
-                            "resolved_commit": "",
-                            "expected_commit": expected_commit,
-                            "observed_commit": "",
-                            "attempts": attempts,
-                            "reason": "remote ref disappeared while it was being materialized",
-                        }
                 elif expected_commit and after_commit.lower() != expected_commit.lower():
+                    last_observed_commit = after_commit
+                    should_fetch_pinned_commit = True
                     attempts.append({
                         "attempt": attempt_number,
                         "stage": "verify_remote_after_fetch",
-                        "status": "remote_ref_moved",
-                        "reason": "remote ref changed while it was being materialized",
+                        "status": "remote_ref_observed_at_new_commit",
+                        "reason": "remote ref changed after the pinned object was fetched",
                         "retryable": False,
                         "expected_commit": expected_commit,
                         "observed_commit": after_commit,
                     })
-                    return {
-                        "status": "remote_ref_moved",
-                        "resolved_commit": "",
-                        "expected_commit": expected_commit,
-                        "observed_commit": after_commit,
-                        "attempts": attempts,
-                        "reason": "remote ref changed while it was being materialized",
-                    }
-                else:
-                    stdout, verify_error, verify_rc = _git(
-                        repo_dir,
-                        "rev-parse",
-                        "--verify",
-                        f"{expected_commit}^{{commit}}",
-                        timeout=10,
-                    )
-                    fixed_commit = str(stdout or "").splitlines()[-1].strip() if verify_rc == 0 and stdout else ""
-                    if fixed_commit and fixed_commit.lower() == expected_commit.lower():
-                        attempts.append({
-                            "attempt": attempt_number,
-                            "stage": "fetch",
-                            "status": "success",
-                            "reason": "",
-                            "retryable": False,
-                        })
-                        return {
-                            "status": "remote_source_resolved",
-                            "resolved_commit": fixed_commit,
-                            "expected_commit": expected_commit,
-                            "observed_commit": after_commit,
-                            "attempts": attempts,
-                            "reason": "",
-                        }
-                    reason = verify_error or "fetched object is not the expected commit"
+                fixed_commit = _verify_commit_object(repo_dir, expected_commit)
+                if fixed_commit:
                     attempts.append({
                         "attempt": attempt_number,
-                        "stage": "verify_commit",
-                        "status": "commit_verification_failed",
-                        "reason": reason,
+                        "stage": "fetch",
+                        "status": "success",
+                        "reason": "",
                         "retryable": False,
                     })
-                    retryable = False
+                    return {
+                        "status": "remote_source_resolved",
+                        "resolved_commit": fixed_commit,
+                        "expected_commit": expected_commit,
+                        "observed_commit": last_observed_commit or after_commit,
+                        "resolution_mode": "live_remote",
+                        "attempts": attempts,
+                        "reason": "",
+                    }
+                attempts.append({
+                    "attempt": attempt_number,
+                    "stage": "verify_commit",
+                    "status": "commit_verification_failed",
+                    "reason": "fetched object is not the expected commit",
+                    "retryable": False,
+                })
+                should_fetch_pinned_commit = True
+                retryable = False
             else:
                 reason = stderr or stdout or f"git fetch exited with {rc}"
                 failure_type, retryable = classify_fetch_failure(reason, rc)
+                if failure_type == "remote_ref_not_found":
+                    should_fetch_pinned_commit = True
                 attempts.append({
                     "attempt": attempt_number,
                     "stage": "fetch",
@@ -418,6 +475,66 @@ def _materialize_remote_candidate_details(
         delay = delays[min(attempt_number - 1, len(delays) - 1)] if delays else 0
         if delay > 0:
             time.sleep(delay)
+
+    if should_fetch_pinned_commit:
+        fetched = {}
+        for pinned_attempt_number in range(1, max_attempts + 1):
+            fetched = _fetch_expected_commit(
+                repo_dir,
+                candidate,
+                expected_commit,
+                timeout=timeout,
+            )
+            attempts.append({
+                "attempt": pinned_attempt_number,
+                "stage": "fetch_expected_commit",
+                "status": str(fetched.get("status") or "remote_expected_commit_unmaterializable"),
+                "reason": str(fetched.get("reason") or ""),
+                "retryable": bool(fetched.get("retryable")),
+                "target": expected_commit,
+            })
+            if fetched.get("status") == "success":
+                fixed_commit = _verify_commit_object(repo_dir, expected_commit)
+                if fixed_commit:
+                    return {
+                        "status": "remote_source_resolved",
+                        "resolved_commit": fixed_commit,
+                        "expected_commit": expected_commit,
+                        "observed_commit": last_observed_commit,
+                        "resolution_mode": "live_remote_expected_commit",
+                        "attempts": attempts,
+                        "reason": "",
+                    }
+                fetched = {
+                    **fetched,
+                    "status": "remote_expected_commit_unmaterializable",
+                    "failure_type": "commit_verification_failed",
+                    "reason": "the fetched object is not the pinned commit",
+                    "retryable": False,
+                }
+                break
+            if (
+                not fetched.get("retryable")
+                or pinned_attempt_number >= max_attempts
+            ):
+                break
+            delay = (
+                delays[min(pinned_attempt_number - 1, len(delays) - 1)]
+                if delays
+                else 0
+            )
+            if delay > 0:
+                time.sleep(delay)
+        return {
+            "status": "remote_expected_commit_unmaterializable",
+            "resolved_commit": "",
+            "expected_commit": expected_commit,
+            "observed_commit": last_observed_commit,
+            "attempts": attempts,
+            "reason": str(fetched.get("reason") or "pinned commit could not be materialized"),
+            "failure_type": str(fetched.get("failure_type") or "remote_expected_commit_unmaterializable"),
+            "retryable": bool(fetched.get("retryable")),
+        }
 
     last = attempts[-1] if attempts else {}
     return {
@@ -479,8 +596,9 @@ def materialize_remote_source_candidate(
         "resolved_commit": fixed_commit,
         "remote": str(candidate.get("remote") or ""),
         "remote_ref": str(candidate.get("canonical_ref") or ""),
-        "resolution_mode": "live_remote",
+        "resolution_mode": str(materialized.get("resolution_mode") or "live_remote"),
         "expected_commit": str(materialized.get("expected_commit") or fixed_commit),
+        "observed_commit": str(materialized.get("observed_commit") or ""),
         "attempts": list(materialized.get("attempts") or []),
     }
 
@@ -492,11 +610,45 @@ def resolve_remote_source_ref(
     fetch_timeout=60,
     *,
     expected_commit="",
+    expected_remote="",
+    expected_remote_ref="",
 ):
     """Resolve a requested ref from live remotes and fetch its immutable commit."""
-    inventory = query_live_remote_refs(repo_dir, timeout=query_timeout)
-    candidates = _matching_remote_candidates(inventory, requested_ref)
     expected_commit = str(expected_commit or "").strip()
+    expected_remote = str(expected_remote or "").strip()
+    expected_remote_ref = str(expected_remote_ref or "").strip()
+    if expected_commit and expected_remote and expected_remote_ref:
+        short_name = (
+            expected_remote_ref[len("refs/heads/"):]
+            if expected_remote_ref.startswith("refs/heads/")
+            else (
+                expected_remote_ref[len("refs/tags/"):]
+                if expected_remote_ref.startswith("refs/tags/")
+                else expected_remote_ref
+            )
+        )
+        bound_candidate = {
+            "remote": expected_remote,
+            "ref": f"{expected_remote}/{short_name}",
+            "canonical_ref": expected_remote_ref,
+            "short_name": short_name,
+            "kind": "tag" if expected_remote_ref.startswith("refs/tags/") else "branch",
+            "commit": expected_commit,
+            "score": 300,
+        }
+        # A persisted binding is an immutable snapshot, not a request to
+        # rediscover the moving ref.  Skipping the broad inventory query also
+        # prevents ACL/hideRefs/proxy differences from invalidating a SHA that
+        # has already been selected and bound to this repository.
+        inventory = {
+            "queried_at": _now(),
+            "refs": [bound_candidate],
+            "failures": [],
+            "remotes": [expected_remote],
+        }
+    else:
+        inventory = query_live_remote_refs(repo_dir, timeout=query_timeout)
+    candidates = _matching_remote_candidates(inventory, requested_ref)
     requested_text = str(requested_ref or "").strip()
     explicit_remote = ""
     if "/" in requested_text:
@@ -507,7 +659,7 @@ def resolve_remote_source_ref(
         failure for failure in (inventory.get("failures") or [])
         if not explicit_remote or str(failure.get("remote") or "") in {"", explicit_remote}
     ]
-    if relevant_failures:
+    if relevant_failures and not (expected_commit and expected_remote and expected_remote_ref):
         return _base_result(
             "remote_query_failed",
             requested_ref,
@@ -515,25 +667,32 @@ def resolve_remote_source_ref(
             relevant_failures,
             inventory["queried_at"],
         )
-    if expected_commit and candidates:
-        expected_candidates = [
+    if expected_remote and expected_remote_ref:
+        bound_candidates = [
             row for row in candidates
-            if str(row.get("commit") or "").lower() == expected_commit.lower()
+            if str(row.get("remote") or "") == expected_remote
+            and str(row.get("canonical_ref") or "") == expected_remote_ref
         ]
-        if not expected_candidates:
-            result = _base_result(
-                "remote_ref_moved",
-                requested_ref,
-                candidates,
-                inventory["failures"],
-                inventory["queried_at"],
+        candidates = bound_candidates
+        if not candidates and expected_commit:
+            short_name = (
+                expected_remote_ref[len("refs/heads/"):]
+                if expected_remote_ref.startswith("refs/heads/")
+                else (
+                    expected_remote_ref[len("refs/tags/"):]
+                    if expected_remote_ref.startswith("refs/tags/")
+                    else expected_remote_ref
+                )
             )
-            result.update({
-                "expected_commit": expected_commit,
-                "observed_commit": str(candidates[0].get("commit") or ""),
-            })
-            return result
-        candidates = expected_candidates
+            candidates = [{
+                "remote": expected_remote,
+                "ref": f"{expected_remote}/{short_name}",
+                "canonical_ref": expected_remote_ref,
+                "short_name": short_name,
+                "kind": "tag" if expected_remote_ref.startswith("refs/tags/") else "branch",
+                "commit": expected_commit,
+                "score": 300,
+            }]
     commits = {row["commit"] for row in candidates}
     if len(commits) > 1:
         return _base_result(
@@ -553,16 +712,6 @@ def resolve_remote_source_ref(
                 failures,
                 inventory["queried_at"],
             )
-        if expected_commit:
-            result = _base_result(
-                "remote_ref_moved",
-                requested_ref,
-                [],
-                [],
-                inventory["queried_at"],
-            )
-            result.update({"expected_commit": expected_commit, "observed_commit": ""})
-            return result
         if not inventory["remotes"]:
             failures.append({"remote": "", "stage": "resolve", "reason": "repository has no configured remote"})
         elif not failures:
@@ -574,20 +723,19 @@ def resolve_remote_source_ref(
         repo_dir,
         selected,
         timeout=fetch_timeout,
-        expected_commit=expected_commit or str(selected.get("commit") or ""),
+        expected_commit=expected_commit,
     )
     fixed_commit = str(materialized.get("resolved_commit") or "")
     if not fixed_commit:
         observed_commit = str(materialized.get("observed_commit") or "")
-        if materialized.get("status") == "remote_ref_moved":
+        if observed_commit:
             candidates = [
-                ({**row, "commit": observed_commit} if observed_commit else None)
+                {**row, "commit": observed_commit}
                 if row.get("remote") == selected.get("remote")
                 and row.get("canonical_ref") == selected.get("canonical_ref")
                 else row
                 for row in candidates
             ]
-            candidates = [row for row in candidates if row is not None]
         failures = list(inventory["failures"])
         failure = dict(materialized.get("failure") or {})
         failures.append({
@@ -617,8 +765,9 @@ def resolve_remote_source_ref(
         "resolved_commit": fixed_commit,
         "remote": selected["remote"],
         "remote_ref": selected["canonical_ref"],
-        "resolution_mode": "live_remote",
+        "resolution_mode": str(materialized.get("resolution_mode") or "live_remote"),
         "expected_commit": str(materialized.get("expected_commit") or fixed_commit),
+        "observed_commit": str(materialized.get("observed_commit") or ""),
         "attempts": list(materialized.get("attempts") or []),
     })
     return result

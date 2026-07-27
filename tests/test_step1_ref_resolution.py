@@ -76,7 +76,7 @@ class Step1RefResolutionTest(unittest.TestCase):
         self.assertEqual(result["resolved_commit"], "c" * 40)
         self.assertTrue(local_resolver.call_args.kwargs["allow_local_source"])
 
-    def test_remote_ref_movement_never_uses_local_fallback(self):
+    def test_legacy_remote_ref_movement_is_a_system_error_not_a_checkpoint(self):
         remote = {
             "status": "remote_ref_moved",
             "requested_ref": "release",
@@ -95,8 +95,12 @@ class Step1RefResolutionTest(unittest.TestCase):
                 allow_local_source=True,
             )
 
-        self.assertEqual(result["status"], "ref_moved")
-        self.assertEqual(result["source_status"], "remote_ref_moved")
+        self.assertEqual(result["status"], "fetch_failed")
+        self.assertEqual(
+            result["source_status"],
+            "remote_expected_commit_unmaterializable",
+        )
+        self.assertEqual(result["legacy_source_status"], "remote_ref_moved")
         local_resolver.assert_not_called()
 
     def test_remote_resolution_is_exposed_as_resolved(self):

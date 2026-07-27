@@ -4435,7 +4435,7 @@ def _materialize_resolved_remote_ref(
         repo_path,
         candidate,
         timeout=fetch_timeout,
-        expected_commit=expected_commit or str(candidate.get("commit") or ""),
+        expected_commit=expected_commit,
     )
     if materialized.get("status") != "remote_source_resolved":
         failure = materialized.get("failure") or {}

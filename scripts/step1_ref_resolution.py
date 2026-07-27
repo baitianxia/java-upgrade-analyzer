@@ -174,24 +174,36 @@ def resolve_step1_ref(
     requested_ref,
     *,
     expected_commit="",
+    expected_remote="",
+    expected_remote_ref="",
     allow_local_source=False,
     allow_dirty_local_source=False,
 ):
     """Resolve Step1 auxiliary source from live remotes, with confirmed local fallback."""
-    remote = resolve_remote_source_ref(
-        repo_dir,
-        requested_ref,
-        expected_commit=expected_commit,
-    )
+    remote_kwargs = {"expected_commit": expected_commit}
+    if expected_remote:
+        remote_kwargs["expected_remote"] = expected_remote
+    if expected_remote_ref:
+        remote_kwargs["expected_remote_ref"] = expected_remote_ref
+    remote = resolve_remote_source_ref(repo_dir, requested_ref, **remote_kwargs)
     if remote.get("status") == "remote_source_resolved":
         return {**remote, "status": "resolved", "source_status": "remote_source_resolved"}
     if remote.get("status") == "remote_source_ambiguous":
         return {**remote, "status": "ambiguous", "source_status": "remote_source_ambiguous"}
     if remote.get("status") == "remote_ref_moved":
-        return {**remote, "status": "ref_moved", "source_status": "remote_ref_moved"}
+        # Backward-compatible containment for callers or persisted fixtures
+        # that still surface the retired status.  A moving ref cannot revoke
+        # the immutable expected commit and is never a user selection problem.
+        return {
+            **remote,
+            "status": "fetch_failed",
+            "source_status": "remote_expected_commit_unmaterializable",
+            "legacy_source_status": "remote_ref_moved",
+        }
     remote_operational_failure = remote.get("status") in {
         "remote_fetch_failed",
         "remote_query_failed",
+        "remote_expected_commit_unmaterializable",
     }
     if remote_operational_failure and not allow_local_source:
         return {

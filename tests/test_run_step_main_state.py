@@ -5339,6 +5339,178 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(updated["current_resolved_commit"], "a" * 40)
         self.assertEqual(updated["current_ref_resolution_mode"], "unique_remote")
         self.assertEqual(updated["current_ref_candidate_count"], 1)
+        self.assertEqual(
+            updated["current_ref_binding"],
+            {
+                "schema": "java-upgrade-analyzer.remote-ref-binding.v1",
+                "repo_dir": str(project_dir.resolve()),
+                "requested_ref": "release-2.0.0",
+                "remote": "",
+                "canonical_ref": "",
+                "expected_commit": "a" * 40,
+                "artifact_path": "",
+            },
+        )
+
+    def test_step1_ref_preflight_discards_unbound_expected_commit_from_old_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {
+                "analysis_mode": "checkout_build",
+                "base_branch": "release",
+                "base_expected_commit": "a" * 40,
+                "base_resolved_commit": "a" * 40,
+                "base_requested_ref": "release",
+            }
+            resolution = {
+                "status": "resolved",
+                "requested_ref": "release",
+                "resolved_ref": "origin/release",
+                "resolved_commit": "b" * 40,
+                "remote": "origin",
+                "remote_ref": "refs/heads/release",
+                "resolution_mode": "live_remote",
+                "candidates": [{
+                    "ref": "origin/release",
+                    "commit": "b" * 40,
+                    "remote": "origin",
+                    "canonical_ref": "refs/heads/release",
+                }],
+            }
+
+            with patch.object(
+                run_step, "resolve_step1_ref", return_value=resolution
+            ) as resolver:
+                updated, interaction = run_step.resolve_step1_refs_for_execution(
+                    context, project_dir
+                )
+
+        self.assertIsNone(interaction)
+        self.assertEqual(resolver.call_args.kwargs["expected_commit"], "")
+        self.assertEqual(updated["base_expected_commit"], "b" * 40)
+        self.assertEqual(updated["base_resolved_commit"], "b" * 40)
+
+    def test_step1_ref_preflight_reuses_expected_commit_only_with_matching_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {
+                "analysis_mode": "checkout_build",
+                "base_branch": "release",
+                "base_expected_commit": "a" * 40,
+                "base_ref_binding": {
+                    "schema": "java-upgrade-analyzer.remote-ref-binding.v1",
+                    "repo_dir": str(project_dir.resolve()),
+                    "requested_ref": "release",
+                    "remote": "origin",
+                    "canonical_ref": "refs/heads/release",
+                    "expected_commit": "a" * 40,
+                    "artifact_path": "",
+                },
+            }
+            resolution = {
+                "status": "resolved",
+                "requested_ref": "release",
+                "resolved_ref": "origin/release",
+                "resolved_commit": "a" * 40,
+                "remote": "origin",
+                "remote_ref": "refs/heads/release",
+                "resolution_mode": "live_remote_expected_commit",
+                "candidates": [],
+            }
+
+            with patch.object(
+                run_step, "resolve_step1_ref", return_value=resolution
+            ) as resolver:
+                updated, interaction = run_step.resolve_step1_refs_for_execution(
+                    context, project_dir
+                )
+
+        self.assertIsNone(interaction)
+        self.assertEqual(
+            resolver.call_args.kwargs["expected_commit"],
+            "a" * 40,
+        )
+        self.assertEqual(resolver.call_args.kwargs["expected_remote"], "origin")
+        self.assertEqual(
+            resolver.call_args.kwargs["expected_remote_ref"],
+            "refs/heads/release",
+        )
+        self.assertEqual(updated["base_expected_commit"], "a" * 40)
+
+    def test_step1_unmaterializable_pinned_commit_is_system_error_not_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {
+                "analysis_mode": "checkout_build",
+                "base_branch": "release",
+                "base_expected_commit": "a" * 40,
+                "base_ref_binding": {
+                    "schema": "java-upgrade-analyzer.remote-ref-binding.v1",
+                    "repo_dir": str(project_dir.resolve()),
+                    "requested_ref": "release",
+                    "remote": "origin",
+                    "canonical_ref": "refs/heads/release",
+                    "expected_commit": "a" * 40,
+                    "artifact_path": "",
+                },
+            }
+            resolution = {
+                "status": "fetch_failed",
+                "source_status": "remote_expected_commit_unmaterializable",
+                "expected_commit": "a" * 40,
+                "observed_commit": "b" * 40,
+            }
+
+            with patch.object(
+                run_step,
+                "resolve_step1_ref",
+                return_value=resolution,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step.resolve_step1_refs_for_execution(
+                    context,
+                    project_dir,
+                )
+
+        self.assertIn("不会要求用户重新选择 ref", str(raised.exception))
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["STEP1_REMOTE_EXPECTED_COMMIT_UNMATERIALIZABLE"],
+        )
+
+    def test_step1_input_change_invalidates_bound_ref_snapshot(self):
+        project_dir = Path("/project")
+        old_context = {
+            "analysis_mode": "artifact_inputs",
+            "base_artifact_path": "/artifacts/old-base.jar",
+            "base_source_project_dir": "/repos/old",
+            "base_branch": "release",
+            "base_expected_commit": "a" * 40,
+            "base_resolved_commit": "a" * 40,
+            "base_requested_ref": "release",
+            "base_ref_binding": {
+                "schema": "java-upgrade-analyzer.remote-ref-binding.v1",
+                "repo_dir": "/repos/old",
+                "requested_ref": "release",
+                "remote": "origin",
+                "canonical_ref": "refs/heads/release",
+                "expected_commit": "a" * 40,
+                "artifact_path": "/artifacts/old-base.jar",
+            },
+        }
+
+        updated = run_step.merge_user_response_into_run_context(
+            old_context,
+            {
+                "base_artifact_path": "/artifacts/new-base.jar",
+                "base_source_project_dir": "/repos/new",
+            },
+            project_dir,
+        )
+
+        self.assertNotIn("base_expected_commit", updated)
+        self.assertNotIn("base_resolved_commit", updated)
+        self.assertNotIn("base_requested_ref", updated)
+        self.assertNotIn("base_ref_binding", updated)
 
     def test_step1_ref_preflight_resolves_both_branches_from_project_remote(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5472,6 +5644,7 @@ class RunStepMainStateTest(unittest.TestCase):
             project_dir = Path(tmp)
             context = {
                 "current_branch": "release-2.0.0",
+                "current_ref_binding": {},
                 "current_allow_local_source": True,
                 "current_allow_dirty_local_source": True,
             }

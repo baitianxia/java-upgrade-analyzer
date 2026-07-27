@@ -16,7 +16,7 @@ s1_dep_diff.py — Step 1：依赖变更全景扫描
 Windows 兼容：通过 compat.py 统一处理编码，不会因 GBK/UTF-8 不匹配崩溃。
 """
 
-import argparse, csv, hashlib, io, json, os, re, shutil, sys, tempfile, zipfile
+import argparse, csv, hashlib, io, json, os, re, shutil, sys, tempfile, time, zipfile
 import safe_xml as ET
 from collections import defaultdict
 from contextlib import nullcontext
@@ -75,6 +75,7 @@ STEP1_MAX_DEPENDENCY_EXPANSION_RATIO = 200
 # repository connection/read timeouts, so Step1 must not impose a total
 # wall-clock deadline unless an explicit timeout option is added in the future.
 STEP1_BUILD_TOOL_TIMEOUT = None
+GRADLE_LOCK_RETRY_DELAYS_SECONDS = (1, 3)
 
 
 def _observed_phase(observer, phase, **kwargs):
@@ -542,6 +543,18 @@ class Step1RefResolutionRequiredError(RuntimeError):
         )
 
 
+class PinnedCommitMaterializationError(RuntimeError):
+    def __init__(self, side, resolution):
+        self.side = str(side or "")
+        self.resolution = dict(resolution or {})
+        expected = str(self.resolution.get("expected_commit") or "").strip()
+        super().__init__(
+            f"{self.side or '该侧'}已固定 commit {expected or '(unknown)'}，"
+            "但 Git 服务无法物化该对象；这是远端对象可达性或权限问题，"
+            "不能通过让用户重新选择 ref 解决。"
+        )
+
+
 def build_step1_ref_resolution_interaction(error):
     side = str(error.side or "").strip() or "current"
     field = f"{side}_branch"
@@ -670,6 +683,7 @@ def build_step1_ref_resolution_interaction(error):
             "source_status": source_status,
             "requested_ref": request.get("requested_ref"),
             "source_project_dir": request.get("source_project_dir"),
+            "artifact_path": request.get("artifact_path"),
             "resolution_trigger": request.get("resolution_trigger"),
             "remote_query_scope": request.get("remote_query_scope"),
             "candidates": list(request.get("candidates") or []),
@@ -709,6 +723,10 @@ def build_step1_ref_resolution_interaction(error):
                     ),
                 },
                 f"{side}_expected_commit": {"type": "string", "description": "内部固定值：所选 ref 对应的 commit。"},
+                f"{side}_ref_binding": {
+                    "type": "object",
+                    "description": "内部绑定值：源码仓库、远端 ref 与固定 commit 的一致性快照。",
+                },
                 "source_ref_selections": {"type": "array", "description": "选择当前卡片中的 ref 方案。"},
                 "retry_remote_fetch": {
                     "type": "boolean",
@@ -872,6 +890,32 @@ class Step1CommandExecutionBlockedError(RuntimeError):
             + (f": {self.stderr_excerpt}" if self.stderr_excerpt else "")
         )
         super().__init__(message)
+
+
+class GradleCommandFailure(RuntimeError):
+    """Keep the exact failed Gradle stage and command across Step1 layers."""
+
+    def __init__(
+        self,
+        *,
+        stage,
+        command,
+        stdout,
+        stderr,
+        return_code,
+        attempts=1,
+    ):
+        self.stage = str(stage or '').strip()
+        self.command = str(command or '').strip()
+        self.stdout = str(stdout or '')
+        self.stderr = str(stderr or '')
+        self.return_code = int(return_code)
+        self.attempts = max(int(attempts or 1), 1)
+        excerpt = (self.stderr or self.stdout).strip()
+        super().__init__(
+            f"{self.stage} 执行失败（退出码 {self.return_code}，"
+            f"尝试 {self.attempts} 次）：{excerpt[:1000]}"
+        )
 
 
 def emit_step_interaction(interaction):
@@ -1299,6 +1343,11 @@ def _infer_maven_failure_causes(stderr_excerpt):
 def _infer_gradle_failure_causes(stderr_excerpt):
     text = str(stderr_excerpt or "").lower()
     causes = []
+    if _is_gradle_lock_contention(text):
+        causes.append(
+            "Gradle 缓存或 Wrapper 文件锁被其他进程占用；"
+            "Step1 已对原命令完成有限退避重试，未删除锁或停止其他构建。"
+        )
     if any(token in text for token in ("invalid source release", "unsupported class file major version", "could not target platform")):
         causes.append("JDK 版本与目标分支的 Gradle/Java 配置不兼容。")
     if "java_home" in text or "java installation" in text:
@@ -1315,7 +1364,7 @@ def _infer_gradle_failure_causes(stderr_excerpt):
 def _infer_step1_blocked_causes(stage, stderr_excerpt):
     if stage in {"mvn_dependency_list", "mvn_package"}:
         return _infer_maven_failure_causes(stderr_excerpt)
-    if stage in {"gradle_dependencies", "gradle_build"}:
+    if str(stage or "").startswith("gradle_"):
         return _infer_gradle_failure_causes(stderr_excerpt)
     text = str(stderr_excerpt or "").lower()
     causes = []
@@ -1371,6 +1420,27 @@ def build_step1_command_blocked_error(
         source_project_dir=str(source_project_dir or "").strip(),
         artifact_path=str(artifact_path or "").strip(),
         suspected_causes=_infer_step1_blocked_causes(stage, str(exc or "")),
+    )
+
+
+def build_step1_command_blocked_from_exception(
+    exc,
+    *,
+    default_stage,
+    default_command,
+    **context,
+):
+    if isinstance(exc, GradleCommandFailure):
+        stage = exc.stage
+        command = exc.command
+    else:
+        stage = default_stage
+        command = default_command
+    return build_step1_command_blocked_error(
+        stage=stage,
+        command=command,
+        exc=exc,
+        **context,
     )
 
 
@@ -1940,7 +2010,7 @@ def _parse_artifact_version_from_filename(name):
 
 
 def _filename_stem(name):
-    stem = Path(name).name
+    stem = re.split(r'[\\/]', str(name or ''))[-1]
     if stem.lower().endswith('.jar'):
         stem = stem[:-4]
     return stem
@@ -1982,9 +2052,150 @@ def _runtime_candidate_filename_stems(item):
     return stems
 
 
+def _match_runtime_artifact_filename(name, artifact_id, version):
+    """Match one physical JAR name against an already resolved module version.
+
+    The runtime dependency report is authoritative for ``artifact_id`` and
+    ``version``.  Any non-empty remainder in a conventional artifact filename
+    is therefore an artifact classifier, not part of the version.
+    """
+    stem = _filename_stem(name)
+    artifact_id = str(artifact_id or '').strip()
+    version = str(version or '').strip()
+    if not stem or not artifact_id or not version:
+        return False, '', ''
+
+    version_first = f'{artifact_id}-{version}'
+    if stem == version_first:
+        return True, '', 'artifact-version'
+    if stem.startswith(version_first + '-'):
+        classifier = stem[len(version_first) + 1:]
+        if classifier:
+            return True, classifier, 'artifact-version-classifier'
+
+    classifier_first_prefix = f'{artifact_id}-'
+    classifier_first_suffix = f'-{version}'
+    if (
+        stem.startswith(classifier_first_prefix)
+        and stem.endswith(classifier_first_suffix)
+    ):
+        classifier = stem[
+            len(classifier_first_prefix):-len(classifier_first_suffix)
+        ]
+        if classifier:
+            return True, classifier, 'artifact-classifier-version'
+    return False, '', ''
+
+
+def _runtime_dependency_for_packaged_filename(packaged_item, runtime_deps):
+    """Return the strongest unique runtime identity for a physical JAR.
+
+    Exact build-tool artifact inventory matches outrank conventional filename
+    inference.  Gradle may still omit the selected artifact classifier, so the
+    resolved component version anchors classifier extraction when needed.
+    Never choose when two different final identities fit the same filename.
+    """
+    lib_name = str(
+        (packaged_item or {}).get('lib_name')
+        or re.split(
+            r'[\\/]',
+            str((packaged_item or {}).get('lib_entry') or ''),
+        )[-1]
+        or ''
+    ).strip()
+    inventory_matches = {}
+    inferred_matches = {}
+    for raw_item in (runtime_deps or {}).values():
+        candidate = dict(raw_item or {})
+        group_id = str(candidate.get('group_id') or '').strip()
+        artifact_id = str(candidate.get('artifact_id') or '').strip()
+        version = str(candidate.get('version') or '').strip()
+        if not group_id or not artifact_id or not version:
+            continue
+        inventory_filenames = {
+            re.split(r'[\\/]', str(value or ''))[-1]
+            for value in (
+                list(candidate.get('artifact_file_names') or [])
+                + [candidate.get('artifact_file_name')]
+            )
+            if str(value or '').strip()
+        }
+        exact_inventory_match = lib_name in inventory_filenames
+        matched, filename_classifier, layout = (
+            _match_runtime_artifact_filename(
+                lib_name,
+                artifact_id,
+                version,
+            )
+            if not exact_inventory_match
+            else (True, '', 'artifact-inventory')
+        )
+        if not matched:
+            continue
+        declared_classifier = str(candidate.get('classifier') or '').strip()
+        if exact_inventory_match and not declared_classifier:
+            (
+                _conventional_match,
+                filename_classifier,
+                conventional_layout,
+            ) = _match_runtime_artifact_filename(
+                lib_name,
+                artifact_id,
+                version,
+            )
+            if conventional_layout:
+                layout = conventional_layout
+            if len(inventory_filenames) > 1 and not filename_classifier:
+                # A component may expose multiple physical artifacts.  When
+                # neither the build tool nor the conventional filename
+                # identifies their classifiers, mapping all of them to the
+                # same GA would silently collapse distinct artifacts.
+                continue
+        if (
+            declared_classifier
+            and filename_classifier
+            and filename_classifier != declared_classifier
+        ):
+            continue
+        effective_classifier = declared_classifier or filename_classifier
+        coord = normalize_artifact_coord(
+            candidate.get('coord') or f'{group_id}:{artifact_id}',
+            effective_classifier,
+        )
+        identity = (coord, version)
+        candidate.update({
+            'coord': coord,
+            'classifier': effective_classifier,
+            'packaged_match_source': (
+                'runtime-artifact-inventory'
+                if exact_inventory_match
+                else (
+                    'runtime-filename-classifier'
+                    if effective_classifier
+                    else 'runtime-filename'
+                )
+            ),
+            'filename_layout': layout,
+        })
+        target = inventory_matches if exact_inventory_match else inferred_matches
+        target.setdefault(identity, candidate)
+
+    matches = inventory_matches or inferred_matches
+    ordered = [
+        matches[key]
+        for key in sorted(matches)
+    ]
+    return (ordered[0] if len(ordered) == 1 else None), ordered
+
+
 def _should_use_runtime_version_for_filename_match(item, runtime_match):
     if str(item.get('match_source') or '').strip() != 'filename':
         return False
+    if (
+        str(runtime_match.get('packaged_match_source') or '').strip()
+        == 'runtime-artifact-inventory'
+    ):
+        return True
     filename_stem = (item.get('filename_stem') or '').strip()
     if not filename_stem:
         return False
@@ -2633,6 +2844,75 @@ MAVEN_DEPENDENCY_SCOPES = {
     'compile', 'runtime', 'provided', 'test', 'system', 'import',
 }
 MAVEN_COORD_TOKEN_RE = re.compile(r'^[^\s:\[\]]+$')
+GRADLE_ARTIFACT_INVENTORY_PREFIX = 'JUA_ARTIFACT_INVENTORY_JSON:'
+GRADLE_ARTIFACT_INVENTORY_TASK = 'juaRuntimeArtifactInventory'
+
+
+GRADLE_ARTIFACT_INVENTORY_INIT_SCRIPT = r'''
+import groovy.json.JsonOutput
+import org.gradle.api.GradleException
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+
+gradle.projectsEvaluated {
+    allprojects { ownerProject ->
+        if (ownerProject.tasks.findByName("juaRuntimeArtifactInventory") == null) {
+            ownerProject.tasks.create(name: "juaRuntimeArtifactInventory") {
+                doLast {
+                    def configuration = ownerProject.configurations.findByName("runtimeClasspath")
+                    if (configuration == null) {
+                        throw new GradleException(
+                            "runtimeClasspath configuration does not exist for ${ownerProject.path}"
+                        )
+                    }
+                    def artifactCollection = configuration.incoming.artifactView {
+                        lenient(true)
+                    }.artifacts
+                    artifactCollection.artifacts.each { resolvedArtifact ->
+                        def component = resolvedArtifact.id.componentIdentifier
+                        def row = [
+                            file_name: resolvedArtifact.file.name,
+                            file_path: resolvedArtifact.file.absolutePath,
+                        ]
+                        if (component instanceof ModuleComponentIdentifier) {
+                            row.group_id = component.group
+                            row.artifact_id = component.module
+                            row.version = component.version
+                        } else if (component instanceof ProjectComponentIdentifier) {
+                            row.project_path = component.projectPath
+                        } else {
+                            row.component_display_name = component.displayName
+                        }
+                        println(
+                            "JUA_ARTIFACT_INVENTORY_JSON:"
+                            + JsonOutput.toJson(row)
+                        )
+                    }
+                    if (!artifactCollection.failures.empty) {
+                        artifactCollection.failures.each { failure ->
+                            logger.error(
+                                "JUA_ARTIFACT_INVENTORY_FAILURE:"
+                                + failure.message
+                            )
+                        }
+                        throw new GradleException(
+                            "runtimeClasspath artifact inventory is incomplete"
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+'''
+
+
+def _split_maven_dependency_artifact_path(value):
+    text = str(value or '').strip()
+    match = re.search(r':((?:[A-Za-z]:[\\/]|/|\\\\).+)$', text)
+    if not match:
+        return text, ''
+    return text[:match.start()].strip(), match.group(1).strip()
 
 
 def _parse_maven_dependency_list_line(raw_line):
@@ -2644,7 +2924,7 @@ def _parse_maven_dependency_list_line(raw_line):
 
     left = re.sub(r'\s+--\s+.+$', '', line).strip()
     left = re.sub(r'\s+\((?:optional|omitted[^)]*)\)$', '', left, flags=re.IGNORECASE)
-    left = re.sub(r':(?:[A-Za-z]:[\\/]|/|\\\\).+$', '', left)
+    left, artifact_file_path = _split_maven_dependency_artifact_path(left)
     if not left or ':' not in left:
         return None
 
@@ -2693,6 +2973,12 @@ def _parse_maven_dependency_list_line(raw_line):
         'scope': scope,
         'remark': 'source:dependency:list(runtime)',
         'classifier': classifier,
+        'artifact_file_name': (
+            re.split(r'[\\/]', artifact_file_path)[-1]
+            if artifact_file_path
+            else ''
+        ),
+        'artifact_file_path': artifact_file_path,
         'packaged_present': '',
         'packaged_match_source': '',
     }
@@ -2704,7 +2990,7 @@ def parse_maven_dependency_list(text):
         parsed = _parse_maven_dependency_list_line(raw_line)
         if not parsed:
             continue
-        deps[parsed['key']] = parsed
+        _merge_runtime_artifact_record(deps, parsed)
     return deps
 
 
@@ -2712,17 +2998,159 @@ GRADLE_DEPENDENCY_RE = re.compile(
     r"(?<![\w.-])([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([^\s()]+)"
     r"(?:\s+->\s+([^\s()]+))?"
 )
+GRADLE_PROJECT_DEPENDENCY_RE = re.compile(
+    r"\bproject\s+['\"]?((?::)[A-Za-z0-9_.:-]+)['\"]?"
+)
 
 
-def parse_gradle_dependency_report(text):
-    """Parse resolved external modules from Gradle's runtimeClasspath report."""
+def _merge_runtime_artifact_record(deps, item):
+    key = str((item or {}).get('key') or '').strip()
+    if not key:
+        return
+    existing = deps.get(key)
+    if existing is None:
+        names = [
+            str(item.get('artifact_file_name') or '').strip()
+        ]
+        paths = [
+            str(item.get('artifact_file_path') or '').strip()
+        ]
+        item['artifact_file_names'] = [value for value in names if value]
+        item['artifact_file_paths'] = [value for value in paths if value]
+        deps[key] = item
+        return
+    if str(existing.get('version') or '') != str(item.get('version') or ''):
+        raise RuntimeError(
+            f"构建工具 artifact inventory 对 {key} 返回多个版本："
+            f"{existing.get('version')}、{item.get('version')}"
+        )
+    for singular, plural in (
+        ('artifact_file_name', 'artifact_file_names'),
+        ('artifact_file_path', 'artifact_file_paths'),
+    ):
+        values = list(existing.get(plural) or [])
+        value = str(item.get(singular) or '').strip()
+        if value and value not in values:
+            values.append(value)
+        existing[plural] = values
+        if not existing.get(singular) and value:
+            existing[singular] = value
+
+
+def parse_gradle_artifact_inventory(text, project_modules=None):
+    """Parse exact resolved-artifact records emitted by the generated init task."""
+    modules_by_path = {
+        str(item.get('gradle_path') or '').strip(): dict(item)
+        for item in (project_modules or [])
+        if str(item.get('gradle_path') or '').strip()
+    }
     deps = {}
+    for raw_line in str(text or '').splitlines():
+        marker_index = raw_line.find(GRADLE_ARTIFACT_INVENTORY_PREFIX)
+        if marker_index < 0:
+            continue
+        payload = raw_line[
+            marker_index + len(GRADLE_ARTIFACT_INVENTORY_PREFIX):
+        ].strip()
+        try:
+            row = json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        project_path = str(row.get('project_path') or '').strip()
+        project_model = modules_by_path.get(project_path) or {}
+        group_id = str(
+            row.get('group_id') or project_model.get('group_id') or ''
+        ).strip()
+        artifact_id = str(
+            row.get('artifact_id') or project_model.get('artifact_id') or ''
+        ).strip()
+        version = str(
+            row.get('version') or project_model.get('version') or ''
+        ).strip()
+        file_name = re.split(
+            r'[\\/]',
+            str(row.get('file_name') or ''),
+        )[-1]
+        if (
+            not group_id
+            or not artifact_id
+            or not version
+            or version == 'unspecified'
+            or not file_name
+        ):
+            continue
+        _matched, classifier, _layout = _match_runtime_artifact_filename(
+            file_name,
+            artifact_id,
+            version,
+        )
+        key = normalize_artifact_coord(
+            f'{group_id}:{artifact_id}',
+            classifier,
+        )
+        _merge_runtime_artifact_record(deps, {
+            'key': key,
+            'coord': key,
+            'group_id': group_id,
+            'artifact_id': artifact_id,
+            'version': version,
+            'scope': 'runtime',
+            'remark': 'source:gradle_artifact_inventory(runtimeClasspath)',
+            'classifier': classifier,
+            'artifact_file_name': file_name,
+            'artifact_file_path': str(row.get('file_path') or '').strip(),
+            'packaged_present': '',
+            'packaged_match_source': '',
+            'gradle_project_path': project_path,
+        })
+    return deps
+
+
+def parse_gradle_dependency_report(text, project_modules=None):
+    """Parse resolved external and exact internal-project runtime dependencies."""
+    deps = {}
+    modules_by_path = {
+        str(item.get('gradle_path') or '').strip(): dict(item)
+        for item in (project_modules or [])
+        if str(item.get('gradle_path') or '').strip()
+    }
     for raw_line in str(text or '').splitlines():
         line = raw_line.strip()
         if not line or ' FAILED' in line or line.startswith(('No dependencies', 'A web-based')):
             continue
         match = GRADLE_DEPENDENCY_RE.search(line)
         if not match:
+            project_match = GRADLE_PROJECT_DEPENDENCY_RE.search(line)
+            project_path = (
+                str(project_match.group(1) or '').strip()
+                if project_match
+                else ''
+            )
+            project_model = modules_by_path.get(project_path) or {}
+            group_id = str(project_model.get('group_id') or '').strip()
+            artifact_id = str(project_model.get('artifact_id') or '').strip()
+            version = str(project_model.get('version') or '').strip()
+            if (
+                not project_path
+                or not group_id
+                or not artifact_id
+                or not version
+                or version == 'unspecified'
+            ):
+                continue
+            key = f"{group_id}:{artifact_id}"
+            deps[key] = {
+                'key': key,
+                'group_id': group_id,
+                'artifact_id': artifact_id,
+                'version': version,
+                'scope': 'runtime',
+                'remark': 'source:gradle_dependencies(runtimeClasspath_project)',
+                'classifier': '',
+                'packaged_present': '',
+                'packaged_match_source': '',
+                'gradle_project_path': project_path,
+            }
             continue
         group_id, artifact_id, requested_version, selected_version = match.groups()
         selected = (selected_version or '').rstrip(',')
@@ -2841,22 +3269,23 @@ def _enrich_packaged_deps_with_runtime(
         packaged_version = (item.get('version') or '').strip()
         runtime_match = None
         manual_override = None
+        filename_runtime_candidates = []
         coord = (item.get('coord') or '').strip()
         if coord and coord in runtime_deps:
             runtime_match = runtime_deps.get(coord)
-        elif item.get('artifact_id') and item.get('version'):
-            item_classifier = str(item.get('classifier') or '').strip()
-            manual_override = (
-                manual_coord_overrides.get((
-                    item.get('artifact_id'),
-                    item.get('version'),
-                    item_classifier,
-                ))
-                or manual_coord_overrides.get((
-                    item.get('artifact_id'),
-                    item.get('version'),
-                ))
+        if runtime_match is None and item.get('match_source') == 'filename':
+            runtime_match, filename_runtime_candidates = (
+                _runtime_dependency_for_packaged_filename(
+                    item,
+                    runtime_deps,
+                )
             )
+        if (
+            runtime_match is None
+            and item.get('artifact_id')
+            and item.get('version')
+        ):
+            item_classifier = str(item.get('classifier') or '').strip()
             candidates = (
                 runtime_by_filename_artifact_version.get(
                     (
@@ -2879,7 +3308,28 @@ def _enrich_packaged_deps_with_runtime(
             stem_candidates = runtime_by_filename_stem.get((item.get('filename_stem') or '').strip(), [])
             if len(stem_candidates) == 1:
                 runtime_match = stem_candidates[0]
-        if manual_override:
+        if runtime_match is None and item.get('artifact_id') and item.get('version'):
+            item_classifier = str(item.get('classifier') or '').strip()
+            manual_override = (
+                manual_coord_overrides.get((
+                    item.get('artifact_id'),
+                    item.get('version'),
+                    item_classifier,
+                ))
+                or manual_coord_overrides.get((
+                    item.get('artifact_id'),
+                    item.get('version'),
+                ))
+            )
+        if len(filename_runtime_candidates) > 1 and manual_override is None:
+            anomaly = 'runtime_filename_coordinate_ambiguous:' + '|'.join(
+                f"{candidate.get('coord')}@{candidate.get('version')}"
+                for candidate in filename_runtime_candidates
+            )
+            enriched['metadata_anomalies'] = list(
+                enriched.get('metadata_anomalies') or []
+            ) + [anomaly]
+        if manual_override and runtime_match is None:
             enriched['group_id'] = manual_override.get('group_id') or enriched.get('group_id', '')
             enriched['artifact_id'] = manual_override.get('artifact_id') or enriched.get('artifact_id', '')
             enriched['coord'] = normalize_artifact_coord(
@@ -2888,7 +3338,21 @@ def _enrich_packaged_deps_with_runtime(
             )
             enriched['match_source'] = 'manual_override'
         confirmed_unresolved = confirmed_unresolved_for(item)
-        if confirmed_unresolved and not manual_override:
+        stale_filename_confirmation = bool(
+            confirmed_unresolved
+            and runtime_match
+            and str(confirmed_unresolved.get('source') or '').strip() == 'filename'
+            and not str(confirmed_unresolved.get('classifier') or '').strip()
+            and runtime_match.get('packaged_match_source') in {
+                'runtime-artifact-inventory',
+                'runtime-filename-classifier',
+            }
+        )
+        if (
+            confirmed_unresolved
+            and manual_override is None
+            and not stale_filename_confirmation
+        ):
             unresolved_item = {
                 'artifact_id': (item.get('artifact_id') or '').strip() or '<unknown-artifact>',
                 'version': (item.get('version') or '').strip() or '<unknown-version>',
@@ -2933,6 +3397,8 @@ def _enrich_packaged_deps_with_runtime(
         if runtime_match:
             enriched['group_id'] = runtime_match.get('group_id') or enriched.get('group_id', '')
             enriched['artifact_id'] = runtime_match.get('artifact_id') or enriched.get('artifact_id', '')
+            if runtime_match.get('packaged_match_source'):
+                enriched['match_source'] = runtime_match['packaged_match_source']
             runtime_version = (runtime_match.get('version') or '').strip()
             normalized_packaged_version = packaged_version
             if (
@@ -3196,39 +3662,221 @@ def _gradle_task(target_model, task):
     return f"{gradle_path}:{task}" if gradle_path else task
 
 
+def _is_gradle_lock_contention(output):
+    text = str(output or '').lower()
+    return any(token in text for token in (
+        'timeout waiting to lock',
+        'timed out waiting to lock',
+        'could not acquire lock',
+        'could not lock',
+        'cannot lock',
+        'failed to acquire lock',
+        'lock timeout',
+        'is currently in use by another gradle instance',
+        'another gradle instance',
+        'reached waiting for exclusive access to file',
+    ))
+
+
+def _run_gradle_command_with_lock_retry(command, **run_kwargs):
+    """Retry only the same Gradle command when its completed process reports lock contention."""
+    attempts = 0
+    stdout = ''
+    stderr = ''
+    return_code = -1
+    for retry_index in range(len(GRADLE_LOCK_RETRY_DELAYS_SECONDS) + 1):
+        attempts += 1
+        stdout, stderr, return_code = run_cmd(command, **run_kwargs)
+        if return_code == 0:
+            break
+        if not _is_gradle_lock_contention(f'{stdout}\n{stderr}'):
+            break
+        if retry_index < len(GRADLE_LOCK_RETRY_DELAYS_SECONDS):
+            time.sleep(GRADLE_LOCK_RETRY_DELAYS_SECONDS[retry_index])
+    return stdout, stderr, return_code, attempts
+
+
+def _gradle_inventory_fallback_allowed(stdout, stderr):
+    """Return whether the generated ArtifactView task is unsupported, not unhealthy."""
+    text = f'{stdout}\n{stderr}'.lower()
+    task_is_unavailable = any(token in text for token in (
+        "task 'juaruntimeartifactinventory' not found",
+        "task 'juaruntimeartifactinventory' does not exist",
+    ))
+    artifact_api_is_unavailable = (
+        'artifactview' in text
+        and any(token in text for token in (
+            'could not find method',
+            'no signature of method',
+            'nosuchmethoderror',
+            'missingmethodexception',
+        ))
+    )
+    component_api_is_unavailable = any(token in text for token in (
+        'unable to resolve class org.gradle.api.artifacts.component',
+        "could not get unknown property 'incoming'",
+    ))
+    return (
+        task_is_unavailable
+        or artifact_api_is_unavailable
+        or component_api_is_unavailable
+    )
+
+
+def _raise_gradle_command_failure(
+    *,
+    stage,
+    command,
+    stdout,
+    stderr,
+    return_code,
+    attempts,
+):
+    raise GradleCommandFailure(
+        stage=stage,
+        command=command,
+        stdout=stdout,
+        stderr=stderr,
+        return_code=return_code,
+        attempts=attempts,
+    )
+
+
 def _collect_gradle_runtime_deps_for_workspace(
     work_dir, primary_module=None, modules=None, env=None, observer=None, side="",
 ):
     work_dir = str(Path(work_dir).resolve())
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
     target_model = _gradle_target_model(work_dir, target_selector)
-    list_cmd = gradle_cmd(work_dir) + [
+    discovery = discover_project_modules(work_dir, build_tool='gradle')
+    init_script_path = ''
+    with named_temporary_file(
+        mode='w',
+        encoding='utf-8',
+        suffix='.gradle',
+        prefix='jua-gradle-artifacts-',
+        delete=False,
+    ) as init_script:
+        init_script.write(GRADLE_ARTIFACT_INVENTORY_INIT_SCRIPT)
+        init_script_path = init_script.name
+    inventory_cmd = gradle_cmd(work_dir) + [
+        '--no-daemon', '--console=plain',
+        '--init-script', init_script_path,
+        _gradle_task(target_model, GRADLE_ARTIFACT_INVENTORY_TASK),
+    ]
+    inventory_command = ' '.join(
+        '<generated-init-script>' if value == init_script_path else value
+        for value in inventory_cmd
+    )
+    fallback_cmd = gradle_cmd(work_dir) + [
         '--no-daemon', '--console=plain',
         _gradle_task(target_model, 'dependencies'),
         '--configuration', 'runtimeClasspath',
     ]
-    list_command = ' '.join(list_cmd)
+    fallback_command = ' '.join(fallback_cmd)
     side_display = _side_display(side)
+    try:
+        with _observed_phase(
+            observer,
+            "gradle_artifact_inventory",
+            side=side,
+            item=target_selector or ".",
+            command=inventory_command,
+            start_message=f"开始采集{side_display}运行时物理 artifact 清单",
+            complete_message=f"{side_display}运行时物理 artifact 清单采集完成",
+        ):
+            (
+                inventory_stdout,
+                inventory_stderr,
+                inventory_rc,
+                inventory_attempts,
+            ) = _run_gradle_command_with_lock_retry(
+                inventory_cmd,
+                cwd=work_dir,
+                timeout=STEP1_BUILD_TOOL_TIMEOUT,
+                env=env,
+                stream_output=True,
+            )
+    finally:
+        try:
+            Path(init_script_path).unlink()
+        except OSError:
+            pass
+
+    if inventory_rc != 0 and (
+        _is_gradle_lock_contention(
+            f'{inventory_stdout}\n{inventory_stderr}'
+        )
+        or not _gradle_inventory_fallback_allowed(
+            inventory_stdout,
+            inventory_stderr,
+        )
+    ):
+        _raise_gradle_command_failure(
+            stage='gradle_artifact_inventory',
+            command=inventory_command,
+            stdout=inventory_stdout,
+            stderr=inventory_stderr,
+            return_code=inventory_rc,
+            attempts=inventory_attempts,
+        )
+
+    runtime_deps = (
+        parse_gradle_artifact_inventory(
+            inventory_stdout,
+            project_modules=discovery.get('modules') or [],
+        )
+        if inventory_rc == 0
+        else {}
+    )
+    if runtime_deps:
+        return runtime_deps, inventory_command
+
+    # Compatibility fallback for Gradle versions/plugins that do not expose
+    # ArtifactView.  This preserves existing support, but only the inventory
+    # path is considered physical-file evidence.
     with _observed_phase(
         observer,
-        "gradle_dependencies",
+        "gradle_dependencies_fallback",
         side=side,
         item=target_selector or ".",
-        command=list_command,
-        start_message=f"开始补全{side_display}最终制品依赖坐标",
-        complete_message=f"{side_display}依赖坐标补全完成",
+        command=fallback_command,
+        start_message=f"开始使用 Gradle 组件树补全{side_display}依赖坐标",
+        complete_message=f"{side_display}Gradle 组件树坐标补全完成",
     ):
-        list_stdout, list_stderr, list_rc = run_cmd(
-            list_cmd, cwd=work_dir, timeout=STEP1_BUILD_TOOL_TIMEOUT,
-            env=env, stream_output=True,
+        (
+            list_stdout,
+            list_stderr,
+            list_rc,
+            fallback_attempts,
+        ) = _run_gradle_command_with_lock_retry(
+            fallback_cmd,
+            cwd=work_dir,
+            timeout=STEP1_BUILD_TOOL_TIMEOUT,
+            env=env,
+            stream_output=True,
         )
-        if list_rc != 0:
-            raise RuntimeError(
-                "最终制品中存在无法直接识别坐标的嵌套依赖，且 Gradle "
-                "runtimeClasspath 解析失败，无法安全补全坐标："
-                f"{(list_stderr[:300] or list_stdout[:300])}"
-            )
-    return parse_gradle_dependency_report(list_stdout), list_command
+    if list_rc != 0:
+        inventory_context = (
+            inventory_stderr or inventory_stdout
+            if inventory_rc != 0
+            else 'artifact inventory returned no usable records'
+        )
+        _raise_gradle_command_failure(
+            stage='gradle_dependencies_fallback',
+            command=fallback_command,
+            stdout=list_stdout,
+            stderr=(
+                f"{list_stderr}\n"
+                f"artifact inventory context: {inventory_context}"
+            ),
+            return_code=list_rc,
+            attempts=fallback_attempts,
+        )
+    return parse_gradle_dependency_report(
+        list_stdout,
+        project_modules=discovery.get('modules') or [],
+    ), f'{inventory_command}; fallback={fallback_command}'
 
 
 def collect_runtime_deps_for_workspace(
@@ -3453,13 +4101,23 @@ def collect_gradle_deps_for_workspace(
         start_message=f"开始构建{side_display}目标模块",
         complete_message=f"{side_display}目标模块构建完成",
     ):
-        stdout, stderr, rc = run_cmd(
-            package_cmd, cwd=work_dir, timeout=STEP1_BUILD_TOOL_TIMEOUT,
-            env=env, stream_output=True,
+        stdout, stderr, rc, build_attempts = (
+            _run_gradle_command_with_lock_retry(
+                package_cmd,
+                cwd=work_dir,
+                timeout=STEP1_BUILD_TOOL_TIMEOUT,
+                env=env,
+                stream_output=True,
+            )
         )
         if rc != 0:
-            raise RuntimeError(
-                f"Gradle build 失败（退出码 {rc}）：\n{stderr[:1000] or stdout[:1000]}"
+            _raise_gradle_command_failure(
+                stage='gradle_build',
+                command=package_command,
+                stdout=stdout,
+                stderr=stderr,
+                return_code=rc,
+                attempts=build_attempts,
             )
     post_build_scope = build_project_scope(
         work_dir, target_selector or '.', build_tool='gradle'
@@ -3677,6 +4335,8 @@ def _collect_runtime_deps_for_artifact_input(
     observer=None,
     source_resolution=None,
     expected_commit="",
+    expected_remote="",
+    expected_remote_ref="",
     allow_local_source=False,
     allow_dirty_local_source=False,
     active_maven_profiles=None,
@@ -3700,8 +4360,17 @@ def _collect_runtime_deps_for_artifact_input(
             }
             if str(expected_commit or "").strip():
                 resolve_kwargs["expected_commit"] = str(expected_commit).strip()
+            if str(expected_remote or "").strip():
+                resolve_kwargs["expected_remote"] = str(expected_remote).strip()
+            if str(expected_remote_ref or "").strip():
+                resolve_kwargs["expected_remote_ref"] = str(expected_remote_ref).strip()
             resolution = resolve_step1_ref(repo_dir, branch, **resolve_kwargs)
         if resolution.get("status") != "resolved":
+            if resolution.get("source_status") in {
+                "remote_expected_commit_unmaterializable",
+                "remote_ref_moved",
+            }:
+                raise PinnedCommitMaterializationError(side, resolution)
             raise Step1RefResolutionRequiredError(
                 side, repo_dir, artifact_path, resolution,
             )
@@ -3883,19 +4552,27 @@ def get_packaged_deps_by_switching_branch(
                 )
             result = (deps, meta)
         except Exception as exc:
-            blocked_error = exc if isinstance(exc, Step1CommandExecutionBlockedError) else build_step1_command_blocked_error(
-                stage=("gradle_build" if str(build_tool).lower() == 'gradle' else "mvn_package"),
-                command=(
-                    "gradlew --no-daemon --console=plain build -x test"
-                    if str(build_tool).lower() == 'gradle'
-                    else "mvn --batch-mode -DskipTests package"
-                ),
-                exc=exc,
-                side=side,
-                branch=branch,
-                jdk_field=jdk_field,
-                jdk_home=jdk_home,
-                source_mode="checkout_build",
+            blocked_error = (
+                exc
+                if isinstance(exc, Step1CommandExecutionBlockedError)
+                else build_step1_command_blocked_from_exception(
+                    exc,
+                    default_stage=(
+                        "gradle_build"
+                        if str(build_tool).lower() == 'gradle'
+                        else "mvn_package"
+                    ),
+                    default_command=(
+                        "gradlew --no-daemon --console=plain build -x test"
+                        if str(build_tool).lower() == 'gradle'
+                        else "mvn --batch-mode -DskipTests package"
+                    ),
+                    side=side,
+                    branch=branch,
+                    jdk_field=jdk_field,
+                    jdk_home=jdk_home,
+                    source_mode="checkout_build",
+                )
             )
     if temp_dir is not None:
         try:
@@ -3997,20 +4674,33 @@ def get_runtime_deps_by_switching_branch(
                 },
             )
         except Exception as exc:
-            blocked_error = exc if isinstance(exc, Step1CommandExecutionBlockedError) else build_step1_command_blocked_error(
-                stage=("gradle_dependencies" if str(build_tool).lower() == 'gradle' else "mvn_dependency_list"),
-                command=(
-                    "gradlew --no-daemon --console=plain dependencies --configuration runtimeClasspath"
-                    if str(build_tool).lower() == 'gradle'
-                    else "mvn --batch-mode -DskipTests dependency:list -DincludeScope=runtime -DoutputAbsoluteArtifactFilename=true"
-                ),
-                exc=exc,
-                side=side,
-                branch=branch,
-                jdk_field=jdk_field,
-                jdk_home=jdk_home,
-                source_mode="branch_checkout",
-                artifact_path=artifact_path,
+            blocked_error = (
+                exc
+                if isinstance(exc, Step1CommandExecutionBlockedError)
+                else build_step1_command_blocked_from_exception(
+                    exc,
+                    default_stage=(
+                        "gradle_dependencies"
+                        if str(build_tool).lower() == 'gradle'
+                        else "mvn_dependency_list"
+                    ),
+                    default_command=(
+                        "gradlew --no-daemon --console=plain dependencies "
+                        "--configuration runtimeClasspath"
+                        if str(build_tool).lower() == 'gradle'
+                        else (
+                            "mvn --batch-mode -DskipTests dependency:list "
+                            "-DincludeScope=runtime "
+                            "-DoutputAbsoluteArtifactFilename=true"
+                        )
+                    ),
+                    side=side,
+                    branch=branch,
+                    jdk_field=jdk_field,
+                    jdk_home=jdk_home,
+                    source_mode="branch_checkout",
+                    artifact_path=artifact_path,
+                )
             )
     if temp_dir is not None:
         try:
@@ -4432,6 +5122,8 @@ def main():
             def load_base_runtime_deps():
                 nonlocal base_runtime_deps, base_runtime_meta
                 if not base_runtime_meta:
+                    ref_binding = orchestrated_input.get("base_ref_binding")
+                    ref_binding = ref_binding if isinstance(ref_binding, dict) else {}
                     base_runtime_deps, base_runtime_meta = _collect_runtime_deps_for_artifact_input(
                         args.base_source_project_dir,
                         args.base_branch,
@@ -4447,6 +5139,8 @@ def main():
                         build_tool=args.tool,
                         source_resolution=confirmed_source_resolution("base"),
                         expected_commit=str(orchestrated_input.get("base_expected_commit") or ""),
+                        expected_remote=str(ref_binding.get("remote") or ""),
+                        expected_remote_ref=str(ref_binding.get("canonical_ref") or ""),
                         allow_local_source=bool(orchestrated_input.get("base_allow_local_source")),
                         allow_dirty_local_source=bool(orchestrated_input.get("base_allow_dirty_local_source")),
                     )
@@ -4455,6 +5149,8 @@ def main():
             def load_current_runtime_deps():
                 nonlocal curr_runtime_deps, curr_runtime_meta
                 if not curr_runtime_meta:
+                    ref_binding = orchestrated_input.get("current_ref_binding")
+                    ref_binding = ref_binding if isinstance(ref_binding, dict) else {}
                     curr_runtime_deps, curr_runtime_meta = _collect_runtime_deps_for_artifact_input(
                         args.current_source_project_dir,
                         args.current_branch,
@@ -4470,6 +5166,8 @@ def main():
                         build_tool=args.tool,
                         source_resolution=confirmed_source_resolution("current"),
                         expected_commit=str(orchestrated_input.get("current_expected_commit") or ""),
+                        expected_remote=str(ref_binding.get("remote") or ""),
+                        expected_remote_ref=str(ref_binding.get("canonical_ref") or ""),
                         allow_local_source=bool(orchestrated_input.get("current_allow_local_source")),
                         allow_dirty_local_source=bool(orchestrated_input.get("current_allow_dirty_local_source")),
                     )

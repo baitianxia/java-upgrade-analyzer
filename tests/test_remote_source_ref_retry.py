@@ -140,23 +140,69 @@ class RemoteSourceRefRetryTest(unittest.TestCase):
         git_mock.assert_not_called()
         self.assertEqual(sleep_mock.call_count, 2)
 
-    def test_successful_targeted_ls_remote_without_ref_is_ref_movement(self):
+    def test_successful_targeted_ls_remote_without_ref_retries_and_reuses_pinned_object(self):
+        absent = ("", "remote ref no longer exists", refs._REMOTE_REF_ABSENT_RC)
         with patch.object(
             refs,
-            "_git",
-            return_value=("", "", 0),
-        ) as git_mock, patch.object(refs.time, "sleep") as sleep_mock:
+            "_query_remote_candidate_commit",
+            side_effect=[absent, absent, absent],
+        ) as query_mock, patch.object(
+            refs,
+            "_verify_commit_object",
+            side_effect=["", self.commit],
+        ) as verify_mock, patch.object(
+            refs,
+            "_fetch_expected_commit",
+            return_value={
+                "status": "success",
+                "target": self.commit,
+                "failure_type": "",
+                "reason": "",
+                "retryable": False,
+            },
+        ) as fetch_mock, patch.object(refs.time, "sleep") as sleep_mock:
+            result = refs.materialize_remote_source_candidate(
+                "/repo",
+                self.candidate,
+                expected_commit=self.commit,
+                retry_delays=(1, 3),
+            )
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["expected_commit"], self.commit)
+        self.assertEqual(result["observed_commit"], "")
+        self.assertEqual(result["resolution_mode"], "live_remote_expected_commit")
+        self.assertEqual(query_mock.call_count, 3)
+        self.assertEqual(verify_mock.call_count, 2)
+        fetch_mock.assert_called_once()
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_existing_pinned_object_does_not_require_a_second_remote_query(self):
+        with patch.object(
+            refs,
+            "_verify_commit_object",
+            return_value=self.commit,
+        ), patch.object(
+            refs,
+            "_query_remote_candidate_commit",
+        ) as query_mock, patch.object(
+            refs,
+            "_fetch_expected_commit",
+        ) as fetch_mock:
             result = refs.materialize_remote_source_candidate(
                 "/repo",
                 self.candidate,
                 expected_commit=self.commit,
             )
 
-        self.assertEqual(result["status"], "remote_ref_moved")
-        self.assertEqual(result["expected_commit"], self.commit)
-        self.assertEqual(result["observed_commit"], "")
-        self.assertEqual(git_mock.call_count, 1)
-        sleep_mock.assert_not_called()
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_commit"], self.commit)
+        self.assertEqual(
+            result["resolution_mode"],
+            "live_remote_expected_commit",
+        )
+        query_mock.assert_not_called()
+        fetch_mock.assert_not_called()
 
     def test_authentication_failure_is_not_retried(self):
         with patch.object(
@@ -176,33 +222,149 @@ class RemoteSourceRefRetryTest(unittest.TestCase):
         self.assertEqual(git_mock.call_count, 1)
         sleep_mock.assert_not_called()
 
-    def test_remote_ref_movement_stops_before_fetch(self):
+    def test_remote_ref_movement_retries_then_materializes_original_snapshot(self):
         moved_commit = "b" * 40
         with patch.object(
             refs,
             "_query_remote_candidate_commit",
-            return_value=(moved_commit, "", 0),
-        ), patch.object(refs, "_git") as git_mock:
+            side_effect=[
+                (moved_commit, "", 0),
+                (moved_commit, "", 0),
+                (moved_commit, "", 0),
+            ],
+        ) as query_mock, patch.object(
+            refs,
+            "_verify_commit_object",
+            side_effect=["", self.commit],
+        ), patch.object(
+            refs,
+            "_fetch_expected_commit",
+            return_value={
+                "status": "success",
+                "target": self.commit,
+                "failure_type": "",
+                "reason": "",
+                "retryable": False,
+            },
+        ) as fetch_mock, patch.object(refs.time, "sleep"):
             result = refs.materialize_remote_source_candidate(
                 "/repo",
                 self.candidate,
                 expected_commit=self.commit,
             )
 
-        self.assertEqual(result["status"], "remote_ref_moved")
+        self.assertEqual(result["status"], "remote_source_resolved")
         self.assertEqual(result["expected_commit"], self.commit)
         self.assertEqual(result["observed_commit"], moved_commit)
-        git_mock.assert_not_called()
+        self.assertEqual(result["resolution_mode"], "live_remote_expected_commit")
+        self.assertEqual(query_mock.call_count, 3)
+        fetch_mock.assert_called_once_with(
+            "/repo",
+            self.candidate,
+            self.commit,
+            timeout=60,
+        )
 
-    def test_expected_commit_mismatch_is_detected_before_materialization(self):
+    def test_exact_pinned_commit_fetch_retries_transient_failures(self):
+        moved_commit = "b" * 40
+        transient = {
+            "status": "remote_expected_commit_unmaterializable",
+            "target": self.commit,
+            "failure_type": "transient_network_failure",
+            "reason": "connection reset by peer",
+            "retryable": True,
+        }
+        success = {
+            "status": "success",
+            "target": self.commit,
+            "failure_type": "",
+            "reason": "",
+            "retryable": False,
+        }
+        with patch.object(
+            refs,
+            "_query_remote_candidate_commit",
+            side_effect=[
+                (moved_commit, "", 0),
+                (moved_commit, "", 0),
+                (moved_commit, "", 0),
+            ],
+        ), patch.object(
+            refs,
+            "_verify_commit_object",
+            side_effect=["", self.commit],
+        ), patch.object(
+            refs,
+            "_fetch_expected_commit",
+            side_effect=[transient, transient, success],
+        ) as fetch_mock, patch.object(refs.time, "sleep") as sleep_mock:
+            result = refs.materialize_remote_source_candidate(
+                "/repo",
+                self.candidate,
+                expected_commit=self.commit,
+                retry_delays=(1, 3),
+            )
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(fetch_mock.call_count, 3)
+        self.assertEqual(sleep_mock.call_count, 4)
+
+    def test_ref_disappearing_during_canonical_fetch_falls_back_to_pinned_sha(self):
+        with patch.object(
+            refs,
+            "_query_remote_candidate_commit",
+            return_value=(self.commit, "", 0),
+        ), patch.object(
+            refs,
+            "_verify_commit_object",
+            side_effect=["", self.commit],
+        ), patch.object(
+            refs,
+            "_git",
+            return_value=("", "couldn't find remote ref release", 128),
+        ), patch.object(
+            refs,
+            "_fetch_expected_commit",
+            return_value={
+                "status": "success",
+                "target": self.commit,
+                "failure_type": "",
+                "reason": "",
+                "retryable": False,
+            },
+        ) as exact_fetch:
+            result = refs.materialize_remote_source_candidate(
+                "/repo",
+                self.candidate,
+                expected_commit=self.commit,
+            )
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_commit"], self.commit)
+        exact_fetch.assert_called_once_with(
+            "/repo",
+            self.candidate,
+            self.commit,
+            timeout=60,
+        )
+
+    def test_expected_commit_mismatch_is_materialized_instead_of_reconfirmed(self):
         inventory = {
             "queried_at": "now",
             "refs": [self.candidate],
             "failures": [],
             "remotes": ["origin"],
         }
+        materialized = {
+            "status": "remote_source_resolved",
+            "resolved_commit": "b" * 40,
+            "expected_commit": "b" * 40,
+            "observed_commit": self.commit,
+            "resolution_mode": "live_remote_expected_commit",
+            "attempts": [],
+        }
         with patch.object(refs, "query_live_remote_refs", return_value=inventory), patch.object(
-            refs, "materialize_remote_source_candidate"
+            refs, "materialize_remote_source_candidate", return_value=materialized
         ) as materialize_mock:
             result = refs.resolve_remote_source_ref(
                 "/repo",
@@ -210,9 +372,95 @@ class RemoteSourceRefRetryTest(unittest.TestCase):
                 expected_commit="b" * 40,
             )
 
-        self.assertEqual(result["status"], "remote_ref_moved")
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_commit"], "b" * 40)
         self.assertEqual(result["observed_commit"], self.commit)
-        materialize_mock.assert_not_called()
+        materialize_mock.assert_called_once()
+        self.assertEqual(
+            materialize_mock.call_args.kwargs["expected_commit"],
+            "b" * 40,
+        )
+
+    def test_bound_snapshot_is_materialized_when_current_inventory_has_no_ref(self):
+        inventory = {
+            "queried_at": "now",
+            "refs": [],
+            "failures": [],
+            "remotes": ["origin"],
+        }
+        materialized = {
+            "status": "remote_source_resolved",
+            "resolved_commit": self.commit,
+            "expected_commit": self.commit,
+            "observed_commit": "",
+            "resolution_mode": "live_remote_expected_commit",
+            "attempts": [],
+        }
+        with patch.object(
+            refs,
+            "query_live_remote_refs",
+            return_value=inventory,
+        ) as query_mock, patch.object(
+            refs,
+            "materialize_remote_source_candidate",
+            return_value=materialized,
+        ) as materialize_mock:
+            result = refs.resolve_remote_source_ref(
+                "/repo",
+                "origin/release",
+                expected_commit=self.commit,
+                expected_remote="origin",
+                expected_remote_ref="refs/heads/release",
+            )
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        query_mock.assert_not_called()
+        candidate = materialize_mock.call_args.args[1]
+        self.assertEqual(candidate["remote"], "origin")
+        self.assertEqual(candidate["canonical_ref"], "refs/heads/release")
+        self.assertEqual(
+            materialize_mock.call_args.kwargs["expected_commit"],
+            self.commit,
+        )
+
+    def test_unmaterializable_expected_commit_is_not_reported_as_ref_movement(self):
+        moved_commit = "b" * 40
+        with patch.object(
+            refs,
+            "_query_remote_candidate_commit",
+            side_effect=[
+                (moved_commit, "", 0),
+                (moved_commit, "", 0),
+                (moved_commit, "", 0),
+            ],
+        ), patch.object(
+            refs,
+            "_verify_commit_object",
+            return_value="",
+        ), patch.object(
+            refs,
+            "_fetch_expected_commit",
+            return_value={
+                "status": "remote_expected_commit_unmaterializable",
+                "target": self.commit,
+                "failure_type": "remote_ref_not_found",
+                "reason": "server does not allow fetching the pinned object",
+                "retryable": False,
+            },
+        ), patch.object(refs.time, "sleep"):
+            result = refs.materialize_remote_source_candidate(
+                "/repo",
+                self.candidate,
+                expected_commit=self.commit,
+            )
+
+        self.assertEqual(
+            result["status"],
+            "remote_expected_commit_unmaterializable",
+        )
+        self.assertEqual(result["expected_commit"], self.commit)
+        self.assertEqual(result["observed_commit"], moved_commit)
+        self.assertNotEqual(result["status"], "remote_ref_moved")
 
     def test_failed_second_remote_prevents_unqualified_unique_claim(self):
         inventory = {
@@ -257,7 +505,7 @@ class RemoteSourceRefRetryTest(unittest.TestCase):
         self.assertEqual(result["status"], "remote_source_resolved")
         self.assertEqual(result["resolved_commit"], self.commit)
 
-    def test_moved_ref_refreshes_candidates_for_reconfirmation(self):
+    def test_materialization_failure_keeps_observed_candidate_for_diagnostics(self):
         moved_commit = "b" * 40
         inventory = {
             "queried_at": "now",
@@ -266,19 +514,25 @@ class RemoteSourceRefRetryTest(unittest.TestCase):
             "remotes": ["origin"],
         }
         moved = {
-            "status": "remote_ref_moved",
+            "status": "remote_expected_commit_unmaterializable",
             "resolved_commit": "",
             "expected_commit": self.commit,
             "observed_commit": moved_commit,
             "attempts": [],
-            "failure": {"reason": "moved", "reason_code": "remote_ref_moved"},
+            "failure": {
+                "reason": "pinned object unavailable",
+                "reason_code": "remote_expected_commit_unmaterializable",
+            },
         }
         with patch.object(refs, "query_live_remote_refs", return_value=inventory), patch.object(
             refs, "materialize_remote_source_candidate", return_value=moved
         ):
             result = refs.resolve_remote_source_ref("/repo", "origin/release")
 
-        self.assertEqual(result["status"], "remote_ref_moved")
+        self.assertEqual(
+            result["status"],
+            "remote_expected_commit_unmaterializable",
+        )
         self.assertEqual(result["candidates"][0]["commit"], moved_commit)
 
 

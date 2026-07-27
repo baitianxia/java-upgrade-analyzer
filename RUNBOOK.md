@@ -401,17 +401,17 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 
 说明：
 - Maven 场景下，Step1 会真实执行目标模块的 `package`
-- Gradle 场景下，Step1 优先调用项目 Wrapper，执行目标 project 的 `build -x test`；Groovy DSL、Kotlin DSL、`projectDir` 与 `project(...)` 模块依赖均纳入模块/源码范围推导
+- Gradle 场景下，Step1 优先调用项目 Wrapper，执行目标 project 的 `build -x test`；Groovy DSL、Kotlin DSL、`projectDir` 与 `project(...)` 模块依赖均纳入模块/源码范围推导。坐标补全优先使用 `runtimeClasspath` resolved artifacts 的组件坐标与物理文件清单；`project :internal` 按精确 Gradle project path 映射到内部模块的 group、artifact、version。不支持 artifact inventory 的 Gradle 版本或插件才回退到原有组件依赖树。Gradle build、inventory 或回退命令出现明确文件锁冲突时，只重试同一命令最多 3 次（间隔 1 秒、3 秒）；不得因锁冲突切换命令、删除 `.lock/.lck` 或执行全局 `gradle --stop`
 - Maven/Gradle 构建、Wrapper 下载和运行时依赖坐标补全默认不设置总执行时限；首次填充本地依赖缓存时不会再因超过固定 30 分钟而被 Step1 中止。仓库连接或读取失败仍由 Maven/Gradle 自身的网络超时与退出码显式报告
 - 两种构建工具都可以跳过自动构建，直接读取用户提供的编译产物
 - `boot jar/war` 直接读取最终产物
 - `thin jar` / 无嵌套依赖场景当前不支持，会直接报错
 - 若 Step1 先进入待交互，Claude Code 必须把 `interaction.json` 整理成用户可读的决策卡片：缺什么输入、可用哪种输入方式、可以直接怎么回复；协议字段只用于内部恢复命令构造
 - 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支生成 Maven `dependency:list` 或 Gradle `runtimeClasspath` 报告补全坐标；但这不是 direct artifact 模式的执行前硬前置
+- Maven/Gradle artifact inventory 与 fat JAR 条目物理文件名的精确匹配是最高优先级坐标补全证据；它可以纠正 filename-only 解析得到的误导性 artifact/version。构建工具只提供唯一 group、artifact、version 而没有 classifier 时，Step1 再以完整 version 为锚拆分标准物理文件名；例如 `jffi-1.2.23.jar` 与 `jffi-1.2.23-native.jar` 分别固化为 `com.github.jnr:jffi` 与 `com.github.jnr:jffi:native`。版本本身含连字符时不把版本尾部误判为 classifier。只有两个以上不同最终坐标都能解释同一物理条目时才视为真实歧义
 - `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
 - 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧源码并运行对应构建工具补全；自动构建模式则在构建前解析两侧 ref。解析时先查询实时远程 refs，候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在构建前暂停确认；选定后仅定向 fetch 所需 ref，不执行 `git pull`，也不修改用户当前分支。
-- 对 Step1 构建来源，远端不存在、认证失败、网络失败、超时或定向 fetch 失败时会暂停。瞬时网络错误在暂停前最多尝试 3 次（间隔 1 秒、3 秒），认证失败、ref 不存在和 ref 移动不重试；裸 SHA 必须先与实时远端记录的 `commit` 匹配并按 expected commit 固定。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地 commit；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。Step4 的依赖源码属于辅助证据：远端查询、fetch、ref 移动、未匹配等内部故障在受控重试后记录为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并自动改用最终 JAR 方法字节码指纹识别同签名实现变化；不会要求用户修复，也不会静默使用本地 ref。若字节码兜底也失败，行为覆盖成为关键缺口并限制最终结论。只有两个以上不同 commit pair 会改变源码对比范围时才暂停确认。
-- 全量 `ls-remote` 选出 ref 后，定向 `ls-remote` 只有在命令成功且结果为空，或成功返回了不同 commit 时才判为 ref 删除/移动；SSH 握手、断连、超时、DNS 和临时服务故障按瞬时网络错误重试，重试耗尽后进入远端不可用及已授权的 local fallback 路径，不得误报 `remote_ref_moved`
+- 对 Step1 构建来源，首次全量远端清单选出的 commit 是后续执行的固定快照，并与 repo、remote、canonical ref、artifact 一起写入状态绑定。二次定向查询为空、查询到不同 commit、SSH 握手失败、断连、超时、DNS 或临时服务故障都按错误类型受控重试；空结果或不同 commit 只是后续观测，不能让已固定快照失效。本地已有固定 SHA 对象时直接验证复用，否则按该 SHA 精确 fetch；固定 SHA 最终无法物化时以 `STEP1_REMOTE_EXPECTED_COMMIT_UNMATERIALIZABLE` 系统错误停止，不生成“重新选 ref”的用户 checkpoint。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地分支兜底；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。Step4 的依赖源码属于辅助证据：远端查询、fetch、ref 移动、未匹配等内部故障在受控重试后记录为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并自动改用最终 JAR 方法字节码指纹识别同签名实现变化；不会要求用户修复，也不会静默使用本地 ref。若字节码兜底也失败，行为覆盖成为关键缺口并限制最终结论。只有两个以上不同 commit pair 会改变源码对比范围时才暂停确认。
 - Step5 分析业务源码前会核对 Step1 记录的 current commit：现有业务源码工作区 HEAD 一致且干净时直接复用；否则从本地 Git 对象创建临时 detached worktree，并把业务源码目录映射到该 commit 后只读扫描。该过程不重新 clone、不运行构建且不下载 Maven/Gradle 依赖，Step5 结束或异常后统一清理；若本地已不存在该 commit，则失败关闭而不使用错误版本源码。
 - 同时提供 branch/ref 与 source directory 时，以确认后的 branch/ref 为准；只有 source directory 时不得直接使用当前 checkout 执行坐标补全
 - 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源

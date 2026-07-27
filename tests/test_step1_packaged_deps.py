@@ -10,7 +10,7 @@ import unittest
 import warnings
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -208,12 +208,390 @@ class Step1PackagedDepsTest(unittest.TestCase):
             |    \\--- org.example:transitive:3.4 (*)
             +--- project :internal
             \\--- org.example:broken:9 FAILED
-            """
+            """,
+            project_modules=[{
+                "gradle_path": ":internal",
+                "group_id": "com.acme",
+                "artifact_id": "internal-core",
+                "version": "2.1.0",
+            }],
         )
 
         self.assertEqual(deps["org.example:direct"]["version"], "1.2")
         self.assertEqual(deps["org.example:transitive"]["version"], "3.4")
+        self.assertEqual(deps["com.acme:internal-core"]["version"], "2.1.0")
+        self.assertEqual(
+            deps["com.acme:internal-core"]["gradle_project_path"],
+            ":internal",
+        )
         self.assertNotIn("org.example:broken", deps)
+
+    def test_parse_gradle_artifact_inventory_preserves_physical_artifacts(self):
+        prefix = s1_dep_diff.GRADLE_ARTIFACT_INVENTORY_PREFIX
+        rows = [
+            {
+                "group_id": "com.github.jnr",
+                "artifact_id": "jffi",
+                "version": "1.2.23",
+                "file_name": "jffi-1.2.23.jar",
+                "file_path": "/cache/jffi-1.2.23.jar",
+            },
+            {
+                "group_id": "com.github.jnr",
+                "artifact_id": "jffi",
+                "version": "1.2.23",
+                "file_name": "jffi-1.2.23-native.jar",
+                "file_path": "/cache/jffi-1.2.23-native.jar",
+            },
+            {
+                "project_path": ":internal",
+                "file_name": "internal-core-2.1.0.jar",
+                "file_path": "/workspace/internal-core-2.1.0.jar",
+            },
+        ]
+        report = "\n".join(
+            prefix + json.dumps(row)
+            for row in rows
+        )
+
+        deps = s1_dep_diff.parse_gradle_artifact_inventory(
+            report,
+            project_modules=[{
+                "gradle_path": ":internal",
+                "group_id": "com.acme",
+                "artifact_id": "internal-core",
+                "version": "2.1.0",
+            }],
+        )
+
+        self.assertEqual(
+            set(deps),
+            {
+                "com.github.jnr:jffi",
+                "com.github.jnr:jffi:native",
+                "com.acme:internal-core",
+            },
+        )
+        self.assertEqual(
+            deps["com.github.jnr:jffi:native"]["artifact_file_name"],
+            "jffi-1.2.23-native.jar",
+        )
+        self.assertEqual(
+            deps["com.acme:internal-core"]["gradle_project_path"],
+            ":internal",
+        )
+
+    def test_collect_gradle_runtime_deps_prefers_artifact_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "settings.gradle").write_text(
+                "include ':app'\n",
+                encoding="utf-8",
+            )
+            (root / "build.gradle").write_text(
+                "group = 'com.acme'\nversion = '1.0'\n",
+                encoding="utf-8",
+            )
+            (root / "app").mkdir()
+            (root / "app/build.gradle").write_text(
+                "plugins { id 'java' }\n",
+                encoding="utf-8",
+            )
+            row = {
+                "group_id": "org.example",
+                "artifact_id": "native-lib",
+                "version": "3.2.1",
+                "file_name": "native-lib-3.2.1-linux.jar",
+                "file_path": "/cache/native-lib-3.2.1-linux.jar",
+            }
+            report = (
+                s1_dep_diff.GRADLE_ARTIFACT_INVENTORY_PREFIX
+                + json.dumps(row)
+            )
+            commands = []
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                return report, "", 0
+
+            with patch.object(s1_dep_diff, "run_cmd", side_effect=fake_run):
+                deps, command_text = (
+                    s1_dep_diff.collect_runtime_deps_for_workspace(
+                        root,
+                        primary_module=":app",
+                        build_tool="gradle",
+                    )
+                )
+
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(any(
+            value.endswith(s1_dep_diff.GRADLE_ARTIFACT_INVENTORY_TASK)
+            for value in commands[0]
+        ))
+        self.assertNotIn("dependencies", commands[0])
+        self.assertIn("<generated-init-script>", command_text)
+        self.assertEqual(
+            set(deps),
+            {"org.example:native-lib:linux"},
+        )
+
+    def test_gradle_lock_contention_retries_only_the_same_command(self):
+        command = ["gradlew", "--no-daemon", ":app:dependencies"]
+        results = [
+            ("", "Timeout waiting to lock dependency cache", 1),
+            ("", "Could not lock file hash cache", 1),
+            ("resolved", "", 0),
+        ]
+
+        with patch.object(
+            s1_dep_diff,
+            "run_cmd",
+            side_effect=results,
+        ) as runner, patch.object(
+            s1_dep_diff.time,
+            "sleep",
+        ) as sleeper:
+            stdout, stderr, return_code, attempts = (
+                s1_dep_diff._run_gradle_command_with_lock_retry(
+                    command,
+                    cwd="/workspace",
+                )
+            )
+
+        self.assertEqual((stdout, stderr, return_code), ("resolved", "", 0))
+        self.assertEqual(attempts, 3)
+        self.assertEqual(
+            [call.args[0] for call in runner.call_args_list],
+            [command, command, command],
+        )
+        self.assertEqual(
+            [call.args[0] for call in sleeper.call_args_list],
+            [1, 3],
+        )
+        self.assertTrue(s1_dep_diff._is_gradle_lock_contention(
+            "Timeout of 120000 reached waiting for exclusive access to file: "
+            "/home/user/.gradle/wrapper/dists/gradle.zip"
+        ))
+
+    def test_gradle_inventory_lock_failure_never_starts_component_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "settings.gradle").write_text(
+                "include ':app'\n",
+                encoding="utf-8",
+            )
+            (root / "build.gradle").write_text(
+                "group = 'com.acme'\nversion = '1.0'\n",
+                encoding="utf-8",
+            )
+            (root / "app").mkdir()
+            (root / "app/build.gradle").write_text(
+                "plugins { id 'java' }\n",
+                encoding="utf-8",
+            )
+            commands = []
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                return "", "Timeout waiting to lock dependency cache", 1
+
+            with patch.object(
+                s1_dep_diff,
+                "run_cmd",
+                side_effect=fake_run,
+            ), patch.object(
+                s1_dep_diff.time,
+                "sleep",
+            ):
+                with self.assertRaises(
+                    s1_dep_diff.GradleCommandFailure
+                ) as raised:
+                    s1_dep_diff.collect_runtime_deps_for_workspace(
+                        root,
+                        primary_module=":app",
+                        build_tool="gradle",
+                    )
+
+        self.assertEqual(len(commands), 3)
+        self.assertTrue(all(
+            any(
+                value.endswith(
+                    s1_dep_diff.GRADLE_ARTIFACT_INVENTORY_TASK
+                )
+                for value in command
+            )
+            for command in commands
+        ))
+        self.assertEqual(
+            raised.exception.stage,
+            "gradle_artifact_inventory",
+        )
+        self.assertEqual(raised.exception.attempts, 3)
+        self.assertNotIn("dependencies --configuration", str(
+            raised.exception.command
+        ))
+
+    def test_gradle_inventory_api_incompatibility_allows_component_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "settings.gradle").write_text(
+                "include ':app', ':internal'\n",
+                encoding="utf-8",
+            )
+            (root / "build.gradle").write_text(
+                "allprojects {\n"
+                "  group = 'com.acme'\n"
+                "  version = '2.1.0'\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            for module in ("app", "internal"):
+                (root / module).mkdir()
+                (root / module / "build.gradle").write_text(
+                    "plugins { id 'java' }\n",
+                    encoding="utf-8",
+                )
+            fallback_report = (
+                "+--- project :internal\n"
+                "\\--- org.example:external:1.0\n"
+            )
+            results = [
+                ("", "Could not find method artifactView()", 1),
+                (fallback_report, "", 0),
+            ]
+
+            with patch.object(
+                s1_dep_diff,
+                "run_cmd",
+                side_effect=results,
+            ) as runner:
+                deps, command_text = (
+                    s1_dep_diff.collect_runtime_deps_for_workspace(
+                        root,
+                        primary_module=":app",
+                        build_tool="gradle",
+                    )
+                )
+
+        self.assertEqual(runner.call_count, 2)
+        self.assertIn("fallback=", command_text)
+        self.assertEqual(
+            set(deps),
+            {"com.acme:internal", "org.example:external"},
+        )
+        self.assertFalse(
+            s1_dep_diff._gradle_inventory_fallback_allowed(
+                "",
+                "MissingMethodException in the user's build.gradle",
+            )
+        )
+
+    def test_gradle_failure_keeps_actual_stage_and_command(self):
+        failure = s1_dep_diff.GradleCommandFailure(
+            stage="gradle_artifact_inventory",
+            command="gradlew --init-script <generated> :app:juaRuntimeArtifactInventory",
+            stdout="",
+            stderr="Timeout waiting to lock dependency cache",
+            return_code=1,
+            attempts=3,
+        )
+
+        blocked = s1_dep_diff.build_step1_command_blocked_from_exception(
+            failure,
+            default_stage="gradle_dependencies",
+            default_command=(
+                "gradlew dependencies --configuration runtimeClasspath"
+            ),
+            side="base",
+            branch="abc123",
+        )
+
+        self.assertEqual(blocked.stage, "gradle_artifact_inventory")
+        self.assertIn("juaRuntimeArtifactInventory", blocked.command)
+        self.assertNotIn(
+            "dependencies --configuration",
+            blocked.command,
+        )
+        self.assertTrue(any(
+            "文件锁" in cause
+            for cause in blocked.suspected_causes
+        ))
+
+    def test_collect_gradle_runtime_deps_maps_internal_project_coordinates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "settings.gradle").write_text(
+                "include ':app', ':internal'\n",
+                encoding="utf-8",
+            )
+            (root / "build.gradle").write_text(
+                "allprojects {\n"
+                "  group = 'com.acme'\n"
+                "  version = '2.1.0'\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            for module in ("app", "internal"):
+                (root / module).mkdir()
+                (root / module / "build.gradle").write_text(
+                    "plugins { id 'java' }\n",
+                    encoding="utf-8",
+                )
+
+            report = (
+                "runtimeClasspath - Runtime classpath of source set 'main'.\n"
+                "+--- project :internal\n"
+                "\\--- org.example:external:1.0\n"
+            )
+            with patch.object(
+                s1_dep_diff,
+                "run_cmd",
+                return_value=(report, "", 0),
+            ):
+                deps, _command = s1_dep_diff.collect_runtime_deps_for_workspace(
+                    root,
+                    primary_module=":app",
+                    build_tool="gradle",
+                )
+
+        self.assertEqual(deps["com.acme:internal"]["version"], "2.1.0")
+        self.assertEqual(
+            deps["com.acme:internal"]["remark"],
+            "source:gradle_dependencies(runtimeClasspath_project)",
+        )
+        self.assertEqual(deps["org.example:external"]["version"], "1.0")
+
+    def test_gradle_internal_project_coordinate_resolves_packaged_nested_jar(self):
+        runtime_deps = s1_dep_diff.parse_gradle_dependency_report(
+            "+--- project :internal\n",
+            project_modules=[{
+                "gradle_path": ":internal",
+                "group_id": "com.acme",
+                "artifact_id": "internal-core",
+                "version": "2.1.0",
+            }],
+        )
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                [{
+                    "entry_id": "internal-entry",
+                    "lib_entry": "BOOT-INF/lib/internal-core-2.1.0.jar",
+                    "lib_name": "internal-core-2.1.0.jar",
+                    "artifact_id": "internal-core",
+                    "version": "2.1.0",
+                    "classifier": "",
+                    "coord": "",
+                    "match_source": "filename",
+                    "filename_stem": "internal-core-2.1.0",
+                }],
+                runtime_deps,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertIn("com.acme:internal-core", resolved)
+        self.assertEqual(entries[0]["coord"], "com.acme:internal-core")
+        self.assertEqual(entries[0]["resolution_status"], "resolved")
 
     def test_collect_gradle_deps_uses_wrapper_and_target_module_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -386,6 +764,26 @@ class Step1PackagedDepsTest(unittest.TestCase):
             "org.example:helper:jar:2.0:compile (optional)"
         )
         self.assertEqual(optional["scope"], "compile")
+
+    def test_maven_dependency_list_preserves_physical_artifact_path(self):
+        unix = s1_dep_diff._parse_maven_dependency_list_line(
+            "[INFO] org.example:native-lib:jar:linux:1.2.3:runtime:"
+            "/repo/org/example/native-lib/1.2.3/native-lib-1.2.3-linux.jar"
+        )
+        windows = s1_dep_diff._parse_maven_dependency_list_line(
+            "[INFO] org.example:helper:jar:2.0:runtime:"
+            r"C:\repo\org\example\helper\2.0\renamed-helper.jar"
+        )
+
+        self.assertEqual(
+            unix["artifact_file_name"],
+            "native-lib-1.2.3-linux.jar",
+        )
+        self.assertEqual(
+            windows["artifact_file_name"],
+            "renamed-helper.jar",
+        )
+        self.assertTrue(windows["artifact_file_path"].startswith("C:"))
 
     def test_dependency_list_parser_ignores_absolute_artifact_filename(self):
         samples = (
@@ -1163,6 +1561,419 @@ class Step1PackagedDepsTest(unittest.TestCase):
             {"org.apache.shiro:shiro-core", "org.apache.shiro:shiro-core:jakarta"},
         )
 
+    def test_filename_only_classifier_is_derived_from_runtime_version(self):
+        nested = self._nested_jar_bytes([
+            ("jnr/ffi/Provider.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                f"BOOT-INF/lib/{name}",
+            )
+            for name in (
+                "jffi-1.2.23.jar",
+                "jffi-1.2.23-native.jar",
+            )
+        ]
+        runtime = {
+            "com.github.jnr:jffi": {
+                "group_id": "com.github.jnr",
+                "artifact_id": "jffi",
+                "version": "1.2.23",
+                "classifier": "",
+            },
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(
+            set(resolved),
+            {
+                "com.github.jnr:jffi",
+                "com.github.jnr:jffi:native",
+            },
+        )
+        native = next(
+            item for item in entries
+            if item["coord"] == "com.github.jnr:jffi:native"
+        )
+        self.assertEqual(native["version"], "1.2.23")
+        self.assertEqual(native["classifier"], "native")
+        self.assertEqual(
+            native["packaged_match_source"],
+            "runtime-filename-classifier",
+        )
+
+    def test_artifact_inventory_corrects_misleading_packaged_filename(self):
+        nested = self._nested_jar_bytes([
+            ("example/Real.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/renamed-9.jar",
+            )
+        ]
+        runtime = s1_dep_diff.parse_maven_dependency_list(
+            "[INFO] org.example:real-library:jar:1.4.0:runtime:"
+            "/repo/org/example/real-library/1.4.0/renamed-9.jar"
+        )
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"org.example:real-library"})
+        self.assertEqual(entries[0]["version"], "1.4.0")
+        self.assertEqual(
+            entries[0]["packaged_match_source"],
+            "runtime-artifact-inventory",
+        )
+
+    def test_artifact_inventory_precedes_plausible_filename_identity(self):
+        nested = self._nested_jar_bytes([
+            ("example/Real.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/renamed-9.jar",
+            )
+        ]
+        runtime = {
+            "org.example:real-library": {
+                "group_id": "org.example",
+                "artifact_id": "real-library",
+                "version": "1.4.0",
+                "classifier": "",
+                "artifact_file_name": "renamed-9.jar",
+            },
+            "org.wrong:renamed": {
+                "group_id": "org.wrong",
+                "artifact_id": "renamed",
+                "version": "9",
+                "classifier": "",
+            },
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"org.example:real-library"})
+        self.assertEqual(entries[0]["version"], "1.4.0")
+        self.assertEqual(
+            entries[0]["packaged_match_source"],
+            "runtime-artifact-inventory",
+        )
+
+    def test_artifact_inventory_refuses_conflicting_physical_mapping(self):
+        nested = self._nested_jar_bytes([
+            ("example/Shared.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/shared.jar",
+            )
+        ]
+        runtime = {
+            "org.first:shared": {
+                "group_id": "org.first",
+                "artifact_id": "shared",
+                "version": "1.0",
+                "classifier": "",
+                "artifact_file_name": "shared.jar",
+            },
+            "org.second:shared": {
+                "group_id": "org.second",
+                "artifact_id": "shared",
+                "version": "1.0",
+                "classifier": "",
+                "artifact_file_name": "shared.jar",
+            },
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+            )
+        )
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
+        self.assertTrue(any(
+            str(item).startswith("runtime_filename_coordinate_ambiguous:")
+            for item in entries[0]["metadata_anomalies"]
+        ))
+
+    def test_runtime_version_with_hyphen_is_not_misread_as_classifier(self):
+        nested = self._nested_jar_bytes([
+            ("example/Feature.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/example-1.2.3-native.jar",
+            )
+        ]
+        runtime = {
+            "org.example:example": {
+                "group_id": "org.example",
+                "artifact_id": "example",
+                "version": "1.2.3-native",
+                "classifier": "",
+            },
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"org.example:example"})
+        self.assertEqual(entries[0]["version"], "1.2.3-native")
+        self.assertEqual(entries[0]["classifier"], "")
+
+    def test_classifier_first_filename_is_derived_from_runtime_version(self):
+        nested = self._nested_jar_bytes([
+            ("example/Native.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/native-lib-linux-1.0.jar",
+            )
+        ]
+        runtime = {
+            "org.example:native-lib": {
+                "group_id": "org.example",
+                "artifact_id": "native-lib",
+                "version": "1.0",
+                "classifier": "",
+            },
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"org.example:native-lib:linux"})
+        self.assertEqual(entries[0]["version"], "1.0")
+        self.assertEqual(entries[0]["classifier"], "linux")
+
+    def test_runtime_filename_classifier_inference_refuses_ambiguous_ga(self):
+        nested = self._nested_jar_bytes([
+            ("example/Native.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/native-lib-1.0-linux.jar",
+            )
+        ]
+        runtime = {
+            "org.first:native-lib": {
+                "group_id": "org.first",
+                "artifact_id": "native-lib",
+                "version": "1.0",
+                "classifier": "",
+            },
+            "org.second:native-lib": {
+                "group_id": "org.second",
+                "artifact_id": "native-lib",
+                "version": "1.0",
+                "classifier": "",
+            },
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+            )
+        )
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
+        self.assertTrue(any(
+            str(item).startswith("runtime_filename_coordinate_ambiguous:")
+            for item in entries[0]["metadata_anomalies"]
+        ))
+
+    def test_source_runtime_evidence_precedes_manual_coordinate_fallback(self):
+        nested = self._nested_jar_bytes([
+            ("jnr/ffi/Provider.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/jffi-1.2.23-native.jar",
+            )
+        ]
+        runtime = {
+            "com.github.jnr:jffi": {
+                "group_id": "com.github.jnr",
+                "artifact_id": "jffi",
+                "version": "1.2.23",
+                "classifier": "",
+            },
+        }
+        manual = {
+            ("jffi", "1.2.23-native"): {
+                "group_id": "wrong.group",
+                "artifact_id": "jffi",
+                "coord": "wrong.group:jffi",
+            },
+        }
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+                manual,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"com.github.jnr:jffi:native"})
+        self.assertEqual(
+            entries[0]["packaged_match_source"],
+            "runtime-filename-classifier",
+        )
+
+    def test_new_runtime_evidence_supersedes_stale_confirmed_unresolved(self):
+        nested = self._nested_jar_bytes([
+            ("jnr/ffi/Provider.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/jffi-1.2.23-native.jar",
+            )
+        ]
+        runtime = {
+            "com.github.jnr:jffi": {
+                "group_id": "com.github.jnr",
+                "artifact_id": "jffi",
+                "version": "1.2.23",
+                "classifier": "",
+            },
+        }
+        confirmed_unresolved = [{
+            "artifact_id": "jffi",
+            "version": "1.2.23-native",
+            "source": "filename",
+        }]
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+                confirmed_unresolved_items=confirmed_unresolved,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"com.github.jnr:jffi:native"})
+        self.assertEqual(entries[0]["resolution_status"], "resolved")
+
+    def test_artifact_inventory_supersedes_stale_filename_unresolved(self):
+        nested = self._nested_jar_bytes([
+            ("example/Real.class", b"class"),
+        ])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/renamed-9.jar",
+            )
+        ]
+        runtime = s1_dep_diff.parse_maven_dependency_list(
+            "[INFO] org.example:real-library:jar:1.4.0:runtime:"
+            "/repo/org/example/real-library/1.4.0/renamed-9.jar"
+        )
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+                confirmed_unresolved_items=[{
+                    "artifact_id": "renamed",
+                    "version": "9",
+                    "source": "filename",
+                }],
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"org.example:real-library"})
+        self.assertEqual(entries[0]["resolution_status"], "resolved")
+
+    def test_direct_fat_jar_and_source_runtime_catalog_resolve_jffi_pair(self):
+        nested = self._nested_jar_bytes([
+            ("jnr/ffi/Provider.class", b"class"),
+        ])
+        runtime = {
+            "com.github.jnr:jffi": {
+                "group_id": "com.github.jnr",
+                "artifact_id": "jffi",
+                "version": "1.2.23",
+                "classifier": "",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_path = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                outer.writestr(
+                    "BOOT-INF/lib/jffi-1.2.23.jar",
+                    nested,
+                )
+                outer.writestr(
+                    "BOOT-INF/lib/jffi-1.2.23-native.jar",
+                    nested,
+                )
+            runtime_loader = Mock(return_value=runtime)
+            packaged_deps, meta = (
+                s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                    artifact_path,
+                    runtime_deps_loader=runtime_loader,
+                )
+            )
+
+        runtime_loader.assert_called_once_with()
+        self.assertEqual(
+            set(packaged_deps),
+            {
+                "com.github.jnr:jffi",
+                "com.github.jnr:jffi:native",
+            },
+        )
+        self.assertEqual(meta["unresolved_items"], [])
+
     def test_final_artifact_is_authoritative_for_bom_and_exclusion_resolution(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact_path = Path(tmp) / "app.jar"
@@ -1717,6 +2528,43 @@ class Step1PackagedDepsTest(unittest.TestCase):
             interaction["ref_resolution_requests"][0]["resolution_trigger"],
             "artifact_coordinate_enrichment",
         )
+
+    def test_artifact_enrichment_does_not_turn_pinned_commit_failure_into_checkpoint(self):
+        resolution = {
+            "status": "fetch_failed",
+            "source_status": "remote_expected_commit_unmaterializable",
+            "expected_commit": "a" * 40,
+            "observed_commit": "b" * 40,
+        }
+        with patch.object(
+            s1_dep_diff,
+            "resolve_step1_ref",
+            return_value=resolution,
+        ) as resolver, patch.object(
+            s1_dep_diff,
+            "get_runtime_deps_by_switching_branch",
+        ) as branch_call:
+            with self.assertRaises(
+                s1_dep_diff.PinnedCommitMaterializationError
+            ) as raised:
+                s1_dep_diff._collect_runtime_deps_for_artifact_input(
+                    "/same/project",
+                    "release",
+                    "/same/project",
+                    side="base",
+                    artifact_path="/tmp/base.jar",
+                    expected_commit="a" * 40,
+                    expected_remote="origin",
+                    expected_remote_ref="refs/heads/release",
+                )
+
+        self.assertIn("不能通过让用户重新选择 ref 解决", str(raised.exception))
+        self.assertEqual(resolver.call_args.kwargs["expected_remote"], "origin")
+        self.assertEqual(
+            resolver.call_args.kwargs["expected_remote_ref"],
+            "refs/heads/release",
+        )
+        branch_call.assert_not_called()
 
     def test_source_only_artifact_enrichment_requires_revision_confirmation(self):
         resolution = {

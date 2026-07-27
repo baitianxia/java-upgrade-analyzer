@@ -1185,11 +1185,107 @@ def apply_user_response_clears(updated, clear_fields):
             result.pop("accept_suggested_mappings", None)
             continue
         if field in ("base_branch", "current_branch"):
+            side = field.split("_", 1)[0]
+            result = _clear_step1_ref_state(result, side)
             result.pop(field, None)
             result.pop(f"{field}_explicit", None)
             continue
         result.pop(field, None)
     return result
+
+
+STEP1_REF_BINDING_SCHEMA = "java-upgrade-analyzer.remote-ref-binding.v1"
+STEP1_REF_STATE_SUFFIXES = (
+    "requested_ref",
+    "resolved_ref",
+    "resolved_commit",
+    "expected_commit",
+    "ref_resolution_mode",
+    "ref_resolution_fingerprint",
+    "ref_candidate_count",
+    "ref_source_status",
+    "ref_remote",
+    "ref_remote_ref",
+    "ref_queried_at",
+    "ref_binding",
+)
+
+
+def _clear_step1_ref_state(context, side):
+    updated = dict(context or {})
+    for suffix in STEP1_REF_STATE_SUFFIXES:
+        updated.pop(f"{side}_{suffix}", None)
+    updated.pop(f"{side}_allow_local_source", None)
+    updated.pop(f"{side}_allow_dirty_local_source", None)
+    return updated
+
+
+def _step1_ref_binding(
+    repo_dir,
+    requested_ref,
+    expected_commit,
+    *,
+    remote="",
+    canonical_ref="",
+    artifact_path="",
+):
+    return {
+        "schema": STEP1_REF_BINDING_SCHEMA,
+        "repo_dir": str(Path(repo_dir).resolve()) if str(repo_dir or "").strip() else "",
+        "requested_ref": str(requested_ref or "").strip(),
+        "remote": str(remote or "").strip(),
+        "canonical_ref": str(canonical_ref or "").strip(),
+        "expected_commit": str(expected_commit or "").strip(),
+        "artifact_path": (
+            str(Path(artifact_path).resolve())
+            if str(artifact_path or "").strip()
+            else ""
+        ),
+    }
+
+
+def _matching_step1_ref_binding(context, side, repo_dir):
+    binding = context.get(f"{side}_ref_binding")
+    if not isinstance(binding, dict):
+        return {}
+    expected_commit = str(context.get(f"{side}_expected_commit") or "").strip()
+    requested_ref = str(context.get(f"{side}_branch") or "").strip()
+    artifact_path = str(context.get(f"{side}_artifact_path") or "").strip()
+    expected_binding = _step1_ref_binding(
+        repo_dir,
+        requested_ref,
+        expected_commit,
+        remote=binding.get("remote"),
+        canonical_ref=binding.get("canonical_ref"),
+        artifact_path=artifact_path,
+    )
+    normalized_binding = _step1_ref_binding(
+        binding.get("repo_dir"),
+        binding.get("requested_ref"),
+        binding.get("expected_commit"),
+        remote=binding.get("remote"),
+        canonical_ref=binding.get("canonical_ref"),
+        artifact_path=binding.get("artifact_path"),
+    )
+    if (
+        binding.get("schema") != STEP1_REF_BINDING_SCHEMA
+        or not expected_commit
+        or normalized_binding != expected_binding
+    ):
+        return {}
+    return normalized_binding
+
+
+def _sanitize_step1_ref_state(context, side, repo_dir):
+    updated = dict(context or {})
+    derived_fields_present = any(
+        updated.get(f"{side}_{suffix}") not in (None, "", {}, [])
+        for suffix in STEP1_REF_STATE_SUFFIXES
+    )
+    binding = _matching_step1_ref_binding(updated, side, repo_dir)
+    if derived_fields_present and not binding:
+        updated = _clear_step1_ref_state(updated, side)
+    return updated, binding
 
 
 def merge_user_response_into_run_context(run_context, user_response, project_dir):
@@ -1199,6 +1295,30 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         return updated
     clear_fields = list(response.pop("__clear_fields", []) or [])
     response.pop("__intent_patch", None)
+
+    for side in ("base", "current"):
+        branch_field = f"{side}_branch"
+        path_fields = (
+            f"{side}_artifact_path",
+            f"{side}_source_project_dir",
+        )
+        branch_was_supplied = (
+            isinstance(response.get(branch_field), str)
+            and bool(response.get(branch_field).strip())
+        )
+        path_changed = False
+        for path_field in path_fields:
+            value = response.get(path_field)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            incoming = absolutize_path(value.strip(), project_dir)
+            existing = str(updated.get(path_field) or "").strip()
+            existing = absolutize_path(existing, project_dir) if existing else ""
+            if incoming != existing:
+                path_changed = True
+                break
+        if branch_was_supplied or path_changed:
+            updated = _clear_step1_ref_state(updated, side)
 
     primary_module_explicit = False
     if "analysis_mode" in response:
@@ -1215,19 +1335,6 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
                 updated["primary_module"] = value.strip()
             if key in ("base_branch", "current_branch"):
                 updated[f"{key}_explicit"] = True
-                side = key.split("_", 1)[0]
-                updated.pop(f"{side}_allow_local_source", None)
-                updated.pop(f"{side}_allow_dirty_local_source", None)
-                for suffix in (
-                    "requested_ref",
-                    "resolved_ref",
-                    "resolved_commit",
-                    "ref_resolution_mode",
-                    "ref_resolution_fingerprint",
-                    "ref_candidate_count",
-                ):
-                    updated.pop(f"{side}_{suffix}", None)
-                updated.pop(f"{side}_expected_commit", None)
     for key in ("jdk_base", "jdk_current", "springboot_base", "springboot_current"):
         value = response.get(key)
         if isinstance(value, (str, int, float)) and str(value).strip():
@@ -1237,6 +1344,9 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         value = response.get(expected_field)
         if isinstance(value, str) and value.strip():
             updated[expected_field] = value.strip()
+        binding = response.get(f"{side}_ref_binding")
+        if isinstance(binding, dict):
+            updated[f"{side}_ref_binding"] = dict(binding)
     for key in ("base_jdk_home", "current_jdk_home"):
         value = response.get(key)
         if isinstance(value, str) and value.strip():
@@ -3796,6 +3906,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "base_resolved_ref": resolve_value(None, merged, "base_resolved_ref", ""),
         "base_resolved_commit": resolve_value(None, merged, "base_resolved_commit", ""),
         "base_expected_commit": resolve_value(None, merged, "base_expected_commit", ""),
+        "base_ref_binding": resolve_value(None, merged, "base_ref_binding", {}),
         "base_ref_resolution_mode": resolve_value(None, merged, "base_ref_resolution_mode", ""),
         "base_ref_resolution_fingerprint": resolve_value(
             None, merged, "base_ref_resolution_fingerprint", "",
@@ -3814,6 +3925,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "current_resolved_ref": resolve_value(None, merged, "current_resolved_ref", ""),
         "current_resolved_commit": resolve_value(None, merged, "current_resolved_commit", ""),
         "current_expected_commit": resolve_value(None, merged, "current_expected_commit", ""),
+        "current_ref_binding": resolve_value(None, merged, "current_ref_binding", {}),
         "current_ref_resolution_mode": resolve_value(None, merged, "current_ref_resolution_mode", ""),
         "current_ref_resolution_fingerprint": resolve_value(
             None, merged, "current_ref_resolution_fingerprint", "",
@@ -4987,7 +5099,15 @@ def _step1_ref_repository(run_context, side, project_dir):
     return Path(source_dir).resolve() if source_dir else Path(project_dir).resolve()
 
 
-def _step1_ref_request(side, field, source_dir, resolution, *, source_only=False):
+def _step1_ref_request(
+    side,
+    field,
+    source_dir,
+    resolution,
+    *,
+    source_only=False,
+    artifact_path="",
+):
     candidates = [dict(item) for item in (resolution.get("candidates") or [])]
     for candidate in candidates:
         payload = {
@@ -5005,6 +5125,7 @@ def _step1_ref_request(side, field, source_dir, resolution, *, source_only=False
         "status": str(resolution.get("status") or "not_found"),
         "fingerprint": str(resolution.get("fingerprint") or ""),
         "source_project_dir": str(source_dir or ""),
+        "artifact_path": str(artifact_path or ""),
         "candidates": candidates,
         "source_status": str(resolution.get("source_status") or ""),
         "remote_failures": [dict(item) for item in (resolution.get("failures") or resolution.get("remote_failures") or [])],
@@ -5119,6 +5240,10 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             "type": "string",
             "description": f"内部固定值：{side_cn}确认卡中所选 ref 对应的 commit。",
         }
+        properties[f"{side}_ref_binding"] = {
+            "type": "object",
+            "description": f"内部绑定值：{side_cn}源码仓库、ref、远端与固定 commit 的一致性快照。",
+        }
         allow_local_field = f"{side}_allow_local_source"
         allow_dirty_field = f"{side}_allow_dirty_local_source"
         properties[allow_local_field] = {
@@ -5175,6 +5300,8 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             "status": item.get("status"),
             "source_status": item.get("source_status"),
             "requested_ref": item.get("requested_ref"),
+            "source_project_dir": item.get("source_project_dir"),
+            "artifact_path": item.get("artifact_path"),
             "candidates": list(item.get("candidates") or []),
         }
         for item in requests
@@ -5261,6 +5388,14 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
 def resolve_step1_refs_for_execution(run_context, project_dir):
     """Resolve explicit Step1 refs before Maven/Gradle execution."""
     updated = dict(run_context or {})
+    bindings = {}
+    for side in ("base", "current"):
+        repo_dir = _step1_ref_repository(updated, side, project_dir)
+        updated, bindings[side] = _sanitize_step1_ref_state(
+            updated,
+            side,
+            repo_dir,
+        )
     if updated.get("base_artifact_path") and updated.get("current_artifact_path"):
         # Direct artifacts are parsed first. Ref resolution is deferred until a
         # concrete unresolved nested JAR actually needs build-tool coordinate fallback.
@@ -5273,23 +5408,43 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
         source_dir = str(updated.get(source_field) or "").strip()
         repo_dir = _step1_ref_repository(updated, side, project_dir)
         if requested_ref:
+            binding = bindings.get(side) or {}
             expected_commit = str(
-                updated.get(f"{side}_expected_commit")
-                or updated.get(f"{side}_resolved_commit")
-                or ""
+                updated.get(f"{side}_expected_commit") if binding else ""
             ).strip()
             resolution = resolve_step1_ref(
                 repo_dir,
                 requested_ref,
                 expected_commit=expected_commit,
+                expected_remote=str(binding.get("remote") or ""),
+                expected_remote_ref=str(binding.get("canonical_ref") or ""),
                 allow_local_source=bool(updated.get(f"{side}_allow_local_source")),
                 allow_dirty_local_source=bool(updated.get(f"{side}_allow_dirty_local_source")),
             )
             if resolution.get("status") != "resolved":
+                if resolution.get("source_status") in {
+                    "remote_expected_commit_unmaterializable",
+                    "remote_ref_moved",
+                }:
+                    raise StepError(
+                        f"Step1 {side} 侧已固定 commit "
+                        f"{resolution.get('expected_commit') or expected_commit}，"
+                        "但 Git 服务无法物化该对象；这是远端对象可达性或权限问题，"
+                        "不会要求用户重新选择 ref。",
+                        reason_codes=[
+                            "STEP1_REMOTE_EXPECTED_COMMIT_UNMATERIALIZABLE",
+                        ],
+                    )
                 if resolution.get("expected_commit"):
                     updated[f"{side}_expected_commit"] = str(resolution.get("expected_commit") or "")
                 requests.append(
-                    _step1_ref_request(side, branch_field, source_dir or str(repo_dir), resolution)
+                    _step1_ref_request(
+                        side,
+                        branch_field,
+                        source_dir or str(repo_dir),
+                        resolution,
+                        artifact_path=updated.get(f"{side}_artifact_path"),
+                    )
                 )
                 continue
             updated[f"{side}_requested_ref"] = requested_ref
@@ -5307,6 +5462,17 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
             updated[f"{side}_ref_remote"] = str(resolution.get("remote") or "")
             updated[f"{side}_ref_remote_ref"] = str(resolution.get("remote_ref") or "")
             updated[f"{side}_ref_queried_at"] = str(resolution.get("queried_at") or "")
+            updated[f"{side}_ref_binding"] = _step1_ref_binding(
+                repo_dir,
+                requested_ref,
+                updated[f"{side}_expected_commit"],
+                remote=resolution.get("remote") or binding.get("remote"),
+                canonical_ref=(
+                    resolution.get("remote_ref")
+                    or binding.get("canonical_ref")
+                ),
+                artifact_path=updated.get(f"{side}_artifact_path"),
+            )
             continue
         if source_dir:
             resolution = resolve_step1_ref(repo_dir, "HEAD")
@@ -5317,6 +5483,7 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
                     str(repo_dir),
                     resolution,
                     source_only=True,
+                    artifact_path=updated.get(f"{side}_artifact_path"),
                 )
             )
     if requests:
@@ -7215,6 +7382,45 @@ def expand_step1_ref_selections(pending_interaction, user_response):
         commits = {str(candidate.get("commit") or "") for candidate in matches if candidate.get("commit")}
         if len(commits) == 1:
             response[f"{side}_expected_commit"] = next(iter(commits))
+
+    for side, item in decision_items.items():
+        field = str(item.get("field") or f"{side}_branch")
+        selected_ref = str(response.get(field) or "").strip()
+        expected_commit = str(
+            response.get(f"{side}_expected_commit") or ""
+        ).strip()
+        if not selected_ref or not expected_commit:
+            continue
+        matches = [
+            candidate for candidate in (item.get("candidates") or [])
+            if str(candidate.get("commit") or "").lower() == expected_commit.lower()
+            and selected_ref in {
+                str(candidate.get("ref") or ""),
+                str(candidate.get("canonical_ref") or ""),
+                str(candidate.get("display_ref") or ""),
+            }
+        ]
+        if len(matches) != 1:
+            continue
+        chosen = matches[0]
+        source_dir = str(
+            response.get(f"{side}_source_project_dir")
+            or item.get("source_project_dir")
+            or ""
+        ).strip()
+        artifact_path = str(
+            response.get(f"{side}_artifact_path")
+            or item.get("artifact_path")
+            or ""
+        ).strip()
+        response[f"{side}_ref_binding"] = _step1_ref_binding(
+            source_dir,
+            selected_ref,
+            expected_commit,
+            remote=chosen.get("remote"),
+            canonical_ref=chosen.get("canonical_ref"),
+            artifact_path=artifact_path,
+        )
     return response
 
 

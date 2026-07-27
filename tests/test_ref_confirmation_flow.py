@@ -417,8 +417,18 @@ class RefConfirmationFlowTest(unittest.TestCase):
             "requested_ref": "release",
             "source_status": "remote_source_ambiguous",
             "candidates": [
-                {"ref": "origin/release", "commit": "a" * 40},
-                {"ref": "upstream/release", "commit": "b" * 40},
+                {
+                    "ref": "origin/release",
+                    "commit": "a" * 40,
+                    "remote": "origin",
+                    "canonical_ref": "refs/heads/release",
+                },
+                {
+                    "ref": "upstream/release",
+                    "commit": "b" * 40,
+                    "remote": "upstream",
+                    "canonical_ref": "refs/heads/release",
+                },
             ],
         }
         request = run_step._step1_ref_request("base", "base_branch", "/repo", resolution)
@@ -430,6 +440,18 @@ class RefConfirmationFlowTest(unittest.TestCase):
 
         self.assertEqual(response["base_branch"], "upstream/release")
         self.assertEqual(response["base_expected_commit"], "b" * 40)
+        self.assertEqual(
+            response["base_ref_binding"],
+            {
+                "schema": "java-upgrade-analyzer.remote-ref-binding.v1",
+                "repo_dir": "/repo",
+                "requested_ref": "upstream/release",
+                "remote": "upstream",
+                "canonical_ref": "refs/heads/release",
+                "expected_commit": "b" * 40,
+                "artifact_path": "",
+            },
+        )
         run_step.validate_pending_interaction_response(interaction, response)
 
     def test_step2_uses_fixed_commits_but_keeps_branch_labels(self):
