@@ -2339,6 +2339,14 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(canonical["notes"], "修正源码目录后从 step2 重跑")
         self.assertIn("__intent_patch", canonical)
 
+    def test_build_canonical_user_response_allows_action_only_intent_patch(self):
+        canonical = run_step.build_canonical_user_response(
+            {"intent_patch": {"action": "continue"}}
+        )
+
+        self.assertEqual(canonical["action"], "continue")
+        self.assertEqual(canonical["__intent_patch"]["set"], {})
+
     def test_build_canonical_user_response_rejects_unresolved_slots(self):
         with self.assertRaises(run_step.StepError):
             run_step.build_canonical_user_response(

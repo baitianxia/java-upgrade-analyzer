@@ -40,7 +40,7 @@ class ClaudeSkillContractTest(unittest.TestCase):
         self.assertEqual(report.rerun_returncode, 4)
         self.assertEqual(report.first_state_sha256, report.rerun_state_sha256)
         self.assertTrue(report.clean_copy_without_report_state)
-        self.assertNotEqual(report.failed_resume_returncode, 0)
+        self.assertEqual(report.failed_resume_returncode, 1)
 
     def test_clean_copy_completes_public_step1_to_step6_workflow(self):
         with tempfile.TemporaryDirectory() as tmp:

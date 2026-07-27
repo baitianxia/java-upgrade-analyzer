@@ -262,12 +262,15 @@ def run_skill_contract(
             "--step", "auto",
             "--project-dir", str(fixture),
             "--report-dir", str(invalid_report_dir),
-            "--response-json", '{"intent_patch":{"action":"continue"}}',
+            "--response-json",
+            '{"intent_patch":{"action":"continue","set":"not-an-object"}}',
         ],
         fixture,
     )
-    if failed_resume.returncode == 0:
-        errors.append("invalid_resume_was_accepted")
+    if failed_resume.returncode != 1:
+        errors.append(f"invalid_resume_returncode:{failed_resume.returncode}")
+    if "intent_patch.set 必须是 JSON 对象" not in failed_resume.stderr:
+        errors.append("invalid_resume_rejection_reason_mismatch")
     completed_step = _state_completed_step(state)
     deliverables_verified = False
     successful_rerun_returncode = -1
