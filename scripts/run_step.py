@@ -135,6 +135,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "springboot_base",
     "springboot_current",
     "selected_targets",
+    "scope_mode",
     "step4_fetch_timeout",
     "step4_tool_install_timeout",
     "step4_git_diff_timeout",
@@ -946,6 +947,7 @@ def build_step_derived_snapshot(step_id, run_context, report_dir):
                 "dependency_repo_mappings",
                 "dependency_source_mappings",
                 "dependency_source_mapping_conflicts",
+                "step5_scope_mode",
                 "step5_selected_coords",
                 "step5_selected_names",
                 "unmapped_dependency_coords",
@@ -1448,6 +1450,12 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         value = normalize_step5_target_list(response.get(key), key)
         if value is not None:
             updated[key] = value
+    if response.get("scope_mode") not in (None, ""):
+        updated["step5_scope_mode"] = normalize_step5_scope_mode(
+            response.get("scope_mode"),
+            "scope_mode",
+            allow_empty=False,
+        )
 
     for key in (
         "base_file",
@@ -2622,6 +2630,15 @@ def normalize_step5_target_list(raw_value, field_name):
     return normalized
 
 
+def normalize_step5_scope_mode(raw_value, field_name="scope_mode", allow_empty=True):
+    value = str(raw_value or "").strip().lower()
+    if not value and allow_empty:
+        return ""
+    if value not in {"full", "partial"}:
+        raise StepError(f"{field_name} 仅支持 full 或 partial")
+    return value
+
+
 def _artifact_name_from_coord(coord):
     parts = [part.strip() for part in str(coord or "").strip().split(":")]
     if len(parts) < 2:
@@ -2679,10 +2696,14 @@ def build_selection_resolution(selection_options):
         return {}
     return {
         "enabled": True,
+        "purpose": "step5_scope",
         "response_field": "selected_targets",
+        "scope_mode_field": "scope_mode",
         "preferred_identifier": "coord",
         "preferred_write_fields": ["step5_selected_coords", "step5_selected_names"],
         "rules": [
+            "用户选择全量分析时，内部答复必须设置 scope_mode=full，且不要设置 selected_targets。",
+            "用户选择部分分析时，内部答复必须设置 scope_mode=partial，并把用户点名的依赖写入 selected_targets。",
             "若用户提到候选依赖，应优先输出 selected_targets，并使用 changed_dependencies.md 中的完整依赖坐标。",
             "完整依赖坐标必须严格匹配唯一目标；只有用户仅提供依赖名称时，才按 artifactId 名称筛选命中的全部候选。",
             "selected_targets 只是候选选择输入；系统会自动把它归一化为正式的 step5_selected_coords / step5_selected_names。",
@@ -3181,6 +3202,22 @@ def materialize_step5_all_changed_apis_input(all_changed_apis_path, report_dir, 
         selected_names=selected_names,
     )
     has_selection = bool(selection_summary.get("selected_coords") or selection_summary.get("selected_names"))
+    requested_scope_mode = normalize_step5_scope_mode(
+        run_context.get("step5_scope_mode"),
+        "step5_scope_mode",
+        allow_empty=True,
+    )
+    if not requested_scope_mode:
+        requested_scope_mode = "partial" if has_selection else "full"
+    if requested_scope_mode == "partial" and not has_selection:
+        raise StepError(
+            "Step5 范围协议无效：部分分析必须包含至少一个已解析的目标依赖，"
+            "不能静默回退为全量分析。"
+        )
+    if requested_scope_mode == "full" and has_selection:
+        raise StepError(
+            "Step5 范围协议无效：全量分析不能同时携带目标依赖筛选条件。"
+        )
     base_path = Path(all_changed_apis_path)
     if has_selection:
         if selection_summary.get("unmatched_coords") or selection_summary.get("unmatched_names"):
@@ -3218,6 +3255,7 @@ def materialize_step5_all_changed_apis_input(all_changed_apis_path, report_dir, 
     scope_payload = {
         "schema": "java-upgrade-analyzer.step5-selection.v1",
         "mode": effective_scope_mode,
+        "requested_mode": requested_scope_mode,
         "selection_basis": "explicit_targets" if has_selection else "all_targets",
         "selected_coords": list(selection_summary.get("selected_coords") or []),
         "selected_names": list(selection_summary.get("selected_names") or []),
@@ -3979,6 +4017,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         ),
         "step5_selected_coords": resolve_value(None, merged, "step5_selected_coords", []),
         "step5_selected_names": resolve_value(None, merged, "step5_selected_names", []),
+        "step5_scope_mode": resolve_value(None, merged, "step5_scope_mode", ""),
         "include_test_scope": (
             parse_bool_like(merged.get("include_test_scope"), "include_test_scope")
             if "include_test_scope" in merged
@@ -4131,6 +4170,11 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         result.get("step5_selected_names"),
         "step5_selected_names",
     ) or []
+    result["step5_scope_mode"] = normalize_step5_scope_mode(
+        result.get("step5_scope_mode"),
+        "step5_scope_mode",
+        allow_empty=True,
+    )
     for timeout_key in (
         "step4_git_diff_timeout",
         "step4_japicmp_timeout",
@@ -4384,6 +4428,7 @@ def _response_example_value(field, meta=None):
             "com.example:demo-lib=/abs/path/to/dependency-repo"
         ],
         "selected_targets": ["com.example:demo-lib"],
+        "scope_mode": "full",
         "step5_selected_coords": ["com.example:demo-lib"],
         "step5_selected_names": ["demo-lib"],
         "strict_risk_gate": True,
@@ -4448,6 +4493,8 @@ def _response_payload_example(action_id, required_fields, properties, overrides=
         if "strict_risk_gate" in required_fields:
             payload["strict_risk_gate"] = True
     _populate_required_response_example(payload, required_fields, properties)
+    if payload.get("selected_targets") and "scope_mode" in properties:
+        payload["scope_mode"] = "partial"
     payload.update(dict(overrides or {}))
     return _wrap_response_payload_as_intent_patch(payload)
 
@@ -4492,6 +4539,17 @@ def build_resume_command_examples(options, required_fields, properties, project_
             variants = [
                 ("采用建议映射后继续", {"accept_suggested_mappings": True}),
                 ("不采用建议映射，按最终制品证据继续", {"accept_suggested_mappings": False}),
+            ]
+        elif action_id == "continue" and "scope_mode" in properties:
+            variants = [
+                ("全量分析", {"scope_mode": "full"}),
+                (
+                    "部分分析",
+                    {
+                        "scope_mode": "partial",
+                        "selected_targets": ["<依赖包完整坐标>"],
+                    },
+                ),
             ]
         for label, overrides in variants:
             payload = _response_payload_example(
@@ -4582,6 +4640,8 @@ def _response_payload_action_example(action_id, properties, required_fields=None
         if "notes" in properties:
             payload["notes"] = "先补充信息，稍后继续"
     _populate_required_response_example(payload, required_field_list, properties)
+    if payload.get("selected_targets") and "scope_mode" in properties:
+        payload["scope_mode"] = "partial"
     return _wrap_response_payload_as_intent_patch(payload)
 
 
@@ -5571,9 +5631,19 @@ def enrich_input_normalization_contract(contract, action_requirements=None, sele
         selection_rule = "若用户提到候选对象，优先归一化为 selected_targets；若匹配到多个候选，必须先澄清。"
         if selection_rule not in rules:
             rules.append(selection_rule)
+        if selection_resolution.get("scope_mode_field") == "scope_mode":
+            for rule in (
+                "用户回复“全量分析”时归一化为 scope_mode=full，且不要设置 selected_targets。",
+                "用户回复“只分析/部分分析”并点名依赖时归一化为 scope_mode=partial，并把依赖名称或完整坐标写入 selected_targets。",
+            ):
+                if rule not in rules:
+                    rules.append(rule)
         selection_do_not = "不要把候选展示文案直接当成正式业务字段；先解析为 selected_targets 或正式主键。"
         if selection_do_not not in do_not:
             do_not.append(selection_do_not)
+        notes_do_not = "不要把全量/部分范围选择只写入 notes；notes 不参与分析范围控制。"
+        if notes_do_not not in do_not:
+            do_not.append(notes_do_not)
     payload["rules"] = rules
     if do_not:
         payload["do_not"] = do_not
@@ -5707,6 +5777,30 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
             },
         )
         payload["selection_resolution"] = selection_resolution
+    is_step4_scope_confirmation = bool(
+        step_id == "step4"
+        and selection_resolution.get("enabled")
+        and "continue" in {
+            str((item or {}).get("id") or "").strip()
+            for item in options
+        }
+    )
+    if is_step4_scope_confirmation:
+        properties.setdefault(
+            "scope_mode",
+            {
+                "type": "string",
+                "enum": ["full", "partial"],
+                "description": (
+                    "内部恢复字段，不向用户展示或要求用户填写。"
+                    "用户选择全量分析时为 full；用户点名一个或多个依赖时为 partial。"
+                ),
+            },
+        )
+        required_fields = list(payload.get("required_fields") or [])
+        if "scope_mode" not in required_fields:
+            required_fields.append("scope_mode")
+        payload["required_fields"] = required_fields
     action_requirements = normalize_action_requirements(
         payload.get("action_requirements") or {},
         options,
@@ -5810,6 +5904,7 @@ def _user_field_label(field):
         "step5_selected_coords": "系统触达证据要分析的依赖坐标",
         "step5_selected_names": "系统触达证据要分析的依赖名称",
         "selected_targets": "选择的依赖包",
+        "scope_mode": "分析范围模式",
         "strict_risk_gate": "严格门控",
         "step4_git_diff_timeout": "源码差异对比超时秒数",
         "step4_japicmp_timeout": "JApiCmp 对比超时秒数",
@@ -5844,6 +5939,7 @@ def _user_field_description(field, meta=None):
         "source_ref_selections": "从当前决策卡中按 base/current 侧选择源码 ref 方案。",
         "retry_remote_fetch": "确认远端状态已正常后，显式重新查询 ref 并重试定向 fetch。",
         "selected_targets": "从 changed_dependencies.md 的“依赖包”列复制完整坐标。",
+        "scope_mode": "系统根据用户选择写入 full（全量）或 partial（部分）；不要求用户填写。",
         "step5_selected_coords": "只分析这些依赖坐标的系统触达证据。",
         "step5_selected_names": "只分析这些依赖名称的系统触达证据。",
         "strict_risk_gate": "要求存在未确认项时不要继续产出无盲区结论。",
@@ -5873,6 +5969,7 @@ def _humanize_interaction_text(text):
         "step5_selected_coords": "系统触达证据要分析的依赖坐标",
         "step5_selected_names": "系统触达证据要分析的依赖名称",
         "selected_targets": "选择的依赖包",
+        "scope_mode": "分析范围模式",
         "selection_key": "依赖坐标",
         "action=continue": "全量分析",
         "restart_step_id": "重跑起始步骤",
@@ -7542,6 +7639,76 @@ def expand_dependency_git_ref_selections(pending_interaction, user_response):
     return response
 
 
+def _is_step4_scope_confirmation(pending_interaction, action):
+    interaction = dict(pending_interaction or {})
+    selection_resolution = dict(interaction.get("selection_resolution") or {})
+    return bool(
+        str(interaction.get("step_id") or "").strip() == "step4"
+        and str(action or "").strip() == "continue"
+        and (
+            selection_resolution.get("enabled")
+            or interaction.get("selection_options")
+        )
+    )
+
+
+def _notes_look_like_partial_scope(notes, selection_resolution):
+    text = str(notes or "").strip().lower()
+    if not text:
+        return False
+    if any(token in text for token in ("只分析", "仅分析", "部分分析", "定向分析")):
+        return True
+    for item in (selection_resolution or {}).get("options") or []:
+        coord = str((item or {}).get("coord") or "").strip().lower()
+        if coord and coord in text:
+            return True
+    return False
+
+
+def validate_step5_scope_response(pending_interaction, user_response):
+    response = dict(user_response or {})
+    action = str(response.get("action") or "").strip()
+    if not _is_step4_scope_confirmation(pending_interaction, action):
+        return
+    scope_mode = normalize_step5_scope_mode(
+        response.get("scope_mode"),
+        "scope_mode",
+        allow_empty=True,
+    )
+    selected_targets = normalize_step5_target_list(
+        response.get("selected_targets"),
+        "selected_targets",
+    ) or []
+    if not scope_mode:
+        # Old persisted checkpoints did not require scope_mode. Keep valid legacy
+        # replies working, but reject notes-only partial choices instead of
+        # silently widening them to full analysis.
+        if selected_targets:
+            scope_mode = "partial"
+        elif _notes_look_like_partial_scope(
+            response.get("notes"),
+            (pending_interaction or {}).get("selection_resolution")
+            or {
+                "options": list(
+                    (pending_interaction or {}).get("selection_options") or []
+                )
+            },
+        ):
+            raise StepError(
+                "检测到 notes 中包含部分分析选择，但 notes 不参与范围控制。"
+                "请将用户点名的依赖归一化为 selected_targets 后再恢复。"
+            )
+        else:
+            scope_mode = "full"
+    if scope_mode == "partial" and not selected_targets:
+        raise StepError(
+            "scope_mode=partial 时必须提供非空 selected_targets，"
+            "不能静默回退为全量分析。"
+        )
+    if scope_mode == "full" and selected_targets:
+        raise StepError("scope_mode=full 时不能同时提供 selected_targets。")
+
+
 def validate_pending_interaction_response(pending_interaction, user_response):
     pending_interaction = dict(pending_interaction or {})
     user_response = expand_step1_ref_selections(pending_interaction, user_response)
@@ -7632,6 +7799,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             pending_interaction.get("selection_resolution") or {},
             user_response.get("selected_targets"),
         )
+    validate_step5_scope_response(pending_interaction, user_response)
 
     if step_id == "step1" and reason_code in {
         "AMBIGUOUS_STEP1_SOURCE_REF",
@@ -7793,8 +7961,35 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
     step_id = str(target_step_id or pending_step_id or "").strip()
     if not step_id:
         return main_state, {}
-    base_context = build_restore_context(main_state, step_id)
     action = str((user_response or {}).get("action") or "").strip()
+    scope_mode = normalize_step5_scope_mode(
+        user_response.get("scope_mode"),
+        "scope_mode",
+        allow_empty=True,
+    )
+    response_has_selection = bool(
+        user_response.get("step5_selected_coords")
+        or user_response.get("step5_selected_names")
+    )
+    is_step4_scope_confirmation = _is_step4_scope_confirmation(
+        pending_interaction,
+        action,
+    ) and step_id == "step4"
+    if not scope_mode and response_has_selection:
+        scope_mode = "partial"
+    elif not scope_mode and is_step4_scope_confirmation:
+        # Backward compatibility for already-persisted checkpoints created
+        # before scope_mode became mandatory. New checkpoints require the field.
+        scope_mode = "full"
+    if scope_mode == "partial" and not response_has_selection:
+        raise StepError(
+            "部分分析必须包含至少一个已解析的目标依赖，不能通过 notes 传递选择。"
+        )
+    if scope_mode == "full" and response_has_selection:
+        raise StepError("全量分析不能同时携带目标依赖筛选条件。")
+    if scope_mode:
+        user_response["scope_mode"] = scope_mode
+    base_context = build_restore_context(main_state, step_id)
     if (
         step_id == "step4"
         and action == "continue"
@@ -8162,6 +8357,24 @@ def handle_step4_resume_followups(
             step5_input[key] = values
         else:
             step5_input.pop(key, None)
+    scope_mode = normalize_step5_scope_mode(
+        step4_input.get("step5_scope_mode"),
+        "step5_scope_mode",
+        allow_empty=True,
+    )
+    has_selection = bool(
+        step5_input.get("step5_selected_coords")
+        or step5_input.get("step5_selected_names")
+    )
+    if not scope_mode:
+        scope_mode = "partial" if has_selection else "full"
+    if scope_mode == "partial" and not has_selection:
+        raise StepError(
+            "Step5 范围恢复失败：部分分析缺少目标依赖，不能静默执行全量分析。"
+        )
+    if scope_mode == "full" and has_selection:
+        raise StepError("Step5 范围恢复失败：全量分析与目标依赖筛选条件冲突。")
+    step5_input["step5_scope_mode"] = scope_mode
     main_state["step5"]["input"] = step5_input
     save_main_state(report_dir, main_state)
     all_rows = read_csv_rows(step4_api_changes_dir(report_dir) / "all_changed_apis.csv")
@@ -8170,9 +8383,7 @@ def handle_step4_resume_followups(
         selected_coords=step5_input.get("step5_selected_coords"),
         selected_names=step5_input.get("step5_selected_names"),
     )
-    has_partial_request = bool(
-        selection.get("selected_coords") or selection.get("selected_names")
-    )
+    has_partial_request = scope_mode == "partial"
     total_high_risk = sum(1 for row in all_rows if _is_high_risk_selection_api_row(row))
     selected_high_risk = sum(
         1

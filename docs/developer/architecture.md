@@ -505,7 +505,7 @@ Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系�
 - 自动推断或用户补齐的依赖源码映射
 - 用户在 Step4 范围 checkpoint 中选择的目标 API 子集；选择全量时使用全部 Step4 API
 
-调度层在执行 Step5 前写入 `.runtime/cache/step5_selection.json`，记录全量/部分模式、纳入和排除的依赖以及 API 数量。Step6 必须读取该快照声明结论范围；快照缺失时不得默认解释为全量分析。
+调度层在执行 Step5 前写入 `.runtime/cache/step5_selection.json`，记录全量/部分模式、纳入和排除的依赖以及 API 数量。范围恢复协议内部使用 `scope_mode=full|partial`：部分模式必须同时包含非空目标依赖，全量模式不得携带筛选条件；`notes` 不参与范围控制。协议不一致时必须停止，不能静默扩大为全量分析。Step6 必须读取该快照声明结论范围；快照缺失时不得默认解释为全量分析。
 
 当 `Step5` 作为独立 CLI 运行且未显式传 `--report-dir` 时，当前实现会优先从 `all_changed_apis.csv` 所在的 `evidence/api_changes/` 目录推导报告目录；若该输入也未提供，则再回退到 `output_dir` 的父目录。
 

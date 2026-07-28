@@ -293,6 +293,14 @@
               "type": "array",
               "description": "内部恢复字段，不向用户展示或要求用户填写。系统根据用户回复的依赖名称或完整坐标自动生成。"
             },
+            "scope_mode": {
+              "type": "string",
+              "enum": [
+                "full",
+                "partial"
+              ],
+              "description": "内部恢复字段，不向用户展示或要求用户填写。全量分析为 full；部分分析为 partial，并同时生成 selected_targets。"
+            },
             "notes": {
               "type": "string",
               "description": "可选。记录本次选择全量或部分分析范围的原因。"
@@ -314,6 +322,9 @@
         ],
         "action_requirements": {
           "continue": {
+            "required_fields": [
+              "scope_mode"
+            ],
             "description": "全量分析时直接回复“全量分析”；部分分析时直接说明要分析的依赖名称或完整坐标，系统负责转换内部参数。"
           }
         }

@@ -2959,15 +2959,23 @@ class RunStepMainStateTest(unittest.TestCase):
         )
 
         normalization = interaction["input_normalization"]
-        self.assertEqual(interaction["required_fields"], ["selected_targets"])
+        self.assertEqual(
+            interaction["required_fields"],
+            ["selected_targets", "scope_mode"],
+        )
         self.assertIn("selected_targets", normalization["field_hints"])
+        self.assertIn("scope_mode", normalization["field_hints"])
         self.assertIn("selected_targets", interaction["response_schema"]["properties"])
+        self.assertIn("scope_mode", interaction["response_schema"]["properties"])
         self.assertNotIn("step5_selected_coords", interaction["response_schema"]["properties"])
         self.assertNotIn("step5_selected_names", interaction["response_schema"]["properties"])
         example = normalization["action_examples"][0]["normalized_response_example"]
         self.assertEqual(
             example["intent_patch"]["set"],
-            {"selected_targets": ["com.example:demo-lib"]},
+            {
+                "selected_targets": ["com.example:demo-lib"],
+                "scope_mode": "partial",
+            },
         )
         self.assertNotIn("step5_selected_coords", json.dumps(example, ensure_ascii=False))
 
@@ -3022,7 +3030,11 @@ class RunStepMainStateTest(unittest.TestCase):
 
         run_step.validate_pending_interaction_response(
             interaction,
-            {"action": "continue", "selected_targets": ["demo-lib"]},
+            {
+                "action": "continue",
+                "scope_mode": "partial",
+                "selected_targets": ["demo-lib"],
+            },
         )
         normalized = run_step.resolve_selected_targets(
             interaction.get("selection_resolution") or {},
@@ -3032,6 +3044,96 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(normalized["selected_targets"], ["demo-lib"])
         self.assertEqual(normalized["step5_selected_coords"], [])
         self.assertEqual(normalized["step5_selected_names"], ["demo-lib"])
+
+    def test_step4_scope_confirmation_rejects_notes_only_partial_selection(self):
+        selection_options = run_step.build_interaction_selection_options(
+            [
+                {
+                    "coord": "org.apache.seata:seata-common",
+                    "name": "seata-common",
+                },
+                {
+                    "coord": "net.sf.json-lib:json-lib:jdk15",
+                    "name": "json-lib",
+                },
+            ]
+        )
+        # Simulate a persisted checkpoint created before scope_mode was added.
+        interaction = {
+            "step_id": "step4",
+            "options": [{"id": "continue", "label": "继续"}],
+            "response_schema": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string"},
+                    "selected_targets": {"type": "array"},
+                    "notes": {"type": "string"},
+                },
+            },
+            "selection_resolution": run_step.build_selection_resolution(
+                selection_options
+            ),
+        }
+
+        with self.assertRaisesRegex(run_step.StepError, "notes 不参与范围控制"):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {
+                    "action": "continue",
+                    "notes": (
+                        "只分析 org.apache.seata:seata-common 和 "
+                        "net.sf.json-lib:json-lib:jdk15"
+                    ),
+                },
+            )
+
+    def test_step4_scope_confirmation_requires_consistent_explicit_mode(self):
+        interaction = run_step.apply_interaction_protocol_enhancements(
+            {
+                "step_id": "step4",
+                "options": [{"id": "continue", "label": "继续"}],
+                "response_schema": {
+                    "type": "object",
+                    "required": ["action"],
+                    "properties": {
+                        "action": {"type": "string"},
+                        "notes": {"type": "string"},
+                    },
+                },
+                "selection_options": [
+                    {
+                        "coord": "org.apache.seata:seata-common",
+                        "name": "seata-common",
+                    }
+                ],
+            },
+            "step4",
+        )
+
+        with self.assertRaisesRegex(run_step.StepError, "scope_mode"):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "continue", "notes": "全量分析"},
+            )
+        with self.assertRaisesRegex(run_step.StepError, "非空 selected_targets"):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {"action": "continue", "scope_mode": "partial"},
+            )
+        with self.assertRaisesRegex(run_step.StepError, "不能同时提供 selected_targets"):
+            run_step.validate_pending_interaction_response(
+                interaction,
+                {
+                    "action": "continue",
+                    "scope_mode": "full",
+                    "selected_targets": ["org.apache.seata:seata-common"],
+                },
+            )
+        run_step.validate_pending_interaction_response(
+            interaction,
+            {"action": "continue", "scope_mode": "full"},
+        )
 
     def test_step5_checkpoint_allows_selected_targets_from_step4_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4180,8 +4282,14 @@ class RunStepMainStateTest(unittest.TestCase):
 
             properties = payload["response_schema"]["properties"]
             self.assertIn("selected_targets", properties)
+            self.assertIn("scope_mode", properties)
             self.assertNotIn("step5_selected_coords", properties)
             self.assertNotIn("step5_selected_names", properties)
+            self.assertIn("scope_mode", payload["required_fields"])
+            self.assertIn(
+                "scope_mode",
+                payload["action_requirements"]["continue"]["required_fields"],
+            )
             self.assertTrue(payload["selection_resolution"]["enabled"])
             self.assertEqual(payload["selection_options"][0]["coord"], "com.example:demo-lib")
             self.assertEqual(payload["selection_options"][0]["name"], "demo-lib")
@@ -4190,6 +4298,10 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(
                 payload["recommended_selection_options"][0]["coord"],
                 "com.example:demo-lib",
+            )
+            self.assertNotIn(
+                "scope_mode",
+                "\n".join(payload["user_decision_card"]),
             )
 
     def test_apply_user_response_to_main_state_resolves_selected_targets(self):
@@ -4248,6 +4360,84 @@ class RunStepMainStateTest(unittest.TestCase):
             updated_state["step5"]["input"]["step5_selected_coords"],
             ["com.example:demo-lib"],
         )
+
+    def test_partial_scope_keeps_two_selected_dependencies_out_of_eighty_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            selected = [
+                "org.apache.seata:seata-common",
+                "net.sf.json-lib:json-lib:jdk15",
+            ]
+            coords = selected + [
+                f"com.example:dependency-{index:02d}" for index in range(79)
+            ]
+            rows = [
+                {
+                    "coord": coord,
+                    "class_name": "com.example.Demo",
+                    "member": "run()",
+                }
+                for coord in coords
+            ]
+            selection_options = run_step.build_interaction_selection_options(
+                [
+                    {
+                        "coord": coord,
+                        "name": run_step._artifact_name_from_coord(coord),
+                    }
+                    for coord in coords
+                ]
+            )
+            interaction = run_step.apply_interaction_protocol_enhancements(
+                {
+                    "step_id": "step4",
+                    "kind": "review",
+                    "options": [{"id": "continue", "label": "继续"}],
+                    "response_schema": {
+                        "type": "object",
+                        "required": ["action"],
+                        "properties": {"action": {"type": "string"}},
+                    },
+                    "selection_options": selection_options,
+                },
+                "step4",
+            )
+            response = {
+                "intent_patch": {
+                    "action": "continue",
+                    "set": {
+                        "scope_mode": "partial",
+                        "selected_targets": selected,
+                    },
+                }
+            }
+            canonical = run_step.build_canonical_user_response(response)
+            run_step.validate_pending_interaction_response(interaction, canonical)
+            state = run_step.new_main_state(report_dir)
+
+            _, context = run_step.apply_user_response_to_main_state(
+                state,
+                interaction,
+                response,
+                project_dir,
+                target_step_id="step4",
+            )
+            summary = run_step.build_step5_selection_summary(
+                rows,
+                selected_coords=context.get("step5_selected_coords"),
+                selected_names=context.get("step5_selected_names"),
+            )
+
+        self.assertEqual(context["step5_scope_mode"], "partial")
+        self.assertEqual(context["step5_selected_coords"], selected)
+        self.assertEqual(
+            {row["coord"] for row in summary["matched_rows"]},
+            set(selected),
+        )
+        self.assertEqual(summary["available_target_count"], 81)
+        self.assertEqual(summary["matched_row_count"], 2)
 
     def test_build_interaction_payload_step4_keeps_full_selection_resolution_when_display_truncated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4514,6 +4704,40 @@ class RunStepMainStateTest(unittest.TestCase):
             {row["coord"] for row in captured["selected_rows"]},
             {"com.example:demo-lib", "com.example:core-lib"},
         )
+
+    def test_materialize_step5_rejects_partial_scope_without_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            all_changed_path = (
+                self._api_changes_dir(report_dir) / "all_changed_apis.csv"
+            )
+            all_changed_path.parent.mkdir(parents=True)
+            with all_changed_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=run_step.ALL_CHANGED_APIS_FIELDS,
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "coord": "com.example:demo-lib",
+                        "api_name": "com.example.Demo.call",
+                        "api_simple": "call",
+                        "api_signature": "()",
+                        "symbol_kind": "method",
+                        "change_type": "REMOVED",
+                    }
+                )
+
+            with self.assertRaisesRegex(
+                run_step.StepError,
+                "不能静默回退为全量分析",
+            ):
+                run_step.materialize_step5_all_changed_apis_input(
+                    all_changed_path,
+                    report_dir,
+                    {"step5_scope_mode": "partial"},
+                )
 
     def test_execute_step5_rejects_unmatched_selected_targets(self):
         with tempfile.TemporaryDirectory() as tmp:

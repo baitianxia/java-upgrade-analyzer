@@ -253,12 +253,14 @@ com.example:legacy-lib
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"action":"continue","selected_targets":["com.example:legacy-lib"],"notes":"只分析所选依赖"}'
+  --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"partial","selected_targets":["com.example:legacy-lib"]}}}'
 ```
 
 说明：
 
 - 用户无需填写或理解 `selected_targets`；只需自然语言回复要分析的依赖名称或完整坐标，调度器负责生成内部字段
+- 用户回复“全量分析”时，调度器生成 `scope_mode=full`；用户点名依赖时生成 `scope_mode=partial` 和非空 `selected_targets`
+- `notes` 只用于备注，不参与分析范围控制；只在 `notes` 中记录部分选择会被拒绝，不会回退为全量分析
 - `changed_dependencies.csv` 中的 `selection_key` 仅供程序兼容解析和自动化使用，不作为人工选择入口
 - 这些选择字段必须先归一化写入 `main_state.json`
 - 正式流程中不要把选中依赖直接透传给 `s5_call_chain*.py`
@@ -272,7 +274,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"selected_targets":["com.example:legacy-lib"]}}}'
+  --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"partial","selected_targets":["com.example:legacy-lib"]}}}'
 ```
 
 - 调度器会先把 `selected_targets` 归一化为正式 `step5_selected_coords` / `step5_selected_names`，再自动桥接为从 `step5` 重跑，而不是直接卡死在“当前没有 pending interaction”

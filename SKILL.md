@@ -135,7 +135,7 @@ if gate failed or step blocked:
 4. checkpoint 转述必须先形成用户可读的“决策卡片”：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可以直接怎么回复。
 5. Claude Code 不要把 action_requirements、selection_resolution、response_schema、runtime_rules 作为普通用户的主信息；这些字段只用于构造恢复命令。
 6. Step4 后进入 Step5 的候选对象必须按依赖包维度展示，优先引用 `evidence/api_changes/changed_dependencies.md`，不要要求用户从 `all_changed_apis.csv` 中逐行挑 API。
-7. `selected_targets`、`selection_key`、`action=continue` 等是机器协议，禁止出现在面向用户的决策卡、动作说明和回复示例中。用户只需回复“全量分析”或“只分析 <依赖名称/完整坐标>”，系统负责转换内部字段。
+7. `scope_mode`、`selected_targets`、`selection_key`、`action=continue` 等是机器协议，禁止出现在面向用户的决策卡、动作说明和回复示例中。用户只需回复“全量分析”或“只分析 <依赖名称/完整坐标>”，系统负责转换内部字段。
 8. 候选未全部展示时，不能只把 `changed_dependencies.md` 列为“待复核产物”；必须明确说明它是完整依赖选择清单，并指引用户从“依赖包”列取得未展示候选后直接回复。
 9. 若 `JUA_CONFIRMATION_JSON` 提供 `user_decision_card`，必须优先展示该字段；`response_schema`、`selection_resolution`、`selected_targets` 只用于把用户自然语言答复转换成恢复输入。
 
@@ -425,7 +425,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 - 对应步骤：`step4` 成功后
 - 当 `changed_dependencies.md/csv` 中存在至少两个候选依赖时必须停下，让用户选择全部分析或只分析所选依赖；0 个候选时 Step5 没有范围可选，1 个候选时“全量”和“选择该候选”等价，均直接继续
-- 面向用户只能表述为“全量分析”或“只分析指定依赖名称/完整坐标”；`selected_targets` 仅由系统在恢复时生成，禁止要求用户理解或填写该内部字段
+- 面向用户只能表述为“全量分析”或“只分析指定依赖名称/完整坐标”；`scope_mode`、`selected_targets` 仅由系统在恢复时生成，禁止要求用户理解或填写这些内部字段
 - 决策卡必须展示全量依赖数、变化 API 数和高风险 API 数，并说明取舍：全量分析覆盖最完整但耗时可能更长；部分分析降低耗时，但 Step6 结论只能适用于所选依赖，不能表述为全局无影响
 - 真实 commit pair 歧义仍由 Step4 的专用 checkpoint 在耗时分析前处理；内部超时或证据故障记录覆盖缺口后继续，不得作为本范围 checkpoint 的用户修复问题
 - `selection_options` 只反映 Step4 依赖包维度候选；内部每个候选都应带稳定 `selection_key`，但用户卡片只展示名称或完整坐标
@@ -438,12 +438,19 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
-  --response-json '{"action":"continue","notes":"全量分析全部变化依赖"}'
+  --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"full"}}}'
 
-# 部分分析由系统把用户回复的依赖名称/完整坐标转换成内部恢复字段。
+# 部分分析：系统把用户回复的依赖名称/完整坐标转换成内部恢复字段。
+python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+  --project-dir . \
+  --report-dir .upgrade-report \
+  --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"partial","selected_targets":["com.example:legacy-lib"]}}}'
+
 # 禁止把内部字段名或恢复命令展示给用户。
 ```
 
+- `scope_mode` 是内部恢复字段：用户回复“全量分析”时写 `full`；用户回复“只分析 …”时写 `partial`，并同时生成非空 `selected_targets`
+- `notes` 只记录备注，不参与范围控制；禁止把用户点名的依赖只写入 `notes`
 - 调度层必须将确认结果写入 `.runtime/cache/step5_selection.json`；Step6 必须据此展示全量/部分范围。范围快照缺失时不得默认宣称全量分析
 
 ### Phase 8 [AUTO] Call Chain Analysis
@@ -456,7 +463,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
 - 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
 - 规则：名称筛选按 `coord` 的 `artifactId` 精确匹配；坐标筛选按 `coord` 精确匹配
-- 规则：用户只需用自然语言选择“全部分析”或说出依赖名称/完整坐标；`selected_targets`、`selection_key` 等仅是程序内部字段，禁止出现在用户卡片、回复示例和操作指引中。内部归一化后，Step5 只能分析对应唯一依赖；只有用户只给出依赖简称时，才允许按名称批量筛选
+- 规则：用户只需用自然语言选择“全部分析”或说出依赖名称/完整坐标；`scope_mode`、`selected_targets`、`selection_key` 等仅是程序内部字段，禁止出现在用户卡片、回复示例和操作指引中。内部归一化后，Step5 只能分析对应唯一依赖；只有用户只给出依赖简称时，才允许按名称批量筛选
 - 规则：筛选匹配范围只允许来自 Step4 API；Step3 平台/框架风险和类级 candidate 不得追加为 Step5 变更 API
 - 规则：显式重跑某一步前，调度层必须先清空该步骤全部正式输出，避免旧轮次的制品、目录或字节码证据混入本轮结果
 - 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
