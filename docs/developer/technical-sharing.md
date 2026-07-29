@@ -142,7 +142,9 @@ Step1 使用最终制品优先的分析方式：
 - 识别普通 jar、Spring Boot fat jar、war 等产物结构；
 - 从 `BOOT-INF/lib`、`WEB-INF/lib` 等目录提取运行时依赖；
 - 读取 jar 内 `META-INF/maven/**/pom.properties` 补 Maven 坐标；
-- 坐标缺失时结合 Maven dependency 输出和文件名补全；
+- 坐标缺失时优先结合 Maven `dependency:list` 或 Gradle `runtimeClasspath` artifact inventory 与物理文件名补全；
+- 构建输出漏掉 reactor/project 依赖身份时，只从目标模块运行时闭包补内部模块坐标：解析 Maven 有效属性或 Gradle 精确 project path，并保留构建工具已解析结果的优先级；
+- 内部模块的唯一主归档可匹配自定义 `finalName`，但项目模型不能把最终制品中不存在的模块扩展为依赖事实；
 - 把构建来源、artifact 路径、模块信息写入 `build_provenance.json`。
 
 ### 达成的效果

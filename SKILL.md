@@ -74,7 +74,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 
 ## 核心原则
 
-1. **最终产物优先**：Step1 只比较单个目标模块的最终打包依赖；输入既可以是从已固定远程 commit 构建的真实结果，也可以是用户直接提供的 base/current 编译产物路径。`boot jar/war` 读最终产物，`thin jar` / 无嵌套依赖场景直接阻塞。若 direct artifact 模式还要继续进入 Step2+，必须显式给出 `base_branch/current_branch`，不能让系统自动猜。源码永远是辅助证据，不能覆盖最终制品中的依赖、版本、类或字节码事实。
+1. **最终产物优先**：Step1 只比较单个目标模块的最终打包依赖；输入既可以是从已固定远程 commit 构建的真实结果，也可以是用户直接提供的 base/current 编译产物路径。`boot jar/war` 读最终产物，`thin jar` / 无嵌套依赖场景直接阻塞。若 direct artifact 模式还要继续进入 Step2+，必须显式给出 `base_branch/current_branch`，不能让系统自动猜。项目源码模型只可为最终制品中实际存在的内部模块补坐标，且仅限目标模块运行时闭包；不得覆盖构建工具已解析的坐标或版本，也不得扩展最终制品依赖范围。依赖源码同样永远是辅助证据，不能覆盖最终制品中的依赖、版本、类或字节码事实。
 2. **门控强制**：上一步输入不完整或门控失败，不进入下一步。
 3. **结论可追溯**：每条结论都要记录证据来源。
 4. **不猜测**：必须区分五态：`reachable` / `not_impacted` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis`。只有当前制品中的其他依赖以完全相同的类字节码保留目标 API 时才能使用 `not_impacted`；不要把“未覆盖”或“静态未找到”误写成“未影响”。
@@ -336,6 +336,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：若两种输入方式都不完整，不进入实际 Step1，而是先进入前置输入契约交互（`reason_code=missing_step1_entry_inputs`）
 - 规则：若用户首轮已明确模块范围，第一次执行 `step1` 时必须直接传 `target_module`；不得先跑 root 范围结果再靠待交互确认点纠偏
 - 规则：对 direct artifact 模式，若后续要进入 Step2+，必须显式给出 `base_branch/current_branch`；不得依赖系统自动猜测
+- 规则：坐标补全必须先消费 Maven `dependency:list` 或 Gradle artifact inventory，再用目标模块运行时闭包内的 reactor/project 模块目录补齐缺失的内部模块身份。Maven 属性继承和 Gradle project path 必须解析到有效 group、artifact、version；目标模块自身、闭包外模块、未解析占位符和 `unspecified` 版本不得进入补全目录；构建工具已解析结果优先
 - 规则：若 Step1 进入 `unresolved_dependency_coordinates_after_enrichment`，Claude Code 必须先向用户暴露 `unresolved_items`，允许用户补 `manual_coord_overrides`，或明确选择 `confirm_unresolved`；这条补丁路径同时适用于直接产物模式和 checkout_build 模式
 - 门控：执行 `step1_scope`
 
@@ -416,7 +417,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：Step1 必须把变化依赖的 base/current 内嵌 JAR 一次性提取到 `evidence/dependencies/s1_dependency_jars/`，并在 `dependency_jars.json` 记录 `coord + side + lib_entry + SHA-256 + retained_path`。正式 Step4 只能按该清单直读已固化 JAR，不得重新打开 fat JAR、递归查询嵌套归档、回退本地 Maven 仓库或下载同坐标 JAR；条目缺失或摘要不一致必须由 Step1 门控报错
 - 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
 - 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应超时；Git fetch 与 JApiCmp 工具安装不得共用一个超时字段
-- 规则：依赖坐标只由 Step1 的最终制品条目确定；内嵌 Maven 元数据无法确定坐标时，工程依赖树只用于补齐该条目。源码只能 enrich Step1 已有变化 GAV，不能再次发现依赖或新增同 GAV 行。若提供 `dependency_source_dirs`，模块定位只扫描构建清单一次，必须先按 Step1 变化坐标过滤，并设置深度和文件数上限；禁止递归扫描源码树或多轮嵌套查询。Git 地址先克隆到报告内部缓存并保留 `origin`，本地目录原样只读使用；随后用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref。只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；只有两个以上不同 commit pair、且选择会改变源码 diff 范围的真实歧义才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
+- 规则：依赖身份只由 Step1 的最终制品条目确定；内嵌 Maven 元数据无法确定坐标时，构建工具运行时输出和目标闭包内的项目模块目录只用于补齐该条目。Step4 的依赖源码只能 enrich Step1 已有变化 GAV，不能再次发现依赖或新增同 GAV 行。若提供 `dependency_source_dirs`，模块定位只扫描构建清单一次，必须先按 Step1 变化坐标过滤，并设置深度和文件数上限；禁止递归扫描源码树或多轮嵌套查询。Git 地址先克隆到报告内部缓存并保留 `origin`，本地目录原样只读使用；随后用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref。只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；只有两个以上不同 commit pair、且选择会改变源码 diff 范围的真实歧义才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
 - 规则：Step4 的远端查询失败、fetch 失败、ref 移动、未匹配、远端不可用和未授权本地兜底均属于内部源码证据故障。按错误类型完成受控重试后，不得把修复工作抛给用户，也不得猜测或静默改用本地 ref；应记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并从升级前后最终制品 JAR 对共享变化类执行同签名方法字节码指纹对比，以 `jar_bytecode` 证据补齐 `BEHAVIOR_CHANGED` 候选。只有源码 diff 或最终 JAR 方法字节码兜底至少一项完整时，该依赖的行为变化覆盖才可计为 complete；两者都失败时 `behavior_diff` 必须进入关键覆盖缺口，禁止输出完整或无影响结论。若存在真实 commit pair 歧义，必须在一张决策卡中展示全部待确认依赖；每项给出按稳定顺序排列、按 commit pair 去重的方案编号、升级前/升级后源码分支和 commit 摘要。卡片最多展示 6 个方案时必须标明总数和完整候选文件；用户可以一次回复各依赖的方案编号，也可以直接给 old_ref/new_ref，恢复前必须校验本轮所有待确认依赖均已覆盖
 - 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
 - 门控：`step4` 完成后执行 `jar_compare`

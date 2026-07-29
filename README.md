@@ -1,10 +1,10 @@
 # java-upgrade-analyzer
 
-这是一个给 Claude Code 使用的 Java 升级兼容性分析 Skill。
+这是一个给 Claude Code 使用的 Java 升级兼容性分析 Skill，用于评估 Java 运行平台、应用框架、规范迁移和项目依赖变化对业务系统的实际影响。
 
 它用于回答：
 
-> JDK、Spring、Jakarta 或依赖升级/删除后，哪些变更 API 真的会影响当前业务系统？
+> Java 工程的运行平台、框架或依赖发生变化后，哪些兼容性风险真的会影响当前业务系统？
 
 使用者只需要在 Claude Code 中描述升级场景，让 Claude Code 调用本 Skill，按交互提示补充信息，并查看最终报告。
 
@@ -12,13 +12,13 @@
 
 ## 它能做什么
 
-这个 Skill 会围绕升级前后差异建立一条可复核证据链：
+这个 Skill 会围绕变化前后的最终制品、源码和调用关系建立一条可复核证据链：
 
-- 识别依赖 jar 的新增、删除、升级；
+- 比较目标模块的升级前后最终制品，识别依赖 JAR 的新增、删除、升级和降级；
 - 识别依赖 API 的类、方法、字段变化；
 - 识别 DTO/数据对象字段新增、删除或类型变化，并判断该类型是否进入业务代码、定时任务、消息监听等系统运行路径；
-- 分析 JDK、Spring、Jakarta 等框架级迁移风险；
-- 追踪变化 API 是否被业务源码、业务字节码或运行时依赖 jar 使用；
+- 扫描 JDK 升级、Spring 等框架升级以及 `javax.* → jakarta.*` 规范/命名空间迁移风险；
+- 追踪变化 API 是否被业务源码、业务字节码或运行时依赖 JAR 使用；
 - 尽量给出完整调用链，例如“业务代码 A → 依赖 B → 依赖 C → 变更 API D”；
 - 在系统触达证据分析完成后，支持按指定方法即时查询调用链，直接返回链路文本；
 - 输出人工可复核的明细和最终汇总报告。
@@ -31,15 +31,13 @@
 
 ## 适合什么时候用
 
-推荐在这些场景使用：
+推荐在以下类型的 Java 工程变化中使用：
 
-- JDK 8 → 11 / 17 / 21；
-- Spring Boot 2.x → 3.x；
-- Spring Framework 5 → 6；
-- `javax.*` → `jakarta.*`；
-- Maven / Gradle 依赖批量升级；
-- 某个依赖 jar 被删除；
-- 想确认某个依赖 API 变化是否真正影响当前业务系统。
+- **运行平台升级**：例如 JDK 8 → 11 / 17 / 21；
+- **应用框架升级**：例如 Spring Boot 2.x → 3.x、Spring Framework 5 → 6；
+- **规范或命名空间迁移**：例如 `javax.*` → `jakarta.*`；
+- **项目依赖变化**：例如 Maven / Gradle 依赖新增、删除、升级、降级或批量调整；
+- **影响复核**：确认某个依赖或 API 的变化是否真正触达当前业务系统。
 
 ---
 
@@ -81,7 +79,7 @@ Claude Code 会负责：
 |---|---:|---|
 | 待分析工程 | 通常已知 | Claude Code 当前打开的工程；如果不是目标工程，请明确路径 |
 | 目标模块 | 必需 | 本次唯一分析的可部署模块；多模块项目必须明确 |
-| 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current jar/war |
+| 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current JAR/WAR |
 | 依赖源码路径或 Git 地址 | 可选但推荐 | 依赖包源码仓库本地路径或 HTTPS/SSH Git 地址，用于提升 API 行为变更和跨依赖调用链分析能力 |
 | 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
 
@@ -91,12 +89,14 @@ Claude Code 会负责：
 - Maven 项目优先使用对应 base/current revision 内的 `mvnw` / `mvnw.cmd`，没有 Wrapper 时才使用系统 `mvn`；分析器不规定 Maven 最低版本。
 - Gradle 项目同时支持 Groovy DSL 与 Kotlin DSL；优先使用仓库内 `gradlew` / `gradlew.bat`，没有 Wrapper 时才使用系统 `gradle`。多模块选择既可写 `app`，也可写 `:app`。
 - JDK、Maven、Gradle 均以用户工程为准。base/current 可分别使用不同 JDK；实际工具链不兼容时按真实构建命令失败原因阻塞，不会因分析器预设版本白名单提前拒绝。
-- Gradle 自动构建执行目标模块的 `build -x test`；缺失嵌套 JAR 坐标时，优先从 `runtimeClasspath` 的 resolved artifacts 采集“组件坐标 ↔ 物理文件”清单，其中 `project :module` 会按精确 Gradle project path 映射为内部模块的 group、artifact、version。不支持 artifact inventory 的旧 Gradle/插件才回退到组件依赖树；文件锁冲突只对原命令按 1 秒、3 秒退避重试，不触发组件树回退、不删除锁，也不停止其他 Gradle daemon。Maven 同样保留 `dependency:list` 输出的绝对 artifact 文件。物理文件精确匹配优先于文件名解释；构建工具未报告 classifier 时，才以清单中的完整 version 为锚唯一推导，例如将 `jffi-1.2.23-native.jar` 解析为 `com.github.jnr:jffi:native`。多个最终身份同时匹配时才保留歧义，不按文件名猜选。最终依赖版本与内容仍以实际 fat JAR / boot JAR / WAR 为准。thin JAR 本身不包含运行时依赖，不能作为正式比较结果。
+- Gradle 自动构建执行目标模块的 `build -x test`；缺失嵌套 JAR 坐标时，优先从 `runtimeClasspath` 的 resolved artifacts 采集“组件坐标 ↔ 物理文件”清单。不支持 artifact inventory 的旧 Gradle/插件才回退到组件依赖树；文件锁冲突只对原命令按 1 秒、3 秒退避重试，不触发组件树回退、不删除锁，也不停止其他 Gradle daemon。Maven 同样保留 `dependency:list` 输出的绝对 artifact 文件。
+- Maven `dependency:list` 漏掉 reactor 内部模块，或 Gradle 只返回 `ProjectComponentIdentifier` 时，Step1 会从目标模块的实际运行时闭包补齐内部模块坐标：Maven 解析继承和 `${revision}`、`${project.version}` 等有效属性，Gradle 按精确 project path 读取实际 group、artifact、version。只补目标闭包中的依赖模块，不把目标模块自身或无关 sibling 纳入依赖；构建工具已经给出的坐标和版本优先，源码模型不能覆盖它们。若内部模块存在唯一主归档，还会用该物理文件匹配自定义 `finalName`。
+- 物理文件精确匹配优先于文件名解释；构建工具未报告 classifier 时，才以清单中的完整 version 为锚唯一推导，例如将 `jffi-1.2.23-native.jar` 解析为 `com.github.jnr:jffi:native`。多个最终身份同时匹配时才保留歧义，不按文件名猜选。项目模型只帮助识别最终制品中实际存在的内部 JAR，不能扩展制品范围。最终依赖版本与内容仍以实际 Fat JAR、Spring Boot JAR 或 WAR 为准。Thin JAR 本身不包含运行时依赖，不能作为正式比较结果。
 - 依赖源码输入指的是依赖包自己的源码仓库，不是当前业务系统源码路径。既可以填写本地目录，也可以直接填写 HTTPS/SSH Git 地址；远端仓库会克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/`，不会切换或修改用户工作区。
 - Git 克隆复用当前环境已有的 SSH key 或 Git 凭据配置，并禁用交互式密码提示；地址不可达或无权限时会明确停止，不会把失败仓库当成有效源码继续分析。
 - base/current 可以使用同一个工程目录；两侧身份由各自确认后的远程分支、tag 或 commit 决定。Skill 会查询远端最新 ref、定向 fetch 并固定到具体 commit，在隔离快照中分析，不会切换或拉取你的当前分支。
 - 直接产物模式会先解析 JAR；只有依赖坐标仍缺失时才使用对应侧源码补全。Step4 的依赖源码默认只取远端：唯一 ref pair 或多个名称指向同一 commit pair 时自动采用；只有两个以上不同 commit pair、且选择会改变源码对比范围时，才把全部歧义依赖及方案编号汇总到一张决策卡中，用户可一次答全。
-- Step1 先从 fat JAR/WAR 解析坐标；坐标确认后通过一次留存遍历固化 Step4 所需的变化 JAR、Step5 所需的全部 current 运行时 JAR和业务内容。Step4、Step5 直接读取这份清单，不会再次解包 fat JAR、递归查询嵌套 JAR、读取本地 Maven 仓库或下载替代 JAR。源码只增强 Step1 已确定的 GAV，不会重新发现同坐标依赖。
+- Step1 先从 fat JAR/WAR 解析坐标；坐标确认后通过一次留存遍历固化 Step4 所需的变化 JAR、Step5 所需的全部 current 运行时 JAR和业务内容。Step4、Step5 直接读取这份清单，不会再次解包 fat JAR、递归查询嵌套 JAR、读取本地 Maven 仓库或下载替代 JAR。Step4 使用的依赖源码只增强 Step1 已确定的 GAV，不会重新发现同坐标依赖。
 - Step5 的 JAR 类型元数据 `javap` 单次超时为 30 秒；超时后对同一命令最多尝试 3 次，按 1 秒、3 秒退避。非超时错误不盲目重试；重试耗尽后只限制对应类型及相关调用路径，不会把一个类的失败提升为全部 API 的全局“未分析”。
 - 分支名只用于定位和展示，确认卡选择会同时绑定 repo、remote、canonical ref、artifact 与当时的 commit SHA。Step1 首次选定的 SHA 是固定快照；后续查询为空或 ref 已移动只触发受控重试和按原 SHA 物化，不会改用新 SHA，也不会要求用户重新确认。Step4 的依赖源码 ref 移动或不可用时不要求用户修复，而是从升级前后最终 JAR 比较同签名方法的规范化字节码，继续识别实现变化。
 - 远端 `ls-remote`/`fetch` 对超时、连接重置、临时 DNS/HTTP 5xx 等瞬时错误最多尝试 3 次，重试间隔为 1 秒、3 秒；已选定 SHA 后，定向查询中的 ref 空结果或新 commit 观测也会重试，但不会替换该 SHA。认证失败等确定性错误不重试。Step4 自动重试耗尽后会记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不会生成要求用户处理网络、权限或 ref 的确认卡，也不会静默使用本地对象；只有运行前已经明确提供 `allow_local_source=true` 时才允许采用本地兜底。若最终 JAR 方法字节码兜底也无法完成，行为变化覆盖会成为关键缺口，报告不得输出“完整”或“不受影响”结论。
@@ -231,8 +231,8 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 |---|---|
 | Step1 | 重新比较 base/current 最终依赖差异 |
 | Step2 | 重新建立升级上下文、源码和依赖映射 |
-| Step3 | 重新扫描 JDK/Spring/Jakarta 等框架级风险 |
-| Step4 | 重新比较变更依赖 jar 的 API 变化 |
+| Step3 | 重新扫描运行平台、应用框架及规范/命名空间迁移风险 |
+| Step4 | 重新比较变更依赖 JAR 的 API 变化 |
 | Step5 | 重新追踪变化 API 是否触达业务代码 |
 | Step6 | 重新生成最终报告 |
 
@@ -287,7 +287,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 | 状态 | 含义 |
 |---|---|
 | `reachable` | 已找到调用链并触达业务代码，属于确认影响 |
-| `not_impacted` | 直接制品证据证明该变更 API 仍由当前运行时依赖以完全相同的类字节码提供；仅证明该 API 未实际消失，不代表被删除 jar 的资源、SPI 或其他非 API 内容没有影响 |
+| `not_impacted` | 直接制品证据证明该变更 API 仍由当前运行时依赖以完全相同的类字节码提供；仅证明该 API 未实际消失，不代表被删除 JAR 的资源、SPI 或其他非 API 内容没有影响 |
 | `uncertain` | 有候选证据，但链路、源码映射、反射、框架或字节码证据不足，需要人工确认 |
 | `not_found_in_static_analysis` | 静态分析执行过，但当前源码、字节码和框架证据中没有找到引用路径；不等于确定无影响 |
 | `not_analyzed` | 输入缺失或工具能力不足，无法完成有效分析 |
@@ -296,7 +296,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 - `not_found_in_static_analysis` 不是“确定不影响”。
 - 反射、动态代理、运行时配置、依赖源码缺失都可能让结果进入 `uncertain` 或 `not_analyzed`。
-- 删除依赖 jar 的场景下，即使业务源码没有直接引用，运行时依赖 jar 使用了被删 API 也会进入 Step5 证据链。
+- 删除依赖 JAR 的场景下，即使业务源码没有直接引用，运行时依赖 JAR 使用了被删 API 也会进入 Step5 证据链。
 
 ---
 
@@ -306,8 +306,8 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 |---|---|---|
 | Step1 | 比较 base/current 最终依赖差异 | `evidence/dependencies/dep_changes.csv` |
 | Step2 | 建立升级上下文、源码和依赖映射 | `evidence/context/context.json` |
-| Step3 | 分析 JDK/Spring/Jakarta 等框架级风险 | `evidence/static_scan/*.csv` |
-| Step4 | 比较变更依赖 jar 的 API 变化 | `evidence/api_changes/changed_dependencies.md`、`evidence/api_changes/all_changed_apis.csv` |
+| Step3 | 分析运行平台、应用框架及规范/命名空间迁移风险 | `evidence/static_scan/*.csv` |
+| Step4 | 比较变更依赖 JAR 的 API 变化 | `evidence/api_changes/changed_dependencies.md`、`evidence/api_changes/all_changed_apis.csv` |
 | Step5 | 追踪变化 API 是否触达业务代码 | `evidence/call_chain/alerts.csv` |
 | Step6 | 生成依赖结论、API 调用关系和两份全量明细 | `deliverables/report.md`、`deliverables/all-affected-dependencies.md`、`deliverables/all-impact-details.md` |
 
@@ -341,7 +341,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 可以，但准确性会下降。
 
-没有依赖源码时，Skill 仍会尽量通过业务源码、业务字节码、运行时依赖 jar 字节码和框架适配器追踪影响。但依赖内部行为变化、跨依赖源码调用链、部分反射/配置关系可能只能给出 `uncertain` 或 `not_analyzed`。
+没有依赖源码时，Skill 仍会尽量通过业务源码、业务字节码、运行时依赖 JAR 字节码和框架适配器追踪影响。但依赖内部行为变化、跨依赖源码调用链、部分反射/配置关系可能只能给出 `uncertain` 或 `not_analyzed`。
 
 ### Step4 / Step5 很慢怎么办？
 
@@ -360,7 +360,7 @@ Step4 慢时，让 Claude Code 先查看：
 - `dependency.changed_classes`
 - `write.*`
 
-这些指标可以判断耗时主要来自 jar 定位/解压、源码 diff、JApiCmp、删除依赖符号导出、类 hash 或输出汇总。
+这些指标可以判断耗时主要来自 JAR 定位/解压、源码 diff、JApiCmp、删除依赖符号导出、类 hash 或输出汇总。
 
 Step5 慢时，让 Claude Code 查看：
 
@@ -384,11 +384,11 @@ Step5 慢时，让 Claude Code 查看：
 - `bytecode_expand`
 - `main.indirect_usage_*`
 
-不要只看总耗时猜瓶颈。运行时依赖 jar 很多、变更 API 很多、依赖间调用链很深时，Step5 会明显变慢。
+不要只看总耗时猜瓶颈。运行时依赖 JAR 很多、变更 API 很多、依赖间调用链很深时，Step5 会明显变慢。
 
 ### 没安装 japicmp 会怎样？
 
-Step4 需要 JApiCmp 做 jar API 对比。
+Step4 需要 JApiCmp 做 JAR API 对比。
 
 如果缺失，Skill 会先自动尝试安装 JApiCmp。自动安装失败时，本次执行会记录为系统环境阻塞，不会生成一项让用户决定如何处理的业务确认；安装完成前也不会继续生成不完整的 API 结论。
 

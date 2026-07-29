@@ -132,6 +132,8 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 - 以真实构建结果或用户提供的构建产物为准；
 - 多模块项目必须明确目标部署模块；
 - 不得用不完整 dependency tree 替代正式产物事实；
+- Maven/Gradle 内部模块补全只能覆盖目标模块运行时闭包，必须排除目标模块自身和无关 sibling；Maven 有效属性、Gradle project path、自定义 `finalName` 以及构建输出优先级都要有正反例；
+- 静态项目模型只能为最终制品中实际存在的内部 JAR 补身份，不能覆盖构建工具报告的不同版本，也不能扩展制品依赖范围；
 - 无法安全解析的坐标必须显式进入交互或 unresolved。
 
 ### Step4

@@ -8,7 +8,7 @@
 2. 它依赖哪些技术与内部契约
 3. 它如何在当前静态分析边界内保证结果的准确性、可追溯性和可恢复性
 
-本文于 2026-07-21 以 `main@69b60af` 为代码复核基线。五态裁决以
+本文于 2026-07-29 以 `main@e72c769` 为代码复核基线。五态裁决以
 `scripts/step5_evidence_model.py` 为准，发布裁决以 `scripts/quality_gate.py`
 为准；后续 HEAD 若发生变化，应以对应代码和当前提交上的测试结果更新本文，
 不能把本页的复核日期当成新鲜验证证据。
@@ -167,6 +167,8 @@
 
 #### 共享能力层
 
+- `scripts/analysis_contract.py`
+  - 共享项目模型：解析 Maven reactor / Gradle project graph、有效模块坐标和目标模块运行时闭包
 - `scripts/enhanced_source_analyzer.py`
   - 事实提取：AST、正则补充、调用边提取和类型推测
 - `scripts/signature_utils.py`
@@ -365,6 +367,10 @@ Step1 负责识别依赖变化范围，并建立后续分析所需的最小可�
 - 输入不足时优先进入前置交互，而不是直接失败
 - base/current 可共享同一个源码仓库路径；revision 才是两侧身份，解析后持久化 requested ref、resolved ref 与 immutable commit
 - `artifact_inputs` 先解析最终 JAR，只有坐标缺失的一侧才按需解析 ref 并运行 Maven 补全；`checkout_build` 在构建前解析两侧 ref
+- 坐标补全先采用 Maven `dependency:list` 或 Gradle `runtimeClasspath` artifact inventory；随后用 `analysis_contract.py` 建立目标模块运行时闭包内的内部模块目录，补齐构建输出遗漏的 reactor/project component 身份
+- Maven 内部模块坐标支持 reactor 父子继承以及 `${revision}`、`${project.version}` 等有效属性；Gradle 内部模块按精确 project path 读取有效 group、artifact、version
+- 内部模块目录排除目标模块自身、闭包外 sibling、`unspecified` 和未解析占位符；同坐标版本冲突时构建工具输出优先，静态源码模型不能覆盖已解析结果
+- 内部模块存在唯一主归档时，其物理文件名可匹配自定义 `finalName`；无论是否完成补全，只有最终 fat JAR / boot JAR / WAR 中实际存在的条目才能进入依赖事实
 - ref 解析通过实时 `ls-remote` 获取候选并定向 fetch 所选 ref；不会执行 pull 或改变当前 checkout。候选按 commit 去重，唯一 commit 自动采用，歧义在 Maven 前形成硬 checkpoint；交互选择同时绑定 expected commit，执行前再次校验 ref 未移动
 - 坐标补全同时拿到 source directory 与 ref 时始终优先 ref；source-only 输入必须确认 HEAD 对应的 commit，不能直接分析可变工作区
 - 所有分支构建和坐标补全使用 detached worktree，不改变用户仓库当前 HEAD 与未提交内容
@@ -420,7 +426,7 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 当前关键语义如下：
 
 - Step1 从最终制品提取变化依赖 JAR，并用 `dependency_jars.json` 固化 `side + coord + lib_entry + SHA-256 + retained_path`；Step1 门控逐项验证，正式 Step4 只直读该清单
-- JAR 坐标优先来自内嵌 Maven 元数据，无法确定时只用工程依赖树补齐对应制品条目；源码不是坐标事实源
+- JAR 坐标优先来自内嵌 Maven 元数据，无法确定时可用构建工具运行时输出和目标闭包内的项目模块目录补齐对应制品条目；项目模块目录只是与最终制品条目绑定的身份候选，Step4 的依赖源码仓库不是坐标事实源
 - `dependency_source_dirs` 是推荐入口，同时接受本地目录和 Git 地址；Git 地址先物化到 `.runtime/cache/dependency_source_git/`。模块定位仅针对 Step1 已有变化 GAV，对构建清单做一次有深度和数量上限的扫描；源码不得新增依赖行
 - `dependency_repo_mappings` 是内部派生结果
 - `s4_contract.py` 固定 `all_changed_apis.csv` 字段契约

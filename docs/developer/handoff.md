@@ -6,8 +6,8 @@
 
 ## 状态快照
 
-- 快照日期：2026-07-22（Asia/Shanghai）。
-- 交接审计起点：`main@e313356`；本次文档复核以 `main@69b60af` 为代码基线，当时本地 `main` 比 `origin/main@e24d7ab` 超前 2 个提交；后续状态必须以 `git status` 和 `git log` 为准。
+- 快照日期：2026-07-29（Asia/Shanghai）。
+- 交接审计起点：`main@e313356`；本次文档复核以 `main@e72c769` 为代码基线，当时本地 `main` 比 `origin/main@83d071e` 超前 2 个提交；后续状态必须以 `git status` 和 `git log` 为准。
 - 工程定位：供 Claude Code 使用的 Java 升级兼容性分析 Skill；它负责分析风险、输出证据和结论，不自动修改待分析工程。
 - 已核实：根目录 `TODO.md` 在 `641c39f` 清空了当时已验证完成的待办；这不代表当前工作区没有移交事项。
 - 已核实：TODO 曾记录一个未受 Git 跟踪的 `.superpowers/sdd/progress.md`，其基线停留在 `f376270` 且含有过期的 `Task 4: in progress`。2026-07-21 复核时该文件已不存在，Git 历史也无法恢复其逐行内容；它不再构成状态冲突，也不得作为正式状态源。
@@ -21,6 +21,9 @@
 - 已验证：quick/Step5 测试范围由 capability-family profile 声明生成并支持稳定分片；全部 enforced 引用可加载。核心分支覆盖为 `signature_utils` 76.09%、结论策略 88.89%，11 类生产变异全部被杀死，性质测试两轮无 flaky/超时，增强后的 quick 通过。
 - 已验证：Step5 已建立事实提取、身份、图契约、纯追踪策略、图查询、结论与渲染的单向模块边界；策略分支覆盖 92.31%。两条 `javap` 路径使用统一结构化失败，且工具失败经过 collector ingestion 后仍保留为 blocking evidence。
 - 已验证：以 `main@5b4183492cf1d026ade20590dfa20a4173aa7c7a` 为基线的当前工作区于 2026-07-22 通过完整 `release --include-real --real-case guard`：2035 项单测通过（跳过 1 项），smoke、用户场景、9 个真实项目、质量信号审计、复盘与 capability closure 全部通过，阻塞与非阻塞质量信号均为 0，发布裁决为 `release_allowed`。本机证据为 `/private/tmp/jua-final-release-2-quality-gate.json` 和 `/private/tmp/jua-final-release-2/real_project_guard.json`；这些临时路径只用于本轮复核，后续提交后应重新生成证据。
+- 已核实：Step1 会在 Maven `dependency:list` 漏项或 Gradle 只提供 project component 时，从目标模块运行时闭包补齐内部模块身份；Maven 支持 reactor 继承与属性化坐标，Gradle 使用精确 project path，并以构建工具已解析结果为优先。内部模块的唯一主归档可匹配自定义 `finalName`，闭包外模块和最终制品中不存在的模块不会被扩入正式依赖范围。
+- 已核实：Step4 范围选择已显式区分 `scope_mode=full/partial`，备注字段不能替代范围控制；确认后的选择持久化到主状态并生成 Step5 范围快照，恢复执行不会静默退回全量分析。
+- 已验证：2026-07-29 在 `main@e72c769` 加本文档同步改动的工作区中，项目模型、Step1 制品解析、范围状态恢复和 Skill 协议共 275 项定向测试通过；用户可见输出与 CSV 契约 12 项测试通过，`claude_skill_contract.py` 与 `git diff --check` 通过。该结果不是完整 release/真实项目门禁的新鲜证据。
 
 接手后先执行：
 
