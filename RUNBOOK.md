@@ -203,10 +203,12 @@ python3 scripts/quality_gate.py --profile quick --skip-real
   "blocked": false,
   "blocking_reason": null,
   "next_step_id": "step3",
-  "status": "completed",
+  "status": "ready",
   "pending_interaction": null
 }
 ```
+
+`ready` 表示上一 Step 已完成、下一 Step 尚待执行。只有 `current_step=done` 且 `completed_step=step6` 时，`status` 才能是 `completed` 或 `completed_with_limits`；不能仅凭某个中间 Step 成功就判断整个分析完成。
 
 新对话恢复时：
 
@@ -234,6 +236,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 若当前不存在 `pending_interaction`，但用户提出了新的正式业务意图，也可以继续使用 `intent_patch`
 - 这类输入不会伪装成 checkpoint 恢复；调度器会先把它桥接为主状态更新，再从推断出的目标步骤或 `restart_step_id` 重跑
 - 非 checkpoint 场景下，`intent_patch` 必须在 `set` / `clear` 中提供至少一个正式业务字段，或显式使用 `action=restart_from_step`
+- `blocked_by_system` 下可直接重新运行 `--step auto`，也可提交不带业务字段的 `action=rerun_current_step`；两种方式都只重建当前步骤及后续结果
+- 回退步骤的标准字段位置是 `intent_patch.restart_step_id`，例如 `{"intent_patch":{"action":"restart_from_step","restart_step_id":"step2","set":{}}}`
 
 ### Step4 后按单依赖包进入 Step5
 

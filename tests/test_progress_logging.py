@@ -192,6 +192,8 @@ class ProgressLoggingTest(unittest.TestCase):
         self.assertEqual(event["phase"], "dependency")
         self.assertEqual(event["item"], "com.acme:demo")
         self.assertEqual(event["estimated_remaining_sec"], 1.25)
+        self.assertEqual(event["percentage"], 50.0)
+        self.assertIn("[50.0%]", stderr.getvalue())
         self.assertIn("预计剩余约 1.2s", stderr.getvalue())
 
 

@@ -281,6 +281,7 @@ class Step1ObservabilityTest(unittest.TestCase):
         self.assertIn(observability / "step4_timing.csv", step4_paths)
         self.assertIn(observability / "step5_timing.csv", step5_paths)
         self.assertIn(observability / "step5_diagnostics.jsonl", step5_paths)
+        self.assertIn(observability / "step5_progress.json", step5_paths)
 
     def test_step4_timing_records_resources_and_external_processes(self):
         with tempfile.TemporaryDirectory() as tmp:

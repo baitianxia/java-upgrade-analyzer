@@ -47,6 +47,34 @@ class Step5LiveDiagnosticsTest(unittest.TestCase):
         self.assertEqual(events[0]["total"], 1972)
         self.assertEqual(events[0]["failure_count"], 1)
 
+    def test_trace_progress_snapshot_includes_successful_completed_apis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = Step5DiagnosticRecorder(
+                tmp,
+                progress_flush_interval_seconds=0,
+            )
+            recorder.start_trace(2)
+            result = SimpleNamespace(
+                analysis_status="reachable",
+                reason_code="",
+            )
+
+            recorder.record_trace_result(result, 1, 2)
+            progress = json.loads(recorder.progress_path.read_text(encoding="utf-8"))
+            diagnostic_lines = recorder.path.read_text(encoding="utf-8").splitlines()
+
+            self.assertEqual(progress["completed"], 1)
+            self.assertEqual(progress["total"], 2)
+            self.assertEqual(progress["percentage"], 50.0)
+            self.assertEqual(progress["status"], "running")
+            self.assertEqual(diagnostic_lines, [])
+
+            recorder.finish_trace(2, 2)
+            completed = json.loads(recorder.progress_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(completed["completed"], 2)
+        self.assertEqual(completed["status"], "completed")
+
     def test_global_artifact_coverage_stops_on_first_affected_api(self):
         with tempfile.TemporaryDirectory() as tmp:
             recorder = Step5DiagnosticRecorder(tmp)

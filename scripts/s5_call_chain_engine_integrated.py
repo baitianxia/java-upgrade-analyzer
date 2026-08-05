@@ -2230,6 +2230,7 @@ def _step5_integrated_main_impl(args):
         item=f'{len(all_apis)} APIs',
         message=f'正在反向追踪 {len(all_apis)} 个变更 API 的业务调用链',
     )
+    diagnostics.start_trace(len(all_apis))
 
     try:
         all_results = trace_all_apis_with_confidence_weighting(
@@ -2246,6 +2247,7 @@ def _step5_integrated_main_impl(args):
                 )
             ),
         )
+        diagnostics.finish_trace(len(all_results), len(all_apis))
     except Step5GlobalCoverageBlocked as exc:
         timing.finish_phase(
             trace_timing_token,

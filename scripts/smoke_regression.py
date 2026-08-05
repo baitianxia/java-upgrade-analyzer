@@ -2771,7 +2771,7 @@ return ExtraApi.callLegacy();
     assert_true(rc == 0, "Step4 只有一个变化依赖时不应伪造部分范围选择")
     interactive_step4_ckpt = read_json(main_state_path(interactive_step4_report))
     assert_true(
-        main_state_meta(interactive_step4_ckpt).get("status") == "completed"
+        main_state_meta(interactive_step4_ckpt).get("status") == "ready"
         and main_state_meta(interactive_step4_ckpt).get("current_step") == "step5",
         "Step4 单一候选成功后应直接进入 Step5",
     )
@@ -5996,7 +5996,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     step4_ckpt = read_json(main_state_path(orchestrated_report))
     assert_true(
-        main_state_meta(step4_ckpt).get("status") == "completed"
+        main_state_meta(step4_ckpt).get("status") == "ready"
         and main_state_meta(step4_ckpt).get("current_step") == "step5",
         "step4 单一候选完成后主状态未指向 Step5",
     )

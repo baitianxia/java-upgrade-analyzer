@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -53,8 +53,10 @@ from pipeline_constants import (
     STEP5_ARTIFACT_BYTECODE_DIRNAME,
     STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
     STEP5_DIAGNOSTICS_FILE,
+    STEP5_PROGRESS_FILE,
     STEP5_QUERY_INDEX_FILE,
     STEP_SEQUENCE,
+    UNCERTAINTY_KIND_ANALYSIS_LIMITATION,
 )
 from s4_contract import (
     ALL_CHANGED_APIS_FIELDS,
@@ -76,6 +78,7 @@ CHECKPOINT_RULES_FILE = SKILL_DIR / "CHECKPOINT_RULES.md"
 EXIT_AWAITING_USER = 4
 EXIT_INTERRUPTED = 130
 MAIN_STATE_FILE_NAME = "main_state.json"
+TERMINAL_WORKFLOW_STATUSES = {"completed", "completed_with_limits"}
 USER_TASK_NAMES = {
     "step1": "分析对象与依赖范围",
     "step2": "升级上下文",
@@ -788,6 +791,15 @@ def ensure_main_state_structure(data, report_dir, manifest_path=""):
     if manifest_path:
         merged_state["manifest_path"] = str(Path(manifest_path).resolve())
     merged_state["saved_at"] = datetime.now().isoformat()
+    current_step = str(merged_state.get("current_step") or "").strip()
+    if current_step != "done":
+        # Before this invariant was introduced, every successful individual
+        # step persisted ``completed`` even though another step was still
+        # pending.  Normalize those durable states on read/write so consumers
+        # can reserve terminal statuses for a finished workflow.
+        if str(merged_state.get("status") or "").strip() in TERMINAL_WORKFLOW_STATUSES:
+            merged_state["status"] = "ready"
+        merged_state["completion_summary"] = None
     merged["state"] = merged_state
     for step_id in STEP_SEQUENCE:
         step_data = data.get(step_id) if isinstance(data.get(step_id), dict) else {}
@@ -1084,6 +1096,20 @@ def normalize_intent_patch(raw_patch):
     set_payload = patch.get("set") or {}
     if set_payload and not isinstance(set_payload, dict):
         raise StepError("intent_patch.set 必须是 JSON 对象。")
+    normalized_set_payload = dict(set_payload or {})
+    nested_restart_step_id = str(
+        normalized_set_payload.pop("restart_step_id", "") or ""
+    ).strip()
+    restart_step_id = str(patch.get("restart_step_id") or "").strip()
+    if (
+        restart_step_id
+        and nested_restart_step_id
+        and restart_step_id != nested_restart_step_id
+    ):
+        raise StepError(
+            "intent_patch.restart_step_id 与 "
+            "intent_patch.set.restart_step_id 冲突。"
+        )
     clear_fields = patch.get("clear") or []
     if clear_fields and not isinstance(clear_fields, list):
         raise StepError("intent_patch.clear 必须是字符串数组。")
@@ -1091,7 +1117,7 @@ def normalize_intent_patch(raw_patch):
     if unresolved_slots and not isinstance(unresolved_slots, list):
         raise StepError("intent_patch.unresolved_slots 必须是字符串数组。")
     unknown_fields = sorted(
-        key for key in (set_payload or {}).keys()
+        key for key in normalized_set_payload.keys()
         if key not in INTENT_PATCH_ALLOWED_SET_FIELDS
     )
     if unknown_fields:
@@ -1115,9 +1141,9 @@ def normalize_intent_patch(raw_patch):
             normalized_unresolved.append(field)
     return {
         "action": str(patch.get("action") or "").strip(),
-        "set": dict(set_payload or {}),
+        "set": normalized_set_payload,
         "clear": normalized_clear,
-        "restart_step_id": str(patch.get("restart_step_id") or "").strip(),
+        "restart_step_id": restart_step_id or nested_restart_step_id,
         "notes": str(patch.get("notes") or "").strip(),
         "unresolved_slots": normalized_unresolved,
     }
@@ -1621,8 +1647,80 @@ def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
     heartbeat_interval = max(0.01, heartbeat_interval)
     heartbeat_step_id = SCRIPT_STEP_IDS.get(script_name, "")
 
+    def load_step5_progress_snapshot():
+        if heartbeat_step_id != "step5" or report_dir is None:
+            return {}
+        path = runtime_observability_dir(report_dir) / STEP5_PROGRESS_FILE
+        try:
+            payload = read_json(path)
+            completed = int(payload.get("completed"))
+            total = int(payload.get("total"))
+            elapsed_sec = float(payload.get("elapsed_sec"))
+            updated_at = datetime.fromisoformat(
+                str(payload.get("updated_at") or "").replace("Z", "+00:00")
+            )
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if (
+            payload.get("schema") != "java-upgrade-analyzer.step5-progress.v1"
+            or payload.get("step_id") != "step5"
+            or payload.get("phase") != "trace"
+            or total <= 0
+            or completed < 0
+            or completed > total
+            or elapsed_sec < 0
+        ):
+            return {}
+        age_sec = max(
+            0.0,
+            (datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds(),
+        )
+        return {
+            "completed": completed,
+            "total": total,
+            "elapsed_sec": elapsed_sec,
+            "age_sec": age_sec,
+        }
+
     def heartbeat_loop():
         while not heartbeat_stop.wait(heartbeat_interval):
+            snapshot = load_step5_progress_snapshot()
+            if snapshot:
+                completed = snapshot["completed"]
+                total = snapshot["total"]
+                age_sec = snapshot["age_sec"]
+                snapshot_is_fresh = age_sec <= max(10.0, heartbeat_interval * 2)
+                eta_is_reliable = (
+                    snapshot_is_fresh
+                    and completed > 1
+                    and snapshot["elapsed_sec"] >= 10.0
+                    and completed < total
+                )
+                message = (
+                    "任务仍在执行，API 追踪完成数持续更新。"
+                    if snapshot_is_fresh
+                    else (
+                        "任务仍在执行；最近确认的 API 完成数已有 "
+                        f"{int(age_sec)} 秒无新增完成项，当前可能正在处理耗时对象。"
+                    )
+                )
+                emit_progress(
+                    heartbeat_step_id,
+                    "heartbeat",
+                    message,
+                    current=completed,
+                    total=total,
+                    elapsed=(
+                        snapshot["elapsed_sec"]
+                        if snapshot_is_fresh
+                        else time.perf_counter() - heartbeat_started
+                    ),
+                    report_dir=report_dir,
+                    estimate_remaining=eta_is_reliable,
+                )
+                continue
             emit_progress(
                 heartbeat_step_id,
                 "heartbeat",
@@ -8256,10 +8354,18 @@ def apply_non_pending_structured_response(args, project_dir, report_dir, main_st
             "user_response": user_response,
             "early_exit_code": 0,
         }
-    if response_action != "restart_from_step" and not has_non_pending_intent_payload(user_response):
+    action_without_business_payload = {
+        "rerun_current_step",
+        "restart_from_step",
+    }
+    if (
+        response_action not in action_without_business_payload
+        and not has_non_pending_intent_payload(user_response)
+    ):
         raise StepError(
             "当前没有待恢复的 pending interaction。若要提交新的正式业务意图，"
-            "请在 intent_patch.set / clear 中提供至少一个业务字段，或使用 action=restart_from_step。"
+            "请在 intent_patch.set / clear 中提供至少一个业务字段，"
+            "或使用 action=rerun_current_step / restart_from_step。"
         )
     target_step_id = resolve_non_pending_structured_response_step(args, main_state, user_response)
     synthetic_interaction = build_non_pending_structured_response_interaction(
@@ -8637,6 +8743,18 @@ def build_final_completion_summary(report_dir):
     high_risk_count = sum(len(findings.get(key) or []) for key in ("p0", "p1"))
     probable_count = len(findings.get("probable_impact") or [])
     uncertain_count = len(findings.get("uncertain") or [])
+    uncertain_candidate_count = sum(
+        1
+        for item in (findings.get("uncertain") or [])
+        if str((item or {}).get("uncertainty_kind") or "").strip()
+        != UNCERTAINTY_KIND_ANALYSIS_LIMITATION
+    )
+    uncertain_analysis_limitation_count = sum(
+        1
+        for item in (findings.get("uncertain") or [])
+        if str((item or {}).get("uncertainty_kind") or "").strip()
+        == UNCERTAINTY_KIND_ANALYSIS_LIMITATION
+    )
     needs_input_count = len(findings.get("needs_input") or [])
     not_analyzed_count = sum(
         1
@@ -8712,8 +8830,15 @@ def build_final_completion_summary(report_dir):
         limitations.append("关键证据覆盖状态无法确认")
     if probable_count:
         limitations.append(f"{probable_count} 项只能判定为可能影响")
-    if uncertain_count:
-        limitations.append(f"{uncertain_count} 项存在候选证据但结论未确定")
+    if uncertain_candidate_count:
+        limitations.append(
+            f"{uncertain_candidate_count} 项存在候选证据但结论未确定"
+        )
+    if uncertain_analysis_limitation_count:
+        limitations.append(
+            f"{uncertain_analysis_limitation_count} 项受静态分析能力边界限制，"
+            "未发现候选调用证据且结论未确定"
+        )
     dependency_incomplete_count = int(
         dependency_model.get("incomplete_count") or 0
     )
@@ -8753,6 +8878,10 @@ def build_final_completion_summary(report_dir):
         "high_risk_count": high_risk_count,
         "probable_count": probable_count,
         "uncertain_count": uncertain_count,
+        "uncertain_candidate_count": uncertain_candidate_count,
+        "uncertain_analysis_limitation_count": (
+            uncertain_analysis_limitation_count
+        ),
         "needs_input_count": needs_input_count,
         "not_analyzed_count": not_analyzed_count,
         "diagnostic_count": diagnostic_count,
@@ -8791,7 +8920,11 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
         main_state,
         current_step=next_step or "done",
         completed_step=step_id,
-        status=(completion_summary or {}).get("status") or "completed",
+        status=(
+            (completion_summary or {}).get("status") or "completed"
+            if next_step is None
+            else "ready"
+        ),
         blocking_reason=None,
         blocking_reason_codes=[],
         pending_interaction=None,
@@ -9030,6 +9163,7 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             step5_call_chain_dir(report_dir),
             runtime_observability_dir(report_dir) / "step5_timing.csv",
             runtime_observability_dir(report_dir) / STEP5_DIAGNOSTICS_FILE,
+            runtime_observability_dir(report_dir) / STEP5_PROGRESS_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME,

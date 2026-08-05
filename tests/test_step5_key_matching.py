@@ -4541,6 +4541,15 @@ public class com.example.TargetBridge {
         self.assertEqual(updated.analysis_status, "uncertain")
         self.assertIsNone(updated.is_reachable)
         self.assertEqual(updated.reason_code, "INLINED_CONSTANT_USAGE_UNDETECTABLE")
+        entry = formatter.trace_result_to_api_entry(updated)
+        alert = formatter._alert_rows_for_result(updated)[0]
+        self.assertEqual(entry["uncertainty_kind"], "analysis_limitation")
+        self.assertEqual(alert["uncertainty_kind"], "analysis_limitation")
+        self.assertEqual(alert["path_occurrence_count"], 0)
+        self.assertEqual(alert["conclusion"], "结论未确定（静态分析能力边界）")
+        self.assertIn("未发现候选调用证据", alert["chain_summary"])
+        self.assertIn("编译期常量可能已内联", alert["chain_detail"])
+        self.assertNotIn("存在候选证据", alert["chain_detail"])
 
     def test_field_type_change_is_not_treated_as_an_inlined_constant(self):
         self.assertFalse(tracer._is_inlined_constant_change({
@@ -12230,13 +12239,14 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         self.assertEqual(2, summary["meta"]["graph_stats"]["parser_usage"]["regex"])
 
     def test_alerts_csv_is_a_focused_human_review_table(self):
-        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 32)
+        self.assertLessEqual(len(formatter.ALERTS_CSV_FIELDNAMES), 33)
         self.assertIn("chain_detail", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("path_text", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("api_signature", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("symbol_kind", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("compile_impact", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("runtime_link_impact", formatter.ALERTS_CSV_FIELDNAMES)
+        self.assertIn("uncertainty_kind", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertIn("business_entry", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("conclusion_level", formatter.ALERTS_CSV_FIELDNAMES)
         self.assertNotIn("action_type", formatter.ALERTS_CSV_FIELDNAMES)
@@ -22953,6 +22963,11 @@ public class com.example.consumer.Adapter {
         rendered = formatter.trace_result_to_api_entry(result)
         self.assertEqual(rendered["compile_impact"], "recompile_break")
         self.assertEqual(rendered["runtime_link_impact"], "inlined_no_link")
+        self.assertEqual(rendered["uncertainty_kind"], "candidate_evidence")
+        alert = formatter._alert_rows_for_result(result)[0]
+        self.assertEqual(alert["uncertainty_kind"], "candidate_evidence")
+        self.assertEqual(alert["conclusion"], "结论未确定（存在候选证据）")
+        self.assertGreater(alert["path_occurrence_count"], 0)
 
     def test_constant_field_bytecode_hit_reports_runtime_link_present(self):
         api_row = {

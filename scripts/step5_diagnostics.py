@@ -9,16 +9,21 @@ discovered instead of only after every API has been traced and rendered.
 from __future__ import annotations
 
 import json
+import os
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 from diagnostic_contract import canonical_reason_code, normalize_diagnostic_payload
+from pipeline_constants import STEP5_PROGRESS_FILE
 from progress_logging import emit_progress
 
 
 STEP5_DIAGNOSTICS_SCHEMA = "java-upgrade-analyzer.step5-diagnostics.v1"
+STEP5_PROGRESS_SCHEMA = "java-upgrade-analyzer.step5-progress.v1"
 _SAMPLE_LIMIT = 5
+_PROGRESS_FLUSH_INTERVAL_SECONDS = 1.0
 
 
 def _failure_sample(failure):
@@ -34,7 +39,13 @@ def _failure_sample(failure):
 class Step5DiagnosticRecorder:
     """Write bounded, immediately readable Step5 diagnostic events."""
 
-    def __init__(self, report_dir, *, reset=True):
+    def __init__(
+        self,
+        report_dir,
+        *,
+        reset=True,
+        progress_flush_interval_seconds=_PROGRESS_FLUSH_INTERVAL_SECONDS,
+    ):
         self.report_dir = Path(report_dir).resolve()
         self.path = (
             self.report_dir
@@ -42,10 +53,101 @@ class Step5DiagnosticRecorder:
             / "observability"
             / "step5_diagnostics.jsonl"
         )
+        self.progress_path = self.path.with_name(STEP5_PROGRESS_FILE)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if reset:
             self.path.write_text("", encoding="utf-8")
+            try:
+                self.progress_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         self._trace_reason_counts = Counter()
+        self._trace_started_at = ""
+        self._trace_started_perf = None
+        self._last_progress_flush_perf = 0.0
+        self._latest_progress = {}
+        try:
+            interval = float(progress_flush_interval_seconds)
+        except (TypeError, ValueError):
+            interval = _PROGRESS_FLUSH_INTERVAL_SECONDS
+        self._progress_flush_interval_seconds = max(0.0, interval)
+
+    def _write_progress_snapshot(self, payload):
+        temporary_path = self.progress_path.with_name(
+            f".{self.progress_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            with temporary_path.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+            os.replace(temporary_path, self.progress_path)
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+        finally:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def start_trace(self, total):
+        self._trace_started_at = datetime.now(timezone.utc).isoformat()
+        self._trace_started_perf = time.perf_counter()
+        self._last_progress_flush_perf = 0.0
+        self._latest_progress = {}
+        return self.record_trace_progress(0, total, force=True)
+
+    def record_trace_progress(self, completed, total, *, force=False, status="running"):
+        try:
+            completed = int(completed)
+            total = int(total)
+        except (TypeError, ValueError):
+            return {}
+        if total < 0 or completed < 0 or completed > total:
+            return {}
+        previous = dict(self._latest_progress or {})
+        if previous:
+            previous_total = int(previous.get("total") or 0)
+            previous_completed = int(previous.get("completed") or 0)
+            if previous_total != total or completed < previous_completed:
+                return previous
+        if self._trace_started_perf is None:
+            self._trace_started_at = datetime.now(timezone.utc).isoformat()
+            self._trace_started_perf = time.perf_counter()
+            force = True
+        now_perf = time.perf_counter()
+        elapsed = max(0.0, now_perf - self._trace_started_perf)
+        payload = {
+            "schema": STEP5_PROGRESS_SCHEMA,
+            "step_id": "step5",
+            "phase": "trace",
+            "status": str(status or "running"),
+            "completed": completed,
+            "total": total,
+            "percentage": round(100.0 * completed / total, 3) if total else 100.0,
+            "trace_started_at": self._trace_started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "elapsed_sec": round(elapsed, 3),
+        }
+        self._latest_progress = payload
+        should_flush = (
+            force
+            or completed == total
+            or now_perf - self._last_progress_flush_perf
+            >= self._progress_flush_interval_seconds
+        )
+        if should_flush and self._write_progress_snapshot(payload):
+            self._last_progress_flush_perf = now_perf
+        return payload
+
+    def finish_trace(self, completed, total):
+        return self.record_trace_progress(
+            completed,
+            total,
+            force=True,
+            status="completed",
+        )
 
     def record(
         self,
@@ -144,6 +246,7 @@ class Step5DiagnosticRecorder:
         return events
 
     def record_trace_result(self, result, current, total):
+        self.record_trace_progress(current, total)
         status = str(getattr(result, "analysis_status", "") or "")
         reason_code = canonical_reason_code(
             getattr(result, "reason_code", "") or "UNKNOWN"
@@ -181,5 +284,6 @@ class Step5DiagnosticRecorder:
 
 __all__ = [
     "STEP5_DIAGNOSTICS_SCHEMA",
+    "STEP5_PROGRESS_SCHEMA",
     "Step5DiagnosticRecorder",
 ]

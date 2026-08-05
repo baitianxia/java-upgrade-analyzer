@@ -253,7 +253,9 @@ Step5 的两条 `javap` 路径已迁移到 `tool_execution.py`。命令启动失
 - `completed_step`
   - 最近一个已完成并已写回主状态的步骤
 - `status`
-  - 当前运行态，如 `idle`、`ready`、`completed`、`awaiting_user_input`、`blocked_by_system`
+  - 当前运行态，如 `idle`、`ready`、`completed`、`completed_with_limits`、`awaiting_user_input`、`blocked_by_system`
+  - `ready` 表示上一 Step 已完成、`current_step` 指向下一待执行 Step
+  - `completed` / `completed_with_limits` 只表示整个流程终态；此时必须同时满足 `current_step=done`、`completed_step=step6`
 - `blocking_reason`
   - 当前阻塞原因
 - `pending_interaction`
@@ -262,6 +264,7 @@ Step5 的两条 `javap` 路径已迁移到 `tool_execution.py`。命令启动失
   - 最近一次已归一化并写回主状态的结构化用户答复
 
 这些字段由调度层维护。步骤脚本不直接实现状态机迁移。
+读取历史状态时，调度层会将“`current_step` 尚未结束但 `status=completed*`”的旧状态归一化为 `ready`，避免把局部步骤成功误认为全流程完成。
 
 ### 展示文件与证据文件
 

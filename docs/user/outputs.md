@@ -105,6 +105,7 @@ base/current 即使使用同一个源码目录，也会按各自确认后的 com
 | `.runtime/observability/step4_timing.csv` | Step4 当前执行阶段及耗时；按依赖并行记录源码 diff、JApiCmp、数据契约、行为字节码兜底和结果写入等 start/end 事件。以相同 `phase + coord + old_version + new_version` 的最后一条状态判断任务是否仍在运行 |
 | `.runtime/observability/step5_timing.csv` | Step5 当前执行阶段及耗时；`activity` 段实时显示输入解析、建图、字节码扫描、框架适配、间接引用、证据合并、调用链追踪和报告写入，最终追加性能指标；`memory` 段同时记录主进程与完整子进程树的当前/峰值内存、CPU、外部命令次数/并发/墙钟时间、临时文件高水位及图规模 |
 | `.runtime/observability/step5_diagnostics.jsonl` | Step5 实时诊断台账；制品、字节码、框架和逐 API 追踪一旦发现失败就追加原因码、阻断属性、作用域、计数与样例，不必等待最终 `summary.json` |
+| `.runtime/observability/step5_progress.json` | Step5 当前追踪进度快照；`completed/total` 只在单个 API 完成后推进，供心跳显示可靠完成比例。该文件是运行观测状态，不是分析结论证据 |
 
 Step5 的 stderr 会由正式调度器实时转发，因此诊断事件也会立即出现在终端。核心制品身份、安全性或全局业务字节码证据失效时，Step5 会写入 `artifact_preflight_failure.json` 并立即停止；路径级歧义只限制相关路径，其他 API 继续分析。
 
@@ -181,7 +182,7 @@ Step4 还会从 old/current 最终 JAR 识别 DTO/数据对象的实例字段新
 
 最终会同时生成 `deliverables/analysis-scope.md`，把运行时范围快照转换为可直接核对的纳入/排除依赖清单和 API 数量。根目录 `README.md` 只展示本轮实际存在的文件，并使用可点击的相对链接；若流程正在等待确认，确认问题、选项和回复示例也会保留在该入口中。
 
-完成状态分为“分析已完成”和“分析已完成，但存在结论限制”。部分范围、关键证据覆盖不完整、可能影响、存在候选证据但结论未确定、本次未完成或证据读取异常均属于后者。
+完成状态分为“分析已完成”和“分析已完成，但存在结论限制”。部分范围、关键证据覆盖不完整、可能影响、结论未确定、本次未完成或证据读取异常均属于后者。结论未确定会进一步区分“存在候选证据”和“静态分析能力边界”，后者表示当前没有候选调用证据，不能误读为已经找到调用线索。
 
 ### per-dependency 视图
 
@@ -212,7 +213,7 @@ evidence/call_chain/
 | 文件 | 说明 | 复核重点 |
 |---|---|---|
 | `alerts.csv` | 人工优先入口，完整链路台账 | 每个 API、每条终止链路、状态和原因 |
-| `alerts_<status>.csv` | 按结论状态拆分的链路台账 | 分别记录已确认影响、存在候选证据但结论未确定、未发现路径和未完成分析 |
+| `alerts_<status>.csv` | 按结论状态拆分的链路台账 | 分别记录已确认影响、结论未确定、未发现路径和未完成分析；`uncertain` 行通过 `uncertainty_kind` 区分候选证据与分析能力边界 |
 | `alerts_<status>_NNN.csv` | 大文件分片 | 单个状态文件太大时分段打开 |
 | `by_api/*.json` | 单 API 详细证据 | 已经锁定某个 API，需要看逐跳链路、证据路径、终止原因 |
 
@@ -306,7 +307,8 @@ alerts_reachable_002.csv
 |---|---|---|
 | 已确认影响 | 已找到业务代码或当前制品中已激活入口到变更 API 的完整路径 | `reachable` |
 | 已确认不受影响 | 当前制品中的其他依赖以完全相同的类字节码保留该 API；不覆盖资源、SPI 等非 API 内容 | `not_impacted` |
-| 存在候选证据但结论未确定 | 有候选证据，但尚不能形成确定链路 | `uncertain` |
+| 存在候选证据但结论未确定 | 已有调用或引用候选证据，但尚不能形成确定链路 | `uncertain` + `candidate_evidence` |
+| 静态分析能力边界，结论未确定 | 没有候选调用证据，但当前场景无法通过静态未命中证明未使用 | `uncertain` + `analysis_limitation` |
 | 静态分析未找到路径 | 已完成静态分析，但没有找到路径；不能解释为确定不影响 | `not_found_in_static_analysis` |
 | 本次未完成分析 | 输入或工具能力不足，无法完成本项分析 | `not_analyzed` |
 

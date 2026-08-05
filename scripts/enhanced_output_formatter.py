@@ -35,7 +35,12 @@ from diagnostic_contract import (
     diagnostic_contract_metadata,
     reason_code_aliases,
 )
-from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_OBSERVABILITY_DIRNAME
+from pipeline_constants import (
+    RUNTIME_DIRNAME,
+    RUNTIME_OBSERVABILITY_DIRNAME,
+    UNCERTAINTY_KIND_ANALYSIS_LIMITATION,
+    UNCERTAINTY_KIND_CANDIDATE_EVIDENCE,
+)
 from path_runtime import short_temporary_directory
 from reason_guidance import (
     REASON_GUIDANCE_SCHEMA,
@@ -64,6 +69,7 @@ ALERTS_CSV_FIELDNAMES = [
     'review_focus', 'chain_entry', 'chain_target', 'chain_hop_count', 'chain_detail',
     'api_identity', 'path_id', 'target_coord', 'changed_symbol', 'api_signature',
     'symbol_kind', 'compile_impact', 'runtime_link_impact', 'change_type', 'severity', 'path_status',
+    'uncertainty_kind',
     'business_reachable', 'entry_kind', 'reach_kind', 'business_entry',
     'consumer_coord', 'consumer_class',
     'consumer_method', 'consumer_signature', 'path_text',
@@ -140,7 +146,47 @@ def _human_evidence_type(value):
     }.get(str(value or ''), '静态分析证据')
 
 
-def _human_analysis_status(value):
+def _has_evidence_items(evidence_paths):
+    for path in evidence_paths or []:
+        if isinstance(path, dict):
+            if any(value not in ('', None, [], {}) for value in path.values()):
+                return True
+            continue
+        for item in path or []:
+            if isinstance(item, dict):
+                if any(value not in ('', None, [], {}) for value in item.values()):
+                    return True
+            elif str(item or '').strip():
+                return True
+    return False
+
+
+def _uncertainty_kind(trace_like):
+    """Separate an uncertain conclusion from the evidence that led to it."""
+    if str(_get_trace_attr(trace_like, 'analysis_status', '') or '').strip() != 'uncertain':
+        return ''
+
+    if any(str(path or '').strip() for path in (_get_trace_attr(trace_like, 'call_paths', []) or [])):
+        return UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+    if _has_evidence_items(_get_trace_attr(trace_like, 'evidence_paths', []) or []):
+        return UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+    for detail in (_get_trace_attr(trace_like, 'path_details', []) or []):
+        if not isinstance(detail, dict):
+            continue
+        if (
+            str(detail.get('path_text') or '').strip()
+            or _has_evidence_items([detail.get('evidence') or []])
+        ):
+            return UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+    return UNCERTAINTY_KIND_ANALYSIS_LIMITATION
+
+
+def _human_analysis_status(value, uncertainty_kind=''):
+    if (
+        str(value or '') == 'uncertain'
+        and uncertainty_kind == UNCERTAINTY_KIND_ANALYSIS_LIMITATION
+    ):
+        return '结论未确定（静态分析能力边界）'
     return {
         'reachable': '已确认影响',
         'uncertain': '结论未确定（存在候选证据）',
@@ -195,6 +241,7 @@ def trace_result_to_api_entry(r):
         public_match_tier = None
 
     canonical_code = canonical_reason_code(r.reason_code)
+    uncertainty_kind = _uncertainty_kind(r)
     return {
         'diagnostic_schema':   diagnostic_contract_metadata()['schema'],
         'origin_step':         'step5',
@@ -218,6 +265,7 @@ def trace_result_to_api_entry(r):
         'confirmed':           str(r.confirmed).lower() if r.confirmed is not None else '',
         'source':              r.source,
         'analysis_status':     r.analysis_status,
+        'uncertainty_kind':    uncertainty_kind,
         'reason_code':         canonical_code,
         'reason_code_aliases': reason_code_aliases(canonical_code),
         'reason':              r.reachable_note,
@@ -889,6 +937,7 @@ def format_call_chain_readable(trace_result):
     explanation = explain_reason_code(trace_result.reason_code, trace_result)
     user_view = summarize_user_facing_outcome(trace_result)
     display_api = _api_display_name(trace_result)
+    uncertainty_kind = _uncertainty_kind(trace_result)
 
     # 标题和首屏结论
     lines.append("=" * 70)
@@ -899,7 +948,7 @@ def format_call_chain_readable(trace_result):
 
     lines.append("【结论】")
     lines.append(
-        f"  结论: {_human_analysis_status(trace_result.analysis_status)}"
+        f"  结论: {_human_analysis_status(trace_result.analysis_status, uncertainty_kind)}"
     )
     lines.append(f"  原因: {user_view['user_reason']}")
     if user_view.get('key_evidence'):
@@ -914,13 +963,18 @@ def format_call_chain_readable(trace_result):
         lines.append("")
     else:
         lines.append("【符号保留证据】" if trace_result.analysis_status == 'not_impacted' else "【调用链路】")
-        lines.append("  未形成可确认的完整调用链。")
+        if uncertainty_kind == UNCERTAINTY_KIND_ANALYSIS_LIMITATION:
+            lines.append("  未发现候选调用证据；当前场景超出静态分析可确认范围。")
+        else:
+            lines.append("  未形成可确认的完整调用链。")
         lines.append("")
 
     # 基本信息后置，避免首屏被内部状态淹没。
     lines.append("【变更信息】")
     lines.append(f"  {_alert_change_summary(trace_result)}")
-    lines.append(f"  分析状态: {_human_analysis_status(trace_result.analysis_status)}")
+    lines.append(
+        f"  分析状态: {_human_analysis_status(trace_result.analysis_status, uncertainty_kind)}"
+    )
     if trace_result.dependency_chain_coords:
         lines.append(f"  涉及依赖链: {' -> '.join(trace_result.dependency_chain_coords)}")
     lines.append("")
@@ -1317,6 +1371,16 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     # Keep the two states separate: an uncertain candidate has different
     # remediation from an API that could not be analysed at all.
     uncertain_reason_summary = reason_summary(uncertain)
+    uncertainty_kind_summary = dict(sorted(
+        {
+            kind: sum(1 for item in uncertain if _uncertainty_kind(item) == kind)
+            for kind in (
+                UNCERTAINTY_KIND_CANDIDATE_EVIDENCE,
+                UNCERTAINTY_KIND_ANALYSIS_LIMITATION,
+            )
+        }.items(),
+        key=lambda item: item[0],
+    ))
     not_analyzed_reason_summary = reason_summary(not_analyzed)
     diagnostic_guidance = build_diagnostic_guidance(
         all_results,
@@ -1330,6 +1394,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
             'reachable':    len(reachable),
             'not_impacted': len(not_impacted),
             'uncertain':    len(uncertain),
+            'uncertainty_kind_summary': uncertainty_kind_summary,
             'not_analyzed': len(not_analyzed),
             'not_found_in_static_analysis': len(not_found),
             'tool':         's5_call_chain_engine_integrated.py (enhanced)',
@@ -1433,6 +1498,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         write_api_array('not_analyzed_apis', not_analyzed)
         write_api_array('not_found_apis', not_found)
         write_field('uncertain_reason_summary', uncertain_reason_summary)
+        write_field('uncertainty_kind_summary', uncertainty_kind_summary)
         write_field('not_analyzed_reason_summary', not_analyzed_reason_summary)
         write_field('diagnostic_guidance_schema', REASON_GUIDANCE_SCHEMA)
         write_field('diagnostic_contract', diagnostic_contract_metadata())
@@ -1906,6 +1972,13 @@ def _alert_rows_for_result(result):
             len(_split_chain_nodes(raw_path_text)) >= 2
             or len(_nodes_from_evidence(evidence)) >= 2
         )
+        uncertainty_kind = ''
+        if path_status == 'uncertain':
+            uncertainty_kind = (
+                UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+                if raw_path_text or _has_evidence_items([evidence])
+                else UNCERTAINTY_KIND_ANALYSIS_LIMITATION
+            )
         path_identity = json.dumps({
             'api_id': api_id, 'status': path_status, 'stop_reason': stop_reason,
             'path_text': raw_path_text, 'evidence': semantic_evidence,
@@ -1919,14 +1992,31 @@ def _alert_rows_for_result(result):
         changed_symbol = _api_display_name(result)
         chain_view = _alert_chain_view(path_text, business_entry, changed_symbol, evidence)
         if not has_chain:
-            chain_view = _alert_no_chain_view(path_status, changed_symbol)
+            chain_view = _alert_no_chain_view(
+                path_status,
+                changed_symbol,
+                uncertainty_kind=uncertainty_kind,
+                stop_reason=stop_reason,
+            )
         review_reason = _alert_review_reason(result, detail, evidence, explanation, stop_reason)
         rows.append({
-            'conclusion': _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_reason),
+            'conclusion': _alert_conclusion_text(
+                result,
+                detail,
+                path_status,
+                conclusion_level,
+                stop_reason,
+                uncertainty_kind=uncertainty_kind,
+            ),
             'change_summary': _alert_change_summary(result),
             'review_reason': review_reason,
             'chain_summary': chain_view['summary'],
-            'review_focus': _alert_review_focus(path_status, conclusion_level, stop_reason),
+            'review_focus': _alert_review_focus(
+                path_status,
+                conclusion_level,
+                stop_reason,
+                uncertainty_kind=uncertainty_kind,
+            ),
             'chain_entry': chain_view['entry'],
             'chain_target': chain_view['target'],
             'chain_hop_count': chain_view['hop_count'],
@@ -1950,6 +2040,7 @@ def _alert_rows_for_result(result):
             'severity': result.severity,
             'api_status': result.analysis_status,
             'path_status': path_status,
+            'uncertainty_kind': uncertainty_kind,
             'conclusion_level': conclusion_level,
             'action_type': action_type,
             'business_reachable': 'true' if reachable is True else ('false' if reachable is False else 'unknown'),
@@ -1980,7 +2071,9 @@ def _alert_rows_for_result(result):
     return rows
 
 
-def _alert_no_chain_view(path_status, changed_symbol):
+def _alert_no_chain_view(
+    path_status, changed_symbol, *, uncertainty_kind='', stop_reason=''
+):
     """Explain an absent chain without conflating incomplete and negative analysis."""
     status = str(path_status or '').strip()
     target_suffix = f"；目标 API：{changed_symbol}" if changed_symbol else ''
@@ -1991,8 +2084,25 @@ def _alert_no_chain_view(path_status, changed_symbol):
         summary = f'静态分析未发现调用链{target_suffix}'
         detail = '完整静态分析未发现调用链'
     elif status == 'uncertain':
-        summary = f'存在候选证据，但尚未形成可确认调用链{target_suffix}'
-        detail = '存在候选证据，尚未形成可确认调用链'
+        if uncertainty_kind == UNCERTAINTY_KIND_ANALYSIS_LIMITATION:
+            if str(stop_reason or '').strip() == 'INLINED_CONSTANT_USAGE_UNDETECTABLE':
+                summary = (
+                    '未发现候选调用证据；编译期常量可能已内联，'
+                    f'当前静态分析无法确认是否使用{target_suffix}'
+                )
+                detail = (
+                    '未发现可展示的源码引用或字节码字段访问证据；'
+                    '编译期常量可能已内联，当前静态分析无法确认是否使用'
+                )
+            else:
+                summary = (
+                    '未发现候选调用证据；受静态分析能力边界限制，'
+                    f'尚无法确认是否存在调用链{target_suffix}'
+                )
+                detail = '未发现候选调用证据；当前静态分析能力不足以形成确定结论'
+        else:
+            summary = f'存在候选证据，但尚未形成可确认调用链{target_suffix}'
+            detail = '存在候选证据，尚未形成可确认调用链'
     elif status == 'not_impacted':
         summary = f'目标 API 已确认保留，无需调用链判定{target_suffix}'
         detail = '目标 API 在当前版本中仍然存在'
@@ -2035,11 +2145,13 @@ def _alert_reach_kind(has_chain, reachable, hop_count):
     return '直接调用' if hops == 1 else '间接调用'
 
 
-def _alert_conclusion_label(path_status, conclusion_level):
+def _alert_conclusion_label(path_status, conclusion_level, uncertainty_kind=''):
     status = str(path_status or '')
     if status == 'reachable':
         return '已确认影响'
     if status == 'uncertain':
+        if uncertainty_kind == UNCERTAINTY_KIND_ANALYSIS_LIMITATION:
+            return '结论未确定（静态分析能力边界）'
         return '结论未确定（存在候选证据）'
     if status == 'not_impacted':
         return '已确认不受影响'
@@ -2057,7 +2169,14 @@ def _alert_conclusion_label(path_status, conclusion_level):
     }.get(level, '结论未确定')
 
 
-def _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_reason):
+def _alert_conclusion_text(
+    result,
+    detail,
+    path_status,
+    conclusion_level,
+    stop_reason,
+    uncertainty_kind='',
+):
     symbol_kind = str(getattr(result, 'symbol_kind', '') or '')
     change_type = str(getattr(result, 'change_type', '') or '').upper()
     if path_status == 'reachable':
@@ -2068,9 +2187,13 @@ def _alert_conclusion_text(result, detail, path_status, conclusion_level, stop_r
         if symbol_kind == 'class':
             return '已确认影响：业务制品直接引用了被删除的类'
         return '已确认影响：已找到业务或已激活入口到变更 API 的路径'
-    if path_status == 'uncertain' and detail.get('consumer_coord'):
+    if (
+        path_status == 'uncertain'
+        and uncertainty_kind == UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+        and detail.get('consumer_coord')
+    ):
         return '结论未确定：当前制品中的依赖已引用该 API，但尚未证明会由业务入口触发'
-    return _alert_conclusion_label(path_status, conclusion_level)
+    return _alert_conclusion_label(path_status, conclusion_level, uncertainty_kind)
 
 
 def _alert_change_summary(result):
@@ -2116,12 +2239,24 @@ def _alert_change_summary(result):
     return f"依赖 {coord} {change_sentence}（严重级别 {severity}）"
 
 
-def _alert_review_focus(path_status, conclusion_level, stop_reason):
+def _alert_review_focus(
+    path_status, conclusion_level, stop_reason, uncertainty_kind=''
+):
     status = str(path_status or '').strip()
     reason = str(stop_reason or '').strip()
     if status == 'reachable':
         return "当前记录包含业务入口和变更 API 终点。"
     if status == 'uncertain':
+        if uncertainty_kind == UNCERTAINTY_KIND_ANALYSIS_LIMITATION:
+            if reason == 'INLINED_CONSTANT_USAGE_UNDETECTABLE':
+                return (
+                    "当前没有候选调用证据；编译期常量可能已内联，"
+                    "需通过源码检索或业务回归确认。"
+                )
+            return (
+                "当前没有候选调用证据；受静态分析能力边界限制，"
+                "需补充动态或人工验证。"
+            )
         return "该候选链路的运行时触发事实未确认。"
     if status == 'not_impacted':
         return "当前制品中记录了保留该 API 的依赖字节码。"
@@ -2172,7 +2307,14 @@ def _alert_review_reason(result, detail, evidence, explanation, stop_reason):
         return f"业务制品中的 {consumer or '业务代码'} 直接调用 {api_name}{signature}{consequence}。"
     if stop_reason == 'RUNTIME_DEPENDENCY_ENTRY_REACHED':
         return f"当前制品已证明该框架入口会被激活，且完整路径最终使用 {api_name}{signature}。"
-    if (detail or {}).get('path_status') == 'uncertain' and consumer_coord:
+    if (
+        (detail or {}).get('path_status') == 'uncertain'
+        and consumer_coord
+        and (
+            _has_evidence_items([evidence])
+            or str((detail or {}).get('path_text') or '').strip()
+        )
+    ):
         return (
             f"运行时依赖 {consumer_coord} 中的 {consumer or '字节码'} "
             f"精确引用 {api_name}{signature}；尚缺少从业务入口到该依赖方法的可确认路径。"

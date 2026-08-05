@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -530,6 +531,10 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(executed, ["step5", "step6"])
         self.assertEqual(saved["state"]["current_step"], "done")
         self.assertEqual(saved["state"]["completed_step"], "step6")
+        self.assertIn(
+            saved["state"]["status"],
+            {"completed", "completed_with_limits"},
+        )
 
     def test_step4_scope_review_is_preserved_and_step5_success_review_auto_continues(self):
         interaction = {
@@ -609,7 +614,49 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(saved["state"]["current_step"], "step6")
         self.assertEqual(saved["state"]["completed_step"], "step5")
+        self.assertEqual(saved["state"]["status"], "ready")
         self.assertIsNone(saved["state"]["pending_interaction"])
+
+    def test_legacy_nonterminal_completed_state_normalizes_to_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            state["state"].update(
+                {
+                    "current_step": "step6",
+                    "completed_step": "step5",
+                    "status": "completed",
+                    "completion_summary": {"status": "completed"},
+                }
+            )
+
+            normalized = run_step.ensure_main_state_structure(state, report_dir)
+
+        self.assertEqual(normalized["state"]["current_step"], "step6")
+        self.assertEqual(normalized["state"]["completed_step"], "step5")
+        self.assertEqual(normalized["state"]["status"], "ready")
+        self.assertIsNone(normalized["state"]["completion_summary"])
+
+    def test_terminal_completed_state_remains_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            completion_summary = {"status": "completed", "finding_count": 0}
+            state["state"].update(
+                {
+                    "current_step": "done",
+                    "completed_step": "step6",
+                    "status": "completed",
+                    "completion_summary": completion_summary,
+                }
+            )
+
+            normalized = run_step.ensure_main_state_structure(state, report_dir)
+
+        self.assertEqual(normalized["state"]["status"], "completed")
+        self.assertEqual(
+            normalized["state"]["completion_summary"], completion_summary
+        )
 
     def test_main_keeps_step4_scope_confirmation_even_if_auto_continue_is_misconfigured(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1617,6 +1664,39 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("deliverables/all-impact-details.csv", message)
         self.assertNotIn("deliverables/analysis-scope.md", message)
 
+    def test_final_completion_separates_candidate_uncertainty_from_analysis_limitations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            findings_path = run_step.s6_findings_path(report_dir)
+            findings_path.parent.mkdir(parents=True)
+            findings_path.write_text(
+                json.dumps({
+                    "coverage": {"overall_status": "complete"},
+                    "analysis_scope": {"mode": "full"},
+                    "p0": [], "p1": [], "p2": [], "probable_impact": [],
+                    "uncertain": [
+                        {"uncertainty_kind": "candidate_evidence"},
+                        {"uncertainty_kind": "analysis_limitation"},
+                    ],
+                    "needs_input": [], "not_analyzed": [], "diagnostics": [],
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            summary = run_step.build_final_completion_summary(report_dir)
+
+        self.assertEqual(summary["uncertain_count"], 2)
+        self.assertEqual(summary["uncertain_candidate_count"], 1)
+        self.assertEqual(summary["uncertain_analysis_limitation_count"], 1)
+        self.assertIn(
+            "1 项存在候选证据但结论未确定",
+            summary["limitations"],
+        )
+        self.assertIn(
+            "1 项受静态分析能力边界限制，未发现候选调用证据且结论未确定",
+            summary["limitations"],
+        )
+
     def test_landing_status_does_not_hide_completion_limits(self):
         state = {
             "state": {
@@ -2377,6 +2457,35 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(canonical["restart_step_id"], "step2")
         self.assertEqual(canonical["notes"], "修正源码目录后从 step2 重跑")
         self.assertIn("__intent_patch", canonical)
+
+    def test_build_canonical_user_response_hoists_restart_step_from_set(self):
+        canonical = run_step.build_canonical_user_response(
+            {
+                "intent_patch": {
+                    "action": "restart_from_step",
+                    "set": {"restart_step_id": "step2"},
+                }
+            }
+        )
+
+        self.assertEqual(canonical["restart_step_id"], "step2")
+        self.assertEqual(canonical["__intent_patch"]["set"], {})
+        self.assertEqual(
+            canonical["__intent_patch"]["restart_step_id"],
+            "step2",
+        )
+
+    def test_build_canonical_user_response_rejects_conflicting_restart_steps(self):
+        with self.assertRaisesRegex(run_step.StepError, "restart_step_id.*冲突"):
+            run_step.build_canonical_user_response(
+                {
+                    "intent_patch": {
+                        "action": "restart_from_step",
+                        "restart_step_id": "step2",
+                        "set": {"restart_step_id": "step3"},
+                    }
+                }
+            )
 
     def test_build_canonical_user_response_allows_action_only_intent_patch(self):
         canonical = run_step.build_canonical_user_response(
@@ -3688,6 +3797,52 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertIn("分析对象与依赖范围及之前的正式产物继续保留", stderr.getvalue())
             self.assertIn("升级上下文及之后的产物会按新输入重建", stderr.getvalue())
 
+    def test_blocked_system_state_allows_action_only_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            retained_path = (
+                run_step.evidence_static_scan_dir(report_dir)
+                / "s3_jdk_removed_api.csv"
+            )
+            incomplete_path = (
+                run_step.step4_api_changes_dir(report_dir)
+                / "partial.csv"
+            )
+            self._write_text(retained_path, "retained\n")
+            self._write_text(incomplete_path, "incomplete\n")
+            state = run_step.new_main_state(report_dir)
+            state["state"].update({
+                "current_step": "step4",
+                "completed_step": "step3",
+                "status": "blocked_by_system",
+                "blocking_reason": "temporary Python failure",
+            })
+            state["step3"]["output"] = {"completed": True}
+            state["step4"]["input"] = {
+                "base_branch": "base",
+                "current_branch": "current",
+            }
+            state["step4"]["output"] = {"partial": True}
+
+            with patch.object(sys, "stderr", io.StringIO()):
+                result = run_step.apply_non_pending_structured_response(
+                    SimpleNamespace(step="auto"),
+                    project_dir,
+                    report_dir,
+                    state,
+                    {"action": "rerun_current_step"},
+                )
+
+            self.assertEqual(result["step_id"], "step4")
+            self.assertEqual(state["state"]["status"], "ready")
+            self.assertIsNone(state["state"]["blocking_reason"])
+            self.assertEqual(state["step3"]["output"], {"completed": True})
+            self.assertEqual(state["step4"]["input"]["base_branch"], "base")
+            self.assertEqual(state["step4"]["output"], {})
+            self.assertTrue(retained_path.exists())
+            self.assertFalse(incomplete_path.exists())
+
     def test_execute_step1_does_not_pass_business_inputs_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -3997,6 +4152,96 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertIn("[进度][兼容性线索][运行中]", stderr.getvalue())
         self.assertTrue(any(item.get("phase") == "heartbeat" for item in events))
+
+    def test_step5_heartbeat_uses_reliable_completed_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            progress_snapshot = (
+                run_step.runtime_observability_dir(report_dir)
+                / run_step.STEP5_PROGRESS_FILE
+            )
+            run_step.write_json(
+                progress_snapshot,
+                {
+                    "schema": "java-upgrade-analyzer.step5-progress.v1",
+                    "step_id": "step5",
+                    "phase": "trace",
+                    "status": "running",
+                    "completed": 2606,
+                    "total": 2953,
+                    "elapsed_sec": 1500.0,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            stderr = io.StringIO()
+
+            def slow_run_cmd(*_args, **_kwargs):
+                time.sleep(0.06)
+                return "", "", 0
+
+            with patch.dict(
+                os.environ,
+                {"JUA_HEARTBEAT_INTERVAL_SECONDS": "0.01"},
+            ), patch.object(
+                run_step,
+                "run_cmd",
+                side_effect=slow_run_cmd,
+            ), patch.object(sys, "stderr", stderr):
+                run_step.run_python(
+                    "s5_call_chain_engine_integrated.py",
+                    [],
+                    tmp,
+                    report_dir=report_dir,
+                )
+
+        self.assertIn("[2606/2953]", stderr.getvalue())
+        self.assertIn("[88.2%]", stderr.getvalue())
+        self.assertIn("预计剩余约", stderr.getvalue())
+
+    def test_step5_heartbeat_omits_eta_for_stale_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            progress_snapshot = (
+                run_step.runtime_observability_dir(report_dir)
+                / run_step.STEP5_PROGRESS_FILE
+            )
+            run_step.write_json(
+                progress_snapshot,
+                {
+                    "schema": "java-upgrade-analyzer.step5-progress.v1",
+                    "step_id": "step5",
+                    "phase": "trace",
+                    "status": "running",
+                    "completed": 2606,
+                    "total": 2953,
+                    "elapsed_sec": 1500.0,
+                    "updated_at": "2000-01-01T00:00:00+00:00",
+                },
+            )
+            stderr = io.StringIO()
+
+            def slow_run_cmd(*_args, **_kwargs):
+                time.sleep(0.04)
+                return "", "", 0
+
+            with patch.dict(
+                os.environ,
+                {"JUA_HEARTBEAT_INTERVAL_SECONDS": "0.01"},
+            ), patch.object(
+                run_step,
+                "run_cmd",
+                side_effect=slow_run_cmd,
+            ), patch.object(sys, "stderr", stderr):
+                run_step.run_python(
+                    "s5_call_chain_engine_integrated.py",
+                    [],
+                    tmp,
+                    report_dir=report_dir,
+                )
+
+        self.assertIn("[2606/2953]", stderr.getvalue())
+        self.assertIn("无新增完成项", stderr.getvalue())
+        self.assertNotIn("预计剩余约", stderr.getvalue())
 
     def test_keyboard_interrupt_cleans_partial_current_step_and_can_resume_safely(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5171,6 +5416,10 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step.runtime_observability_dir(report_dir)
                 / run_step.STEP5_DIAGNOSTICS_FILE
             )
+            progress_snapshot = (
+                run_step.runtime_observability_dir(report_dir)
+                / run_step.STEP5_PROGRESS_FILE
+            )
             main_state = self._runtime_state_dir(report_dir) / "main_state.json"
             interaction = self._runtime_state_dir(report_dir) / "interaction.json"
             step5_dir.mkdir(parents=True)
@@ -5184,6 +5433,7 @@ class RunStepMainStateTest(unittest.TestCase):
             source_alignment.write_text("{}", encoding="utf-8")
             diagnostics.parent.mkdir(parents=True, exist_ok=True)
             diagnostics.write_text("{}\n", encoding="utf-8")
+            progress_snapshot.write_text("{}\n", encoding="utf-8")
             main_state.parent.mkdir(parents=True, exist_ok=True)
             main_state.write_text("{}", encoding="utf-8")
             interaction.write_text("{}", encoding="utf-8")
@@ -5197,6 +5447,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertFalse(framework_adapters.exists())
             self.assertFalse(source_alignment.exists())
             self.assertFalse(diagnostics.exists())
+            self.assertFalse(progress_snapshot.exists())
             self.assertTrue(main_state.exists())
             self.assertTrue(interaction.exists())
 

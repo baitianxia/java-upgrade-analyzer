@@ -33,6 +33,8 @@ from pipeline_constants import (
     RUNTIME_CACHE_DIRNAME,
     RUNTIME_COVERAGE_DIRNAME,
     RUNTIME_DIRNAME,
+    UNCERTAINTY_KIND_ANALYSIS_LIMITATION,
+    UNCERTAINTY_KIND_CANDIDATE_EVIDENCE,
 )
 from reason_guidance import (
     REASON_GUIDANCE_SCHEMA,
@@ -57,6 +59,61 @@ S6_DETAIL_MD_FULL_LIMIT = 200
 S6_DETAIL_MD_SAMPLE_LIMIT = 50
 S6_DETAIL_MD_DEP_SUMMARY_LIMIT = 50
 S6_CHANGED_API_SPLIT_ROWS = 500
+
+UNCERTAIN_CANDIDATE_CONCLUSION = "结论未确定（存在候选证据）"
+UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION = "结论未确定（静态分析能力边界）"
+
+
+def _uncertainty_kind(item):
+    """Read the Step5 evidence subtype, with a safe legacy-artifact fallback."""
+    item = item or {}
+    kind = str(item.get("uncertainty_kind") or "").strip()
+    if kind in {
+        UNCERTAINTY_KIND_CANDIDATE_EVIDENCE,
+        UNCERTAINTY_KIND_ANALYSIS_LIMITATION,
+    }:
+        return kind
+    if any(str(path or "").strip() for path in (item.get("call_paths") or [])):
+        return UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+    if _has_uncertain_evidence_items(item.get("evidence_paths") or []):
+        return UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+    for detail in item.get("path_details") or []:
+        if not isinstance(detail, dict):
+            continue
+        if (
+            str(detail.get("path_text") or "").strip()
+            or _has_uncertain_evidence_items([detail.get("evidence") or []])
+        ):
+            return UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+    return UNCERTAINTY_KIND_ANALYSIS_LIMITATION
+
+
+def _has_uncertain_evidence_items(evidence_paths):
+    for path in evidence_paths or []:
+        if isinstance(path, dict):
+            if any(value not in ('', None, [], {}) for value in path.values()):
+                return True
+            continue
+        for evidence in path or []:
+            if isinstance(evidence, dict):
+                if any(value not in ('', None, [], {}) for value in evidence.values()):
+                    return True
+            elif str(evidence or '').strip():
+                return True
+    return False
+
+
+def _uncertain_conclusion(item):
+    if _uncertainty_kind(item) == UNCERTAINTY_KIND_ANALYSIS_LIMITATION:
+        return UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION
+    return UNCERTAIN_CANDIDATE_CONCLUSION
+
+
+def _uncertainty_counts(items):
+    counts = defaultdict(int)
+    for item in items or []:
+        counts[_uncertainty_kind(item)] += 1
+    return counts
 
 
 def _evidence_dir(report_dir, name):
@@ -232,12 +289,15 @@ S6_DETAIL_BUCKETS = {
         "note": "最终制品证据证明这些变更 API 仍由其他运行时 JAR 以完全相同的 class 字节码提供。",
     },
     "uncertain": {
-        "title": "存在候选证据但结论未确定清单",
-        "conclusion": "结论未确定（存在候选证据）",
+        "title": "结论未确定清单",
+        "conclusion": "",
         "csv": "s6_uncertain_apis.csv",
         "md": "s6_uncertain_apis.md",
         "summary_key": "uncertain_reason_summary",
-        "note": "静态分析发现候选路径，但现有证据存在歧义，尚未形成确定结论。",
+        "note": (
+            "包含已有候选证据但链路未确认的项目，以及因静态分析能力边界"
+            "无法取得候选调用证据的项目；两类证据状态在明细中分别标注。"
+        ),
     },
     "probable_impact": {
         "title": "可能影响完整清单",
@@ -1811,18 +1871,26 @@ def _known_context_parts(findings):
 
 
 def _detail_row(idx, item, conclusion=''):
+    display_conclusion = str(conclusion or '').strip()
+    if not display_conclusion and str((item or {}).get('uncertainty_kind') or '').strip():
+        display_conclusion = _uncertain_conclusion(item)
+    if not display_conclusion:
+        display_conclusion = (
+            item.get("user_conclusion")
+            or _bucket_csv_conclusion('', item)
+        )
     reason = (
         _objective_item_reason(
             item,
-            conclusion or item.get("user_conclusion") or "",
+            display_conclusion,
         )
         or "未记录更多客观原因。"
     )
-    boundary = _detail_review_focus(item, conclusion)
+    boundary = _detail_review_focus(item, display_conclusion)
     return (
         f"| {idx} | `{_md_cell(item.get('coord'))}` | `{_md_cell(item.get('api'))}` | "
         f"{_md_cell(_change_summary(item), 220)} | "
-        f"{_md_cell(conclusion or item.get('user_conclusion') or _bucket_csv_conclusion('', item))} | "
+        f"{_md_cell(display_conclusion)} | "
         f"{_md_cell(reason)} | {_md_cell(boundary)} |"
     )
 
@@ -1839,6 +1907,11 @@ def _detail_review_focus(item, conclusion=''):
         "结论未确定（候选证据）",
     }:
         return "现有记录包含候选证据，但未形成完整的系统触达事实。"
+    if conclusion_text == UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION:
+        return (
+            "当前未发现候选调用证据；受静态分析能力边界限制，"
+            "需通过源码检索、动态验证或业务回归确认。"
+        )
     if conclusion_text in {
         "需要补充输入", "缺少依赖源码/构建产物", "输入不足，结论未确定"
     }:
@@ -2144,6 +2217,7 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
         "symbol_kind",
         "change_type",
         "severity",
+        "uncertainty_kind",
         "reason_code",
         "reason",
         "user_reason",
@@ -2185,10 +2259,11 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
 
 
 def _bucket_csv_conclusion(bucket_name, item):
+    if bucket_name == "uncertain":
+        return _uncertain_conclusion(item)
     structural_conclusions = {
         "confirmed": "已确认影响",
         "probable_impact": "可能影响",
-        "uncertain": "结论未确定（存在候选证据）",
         "not_impacted": "已确认不受影响",
         "needs_input": "输入不足，结论未确定",
         "not_analyzed": "未完成分析",
@@ -3278,6 +3353,7 @@ def collect_findings(d):
         'not_analyzed':        [],
         'not_found':           [],
         'uncertain_reason_summary': {},
+        'uncertainty_kind_summary': {},
         'not_analyzed_reason_summary': {},
         'not_found_reason_summary': {},
         'diagnostic_guidance_schema': REASON_GUIDANCE_SCHEMA,
@@ -3682,6 +3758,7 @@ def collect_findings(d):
             else:              findings['p2'].append(entry)
 
         uncertain_reason_counts = defaultdict(int)
+        uncertainty_kind_counts = defaultdict(int)
         for item in call_summary.get('uncertain_apis', []):
             coord = item.get('coord', '')
             if coord:
@@ -3689,7 +3766,9 @@ def collect_findings(d):
             reason_code = canonical_reason_code(
                 item.get('reason_code') or 'UNKNOWN'
             )
+            uncertainty_kind = _uncertainty_kind(item)
             uncertain_reason_counts[reason_code or 'UNKNOWN'] += 1
+            uncertainty_kind_counts[uncertainty_kind] += 1
             findings['uncertain'].append({
                 'coord':         coord,
                 'old_version':   item.get('old_version', ''),
@@ -3699,12 +3778,17 @@ def collect_findings(d):
                 'symbol_kind':  item.get('symbol_kind', ''),
                 'change_type':  item.get('change_type', ''),
                 'severity':     item.get('severity', ''),
-                'user_conclusion': item.get('user_conclusion', ''),
+                'user_conclusion': _uncertain_conclusion(item),
+                'uncertainty_kind': uncertainty_kind,
                 'user_reason':  item.get('user_reason', ''),
                 'recommended_action': item.get('recommended_action', ''),
                 'key_evidence': item.get('key_evidence', ''),
                 'business_reach_depth': item.get('business_reach_depth'),
                 'dependency_chain_coords': item.get('dependency_chain_coords', []),
+                'call_paths': item.get('call_paths', []),
+                'path_details': item.get('path_details', []),
+                'compile_impact': item.get('compile_impact', ''),
+                'runtime_link_impact': item.get('runtime_link_impact', ''),
                 'reason':       item.get('reason', ''),
                 'reason_code':  reason_code,
                 'origin_step':  item.get('origin_step', ''),
@@ -3712,6 +3796,9 @@ def collect_findings(d):
                 'evidence_paths': [],
             })
         findings['uncertain_reason_summary'] = dict(sorted(uncertain_reason_counts.items(), key=lambda x: (-x[1], x[0])))
+        findings['uncertainty_kind_summary'] = dict(sorted(
+            uncertainty_kind_counts.items(), key=lambda x: x[0]
+        ))
 
         not_analyzed_reason_counts = defaultdict(int)
         for item in call_summary.get('not_analyzed_apis', []):
@@ -4505,6 +4592,7 @@ def render_core_conclusion(findings):
     unresolved_count = _unresolved_count(findings)
     not_found = findings.get('not_found') or []
     not_impacted = findings.get('not_impacted') or []
+    uncertainty_counts = _uncertainty_counts(findings.get('uncertain') or [])
     coverage_incomplete = _effective_coverage_status(findings) not in {
         'complete', 'not_applicable'
     }
@@ -4542,7 +4630,14 @@ def render_core_conclusion(findings):
         ('已确认影响', len(confirmed)),
         ('高风险（P0/P1）', len(p0) + len(p1)),
         ('可能影响', len(findings.get('probable_impact') or [])),
-        ('结论未确定（候选证据）', len(findings.get('uncertain') or [])),
+        (
+            '结论未确定（候选证据）',
+            uncertainty_counts.get(UNCERTAINTY_KIND_CANDIDATE_EVIDENCE, 0),
+        ),
+        (
+            '结论未确定（静态分析能力边界）',
+            uncertainty_counts.get(UNCERTAINTY_KIND_ANALYSIS_LIMITATION, 0),
+        ),
         ('缺少输入', len(findings.get('needs_input') or [])),
         ('本次未完成分析', len(_exclusive_not_analyzed(findings))),
         ('未发现调用路径', len(not_found)),
@@ -4632,12 +4727,34 @@ def _conclusion_for_report(item, fallback):
     # The structural Step5 bucket is the report conclusion. Free-text legacy
     # labels may be broader, older, or contradictory and are never merged into
     # the displayed status.
+    if fallback == UNCERTAIN_CANDIDATE_CONCLUSION:
+        return _uncertain_conclusion(item)
     if fallback:
         return _display_label(fallback)
     conclusion = str(item.get('user_conclusion') or '').strip()
     if conclusion:
         return _display_label(conclusion)
     return _display_label(fallback)
+
+
+def _uncertainty_kind_for_report(item, overview):
+    explicit = str((item or {}).get('uncertainty_kind') or '').strip()
+    if explicit in {
+        UNCERTAINTY_KIND_CANDIDATE_EVIDENCE,
+        UNCERTAINTY_KIND_ANALYSIS_LIMITATION,
+    }:
+        return explicit
+    overview = overview or {}
+    uncertain_paths = list(
+        ((overview.get('paths_by_status') or {}).get('uncertain') or [])
+    )
+    uncertain_count = max(
+        int((overview.get('logical_path_counts_by_status') or {}).get('uncertain') or 0),
+        int((overview.get('path_counts_by_status') or {}).get('uncertain') or 0),
+    )
+    if uncertain_paths or uncertain_count:
+        return UNCERTAINTY_KIND_CANDIDATE_EVIDENCE
+    return _uncertainty_kind(item)
 
 
 def _paths_for_report(item, overview_lookup, desired_statuses=None):
@@ -4829,6 +4946,9 @@ def _human_reason(value):
         'OVERLOAD_AMBIGUOUS_INTERMEDIATE': '中间调用存在重载歧义。',
         'LOW_CONFIDENCE_EDGE': '调用边置信度较低，尚未形成确定结论。',
         'CALL_GRAPH_LIMITATION_SYMBOL_KIND': '当前符号类型的调用图识别不完整。',
+        'INLINED_CONSTANT_USAGE_UNDETECTABLE': (
+            '编译期常量可能已内联到调用方，静态字节码中不会保留字段访问指令。'
+        ),
         'ANALYSIS_INCOMPLETE': '分析未完整完成。',
         'SYSTEM_CODE_REACHED': '调用链已从当前系统入口触达变更 API。',
         'RUNTIME_DEPENDENCY_USES_REMOVED_API': (
@@ -4895,8 +5015,8 @@ def _reason_conflicts_with_conclusion(value, conclusion):
         )
     if status in {
         "可能影响",
-        "结论未确定（存在候选证据）",
-        "结论未确定（存在候选证据）",
+        UNCERTAIN_CANDIDATE_CONCLUSION,
+        UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION,
         "输入不足，结论未确定",
         "本次未完成分析",
         "未发现调用路径",
@@ -5042,7 +5162,18 @@ def build_api_result_rows(findings):
         }.get(fallback_conclusion, ())
         for item in items:
             identity = _identity_without_severity(item)
-            key = (identity, fallback_conclusion)
+            report_item = item
+            if fallback_conclusion == UNCERTAIN_CANDIDATE_CONCLUSION:
+                report_item = {
+                    **dict(item or {}),
+                    'uncertainty_kind': _uncertainty_kind_for_report(
+                        item, overview_lookup.get(identity) or {}
+                    ),
+                }
+            item_conclusion = _conclusion_for_report(
+                report_item, fallback_conclusion
+            )
+            key = (identity, item_conclusion)
             dependency = _dependency_for_item(findings, item)
             old_version = str(
                 item.get("old_version")
@@ -5090,7 +5221,7 @@ def build_api_result_rows(findings):
                         *existing.get("reason_codes", []),
                         item.get("reason_code"),
                     ],
-                    fallback_conclusion,
+                    existing.get('conclusion') or fallback_conclusion,
                 )
                 continue
             sampled_paths = _paths_for_report(item, overview_lookup, desired_statuses)
@@ -5171,7 +5302,12 @@ def build_api_result_rows(findings):
                     item,
                     include_item_severity=False,
                 ),
-                'conclusion': _conclusion_for_report(item, fallback_conclusion),
+                'conclusion': item_conclusion,
+                'uncertainty_kind': (
+                    _uncertainty_kind(report_item)
+                    if fallback_conclusion == UNCERTAIN_CANDIDATE_CONCLUSION
+                    else ''
+                ),
                 'business_entries': business_entries,
                 'business_entry_count': len(all_business_entries),
                 'modules': modules,
@@ -5194,7 +5330,7 @@ def build_api_result_rows(findings):
             _set_report_row_reasons(
                 row,
                 [item.get("reason_code")],
-                fallback_conclusion,
+                row.get('conclusion') or fallback_conclusion,
             )
             rows.append(row)
             row_by_key[key] = row
@@ -5610,7 +5746,10 @@ def _result_boundary_text(row):
     reason = _human_reason(row.get('reason'))
     boundaries = {
         '可能影响': '已有相关证据，但当前证据不能确认运行时是否会触发该影响。',
-        '结论未确定（存在候选证据）': '存在候选调用关系，但尚未形成完整的系统触达证据。',
+        UNCERTAIN_CANDIDATE_CONCLUSION: '存在候选调用关系，但尚未形成完整的系统触达证据。',
+        UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION: (
+            '当前未发现候选调用证据；受静态分析能力边界限制，不能据此判定未使用。'
+        ),
         '输入不足，结论未确定': '本轮输入不足，未形成影响或不受影响结论。',
         '本次未完成分析': '该项未完成有效分析，不能按未影响解释。',
         '未发现调用路径': '当前静态分析范围内未找到路径；该结果不等同于已确认不受影响。',
@@ -6369,7 +6508,8 @@ def _api_result_priority(row):
         "已确认影响": 0,
         "已确认不受影响": 1,
         "可能影响": 2,
-        "结论未确定（存在候选证据）": 3,
+        UNCERTAIN_CANDIDATE_CONCLUSION: 3,
+        UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION: 3,
         "未发现调用路径": 4,
         "输入不足，结论未确定": 5,
         "本次未完成分析": 6,
@@ -6386,7 +6526,8 @@ def _analysis_conclusion_label(row):
         "已确认影响": "确认影响",
         "已确认不受影响": "确认不受影响",
         "可能影响": "未确认影响（存在候选关系）",
-        "结论未确定（存在候选证据）": "未确认影响（存在候选关系）",
+        UNCERTAIN_CANDIDATE_CONCLUSION: "未确认影响（存在候选关系）",
+        UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION: "未确认影响（静态分析能力边界）",
         "未发现调用路径": "未确认影响",
         "输入不足，结论未确定": "未完成分析",
         "本次未完成分析": "未完成分析",
@@ -6942,7 +7083,8 @@ def _dependency_basis(api_rows):
     for conclusion, label in (
         ("已确认不受影响", "确认不受影响"),
         ("可能影响", "存在候选关系"),
-        ("结论未确定（存在候选证据）", "存在候选关系"),
+        (UNCERTAIN_CANDIDATE_CONCLUSION, "存在候选关系"),
+        (UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION, "静态分析能力边界"),
         ("未发现调用路径", "未发现调用关系"),
     ):
         count = sum(
@@ -7817,8 +7959,13 @@ def _api_result_explanation(row, findings=None):
         return (
             "已有相关证据，但现有证据不能确认当前系统是否会触发该影响。"
         )
-    if conclusion == "结论未确定（存在候选证据）":
+    if conclusion == UNCERTAIN_CANDIDATE_CONCLUSION:
         return "存在候选调用关系，但尚未形成完整的系统触达证据。"
+    if conclusion == UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION:
+        return (
+            "当前未发现候选调用证据；受静态分析能力边界限制，"
+            "不能据此判定该 API 未被使用。"
+        )
     boundary = _result_boundary_text(row)
     if boundary and boundary != "当前记录未提供更多结论边界。":
         return boundary
@@ -8855,12 +9002,20 @@ def main():
         for k in ('p0', 'p1', 'p2', 'uncertain', 'not_found')
     )
     probable = len(findings.get('probable_impact') or [])
+    uncertainty_counts = _uncertainty_counts(findings.get('uncertain') or [])
+    uncertain_candidates = uncertainty_counts.get(
+        UNCERTAINTY_KIND_CANDIDATE_EVIDENCE, 0
+    )
+    uncertain_limitations = uncertainty_counts.get(
+        UNCERTAINTY_KIND_ANALYSIS_LIMITATION, 0
+    )
     needs_input = len(findings.get('needs_input') or [])
     not_analyzed = len(_exclusive_not_analyzed(findings))
     print("最终分析报告已生成。", file=sys.stderr)
     print(
         f"结果：已确认影响 {p0 + p1 + p2}（其中高风险 {p0 + p1}），"
-        f"可能影响 {probable}，结论未确定（存在候选证据）{unk}，"
+        f"可能影响 {probable}，结论未确定 {unk}"
+        f"（候选证据 {uncertain_candidates}、静态分析能力边界 {uncertain_limitations}），"
         f"输入不足且结论未确定 {needs_input}，"
         f"本次未完成分析 {not_analyzed}，未发现静态路径 {nf}。",
         file=sys.stderr,

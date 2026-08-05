@@ -119,6 +119,17 @@ def _estimate_remaining(current, total, elapsed):
     return max(0.0, elapsed * (total - current) / current)
 
 
+def _progress_percentage(current, total):
+    try:
+        current = float(current)
+        total = float(total)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0 or current < 0 or current > total:
+        return None
+    return 100.0 * current / total
+
+
 def emit_progress(
     step_id,
     phase,
@@ -128,12 +139,18 @@ def emit_progress(
     elapsed=None,
     item=None,
     report_dir=None,
+    estimate_remaining=True,
 ):
     step_id = str(step_id or "").strip()
     phase = str(phase or "").strip()
     message = str(message or "")
     elapsed_value = None if elapsed is None else max(0.0, float(elapsed))
-    estimated_remaining = _estimate_remaining(current, total, elapsed_value)
+    percentage = _progress_percentage(current, total)
+    estimated_remaining = (
+        _estimate_remaining(current, total, elapsed_value)
+        if estimate_remaining
+        else None
+    )
     payload = {
         "schema": "java-upgrade-analyzer.progress.v1",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -144,6 +161,7 @@ def emit_progress(
         "message": message,
         "current": current,
         "total": total,
+        "percentage": round(percentage, 3) if percentage is not None else None,
         "elapsed_sec": round(elapsed_value, 3) if elapsed_value is not None else None,
         "estimated_remaining_sec": (
             round(estimated_remaining, 3) if estimated_remaining is not None else None
@@ -158,6 +176,8 @@ def emit_progress(
     parts = [prefix]
     if current is not None and total is not None:
         parts.append(f"[{current}/{total}]")
+        if percentage is not None:
+            parts.append(f"[{percentage:.1f}%]")
     elif current is not None:
         parts.append(f"[{current}]")
     if elapsed_value is not None:

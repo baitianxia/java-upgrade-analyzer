@@ -12440,7 +12440,7 @@ def trace_all_apis_with_confidence_weighting(all_apis, graph, type_metadata, max
                 "step5",
                 "trace",
                 f"正在追踪 {api_name[:80]}",
-                current=idx,
+                current=idx - 1,
                 total=total,
                 elapsed=time.perf_counter() - started_at,
                 item=api_name[:80],

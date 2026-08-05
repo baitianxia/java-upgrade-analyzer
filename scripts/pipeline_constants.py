@@ -36,6 +36,14 @@ STEP5_ARTIFACT_BYTECODE_CATALOG_FILE = "s5_artifact_bytecode_catalog.json"
 STEP5_ARTIFACT_BYTECODE_INDEX_FILE = "s5_artifact_bytecode_index.json"
 STEP5_QUERY_INDEX_FILE = "s5_query_index.json"
 STEP5_DIAGNOSTICS_FILE = "step5_diagnostics.jsonl"
+STEP5_PROGRESS_FILE = "step5_progress.json"
+
+# ``analysis_status=uncertain`` describes the conclusion, not whether the
+# analyzer actually found a candidate usage.  Keep that evidence distinction
+# orthogonal so user-facing reports do not invent a candidate path for static
+# analysis blind spots such as compile-time constant inlining.
+UNCERTAINTY_KIND_CANDIDATE_EVIDENCE = "candidate_evidence"
+UNCERTAINTY_KIND_ANALYSIS_LIMITATION = "analysis_limitation"
 
 DELIVERABLES_DIRNAME = "deliverables"
 EVIDENCE_DIRNAME = "evidence"

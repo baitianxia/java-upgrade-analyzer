@@ -819,6 +819,58 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertNotIn("## 附录：聚合统计", text)
         self.assertNotIn("### 原因分类", text)
 
+    def test_uncertain_evidence_subtypes_are_reported_without_inventing_candidates(self):
+        limitation = {
+            "coord": "io.seata:seata-common",
+            "api": "io.seata.common.Constants.DEFAULT_VALUE",
+            "symbol_kind": "field",
+            "change_type": "CONSTANT_VALUE_CHANGED",
+            "severity": "P1",
+            "uncertainty_kind": "analysis_limitation",
+            "reason_code": "INLINED_CONSTANT_USAGE_UNDETECTABLE",
+            "call_paths": [],
+            "evidence_paths": [],
+        }
+        candidate = {
+            "coord": "com.acme:bridge",
+            "api": "com.acme.Bridge.call",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "uncertainty_kind": "candidate_evidence",
+            "reason_code": "LOW_CONFIDENCE_EDGE",
+            "call_paths": ["app.Entry.run -> com.acme.Bridge.call"],
+        }
+        findings = {
+            "p0": [], "p1": [], "p2": [], "probable_impact": [],
+            "uncertain": [limitation, candidate], "not_impacted": [],
+            "needs_input": [], "not_analyzed": [], "not_found": [],
+            "coverage": {"overall_status": "complete"},
+            "analysis_scope": {"mode": "full"},
+        }
+
+        rows = s6_report.build_api_result_rows(findings)
+        conclusions = {row["api"]: row["conclusion"] for row in rows}
+        core = "\n".join(s6_report.render_core_conclusion(findings))
+        detail = s6_report.build_bucket_detail_markdown(
+            s6_report.S6_DETAIL_BUCKETS["uncertain"],
+            [limitation, candidate],
+            "s6_uncertain_apis.csv",
+        )
+
+        self.assertEqual(
+            conclusions["io.seata.common.Constants.DEFAULT_VALUE"],
+            "结论未确定（静态分析能力边界）",
+        )
+        self.assertEqual(
+            conclusions["com.acme.Bridge.call"],
+            "结论未确定（存在候选证据）",
+        )
+        self.assertIn("结论未确定（静态分析能力边界） 1", core)
+        self.assertIn("结论未确定（候选证据） 1", core)
+        self.assertIn("当前未发现候选调用证据", detail)
+        self.assertIn("现有记录包含候选证据", detail)
+
     def test_core_conclusion_translates_partial_coverage_without_raw_status(self):
         text = "\n".join(
             s6_report.render_core_conclusion(
@@ -879,6 +931,8 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             }
             for index, coord in enumerate(coords)
         ]
+        for item in items[10:12]:
+            item["uncertainty_kind"] = "candidate_evidence"
         findings = {
             "p0": [],
             "p1": [],

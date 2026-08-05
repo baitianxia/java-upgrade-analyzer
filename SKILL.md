@@ -82,6 +82,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
 8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
+   - `state.status=ready` 表示上一 Step 已完成、`current_step` 指向下一待执行 Step；只有 `current_step=done`、`completed_step=step6` 且 `status` 为 `completed` / `completed_with_limits` 时，才能向用户表述为整个分析已完成。
 9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。tree-sitter 必须按固定清单显式 bootstrap，运行时不联网安装；安装、版本或加载检查失败时记录 `blocked_by_system` 并停止，不生成用户确认项。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
 10. **CSV 编码统一**：所有 CSV 产物统一使用 UTF-8 BOM；程序读取时同时兼容带 BOM 与历史无 BOM 的 UTF-8 文件，保证 Excel 直接打开中文不乱码。
 11. **准确性双线验证**：真实项目验证必须并行生成分析器结果与独立 Oracle 结果，只共享同一最终制品、API 身份协议和运行输入，不得复用分析器的解析、筛选或结论实现。必须逐 API 闭集对账；缺失、重复、额外、冲突、错误结论或无法绑定本次最终制品的 Oracle 均不得标记为已验证。接入新项目只增加数据输入和独立证据，不得在生产代码中登记项目、坐标或类名特例。失效的辅助证据必须报告，但不能推翻同一 API 已存在的有效强证据。
@@ -493,7 +494,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 规则：Step5 必须独立解析与 Step4 目标相关的反射、可静态求值 MethodHandle 和资源间接引用；精确证据合并到统一图，动态或不唯一目标输出 `uncertain`，不得伪装为静态未找到
 - 规则：`alerts.csv` 必须输出间接引用的证据类型、位置及能力覆盖状态；完全动态且无法关联到目标范围的线索不得污染所有 API
 - 规则：间接调用覆盖必须按 Step4 API 独立求值；目标相关能力为 `partial/insufficient` 时禁止输出 `not_found_in_static_analysis`，严格模式必须将该覆盖缺口作为关键门控
-- 规则：编译期常量变化不得因 class 中缺少字段访问而判为未使用，必须输出 `INLINED_CONSTANT_USAGE_UNDETECTABLE/uncertain`
+- 规则：编译期常量变化不得因 class 中缺少字段访问而判为未使用，必须输出 `INLINED_CONSTANT_USAGE_UNDETECTABLE/uncertain`；若没有任何源码引用、调用路径或字段访问证据，必须同时标记 `uncertainty_kind=analysis_limitation`，不得显示“存在候选证据”。只有实际存在调用或引用线索时才使用 `uncertainty_kind=candidate_evidence`
 - 规则：SPI、Spring、MyBatis 隐式关系由独立 Adapter 输出；条件未决和多实现必须保留 ambiguity，禁止任意绑定到某个实现
 - 规则：Spring `@Bean` 必须绑定方法返回类型与实际构造实现；无法解析工厂返回实现时 Adapter 状态必须为 `partial`，禁止绑定到配置类并报告完整覆盖
 - 规则：动态代理只有在注册点能够绑定具体 handler 时才能输出具体回调证据，但仅注册不能把 handler 提升为业务入口；声明式 HTTP Client 属于出站边，也不得作为业务代码入站入口
@@ -624,6 +625,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - `cancel` 只表示停止当前续跑，不会清空已有产物
 - 若上一条命令退出码为 `4`，优先读取 `interaction.json`，不要把它当成失败重试
 - 若当前没有 `pending_interaction`，`intent_patch` 必须在 `set` / `clear` 中提供正式业务字段，或显式使用 `action=restart_from_step`
+- `blocked_by_system` 不是用户确认项：直接重新运行 `--step auto` 即可重试当前步骤；若需要显式恢复，可使用 `action=rerun_current_step`，无需附加业务字段
+- 需要回退时，标准写法为 `{"intent_patch":{"action":"restart_from_step","restart_step_id":"step2","set":{}}}`；`restart_step_id` 是控制字段，不属于业务输入
 - 若 `step1` 需要切换到模块级分析，优先使用：
 
 ```bash
