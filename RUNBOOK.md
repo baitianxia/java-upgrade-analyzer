@@ -605,7 +605,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
 - 若直接指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
 - 若筛选条件未在 Step4 API 目标中命中，Step5 会直接报错，避免静默分析错范围
 - 正式流程会向 `stderr` 输出 `[进度][系统触达证据][发现源码/构建调用图/跨依赖检查/追踪系统触达/生成结果/完成]` 等用户可读进度
-- Step5 会生成内部查询索引 `.upgrade-report/.runtime/indexes/s5_query_index.json`。当用户询问某个方法的调用链时，Claude Code 可使用 `scripts/s5_query_call_chain.py` 即时查询；默认只把调用链返回给用户，不额外落查询结果文件。
+- Step5 会生成内部查询索引 `.upgrade-report/.runtime/indexes/s5_query_index.json`。当用户询问某个方法、依赖坐标/ArtifactId 或 Java 包前缀的调用链时，Claude Code 可使用 `scripts/s5_query_call_chain.py` 的 `--method`、`--coord` 或 `--package` 即时查询；默认只把调用链返回给用户，不额外落查询结果文件。
 - 该查询是只读旁路能力：Step5 完成后任意时刻都可使用；它不会改写主流程状态。
 - 当 `reason_code` 为 `DIRECT_CLASS_USAGE`、`DIRECT_FIELD_USAGE`、`DIRECT_STATIC_IMPORT_USAGE` 时，表示 Step5 已直接在业务源码中找到类型/字段引用证据，而不是传统方法调用链
 - `DIRECT_CLASS_USAGE` 仅接受声明类型、import（含 wildcard import）精确命中或 FQCN 直写等正式类型证据；若 simple name 已被 import 解析到其他 FQCN，不会再升级为直接类型命中

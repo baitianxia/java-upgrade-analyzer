@@ -3740,6 +3740,7 @@ def _enrich_packaged_deps_with_runtime(
                 'resolution_status': 'unresolved',
                 'match_source': enriched.get('match_source', ''),
                 'read_error': enriched.get('read_error', ''),
+                'content_sha256': enriched.get('content_sha256', ''),
                 'metadata_anomalies': list(enriched.get('metadata_anomalies') or []),
             })
             continue
@@ -3822,6 +3823,7 @@ def _enrich_packaged_deps_with_runtime(
                 'resolution_status': 'unresolved',
                 'match_source': enriched.get('match_source', ''),
                 'read_error': enriched.get('read_error', ''),
+                'content_sha256': enriched.get('content_sha256', ''),
                 'metadata_anomalies': list(enriched.get('metadata_anomalies') or []),
                 'version_confirmation_status': (
                     'confirmed' if version_confirmed else 'unconfirmed'
@@ -3842,6 +3844,7 @@ def _enrich_packaged_deps_with_runtime(
             ),
             'packaged_present': 'true',
             'packaged_match_source': enriched.get('match_source', 'archive'),
+            'content_sha256': enriched.get('content_sha256', ''),
         }
         resolved[key] = resolved_row
         entries.append({
@@ -5373,6 +5376,11 @@ def _entry_full_compare_key(entry):
     return _resolved_coord(entry)
 
 
+def _entry_content_sha256(entry):
+    value = str((entry or {}).get('content_sha256') or '').strip().lower()
+    return value if re.fullmatch(r'[0-9a-f]{64}', value) else ''
+
+
 def _make_step1_change_row(base_entry, current_entry, comparison_key, pairing_status, pairing_reason_code=''):
     old_ver = str((base_entry or {}).get('version') or '-').strip() or '-'
     new_ver = str((current_entry or {}).get('version') or '-').strip() or '-'
@@ -5386,12 +5394,32 @@ def _make_step1_change_row(base_entry, current_entry, comparison_key, pairing_st
     )
     if resolution_status == 'resolved':
         change, risk = classify_change(old_ver, new_ver)
+        base_content_sha256 = _entry_content_sha256(base_entry)
+        current_content_sha256 = _entry_content_sha256(current_entry)
+        same_version_content_changed = bool(
+            old_ver == new_ver
+            and old_ver not in ('', '-')
+            and base_content_sha256
+            and current_content_sha256
+            and base_content_sha256 != current_content_sha256
+        )
+        if same_version_content_changed:
+            # A republished SNAPSHOT/proprietary artifact can change without a
+            # version change. The final packaged bytes are authoritative, so
+            # retain both sides and let Step4 compare their actual APIs.
+            change, risk = '已变更', '❓需人工确认'
     else:
         change, risk = 'unresolved', '需人工确认'
+        same_version_content_changed = False
     scope = str(((current_entry or base_entry or {}).get('scope')) or 'packaged').strip() or 'packaged'
     if scope in ('test', 'provided', 'optional') and risk == '高':
         risk = '低(非compile)'
     remark = str(((current_entry or {}).get('remark')) or ((base_entry or {}).get('remark')) or '').strip()
+    if same_version_content_changed:
+        remark = ';'.join(item for item in (
+            remark,
+            'same_version_artifact_content_changed',
+        ) if item)
     if pairing_reason_code:
         remark = ';'.join(item for item in (remark, f'pairing:{pairing_reason_code}') if item)
     return {

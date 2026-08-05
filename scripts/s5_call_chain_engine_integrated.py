@@ -29,6 +29,7 @@ import io
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import traceback
@@ -61,7 +62,7 @@ from confidence_weighted_tracer import (
 )
 from enhanced_output_formatter import generate_enhanced_summary, register_step5_summary_artifacts
 import compat as compat_module
-from compat import git_cmd, run_cmd
+from compat import IS_WINDOWS, git_cmd, mvn_cmd, run_cmd
 from csv_io import open_csv_read, open_csv_write
 from progress_logging import PhaseTimer, emit_progress
 from business_bytecode_graph import collect_business_bytecode_batch
@@ -230,7 +231,10 @@ def load_context_source_dirs(context_path):
     return source_dirs
 
 
-def load_current_build_provenance(report_dir):
+def load_build_provenance_side(report_dir, side):
+    side = str(side or "").strip().lower()
+    if side not in {"base", "current"}:
+        raise ValueError(f"unsupported build provenance side: {side or '(empty)'}")
     provenance_path = _build_provenance_path(report_dir)
     if not provenance_path.is_file():
         return {}
@@ -242,10 +246,14 @@ def load_current_build_provenance(report_dir):
         (
             dict(item)
             for item in provenance.get("sides") or []
-            if isinstance(item, dict) and item.get("side") == "current"
+            if isinstance(item, dict) and item.get("side") == side
         ),
         {},
     )
+
+
+def load_current_build_provenance(report_dir):
+    return load_build_provenance_side(report_dir, "current")
 
 
 def resolve_configured_step5_business_source_dirs(args, report_dir):
@@ -284,19 +292,242 @@ def _step5_source_git_root(source_dir):
     return Path(stdout).resolve() if rc == 0 and stdout else None
 
 
+def _step5_maven_settings_from_args(command_text, project_root):
+    try:
+        tokens = shlex.split(str(command_text or ""), posix=not IS_WINDOWS)
+    except ValueError:
+        return None
+    for index, token in enumerate(tokens):
+        value = ""
+        if token in {"-s", "--settings"} and index + 1 < len(tokens):
+            value = tokens[index + 1]
+        elif token.startswith("--settings="):
+            value = token.split("=", 1)[1]
+        if not value:
+            continue
+        value = value.strip()
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {"'", '"'}
+        ):
+            value = value[1:-1]
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path(project_root) / path
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
+def _step5_maven_settings_context(project_root, provenance):
+    project_root = Path(project_root).resolve()
+    path = _step5_maven_settings_from_args(
+        (provenance or {}).get("build_command"), project_root,
+    )
+    if path is not None:
+        return path, True
+    maven_config = project_root / ".mvn" / "maven.config"
+    if maven_config.is_file():
+        try:
+            config_text = maven_config.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            config_text = ""
+        path = _step5_maven_settings_from_args(config_text, project_root)
+        if path is not None:
+            return path, True
+    # MAVEN_ARGS is inherited by compat.run_cmd; adding a second --settings
+    # would duplicate the option and can make Maven reject the command.
+    path = _step5_maven_settings_from_args(
+        os.environ.get("MAVEN_ARGS"), project_root,
+    )
+    if path is not None:
+        return path, False
+    project_settings = project_root / ".mvn" / "settings.xml"
+    if project_settings.is_file():
+        return project_settings.resolve(), True
+    root_settings = project_root / "settings.xml"
+    if root_settings.is_file():
+        return root_settings.resolve(), True
+    maven_user_home = str(os.environ.get("MAVEN_USER_HOME") or "").strip()
+    if maven_user_home:
+        user_settings = Path(maven_user_home).expanduser() / "settings.xml"
+        if user_settings.is_file():
+            return user_settings.resolve(), False
+    user_settings = Path.home() / ".m2" / "settings.xml"
+    if user_settings.is_file():
+        return user_settings.resolve(), False
+    return None, False
+
+
+def _step5_maven_command(project_root, worktree):
+    wrapper_name = "mvnw.cmd" if IS_WINDOWS else "mvnw"
+    project_root = Path(project_root).resolve()
+    worktree = Path(worktree).resolve()
+    # Prefer the wrapper pinned in the detached revision. Preserve an untracked
+    # or locally provisioned wrapper from the original project as the fallback,
+    # and only then use Maven on PATH through compat.mvn_cmd().
+    if (worktree / wrapper_name).is_file():
+        return mvn_cmd(worktree)
+    if (project_root / wrapper_name).is_file():
+        return mvn_cmd(project_root)
+    return mvn_cmd(worktree)
+
+
+def _step5_side_java_env(orchestrated_input, provenance, side):
+    side_key = f"{side}_jdk_home"
+    configured_home = str((orchestrated_input or {}).get(side_key) or "").strip()
+    provenance_home = str((provenance or {}).get("jdk_home") or "").strip()
+    ambient_home = str(os.environ.get("JAVA_HOME") or "").strip()
+    selected = configured_home or provenance_home or ambient_home
+    if not selected:
+        return {}, ""
+    home = Path(selected).expanduser().resolve()
+    java_name = "java.exe" if IS_WINDOWS else "java"
+    if not home.is_dir() or not (home / "bin" / java_name).is_file():
+        raise RuntimeError(
+            f"STEP5_{side.upper()}_JDK_HOME_INVALID:{home}:missing bin/{java_name}"
+        )
+    current_path = str(os.environ.get("PATH") or "")
+    return {
+        "JAVA_HOME": str(home),
+        "PATH": str(home / "bin") + (os.pathsep + current_path if current_path else ""),
+    }, str(home)
+
+
+def _step5_source_generation_timeout(orchestrated_input):
+    value = (orchestrated_input or {}).get("step5_timeout")
+    if value in (None, ""):
+        return None
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"STEP5_TIMEOUT_INVALID:{value}") from exc
+    if timeout <= 0:
+        raise RuntimeError(f"STEP5_TIMEOUT_INVALID:{value}")
+    return timeout
+
+
+def _step5_maven_module_selector(target_module, project_root):
+    value = str(target_module or "").strip()
+    if value in {"", ".", "./"}:
+        return ""
+    candidate = Path(value)
+    if candidate.is_absolute():
+        try:
+            return candidate.resolve().relative_to(Path(project_root).resolve()).as_posix()
+        except ValueError:
+            return value
+    if any(separator in value for separator in ("/", "\\", ":")):
+        return value
+    return f":{value}"
+
+
+def run_step5_detached_maven_compile(
+    report_dir,
+    project_root,
+    worktree,
+    *,
+    side,
+    runner=run_cmd,
+):
+    """Regenerate one side's Maven sources with its recorded build context."""
+    provenance = load_build_provenance_side(report_dir, side)
+    orchestrated_input = load_orchestrated_step5_input(report_dir)
+    command = list(_step5_maven_command(project_root, worktree))
+    command.append("--batch-mode")
+    settings_path, pass_settings_argument = _step5_maven_settings_context(
+        project_root, provenance,
+    )
+    if settings_path is not None and pass_settings_argument:
+        command.extend(["--settings", str(settings_path)])
+    profiles = list(dict.fromkeys(
+        str(item).strip()
+        for item in (
+            (provenance or {}).get("active_maven_profiles")
+            or (orchestrated_input or {}).get("active_maven_profiles")
+            or []
+        )
+        if str(item).strip()
+    ))
+    if profiles:
+        command.append(f"-P{','.join(profiles)}")
+    target_module = (
+        (provenance or {}).get("target_module")
+        or (orchestrated_input or {}).get("target_module")
+        or (orchestrated_input or {}).get("primary_module")
+    )
+    selector = _step5_maven_module_selector(target_module, project_root)
+    if selector:
+        command.extend(["-pl", selector, "-am"])
+    command.extend(["-DskipTests", "compile"])
+    env, jdk_home = _step5_side_java_env(
+        orchestrated_input, provenance, side,
+    )
+    env.update({
+        "MAVEN_BASEDIR": str(Path(worktree).resolve()),
+        "MAVEN_PROJECTBASEDIR": str(Path(worktree).resolve()),
+    })
+    timeout = _step5_source_generation_timeout(orchestrated_input)
+    emit_progress(
+        "step5",
+        "source-generation",
+        f"开始在 {side} detached worktree 生成 Maven 源码",
+    )
+    started = time.perf_counter()
+    stdout, stderr, rc = runner(
+        command,
+        cwd=str(Path(worktree).resolve()),
+        timeout=timeout,
+        env=env,
+        stream_output=True,
+    )
+    elapsed = time.perf_counter() - started
+    if rc != 0:
+        detail = str(stderr or stdout or "mvn compile failed").strip()[-2000:]
+        raise RuntimeError(
+            f"STEP5_BUSINESS_SOURCE_GENERATION_FAILED:{side}:rc={rc}:{detail}"
+        )
+    emit_progress(
+        "step5",
+        "source-generation",
+        f"{side} detached worktree Maven 源码生成完成",
+        elapsed=elapsed,
+    )
+    return {
+        "side": side,
+        "build_tool": "maven",
+        "command": command,
+        "settings_path": str(settings_path or ""),
+        "jdk_home": jdk_home,
+        "timeout_seconds": timeout,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+
+
+def _step5_detached_build_tool(provenance, worktree):
+    declared = str((provenance or {}).get("build_tool") or "").strip().lower()
+    if declared:
+        return declared
+    return "maven" if (Path(worktree) / "pom.xml").is_file() else ""
+
+
 @contextmanager
-def materialize_step5_business_source_workspace(report_dir, source_dirs):
-    """Pin checkout-built business sources to the Step1 current commit for Step5."""
+def materialize_step5_business_source_workspace(
+    report_dir, source_dirs, *, side="current",
+):
+    """Pin checkout-built business sources to one Step1 side's commit."""
     original_dirs = [
         str(Path(item).expanduser().resolve())
         for item in source_dirs or []
         if str(item or "").strip()
     ]
-    current = load_current_build_provenance(report_dir)
-    source_mode = str(current.get("source_mode") or "").strip()
-    expected_commit = str(current.get("revision") or "").strip().lower()
+    build_side = load_build_provenance_side(report_dir, side)
+    source_mode = str(build_side.get("source_mode") or "").strip()
+    expected_commit = str(build_side.get("revision") or "").strip().lower()
     metadata = {
         "mode": "configured_sources",
+        "side": side,
         "source_mode": source_mode,
         "expected_commit": expected_commit,
         "source_dirs": list(original_dirs),
@@ -305,7 +536,7 @@ def materialize_step5_business_source_workspace(report_dir, source_dirs):
     }
 
     # Direct-artifact inputs can be bound to source in several user-defined ways.
-    # Only checkout_build has a Step1-created commit that we can enforce here.
+    # Only checkout_build has a Step1-created commit that we can bind here.
     if (
         source_mode != "checkout_build"
         or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_commit)
@@ -348,24 +579,24 @@ def materialize_step5_business_source_workspace(report_dir, source_dirs):
         f"{expected_commit}^{{commit}}",
     )
     if commit_rc != 0 or resolved_commit.lower() != expected_commit:
+        side_code = "CURRENT" if side == "current" else "BASE"
         raise RuntimeError(
-            "STEP5_CURRENT_COMMIT_UNAVAILABLE:"
+            f"STEP5_{side_code}_COMMIT_UNAVAILABLE:"
             f"{expected_commit}:{commit_stderr or resolved_commit or 'not found'}"
         )
 
     head, _head_stderr, head_rc = _step5_git_output(
         git_root, "rev-parse", "HEAD",
     )
-    status, status_stderr, status_rc = _step5_git_output(
-        git_root, "status", "--porcelain=v1", "--untracked-files=all",
-    )
-    if status_rc != 0:
-        raise RuntimeError(
-            "STEP5_BUSINESS_SOURCE_STATUS_FAILED:"
-            + (status_stderr or "git status failed")
-        )
-    if head_rc == 0 and head.lower() == expected_commit and not status:
-        metadata["mode"] = "existing_clean_checkout"
+    # Compile-time generators can modify both untracked files (for example
+    # MyBatis DAOs) and tracked files (for example filtered properties).
+    # Git dirty state therefore cannot distinguish build output from user
+    # edits.  Revision identity is the binding used by Step5; when HEAD still
+    # matches the Step1 commit for this side, preserve the complete post-build
+    # workspace instead of replacing it with an incomplete checkout.
+    if head_rc == 0 and head.lower() == expected_commit:
+        metadata["mode"] = "existing_matching_checkout"
+        metadata["worktree_dirty_check"] = "skipped"
         yield metadata
         return
 
@@ -380,6 +611,13 @@ def materialize_step5_business_source_workspace(report_dir, source_dirs):
     metadata["temporary_worktree"] = str(worktree)
     mapped_dirs = []
     try:
+        if _step5_detached_build_tool(build_side, worktree) == "maven":
+            metadata["source_generation"] = run_step5_detached_maven_compile(
+                report_dir,
+                git_root,
+                worktree,
+                side=side,
+            )
         for path in source_paths:
             relative = path.relative_to(git_root)
             mapped = worktree / relative
@@ -881,7 +1119,7 @@ def step5_integrated_main(args):
         )
         prepare_started = time.perf_counter()
         with materialize_step5_business_source_workspace(
-            report_dir, configured_source_dirs,
+            report_dir, configured_source_dirs, side="current",
         ) as workspace:
             args._materialized_business_source_dirs = list(
                 workspace.get("source_dirs") or []
@@ -894,9 +1132,9 @@ def step5_integrated_main(args):
                     f"{workspace.get('expected_commit')}",
                     file=sys.stderr,
                 )
-            elif mode == "existing_clean_checkout":
+            elif mode == "existing_matching_checkout":
                 print(
-                    "  Step5 复用与 current commit 一致的干净业务源码工作区",
+                    "  Step5 复用与 current commit 一致的编译后业务源码工作区",
                     file=sys.stderr,
                 )
             emit_progress(
@@ -2318,6 +2556,7 @@ def _step5_integrated_main_impl(args):
     query_index_path = write_query_index(
         graph,
         str(Path(getattr(args, 'query_index', '') or _default_query_index_path(report_dir))),
+        target_apis=all_apis,
         graph_stats={
             'methods_indexed': len(graph.methods_by_id),
             'reverse_edge_keys': len(graph.reverse_edges),
@@ -3046,8 +3285,6 @@ def assess_source_artifact_alignment(report_dir, business_source_dirs):
             git_root = stdout.strip()
             stdout, _stderr, rc = run_cmd(['git', '-C', git_root, 'rev-parse', 'HEAD'])
             revision = stdout.strip() if rc == 0 else ''
-            stdout, _stderr, rc = run_cmd(['git', '-C', git_root, 'status', '--porcelain'])
-            dirty = bool(stdout.strip()) if rc == 0 else None
     expected_revision = str(current.get('revision') or '').strip()
     source_mode = str(current.get('source_mode') or '').strip()
     reasons = []
@@ -3068,6 +3305,10 @@ def assess_source_artifact_alignment(report_dir, business_source_dirs):
             expected_sha256=current.get('artifact_sha256') or '',
             internally_built=source_mode == 'checkout_build',
             artifact_relative_path=current.get('artifact_relative_path') or '',
+            # Build plugins can legitimately modify tracked and untracked
+            # files.  Step5 binds this workspace by revision and does not use
+            # Git dirty state as a source/artifact discriminator.
+            check_worktree_dirty=False,
         )
         reason_map = {
             'source_revision_mismatch': 'source_revision_differs_from_build_revision',
@@ -3096,6 +3337,7 @@ def assess_source_artifact_alignment(report_dir, business_source_dirs):
         'actual_revision': revision,
         'git_root': git_root,
         'worktree_dirty': dirty,
+        'worktree_dirty_checked': False,
         'target_module': current.get('target_module', ''),
         'artifact_path': current.get('artifact_path', ''),
         'artifact_sha256': current.get('artifact_sha256', ''),

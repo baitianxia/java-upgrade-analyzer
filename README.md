@@ -174,9 +174,9 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 
 ---
 
-## 即时查询某个方法的调用链
+## 即时查询方法、依赖或包的调用链
 
-当 Step5 已经生成调用链查询索引后，如果你只是想确认某个方法是否存在调用链，可以直接让 Claude Code 查询：
+当 Step5 已经生成调用链查询索引后，可以按方法、依赖坐标或 Java 包前缀查询：
 
 ```text
 查询 com.foo.Bar.baz(String) 的调用链
@@ -188,10 +188,19 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 帮我看一下 org.apache.commons.lang.StringUtils.isBlank(String) 是从哪里被调用到的。
 ```
 
+```text
+查询 commons-lang 的调用链
+查询 org.apache.commons.lang 包下所有变更 API 的调用链
+```
+
 默认行为：
 
 - 直接在对话中返回调用链；
 - 默认按全限定名精确匹配，不会自动退回简单名匹配，避免 `StringUtils`、`JSONArray`、`isEmpty` 这类同名类/方法串链误报；
+- 方法全限定名未带签名时，仅聚合该全限定方法的已签名重载，不会按 `equals` 等简单名扩散；
+- 依赖可使用完整 `groupId:artifactId[:classifier]` 坐标；仅使用 artifactId 时必须在本次分析范围内唯一，否则会要求改用完整坐标；
+- 包前缀按 Java 包段边界匹配，`org.apache.commons.lang` 不会命中 `org.apache.commons.lang3`；
+- 聚合查询默认最多返回 20 条；达到上限时会明确提示，可通过 `--limit` 调整；
 - 如果没有精确命中，会明确告诉你“未找到精确匹配的调用链”；
 - 不额外生成查询结果文件；
 - 不重跑 Step5；

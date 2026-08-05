@@ -1,7 +1,9 @@
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,11 +18,14 @@ from s5_query_call_chain import (
     build_target_keys,
     _is_precise_lookup_key,
     query_alert_chains,
+    query_alert_chains_by_scope,
     query_call_chains,
     query_call_chain_result,
+    query_scope_call_chain_result,
     render_call_chains,
     write_query_index,
     load_query_index,
+    main,
 )
 
 
@@ -83,6 +88,28 @@ class S5QueryCallChainTest(unittest.TestCase):
 
         self.assertEqual(forward, reversed_input)
 
+    def test_query_index_target_apis_are_deduplicated_and_stable(self):
+        graph = SimpleNamespace(methods_by_id={}, lookup_keys_by_symbol={}, reverse_edges={})
+        first = {
+            "coord": "commons-lang:commons-lang",
+            "api_name": "org.apache.commons.lang.StringUtils.equals",
+            "api_signature": "(java.lang.String, java.lang.String)",
+            "symbol_kind": "method",
+        }
+        duplicate = dict(first, change_type="REMOVED")
+        second = {
+            "coord": "commons-lang:commons-lang",
+            "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+            "api_signature": "(String)",
+            "symbol_kind": "method",
+        }
+
+        forward = build_query_index(graph, target_apis=[first, duplicate, second])
+        reversed_input = build_query_index(graph, target_apis=[second, duplicate, first])
+
+        self.assertEqual(forward, reversed_input)
+        self.assertEqual(len(forward["target_apis"]), 2)
+
     def test_query_returns_complete_business_to_dependency_chain(self):
         app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
         dep_a = method("a", "com.depa.FacadeA.entry", owner_coord="com.example:dep-a", module="dep-a")
@@ -127,6 +154,50 @@ class S5QueryCallChainTest(unittest.TestCase):
         chains = query_call_chains(build_query_index(graph), "com.vendor.Target.removed(String)")
 
         self.assertEqual(chains, ["com.app.App.run → com.vendor.Target.removed(String)"])
+
+    def test_unsigned_fully_qualified_method_queries_only_its_signed_overloads(self):
+        app_one = method("app-one", "com.app.First.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        app_two = method("app-two", "com.app.Second.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        unrelated = method("unrelated", "com.app.Unrelated.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        target_name = "org.apache.commons.lang.StringUtils.equals"
+        graph = SimpleNamespace(
+            methods_by_id={item.symbol_id: item for item in (app_one, app_two, unrelated)},
+            lookup_keys_by_symbol={
+                "app-one": ["com.app.First.run", "method:run"],
+                "app-two": ["com.app.Second.run", "method:run"],
+                "unrelated": ["com.app.Unrelated.run", "method:run"],
+            },
+            reverse_edges={
+                f"{target_name}(String,String)": [
+                    edge(app_one, f"{target_name}(String,String)", owner_type="business", owner_coord="BUSINESS", module="app")
+                ],
+                f"{target_name}(Object,Object)": [
+                    edge(app_two, f"{target_name}(Object,Object)", owner_type="business", owner_coord="BUSINESS", module="app")
+                ],
+                "method:equals": [
+                    edge(unrelated, "java.lang.String.equals(Object)", owner_type="business", owner_coord="BUSINESS", module="app")
+                ],
+            },
+        )
+
+        index = build_query_index(graph)
+        chains = query_call_chains(index, target_name)
+        fuzzy_chains = query_call_chains(index, target_name, fuzzy=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            write_query_index(
+                graph,
+                report_dir / ".runtime" / "indexes" / "s5_query_index.json",
+            )
+            result = query_call_chain_result(report_dir, target_name)
+
+        self.assertEqual(len(chains), 2)
+        self.assertEqual(fuzzy_chains, chains)
+        self.assertTrue(all(target_name in chain for chain in chains))
+        self.assertFalse(any("java.lang.String.equals" in chain for chain in chains))
+        self.assertEqual(result["match_mode"], "exact")
+        self.assertTrue(result["exact_match"])
+        self.assertTrue(all(key.startswith(f"{target_name}(") for key in result["matched_keys"]))
 
     def test_query_returns_empty_when_target_is_missing(self):
         graph = SimpleNamespace(methods_by_id={}, lookup_keys_by_symbol={}, reverse_edges={})
@@ -273,8 +344,10 @@ class S5QueryCallChainTest(unittest.TestCase):
         )
 
         chains = query_call_chains(build_query_index(graph), target)
+        fuzzy_chains = query_call_chains(build_query_index(graph), target, fuzzy=True)
 
         self.assertEqual(chains, [])
+        self.assertEqual(fuzzy_chains, [])
 
     def test_upstream_expansion_follows_precise_lookup_keys(self):
         app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
@@ -412,6 +485,284 @@ class S5QueryCallChainTest(unittest.TestCase):
             ["com.app.App.run → com.vendor.LegacyApi.removed(String)"],
         )
 
+    def test_coord_query_accepts_unique_artifact_id_and_aggregates_target_apis(self):
+        first = method("first", "com.app.First.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        second = method("second", "com.app.Second.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        unrelated = method("other", "com.app.Other.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        equals_target = "org.apache.commons.lang.StringUtils.equals(String,String)"
+        blank_target = "org.apache.commons.lang.StringUtils.isBlank(String)"
+        unrelated_target = "com.example.StringUtil.equals(String,String)"
+        graph = SimpleNamespace(
+            methods_by_id={item.symbol_id: item for item in (first, second, unrelated)},
+            lookup_keys_by_symbol={item.symbol_id: [item.qualified_key] for item in (first, second, unrelated)},
+            reverse_edges={
+                equals_target: [edge(first, equals_target, owner_type="business", owner_coord="BUSINESS", module="app")],
+                blank_target: [edge(second, blank_target, owner_type="business", owner_coord="BUSINESS", module="app")],
+                unrelated_target: [edge(unrelated, unrelated_target, owner_type="business", owner_coord="BUSINESS", module="app")],
+            },
+        )
+        targets = [
+            {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.equals",
+                "api_signature": "(String,String)",
+                "symbol_kind": "method",
+            },
+            {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.isBlank",
+                "api_signature": "(String)",
+                "symbol_kind": "method",
+            },
+            {
+                "coord": "com.example:other",
+                "api_name": "com.example.StringUtil.equals",
+                "api_signature": "(String,String)",
+                "symbol_kind": "method",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            write_query_index(
+                graph,
+                report_dir / ".runtime" / "indexes" / "s5_query_index.json",
+                target_apis=targets,
+            )
+
+            result = query_scope_call_chain_result(report_dir, "commons-lang", "coord")
+            exact_result = query_scope_call_chain_result(
+                report_dir, "commons-lang:commons-lang", "coord"
+            )
+            limited_result = query_scope_call_chain_result(
+                report_dir, "commons-lang", "coord", limit=1
+            )
+
+        self.assertEqual(result["match_mode"], "coord_artifact_unique")
+        self.assertEqual(result["matched_coords"], ["commons-lang:commons-lang"])
+        self.assertEqual(result["matched_target_count"], 2)
+        self.assertEqual(len(result["chains"]), 2)
+        self.assertEqual(exact_result["match_mode"], "coord_exact")
+        self.assertFalse(any("com.example.StringUtil.equals" in chain for chain in result["chains"]))
+        self.assertTrue(limited_result["limit_reached"])
+        self.assertIn("--limit=1", limited_result["warnings"][0])
+
+    def test_coord_query_rejects_ambiguous_artifact_id(self):
+        graph = SimpleNamespace(methods_by_id={}, lookup_keys_by_symbol={}, reverse_edges={})
+        targets = [
+            {
+                "coord": "legacy:commons-lang",
+                "api_name": "legacy.StringUtils.equals",
+                "api_signature": "(Object,Object)",
+                "symbol_kind": "method",
+            },
+            {
+                "coord": "internal:commons-lang",
+                "api_name": "internal.StringUtils.equals",
+                "api_signature": "(Object,Object)",
+                "symbol_kind": "method",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            write_query_index(
+                graph,
+                report_dir / ".runtime" / "indexes" / "s5_query_index.json",
+                target_apis=targets,
+            )
+
+            result = query_scope_call_chain_result(report_dir, "commons-lang", "coord")
+
+        self.assertEqual(result["match_mode"], "coord_ambiguous")
+        self.assertEqual(result["chains"], [])
+        self.assertIn("legacy:commons-lang", result["warnings"][0])
+        self.assertIn("internal:commons-lang", result["warnings"][0])
+
+    def test_coord_query_does_not_broaden_changed_method_without_signature(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        signed_target = "org.apache.commons.lang.StringUtils.equals(Object,Object)"
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": [app.qualified_key]},
+            reverse_edges={
+                signed_target: [edge(app, signed_target, owner_type="business", owner_coord="BUSINESS", module="app")]
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            write_query_index(
+                graph,
+                report_dir / ".runtime" / "indexes" / "s5_query_index.json",
+                target_apis=[{
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.equals",
+                    "api_signature": "",
+                    "symbol_kind": "method",
+                }],
+            )
+
+            result = query_scope_call_chain_result(report_dir, "commons-lang", "coord")
+
+        self.assertEqual(result["matched_target_count"], 1)
+        self.assertEqual(result["unqueryable_target_count"], 1)
+        self.assertEqual(result["chains"], [])
+        self.assertIn("缺少精确签名", result["warnings"][0])
+
+    def test_package_query_uses_segment_boundary_and_aggregates_matching_apis(self):
+        included = method("included", "com.app.Included.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        excluded = method("excluded", "com.app.Excluded.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        target = "org.apache.commons.lang.StringUtils.equals(Object,Object)"
+        neighboring_target = "org.apache.commons.lang3.StringUtils.equals(Object,Object)"
+        graph = SimpleNamespace(
+            methods_by_id={item.symbol_id: item for item in (included, excluded)},
+            lookup_keys_by_symbol={item.symbol_id: [item.qualified_key] for item in (included, excluded)},
+            reverse_edges={
+                target: [edge(included, target, owner_type="business", owner_coord="BUSINESS", module="app")],
+                neighboring_target: [edge(excluded, neighboring_target, owner_type="business", owner_coord="BUSINESS", module="app")],
+            },
+        )
+        targets = [
+            {
+                "coord": "commons-lang:commons-lang",
+                "api_name": "org.apache.commons.lang.StringUtils.equals",
+                "api_signature": "(Object,Object)",
+                "symbol_kind": "method",
+            },
+            {
+                "coord": "org.apache.commons:commons-lang3",
+                "api_name": "org.apache.commons.lang3.StringUtils.equals",
+                "api_signature": "(Object,Object)",
+                "symbol_kind": "method",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            write_query_index(
+                graph,
+                report_dir / ".runtime" / "indexes" / "s5_query_index.json",
+                target_apis=targets,
+            )
+
+            result = query_scope_call_chain_result(
+                report_dir, "org.apache.commons.lang.*", "package"
+            )
+
+        self.assertEqual(result["match_mode"], "package_prefix")
+        self.assertEqual(result["matched_target_count"], 1)
+        self.assertEqual(result["chains"], [f"com.app.Included.run → {target}"])
+
+    def test_scope_query_merges_graph_and_alert_chain_preferring_known_signatures(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        target = "org.apache.commons.lang.StringUtils.equals(Object,Object)"
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": [app.qualified_key]},
+            reverse_edges={
+                target: [edge(app, target, owner_type="business", owner_coord="BUSINESS", module="app")]
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            write_query_index(
+                graph,
+                report_dir / ".runtime" / "indexes" / "s5_query_index.json",
+                target_apis=[{
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.equals",
+                    "api_signature": "(Object,Object)",
+                    "symbol_kind": "method",
+                }],
+            )
+            alerts = report_dir / "evidence" / "call_chain" / "alerts.csv"
+            alerts.parent.mkdir(parents=True)
+            alerts.write_text(
+                "target_coord,changed_symbol,api_signature,path_status,path_text\n"
+                "commons-lang:commons-lang,org.apache.commons.lang.StringUtils.equals,"
+                "\"(Object,Object)\",reachable,"
+                "\"com.app.App.run(String) -> org.apache.commons.lang.StringUtils.equals(Object,Object)\"\n"
+                "commons-lang:commons-lang,org.apache.commons.lang.StringUtils.equals,"
+                "\"(Object,Object)\",reachable,"
+                "\"com.app.App.run(int) -> org.apache.commons.lang.StringUtils.equals(Object,Object)\"\n",
+                encoding="utf-8",
+            )
+
+            result = query_scope_call_chain_result(report_dir, "commons-lang", "coord")
+
+        self.assertEqual(
+            result["chains"],
+            [
+                f"com.app.App.run(String) → {target}",
+                f"com.app.App.run(int) → {target}",
+            ],
+        )
+
+    def test_scope_query_falls_back_to_versioned_alert_coordinate_for_old_index(self):
+        graph = SimpleNamespace(methods_by_id={}, lookup_keys_by_symbol={}, reverse_edges={})
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            index = build_query_index(graph)
+            index.pop("target_apis")
+            index_path = report_dir / ".runtime" / "indexes" / "s5_query_index.json"
+            index_path.parent.mkdir(parents=True)
+            index_path.write_text(json.dumps(index), encoding="utf-8")
+            alerts = report_dir / "evidence" / "call_chain" / "alerts.csv"
+            alerts.parent.mkdir(parents=True)
+            alerts.write_text(
+                "target_coord,changed_symbol,api_signature,path_status,path_text\n"
+                "commons-lang:commons-lang（2.6 -> 2.7）,"
+                "org.apache.commons.lang.StringUtils.equals,\"(Object,Object)\",reachable,"
+                "\"com.app.App.run -> org.apache.commons.lang.StringUtils.equals(Object,Object)\"\n",
+                encoding="utf-8",
+            )
+
+            alert_result = query_alert_chains_by_scope(
+                report_dir, "commons-lang", "coord"
+            )
+            result = query_scope_call_chain_result(
+                report_dir, "commons-lang", "coord"
+            )
+
+        self.assertEqual(alert_result["matched_coords"], ["commons-lang:commons-lang"])
+        self.assertEqual(result["match_mode"], "alerts_coord_artifact_unique")
+        self.assertEqual(
+            result["chains"],
+            ["com.app.App.run → org.apache.commons.lang.StringUtils.equals(Object,Object)"],
+        )
+
+    def test_cli_supports_coord_query_json_output(self):
+        app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")
+        target = "org.apache.commons.lang.StringUtils.equals(Object,Object)"
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": [app.qualified_key]},
+            reverse_edges={
+                target: [edge(app, target, owner_type="business", owner_coord="BUSINESS", module="app")]
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            write_query_index(
+                graph,
+                report_dir / ".runtime" / "indexes" / "s5_query_index.json",
+                target_apis=[{
+                    "coord": "commons-lang:commons-lang",
+                    "api_name": "org.apache.commons.lang.StringUtils.equals",
+                    "api_signature": "(Object,Object)",
+                    "symbol_kind": "method",
+                }],
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = main([
+                    "--report-dir", str(report_dir),
+                    "--coord", "commons-lang",
+                    "--json",
+                ])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["query_type"], "coord")
+        self.assertEqual(payload["chains"], [f"com.app.App.run → {target}"])
+
     def test_alert_fallback_rejects_exact_symbol_with_wrong_path_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
@@ -420,13 +771,17 @@ class S5QueryCallChainTest(unittest.TestCase):
             alerts.write_text(
                 "changed_symbol,api_signature,path_status,path_text\n"
                 "net.sf.json.JSONArray,,reachable,"
-                "com.app.App.run -> jsonSwitch.JSONArray -> com.alibaba.fastjson.JSONArray\n",
+                "com.app.App.run -> net.sf.json.JSONArray.helper -> com.alibaba.fastjson.JSONArray\n",
                 encoding="utf-8",
             )
 
             chains = query_alert_chains(report_dir, "net.sf.json.JSONArray")
+            scope_result = query_alert_chains_by_scope(
+                report_dir, "net.sf.json", "package"
+            )
 
         self.assertEqual(chains, [])
+        self.assertEqual(scope_result["chains"], [])
 
     def test_query_result_reports_exact_not_found_without_silent_fuzzy_match(self):
         app = method("app", "com.app.App.run", owner_type="business", owner_coord="BUSINESS", module="app")

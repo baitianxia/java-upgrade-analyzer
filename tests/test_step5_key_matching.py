@@ -19583,8 +19583,9 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 fake_graph.reverse_edges["runtime.Target.call()"] = [SimpleNamespace()]
                 return [fake_result]
 
-            def fake_write_query_index(graph, path, graph_stats=None):
+            def fake_write_query_index(graph, path, graph_stats=None, target_apis=None):
                 query_index_edge_counts.append(len(graph.reverse_edges))
+                self.assertEqual(target_apis[0]["coord"], "sample:dep")
                 return path
 
             with patch.object(step5, "auto_discover_bridge_sources", return_value={

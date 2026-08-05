@@ -56,7 +56,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 10. 只要仍有待执行、正在执行、阻塞、失败、未交付或用户要求的验证尚未执行，就必须直接回答“没有全部完成”，并准确列出各项状态。不得把待执行写成正在执行，也不得用“应该正确”“基本完成”或“后续增强”掩盖未完成工作。
 11. 只有所有任务项均已完成、要求的验证有本轮新鲜证据、交付动作已经完成且没有已知剩余项时，才能宣称“全部完成”。无法取得事实或证据时，应说明“无法确认”，不得用推测填补。
 
-窄例外：如果 Step5 已经成功生成 `.upgrade-report/.runtime/indexes/s5_query_index.json`，且用户只是询问某个方法的调用链，允许执行只读诊断查询 `scripts/s5_query_call_chain.py` 并直接返回调用链文本。该动作不得修改 `main_state.json`、不得清理/重跑任何 Step、不得恢复 checkpoint，也不得继续推进 Step6。
+窄例外：如果 Step5 已经成功生成 `.upgrade-report/.runtime/indexes/s5_query_index.json`，且用户只是按方法、依赖坐标/ArtifactId 或 Java 包前缀询问调用链，允许执行只读诊断查询 `scripts/s5_query_call_chain.py` 并直接返回调用链文本。该动作不得修改 `main_state.json`、不得清理/重跑任何 Step、不得恢复 checkpoint，也不得继续推进 Step6。
 
 ## 目标
 
@@ -130,7 +130,7 @@ if gate failed or step blocked:
 
 硬规则：
 
-1. 遇到 `awaiting_*` 时，唯一合法动作是“读交互文件 -> 问用户 -> 等用户答复 -> 用答复恢复”；唯一例外是用户明确要求查询 Step5 已生成索引中的某个方法调用链，此时只允许执行只读 `s5_query_call_chain.py` 查询并返回链路
+1. 遇到 `awaiting_*` 时，唯一合法动作是“读交互文件 -> 问用户 -> 等用户答复 -> 用答复恢复”；唯一例外是用户明确要求按方法、依赖坐标/ArtifactId 或 Java 包前缀查询 Step5 已生成索引中的调用链，此时只允许执行只读 `s5_query_call_chain.py` 查询并返回链路
 2. `run_step.py` 退出码 `4` 表示 `AWAITING_USER`；必须读取 `interaction.json` 后停下问用户，不能把它当成失败重试，也不能当成成功完成
 3. 恢复命令只使用 `--response-json` 或 `--response-file`；不得使用裸动作参数绕过结构化用户答复
 4. checkpoint 转述必须先形成用户可读的“决策卡片”：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可以直接怎么回复。

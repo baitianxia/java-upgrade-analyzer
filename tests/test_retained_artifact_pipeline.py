@@ -130,6 +130,88 @@ class RetainedArtifactPipelineTest(unittest.TestCase):
                 2,
             )
 
+    def test_same_version_changed_bytes_retain_base_and_current_jars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dependencies = root / "dependencies"
+            base_artifact = root / "base.jar"
+            current_artifact = root / "current.jar"
+            lib_entry = "BOOT-INF/lib/nbs-bcl-basesvr-1.0.0-SNAPSHOT.jar"
+            pom_properties = (
+                b"groupId=com.nbs\n"
+                b"artifactId=nbs-bcl-basesvr\n"
+                b"version=1.0.0-SNAPSHOT\n"
+            )
+            base_nested = self._jar_bytes([
+                (
+                    "META-INF/maven/com.nbs/nbs-bcl-basesvr/pom.properties",
+                    pom_properties,
+                ),
+                ("com/nbs/BaseService.class", b"base"),
+            ])
+            current_nested = self._jar_bytes([
+                (
+                    "META-INF/maven/com.nbs/nbs-bcl-basesvr/pom.properties",
+                    pom_properties,
+                ),
+                ("com/nbs/BaseService.class", b"current"),
+            ])
+            for artifact, nested in (
+                (base_artifact, base_nested),
+                (current_artifact, current_nested),
+            ):
+                with zipfile.ZipFile(artifact, "w") as outer:
+                    outer.writestr(lib_entry, nested)
+
+            _base_deps, base_meta = (
+                s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                    base_artifact, side="base"
+                )
+            )
+            _current_deps, current_meta = (
+                s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                    current_artifact, side="current"
+                )
+            )
+            base_entry = base_meta["dep_entries"][0]
+            current_entry = current_meta["dep_entries"][0]
+            rows = s1_dep_diff._build_step1_change_rows(
+                [base_entry], [current_entry]
+            )
+
+            manifest_path, items = s1_dep_diff.materialize_changed_dependency_jars(
+                rows,
+                {
+                    "base": {
+                        "artifact_path": str(base_artifact),
+                        "artifact_sha256": hashlib.sha256(
+                            base_artifact.read_bytes()
+                        ).hexdigest(),
+                    },
+                    "current": {
+                        "artifact_path": str(current_artifact),
+                        "artifact_sha256": hashlib.sha256(
+                            current_artifact.read_bytes()
+                        ).hexdigest(),
+                    },
+                },
+                dependencies,
+                current_entries=[current_entry],
+            )
+
+            self.assertEqual(rows[0]["change_type"], "已变更")
+            self.assertEqual(
+                {item["side"] for item in items}, {"base", "current"}
+            )
+            by_side = {item["side"]: item for item in items}
+            self.assertEqual(by_side["base"]["purposes"], ["step4_change"])
+            self.assertEqual(
+                by_side["current"]["purposes"],
+                ["step4_change", "step5_runtime"],
+            )
+            self.assertTrue(Path(by_side["base"]["retained_path"]).is_file())
+            self.assertTrue(manifest_path.is_file())
+
     def test_step5_catalog_survives_after_outer_fat_jar_is_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

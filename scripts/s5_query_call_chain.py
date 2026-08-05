@@ -19,9 +19,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_INDEXES_DIRNAME, STEP5_QUERY_INDEX_FILE
+from artifact_coordinates import split_artifact_coord
 from csv_io import open_csv_read
-from signature_utils import normalize_signature_for_lookup
+from pipeline_constants import RUNTIME_DIRNAME, RUNTIME_INDEXES_DIRNAME, STEP5_QUERY_INDEX_FILE
+from signature_utils import (
+    normalize_signature_for_identity,
+    normalize_signature_for_lookup,
+    signatures_match_identity,
+)
 
 
 SCHEMA = "java-upgrade-analyzer.s5-query-index.v1"
@@ -69,7 +74,59 @@ def _edge_to_record(edge):
     }
 
 
-def build_query_index(graph, graph_stats=None):
+def _target_api_record(api_row):
+    row = api_row or {}
+    api_name = _clean(row.get("api_name") or row.get("changed_symbol"))
+    api_name, embedded_signature = _split_method_and_signature(api_name)
+    api_signature = _clean(row.get("api_signature")) or embedded_signature
+    return {
+        "coord": _clean(row.get("coord") or row.get("target_coord")),
+        "api_name": api_name,
+        "api_signature": api_signature,
+        "symbol_kind": _clean(row.get("symbol_kind")).lower(),
+    }
+
+
+def _target_api_identity(record):
+    signature = normalize_signature_for_identity(record.get("api_signature"))
+    if not signature:
+        signature = "".join(_clean(record.get("api_signature")).split())
+    return (
+        _clean(record.get("coord")),
+        _clean(record.get("api_name")).replace("$", "."),
+        signature,
+        _clean(record.get("symbol_kind")).lower(),
+    )
+
+
+def _index_target_apis(target_apis):
+    records = [
+        _target_api_record(item)
+        for item in target_apis or []
+        if isinstance(item, dict)
+    ]
+    records = [item for item in records if item.get("coord") and item.get("api_name")]
+    unique = {}
+    for record in sorted(
+        records,
+        key=lambda item: (
+            _target_api_identity(item),
+            item.get("api_signature", ""),
+        ),
+    ):
+        unique.setdefault(_target_api_identity(record), record)
+    return sorted(
+        unique.values(),
+        key=lambda item: (
+            item.get("coord", ""),
+            item.get("api_name", ""),
+            normalize_signature_for_identity(item.get("api_signature", "")),
+            item.get("symbol_kind", ""),
+        ),
+    )
+
+
+def build_query_index(graph, graph_stats=None, target_apis=None):
     """Build a compact, JSON-safe reverse-call-chain query index from Step5 graph."""
     methods_by_id = getattr(graph, "methods_by_id", {}) or {}
     reverse_edges = getattr(graph, "reverse_edges", {}) or {}
@@ -114,23 +171,33 @@ def build_query_index(graph, graph_stats=None):
             continue
         records = [_edge_to_record(edge) for edge in edges or []]
         indexed_reverse_edges[clean_key] = sorted(records, key=_edge_sort_key)
+    indexed_target_apis = _index_target_apis(target_apis)
     return {
         "schema": SCHEMA,
         "methods": methods,
         "lookup_keys_by_symbol": lookup_keys,
         "reverse_edges": indexed_reverse_edges,
+        # Optional in schema v1 so reports produced by older releases remain
+        # readable. New indexes retain the authoritative Step4 -> Step5 target
+        # ownership needed by dependency/package scoped queries.
+        "target_apis": indexed_target_apis,
         "stats": {
             "methods_indexed": len(methods),
             "reverse_edge_keys": len(indexed_reverse_edges),
+            "target_apis_indexed": len(indexed_target_apis),
             **(graph_stats or {}),
         },
     }
 
 
-def write_query_index(graph, output_path, graph_stats=None):
+def write_query_index(graph, output_path, graph_stats=None, target_apis=None):
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    index = build_query_index(graph, graph_stats=graph_stats)
+    index = build_query_index(
+        graph,
+        graph_stats=graph_stats,
+        target_apis=target_apis,
+    )
     output.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return output
 
@@ -200,6 +267,57 @@ def _target_match_prefixes(method):
     if method_name and not signature:
         prefixes.append(f"{method_name}(")
     return tuple(prefixes)
+
+
+def _path_ends_with_target(path_text, target_name, target_signature=""):
+    normalized_path = _clean(path_text).replace(" -> ", " → ")
+    nodes = [item.strip() for item in normalized_path.split(" → ") if item.strip()]
+    if not nodes:
+        return False
+    node_name, node_signature = _split_method_and_signature(nodes[-1])
+    wanted_name, embedded_signature = _split_method_and_signature(target_name)
+    wanted_signature = _clean(target_signature) or embedded_signature
+    if node_name != wanted_name and not node_name.endswith(f":{wanted_name}"):
+        return False
+    if wanted_signature and node_signature:
+        return signatures_match_identity(wanted_signature, node_signature)
+    return True
+
+
+def _resolve_target_keys(index, method, *, fuzzy=False):
+    """Resolve exact owner-preserving keys, including every signed overload.
+
+    Reverse-edge indexes normally store ``owner.method(signature)``. A user
+    should therefore be able to omit the signature without losing the exact
+    owner/package constraint. This expansion deliberately never searches
+    ``method:<simple-name>`` unless fuzzy mode was explicitly requested.
+    """
+    reverse_edges = index.get("reverse_edges") or {}
+    method_name, signature = _split_method_and_signature(method)
+    exact_keys = [
+        key
+        for key in build_target_keys(method, fuzzy=False)
+        if reverse_edges.get(key)
+    ]
+    class_key = f"class:{method_name}" if method_name else ""
+    if method_name and not signature and not reverse_edges.get(class_key):
+        overload_prefix = f"{method_name}("
+        overload_keys = []
+        for key in sorted(reverse_edges):
+            if key.startswith(overload_prefix) and reverse_edges.get(key) and key not in exact_keys:
+                overload_keys.append(key)
+        # Prefer signed keys so duplicate unsigned aggregate edges do not use
+        # up the result limit before distinct overload paths are considered.
+        exact_keys = overload_keys + exact_keys
+
+    matched_keys = list(exact_keys)
+    # Fuzzy is a fallback, not a union. Once owner-preserving keys exist,
+    # adding simple-name keys would contaminate an otherwise exact result.
+    if fuzzy and not exact_keys:
+        for key in build_target_keys(method, fuzzy=True):
+            if reverse_edges.get(key) and key not in matched_keys:
+                matched_keys.append(key)
+    return exact_keys, matched_keys
 
 
 def _edge_contains_exact_target(edge, exact_target_keys, target_prefixes, *, fuzzy=False):
@@ -303,19 +421,22 @@ def _dedupe_and_prefer_longest(paths, methods, target, limit):
 
 
 def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000, *, fuzzy=False):
+    if limit <= 0:
+        return []
     methods = index.get("methods") or {}
     lookup_keys_by_symbol = index.get("lookup_keys_by_symbol") or {}
     reverse_edges = index.get("reverse_edges") or {}
-    exact_target_keys = build_target_keys(method, fuzzy=False)
+    exact_target_keys, target_keys = _resolve_target_keys(index, method, fuzzy=fuzzy)
+    effective_fuzzy = bool(fuzzy and not exact_target_keys)
     target_prefixes = _target_match_prefixes(method)
-    target_keys = [key for key in build_target_keys(method, fuzzy=fuzzy) if reverse_edges.get(key)]
     if not target_keys:
         return []
+    collection_limit = limit * min(max(len(target_keys), 1), 4)
     queue = deque((key, []) for key in target_keys)
     collected = []
     visited = set()
     visits = 0
-    while queue and len(collected) < limit and visits < max_visits:
+    while queue and len(collected) < collection_limit and visits < max_visits:
         current_key, path = queue.popleft()
         visits += 1
         if len(path) >= max_depth:
@@ -340,20 +461,41 @@ def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000, *,
                     next_path[0],
                     exact_target_keys,
                     target_prefixes,
-                    fuzzy=fuzzy,
+                    fuzzy=effective_fuzzy,
                 ):
                     collected.append(next_path)
-                if len(collected) >= limit:
+                if len(collected) >= collection_limit:
                     break
             if len(next_path) >= max_depth:
                 continue
-            for next_key in _iter_next_lookup_keys(lookup_keys_by_symbol.get(caller_id), fuzzy=fuzzy):
+            for next_key in _iter_next_lookup_keys(
+                lookup_keys_by_symbol.get(caller_id),
+                fuzzy=effective_fuzzy,
+            ):
                 if reverse_edges.get(next_key):
                     queue.append((next_key, next_path))
-    return [
-        _format_path(path, methods, method)
-        for path in _dedupe_and_prefer_longest(collected, methods, method, limit)
-    ]
+    chains = []
+    chain_groups = {}
+    for path in _dedupe_and_prefer_longest(
+        collected,
+        methods,
+        method,
+        collection_limit,
+    ):
+        _merge_chain(
+            chains,
+            _format_path(path, methods, method),
+            limit=limit,
+            groups=chain_groups,
+        )
+    return chains
+
+
+def _alerts_path(report_dir_or_file):
+    root = Path(report_dir_or_file)
+    if root.is_file():
+        root = root.parent.parent.parent if root.name == STEP5_QUERY_INDEX_FILE else root.parent
+    return root / "evidence" / "call_chain" / "alerts.csv"
 
 
 def query_alert_chains(report_dir_or_file, method, limit=20):
@@ -364,16 +506,12 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
       business source -> dependency jar A -> dependency jar B -> changed API
     This fallback keeps the user-facing query useful after Step5 completes.
     """
-    root = Path(report_dir_or_file)
-    if root.is_file():
-        root = root.parent.parent.parent if root.name == STEP5_QUERY_INDEX_FILE else root.parent
-    alerts_path = root / "evidence" / "call_chain" / "alerts.csv"
+    alerts_path = _alerts_path(report_dir_or_file)
     if not alerts_path.exists():
         return []
 
     method_name, signature = _split_method_and_signature(method)
     wanted_signature = normalize_signature_for_lookup(signature) if signature else ""
-    target_prefixes = _target_match_prefixes(method)
     chains = []
     seen = set()
     with open_csv_read(alerts_path) as fh:
@@ -392,10 +530,7 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
             path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
             if not path_text:
                 continue
-            if not any(
-                target in path_text or (target.endswith("(") and target[:-1] in path_text)
-                for target in target_prefixes
-            ):
+            if not _path_ends_with_target(path_text, method_name, wanted_signature):
                 continue
             if path_text in seen:
                 continue
@@ -406,14 +541,354 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
     return chains
 
 
+def _coord_without_versions(value):
+    text = _clean(value).split("（", 1)[0].strip()
+    return text.split(" (", 1)[0].strip()
+
+
+def _coord_ga(coord):
+    group_id, artifact_id, _classifier = split_artifact_coord(coord)
+    return f"{group_id}:{artifact_id}" if group_id and artifact_id else ""
+
+
+def _coord_artifact_id(coord):
+    _group_id, artifact_id, _classifier = split_artifact_coord(coord)
+    return artifact_id
+
+
+def _resolve_coord_query(query, available_coords):
+    wanted = _clean(query)
+    coords = sorted({_coord_without_versions(item) for item in available_coords if _coord_without_versions(item)})
+    if not wanted:
+        return [], "coord_not_found", ["依赖坐标不能为空。"]
+
+    if wanted in coords:
+        return [wanted], "coord_exact", []
+
+    candidates = []
+    if ":" in wanted:
+        _group_id, _artifact_id, classifier = split_artifact_coord(wanted)
+        if not classifier:
+            candidates = [item for item in coords if _coord_ga(item) == wanted]
+    else:
+        candidates = [item for item in coords if _coord_artifact_id(item) == wanted]
+
+    if len(candidates) == 1:
+        mode = "coord_ga_unique" if ":" in wanted else "coord_artifact_unique"
+        return candidates, mode, []
+    if len(candidates) > 1:
+        return [], "coord_ambiguous", [
+            f"依赖标识 {wanted} 对应多个坐标：{', '.join(candidates)}；请使用完整物理制品坐标。"
+        ]
+    return [], "coord_not_found", [f"本次 Step5 分析范围内没有依赖 {wanted}。"]
+
+
+def _normalize_package_prefix(value):
+    prefix = _clean(value)
+    if prefix.endswith(".*"):
+        prefix = prefix[:-2]
+    return prefix.rstrip(".")
+
+
+def _api_in_package(api_name, package_prefix):
+    name = _split_method_and_signature(api_name)[0].replace("$", ".")
+    prefix = _normalize_package_prefix(package_prefix).replace("$", ".")
+    return bool(prefix and (name == prefix or name.startswith(prefix + ".")))
+
+
+def _target_api_query(record):
+    api_name = _clean(record.get("api_name"))
+    signature = _clean(record.get("api_signature"))
+    symbol_kind = _clean(record.get("symbol_kind")).lower()
+    if symbol_kind in {"method", "constructor"}:
+        # A scoped target denotes one changed API, not a user-requested
+        # overload family. Missing method signatures therefore stay
+        # unqueryable instead of broadening to every overload.
+        return f"{api_name}{signature}" if signature else ""
+    if signature and not symbol_kind:
+        return f"{api_name}{signature}"
+    return api_name
+
+
+def _chain_identity(chain):
+    return "".join(_clean(chain).replace(" -> ", " → ").split())
+
+
+def _chain_node_identity(node):
+    name, signature = _split_method_and_signature(node)
+    normalized_signature = normalize_signature_for_identity(signature)
+    if signature and not normalized_signature:
+        normalized_signature = "".join(signature.split())
+    return "".join(name.split()), normalized_signature
+
+
+def _chains_equivalent(left, right):
+    left_nodes = [
+        _chain_node_identity(item.strip())
+        for item in _clean(left).replace(" -> ", " → ").split(" → ")
+        if item.strip()
+    ]
+    right_nodes = [
+        _chain_node_identity(item.strip())
+        for item in _clean(right).replace(" -> ", " → ").split(" → ")
+        if item.strip()
+    ]
+    if len(left_nodes) != len(right_nodes):
+        return False
+    for (left_name, left_signature), (right_name, right_signature) in zip(left_nodes, right_nodes):
+        if left_name != right_name:
+            return False
+        if left_signature and right_signature and left_signature != right_signature:
+            return False
+    return True
+
+
+def _chain_precision(chain):
+    return sum(
+        1
+        for item in _clean(chain).replace(" -> ", " → ").split(" → ")
+        if _chain_node_identity(item.strip())[1]
+    )
+
+
+def _chain_skeleton(chain):
+    return tuple(
+        _chain_node_identity(item.strip())[0]
+        for item in _clean(chain).replace(" -> ", " → ").split(" → ")
+        if item.strip()
+    )
+
+
+def _merge_chain(chains, candidate, limit=None, groups=None):
+    candidate_id = _chain_identity(candidate)
+    skeleton = _chain_skeleton(candidate)
+    candidate_indexes = (
+        groups.get(skeleton, []) if groups is not None else range(len(chains))
+    )
+    for index in candidate_indexes:
+        existing = chains[index]
+        if _chain_identity(existing) != candidate_id and not _chains_equivalent(existing, candidate):
+            continue
+        if _chain_precision(candidate) > _chain_precision(existing):
+            chains[index] = candidate
+        return False
+    if limit is None or len(chains) < limit:
+        chains.append(candidate)
+        if groups is not None:
+            groups.setdefault(skeleton, []).append(len(chains) - 1)
+        return True
+    return False
+
+
+def _resolve_scope_targets(index, query, query_type):
+    targets = [item for item in index.get("target_apis") or [] if isinstance(item, dict)]
+    warnings = []
+    if query_type == "coord":
+        matched_coords, match_mode, warnings = _resolve_coord_query(
+            query,
+            [item.get("coord") for item in targets],
+        )
+        matched = [item for item in targets if _clean(item.get("coord")) in matched_coords]
+    elif query_type == "package":
+        prefix = _normalize_package_prefix(query)
+        if not prefix:
+            matched = []
+            match_mode = "package_not_found"
+            warnings = ["包前缀不能为空。"]
+        else:
+            matched = [item for item in targets if _api_in_package(item.get("api_name"), prefix)]
+            match_mode = "package_prefix" if matched else "package_not_found"
+            if not matched:
+                warnings = [f"本次 Step5 分析范围内没有包前缀 {prefix} 对应的变更 API。"]
+        matched_coords = sorted({_clean(item.get("coord")) for item in matched if _clean(item.get("coord"))})
+    else:
+        raise ValueError(f"unsupported query type: {query_type}")
+    return matched, matched_coords, match_mode, warnings
+
+
+def _alert_scope_rows(report_dir_or_file):
+    alerts_path = _alerts_path(report_dir_or_file)
+    if not alerts_path.exists():
+        return []
+    rows = []
+    with open_csv_read(alerts_path) as fh:
+        for row in csv.DictReader(fh):
+            if _clean(row.get("path_status")) and _clean(row.get("path_status")) != "reachable":
+                continue
+            path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
+            if not path_text:
+                continue
+            normalized = dict(row)
+            normalized["path_text"] = path_text
+            normalized["coord"] = _coord_without_versions(row.get("target_coord"))
+            api_name, embedded_signature = _split_method_and_signature(row.get("changed_symbol"))
+            normalized["api_name"] = api_name
+            normalized["api_signature"] = _clean(row.get("api_signature")) or embedded_signature
+            if not api_name or not _path_ends_with_target(
+                path_text,
+                api_name,
+                normalized["api_signature"],
+            ):
+                continue
+            rows.append(normalized)
+    return rows
+
+
+def query_alert_chains_by_scope(report_dir_or_file, query, query_type, limit=20):
+    """Query coord/package scope from alerts for indexes created before scope metadata."""
+    rows = _alert_scope_rows(report_dir_or_file)
+    warnings = []
+    if query_type == "coord":
+        matched_coords, match_mode, warnings = _resolve_coord_query(
+            query,
+            [row.get("coord") for row in rows],
+        )
+        matched = [row for row in rows if row.get("coord") in matched_coords]
+    elif query_type == "package":
+        prefix = _normalize_package_prefix(query)
+        matched = [row for row in rows if _api_in_package(row.get("api_name"), prefix)]
+        matched_coords = sorted({row.get("coord") for row in matched if row.get("coord")})
+        match_mode = "package_prefix" if matched else "package_not_found"
+        if not prefix:
+            warnings = ["包前缀不能为空。"]
+        elif not matched:
+            warnings = [f"alerts.csv 中没有包前缀 {prefix} 对应的可达调用链。"]
+    else:
+        raise ValueError(f"unsupported query type: {query_type}")
+
+    matched_targets = {
+        (row.get("coord", ""), row.get("api_name", ""), _clean(row.get("api_signature")))
+        for row in matched
+    }
+    all_chains = []
+    chain_groups = {}
+    for row in matched:
+        chain = row.get("path_text", "")
+        _merge_chain(all_chains, chain, groups=chain_groups)
+    chains = all_chains[:max(0, limit)]
+    return {
+        "chains": chains,
+        "_all_chains": all_chains,
+        "matched_coords": matched_coords,
+        "matched_target_count": len(matched_targets),
+        "match_mode": match_mode,
+        "warnings": warnings,
+    }
+
+
+def query_scope_call_chain_result(
+    report_dir_or_file,
+    query,
+    query_type,
+    max_depth=5,
+    limit=20,
+    max_visits=50000,
+):
+    """Return all reachable changed-API chains for one dependency or package."""
+    index, index_path = load_query_index(report_dir_or_file)
+    has_scope_metadata = "target_apis" in index
+    targets, matched_coords, match_mode, warnings = _resolve_scope_targets(
+        index, query, query_type,
+    )
+
+    if match_mode == "coord_ambiguous":
+        return {
+            "query": query,
+            "query_type": query_type,
+            "chains": [],
+            "exact_match": False,
+            "match_mode": match_mode,
+            "matched_coords": [],
+            "matched_target_count": 0,
+            "unqueryable_target_count": 0,
+            "limit_reached": False,
+            "index_path": str(index_path),
+            "warnings": warnings,
+        }
+
+    chains = []
+    chain_groups = {}
+    unqueryable_target_count = 0
+    for target in targets:
+        remaining = limit - len(chains)
+        if remaining <= 0:
+            break
+        target_query = _target_api_query(target)
+        if not target_query:
+            unqueryable_target_count += 1
+            continue
+        for chain in query_call_chains(
+            index,
+            target_query,
+            max_depth=max_depth,
+            limit=remaining,
+            max_visits=max_visits,
+        ):
+            _merge_chain(chains, chain, limit=limit, groups=chain_groups)
+            if len(chains) >= limit:
+                break
+
+    # alerts.csv contains packaged-runtime paths that can be absent from the
+    # compact source graph. It is also the compatibility path for old v1
+    # indexes that predate target_apis.
+    alert_result = query_alert_chains_by_scope(
+        report_dir_or_file,
+        query,
+        query_type,
+        limit=limit,
+    )
+    if not has_scope_metadata:
+        targets = []
+        matched_coords = alert_result["matched_coords"]
+        match_mode = f"alerts_{alert_result['match_mode']}"
+        warnings = alert_result["warnings"]
+    if (targets or not has_scope_metadata) and match_mode != "coord_ambiguous":
+        for chain in alert_result["_all_chains"]:
+            _merge_chain(chains, chain, limit=limit, groups=chain_groups)
+
+    matched_target_count = (
+        len(targets) if has_scope_metadata else alert_result["matched_target_count"]
+    )
+    limit_reached = bool(limit > 0 and len(chains) >= limit)
+    scope_warnings = []
+    if unqueryable_target_count:
+        scope_warnings.append(
+            f"{unqueryable_target_count} 个方法/构造器目标缺少精确签名；"
+            "为避免混淆重载，图索引未扩展这些目标。"
+        )
+    if chains:
+        warnings = scope_warnings
+        if limit_reached:
+            warnings.append(f"结果已达 --limit={limit} 上限，可能还有更多调用链。")
+    elif (
+        matched_target_count
+        and not warnings
+        and unqueryable_target_count < matched_target_count
+    ):
+        warnings = [f"已匹配 {matched_target_count} 个变更 API，但没有找到可达业务调用链。"]
+        warnings.extend(scope_warnings)
+    elif scope_warnings and not warnings:
+        warnings = scope_warnings
+    return {
+        "query": query,
+        "query_type": query_type,
+        "chains": chains,
+        "exact_match": bool(chains and match_mode != "coord_ambiguous"),
+        "match_mode": match_mode,
+        "matched_coords": matched_coords,
+        "matched_target_count": matched_target_count,
+        "unqueryable_target_count": unqueryable_target_count,
+        "limit_reached": limit_reached,
+        "index_path": str(index_path),
+        "warnings": warnings,
+    }
+
+
 def query_call_chain_result(report_dir_or_file, method, max_depth=5, limit=20, max_visits=50000, *, fuzzy=False):
     """Return query chains with trust metadata for CLI and programmatic callers."""
     index, index_path = load_query_index(report_dir_or_file)
-    exact_keys = build_target_keys(method, fuzzy=False)
-    all_keys = build_target_keys(method, fuzzy=fuzzy)
-    reverse_edges = index.get("reverse_edges") or {}
-    exact_present = any(reverse_edges.get(key) for key in exact_keys)
-    matched_keys = [key for key in all_keys if reverse_edges.get(key)]
+    exact_keys, matched_keys = _resolve_target_keys(index, method, fuzzy=fuzzy)
+    exact_present = bool(exact_keys)
     warnings = []
     chains = query_call_chains(
         index,
@@ -471,9 +946,24 @@ def render_query_result(result):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="查询 Step5 调用链索引，默认只返回调用链文本")
+    parser = argparse.ArgumentParser(
+        description="按方法、依赖坐标或包前缀查询 Step5 调用链索引"
+    )
     parser.add_argument("--report-dir", required=True, help="升级报告根目录，或 s5_query_index.json 文件路径")
-    parser.add_argument("--method", required=True, help="方法全限定名，可带签名，例如 a.b.C.m(String)")
+    query_group = parser.add_mutually_exclusive_group(required=True)
+    query_group.add_argument(
+        "--method",
+        help="方法全限定名，可带签名；省略签名时查询该全限定方法的全部重载",
+    )
+    query_group.add_argument(
+        "--coord",
+        help="依赖完整坐标或唯一 artifactId，例如 commons-lang:commons-lang 或 commons-lang",
+    )
+    query_group.add_argument(
+        "--package",
+        dest="package_prefix",
+        help="Java 包前缀，例如 org.apache.commons.lang",
+    )
     parser.add_argument("--max-depth", type=int, default=5)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--max-visits", type=int, default=50000, help=argparse.SUPPRESS)
@@ -481,14 +971,28 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true", help="以 JSON 输出调用链列表")
     args = parser.parse_args(argv)
 
-    result = query_call_chain_result(
-        args.report_dir,
-        args.method,
-        max_depth=args.max_depth,
-        limit=args.limit,
-        max_visits=args.max_visits,
-        fuzzy=args.fuzzy,
-    )
+    if args.fuzzy and not args.method:
+        parser.error("--fuzzy 只能与 --method 一起使用")
+    if args.method:
+        result = query_call_chain_result(
+            args.report_dir,
+            args.method,
+            max_depth=args.max_depth,
+            limit=args.limit,
+            max_visits=args.max_visits,
+            fuzzy=args.fuzzy,
+        )
+    else:
+        query_type = "coord" if args.coord else "package"
+        query = args.coord or args.package_prefix
+        result = query_scope_call_chain_result(
+            args.report_dir,
+            query,
+            query_type,
+            max_depth=args.max_depth,
+            limit=args.limit,
+            max_visits=args.max_visits,
+        )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

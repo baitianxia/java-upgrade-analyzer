@@ -2622,6 +2622,31 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(rows[0]["comparison_key"], "jackson-core")
         self.assertEqual(rows[0]["pairing_status"], "unique_artifact_migration")
 
+    def test_build_step1_change_rows_detects_same_version_content_change(self):
+        common = {
+            "coord": "com.nbs:nbs-bcl-basesvr",
+            "artifact_id": "nbs-bcl-basesvr",
+            "version": "1.0.0-SNAPSHOT",
+            "scope": "runtime",
+            "resolution_status": "resolved",
+        }
+
+        changed = s1_dep_diff._build_step1_change_rows(
+            [{**common, "content_sha256": "a" * 64}],
+            [{**common, "content_sha256": "b" * 64}],
+        )[0]
+        unchanged = s1_dep_diff._build_step1_change_rows(
+            [{**common, "content_sha256": "a" * 64}],
+            [{**common, "content_sha256": "a" * 64}],
+        )[0]
+
+        self.assertEqual(changed["old_version"], changed["new_version"])
+        self.assertEqual(changed["change_type"], "已变更")
+        self.assertIn(
+            "same_version_artifact_content_changed", changed["remark"]
+        )
+        self.assertEqual(unchanged["change_type"], "未变")
+
     def test_build_step1_change_rows_matches_exact_coord_before_group_migration(self):
         rows = s1_dep_diff._build_step1_change_rows(
             [

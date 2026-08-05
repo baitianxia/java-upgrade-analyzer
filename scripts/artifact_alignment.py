@@ -63,12 +63,17 @@ def build_artifact_alignment(
     expected_sha256="",
     internally_built=False,
     artifact_relative_path="",
+    check_worktree_dirty=True,
 ):
     project = Path(project_root).resolve()
     artifact = Path(artifact_path).resolve()
     relative_artifact = str(artifact_relative_path or "").strip()
     revision = _git(project, "rev-parse", "HEAD")
-    status_text = _git(project, "status", "--porcelain=v1", "--untracked-files=all")
+    status_text = (
+        _git(project, "status", "--porcelain=v1", "--untracked-files=all")
+        if check_worktree_dirty
+        else ""
+    )
     dirty_paths = tuple(
         sorted(line[3:] for line in status_text.splitlines() if len(line) > 3)
     )
